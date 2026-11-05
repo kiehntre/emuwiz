@@ -332,6 +332,8 @@ impl App {
         if self.show_big_picture(context) {
             return;
         }
+        self.drive_pad_shell(context);
+        crate::ui::picker::show(context);
         let modal_open = self.confirm_scan
             || self.setup_actions.confirm.is_some()
             || self.repair_confirm
@@ -1097,12 +1099,14 @@ impl App {
                                 icon.center(),
                                 palette::SECONDARY_TEXT,
                             );
-                            ui.add(
+                            let field = ui.add(
                                 egui::TextEdit::singleline(&mut self.filter.search)
                                     .hint_text("Search your games or systems…")
                                     .frame(egui::Frame::NONE)
                                     .desired_width(width - 60.0),
-                            )
+                            );
+                            super::pad_shell::mark_suggestions(&field);
+                            field
                         });
                     let response = field.inner;
                     if response.changed() {
@@ -1517,6 +1521,7 @@ impl App {
                     .hint_text("Search title or system")
                     .desired_width(240.0),
             );
+            super::pad_shell::mark_suggestions(&search);
             let mut changed = search.changed();
             let previous_platform = self.filter.platform.clone();
             egui::ComboBox::from_id_salt("v2_platform_filter")

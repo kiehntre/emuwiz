@@ -22,7 +22,7 @@ fn texture_undo(interfere: bool) {
     std::fs::write(source.join("new.png"), b"texture").unwrap();
     let identity = PpssppTextureIdentity {
         disc_id: "ULUS-12345".into(),
-        platform: IdentityPlatform::PlayStation,
+        platform: IdentityPlatform::Psp,
     };
     let build = build_ppsspp_texture_pack_manifest(&PpssppTexturePackBuildRequest {
         source_root: source.clone(),
@@ -168,4 +168,103 @@ mod rollback_warnings {
     fn warning_text_says_when_no_rollback_ran() {
         assert_rollback_did_not_run(&message(None));
     }
+}
+
+fn inject(state: &mut PpssppTextureModPageState, work: Work) {
+    let (sender, receiver) = mpsc::channel();
+    sender.send(work).unwrap();
+    state.worker = Some(receiver);
+}
+
+#[test]
+fn polling_an_empty_worker_stays_busy_and_keeps_the_receipt() {
+    let mut state = PpssppTextureModPageState::default();
+    let (_sender, receiver) = mpsc::channel::<Work>();
+    state.worker = Some(receiver);
+    assert!(state.is_busy());
+    assert!(!state.poll());
+    assert!(state.is_busy());
+    // A running job is never dropped by a context reset.
+    state.reset();
+    assert!(state.is_busy());
+}
+
+#[test]
+fn a_cancelled_picker_changes_nothing_and_a_chosen_one_clears_stale_state() {
+    let mut state = PpssppTextureModPageState {
+        source_root: Some("/old".into()),
+        error: Some("old".into()),
+        ..Default::default()
+    };
+    inject(&mut state, Work::Picked(None));
+    assert!(state.poll());
+    assert_eq!(state.source_root.as_deref(), Some(Path::new("/old")));
+    inject(&mut state, Work::Picked(Some("/new".into())));
+    assert!(state.poll());
+    assert_eq!(state.source_root.as_deref(), Some(Path::new("/new")));
+    assert!(state.error.is_none() && state.plan.is_none());
+}
+
+#[test]
+fn install_is_reported_only_after_the_worker_returns_success() {
+    let mut state = PpssppTextureModPageState::default();
+    inject(&mut state, Work::Installed(Err("no history root".into())));
+    assert!(state.poll());
+    assert!(state.applied.is_none());
+    assert!(state.error.as_deref().unwrap().contains("did not start"));
+    // A vanished worker is an unknown outcome, never "Installed".
+    let (sender, receiver) = mpsc::channel::<Work>();
+    drop(sender);
+    state.worker = Some(receiver);
+    assert!(state.poll());
+    assert!(state.applied.is_none());
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("stopped unexpectedly")
+    );
+    assert!(!state.is_busy());
+}
+
+#[test]
+fn a_failed_undo_start_retains_the_installed_receipt() {
+    let mut state = PpssppTextureModPageState::default();
+    inject(&mut state, Work::RolledBack(Err("no backup root".into())));
+    assert!(state.poll());
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("receipt was retained")
+    );
+}
+
+#[test]
+fn journal_timestamps_are_real_not_the_2023_placeholder() {
+    assert!(now() > 1_700_000_001, "{}", now());
+}
+
+#[test]
+fn another_games_pack_plan_and_receipt_never_carry_over() {
+    let mut state = PpssppTextureModPageState {
+        source_root: Some("/pack".into()),
+        error: Some("old".into()),
+        ..Default::default()
+    };
+    state.sync(Path::new("/games/a.iso"), "p", "D1");
+    state.source_root = Some("/pack".into());
+    state.sync(Path::new("/games/a.iso"), "p", "D1");
+    assert!(state.source_root.is_some(), "same game keeps its pack");
+    state.sync(Path::new("/games/b.iso"), "p", "D2");
+    assert!(state.source_root.is_none() && state.error.is_none());
+    // A running job pins the state until it finishes.
+    let (_sender, receiver) = mpsc::channel::<Work>();
+    state.worker = Some(receiver);
+    state.source_root = Some("/pack".into());
+    state.sync(Path::new("/games/c.iso"), "p", "D3");
+    assert!(!state.belongs_to(Path::new("/games/c.iso"), "p", "D3"));
+    assert!(state.source_root.is_some());
 }

@@ -22,6 +22,8 @@ pub(in crate::gui_v2) enum Button {
     LeftBumper,
     RightBumper,
     Start,
+    /// Right stick pressed in (R3).
+    RightStick,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -31,7 +33,7 @@ pub(in crate::gui_v2) enum Control {
     Direction(Direction),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::gui_v2) enum PadEvent {
     Pressed {
         device: u32,
@@ -44,6 +46,13 @@ pub(in crate::gui_v2) enum PadEvent {
     /// The device left, or the kernel dropped events: what it holds is unknown.
     Reset {
         device: u32,
+    },
+    /// The right stick, each axis -1.0 to 1.0 with up/left negative; (0, 0)
+    /// when at rest. Only sent while a consumer asked for it.
+    RightStick {
+        device: u32,
+        x: f32,
+        y: f32,
     },
 }
 
@@ -59,6 +68,8 @@ pub(in crate::gui_v2) enum Command {
     Launch,
     Search,
     Platforms,
+    /// R3: the controller's virtual mouse (ordinary pages only).
+    Pointer,
 }
 
 const REPEAT_DELAY: f64 = 0.35;
@@ -77,6 +88,7 @@ fn command_for(control: Control) -> Command {
         Control::Button(Button::North) => Command::Platforms,
         Control::Button(Button::LeftBumper) => Command::PageUp,
         Control::Button(Button::RightBumper) => Command::PageDown,
+        Control::Button(Button::RightStick) => Command::Pointer,
     }
 }
 
@@ -136,6 +148,7 @@ impl Navigator {
                 }
                 None
             }
+            PadEvent::RightStick { .. } => None,
             PadEvent::Reset { device } => {
                 self.held.retain(|(held, _)| *held != device);
                 if self.repeat.as_ref().is_some_and(|r| r.device == device) {

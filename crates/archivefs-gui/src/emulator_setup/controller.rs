@@ -773,7 +773,15 @@ impl ArchiveFsApp {
                         }),
                     )
                     .clicked()
-                    && let Some(folder) = rfd::FileDialog::new().pick_folder()
+                {
+                    crate::ui::picker::request(
+                        ui.ctx(),
+                        egui::Id::new("core_folder_pick"),
+                        crate::ui::picker::PickRequest::folder("Choose game-support folder"),
+                    );
+                }
+                if let Some(folder) =
+                    crate::ui::picker::take(ui.ctx(), egui::Id::new("core_folder_pick"))
                 {
                     pending = Some(CoreFolderAction::ChooseFolder(folder));
                 }

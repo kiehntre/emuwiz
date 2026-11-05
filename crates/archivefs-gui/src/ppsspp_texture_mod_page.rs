@@ -3,10 +3,10 @@
 use crate::ui::components as widgets;
 use archivefs_core::game_identity::GameIdentityReport;
 use archivefs_core::patch_manager::{
-    PpssppProfile, PpssppTexturePackBuildRequest, PpssppTexturePackPlan, SharedApplyConfirmation,
-    SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedRollbackConfirmation,
-    SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult,
-    build_ppsspp_texture_pack_manifest, build_ppsspp_texture_pack_preview,
+    PpssppProfile, PpssppTexturePackApplyResult, PpssppTexturePackBuildRequest,
+    PpssppTexturePackPlan, SharedApplyConfirmation, SharedApplyOptions, SharedApplyResult,
+    SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview,
+    SharedRollbackResult, build_ppsspp_texture_pack_manifest, build_ppsspp_texture_pack_preview,
     build_ppsspp_texture_pack_transaction_plan, default_shared_backup_root,
     default_shared_history_root, execute_ppsspp_texture_pack_apply, execute_shared_rollback,
     generate_shared_operation_id, ppsspp_texture_destination_root, preview_shared_rollback,
@@ -14,7 +14,8 @@ use archivefs_core::patch_manager::{
 };
 use eframe::egui;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long a PPSSPP profile discovery is reused, so the filesystem probe
 /// does not run on every rendered frame.
@@ -22,6 +23,8 @@ const PROFILE_DISCOVERY_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub(crate) struct PpssppTextureModPageState {
+    /// The game this state belongs to; any other game starts clean.
+    key: Option<(PathBuf, String, String)>,
     source_root: Option<PathBuf>,
     plan: Option<PpssppTexturePackPlan>,
     transaction: Option<archivefs_core::patch_manager::SharedTransactionPlan>,
@@ -29,6 +32,22 @@ pub(crate) struct PpssppTextureModPageState {
     rollback_preview: Option<SharedRollbackPreview>,
     error: Option<String>,
     profile_cache: Option<(Instant, Option<PpssppProfile>)>,
+    /// The one background job (folder picker, install or Undo) in flight.
+    worker: Option<Receiver<Work>>,
+}
+
+/// Result of the single in-flight background job.
+enum Work {
+    Picked(Option<PathBuf>),
+    Installed(Result<Box<PpssppTexturePackApplyResult>, String>),
+    RolledBack(Result<SharedRollbackResult, String>),
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl PpssppTextureModPageState {
@@ -63,7 +82,98 @@ impl PpssppTextureModPageState {
     }
 
     pub(crate) fn reset(&mut self) {
-        *self = Self::default();
+        // A running job owns filesystem writes; never drop its receiver.
+        if self.worker.is_none() {
+            *self = Self::default();
+        }
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.worker.is_some()
+    }
+
+    /// Test support: queue a finished folder-picker result as the worker would.
+    #[cfg(test)]
+    pub(crate) fn queue_picked_for_test(&mut self, path: Option<PathBuf>) {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Work::Picked(path)).unwrap();
+        self.worker = Some(receiver);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_root(&self) -> Option<&Path> {
+        self.source_root.as_deref()
+    }
+
+    fn belongs_to(&self, archive_path: &Path, profile_id: &str, disc_id: &str) -> bool {
+        self.key
+            .as_ref()
+            .is_some_and(|(a, p, d)| a == archive_path && p == profile_id && d == disc_id)
+    }
+
+    /// Drops a pack, plan or receipt that belongs to a different game. A
+    /// running job is left alone (its game stays selected by the caller).
+    fn sync(&mut self, archive_path: &Path, profile_id: &str, disc_id: &str) {
+        let key = (
+            archive_path.to_path_buf(),
+            profile_id.to_owned(),
+            disc_id.to_owned(),
+        );
+        if self.key.as_ref() != Some(&key) && self.worker.is_none() {
+            let cache = self.profile_cache.take();
+            *self = Self::default();
+            self.profile_cache = cache;
+            self.key = Some(key);
+        }
+    }
+
+    /// Drains the background job. Returns whether anything changed.
+    pub(crate) fn poll(&mut self) -> bool {
+        let Some(receiver) = self.worker.take() else {
+            return false;
+        };
+        match receiver.try_recv() {
+            Err(TryRecvError::Empty) => {
+                self.worker = Some(receiver);
+                false
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.error = Some("The texture pack worker stopped unexpectedly. Nothing is reported as installed; review History before retrying.".into());
+                true
+            }
+            Ok(Work::Picked(path)) => {
+                if let Some(path) = path {
+                    self.source_root = Some(path);
+                    self.plan = None;
+                    self.transaction = None;
+                    self.error = None;
+                }
+                true
+            }
+            Ok(Work::Installed(Err(detail))) => {
+                self.error = Some(format!("Install did not start: {detail}"));
+                true
+            }
+            Ok(Work::Installed(Ok(result))) => {
+                if result.apply.journal.status == SharedApplyStatus::Success {
+                    self.error = None;
+                    self.applied = Some(result.apply);
+                } else {
+                    self.error = Some(incomplete_install_message(&result));
+                }
+                true
+            }
+            Ok(Work::RolledBack(Err(detail))) => {
+                self.error = Some(format!(
+                    "Undo did not start: {detail}. The installed receipt was retained."
+                ));
+                true
+            }
+            Ok(Work::RolledBack(Ok(result))) => {
+                self.finish_rollback(result);
+                true
+            }
+        }
     }
 }
 
@@ -110,6 +220,16 @@ pub(crate) fn show_ppsspp_texture_mod_panel(
             return;
         }
     };
+    state.sync(archive_path, &profile.profile_id, &identity.disc_id);
+    if !state.belongs_to(archive_path, &profile.profile_id, &identity.disc_id) {
+        widgets::banner(
+            ui,
+            "Texture job still running",
+            "A texture pack job for another game or profile is still running. Return to that game to see its result; nothing here can be changed until it finishes.",
+            widgets::StatusTone::Pending,
+        );
+        return;
+    }
     widgets::card(ui, |ui| {
         ui.label(format!("Verified Disc ID: {}", identity.disc_id));
         ui.label(format!("Destination root: {}", destination.display()));
@@ -120,17 +240,19 @@ pub(crate) fn show_ppsspp_texture_mod_panel(
             ui,
             "Choose pack",
             widgets::ActionStyle::Primary,
-            state.applied.is_none(),
+            state.applied.is_none() && !state.is_busy(),
         )
         .clicked()
         {
-            state.source_root = rfd::FileDialog::new().pick_folder();
-            state.plan = None;
-            state.transaction = None;
-            state.error = None;
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(Work::Picked(rfd::FileDialog::new().pick_folder()));
+            });
+            state.worker = Some(receiver);
         }
         if state.source_root.is_some()
             && state.plan.is_none()
+            && !state.is_busy()
             && widgets::action_button(ui, "Inspect", widgets::ActionStyle::Secondary, true)
                 .clicked()
         {
@@ -204,7 +326,7 @@ pub(crate) fn show_ppsspp_texture_mod_panel(
                     ui,
                     "Confirm and install",
                     widgets::ActionStyle::Primary,
-                    plan.is_applyable(),
+                    plan.is_applyable() && !state.is_busy(),
                 )
                 .clicked()
             {
@@ -217,65 +339,87 @@ pub(crate) fn show_ppsspp_texture_mod_panel(
             }
         }
         if let Some(plan) = state.transaction.take() {
-            let history = default_shared_history_root();
-            let backups = default_shared_backup_root();
-            if let (Ok(history_root), Ok(backup_root)) = (history, backups) {
-                let result = execute_ppsspp_texture_pack_apply(
-                    &plan,
-                    &SharedApplyOptions {
-                        dry_run: false,
-                        confirmation: Some(SharedApplyConfirmation {
-                            plan_id: plan.plan_id.clone(),
-                            general_approved: true,
-                            replacement_approved: true,
-                        }),
-                        operation_id: generate_shared_operation_id(),
-                        timestamp_unix_seconds: 1_700_000_000,
-                        current_context: plan.context.clone(),
-                        history_root,
-                        backup_root,
-                    },
-                );
-                if result.apply.journal.status == SharedApplyStatus::Success {
-                    state.applied = Some(result.apply);
-                } else {
-                    state.error = Some(incomplete_install_message(&result));
-                }
-            }
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = (|| {
+                    let history_root = default_shared_history_root().map_err(|e| e.detail)?;
+                    let backup_root = default_shared_backup_root().map_err(|e| e.detail)?;
+                    Ok(Box::new(execute_ppsspp_texture_pack_apply(
+                        &plan,
+                        &SharedApplyOptions {
+                            dry_run: false,
+                            confirmation: Some(SharedApplyConfirmation {
+                                plan_id: plan.plan_id.clone(),
+                                general_approved: true,
+                                replacement_approved: true,
+                            }),
+                            operation_id: generate_shared_operation_id(),
+                            timestamp_unix_seconds: now(),
+                            current_context: plan.context.clone(),
+                            history_root,
+                            backup_root,
+                        },
+                    )))
+                })();
+                let _ = sender.send(Work::Installed(result));
+            });
+            state.worker = Some(receiver);
+        }
+        if state.is_busy() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Working… keep this page open until the result is shown.");
+            });
         }
         if let Some(result) = &state.applied {
             show_applied_summary(ui, result);
             if let Some(path) = &result.journal_path
                 && state.rollback_preview.is_none()
-                && let Ok(backups) = default_shared_backup_root()
+                && !state.is_busy()
             {
-                state.rollback_preview =
-                    Some(preview_shared_rollback(path, &destination, &backups));
+                match default_shared_backup_root() {
+                    Ok(backups) => {
+                        state.rollback_preview =
+                            Some(preview_shared_rollback(path, &destination, &backups));
+                    }
+                    Err(error) => {
+                        state.error = Some(format!("Undo is unavailable: {}", error.detail));
+                    }
+                }
             }
         }
         if let Some(preview) = state.rollback_preview.take() {
             if preview.available
-                && widgets::action_button(ui, "Undo", widgets::ActionStyle::Secondary, true)
-                    .clicked()
+                && widgets::action_button(
+                    ui,
+                    "Undo",
+                    widgets::ActionStyle::Secondary,
+                    !state.is_busy(),
+                )
+                .clicked()
             {
-                if let (Ok(history), Ok(backups)) =
-                    (default_shared_history_root(), default_shared_backup_root())
-                {
-                    let result = execute_shared_rollback(
-                        &preview,
-                        &SharedRollbackOptions {
-                            confirmation: SharedRollbackConfirmation {
-                                preview_id: preview.preview_id.clone(),
-                                approved: true,
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = (|| {
+                        let history_root = default_shared_history_root().map_err(|e| e.detail)?;
+                        let backup_root = default_shared_backup_root().map_err(|e| e.detail)?;
+                        Ok(execute_shared_rollback(
+                            &preview,
+                            &SharedRollbackOptions {
+                                confirmation: SharedRollbackConfirmation {
+                                    preview_id: preview.preview_id.clone(),
+                                    approved: true,
+                                },
+                                rollback_operation_id: generate_shared_operation_id(),
+                                timestamp_unix_seconds: now(),
+                                history_root,
+                                backup_root,
                             },
-                            rollback_operation_id: generate_shared_operation_id(),
-                            timestamp_unix_seconds: 1_700_000_001,
-                            history_root: history,
-                            backup_root: backups,
-                        },
-                    );
-                    state.finish_rollback(result);
-                }
+                        ))
+                    })();
+                    let _ = sender.send(Work::RolledBack(result));
+                });
+                state.worker = Some(receiver);
             } else {
                 state.rollback_preview = Some(preview);
             }

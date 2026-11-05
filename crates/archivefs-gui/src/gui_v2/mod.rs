@@ -73,6 +73,11 @@ mod nkit;
 mod onboarding;
 mod optical_compare;
 mod organisation;
+mod osk;
+mod pad_mouse;
+mod pad_shell;
+mod suggest;
+pub(crate) use pad_shell::mark_secret;
 mod pages;
 mod patch_composition;
 mod patch_package_preview;
@@ -363,6 +368,7 @@ pub(super) struct App {
     filter_generation: u64,
     filter_inflight: bool,
     big_picture: Option<Box<big_picture::BigPicture>>,
+    pad_shell: Option<Box<pad_shell::PadShell>>,
     filter_dirty: Option<Instant>,
     detail: Option<Detail>,
     detail_pending: Option<i64>,
@@ -500,6 +506,7 @@ impl App {
             filter_generation: 0,
             filter_inflight: false,
             big_picture: None,
+            pad_shell: None,
             filter_dirty: None,
             detail: None,
             detail_pending: None,

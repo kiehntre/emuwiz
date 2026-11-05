@@ -18,6 +18,8 @@ mod native_collection;
 
 #[path = "native_mod_activation.rs"]
 mod native_mod_activation;
+#[path = "native_texture_packs.rs"]
+mod native_texture_packs;
 
 #[path = "game_firmware_guidance.rs"]
 mod game_firmware_guidance;
@@ -407,6 +409,7 @@ impl NativeWorkflows {
 
     pub(super) fn poll(&mut self, context: &egui::Context, activity: &mut Activity) {
         self.scummvm_trainer.poll();
+        self.poll_texture_jobs(context);
         if self.native_romm.is_open()
             && self.app.romm_ui.config_draft.is_some()
             && context.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft))
@@ -1368,7 +1371,14 @@ impl NativeWorkflows {
             if ui
                 .add_enabled(!busy, egui::Button::new("Add source"))
                 .clicked()
-                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                crate::ui::picker::request(
+                    ui.ctx(),
+                    egui::Id::new("blue_add_source"),
+                    crate::ui::picker::PickRequest::folder("Choose a games folder to add"),
+                );
+            }
+            if let Some(path) = crate::ui::picker::take(ui.ctx(), egui::Id::new("blue_add_source"))
             {
                 action = Some(crate::SourceAction::Add(path));
             }
