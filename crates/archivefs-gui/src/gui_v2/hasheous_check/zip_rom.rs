@@ -1,11 +1,9 @@
 //! The SHA-1 of the one cartridge ROM inside a ZIP, for Check Hasheous.
 //!
-//! Selection reads only the central directory (the DAT engine's bounded
-//! [`preflight_zip`]) and applies the same member refusals as zipped-cartridge
-//! identity (#333): encrypted, symbolic-link, unsafe or duplicate names refuse
-//! the whole archive, and exactly one member may be a ROM that
-//! [`supported_loose_rom_format`] accepts for the game's system. Anything else
-//! (no ROM, several ROMs) is refused rather than picked.
+//! Selection is core's shared [`select_zip_cartridge_member`] (the same rule
+//! zipped-cartridge identity and launch staging use), behind the same
+//! [`is_loose_cartridge_platform`] guard, so Hasheous accepts, refuses and
+//! picks exactly what they do. There is no second selection rule here.
 //!
 //! Hashing is the DAT engine's own [`ZipArchiveSource`] pass: streamed in
 //! chunks, cancellable, each member checked against its stored CRC, bounded
@@ -16,13 +14,15 @@
 //! ROM gets.
 use archivefs_core::dat::archive::limits::ArchiveLimits;
 use archivefs_core::dat::archive::zip::ZipArchiveSource;
-use archivefs_core::dat::archive::zip_preflight::{ZipPreflightError, preflight_zip};
 use archivefs_core::dat::archive::{
     ArchiveMemberSource, ArchiveMemberStatus, ArchivePassCompletion, ArchivePassStopReason,
     ArchiveRunBudget,
 };
-use archivefs_core::game_identity::{IdentityPlatform, supported_loose_rom_format};
+use archivefs_core::game_identity::{IdentityPlatform, IdentityStatus};
 use archivefs_core::safe_read::{TrustedRoots, open_bounded_read};
+use archivefs_core::zip_cartridge_select::{
+    ZipCartridgeMember, is_loose_cartridge_platform, select_zip_cartridge_member,
+};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
@@ -32,11 +32,12 @@ pub(super) const MAX_ROM_BYTES: u64 = archivefs_core::game_identity::MAX_LOOSE_R
 pub(super) const MAX_ZIP_LOGICAL_BYTES: u64 = 4 * MAX_ROM_BYTES;
 pub(super) const MAX_ZIP_MEMBERS: usize = 64;
 
+pub(super) const NOT_CARTRIDGE: &str =
+    "EmuWiz reads a ZIP here only for cartridge systems, so nothing was sent.";
 pub(super) const NO_ROM: &str =
     "This ZIP holds no ROM for this game's system, so nothing was sent.";
-pub(super) const SEVERAL_ROMS: &str =
-    "This ZIP holds more than one ROM. EmuWiz does not pick one, so nothing was sent.";
-pub(super) const UNSAFE_ENTRY: &str = "This ZIP has an encrypted, linked, duplicate or unsafely named entry, so it was not read and nothing was sent.";
+pub(super) const SEVERAL_ROMS: &str = "This ZIP holds more than one ROM, or entries with the same name. EmuWiz does not pick one, so nothing was sent.";
+pub(super) const UNSAFE_ENTRY: &str = "This ZIP has an encrypted, linked or unsafely named entry, so it was not read and nothing was sent.";
 pub(super) const DAMAGED: &str =
     "This ZIP is damaged or failed its integrity check, so nothing was sent.";
 pub(super) const TOO_LARGE: &str =
@@ -56,6 +57,10 @@ pub(super) enum ZipRefusal {
     Refused(String),
 }
 
+fn refused(text: &str) -> ZipRefusal {
+    ZipRefusal::Refused(text.to_string())
+}
+
 fn limits() -> ArchiveLimits {
     ArchiveLimits {
         max_members: MAX_ZIP_MEMBERS,
@@ -65,24 +70,35 @@ fn limits() -> ArchiveLimits {
     }
 }
 
-/// Unix symbolic-link entries, as recorded by Unix ZIP tools.
-fn is_symlink(external_attributes: u32) -> bool {
-    (external_attributes >> 16) & 0o170000 == 0o120000
-}
-
-fn safe_name(raw: &[u8]) -> Option<&str> {
-    let name = std::str::from_utf8(raw).ok()?;
-    let unsafe_name = name.is_empty()
-        || name.len() > 4096
-        || name.contains('\0')
-        || name.contains('\\')
-        || name.starts_with('/')
-        || name.split('/').any(|part| part == "..");
-    (!unsafe_name).then_some(name)
-}
-
-fn refused(text: &str) -> ZipRefusal {
-    ZipRefusal::Refused(text.to_string())
+/// Core's shared selection for `path`, read under the normal read policy.
+pub(super) fn select(
+    path: &Path,
+    platform: &str,
+    roots: &TrustedRoots,
+) -> Result<ZipCartridgeMember, ZipRefusal> {
+    let platform = IdentityPlatform::from_catalogue(Some(platform));
+    if !is_loose_cartridge_platform(platform) {
+        return Err(refused(NOT_CARTRIDGE));
+    }
+    let file = open_bounded_read(path, roots)
+        .map_err(|error| {
+            ZipRefusal::Refused(format!(
+                "This ZIP could not be opened, so nothing was sent: {}",
+                error.detail()
+            ))
+        })?
+        .into_file();
+    let mut archive = zip::ZipArchive::new(file).map_err(|_| refused(DAMAGED))?;
+    let mut seen = 0;
+    select_zip_cartridge_member(&mut archive, platform, &mut seen).map_err(|(status, _)| {
+        refused(match status {
+            IdentityStatus::Missing => NO_ROM,
+            IdentityStatus::Ambiguous => SEVERAL_ROMS,
+            IdentityStatus::Invalid | IdentityStatus::Unsupported => UNSAFE_ENTRY,
+            IdentityStatus::ResourceLimitReached => TOO_LARGE,
+            _ => DAMAGED,
+        })
+    })
 }
 
 /// Selects the ZIP's single ROM for `platform` and returns its SHA-1.
@@ -92,56 +108,18 @@ pub(super) fn sole_rom_sha1(
     roots: &TrustedRoots,
     cancel: &AtomicBool,
 ) -> Result<ZipRom, ZipRefusal> {
-    let platform = IdentityPlatform::from_catalogue(Some(platform));
-    let limits = limits();
-
-    // 1. Choose the member from the central directory alone.
-    let safe = open_bounded_read(path, roots).map_err(|error| {
-        ZipRefusal::Refused(format!(
-            "This ZIP could not be opened, so nothing was sent: {}",
-            error.detail()
-        ))
-    })?;
-    let len = safe.len();
-    let mut file = safe.into_file();
-    let preflight =
-        preflight_zip(&mut file, len, &limits, cancel).map_err(|error| match error {
-            ZipPreflightError::Cancelled => ZipRefusal::Cancelled,
-            ZipPreflightError::Refused("member count" | "central directory size") => {
-                refused(TOO_LARGE)
-            }
-            ZipPreflightError::Refused(_) => refused(DAMAGED),
-            ZipPreflightError::Corrupt(_) => refused(DAMAGED),
-        })?;
-    drop(file);
-    let mut names = std::collections::HashSet::new();
-    let mut candidates = Vec::new();
-    for entry in &preflight.entries {
-        let Some(name) = safe_name(&entry.name_raw) else {
-            return Err(refused(UNSAFE_ENTRY));
-        };
-        if entry.flags & 1 != 0
-            || is_symlink(entry.external_attributes)
-            || !names.insert(name.to_ascii_lowercase())
-        {
-            return Err(refused(UNSAFE_ENTRY));
-        }
-        if entry.is_directory {
-            continue;
-        }
-        if supported_loose_rom_format(Path::new(name), platform).is_some() {
-            candidates.push(entry.name_raw.clone());
-        }
+    let cancelled = || cancel.load(std::sync::atomic::Ordering::SeqCst);
+    if cancelled() {
+        return Err(ZipRefusal::Cancelled);
     }
-    let chosen = match candidates.len() {
-        1 => candidates.remove(0),
-        0 => return Err(refused(NO_ROM)),
-        _ => return Err(refused(SEVERAL_ROMS)),
-    };
-
-    // 2. Hash with the DAT engine's bounded, CRC-checked member pass.
-    let mut source =
-        ZipArchiveSource::open(path, roots, limits, cancel).map_err(|_| refused(DAMAGED))?;
+    let chosen = select(path, platform, roots)?;
+    let mut source = ZipArchiveSource::open(path, roots, limits(), cancel).map_err(|_| {
+        if cancelled() {
+            ZipRefusal::Cancelled
+        } else {
+            refused(DAMAGED)
+        }
+    })?;
     let mut budget = ArchiveRunBudget::new(MAX_ZIP_LOGICAL_BYTES);
     let pass = source.verify_all(cancel, &mut budget);
     if let ArchivePassCompletion::Incomplete { reason } = &pass.completion {
@@ -161,10 +139,11 @@ pub(super) fn sole_rom_sha1(
     }) {
         return Err(refused(DAMAGED));
     }
+    // The hashed member must be the selected one: same index and exact name.
     let member = pass
         .members
         .iter()
-        .find(|member| member.member_name_raw == chosen)
+        .find(|member| member.index == chosen.index && member.member_name_raw == chosen.name)
         .ok_or_else(|| refused(DAMAGED))?;
     match (&member.status, &member.hashes) {
         (ArchiveMemberStatus::HashComplete, Some(hashes)) => Ok(ZipRom {

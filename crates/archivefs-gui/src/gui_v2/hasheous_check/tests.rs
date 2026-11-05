@@ -809,3 +809,44 @@ fn a_headered_nes_rom_sends_its_whole_file_sha1_header_included() {
     ));
     assert!(WHOLE_FILE_NOTE.contains("including any ROM header"));
 }
+
+#[test]
+fn hasheous_hashes_exactly_the_member_the_shared_core_selector_picks() {
+    use archivefs_core::game_identity::IdentityPlatform;
+    use archivefs_core::zip_cartridge_select::select_zip_cartridge_member;
+    let folder = Folder::new();
+    let fixtures = [
+        zip_file(
+            &folder,
+            "One.zip",
+            &[
+                ("docs/readme.txt", b"notes", false),
+                ("One.gb", CONTENT, false),
+            ],
+        ),
+        zip_file(
+            &folder,
+            "Two.zip",
+            &[("A.gb", CONTENT, false), ("B.gb", CONTENT, false)],
+        ),
+        zip_file(&folder, "None.zip", &[("readme.txt", b"notes", false)]),
+        zip_file(&folder, "Other.zip", &[("Game.sfc", CONTENT, false)]),
+        zip_file(
+            &folder,
+            "Case.zip",
+            &[("Game.gb", CONTENT, true), ("GAME.GB", CONTENT, true)],
+        ),
+    ];
+    let roots = TrustedRoots::from_paths([folder.dir.path().to_path_buf()]);
+    for path in &fixtures {
+        // What core (and so identity and Play) selects.
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        let core = select_zip_cartridge_member(&mut archive, IdentityPlatform::GameBoy, &mut 0)
+            .map(|member| String::from_utf8(member.name).unwrap())
+            .ok();
+        let hasheous = zip_rom::sole_rom_sha1(path, "GB", &roots, &AtomicBool::new(false))
+            .map(|rom| rom.member)
+            .ok();
+        assert_eq!(hasheous, core, "{path:?}");
+    }
+}

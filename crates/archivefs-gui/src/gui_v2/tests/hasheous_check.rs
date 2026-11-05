@@ -109,3 +109,90 @@ fn blue_game_details_check_hasheous_runs_only_when_clicked() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+fn press(context: &egui::Context, app: &mut App, size: [f32; 2], at: egui::Pos2) {
+    for pressed in [true, false] {
+        frame_with(
+            context,
+            app,
+            size,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+}
+
+#[test]
+fn the_identity_shortcut_reveals_and_focuses_the_lookup_without_sending() {
+    use super::super::hasheous_check::SHORTCUT_LABEL;
+    const SMALL: [f32; 2] = [1024.0, 600.0];
+    let context = egui::Context::default();
+    context.style_mut(|style| style.animation_time = 0.0);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut app = app(&context, &calls);
+    for _ in 0..3 {
+        frame(&context, &mut app, SMALL);
+    }
+    let output = frame(&context, &mut app, SMALL);
+    // On the first screen of the smallest supported window, beside Identity.
+    assert!(visible_text(&output, SHORTCUT_LABEL), "{:?}", text(&output));
+    assert!(!visible_text(&output, "Hasheous (online)"));
+    let at = text_bounds(&output, SHORTCUT_LABEL)[0].center();
+    press(&context, &mut app, SMALL, at);
+    let mut revealed = frame(&context, &mut app, SMALL);
+    for _ in 0..3 {
+        revealed = frame(&context, &mut app, SMALL);
+    }
+    assert!(
+        visible_text(&revealed, "Hasheous (online)"),
+        "{:?}",
+        text(&revealed)
+    );
+    assert!(app.router.current == Route::Game(7));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the shortcut sent a lookup"
+    );
+    // The section's button now has focus: Enter (keyboard, or a controller's
+    // confirm mapped to it) is what starts the lookup.
+    frame_with(
+        &context,
+        &mut app,
+        SMALL,
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    frame_with(
+        &context,
+        &mut app,
+        SMALL,
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Enter on the focused button did nothing"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}

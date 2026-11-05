@@ -41,6 +41,10 @@ mod tests;
 mod zip_rom;
 
 pub(super) const CHECK_LABEL: &str = "Check Hasheous";
+/// The Identity line's shortcut to the "Look up online" section.
+pub(super) const SHORTCUT_LABEL: &str = "Check Hasheous…";
+pub(super) const SHORTCUT_HINT: &str =
+    "Go to Look up online below. Nothing is read or sent until you press Check Hasheous there.";
 pub(super) const CHECK_AGAIN_LABEL: &str = "Check Hasheous again";
 pub(super) const CANCEL_LABEL: &str = "Cancel";
 pub(super) const NOT_VERIFICATION: &str = "Hasheous is an online service. A match means it lists this hash in another project's catalogue; it is not checked against your catalogues and does not verify the game or change launch checks. Nothing is saved.";
@@ -248,6 +252,9 @@ struct Entry {
 /// its own game and file.
 pub(super) struct State {
     entries: HashMap<i64, Entry>,
+    /// The game whose "Look up online" section should come into view and
+    /// take focus on the next frame. Navigation only; never starts a lookup.
+    reveal: Option<i64>,
     lookup: Lookup,
     roots: Roots,
 }
@@ -288,8 +295,24 @@ impl State {
     pub(super) fn with(lookup: Lookup, roots: Roots) -> Self {
         Self {
             entries: HashMap::new(),
+            reveal: None,
             lookup,
             roots,
+        }
+    }
+
+    /// Asks the section for `id` to scroll into view and take focus.
+    pub(super) fn reveal(&mut self, id: i64) {
+        self.reveal = Some(id);
+    }
+
+    /// True once, on the frame the section for `id` should be revealed.
+    pub(super) fn take_reveal(&mut self, id: i64) -> bool {
+        if self.reveal == Some(id) {
+            self.reveal = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -614,10 +637,22 @@ pub(super) fn status_line(outcome: &HasheousCheckOutcome) -> String {
 
 /// Draws the Hasheous section. Returns what the person asked for; drawing
 /// never starts or stops anything itself.
-pub(super) fn show(ui: &mut egui::Ui, view: &View<'_>) -> Option<Request> {
+/// `reveal` scrolls the section into view and focuses its first control, so
+/// the Identity shortcut works with mouse, keyboard and controller alike.
+pub(super) fn show(ui: &mut egui::Ui, view: &View<'_>, reveal: bool) -> Option<Request> {
     let mut request = None;
     ui.horizontal_wrapped(|ui| {
-        ui.strong("Hasheous (online)");
+        let heading = ui.strong("Hasheous (online)");
+        if reveal {
+            heading.scroll_to_me(Some(egui::Align::Center));
+        }
+        // Focus only; pressing it is still the person's own choice.
+        let focus = |response: egui::Response| {
+            if reveal {
+                response.request_focus();
+            }
+            response
+        };
         match view {
             View::Unavailable(reason) => {
                 ui.add_enabled(false, egui::Button::new(CHECK_LABEL))
@@ -625,8 +660,7 @@ pub(super) fn show(ui: &mut egui::Ui, view: &View<'_>) -> Option<Request> {
             }
             View::Idle { hash_first } => {
                 let hint = if *hash_first { HASH_FIRST } else { SAVED_SHA1 };
-                if ui
-                    .button(CHECK_LABEL)
+                if focus(ui.button(CHECK_LABEL))
                     .on_hover_text(format!("{hint}\n\n{NOT_VERIFICATION}"))
                     .clicked()
                 {
@@ -642,7 +676,7 @@ pub(super) fn show(ui: &mut egui::Ui, view: &View<'_>) -> Option<Request> {
                     ),
                     None => "Working out this file's SHA-1…".to_string(),
                 });
-                if ui.small_button(CANCEL_LABEL).clicked() {
+                if focus(ui.small_button(CANCEL_LABEL)).clicked() {
                     request = Some(Request::Cancel);
                 }
             }
@@ -651,7 +685,7 @@ pub(super) fn show(ui: &mut egui::Ui, view: &View<'_>) -> Option<Request> {
                 ui.label("Checking Hasheous…");
             }
             View::Done { .. } | View::Refused(_) | View::Cancelled => {
-                if ui.small_button(CHECK_AGAIN_LABEL).clicked() {
+                if focus(ui.small_button(CHECK_AGAIN_LABEL)).clicked() {
                     request = Some(Request::Check);
                 }
             }
