@@ -716,12 +716,13 @@ impl App {
             view_toggle(ui, &mut this.filter.list, true, "List");
         };
         ui.horizontal(|ui| {
-            ui.add_sized(
+            let field = ui.add_sized(
                 [search, 34.0],
                 egui::TextEdit::singleline(&mut self.filter.search)
                     .hint_text("Search by title or system")
                     .desired_width(search),
             );
+            super::pad_shell::mark_suggestions(&field);
             if !self.filter.search.is_empty() && ui.button("Clear").clicked() {
                 self.filter.search.clear();
             }

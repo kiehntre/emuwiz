@@ -167,6 +167,7 @@ mod text_entry {
         app: App,
         text: String,
         secret: bool,
+        suggest: bool,
         copied: bool,
     }
 
@@ -181,6 +182,7 @@ mod text_entry {
                 app,
                 text: text.into(),
                 secret,
+                suggest: false,
                 copied: false,
             };
             rig.frame();
@@ -200,7 +202,7 @@ mod text_entry {
         }
 
         fn frame_with(&mut self, events: Vec<egui::Event>) {
-            let (text, secret) = (&mut self.text, self.secret);
+            let (text, secret, suggest) = (&mut self.text, self.secret, self.suggest);
             let app = &mut self.app;
             let out = run_ui_frame(&self.context, events, |context| {
                 app.show(context);
@@ -208,6 +210,9 @@ mod text_entry {
                     let r = ui.add(egui::TextEdit::singleline(text).id(egui::Id::new(FIELD)));
                     if secret {
                         crate::gui_v2::mark_secret(&r);
+                    }
+                    if suggest {
+                        super::super::super::pad_shell::mark_suggestions(&r);
                     }
                 });
             });
@@ -229,6 +234,10 @@ mod text_entry {
 
         fn osk_open(&self) -> bool {
             self.app.pad_shell.as_ref().unwrap().osk_open()
+        }
+
+        fn mark_suggest(&mut self, on: bool) {
+            self.suggest = on;
         }
 
         fn buffer(&self) -> Option<String> {
@@ -400,6 +409,97 @@ mod text_entry {
             egui::Event::Copy,
         ]);
         assert!(rig.copied, "a user's own copy still reaches the clipboard");
+    }
+
+    fn library_of(titles: &[&str]) -> Arc<Library> {
+        Arc::new(Library::new(
+            titles
+                .iter()
+                .enumerate()
+                .map(|(i, t)| archive(i as i64 + 1, t, Some("SNES")))
+                .collect(),
+        ))
+    }
+
+    /// Frames until the background title index has answered.
+    fn await_suggestions(rig: &mut Rig) {
+        for _ in 0..200 {
+            rig.frame();
+            if !rig.app.pad_shell.as_ref().unwrap().suggestions().is_empty() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("suggestions never arrived");
+    }
+
+    #[test]
+    fn search_fields_offer_title_suggestions_that_a_picks_and_done_applies() {
+        let mut rig = Rig::new("", false);
+        rig.mark_suggest(true);
+        rig.app.library = library_of(&["Alpha Quest", "Alien Run", "Beta Racer", "Gamma Blaster"]);
+        rig.frame();
+        rig.press(A);
+        assert!(rig.osk_open());
+        let shell = rig.app.pad_shell.as_mut().unwrap();
+        shell.type_for_test("al");
+        shell.focus_top_row_for_test();
+        await_suggestions(&mut rig);
+        let offered = rig.app.pad_shell.as_ref().unwrap().suggestions();
+        assert_eq!(
+            offered,
+            vec!["Alien Run".to_owned(), "Alpha Quest".to_owned()]
+        );
+        assert_eq!(rig.text, "", "suggestions do not touch the field");
+        rig.press(Control::Direction(Direction::Up));
+        assert_eq!(
+            rig.app.pad_shell.as_ref().unwrap().suggestion_focus(),
+            Some(0)
+        );
+        rig.press(Control::Direction(Direction::Right));
+        rig.press(A); // take "Alpha Quest"
+        assert_eq!(rig.buffer().as_deref(), Some("Alpha Quest"));
+        assert_eq!(rig.text, "", "still only staged");
+        rig.press(START);
+        assert_eq!(rig.text, "Alpha Quest", "Done applies the search");
+    }
+
+    #[test]
+    fn plain_fields_and_secrets_get_no_suggestions_and_cancel_still_changes_nothing() {
+        let mut rig = Rig::new("keep", false);
+        rig.app.library = library_of(&["Keep Going"]);
+        rig.frame();
+        rig.press(A);
+        rig.app.pad_shell.as_mut().unwrap().type_for_test("ke");
+        for _ in 0..20 {
+            rig.frame();
+        }
+        assert!(
+            rig.app.pad_shell.as_ref().unwrap().suggestions().is_empty(),
+            "unmarked field"
+        );
+        rig.press(B);
+        assert_eq!(rig.text, "keep");
+
+        let mut secret = Rig::new("hunter2", true);
+        secret.mark_suggest(true);
+        secret.app.library = library_of(&["Hunter Hunted"]);
+        secret.frame();
+        secret.press(A);
+        secret.app.pad_shell.as_mut().unwrap().type_for_test("hun");
+        for _ in 0..20 {
+            secret.frame();
+        }
+        assert!(
+            secret
+                .app
+                .pad_shell
+                .as_ref()
+                .unwrap()
+                .suggestions()
+                .is_empty(),
+            "never for secrets"
+        );
     }
 
     #[test]
