@@ -103,9 +103,12 @@ fn set_phase(phase: &Phase, text: &'static str) {
 enum JobDone {
     Checked(UpdateReport),
     Prepared(Result<Box<UpdateReview>, String>),
-    Applied(Result<UpdateJournal, UpdateExecutionError>),
-    RolledBack(UpdateJournal, Result<UpdateJournal, UpdateExecutionError>),
-    Recovered(Result<UpdateJournal, UpdateExecutionError>),
+    Applied(Box<Result<UpdateJournal, UpdateExecutionError>>),
+    RolledBack(
+        Box<UpdateJournal>,
+        Box<Result<UpdateJournal, UpdateExecutionError>>,
+    ),
+    Recovered(Box<Result<UpdateJournal, UpdateExecutionError>>),
 }
 
 struct Job {
@@ -128,12 +131,12 @@ pub(super) struct BlueUpdateState {
 /// What the user asked for during one frame; applied after drawing.
 enum Intent {
     Check,
-    Review(EmulatorInstallation, UpdateResult),
+    Review(Box<(EmulatorInstallation, UpdateResult)>),
     CloseReview,
     Apply,
     ReviewUndo(PathBuf),
     Undo,
-    Recover(PathBuf, UpdateJournal),
+    Recover(PathBuf, Box<UpdateJournal>),
 }
 
 impl EmulatorInventoryPageState {
@@ -156,6 +159,7 @@ impl EmulatorInventoryPageState {
         self.blue.tracked.store(running, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
     pub(crate) fn blue_busy(&self) -> bool {
         self.blue.job.is_some()
     }
@@ -230,11 +234,11 @@ impl EmulatorInventoryPageState {
                 self.review = None;
                 self.error = Some(message);
             }
-            JobDone::Applied(result) => self.finish_apply(&root, result),
-            JobDone::RolledBack(journal, result) => self.finish_rollback(&journal, result),
+            JobDone::Applied(result) => self.finish_apply(&root, *result),
+            JobDone::RolledBack(journal, result) => self.finish_rollback(&journal, *result),
             JobDone::Recovered(result) => {
                 self.feedback = None;
-                self.finish_recover(result);
+                self.finish_recover(*result);
             }
         }
         false
@@ -321,13 +325,13 @@ impl EmulatorInventoryPageState {
                     inner: backend.downloader(),
                     phase,
                 };
-                JobDone::Applied(execute_staged_update(
+                JobDone::Applied(Box::new(execute_staged_update(
                     &review.plan,
                     &review.installation,
                     &review.update,
                     quiescence,
                     &mut downloader,
-                ))
+                )))
             },
         );
     }
@@ -357,7 +361,7 @@ impl EmulatorInventoryPageState {
                 let probe = journal.clone();
                 let result =
                     rollback_staged_update(&journal, move || backend.journal_quiescence(tracked.load(Ordering::SeqCst), &probe));
-                JobDone::RolledBack(journal, result)
+                JobDone::RolledBack(Box::new(journal), Box::new(result))
             },
         );
     }
@@ -375,9 +379,9 @@ impl EmulatorInventoryPageState {
             root,
             "Reconciling the interrupted update from file hashes…",
             move |_| {
-                JobDone::Recovered(recover_update(&record, move || {
+                JobDone::Recovered(Box::new(recover_update(&record, move || {
                     backend.journal_quiescence(tracked.load(Ordering::SeqCst), &journal)
-                }))
+                })))
             },
         );
     }
@@ -439,7 +443,8 @@ impl EmulatorInventoryPageState {
 
         match intent {
             Some(Intent::Check) => self.start_check(&ctx),
-            Some(Intent::Review(installation, update)) => {
+            Some(Intent::Review(pair)) => {
+                let (installation, update) = *pair;
                 self.start_review(&ctx, installation, update)
             }
             Some(Intent::CloseReview) => {
@@ -449,7 +454,7 @@ impl EmulatorInventoryPageState {
             Some(Intent::Apply) => self.start_apply(&ctx),
             Some(Intent::ReviewUndo(target)) => self.review_undo_for(&target),
             Some(Intent::Undo) => self.start_undo(&ctx),
-            Some(Intent::Recover(record, journal)) => self.start_recover(&ctx, record, journal),
+            Some(Intent::Recover(record, journal)) => self.start_recover(&ctx, record, *journal),
             None => {}
         }
     }
@@ -491,7 +496,10 @@ impl EmulatorInventoryPageState {
                             .add_enabled(!busy, egui::Button::new("Review update"))
                             .clicked()
                     {
-                        *intent = Some(Intent::Review(installation.clone(), result.clone()));
+                        *intent = Some(Intent::Review(Box::new((
+                            installation.clone(),
+                            result.clone(),
+                        ))));
                     }
                 });
             });
@@ -654,7 +662,10 @@ impl EmulatorInventoryPageState {
                             .add_enabled(!busy, egui::Button::new("Recover"))
                             .clicked()
                         {
-                            *intent = Some(Intent::Recover(entry.path.clone(), journal.clone()));
+                            *intent = Some(Intent::Recover(
+                                entry.path.clone(),
+                                Box::new(journal.clone()),
+                            ));
                         }
                     });
                 }

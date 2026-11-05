@@ -119,7 +119,7 @@ fn fixture_page(
     page.blue.backend = Some(Arc::new(fixture));
     page.refresh_with_inventory(
         EmulatorInventory {
-            installations: vec![installation.clone()],
+            installations: std::slice::from_ref(&installation).to_vec(),
             ..Default::default()
         },
         vec![root.into()],
