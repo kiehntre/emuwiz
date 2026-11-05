@@ -186,6 +186,19 @@ pub fn verify_three_dsx(path: &Path) -> Result<ThreeDsxEvidence, ThreeDsxRefusal
             "the .3dsx is larger than the homebrew inspection limit",
         ));
     }
+    // O_NOFOLLOW | O_NONBLOCK: a path swapped to a symlink or FIFO after the
+    // stat above is refused or opened without blocking, then caught by the
+    // handle-vs-stat identity comparison below.
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(unreadable)?
+    };
+    #[cfg(not(unix))]
     let mut file = fs::File::open(path).map_err(unreadable)?;
     // The handle we hash must be the file we statted.
     if CapturedFileIdentity::capture(&file.metadata().map_err(unreadable)?) != before {
@@ -438,6 +451,18 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn a_fifo_at_the_path_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe.3dsx");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            verify_three_dsx(&fifo).unwrap_err().kind,
+            ThreeDsxRefusalKind::NotRegularFile
+        );
     }
 
     #[test]

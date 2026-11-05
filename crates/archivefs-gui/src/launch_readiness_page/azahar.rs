@@ -19,6 +19,20 @@ pub(crate) fn is_three_dsx(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("3dsx"))
 }
 
+/// A catalogued platform other than Nintendo 3DS means other evidence places
+/// the file elsewhere; the launch-only identity must not override it.
+pub(crate) fn platform_allows(catalogued: Option<&str>) -> bool {
+    catalogued.is_none_or(|platform| {
+        platform.is_empty()
+            || archivefs_core::canonical_platform_for_alias(platform) == Some("Nintendo 3DS")
+    })
+}
+
+/// Launch-only file-hash keys are never stored as a per-game default.
+pub(crate) fn game_default_allowed(game_key: &str) -> bool {
+    !game_key.starts_with(AZAHAR_HOMEBREW_KEY_PREFIX)
+}
+
 #[derive(Clone)]
 pub(crate) struct Context {
     pub selected: PathBuf,
@@ -267,6 +281,21 @@ mod tests {
             GamerPlayAction::Launch(request)
                 if matches!(**request, TypedLaunchRequest::Standalone(StandaloneLaunchRequest::Azahar(_)))
         )
+    }
+
+    #[test]
+    fn a_non_3ds_catalogued_platform_blocks_the_launch_only_identity() {
+        assert!(platform_allows(None));
+        assert!(platform_allows(Some("")));
+        assert!(platform_allows(Some("Nintendo 3DS")));
+        assert!(!platform_allows(Some("Switch")));
+        assert!(!platform_allows(Some("PSP")));
+    }
+
+    #[test]
+    fn launch_only_keys_are_never_a_per_game_default() {
+        assert!(!game_default_allowed("3dsx-sha256:abcd"));
+        assert!(game_default_allowed("some-catalogue-key"));
     }
 
     #[test]

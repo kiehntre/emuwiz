@@ -227,8 +227,21 @@ impl ReadinessSources<'_> {
             identity_status = identity.clone();
         }
         let azahar_context = self.readiness.azahar_homebrew.context(focused);
+        // Never impose Nintendo 3DS on a file that other evidence places on
+        // another platform.
         let azahar_inputs = azahar_context
             .as_ref()
+            .filter(|_| {
+                selected_game_identity_report.is_none_or(|r| {
+                    matches!(
+                        r.platform,
+                        archivefs_core::game_identity::IdentityPlatform::ThreeDS
+                            | archivefs_core::game_identity::IdentityPlatform::Other
+                    )
+                }) && crate::launch_readiness_page::azahar::platform_allows(
+                    focused_record.and_then(|r| r.mount_plan.archive.identity.platform.as_deref()),
+                )
+            })
             .and_then(|c| c.inputs(&identity_status));
         if let Some((identity, _)) = &azahar_inputs {
             identity_status = identity.clone();

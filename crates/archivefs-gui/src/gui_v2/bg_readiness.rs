@@ -275,10 +275,7 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
     // selected game runs (one small file, hashed once). A catalogue platform
     // that is not Nintendo 3DS means the folder says otherwise: skip.
     if crate::launch_readiness_page::azahar::is_three_dsx(&path)
-        && (job.catalogue_platform.is_empty()
-            || archivefs_core::canonical_platform_for_alias(&job.catalogue_platform)
-                .unwrap_or(&job.catalogue_platform)
-                .eq_ignore_ascii_case("Nintendo 3DS"))
+        && crate::launch_readiness_page::azahar::platform_allows(Some(&job.catalogue_platform))
     {
         if cancel.load(Ordering::Relaxed) {
             return Outcome::Unknown;
