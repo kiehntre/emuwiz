@@ -50,6 +50,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 pub(super) struct NativeWorkflows {
     pub(super) app: ArchiveFsApp,
+    /// Set by the readiness card's Hasheous shortcut; Game Details takes it.
+    lookup_online_requested: bool,
     native_romm: native_romm::State,
     selected: Option<PathBuf>,
     catalogue_identity_report: Option<archivefs_core::game_identity::GameIdentityReport>,
@@ -372,6 +374,7 @@ impl NativeWorkflows {
         super::readable_style(&context);
         Self {
             app,
+            lookup_online_requested: false,
             native_romm: native_romm::State::default(),
             selected: None,
             catalogue_identity_report: None,
@@ -830,7 +833,15 @@ impl NativeWorkflows {
         if action == ReadinessAction::RecheckReadiness {
             self.recheck_readiness_in_place(context);
         }
+        if action == ReadinessAction::LookUpOnline {
+            self.lookup_online_requested = true;
+        }
         route_for_action(action, game_id)
+    }
+
+    /// True once after the card's "Check Hasheous…" shortcut was pressed.
+    pub(super) fn take_lookup_online(&mut self) -> bool {
+        std::mem::take(&mut self.lookup_online_requested)
     }
 
     /// Reuse the same current plan and candidate policy as Launch. Never
@@ -4653,7 +4664,7 @@ mod lifecycle_selection_tests {
 /// Review Identity screen.
 pub(super) fn route_for_action(action: ReadinessAction, game_id: i64) -> Option<Route> {
     match action {
-        ReadinessAction::RecheckReadiness => None,
+        ReadinessAction::RecheckReadiness | ReadinessAction::LookUpOnline => None,
         ReadinessAction::ReviewDiscSet => Some(Route::Section(Section::MultiDisc)),
         ReadinessAction::OpenActivity => Some(Route::Section(Section::Activity)),
         ReadinessAction::Play | ReadinessAction::ChooseEmulator => Some(Route::Task {

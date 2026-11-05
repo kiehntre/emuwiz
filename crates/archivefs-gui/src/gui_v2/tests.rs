@@ -57,6 +57,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         moved_game: None,
         review: Default::default(),
         game_dat_check: Default::default(),
+        hasheous_check: Default::default(),
         indices: Vec::new(),
         filter: Filter::default(),
         filter_generation: 0,
@@ -11450,6 +11451,7 @@ mod history_page {
 mod blue_home_library;
 mod blue_usability;
 mod game_detail_facts;
+mod hasheous_check;
 mod history_records;
 mod organisation_outcomes;
 mod simple_shell_ui;

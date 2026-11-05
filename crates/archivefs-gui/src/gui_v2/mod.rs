@@ -36,6 +36,7 @@ mod game_verification_guidance;
 mod glyph_coverage_tests;
 mod guidance;
 mod hackhash;
+mod hasheous_check;
 mod hdf_contents;
 mod history_discovery_import;
 mod history_duckstation;
@@ -401,6 +402,7 @@ pub(super) struct App {
     moved_game: Option<i64>,
     review: identity_review_page::ReviewUi,
     game_dat_check: game_dat_check::State,
+    hasheous_check: hasheous_check::State,
     notice: Option<Notice>,
     /// Non-alarming confirmation that a separate window was opened; cleared on
     /// navigation or dismissal.
@@ -535,6 +537,7 @@ impl App {
             moved_game: None,
             review: Default::default(),
             game_dat_check: Default::default(),
+            hasheous_check: Default::default(),
             notice: None,
             handoff_status: None,
             confirm_scan: false,
@@ -2436,6 +2439,7 @@ impl eframe::App for App {
         // A finished one-game check saves new evidence even when its page is
         // no longer showing; reload so Game Details reads it.
         self.game_dat_check.poll();
+        self.hasheous_check.poll();
         if self.load_job.is_none() && self.game_dat_check.take_saved() {
             reload_library = true;
         }

@@ -161,6 +161,7 @@ impl super::App {
         if let Some(game) = library.games.iter_mut().find(|game| game.archive.id == id) {
             game.dat_exact = None;
             game.dat_exact_hashes = None;
+            game.saved_hashes = None;
             game.dat_proof_invalidated = true;
         }
     }

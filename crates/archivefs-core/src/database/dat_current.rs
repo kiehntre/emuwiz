@@ -14,6 +14,10 @@ pub struct CurrentLibraryDatEvidence {
     /// same current, unchanged-file evidence. Absent when two verified rows
     /// for one item disagree, so a caller never picks one of them.
     pub exact_hashes: HashMap<i64, crate::dat::library_identity_summary::LibraryItemHashes>,
+    /// The audited hashes from every current row for an item, whatever its
+    /// verdict (the same unchanged-file and current-source rules as above).
+    /// Absent when two current rows disagree. Hashes only: never proof.
+    pub current_hashes: HashMap<i64, crate::dat::library_identity_summary::LibraryItemHashes>,
 }
 
 impl Database {
@@ -25,6 +29,7 @@ impl Database {
     ) -> Result<CurrentLibraryDatEvidence> {
         let mut result = CurrentLibraryDatEvidence::default();
         let mut conflicting_hashes = std::collections::HashSet::new();
+        let mut conflicting_current = std::collections::HashSet::new();
         let mut statement = self.connection.prepare(
             "SELECT d.archive_id, d.dat_source_id, d.facts_json, a.size_bytes, p.platform, d.dat_ecosystem, a.absolute_path_cached \
              FROM library_dat_identities d JOIN archives a ON a.id = d.archive_id \
@@ -91,6 +96,20 @@ impl Database {
                 DatVerificationState::NoMatch => LibraryDatState::NoMatch,
                 _ => continue,
             };
+            if !conflicting_current.contains(&archive_id) {
+                match result.current_hashes.get(&archive_id) {
+                    None => {
+                        result
+                            .current_hashes
+                            .insert(archive_id, saved.audited_hashes.clone());
+                    }
+                    Some(existing) if *existing != saved.audited_hashes => {
+                        result.current_hashes.remove(&archive_id);
+                        conflicting_current.insert(archive_id);
+                    }
+                    _ => {}
+                }
+            }
             result
                 .states
                 .entry(archive_id)
