@@ -333,6 +333,7 @@ impl App {
             return;
         }
         self.drive_pad_shell(context);
+        crate::ui::picker::show(context);
         let modal_open = self.confirm_scan
             || self.setup_actions.confirm.is_some()
             || self.repair_confirm

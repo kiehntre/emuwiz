@@ -1368,7 +1368,14 @@ impl NativeWorkflows {
             if ui
                 .add_enabled(!busy, egui::Button::new("Add source"))
                 .clicked()
-                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                crate::ui::picker::request(
+                    ui.ctx(),
+                    egui::Id::new("blue_add_source"),
+                    crate::ui::picker::PickRequest::folder("Choose a games folder to add"),
+                );
+            }
+            if let Some(path) = crate::ui::picker::take(ui.ctx(), egui::Id::new("blue_add_source"))
             {
                 action = Some(crate::SourceAction::Add(path));
             }

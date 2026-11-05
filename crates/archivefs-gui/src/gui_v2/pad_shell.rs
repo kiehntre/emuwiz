@@ -61,6 +61,9 @@ impl App {
             shell.reader = (!cfg!(test)).then(|| Reader::start(context.clone()));
         }
         let (now, focused) = context.input(|i| (i.time, i.focused));
+        if let Some(reader) = &shell.reader {
+            crate::ui::picker::set_controller_in_use(context, reader.status().connected());
+        }
         // Unfocused (an emulator is running, say): read nothing and repaint
         // nothing, so a running game's input never reaches EmuWiz.
         if let Some(reader) = &shell.reader {
@@ -312,6 +315,16 @@ impl App {
     }
 
     fn pad_shell_command(&mut self, context: &egui::Context, command: Command) {
+        // A file picker is open: it is driven by focus like any page, and the
+        // page behind it must not change.
+        if crate::ui::picker::open(context)
+            && matches!(
+                command,
+                Command::Platforms | Command::Search | Command::Launch
+            )
+        {
+            return;
+        }
         match command {
             Command::Select => self.pad_shell_select(context),
             Command::Move(_) => page_command(context, command),

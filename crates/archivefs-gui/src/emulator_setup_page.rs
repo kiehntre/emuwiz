@@ -335,14 +335,36 @@ fn candidate_grid_layout(available_width: f32, candidate_count: usize) -> Candid
 /// restriction (Linux executables commonly carry no extension, e.g.
 /// `pcsx2-qt`, or an unusual one, e.g. `.AppImage`), but still a *file*
 /// picker, never a folder picker.
-fn pick_executable_candidate() -> Option<std::path::PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter("Executable", &["*"])
-        .pick_file()
+fn pick_executable_candidate(
+    ui: &egui::Ui,
+    emulator: OverridableEmulator,
+    start: bool,
+) -> Option<std::path::PathBuf> {
+    let slot = egui::Id::new(("emulator_exe_pick", format!("{emulator:?}")));
+    if start {
+        crate::ui::picker::request(
+            ui.ctx(),
+            slot,
+            crate::ui::picker::PickRequest::file("Choose the emulator program", &["*"]),
+        );
+    }
+    crate::ui::picker::take(ui.ctx(), slot)
 }
 
-fn pick_configuration_folder_candidate() -> Option<std::path::PathBuf> {
-    rfd::FileDialog::new().pick_folder()
+fn pick_configuration_folder_candidate(
+    ui: &egui::Ui,
+    emulator: OverridableEmulator,
+    start: bool,
+) -> Option<std::path::PathBuf> {
+    let slot = egui::Id::new(("emulator_cfg_pick", format!("{emulator:?}")));
+    if start {
+        crate::ui::picker::request(
+            ui.ctx(),
+            slot,
+            crate::ui::picker::PickRequest::folder("Choose the emulator configuration folder"),
+        );
+    }
+    crate::ui::picker::take(ui.ctx(), slot)
 }
 
 /// A compact "Executable"/"Configuration folder" remediation row for one
@@ -373,15 +395,14 @@ fn show_path_override_controls(
             };
         });
         ui.horizontal_wrapped(|ui| {
-            if widgets::action_button(
+            let choose = widgets::action_button(
                 ui,
                 "Choose executable…",
                 widgets::ActionStyle::Secondary,
                 true,
             )
-            .clicked()
-                && let Some(picked) = pick_executable_candidate()
-            {
+            .clicked();
+            if let Some(picked) = pick_executable_candidate(ui, emulator, choose) {
                 match classify_picked_executable(&picked) {
                     PickedExecutable::Usable => {
                         *picker_rejection = None;
@@ -441,10 +462,10 @@ fn show_path_override_controls(
             };
         });
         ui.horizontal_wrapped(|ui| {
-            if widgets::action_button(ui, "Choose folder…", widgets::ActionStyle::Secondary, true)
-                .clicked()
-                && let Some(picked) = pick_configuration_folder_candidate()
-            {
+            let choose =
+                widgets::action_button(ui, "Choose folder…", widgets::ActionStyle::Secondary, true)
+                    .clicked();
+            if let Some(picked) = pick_configuration_folder_candidate(ui, emulator, choose) {
                 match classify_picked_configuration_folder(&picked) {
                     PickedConfigurationFolder::Directory => {
                         action = Some(EmulatorSetupAction::SetConfigurationFolderOverride(

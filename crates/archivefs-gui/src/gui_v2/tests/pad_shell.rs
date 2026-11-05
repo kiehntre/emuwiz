@@ -424,3 +424,154 @@ mod text_entry {
         assert_eq!(rig.text, "abc");
     }
 }
+
+mod picker_journey {
+    use super::*;
+    use crate::ui::picker::{self, PickRequest};
+
+    struct Rig {
+        context: egui::Context,
+        app: App,
+        taken: Vec<std::path::PathBuf>,
+        behind_clicks: u32,
+    }
+
+    fn slot() -> egui::Id {
+        egui::Id::new("picker_test_slot")
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let context = egui::Context::default();
+            let app = super::app(&context);
+            let mut rig = Self {
+                context,
+                app,
+                taken: Vec::new(),
+                behind_clicks: 0,
+            };
+            rig.frame();
+            picker::set_controller_in_use(&rig.context, true);
+            rig
+        }
+
+        fn frame(&mut self) {
+            let (app, taken, clicks) = (&mut self.app, &mut self.taken, &mut self.behind_clicks);
+            run_ui_frame(&self.context, Vec::new(), |context| {
+                app.show(context);
+                egui::Area::new(egui::Id::new("behind")).show(context, |ui| {
+                    if ui.button("Behind the picker").clicked() {
+                        *clicks += 1;
+                    }
+                });
+                if let Some(path) = picker::take(context, slot()) {
+                    taken.push(path);
+                }
+            });
+        }
+
+        fn press(&mut self, control: Control) {
+            let shell = self.app.pad_shell.as_mut().unwrap();
+            shell.inject(PadEvent::Pressed { device: 1, control });
+            shell.inject(PadEvent::Released { device: 1, control });
+            for _ in 0..3 {
+                self.frame();
+            }
+        }
+
+        fn open(&mut self, request: PickRequest) {
+            picker::request(&self.context, slot(), request);
+            for _ in 0..3 {
+                self.frame();
+            }
+        }
+    }
+
+    const A: Control = Control::Button(Button::South);
+    const B: Control = Control::Button(Button::East);
+    const DOWN: Control = Control::Direction(Direction::Down);
+
+    fn tree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Games")).unwrap();
+        std::fs::write(dir.path().join("Games").join("a.iso"), b"x").unwrap();
+        std::fs::write(dir.path().join("Games").join("b.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("Games").join(".hidden"), b"x").unwrap();
+        dir
+    }
+
+    fn request_at(dir: &std::path::Path, folder: bool) -> PickRequest {
+        let mut request = if folder {
+            PickRequest::folder("Pick")
+        } else {
+            PickRequest::file("Pick", &["iso"])
+        };
+        request.start = Some(dir.to_path_buf());
+        request
+    }
+
+    #[test]
+    fn controller_can_choose_the_current_folder_without_touching_the_page_behind() {
+        let dir = tree();
+        let mut rig = Rig::new();
+        rig.open(request_at(dir.path(), true));
+        assert!(picker::open(&rig.context));
+        // Walk the whole list: focus never leaves the picker.
+        for _ in 0..12 {
+            rig.press(DOWN);
+            assert!(rig.context.memory(|m| m.focused()).is_some());
+        }
+        assert_eq!(rig.behind_clicks, 0, "moving never presses the page behind");
+        // Go back to the first row, "Use this folder", and choose it.
+        for _ in 0..12 {
+            rig.press(Control::Direction(Direction::Up));
+        }
+        rig.press(A);
+        assert!(!picker::open(&rig.context));
+        assert_eq!(rig.taken, vec![dir.path().to_path_buf()]);
+        assert_eq!(rig.behind_clicks, 0);
+    }
+
+    #[test]
+    fn controller_can_open_a_folder_and_pick_a_filtered_file() {
+        let dir = tree();
+        let mut rig = Rig::new();
+        rig.open(request_at(dir.path(), false));
+        // First row after the shortcuts: "Up one folder", then "Games".
+        rig.press(DOWN);
+        rig.press(A);
+        assert!(
+            picker::open(&rig.context),
+            "entering a folder keeps the picker open"
+        );
+        // Focus restarts on the first row ("Up one folder"); the files follow.
+        rig.press(DOWN);
+        rig.press(A);
+        assert_eq!(rig.taken, vec![dir.path().join("Games").join("a.iso")]);
+    }
+
+    #[test]
+    fn back_cancels_and_answers_nothing() {
+        let dir = tree();
+        let mut rig = Rig::new();
+        rig.open(request_at(dir.path(), true));
+        rig.press(B);
+        assert!(!picker::open(&rig.context));
+        assert!(rig.taken.is_empty());
+        assert_eq!(rig.behind_clicks, 0);
+    }
+
+    #[test]
+    fn section_buttons_do_nothing_while_the_picker_is_open() {
+        let dir = tree();
+        let mut rig = Rig::new();
+        let route = rig.app.router.current.clone();
+        rig.open(request_at(dir.path(), true));
+        for button in [Button::North, Button::West, Button::Start] {
+            rig.press(Control::Button(button));
+        }
+        assert_eq!(rig.app.router.current, route);
+        assert!(picker::open(&rig.context));
+        assert!(rig.app.big_picture.is_none());
+    }
+}
