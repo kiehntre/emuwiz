@@ -55,6 +55,7 @@ pub(crate) mod dosbox;
 pub(crate) mod flycast;
 mod melonds_cheats;
 mod mgba;
+pub(crate) use mgba::CHECKING_BLOCKER as MGBA_CHECKING_BLOCKER;
 #[cfg(target_os = "linux")]
 mod pcsx2_cheats;
 mod retroarch_cheat_sets;
@@ -400,6 +401,9 @@ impl TypedLaunchRequest {
             Self::Standalone(StandaloneLaunchRequest::Vice(_)) => vec![vice::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Desmume(_)) => vec![desmume::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::SameBoy(_)) => vec![sameboy::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Mgba(_)) => vec![mgba::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Rmg(_)) => vec![rmg::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Stella(_)) => vec![stella::LIMITATION],
             _ => Vec::new(),
         }
     }
@@ -412,6 +416,11 @@ impl TypedLaunchRequest {
             Self::Standalone(
                 StandaloneLaunchRequest::Desmume(_) | StandaloneLaunchRequest::SameBoy(_),
             ) => "Ready, identity not DAT-verified",
+            Self::Standalone(
+                StandaloneLaunchRequest::Mgba(_)
+                | StandaloneLaunchRequest::Rmg(_)
+                | StandaloneLaunchRequest::Stella(_),
+            ) => "Ready, local launch identity",
             _ => "Ready, compatibility unverified",
         }
     }
@@ -810,6 +819,23 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                     StandaloneLaunchRequest::SameBoy(request),
                 ));
             }
+            // mGBA, RMG and Stella: the same Gold-panel requests (click-time
+            // rediscovery, content and identity recheck, Core preflight and spawn).
+            if let Some(Ok(request)) = mgba::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Mgba(request),
+                ));
+            }
+            if let Some(Ok(request)) = rmg::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Rmg(request),
+                ));
+            }
+            if let Some(Ok(request)) = stella::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Stella(request),
+                ));
+            }
             if let Some(request) = azahar
                 .as_ref()
                 .and_then(|context| context.request(plan, candidate))
@@ -851,6 +877,29 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             )
         })
         .collect();
+    // mGBA's offer waits on a one-time Bubblewrap capability check; say so
+    // (and keep repainting) rather than showing a generic blocker.
+    if requests.is_empty() {
+        for candidate in plan.candidates.iter().filter(preferred) {
+            match mgba::offer_for(plan, candidate) {
+                Some(Err(reason)) if mgba::is_checking(&reason) => {
+                    return GamerPlayAction::BlockedTyped(GamerBlocker::new(
+                        GamerBlockerKind::CheckingGame,
+                        mgba::CHECKING_BLOCKER,
+                    ));
+                }
+                // The specific, actionable reason (missing or unsupported
+                // Bubblewrap), as the Gold panel shows it.
+                Some(Err(reason)) if mgba::is_bubblewrap_refusal(&reason) => {
+                    return GamerPlayAction::BlockedTyped(GamerBlocker::new(
+                        GamerBlockerKind::NoSafeEmulator,
+                        reason,
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
     if requests.len() == 1 {
         return GamerPlayAction::Launch(Box::new(
             requests.into_iter().next().expect("one request"),
