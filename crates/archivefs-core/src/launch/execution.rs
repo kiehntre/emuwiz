@@ -892,6 +892,9 @@ pub struct LaunchedRetroArchProcess {
     watched: WatchedProcess,
     /// The launched file as it was when the launch started. `None` refuses Stop.
     launched_file: Option<process_spawn::ExecutableFile>,
+    /// A zipped cartridge's private extracted copy; removed when the process
+    /// has exited or this value is dropped.
+    staged_cartridge: Option<crate::zip_cartridge_stage::StagedCartridge>,
 }
 
 impl LaunchedRetroArchProcess {
@@ -899,6 +902,9 @@ impl LaunchedRetroArchProcess {
     /// thread has observed the process exit, `None` while it is still
     /// running. Safe to call every GUI frame.
     pub fn poll(&mut self) -> Option<&LaunchExitReport> {
+        if self.watched.poll().is_some() {
+            self.staged_cartridge = None;
+        }
         self.watched.poll()
     }
 
@@ -1083,6 +1089,7 @@ pub(crate) fn spawn_retroarch_guarded(
         .spawn(&prepared)
         .map_err(LaunchSpawnError::Spawn)?;
     Ok(LaunchedRetroArchProcess {
+        staged_cartridge: None,
         pid: watched.pid,
         command_facts: facts,
         watched,
@@ -1145,6 +1152,35 @@ pub fn preflight_and_launch_retroarch_with_playlist(
         &crate::launch::multidisc_launch::MultiDiscPlaylist,
     )>,
 ) -> Result<LaunchedRetroArchProcess, LaunchExecutionError> {
+    // A zipped cartridge is extracted to a private temporary file for this
+    // launch only; the normal preflight then re-verifies that file's identity
+    // against `expected_game_key`. Anything else takes the unchanged route.
+    match crate::zip_cartridge_stage::stage_zip_cartridge_for_launch(
+        &request.selected_content_path,
+        &request.expected_platform_id,
+    ) {
+        Ok(staged) => {
+            let mut staged_request = request.clone();
+            staged_request.selected_content_path = staged.path().to_path_buf();
+            let command = preflight_retroarch_launch_with_playlist(
+                &staged_request,
+                filesystem,
+                environment,
+                playlist,
+            )?;
+            let mut process = spawn_retroarch(command)?;
+            process.staged_cartridge = Some(staged);
+            return Ok(process);
+        }
+        Err(crate::zip_cartridge_stage::StageZipError::NotApplicable) => {}
+        Err(crate::zip_cartridge_stage::StageZipError::Refused(detail)) => {
+            return Err(preflight_error(
+                LaunchPreflightErrorKind::ContentRequiresMount,
+                format!("zipped cartridge cannot be launched: {detail}"),
+            )
+            .into());
+        }
+    }
     let command =
         preflight_retroarch_launch_with_playlist(request, filesystem, environment, playlist)?;
     Ok(spawn_retroarch(command)?)

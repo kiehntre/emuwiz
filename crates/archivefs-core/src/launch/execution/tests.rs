@@ -1058,3 +1058,229 @@ fn a_gamecube_retroarch_tie_launches_only_the_explicitly_chosen_installation() {
     assert_eq!(command.selection.core_stem, "dolphin");
     assert_eq!(command.selection.profile, native);
 }
+
+// ---------------------------------------------------------------------------
+// Zipped cartridge launch: extract the one verified member for this launch only
+// ---------------------------------------------------------------------------
+
+fn write_rom_zip(path: &std::path::Path, members: &[(&str, &[u8])]) {
+    use std::io::Write as _;
+    let mut writer = zip::write::ZipWriter::new(fs::File::create(path).unwrap());
+    for (name, bytes) in members {
+        writer
+            .start_file(
+                *name,
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap();
+}
+
+fn zipped_ready(label: &str, members: &[(&str, &[u8])]) -> (ReadyFixture, PathBuf, Vec<u8>) {
+    let mut ready = build_ready_fixture(label);
+    let rom = b"synthetic mega drive rom bytes".to_vec();
+    let zip = ready.fixture.path("content/game.zip");
+    write_rom_zip(&zip, members);
+    ready.request.selected_content_path = zip.clone();
+    (ready, zip, rom)
+}
+
+fn staged_dirs() -> Vec<PathBuf> {
+    fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("emuwiz-zip-rom-"))
+        })
+        .collect()
+}
+
+static STAGING_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn zipped_cartridge_launches_from_a_private_copy_and_cleans_up_after_exit() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let rom = b"synthetic mega drive rom bytes";
+    let (ready, zip, _) = zipped_ready("zip-happy", &[("Game (USA).md", rom)]);
+    let zip_before = fs::read(&zip).unwrap();
+    let mut process = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .expect("a verified zipped cartridge launches");
+    let staged = process
+        .staged_cartridge
+        .as_ref()
+        .expect("guard travels with the process")
+        .path()
+        .to_path_buf();
+    assert_eq!(fs::read(&staged).unwrap(), rom);
+    assert_eq!(staged.file_name().unwrap(), "Game (USA).md");
+    assert_ne!(staged, zip);
+    let dir = staged.parent().unwrap().to_path_buf();
+    let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    assert_eq!(fs::read(&zip).unwrap(), zip_before, "ZIP never modified");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while process.poll().is_none() {
+        assert!(std::time::Instant::now() < deadline, "fake script exits");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!dir.exists(), "staging directory removed after exit");
+}
+
+#[test]
+fn zipped_cartridge_refusals_launch_nothing_and_leave_no_staging() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let before = staged_dirs();
+    let rom = b"synthetic mega drive rom bytes";
+    // Ambiguous: two candidate ROM members.
+    let (ready, _, _) = zipped_ready(
+        "zip-ambiguous",
+        &[("a.md", rom), ("b.md", b"other rom bytes")],
+    );
+    assert!(
+        preflight_and_launch_retroarch_with_playlist(
+            &ready.request,
+            &HostReadOnlyFilesystem,
+            &ready.environment,
+            None
+        )
+        .is_err()
+    );
+    // Changed since readiness: a different ROM now sits at the same path.
+    let (ready, zip, _) = zipped_ready("zip-changed", &[("a.md", rom)]);
+    write_rom_zip(&zip, &[("a.md", b"a different rom entirely")]);
+    let error = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .err()
+    .expect("a replaced ZIP must not launch");
+    assert!(
+        format!("{error:?}").contains("IdentityMismatch"),
+        "{error:?}"
+    );
+    // Traversal member name.
+    let (ready, _, _) = zipped_ready("zip-traversal", &[("../evil.md", rom)]);
+    assert!(
+        preflight_and_launch_retroarch_with_playlist(
+            &ready.request,
+            &HostReadOnlyFilesystem,
+            &ready.environment,
+            None
+        )
+        .is_err()
+    );
+    // Corrupt payload fails after the directory exists; it must be removed.
+    let (ready, zip, _) = zipped_ready("zip-corrupt", &[("a.md", rom)]);
+    let mut bytes = fs::read(&zip).unwrap();
+    let at = bytes.windows(rom.len()).position(|w| w == rom).unwrap();
+    bytes[at] ^= 0xFF;
+    fs::write(&zip, bytes).unwrap();
+    assert!(
+        preflight_and_launch_retroarch_with_playlist(
+            &ready.request,
+            &HostReadOnlyFilesystem,
+            &ready.environment,
+            None
+        )
+        .is_err()
+    );
+    assert_eq!(staged_dirs(), before, "no staging directory left behind");
+}
+
+#[test]
+fn zipped_cartridge_symlink_member_and_oversize_are_refused() {
+    use std::io::Write as _;
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let before = staged_dirs();
+    let (ready, zip, _) = zipped_ready("zip-symlink", &[("a.md", b"x")]);
+    let mut writer = zip::write::ZipWriter::new(fs::File::create(&zip).unwrap());
+    writer
+        .add_symlink(
+            "a.md",
+            "/etc/passwd",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    assert!(
+        preflight_and_launch_retroarch_with_playlist(
+            &ready.request,
+            &HostReadOnlyFilesystem,
+            &ready.environment,
+            None
+        )
+        .is_err()
+    );
+    let (ready, zip, _) = zipped_ready("zip-big", &[("a.md", b"x")]);
+    let mut writer = zip::write::ZipWriter::new(fs::File::create(&zip).unwrap());
+    writer
+        .start_file(
+            "a.md",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+    writer
+        .write_all(&vec![
+            0u8;
+            (crate::game_identity::MAX_LOOSE_ROM_BYTES + 1)
+                as usize
+        ])
+        .unwrap();
+    writer.finish().unwrap();
+    assert!(
+        preflight_and_launch_retroarch_with_playlist(
+            &ready.request,
+            &HostReadOnlyFilesystem,
+            &ready.environment,
+            None
+        )
+        .is_err()
+    );
+    assert_eq!(staged_dirs(), before);
+}
+
+#[test]
+fn zipped_cartridge_plan_is_ready_for_retroarch_and_only_when_verified() {
+    let rom = b"synthetic mega drive rom bytes";
+    let (ready, zip, _) = zipped_ready("zip-plan", &[("a.md", rom)]);
+    let report = inspect_catalogued_game_identity(&zip, Some("MegaDrive"));
+    let content = crate::launch::launch_content_ref_for_zipped_cartridge(&report)
+        .expect("a verified single-ROM ZIP has launch content");
+    assert!(!content.requires_mount);
+    assert_eq!(content.resolved_path.as_deref(), Some(zip.as_path()));
+    let (identity, _) = crate::launch::canonical_identity_from_game_report(&report);
+    let environment =
+        discover_retroarch_environment(&HostReadOnlyFilesystem, &ready.environment).unwrap();
+    let plan = build_launch_plan(&identity, &content, &[], &environment, &[]);
+    assert!(
+        plan.candidates.iter().any(|candidate| matches!(
+            candidate.target,
+            LaunchTarget::RetroArchCore { .. }
+        ) && candidate.readiness == LaunchReadiness::Ready),
+        "{plan:?}"
+    );
+    // Ambiguous or loose evidence never gets the zipped-cartridge content.
+    let (ambiguous, zip2, _) = zipped_ready("zip-plan-amb", &[("a.md", rom), ("b.md", b"zz")]);
+    let _ = ambiguous;
+    let report = inspect_catalogued_game_identity(&zip2, Some("MegaDrive"));
+    assert!(crate::launch::launch_content_ref_for_zipped_cartridge(&report).is_none());
+    let loose = inspect_catalogued_game_identity(
+        &ready.fixture.write("content/x.md", rom),
+        Some("MegaDrive"),
+    );
+    assert!(crate::launch::launch_content_ref_for_zipped_cartridge(&loose).is_none());
+}
