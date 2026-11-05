@@ -41,6 +41,8 @@ pub(super) struct State {
     /// The text-box value the shown result was requested with.
     result_url: String,
     requested: String,
+    requested_mode: Option<Lookup>,
+    result_mode: Option<Lookup>,
 }
 
 impl State {
@@ -56,6 +58,7 @@ impl State {
         self.task = None;
         self.result = Some(outcome);
         self.result_url = self.requested.clone();
+        self.result_mode = self.requested_mode;
         true
     }
 
@@ -65,6 +68,7 @@ impl State {
         }
         let url = self.url.trim().to_string();
         self.requested = url.clone();
+        self.requested_mode = Some(mode);
         let (sender, receiver) = mpsc::channel();
         self.task = Some(receiver);
         self.result = None;
@@ -119,6 +123,22 @@ pub(super) fn assess(
             .game_evidence
             .assess_against(report, Some(title))
     })
+}
+
+/// What the Compatibility line says. A page that states no game and no
+/// identity fact can never produce a positive result, whatever its tags say.
+pub(super) fn compatibility_line(
+    record: &ModDbPageRecord,
+    identity: Option<(&GameIdentityReport, &str)>,
+) -> String {
+    let evidence = &record.result.game_evidence;
+    if record.result.game_claim.is_none()
+        && evidence.title_claim.is_none()
+        && evidence.identity_facts.is_empty()
+    {
+        return "Not established: the page does not say which game it is for.".into();
+    }
+    compatibility_text(assess(record, identity).as_ref())
 }
 
 pub(super) fn compatibility_text(assessment: Option<&ModCompatibilityAssessment>) -> String {
@@ -181,6 +201,18 @@ pub(super) fn freshness_text(state: ModDbCacheState, age_secs: u64) -> String {
     }
 }
 
+/// A deliberate saved-copy request is not an outage: Core's "offline lookup
+/// requested" warning is not shown for it.
+pub(super) fn saved_copy_text(age_secs: u64) -> String {
+    let fetched = freshness_text(ModDbCacheState::Stale, age_secs);
+    let age = fetched
+        .trim_start_matches("Saved copy from ")
+        .split(';')
+        .next()
+        .unwrap_or_default();
+    format!("Saved copy from {age} (no network was used); it may be out of date.")
+}
+
 fn size_text(bytes: u64) -> String {
     format!("{:.1} MiB ({bytes} bytes)", bytes as f64 / 1_048_576.0)
 }
@@ -234,7 +266,7 @@ pub(super) fn show(
                 );
                 ui.label("Nothing was changed.");
             }
-            Some(Ok(record)) => show_record(ui, record, identity),
+            Some(Ok(record)) => show_record(ui, record, identity, state.result_mode),
         }
     });
 }
@@ -243,6 +275,7 @@ fn show_record(
     ui: &mut egui::Ui,
     record: &ModDbPageRecord,
     identity: Option<(&GameIdentityReport, &str)>,
+    mode: Option<Lookup>,
 ) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -250,12 +283,14 @@ fn show_record(
     let result = &record.result;
     ui.separator();
     ui.strong(&result.title);
-    ui.label(freshness_text(
-        record.cache_state,
-        now.saturating_sub(record.retrieved_at_unix_secs),
-    ));
-    if let Some(warning) = &record.warning {
-        ui.colored_label(theme::warning(ui), warning);
+    let age = now.saturating_sub(record.retrieved_at_unix_secs);
+    if mode == Some(Lookup::SavedCopy) {
+        ui.label(saved_copy_text(age));
+    } else {
+        ui.label(freshness_text(record.cache_state, age));
+        if let Some(warning) = &record.warning {
+            ui.colored_label(theme::warning(ui), warning);
+        }
     }
     if let Some(author) = &result.author_or_team {
         ui.label(format!("Author: {author}"));
@@ -278,7 +313,7 @@ fn show_record(
     }
     ui.label(format!(
         "Compatibility: {}",
-        compatibility_text(assess(record, identity).as_ref())
+        compatibility_line(record, identity)
     ));
     ui.label("Licence and redistribution terms are not read by EmuWiz. Check them on the ModDB page before using or sharing this mod.");
     ui.horizontal_wrapped(|ui| {
@@ -338,6 +373,16 @@ mod tests {
     struct Fake {
         calls: Arc<AtomicUsize>,
         ok: bool,
+        body: &'static str,
+    }
+    impl Fake {
+        fn serving(body: &'static str) -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                ok: true,
+                body,
+            }
+        }
     }
     impl ModDbTransport for Fake {
         fn get(&self, url: &str) -> Result<ModDbHttpResponse, ModProviderError> {
@@ -349,7 +394,7 @@ mod tests {
                 status: 200,
                 location: None,
                 content_type: Some("text/html".into()),
-                body: PAGE.as_bytes().to_vec(),
+                body: self.body.as_bytes().to_vec(),
                 retrieved_url: url.into(),
             })
         }
@@ -365,6 +410,7 @@ mod tests {
             ModDbProvider::with_transport(Fake {
                 calls: calls.clone(),
                 ok,
+                body: PAGE,
             }),
             calls,
         )
@@ -421,6 +467,32 @@ mod tests {
         let record = lookup(&provider(true), URL, Lookup::Network).unwrap();
         assert!(assess(&record, None).is_none());
         assert!(compatibility_text(None).contains("Not assessed"));
+    }
+
+    #[test]
+    fn saved_copy_wording_does_not_blame_moddb() {
+        let text = saved_copy_text(3 * 86_400);
+        assert_eq!(
+            text,
+            "Saved copy from 3 days ago (no network was used); it may be out of date."
+        );
+        assert!(!text.contains("unavailable"));
+    }
+
+    #[test]
+    fn page_without_game_metadata_is_never_a_positive_match() {
+        // Platform tag present, but no game claim and no identity fact.
+        let body = r#"<html><head><title>Texture Pack</title></head><body>
+          <a href="/members/register">register</a><a href="/games/top">popular</a>
+          <div data-moddb-platform="PS2" data-moddb-tag="ps2"></div></body></html>"#;
+        let record = ModDbProvider::with_transport(Fake::serving(body))
+            .inspect_url("https://www.moddb.com/mods/texture-pack")
+            .unwrap();
+        assert_eq!(record.result.author_or_team, None);
+        assert_eq!(record.result.game_claim, None);
+        assert!(!record.result.platform_claims.is_empty());
+        let line = compatibility_line(&record, None);
+        assert!(line.starts_with("Not established"), "{line}");
     }
 
     #[test]
