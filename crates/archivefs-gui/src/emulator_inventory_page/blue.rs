@@ -651,7 +651,7 @@ impl EmulatorInventoryPageState {
                 Ok(journal) => {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!(
-                            "{} {} → {}: {:?} — {}",
+                            "{} {} to {}: {:?} — {}",
                             journal.emulator.label(),
                             journal.old_version,
                             journal.new_version,

@@ -1155,6 +1155,13 @@ impl NativeWorkflows {
         if let Some(environment) = environment {
             lifecycle_setup_panel(ui, &environment.lifecycle, &mut self.app);
         }
+        let context = ui.ctx().clone();
+        self.app
+            .navigate_to_main_view(crate::navigation::MainView::EmulatorSetup);
+        self.app.show_emulator_setup_page(ui, &context);
+        // Updates sit below the page's own primary action so that action
+        // stays visible without scrolling.
+        ui.separator();
         let emulator_running = self.app.launch_dolphin.is_active()
             || self.app.launch_pcsx2.is_active()
             || self.app.launch_standalone.is_active();
@@ -1162,11 +1169,6 @@ impl NativeWorkflows {
             .emulator_readiness
             .emulator_inventory_page
             .show_blue(ui, emulator_running);
-        ui.separator();
-        let context = ui.ctx().clone();
-        self.app
-            .navigate_to_main_view(crate::navigation::MainView::EmulatorSetup);
-        self.app.show_emulator_setup_page(ui, &context);
     }
 
     fn poll_native_repairs(&mut self, context: &egui::Context) {
