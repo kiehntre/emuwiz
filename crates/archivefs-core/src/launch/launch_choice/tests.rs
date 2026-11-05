@@ -429,6 +429,42 @@ fn option_ids_are_stable_and_distinguish_every_launch_identity_fact() {
 }
 
 #[test]
+fn launch_only_homebrew_keys_are_never_saved_as_a_game_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config").join(LAUNCH_PREFERENCES_FILE);
+    let key = format!(
+        "{}{}",
+        crate::launch::AZAHAR_HOMEBREW_KEY_PREFIX,
+        "ab".repeat(32)
+    );
+    let error = set_launch_preference_at(
+        &path,
+        &LaunchPreference::game("Nintendo 3DS", &key, "standalone/azahar/x"),
+    )
+    .unwrap_err();
+    assert!(error.contains("launch target only"), "{error}");
+    assert!(!path.exists(), "nothing may be written");
+    // System-wide defaults and ordinary game defaults are unaffected.
+    set_launch_preference_at(
+        &path,
+        &LaunchPreference::system("Nintendo 3DS", "standalone/azahar/x"),
+    )
+    .unwrap();
+    set_launch_preference_at(
+        &path,
+        &LaunchPreference::game("GameCube", GAME, &option(NATIVE)),
+    )
+    .unwrap();
+    let saved = load_launch_preferences_at(&path).unwrap();
+    assert_eq!(saved.len(), 2);
+    assert!(saved.iter().all(|p| {
+        !p.game_key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("3dsx-sha256:"))
+    }));
+}
+
+#[test]
 fn preferences_survive_reload_and_replace_only_their_own_slot() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config").join(LAUNCH_PREFERENCES_FILE);
