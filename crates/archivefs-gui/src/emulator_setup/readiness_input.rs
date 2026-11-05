@@ -1067,6 +1067,23 @@ impl ReadinessSources<'_> {
                     firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
                 }),
         );
+        let snes9x_roots =
+            archivefs_core::patch_manager::Snes9xProfileDiscoveryRoots::from_environment();
+        standalone_profiles.extend(
+            archivefs_core::patch_manager::discover_snes9x_profiles(&snes9x_roots)
+                .profiles
+                .iter()
+                .map(|profile| archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "snes9x",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: None,
+                    eligible: archivefs_core::patch_manager::resolve_snes9x_native_launch_binding(
+                        profile,
+                    )
+                    .is_ok(),
+                    firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                }),
+        );
         if let Ok(roots) =
             archivefs_core::patch_manager::SameBoyProfileDiscoveryRoots::from_environment()
         {
