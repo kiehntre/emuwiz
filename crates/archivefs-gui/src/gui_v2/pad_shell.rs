@@ -162,8 +162,13 @@ impl App {
             (cancel, done, typed)
         });
         if typed {
-            if let Some(shell) = self.pad_shell.as_mut() {
-                shell.osk = None;
+            if let Some(shell) = self.pad_shell.as_mut()
+                && let Some(osk) = shell.osk.take()
+            {
+                // The typed text is still in this frame's input: give the
+                // field focus before it is drawn so it lands there.
+                context.memory_mut(|m| m.request_focus(osk.target));
+                shell.refocus = Some((osk.target, 0));
             }
         } else if cancel {
             self.pad_shell_osk_command(context, Command::Back);
@@ -357,6 +362,17 @@ impl App {
 fn snapshot_slot() -> egui::Id {
     egui::Id::new("pad_shell_snapshot")
 }
+fn hook_runs_slot() -> egui::Id {
+    egui::Id::new("pad_shell_hook_runs")
+}
+/// How many passes the end-of-pass hook has run in. egui only runs it for
+/// `run_ui`; tests use this to fail loudly when driven through plain `run`.
+#[cfg(test)]
+pub(super) fn hook_runs(context: &egui::Context) -> u64 {
+    context
+        .data(|d| d.get_temp::<u64>(hook_runs_slot()))
+        .unwrap_or(0)
+}
 fn capture_slot() -> egui::Id {
     egui::Id::new("pad_shell_capture")
 }
@@ -388,6 +404,9 @@ fn register_capture(context: &egui::Context) {
         "pad_shell_capture",
         std::sync::Arc::new(|ui: &mut egui::Ui| {
             let context = &ui.ctx().clone();
+            context.data_mut(|d| {
+                *d.get_temp_mut_or_insert_with(hook_runs_slot(), || 0_u64) += 1;
+            });
             if !context
                 .data(|d| d.get_temp::<bool>(capture_slot()))
                 .unwrap_or(false)
@@ -454,6 +473,9 @@ fn key_tap(context: &egui::Context, key: egui::Key) {
 
 #[cfg(test)]
 impl PadShell {
+    pub(super) fn buffer(&self) -> Option<String> {
+        self.osk.as_ref().map(|o| o.buffer.clone())
+    }
     pub(super) fn osk_open(&self) -> bool {
         self.osk.is_some()
     }
