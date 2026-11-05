@@ -13,7 +13,9 @@ use std::{
 
 use archivefs_core::{
     game_identity::GameIdentityReport,
-    mod_provider::{ModAcquisitionMode, ModCompatibilityAssessment, ModCompatibilityLevel},
+    mod_provider::{
+        ModAcquisitionMode, ModCompatibilityAssessment, ModCompatibilityLevel, ModProviderError,
+    },
     moddb::{ModDbCacheState, ModDbPageRecord, ModDbProvider, ModDbTransport},
 };
 use eframe::egui;
@@ -36,6 +38,9 @@ pub(super) struct State {
     url: String,
     task: Option<Receiver<Outcome>>,
     result: Option<Outcome>,
+    /// The text-box value the shown result was requested with.
+    result_url: String,
+    requested: String,
 }
 
 impl State {
@@ -50,6 +55,7 @@ impl State {
         };
         self.task = None;
         self.result = Some(outcome);
+        self.result_url = self.requested.clone();
         true
     }
 
@@ -58,6 +64,7 @@ impl State {
             return;
         }
         let url = self.url.trim().to_string();
+        self.requested = url.clone();
         let (sender, receiver) = mpsc::channel();
         self.task = Some(receiver);
         self.result = None;
@@ -92,7 +99,12 @@ pub(super) fn lookup<T: ModDbTransport>(
         Lookup::Network => provider.inspect_url(url),
         Lookup::SavedCopy => provider.inspect_cached(url),
     };
-    result.map_err(|e| e.to_string())
+    result.map_err(|e| match (mode, e) {
+        (Lookup::SavedCopy, ModProviderError::ProviderUnavailable(_)) => {
+            "There is no saved copy of this page yet.".to_string()
+        }
+        (_, e) => e.to_string(),
+    })
 }
 
 /// Compatibility is only assessed against a game whose saved identity is
@@ -207,7 +219,13 @@ pub(super) fn show(
             ui.spinner();
             ui.label("Reading the page…");
         }
-        match &state.result {
+        let current = state.result_url == state.url.trim();
+        if state.result.is_some() && !current && state.task.is_none() {
+            ui.label(
+                "The address changed since the last lookup. Look it up again to see its details.",
+            );
+        }
+        match state.result.as_ref().filter(|_| current) {
             None => {}
             Some(Err(error)) => {
                 ui.colored_label(
@@ -304,7 +322,6 @@ fn show_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use archivefs_core::mod_provider::ModProviderError;
     use archivefs_core::moddb::ModDbHttpResponse;
     use std::sync::{
         Arc,
