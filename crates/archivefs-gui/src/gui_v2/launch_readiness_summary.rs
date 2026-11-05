@@ -11,6 +11,7 @@ use archivefs_core::launch::{
 use eframe::egui;
 
 mod diagnosis;
+pub(crate) mod route_truth;
 pub(crate) use diagnosis::{Attempt, AttemptTracker, Finding};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
