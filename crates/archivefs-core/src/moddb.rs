@@ -747,14 +747,6 @@ fn first_attr(document: &Html, selector: &str, attribute: &str) -> Option<String
         .filter(|value| !value.trim().is_empty())
 }
 
-fn first_link_text(document: &Html, selector: &str) -> Option<String> {
-    let selector = Selector::parse(selector).ok()?;
-    document
-        .select(&selector)
-        .map(|node| node.text().collect::<String>().trim().to_string())
-        .find(|value| !value.is_empty() && value.len() <= MAX_PROVIDER_TEXT_BYTES)
-}
-
 fn attr_value(value: scraper::ElementRef<'_>, attribute: &str) -> Option<String> {
     value
         .value()
