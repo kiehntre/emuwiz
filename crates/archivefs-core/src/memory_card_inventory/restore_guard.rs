@@ -8,14 +8,21 @@
 //! * **Kernel lease over the publication window.** Where Linux grants them,
 //!   read leases on the live card and on its replacement are taken before the
 //!   final check and held until the operation, including any reversal, is
-//!   finished. A lease is refused while any process, of any user or container,
-//!   has the inode open for writing, and is broken by any later open for
-//!   writing or truncate; the opener is held back until we release. A break
+//!   finished. A lease is refused while any other descriptor, of any process,
+//!   user or container, is open on the inode (readers included), and is
+//!   broken by any later open for writing or truncate. The opener is held back
+//!   until we release, or until `fs.lease-break-time` (45 s by default)
+//!   expires; after expiry the lease reads as broken (`F_UNLCK`), and a writer
+//!   that got through is caught by the identity and SHA-256 checks
+//!   (RollbackFailed or UndoFailed, both files kept), never committed. A break
 //!   on the outgoing card refuses before the exchange and reverses it after;
 //!   the opener then resumes on the unchanged original at the card path. This
 //!   protection does not depend on knowing what any process is; only while it
 //!   is held may the process scan leave uninspectable descriptor tables to
-//!   the kernel. Without lease support the strict process scan alone decides.
+//!   the kernel. Without lease support the strict process scan alone decides;
+//!   on storage whose writes can bypass the inode (FUSE such as mergerfs,
+//!   overlayfs, network filesystems; judged from the file's filesystem, never
+//!   its path) an incomplete scan refuses as `StorageUnprotected`.
 //! * **Durable intent.** A checksummed journal is written (atomically, with
 //!   fsync) before the first mutation and at every phase change, so an
 //!   interrupted restore can be found and judged after a restart.
@@ -41,7 +48,9 @@ mod exchange;
 mod ownership;
 mod proc_scan;
 mod recovery_evidence;
-pub use card_lease::{CardLeaseAttempt, CardWriteLease, observe_card_now};
+pub use card_lease::{
+    CardLeaseAttempt, CardWriteLease, card_storage_unprotectable, observe_card_now,
+};
 use card_lease::{PublicationLeaseAttempt, PublicationLeases};
 pub use discovery::{
     PS2_DISCOVERY_LIMIT, Ps2DiscoveryProblem, Ps2RecoveryRun, Ps2RestoreDiscovery,
@@ -269,11 +278,17 @@ pub fn ps2_card_binding(card_path: &Path, save_display_name: &str) -> DirectoryS
     }
 }
 
-fn check_quiescence(state: EmulatorQuiescence) -> Result<(), Ps2PsuRestoreError> {
+fn check_quiescence(state: EmulatorQuiescence, card: &Path) -> Result<(), Ps2PsuRestoreError> {
     match state {
         EmulatorQuiescence::Closed => Ok(()),
         EmulatorQuiescence::Running => Err(Ps2PsuRestoreError::EmulatorRunning),
         EmulatorQuiescence::CardInUse => Err(Ps2PsuRestoreError::CardInUse),
+        // Without kernel evidence, explain why: on storage whose writes can
+        // bypass the card inode, no lease is taken and the strict scan alone
+        // decides. Either way the operation is refused.
+        EmulatorQuiescence::Unknown if card_storage_unprotectable(card) => {
+            Err(Ps2PsuRestoreError::StorageUnprotected)
+        }
         EmulatorQuiescence::Unknown => Err(Ps2PsuRestoreError::EmulatorStateUnknown),
     }
 }
@@ -495,12 +510,15 @@ impl Run<'_> {
     }
 
     fn quiet(&self) -> Result<(), Ps2PsuRestoreError> {
-        check_quiescence(match &self.leases {
-            Some(leases) => self
-                .quiescence
-                .observe_under_card_lease(&self.journal.binding, &leases.outgoing),
-            None => self.quiescence.observe(&self.journal.binding),
-        })
+        check_quiescence(
+            match &self.leases {
+                Some(leases) => self
+                    .quiescence
+                    .observe_under_card_lease(&self.journal.binding, &leases.outgoing),
+                None => self.quiescence.observe(&self.journal.binding),
+            },
+            &self.journal.card_path,
+        )
     }
 
     /// Lease the live card and the staged replacement for the rest of the
@@ -602,11 +620,10 @@ pub(crate) fn apply_with_hook(
     let _operation_lock = ownership::lock(&plan.source_card_path)?;
     let binding = ps2_card_binding(&plan.source_card_path, &plan.save_display_name);
     // Early refusal only; the publication gate below is held under leases.
-    check_quiescence(observe_card_now(
-        quiescence,
-        &binding,
+    check_quiescence(
+        observe_card_now(quiescence, &binding, &plan.source_card_path),
         &plan.source_card_path,
-    ))?;
+    )?;
     let psu = fs::read(&plan.source_psu_path).map_err(restore_error)?;
     if sha256_hex(&psu) != plan.source_psu_sha256 {
         return Err(Ps2PsuRestoreError::SourceChanged);
@@ -996,11 +1013,10 @@ pub(crate) fn undo_with_hook(
         ));
     };
     // Early refusal only; the exchange below is held under leases.
-    check_quiescence(observe_card_now(
-        quiescence,
-        &journal.binding,
+    check_quiescence(
+        observe_card_now(quiescence, &journal.binding, &journal.card_path),
         &journal.card_path,
-    ))?;
+    )?;
     validate_source_path(&journal.card_path)
         .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
     let mut pinned = fs::File::open(&journal.card_path).map_err(restore_error)?;
@@ -1054,11 +1070,10 @@ pub(crate) fn undo_with_hook(
     let result = (|| -> Result<Option<PublicationLeases>, Fail> {
         // Early refusal under a lease held for this check only; repeated
         // under the publication leases once the original is staged.
-        check_quiescence(observe_card_now(
-            quiescence,
-            &journal.binding,
+        check_quiescence(
+            observe_card_now(quiescence, &journal.binding, &journal.card_path),
             &journal.card_path,
-        ))?;
+        )?;
         if path_identity(&journal.card_path)? != post_identity {
             return Err(Ps2PsuRestoreError::StaleUndo.into());
         }
@@ -1096,10 +1111,15 @@ pub(crate) fn undo_with_hook(
             PublicationLeaseAttempt::Changed => return Err(Ps2PsuRestoreError::StaleUndo.into()),
             PublicationLeaseAttempt::Unavailable => None,
         };
-        check_quiescence(match &leases {
-            Some(leases) => quiescence.observe_under_card_lease(&journal.binding, &leases.outgoing),
-            None => quiescence.observe(&journal.binding),
-        })?;
+        check_quiescence(
+            match &leases {
+                Some(leases) => {
+                    quiescence.observe_under_card_lease(&journal.binding, &leases.outgoing)
+                }
+                None => quiescence.observe(&journal.binding),
+            },
+            &journal.card_path,
+        )?;
         if path_identity(&journal.card_path)? != post_identity
             || sha256_hex(
                 &read_source_card(&journal.card_path)

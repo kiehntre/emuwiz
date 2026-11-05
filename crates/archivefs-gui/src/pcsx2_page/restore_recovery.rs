@@ -203,6 +203,9 @@ pub(super) fn process_gate(card: &Path, save: &str) -> Result<(), Ps2PsuRestoreE
         &observer, &binding, card,
     ) == archivefs_core::save_snapshots::tree_restore::safety::EmulatorQuiescence::Unknown
     {
+        if archivefs_core::memory_card_inventory::restore_guard::card_storage_unprotectable(card) {
+            return Err(Ps2PsuRestoreError::StorageUnprotected);
+        }
         let report = observer.report(&binding);
         return Err(Ps2PsuRestoreError::RecoveryRequired(format!(
             "Process inspection is incomplete. Unreadable live process IDs: {:?}. Close these processes or correct /proc access, then retry. The card was not changed.",

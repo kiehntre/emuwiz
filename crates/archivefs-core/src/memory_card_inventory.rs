@@ -621,6 +621,10 @@ pub enum Ps2PsuRestoreError {
     CardInUse,
     /// Whether an emulator is using the card could not be established.
     EmulatorStateUnknown,
+    /// The card's filesystem cannot give kernel evidence of writers (FUSE,
+    /// mergerfs, overlay, network), and the process scan alone was
+    /// incomplete. Not a statement that an emulator is running.
+    StorageUnprotected,
     UnsupportedAtomicExchange,
     /// Cards that store spare/ECC bytes (528-byte pages) are not written: the
     /// writer does not regenerate ECC, so a restore would leave stale ECC.
@@ -680,6 +684,10 @@ impl std::fmt::Display for Ps2PsuRestoreError {
             Self::EmulatorStateUnknown => write!(
                 formatter,
                 "EmuWiz could not confirm that no PS2 emulator is using the card"
+            ),
+            Self::StorageUnprotected => write!(
+                formatter,
+                "the memory card's storage location cannot be safely protected during a restore (merged, FUSE or network folder); copy the card to a local disk to restore it"
             ),
             Self::UnsupportedRepresentation(detail) => {
                 write!(

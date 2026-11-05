@@ -661,11 +661,25 @@ held = []
 print("ready", flush=True)
 for line in sys.stdin:
     _, mode, path = line.rstrip("\n").split(" ", 2)
-    f = open(path, mode)
-    held.append(f)
-    print(os.fstat(f.fileno()).st_ino, flush=True)
+    try:
+        f = open(path, mode)
+        held.append(f)
+        inode = os.fstat(f.fileno()).st_ino
+    except OSError:
+        inode = 0  # failed, or the opened file is gone; no inode is 0
+    print(inode, flush=True)
 "#;
-        let mut child = std::process::Command::new("python3")
+        // Inside a test user namespace our own non-dumpable children stay
+        // readable; started in an unmapped nested namespace, /proc/<pid> is
+        // owned by global root again, as for other users' processes.
+        let mut command = if std::env::var_os("EMUWIZ_HELPER_NESTED_USERNS").is_some() {
+            let mut command = std::process::Command::new("unshare");
+            command.args(["-U", "python3"]);
+            command
+        } else {
+            std::process::Command::new("python3")
+        };
+        let mut child = command
             .args(["-I", "-c", script, name])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -826,4 +840,160 @@ fn real_proc_refuses_while_pcsx2_runs() {
         Err(Ps2PsuRestoreError::EmulatorRunning)
     ));
     assert_eq!(world.card_bytes(), world.original);
+}
+
+/// Storage acceptance on a real filesystem. Cards are created under TMPDIR
+/// (the path the restore uses). With `EMUWIZ_STORAGE_ALIAS`, competing
+/// programs open the same directory through that other path instead (a bind
+/// mount, the underlying ext4 path, or a mergerfs view of it). The expected
+/// outcome comes from `EMUWIZ_STORAGE_EXPECT` (`protected` / `unprotected`),
+/// which the test checks against the filesystem of the card itself.
+#[test]
+#[ignore = "real storage acceptance; set EMUWIZ_STORAGE_EXPECT and TMPDIR"]
+fn real_storage_acceptance() {
+    let Ok(expect) = std::env::var("EMUWIZ_STORAGE_EXPECT") else {
+        return;
+    };
+    let observer = ProcScanQuiescence::new();
+    let alias_root = std::env::var_os("EMUWIZ_STORAGE_ALIAS").map(PathBuf::from);
+    let alias = |world: &World, path: &Path| -> PathBuf {
+        match &alias_root {
+            Some(root) => root
+                .join(world.dir.path().file_name().unwrap())
+                .join(path.file_name().unwrap()),
+            None => path.to_path_buf(),
+        }
+    };
+    let world = World::new();
+    let seen = alias(&world, &world.card);
+    let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
+    let c = std::ffi::CString::new(world.card.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::statfs(c.as_ptr(), &mut statfs) }, 0);
+    eprintln!(
+        "card {} (filesystem magic {:#x}); competitors use {} (same inode: {})",
+        world.card.display(),
+        statfs.f_type,
+        seen.display(),
+        fs::metadata(&seen).unwrap().ino() == fs::metadata(&world.card).unwrap().ino()
+    );
+    assert_eq!(
+        fs::read(&seen).unwrap(),
+        world.original,
+        "alias shows the card"
+    );
+
+    if expect == "unprotected" {
+        assert!(card_storage_unprotectable(&world.card));
+        let result = apply_ps2_psu_restore_guarded(&world.plan(), &observer, &world.options());
+        eprintln!("restore on unprotectable storage: {result:?}");
+        assert!(matches!(
+            result,
+            Err(Ps2PsuRestoreError::StorageUnprotected)
+        ));
+        assert_eq!(world.card_bytes(), world.original);
+        eprintln!("storage checks passed");
+        return;
+    }
+    assert_eq!(expect, "protected");
+    assert!(!card_storage_unprotectable(&world.card));
+    let applied =
+        apply_ps2_psu_restore_guarded(&world.plan(), &observer, &world.options()).unwrap();
+    assert_ne!(world.card_bytes(), world.original);
+    undo_ps2_psu_restore_guarded(&applied.journal_path, &observer, 2).unwrap();
+    assert_eq!(world.card_bytes(), world.original);
+    eprintln!("restore -> verify -> Undo: passed");
+
+    let world = World::new();
+    let mut writer = HiddenProcess::spawn("card-writer");
+    writer.request_open("r+b", &alias(&world, &world.card));
+    writer.opened_inode();
+    let result = apply_ps2_psu_restore_guarded(&world.plan(), &observer, &world.options());
+    eprintln!("writer holding the card through the alias: {result:?}");
+    assert!(matches!(result, Err(Ps2PsuRestoreError::CardInUse)));
+    assert_eq!(world.card_bytes(), world.original);
+    drop(writer);
+
+    let world = World::new();
+    let original_inode = fs::metadata(&world.card).unwrap().ino();
+    let competitor = RefCell::new(HiddenProcess::spawn("innocent-name"));
+    let hook = |step: Ps2RestoreStep| {
+        if step == Ps2RestoreStep::AfterRename {
+            competitor
+                .borrow_mut()
+                .request_open("r+b", &alias(&world, &stage_path(&world)));
+            wait_breaking(original_inode);
+        }
+        Ok(())
+    };
+    let result = apply_with_hook(&world.plan(), &observer, &world.options(), &hook);
+    let opened = competitor.borrow_mut().opened_inode();
+    eprintln!(
+        "writer opening through the alias during publication: {result:?}; its open {}",
+        if opened == 0 {
+            "failed".to_string()
+        } else {
+            format!("got inode {opened}")
+        }
+    );
+    assert!(matches!(result, Err(Ps2PsuRestoreError::CardInUse)));
+    assert_eq!(world.card_bytes(), world.original);
+    assert_eq!(only_journal(&world).phase, Ps2RestorePhase::RolledBack);
+    drop(competitor);
+
+    let world = World::new();
+    let mut reader = HiddenProcess::spawn("card-reader");
+    reader.request_open("rb", &alias(&world, &world.card));
+    reader.opened_inode();
+    let result = apply_ps2_psu_restore_guarded(&world.plan(), &observer, &world.options());
+    eprintln!("read-only holder through the alias: {result:?}");
+    assert!(matches!(result, Err(Ps2PsuRestoreError::CardInUse)));
+    assert_eq!(world.card_bytes(), world.original);
+    drop(reader);
+    eprintln!("storage checks passed");
+}
+
+/// Read-only: classify existing files (paths in `EMUWIZ_STORAGE_PROBE`,
+/// colon-separated) the way a restore would. Opens read-only, writes nothing.
+#[test]
+#[ignore = "read-only storage probe; set EMUWIZ_STORAGE_PROBE"]
+fn real_storage_probe_read_only() {
+    let Some(paths) = std::env::var_os("EMUWIZ_STORAGE_PROBE") else {
+        return;
+    };
+    for path in std::env::split_paths(&paths) {
+        eprintln!(
+            "{}: unprotectable={} lease={}",
+            path.display(),
+            card_storage_unprotectable(&path),
+            match CardWriteLease::acquire(&path, None) {
+                CardLeaseAttempt::Held(_) => "held",
+                CardLeaseAttempt::Writers => "writers",
+                CardLeaseAttempt::Changed => "changed",
+                CardLeaseAttempt::Unavailable => "unavailable",
+            }
+        );
+    }
+}
+
+#[test]
+fn a_descriptor_held_only_for_an_instant_does_not_make_the_card_look_in_use() {
+    // Like a forked child holding copies of its parent's descriptors until
+    // it executes: gone within a few milliseconds.
+    let world = World::new();
+    let brief = fs::File::open(&world.card).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(brief);
+    });
+    assert!(matches!(
+        CardWriteLease::acquire(&world.card, None),
+        CardLeaseAttempt::Held(_)
+    ));
+    release.join().unwrap();
+    // One that stays open is still reported.
+    let _kept = fs::File::open(&world.card).unwrap();
+    assert!(matches!(
+        CardWriteLease::acquire(&world.card, None),
+        CardLeaseAttempt::Writers
+    ));
 }

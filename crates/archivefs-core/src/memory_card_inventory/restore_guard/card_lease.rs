@@ -4,14 +4,18 @@
 //! only while no process (any user, any container, inspectable or not) has
 //! that inode open for writing, including writable shared mappings. While it
 //! is held, any open of the inode for writing, or a truncate, breaks it: the
-//! opener is held back by the kernel until we release the lease, and we see
-//! the break. The lease says nothing about which programs are running; it
+//! opener is held back by the kernel until we release the lease (or until
+//! `fs.lease-break-time` expires, below), and we see the break. The lease says nothing about which programs are running; it
 //! only proves that the inode was not opened for writing in the window.
 //!
 //! Before settling on the read lease, a write lease is taken on the same
 //! descriptor and immediately downgraded. A write lease is granted only while
-//! no other descriptor is open on the inode at all, readers included (with
-//! `CONFIG_IMA`, which tracks readers; Ubuntu kernels enable it). So at the
+//! no other descriptor is open on the inode at all, readers included: the
+//! kernel compares the inode's open-for-read and open-for-write counts
+//! (`i_readcount`, `i_writecount`) with the lease holder's own descriptor.
+//! `i_readcount` is maintained whenever file locking is built in
+//! (`CONFIG_FILE_LOCKING`, which leases themselves require) or IMA is
+//! enabled; this does not depend on IMA. So at the
 //! moment of acquisition the kernel answers what a complete descriptor scan
 //! would: nobody else has the card open. From then on the read lease catches
 //! every new open for writing.
@@ -24,7 +28,9 @@
 //!
 //! A lease protects only for `fs.lease-break-time` (45 s by default) after a
 //! break; after that the kernel lets the opener proceed. The lease then reads
-//! as broken, and the operations' identity and SHA-256 checks report it.
+//! as broken (`F_UNLCK`) for good, so no operation can report success, and
+//! the identity and SHA-256 checks catch a write that got through
+//! (RollbackFailed or UndoFailed, both files kept).
 //!
 //! The card operations hold these leases across their whole publication
 //! window and only release them after any reversal (see `restore_guard`).
@@ -79,7 +85,28 @@ thread_local! {
 impl CardWriteLease {
     /// Lease the regular file at `path`, never following a link. With
     /// `expected`, the opened inode must be that file.
+    ///
+    /// A refusal because another descriptor is open is retried briefly
+    /// (about 100 ms in all): any process that forks holds a copy of every
+    /// descriptor of its parent until it executes, so a program starting a
+    /// child at the wrong moment would otherwise make the card look in use.
+    /// Each attempt starts again from scratch, so a lease is only ever
+    /// granted when the kernel shows no other descriptor at that moment; a
+    /// program that keeps the card open is still reported (`Writers`).
     pub fn acquire(path: &Path, expected: Option<FileIdentity>) -> CardLeaseAttempt {
+        const ATTEMPTS: u32 = 10;
+        for attempt in 1..=ATTEMPTS {
+            match Self::acquire_once(path, expected) {
+                CardLeaseAttempt::Writers if attempt < ATTEMPTS => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                outcome => return outcome,
+            }
+        }
+        CardLeaseAttempt::Writers
+    }
+
+    fn acquire_once(path: &Path, expected: Option<FileIdentity>) -> CardLeaseAttempt {
         #[cfg(test)]
         if LEASES_DISABLED.with(|disabled| disabled.get()) {
             return CardLeaseAttempt::Unavailable;
@@ -165,6 +192,24 @@ impl Drop for CardWriteLease {
         // SAFETY: fcntl on a descriptor we own.
         unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK) };
     }
+}
+
+/// The card is on a filesystem whose writes can bypass the card inode
+/// (FUSE such as mergerfs or rclone, overlayfs, network filesystems), judged
+/// from the filesystem of the file itself, never from its path. Leases are
+/// never trusted there. False when it cannot be determined.
+pub fn card_storage_unprotectable(card: &Path) -> bool {
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(card)
+    else {
+        return false;
+    };
+    // SAFETY: statfs into zeroed storage for a descriptor we own.
+    let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstatfs(file.as_raw_fd(), &mut filesystem) }) == 0
+        && !lease_trusted_filesystem(filesystem.f_type as i64)
 }
 
 fn signal_is_default_or_ignored(signal: libc::c_int) -> bool {
