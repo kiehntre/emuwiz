@@ -294,15 +294,30 @@ fn a_card_replaced_immediately_before_publication_is_never_overwritten() {
 
 #[test]
 fn an_in_place_edit_after_the_final_recheck_is_detected_and_kept() {
+    // Another program edits the card in place right before publication. The
+    // kernel holds its open back (our lease breaks), the restore stops with
+    // nothing published, and the edit then lands on the untouched card.
     let world = World::new();
     let card = world.card.clone();
+    let inode = fs::metadata(&card).unwrap().ino();
+    let editor = std::cell::RefCell::new(None);
     let result = world.apply_hooked(&CLOSED, &|step| {
         if step == Ps2RestoreStep::BeforeRename {
-            flip(&card, 12_345);
+            let card = card.clone();
+            *editor.borrow_mut() = Some(std::thread::spawn(move || flip(&card, 12_345)));
+            let needle = format!(":{inode} ");
+            while !fs::read_to_string("/proc/locks")
+                .unwrap_or_default()
+                .lines()
+                .any(|line| line.contains("BREAKING") && line.contains(&needle))
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
         Ok(())
     });
-    assert_eq!(result.unwrap_err(), Ps2PsuRestoreError::CardChanged);
+    editor.take().unwrap().join().unwrap();
+    assert_eq!(result.unwrap_err(), Ps2PsuRestoreError::EmulatorRunning);
     let mut expected = world.original.clone();
     expected[12_345] ^= 0xff;
     assert_eq!(world.card_bytes(), expected);
@@ -827,6 +842,7 @@ fn fake_proc(entries: &[(&str, &str, &str, Option<&Path>)]) -> tempfile::TempDir
         fs::create_dir_all(dir.join("fd")).unwrap();
         fs::write(dir.join("comm"), comm).unwrap();
         fs::write(dir.join("cmdline"), cmdline.replace(' ', "\0")).unwrap();
+        fs::write(dir.join("cgroup"), "0::/user.slice/user-1000.slice\n").unwrap();
         if let Some(target) = fd_target {
             std::os::unix::fs::symlink(target, dir.join("fd/7")).unwrap();
         }
@@ -889,7 +905,8 @@ fn an_unreadable_process_of_our_own_user_makes_the_state_unknown() {
     let fd = proc.path().join("400/fd");
     fs::set_permissions(&fd, fs::Permissions::from_mode(0o000)).unwrap();
     assert_eq!(
-        observe(proc.path(), &world.card),
+        ProcScanQuiescence::with_root(proc.path().to_path_buf())
+            .observe(&ps2_card_binding(&world.card, "SAVE")),
         EmulatorQuiescence::Unknown
     );
     fs::set_permissions(&fd, fs::Permissions::from_mode(0o755)).unwrap();
@@ -971,5 +988,7 @@ fn an_undo_target_replaced_at_the_last_instant_is_swapped_back_untouched() {
     );
 }
 
+#[path = "lease_regressions.rs"]
+mod lease_regressions;
 #[path = "review_regressions.rs"]
 mod review_regressions;

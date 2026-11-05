@@ -10,7 +10,9 @@ use super::{
     EmulatorUseStatus, SaveLocation, SaveRestoreConflict, SaveRestorePlan, SaveSnapshot,
     SaveSnapshotManifest, build_restore_plan, verify_snapshot,
 };
-use crate::memory_card_inventory::restore_guard::{ProcScanQuiescence, ps2_card_binding};
+use crate::memory_card_inventory::restore_guard::{
+    ProcScanQuiescence, observe_card_now, ps2_card_binding,
+};
 use crate::persistent_state_inventory::StateEmulator;
 use crate::save_snapshots::tree_restore::safety::{EmulatorQuiescence, QuiescenceProvider};
 use std::{
@@ -221,6 +223,12 @@ pub fn snapshot_closure_supported(emulator: StateEmulator) -> bool {
 
 /// Emulator-use evidence for snapshot creation of `save_path`.
 /// `NotDetected` only when the reviewed observer reports `Closed`.
+///
+/// Observed under a kernel lease held for the observation (see
+/// `observe_card_now`): the snapshot only reads the card, and
+/// `create_snapshot` refuses with `SourceChanged` if its size or modification
+/// time changes while it is copied, so a later writer cannot yield a torn
+/// snapshot that is kept.
 pub fn snapshot_emulator_use(
     emulator: StateEmulator,
     save_path: &Path,
@@ -229,7 +237,11 @@ pub fn snapshot_emulator_use(
     if !snapshot_closure_supported(emulator) {
         return EmulatorUseStatus::Unknown;
     }
-    match observer.observe(&ps2_card_binding(save_path, "save snapshot")) {
+    match observe_card_now(
+        observer,
+        &ps2_card_binding(save_path, "save snapshot"),
+        save_path,
+    ) {
         EmulatorQuiescence::Closed => EmulatorUseStatus::NotDetected,
         EmulatorQuiescence::Running => EmulatorUseStatus::Running,
         EmulatorQuiescence::Unknown => EmulatorUseStatus::Unknown,

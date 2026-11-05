@@ -5,6 +5,17 @@
 //! * **Quiescence.** Mutation is refused unless the Save Vault policy
 //!   ([`QuiescenceProvider`]) reports `Closed`. `Running` and `Unknown` refuse,
 //!   and the check is repeated immediately before publication.
+//! * **Kernel lease over the publication window.** Where Linux grants them,
+//!   read leases on the live card and on its replacement are taken before the
+//!   final check and held until the operation, including any reversal, is
+//!   finished. A lease is refused while any process, of any user or container,
+//!   has the inode open for writing, and is broken by any later open for
+//!   writing or truncate; the opener is held back until we release. A break
+//!   on the outgoing card refuses before the exchange and reverses it after;
+//!   the opener then resumes on the unchanged original at the card path. This
+//!   protection does not depend on knowing what any process is; only while it
+//!   is held may the process scan leave uninspectable descriptor tables to
+//!   the kernel. Without lease support the strict process scan alone decides.
 //! * **Durable intent.** A checksummed journal is written (atomically, with
 //!   fsync) before the first mutation and at every phase change, so an
 //!   interrupted restore can be found and judged after a restart.
@@ -24,11 +35,14 @@
 
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+mod card_lease;
 mod discovery;
 mod exchange;
 mod ownership;
 mod proc_scan;
 mod recovery_evidence;
+pub use card_lease::{CardLeaseAttempt, CardWriteLease, observe_card_now};
+use card_lease::{PublicationLeaseAttempt, PublicationLeases};
 pub use discovery::{
     PS2_DISCOVERY_LIMIT, Ps2DiscoveryProblem, Ps2RecoveryRun, Ps2RestoreDiscovery,
     discover_ps2_restore_journals, recover_all_interrupted_ps2_restores,
@@ -467,6 +481,9 @@ struct Run<'a> {
     original: Vec<u8>,
     renamed: bool,
     quiescence: &'a dyn QuiescenceProvider,
+    /// Held from the publication gate until the run is dropped, which is
+    /// after any reversal by `unwind`.
+    leases: Option<PublicationLeases>,
 }
 
 impl Run<'_> {
@@ -477,7 +494,63 @@ impl Run<'_> {
     }
 
     fn quiet(&self) -> Result<(), Ps2PsuRestoreError> {
-        check_quiescence(self.quiescence.observe(&self.journal.binding))
+        check_quiescence(match &self.leases {
+            Some(leases) => self
+                .quiescence
+                .observe_under_card_lease(&self.journal.binding, &leases.outgoing),
+            None => self.quiescence.observe(&self.journal.binding),
+        })
+    }
+
+    /// Lease the live card and the staged replacement for the rest of the
+    /// run. Without kernel support, nothing is held and `quiet` is strict.
+    fn lease_publication(&mut self, staged: &Path) -> Result<(), Ps2PsuRestoreError> {
+        let staged_identity = path_identity(staged)?;
+        match PublicationLeases::acquire(
+            &self.journal.card_path,
+            self.journal.original_identity,
+            staged,
+            staged_identity,
+        ) {
+            PublicationLeaseAttempt::Held(leases) => {
+                self.leases = Some(leases);
+                Ok(())
+            }
+            PublicationLeaseAttempt::Writers => Err(Ps2PsuRestoreError::EmulatorRunning),
+            PublicationLeaseAttempt::Changed => Err(Ps2PsuRestoreError::CardChanged),
+            PublicationLeaseAttempt::Unavailable => Ok(()),
+        }
+    }
+
+    /// Immediately before the exchange: nothing opened either file for writing.
+    fn leases_unbroken(&self) -> Result<(), Ps2PsuRestoreError> {
+        match &self.leases {
+            Some(leases) if !leases.outgoing.intact() || !leases.incoming.intact() => {
+                Err(Ps2PsuRestoreError::EmulatorRunning)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// After the exchange and its verification, before the restore counts as
+    /// published. An opener of the outgoing card resolved the card path before
+    /// the exchange: the exchange is reversed (by `unwind`) before the leases
+    /// are released, so it resumes on the original at the card path. An opener
+    /// of the incoming card opened the new live card: it resumes on it after
+    /// release, exactly as if it had opened it after the restore.
+    fn leases_settled(&self, staged: &Path) -> Result<(), Ps2PsuRestoreError> {
+        let Some(leases) = &self.leases else {
+            return Ok(());
+        };
+        match (leases.outgoing.intact(), leases.incoming.intact()) {
+            (true, _) => Ok(()),
+            (false, true) => Err(Ps2PsuRestoreError::EmulatorRunning),
+            (false, false) => Err(Ps2PsuRestoreError::RecoveryRequired(format!(
+                "Programs opened both the previous card and the restored card for writing during publication. Both are kept for inspection: the restored card at {} and the previous card at {}.",
+                self.journal.card_path.display(),
+                staged.display()
+            ))),
+        }
     }
 
     /// The reviewed card, unchanged: same inode/size/mtime and same bytes.
@@ -517,7 +590,12 @@ pub(crate) fn apply_with_hook(
     restore_require_data_only_pages(&plan.geometry)?;
     let _operation_lock = ownership::lock(&plan.source_card_path)?;
     let binding = ps2_card_binding(&plan.source_card_path, &plan.save_display_name);
-    check_quiescence(quiescence.observe(&binding))?;
+    // Early refusal only; the publication gate below is held under leases.
+    check_quiescence(observe_card_now(
+        quiescence,
+        &binding,
+        &plan.source_card_path,
+    ))?;
     let psu = fs::read(&plan.source_psu_path).map_err(restore_error)?;
     if sha256_hex(&psu) != plan.source_psu_sha256 {
         return Err(Ps2PsuRestoreError::SourceChanged);
@@ -574,6 +652,7 @@ pub(crate) fn apply_with_hook(
         original,
         renamed: false,
         quiescence,
+        leases: None,
     };
     match execute(plan, &mut run, &psu, hook) {
         Ok(result) => Ok(Ps2GuardedRestore {
@@ -678,6 +757,7 @@ fn execute(
     // one more time, immediately before the rename.
     run.journal.post_identity = Some(path_identity(&staged_path)?);
     run.set_phase(Ps2RestorePhase::Publishing)?;
+    run.lease_publication(&staged_path)?;
     run.quiet()?;
     if sha256_hex(&fs::read(&plan.source_psu_path).map_err(restore_error)?)
         != run.journal.psu_sha256
@@ -687,6 +767,7 @@ fn execute(
     }
     run.card_is_reviewed()?;
     step(hook, Ps2RestoreStep::BeforeRename)?;
+    run.leases_unbroken()?;
 
     exchange::publish(
         &staged_path,
@@ -719,6 +800,7 @@ fn execute(
         )
         .into());
     }
+    run.leases_settled(&staged_path)?;
     run.journal.post_identity = Some(path_identity(&plan.source_card_path)?);
     run.set_phase(Ps2RestorePhase::Published)?;
     remove_owned_temp(&run.journal);
@@ -854,7 +936,12 @@ pub(crate) fn undo_with_hook(
             "published journal lacks its recorded output".into(),
         ));
     };
-    check_quiescence(quiescence.observe(&journal.binding))?;
+    // Early refusal only; the exchange below is held under leases.
+    check_quiescence(observe_card_now(
+        quiescence,
+        &journal.binding,
+        &journal.card_path,
+    ))?;
     validate_source_path(&journal.card_path)
         .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
     let mut pinned = fs::File::open(&journal.card_path).map_err(restore_error)?;
@@ -900,7 +987,12 @@ pub(crate) fn undo_with_hook(
     set(&mut journal, Ps2RestorePhase::UndoIntent, None)?;
     let mut undo_published = false;
     let result = (|| -> Result<(), Fail> {
-        check_quiescence(quiescence.observe(&journal.binding))?;
+        // Strict now; repeated under the leases once the original is staged.
+        check_quiescence(observe_card_now(
+            quiescence,
+            &journal.binding,
+            &journal.card_path,
+        ))?;
         if path_identity(&journal.card_path)? != post_identity {
             return Err(Ps2PsuRestoreError::StaleUndo.into());
         }
@@ -921,9 +1013,42 @@ pub(crate) fn undo_with_hook(
             ownership::preserve(&file, &permissions)?;
             file.sync_all().map_err(restore_error)?;
         }
-        journal.undo_identity = Some(path_identity(&undo_temp)?);
+        let undo_identity = path_identity(&undo_temp)?;
+        journal.undo_identity = Some(undo_identity);
         set(&mut journal, Ps2RestorePhase::UndoIntent, None)?;
+        // Held until this closure returns, after any reversal below.
+        let leases = match PublicationLeases::acquire(
+            &journal.card_path,
+            post_identity,
+            &undo_temp,
+            undo_identity,
+        ) {
+            PublicationLeaseAttempt::Held(leases) => Some(leases),
+            PublicationLeaseAttempt::Writers => {
+                return Err(Ps2PsuRestoreError::EmulatorRunning.into());
+            }
+            PublicationLeaseAttempt::Changed => return Err(Ps2PsuRestoreError::StaleUndo.into()),
+            PublicationLeaseAttempt::Unavailable => None,
+        };
+        check_quiescence(match &leases {
+            Some(leases) => quiescence.observe_under_card_lease(&journal.binding, &leases.outgoing),
+            None => quiescence.observe(&journal.binding),
+        })?;
+        if path_identity(&journal.card_path)? != post_identity
+            || sha256_hex(
+                &read_source_card(&journal.card_path)
+                    .map_err(|e| Ps2PsuRestoreError::Io(e.to_string()))?,
+            ) != post_sha
+        {
+            return Err(Ps2PsuRestoreError::StaleUndo.into());
+        }
         step(hook, Ps2RestoreStep::BeforeUndoRename)?;
+        if leases
+            .as_ref()
+            .is_some_and(|leases| !leases.outgoing.intact() || !leases.incoming.intact())
+        {
+            return Err(Ps2PsuRestoreError::EmulatorRunning.into());
+        }
         match exchange::publish(
             &undo_temp,
             &journal.card_path,
@@ -951,6 +1076,40 @@ pub(crate) fn undo_with_hook(
                 "undo did not restore the original card bytes".into(),
             )
             .into());
+        }
+        // See `Run::leases_settled`. An opener of the restored card (now at
+        // the staging path) resolved the card path before the exchange: swap
+        // it back, verified, before the leases are released.
+        if let Some(leases) = &leases {
+            match (leases.outgoing.intact(), leases.incoming.intact()) {
+                (true, _) => {}
+                (false, true) => {
+                    let mut reversed = false;
+                    exchange::publish(
+                        &undo_temp,
+                        &journal.card_path,
+                        undo_identity,
+                        &journal.original_sha256,
+                        &post_sha,
+                        &mut reversed,
+                        &no_hook,
+                        None,
+                    )?;
+                    fs::File::open(&card_dir)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(restore_error)?;
+                    undo_published = false;
+                    return Err(Ps2PsuRestoreError::EmulatorRunning.into());
+                }
+                (false, false) => {
+                    return Err(Ps2PsuRestoreError::RecoveryRequired(format!(
+                        "Programs opened both the restored card and the original card for writing during Undo. Both are kept for inspection: the original at {} and the restored card at {}.",
+                        journal.card_path.display(),
+                        undo_temp.display()
+                    ))
+                    .into());
+                }
+            }
         }
         Ok(())
     })();
