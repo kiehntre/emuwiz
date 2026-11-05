@@ -1093,8 +1093,20 @@ impl App {
     /// shown. Pointer presses and the wheel never scroll it.
     fn reveal_keyboard_focus(ui: &egui::Ui, response: &egui::Response) {
         let pointer = ui.input(|input| input.pointer.any_pressed() || input.pointer.any_released());
-        if response.gained_focus() && !pointer {
-            ui.scroll_to_rect(response.rect, None);
+        // egui reports `gained_focus` for Tab but not for a directional
+        // (controller) move, so notice the change ourselves: the focused card
+        // is revealed once, in the pass that finds it newly focused.
+        let key = egui::Id::new("browse_play_revealed_card");
+        let revealed = ui.data(|d| d.get_temp::<egui::Id>(key));
+        if response.has_focus() {
+            if revealed != Some(response.id) {
+                ui.data_mut(|d| d.insert_temp(key, response.id));
+                if !pointer {
+                    ui.scroll_to_rect(response.rect, None);
+                }
+            }
+        } else if revealed == Some(response.id) {
+            ui.data_mut(|d| d.remove::<egui::Id>(key));
         }
     }
 
