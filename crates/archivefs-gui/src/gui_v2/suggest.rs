@@ -56,6 +56,7 @@ impl TitleIndex {
         index
     }
 
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.titles.len()
     }
