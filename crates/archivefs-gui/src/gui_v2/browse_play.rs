@@ -1146,6 +1146,10 @@ impl App {
             let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(card_width, CARD_HEIGHT), egui::Sense::click());
             Self::reveal_keyboard_focus(ui, &response);
+            // Name the card for assistive tech and the controller layer.
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, game.title.clone())
+            });
             if !ui.is_rect_visible(rect) {
                 return;
             }
@@ -1229,6 +1233,10 @@ impl App {
                 egui::Sense::click(),
             );
             Self::reveal_keyboard_focus(ui, &response);
+            // Name the card for assistive tech and the controller layer.
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, game.title.clone())
+            });
             if !ui.is_rect_visible(rect) {
                 return;
             }

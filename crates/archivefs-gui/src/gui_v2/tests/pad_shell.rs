@@ -745,3 +745,122 @@ mod dialog_safety {
         assert_eq!(rig.page, 1, "the dialog guard is for dialogs only");
     }
 }
+
+/// The acceptance journey, driven only by controller events: Home → Library →
+/// a game's details → Verify Games → back → Setup → Enhance (saves) → back to
+/// Library → Big Picture. (Emulator configuration and real devices are covered
+/// by the Nobara acceptance run; this proves the navigation path needs no mouse.)
+mod journey {
+    use super::*;
+
+    struct Pad {
+        context: egui::Context,
+        app: App,
+        seen: Vec<String>,
+    }
+
+    impl Pad {
+        fn frames(&mut self) {
+            for _ in 0..3 {
+                let app = &mut self.app;
+                run_ui_frame(&self.context, Vec::new(), |ctx| app.show(ctx));
+            }
+        }
+        fn tap(&mut self, control: Control) {
+            let shell = self
+                .app
+                .pad_shell
+                .as_mut()
+                .expect("controller layer active");
+            shell.inject(PadEvent::Pressed { device: 1, control });
+            shell.inject(PadEvent::Released { device: 1, control });
+            self.frames();
+        }
+        fn label(&self) -> Option<String> {
+            self.context
+                .data(|d| {
+                    d.get_temp::<(egui::Id, String, bool)>(egui::Id::new("pad_shell_focus_label"))
+                })
+                .map(|x| x.1)
+        }
+        /// Walk focus with Down until a control whose label satisfies `wanted`.
+        fn focus(&mut self, wanted: impl Fn(&str) -> bool, what: &str) {
+            for _ in 0..200 {
+                self.tap(Control::Direction(Direction::Down));
+                if let Some(l) = self.label() { self.seen.push(l); }
+                if self.label().is_some_and(|l| wanted(&l)) {
+                    return;
+                }
+            }
+            panic!(
+                "controller could not reach {what}; last focus {:?}; seen {:?}",
+                self.label(),
+                self.seen
+            );
+        }
+        fn destination(&self) -> Option<super::super::simple_shell::Destination> {
+            super::super::simple_shell::destination_for(&self.app.router.current)
+        }
+    }
+
+    #[test]
+    fn launch_browse_details_verify_setup_saves_and_big_picture_without_a_mouse() {
+        let context = egui::Context::default();
+        let mut app = super::app(&context);
+        app.simple.enabled = true;
+        app.artwork.index = Some(Arc::new(MediaIndex::default()));
+        let mut pad = Pad { context, app, seen: Vec::new() };
+        pad.frames();
+        let north = Control::Button(Button::North);
+        let south = Control::Button(Button::South);
+        let east = Control::Button(Button::East);
+
+        pad.tap(north); // Home → Library
+        assert_eq!(pad.destination(), Some(Destination::Library));
+
+        // Open a game's details from the list.
+        pad.focus(|l| l.contains("Game 1"), "the game in the Library");
+        pad.tap(south);
+        assert!(
+            matches!(
+                pad.app.router.current,
+                Route::BrowsePlayGame(_) | Route::Game(_)
+            ),
+            "A opens the game's details, got {:?}",
+            pad.app.router.current
+        );
+        pad.tap(east); // Back to the Library
+        assert_eq!(pad.destination(), Some(Destination::Library));
+        assert!(matches!(pad.app.router.current, Route::BrowsePlay));
+
+        // Verify Games is reachable and opens its page.
+        pad.focus(|l| l == "Verify Games", "Verify Games");
+        pad.tap(south);
+        assert_ne!(
+            pad.app.router.current,
+            Route::BrowsePlay,
+            "Verify Games opened"
+        );
+        pad.tap(east);
+
+        // Setup, then Enhance (cheats, mods, saves), with the section buttons.
+        pad.tap(north);
+        assert_eq!(pad.destination(), Some(Destination::Setup));
+        for _ in 0..3 {
+            pad.tap(north);
+        }
+        assert_eq!(pad.destination(), Some(Destination::Enhance));
+
+        // Back to the Library by section buttons, then into Big Picture.
+        for _ in 0..4 {
+            pad.tap(Control::Button(Button::West));
+        }
+        assert_eq!(pad.destination(), Some(Destination::Library));
+        pad.focus(|l| l == "Big Picture", "Big Picture");
+        pad.tap(south);
+        assert!(
+            pad.app.big_picture.is_some(),
+            "Big Picture opened from the pad"
+        );
+    }
+}
