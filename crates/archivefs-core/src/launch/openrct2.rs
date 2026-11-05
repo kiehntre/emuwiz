@@ -23,8 +23,25 @@
 //! candidate the user explicitly chose, after its path was shown. The
 //! two-second and 16 KiB limits keep a misbehaving program from hanging the
 //! check; they are not a sandbox and do not make running an untrusted file
-//! safe. Launch preflight never re-runs `--version`: it binds the checked
-//! file's identity instead.
+//! safe. Launch preflight never re-runs `--version`.
+//!
+//! # Executable binding
+//!
+//! The file that is version-checked is the file that is launched, by
+//! descriptor, not by pathname. [`PinnedOpenRct2`] opens the candidate once
+//! (`O_NOFOLLOW`), requires a regular executable native ELF (scripts and
+//! wrappers cannot be descriptor-pinned and are refused) of at most 128 MiB,
+//! and hashes it through that same descriptor. Both the `--version` run and
+//! the final launch exec `/proc/self/fd/N` of such a descriptor, and the
+//! launch additionally requires the file's identity *and* SHA-256 to equal
+//! what the explicit check saw, so replacing the path (rename, symlink, copy)
+//! after the check can neither be executed nor reuse the checked version.
+//! Limit: a process with write access to the very same inode can still edit
+//! it in place between hashing and exec (the kernel only blocks that while a
+//! writer is open at exec time); the identity is re-read from the descriptor
+//! immediately before use to narrow, not eliminate, that. Shared libraries
+//! and OpenRCT2's own data files are not pinned, and neither is the RCT2
+//! folder between preflight and OpenRCT2 reading it.
 //!
 //! Game identity here is *user-declared*: the folder is the one the person
 //! chose, and its only content evidence is `Data/g1.dat`, the file OpenRCT2
@@ -33,8 +50,11 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -47,7 +67,8 @@ use crate::alternative_launch_provider_planner::{
 };
 use crate::emulator_inventory::parse_version_output;
 use crate::launch::process_spawn::{
-    CapturedFileIdentity, PreparedProcessCommand, WatchedProcess, spawn_watched_process,
+    CapturedFileIdentity, PreparedProcessCommand, WatchedProcess,
+    spawn_watched_process_private_pinned,
 };
 
 pub const OPENRCT2_PROVIDER_ID: &str = "openrct2";
@@ -60,12 +81,91 @@ const MIN_SUPPORTED: (u64, u64) = (0, 4);
 const G1_RELATIVE: [&str; 2] = ["Data", "g1.dat"];
 const MAX_VERSION_BYTES: usize = 16 * 1024;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
+/// Larger files (for example AppImages) are refused, not trusted by metadata.
+const MAX_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenRct2Install {
     pub executable: PathBuf,
+    /// Metadata identity from passive discovery.
     pub executable_identity: CapturedFileIdentity,
+    /// Set only by [`check_openrct2`], together with `content_sha256`.
     pub version: Option<String>,
+    /// SHA-256 of the exact bytes the explicit check executed.
+    pub content_sha256: Option<[u8; 32]>,
+}
+
+/// One verified executable file object, held open. See the module docs.
+#[derive(Debug)]
+pub struct PinnedOpenRct2 {
+    file: fs::File,
+    path: PathBuf,
+    identity: CapturedFileIdentity,
+    sha256: [u8; 32],
+}
+
+impl PinnedOpenRct2 {
+    /// Open without following a final symlink, accept only a native ELF
+    /// regular executable, hash it through this descriptor and confirm the
+    /// descriptor did not change while hashing.
+    pub fn open(path: &Path) -> Result<Self, String> {
+        use sha2::{Digest, Sha256};
+        if !path.is_absolute() {
+            return Err("the executable path must be absolute".into());
+        }
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| format!("the executable cannot be opened safely: {e}"))?;
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err("the executable is not a regular executable file".into());
+        }
+        if metadata.len() < 4 || metadata.len() > MAX_EXECUTABLE_BYTES {
+            return Err("the executable is empty or larger than the 128 MiB limit".into());
+        }
+        let identity = CapturedFileIdentity::capture(&metadata);
+        let mut hash = Sha256::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut first = true;
+        let mut remaining = metadata.len();
+        while remaining > 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            file.read_exact(&mut buffer[..count])
+                .map_err(|e| format!("the executable could not be read: {e}"))?;
+            if first && buffer[..4] != *b"\x7fELF" {
+                return Err(
+                    "not a native ELF program (scripts and wrappers cannot be pinned and are refused)"
+                        .into(),
+                );
+            }
+            first = false;
+            hash.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+        let pinned = Self {
+            file,
+            path: path.to_path_buf(),
+            identity,
+            sha256: hash.finalize().into(),
+        };
+        pinned.confirm_unchanged()?;
+        Ok(pinned)
+    }
+
+    /// Re-read the identity from the descriptor itself.
+    fn confirm_unchanged(&self) -> Result<(), String> {
+        let now = self.file.metadata().map_err(|e| e.to_string())?;
+        if CapturedFileIdentity::capture(&now) != self.identity {
+            return Err("the executable was modified while it was being verified".into());
+        }
+        Ok(())
+    }
+
+    fn proc_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,16 +201,20 @@ fn is_executable_file(path: &Path) -> Option<fs::Metadata> {
         .then_some(metadata)
 }
 
-/// Bounded `openrct2 --version`. Executes the file: call only from
-/// [`check_openrct2`], after an explicit user action.
-pub fn probe_openrct2_version(path: &Path) -> Option<String> {
-    let mut child = Command::new(path)
+/// Bounded `openrct2 --version` of the *pinned descriptor* (never a path).
+/// Executes the file: call only from [`check_openrct2`], after an explicit
+/// user action. The environment is cleared and stdin is closed; the time and
+/// output limits only stop a hang or flood and are not a sandbox.
+pub fn probe_openrct2_version(pinned: &PinnedOpenRct2) -> Option<String> {
+    let mut command = Command::new(pinned.proc_path());
+    command
+        .arg0(&pinned.path)
         .arg("--version")
+        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().ok()?;
     let started = Instant::now();
     while child.try_wait().ok()?.is_none() {
         if started.elapsed() >= VERSION_TIMEOUT {
@@ -145,6 +249,7 @@ pub fn discover_openrct2(search_dirs: &[PathBuf]) -> Vec<OpenRct2Install> {
             found.push(OpenRct2Install {
                 executable_identity: CapturedFileIdentity::capture(&metadata),
                 version: None,
+                content_sha256: None,
                 executable: path,
             });
         }
@@ -168,7 +273,7 @@ pub enum OpenRct2CheckError {
 pub fn check_openrct2(
     candidate: &OpenRct2Install,
     search_dirs: &[PathBuf],
-    probe: &dyn Fn(&Path) -> Option<String>,
+    probe: &dyn Fn(&PinnedOpenRct2) -> Option<String>,
 ) -> Result<OpenRct2Install, OpenRct2CheckError> {
     let matches: Vec<_> = discover_openrct2(search_dirs)
         .into_iter()
@@ -184,9 +289,21 @@ pub fn check_openrct2(
             "the selected OpenRCT2 file changed since it was listed".into(),
         ));
     }
-    let version = probe(&fresh.executable).ok_or(OpenRct2CheckError::NoVersion)?;
+    // Pin the exact file object, require it to be the one that was listed,
+    // and run the probe on that descriptor, never on the pathname.
+    let pinned = PinnedOpenRct2::open(&fresh.executable).map_err(OpenRct2CheckError::Refused)?;
+    if pinned.identity != candidate.executable_identity {
+        return Err(OpenRct2CheckError::Refused(
+            "the selected OpenRCT2 file changed since it was listed".into(),
+        ));
+    }
+    let version = probe(&pinned).ok_or(OpenRct2CheckError::NoVersion)?;
+    pinned
+        .confirm_unchanged()
+        .map_err(OpenRct2CheckError::Refused)?;
     Ok(OpenRct2Install {
         version: Some(version),
+        content_sha256: Some(pinned.sha256),
         ..fresh.clone()
     })
 }
@@ -320,46 +437,70 @@ pub enum OpenRct2LaunchError {
     Spawn(std::io::Error),
 }
 
-/// Fresh, click-time revalidation. Builds the exact argv only on success.
+/// A validated command together with the descriptor it must be executed by.
+#[derive(Debug)]
+pub struct PreparedOpenRct2Launch {
+    pub command: PreparedProcessCommand,
+    pinned: PinnedOpenRct2,
+}
+
+/// Fresh, click-time revalidation. Builds the exact argv only on success and
+/// keeps the verified executable open so it, and nothing at the path, runs.
 pub fn preflight_openrct2_launch(
     request: &OpenRct2LaunchRequest,
     search_dirs: &[PathBuf],
-) -> Result<PreparedProcessCommand, OpenRct2LaunchError> {
+) -> Result<PreparedOpenRct2Launch, OpenRct2LaunchError> {
     use OpenRct2LaunchError::*;
     let fresh_data = inspect_rct2_data(&request.data.root);
-    // Passive only: the version comes from the explicit check and stays valid
-    // exactly while the checked file's identity is unchanged.
+    let checked = &request.install;
+    let (Some(version), Some(sha)) = (checked.version.clone(), checked.content_sha256) else {
+        return Err(NotReady(
+            AlternativeLaunchReadiness::RequirementsUnknown,
+            "this OpenRCT2 has not been checked".into(),
+        ));
+    };
+    // Passive rediscovery; exactly one candidate at the checked path.
     let matches: Vec<_> = discover_openrct2(search_dirs)
         .into_iter()
-        .filter(|i| i.executable == request.install.executable)
-        .map(|i| OpenRct2Install {
-            version: request.install.version.clone(),
-            ..i
-        })
+        .filter(|i| i.executable == checked.executable)
         .collect();
-    let fresh_install = match matches.as_slice() {
-        [one] => Some(one.clone()),
-        _ => None,
+    let [fresh] = matches.as_slice() else {
+        let projection = plan_openrct2(None, Some(&fresh_data));
+        return Err(NotReady(projection.readiness, projection.reason));
     };
-    let projection = plan_openrct2(fresh_install.as_ref(), Some(&fresh_data));
+    // Pin the file now. The checked version is evidence about these exact
+    // bytes only: identity and content hash must both still match.
+    let pinned = PinnedOpenRct2::open(&fresh.executable).map_err(Changed)?;
+    if pinned.identity != checked.executable_identity || pinned.sha256 != sha {
+        return Err(Changed(
+            "the OpenRCT2 executable changed since it was checked".into(),
+        ));
+    }
+    let install = OpenRct2Install {
+        version: Some(version),
+        content_sha256: Some(sha),
+        ..fresh.clone()
+    };
+    let projection = plan_openrct2(Some(&install), Some(&fresh_data));
     if projection.readiness != AlternativeLaunchReadiness::Ready {
         return Err(NotReady(projection.readiness, projection.reason));
     }
-    let (install, data) = (fresh_install.expect("ready"), fresh_data);
-    if install.executable_identity != request.install.executable_identity {
-        return Err(Changed("the OpenRCT2 executable changed".into()));
-    }
+    let data = fresh_data;
     if data.root_identity != request.data.root_identity
         || data.g1_identity != request.data.g1_identity
     {
         return Err(Changed("the RollerCoaster Tycoon 2 data changed".into()));
     }
+    pinned.confirm_unchanged().map_err(Changed)?;
     let mut option = OsString::from("--rct2-data-path=").into_vec();
     option.extend(data.root.as_os_str().to_owned().into_vec());
-    Ok(PreparedProcessCommand {
-        executable: install.executable,
-        arguments: vec![OsString::from_vec(option)],
-        working_directory: None,
+    Ok(PreparedOpenRct2Launch {
+        command: PreparedProcessCommand {
+            executable: install.executable,
+            arguments: vec![OsString::from_vec(option)],
+            working_directory: None,
+        },
+        pinned,
     })
 }
 
@@ -367,8 +508,26 @@ pub fn preflight_and_launch_openrct2(
     request: &OpenRct2LaunchRequest,
     search_dirs: &[PathBuf],
 ) -> Result<WatchedProcess, OpenRct2LaunchError> {
-    let command = preflight_openrct2_launch(request, search_dirs)?;
-    spawn_watched_process(&command).map_err(OpenRct2LaunchError::Spawn)
+    let prepared = preflight_openrct2_launch(request, search_dirs)?;
+    spawn_prepared_openrct2(&prepared).map_err(OpenRct2LaunchError::Spawn)
+}
+
+/// Executes the pinned descriptor. The child keeps the parent's environment
+/// (a game needs DISPLAY, HOME, XDG_*), but every other descriptor is closed.
+pub fn spawn_prepared_openrct2(
+    prepared: &PreparedOpenRct2Launch,
+) -> std::io::Result<WatchedProcess> {
+    let environment: Vec<_> = std::env::vars_os().collect();
+    prepared
+        .pinned
+        .confirm_unchanged()
+        .map_err(std::io::Error::other)?;
+    spawn_watched_process_private_pinned(
+        &prepared.command,
+        &environment,
+        &prepared.pinned.file,
+        |_| {},
+    )
 }
 
 #[cfg(test)]

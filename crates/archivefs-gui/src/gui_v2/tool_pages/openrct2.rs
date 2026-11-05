@@ -8,12 +8,14 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use archivefs_core::alternative_launch_provider_planner::AlternativeLaunchReadiness;
 use archivefs_core::launch::{
-    OpenRct2Install, OpenRct2LaunchRequest, Rct2DataReport, check_openrct2, discover_openrct2,
-    inspect_rct2_data, openrct2_search_dirs, plan_openrct2, probe_openrct2_version,
+    OpenRct2Install, OpenRct2LaunchRequest, PinnedOpenRct2, Rct2DataReport, check_openrct2,
+    discover_openrct2, inspect_rct2_data, openrct2_search_dirs, plan_openrct2,
+    probe_openrct2_version,
 };
 use eframe::egui::{self, RichText};
 
@@ -31,6 +33,8 @@ enum Scan {
     Scanning(Receiver<Vec<OpenRct2Install>>),
     Ready(Vec<OpenRct2Install>),
 }
+
+type Probe = Arc<dyn Fn(&PinnedOpenRct2) -> Option<String> + Send + Sync>;
 
 /// The explicit, per-candidate version check (this is what runs the file).
 enum Check {
@@ -61,24 +65,20 @@ impl State {
     }
 
     /// Runs `--version` on exactly this candidate, off the UI thread.
-    fn begin_check(&mut self, context: &egui::Context, candidate: OpenRct2Install) {
+    fn begin_check(&mut self, context: &egui::Context, candidate: OpenRct2Install, probe: Probe) {
         let (sender, receiver) = mpsc::channel();
         self.checks
             .insert(candidate.executable.clone(), Check::Running(receiver));
         let (dirs, context) = (self.dirs.clone(), context.clone());
         std::thread::spawn(move || {
-            let result =
-                check_openrct2(&candidate, &dirs, &probe_openrct2_version).map_err(|error| {
-                    match error {
-                        archivefs_core::launch::OpenRct2CheckError::Refused(why) => {
-                            format!("Not checked: {why}. Refresh the list.")
-                        }
-                        archivefs_core::launch::OpenRct2CheckError::NoVersion => {
-                            "It was run but did not report a version, so it is not trusted."
-                                .to_string()
-                        }
-                    }
-                });
+            let result = check_openrct2(&candidate, &dirs, &*probe).map_err(|error| match error {
+                archivefs_core::launch::OpenRct2CheckError::Refused(why) => {
+                    format!("Not checked: {why}. Refresh the list.")
+                }
+                archivefs_core::launch::OpenRct2CheckError::NoVersion => {
+                    "It was run but did not report a version, so it is not trusted.".to_string()
+                }
+            });
             let _ = sender.send(result);
             context.request_repaint();
         });
@@ -146,8 +146,9 @@ fn show_candidate(
             }
             ui.label("Not checked. EmuWiz has not run this file.");
             ui.small(
-                "Checking the version will run this file with --version. Only check a program you \
-                 trust. EmuWiz limits the time and output, but that does not make running an \
+                "Checking the version will run this file with --version. EmuWiz opens exactly this \
+                 file once and runs and later launches that same file; scripts and wrappers are \
+                 refused. Only check a program you trust. EmuWiz limits the time and output, but that does not make running an \
                  untrusted file safe.",
             );
             check_clicked = ui.button("Check OpenRCT2").clicked();
@@ -268,7 +269,7 @@ pub(in crate::gui_v2) fn show(
                 }
             }
             if let Some(candidate) = selected {
-                state.begin_check(ui.ctx(), candidate);
+                state.begin_check(ui.ctx(), candidate, Arc::new(probe_openrct2_version));
             }
         }
     }
@@ -306,22 +307,18 @@ mod tests {
         }
     }
 
-    fn marker_dir(root: &std::path::Path) -> (Vec<PathBuf>, PathBuf) {
+    fn elf_dir(root: &std::path::Path) -> Vec<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let marker = root.join("ran");
+        let source = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .unwrap();
         let exe = bin.join("openrct2");
-        std::fs::write(
-            &exe,
-            format!(
-                "#!/bin/sh\ntouch '{}'\necho 'OpenRCT2, v0.4.14'\n",
-                marker.display()
-            ),
-        )
-        .unwrap();
+        std::fs::copy(source, &exe).unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        (vec![bin], marker)
+        vec![bin]
     }
 
     fn wait_scan(state: &mut State) {
@@ -335,10 +332,20 @@ mod tests {
         panic!("scan did not finish");
     }
 
+    fn counting() -> (Probe, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let probe: Probe = Arc::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some("0.4.14".to_string())
+        });
+        (probe, calls)
+    }
+
     #[test]
-    fn opening_the_page_scans_passively_and_never_runs_a_candidate() {
+    fn opening_the_page_scans_passively_and_never_probes_a_candidate() {
         let dir = tempfile::tempdir().unwrap();
-        let (dirs, marker) = marker_dir(dir.path());
+        let dirs = elf_dir(dir.path());
         let mut state = State::default();
         state.start(&egui::Context::default(), dirs);
         wait_scan(&mut state);
@@ -346,27 +353,21 @@ mod tests {
             unreachable!()
         };
         assert_eq!(found.len(), 1);
-        assert!(found[0].version.is_none());
-        // Rendering the whole page also runs nothing.
+        assert!(found[0].version.is_none() && found[0].content_sha256.is_none());
+        // Rendering the whole page (scan already Ready) checks nothing either.
         let ctx = egui::Context::default();
         let mut standalone = StandaloneLaunchState::default();
         let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                // Scan is already Ready, so show() does not rescan.
-                show(ui, &mut state, &mut standalone);
-            });
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut state, &mut standalone));
         });
-        assert!(
-            !marker.exists(),
-            "opening/rendering must not execute anything"
-        );
-        assert!(state.checks.is_empty());
+        assert!(state.checks.is_empty(), "no check starts without a click");
     }
 
     #[test]
-    fn only_the_explicit_check_runs_the_selected_file_off_the_ui_thread() {
+    fn only_the_explicit_check_probes_the_selected_file_off_the_ui_thread() {
+        use std::sync::atomic::Ordering;
         let dir = tempfile::tempdir().unwrap();
-        let (dirs, marker) = marker_dir(dir.path());
+        let dirs = elf_dir(dir.path());
         let mut state = State::default();
         let ctx = egui::Context::default();
         state.start(&ctx, dirs);
@@ -375,8 +376,8 @@ mod tests {
             unreachable!()
         };
         let candidate = found[0].clone();
-        state.begin_check(&ctx, candidate.clone());
-        // begin_check returns immediately with the check still pending or done.
+        let (probe, calls) = counting();
+        state.begin_check(&ctx, candidate.clone(), probe);
         for _ in 0..500 {
             state.poll();
             if matches!(
@@ -387,11 +388,16 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(marker.exists(), "the explicit check ran the selected file");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one probe, after the click"
+        );
         let Some(Check::Verified(install)) = state.checks.get(&candidate.executable) else {
             panic!("check did not verify");
         };
         assert_eq!(install.version.as_deref(), Some("0.4.14"));
+        assert!(install.content_sha256.is_some());
     }
 
     #[test]
