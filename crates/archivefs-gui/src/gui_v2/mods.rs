@@ -103,11 +103,6 @@ impl ModsPageState {
         self.tab = Tab::TexturePacks;
     }
 
-    #[cfg(test)]
-    pub(super) fn select_catalogues(&mut self) {
-        self.tab = Tab::Catalogues;
-    }
-
     pub(super) fn select_cheats(&mut self) {
         self.tab = Tab::Cheats;
     }
