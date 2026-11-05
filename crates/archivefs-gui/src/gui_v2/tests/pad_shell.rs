@@ -1254,6 +1254,40 @@ mod spatial {
         );
     }
 
+    /// Regression: the shelf scrolled to a focused card only for Tab, not for a
+    /// controller move, so on a real-sized library Down left the focused card
+    /// below the screen and the page did not follow.
+    #[test]
+    fn moving_down_a_long_grid_keeps_the_focused_card_on_screen() {
+        let mut lib = Lib::new(300);
+        lib.focus_sidebar();
+        lib.reach_a_card();
+        let mut deepest = 0.0_f32;
+        for step in 0..25 {
+            lib.tap(DOWN);
+            lib.frames(); // the page follows the focus a frame after it moves
+            let id = lib.focused().expect("focus stays on a control");
+            let rect = lib.rect(id);
+            deepest = deepest.max(rect.top());
+            assert!(
+                rect.top() >= 0.0 && rect.bottom() <= SIZE[1] + 1.0,
+                "step {step}: the focused card is off screen: {rect:?}"
+            );
+        }
+        // And it really travelled down the library (the page followed).
+        let id = lib.focused().unwrap();
+        assert!(lib.is_card(id));
+        for _ in 0..25 {
+            lib.tap(UP);
+            lib.frames();
+            let rect = lib.rect(lib.focused().unwrap());
+            assert!(
+                rect.top() >= 0.0 && rect.bottom() <= SIZE[1] + 1.0,
+                "moving back up: off screen {rect:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_remembered_card_that_is_gone_falls_back_safely() {
         let mut lib = Lib::new(40);
