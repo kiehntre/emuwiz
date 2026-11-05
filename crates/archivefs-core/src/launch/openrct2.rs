@@ -24,7 +24,7 @@
 //! two-second and 16 KiB limits stop a misbehaving program from hanging the
 //! check or flooding memory (output is read through a hard byte cap on helper
 //! threads, and the program runs in its own process group that is killed on
-//! timeout); a descendant that leaves the group can outlive the check. They
+//! timeout or after exit; a descendant that leaves the group can still outlive the check. They
 //! are not a sandbox and do not make running an untrusted file safe. Launch preflight never re-runs `--version`.
 //!
 //! # Executable binding
@@ -136,20 +136,7 @@ impl PinnedOpenRct2 {
         if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
             return Err("the executable is not a regular executable file".into());
         }
-        {
-            use std::os::unix::fs::MetadataExt;
-            // SAFETY: geteuid has no preconditions.
-            let me = unsafe { libc::geteuid() };
-            if metadata.uid() != 0 && metadata.uid() != me {
-                return Err("the executable is owned by another user".into());
-            }
-            if metadata.mode() & 0o022 != 0 {
-                return Err("the executable is group- or world-writable".into());
-            }
-            if metadata.mode() & 0o6000 != 0 {
-                return Err("the executable is setuid or setgid".into());
-            }
-        }
+        check_file_mode(&metadata)?;
         if metadata.len() < 4 || metadata.len() > MAX_EXECUTABLE_BYTES {
             return Err("the executable is empty or larger than the 128 MiB limit".into());
         }
@@ -182,9 +169,10 @@ impl PinnedOpenRct2 {
         Ok(pinned)
     }
 
-    /// Re-read the identity from the descriptor itself.
+    /// Re-read the identity, owner and mode from the descriptor itself.
     fn confirm_unchanged(&self) -> Result<(), String> {
         let now = self.file.metadata().map_err(|e| e.to_string())?;
+        check_file_mode(&now)?;
         if CapturedFileIdentity::capture(&now) != self.identity {
             return Err("the executable was modified while it was being verified".into());
         }
@@ -203,6 +191,27 @@ pub struct Rct2DataReport {
     pub g1_identity: Option<CapturedFileIdentity>,
     /// Why the folder cannot be used; `None` when `Data/g1.dat` is present.
     pub blocker: Option<String>,
+}
+
+/// Owner and mode rules for a pinned executable, read from its descriptor.
+fn check_file_mode(metadata: &fs::Metadata) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    check_owner_and_mode(metadata.uid(), metadata.mode(), me)
+}
+
+fn check_owner_and_mode(owner: u32, mode: u32, effective_user: u32) -> Result<(), String> {
+    if owner != 0 && owner != effective_user {
+        return Err("the executable is owned by another user".into());
+    }
+    if mode & 0o022 != 0 {
+        return Err("the executable is group- or world-writable".into());
+    }
+    if mode & 0o6000 != 0 {
+        return Err("the executable is setuid or setgid".into());
+    }
+    Ok(())
 }
 
 /// Directories searched for the executable: `PATH`, Debian's `/usr/games`
@@ -287,23 +296,35 @@ fn run_version_command(mut command: Command) -> Option<String> {
     let (out, err) = (capped(out), capped(err));
     let started = Instant::now();
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() < VERSION_TIMEOUT => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            _ => {
-                kill_group(&mut child);
-                return None;
-            }
+        // Peek at the exit (WNOWAIT) so the leader stays an unreaped zombie
+        // and its process group id cannot be recycled before we kill the
+        // group, including any descendant still running.
+        // SAFETY: waitid with a zeroed siginfo_t and our own child's pid.
+        let exited = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                group as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) == 0
+                && info.si_pid() != 0
+        };
+        if exited {
+            break;
         }
+        if started.elapsed() >= VERSION_TIMEOUT {
+            kill_group(&mut child);
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
-    // Give the readers a short grace period to drain what is already in the
-    // pipes, then use whatever arrived; stragglers are abandoned.
+    // Drain what is already buffered, then end the whole group and reap.
     let grace = Instant::now() + Duration::from_millis(300);
     while Instant::now() < grace && !(out.lock().unwrap().1 && err.lock().unwrap().1) {
         std::thread::sleep(Duration::from_millis(10));
     }
+    kill_group(&mut child);
     let mut bytes = out.lock().unwrap().0.clone();
     bytes.extend_from_slice(&err.lock().unwrap().0);
     parse_version_output(&String::from_utf8_lossy(&bytes))

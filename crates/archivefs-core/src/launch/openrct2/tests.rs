@@ -407,7 +407,7 @@ fn real_probe_runs_the_pinned_descriptor_and_limits_output() {
 }
 
 #[test]
-fn files_that_are_writable_foreign_or_setuid_are_not_pinned() {
+fn files_that_are_writable_or_setuid_are_not_pinned() {
     let t = tempfile::tempdir().unwrap();
     let bin = elf(&t.path().join("bin"), "true");
     let path = fs::canonicalize(&bin).unwrap();
@@ -497,4 +497,47 @@ fn version_probe_is_not_blocked_by_a_descendant_holding_the_pipe_or_by_a_flood()
     let flood = run_version_command(sh("echo v0.4.9; head -c 50000000 /dev/zero | tr '\\0' 'a'"));
     assert!(started.elapsed() < Duration::from_secs(6));
     assert_eq!(flood.as_deref(), Some("0.4.9"));
+}
+
+#[test]
+fn owner_and_mode_rules_cover_foreign_owners_without_needing_root() {
+    assert!(check_owner_and_mode(1000, 0o755, 1000).is_ok());
+    assert!(check_owner_and_mode(0, 0o755, 1000).is_ok());
+    assert!(
+        check_owner_and_mode(1001, 0o755, 1000)
+            .unwrap_err()
+            .contains("another user")
+    );
+    assert!(
+        check_owner_and_mode(1000, 0o775, 1000)
+            .unwrap_err()
+            .contains("writable")
+    );
+    assert!(
+        check_owner_and_mode(1000, 0o4755, 1000)
+            .unwrap_err()
+            .contains("setuid")
+    );
+}
+
+#[test]
+fn a_descendant_left_in_the_group_is_killed_after_a_successful_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("pid");
+    let script = format!(
+        "(sleep 30) & echo $! > '{}'; echo v0.4.1",
+        pidfile.display()
+    );
+    assert_eq!(run_version_command(sh(&script)).as_deref(), Some("0.4.1"));
+    let pid: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let alive = fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| !s.contains(") Z"));
+    assert!(
+        !alive,
+        "the leftover descendant must be killed with its group"
+    );
 }
