@@ -598,9 +598,11 @@ mod dialog_safety {
         page: u32,
         page_rect: egui::Rect,
         dialog_open: bool,
+        dialog_buttons: bool,
     }
 
     const A: Control = Control::Button(Button::South);
+    const B: Control = Control::Button(Button::East);
 
     impl Rig {
         fn new() -> Self {
@@ -615,6 +617,7 @@ mod dialog_safety {
                 page: 0,
                 page_rect: egui::Rect::NOTHING,
                 dialog_open: true,
+                dialog_buttons: true,
             };
             rig.frame();
             rig
@@ -633,7 +636,7 @@ mod dialog_safety {
                 &mut self.page,
                 &mut self.page_rect,
             );
-            let dialog_open = self.dialog_open;
+            let (dialog_open, dialog_buttons) = (self.dialog_open, self.dialog_buttons);
             run_ui_frame_at(&self.context, Some(self.time), events, |context| {
                 app.show(context);
                 egui::Area::new(egui::Id::new("page_area"))
@@ -649,6 +652,10 @@ mod dialog_safety {
                     egui::Window::new("Are you sure?")
                         .fixed_pos(egui::pos2(800.0, 400.0))
                         .show(context, |ui| {
+                            if !dialog_buttons {
+                                ui.label("Working… nothing to press here");
+                                return;
+                            }
                             if ui.button("Cancel").clicked() {
                                 *cancel += 1;
                             }
@@ -775,6 +782,28 @@ mod dialog_safety {
             assert_eq!(rig.page, 0, "the page behind was never pressed");
             assert_eq!(rig.destroy, 0, "a tap never confirms");
         }
+    }
+
+    #[test]
+    fn a_dialog_with_no_close_button_cannot_trap_the_controller() {
+        let mut rig = Rig::new();
+        rig.dialog_buttons = false; // a window with only text: nothing to focus
+        rig.frame();
+        rig.step(Control::Direction(Direction::Down));
+        for _ in 0..6 {
+            rig.step(Control::Direction(Direction::Down));
+            assert!(focus_is_in_the_dialog(&rig), "locked in while it is open");
+        }
+        assert_eq!(rig.page, 0);
+        rig.step(B); // Back: this window has no close rule
+        rig.step(Control::Direction(Direction::Down));
+        let mut reached_page = false;
+        for _ in 0..30 {
+            rig.step(Control::Direction(Direction::Down));
+            reached_page |= !focus_is_in_the_dialog(&rig);
+        }
+        assert!(reached_page, "after B the controller can leave the window");
+        assert!(rig.dialog_open, "the dialog itself was not touched");
     }
 
     #[test]
