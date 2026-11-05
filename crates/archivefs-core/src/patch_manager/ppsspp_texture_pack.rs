@@ -85,7 +85,7 @@ pub fn verified_ppsspp_texture_identity(
             "identity report belongs to a different selected archive",
         ));
     }
-    if report.platform != IdentityPlatform::PlayStation {
+    if report.platform != IdentityPlatform::Psp {
         return Err(error(
             PpssppTexturePackErrorKind::WrongPlatform,
             "PPSSPP texture replacement requires a PSP identity",
@@ -524,6 +524,36 @@ pub fn execute_ppsspp_texture_pack_apply(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn identity_requires_a_psp_report_with_a_verified_disc_id() {
+        use crate::game_identity::{
+            IdentityConfidence, IdentityEvidence, IdentityKind, IdentityProvenance, IdentityStatus,
+            inspect_game_identity,
+        };
+        let path = std::path::PathBuf::from("/disposable/game.iso");
+        let mut report = inspect_game_identity(&path, None);
+        report.archive_path = path.clone();
+        report.platform = IdentityPlatform::Psp;
+        report.evidence.push(IdentityEvidence {
+            kind: IdentityKind::PspDiscId,
+            status: IdentityStatus::Verified,
+            value: Some("ULUS10041".into()),
+            confidence: IdentityConfidence::StructuredMetadata,
+            provenance: IdentityProvenance {
+                archive_path: path.clone(),
+                member_path: None,
+                member_index: None,
+                method: "synthetic".into(),
+            },
+            diagnostic: "fixture".into(),
+        });
+        let identity = verified_ppsspp_texture_identity(&report, &path).unwrap();
+        assert_eq!(identity.disc_id, "ULUS10041");
+        assert!(verified_ppsspp_texture_identity(&report, Path::new("/other.iso")).is_err());
+        report.platform = IdentityPlatform::PlayStation;
+        assert!(verified_ppsspp_texture_identity(&report, &path).is_err());
+    }
+
     use super::*;
     fn dir(label: &str) -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -534,7 +564,7 @@ mod tests {
     fn identity() -> PpssppTextureIdentity {
         PpssppTextureIdentity {
             disc_id: "ULUS-12345".into(),
-            platform: IdentityPlatform::PlayStation,
+            platform: IdentityPlatform::Psp,
         }
     }
     fn digest(bytes: &[u8]) -> String {
