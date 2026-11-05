@@ -27,7 +27,8 @@ struct Lab {
 fn lab(conf: &str, kickstart: bool) -> Lab {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path();
-    let adf = base.join("Speedball.adf");
+    let adf = base.join("games/amiga/Speedball.adf");
+    fs::create_dir_all(adf.parent().unwrap()).unwrap();
     fs::write(&adf, floppy()).unwrap();
     let config_root = base.join("fs-uae");
     fs::create_dir_all(&config_root).unwrap();
@@ -270,7 +271,21 @@ fn preflight_local(
     archivefs_core::launch::FsUaeAdfLaunchError,
 > {
     // An empty catalogue: the file is not in the library, so no DAT speaks.
-    let database = archivefs_core::Database::open_or_create(lab.database.clone()).unwrap();
+    let mut database = archivefs_core::Database::open_or_create(lab.database.clone()).unwrap();
+    // The click needs the file in the library, as the plan did.
+    let base = lab._dir.path();
+    archivefs_core::scan_and_persist(
+        &mut database,
+        &archivefs_core::Config {
+            configured_source_roots: None,
+            source_folders: vec![base.join("games")],
+            mount_root: base.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        },
+        "test",
+    )
+    .unwrap();
     // A loaded (but irrelevant) catalogue: the local route refuses without one.
     let mut catalogues = std::collections::HashMap::new();
     catalogues.insert(
@@ -388,7 +403,7 @@ fn the_local_route_keeps_kickstart_and_machine_refusals() {
     // A Kickstart that disappears after planning is refused at the click.
     let lab = lab("amiga_model = A500", true);
     let request = local_request(&lab);
-    fs::remove_file(lab.adf.parent().unwrap().join("kick13.rom")).unwrap();
+    fs::remove_file(lab._dir.path().join("kick13.rom")).unwrap();
     assert!(preflight_local(&request, &lab).is_err());
 }
 
@@ -463,6 +478,45 @@ fn the_local_route_refuses_without_a_loaded_catalogue() {
         &database,
         &std::collections::HashMap::new(),
     );
+    assert!(refused.is_err(), "{refused:?}");
+}
+
+#[test]
+fn a_disk_two_of_another_variant_beside_the_adf_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let one = dir.path().join("Game (1991)(Pub).adf");
+    let two = dir.path().join("Game (1991)(Pub)(de)(Disk 2 of 2).adf");
+    fs::write(&one, floppy()).unwrap();
+    fs::write(&two, floppy()).unwrap();
+    assert!(local_adf_media(&one).is_err());
+}
+
+#[test]
+fn a_file_that_left_the_library_is_refused_at_click_time() {
+    let lab = lab("amiga_model = A500", true);
+    let request = local_request(&lab);
+    // A database that never saw the file: NotInLibrary at the click.
+    let other = tempfile::tempdir().unwrap();
+    let database =
+        archivefs_core::Database::open_or_create(other.path().join("x.sqlite3")).unwrap();
+    let mut catalogues = std::collections::HashMap::new();
+    catalogues.insert(
+        "test".to_string(),
+        archivefs_core::dat::configured_catalogues::ConfiguredCatalogue {
+            reference: archivefs_core::dat::catalogue_selection::CatalogueRef::Local {
+                source_id: "test".into(),
+                member: None,
+            },
+            source_id: "test".into(),
+            display_name: "test".into(),
+            path: lab.adf.with_extension("dat"),
+            kind: archivefs_core::dat::sources::DatSourceKind::File,
+            sha256: None,
+            revision: None,
+        },
+    );
+    let refused =
+        archivefs_core::launch::preflight_fsuae_adf_launch(&request, &database, &catalogues);
     assert!(refused.is_err(), "{refused:?}");
 }
 

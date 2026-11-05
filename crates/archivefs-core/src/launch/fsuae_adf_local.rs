@@ -1,7 +1,7 @@
 //! Native FS-UAE launch of one local Amiga ADF without a DAT match.
 //!
 //! This is a media route, not an identity route. It proves only that the
-//! selected file is one structurally valid Amiga floppy image whose exact
+//! selected file is one plausible Amiga floppy image whose exact
 //! bytes (SHA-256) were seen, that nothing known says it belongs to a
 //! multi-disk set, and that the FS-UAE profile can run an ordinary Amiga
 //! floppy. It never says which game the disk is: no catalogue identity is
@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::dat::amiga_adf_identity::AmigaAdfIdentityRefusal;
 use crate::dat::configured_catalogues::ConfiguredCatalogue;
 use crate::launch::fsuae_adf::{
     FsUaeAdfLaunchError, FsUaeAdfLaunchRequest, FsUaeAdfRoute, fsuae_adf_config,
@@ -61,6 +62,8 @@ pub struct LocalAdfMedia {
     pub path: PathBuf,
     pub sha256: String,
     pub size: u64,
+    /// Identity of the descriptor the bytes were hashed from.
+    pub identity: crate::launch::process_spawn::CapturedFileIdentity,
 }
 
 fn refuse(reason: impl Into<String>) -> FsUaeAdfLaunchError {
@@ -78,6 +81,8 @@ const MULTI_DISK_REASON: &str = "This ADF may be one disk of a multi-disk set (d
 /// Amiga-media-like file beside it (symlinks included), puts it in a set with
 /// an ordinal, an expected count above one or another member. It cannot prove
 /// a game has one disk. An unreadable, oversized or unplaceable case refuses.
+/// Best-effort only: names the tokenizer cannot recognise, other directories
+/// and .7z/.rar/.lha siblings are not examined.
 fn multi_disk_refusal(path: &Path) -> Option<String> {
     let mut paths = vec![path.to_path_buf()];
     if let Some(parent) = path.parent() {
@@ -103,10 +108,32 @@ fn multi_disk_refusal(path: &Path) -> Option<String> {
             }
         }
     }
-    let records = paths
+    let records: Vec<_> = paths
         .iter()
         .map(|p| media_record(p, Some("Amiga")))
         .collect();
+    // The engine splits sets by variant (region, revision, language), so a
+    // disk 2 of a differently-tagged release can sit in another set. Refuse
+    // when any other sibling has the same normalised title and carries
+    // ordinal, count or side evidence of its own.
+    let title_of = |r: &crate::media_set::MediaRecord| {
+        r.evidence
+            .iter()
+            .find(|e| e.provenance.kind == crate::media_set::EvidenceKind::Filename)
+            .and_then(|e| e.title.clone())
+    };
+    if let Some(ours) = records.first().and_then(title_of)
+        && !ours.is_empty()
+        && records.iter().skip(1).any(|r| {
+            title_of(r).as_deref() == Some(ours.as_str())
+                && r.evidence.iter().any(|e| {
+                    e.provenance.kind == crate::media_set::EvidenceKind::Filename
+                        && (e.ordinal.is_some() || e.expected_count.is_some() || e.side.is_some())
+                })
+        })
+    {
+        return Some(MULTI_DISK_REASON.into());
+    }
     let report = resolve_index(index_media(records));
     let mut placed = false;
     for set in &report.sets {
@@ -207,6 +234,7 @@ pub fn local_adf_media(path: &Path) -> Result<LocalAdfMedia, FsUaeAdfLaunchError
         path: path.to_path_buf(),
         sha256,
         size,
+        identity: crate::launch::process_spawn::CapturedFileIdentity::capture(&after),
     })
 }
 
@@ -246,7 +274,7 @@ pub fn build_fsuae_local_adf_request(
             expected_platform_id: "Amiga".into(),
             expected_game_key: local_key(&media.sha256),
             profile_id: profile.profile_id.clone(),
-            content_identity: capture(&media.path)?,
+            content_identity: media.identity,
             executable_identity: capture(&binding.executable)?,
             expected_executable: binding.executable,
             config_identity: capture(&config)?,
@@ -276,6 +304,11 @@ pub(crate) fn preflight_local_adf(
         return Err(FsUaeAdfLaunchError::NotAdf);
     }
     let media = local_adf_media(path)?;
+    if media.identity != request.fsuae.content_identity {
+        return Err(refuse(
+            "The ADF is no longer the file that was checked; check it again.",
+        ));
+    }
     if media.sha256 != sha256 || request.fsuae.expected_game_key != local_key(sha256) {
         return Err(refuse(
             "The ADF's contents changed since it was checked; check it again.",
@@ -295,6 +328,13 @@ pub(crate) fn preflight_local_adf(
         .amiga_adf_launch_identity(path, catalogues)
         .map_err(|error| FsUaeAdfLaunchError::Database(error.to_string()))?
     {
+        // The plan relied on a library record's platform; if the file is no
+        // longer in the library that platform can no longer be confirmed.
+        Err(AmigaAdfIdentityRefusal::NotInLibrary) => {
+            return Err(FsUaeAdfLaunchError::Identity(
+                AmigaAdfIdentityRefusal::NotInLibrary,
+            ));
+        }
         Err(refusal) if refusal.permits_local_media() => {}
         Err(refusal) => return Err(FsUaeAdfLaunchError::Identity(refusal)),
         Ok(_) => {

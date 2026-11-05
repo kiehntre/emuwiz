@@ -71,6 +71,8 @@ impl Database {
         let mut ambiguous = false;
         let mut stale = false;
         let mut file_changed = false;
+        // Saved DAT evidence that exists but is not a strong exact match.
+        let mut weak = false;
         let mut claims = Vec::new();
         for persisted in self.library_dat_identities_for_item(archive_id)? {
             let source_id = persisted.source.source_id.clone();
@@ -86,6 +88,7 @@ impl Database {
                 true,
             )?
             else {
+                weak |= persisted.carries_identity();
                 continue;
             };
             catalogue.check_saved_identity(&mut summary);
@@ -96,6 +99,7 @@ impl Database {
             if !content_evidence(&summary.verification_state) {
                 continue;
             }
+            weak = true;
             ambiguous |= summary.is_ambiguous();
             named.extend(summary.canonical.canonical_dat_name.clone());
             let strong = matches!(&summary.verification_state,
@@ -126,6 +130,8 @@ impl Database {
                 Refusal::FileChanged
             } else if stale {
                 Refusal::CatalogueStale
+            } else if weak || !named.is_empty() {
+                Refusal::WeakEvidenceOnly
             } else {
                 Refusal::NoCurrentMatch
             }));

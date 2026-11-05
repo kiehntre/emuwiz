@@ -81,6 +81,26 @@ fn lab(entries: Entries, files: &[(&str, &str, &str)]) -> Lab {
 }
 
 fn lab_in(header: &str, entries: Entries, files: &[(&str, &str, &str)]) -> Lab {
+    lab_hashed(header, entries, files, false)
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// `crc_only`: the DAT lists CRC32 and size only (weak evidence).
+fn lab_hashed(header: &str, entries: Entries, files: &[(&str, &str, &str)], crc_only: bool) -> Lab {
     let root = tempfile::tempdir().unwrap().keep();
     for (folder, file, volume) in files {
         let dir = root.join("games").join(folder);
@@ -94,11 +114,19 @@ fn lab_in(header: &str, entries: Entries, files: &[(&str, &str, &str)]) -> Lab {
                 .iter()
                 .map(|(rom, volume)| {
                     let bytes = adf(volume);
-                    format!(
-                        r#"<rom name="{rom}" size="{}" sha1="{}"/>"#,
-                        bytes.len(),
-                        hex(&Sha1::digest(&bytes))
-                    )
+                    if crc_only {
+                        format!(
+                            r#"<rom name="{rom}" size="{}" crc="{:08x}"/>"#,
+                            bytes.len(),
+                            crc32(&bytes)
+                        )
+                    } else {
+                        format!(
+                            r#"<rom name="{rom}" size="{}" sha1="{}"/>"#,
+                            bytes.len(),
+                            hex(&Sha1::digest(&bytes))
+                        )
+                    }
                 })
                 .collect();
             format!(r#"<game name="{entry}"><description>{entry}</description>{roms}</game>"#)
@@ -650,10 +678,38 @@ fn a_dat_matched_numbered_disk_never_reaches_the_local_route_even_without_its_da
         !lab.db
             .amiga_adf_launch_identity(&path, &none)
             .unwrap()
-            .err()
-            .expect("refused")
+            .expect_err("refused")
             .permits_local_media()
     );
     // The click-time gate refuses outright when no catalogue is loaded.
     assert!(preflight_fsuae_adf_launch(&request, &lab.db, &none).is_err());
+}
+
+#[test]
+fn weak_dat_evidence_is_never_no_evidence() {
+    let set: [(&str, &[(&str, &str)]); 1] = [(
+        "Lotus (1990)(Gremlin)(Disk 2 of 2)",
+        &[("Lotus (1990)(Gremlin)(Disk 2 of 2).adf", "LOTUS2")],
+    )];
+    let lab = lab_hashed(GAMES_ADF, &set, &[("amiga", "neutral.adf", "LOTUS2")], true);
+    let refusal = lab
+        .identity("amiga", "neutral.adf")
+        .expect_err("a CRC32-only match never verifies");
+    assert!(!refusal.permits_local_media(), "{refusal:?}");
+    assert_ne!(refusal, R::NoCurrentMatch);
+    // The same file with no DAT entry at all is genuinely "no evidence".
+    let other: [(&str, &[(&str, &str)]); 1] = [(
+        "Elsewhere (1990)(Pub)(Disk 1 of 1)",
+        &[("Elsewhere (1990)(Pub)(Disk 1 of 1).adf", "OTHER")],
+    )];
+    let none = lab_hashed(
+        GAMES_ADF,
+        &other,
+        &[("amiga", "neutral.adf", "LOTUS2")],
+        false,
+    );
+    assert_eq!(
+        none.identity("amiga", "neutral.adf"),
+        Err(R::NoCurrentMatch)
+    );
 }

@@ -3,7 +3,7 @@
 //! Game identity comes only from core's DAT check
 //! (`Database::amiga_adf_launch_identity`); a filename, folder or extension
 //! never creates it. Without a DAT match (and without catalogue evidence
-//! against), core's local-media route can still allow one validated,
+//! against), core's local-media route can still allow one plausible,
 //! non-multi-disk floppy image; that proves media, not which game it is. Each discovered FS-UAE profile becomes a planner profile
 //! plus, when it can run the game, a typed request that core preflights again
 //! at click time. The plan-time identity is cached briefly because checking
@@ -98,7 +98,7 @@ fn cached_media(path: &Path) -> Option<LocalAdfMedia> {
 
 /// `None` unless `focused` is an Amiga ADF that either has a verified
 /// single-disk DAT identity, or - with no catalogue evidence against it - is
-/// one validated, non-multi-disk floppy image (local media route; no game
+/// one plausible, non-multi-disk floppy image (local media route; no game
 /// identity is claimed). The catalogue is always asked first.
 pub(crate) fn launch_inputs(focused: &Path, platform: Option<&str>) -> Option<AdfLaunchInputs> {
     if !is_amiga_adf(focused, platform) {

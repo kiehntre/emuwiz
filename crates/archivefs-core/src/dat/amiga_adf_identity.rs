@@ -96,6 +96,9 @@ pub enum AmigaAdfIdentityRefusal {
     FileChanged,
     /// No current exact SHA-256/SHA-1/MD5 match from a configured catalogue.
     NoCurrentMatch,
+    /// Saved DAT evidence names or partly matches this file but is not an
+    /// exact SHA-256/SHA-1/MD5 match, so it proves nothing and rules nothing out.
+    WeakEvidenceOnly,
     /// Current content evidence names more than one entry, or is ambiguous.
     Conflicting(Vec<String>),
     /// The catalogue that matched it is no longer configured, or its file is
@@ -132,6 +135,7 @@ impl AmigaAdfIdentityRefusal {
             | Self::NotAmiga
             | Self::FileChanged
             | Self::Conflicting(_)
+            | Self::WeakEvidenceOnly
             | Self::CatalogueStale
             | Self::InventoryMissing
             | Self::InventoryStale
@@ -152,6 +156,9 @@ impl AmigaAdfIdentityRefusal {
             Self::NotAmiga => "This game is not stored as an ordinary Amiga game.".into(),
             Self::FileChanged => {
                 "The ADF changed since it was checked; scan and verify it again.".into()
+            }
+            Self::WeakEvidenceOnly => {
+                "The DAT only weakly matches this ADF (no exact SHA-256, SHA-1 or MD5 match), so EmuWiz cannot tell what it is.".into()
             }
             Self::NoCurrentMatch => {
                 "No configured DAT verified this ADF by an exact hash. Verify it against an Amiga DAT first.".into()
