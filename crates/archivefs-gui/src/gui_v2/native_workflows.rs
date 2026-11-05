@@ -18,6 +18,8 @@ mod native_collection;
 
 #[path = "native_mod_activation.rs"]
 mod native_mod_activation;
+#[path = "native_texture_packs.rs"]
+mod native_texture_packs;
 
 #[path = "game_firmware_guidance.rs"]
 mod game_firmware_guidance;

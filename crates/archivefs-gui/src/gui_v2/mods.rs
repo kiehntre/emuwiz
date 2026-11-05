@@ -32,6 +32,7 @@ enum Tab {
     Stack,
     Conflicts,
     Activation,
+    TexturePacks,
     Cheats,
 }
 
@@ -96,6 +97,11 @@ impl ModsPageState {
         });
     }
 
+    #[cfg(test)]
+    pub(super) fn select_texture_packs(&mut self) {
+        self.tab = Tab::TexturePacks;
+    }
+
     pub(super) fn select_cheats(&mut self) {
         self.tab = Tab::Cheats;
     }
@@ -143,6 +149,7 @@ pub(super) fn show_mods_page(
                 (Tab::Stack, "Recorded changes"),
                 (Tab::Conflicts, "Conflicts"),
                 (Tab::Activation, "Enable / disable"),
+                (Tab::TexturePacks, "Texture packs"),
                 (Tab::Cheats, "Cheats"),
             ];
             ui.horizontal_wrapped(|ui| {
@@ -220,6 +227,9 @@ pub(super) fn show_mods_page(
                     Tab::Activation => {
                         destination = workflows.show_mod_activation(ui, selected_game, activity).or(destination.take());
                     }
+                    Tab::TexturePacks => {
+                        destination = workflows.show_texture_packs(ui, selected_game, activity).or(destination.take());
+                    }
                     Tab::Cheats => {
                         destination = workflows.show_cheats(ui, selected_game, activity).or(destination.take());
                         show_cheatbase(ui, &mut state.cheatbase, selected_game);
@@ -241,7 +251,7 @@ pub(super) fn show_mods_page(
             });
         });
 
-    let busy = state.local.is_busy();
+    let busy = state.local.is_busy() || workflows.texture_busy();
     if busy {
         ui.label("The mod operation is running. It cannot be cancelled from Activity; wait for the result before starting another change.");
     }
@@ -915,6 +925,34 @@ mod tests {
             });
         });
         assert_eq!(state.tab, Tab::Installed);
+    }
+
+    #[test]
+    fn texture_packs_tab_is_listed_and_needs_a_game_first() {
+        let context = egui::Context::default();
+        let mut state = ModsPageState {
+            history_loaded: true,
+            ..Default::default()
+        };
+        state.select_texture_packs();
+        let mut workflows = NativeWorkflows::new(context.clone());
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_mods_page(ui, &mut state, None, &mut workflows, &mut Activity::default());
+            });
+        });
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Texture packs"), "{text}");
+        assert!(text.contains("Choose a game before looking at texture packs"), "{text}");
+        assert!(workflows.app.cheat_workflow.is_none());
     }
 
     #[test]
