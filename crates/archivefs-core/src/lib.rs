@@ -657,6 +657,7 @@ pub mod platform;
 pub mod platform_artwork;
 
 pub mod patch_manager;
+pub mod path_alias;
 
 /// Read-only inspection and deterministic planning for caller-supplied local
 /// game-mod package directories. This is intentionally separate from the
