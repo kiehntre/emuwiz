@@ -398,7 +398,20 @@ impl TypedLaunchRequest {
                 request.plan.warnings().to_vec()
             }
             Self::Standalone(StandaloneLaunchRequest::Vice(_)) => vec![vice::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Desmume(_)) => vec![desmume::LIMITATION],
             _ => Vec::new(),
+        }
+    }
+
+    /// Short status for a request that carries caveats: DeSmuME's caveat is
+    /// about identity, not compatibility, so it must not read as a
+    /// compatibility warning.
+    pub(crate) fn unverified_status_label(&self) -> &'static str {
+        match self {
+            Self::Standalone(StandaloneLaunchRequest::Desmume(_)) => {
+                "Ready, identity not DAT-verified"
+            }
+            _ => "Ready, compatibility unverified",
         }
     }
 
@@ -779,6 +792,14 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             {
                 return Some(TypedLaunchRequest::Standalone(
                     StandaloneLaunchRequest::XRoar(request),
+                ));
+            }
+            // Same request, preflight and spawn as the Gold panel's DeSmuME
+            // offer; an unready or refused offer simply falls through to the
+            // ordinary blocker below.
+            if let Some(Ok(request)) = desmume::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Desmume(request),
                 ));
             }
             if let Some(request) = azahar
