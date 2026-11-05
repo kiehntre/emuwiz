@@ -19,14 +19,14 @@ use archivefs_core::{
 #[derive(Clone)]
 pub(crate) enum Request {
     /// A title listed from Vita3K's own inventory (All Tools page).
-    Installed(Vita3kInstalledLaunchRequest),
+    Installed(Box<Vita3kInstalledLaunchRequest>),
     /// A library `.vpk` whose title id is installed in Vita3K.
     Library(Box<Vita3kLibraryLaunchRequest>),
 }
 
 impl Request {
     pub(crate) fn new(entry: Vita3kInstalledEntry) -> Self {
-        Self::Installed(Vita3kInstalledLaunchRequest { entry })
+        Self::Installed(Box::new(Vita3kInstalledLaunchRequest { entry }))
     }
 
     pub(crate) fn key(&self) -> (PathBuf, String) {

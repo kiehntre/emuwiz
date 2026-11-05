@@ -58,7 +58,8 @@ fn a_package_reads_only_its_title_id_and_hash() {
 fn malformed_packages_are_refused() {
     let f = fixture();
     let p = f.dir.path().join("a.vpk");
-    let cases: Vec<(&str, Vec<(&str, Vec<u8>)>, VpkRefusalKind)> = vec![
+    type Case<'a> = (&'a str, Vec<(&'a str, Vec<u8>)>, VpkRefusalKind);
+    let cases: Vec<Case> = vec![
         (
             "no param",
             vec![("eboot.bin", vec![1])],
