@@ -143,3 +143,38 @@ fn only_cartridge_systems_take_the_zipped_route() {
     assert!(!is_loose_cartridge_platform(IdentityPlatform::PlayStation));
     assert!(!is_loose_cartridge_platform(IdentityPlatform::Amiga));
 }
+
+/// Two entries stored under the exact same name (a writer refuses to make
+/// one, so the second name is patched in afterwards).
+fn exact_duplicate() -> Vec<u8> {
+    let mut bytes = zip_bytes(&[
+        Entry::File("Game.gb", ROM),
+        Entry::File("Gxme.gb", b"other"),
+    ]);
+    for at in 0..bytes.len() - 7 {
+        if &bytes[at..at + 7] == b"Gxme.gb" {
+            bytes[at..at + 7].copy_from_slice(b"Game.gb");
+        }
+    }
+    bytes
+}
+
+#[test]
+fn exact_duplicate_names_are_refused_not_collapsed() {
+    assert_eq!(
+        select(&exact_duplicate(), IdentityPlatform::GameBoy),
+        Err(IdentityStatus::Invalid)
+    );
+}
+
+#[test]
+fn drive_prefixed_and_nul_names_are_refused() {
+    for name in ["C:/Game.gb", "C:Game.gb", "Ga\0me.gb"] {
+        let bytes = zip_bytes(&[Entry::File(name, ROM)]);
+        assert_eq!(
+            select(&bytes, IdentityPlatform::GameBoy),
+            Err(IdentityStatus::Invalid),
+            "{name:?}"
+        );
+    }
+}

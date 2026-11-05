@@ -7,14 +7,19 @@
 //! here. Selection and hashing stay separate; each consumer hashes or stages
 //! the selected member with its own bounded reader.
 //!
-//! One safety fix from #333's copy: a member name with a leading `/` is now
-//! refused, as its own refusal message always said (`enclosed_name` alone
-//! accepts it as relative).
+//! Safety fixes relative to #333's copy:
+//! - exact-duplicate, overlapping or header-inconsistent entries are refused
+//!   (`ZipArchive::validate_header_consistency`); `zip` otherwise collapses an
+//!   exact duplicate name into one index that reads the last entry's data;
+//! - a member name with a leading `/` or a `:` (Windows drive prefix) is
+//!   refused, as the refusal message always said (`enclosed_name` alone
+//!   accepts both as relative).
 //!
 //! Refusals (all of the archive, never "skip and continue"): more than
 //! [`MAX_ARCHIVE_MEMBERS`] entries, an unreadable entry, any encrypted entry,
-//! an empty, over-long, NUL, backslash, non-UTF-8, absolute or traversing
-//! name, duplicate names (case-insensitive), any symbolic-link entry, no
+//! duplicated, overlapping or header-inconsistent entries, an empty,
+//! over-long, NUL, backslash, colon, non-UTF-8, absolute or traversing name,
+//! duplicate names (case-insensitive), any symbolic-link entry, no
 //! supported ROM for the system, more than one, a ROM declaring more than
 //! [`MAX_LOOSE_ROM_BYTES`], or a declared decompression ratio above
 //! [`MAX_ZIP_CARTRIDGE_RATIO`].
@@ -85,6 +90,16 @@ pub fn select_zip_cartridge_member(
             ("ZIP member limit reached before identity inspection").to_string(),
         ));
     }
+    // zip keys entries by name: an exact duplicate silently collapses into
+    // one index that reads the *last* entry's data, so the name check below
+    // would never see it. Its own consistency check refuses duplicate names,
+    // local/central header disagreement and overlapping entries.
+    if let Err(error) = archive.validate_header_consistency() {
+        return Err((
+            IdentityStatus::Invalid,
+            format!("ZIP entries are duplicated, overlapping or inconsistent: {error}"),
+        ));
+    }
     let mut seen_names = std::collections::HashSet::new();
     let mut candidates: Vec<(usize, Vec<u8>, u64, u64, &'static str)> = Vec::new();
     for index in 0..archive.len() {
@@ -109,6 +124,8 @@ pub fn select_zip_cartridge_member(
             // `enclosed_name` treats a leading `/` as relative, so an
             // absolute name is refused explicitly (the one change from #333).
             && !name_raw.starts_with(b"/")
+            // `enclosed_name` also ignores a Windows drive prefix (`C:x`).
+            && !name_raw.contains(&b':')
             && std::str::from_utf8(&name_raw).is_ok()
             && raw.enclosed_name().is_some();
         if !name_ok {
