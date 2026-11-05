@@ -321,26 +321,27 @@ impl App {
             Command::First => key_tap(context, egui::Key::Home),
             Command::Last => key_tap(context, egui::Key::End),
             Command::Platforms => self.pad_shell_section(1),
+            Command::Search => self.pad_shell_section(-1),
             Command::Launch => {
                 self.enter_big_picture(context);
                 // Big Picture starts its own reader; release this one now.
                 self.pad_shell = None;
             }
-            // Text entry (on-screen keyboard) arrives in a later slice.
-            Command::Search => {}
         }
     }
 
-    /// Next Blue destination, skipping Tools (it has no page of its own).
+    /// Previous or next Blue destination. Tools opens the All Tools browser,
+    /// which is where its tiles live.
     fn pad_shell_section(&mut self, step: isize) {
-        let mut at = destination_for(&self.router.current);
-        for _ in 0..DESTINATIONS.len() {
-            let next = neighbour_destination(at, step);
-            if let Some(route) = next.route() {
-                self.go(route);
-                return;
-            }
-            at = Some(next);
+        let at = if self.simple.all_tools_open() {
+            Some(simple_shell::Destination::Tools)
+        } else {
+            destination_for(&self.router.current)
+        };
+        let next = neighbour_destination(at, step);
+        match next.route() {
+            Some(route) => self.go(route),
+            None => self.open_all_tools(),
         }
     }
 }
