@@ -33,6 +33,8 @@ pub enum AlternativeLaunchAssetKind {
     Rff,
     Art,
     GameDataArchive,
+    /// A user-selected folder of original game data (not an archive file).
+    GameDataDirectory,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

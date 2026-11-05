@@ -15,6 +15,12 @@ guessing at intent, dates, or scope.
 
 Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
+- Games & collection: an explicitly labelled alternative way to play
+  RollerCoaster Tycoon 2 with an OpenRCT2 you already installed and your own
+  game folder. Readiness comes from the existing alternative-provider planner;
+  the launch re-checks the executable and folder at click time. Nothing is
+  installed, downloaded, copied or modified. OpenRCT2 is a separate GPL-3.0
+  project; EmuWiz only starts it.
 - Big Picture: a full-screen, controller-friendly game browser with large
   covers, D-pad and analogue-stick navigation, search with an on-screen
   keyboard, and system filtering, opened from the Library or with

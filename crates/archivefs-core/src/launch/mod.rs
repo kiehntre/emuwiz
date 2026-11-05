@@ -136,6 +136,7 @@ pub mod native_support;
 pub mod np2kai;
 pub mod openmsx_command;
 pub mod openmsx_execution;
+pub mod openrct2;
 #[cfg(target_os = "linux")]
 pub mod oricutron;
 pub mod pcsx2_command;
@@ -584,6 +585,11 @@ pub use vita3k_command::{
 pub use vita3k_execution::{
     Vita3kLaunchPreflightError, Vita3kLaunchPreflightErrorKind, Vita3kLaunchRequest,
     preflight_vita3k_launch, spawn_vita3k,
+};
+pub use openrct2::{
+    OpenRct2Install, OpenRct2LaunchError, OpenRct2LaunchRequest, Rct2DataReport,
+    default_search_dirs as openrct2_search_dirs, discover_openrct2, inspect_rct2_data,
+    plan_openrct2, preflight_and_launch_openrct2, probe_openrct2_version,
 };
 pub use vita3k_installed::{
     VITA3K_INSTALLED_KEY_PREFIX, Vita3kInstalledEntry, Vita3kInstalledLaunchError,

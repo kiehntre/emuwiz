@@ -72,6 +72,7 @@ pub(crate) mod saturn_core;
 mod scummvm_profile;
 mod stella;
 pub(crate) mod vice;
+pub(crate) mod openrct2;
 pub(crate) mod vita3k;
 pub(crate) mod xroar;
 use std::path::{Path, PathBuf};
@@ -1136,6 +1137,7 @@ pub(crate) enum StandaloneProcess {
     XRoar(archivefs_core::launch::process_spawn::WatchedProcess),
     Azahar(archivefs_core::launch::LaunchedAzaharProcess),
     Vita3k(archivefs_core::launch::process_spawn::WatchedProcess),
+    OpenRct2(archivefs_core::launch::process_spawn::WatchedProcess),
     Vice(archivefs_core::launch::process_spawn::WatchedProcess),
     ViceTrainers(
         Box<
@@ -1403,6 +1405,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::XRoar(p) => p.poll().is_some(),
                     StandaloneProcess::Azahar(p) => p.poll().is_some(),
                     StandaloneProcess::Vita3k(p) => p.poll().is_some(),
+                    StandaloneProcess::OpenRct2(p) => p.poll().is_some(),
                     StandaloneProcess::Vice(p) => p.poll().is_some(),
                     StandaloneProcess::ViceTrainers(session) => {
                         let _ = session.poll();
@@ -1619,6 +1622,7 @@ pub(crate) enum StandaloneLaunchRequest {
     XRoar(xroar::Request),
     Azahar(azahar::Request),
     Vita3k(vita3k::Request),
+    OpenRct2(openrct2::Request),
     Vice(vice::Request),
     #[cfg(target_os = "linux")]
     ShadPs4(crate::emulator_setup::shadps4::Request),
@@ -1696,6 +1700,7 @@ impl StandaloneLaunchRequest {
             Self::XRoar(_) => "XRoar",
             Self::Azahar(_) => "Azahar",
             Self::Vita3k(_) => "Vita3K",
+            Self::OpenRct2(_) => "OpenRCT2",
             Self::Vice(_) => "VICE",
             Self::ScummVm(_) => "ScummVM",
             Self::OpenMsx(..) => "openMSX",
@@ -1727,6 +1732,7 @@ impl StandaloneLaunchRequest {
             Self::XRoar(r) => r.key(),
             Self::Azahar(r) => r.key(),
             Self::Vita3k(r) => r.key(),
+            Self::OpenRct2(r) => r.key(),
             Self::Vice(r) => r.key(),
             Self::ScummVm(r) => (r.selected_game_folder.clone(), "scummvm".into()),
             Self::OpenMsx(r, _) => (r.selected_content_path.clone(), "openmsx".into()),
@@ -1743,6 +1749,7 @@ impl StandaloneLaunchRequest {
             Self::XRoar(r) => r.execute().map(StandaloneProcess::XRoar),
             Self::Azahar(r) => r.execute().map(StandaloneProcess::Azahar),
             Self::Vita3k(r) => r.execute().map(StandaloneProcess::Vita3k),
+            Self::OpenRct2(r) => r.execute().map(StandaloneProcess::OpenRct2),
             Self::Vice(r) => r.execute().map(StandaloneProcess::Vice),
             #[cfg(target_os = "linux")]
             Self::ShadPs4(r) => r
@@ -5576,6 +5583,11 @@ pub(crate) fn show_standalone_launch_action(
                 {
                     ui.label(exit_line("Vita3K", report));
                 }
+                if let StandaloneProcess::OpenRct2(process) = process
+                    && let Some(report) = process.poll()
+                {
+                    ui.label(exit_line("OpenRCT2", report));
+                }
                 if let StandaloneProcess::DosBox(process) = process
                     && let Some(report) = process.poll()
                 {
@@ -5674,6 +5686,13 @@ pub(crate) fn show_standalone_launch_action(
             state.start(request);
             return;
         }
+        if adapter == openrct2::ADAPTER_KEY
+            && !state.is_active()
+            && ui.button("Play with OpenRCT2 again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
         if adapter == "azahar"
             && !state.is_active()
             && ui.button("Launch Azahar again (recheck)").clicked()
@@ -5739,6 +5758,9 @@ pub(crate) fn show_standalone_launch_action(
         _ if adapter == "amiberry_cd" => "Launch Amiberry CD".to_string(),
         _ if adapter == dosbox::ADAPTER_KEY => "Play in DOSBox".to_string(),
         _ if adapter == "vice" => "Play in VICE".to_string(),
+        _ if adapter == openrct2::ADAPTER_KEY => {
+            "Play with OpenRCT2 (alternative to the original game)".to_string()
+        }
         // ScummVM's Play reads as the product name, like its recheck button.
         _ if adapter == "scummvm" => format!("Launch {}", request.adapter_name()),
         _ => format!("Launch {adapter}"),
