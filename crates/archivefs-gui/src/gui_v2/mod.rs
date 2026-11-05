@@ -60,6 +60,7 @@ mod media_sets;
 mod media_sets_tool;
 mod media_sources;
 mod missing_review;
+mod mod_discovery;
 mod mods;
 mod mounts_page;
 mod multi_selection;
