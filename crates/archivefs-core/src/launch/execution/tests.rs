@@ -1440,3 +1440,15 @@ fn zipped_cartridge_save_setup_fails_closed_on_every_unreadable_or_overriding_so
     });
     assert!(text.contains("temporary folder"), "{text}");
 }
+
+#[test]
+fn only_cartridge_platform_zips_count_as_zipped_cartridges() {
+    use crate::zip_cartridge_stage::is_zipped_cartridge_request as zipped;
+    use std::path::Path;
+    assert!(zipped(Path::new("/r/g.zip"), "SNES"));
+    assert!(zipped(Path::new("/r/g.ZIP"), "MegaDrive"));
+    for platform in ["Arcade", "MAME", "PlayStation", "GameCube", "Amiga"] {
+        assert!(!zipped(Path::new("/r/g.zip"), platform), "{platform}");
+    }
+    assert!(!zipped(Path::new("/r/g.sfc"), "SNES"));
+}

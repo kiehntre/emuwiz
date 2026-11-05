@@ -15,6 +15,17 @@ use crate::game_identity::{
 };
 use crate::safe_read::TrustedRoots;
 
+/// Whether a launch request is for a zipped cartridge, i.e. staging applies:
+/// a `.zip` on a loose-cartridge platform. Arcade, disc and other platforms'
+/// ZIPs are native content and never match.
+pub fn is_zipped_cartridge_request(content: &Path, platform_id: &str) -> bool {
+    content
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("zip"))
+        && is_loose_cartridge_platform(IdentityPlatform::from_catalogue(Some(platform_id)))
+}
+
 /// A zipped cartridge ROM extracted for one launch into a private, owner-only
 /// temporary directory outside the library. Dropping it removes the directory,
 /// so failure paths and process exit clean up. The ZIP is never modified.
@@ -77,11 +88,7 @@ pub fn stage_zip_cartridge_for_launch(
     use std::os::unix::fs::OpenOptionsExt;
 
     let platform = IdentityPlatform::from_catalogue(Some(platform_hint));
-    let is_zip = zip
-        .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| value.eq_ignore_ascii_case("zip"));
-    if !is_zip || !is_loose_cartridge_platform(platform) {
+    if !is_zipped_cartridge_request(zip, platform_hint) {
         return Err(StageZipError::NotApplicable);
     }
     let refuse = |message: String| StageZipError::Refused(message);

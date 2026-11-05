@@ -5816,11 +5816,10 @@ const ZIPPED_NO_EXTRAS_NOTE: &str =
     "Cheats and pokes aren't supported for zipped games yet; plain Play works.";
 
 pub(crate) fn is_zipped_cartridge_request(request: &RetroArchLaunchRequest) -> bool {
-    request
-        .selected_content_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+    archivefs_core::zip_cartridge_stage::is_zipped_cartridge_request(
+        &request.selected_content_path,
+        &request.expected_platform_id,
+    )
 }
 
 /// The reason Play must be Blocked for a zipped cartridge with an unsupported

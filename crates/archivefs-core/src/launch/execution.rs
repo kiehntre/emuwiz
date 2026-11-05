@@ -1341,6 +1341,18 @@ pub fn preflight_and_launch_retroarch_with_playlist(
         &crate::launch::multidisc_launch::MultiDiscPlaylist,
     )>,
 ) -> Result<LaunchedRetroArchProcess, LaunchExecutionError> {
+    if playlist.is_some()
+        && crate::zip_cartridge_stage::is_zipped_cartridge_request(
+            &request.selected_content_path,
+            &request.expected_platform_id,
+        )
+    {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::ContentRequiresMount,
+            "multi-disc play is not supported for a zipped cartridge",
+        )
+        .into());
+    }
     // A zipped cartridge is extracted to a private temporary file for this
     // launch only; the normal preflight then re-verifies that file's identity
     // against `expected_game_key`. Anything else takes the unchanged route.
