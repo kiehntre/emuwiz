@@ -676,6 +676,7 @@ fn discover_executables(roots: &DuckStationProfileDiscoveryRoots) -> Vec<DuckSta
     );
     candidates.sort();
     candidates.dedup();
+    crate::path_alias::dedup_by_real_path(&mut candidates, |entry| entry.as_path());
     let mut executables: Vec<DuckStationExecutable> = candidates
         .into_iter()
         .filter(|path| is_regular_file(path))

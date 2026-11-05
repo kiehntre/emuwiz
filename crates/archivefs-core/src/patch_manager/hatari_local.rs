@@ -584,6 +584,7 @@ fn discover_executables(roots: &HatariProfileDiscoveryRoots) -> Vec<HatariExecut
     }
     paths.sort();
     paths.dedup();
+    crate::path_alias::dedup_by_real_path(&mut paths, |entry| entry.as_path());
     paths
         .into_iter()
         .filter(|p| is_regular(p))
@@ -1138,6 +1139,43 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).unwrap();
         }
+    }
+    /// Merged-/usr systems list both `/bin` and `/usr/bin` on PATH; one Hatari
+    /// must not be reported as two executables.
+    #[cfg(unix)]
+    #[test]
+    fn one_hatari_reached_through_a_directory_alias_is_a_single_executable() {
+        let tree = TempDir::new().unwrap();
+        let usr_bin = tree.path().join("usr/bin");
+        executable(&usr_bin.join("hatari"));
+        let bin = tree.path().join("bin");
+        std::os::unix::fs::symlink(&usr_bin, &bin).unwrap();
+        write(&tree.path().join("config/hatari/hatari.cfg"), b"");
+        let mut r = roots(&tree);
+        // Alias first, as /bin precedes /usr/bin on a typical PATH.
+        r.path_override = Some(vec![bin, usr_bin.clone()]);
+        let discovery = discover_hatari_profiles(&r);
+        let profile = discovery.profiles.first().expect("profile discovered");
+        assert_eq!(profile.executable_candidates.len(), 1);
+        assert_eq!(
+            profile.executable_candidates[0].path,
+            fs::canonicalize(usr_bin.join("hatari")).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_distinct_hatari_installs_stay_ambiguous() {
+        let tree = TempDir::new().unwrap();
+        let one = tree.path().join("one");
+        let two = tree.path().join("two");
+        executable(&one.join("hatari"));
+        executable(&two.join("hatari"));
+        write(&tree.path().join("config/hatari/hatari.cfg"), b"");
+        let mut r = roots(&tree);
+        r.path_override = Some(vec![one, two]);
+        let discovery = discover_hatari_profiles(&r);
+        assert_eq!(discovery.profiles[0].executable_candidates.len(), 2);
     }
     fn profile(config: PathBuf) -> HatariProfile {
         HatariProfile {
