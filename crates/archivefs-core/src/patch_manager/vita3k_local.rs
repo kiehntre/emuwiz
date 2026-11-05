@@ -190,8 +190,13 @@ fn inspect_config(path: &Path, default_pref_root: &Path) -> Vita3kConfigInspecti
         .filter(|bytes| bytes.len() as u64 <= VITA3K_MAX_CONFIG_BYTES)
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .unwrap_or_default();
-    let vita_fs_path =
-        configured_path(&text, "pref-path").or_else(|| Some(default_pref_root.to_path_buf()));
+    // An empty or relative pref-path would resolve against the process's
+    // working folder, so it is treated as invalid (None), never as "unset".
+    let vita_fs_path = match configured_path(&text, "pref-path") {
+        Some(path) if path.is_absolute() => Some(path),
+        Some(_) => None,
+        None => Some(default_pref_root.to_path_buf()),
+    };
     Vita3kConfigInspection {
         path: path.to_path_buf(),
         readable,
@@ -208,6 +213,9 @@ fn profile(
     let config = config_path.as_ref().map(|path| inspect_config(path, &root));
     // Vita3K keeps `ux0` (titles, saves) and `vs0` (firmware) as siblings under
     // its pref root, so both are derived from that one root.
+    let pref_invalid = config
+        .as_ref()
+        .is_some_and(|config| config.vita_fs_path.is_none());
     let pref_root = config
         .as_ref()
         .and_then(|config| config.vita_fs_path.clone())
@@ -222,12 +230,14 @@ fn profile(
         .cloned()
         .collect();
     let config_ok = config.as_ref().is_none_or(|config| config.readable);
-    let eligible = !candidates.is_empty() && config_ok && directory(&vita_fs_path);
+    let eligible = !candidates.is_empty() && config_ok && !pref_invalid && directory(&vita_fs_path);
     let blocker = (!eligible).then(|| {
         if candidates.is_empty() {
             "no safe Vita3K executable was discovered".to_string()
         } else if !config_ok {
             "Vita3K configuration is unreadable or oversized".to_string()
+        } else if pref_invalid {
+            "Vita3K's pref-path is empty or not an absolute path".to_string()
         } else {
             "Vita3K emulated filesystem is missing or unsafe".to_string()
         }
@@ -673,6 +683,25 @@ mod tests {
         assert_eq!(profile.vita_fs_path, pref.join("ux0"));
         assert_eq!(profile.firmware, Vita3kFirmwareState::PresentUnverified);
         assert!(profile.eligible);
+        // An empty or relative pref-path is never resolved against the cwd.
+        for bad in ["''", "relative/pref", ""] {
+            fs::write(
+                config_root.join("config.yml"),
+                format!("pref-path: {bad}\n"),
+            )
+            .unwrap();
+            let profile = &discover_vita3k_profiles(&roots_for(&config_root)).profiles[0];
+            assert!(!profile.eligible, "{bad:?}");
+            assert!(
+                profile.blocker.as_deref().unwrap().contains("pref-path"),
+                "{bad:?}"
+            );
+        }
+        fs::write(
+            config_root.join("config.yml"),
+            format!("pref-path: {}\n", pref.display()),
+        )
+        .unwrap();
         // No firmware folder: Unknown, never Present.
         fs::remove_dir_all(pref.join("vs0")).unwrap();
         let profile = &discover_vita3k_profiles(&roots_for(&config_root)).profiles[0];
