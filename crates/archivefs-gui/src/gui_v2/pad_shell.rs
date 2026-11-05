@@ -11,7 +11,7 @@
 
 use super::big_picture::{
     Reader,
-    nav::{Button, Command, Control, Navigator, PadEvent},
+    nav::{Button, Command, Control, Direction, Navigator, PadEvent},
     page_command,
 };
 use super::osk::{self, Key as OskKey, Osk, Outcome};
@@ -34,6 +34,19 @@ pub(super) struct PadShell {
     /// The last input was the controller, not the mouse: only then is an open
     /// dialog made modal for focus, so mouse use behind it is unchanged.
     pad_mode: bool,
+    /// Test oracle: scan controls in reading order, the only moves egui names.
+    #[cfg(test)]
+    pub(super) reading_order: bool,
+    /// The last focused control in the page content (not the sidebar), so
+    /// Right from the sidebar can return to it.
+    last_content: Option<egui::Id>,
+    /// An Up/Down that may have found nothing spatially: (direction, focus
+    /// before, frames waited). Falls back to reading order so lists that
+    /// scroll past the visible controls still move.
+    pending_move: Option<(Direction, Option<egui::Id>, u8, bool)>,
+    /// The sidebar row of the page being shown: where Left lands when nothing
+    /// in the content is further left.
+    current_nav: Option<egui::Id>,
     /// B was pressed over this dialog layer: if it is still open after a few
     /// frames, Back did not close it (a window EmuWiz has no close rule for).
     back_pending: Option<(egui::LayerId, u8)>,
@@ -66,7 +79,9 @@ impl App {
             self.pad_shell = None;
             return;
         }
+        let current_nav = destination_for(&self.router.current).map(simple_shell::nav_id);
         let shell = self.pad_shell.get_or_insert_with(Default::default);
+        shell.current_nav = current_nav;
         if !shell.started {
             shell.started = true;
             register_capture(context);
@@ -103,6 +118,7 @@ impl App {
         {
             shell.pad_mode = true;
         }
+        track_focus_region(context, shell);
         if shell.pad_mode {
             confine_to_dialog(context, shell);
         }
@@ -421,7 +437,7 @@ impl App {
         }
         match command {
             Command::Select => self.pad_shell_select(context),
-            Command::Move(_) => page_command(context, command),
+            Command::Move(direction) => self.pad_shell_move(context, direction),
             Command::Back => {
                 // If this dialog is still open a few frames from now, B has no
                 // way to close it: let the controller out rather than trap it.
@@ -445,6 +461,59 @@ impl App {
         }
     }
 
+    /// Spatial movement: the nearest control in the direction pressed, so a
+    /// grid moves by row and column and Right from the sidebar lands level
+    /// with where you were. Nothing focused yet starts from the ends.
+    fn pad_shell_move(&mut self, context: &egui::Context, direction: Direction) {
+        use egui::FocusDirection as F;
+        let focused = context.memory(|m| m.focused());
+        let Some(shell) = self.pad_shell.as_mut() else {
+            return;
+        };
+        // In a dialog or the picker, stay in reading order: egui reports a
+        // control's name (used by hold-to-confirm) only for those moves, and
+        // dialogs are short vertical lists where reading order is the layout.
+        #[cfg(test)]
+        let forced = shell.reading_order;
+        #[cfg(not(test))]
+        let forced = false;
+        let in_dialog = forced
+            || crate::ui::picker::open(context)
+            || context.memory(|m| {
+                m.areas()
+                    .top_layer_id(egui::Order::Middle)
+                    .is_some_and(|l| m.areas().is_visible(&l) && shell.released != Some(l))
+            });
+        if in_dialog {
+            let forward = matches!(direction, Direction::Down | Direction::Right);
+            context.memory_mut(|m| m.move_focus(if forward { F::Next } else { F::Previous }));
+            return;
+        }
+        let Some(from) = focused else {
+            let first = matches!(direction, Direction::Down | Direction::Right);
+            context.memory_mut(|m| m.move_focus(if first { F::Next } else { F::Previous }));
+            return;
+        };
+        if direction == Direction::Right
+            && is_sidebar(context, from)
+            && let Some(back) = shell.last_content.filter(|id| usable(context, *id))
+        {
+            // Return to where you were in the content, without scrolling.
+            context.memory_mut(|m| m.request_focus(back));
+            return;
+        }
+        let spatial = match direction {
+            Direction::Up => F::Up,
+            Direction::Down => F::Down,
+            Direction::Left => F::Left,
+            Direction::Right => F::Right,
+        };
+        context.memory_mut(|m| m.move_focus(spatial));
+        if matches!(direction, Direction::Up | Direction::Down | Direction::Left) {
+            shell.pending_move = Some((direction, focused, 0, false));
+        }
+    }
+
     /// Previous or next Blue destination. Tools opens the All Tools browser,
     /// which is where its tiles live.
     fn pad_shell_section(&mut self, step: isize) {
@@ -457,6 +526,72 @@ impl App {
         match next.route() {
             Some(route) => self.go(route),
             None => self.open_all_tools(),
+        }
+    }
+}
+
+/// Whether a control sits in Blue's sidebar: by position, so every control in
+/// that column counts, not only the eight destination rows.
+fn is_sidebar(context: &egui::Context, id: egui::Id) -> bool {
+    let edge = DESTINATIONS
+        .iter()
+        .filter_map(|d| context.read_response(simple_shell::nav_id(*d)))
+        .map(|r| r.rect.right())
+        .fold(f32::NEG_INFINITY, f32::max);
+    edge.is_finite()
+        && context
+            .read_response(id)
+            .is_some_and(|r| r.rect.right() <= edge + 1.0)
+}
+
+/// A remembered control that is still drawn, enabled and on screen.
+fn usable(context: &egui::Context, id: egui::Id) -> bool {
+    context.read_response(id).is_some_and(|r| {
+        r.enabled() && r.rect.is_finite() && context.content_rect().intersects(r.rect)
+    })
+}
+
+/// Remember the last content-region focus, and retry an Up/Down that found
+/// nothing yet (a scrolling grid renders its next row after the scroll).
+fn track_focus_region(context: &egui::Context, shell: &mut PadShell) {
+    let focused = context.memory(|m| m.focused());
+    if let Some(id) = focused
+        && !is_sidebar(context, id)
+        && context
+            .read_response(id)
+            .is_some_and(|r| r.layer_id.order == egui::Order::Background)
+    {
+        shell.last_content = Some(id);
+    }
+    if let Some((direction, before, waited, retried)) = shell.pending_move {
+        if focused != before {
+            shell.pending_move = None;
+        } else if waited >= 1 {
+            // Nothing was in that direction. A grid that scrolls renders its
+            // next row only once the focused row is revealed, so look once
+            // more; if there is still nothing, stay put (an edge), never
+            // wander to an unrelated control.
+            shell.pending_move = (!retried).then_some((direction, before, 0, true));
+            if direction == Direction::Left {
+                // Nothing further left in the content: the sidebar, on the row
+                // of the page being shown (the sidebar may not be level).
+                if let Some(row) = shell.current_nav.filter(|id| usable(context, *id)) {
+                    context.memory_mut(|m| m.request_focus(row));
+                }
+                shell.pending_move = None;
+            } else if !retried {
+                context.memory_mut(|m| {
+                    m.move_focus(if direction == Direction::Down {
+                        egui::FocusDirection::Down
+                    } else {
+                        egui::FocusDirection::Up
+                    })
+                });
+                context.request_repaint();
+            }
+        } else {
+            shell.pending_move = Some((direction, before, waited + 1, retried));
+            context.request_repaint();
         }
     }
 }
@@ -515,9 +650,13 @@ fn is_safe_label(label: &str) -> bool {
 /// a wrongly guarded button costs a longer press, never a wrong action.
 fn guarded_button(context: &egui::Context) -> Option<(egui::Id, String)> {
     let id = context.memory(|m| m.focused())?;
-    let (focus_id, label, button) =
-        context.data(|d| d.get_temp::<(egui::Id, String, bool)>(focus_label_slot()))?;
-    if focus_id != id || !button || is_safe_label(&label) {
+    // A control whose name was never reported is guarded, not trusted.
+    let (label, button) =
+        match context.data(|d| d.get_temp::<(egui::Id, String, bool)>(focus_label_slot())) {
+            Some((focus_id, label, button)) if focus_id == id => (label, button),
+            _ => ("this control".to_owned(), true),
+        };
+    if !button || is_safe_label(&label) {
         return None;
     }
     let layer = context.read_response(id)?.layer_id;
@@ -658,6 +797,9 @@ fn key_tap(context: &egui::Context, key: egui::Key) {
 impl PadShell {
     pub(super) fn buffer(&self) -> Option<String> {
         self.osk.as_ref().map(|o| o.buffer.clone())
+    }
+    pub(super) fn set_pad_mode_for_test(&mut self) {
+        self.pad_mode = true;
     }
     pub(super) fn osk_open(&self) -> bool {
         self.osk.is_some()
