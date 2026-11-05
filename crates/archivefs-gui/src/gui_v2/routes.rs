@@ -825,7 +825,7 @@ impl ToolPage {
             Self::WhdloadOptions => "WHDLoad ToolType review",
             Self::OpticalCompare => "Compare optical layouts",
             Self::SourceImpact => "Source-location impact preview",
-            Self::HomebrewBrowser => "Offline homebrew catalogue",
+            Self::HomebrewBrowser => "Homebrew",
             Self::NetplayPreview => "Netplay comparison",
             Self::HostDiagnostics => "Host capability diagnostics",
             Self::CheatExtras => "Providers and code previews",
@@ -864,7 +864,7 @@ impl ToolPage {
                 "Preview one library source at a new folder without relocating anything."
             }
             Self::HomebrewBrowser => {
-                "Search a local catalogue and review dated claims without acquiring games."
+                "Browse homebrew titles offline, or look up a GitHub repository's releases on request. Nothing is downloaded."
             }
             Self::NetplayPreview => {
                 "Compare two manually supplied peer observations without connecting."
