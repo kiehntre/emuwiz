@@ -55,6 +55,7 @@ pub(crate) mod dosbox;
 pub(crate) mod flycast;
 mod melonds_cheats;
 mod mgba;
+pub(crate) use mgba::CHECKING_BLOCKER as MGBA_CHECKING_BLOCKER;
 #[cfg(target_os = "linux")]
 mod pcsx2_cheats;
 mod retroarch_cheat_sets;
@@ -870,15 +871,26 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         .collect();
     // mGBA's offer waits on a one-time Bubblewrap capability check; say so
     // (and keep repainting) rather than showing a generic blocker.
-    if requests.is_empty()
-        && plan.candidates.iter().filter(preferred).any(|candidate| {
-            matches!(mgba::offer_for(plan, candidate), Some(Err(reason)) if mgba::is_checking(&reason))
-        })
-    {
-        return GamerPlayAction::BlockedTyped(GamerBlocker::new(
-            GamerBlockerKind::CheckingGame,
-            "Checking Bubblewrap's required launch options for mGBA.",
-        ));
+    if requests.is_empty() {
+        for candidate in plan.candidates.iter().filter(preferred) {
+            match mgba::offer_for(plan, candidate) {
+                Some(Err(reason)) if mgba::is_checking(&reason) => {
+                    return GamerPlayAction::BlockedTyped(GamerBlocker::new(
+                        GamerBlockerKind::CheckingGame,
+                        mgba::CHECKING_BLOCKER,
+                    ));
+                }
+                // The specific, actionable reason (missing or unsupported
+                // Bubblewrap), as the Gold panel shows it.
+                Some(Err(reason)) if mgba::is_bubblewrap_refusal(&reason) => {
+                    return GamerPlayAction::BlockedTyped(GamerBlocker::new(
+                        GamerBlockerKind::NoSafeEmulator,
+                        reason,
+                    ));
+                }
+                _ => {}
+            }
+        }
     }
     if requests.len() == 1 {
         return GamerPlayAction::Launch(Box::new(

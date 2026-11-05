@@ -293,10 +293,12 @@ pub(crate) fn show_gamer_launch_blocker(
     ui.colored_label(ui.visuals().warn_fg_color, blocker.heading());
     let next = match blocker.kind {
         launch_readiness_page::GamerBlockerKind::CheckingGame => {
-            // A check that finishes on a worker thread (identity evidence, the
-            // mGBA Bubblewrap probe) must not wait for the next input event.
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(100));
+            // mGBA's Bubblewrap probe finishes on a worker thread, so it must
+            // not wait for the next input event. Other checks are unchanged.
+            if blocker.detail == launch_readiness_page::MGBA_CHECKING_BLOCKER {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+            }
             "EmuWiz is still checking this game."
         }
         launch_readiness_page::GamerBlockerKind::UnknownSystem => {

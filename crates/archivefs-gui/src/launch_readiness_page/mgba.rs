@@ -408,6 +408,14 @@ impl Request {
 /// content hash, which is not a DAT check.
 pub(crate) const LIMITATION: &str = "Local launch identity (this file's own SHA-256), not a DAT check. mGBA is only started; EmuWiz cannot confirm the game runs.";
 
+/// Blocker text while the one-time Bubblewrap check runs; Blue repaints on it.
+pub(crate) const CHECKING_BLOCKER: &str = "Checking Bubblewrap's required launch options for mGBA.";
+
+/// Whether an offer refusal is the settled Bubblewrap capability result.
+pub(super) fn is_bubblewrap_refusal(reason: &str) -> bool {
+    reason.starts_with("Bubblewrap")
+}
+
 /// Whether an offer refusal only means the Bubblewrap check is still running.
 pub(super) fn is_checking(reason: &str) -> bool {
     #[cfg(target_os = "linux")]
@@ -945,5 +953,9 @@ mod tests {
     fn only_the_bubblewrap_wait_reads_as_checking() {
         assert!(is_checking(CHECKING));
         assert!(!is_checking("Bubblewrap is missing."));
+        assert!(is_bubblewrap_refusal("Bubblewrap is missing."));
+        assert!(!is_bubblewrap_refusal(
+            "Native mGBA supports only GB, GBC and GBA games."
+        ));
     }
 }
