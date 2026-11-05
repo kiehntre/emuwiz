@@ -22,7 +22,7 @@ fn texture_undo(interfere: bool) {
     std::fs::write(source.join("new.png"), b"texture").unwrap();
     let identity = PpssppTextureIdentity {
         disc_id: "ULUS-12345".into(),
-        platform: IdentityPlatform::PlayStation,
+        platform: IdentityPlatform::Psp,
     };
     let build = build_ppsspp_texture_pack_manifest(&PpssppTexturePackBuildRequest {
         source_root: source.clone(),
@@ -245,4 +245,26 @@ fn a_failed_undo_start_retains_the_installed_receipt() {
 #[test]
 fn journal_timestamps_are_real_not_the_2023_placeholder() {
     assert!(now() > 1_700_000_001, "{}", now());
+}
+
+#[test]
+fn another_games_pack_plan_and_receipt_never_carry_over() {
+    let mut state = PpssppTextureModPageState {
+        source_root: Some("/pack".into()),
+        error: Some("old".into()),
+        ..Default::default()
+    };
+    state.sync(Path::new("/games/a.iso"), "p", "D1");
+    state.source_root = Some("/pack".into());
+    state.sync(Path::new("/games/a.iso"), "p", "D1");
+    assert!(state.source_root.is_some(), "same game keeps its pack");
+    state.sync(Path::new("/games/b.iso"), "p", "D2");
+    assert!(state.source_root.is_none() && state.error.is_none());
+    // A running job pins the state until it finishes.
+    let (_sender, receiver) = mpsc::channel::<Work>();
+    state.worker = Some(receiver);
+    state.source_root = Some("/pack".into());
+    state.sync(Path::new("/games/c.iso"), "p", "D3");
+    assert!(!state.belongs_to(Path::new("/games/c.iso"), "p", "D3"));
+    assert!(state.source_root.is_some());
 }

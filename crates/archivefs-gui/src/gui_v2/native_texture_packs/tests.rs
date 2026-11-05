@@ -190,3 +190,46 @@ fn no_game_is_reachable_and_activatable_from_the_keyboard_or_controller() {
     );
     assert_eq!(route, Some(Route::Section(Section::Games)));
 }
+
+#[test]
+fn one_app_level_pump_collects_results_on_any_page_exactly_once() {
+    let context = egui::Context::default();
+    let (mut workflows, _) = fixture(&context, None);
+    let pack = std::path::PathBuf::from("/disposable/pack");
+    workflows
+        .app
+        .ppsspp_texture_mod
+        .queue_picked_for_test(Some(pack.clone()));
+    assert!(workflows.texture_busy());
+    // No texture page or tab is rendered: the per-frame poll alone collects it.
+    workflows.poll(&context, &mut Activity::default());
+    assert!(!workflows.texture_busy(), "the result was consumed");
+    assert_eq!(
+        workflows.app.ppsspp_texture_mod.source_root(),
+        Some(pack.as_path())
+    );
+    // A second pump (the Texture packs tab rendering) has nothing to consume
+    // and does not disturb the collected state.
+    workflows.poll_texture_jobs(&context);
+    let _ = run(&context, &mut workflows, None, vec![]);
+    assert_eq!(
+        workflows.app.ppsspp_texture_mod.source_root(),
+        Some(pack.as_path())
+    );
+}
+
+#[test]
+fn a_result_waits_in_its_worker_until_polled_and_is_not_lost_by_page_switches() {
+    let context = egui::Context::default();
+    let (mut workflows, game) = fixture(&context, Some(IdentityPlatform::Wii));
+    workflows
+        .app
+        .ppsspp_texture_mod
+        .queue_picked_for_test(Some("/disposable/pack".into()));
+    // Rendering other pages / the tab with a different engine does not consume it.
+    let _ = run(&context, &mut workflows, Some(&game), vec![]);
+    assert!(workflows.texture_busy());
+    workflows.poll_texture_jobs(&context);
+    assert!(!workflows.texture_busy());
+    assert!(workflows.app.ppsspp_texture_mod.source_root().is_some());
+}

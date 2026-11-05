@@ -23,6 +23,8 @@ const PROFILE_DISCOVERY_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub(crate) struct PpssppTextureModPageState {
+    /// The game this state belongs to; any other game starts clean.
+    key: Option<(PathBuf, String, String)>,
     source_root: Option<PathBuf>,
     plan: Option<PpssppTexturePackPlan>,
     transaction: Option<archivefs_core::patch_manager::SharedTransactionPlan>,
@@ -88,6 +90,41 @@ impl PpssppTextureModPageState {
 
     pub(crate) fn is_busy(&self) -> bool {
         self.worker.is_some()
+    }
+
+    /// Test support: queue a finished folder-picker result as the worker would.
+    #[cfg(test)]
+    pub(crate) fn queue_picked_for_test(&mut self, path: Option<PathBuf>) {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Work::Picked(path)).unwrap();
+        self.worker = Some(receiver);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_root(&self) -> Option<&Path> {
+        self.source_root.as_deref()
+    }
+
+    fn belongs_to(&self, archive_path: &Path, profile_id: &str, disc_id: &str) -> bool {
+        self.key
+            .as_ref()
+            .is_some_and(|(a, p, d)| a == archive_path && p == profile_id && d == disc_id)
+    }
+
+    /// Drops a pack, plan or receipt that belongs to a different game. A
+    /// running job is left alone (its game stays selected by the caller).
+    fn sync(&mut self, archive_path: &Path, profile_id: &str, disc_id: &str) {
+        let key = (
+            archive_path.to_path_buf(),
+            profile_id.to_owned(),
+            disc_id.to_owned(),
+        );
+        if self.key.as_ref() != Some(&key) && self.worker.is_none() {
+            let cache = self.profile_cache.take();
+            *self = Self::default();
+            self.profile_cache = cache;
+            self.key = Some(key);
+        }
     }
 
     /// Drains the background job. Returns whether anything changed.
@@ -183,6 +220,16 @@ pub(crate) fn show_ppsspp_texture_mod_panel(
             return;
         }
     };
+    state.sync(archive_path, &profile.profile_id, &identity.disc_id);
+    if !state.belongs_to(archive_path, &profile.profile_id, &identity.disc_id) {
+        widgets::banner(
+            ui,
+            "Texture job still running",
+            "A texture pack job for another game or profile is still running. Return to that game to see its result; nothing here can be changed until it finishes.",
+            widgets::StatusTone::Pending,
+        );
+        return;
+    }
     widgets::card(ui, |ui| {
         ui.label(format!("Verified Disc ID: {}", identity.disc_id));
         ui.label(format!("Destination root: {}", destination.display()));

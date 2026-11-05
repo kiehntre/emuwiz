@@ -409,6 +409,7 @@ impl NativeWorkflows {
 
     pub(super) fn poll(&mut self, context: &egui::Context, activity: &mut Activity) {
         self.scummvm_trainer.poll();
+        self.poll_texture_jobs(context);
         if self.native_romm.is_open()
             && self.app.romm_ui.config_draft.is_some()
             && context.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft))

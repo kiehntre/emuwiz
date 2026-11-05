@@ -56,21 +56,26 @@ impl NativeWorkflows {
             || self.app.ppsspp_texture_mod.is_busy()
     }
 
+    /// The one place the Dolphin, PCSX2 and PPSSPP panels' background jobs
+    /// (folder picker, install, Undo) are collected. Called once per frame
+    /// from `NativeWorkflows::poll`, whatever page is open, so the panels in
+    /// the Cheats tab and in Texture packs share one state and a result is
+    /// consumed exactly once and never waits for a tab to be reopened.
+    pub(in crate::gui_v2) fn poll_texture_jobs(&mut self, context: &egui::Context) {
+        let changed = self.app.dolphin_texture_mod.poll()
+            | self.app.dolphin_texture_mod.pcsx2_texture_mod.poll()
+            | self.app.ppsspp_texture_mod.poll();
+        if changed || self.texture_busy() {
+            context.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
     pub(in crate::gui_v2) fn show_texture_packs(
         &mut self,
         ui: &mut egui::Ui,
         selected: Option<&crate::gui_v2::library::Game>,
         activity: &mut Activity,
     ) -> Option<Route> {
-        // These panels' workers are drained here: the legacy page that used to
-        // poll them is not part of Blue.
-        let changed = self.app.dolphin_texture_mod.poll()
-            | self.app.dolphin_texture_mod.pcsx2_texture_mod.poll()
-            | self.app.ppsspp_texture_mod.poll();
-        if changed || self.texture_busy() {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(100));
-        }
         ui.heading("Texture packs");
         ui.label("Dolphin (GameCube, Wii), PCSX2 (PlayStation 2) and PPSSPP (PSP). Choosing and previewing a pack changes nothing; installing writes only into the emulator's texture folder, keeps a journal and can be undone. Game files and disc images are never modified.");
         let Some(game) = selected else {
