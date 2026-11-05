@@ -389,6 +389,10 @@ mod tests {
             TypedLaunchRequest::Standalone(StandaloneLaunchRequest::Desmume(_))
         ));
         assert_eq!(request.adapter_name(), "DeSmuME");
+        assert_eq!(
+            request.unverified_status_label(),
+            "Ready, identity not DAT-verified"
+        );
         // The identity is the cartridge's own game code, never a DAT match, and
         // Blue must say so wherever Play is offered.
         assert!(

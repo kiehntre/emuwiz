@@ -403,6 +403,18 @@ impl TypedLaunchRequest {
         }
     }
 
+    /// Short status for a request that carries caveats: DeSmuME's caveat is
+    /// about identity, not compatibility, so it must not read as a
+    /// compatibility warning.
+    pub(crate) fn unverified_status_label(&self) -> &'static str {
+        match self {
+            Self::Standalone(StandaloneLaunchRequest::Desmume(_)) => {
+                "Ready, identity not DAT-verified"
+            }
+            _ => "Ready, compatibility unverified",
+        }
+    }
+
     pub(crate) fn adapter_name(&self) -> &'static str {
         match self {
             Self::RetroArch(..) => "RetroArch",
