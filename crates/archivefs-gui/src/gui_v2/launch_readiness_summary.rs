@@ -1427,6 +1427,7 @@ mod tests {
             cemu: None,
             flycast: None,
             xroar: None,
+            azahar: None,
             vice: None,
             amiga_whdload: None,
             #[cfg(target_os = "linux")]

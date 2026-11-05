@@ -529,6 +529,10 @@ impl NativeWorkflows {
             .emulator_readiness
             .xroar_cassette
             .show(ui, Some(path));
+        self.app
+            .emulator_readiness
+            .azahar_homebrew
+            .show(ui, Some(path));
         self.start_launch_readiness(ui.ctx());
 
         let input = self.launch_input();
@@ -641,6 +645,10 @@ impl NativeWorkflows {
         self.app
             .emulator_readiness
             .xroar_cassette
+            .show(ui, Some(path));
+        self.app
+            .emulator_readiness
+            .azahar_homebrew
             .show(ui, Some(path));
         let (mut summary, input) = self.readiness_projection(
             ui.ctx(),

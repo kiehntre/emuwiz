@@ -213,7 +213,11 @@ pub(super) fn show_controls(
                 option_id: option_id.clone(),
             }));
         }
-        if chosen != Some(LaunchChoiceSource::Game) && ui.button("Default for this game").clicked()
+        // A launch-only file-hash key is not a stable game identity, so it is
+        // never written as a per-game default (use once / system stay available).
+        if chosen != Some(LaunchChoiceSource::Game)
+            && super::azahar::game_default_allowed(game_key)
+            && ui.button("Default for this game").clicked()
         {
             action = Some(LaunchChoiceAction::SetDefault(LaunchPreference::game(
                 platform_id,
