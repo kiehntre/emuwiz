@@ -34,6 +34,9 @@
 mod background;
 mod restore_recovery;
 
+#[cfg(test)]
+pub(crate) use background::save_fixture_tests::ps2_inventory_fixture;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
@@ -972,7 +975,7 @@ fn show_export_dialog(ui: &mut egui::Ui) {
     }
 }
 
-fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
+pub(crate) fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
     match error {
         Ps2PsuRestoreError::ExistingSave(name) => {
             format!("Save already exists on this card: {name}")

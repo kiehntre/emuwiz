@@ -45,6 +45,7 @@ pub(super) struct SavesStatesState {
     pub(super) search: String,
     pub(super) error: Option<String>,
     pub(super) snapshots: super::save_snapshots::SnapshotPanelState,
+    pub(super) card_restore: super::card_restore::CardRestoreState,
     pub(super) compatibility: super::save_compatibility::Panel,
 }
 
@@ -453,12 +454,31 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
             return;
         }
     }
+    // Card locations are judged against the whole inventory so a card
+    // listed twice is refused as ambiguous, never guessed.
+    let card_locations: Vec<_> = records
+        .iter()
+        .map(|record| super::card_restore::card_location(record, &inventory.records))
+        .collect();
     let records: Vec<PersistentStateRecord> = records.into_iter().cloned().collect();
     let inventory_warnings = inventory.warnings.clone();
+    if selected_game.is_none() {
+        // Every eligible card in the inventory, not only the ones the current
+        // search/filter shows: history is loaded once per inventory, so a
+        // card hidden now must still have its snapshots when shown later.
+        let locations = inventory
+            .records
+            .iter()
+            .filter_map(|record| {
+                super::card_restore::card_location(record, &inventory.records).ok()
+            })
+            .collect();
+        super::card_restore::ensure_history(app, locations);
+    }
     egui::ScrollArea::vertical()
         .id_salt(("v2_saves_states_records", game_id))
         .show(ui, |ui| {
-            for record in &records {
+            for (record, card_location) in records.iter().zip(&card_locations) {
                 ui.push_id(&record.path, |ui| {
                     record_card(ui, record, &mut app.imagery);
                     super::save_state_guidance::show(ui, record, state_target.as_ref());
@@ -469,6 +489,13 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
                             app,
                             record,
                             target.as_ref().map_err(|reason| *reason),
+                        );
+                    } else {
+                        super::card_restore::show(
+                            ui,
+                            app,
+                            record,
+                            card_location.as_ref().map_err(|reason| *reason),
                         );
                     }
                 });
