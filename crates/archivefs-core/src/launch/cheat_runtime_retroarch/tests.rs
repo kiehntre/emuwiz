@@ -1214,3 +1214,57 @@ fn a_different_frontend_than_the_verified_one_refuses_before_materialising() {
     assert!(!workspace(&id).exists());
     assert!(!world.root.join("record").exists());
 }
+
+#[test]
+fn a_zipped_cartridge_with_cheats_is_refused_before_anything_starts() {
+    let mut world = World::new("zip-cheats", true);
+    world.request.selected_content_path = world.root.join("content/game.zip");
+    let id = unique("zip-cheats");
+    let error = launch(&world, &selection(), &id).err().expect("refused");
+    match error {
+        RetroArchCheatLaunchError::Preflight(error) => {
+            assert_eq!(
+                error.kind,
+                crate::launch::LaunchPreflightErrorKind::ContentRequiresMount
+            );
+            assert!(
+                error.detail.contains("zipped cartridge"),
+                "{}",
+                error.detail
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!workspace(&id).exists());
+    assert!(!world.root.join("record").exists());
+}
+
+#[test]
+fn the_zipped_cartridge_cheat_guard_does_not_touch_other_zips_or_empty_selections() {
+    let id = unique("zip-others");
+    // An arcade-style ZIP with cheats is not refused by this guard.
+    let mut world = World::new("zip-arcade", true);
+    world.request.selected_content_path = world.root.join("content/game.zip");
+    world.request.expected_platform_id = "Arcade".into();
+    if let Err(RetroArchCheatLaunchError::Preflight(error)) = launch(&world, &selection(), &id) {
+        assert!(
+            !error.detail.contains("zipped cartridge"),
+            "{}",
+            error.detail
+        );
+    }
+    // A zipped cartridge with no cheats selected falls through to the ordinary
+    // preflight, which has its own refusal.
+    let mut world = World::new("zip-empty", true);
+    world.request.selected_content_path = world.root.join("content/game.zip");
+    let mut none = selection();
+    none.selections.clear();
+    if let Err(RetroArchCheatLaunchError::Preflight(error)) = launch(&world, &none, &id) {
+        assert!(
+            !error.detail.contains("zipped cartridge"),
+            "{}",
+            error.detail
+        );
+    }
+    assert!(!world.root.join("record").exists());
+}
