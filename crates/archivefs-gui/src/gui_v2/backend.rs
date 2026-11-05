@@ -1026,6 +1026,11 @@ pub(super) fn load_library_with_catalogues(
                 dat_evidence.exact_hashes.get(&archive_id).cloned();
         }
     }
+    for (archive_id, hashes) in dat_evidence.current_hashes {
+        if let Some(index) = library.by_id.get(&archive_id).copied() {
+            library.games[index].saved_hashes = Some(hashes);
+        }
+    }
     // Other saved DAT evidence, shown as such; never a verification.
     for (archive_id, state) in dat_evidence.states {
         if let Some(index) = library.by_id.get(&archive_id).copied() {
