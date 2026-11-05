@@ -192,6 +192,7 @@ pub mod vice_command;
 pub mod vice_execution;
 pub mod vita3k_command;
 pub mod vita3k_execution;
+pub mod vita3k_installed;
 pub mod xemu_command;
 pub mod xemu_execution;
 pub mod xenia_command;
@@ -578,6 +579,11 @@ pub use vita3k_command::{
 pub use vita3k_execution::{
     Vita3kLaunchPreflightError, Vita3kLaunchPreflightErrorKind, Vita3kLaunchRequest,
     preflight_vita3k_launch, spawn_vita3k,
+};
+pub use vita3k_installed::{
+    VITA3K_INSTALLED_KEY_PREFIX, Vita3kInstalledEntry, Vita3kInstalledLaunchError,
+    Vita3kInstalledLaunchRequest, Vita3kInventory, Vita3kProfileSummary,
+    preflight_and_launch_vita3k_installed, scan_vita3k_installed_titles,
 };
 pub use xemu_command::{
     XEMU_SUPPORTED_PLATFORM_ID, XemuCommand, XemuCommandPlan, XemuCommandSelection,
