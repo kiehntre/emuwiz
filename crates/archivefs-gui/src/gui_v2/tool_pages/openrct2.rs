@@ -146,9 +146,9 @@ fn show_candidate(
             }
             ui.label("Not checked. EmuWiz has not run this file.");
             ui.small(
-                "Checking the version will run this file with --version. EmuWiz opens exactly this \
-                 file once and runs and later launches that same file; scripts and wrappers are \
-                 refused. Only check a program you trust. EmuWiz limits the time and output, but that does not make running an \
+                "Checking the version will run this file with --version. EmuWiz runs exactly the file it \
+                 opened and hashed, and will only launch it later if it is byte-for-byte unchanged; \
+                 scripts and wrappers are refused. A version is not proof that this is OpenRCT2. Only check a program you trust. EmuWiz limits the time and output, but that does not make running an \
                  untrusted file safe.",
             );
             check_clicked = ui.button("Check OpenRCT2").clicked();

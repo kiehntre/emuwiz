@@ -405,3 +405,96 @@ fn real_probe_runs_the_pinned_descriptor_and_limits_output() {
     assert!(probe_openrct2_version(&pinned).is_some());
     assert!(pinned.confirm_unchanged().is_ok());
 }
+
+#[test]
+fn files_that_are_writable_foreign_or_setuid_are_not_pinned() {
+    let t = tempfile::tempdir().unwrap();
+    let bin = elf(&t.path().join("bin"), "true");
+    let path = fs::canonicalize(&bin).unwrap();
+    assert!(PinnedOpenRct2::open(&path).is_ok());
+    for (mode, why) in [
+        (0o775, "writable"),
+        (0o757, "writable"),
+        (0o4755, "setuid"),
+        (0o2755, "setuid"),
+    ] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        let error = PinnedOpenRct2::open(&path).unwrap_err();
+        assert!(error.contains(why), "{mode:o}: {error}");
+    }
+    // Refusals reach the check as Refused, without running anything.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o775)).unwrap();
+    let dirs = vec![path.parent().unwrap().to_path_buf()];
+    let candidate = discover_openrct2(&dirs).remove(0);
+    let calls = AtomicUsize::new(0);
+    let counting = |_: &PinnedOpenRct2| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Some("0.4.14".into())
+    };
+    assert!(matches!(
+        check_openrct2(&candidate, &dirs, &counting),
+        Err(OpenRct2CheckError::Refused(_))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+fn sh(script: &str) -> Command {
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(script);
+    command
+}
+
+#[test]
+fn version_probe_reads_a_version_from_a_well_behaved_program() {
+    assert_eq!(
+        run_version_command(sh("echo 'OpenRCT2, v0.4.14'")).as_deref(),
+        Some("0.4.14")
+    );
+    // Non-UTF8 bytes do not hide a valid version.
+    assert_eq!(
+        run_version_command(sh("printf '\\377\\376 v0.4.2\\n'")).as_deref(),
+        Some("0.4.2")
+    );
+}
+
+#[test]
+fn version_probe_times_out_and_kills_the_whole_group() {
+    let marker = tempfile::tempdir().unwrap();
+    let pidfile = marker.path().join("pid");
+    let started = Instant::now();
+    let script = format!("sleep 30 & echo $! > '{}'; sleep 30", pidfile.display());
+    assert_eq!(run_version_command(sh(&script)), None);
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "bounded by the timeout"
+    );
+    let pid: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    // SAFETY: signal 0 only tests for existence.
+    let alive = unsafe { libc::kill(pid, 0) } == 0
+        && fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| !s.contains(") Z"));
+    assert!(!alive, "the descendant must be killed with the group");
+}
+
+#[test]
+fn version_probe_is_not_blocked_by_a_descendant_holding_the_pipe_or_by_a_flood() {
+    let started = Instant::now();
+    // The shell exits at once; a background child keeps stdout open for 30 s.
+    assert_eq!(
+        run_version_command(sh("(sleep 30) & echo v0.4.1")).as_deref(),
+        Some("0.4.1")
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "not held by the pipe holder"
+    );
+    // A flood is capped; the version at the start is still read, memory is bounded.
+    let started = Instant::now();
+    let flood = run_version_command(sh("echo v0.4.9; head -c 50000000 /dev/zero | tr '\\0' 'a'"));
+    assert!(started.elapsed() < Duration::from_secs(6));
+    assert_eq!(flood.as_deref(), Some("0.4.9"));
+}

@@ -21,16 +21,20 @@
 //! looks at file metadata). Reading a version needs to *run* the executable
 //! with `--version`; that happens only in [`check_openrct2`], for the one
 //! candidate the user explicitly chose, after its path was shown. The
-//! two-second and 16 KiB limits keep a misbehaving program from hanging the
-//! check; they are not a sandbox and do not make running an untrusted file
-//! safe. Launch preflight never re-runs `--version`.
+//! two-second and 16 KiB limits stop a misbehaving program from hanging the
+//! check or flooding memory (output is read through a hard byte cap on helper
+//! threads, and the program runs in its own process group that is killed on
+//! timeout); a descendant that leaves the group can outlive the check. They
+//! are not a sandbox and do not make running an untrusted file safe. Launch preflight never re-runs `--version`.
 //!
 //! # Executable binding
 //!
 //! The file that is version-checked is the file that is launched, by
 //! descriptor, not by pathname. [`PinnedOpenRct2`] opens the candidate once
 //! (`O_NOFOLLOW`), requires a regular executable native ELF (scripts and
-//! wrappers cannot be descriptor-pinned and are refused) of at most 128 MiB,
+//! wrappers cannot be descriptor-pinned and are refused) of at most 128 MiB
+//! that is owned by root or the current user and is neither group/world
+//! writable nor setuid/setgid,
 //! and hashes it through that same descriptor. Both the `--version` run and
 //! the final launch exec `/proc/self/fd/N` of such a descriptor, and the
 //! launch additionally requires the file's identity *and* SHA-256 to equal
@@ -51,7 +55,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -118,9 +122,33 @@ impl PinnedOpenRct2 {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)
             .map_err(|e| format!("the executable cannot be opened safely: {e}"))?;
+        // A descriptor below 3 would be replaced by the child's stdio set-up.
+        if file.as_raw_fd() < 3 {
+            // SAFETY: plain fcntl on a descriptor we own; the new one is owned
+            // by the File that replaces the old.
+            let moved = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if moved < 0 {
+                return Err("the executable descriptor could not be moved".into());
+            }
+            file = unsafe { fs::File::from_raw_fd(moved) };
+        }
         let metadata = file.metadata().map_err(|e| e.to_string())?;
         if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
             return Err("the executable is not a regular executable file".into());
+        }
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid has no preconditions.
+            let me = unsafe { libc::geteuid() };
+            if metadata.uid() != 0 && metadata.uid() != me {
+                return Err("the executable is owned by another user".into());
+            }
+            if metadata.mode() & 0o022 != 0 {
+                return Err("the executable is group- or world-writable".into());
+            }
+            if metadata.mode() & 0o6000 != 0 {
+                return Err("the executable is setuid or setgid".into());
+            }
         }
         if metadata.len() < 4 || metadata.len() > MAX_EXECUTABLE_BYTES {
             return Err("the executable is empty or larger than the 128 MiB limit".into());
@@ -201,34 +229,84 @@ fn is_executable_file(path: &Path) -> Option<fs::Metadata> {
         .then_some(metadata)
 }
 
-/// Bounded `openrct2 --version` of the *pinned descriptor* (never a path).
+/// `openrct2 --version` of the *pinned descriptor* (never a path).
 /// Executes the file: call only from [`check_openrct2`], after an explicit
-/// user action. The environment is cleared and stdin is closed; the time and
-/// output limits only stop a hang or flood and are not a sandbox.
+/// user action. The environment is cleared and stdin is closed.
 pub fn probe_openrct2_version(pinned: &PinnedOpenRct2) -> Option<String> {
     let mut command = Command::new(pinned.proc_path());
+    command.arg0(&pinned.path).arg("--version");
+    run_version_command(command)
+}
+
+/// Runs `command` with a cleared environment in its own process group and
+/// returns the version it prints. At most [`MAX_VERSION_BYTES`] are kept per
+/// stream (read on helper threads, so a flood cannot grow memory), the whole
+/// check is limited to [`VERSION_TIMEOUT`], and on timeout the process group
+/// is killed. A grandchild that holds the pipe cannot block the caller: the
+/// readers are abandoned after a short grace period.
+fn run_version_command(mut command: Command) -> Option<String> {
     command
-        .arg0(&pinned.path)
-        .arg("--version")
         .env_clear()
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().ok()?;
+    let group = child.id() as libc::pid_t;
+    let kill_group = |child: &mut std::process::Child| {
+        // SAFETY: the leader is not yet reaped, so `group` is still ours.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+        let _ = child.wait();
+    };
+    /// Reads into a shared buffer chunk by chunk, so whatever arrived is
+    /// still usable if EOF never does (a descendant holding the pipe).
+    type Shared = std::sync::Arc<std::sync::Mutex<(Vec<u8>, bool)>>;
+    fn capped(mut stream: impl Read + Send + 'static) -> Shared {
+        let shared: Shared = Default::default();
+        let writer = shared.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 1024];
+            loop {
+                let room = (MAX_VERSION_BYTES - writer.lock().unwrap().0.len()).min(chunk.len());
+                if room == 0 {
+                    break;
+                }
+                match stream.read(&mut chunk[..room]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => writer.lock().unwrap().0.extend_from_slice(&chunk[..n]),
+                }
+            }
+            writer.lock().unwrap().1 = true;
+        });
+        shared
+    }
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
+        kill_group(&mut child);
+        return None;
+    };
+    let (out, err) = (capped(out), capped(err));
     let started = Instant::now();
-    while child.try_wait().ok()?.is_none() {
-        if started.elapsed() >= VERSION_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < VERSION_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                kill_group(&mut child);
+                return None;
+            }
         }
+    }
+    // Give the readers a short grace period to drain what is already in the
+    // pipes, then use whatever arrived; stragglers are abandoned.
+    let grace = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < grace && !(out.lock().unwrap().1 && err.lock().unwrap().1) {
         std::thread::sleep(Duration::from_millis(10));
     }
-    let output = child.wait_with_output().ok()?;
-    let mut bytes = output.stdout;
-    bytes.extend_from_slice(&output.stderr);
-    bytes.truncate(MAX_VERSION_BYTES);
-    parse_version_output(&String::from_utf8(bytes).ok()?)
+    let mut bytes = out.lock().unwrap().0.clone();
+    bytes.extend_from_slice(&err.lock().unwrap().0);
+    parse_version_output(&String::from_utf8_lossy(&bytes))
 }
 
 /// Passive discovery: candidate paths only, read-only metadata, nothing is
