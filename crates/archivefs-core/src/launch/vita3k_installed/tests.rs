@@ -77,7 +77,7 @@ fn install(config_root: &Path, dir_name: &str, title_id: &str, title: &str, cate
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let config_root = dir.path().join("profile-a");
-    fs::create_dir_all(config_root.join("ux0/vs0/sys/external")).unwrap();
+    fs::create_dir_all(config_root.join("vs0/sys/external")).unwrap();
     let executable = fake_vita3k(dir.path());
     let roots = Vita3kProfileDiscoveryRoots {
         home: dir.path().join("home"),
@@ -201,7 +201,7 @@ fn missing_licence_and_missing_firmware_block_the_title() {
     assert!(matches!(err, Vita3kInstalledLaunchError::Refused(_)));
 
     let g = fixture();
-    fs::remove_dir_all(g.config_root.join("ux0/vs0")).unwrap();
+    fs::remove_dir_all(g.config_root.join("vs0")).unwrap();
     install(&g.config_root, "PCSE00001", "PCSE00001", "Homebrew", "HB");
     let inventory = scan_vita3k_installed_titles(&g.roots);
     assert_eq!(inventory.entries[0].firmware, Vita3kFirmwareState::Unknown);
@@ -390,4 +390,27 @@ fn no_vita3k_installation_gives_an_empty_inventory_with_a_reason() {
     let inventory = scan_vita3k_installed_titles(&roots);
     assert!(inventory.entries.is_empty());
     assert!(inventory.profiles.iter().all(|p| !p.eligible));
+}
+
+#[test]
+fn a_configured_pref_path_with_sibling_ux0_and_vs0_lists_titles() {
+    let f = fixture();
+    let pref = f.dir.path().join("pref");
+    fs::create_dir_all(pref.join("vs0/sys/external")).unwrap();
+    fs::write(
+        f.config_root.join("config.yml"),
+        format!("pref-path: {}\n", pref.display()),
+    )
+    .unwrap();
+    // The profile root's own ux0 is ignored; the configured pref root rules.
+    install(&pref, "PCSE00001", "PCSE00001", "Configured layout", "HB");
+    install(&f.config_root, "PCSE00002", "PCSE00002", "Wrong tree", "HB");
+    let inventory = scan_vita3k_installed_titles(&f.roots);
+    let ids: Vec<_> = inventory
+        .entries
+        .iter()
+        .map(|e| e.title_id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["PCSE00001"]);
+    assert_eq!(inventory.entries[0].blocker, None);
 }

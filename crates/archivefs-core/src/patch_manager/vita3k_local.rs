@@ -179,7 +179,9 @@ fn configured_path(text: &str, key: &str) -> Option<PathBuf> {
     })
 }
 
-fn inspect_config(path: &Path, default_fs: &Path) -> Vita3kConfigInspection {
+/// `vita_fs_path` in the result is the Vita3K *pref root* (`pref-path`, or the
+/// profile root when unset): the folder holding `ux0/` and `vs0/` side by side.
+fn inspect_config(path: &Path, default_pref_root: &Path) -> Vita3kConfigInspection {
     let bytes = fs::read(path).ok();
     let readable = bytes
         .as_ref()
@@ -189,7 +191,7 @@ fn inspect_config(path: &Path, default_fs: &Path) -> Vita3kConfigInspection {
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .unwrap_or_default();
     let vita_fs_path =
-        configured_path(&text, "pref-path").or_else(|| Some(default_fs.to_path_buf()));
+        configured_path(&text, "pref-path").or_else(|| Some(default_pref_root.to_path_buf()));
     Vita3kConfigInspection {
         path: path.to_path_buf(),
         readable,
@@ -202,15 +204,15 @@ fn profile(
     installation_type: Vita3kInstallationType,
     executables: &[Vita3kExecutable],
 ) -> Vita3kProfile {
-    let default_fs = root.join("ux0");
     let config_path = config_path(&root);
-    let config = config_path
-        .as_ref()
-        .map(|path| inspect_config(path, &default_fs));
-    let vita_fs_path = config
+    let config = config_path.as_ref().map(|path| inspect_config(path, &root));
+    // Vita3K keeps `ux0` (titles, saves) and `vs0` (firmware) as siblings under
+    // its pref root, so both are derived from that one root.
+    let pref_root = config
         .as_ref()
         .and_then(|config| config.vita_fs_path.clone())
-        .unwrap_or(default_fs);
+        .unwrap_or_else(|| root.clone());
+    let vita_fs_path = pref_root.join("ux0");
     let candidates: Vec<_> = executables
         .iter()
         .filter(|executable| {
@@ -230,7 +232,7 @@ fn profile(
             "Vita3K emulated filesystem is missing or unsafe".to_string()
         }
     });
-    let firmware_root = vita_fs_path.join("vs0/sys/external");
+    let firmware_root = pref_root.join("vs0/sys/external");
     Vita3kProfile {
         profile_id: format!("vita3k:{}", root.display()),
         installation_type,
@@ -628,6 +630,53 @@ mod tests {
         output.extend_from_slice(&key_table);
         output.extend_from_slice(&data_table);
         output
+    }
+
+    #[test]
+    fn discovery_derives_ux0_and_vs0_from_one_pref_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("Vita3K");
+        fs::write(&exe, b"vita3k").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let roots_for = |config_root: &Path| Vita3kProfileDiscoveryRoots {
+            home: dir.path().join("home"),
+            xdg_data_home: dir.path().join("xdg"),
+            explicit_configuration_roots: vec![config_root.to_path_buf()],
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: vec![exe.clone()],
+            known_version_outputs: Default::default(),
+        };
+        // Default: no pref-path, so the profile root is the pref root.
+        let plain = dir.path().join("plain");
+        fs::create_dir_all(plain.join("ux0/app")).unwrap();
+        fs::create_dir_all(plain.join("vs0/sys/external")).unwrap();
+        let profile = &discover_vita3k_profiles(&roots_for(&plain)).profiles[0];
+        assert_eq!(profile.vita_fs_path, plain.join("ux0"));
+        assert_eq!(profile.firmware, Vita3kFirmwareState::PresentUnverified);
+        assert!(profile.eligible);
+        // Configured pref-path elsewhere (the real Vita3K layout).
+        let config_root = dir.path().join("config");
+        let pref = dir.path().join("pref");
+        fs::create_dir_all(&config_root).unwrap();
+        fs::create_dir_all(pref.join("ux0/app")).unwrap();
+        fs::create_dir_all(pref.join("vs0/sys/external")).unwrap();
+        fs::write(
+            config_root.join("config.yml"),
+            format!("pref-path: {}\n", pref.display()),
+        )
+        .unwrap();
+        let profile = &discover_vita3k_profiles(&roots_for(&config_root)).profiles[0];
+        assert_eq!(profile.vita_fs_path, pref.join("ux0"));
+        assert_eq!(profile.firmware, Vita3kFirmwareState::PresentUnverified);
+        assert!(profile.eligible);
+        // No firmware folder: Unknown, never Present.
+        fs::remove_dir_all(pref.join("vs0")).unwrap();
+        let profile = &discover_vita3k_profiles(&roots_for(&config_root)).profiles[0];
+        assert_eq!(profile.firmware, Vita3kFirmwareState::Unknown);
     }
 
     #[test]
