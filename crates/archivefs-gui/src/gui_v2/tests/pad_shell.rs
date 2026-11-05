@@ -865,7 +865,9 @@ mod journey {
         fn focus(&mut self, wanted: impl Fn(&str) -> bool, what: &str) {
             for _ in 0..200 {
                 self.tap(Control::Direction(Direction::Down));
-                if let Some(l) = self.label() { self.seen.push(l); }
+                if let Some(l) = self.label() {
+                    self.seen.push(l);
+                }
                 if self.label().is_some_and(|l| wanted(&l)) {
                     return;
                 }
@@ -887,7 +889,11 @@ mod journey {
         let mut app = super::app(&context);
         app.simple.enabled = true;
         app.artwork.index = Some(Arc::new(MediaIndex::default()));
-        let mut pad = Pad { context, app, seen: Vec::new() };
+        let mut pad = Pad {
+            context,
+            app,
+            seen: Vec::new(),
+        };
         pad.frames();
         let north = Control::Button(Button::North);
         let south = Control::Button(Button::South);
