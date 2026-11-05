@@ -64,6 +64,9 @@ impl World {
         let state = &mut app.saves_states.card_restore;
         state.paths = Some(self.paths.clone());
         state.paths_resolved = true;
+        // The records panel is exercised by its own tests; here it must not
+        // occupy the single job slot with its automatic first check.
+        state.panel.records_requested = true;
         app
     }
 
@@ -382,4 +385,43 @@ fn card_history_loads_even_when_the_first_view_filters_cards_out() {
     app.saves_states.filter = super::super::saves_states::Filter::All;
     let strings = shown(&context, &mut app);
     assert!(has(&strings, "Restore a save folder…"), "{strings:?}");
+}
+
+#[test]
+fn saves_page_shows_restore_records_review_and_storage_panels() {
+    use super::super::card_restore::recovery;
+    let context = egui::Context::default();
+    let world = World::new();
+    let mut app = world.app(&context);
+    world.load_history(&mut app);
+    let garbage = world.paths.journal_dir.join("ps2-psu-restore-garbage.json");
+    std::fs::write(&garbage, b"not a journal").unwrap();
+    app.saves_states.card_restore.panel.records =
+        Some(recovery::load_records(&world.paths.journal_dir));
+    let strings = shown(&context, &mut app);
+    for expected in [
+        "Memory card restore records · 1 need attention",
+        "Unreadable",
+        "Restores to every memory card stay paused",
+        "Show evidence…",
+        "Refresh records",
+        "Restore storage",
+    ] {
+        assert!(has(&strings, expected), "missing {expected}: {strings:?}");
+    }
+    app.saves_states.card_restore.panel.review = Some(recovery::review_preview(&garbage).unwrap());
+    let strings = shown(&context, &mut app);
+    for expected in [
+        "Review restore record",
+        "Evidence to inspect",
+        "cannot tell which memory card",
+        "This cannot be marked reviewed",
+    ] {
+        assert!(has(&strings, expected), "missing {expected}: {strings:?}");
+    }
+    assert!(
+        !has(&strings, "Mark as reviewed"),
+        "no acknowledgement for unreadable records"
+    );
+    assert_eq!(std::fs::read(&garbage).unwrap(), b"not a journal");
 }
