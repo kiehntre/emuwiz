@@ -399,6 +399,9 @@ impl TypedLaunchRequest {
             }
             Self::Standalone(StandaloneLaunchRequest::Vice(_)) => vec![vice::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Desmume(_)) => vec![desmume::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Mgba(_)) => vec![mgba::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Rmg(_)) => vec![rmg::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Stella(_)) => vec![stella::LIMITATION],
             _ => Vec::new(),
         }
     }
@@ -411,6 +414,11 @@ impl TypedLaunchRequest {
             Self::Standalone(StandaloneLaunchRequest::Desmume(_)) => {
                 "Ready, identity not DAT-verified"
             }
+            Self::Standalone(
+                StandaloneLaunchRequest::Mgba(_)
+                | StandaloneLaunchRequest::Rmg(_)
+                | StandaloneLaunchRequest::Stella(_),
+            ) => "Ready, local launch identity",
             _ => "Ready, compatibility unverified",
         }
     }
@@ -802,6 +810,23 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                     StandaloneLaunchRequest::Desmume(request),
                 ));
             }
+            // mGBA and RMG: the same Gold-panel requests (click-time rediscovery,
+            // content and identity recheck, Core preflight and spawn).
+            if let Some(Ok(request)) = mgba::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Mgba(request),
+                ));
+            }
+            if let Some(Ok(request)) = rmg::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Rmg(request),
+                ));
+            }
+            if let Some(Ok(request)) = stella::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Stella(request),
+                ));
+            }
             if let Some(request) = azahar
                 .as_ref()
                 .and_then(|context| context.request(plan, candidate))
@@ -843,6 +868,18 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             )
         })
         .collect();
+    // mGBA's offer waits on a one-time Bubblewrap capability check; say so
+    // (and keep repainting) rather than showing a generic blocker.
+    if requests.is_empty()
+        && plan.candidates.iter().filter(preferred).any(|candidate| {
+            matches!(mgba::offer_for(plan, candidate), Some(Err(reason)) if mgba::is_checking(&reason))
+        })
+    {
+        return GamerPlayAction::BlockedTyped(GamerBlocker::new(
+            GamerBlockerKind::CheckingGame,
+            "Checking Bubblewrap's required launch options for mGBA.",
+        ));
+    }
     if requests.len() == 1 {
         return GamerPlayAction::Launch(Box::new(
             requests.into_iter().next().expect("one request"),

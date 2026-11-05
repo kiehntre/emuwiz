@@ -160,6 +160,10 @@ fn fresh_identity(
     ))
 }
 
+/// Shown wherever Stella Play is offered: the launch identity is the SHA-256 of
+/// the cartridge file, which is not a DAT check.
+pub(crate) const LIMITATION: &str = "Local launch identity (this cartridge file's own SHA-256), not a DAT check. Stella is only started; EmuWiz cannot confirm the game runs.";
+
 pub(super) fn offer_for(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
@@ -181,11 +185,14 @@ pub(super) fn show_offer(
 ) {
     ui.add_space(6.0);
     match offer {
-        Ok(request) => super::show_standalone_launch_action(
-            ui,
-            state,
-            StandaloneLaunchRequest::Stella(request),
-        ),
+        Ok(request) => {
+            ui.small(LIMITATION);
+            super::show_standalone_launch_action(
+                ui,
+                state,
+                StandaloneLaunchRequest::Stella(request),
+            )
+        }
         Err(reason) => {
             ui.colored_label(ui.visuals().warn_fg_color, reason);
         }
@@ -365,5 +372,158 @@ mod tests {
             crate::launch_readiness_page::LaunchReadinessInput::Plan { plan: actual, .. }
                 if actual.platform_id == plan.platform_id && actual.game_key == plan.game_key
         ));
+    }
+
+    fn blue_input(plan: &LaunchPlan) -> LaunchReadinessInput {
+        LaunchReadinessInput::Plan {
+            plan: plan.clone(),
+            retroarch: None,
+            retroarch_scanned: true,
+            standalone_scans_complete: true,
+            dolphin: None,
+            pcsx2: None,
+            duckstation: None,
+            ppsspp: None,
+            rpcs3: None,
+            xemu: None,
+            xenia: None,
+            melonds: None,
+            cemu: None,
+            flycast: None,
+            xroar: None,
+            azahar: None,
+            vice: None,
+            amiga_whdload: None,
+            #[cfg(target_os = "linux")]
+            shadps4: None,
+        }
+    }
+
+    /// Blue Play for `plan`; waits out any one-time asynchronous check.
+    fn blue_play(plan: &LaunchPlan) -> GamerPlayAction {
+        for _ in 0..200 {
+            let action = gamer_play_action(&blue_input(plan));
+            let checking = matches!(
+                &action,
+                GamerPlayAction::BlockedTyped(blocker)
+                    if blocker.kind == GamerBlockerKind::CheckingGame
+            );
+            if !checking {
+                return action;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("the check never completed")
+    }
+
+    fn blue_request(plan: &LaunchPlan) -> Request {
+        let GamerPlayAction::Launch(request) = blue_play(plan) else {
+            panic!("Blue Play must offer the Stella launch")
+        };
+        let TypedLaunchRequest::Standalone(StandaloneLaunchRequest::Stella(request)) = *request
+        else {
+            panic!("not a Stella request")
+        };
+        request
+    }
+
+    #[test]
+    fn a_ready_cartridge_reaches_blue_play_with_the_local_identity_caveat() {
+        let (_dir, _roots, plan, _candidate) = fixture(0);
+        let GamerPlayAction::Launch(request) = blue_play(&plan) else {
+            panic!("Blue Play must offer the Stella launch")
+        };
+        assert!(matches!(
+            *request,
+            TypedLaunchRequest::Standalone(StandaloneLaunchRequest::Stella(_))
+        ));
+        assert_eq!(request.adapter_name(), "Stella");
+        assert_eq!(
+            request.unverified_status_label(),
+            "Ready, local launch identity"
+        );
+        assert!(
+            request
+                .unverified_warnings()
+                .iter()
+                .any(|line| line.contains("not a DAT check"))
+        );
+    }
+
+    #[test]
+    fn blue_play_refuses_archives_unready_candidates_and_missing_or_wrong_identity() {
+        let (_dir, _roots, plan, _candidate) = fixture(0);
+        let mut archive = plan.clone();
+        archive.candidates[0].content.container = Some(LaunchContainerKind::Archive);
+        let mut blocked = plan.clone();
+        blocked.candidates[0].readiness = LaunchReadiness::Blocked;
+        let mut warned = plan.clone();
+        warned.candidates[0].warnings = vec![archivefs_core::launch::LaunchWarning::new(
+            archivefs_core::launch::LaunchWarningKind::FirmwarePresentUnverified,
+            "test warning",
+        )];
+        let mut keyless = plan.clone();
+        keyless.game_key = None;
+        let mut wrong_platform = plan.clone();
+        wrong_platform.platform_id = Some("N64".into());
+        let mut wrong_adapter = plan.clone();
+        wrong_adapter.candidates[0].target = LaunchTarget::Standalone {
+            adapter_id: "desmume",
+            profile_id: "x".into(),
+            profile_path: None,
+        };
+        for refused in [
+            archive,
+            blocked,
+            warned,
+            keyless,
+            wrong_platform,
+            wrong_adapter,
+        ] {
+            let action = blue_play(&refused);
+            assert!(
+                !matches!(
+                    &action,
+                    GamerPlayAction::Launch(request)
+                        if matches!(**request, TypedLaunchRequest::Standalone(StandaloneLaunchRequest::Stella(_)))
+                ),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blue_built_request_runs_exits_relaunches_and_refuses_changed_files() {
+        for code in [0, 7] {
+            let (_dir, roots, plan, candidate) = fixture(code);
+            let request = blue_request(&plan);
+            let path = candidate.content.resolved_path.clone().unwrap();
+            let before = std::fs::read(&path).unwrap();
+            // Play, then relaunch from a clone of the same request: each start
+            // rediscovers the emulator and rechecks the file.
+            for _ in 0..2 {
+                let mut process = request.clone().execute_with_roots(roots.clone()).unwrap();
+                let report = loop {
+                    if let Some(report) = process.poll() {
+                        break report;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                };
+                assert_eq!(report.status.as_ref().unwrap().code(), Some(code));
+                assert_eq!(exit_failure(report).is_some(), code != 0);
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before, "game untouched");
+            // A change after Play was offered is refused at click time.
+            std::fs::write(&path, b"different bytes").unwrap();
+            assert!(request.execute_with_roots(roots).is_err());
+        }
+    }
+
+    #[test]
+    fn a_missing_emulator_is_refused_at_click_time() {
+        let (_dir, mut roots, plan, _candidate) = fixture(0);
+        let request = blue_request(&plan);
+        roots.explicit_executables.clear();
+        assert!(request.execute_with_roots(roots).is_err());
     }
 }
