@@ -421,6 +421,13 @@ impl NativeWorkflows {
         self.poll_discovery_import_undo(context);
         crate::pcsx2_page::poll_save_vault(context);
         self.poll_native_repairs(context);
+        let emulator_running = self.app.launch_dolphin.is_active()
+            || self.app.launch_pcsx2.is_active()
+            || self.app.launch_standalone.is_active();
+        self.app
+            .emulator_readiness
+            .emulator_inventory_page
+            .sync_blue(emulator_running);
 
         let changed = self.app.launch_retroarch.poll()
             | self.app.launch_dolphin.poll()

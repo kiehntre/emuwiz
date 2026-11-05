@@ -434,7 +434,7 @@ fn a_worker_that_dies_is_reported_and_records_are_re_read() {
 fn an_emuwiz_tracked_running_emulator_blocks_update_and_undo() {
     let dir = tempfile::tempdir().unwrap();
     let (mut page, installation) = fixture_page(dir.path(), Fixture::ok());
-    page.tracked_running = true;
+    page.set_tracked(true);
     review(&mut page, &installation);
     assert_eq!(
         page.review.as_ref().unwrap().plan.eligibility,
@@ -447,13 +447,13 @@ fn an_emuwiz_tracked_running_emulator_blocks_update_and_undo() {
 
     // The flag is re-read at apply time: a preview opened while stopped is still
     // refused by the worker if the emulator is running when Apply is pressed.
-    page.tracked_running = false;
+    page.set_tracked(false);
     review(&mut page, &installation);
     page.confirmation = "UPDATE DOLPHIN".into();
     page.start_apply(&egui::Context::default());
     settle(&mut page);
     assert_eq!(exe(dir.path()), NEW_BYTES);
-    page.tracked_running = true;
+    page.set_tracked(true);
     page.rollback_confirmation = "ROLL BACK DOLPHIN".into();
     page.start_undo(&egui::Context::default());
     settle(&mut page);
@@ -475,4 +475,89 @@ fn a_new_check_discards_the_old_preview_and_confirmation() {
     page.start_apply(&ctx);
     assert!(!page.blue_busy());
     assert_eq!(exe(dir.path()), b"old emulator");
+}
+
+#[test]
+fn a_launch_during_the_download_is_seen_by_the_final_check() {
+    // The worker reads the live flag when each quiescence check runs, not the
+    // value from when Apply was pressed.
+    struct LaunchesMidDownload(Arc<AtomicBool>);
+    impl UpdateDownloader for LaunchesMidDownload {
+        fn download(
+            &mut self,
+            _: &str,
+            out: &mut std::fs::File,
+        ) -> Result<(), UpdateExecutionError> {
+            use std::io::Write;
+            self.0.store(true, Ordering::SeqCst); // the user launches an emulator now
+            out.write_all(NEW_BYTES)
+                .map_err(|e| UpdateExecutionError::Io(e.to_string()))
+        }
+    }
+    struct Racing(Fixture, Arc<AtomicBool>);
+    impl UpdateBackend for Racing {
+        fn check(&self, i: &[EmulatorInstallation]) -> UpdateReport {
+            self.0.check(i)
+        }
+        fn artifact(
+            &self,
+            i: &EmulatorInstallation,
+            u: &UpdateResult,
+        ) -> Result<UpdateArtifact, String> {
+            self.0.artifact(i, u)
+        }
+        fn downloader(&self) -> Box<dyn UpdateDownloader + Send> {
+            Box::new(LaunchesMidDownload(self.1.clone()))
+        }
+        fn apply_quiescence(&self, t: bool, e: &Path) -> QuiescenceEvidence {
+            self.0.apply_quiescence(t, e)
+        }
+        fn journal_quiescence(&self, t: bool, j: &UpdateJournal) -> QuiescenceEvidence {
+            self.0.journal_quiescence(t, j)
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (mut page, installation) = fixture_page(dir.path(), Fixture::ok());
+    page.blue.backend = Some(Arc::new(Racing(Fixture::ok(), page.blue.tracked.clone())));
+    review(&mut page, &installation);
+    page.confirmation = "UPDATE DOLPHIN".into();
+    page.start_apply(&egui::Context::default());
+    settle(&mut page);
+    assert_eq!(
+        exe(dir.path()),
+        b"old emulator",
+        "refused before the executable moved"
+    );
+    assert!(page.error.is_some());
+}
+
+#[test]
+fn a_typed_undo_phrase_does_not_survive_a_new_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut page, installation) = fixture_page(dir.path(), Fixture::ok());
+    page.rollback_confirmation = "ROLL BACK DOLPHIN".into();
+    review(&mut page, &installation);
+    page.confirmation = "UPDATE DOLPHIN".into();
+    page.start_apply(&egui::Context::default());
+    settle(&mut page);
+    assert!(page.review_journal.is_some());
+    assert!(page.rollback_confirmation.is_empty());
+}
+
+#[test]
+fn a_check_worker_that_dies_says_nothing_changed() {
+    let (mut page, _) = fixture_page(tempfile::tempdir().unwrap().path(), Fixture::ok());
+    page.spawn(
+        &egui::Context::default(),
+        PathBuf::new(),
+        "Checking…",
+        |_| panic!("synthetic"),
+    );
+    settle(&mut page);
+    assert!(
+        page.error
+            .as_deref()
+            .unwrap()
+            .contains("Nothing was changed")
+    );
 }

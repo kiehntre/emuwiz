@@ -23,6 +23,7 @@ use archivefs_core::emulator_update::{
 };
 use eframe::egui;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 /// Everything that touches the network or the process table.  The live
@@ -117,6 +118,10 @@ struct Job {
 #[derive(Default)]
 pub(super) struct BlueUpdateState {
     job: Option<Job>,
+    /// Live "an EmuWiz-launched emulator is running" flag.  Written every frame
+    /// by the app and read by the worker at the moment each quiescence check
+    /// runs, so a launch started during a long download is still seen.
+    tracked: Arc<AtomicBool>,
     backend: Option<Arc<dyn UpdateBackend>>,
 }
 
@@ -137,6 +142,18 @@ impl EmulatorInventoryPageState {
             .backend
             .clone()
             .unwrap_or_else(|| Arc::new(LiveBackend))
+    }
+
+    /// Per-frame hook from the app: keeps the live running flag current and
+    /// collects any finished operation even when the page is not on screen.
+    pub(crate) fn sync_blue(&mut self, emulator_running: bool) {
+        self.set_tracked(emulator_running);
+        self.poll_blue();
+    }
+
+    fn set_tracked(&mut self, running: bool) {
+        self.tracked_running = running;
+        self.blue.tracked.store(running, Ordering::SeqCst);
     }
 
     pub(crate) fn blue_busy(&self) -> bool {
@@ -174,6 +191,15 @@ impl EmulatorInventoryPageState {
                 // The worker died without reporting: the disk may have changed.
                 let root = job.root.clone();
                 self.blue.job = None;
+                if root.as_os_str().is_empty() {
+                    // A read-only Check owns no installation: nothing on disk
+                    // can have changed.
+                    self.error = Some(
+                        "The update check stopped unexpectedly. Nothing was changed; try again."
+                            .into(),
+                    );
+                    return false;
+                }
                 self.reload_after_failed_operation(&root);
                 self.feedback = None;
                 self.error = Some(
@@ -237,7 +263,7 @@ impl EmulatorInventoryPageState {
         update: UpdateResult,
     ) {
         let backend = self.backend();
-        let tracked = self.tracked_running;
+        let tracked = self.blue.tracked.clone();
         let root = installation.installation_root.clone();
         self.spawn(
             ctx,
@@ -248,7 +274,10 @@ impl EmulatorInventoryPageState {
                     Ok(artifact) => artifact,
                     Err(error) => return JobDone::Prepared(Err(error)),
                 };
-                let evidence = backend.apply_quiescence(tracked, &installation.executable_path);
+                let evidence = backend.apply_quiescence(
+                    tracked.load(Ordering::SeqCst),
+                    &installation.executable_path,
+                );
                 let plan = plan_staged_update(&installation, &update, artifact, evidence);
                 JobDone::Prepared(Ok(Box::new(UpdateReview {
                     installation,
@@ -273,7 +302,7 @@ impl EmulatorInventoryPageState {
             return;
         }
         let backend = self.backend();
-        let tracked = self.tracked_running;
+        let tracked = self.blue.tracked.clone();
         let root = review.installation.installation_root.clone();
         self.error = None;
         self.spawn(
@@ -286,7 +315,7 @@ impl EmulatorInventoryPageState {
                     let backend = backend.clone();
                     // Re-evaluated at apply time and again by the core right
                     // before the executable moves.
-                    move || backend.apply_quiescence(tracked, &target)
+                    move || backend.apply_quiescence(tracked.load(Ordering::SeqCst), &target)
                 };
                 let mut downloader = PhaseDownloader {
                     inner: backend.downloader(),
@@ -313,7 +342,7 @@ impl EmulatorInventoryPageState {
             return;
         }
         let backend = self.backend();
-        let tracked = self.tracked_running;
+        let tracked = self.blue.tracked.clone();
         let root = journal
             .target_path
             .parent()
@@ -327,7 +356,7 @@ impl EmulatorInventoryPageState {
             move |_| {
                 let probe = journal.clone();
                 let result =
-                    rollback_staged_update(&journal, move || backend.journal_quiescence(tracked, &probe));
+                    rollback_staged_update(&journal, move || backend.journal_quiescence(tracked.load(Ordering::SeqCst), &probe));
                 JobDone::RolledBack(journal, result)
             },
         );
@@ -335,7 +364,7 @@ impl EmulatorInventoryPageState {
 
     fn start_recover(&mut self, ctx: &egui::Context, record: PathBuf, journal: UpdateJournal) {
         let backend = self.backend();
-        let tracked = self.tracked_running;
+        let tracked = self.blue.tracked.clone();
         let root = journal
             .target_path
             .parent()
@@ -347,7 +376,7 @@ impl EmulatorInventoryPageState {
             "Reconciling the interrupted update from file hashes…",
             move |_| {
                 JobDone::Recovered(recover_update(&record, move || {
-                    backend.journal_quiescence(tracked, &journal)
+                    backend.journal_quiescence(tracked.load(Ordering::SeqCst), &journal)
                 }))
             },
         );
@@ -356,7 +385,7 @@ impl EmulatorInventoryPageState {
     /// Blue's "Emulator updates" panel.  Returns nothing; all effects go through
     /// the shared state and the background worker.
     pub(crate) fn show_blue(&mut self, ui: &mut egui::Ui, emulator_running: bool) {
-        self.tracked_running = emulator_running;
+        self.set_tracked(emulator_running);
         let busy = self.poll_blue();
         let ctx = ui.ctx().clone();
         let mut intent = None;

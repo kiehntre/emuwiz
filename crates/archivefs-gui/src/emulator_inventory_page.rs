@@ -173,6 +173,8 @@ impl EmulatorInventoryPageState {
                 ));
                 self.review = None;
                 self.confirmation.clear();
+                // A phrase typed for an earlier Undo must not arm the new one.
+                self.rollback_confirmation.clear();
                 self.refresh();
                 self.update_report = None;
                 self.review_journal = actionable_undo(&self.records, &journal.target_path);
