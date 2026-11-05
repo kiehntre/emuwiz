@@ -122,7 +122,7 @@ pub fn select_zip_cartridge_member(
             && !name_raw.contains(&0)
             && !name_raw.contains(&b'\\')
             // `enclosed_name` treats a leading `/` as relative, so an
-            // absolute name is refused explicitly (the one change from #333).
+            // absolute name is refused explicitly (a fix relative to #333).
             && !name_raw.starts_with(b"/")
             // `enclosed_name` also ignores a Windows drive prefix (`C:x`).
             && !name_raw.contains(&b':')
@@ -131,7 +131,7 @@ pub fn select_zip_cartridge_member(
         if !name_ok {
             return Err((
                 IdentityStatus::Invalid,
-                ("ZIP contains an absolute, traversing, over-long or non-UTF-8 member name")
+                ("ZIP contains an empty, absolute, drive-prefixed, traversing, over-long, NUL, backslash or non-UTF-8 member name")
                     .to_string(),
             ));
         }
