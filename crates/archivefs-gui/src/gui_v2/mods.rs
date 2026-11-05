@@ -938,7 +938,13 @@ mod tests {
         let mut workflows = NativeWorkflows::new(context.clone());
         let output = context.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show_mods_page(ui, &mut state, None, &mut workflows, &mut Activity::default());
+                show_mods_page(
+                    ui,
+                    &mut state,
+                    None,
+                    &mut workflows,
+                    &mut Activity::default(),
+                );
             });
         });
         let text = output
@@ -951,7 +957,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Texture packs"), "{text}");
-        assert!(text.contains("Choose a game before looking at texture packs"), "{text}");
+        assert!(
+            text.contains("Choose a game before looking at texture packs"),
+            "{text}"
+        );
         assert!(workflows.app.cheat_workflow.is_none());
     }
 
