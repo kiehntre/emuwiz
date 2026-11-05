@@ -59,7 +59,12 @@ impl DirectorySaveBinding {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmulatorQuiescence {
     Closed,
+    /// Process evidence of the emulator itself (executable, arguments,
+    /// launch route or app scope).
     Running,
+    /// Some program has the save open (kernel lease refused or broken, or a
+    /// visible non-emulator holder); which program is not established.
+    CardInUse,
     Unknown,
 }
 
@@ -438,14 +443,20 @@ pub(crate) fn augment_plan(plan: &mut TreeRestorePlan, binding: DirectorySaveBin
 fn requirement(state: EmulatorQuiescence) -> SaveQuiescenceRequirement {
     match state {
         EmulatorQuiescence::Closed => SaveQuiescenceRequirement::ConfirmedClosed,
-        EmulatorQuiescence::Running => SaveQuiescenceRequirement::Running,
+        // Refused like a running emulator; this generic path has no
+        // separate in-use requirement.
+        EmulatorQuiescence::Running | EmulatorQuiescence::CardInUse => {
+            SaveQuiescenceRequirement::Running
+        }
         EmulatorQuiescence::Unknown => SaveQuiescenceRequirement::Unknown,
     }
 }
 fn check_quiescence(state: EmulatorQuiescence) -> Result<(), TreeRestoreError> {
     match state {
         EmulatorQuiescence::Closed => Ok(()),
-        EmulatorQuiescence::Running => Err(refused(TreeRestoreRefusal::EmulatorRunning)),
+        EmulatorQuiescence::Running | EmulatorQuiescence::CardInUse => {
+            Err(refused(TreeRestoreRefusal::EmulatorRunning))
+        }
         EmulatorQuiescence::Unknown => Err(refused(TreeRestoreRefusal::EmulatorStateUnknown)),
     }
 }

@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::pcsx2_page::ps2_inventory_fixture;
+use archivefs_core::save_snapshots::create_snapshot;
 use archivefs_core::{
     memory_card_inventory::restore_guard::{
         Ps2RecoveryOutcome, Ps2RestorePhase, load_ps2_restore_journal,
@@ -516,6 +517,25 @@ fn a_parked_record_blocks_only_its_own_physical_card() {
         !blocked(&world, 4),
         "another card's parked record does not block"
     );
+}
+
+#[test]
+fn a_card_held_by_another_program_is_reported_as_in_use_not_as_pcsx2() {
+    // Kernel evidence (lease refused): some program has the card open.
+    let world = World::new();
+    let holder = fs::File::open(&world.card).unwrap();
+    let error = create_card_snapshot(&world.snapshots, &world.location, &CLOSED).unwrap_err();
+    drop(holder);
+    assert!(error.starts_with(crate::pcsx2_page::CARD_IN_USE), "{error}");
+    assert!(!error.contains("PCSX2 is running"), "{error}");
+    // Process evidence of PCSX2 is still reported as PCSX2.
+    let error = create_card_snapshot(
+        &world.snapshots,
+        &world.location,
+        &Observed(EmulatorQuiescence::Running),
+    )
+    .unwrap_err();
+    assert!(error.starts_with("PCSX2 is running"), "{error}");
 }
 
 mod records_storage;

@@ -975,6 +975,10 @@ fn show_export_dialog(ui: &mut egui::Ui) {
     }
 }
 
+/// Shown when the kernel reports that some program has the card open. Says
+/// nothing about which program: only process evidence says "PCSX2 is running".
+pub(crate) const CARD_IN_USE: &str = "Memory card is in use. Another application may have it open. Close applications accessing this card and try again.";
+
 pub(crate) fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
     match error {
         Ps2PsuRestoreError::ExistingSave(name) => {
@@ -1011,8 +1015,9 @@ pub(crate) fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
         Ps2PsuRestoreError::InvalidPlan(detail) => format!("Restore was refused: {detail}"),
         Ps2PsuRestoreError::Io(detail) => format!("Restore could not be completed: {detail}"),
         Ps2PsuRestoreError::EmulatorRunning => {
-            "A PS2 emulator is running or has this memory card open. Close it completely, then try again. The card was not changed.".into()
+            "A PS2 emulator (PCSX2) is running. Close it completely, then try again. The card was not changed.".into()
         }
+        Ps2PsuRestoreError::CardInUse => format!("{CARD_IN_USE} The card was not changed."),
         Ps2PsuRestoreError::EmulatorStateUnknown => {
             "EmuWiz could not inspect every live process, so it did not change the card. Close the emulator and inaccessible processes or correct /proc permissions, then retry.".into()
         }
@@ -1446,6 +1451,20 @@ mod tests {
         assert!(rollback.contains("/tmp/backup.card") && rollback.contains("AND"));
         let running = psu_restore_error_message(&Ps2PsuRestoreError::EmulatorRunning);
         assert!(running.contains("not changed"));
+    }
+
+    #[test]
+    fn card_in_use_never_claims_that_pcsx2_is_running() {
+        let in_use = psu_restore_error_message(&Ps2PsuRestoreError::CardInUse);
+        assert!(in_use.starts_with(CARD_IN_USE), "{in_use}");
+        assert!(in_use.contains("not changed"));
+        assert!(
+            !in_use.contains("PCSX2") && !in_use.contains("emulator"),
+            "{in_use}"
+        );
+        let running = psu_restore_error_message(&Ps2PsuRestoreError::EmulatorRunning);
+        assert!(running.contains("PCSX2") && running.contains("is running"));
+        assert!(!running.contains("in use"), "{running}");
     }
 
     fn empty_inspection() -> Pcsx2GameInspection {

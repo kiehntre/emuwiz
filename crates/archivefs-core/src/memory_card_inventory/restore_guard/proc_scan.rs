@@ -9,10 +9,13 @@
 //! A process whose descriptor table cannot be read (another user, root, a
 //! container, a non-dumpable process) makes the result `Unknown`. The one
 //! exception is a scan made while the caller holds a kernel lease on the card
-//! (`observe_under_card_lease`): then the question that process's
-//! descriptors would answer, "does anything have the card open for
-//! writing?", is answered by the kernel for every process instead, and the
-//! process is reported as covered by the lease. That says nothing about what
+//! (`observe_under_card_lease`): the lease was granted only while no other
+//! descriptor at all was open on the card (readers included), and it breaks
+//! on any later open for writing. So the question that process's descriptors
+//! would answer is answered by the kernel for every process instead, and the
+//! process is reported as covered by the lease. A read-only open made after
+//! the lease was granted is not seen; it cannot change the card, and a later
+//! open for writing breaks the lease. That says nothing about what
 //! the process is. It is only sound because the card operations hold the
 //! lease across their whole publication window and reverse the exchange if
 //! it breaks (see `card_lease` and `restore_guard`). A broken lease reports
@@ -214,11 +217,12 @@ impl ProcScanQuiescence {
         }
         report.unreadable_processes.sort_unstable();
         report.covered_by_lease.sort_unstable();
-        report.state = if !report.card_holders.is_empty()
-            || !report.emulator_processes.is_empty()
-            || report.card_open_for_writing
-        {
+        // "Running" only on emulator identity; holders and lease breaks say
+        // that some program has the card, not which.
+        report.state = if !report.emulator_processes.is_empty() {
             EmulatorQuiescence::Running
+        } else if !report.card_holders.is_empty() || report.card_open_for_writing {
+            EmulatorQuiescence::CardInUse
         } else if report.listing_unavailable || !report.unreadable_processes.is_empty() {
             EmulatorQuiescence::Unknown
         } else {

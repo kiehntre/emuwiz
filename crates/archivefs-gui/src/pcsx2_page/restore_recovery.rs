@@ -193,11 +193,17 @@ fn show_in(ui: &mut egui::Ui, advanced_mode: bool, dir: &Path) {
     }
 }
 
+/// Early refusal with a readable explanation. Core repeats the check under
+/// kernel leases held across publication, so this only needs the same
+/// lease-backed observation (`observe_card_now`), never the strict scan alone.
 pub(super) fn process_gate(card: &Path, save: &str) -> Result<(), Ps2PsuRestoreError> {
-    let report = ProcScanQuiescence::new().report(&ps2_card_binding(card, save));
-    if report.state
-        == archivefs_core::save_snapshots::tree_restore::safety::EmulatorQuiescence::Unknown
+    let observer = ProcScanQuiescence::new();
+    let binding = ps2_card_binding(card, save);
+    if archivefs_core::memory_card_inventory::restore_guard::observe_card_now(
+        &observer, &binding, card,
+    ) == archivefs_core::save_snapshots::tree_restore::safety::EmulatorQuiescence::Unknown
     {
+        let report = observer.report(&binding);
         return Err(Ps2PsuRestoreError::RecoveryRequired(format!(
             "Process inspection is incomplete. Unreadable live process IDs: {:?}. Close these processes or correct /proc access, then retry. The card was not changed.",
             report.unreadable_processes

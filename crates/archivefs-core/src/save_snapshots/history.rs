@@ -8,10 +8,11 @@
 
 use super::{
     EmulatorUseStatus, SaveLocation, SaveRestoreConflict, SaveRestorePlan, SaveSnapshot,
-    SaveSnapshotManifest, build_restore_plan, verify_snapshot,
+    SaveSnapshotError, SaveSnapshotManifest, SaveSnapshotRequest, build_restore_plan,
+    create_snapshot, create_snapshot_checked, verify_snapshot,
 };
 use crate::memory_card_inventory::restore_guard::{
-    ProcScanQuiescence, observe_card_now, ps2_card_binding,
+    CardLeaseAttempt, CardWriteLease, ProcScanQuiescence, observe_card_now, ps2_card_binding,
 };
 use crate::persistent_state_inventory::StateEmulator;
 use crate::save_snapshots::tree_restore::safety::{EmulatorQuiescence, QuiescenceProvider};
@@ -221,14 +222,10 @@ pub fn snapshot_closure_supported(emulator: StateEmulator) -> bool {
     emulator == StateEmulator::Pcsx2
 }
 
-/// Emulator-use evidence for snapshot creation of `save_path`.
-/// `NotDetected` only when the reviewed observer reports `Closed`.
-///
-/// Observed under a kernel lease held for the observation (see
-/// `observe_card_now`): the snapshot only reads the card, and
-/// `create_snapshot` refuses with `SourceChanged` if its size or modification
-/// time changes while it is copied, so a later writer cannot yield a torn
-/// snapshot that is kept.
+/// Emulator-use evidence for `save_path`, for showing before a snapshot.
+/// `NotDetected` only when the reviewed observer reports `Closed`. Observed
+/// under a kernel lease held for this check only (see `observe_card_now`).
+/// Creating the snapshot re-checks with [`create_snapshot_observed`].
 pub fn snapshot_emulator_use(
     emulator: StateEmulator,
     save_path: &Path,
@@ -244,7 +241,59 @@ pub fn snapshot_emulator_use(
     ) {
         EmulatorQuiescence::Closed => EmulatorUseStatus::NotDetected,
         EmulatorQuiescence::Running => EmulatorUseStatus::Running,
+        EmulatorQuiescence::CardInUse => EmulatorUseStatus::CardInUse,
         EmulatorQuiescence::Unknown => EmulatorUseStatus::Unknown,
+    }
+}
+
+fn emulator_use(state: EmulatorQuiescence) -> EmulatorUseStatus {
+    match state {
+        EmulatorQuiescence::Closed => EmulatorUseStatus::NotDetected,
+        EmulatorQuiescence::Running => EmulatorUseStatus::Running,
+        EmulatorQuiescence::CardInUse => EmulatorUseStatus::CardInUse,
+        EmulatorQuiescence::Unknown => EmulatorUseStatus::Unknown,
+    }
+}
+
+/// Check emulator use now and create the snapshot (`request.emulator_use` is
+/// replaced). For a PCSX2 card file on a lease-capable local filesystem, a
+/// kernel lease is held from the check through the copy, and the snapshot is
+/// published only if no program opened the card for writing meanwhile. So a
+/// torn copy is never kept, whatever the card's timestamps say. Without lease
+/// support the strict process scan decides and the copy relies on
+/// `create_snapshot`'s size and modification-time recheck, as before.
+pub fn create_snapshot_observed(
+    emulator: StateEmulator,
+    mut request: SaveSnapshotRequest,
+    observer: &dyn QuiescenceProvider,
+) -> Result<SaveSnapshot, SaveSnapshotError> {
+    if !snapshot_closure_supported(emulator) {
+        request.emulator_use = EmulatorUseStatus::Unknown;
+        return create_snapshot(&request);
+    }
+    let path = request.location.path.clone();
+    let binding = ps2_card_binding(&path, "save snapshot");
+    match CardWriteLease::acquire(&path, None) {
+        CardLeaseAttempt::Held(lease) => {
+            request.emulator_use =
+                emulator_use(observer.observe_under_card_lease(&binding, &lease));
+            create_snapshot_checked(&request, &|| lease.intact()).map_err(|error| {
+                // A program opened the card for writing during the copy.
+                if matches!(error, SaveSnapshotError::SourceChanged(_)) && !lease.intact() {
+                    SaveSnapshotError::CardInUse
+                } else {
+                    error
+                }
+            })
+        }
+        CardLeaseAttempt::Writers => {
+            request.emulator_use = EmulatorUseStatus::CardInUse;
+            create_snapshot(&request)
+        }
+        CardLeaseAttempt::Changed | CardLeaseAttempt::Unavailable => {
+            request.emulator_use = emulator_use(observer.observe(&binding));
+            create_snapshot(&request)
+        }
     }
 }
 

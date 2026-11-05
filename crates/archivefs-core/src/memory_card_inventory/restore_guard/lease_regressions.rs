@@ -143,7 +143,7 @@ fn a_writer_arriving_during_the_scan_breaks_the_lease() {
     drop(held);
     release.join().unwrap().join().unwrap().unwrap();
     assert!(report.card_open_for_writing);
-    assert_eq!(report.state, EmulatorQuiescence::Running);
+    assert_eq!(report.state, EmulatorQuiescence::CardInUse);
     assert!(
         report.covered_by_lease.is_empty(),
         "nothing covered once broken"
@@ -237,11 +237,11 @@ fn the_kernel_refuses_a_lease_while_any_writer_or_writable_mapping_exists() {
     ));
     assert_eq!(
         observe_card_now(&scan, &binding(&world), &world.card),
-        EmulatorQuiescence::Running
+        EmulatorQuiescence::CardInUse
     );
     assert!(matches!(
         apply_ps2_psu_restore_guarded(&world.plan(), &scan, &world.options()),
-        Err(Ps2PsuRestoreError::EmulatorRunning)
+        Err(Ps2PsuRestoreError::CardInUse)
     ));
     assert_eq!(world.card_bytes(), world.original);
     // A writable shared mapping outlives its descriptor and still counts.
@@ -271,7 +271,178 @@ fn the_kernel_refuses_a_lease_while_any_writer_or_writable_mapping_exists() {
     ));
 }
 
+#[test]
+fn leases_are_trusted_only_on_local_filesystems_that_cannot_be_bypassed() {
+    for magic in [
+        0xEF53_i64,
+        0x5846_5342,
+        0x9123_683E,
+        0xF2F5_2010,
+        0x0102_1994,
+    ] {
+        assert!(card_lease::lease_trusted_filesystem(magic), "{magic:#x}");
+    }
+    // FUSE (mergerfs, rclone), overlayfs, NFS, SMB/CIFS, 9p, ecryptfs.
+    for magic in [
+        0x6573_5546_i64,
+        0x794C_7630,
+        0x6969,
+        0xFF53_4D42,
+        0xFE53_4D42,
+        0x0102_1997,
+        0xF15F,
+    ] {
+        assert!(!card_lease::lease_trusted_filesystem(magic), "{magic:#x}");
+    }
+    // A hard-linked card is never leased (the strict scan decides).
+    let world = World::new();
+    fs::hard_link(&world.card, world.dir.path().join("alias.ps2")).unwrap();
+    assert!(matches!(
+        CardWriteLease::acquire(&world.card, None),
+        CardLeaseAttempt::Unavailable
+    ));
+}
+
+#[test]
+fn a_read_only_holder_the_scan_cannot_see_is_refused() {
+    // The exclusive probe sees every descriptor, readers included.
+    let world = World::new();
+    let proc = uninspectable(&[("993", "sshd", "sshd")]);
+    let scan = ProcScanQuiescence::with_root(proc.path().to_path_buf());
+    let reader = fs::File::open(&world.card).unwrap();
+    assert!(matches!(
+        CardWriteLease::acquire(&world.card, None),
+        CardLeaseAttempt::Writers
+    ));
+    assert_eq!(
+        observe_card_now(&scan, &binding(&world), &world.card),
+        EmulatorQuiescence::CardInUse
+    );
+    assert!(matches!(
+        apply_ps2_psu_restore_guarded(&world.plan(), &scan, &world.options()),
+        Err(Ps2PsuRestoreError::CardInUse)
+    ));
+    drop(reader);
+    assert_eq!(world.card_bytes(), world.original);
+}
+
 // ------------------------------------------- the whole publication window
+
+#[test]
+fn a_descriptor_on_the_staged_replacement_refuses_publication() {
+    let world = World::new();
+    let proc = uninspectable(&[("993", "sshd", "sshd")]);
+    let scan = ProcScanQuiescence::with_root(proc.path().to_path_buf());
+    let holder = RefCell::new(None);
+    let hook = |step: Ps2RestoreStep| {
+        if step == Ps2RestoreStep::AfterStaged {
+            *holder.borrow_mut() = Some(
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(stage_path(&world))
+                    .unwrap(),
+            );
+        }
+        Ok(())
+    };
+    let result = apply_with_hook(&world.plan(), &scan, &world.options(), &hook);
+    drop(holder.take());
+    assert!(
+        matches!(result, Err(Ps2PsuRestoreError::CardInUse)),
+        "{result:?}"
+    );
+    assert_eq!(world.card_bytes(), world.original);
+}
+
+#[test]
+fn a_late_opener_of_the_restored_card_during_the_reversal_keeps_its_file() {
+    // First a writer on the outgoing card forces a reversal; then, before
+    // the reversal exchange, another program opens the card path (the
+    // restored card). After the reversal it holds the restored card at the
+    // staging path: that file must be kept and the record parked.
+    let world = World::new();
+    let proc = uninspectable(&[("993", "sshd", "sshd")]);
+    let scan = ProcScanQuiescence::with_root(proc.path().to_path_buf());
+    let writers = RefCell::new(Vec::new());
+    let marked = RefCell::new(None);
+    let hook = |step: Ps2RestoreStep| {
+        match step {
+            Ps2RestoreStep::AfterRename => {
+                writers
+                    .borrow_mut()
+                    .push(competing_writer(stage_path(&world)));
+            }
+            Ps2RestoreStep::BeforeRollbackWrite => {
+                // Crash safety: the record is parked before reversing.
+                *marked.borrow_mut() = Some(only_journal(&world).phase);
+                writers
+                    .borrow_mut()
+                    .push(competing_writer(world.card.clone()));
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+    let result = apply_with_hook(&world.plan(), &scan, &world.options(), &hook);
+    assert!(
+        matches!(result, Err(Ps2PsuRestoreError::RecoveryRequired(_))),
+        "{result:?}"
+    );
+    assert_eq!(marked.take(), Some(Ps2RestorePhase::NeedsAttention));
+    let files: Vec<_> = writers
+        .take()
+        .into_iter()
+        .map(|w| w.join().unwrap())
+        .collect();
+    let journal = only_journal(&world);
+    assert_eq!(journal.phase, Ps2RestorePhase::NeedsAttention);
+    let staged = journal.staged_path.unwrap();
+    assert_eq!(world.card_bytes(), world.original, "card reversed");
+    assert_eq!(
+        inode_of(&files[0]),
+        fs::metadata(&world.card).unwrap().ino()
+    );
+    assert_eq!(
+        inode_of(&files[1]),
+        fs::metadata(&staged).unwrap().ino(),
+        "the late opener's file is kept, not deleted"
+    );
+}
+
+#[test]
+fn undo_with_writers_on_both_sides_keeps_both_cards() {
+    let world = World::new();
+    let proc = uninspectable(&[("993", "sshd", "sshd")]);
+    let scan = ProcScanQuiescence::with_root(proc.path().to_path_buf());
+    let applied = apply_ps2_psu_restore_guarded(&world.plan(), &scan, &world.options()).unwrap();
+    let restored = world.card_bytes();
+    let journal = load_ps2_restore_journal(&applied.journal_path).unwrap();
+    let writers = RefCell::new(Vec::new());
+    let hook = |step: Ps2RestoreStep| {
+        if step == Ps2RestoreStep::AfterUndoRename {
+            let temp = undo_temp_path(world.dir.path(), &journal.operation_id);
+            writers.borrow_mut().push(competing_writer(temp));
+            writers
+                .borrow_mut()
+                .push(competing_writer(world.card.clone()));
+        }
+        Ok(())
+    };
+    let result = undo_with_hook(&applied.journal_path, &scan, 2, &hook);
+    assert!(
+        matches!(result, Err(Ps2PsuRestoreError::RollbackFailed { .. })),
+        "{result:?}"
+    );
+    for writer in writers.take() {
+        writer.join().unwrap();
+    }
+    let after = load_ps2_restore_journal(&applied.journal_path).unwrap();
+    assert_eq!(after.phase, Ps2RestorePhase::UndoFailed);
+    let temp = undo_temp_path(world.dir.path(), &journal.operation_id);
+    assert_eq!(fs::read(&temp).unwrap(), restored, "restored card kept");
+    assert_eq!(world.card_bytes(), world.original);
+    assert_eq!(fs::read(&world.backup).unwrap(), world.original);
+}
 
 #[test]
 fn restore_and_undo_succeed_with_uninspectable_processes_under_the_lease() {
@@ -298,7 +469,7 @@ fn a_writer_opening_the_card_before_the_exchange_stops_the_restore() {
     };
     let result = apply_with_hook(&world.plan(), &scan, &world.options(), &hook);
     assert!(
-        matches!(result, Err(Ps2PsuRestoreError::EmulatorRunning)),
+        matches!(result, Err(Ps2PsuRestoreError::CardInUse)),
         "{result:?}"
     );
     let file = writer.take().unwrap().join().unwrap();
@@ -329,7 +500,7 @@ fn a_writer_holding_the_outgoing_card_across_the_exchange_reverses_it() {
     };
     let result = apply_with_hook(&world.plan(), &scan, &world.options(), &hook);
     assert!(
-        matches!(result, Err(Ps2PsuRestoreError::EmulatorRunning)),
+        matches!(result, Err(Ps2PsuRestoreError::CardInUse)),
         "{result:?}"
     );
     let mut file = writer.take().unwrap().join().unwrap();
@@ -419,7 +590,7 @@ fn undo_is_reversed_when_the_restored_card_was_opened_across_its_exchange() {
     };
     let result = undo_with_hook(&applied.journal_path, &scan, 2, &before);
     assert!(
-        matches!(result, Err(Ps2PsuRestoreError::EmulatorRunning)),
+        matches!(result, Err(Ps2PsuRestoreError::CardInUse)),
         "{result:?}"
     );
     drop(writer.take().unwrap().join().unwrap());
@@ -438,7 +609,7 @@ fn undo_is_reversed_when_the_restored_card_was_opened_across_its_exchange() {
     };
     let result = undo_with_hook(&applied.journal_path, &scan, 3, &after);
     assert!(
-        matches!(result, Err(Ps2PsuRestoreError::EmulatorRunning)),
+        matches!(result, Err(Ps2PsuRestoreError::CardInUse)),
         "{result:?}"
     );
     let file = writer.take().unwrap().join().unwrap();
@@ -572,11 +743,11 @@ fn real_proc_quiescence_acceptance() {
     writer.opened_inode();
     assert_eq!(
         observe_card_now(&observer, &binding(&world), &world.card),
-        EmulatorQuiescence::Running
+        EmulatorQuiescence::CardInUse
     );
     let result = apply_ps2_psu_restore_guarded(&world.plan(), &observer, &world.options());
     eprintln!("hidden writer holding the card: {result:?}");
-    assert!(matches!(result, Err(Ps2PsuRestoreError::EmulatorRunning)));
+    assert!(matches!(result, Err(Ps2PsuRestoreError::CardInUse)));
     assert_eq!(world.card_bytes(), world.original);
     drop(writer);
 
@@ -596,11 +767,22 @@ fn real_proc_quiescence_acceptance() {
     let result = apply_with_hook(&world.plan(), &observer, &world.options(), &hook);
     let opened = competitor.borrow_mut().opened_inode();
     eprintln!("hidden writer opening during publication: {result:?}");
-    assert!(matches!(result, Err(Ps2PsuRestoreError::EmulatorRunning)));
+    assert!(matches!(result, Err(Ps2PsuRestoreError::CardInUse)));
     assert_eq!(world.card_bytes(), world.original);
     assert_eq!(opened, fs::metadata(&world.card).unwrap().ino());
     assert_eq!(only_journal(&world).phase, Ps2RestorePhase::RolledBack);
     drop(competitor);
+
+    // A hidden process holding the card read-only.
+    let world = World::new();
+    let mut reader = HiddenProcess::spawn("card-reader");
+    reader.request_open("rb", &world.card);
+    reader.opened_inode();
+    let result = apply_ps2_psu_restore_guarded(&world.plan(), &observer, &world.options());
+    eprintln!("hidden read-only holder: {result:?}");
+    assert!(matches!(result, Err(Ps2PsuRestoreError::CardInUse)));
+    assert_eq!(world.card_bytes(), world.original);
+    drop(reader);
 
     // A hidden process named like PCSX2, not touching the card.
     let world = World::new();

@@ -8,6 +8,24 @@
 //! the break. The lease says nothing about which programs are running; it
 //! only proves that the inode was not opened for writing in the window.
 //!
+//! Before settling on the read lease, a write lease is taken on the same
+//! descriptor and immediately downgraded. A write lease is granted only while
+//! no other descriptor is open on the inode at all, readers included (with
+//! `CONFIG_IMA`, which tracks readers; Ubuntu kernels enable it). So at the
+//! moment of acquisition the kernel answers what a complete descriptor scan
+//! would: nobody else has the card open. From then on the read lease catches
+//! every new open for writing.
+//!
+//! Leases are trusted only on local filesystems where every write goes
+//! through the leased inode. FUSE (mergerfs, rclone), overlayfs and network
+//! filesystems can grant leases that writes through another path, a backing
+//! store or another host never break; there the strict process scan alone
+//! decides.
+//!
+//! A lease protects only for `fs.lease-break-time` (45 s by default) after a
+//! break; after that the kernel lets the opener proceed. The lease then reads
+//! as broken, and the operations' identity and SHA-256 checks report it.
+//!
 //! The card operations hold these leases across their whole publication
 //! window and only release them after any reversal (see `restore_guard`).
 use super::*;
@@ -27,21 +45,45 @@ pub struct CardWriteLease {
 }
 
 pub enum CardLeaseAttempt {
-    /// Nobody had the inode open for writing when the lease was granted.
+    /// Nobody else had the inode open at all when the lease was granted, and
+    /// no open for writing has happened since (check `intact`).
     Held(CardWriteLease),
-    /// The kernel refused: the inode is open for writing (or leased) now.
+    /// The kernel refused: another descriptor is open on the inode now (by
+    /// any process, including this one), or it is leased.
     Writers,
     /// The path no longer names the expected inode.
     Changed,
     /// No kernel evidence: not the owner, no lease support, leases
-    /// disabled, a link, or the break signal is not safe to receive.
+    /// disabled, a link, several hard links, a filesystem whose writes can
+    /// bypass the inode, or the break signal is not safe to receive.
     Unavailable,
+}
+
+/// Local filesystems on which every write to the card goes through the leased
+/// inode (`statfs` magic numbers, linux/magic.h).
+pub(super) fn lease_trusted_filesystem(magic: i64) -> bool {
+    const EXT2_3_4: i64 = 0xEF53;
+    const XFS: i64 = 0x5846_5342;
+    const BTRFS: i64 = 0x9123_683E;
+    const F2FS: i64 = 0xF2F5_2010;
+    const TMPFS: i64 = 0x0102_1994;
+    [EXT2_3_4, XFS, BTRFS, F2FS, TMPFS].contains(&magic)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: behave as on a system without lease support.
+    pub(super) static LEASES_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl CardWriteLease {
     /// Lease the regular file at `path`, never following a link. With
     /// `expected`, the opened inode must be that file.
     pub fn acquire(path: &Path, expected: Option<FileIdentity>) -> CardLeaseAttempt {
+        #[cfg(test)]
+        if LEASES_DISABLED.with(|disabled| disabled.get()) {
+            return CardLeaseAttempt::Unavailable;
+        }
         if !signal_is_default_or_ignored(LEASE_BREAK_SIGNAL) {
             return CardLeaseAttempt::Unavailable;
         }
@@ -64,7 +106,7 @@ impl CardWriteLease {
         let Ok(metadata) = file.metadata() else {
             return CardLeaseAttempt::Unavailable;
         };
-        if !metadata.is_file() {
+        if !metadata.is_file() || metadata.nlink() != 1 {
             return CardLeaseAttempt::Unavailable;
         }
         if let Some(expected) = expected
@@ -73,19 +115,35 @@ impl CardWriteLease {
             return CardLeaseAttempt::Changed;
         }
         let fd = file.as_raw_fd();
+        // SAFETY: statfs into zeroed storage for a descriptor we own.
+        let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(fd, &mut filesystem) } != 0
+            || !lease_trusted_filesystem(filesystem.f_type as i64)
+        {
+            return CardLeaseAttempt::Unavailable;
+        }
         // SAFETY: fcntl on a descriptor we own, with integer arguments.
         if unsafe { libc::fcntl(fd, F_SETSIG, LEASE_BREAK_SIGNAL) } != 0 {
             return CardLeaseAttempt::Unavailable;
         }
+        // Exclusive probe: granted only if no other descriptor is open.
         // SAFETY: as above.
-        if unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_RDLCK) } == 0 {
-            return CardLeaseAttempt::Held(Self { file });
+        if unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_WRLCK) } != 0 {
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EAGAIN) => CardLeaseAttempt::Writers,
+                // EACCES (not the owner), EINVAL (no lease support), ...
+                _ => CardLeaseAttempt::Unavailable,
+            };
         }
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::EAGAIN) => CardLeaseAttempt::Writers,
-            // EACCES (not the owner), EINVAL (no lease support), ...
-            _ => CardLeaseAttempt::Unavailable,
+        let lease = Self { file };
+        // Downgrade so that our own and others' reads proceed; any open for
+        // writing that raced the probe leaves an unlock pending, so the
+        // lease then reads as broken.
+        // SAFETY: as above.
+        if unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_RDLCK) } != 0 || !lease.intact() {
+            return CardLeaseAttempt::Writers;
         }
+        CardLeaseAttempt::Held(lease)
     }
 
     /// Still an unbroken read lease: nobody opened the inode for writing.
@@ -127,8 +185,17 @@ pub fn observe_card_now(
     card: &Path,
 ) -> EmulatorQuiescence {
     match CardWriteLease::acquire(card, None) {
-        CardLeaseAttempt::Held(lease) => quiescence.observe_under_card_lease(binding, &lease),
-        CardLeaseAttempt::Writers => EmulatorQuiescence::Running,
+        CardLeaseAttempt::Held(lease) => {
+            let state = quiescence.observe_under_card_lease(binding, &lease);
+            // Broken while observing: a program opened the card for writing,
+            // whatever the provider concluded (unless it saw the emulator).
+            if state != EmulatorQuiescence::Running && !lease.intact() {
+                EmulatorQuiescence::CardInUse
+            } else {
+                state
+            }
+        }
+        CardLeaseAttempt::Writers => EmulatorQuiescence::CardInUse,
         CardLeaseAttempt::Changed | CardLeaseAttempt::Unavailable => quiescence.observe(binding),
     }
 }

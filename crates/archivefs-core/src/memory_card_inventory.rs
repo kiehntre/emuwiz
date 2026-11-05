@@ -616,6 +616,9 @@ pub enum Ps2PsuRestoreError {
     Io(String),
     /// A PS2 emulator (or another process) has the card open or is running.
     EmulatorRunning,
+    /// Another program has the memory card open (kernel evidence); not
+    /// established to be an emulator.
+    CardInUse,
     /// Whether an emulator is using the card could not be established.
     EmulatorStateUnknown,
     UnsupportedAtomicExchange,
@@ -665,9 +668,10 @@ impl std::fmt::Display for Ps2PsuRestoreError {
                 "undo refused because the card changed after restore"
             ),
             Self::Io(detail) => write!(formatter, "PS2 restore I/O failed: {detail}"),
-            Self::EmulatorRunning => write!(
+            Self::EmulatorRunning => write!(formatter, "a PS2 emulator is running"),
+            Self::CardInUse => write!(
                 formatter,
-                "a PS2 emulator is running or has the memory card open"
+                "the memory card is open in another program; close programs using this card and try again"
             ),
             Self::UnsupportedAtomicExchange => write!(
                 formatter,

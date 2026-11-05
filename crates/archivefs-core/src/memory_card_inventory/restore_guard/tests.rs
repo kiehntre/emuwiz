@@ -306,18 +306,44 @@ fn an_in_place_edit_after_the_final_recheck_is_detected_and_kept() {
             let card = card.clone();
             *editor.borrow_mut() = Some(std::thread::spawn(move || flip(&card, 12_345)));
             let needle = format!(":{inode} ");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !fs::read_to_string("/proc/locks")
                 .unwrap_or_default()
                 .lines()
                 .any(|line| line.contains("BREAKING") && line.contains(&needle))
             {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the in-place edit never broke the publication lease"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
         Ok(())
     });
     editor.take().unwrap().join().unwrap();
-    assert_eq!(result.unwrap_err(), Ps2PsuRestoreError::EmulatorRunning);
+    assert_eq!(result.unwrap_err(), Ps2PsuRestoreError::CardInUse);
+    let mut expected = world.original.clone();
+    expected[12_345] ^= 0xff;
+    assert_eq!(world.card_bytes(), expected);
+    assert!(world.stray_temp_files().is_empty());
+}
+
+#[test]
+fn without_leases_an_in_place_edit_is_caught_by_the_exchange_checks() {
+    // Systems without lease support: the edit lands, and the post-exchange
+    // identity/SHA-256 checks reverse publication and keep the edit.
+    card_lease::LEASES_DISABLED.with(|disabled| disabled.set(true));
+    let world = World::new();
+    let card = world.card.clone();
+    let result = world.apply_hooked(&CLOSED, &|step| {
+        if step == Ps2RestoreStep::BeforeRename {
+            flip(&card, 12_345);
+        }
+        Ok(())
+    });
+    card_lease::LEASES_DISABLED.with(|disabled| disabled.set(false));
+    assert_eq!(result.unwrap_err(), Ps2PsuRestoreError::CardChanged);
     let mut expected = world.original.clone();
     expected[12_345] ^= 0xff;
     assert_eq!(world.card_bytes(), expected);
@@ -881,11 +907,12 @@ fn the_proc_detector_distinguishes_closed_running_and_unknown() {
             "{comm}"
         );
     }
-    // Any process holding this card open, whatever its name.
+    // Any process holding this card open, whatever its name: refused, and
+    // reported as the card being in use, not as the emulator running.
     let holder = fake_proc(&[("300", "someapp", "someapp", Some(&world.card))]);
     assert_eq!(
         observe(holder.path(), &world.card),
-        EmulatorQuiescence::Running
+        EmulatorQuiescence::CardInUse
     );
     // Unreadable or missing /proc: cannot say.
     assert_eq!(

@@ -34,8 +34,11 @@ use archivefs_core::{
     persistent_state_inventory::{PersistentStateRecord, PersistentStateType, StateEmulator},
     save_snapshots::{
         EmulatorUseStatus, SaveArtifactType, SaveLocation, SaveSnapshot, SaveSnapshotCompleteness,
-        SaveSnapshotError, SaveSnapshotRequest, create_snapshot,
-        history::{list_snapshots, nearest_existing_directory, snapshot_emulator_use},
+        SaveSnapshotError, SaveSnapshotRequest,
+        history::{
+            create_snapshot_observed, list_snapshots, nearest_existing_directory,
+            snapshot_emulator_use,
+        },
         tree_restore::safety::{FilesystemSpace, QuiescenceProvider, RestoreSpaceProvider},
         verify_snapshot,
     },
@@ -158,10 +161,11 @@ pub(super) fn create_card_snapshot(
     location: &SaveLocation,
     observer: &dyn QuiescenceProvider,
 ) -> Result<String, String> {
-    let emulator_use = snapshot_emulator_use(StateEmulator::Pcsx2, &location.path, observer);
     let available_space_bytes =
         nearest_existing_directory(root).and_then(|dir| FilesystemSpace.available_bytes(&dir).ok());
-    create_snapshot(&SaveSnapshotRequest {
+    create_snapshot_observed(
+        StateEmulator::Pcsx2,
+        SaveSnapshotRequest {
         location: location.clone(),
         game_identity: None,
         platform: Some("PS2".into()),
@@ -169,12 +173,18 @@ pub(super) fn create_card_snapshot(
         available_space_bytes,
         snapshot_id: None,
         now_unix_seconds: None,
-        emulator_use,
-    })
+            // Decided (under a card lease where possible) by Core.
+            emulator_use: EmulatorUseStatus::Unknown,
+        },
+        observer,
+    )
     .map(|snapshot| snapshot.manifest.snapshot_id)
     .map_err(|error| match error {
         SaveSnapshotError::EmulatorRunning => {
             "PCSX2 is running. Close it, then try again. Nothing was copied.".to_string()
+        }
+        SaveSnapshotError::CardInUse => {
+            format!("{} Nothing was copied.", crate::pcsx2_page::CARD_IN_USE)
         }
         SaveSnapshotError::EmulatorUseUnknown => {
             "EmuWiz could not confirm PCSX2 is closed, so nothing was copied.".to_string()

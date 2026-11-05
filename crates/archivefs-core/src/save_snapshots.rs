@@ -64,6 +64,8 @@ pub enum SaveProvenance {
 pub enum EmulatorUseStatus {
     NotDetected,
     Running,
+    /// Another program has the save open; not established to be the emulator.
+    CardInUse,
     Unknown,
 }
 
@@ -131,6 +133,7 @@ pub struct SaveSnapshotRequest {
 pub enum SaveSnapshotReadiness {
     Ready,
     EmulatorRunning,
+    CardInUse,
     EmulatorUseUnknown,
     SourceUnavailable,
     InsufficientSpace { available: u64, required: u64 },
@@ -149,6 +152,7 @@ pub enum SaveRestoreConflict {
     SnapshotUnreadable,
     EmulatorUseUnknown,
     EmulatorRunning,
+    CardInUse,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,11 +373,22 @@ impl From<SaveSnapshotError> for SaveRestoreError {
 
 #[derive(Debug)]
 pub enum SaveSnapshotError {
-    Io { path: PathBuf, detail: String },
-    InvalidPath { path: PathBuf, detail: String },
+    Io {
+        path: PathBuf,
+        detail: String,
+    },
+    InvalidPath {
+        path: PathBuf,
+        detail: String,
+    },
     SourceChanged(PathBuf),
-    InsufficientSpace { available: u64, required: u64 },
+    InsufficientSpace {
+        available: u64,
+        required: u64,
+    },
     EmulatorRunning,
+    /// Another program has the save open (kernel evidence).
+    CardInUse,
     EmulatorUseUnknown,
     TooManyFiles,
     TooLarge,
@@ -405,6 +420,10 @@ impl std::fmt::Display for SaveSnapshotError {
                 f,
                 "close the emulator before snapshotting or restoring this save"
             ),
+            Self::CardInUse => write!(
+                f,
+                "the memory card is open in another program; close programs using this card and try again"
+            ),
             Self::EmulatorUseUnknown => write!(
                 f,
                 "the emulator may still be using this save; close it before continuing"
@@ -432,6 +451,7 @@ pub fn assess_snapshot_readiness(
     }
     match emulator_use {
         EmulatorUseStatus::Running => SaveSnapshotReadiness::EmulatorRunning,
+        EmulatorUseStatus::CardInUse => SaveSnapshotReadiness::CardInUse,
         EmulatorUseStatus::Unknown => SaveSnapshotReadiness::EmulatorUseUnknown,
         EmulatorUseStatus::NotDetected => {
             available_space_bytes.map_or(SaveSnapshotReadiness::Ready, |available| {
@@ -449,9 +469,20 @@ pub fn assess_snapshot_readiness(
 }
 
 pub fn create_snapshot(request: &SaveSnapshotRequest) -> Result<SaveSnapshot, SaveSnapshotError> {
+    create_snapshot_checked(request, &|| true)
+}
+
+/// As [`create_snapshot`]; `still_consistent` is asked once more after the
+/// copy, immediately before the snapshot is published. If it says no, the
+/// copy is discarded and `SourceChanged` is returned.
+pub fn create_snapshot_checked(
+    request: &SaveSnapshotRequest,
+    still_consistent: &dyn Fn() -> bool,
+) -> Result<SaveSnapshot, SaveSnapshotError> {
     let source = validate_source(&request.location.path)?;
     match request.emulator_use {
         EmulatorUseStatus::Running => return Err(SaveSnapshotError::EmulatorRunning),
+        EmulatorUseStatus::CardInUse => return Err(SaveSnapshotError::CardInUse),
         EmulatorUseStatus::Unknown => return Err(SaveSnapshotError::EmulatorUseUnknown),
         EmulatorUseStatus::NotDetected => {}
     }
@@ -519,6 +550,14 @@ pub fn create_snapshot(request: &SaveSnapshotRequest) -> Result<SaveSnapshot, Sa
             let bytes = serde_json::to_vec_pretty(&manifest)
                 .map_err(|error| SaveSnapshotError::Serialization(error.to_string()))?;
             write_file(&staging.join("manifest.json"), &bytes)?;
+            if !still_consistent() {
+                return Err(SaveSnapshotError::SourceChanged(
+                    request.location.path.clone(),
+                ))
+                .inspect_err(|_| {
+                    let _ = fs::remove_dir_all(&staging);
+                });
+            }
             fs::rename(&staging, &final_path).map_err(|error| io_error(&staging, error))?;
             Ok(SaveSnapshot {
                 manifest,
@@ -583,6 +622,7 @@ pub fn build_restore_plan(
     }
     match emulator_use {
         EmulatorUseStatus::Running => plan.conflicts.push(SaveRestoreConflict::EmulatorRunning),
+        EmulatorUseStatus::CardInUse => plan.conflicts.push(SaveRestoreConflict::CardInUse),
         EmulatorUseStatus::Unknown => plan.conflicts.push(SaveRestoreConflict::EmulatorUseUnknown),
         EmulatorUseStatus::NotDetected => {}
     }
