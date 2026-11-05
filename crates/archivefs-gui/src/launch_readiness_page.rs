@@ -398,6 +398,7 @@ impl TypedLaunchRequest {
                 request.plan.warnings().to_vec()
             }
             Self::Standalone(StandaloneLaunchRequest::Vice(_)) => vec![vice::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Desmume(_)) => vec![desmume::LIMITATION],
             _ => Vec::new(),
         }
     }
@@ -779,6 +780,14 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             {
                 return Some(TypedLaunchRequest::Standalone(
                     StandaloneLaunchRequest::XRoar(request),
+                ));
+            }
+            // Same request, preflight and spawn as the Gold panel's DeSmuME
+            // offer; an unready or refused offer simply falls through to the
+            // ordinary blocker below.
+            if let Some(Ok(request)) = desmume::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Desmume(request),
                 ));
             }
             if let Some(request) = azahar
