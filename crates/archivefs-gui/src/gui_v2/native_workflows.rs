@@ -16,6 +16,8 @@ mod retroarch_stop_tests;
 #[path = "native_collection.rs"]
 mod native_collection;
 
+#[path = "native_cheat_catalogues.rs"]
+pub(super) mod native_cheat_catalogues;
 #[path = "native_mod_activation.rs"]
 mod native_mod_activation;
 #[path = "native_texture_packs.rs"]
@@ -62,6 +64,7 @@ pub(super) struct NativeWorkflows {
     launch_kind: Option<LaunchKind>,
     launch_attempts: launch_readiness_summary::AttemptTracker,
     source_job: Option<u64>,
+    cheat_catalogues: native_cheat_catalogues::State,
     provider_job: Option<u64>,
     metadata_job: Option<u64>,
     dat_job: Option<u64>,
@@ -384,6 +387,7 @@ impl NativeWorkflows {
             launch_kind: None,
             launch_attempts: Default::default(),
             source_job: None,
+            cheat_catalogues: Default::default(),
             provider_job: None,
             metadata_job: None,
             dat_job: None,
@@ -410,6 +414,7 @@ impl NativeWorkflows {
     pub(super) fn poll(&mut self, context: &egui::Context, activity: &mut Activity) {
         self.scummvm_trainer.poll();
         self.poll_texture_jobs(context);
+        self.poll_cheat_catalogues(context);
         if self.native_romm.is_open()
             && self.app.romm_ui.config_draft.is_some()
             && context.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft))
@@ -434,6 +439,7 @@ impl NativeWorkflows {
         self.observe_launch_activity(activity);
         self.observe_readiness_activity(activity);
         self.observe_source_activity(activity);
+        self.observe_catalogue_activity(activity);
         self.poll_remote_source_probes(context);
         self.observe_provider_activity(activity);
         self.observe_metadata_activity(activity);
