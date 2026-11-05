@@ -35,7 +35,7 @@ pub(super) struct CheckSummary {
     pub verified: usize,
     pub matched: usize,
     pub need_choice: usize,
-    /// Ready to verify: data may exist, but nothing has been compared yet.
+    /// Not verified yet: data may exist, but nothing has been compared yet.
     pub not_checked: usize,
     /// No usable identification data is installed for this platform.
     pub no_data: usize,
@@ -645,7 +645,7 @@ pub(super) fn setup_verification_route(platform: Option<&str>) -> Route {
 fn verification_guidance(review: &Review) -> String {
     let mut guidance: String = match &review.state {
         ReviewState::NoData { reference_source_exists:true } => "Install compatible identification data, then select it in Check Games. Preview the library population and confirm verification; installation alone does not check or verify any game.".into(),
-        ReviewState::NotCompared => "Catalogue data may be installed, but no completed content check is recorded for this game. Select a compatible catalogue, Preview, then confirm verification. The game remains Not checked until that check completes.".into(),
+        ReviewState::NotCompared => "No completed content check is recorded for this game. If a trusted catalogue is already set up for this system, use Check this game on Game Details: you see a preview first and nothing is checked until you confirm. If not, set one up first. The game remains Not checked until that check completes.".into(),
         ReviewState::NoMatch(super::identity_review::NoMatchReason::NoUsableEvidence) => "No usable content-verification result is recorded. This does not prove that the file is bad. A check may still be required, or its format/evidence may be unsupported or unavailable; Preview explains what can be checked. Catalogue installation is not a Verified match.".into(),
         _ => return review.explanation(),
     };
