@@ -400,6 +400,7 @@ impl TypedLaunchRequest {
             }
             Self::Standalone(StandaloneLaunchRequest::Vice(_)) => vec![vice::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Desmume(_)) => vec![desmume::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::SameBoy(_)) => vec![sameboy::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Mgba(_)) => vec![mgba::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Rmg(_)) => vec![rmg::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Stella(_)) => vec![stella::LIMITATION],
@@ -412,9 +413,9 @@ impl TypedLaunchRequest {
     /// compatibility warning.
     pub(crate) fn unverified_status_label(&self) -> &'static str {
         match self {
-            Self::Standalone(StandaloneLaunchRequest::Desmume(_)) => {
-                "Ready, identity not DAT-verified"
-            }
+            Self::Standalone(
+                StandaloneLaunchRequest::Desmume(_) | StandaloneLaunchRequest::SameBoy(_),
+            ) => "Ready, identity not DAT-verified",
             Self::Standalone(
                 StandaloneLaunchRequest::Mgba(_)
                 | StandaloneLaunchRequest::Rmg(_)
@@ -811,8 +812,15 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                     StandaloneLaunchRequest::Desmume(request),
                 ));
             }
-            // mGBA and RMG: the same Gold-panel requests (click-time rediscovery,
-            // content and identity recheck, Core preflight and spawn).
+            // Same request, fresh content-hash recheck, preflight and spawn
+            // as the Gold panel's SameBoy offer.
+            if let Some(Ok(request)) = sameboy::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::SameBoy(request),
+                ));
+            }
+            // mGBA, RMG and Stella: the same Gold-panel requests (click-time
+            // rediscovery, content and identity recheck, Core preflight and spawn).
             if let Some(Ok(request)) = mgba::offer_for(plan, candidate) {
                 return Some(TypedLaunchRequest::Standalone(
                     StandaloneLaunchRequest::Mgba(request),

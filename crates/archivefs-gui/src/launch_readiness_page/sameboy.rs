@@ -10,6 +10,10 @@ use archivefs_core::patch_manager::{
 use sha2::{Digest, Sha256};
 use std::io::Read;
 
+/// Shown wherever SameBoy Play is offered: the launch identity is this exact
+/// file's content hash plus its cartridge header, which is not a DAT proof.
+pub(crate) const LIMITATION: &str = "Local cartridge identity (this file's own content hash and header), not a DAT verification. SameBoy is only started; EmuWiz cannot confirm the game runs.";
+
 #[derive(Clone)]
 pub(crate) struct Request {
     plan: LaunchPlan,
@@ -126,7 +130,14 @@ impl Request {
                 error.detail
             )
         })?;
-        spawn_sameboy(command).map_err(|error| format!("SameBoy could not start: {error:?}"))
+        spawn_sameboy(command).map_err(|error| {
+            format!(
+                "SameBoy could not start: {}",
+                match error {
+                    archivefs_core::launch::SameBoyLaunchSpawnError::Spawn(io) => io,
+                }
+            )
+        })
     }
 }
 
@@ -190,11 +201,14 @@ pub(super) fn show_offer(
 ) {
     ui.add_space(6.0);
     match offer {
-        Ok(request) => super::show_standalone_launch_action(
-            ui,
-            state,
-            StandaloneLaunchRequest::SameBoy(request),
-        ),
+        Ok(request) => {
+            ui.small(LIMITATION);
+            super::show_standalone_launch_action(
+                ui,
+                state,
+                StandaloneLaunchRequest::SameBoy(request),
+            )
+        }
         Err(reason) => {
             ui.colored_label(ui.visuals().warn_fg_color, reason);
         }
@@ -343,6 +357,97 @@ mod tests {
         let (_dir, _roots, plan, mut candidate) = fixture(0);
         candidate.content.container = Some(LaunchContainerKind::Archive);
         assert!(Request::offer(&plan, &candidate).is_err());
+    }
+
+    fn blue_play_action(plan: &LaunchPlan) -> GamerPlayAction {
+        gamer_play_action(&LaunchReadinessInput::Plan {
+            plan: plan.clone(),
+            retroarch: None,
+            retroarch_scanned: true,
+            standalone_scans_complete: true,
+            dolphin: None,
+            pcsx2: None,
+            duckstation: None,
+            ppsspp: None,
+            rpcs3: None,
+            xemu: None,
+            xenia: None,
+            melonds: None,
+            cemu: None,
+            flycast: None,
+            xroar: None,
+            azahar: None,
+            vice: None,
+            amiga_whdload: None,
+            #[cfg(target_os = "linux")]
+            shadps4: None,
+        })
+    }
+
+    #[test]
+    fn a_ready_cartridge_reaches_the_blue_play_action_as_local_identity() {
+        let (_dir, _roots, plan, _candidate) = fixture(0);
+        let GamerPlayAction::Launch(request) = blue_play_action(&plan) else {
+            panic!("Blue Play must offer the SameBoy launch");
+        };
+        assert!(matches!(
+            *request,
+            TypedLaunchRequest::Standalone(StandaloneLaunchRequest::SameBoy(_))
+        ));
+        assert_eq!(request.adapter_name(), "SameBoy");
+        assert_eq!(
+            request.unverified_status_label(),
+            "Ready, identity not DAT-verified"
+        );
+        assert!(
+            request
+                .unverified_warnings()
+                .iter()
+                .any(|line| line.contains("not a DAT verification"))
+        );
+    }
+
+    #[test]
+    fn blue_play_refuses_archives_unready_candidates_and_missing_identity() {
+        let (_dir, _roots, plan, _candidate) = fixture(0);
+        let mut archive = plan.clone();
+        archive.candidates[0].content.container = Some(LaunchContainerKind::Archive);
+        let mut blocked = plan.clone();
+        blocked.candidates[0].readiness = LaunchReadiness::Blocked;
+        let mut keyless = plan.clone();
+        keyless.game_key = None;
+        let mut wrong_platform = plan.clone();
+        wrong_platform.platform_id = Some("Game Boy Advance".into());
+        let mut wrong_extension = plan.clone();
+        wrong_extension.platform_id = Some("Game Boy Color".into());
+        for refused in [archive, blocked, keyless, wrong_platform, wrong_extension] {
+            assert!(
+                !matches!(blue_play_action(&refused), GamerPlayAction::Launch(_)),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_size_replacement_after_play_became_ready_is_refused_and_relaunch_works() {
+        let (_dir, roots, plan, candidate) = fixture(0);
+        let path = candidate.content.resolved_path.clone().unwrap();
+        let request = Request::offer(&plan, &candidate).unwrap();
+        // Relaunch: a second launch from the same offer starts again.
+        for _ in 0..2 {
+            let mut process = request.clone().execute_with_roots(roots.clone()).unwrap();
+            while process.poll().is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let mut replaced = std::fs::read(&path).unwrap();
+        replaced[0x200] ^= 0xff;
+        std::fs::write(&path, replaced).unwrap();
+        let error = request.execute_with_roots(roots).err().unwrap();
+        assert!(
+            error.contains("changed") || error.contains("no longer matches"),
+            "{error}"
+        );
     }
 
     #[test]
