@@ -1,11 +1,15 @@
 //! The one selector for "a ZIP holding exactly one cartridge ROM".
 //!
-//! Extracted unchanged from zipped-cartridge identity (#333) so every consumer
+//! Extracted from zipped-cartridge identity (#333) so every consumer
 //! — identity inspection, launch staging and the optional Hasheous lookup —
 //! accepts and refuses exactly the same archives and picks exactly the same
 //! member. It reads only the central directory: no member is decompressed
 //! here. Selection and hashing stay separate; each consumer hashes or stages
 //! the selected member with its own bounded reader.
+//!
+//! One safety fix from #333's copy: a member name with a leading `/` is now
+//! refused, as its own refusal message always said (`enclosed_name` alone
+//! accepts it as relative).
 //!
 //! Refusals (all of the archive, never "skip and continue"): more than
 //! [`MAX_ARCHIVE_MEMBERS`] entries, an unreadable entry, any encrypted entry,
@@ -102,6 +106,9 @@ pub fn select_zip_cartridge_member(
             && name_raw.len() <= MAX_PATH_BYTES
             && !name_raw.contains(&0)
             && !name_raw.contains(&b'\\')
+            // `enclosed_name` treats a leading `/` as relative, so an
+            // absolute name is refused explicitly (the one change from #333).
+            && !name_raw.starts_with(b"/")
             && std::str::from_utf8(&name_raw).is_ok()
             && raw.enclosed_name().is_some();
         if !name_ok {
