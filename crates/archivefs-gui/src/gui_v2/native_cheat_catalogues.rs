@@ -521,16 +521,10 @@ impl NativeWorkflows {
         }
         let idle = !state.busy() && !retrieving;
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(idle, egui::Button::new("List saved copies"))
-                .clicked()
-            {
+            if action_button(ui, idle, "List saved copies") {
                 state.start(&context, CacheJob::Inventory);
             }
-            if ui
-                .add_enabled(idle, egui::Button::new("Verify all copies"))
-                .clicked()
-            {
+            if action_button(ui, idle, "Verify all copies") {
                 state.start(&context, CacheJob::Verify);
             }
             if state.busy() {
@@ -608,7 +602,7 @@ impl NativeWorkflows {
                         } else {
                             "Protect from clean-up"
                         };
-                        if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
+                        if action_button(ui, idle, label) {
                             pin_request = Some((id.clone(), !entry.pinned));
                         }
                     }
@@ -659,10 +653,7 @@ impl NativeWorkflows {
         {
             state.plan = None;
         }
-        if ui
-            .add_enabled(idle, egui::Button::new("Preview clean-up"))
-            .clicked()
-        {
+        if action_button(ui, idle, "Preview clean-up") {
             let policy = state.policy();
             state.plan = None;
             state.start(&context, CacheJob::Plan(policy));
@@ -695,17 +686,15 @@ impl NativeWorkflows {
                         human_bytes(entry.bytes)
                     ));
                 }
-                if ui
-                    .add_enabled(
-                        idle,
-                        egui::Button::new(format!(
-                            "Remove {} {}",
-                            plan.candidate_count,
-                            plural(plan.candidate_count, "item", "items")
-                        )),
-                    )
-                    .clicked()
-                {
+                if action_button(
+                    ui,
+                    idle,
+                    &format!(
+                        "Remove {} {}",
+                        plan.candidate_count,
+                        plural(plan.candidate_count, "item", "items")
+                    ),
+                ) {
                     confirm = Some(plan.clone());
                 }
             }
@@ -714,6 +703,16 @@ impl NativeWorkflows {
             state.start(&context, CacheJob::Prune(Box::new(plan)));
         }
     }
+}
+
+/// A button that stays enabled (so keyboard/controller focus survives the
+/// frames while a job runs) but only reports a click when `idle`.
+fn action_button(ui: &mut egui::Ui, idle: bool, label: &str) -> bool {
+    action_button_from(&ui.add(egui::Button::new(label)), idle)
+}
+
+fn action_button_from(response: &egui::Response, idle: bool) -> bool {
+    response.clicked() && idle
 }
 
 /// Mirrors a background job into Activity: queue+start when it begins,

@@ -565,3 +565,42 @@ fn counts_are_worded_correctly() {
     assert_eq!(plural(0, "item", "items"), "items");
     assert_eq!(plural(2, "copy", "copies"), "copies");
 }
+
+#[test]
+fn action_button_keeps_focus_while_busy_and_ignores_clicks_until_idle() {
+    let context = egui::Context::default();
+    let id = egui::Id::new("action-button-focus");
+    let mut frame = |idle: bool, focus: bool, press: bool| {
+        let mut input = egui::RawInput::default();
+        if press {
+            input.events.push(egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let mut result = (false, false);
+        let _ = context.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.push_id(id, |ui| {
+                    let response = ui.add(egui::Button::new("Protect from clean-up"));
+                    if focus {
+                        response.request_focus();
+                    }
+                    result = (action_button_from(&response, idle), response.has_focus());
+                });
+            });
+        });
+        result
+    };
+    frame(true, true, false);
+    // A job is running: nothing fires, yet the button keeps keyboard focus.
+    let (fired, focused) = frame(false, false, true);
+    assert!(!fired, "a busy button must not start a second job");
+    assert!(focused, "focus must survive the frames while a job runs");
+    // Job done: the same focused button activates with Return.
+    let (fired, focused) = frame(true, false, true);
+    assert!(fired && focused, "Return must activate once idle again");
+}
