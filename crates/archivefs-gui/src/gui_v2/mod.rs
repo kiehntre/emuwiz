@@ -74,6 +74,7 @@ mod onboarding;
 mod optical_compare;
 mod organisation;
 mod osk;
+mod pad_mouse;
 mod pad_shell;
 pub(crate) use pad_shell::mark_secret;
 mod pages;

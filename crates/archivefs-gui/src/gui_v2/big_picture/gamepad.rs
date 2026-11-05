@@ -14,6 +14,8 @@ use super::nav::{Button, Control, Direction, PadEvent};
 
 const STICK_ON: f32 = 0.55;
 const STICK_OFF: f32 = 0.35;
+/// Below this the right stick is resting (drift), whatever the pad.
+const RIGHT_STICK_NOISE: f32 = 0.08;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(in crate::gui_v2) enum PadStatus {
@@ -78,6 +80,8 @@ const EV_ABS: u16 = 3;
 const SYN_DROPPED: u16 = 3;
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
+const ABS_RX: u16 = 0x03;
+const ABS_RY: u16 = 0x04;
 const ABS_HAT0X: u16 = 0x10;
 const ABS_HAT0Y: u16 = 0x11;
 const BTN_SOUTH: u16 = 0x130;
@@ -87,6 +91,7 @@ const BTN_WEST: u16 = 0x134;
 const BTN_TL: u16 = 0x136;
 const BTN_TR: u16 = 0x137;
 const BTN_START: u16 = 0x13b;
+const BTN_THUMBR: u16 = 0x13e;
 const BTN_TOUCH: u16 = 0x14a;
 const BTN_DPAD_UP: u16 = 0x220;
 const BTN_DPAD_DOWN: u16 = 0x221;
@@ -176,6 +181,7 @@ fn button(code: u16, layout: FaceLayout) -> Option<Control> {
         BTN_TL => Control::Button(Button::LeftBumper),
         BTN_TR => Control::Button(Button::RightBumper),
         BTN_START => Control::Button(Button::Start),
+        BTN_THUMBR => Control::Button(Button::RightStick),
         _ => return None,
     })
 }
@@ -205,6 +211,11 @@ struct Decoder {
     layout: FaceLayout,
     x: AxisRange,
     y: AxisRange,
+    rx: AxisRange,
+    ry: AxisRange,
+    /// The right stick as last read, and as last reported.
+    right: (f32, f32),
+    right_sent: (f32, f32),
     stick: [Pole; 4],
     hat: [Pole; 4],
     /// D-pads reported as buttons rather than a hat.
@@ -257,12 +268,37 @@ impl Decoder {
         }
     }
 
+    /// Report the right stick when it has moved noticeably or come to rest.
+    /// A stick at rest sends nothing, so it costs no repaints.
+    fn right_stick(&mut self, out: &mut Vec<PadEvent>) {
+        let (x, y) = self.right;
+        let (x, y) = if x.hypot(y) < RIGHT_STICK_NOISE {
+            (0.0, 0.0)
+        } else {
+            (x, y)
+        };
+        let (sx, sy) = self.right_sent;
+        let at_rest = x == 0.0 && y == 0.0;
+        if (at_rest && (sx != 0.0 || sy != 0.0))
+            || (!at_rest && ((x - sx).abs() > 0.015 || (y - sy).abs() > 0.015))
+        {
+            self.right_sent = (x, y);
+            out.push(PadEvent::RightStick {
+                device: self.device,
+                x,
+                y,
+            });
+        }
+    }
+
     fn event(&mut self, kind: u16, code: u16, value: i32, out: &mut Vec<PadEvent>) {
         match (kind, code) {
             (EV_SYN, SYN_DROPPED) => {
                 self.stick = Default::default();
                 self.hat = Default::default();
                 self.dpad = Default::default();
+                self.right = (0.0, 0.0);
+                self.right_sent = (0.0, 0.0);
                 out.push(PadEvent::Reset {
                     device: self.device,
                 });
@@ -285,6 +321,14 @@ impl Decoder {
                         PadEvent::Released { device, control }
                     });
                 }
+            }
+            (EV_ABS, ABS_RX) => {
+                self.right.0 = self.rx.normal(value);
+                self.right_stick(out);
+            }
+            (EV_ABS, ABS_RY) => {
+                self.right.1 = self.ry.normal(value);
+                self.right_stick(out);
             }
             (EV_ABS, ABS_X) => self.axis((0, 1), false, self.x.normal(value), out),
             (EV_ABS, ABS_Y) => self.axis((2, 3), false, self.y.normal(value), out),
@@ -450,6 +494,8 @@ mod linux {
                 layout,
                 x: axis_range(raw, ABS_X),
                 y: axis_range(raw, ABS_Y),
+                rx: axis_range(raw, ABS_RX),
+                ry: axis_range(raw, ABS_RY),
                 ..Default::default()
             },
             fd,
@@ -660,6 +706,7 @@ mod linux {
         status: Arc<Mutex<PadStatus>>,
         stop: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
+        analog: Arc<AtomicBool>,
     }
 
     impl Reader {
@@ -674,6 +721,7 @@ mod linux {
             let status = Arc::new(Mutex::new(scanner.scan(&devices, &mut Vec::new())));
             let stop = Arc::new(AtomicBool::new(false));
             let paused = Arc::new(AtomicBool::new(false));
+            let analog = Arc::new(AtomicBool::new(false));
             let (sender, events) = mpsc::channel();
             let worker = Worker {
                 devices,
@@ -681,6 +729,7 @@ mod linux {
                 status: status.clone(),
                 stop: stop.clone(),
                 paused: paused.clone(),
+                analog: analog.clone(),
                 sender,
                 context,
             };
@@ -696,6 +745,7 @@ mod linux {
                 status,
                 stop,
                 paused,
+                analog,
             }
         }
 
@@ -710,6 +760,11 @@ mod linux {
         /// so an emulator's input cannot reach EmuWiz or keep it drawing.
         pub(in crate::gui_v2) fn set_paused(&self, paused: bool) {
             self.paused.store(paused, Ordering::Relaxed);
+        }
+
+        /// Ask for (or stop) right-stick movement events.
+        pub(in crate::gui_v2) fn set_analog(&self, wanted: bool) {
+            self.analog.store(wanted, Ordering::Relaxed);
         }
 
         pub(in crate::gui_v2) fn drain(&self) -> impl Iterator<Item = PadEvent> + '_ {
@@ -729,6 +784,8 @@ mod linux {
         status: Arc<Mutex<PadStatus>>,
         stop: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
+        /// Whether the right stick's movement is wanted (virtual mouse on).
+        analog: Arc<AtomicBool>,
         sender: mpsc::Sender<PadEvent>,
         context: egui::Context,
     }
@@ -764,6 +821,9 @@ mod linux {
                     }));
                 }
                 was_paused = paused;
+                if !self.analog.load(Ordering::Relaxed) {
+                    events.retain(|e| !matches!(e, PadEvent::RightStick { .. }));
+                }
                 if events.is_empty() {
                     continue;
                 }
@@ -1178,6 +1238,7 @@ mod other {
             PadStatus::Unsupported
         }
         pub(in crate::gui_v2) fn set_paused(&self, _: bool) {}
+        pub(in crate::gui_v2) fn set_analog(&self, _: bool) {}
         pub(in crate::gui_v2) fn drain(&self) -> impl Iterator<Item = PadEvent> + '_ {
             std::iter::empty()
         }
@@ -1196,6 +1257,14 @@ mod tests {
             device: 7,
             x: AxisRange { min: 0, max: 255 },
             y: AxisRange {
+                min: -32768,
+                max: 32767,
+            },
+            rx: AxisRange {
+                min: -32768,
+                max: 32767,
+            },
+            ry: AxisRange {
                 min: -32768,
                 max: 32767,
             },
@@ -1461,5 +1530,43 @@ mod tests {
         let one = PadStatus::Connected(vec!["Pad".into()]);
         assert!(one.connected());
         assert_eq!(one.describe(), "Controller: Pad");
+    }
+
+    #[test]
+    fn right_stick_click_is_a_button_and_the_stick_reports_only_real_movement() {
+        let mut d = decoder();
+        assert_eq!(
+            decode(&mut d, EV_KEY, BTN_THUMBR, 1),
+            [pressed(Control::Button(Button::RightStick))]
+        );
+        assert_eq!(
+            decode(&mut d, EV_KEY, BTN_THUMBR, 0),
+            [released(Control::Button(Button::RightStick))]
+        );
+        // Drift near the centre is silence.
+        assert!(decode(&mut d, EV_ABS, ABS_RX, 1200).is_empty());
+        let moved = decode(&mut d, EV_ABS, ABS_RX, 32767);
+        assert!(matches!(moved[..], [PadEvent::RightStick { x, y, .. }] if x > 0.99 && y == 0.0));
+        // The same position again is not news.
+        assert!(decode(&mut d, EV_ABS, ABS_RX, 32767).is_empty());
+        // Up is negative on a pad; it reaches the consumer as screen-up.
+        let up = decode(&mut d, EV_ABS, ABS_RY, -32768);
+        assert!(matches!(up[..], [PadEvent::RightStick { y, .. }] if y < -0.99));
+        // Letting go reports rest exactly once.
+        decode(&mut d, EV_ABS, ABS_RY, 0);
+        let rest = decode(&mut d, EV_ABS, ABS_RX, 0);
+        assert!(matches!(rest[..], [PadEvent::RightStick { x, y, .. }] if x == 0.0 && y == 0.0));
+        assert!(decode(&mut d, EV_ABS, ABS_RX, 0).is_empty());
+    }
+
+    #[test]
+    fn the_right_stick_never_presses_navigation_directions() {
+        let mut d = decoder();
+        let events = decode(&mut d, EV_ABS, ABS_RX, 32767);
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e, PadEvent::RightStick { .. }))
+        );
     }
 }

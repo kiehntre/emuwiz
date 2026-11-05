@@ -1200,3 +1200,241 @@ mod spatial {
         assert!(!lib.on_sidebar(), "and it moved into the content");
     }
 }
+
+/// The R3 virtual mouse, through real frames.
+mod virtual_mouse {
+    use super::*;
+
+    struct Rig {
+        context: egui::Context,
+        app: App,
+        time: f64,
+        left_clicks: u32,
+        right_clicks: u32,
+        focused_activations: u32,
+    }
+
+    const R3: Control = Control::Button(Button::RightStick);
+    const A: Control = Control::Button(Button::South);
+    const B: Control = Control::Button(Button::East);
+    const X: Control = Control::Button(Button::West);
+
+    fn centre() -> egui::Pos2 {
+        egui::pos2(SIZE[0] / 2.0, SIZE[1] / 2.0)
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let context = egui::Context::default();
+            let app = super::app(&context);
+            let mut rig = Self {
+                context,
+                app,
+                time: 1.0,
+                left_clicks: 0,
+                right_clicks: 0,
+                focused_activations: 0,
+            };
+            rig.frame(true);
+            let target = rig
+                .context
+                .data(|d| d.get_temp::<egui::Id>(egui::Id::new("mouse_target_id")))
+                .expect("target drawn");
+            rig.context.memory_mut(|m| m.request_focus(target));
+            rig.frame(true);
+            // The controller is in use from here on.
+            rig.app.pad_shell.as_mut().unwrap().set_pad_mode_for_test();
+            rig
+        }
+
+        fn frame(&mut self, focused: bool) {
+            self.time += 0.016;
+            let (app, left, right, activated) = (
+                &mut self.app,
+                &mut self.left_clicks,
+                &mut self.right_clicks,
+                &mut self.focused_activations,
+            );
+            let out = self.context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SIZE.into())),
+                    time: Some(self.time),
+                    focused,
+                    ..Default::default()
+                },
+                |ui| {
+                    let context = ui.ctx().clone();
+                    app.show(&context);
+                    egui::Area::new(egui::Id::new("under_pointer"))
+                        .order(egui::Order::Background)
+                        .fixed_pos(centre() - egui::vec2(50.0, 20.0))
+                        .show(&context, |ui| {
+                            let r =
+                                ui.add_sized([100.0, 40.0], egui::Button::new("Under the pointer"));
+                            if r.clicked() {
+                                *left += 1;
+                            }
+                            if r.secondary_clicked() {
+                                *right += 1;
+                            }
+                        });
+                    egui::Area::new(egui::Id::new("target"))
+                        .order(egui::Order::Background)
+                        .fixed_pos(egui::pos2(40.0, 700.0))
+                        .show(&context, |ui| {
+                            let r = ui.button("Focused elsewhere");
+                            ui.data_mut(|d| d.insert_temp(egui::Id::new("mouse_target_id"), r.id));
+                            if r.clicked() {
+                                *activated += 1;
+                            }
+                        });
+                },
+            );
+            let _ = out;
+        }
+
+        fn frames(&mut self, n: usize) {
+            for _ in 0..n {
+                self.frame(true);
+            }
+        }
+
+        fn send(&mut self, event: PadEvent) {
+            self.app.pad_shell.as_mut().unwrap().inject(event);
+        }
+
+        fn tap(&mut self, control: Control) {
+            self.send(PadEvent::Pressed { device: 1, control });
+            self.frames(2);
+            self.send(PadEvent::Released { device: 1, control });
+            self.frames(3);
+        }
+
+        fn stick(&mut self, x: f32, y: f32) {
+            self.send(PadEvent::RightStick { device: 1, x, y });
+        }
+
+        fn pointer(&self) -> Option<egui::Pos2> {
+            self.context.pointer_latest_pos()
+        }
+
+        fn mouse_on(&self) -> bool {
+            self.app.pad_shell.as_ref().unwrap().mouse_on()
+        }
+    }
+
+    #[test]
+    fn r3_toggles_a_visible_pointer_and_b_exits() {
+        let mut rig = Rig::new();
+        assert!(!rig.mouse_on());
+        rig.tap(R3);
+        assert!(rig.mouse_on());
+        rig.tap(B);
+        assert!(!rig.mouse_on(), "B leaves mouse mode");
+        rig.tap(R3);
+        rig.tap(R3);
+        assert!(!rig.mouse_on(), "R3 toggles");
+    }
+
+    #[test]
+    fn the_right_stick_moves_the_pointer_smoothly_and_respects_the_dead_zone() {
+        let mut rig = Rig::new();
+        rig.tap(R3);
+        let start = rig.pointer().expect("pointer placed");
+        rig.stick(0.1, 0.1); // inside the dead zone
+        rig.frames(20);
+        assert_eq!(rig.pointer(), Some(start), "drift does not move it");
+        rig.stick(0.5, 0.0);
+        rig.frames(30);
+        let half = rig.pointer().unwrap();
+        rig.stick(0.0, 0.0);
+        rig.frames(3);
+        let settled = rig.pointer().unwrap();
+        rig.frames(10);
+        assert_eq!(rig.pointer(), Some(settled), "stops when the stick rests");
+        rig.stick(1.0, 0.0);
+        rig.frames(30);
+        let full = rig.pointer().unwrap();
+        assert!(half.x > start.x + 5.0);
+        assert!(
+            (full.x - settled.x) > (half.x - start.x) * 3.0,
+            "a full push is much faster than half: {start:?} {half:?} {full:?}"
+        );
+    }
+
+    #[test]
+    fn a_and_x_click_under_the_pointer_and_never_also_press_the_focused_control() {
+        let mut rig = Rig::new();
+        rig.tap(R3);
+        assert_eq!(rig.pointer(), Some(centre()));
+        rig.tap(A);
+        assert_eq!(rig.left_clicks, 1, "A is a left click");
+        rig.tap(X);
+        assert_eq!(rig.right_clicks, 1, "X is a right click");
+        assert_eq!(
+            rig.focused_activations, 0,
+            "the clicks were consumed, so the focused control was not pressed"
+        );
+        assert_eq!(
+            rig.app.router.current,
+            Route::Home,
+            "and no Search/section command ran"
+        );
+    }
+
+    #[test]
+    fn with_mouse_mode_off_the_stick_does_nothing_and_a_still_presses_the_focus() {
+        let mut rig = Rig::new();
+        rig.stick(1.0, 1.0);
+        rig.frames(20);
+        assert_eq!(rig.left_clicks, 0);
+        rig.tap(A);
+        assert_eq!(
+            rig.focused_activations, 1,
+            "normal controller A is unchanged"
+        );
+        rig.tap(R3);
+        rig.tap(B);
+        rig.tap(A);
+        assert_eq!(
+            rig.focused_activations, 2,
+            "and after leaving mouse mode too"
+        );
+    }
+
+    #[test]
+    fn a_held_click_is_released_when_the_mode_ends_and_a_press_is_never_lost() {
+        let mut rig = Rig::new();
+        rig.tap(R3);
+        rig.send(PadEvent::Pressed {
+            device: 1,
+            control: A,
+        });
+        rig.frames(3); // A held down
+        rig.tap(R3); // mode off while A is still held
+        rig.send(PadEvent::Released {
+            device: 1,
+            control: A,
+        });
+        rig.frames(3);
+        // The click focused the button under the pointer; put focus back, as the
+        // person would, then the next A works as a normal controller A.
+        let target = rig
+            .context
+            .data(|d| d.get_temp::<egui::Id>(egui::Id::new("mouse_target_id")))
+            .unwrap();
+        rig.context.memory_mut(|m| m.request_focus(target));
+        rig.frames(2);
+        rig.tap(A);
+        assert_eq!(rig.focused_activations, 1);
+    }
+
+    #[test]
+    fn leaving_the_window_leaves_the_mode() {
+        let mut rig = Rig::new();
+        rig.tap(R3);
+        assert!(rig.mouse_on());
+        rig.frame(false); // an emulator took focus
+        assert!(!rig.mouse_on());
+    }
+}

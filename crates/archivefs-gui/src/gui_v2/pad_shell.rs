@@ -15,6 +15,7 @@ use super::big_picture::{
     page_command,
 };
 use super::osk::{self, Key as OskKey, Osk, Outcome};
+use super::pad_mouse;
 use super::simple_shell::{DESTINATIONS, destination_for};
 use super::*;
 
@@ -54,8 +55,162 @@ pub(super) struct PadShell {
     released: Option<egui::LayerId>,
     /// A hold-to-confirm in progress: the control, when it began, its label.
     hold: Option<(egui::Id, f64, String)>,
+    /// The R3 virtual mouse.
+    mouse: pad_mouse::VirtualMouse,
     #[cfg(test)]
     injected: Vec<PadEvent>,
+}
+
+impl PadShell {
+    /// The virtual mouse's share of this frame's pad events: R3 toggles it, the
+    /// right stick steers it, and while it is on A, X and B belong to it and
+    /// never reach the navigator (so a click is not also a press). Everything
+    /// else, and everything when it is off, passes through untouched.
+    fn mouse_filter(
+        &mut self,
+        context: &egui::Context,
+        events: Vec<PadEvent>,
+        now: f64,
+        focused: bool,
+    ) -> Vec<PadEvent> {
+        let mut kept = Vec::new();
+        for event in events {
+            match event {
+                PadEvent::RightStick { x, y, .. } => self.mouse.set_stick(x, y),
+                PadEvent::Pressed {
+                    control: Control::Button(Button::RightStick),
+                    ..
+                } => self.toggle_mouse(context),
+                PadEvent::Released {
+                    control: Control::Button(Button::RightStick),
+                    ..
+                } => {}
+                PadEvent::Pressed {
+                    control: Control::Button(button @ (Button::South | Button::West | Button::East)),
+                    ..
+                } if self.mouse.on => {
+                    self.mouse.swallowed.push(button);
+                    match button {
+                        Button::South => {
+                            self.mouse_button(context, egui::PointerButton::Primary, true)
+                        }
+                        Button::West => {
+                            self.mouse_button(context, egui::PointerButton::Secondary, true)
+                        }
+                        _ => self.exit_mouse(context),
+                    }
+                }
+                PadEvent::Released {
+                    control: Control::Button(button),
+                    ..
+                } if self.mouse.swallowed.contains(&button) => {
+                    self.mouse.swallowed.retain(|b| *b != button);
+                    match button {
+                        Button::South => {
+                            self.mouse_button(context, egui::PointerButton::Primary, false)
+                        }
+                        Button::West => {
+                            self.mouse_button(context, egui::PointerButton::Secondary, false)
+                        }
+                        _ => {}
+                    }
+                }
+                PadEvent::Reset { .. } => {
+                    self.exit_mouse(context);
+                    kept.push(event);
+                }
+                other => kept.push(other),
+            }
+        }
+        if self.mouse.on && !focused {
+            // An emulator took the screen: leave the mode rather than hold a
+            // pointer (or a button) across it.
+            self.exit_mouse(context);
+        }
+        if self.mouse.on {
+            if let Some(pos) = self.mouse.step(now, context.content_rect()) {
+                pad_mouse::queue(context, [egui::Event::PointerMoved(pos)]);
+            }
+            pad_mouse::paint(context, self.mouse.pos);
+            show_mouse_hint(context);
+            if self.mouse.moving() {
+                context.request_repaint_after(std::time::Duration::from_millis(8));
+            }
+        } else {
+            // Keep the clock honest for the next time it is switched on.
+            let _ = self.mouse.step(now, context.content_rect());
+        }
+        if let Some(reader) = &self.reader {
+            reader.set_analog(self.mouse.on);
+        }
+        kept
+    }
+
+    fn toggle_mouse(&mut self, context: &egui::Context) {
+        if self.mouse.on {
+            self.exit_mouse(context);
+        } else {
+            self.mouse.on = true;
+            self.mouse.reset_motion();
+            self.mouse.pos = context
+                .pointer_latest_pos()
+                .unwrap_or_else(|| context.content_rect().center());
+            pad_mouse::queue(context, [egui::Event::PointerMoved(self.mouse.pos)]);
+            context.request_repaint();
+        }
+    }
+
+    fn exit_mouse(&mut self, context: &egui::Context) {
+        if !self.mouse.on {
+            return;
+        }
+        self.mouse_button(context, egui::PointerButton::Primary, false);
+        self.mouse_button(context, egui::PointerButton::Secondary, false);
+        self.mouse.on = false;
+        self.mouse.reset_motion();
+        context.request_repaint();
+    }
+
+    fn mouse_button(
+        &mut self,
+        context: &egui::Context,
+        button: egui::PointerButton,
+        pressed: bool,
+    ) {
+        let held = match button {
+            egui::PointerButton::Secondary => &mut self.mouse.secondary_down,
+            _ => &mut self.mouse.primary_down,
+        };
+        if *held == pressed {
+            return; // never a release without a press, or a double press
+        }
+        *held = pressed;
+        pad_mouse::queue(
+            context,
+            [
+                egui::Event::PointerMoved(self.mouse.pos),
+                egui::Event::PointerButton {
+                    pos: self.mouse.pos,
+                    button,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        context.request_repaint();
+    }
+}
+
+fn show_mouse_hint(context: &egui::Context) {
+    egui::Area::new(egui::Id::new("pad_mouse_hint"))
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(16.0, -16.0))
+        .show(context, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.label("Mouse mode: right stick moves · A click · X right-click · B exit");
+            });
+        });
 }
 
 /// The destination `step` places away from `current` (wrapping), or the first
@@ -85,6 +240,7 @@ impl App {
         if !shell.started {
             shell.started = true;
             register_capture(context);
+            pad_mouse::register_injector(context);
             shell.reader = (!cfg!(test)).then(|| Reader::start(context.clone()));
         }
         let (now, focused) = context.input(|i| (i.time, i.focused));
@@ -104,6 +260,7 @@ impl App {
             .unwrap_or_default();
         #[cfg(test)]
         events.append(&mut shell.injected);
+        let events = shell.mouse_filter(context, events, now, focused);
         let pointer_used = context.input(|i| {
             i.pointer.is_moving()
                 || i.pointer.any_pressed()
@@ -453,6 +610,8 @@ impl App {
             Command::Last => key_tap(context, egui::Key::End),
             Command::Platforms => self.pad_shell_section(1),
             Command::Search => self.pad_shell_section(-1),
+            // R3 is taken by the virtual mouse before commands are made.
+            Command::Pointer => {}
             Command::Launch => {
                 self.enter_big_picture(context);
                 // Big Picture starts its own reader; release this one now.
@@ -797,6 +956,9 @@ fn key_tap(context: &egui::Context, key: egui::Key) {
 impl PadShell {
     pub(super) fn buffer(&self) -> Option<String> {
         self.osk.as_ref().map(|o| o.buffer.clone())
+    }
+    pub(super) fn mouse_on(&self) -> bool {
+        self.mouse.on
     }
     pub(super) fn set_pad_mode_for_test(&mut self) {
         self.pad_mode = true;
