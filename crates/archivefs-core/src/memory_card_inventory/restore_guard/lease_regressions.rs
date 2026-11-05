@@ -620,6 +620,10 @@ fn undo_is_reversed_when_the_restored_card_was_opened_across_its_exchange() {
         restored_inode,
         "the writer holds the live card"
     );
+    assert!(
+        !undo_temp_path(world.dir.path(), &journal.operation_id).exists(),
+        "the unused copy of the original was removed while its lease was held"
+    );
     assert_eq!(
         load_ps2_restore_journal(&applied.journal_path)
             .unwrap()

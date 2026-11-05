@@ -224,6 +224,8 @@ impl SaveTargetBinding {
 pub enum SaveQuiescenceRequirement {
     ConfirmedClosed,
     Running,
+    /// Some program has the save open; which program is not established.
+    InUse,
     Unknown,
 }
 
@@ -241,6 +243,7 @@ pub enum SaveRestoreRefusal {
     SharedContainerRestoreNotSupported,
     SaveStateRestoreNotSupported,
     EmulatorRunning,
+    SaveInUse,
     EmulatorStateUnknown,
     DestinationChanged,
     BackupFailed,
@@ -276,6 +279,9 @@ impl std::fmt::Display for SaveRestoreRefusal {
                 "save states require emulator-specific compatibility checks"
             }
             Self::EmulatorRunning => "close the emulator before restoring this save",
+            Self::SaveInUse => {
+                "the save is in use; another application may have it open. Close applications using this save and try again"
+            }
             Self::EmulatorStateUnknown => {
                 "EmuWiz cannot prove that the emulator is closed; close it before restoring this save"
             }
@@ -740,6 +746,7 @@ pub fn build_single_file_restore_preflight(
     match quiescence {
         SaveQuiescenceRequirement::ConfirmedClosed => {}
         SaveQuiescenceRequirement::Running => refusals.push(SaveRestoreRefusal::EmulatorRunning),
+        SaveQuiescenceRequirement::InUse => refusals.push(SaveRestoreRefusal::SaveInUse),
         SaveQuiescenceRequirement::Unknown => {
             refusals.push(SaveRestoreRefusal::EmulatorStateUnknown)
         }

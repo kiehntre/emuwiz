@@ -1047,8 +1047,10 @@ pub(crate) fn undo_with_hook(
     }
     set(&mut journal, Ps2RestorePhase::UndoIntent, None)?;
     let mut undo_published = false;
-    // Set when a program holds the file at the staging path: never cleaned.
-    let mut keep_undo_temp = false;
+    // Set from the moment a swap-back is journalled as NeedsAttention until it
+    // is fully settled: the staging file is never cleaned and the record is
+    // never reset to Published.
+    let mut park = false;
     let result = (|| -> Result<Option<PublicationLeases>, Fail> {
         // Early refusal under a lease held for this check only; repeated
         // under the publication leases once the original is staged.
@@ -1148,6 +1150,7 @@ pub(crate) fn undo_with_hook(
             match (leases.outgoing.intact(), leases.incoming.intact()) {
                 (true, _) => {}
                 (false, true) => {
+                    park = true;
                     // Durable before reversing: if we stop here, recovery
                     // must park this record, not tidy away the restored card
                     // that the released opener holds.
@@ -1182,7 +1185,6 @@ pub(crate) fn undo_with_hook(
                     // The original (from the backup) is now at the staging
                     // path; a program that opened the card in between holds it.
                     if !leases.incoming.intact() {
-                        keep_undo_temp = true;
                         return Err(Ps2PsuRestoreError::RecoveryRequired(format!(
                             "Undo was reversed: the card is the restored version again. A program opened the card in between and holds the copy at {}; it is kept for inspection.",
                             undo_temp.display()
@@ -1192,6 +1194,20 @@ pub(crate) fn undo_with_hook(
                     fs::File::open(&card_dir)
                         .and_then(|directory| directory.sync_all())
                         .map_err(restore_error)?;
+                    // Remove our copy of the original while its lease is held
+                    // and shows nobody opened it, then check again (see Apply).
+                    fs::remove_file(&undo_temp).map_err(restore_error)?;
+                    if !leases.incoming.intact() {
+                        return Err(Ps2PsuRestoreError::RecoveryRequired(format!(
+                            "Undo was reversed: the card is the restored version again. A program opened the card just as the unused copy of the original at {} was removed; whatever it writes does not reach the card.",
+                            undo_temp.display()
+                        ))
+                        .into());
+                    }
+                    fs::File::open(&card_dir)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(restore_error)?;
+                    park = false;
                     return Err(Ps2PsuRestoreError::CardInUse.into());
                 }
                 (false, false) => {
@@ -1234,7 +1250,7 @@ pub(crate) fn undo_with_hook(
         #[cfg(test)]
         Err(Fail::Crash) => Err(Ps2PsuRestoreError::Io(SIMULATED_CRASH.into())),
         Err(Fail::Error(error)) => {
-            if !undo_published && !keep_undo_temp {
+            if !undo_published && !park {
                 clean_undo_temp(&journal);
             }
             // A stale-undo refusal means the card was left exactly as found (a late
@@ -1242,7 +1258,7 @@ pub(crate) fn undo_with_hook(
             if !undo_published {
                 set(
                     &mut journal,
-                    if !recovery_evidence::confirmed_absent(&undo_temp) {
+                    if park || !recovery_evidence::confirmed_absent(&undo_temp) {
                         Ps2RestorePhase::NeedsAttention
                     } else {
                         Ps2RestorePhase::Published
@@ -1261,7 +1277,13 @@ pub(crate) fn undo_with_hook(
             if live.as_deref() == Some(post_sha.as_str()) {
                 set(
                     &mut journal,
-                    Ps2RestorePhase::Published,
+                    // A failed swap-back keeps its NeedsAttention marker: the
+                    // staging path may hold a copy a program wrote to.
+                    if park {
+                        Ps2RestorePhase::NeedsAttention
+                    } else {
+                        Ps2RestorePhase::Published
+                    },
                     Some(format!("undo refused: {error}")),
                 )?;
                 Err(error)

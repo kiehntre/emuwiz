@@ -443,20 +443,16 @@ pub(crate) fn augment_plan(plan: &mut TreeRestorePlan, binding: DirectorySaveBin
 fn requirement(state: EmulatorQuiescence) -> SaveQuiescenceRequirement {
     match state {
         EmulatorQuiescence::Closed => SaveQuiescenceRequirement::ConfirmedClosed,
-        // Refused like a running emulator; this generic path has no
-        // separate in-use requirement.
-        EmulatorQuiescence::Running | EmulatorQuiescence::CardInUse => {
-            SaveQuiescenceRequirement::Running
-        }
+        EmulatorQuiescence::Running => SaveQuiescenceRequirement::Running,
+        EmulatorQuiescence::CardInUse => SaveQuiescenceRequirement::InUse,
         EmulatorQuiescence::Unknown => SaveQuiescenceRequirement::Unknown,
     }
 }
 fn check_quiescence(state: EmulatorQuiescence) -> Result<(), TreeRestoreError> {
     match state {
         EmulatorQuiescence::Closed => Ok(()),
-        EmulatorQuiescence::Running | EmulatorQuiescence::CardInUse => {
-            Err(refused(TreeRestoreRefusal::EmulatorRunning))
-        }
+        EmulatorQuiescence::Running => Err(refused(TreeRestoreRefusal::EmulatorRunning)),
+        EmulatorQuiescence::CardInUse => Err(refused(TreeRestoreRefusal::SaveInUse)),
         EmulatorQuiescence::Unknown => Err(refused(TreeRestoreRefusal::EmulatorStateUnknown)),
     }
 }

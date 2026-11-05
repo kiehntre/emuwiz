@@ -398,6 +398,10 @@ fn running_or_unknown_emulator_and_save_states_are_refused() {
             TreeRestoreRefusal::EmulatorRunning,
         ),
         (
+            SaveQuiescenceRequirement::InUse,
+            TreeRestoreRefusal::SaveInUse,
+        ),
+        (
             SaveQuiescenceRequirement::Unknown,
             TreeRestoreRefusal::EmulatorStateUnknown,
         ),
