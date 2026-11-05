@@ -131,6 +131,15 @@ fn unfocused_window_ignores_the_controller() {
 fn run_ui_frame(
     context: &egui::Context,
     events: Vec<egui::Event>,
+    body: impl FnMut(&egui::Context),
+) -> egui::FullOutput {
+    run_ui_frame_at(context, None, events, body)
+}
+
+fn run_ui_frame_at(
+    context: &egui::Context,
+    time: Option<f64>,
+    events: Vec<egui::Event>,
     mut body: impl FnMut(&egui::Context),
 ) -> egui::FullOutput {
     let before = super::super::pad_shell::hook_runs(context);
@@ -138,6 +147,7 @@ fn run_ui_frame(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SIZE.into())),
             events,
+            time,
             ..Default::default()
         },
         |ui| body(&ui.ctx().clone()),
@@ -573,5 +583,165 @@ mod picker_journey {
         assert_eq!(rig.app.router.current, route);
         assert!(picker::open(&rig.context));
         assert!(rig.app.big_picture.is_none());
+    }
+}
+
+mod dialog_safety {
+    use super::*;
+
+    struct Rig {
+        context: egui::Context,
+        app: App,
+        time: f64,
+        cancel: u32,
+        destroy: u32,
+        page: u32,
+    }
+
+    const A: Control = Control::Button(Button::South);
+
+    impl Rig {
+        fn new() -> Self {
+            let context = egui::Context::default();
+            let app = super::app(&context);
+            let mut rig = Self {
+                context,
+                app,
+                time: 1.0,
+                cancel: 0,
+                destroy: 0,
+                page: 0,
+            };
+            rig.frame();
+            rig
+        }
+
+        fn frame(&mut self) {
+            self.time += 0.1;
+            let (app, cancel, destroy, page) = (
+                &mut self.app,
+                &mut self.cancel,
+                &mut self.destroy,
+                &mut self.page,
+            );
+            run_ui_frame_at(&self.context, Some(self.time), Vec::new(), |context| {
+                app.show(context);
+                egui::Area::new(egui::Id::new("page_area"))
+                    .order(egui::Order::Background)
+                    .show(context, |ui| {
+                        if ui.button("Delete page thing").clicked() {
+                            *page += 1;
+                        }
+                    });
+                egui::Window::new("Are you sure?").show(context, |ui| {
+                    if ui.button("Cancel").clicked() {
+                        *cancel += 1;
+                    }
+                    if ui.button("Delete everything").clicked() {
+                        *destroy += 1;
+                    }
+                });
+            });
+        }
+
+        fn focus(&mut self, label: &str) {
+            // Walk with the controller's own Down until the label is focused.
+            for _ in 0..120 {
+                self.step(Control::Direction(Direction::Down));
+                if self.focused_label().as_deref() == Some(label) {
+                    return;
+                }
+            }
+            panic!("never focused {label}");
+        }
+
+        fn focused_label(&self) -> Option<String> {
+            self.context
+                .data(|d| {
+                    d.get_temp::<(egui::Id, String, bool)>(egui::Id::new("pad_shell_focus_label"))
+                })
+                .map(|(_, label, _)| label)
+        }
+
+        fn step(&mut self, control: Control) {
+            let shell = self.app.pad_shell.as_mut().unwrap();
+            shell.inject(PadEvent::Pressed { device: 1, control });
+            shell.inject(PadEvent::Released { device: 1, control });
+            for _ in 0..3 {
+                self.frame();
+            }
+        }
+
+        fn hold_a(&mut self, frames: usize) {
+            let shell = self.app.pad_shell.as_mut().unwrap();
+            shell.inject(PadEvent::Pressed {
+                device: 1,
+                control: A,
+            });
+            for _ in 0..frames {
+                self.frame();
+            }
+        }
+
+        fn release_a(&mut self) {
+            let shell = self.app.pad_shell.as_mut().unwrap();
+            shell.inject(PadEvent::Released {
+                device: 1,
+                control: A,
+            });
+            for _ in 0..3 {
+                self.frame();
+            }
+        }
+    }
+
+    #[test]
+    fn a_tap_never_presses_an_unrecognised_dialog_button() {
+        let mut rig = Rig::new();
+        rig.focus("Delete everything");
+        rig.step(A);
+        assert_eq!(rig.destroy, 0, "a tap must not confirm");
+    }
+
+    #[test]
+    fn a_tap_presses_cancel() {
+        let mut rig = Rig::new();
+        rig.focus("Cancel");
+        rig.step(A);
+        assert_eq!(rig.cancel, 1);
+        assert_eq!(rig.destroy, 0);
+    }
+
+    #[test]
+    fn holding_a_long_enough_confirms_and_releasing_early_does_not() {
+        let mut rig = Rig::new();
+        rig.focus("Delete everything");
+        rig.hold_a(3); // ~0.3 s
+        rig.release_a();
+        assert_eq!(rig.destroy, 0, "released early");
+        rig.hold_a(9); // ~0.9 s
+        assert_eq!(rig.destroy, 1, "held long enough");
+        rig.release_a();
+        assert_eq!(rig.destroy, 1, "fires once");
+    }
+
+    #[test]
+    fn moving_focus_during_a_hold_cancels_it() {
+        let mut rig = Rig::new();
+        rig.focus("Delete everything");
+        rig.hold_a(2);
+        rig.context
+            .memory_mut(|m| m.request_focus(egui::Id::new("nowhere")));
+        rig.frame();
+        rig.hold_a(9);
+        assert_eq!(rig.destroy, 0);
+    }
+
+    #[test]
+    fn buttons_on_the_page_itself_are_not_slowed_down() {
+        let mut rig = Rig::new();
+        rig.focus("Delete page thing");
+        rig.step(A);
+        assert_eq!(rig.page, 1, "the dialog guard is for dialogs only");
     }
 }

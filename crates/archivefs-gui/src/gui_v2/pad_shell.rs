@@ -11,7 +11,7 @@
 
 use super::big_picture::{
     Reader,
-    nav::{Command, Navigator, PadEvent},
+    nav::{Button, Command, Control, Navigator, PadEvent},
     page_command,
 };
 use super::osk::{self, Key as OskKey, Osk, Outcome};
@@ -29,6 +29,10 @@ pub(super) struct PadShell {
     pending: Option<(egui::Id, u8)>,
     /// The field to hand focus back to once the keyboard has closed.
     refocus: Option<(egui::Id, u8)>,
+    /// Whether A (South) is physically down, for hold-to-confirm.
+    south_down: bool,
+    /// A hold-to-confirm in progress: the control, when it began, its label.
+    hold: Option<(egui::Id, f64, String)>,
     #[cfg(test)]
     injected: Vec<PadEvent>,
 }
@@ -77,6 +81,20 @@ impl App {
             .unwrap_or_default();
         #[cfg(test)]
         events.append(&mut shell.injected);
+        for event in &events {
+            match event {
+                PadEvent::Pressed {
+                    control: Control::Button(Button::South),
+                    ..
+                } => shell.south_down = true,
+                PadEvent::Released {
+                    control: Control::Button(Button::South),
+                    ..
+                }
+                | PadEvent::Reset { .. } => shell.south_down = false,
+                _ => {}
+            }
+        }
         let mut commands: Vec<Command> = events
             .into_iter()
             .filter_map(|e| shell.nav.feed(e, now, focused))
@@ -107,6 +125,7 @@ impl App {
                 self.pad_shell_command(context, command);
             }
         }
+        self.pad_shell_hold_tick(context, now);
         self.pad_shell_draw_osk(context);
     }
 
@@ -275,6 +294,56 @@ impl App {
         }
     }
 
+    /// Press the focused control, unless it is a button in a dialog that is
+    /// not recognisably safe: that must be held (see `HOLD_SECONDS`).
+    fn pad_shell_press_focused(&mut self, context: &egui::Context) {
+        let now = context.input(|i| i.time);
+        let guarded = (!crate::ui::picker::open(context))
+            .then(|| guarded_button(context))
+            .flatten();
+        match (guarded, self.pad_shell.as_mut()) {
+            (Some((id, label)), Some(shell)) => {
+                if shell.hold.is_none() {
+                    shell.hold = Some((id, now, label));
+                }
+                context.request_repaint();
+            }
+            _ => page_command(context, Command::Select),
+        }
+    }
+
+    /// Advance a hold-to-confirm: fires on completion, cancels on release or
+    /// when focus moves, and shows its progress.
+    fn pad_shell_hold_tick(&mut self, context: &egui::Context, now: f64) {
+        let Some(shell) = self.pad_shell.as_mut() else {
+            return;
+        };
+        let Some((id, since, label)) = shell.hold.clone() else {
+            return;
+        };
+        let still = shell.south_down && context.memory(|m| m.focused()) == Some(id);
+        if !still {
+            shell.hold = None;
+            return;
+        }
+        let progress = ((now - since) / HOLD_SECONDS).clamp(0.0, 1.0) as f32;
+        if progress >= 1.0 {
+            shell.hold = None;
+            page_command(context, Command::Select);
+            return;
+        }
+        egui::Area::new(egui::Id::new("pad_shell_hold"))
+            .order(egui::Order::Tooltip)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
+            .show(context, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(format!("Keep holding A to confirm: {label}"));
+                    ui.add(egui::ProgressBar::new(progress).desired_width(320.0));
+                });
+            });
+        context.request_repaint_after(std::time::Duration::from_millis(30));
+    }
+
     /// Select on a focused text field opens the keyboard; anywhere else it
     /// presses the focused control.
     fn pad_shell_select(&mut self, context: &egui::Context) {
@@ -283,7 +352,7 @@ impl App {
             .memory(|m| m.focused())
             .filter(|id| TextEditState::load(context, *id).is_some());
         let Some(id) = field else {
-            page_command(context, Command::Select);
+            self.pad_shell_press_focused(context);
             return;
         };
         if is_secret(context, id) {
@@ -359,6 +428,40 @@ impl App {
     }
 }
 
+/// How long A is held to press an unrecognised button in a dialog.
+const HOLD_SECONDS: f64 = 0.6;
+
+/// Labels that only dismiss or go back: a tap is enough.
+fn is_safe_label(label: &str) -> bool {
+    let l = label.trim().trim_end_matches(['…', '.']).to_lowercase();
+    [
+        "cancel", "close", "back", "no", "ok", "okay", "done", "dismiss", "not now", "skip",
+        "got it",
+    ]
+    .contains(&l.as_str())
+        || ["keep ", "cancel ", "don't ", "do not ", "leave ", "stay "]
+            .iter()
+            .any(|p| l.starts_with(p))
+}
+
+/// The focused control when it is a button inside a dialog (not on the page
+/// itself) whose label is not recognisably safe. Anything unknown is guarded:
+/// a wrongly guarded button costs a longer press, never a wrong action.
+fn guarded_button(context: &egui::Context) -> Option<(egui::Id, String)> {
+    let id = context.memory(|m| m.focused())?;
+    let (focus_id, label, button) =
+        context.data(|d| d.get_temp::<(egui::Id, String, bool)>(focus_label_slot()))?;
+    if focus_id != id || !button || is_safe_label(&label) {
+        return None;
+    }
+    let layer = context.read_response(id)?.layer_id;
+    matches!(layer.order, egui::Order::Middle | egui::Order::Foreground).then_some((id, label))
+}
+
+fn focus_label_slot() -> egui::Id {
+    egui::Id::new("pad_shell_focus_label")
+}
+
 fn snapshot_slot() -> egui::Id {
     egui::Id::new("pad_shell_snapshot")
 }
@@ -407,6 +510,20 @@ fn register_capture(context: &egui::Context) {
             context.data_mut(|d| {
                 *d.get_temp_mut_or_insert_with(hook_runs_slot(), || 0_u64) += 1;
             });
+            let gained = context.output(|o| {
+                o.events.iter().rev().find_map(|e| match e {
+                    egui::output::OutputEvent::FocusGained(info) => Some((
+                        info.label.clone().unwrap_or_default(),
+                        info.typ == egui::WidgetType::Button,
+                    )),
+                    _ => None,
+                })
+            });
+            if let (Some((label, button)), Some(focused)) =
+                (gained, context.memory(|m| m.focused()))
+            {
+                context.data_mut(|d| d.insert_temp(focus_label_slot(), (focused, label, button)));
+            }
             if !context
                 .data(|d| d.get_temp::<bool>(capture_slot()))
                 .unwrap_or(false)
