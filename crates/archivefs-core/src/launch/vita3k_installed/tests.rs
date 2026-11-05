@@ -203,8 +203,66 @@ fn missing_licence_and_missing_firmware_block_the_title() {
     let g = fixture();
     fs::remove_dir_all(g.config_root.join("ux0/vs0")).unwrap();
     install(&g.config_root, "PCSE00001", "PCSE00001", "Homebrew", "HB");
-    let entry = &scan_vita3k_installed_titles(&g.roots).entries[0];
-    assert_eq!(entry.firmware, Vita3kFirmwareState::Unknown);
+    let inventory = scan_vita3k_installed_titles(&g.roots);
+    assert_eq!(inventory.entries[0].firmware, Vita3kFirmwareState::Unknown);
+    assert!(
+        inventory.entries[0]
+            .blocker
+            .as_deref()
+            .unwrap()
+            .contains("firmware")
+    );
+    let err =
+        preflight_and_launch_vita3k_installed(&request_for(&inventory, "PCSE00001"), &g.roots)
+            .err()
+            .unwrap();
+    assert!(matches!(err, Vita3kInstalledLaunchError::Refused(_)));
+}
+
+#[test]
+fn a_symlinked_sce_sys_folder_is_not_listed() {
+    let f = fixture();
+    install(&f.config_root, "PCSE00001", "PCSE00001", "Real", "HB");
+    let sys = f.config_root.join("ux0/app/PCSE00001/sce_sys");
+    let elsewhere = f.dir.path().join("elsewhere-sys");
+    fs::rename(&sys, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &sys).unwrap();
+    let inventory = scan_vita3k_installed_titles(&f.roots);
+    assert!(inventory.entries.is_empty());
+    assert!(inventory.skipped[0].contains("sce_sys"));
+}
+
+#[test]
+fn a_title_id_that_could_pass_as_an_option_is_not_listed() {
+    let f = fixture();
+    install(
+        &f.config_root,
+        "-PCSE0001",
+        "-PCSE0001",
+        "Option-like",
+        "HB",
+    );
+    let inventory = scan_vita3k_installed_titles(&f.roots);
+    assert!(inventory.entries.is_empty());
+    assert!(inventory.skipped[0].contains("not a usable title id"));
+}
+
+#[test]
+fn a_changed_vita3k_configuration_after_listing_is_refused() {
+    let f = fixture();
+    fs::write(f.config_root.join("config.yml"), "# fixture config\n").unwrap();
+    install(&f.config_root, "PCSE00001", "PCSE00001", "Homebrew", "HB");
+    let request = request_for(&scan_vita3k_installed_titles(&f.roots), "PCSE00001");
+    assert!(request.entry.config_identity.is_some());
+    fs::write(
+        f.config_root.join("config.yml"),
+        "# fixture config\n# edited\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        preflight_and_launch_vita3k_installed(&request, &f.roots),
+        Err(Vita3kInstalledLaunchError::Changed(_))
+    ));
 }
 
 #[test]

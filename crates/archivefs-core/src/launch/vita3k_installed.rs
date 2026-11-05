@@ -17,7 +17,10 @@
 //! ambiguous and refused (EmuWiz will not pick an installation), as are a
 //! missing licence, missing firmware, an ineligible profile, a `param.sfo` that
 //! is not a regular file, and any drift between the listing a person saw and
-//! the state at launch time. The launch reuses [`preflight_vita3k_launch`] and
+//! the state at launch time. Vita3K itself resolves `--installed-path <ID>` from
+//! its own configuration; EmuWiz binds the installation it scanned (profile,
+//! executable and config identity) but cannot pass it a different data folder.
+//! The launch reuses [`preflight_vita3k_launch`] and
 //! [`spawn_vita3k`] unchanged.
 
 use std::collections::BTreeMap;
@@ -114,7 +117,8 @@ fn regular_identity(path: &Path) -> Option<CapturedFileIdentity> {
         .then(|| CapturedFileIdentity::capture(&metadata))
 }
 
-fn sha256_of(path: &Path) -> Option<String> {
+/// Reads `param.sfo` once; the hash and the `TITLE_ID` check use these bytes.
+fn read_param(path: &Path) -> Option<(String, Option<String>)> {
     use std::fmt::Write;
     let file = fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
@@ -124,14 +128,26 @@ fn sha256_of(path: &Path) -> Option<String> {
     if bytes.len() as u64 > VITA3K_MAX_SFO_BYTES {
         return None;
     }
-    Some(
-        Sha256::digest(&bytes)
-            .iter()
-            .fold(String::new(), |mut out, byte| {
-                let _ = write!(out, "{byte:02x}");
-                out
-            }),
-    )
+    let hash = Sha256::digest(&bytes)
+        .iter()
+        .fold(String::new(), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        });
+    let title_id = crate::param_sfo::parse_param_sfo(&bytes)
+        .and_then(|sfo| sfo.get_text("TITLE_ID").map(str::to_string));
+    Some((hash, title_id))
+}
+
+/// An id that cannot be mistaken for an option when passed as a value.
+fn safe_title_id(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+}
+
+fn real_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
 }
 
 fn scan_profile(profile: &Vita3kProfile, inventory: &mut Vita3kInventory) {
@@ -179,6 +195,18 @@ fn scan_profile(profile: &Vita3kProfile, inventory: &mut Vita3kInventory) {
         else {
             continue;
         };
+        if !safe_title_id(&name) {
+            inventory
+                .skipped
+                .push(format!("{name}: not a usable title id"));
+            continue;
+        }
+        if !real_directory(&root.join("sce_sys")) {
+            inventory
+                .skipped
+                .push(format!("{name}: sce_sys is not a real folder"));
+            continue;
+        }
         let title = match inspect_installed_title(profile, &name) {
             Ok(title) => title,
             Err(reason) => {
@@ -187,18 +215,24 @@ fn scan_profile(profile: &Vita3kProfile, inventory: &mut Vita3kInventory) {
             }
         };
         let param = root.join("sce_sys/param.sfo");
-        let (Some(param_identity), Some(param_sha256)) =
-            (regular_identity(&param), sha256_of(&param))
+        let (Some(param_identity), Some((param_sha256, hashed_title_id))) =
+            (regular_identity(&param), read_param(&param))
         else {
             inventory
                 .skipped
                 .push(format!("{name}: param.sfo is not a regular file"));
             continue;
         };
+        if hashed_title_id.as_deref() != Some(name.as_str()) {
+            inventory
+                .skipped
+                .push(format!("{name}: param.sfo changed while it was being read"));
+            continue;
+        }
         let blocker = if title.license == Vita3kLicenseState::Missing {
             Some("the installed title's licence is missing in this Vita3K installation".into())
-        } else if profile.firmware == Vita3kFirmwareState::Missing {
-            Some("Vita3K firmware is not installed in this installation".into())
+        } else if profile.firmware != Vita3kFirmwareState::PresentUnverified {
+            Some("Vita3K firmware does not appear to be installed in this installation (install it inside Vita3K)".into())
         } else {
             None
         };
@@ -311,6 +345,9 @@ pub fn preflight_and_launch_vita3k_installed(
         || fresh.executable_identity != reviewed.executable_identity
     {
         return Err(changed("the Vita3K executable"));
+    }
+    if fresh.config_identity != reviewed.config_identity {
+        return Err(changed("the Vita3K configuration"));
     }
     if fresh.title_root != reviewed.title_root
         || (fresh.title_identity.device, fresh.title_identity.inode)
