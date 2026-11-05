@@ -519,10 +519,20 @@ fn stale_reads_are_dropped_after_a_pin_or_a_finished_download() {
         },
     );
     wait(&mut workflows);
+    // The shown entry updates in place (no blank frame that would drop
+    // controller focus) and a re-read is queued.
+    let shown = workflows
+        .cheat_catalogues
+        .verification
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap();
     assert!(
-        workflows.cheat_catalogues.verification.is_none(),
-        "old pin state must not linger"
+        shown.entries.iter().any(|entry| entry.pinned),
+        "pin state must update at once"
     );
+    assert!(workflows.cheat_catalogues.refresh_pending);
     // The next frame re-reads the list instead of leaving it blank.
     workflows.poll_cheat_catalogues(&context);
     wait(&mut workflows);
@@ -547,4 +557,11 @@ fn stale_reads_are_dropped_after_a_pin_or_a_finished_download() {
     workflows.poll_cheat_catalogues(&context);
     assert!(workflows.cheat_catalogues.plan.is_none());
     assert!(workflows.cheat_catalogues.inventory.is_none());
+}
+
+#[test]
+fn counts_are_worded_correctly() {
+    assert_eq!(plural(1, "item", "items"), "item");
+    assert_eq!(plural(0, "item", "items"), "items");
+    assert_eq!(plural(2, "copy", "copies"), "copies");
 }

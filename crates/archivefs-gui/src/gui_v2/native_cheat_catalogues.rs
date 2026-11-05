@@ -228,7 +228,33 @@ impl State {
                     };
                     self.notice = Some((true, text.to_string()));
                     // Pins change inventory and invalidate any reviewed plan.
-                    self.invalidate();
+                    // Update the shown entry in place and re-read afterwards:
+                    // blanking the list would drop keyboard/controller focus
+                    // from the button that was just pressed.
+                    self.plan = None;
+                    let now_pinned = matches!(
+                        result.status,
+                        SnapshotPinStatus::Pinned | SnapshotPinStatus::AlreadyPinned
+                    );
+                    let shown = self
+                        .verification
+                        .as_mut()
+                        .and_then(|report| report.as_mut().ok())
+                        .map(|report| &mut report.entries)
+                        .into_iter()
+                        .chain(
+                            self.inventory
+                                .as_mut()
+                                .and_then(|report| report.as_mut().ok())
+                                .map(|report| &mut report.entries),
+                        );
+                    for entries in shown {
+                        for entry in entries.iter_mut() {
+                            if entry.snapshot_id.as_deref() == Some(result.snapshot_id.as_str()) {
+                                entry.pinned = now_pinned;
+                            }
+                        }
+                    }
                     self.refresh_pending = true;
                 }
                 Err(error) => self.notice = Some((false, error.to_string())),
@@ -251,7 +277,7 @@ impl State {
                             .filter(|entry| entry.status != CachePruneEntryStatus::Deleted)
                             .collect::<Vec<_>>();
                         let mut text = format!(
-                            "Clean-up {}: {} old copies and {} leftovers removed, {} freed.",
+                            "Clean-up {}: {} old {} and {} {} removed, {} freed.",
                             match result.status {
                                 CachePruneExecutionStatus::Completed => "finished",
                                 CachePruneExecutionStatus::PartialFailure =>
@@ -259,7 +285,9 @@ impl State {
                                 CachePruneExecutionStatus::Preview => "previewed",
                             },
                             result.snapshots_deleted,
+                            plural(result.snapshots_deleted, "copy", "copies"),
                             result.staging_entries_removed,
+                            plural(result.staging_entries_removed, "leftover", "leftovers"),
                             human_bytes(result.bytes_reclaimed)
                         );
                         if let Some(first) = untouched.first() {
@@ -285,6 +313,10 @@ impl State {
             ..CachePrunePolicy::default()
         }
     }
+}
+
+fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
+    if count == 1 { one } else { many }
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -639,15 +671,18 @@ impl NativeWorkflows {
         if let Some(plan) = &state.plan {
             if plan.candidate_count == 0 {
                 ui.label(format!(
-                    "Nothing to remove. {} items are protected.",
-                    plan.protected_count
+                    "Nothing to remove. {} {} protected.",
+                    plan.protected_count,
+                    plural(plan.protected_count, "item is", "items are")
                 ));
             } else {
                 ui.label(format!(
-                    "This would remove {} items and free {}. {} items are protected and stay.",
+                    "This would remove {} {} and free {}. {} {} protected and stay.",
                     plan.candidate_count,
+                    plural(plan.candidate_count, "item", "items"),
                     human_bytes(plan.candidate_bytes),
-                    plan.protected_count
+                    plan.protected_count,
+                    plural(plan.protected_count, "item is", "items are")
                 ));
                 for entry in plan
                     .entries
@@ -663,7 +698,11 @@ impl NativeWorkflows {
                 if ui
                     .add_enabled(
                         idle,
-                        egui::Button::new(format!("Remove {} items", plan.candidate_count)),
+                        egui::Button::new(format!(
+                            "Remove {} {}",
+                            plan.candidate_count,
+                            plural(plan.candidate_count, "item", "items")
+                        )),
                     )
                     .clicked()
                 {
