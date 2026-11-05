@@ -7,15 +7,18 @@
 //! *and* the caller's explicit game identity; filenames are never matched.
 
 use super::{
-    EmulatorUseStatus, SaveLocation, SaveRestoreConflict, SaveRestorePlan, SaveSnapshot,
-    SaveSnapshotError, SaveSnapshotManifest, SaveSnapshotRequest, build_restore_plan,
-    create_snapshot, create_snapshot_checked, verify_snapshot,
+    EmulatorUseStatus, SaveArtifactType, SaveLocation, SaveQuiescenceRequirement,
+    SaveRestoreConflict, SaveRestorePlan, SaveSnapshot, SaveSnapshotError, SaveSnapshotManifest,
+    SaveSnapshotRequest, build_restore_plan, create_snapshot, create_snapshot_checked,
+    verify_snapshot,
 };
 use crate::memory_card_inventory::restore_guard::{
     CardLeaseAttempt, CardWriteLease, ProcScanQuiescence, observe_card_now, ps2_card_binding,
 };
 use crate::persistent_state_inventory::StateEmulator;
-use crate::save_snapshots::tree_restore::safety::{EmulatorQuiescence, QuiescenceProvider};
+use crate::save_snapshots::tree_restore::safety::{
+    DirectorySaveBinding, EmulatorQuiescence, QuiescenceProvider, ResolvedSaveGame,
+};
 use std::{
     fs,
     io::Read,
@@ -213,13 +216,46 @@ pub fn history_for_location(
 }
 
 /// Emulators whose closure can be established by an existing, reviewed
-/// process observer. Only PCSX2 has one today
+/// process observer: PCSX2 and RetroArch
 /// ([`ProcScanQuiescence`]: emulator executables plus open descriptors on the
 /// save). Other emulators always report `Unknown`, so snapshot creation is
 /// refused for them; neither names alone nor the absence of an EmuWiz-tracked
 /// launch is treated as proof that an emulator is closed.
 pub fn snapshot_closure_supported(emulator: StateEmulator) -> bool {
-    emulator == StateEmulator::Pcsx2
+    matches!(emulator, StateEmulator::Pcsx2 | StateEmulator::RetroArch)
+}
+
+/// The observer binding for one save file. Its `emulator` selects which
+/// process names the scan treats as "running".
+pub fn closure_binding(emulator: StateEmulator, save_path: &Path) -> DirectorySaveBinding {
+    if emulator == StateEmulator::RetroArch {
+        DirectorySaveBinding {
+            game: ResolvedSaveGame::Unique("save file".to_string()),
+            emulator: "retroarch".to_string(),
+            profile: save_path.to_string_lossy().into_owned(),
+            artifact_type: SaveArtifactType::Sram,
+        }
+    } else {
+        ps2_card_binding(save_path, "save snapshot")
+    }
+}
+
+/// Current closure of the emulator for one save file, as the restore needs
+/// it. Anything but a proved `Closed` is a refusal.
+pub fn restore_quiescence(
+    emulator: StateEmulator,
+    save_path: &Path,
+    observer: &dyn QuiescenceProvider,
+) -> SaveQuiescenceRequirement {
+    if !snapshot_closure_supported(emulator) {
+        return SaveQuiescenceRequirement::Unknown;
+    }
+    match observe_card_now(observer, &closure_binding(emulator, save_path), save_path) {
+        EmulatorQuiescence::Closed => SaveQuiescenceRequirement::ConfirmedClosed,
+        EmulatorQuiescence::Running => SaveQuiescenceRequirement::Running,
+        EmulatorQuiescence::CardInUse => SaveQuiescenceRequirement::InUse,
+        EmulatorQuiescence::Unknown => SaveQuiescenceRequirement::Unknown,
+    }
 }
 
 /// Emulator-use evidence for `save_path`, for showing before a snapshot.
@@ -234,11 +270,7 @@ pub fn snapshot_emulator_use(
     if !snapshot_closure_supported(emulator) {
         return EmulatorUseStatus::Unknown;
     }
-    match observe_card_now(
-        observer,
-        &ps2_card_binding(save_path, "save snapshot"),
-        save_path,
-    ) {
+    match observe_card_now(observer, &closure_binding(emulator, save_path), save_path) {
         EmulatorQuiescence::Closed => EmulatorUseStatus::NotDetected,
         EmulatorQuiescence::Running => EmulatorUseStatus::Running,
         EmulatorQuiescence::CardInUse => EmulatorUseStatus::CardInUse,
@@ -272,7 +304,7 @@ pub fn create_snapshot_observed(
         return create_snapshot(&request);
     }
     let path = request.location.path.clone();
-    let binding = ps2_card_binding(&path, "save snapshot");
+    let binding = closure_binding(emulator, &path);
     match CardWriteLease::acquire(&path, None) {
         CardLeaseAttempt::Held(lease) => {
             request.emulator_use =

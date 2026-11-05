@@ -67,6 +67,7 @@ impl ProcScanQuiescence {
         binding: &DirectorySaveBinding,
         lease: Option<&CardWriteLease>,
     ) -> ProcScanReport {
+        let who = EmulatorIdentity::for_binding(binding);
         let mut report = ProcScanReport {
             state: EmulatorQuiescence::Unknown,
             card_holders: Vec::new(),
@@ -117,23 +118,26 @@ impl ProcScanQuiescence {
             let mut cgroup_unreadable = false;
             let mut descriptors_unreadable = false;
             let mut tokens_seen: Vec<String> = Vec::new();
+            let mut cgroup_text = String::new();
             for leaf in ["comm", "cmdline"] {
                 match fs::read(dir.join(leaf)) {
                     Ok(bytes) => {
-                        let tokens: Vec<_> = bytes
+                        // Lossy, never dropped: a non-UTF-8 byte in a path must
+                        // not hide the emulator's name from the match.
+                        let tokens: Vec<String> = bytes
                             .split(|byte| *byte == 0)
-                            .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+                            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                             .collect();
-                        let executable = tokens.first().copied().unwrap_or("");
+                        let executable = tokens.first().map(String::as_str).unwrap_or("");
                         let launcher = Path::new(executable.trim())
                             .file_name()
                             .and_then(|name| name.to_str())
                             .unwrap_or("");
-                        if emulator_name(executable)
+                        if who.name(executable)
                             || (["flatpak", "bwrap"].contains(&launcher)
-                                && tokens.iter().any(|token| {
-                                    *token == "net.pcsx2.PCSX2" || emulator_name(token)
-                                }))
+                                && tokens
+                                    .iter()
+                                    .any(|token| token.contains(who.flatpak_id) || who.name(token)))
                         {
                             report.emulator_processes.push(pid);
                         }
@@ -148,12 +152,23 @@ impl ProcScanQuiescence {
             // every process it starts, whatever their names. It is required
             // evidence only for waiving a process we cannot inspect.
             match fs::read_to_string(dir.join("cgroup")) {
-                Ok(cgroup) if flatpak_pcsx2_scope(&cgroup) => report.emulator_processes.push(pid),
-                Ok(_) => {}
+                Ok(cgroup) => {
+                    if who.scope(&cgroup) {
+                        report.emulator_processes.push(pid);
+                    }
+                    cgroup_text = cgroup;
+                }
                 Err(_) => cgroup_unreadable = true,
             }
+            // Any emulator marker anywhere in the name, command line or cgroup
+            // refuses, whether or not the process can otherwise be inspected:
+            // a wrapper, AppRun, `emu -L x_libretro.so`, RetroDECK's scope.
+            // Refusal only; a missing marker clears nothing.
+            if who.marker(&cgroup_text) || tokens_seen.iter().any(|token| who.marker(token)) {
+                report.emulator_processes.push(pid);
+            }
             if let Ok(executable) = fs::read_link(dir.join("exe"))
-                && emulator_name(&executable.to_string_lossy())
+                && who.name(&executable.to_string_lossy())
             {
                 report.emulator_processes.push(pid);
             }
@@ -185,7 +200,9 @@ impl ProcScanQuiescence {
                 // the command line counts, not only the executable.
                 if tokens_seen
                     .iter()
-                    .any(|token| emulator_name(token) || token.contains("net.pcsx2.PCSX2"))
+                    .any(|token| who.name(token) || token.contains(who.flatpak_id))
+                    || who.marker(&cgroup_text)
+                    || tokens_seen.iter().any(|token| who.marker(token))
                 {
                     report.emulator_processes.push(pid);
                 }
@@ -198,7 +215,7 @@ impl ProcScanQuiescence {
         report.emulator_processes.dedup();
         // Checked after the scan: a writer arriving during it breaks the lease.
         let covered = match lease {
-            Some(lease) if lease.intact() => true,
+            Some(lease) if lease.intact() => who.lease_waives_uninspectable,
             Some(_) => {
                 report.card_open_for_writing = true;
                 false
@@ -249,20 +266,81 @@ impl QuiescenceProvider for ProcScanQuiescence {
     }
 }
 
-fn flatpak_pcsx2_scope(cgroup: &str) -> bool {
-    cgroup.contains("app-flatpak-net.pcsx2.PCSX2")
+/// What counts as "the emulator is running" for one binding. Names are only
+/// ever used to refuse. Any binding that does not name RetroArch keeps the
+/// PS2 identity the card restore was reviewed with.
+struct EmulatorIdentity {
+    names: &'static [&'static str],
+    flatpak_id: &'static str,
+    /// An intact card lease may stand in for the descriptors of a process we
+    /// cannot inspect, but only when its name, command line and cgroup were
+    /// all readable and carry no emulator marker. The lease answers exactly
+    /// the question the unreadable descriptors would (does any process have
+    /// the save open, or open it for writing), for every uid. Without an
+    /// intact lease the process stays `Unknown`. For RetroArch, which opens
+    /// its SRAM only briefly, an idle emulator is found by identity (inspected
+    /// processes: name and `exe`; uninspectable ones: `markers`), not by the
+    /// lease.
+    lease_waives_uninspectable: bool,
+    /// Substrings (lowercase) that mark a process we cannot inspect as the
+    /// emulator or a launcher of it, wherever they appear in its name,
+    /// command line or cgroup. Used only for uninspectable processes, where
+    /// the alternative is `Unknown`; refusal only, never a clearance.
+    markers: &'static [&'static str],
+    /// Also match names like `retroarch_vulkan` / `retroarch32` (refusal only).
+    loose_suffix: bool,
 }
 
-fn emulator_name(value: &str) -> bool {
-    let name = Path::new(value.trim())
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    PS2_EMULATOR_PROCESS_NAMES.iter().any(|expected| {
-        name == *expected
-            || name.strip_prefix(expected).is_some_and(|suffix| {
-                suffix.starts_with('-') || suffix == ".appimage" || suffix == ".exe"
-            })
-    })
+const RETROARCH_PROCESS_NAMES: &[&str] = &["retroarch"];
+
+impl EmulatorIdentity {
+    fn for_binding(binding: &DirectorySaveBinding) -> Self {
+        if binding.emulator.eq_ignore_ascii_case("retroarch") {
+            Self {
+                names: RETROARCH_PROCESS_NAMES,
+                flatpak_id: "org.libretro.RetroArch",
+                lease_waives_uninspectable: true,
+                loose_suffix: true,
+                markers: &["retroarch", "libretro", "retrodeck"],
+            }
+        } else {
+            Self {
+                names: PS2_EMULATOR_PROCESS_NAMES,
+                flatpak_id: "net.pcsx2.PCSX2",
+                lease_waives_uninspectable: true,
+                loose_suffix: false,
+                markers: &[],
+            }
+        }
+    }
+
+    fn marker(&self, text: &str) -> bool {
+        let text = text.to_ascii_lowercase();
+        self.markers.iter().any(|marker| text.contains(marker))
+    }
+
+    fn scope(&self, cgroup: &str) -> bool {
+        cgroup.contains(&format!("app-flatpak-{}", self.flatpak_id))
+    }
+
+    fn name(&self, value: &str) -> bool {
+        let name = Path::new(value.trim())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        self.names.iter().any(|expected| {
+            name == *expected
+                || name.strip_prefix(expected).is_some_and(|suffix| {
+                    suffix.starts_with('-')
+                        || suffix == ".appimage"
+                        || suffix == ".exe"
+                        || (self.loose_suffix
+                            && suffix
+                                .chars()
+                                .next()
+                                .is_some_and(|c| c == '_' || c == '.' || c.is_ascii_digit()))
+                })
+        })
+    }
 }
