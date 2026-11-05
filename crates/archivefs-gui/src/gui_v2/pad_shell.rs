@@ -661,6 +661,19 @@ impl App {
             context.memory_mut(|m| m.request_focus(back));
             return;
         }
+        // On a Library card Up/Down moves a grid row: the shelf does it, as the
+        // card above or below may be scrolled fully out of view, where egui's
+        // spatial search cannot see it.
+        if matches!(direction, Direction::Up | Direction::Down)
+            && context
+                .data(|d| d.get_temp::<egui::Id>(super::browse_play::focused_card_control_id()))
+                == Some(from)
+        {
+            let step: i32 = if direction == Direction::Down { 1 } else { -1 };
+            context.data_mut(|d| d.insert_temp(super::browse_play::row_step_id(), step));
+            context.request_repaint();
+            return;
+        }
         let spatial = match direction {
             Direction::Up => F::Up,
             Direction::Down => F::Down,
