@@ -8801,7 +8801,7 @@ fn review_identity_explains_each_failed_state_with_its_direct_next_action() {
     let mut app = review_app(&context, vec![(1, "Game", "SNES")]);
     let strings = render_review(&context, &mut app, 1);
     assert!(
-        shows(&strings, "This game is ready to verify"),
+        shows(&strings, "This game has not been verified yet"),
         "{strings:?}"
     );
     assert!(!shows(&strings, "Unknown"));
@@ -11905,6 +11905,8 @@ mod ppsspp_profile_resolution {
 #[path = "tests/save_vault.rs"]
 mod blue_save_vault;
 
+#[path = "tests/card_restore.rs"]
+mod blue_card_restore;
 #[path = "tests/save_snapshots.rs"]
 mod blue_save_snapshots;
 

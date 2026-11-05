@@ -12,6 +12,7 @@ mod bezel_history;
 mod bg_readiness;
 mod big_picture;
 mod browse_play;
+mod card_restore;
 mod cheat_extras_page;
 pub(crate) mod classic_trainers;
 #[cfg(test)]
@@ -843,6 +844,18 @@ impl App {
         self.saves_states.snapshots.feedback = None;
         if !self.send(id, Command::CreateSaveSnapshot { root, target }) {
             self.saves_states.snapshots.create_job = None;
+        }
+    }
+    fn start_card_restore(&mut self, label: &'static str, job: card_restore::Job) {
+        if self.saves_states.card_restore.job.is_some() {
+            return;
+        }
+        let id = self
+            .activity
+            .queue(label, Route::Section(Section::Saves), false);
+        self.saves_states.card_restore.job = Some(id);
+        if !self.send(id, Command::CardRestore(Box::new(job))) {
+            self.saves_states.card_restore.job = None;
         }
     }
     fn start_saves_inventory(&mut self) {
@@ -1867,6 +1880,10 @@ impl App {
                                         None,
                                     );
                                 }
+                                Payload::CardRestore(outcome) => {
+                                    let message = card_restore::receive(self, id, *outcome);
+                                    self.activity.finish(id, message, None);
+                                }
                                 Payload::SaveSnapshotCreated { result } => {
                                     let panel = &mut self.saves_states.snapshots;
                                     if panel.create_job == Some(id) {
@@ -2151,6 +2168,9 @@ impl App {
                             }
                             if self.saves_states.snapshots.history_job == Some(id) {
                                 self.saves_states.snapshots.history_job = None;
+                            }
+                            if self.saves_states.card_restore.job == Some(id) {
+                                card_restore::job_failed(self, &error);
                             }
                             if self.saves_states.snapshots.create_job == Some(id) {
                                 self.saves_states.snapshots.create_job = None;
