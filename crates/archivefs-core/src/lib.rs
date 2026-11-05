@@ -42,6 +42,7 @@ pub mod app_dirs;
 /// Bounded, read-only Apple II disk structural evidence.
 pub mod apple2_disk;
 /// Read-only orchestration of independent MAME and FBNeo compatibility results.
+pub mod arcade_compat_check;
 pub mod arcade_compatibility;
 /// Read-only per-set compatibility against an explicitly pinned FBNeo source.
 pub mod arcade_fbneo_compatibility;

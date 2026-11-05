@@ -121,6 +121,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         playing_library_generation: 0,
         organisation: super::organisation::OrganisationState::default(),
         arcade_input_details: super::arcade_input_details::State::default(),
+        arcade_compat_panel: Default::default(),
         classic_trainers: super::classic_trainers::State::default(),
         recording_integrity: Default::default(),
         game_detail_facts: Default::default(),
