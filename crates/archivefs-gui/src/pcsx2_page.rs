@@ -975,6 +975,11 @@ fn show_export_dialog(ui: &mut egui::Ui) {
     }
 }
 
+/// Shown when the kernel reports that some program has the card open. Says
+/// nothing about which program: only process evidence says "PCSX2 is running".
+pub(crate) const STORAGE_UNPROTECTED: &str = "This memory card is stored on a merged, FUSE or network folder, where EmuWiz cannot safely protect it from other programs during a restore. Copy the card to a local disk and restore it there.";
+pub(crate) const CARD_IN_USE: &str = "Memory card is in use. Another application may have it open. Close applications accessing this card and try again.";
+
 pub(crate) fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
     match error {
         Ps2PsuRestoreError::ExistingSave(name) => {
@@ -1011,8 +1016,10 @@ pub(crate) fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
         Ps2PsuRestoreError::InvalidPlan(detail) => format!("Restore was refused: {detail}"),
         Ps2PsuRestoreError::Io(detail) => format!("Restore could not be completed: {detail}"),
         Ps2PsuRestoreError::EmulatorRunning => {
-            "A PS2 emulator is running or has this memory card open. Close it completely, then try again. The card was not changed.".into()
+            "A PS2 emulator (PCSX2) is running. Close it completely, then try again. The card was not changed.".into()
         }
+        Ps2PsuRestoreError::CardInUse => format!("{CARD_IN_USE} The card was not changed."),
+        Ps2PsuRestoreError::StorageUnprotected => format!("{STORAGE_UNPROTECTED} The card was not changed."),
         Ps2PsuRestoreError::EmulatorStateUnknown => {
             "EmuWiz could not inspect every live process, so it did not change the card. Close the emulator and inaccessible processes or correct /proc permissions, then retry.".into()
         }
@@ -1446,6 +1453,33 @@ mod tests {
         assert!(rollback.contains("/tmp/backup.card") && rollback.contains("AND"));
         let running = psu_restore_error_message(&Ps2PsuRestoreError::EmulatorRunning);
         assert!(running.contains("not changed"));
+    }
+
+    #[test]
+    fn card_in_use_never_claims_that_pcsx2_is_running() {
+        let in_use = psu_restore_error_message(&Ps2PsuRestoreError::CardInUse);
+        assert!(in_use.starts_with(CARD_IN_USE), "{in_use}");
+        assert!(in_use.contains("not changed"));
+        assert!(
+            !in_use.contains("PCSX2") && !in_use.contains("emulator"),
+            "{in_use}"
+        );
+        let running = psu_restore_error_message(&Ps2PsuRestoreError::EmulatorRunning);
+        assert!(running.contains("PCSX2") && running.contains("is running"));
+        assert!(!running.contains("in use"), "{running}");
+    }
+
+    #[test]
+    fn unprotectable_storage_explains_the_location_not_an_emulator() {
+        let storage = psu_restore_error_message(&Ps2PsuRestoreError::StorageUnprotected);
+        assert!(storage.starts_with(STORAGE_UNPROTECTED), "{storage}");
+        assert!(storage.contains("not changed") && storage.contains("local disk"));
+        assert!(
+            !storage.contains("PCSX2") && !storage.contains("running"),
+            "{storage}"
+        );
+        let core = Ps2PsuRestoreError::StorageUnprotected.to_string();
+        assert!(core.contains("storage location") && !core.contains("emulator"));
     }
 
     fn empty_inspection() -> Pcsx2GameInspection {

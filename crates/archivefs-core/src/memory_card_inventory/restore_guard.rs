@@ -5,6 +5,24 @@
 //! * **Quiescence.** Mutation is refused unless the Save Vault policy
 //!   ([`QuiescenceProvider`]) reports `Closed`. `Running` and `Unknown` refuse,
 //!   and the check is repeated immediately before publication.
+//! * **Kernel lease over the publication window.** Where Linux grants them,
+//!   read leases on the live card and on its replacement are taken before the
+//!   final check and held until the operation, including any reversal, is
+//!   finished. A lease is refused while any other descriptor, of any process,
+//!   user or container, is open on the inode (readers included), and is
+//!   broken by any later open for writing or truncate. The opener is held back
+//!   until we release, or until `fs.lease-break-time` (45 s by default)
+//!   expires; after expiry the lease reads as broken (`F_UNLCK`), and a writer
+//!   that got through is caught by the identity and SHA-256 checks
+//!   (RollbackFailed or UndoFailed, both files kept), never committed. A break
+//!   on the outgoing card refuses before the exchange and reverses it after;
+//!   the opener then resumes on the unchanged original at the card path. This
+//!   protection does not depend on knowing what any process is; only while it
+//!   is held may the process scan leave uninspectable descriptor tables to
+//!   the kernel. Without lease support the strict process scan alone decides;
+//!   on storage whose writes can bypass the inode (FUSE such as mergerfs,
+//!   overlayfs, network filesystems; judged from the file's filesystem, never
+//!   its path) an incomplete scan refuses as `StorageUnprotected`.
 //! * **Durable intent.** A checksummed journal is written (atomically, with
 //!   fsync) before the first mutation and at every phase change, so an
 //!   interrupted restore can be found and judged after a restart.
@@ -24,11 +42,16 @@
 
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+mod card_lease;
 mod discovery;
 mod exchange;
 mod ownership;
 mod proc_scan;
 mod recovery_evidence;
+pub use card_lease::{
+    CardLeaseAttempt, CardWriteLease, card_storage_unprotectable, observe_card_now,
+};
+use card_lease::{PublicationLeaseAttempt, PublicationLeases};
 pub use discovery::{
     PS2_DISCOVERY_LIMIT, Ps2DiscoveryProblem, Ps2RecoveryRun, Ps2RestoreDiscovery,
     discover_ps2_restore_journals, recover_all_interrupted_ps2_restores,
@@ -255,10 +278,17 @@ pub fn ps2_card_binding(card_path: &Path, save_display_name: &str) -> DirectoryS
     }
 }
 
-fn check_quiescence(state: EmulatorQuiescence) -> Result<(), Ps2PsuRestoreError> {
+fn check_quiescence(state: EmulatorQuiescence, card: &Path) -> Result<(), Ps2PsuRestoreError> {
     match state {
         EmulatorQuiescence::Closed => Ok(()),
         EmulatorQuiescence::Running => Err(Ps2PsuRestoreError::EmulatorRunning),
+        EmulatorQuiescence::CardInUse => Err(Ps2PsuRestoreError::CardInUse),
+        // Without kernel evidence, explain why: on storage whose writes can
+        // bypass the card inode, no lease is taken and the strict scan alone
+        // decides. Either way the operation is refused.
+        EmulatorQuiescence::Unknown if card_storage_unprotectable(card) => {
+            Err(Ps2PsuRestoreError::StorageUnprotected)
+        }
         EmulatorQuiescence::Unknown => Err(Ps2PsuRestoreError::EmulatorStateUnknown),
     }
 }
@@ -467,6 +497,9 @@ struct Run<'a> {
     original: Vec<u8>,
     renamed: bool,
     quiescence: &'a dyn QuiescenceProvider,
+    /// Held from the publication gate until the run is dropped, which is
+    /// after any reversal by `unwind`.
+    leases: Option<PublicationLeases>,
 }
 
 impl Run<'_> {
@@ -477,7 +510,76 @@ impl Run<'_> {
     }
 
     fn quiet(&self) -> Result<(), Ps2PsuRestoreError> {
-        check_quiescence(self.quiescence.observe(&self.journal.binding))
+        check_quiescence(
+            match &self.leases {
+                Some(leases) => self
+                    .quiescence
+                    .observe_under_card_lease(&self.journal.binding, &leases.outgoing),
+                None => self.quiescence.observe(&self.journal.binding),
+            },
+            &self.journal.card_path,
+        )
+    }
+
+    /// Lease the live card and the staged replacement for the rest of the
+    /// run. Without kernel support, nothing is held and `quiet` is strict.
+    fn lease_publication(&mut self, staged: &Path) -> Result<(), Ps2PsuRestoreError> {
+        let staged_identity = path_identity(staged)?;
+        match PublicationLeases::acquire(
+            &self.journal.card_path,
+            self.journal.original_identity,
+            staged,
+            staged_identity,
+        ) {
+            PublicationLeaseAttempt::Held(leases) => {
+                self.leases = Some(leases);
+                Ok(())
+            }
+            PublicationLeaseAttempt::Writers => Err(Ps2PsuRestoreError::CardInUse),
+            PublicationLeaseAttempt::Changed => Err(Ps2PsuRestoreError::CardChanged),
+            PublicationLeaseAttempt::Unavailable => Ok(()),
+        }
+    }
+
+    /// Immediately before the exchange: nothing opened either file for writing.
+    fn leases_unbroken(&self) -> Result<(), Ps2PsuRestoreError> {
+        match &self.leases {
+            Some(leases) if !leases.outgoing.intact() || !leases.incoming.intact() => {
+                Err(Ps2PsuRestoreError::CardInUse)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// After the exchange and its verification, before the restore counts as
+    /// published. An opener of the outgoing card resolved the card path before
+    /// the exchange: the exchange is reversed (by `unwind`) before the leases
+    /// are released, so it resumes on the original at the card path. An opener
+    /// of the incoming card opened the new live card: it resumes on it after
+    /// release, exactly as if it had opened it after the restore.
+    fn leases_settled(&mut self, staged: &Path) -> Result<(), Ps2PsuRestoreError> {
+        let Some(leases) = &self.leases else {
+            return Ok(());
+        };
+        match (leases.outgoing.intact(), leases.incoming.intact()) {
+            (true, _) => Ok(()),
+            (false, true) => {
+                // Durable before reversing: if we stop here, recovery must
+                // park this record, never tidy away the displaced original
+                // that the released opener holds.
+                self.journal.detail = Some(format!(
+                    "A program opened the previous card for writing during publication; the restore is being reversed. The previous card is at {} until then.",
+                    staged.display()
+                ));
+                self.set_phase(Ps2RestorePhase::NeedsAttention)?;
+                Err(Ps2PsuRestoreError::CardInUse)
+            }
+            (false, false) => Err(Ps2PsuRestoreError::RecoveryRequired(format!(
+                "Programs opened both the previous card and the restored card for writing during publication. Both are kept for inspection: the restored card at {} and the previous card at {}.",
+                self.journal.card_path.display(),
+                staged.display()
+            ))),
+        }
     }
 
     /// The reviewed card, unchanged: same inode/size/mtime and same bytes.
@@ -517,7 +619,11 @@ pub(crate) fn apply_with_hook(
     restore_require_data_only_pages(&plan.geometry)?;
     let _operation_lock = ownership::lock(&plan.source_card_path)?;
     let binding = ps2_card_binding(&plan.source_card_path, &plan.save_display_name);
-    check_quiescence(quiescence.observe(&binding))?;
+    // Early refusal only; the publication gate below is held under leases.
+    check_quiescence(
+        observe_card_now(quiescence, &binding, &plan.source_card_path),
+        &plan.source_card_path,
+    )?;
     let psu = fs::read(&plan.source_psu_path).map_err(restore_error)?;
     if sha256_hex(&psu) != plan.source_psu_sha256 {
         return Err(Ps2PsuRestoreError::SourceChanged);
@@ -537,6 +643,10 @@ pub(crate) fn apply_with_hook(
     {
         return Err(Ps2PsuRestoreError::CardChanged);
     }
+    // Close our own descriptor: the publication lease is granted only while
+    // no other descriptor is open on the card, ours included. The card is
+    // re-verified by identity and SHA-256 at the publication gate.
+    drop(pinned);
 
     let operation_id = new_operation_id(options.unix_seconds);
     let journal_path = options
@@ -574,6 +684,7 @@ pub(crate) fn apply_with_hook(
         original,
         renamed: false,
         quiescence,
+        leases: None,
     };
     match execute(plan, &mut run, &psu, hook) {
         Ok(result) => Ok(Ps2GuardedRestore {
@@ -678,6 +789,7 @@ fn execute(
     // one more time, immediately before the rename.
     run.journal.post_identity = Some(path_identity(&staged_path)?);
     run.set_phase(Ps2RestorePhase::Publishing)?;
+    run.lease_publication(&staged_path)?;
     run.quiet()?;
     if sha256_hex(&fs::read(&plan.source_psu_path).map_err(restore_error)?)
         != run.journal.psu_sha256
@@ -687,6 +799,7 @@ fn execute(
     }
     run.card_is_reviewed()?;
     step(hook, Ps2RestoreStep::BeforeRename)?;
+    run.leases_unbroken()?;
 
     exchange::publish(
         &staged_path,
@@ -719,9 +832,27 @@ fn execute(
         )
         .into());
     }
+    run.leases_settled(&staged_path)?;
     run.journal.post_identity = Some(path_identity(&plan.source_card_path)?);
     run.set_phase(Ps2RestorePhase::Published)?;
-    remove_owned_temp(&run.journal);
+    // The displaced original is removed only while its lease shows nobody
+    // opened it; checked again afterwards, since an open already past its
+    // path lookup can still land in between.
+    let untouched = |run: &Run<'_>| {
+        run.leases
+            .as_ref()
+            .is_none_or(|leases| leases.outgoing.intact())
+    };
+    if untouched(run) {
+        remove_owned_temp(&run.journal);
+    }
+    if !untouched(run) {
+        run.journal.detail = Some(format!(
+            "Published. A program opened the previous card for writing just as it was replaced; whatever it writes does not reach the card. The previous card is kept at {} if it was not yet removed.",
+            staged_path.display()
+        ));
+        run.set_phase(Ps2RestorePhase::Published)?;
+    }
     Ok(Ps2PsuRestoreResult {
         source_card_path: plan.source_card_path.clone(),
         source_psu_path: plan.source_psu_path.clone(),
@@ -775,7 +906,34 @@ fn unwind(
     } else {
         exchange::rollback(run, hook)
     };
+    // A program that opened the restored card before the reversal now holds
+    // it at the staging path: keep it and park the record for review.
+    let restored_opened = run
+        .leases
+        .as_ref()
+        .is_some_and(|leases| !leases.incoming.intact());
     match rollback {
+        Ok(()) if restored_opened => {
+            let staged = run.journal.staged_path.clone().unwrap_or_default();
+            let text = if staged.exists() {
+                format!(
+                    "{cause}; the card was returned to its pre-restore content, but a program opened the restored card before the reversal and holds it at {}. It is kept for inspection.",
+                    staged.display()
+                )
+            } else {
+                format!(
+                    "{cause}; the card was returned to its pre-restore content, but a program opened the restored card just as it was moved aside, and the copy it holds at {} had already been tidied away. Whatever it writes does not reach the card.",
+                    staged.display()
+                )
+            };
+            match note(run, Ps2RestorePhase::NeedsAttention, text.clone()) {
+                Ok(()) => Ps2PsuRestoreError::RecoveryRequired(text),
+                Err(error) => Ps2PsuRestoreError::RecoveryRequired(format!(
+                    "{text} Journal update failed: {error}. Journal: {}",
+                    run.journal_path.display()
+                )),
+            }
+        }
         Ok(()) => {
             if let Err(error) = note(
                 run,
@@ -854,7 +1012,11 @@ pub(crate) fn undo_with_hook(
             "published journal lacks its recorded output".into(),
         ));
     };
-    check_quiescence(quiescence.observe(&journal.binding))?;
+    // Early refusal only; the exchange below is held under leases.
+    check_quiescence(
+        observe_card_now(quiescence, &journal.binding, &journal.card_path),
+        &journal.card_path,
+    )?;
     validate_source_path(&journal.card_path)
         .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
     let mut pinned = fs::File::open(&journal.card_path).map_err(restore_error)?;
@@ -870,6 +1032,8 @@ pub(crate) fn undo_with_hook(
     if sha256_hex(&current) != post_sha {
         return Err(Ps2PsuRestoreError::StaleUndo);
     }
+    // See the same step in Apply: the lease needs our descriptor closed.
+    drop(pinned);
     let backup_meta = fs::symlink_metadata(&journal.backup_path).map_err(restore_error)?;
     if !backup_meta.is_file() || backup_meta.file_type().is_symlink() {
         return Err(Ps2PsuRestoreError::BackupVerificationFailed);
@@ -899,8 +1063,17 @@ pub(crate) fn undo_with_hook(
     }
     set(&mut journal, Ps2RestorePhase::UndoIntent, None)?;
     let mut undo_published = false;
-    let result = (|| -> Result<(), Fail> {
-        check_quiescence(quiescence.observe(&journal.binding))?;
+    // Set from the moment a swap-back is journalled as NeedsAttention until it
+    // is fully settled: the staging file is never cleaned and the record is
+    // never reset to Published.
+    let mut park = false;
+    let result = (|| -> Result<Option<PublicationLeases>, Fail> {
+        // Early refusal under a lease held for this check only; repeated
+        // under the publication leases once the original is staged.
+        check_quiescence(
+            observe_card_now(quiescence, &journal.binding, &journal.card_path),
+            &journal.card_path,
+        )?;
         if path_identity(&journal.card_path)? != post_identity {
             return Err(Ps2PsuRestoreError::StaleUndo.into());
         }
@@ -921,9 +1094,47 @@ pub(crate) fn undo_with_hook(
             ownership::preserve(&file, &permissions)?;
             file.sync_all().map_err(restore_error)?;
         }
-        journal.undo_identity = Some(path_identity(&undo_temp)?);
+        let undo_identity = path_identity(&undo_temp)?;
+        journal.undo_identity = Some(undo_identity);
         set(&mut journal, Ps2RestorePhase::UndoIntent, None)?;
+        // Held until this closure returns, after any reversal below.
+        let leases = match PublicationLeases::acquire(
+            &journal.card_path,
+            post_identity,
+            &undo_temp,
+            undo_identity,
+        ) {
+            PublicationLeaseAttempt::Held(leases) => Some(leases),
+            PublicationLeaseAttempt::Writers => {
+                return Err(Ps2PsuRestoreError::CardInUse.into());
+            }
+            PublicationLeaseAttempt::Changed => return Err(Ps2PsuRestoreError::StaleUndo.into()),
+            PublicationLeaseAttempt::Unavailable => None,
+        };
+        check_quiescence(
+            match &leases {
+                Some(leases) => {
+                    quiescence.observe_under_card_lease(&journal.binding, &leases.outgoing)
+                }
+                None => quiescence.observe(&journal.binding),
+            },
+            &journal.card_path,
+        )?;
+        if path_identity(&journal.card_path)? != post_identity
+            || sha256_hex(
+                &read_source_card(&journal.card_path)
+                    .map_err(|e| Ps2PsuRestoreError::Io(e.to_string()))?,
+            ) != post_sha
+        {
+            return Err(Ps2PsuRestoreError::StaleUndo.into());
+        }
         step(hook, Ps2RestoreStep::BeforeUndoRename)?;
+        if leases
+            .as_ref()
+            .is_some_and(|leases| !leases.outgoing.intact() || !leases.incoming.intact())
+        {
+            return Err(Ps2PsuRestoreError::CardInUse.into());
+        }
         match exchange::publish(
             &undo_temp,
             &journal.card_path,
@@ -952,17 +1163,114 @@ pub(crate) fn undo_with_hook(
             )
             .into());
         }
-        Ok(())
+        // See `Run::leases_settled`. An opener of the restored card (now at
+        // the staging path) resolved the card path before the exchange: swap
+        // it back, verified, before the leases are released.
+        if let Some(leases) = &leases {
+            match (leases.outgoing.intact(), leases.incoming.intact()) {
+                (true, _) => {}
+                (false, true) => {
+                    park = true;
+                    // Durable before reversing: if we stop here, recovery
+                    // must park this record, not tidy away the restored card
+                    // that the released opener holds.
+                    set(
+                        &mut journal,
+                        Ps2RestorePhase::NeedsAttention,
+                        Some(format!(
+                            "A program opened the restored card for writing during Undo; Undo is being reversed. The restored card is at {} until then.",
+                            undo_temp.display()
+                        )),
+                    )?;
+                    let mut reversed = false;
+                    exchange::publish(
+                        &undo_temp,
+                        &journal.card_path,
+                        undo_identity,
+                        &journal.original_sha256,
+                        &post_sha,
+                        &mut reversed,
+                        &no_hook,
+                        None,
+                    )
+                    .map_err(|failure| match failure {
+                        Fail::Error(error) => Fail::Error(Ps2PsuRestoreError::RecoveryRequired(format!(
+                            "A program opened the restored card during Undo and swapping it back failed ({error}). The card may be the original from the backup; the restored card, which that program holds, is kept at {}.",
+                            undo_temp.display()
+                        ))),
+                        #[cfg(test)]
+                        Fail::Crash => Fail::Crash,
+                    })?;
+                    undo_published = false;
+                    // The original (from the backup) is now at the staging
+                    // path; a program that opened the card in between holds it.
+                    if !leases.incoming.intact() {
+                        return Err(Ps2PsuRestoreError::RecoveryRequired(format!(
+                            "Undo was reversed: the card is the restored version again. A program opened the card in between and holds the copy at {}; it is kept for inspection.",
+                            undo_temp.display()
+                        ))
+                        .into());
+                    }
+                    fs::File::open(&card_dir)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(restore_error)?;
+                    // Remove our copy of the original while its lease is held
+                    // and shows nobody opened it, then check again (see Apply).
+                    fs::remove_file(&undo_temp).map_err(restore_error)?;
+                    if !leases.incoming.intact() {
+                        return Err(Ps2PsuRestoreError::RecoveryRequired(format!(
+                            "Undo was reversed: the card is the restored version again. A program opened the card just as the unused copy of the original at {} was removed; whatever it writes does not reach the card.",
+                            undo_temp.display()
+                        ))
+                        .into());
+                    }
+                    fs::File::open(&card_dir)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(restore_error)?;
+                    park = false;
+                    return Err(Ps2PsuRestoreError::CardInUse.into());
+                }
+                (false, false) => {
+                    return Err(Ps2PsuRestoreError::RecoveryRequired(format!(
+                        "Programs opened both the restored card and the original card for writing during Undo. Both are kept for inspection: the original at {} and the restored card at {}.",
+                        journal.card_path.display(),
+                        undo_temp.display()
+                    ))
+                    .into());
+                }
+            }
+        }
+        Ok(leases)
     })();
     match result {
-        Ok(()) => {
+        Ok(leases) => {
             set(&mut journal, Ps2RestorePhase::Undone, None)?;
-            fs::remove_file(&undo_temp).map_err(restore_error)
+            // The displaced restored card is removed only while its lease
+            // shows nobody opened it, and checked again afterwards (see Apply).
+            let untouched = || {
+                leases
+                    .as_ref()
+                    .is_none_or(|leases| leases.outgoing.intact())
+            };
+            if untouched() {
+                fs::remove_file(&undo_temp).map_err(restore_error)?;
+            }
+            if !untouched() {
+                set(
+                    &mut journal,
+                    Ps2RestorePhase::Undone,
+                    Some(format!(
+                        "Undone. A program opened the restored card for writing just as it was replaced; whatever it writes does not reach the card. It is kept at {} if it was not yet removed.",
+                        undo_temp.display()
+                    )),
+                )?;
+            }
+            Ok(())
         }
         #[cfg(test)]
         Err(Fail::Crash) => Err(Ps2PsuRestoreError::Io(SIMULATED_CRASH.into())),
         Err(Fail::Error(error)) => {
-            if !undo_published {
+            if !undo_published && !park {
                 clean_undo_temp(&journal);
             }
             // A stale-undo refusal means the card was left exactly as found (a late
@@ -970,7 +1278,7 @@ pub(crate) fn undo_with_hook(
             if !undo_published {
                 set(
                     &mut journal,
-                    if !recovery_evidence::confirmed_absent(&undo_temp) {
+                    if park || !recovery_evidence::confirmed_absent(&undo_temp) {
                         Ps2RestorePhase::NeedsAttention
                     } else {
                         Ps2RestorePhase::Published
@@ -989,7 +1297,13 @@ pub(crate) fn undo_with_hook(
             if live.as_deref() == Some(post_sha.as_str()) {
                 set(
                     &mut journal,
-                    Ps2RestorePhase::Published,
+                    // A failed swap-back keeps its NeedsAttention marker: the
+                    // staging path may hold a copy a program wrote to.
+                    if park {
+                        Ps2RestorePhase::NeedsAttention
+                    } else {
+                        Ps2RestorePhase::Published
+                    },
                     Some(format!("undo refused: {error}")),
                 )?;
                 Err(error)

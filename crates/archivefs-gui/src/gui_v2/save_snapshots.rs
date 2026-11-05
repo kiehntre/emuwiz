@@ -22,11 +22,11 @@ use archivefs_core::{
     },
     save_snapshots::{
         EmulatorUseStatus, SaveArtifactType, SaveLocation, SaveProvenance, SaveRestoreConflict,
-        SaveSnapshotError, SaveSnapshotRequest, create_snapshot,
+        SaveSnapshotError, SaveSnapshotRequest,
         history::{
-            SnapshotFreshness, SnapshotHistoryEntry, SnapshotIntegrity, history_for_location,
-            list_snapshots, nearest_existing_directory, snapshot_closure_supported,
-            snapshot_emulator_use,
+            SnapshotFreshness, SnapshotHistoryEntry, SnapshotIntegrity, create_snapshot_observed,
+            history_for_location, list_snapshots, nearest_existing_directory,
+            snapshot_closure_supported, snapshot_emulator_use,
         },
         tree_restore::safety::{FilesystemSpace, QuiescenceProvider, RestoreSpaceProvider},
     },
@@ -210,7 +210,6 @@ pub(super) fn create(
     target: &SnapshotTarget,
     observer: &dyn QuiescenceProvider,
 ) -> Result<String, String> {
-    let emulator_use = snapshot_emulator_use(target.emulator, &target.location.path, observer);
     let mut location = target.location.clone();
     if location.artifact_type == SaveArtifactType::Other
         && std::fs::symlink_metadata(&location.path).is_ok_and(|metadata| metadata.is_dir())
@@ -223,7 +222,9 @@ pub(super) fn create(
     }
     let available_space_bytes =
         nearest_existing_directory(root).and_then(|dir| FilesystemSpace.available_bytes(&dir).ok());
-    create_snapshot(&SaveSnapshotRequest {
+    create_snapshot_observed(
+        target.emulator,
+        SaveSnapshotRequest {
         location,
         game_identity: Some(target.game_identity.clone()),
         platform: Some(target.platform.clone()),
@@ -231,13 +232,17 @@ pub(super) fn create(
         available_space_bytes,
         snapshot_id: None,
         now_unix_seconds: None,
-        emulator_use,
-    })
+            // Decided (under a card lease where possible) by Core.
+            emulator_use: EmulatorUseStatus::Unknown,
+        },
+        observer,
+    )
     .map(|snapshot| snapshot.manifest.snapshot_id)
     .map_err(|error| match error {
         SaveSnapshotError::EmulatorRunning => {
             "The emulator is running. Close it, then try again. Nothing was copied.".to_string()
         }
+        SaveSnapshotError::CardInUse => "This save is in use. Another application may have it open. Close applications accessing it and try again. Nothing was copied.".to_string(),
         SaveSnapshotError::EmulatorUseUnknown => "EmuWiz could not confirm the emulator is closed, so nothing was copied.".to_string(),
         SaveSnapshotError::SourceChanged(_) => "The save changed while it was being copied. Nothing was kept; close the emulator and try again.".to_string(),
         SaveSnapshotError::InsufficientSpace { .. } => "There is not enough free space for this snapshot. Nothing was copied.".to_string(),
@@ -369,10 +374,13 @@ pub(super) fn closure_message(
     }
     match observed {
         Some(EmulatorUseStatus::NotDetected) => {
-            "The emulator is closed. A snapshot only reads your save."
+            "No running emulator was detected. A snapshot only reads your save."
         }
         Some(EmulatorUseStatus::Running) => {
-            "The emulator is running or has this save open. Close it, then refresh save locations."
+            "The emulator is running. Close it, then refresh save locations."
+        }
+        Some(EmulatorUseStatus::CardInUse) => {
+            "This save is in use. Another application may have it open. Close applications accessing it, then refresh save locations."
         }
         Some(EmulatorUseStatus::Unknown) | None => {
             "EmuWiz could not check every running program, so it cannot confirm the emulator is closed. Nothing will be copied until it can."

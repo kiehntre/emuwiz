@@ -59,7 +59,12 @@ impl DirectorySaveBinding {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmulatorQuiescence {
     Closed,
+    /// Process evidence of the emulator itself (executable, arguments,
+    /// launch route or app scope).
     Running,
+    /// Some program has the save open (kernel lease refused or broken, or a
+    /// visible non-emulator holder); which program is not established.
+    CardInUse,
     Unknown,
 }
 
@@ -68,6 +73,18 @@ pub enum EmulatorQuiescence {
 /// mandatory on unsupported emulators, incomplete observations or isolation.
 pub trait QuiescenceProvider {
     fn observe(&self, binding: &DirectorySaveBinding) -> EmulatorQuiescence;
+    /// Observe while the caller holds `lease` on the card and keeps holding
+    /// it across its whole publication window, reversing if it breaks. A
+    /// provider may then leave the "is the card open for writing?" question
+    /// to the kernel. Providers that cannot use this observe strictly.
+    fn observe_under_card_lease(
+        &self,
+        binding: &DirectorySaveBinding,
+        lease: &crate::memory_card_inventory::restore_guard::CardWriteLease,
+    ) -> EmulatorQuiescence {
+        let _ = lease;
+        self.observe(binding)
+    }
 }
 
 /// Safe production default. Existing child tracking cannot prove external
@@ -427,6 +444,7 @@ fn requirement(state: EmulatorQuiescence) -> SaveQuiescenceRequirement {
     match state {
         EmulatorQuiescence::Closed => SaveQuiescenceRequirement::ConfirmedClosed,
         EmulatorQuiescence::Running => SaveQuiescenceRequirement::Running,
+        EmulatorQuiescence::CardInUse => SaveQuiescenceRequirement::InUse,
         EmulatorQuiescence::Unknown => SaveQuiescenceRequirement::Unknown,
     }
 }
@@ -434,6 +452,7 @@ fn check_quiescence(state: EmulatorQuiescence) -> Result<(), TreeRestoreError> {
     match state {
         EmulatorQuiescence::Closed => Ok(()),
         EmulatorQuiescence::Running => Err(refused(TreeRestoreRefusal::EmulatorRunning)),
+        EmulatorQuiescence::CardInUse => Err(refused(TreeRestoreRefusal::SaveInUse)),
         EmulatorQuiescence::Unknown => Err(refused(TreeRestoreRefusal::EmulatorStateUnknown)),
     }
 }

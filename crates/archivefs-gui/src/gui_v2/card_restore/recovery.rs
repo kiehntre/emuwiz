@@ -206,6 +206,9 @@ pub(in super::super) fn recover(
         EmulatorQuiescence::Running => {
             return Err("PCSX2 is running. Close it, then check interrupted restores again. Nothing was changed.".into());
         }
+        EmulatorQuiescence::CardInUse => {
+            return Err("Restore records are in use. Another application may have them open. Close it, then check interrupted restores again. Nothing was changed.".into());
+        }
         EmulatorQuiescence::Unknown => {
             return Err("EmuWiz could not confirm PCSX2 is closed, so interrupted restores were not checked. Nothing was changed.".into());
         }
