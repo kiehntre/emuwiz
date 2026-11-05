@@ -302,6 +302,13 @@ commit SHA, and whether independent review is required. Distinguish independentl
 executed validation from reported or proposed tests. If blocked, state what
 remains unresolved and do not claim completion.
 
+Every report for a task that built with `scripts/cargo-iso` must also state the
+Cargo release outcome: either `scripts/cargo-iso --finish-task --task <short-name>`
+was run from the worktree (quote its result and the `worktree-check` verdict), or
+the target is intentionally kept (open PR, unmerged or dirty work, pin) with the
+reason. Unreleased targets are never auto-retired and are the main cause of the
+Saltbox SSD filling up (2026-11-05 incident: 114 GB of IDLE targets unreleased).
+
 ## AI Agent Efficiency and Usage Policy
 
 This is the canonical usage policy for both Codex and Claude Code. Apply it
@@ -370,3 +377,7 @@ For authorised integration tasks, DONE also requires a normal push and verificat
 of the exact SHA on GitHub main. Without explicit push permission, report a local
 candidate awaiting authorised integration rather than claiming integrated DONE.
 Never force-push or bypass existing promotion and preservation safeguards.
+
+DONE also requires the Cargo release step from "Cargo cache release and worktree
+removal order" once the work is merged, promoted or abandoned. This is a release
+request only; it does not weaken any retention safeguard, pin or ownership check.
