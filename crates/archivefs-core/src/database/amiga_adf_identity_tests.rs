@@ -81,7 +81,7 @@ fn lab(entries: Entries, files: &[(&str, &str, &str)]) -> Lab {
 }
 
 fn lab_in(header: &str, entries: Entries, files: &[(&str, &str, &str)]) -> Lab {
-    lab_hashed(header, entries, files, false)
+    lab_hashed(header, entries, files, "sha1")
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -99,8 +99,8 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-/// `crc_only`: the DAT lists CRC32 and size only (weak evidence).
-fn lab_hashed(header: &str, entries: Entries, files: &[(&str, &str, &str)], crc_only: bool) -> Lab {
+/// `hash`: which hash the DAT lists: "sha1", "crc" (weak) or "none" (name and size only).
+fn lab_hashed(header: &str, entries: Entries, files: &[(&str, &str, &str)], hash: &str) -> Lab {
     let root = tempfile::tempdir().unwrap().keep();
     for (folder, file, volume) in files {
         let dir = root.join("games").join(folder);
@@ -114,7 +114,9 @@ fn lab_hashed(header: &str, entries: Entries, files: &[(&str, &str, &str)], crc_
                 .iter()
                 .map(|(rom, volume)| {
                     let bytes = adf(volume);
-                    if crc_only {
+                    if hash == "none" {
+                        format!(r#"<rom name="{rom}" size="{}"/>"#, bytes.len())
+                    } else if hash == "crc" {
                         format!(
                             r#"<rom name="{rom}" size="{}" crc="{:08x}"/>"#,
                             bytes.len(),
@@ -691,7 +693,12 @@ fn weak_dat_evidence_is_never_no_evidence() {
         "Lotus (1990)(Gremlin)(Disk 2 of 2)",
         &[("Lotus (1990)(Gremlin)(Disk 2 of 2).adf", "LOTUS2")],
     )];
-    let lab = lab_hashed(GAMES_ADF, &set, &[("amiga", "neutral.adf", "LOTUS2")], true);
+    let lab = lab_hashed(
+        GAMES_ADF,
+        &set,
+        &[("amiga", "neutral.adf", "LOTUS2")],
+        "crc",
+    );
     let refusal = lab
         .identity("amiga", "neutral.adf")
         .expect_err("a CRC32-only match never verifies");
@@ -706,10 +713,39 @@ fn weak_dat_evidence_is_never_no_evidence() {
         GAMES_ADF,
         &other,
         &[("amiga", "neutral.adf", "LOTUS2")],
-        false,
+        "sha1",
     );
     assert_eq!(
         none.identity("amiga", "neutral.adf"),
         Err(R::NoCurrentMatch)
     );
+}
+
+#[test]
+fn a_persisted_filename_only_result_is_not_silence() {
+    let name = "Foo (1990)(Pub)(Disk 1 of 2)";
+    let file = format!("{name}.adf");
+    let entries: [(&str, &[(&str, &str)]); 1] = [(name, &[(file.as_str(), "FOO1")])];
+    // Same file name as the DAT, different bytes, DAT lists no hash.
+    let lab = lab_hashed(
+        GAMES_ADF,
+        &entries,
+        &[("amiga", file.as_str(), "OTHER")],
+        "none",
+    );
+    let decision = lab.identity("amiga", &file);
+    let refusal = decision.expect_err("never verified");
+    // Whatever the saved state is, it must not read as "no evidence" unless
+    // nothing persisted carries evidence about this file.
+    let persisted = lab
+        .db
+        .find_archive_id_by_absolute_path(&lab.path("amiga", &file))
+        .unwrap()
+        .map(|id| lab.db.library_dat_identities_for_item(id).unwrap())
+        .unwrap_or_default();
+    if persisted.iter().any(|p| p.carries_identity()) {
+        assert!(!refusal.permits_local_media(), "{refusal:?}");
+    } else {
+        assert_eq!(refusal, R::NoCurrentMatch);
+    }
 }

@@ -124,14 +124,18 @@ pub enum AmigaAdfIdentityRefusal {
 
 impl AmigaAdfIdentityRefusal {
     /// Whether the local-media route may proceed after this refusal. Only
-    /// "there is simply no DAT evidence for this file" permits it; every other
+    /// "the file is in the library and no saved DAT evidence concerns it"
+    /// permits it; every other
     /// refusal is either evidence against a standalone game or a catalogue
     /// state that cannot be trusted either way, so it blocks. The match is
     /// exhaustive on purpose: a new refusal must be classified here.
     pub fn permits_local_media(&self) -> bool {
         match self {
-            Self::NoCurrentMatch | Self::NotInLibrary => true,
-            Self::NotAdf
+            Self::NoCurrentMatch => true,
+            // The local route's platform check is anchored on a library
+            // record, so a file outside the library gets no local route.
+            Self::NotInLibrary
+            | Self::NotAdf
             | Self::NotAmiga
             | Self::FileChanged
             | Self::Conflicting(_)

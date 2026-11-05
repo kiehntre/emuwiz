@@ -97,6 +97,9 @@ impl Database {
                 continue;
             }
             if !content_evidence(&summary.verification_state) {
+                // A filename-only result is no proof, but it is saved evidence
+                // about this file; the local route must not read it as silence.
+                weak |= persisted.carries_identity();
                 continue;
             }
             weak = true;
@@ -130,7 +133,7 @@ impl Database {
                 Refusal::FileChanged
             } else if stale {
                 Refusal::CatalogueStale
-            } else if weak || !named.is_empty() {
+            } else if weak {
                 Refusal::WeakEvidenceOnly
             } else {
                 Refusal::NoCurrentMatch

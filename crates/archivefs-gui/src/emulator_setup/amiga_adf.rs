@@ -128,7 +128,11 @@ pub(crate) fn local_inputs_for(
     database: PathBuf,
     config: PathBuf,
 ) -> AdfLaunchInputs {
-    let key = format!("local-adf-sha256:{}", media.sha256);
+    let key = format!(
+        "{}{}",
+        archivefs_core::launch::LOCAL_ADF_KEY_PREFIX,
+        media.sha256
+    );
     collect(
         CanonicalIdentityStatus::Resolved(archivefs_core::launch::ResolvedIdentity {
             platform_id: "Amiga".into(),

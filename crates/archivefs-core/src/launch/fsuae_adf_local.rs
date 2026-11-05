@@ -31,7 +31,6 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::dat::amiga_adf_identity::AmigaAdfIdentityRefusal;
 use crate::dat::configured_catalogues::ConfiguredCatalogue;
 use crate::launch::fsuae_adf::{
     FsUaeAdfLaunchError, FsUaeAdfLaunchRequest, FsUaeAdfRoute, fsuae_adf_config,
@@ -50,7 +49,7 @@ const ADF_SIZES: [u64; 2] = [901_120, 1_802_240];
 /// Most sibling files looked at when checking for a multi-disk set.
 const MAX_SIBLINGS: usize = 4096;
 /// Media-like extensions whose presence beside the ADF is refuse-only evidence.
-const SIBLING_EXTENSIONS: [&str; 5] = ["adf", "adz", "dms", "ipf", "zip"];
+const SIBLING_EXTENSIONS: [&str; 8] = ["adf", "adz", "dms", "ipf", "zip", "xdf", "dim", "lha"];
 
 /// Prefix of the internal, bytes-derived planner token. Never a game identity;
 /// anything that persists or displays a game key must reject it.
@@ -328,13 +327,6 @@ pub(crate) fn preflight_local_adf(
         .amiga_adf_launch_identity(path, catalogues)
         .map_err(|error| FsUaeAdfLaunchError::Database(error.to_string()))?
     {
-        // The plan relied on a library record's platform; if the file is no
-        // longer in the library that platform can no longer be confirmed.
-        Err(AmigaAdfIdentityRefusal::NotInLibrary) => {
-            return Err(FsUaeAdfLaunchError::Identity(
-                AmigaAdfIdentityRefusal::NotInLibrary,
-            ));
-        }
         Err(refusal) if refusal.permits_local_media() => {}
         Err(refusal) => return Err(FsUaeAdfLaunchError::Identity(refusal)),
         Ok(_) => {

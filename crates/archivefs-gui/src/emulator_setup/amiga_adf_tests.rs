@@ -410,10 +410,12 @@ fn the_local_route_keeps_kickstart_and_machine_refusals() {
 #[test]
 fn only_no_evidence_refusals_permit_the_local_route() {
     use archivefs_core::dat::amiga_adf_identity::AmigaAdfIdentityRefusal as R;
-    for open in [R::NotInLibrary, R::NoCurrentMatch] {
-        assert!(open.permits_local_media(), "{open:?}");
-    }
+    assert!(R::NoCurrentMatch.permits_local_media());
+    // Plan time and click time use this one predicate: no library record, no route.
+    assert!(!R::NotInLibrary.permits_local_media());
+    assert!(R::NotInLibrary.reason().contains("scan it first"));
     for blocked in [
+        R::WeakEvidenceOnly,
         R::NotAdf,
         R::NotAmiga,
         R::FileChanged,
