@@ -1154,9 +1154,10 @@ mod spatial {
             // The controller takes over from here.
             self.app.pad_shell.as_mut().unwrap().set_pad_mode_for_test();
         }
-        /// A game card is far taller than any chip or button.
+        /// A game card (or list row) is far bigger than any chip or button.
         fn is_card(&self, id: egui::Id) -> bool {
-            self.rect(id).height() > 100.0
+            let rect = self.rect(id);
+            rect.height() > 50.0 && rect.width() > 150.0
         }
         /// Walk Down from the sidebar's Right until a card has focus.
         fn reach_a_card(&mut self) {
@@ -1256,35 +1257,55 @@ mod spatial {
 
     /// Regression: the shelf scrolled to a focused card only for Tab, not for a
     /// controller move, so on a real-sized library Down left the focused card
-    /// below the screen and the page did not follow.
+    /// below the shelf and the page did not follow. The check is against the
+    /// shelf's own scrolling viewport (what the person can see), not just the
+    /// window, and the focus must really travel down the library.
     #[test]
-    fn moving_down_a_long_grid_keeps_the_focused_card_on_screen() {
+    fn moving_down_a_long_grid_keeps_the_focused_card_inside_the_library_viewport() {
+        long_library_stays_in_view(false);
+    }
+
+    #[test]
+    fn moving_down_a_long_list_keeps_the_focused_row_inside_the_library_viewport() {
+        long_library_stays_in_view(true);
+    }
+
+    fn long_library_stays_in_view(list: bool) {
         let mut lib = Lib::new(300);
+        lib.app.filter.list = list;
+        lib.frames();
         lib.focus_sidebar();
         lib.reach_a_card();
-        let mut deepest = 0.0_f32;
+        let inside = |lib: &Lib, what: &str| {
+            let shelf = lib.app.browse_play.shelf_rect.expect("the shelf was drawn");
+            assert!(
+                shelf.height() > 200.0 && shelf.is_finite(),
+                "a real viewport: {shelf:?}"
+            );
+            let rect = lib.rect(lib.focused().expect("focus stays on a control"));
+            assert!(
+                rect.top() >= shelf.top() - 1.0 && rect.bottom() <= shelf.bottom() + 1.0,
+                "{what}: the focused card {rect:?} is outside the Library viewport {shelf:?}"
+            );
+        };
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(lib.focused().unwrap());
         for step in 0..25 {
             lib.tap(DOWN);
             lib.frames(); // the page follows the focus a frame after it moves
-            let id = lib.focused().expect("focus stays on a control");
-            let rect = lib.rect(id);
-            deepest = deepest.max(rect.top());
-            assert!(
-                rect.top() >= 0.0 && rect.bottom() <= SIZE[1] + 1.0,
-                "step {step}: the focused card is off screen: {rect:?}"
-            );
+            inside(&lib, &format!("down step {step}"));
+            assert!(lib.is_card(lib.focused().unwrap()), "still on a game card");
+            visited.insert(lib.focused().unwrap());
         }
-        // And it really travelled down the library (the page followed).
-        let id = lib.focused().unwrap();
-        assert!(lib.is_card(id));
-        for _ in 0..25 {
+        assert!(
+            visited.len() >= 25,
+            "focus travelled down {} distinct cards",
+            visited.len()
+        );
+        for step in 0..25 {
             lib.tap(UP);
             lib.frames();
-            let rect = lib.rect(lib.focused().unwrap());
-            assert!(
-                rect.top() >= 0.0 && rect.bottom() <= SIZE[1] + 1.0,
-                "moving back up: off screen {rect:?}"
-            );
+            inside(&lib, &format!("up step {step}"));
         }
     }
 

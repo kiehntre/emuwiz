@@ -77,6 +77,23 @@ type ReadinessView = (usize, u64, ReadinessFilter, Arc<Vec<usize>>);
 /// Fewest games for which the A-Z strip is worth its row.
 const ALPHA_STRIP_MIN: usize = 30;
 
+/// Set (by the controller layer) to ask the shelf to move focus one grid row:
+/// -1 up, +1 down. The shelf knows its own columns and which rows are drawn;
+/// egui's spatial search cannot see a card that is fully scrolled out of view.
+pub(super) fn row_step_id() -> egui::Id {
+    egui::Id::new("browse_play_row_step")
+}
+
+/// The game id of the focused Library card, kept for the controller layer.
+pub(super) fn focused_card_id() -> egui::Id {
+    egui::Id::new("browse_play_focused_card")
+}
+
+/// The egui control id of that card.
+pub(super) fn focused_card_control_id() -> egui::Id {
+    egui::Id::new("browse_play_focused_card_control")
+}
+
 /// Cached filter result so typing or scrolling never rescans the catalogue.
 #[derive(Default)]
 pub(super) struct BrowsePlayState {
@@ -87,6 +104,10 @@ pub(super) struct BrowsePlayState {
     alpha_jump: Option<usize>,
     /// The game to focus once the shelf has drawn it (after a jump).
     focus_game: Option<i64>,
+    /// The card holding keyboard focus this frame: (control, game id).
+    focused_card: Option<(egui::Id, i64)>,
+    /// Where the shelf's scrolling viewport was drawn last frame.
+    pub(super) shelf_rect: Option<egui::Rect>,
     key: Option<FilterKey>,
     indices: Arc<Vec<usize>>,
     applied_generation: Option<u64>,
@@ -1050,25 +1071,88 @@ impl App {
                 .and_then(|i| library.games.get(*i))
                 .map(|game| game.archive.id);
         }
-        area.show_rows(ui, row_height, rows, |ui, range| {
-            for row in range {
-                let start = row * columns;
-                let end = (start + columns).min(indices.len());
-                ui.horizontal_top(|ui| {
-                    for position in start..end {
-                        let Some(game) = library.games.get(indices[position]) else {
-                            continue;
-                        };
-                        let selected = selected_id == Some(game.archive.id);
-                        if list {
-                            self.browse_play_list_row(ui, game, selected, &mut cover_note);
-                        } else {
-                            self.browse_play_card(ui, game, selected, card_width, &mut cover_note);
+        // Virtualised like `show_rows` (which already draws one row below the
+        // viewport), plus one row ABOVE it: a controller move to the row above
+        // the first visible one must find a card there, or it escapes to the
+        // controls over the shelf instead of scrolling up.
+        self.browse_play.focused_card = None;
+        let row_step = row_height + spacing.y;
+        // A controller Up/Down on a card: move one grid row in the list shown
+        // (spatial search at the edge of a scrolling shelf would miss it).
+        if let Some(step) = ui.data_mut(|d| d.remove_temp::<i32>(row_step_id())) {
+            let current = ui.data(|d| d.get_temp::<i64>(focused_card_id()));
+            let position = current.and_then(|game| {
+                indices
+                    .iter()
+                    .position(|i| library.games.get(*i).is_some_and(|g| g.archive.id == game))
+            });
+            let target = position
+                .map(|p| p as isize + step as isize * columns as isize)
+                .filter(|t| *t >= 0 && (*t as usize) < indices.len());
+            match target.and_then(|t| library.games.get(indices[t as usize])) {
+                Some(game) => self.browse_play.focus_game = Some(game.archive.id),
+                None => ui.ctx().memory_mut(|m| {
+                    m.move_focus(if step < 0 {
+                        egui::FocusDirection::Up
+                    } else {
+                        egui::FocusDirection::Down
+                    })
+                }),
+            }
+        }
+        let shelf = area.show_viewport(ui, |ui, viewport| {
+            ui.set_height((row_step * rows as f32 - spacing.y).max(0.0));
+            let first = ((viewport.min.y / row_step).floor().max(0.0) as usize).saturating_sub(1);
+            let mut last = (viewport.max.y / row_step).ceil() as usize + 1;
+            let mut first = first;
+            if last > rows {
+                let span = last.saturating_sub(first);
+                last = rows;
+                first = rows.saturating_sub(span);
+            }
+            let top = ui.max_rect().top();
+            let band = egui::Rect::from_x_y_ranges(
+                ui.max_rect().x_range(),
+                (top + first as f32 * row_step)..=(top + last as f32 * row_step),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(band), |ui| {
+                ui.skip_ahead_auto_ids(first);
+                for row in first..last {
+                    let start = row * columns;
+                    let end = (start + columns).min(indices.len());
+                    ui.horizontal_top(|ui| {
+                        for position in start..end {
+                            let Some(game) = library.games.get(indices[position]) else {
+                                continue;
+                            };
+                            let selected = selected_id == Some(game.archive.id);
+                            if list {
+                                self.browse_play_list_row(ui, game, selected, &mut cover_note);
+                            } else {
+                                self.browse_play_card(
+                                    ui,
+                                    game,
+                                    selected,
+                                    card_width,
+                                    &mut cover_note,
+                                );
+                            }
                         }
-                    }
-                });
+                    });
+                }
+            });
+        });
+        ui.data_mut(|d| match self.browse_play.focused_card {
+            Some((control, game)) => {
+                d.insert_temp(focused_card_id(), game);
+                d.insert_temp(focused_card_control_id(), control);
+            }
+            None => {
+                d.remove::<i64>(focused_card_id());
+                d.remove::<egui::Id>(focused_card_control_id());
             }
         });
+        self.browse_play.shelf_rect = Some(shelf.inner_rect);
         self.browse_play.cover_note = cover_note;
     }
 
@@ -1234,6 +1318,9 @@ impl App {
                 self.browse_play.focus_game = None;
                 response.request_focus();
             }
+            if response.has_focus() {
+                self.browse_play.focused_card = Some((response.id, id));
+            }
             Self::reveal_keyboard_focus(ui, &response);
             // Name the card for assistive tech and the controller layer.
             response.widget_info(|| {
@@ -1324,6 +1411,9 @@ impl App {
             if self.browse_play.focus_game == Some(id) {
                 self.browse_play.focus_game = None;
                 response.request_focus();
+            }
+            if response.has_focus() {
+                self.browse_play.focused_card = Some((response.id, id));
             }
             Self::reveal_keyboard_focus(ui, &response);
             // Name the card for assistive tech and the controller layer.
