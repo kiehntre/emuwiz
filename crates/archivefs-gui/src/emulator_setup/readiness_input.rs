@@ -246,6 +246,24 @@ impl ReadinessSources<'_> {
         if let Some((identity, _)) = &azahar_inputs {
             identity_status = identity.clone();
         }
+        let vita3k_context = self.readiness.vita3k_library.context(focused);
+        // Never impose PlayStation Vita on a file other evidence places elsewhere.
+        let vita3k_inputs = vita3k_context
+            .as_ref()
+            .filter(|_| {
+                selected_game_identity_report.is_none_or(|r| {
+                    matches!(
+                        r.platform,
+                        archivefs_core::game_identity::IdentityPlatform::Other
+                    )
+                }) && crate::launch_readiness_page::vita3k::platform_allows(
+                    focused_record.and_then(|r| r.mount_plan.archive.identity.platform.as_deref()),
+                )
+            })
+            .and_then(|c| c.inputs(&identity_status));
+        if let Some((identity, _)) = &vita3k_inputs {
+            identity_status = identity.clone();
+        }
         let xroar_context = self.readiness.xroar_cassette.context(focused);
         let xroar_inputs = xroar_context
             .as_ref()
@@ -381,6 +399,9 @@ impl ReadinessSources<'_> {
         }
         if let Some((_, selected_content)) = azahar_inputs {
             content = selected_content;
+        }
+        if let Some((_, selected_content)) = vita3k_inputs.as_ref() {
+            content = selected_content.clone();
         }
 
         // WHDLoad is an additive, content-bound launch seam.  The package
@@ -1107,6 +1128,13 @@ impl ReadinessSources<'_> {
                 });
             }
         }
+        // The installation comes from the worker's own scan of Vita3K (the
+        // very entry Play will recheck), only when the identity was supplied.
+        if vita3k_inputs.is_some()
+            && let Some(profile) = vita3k_context.as_ref().and_then(|c| c.profile_input())
+        {
+            standalone_profiles.push(profile);
+        }
         if let XeniaProfilesState::Ready(discovery) = &self.readiness.xenia_profiles {
             let (title_id, media_id) = game_identity_report
                 .map(|report| {
@@ -1412,6 +1440,7 @@ impl ReadinessSources<'_> {
             flycast: flycast_context,
             xroar: xroar_context,
             azahar: azahar_context,
+            vita3k: vita3k_context,
             vice: vice_context,
             amiga_whdload: amiga_whdload_context,
             #[cfg(target_os = "linux")]

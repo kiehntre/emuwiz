@@ -536,6 +536,10 @@ impl NativeWorkflows {
             .emulator_readiness
             .azahar_homebrew
             .show(ui, Some(path));
+        self.app
+            .emulator_readiness
+            .vita3k_library
+            .show(ui, Some(path));
         self.start_launch_readiness(ui.ctx());
 
         let input = self.launch_input();
@@ -653,6 +657,10 @@ impl NativeWorkflows {
             .emulator_readiness
             .azahar_homebrew
             .show(ui, Some(path));
+        self.app
+            .emulator_readiness
+            .vita3k_library
+            .show(ui, Some(path));
         let (mut summary, input) = self.readiness_projection(
             ui.ctx(),
             game_id,
@@ -664,6 +672,14 @@ impl NativeWorkflows {
         );
         if let Some(identity) = saved.dat_identity {
             launch_readiness_summary::note_dat_identity(&mut summary, identity);
+        }
+        if let Some(context) = self
+            .app
+            .emulator_readiness
+            .vita3k_library
+            .context(Some(path))
+        {
+            launch_readiness_summary::note_vita3k_package(&mut summary, &context);
         }
         if saved.file_missing {
             launch_readiness_summary::note_file_missing(&mut summary);
@@ -692,7 +708,7 @@ impl NativeWorkflows {
         catalogue_verified: bool,
         activity: &mut Activity,
     ) -> launch_readiness_summary::CompactReadiness {
-        let (summary, _) = self.readiness_projection(
+        let (mut summary, _) = self.readiness_projection(
             context,
             game_id,
             path,
@@ -701,6 +717,14 @@ impl NativeWorkflows {
             false,
             activity,
         );
+        if let Some(vita) = self
+            .app
+            .emulator_readiness
+            .vita3k_library
+            .context(Some(path))
+        {
+            launch_readiness_summary::note_vita3k_package(&mut summary, &vita);
+        }
         launch_readiness_summary::compact(&summary, self.selected_checksum_pending())
     }
 

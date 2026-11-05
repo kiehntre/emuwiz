@@ -11,7 +11,9 @@ use archivefs_core::launch::{
 use eframe::egui;
 
 mod diagnosis;
+mod vita3k_package;
 pub(crate) use diagnosis::{Attempt, AttemptTracker, Finding};
+pub(crate) use vita3k_package::note_vita3k_package;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadinessPresentationState {
@@ -1428,6 +1430,7 @@ mod tests {
             flycast: None,
             xroar: None,
             azahar: None,
+            vita3k: None,
             vice: None,
             amiga_whdload: None,
             #[cfg(target_os = "linux")]

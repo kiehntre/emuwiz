@@ -59,6 +59,7 @@ fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -84,6 +85,7 @@ fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> Launch
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -109,6 +111,7 @@ fn pcsx2_plan_input(plan: LaunchPlan, context: Pcsx2LaunchContext) -> LaunchRead
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -344,6 +347,7 @@ fn verified_pbp_candidate_reaches_the_existing_ppsspp_launch_request() {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -816,6 +820,7 @@ fn gamer_action_can_launch_pcsx2_without_retroarch_discovery() {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -852,6 +857,7 @@ fn gamer_action_can_launch_dolphin_without_retroarch_discovery() {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -890,6 +896,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -927,6 +934,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -3214,6 +3222,7 @@ mod multidisc {
             flycast: None,
             xroar: None,
             azahar: None,
+            vita3k: None,
             vice: None,
             amiga_whdload: None,
             #[cfg(target_os = "linux")]
