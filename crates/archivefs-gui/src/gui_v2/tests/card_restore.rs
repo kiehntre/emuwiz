@@ -262,7 +262,7 @@ fn choose_preview_cancel_and_undo_journey_is_explicit_and_reversible() {
     // process scan. Undo is driven with the fixed observer instead and its
     // outcome delivered as the worker would.
     let result = card_restore::undo_restore(&done.journal_path, &Closed, 4);
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "{result:?}");
     assert_eq!(std::fs::read(&world.card).unwrap(), played);
     card_restore::receive(
         &mut app,

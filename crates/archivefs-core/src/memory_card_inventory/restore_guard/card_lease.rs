@@ -47,7 +47,46 @@ const F_SETSIG: libc::c_int = 10;
 
 /// A held read lease on one inode. Released on drop.
 pub struct CardWriteLease {
-    file: fs::File,
+    file: std::mem::ManuallyDrop<fs::File>,
+    /// (device, inode), registered in `HELD_HERE` while held.
+    key: (u64, u64),
+}
+
+/// Leases held by this process, with the thread that took each. A probe
+/// refused because EmuWiz itself (another thread: a preview check, a
+/// snapshot copy, another operation) holds a lease on the inode waits for it
+/// to be released instead of reporting the card as in use. Only the wait is
+/// affected; whether a lease is granted is still decided by the kernel.
+static HELD_HERE: std::sync::Mutex<Vec<((u64, u64), std::thread::ThreadId)>> =
+    std::sync::Mutex::new(Vec::new());
+static RELEASED_HERE: std::sync::Condvar = std::sync::Condvar::new();
+/// Longest wait for this process's own lease on the same card.
+const IN_PROCESS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait until no other thread of this process holds a lease on `key`.
+/// False if none did (the holder is elsewhere) or the wait timed out.
+fn wait_for_own_release(key: (u64, u64), deadline: std::time::Instant) -> bool {
+    let me = std::thread::current().id();
+    let held_elsewhere = |held: &Vec<((u64, u64), std::thread::ThreadId)>| {
+        held.iter().any(|(k, owner)| *k == key && *owner != me)
+    };
+    let mut held = HELD_HERE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !held_elsewhere(&held) {
+        return false;
+    }
+    while held_elsewhere(&held) {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        held = RELEASED_HERE
+            .wait_timeout(held, deadline - now)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+    }
+    true
 }
 
 pub enum CardLeaseAttempt {
@@ -92,18 +131,30 @@ impl CardWriteLease {
     /// child at the wrong moment would otherwise make the card look in use.
     /// Each attempt starts again from scratch, so a lease is only ever
     /// granted when the kernel shows no other descriptor at that moment; a
-    /// program that keeps the card open is still reported (`Writers`).
+    /// program that keeps the card open is still reported (`Writers`). A
+    /// lease held by another thread of this process is waited for (at most
+    /// `IN_PROCESS_WAIT`), see `HELD_HERE`.
     pub fn acquire(path: &Path, expected: Option<FileIdentity>) -> CardLeaseAttempt {
         const ATTEMPTS: u32 = 10;
-        for attempt in 1..=ATTEMPTS {
+        let deadline = std::time::Instant::now() + IN_PROCESS_WAIT;
+        let mut attempts = 0;
+        loop {
             match Self::acquire_once(path, expected) {
-                CardLeaseAttempt::Writers if attempt < ATTEMPTS => {
+                CardLeaseAttempt::Writers => {
+                    if let Ok(metadata) = fs::symlink_metadata(path)
+                        && wait_for_own_release((metadata.dev(), metadata.ino()), deadline)
+                    {
+                        continue;
+                    }
+                    attempts += 1;
+                    if attempts >= ATTEMPTS {
+                        return CardLeaseAttempt::Writers;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 outcome => return outcome,
             }
         }
-        CardLeaseAttempt::Writers
     }
 
     fn acquire_once(path: &Path, expected: Option<FileIdentity>) -> CardLeaseAttempt {
@@ -162,7 +213,15 @@ impl CardWriteLease {
                 _ => CardLeaseAttempt::Unavailable,
             };
         }
-        let lease = Self { file };
+        let key = (metadata.dev(), metadata.ino());
+        HELD_HERE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((key, std::thread::current().id()));
+        let lease = Self {
+            file: std::mem::ManuallyDrop::new(file),
+            key,
+        };
         // Downgrade so that our own and others' reads proceed; any open for
         // writing that raced the probe leaves an unlock pending, so the
         // lease then reads as broken.
@@ -191,6 +250,22 @@ impl Drop for CardWriteLease {
         // opener without depending on close ordering.
         // SAFETY: fcntl on a descriptor we own.
         unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK) };
+        // Closed before waiters are told, so their retry finds it gone.
+        // SAFETY: dropped exactly once, here; never used afterwards.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.file) };
+        let me = std::thread::current().id();
+        let mut held = HELD_HERE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = held
+            .iter()
+            .position(|(key, owner)| *key == self.key && *owner == me)
+            .or_else(|| held.iter().position(|(key, _)| *key == self.key))
+        {
+            held.swap_remove(index);
+        }
+        drop(held);
+        RELEASED_HERE.notify_all();
     }
 }
 

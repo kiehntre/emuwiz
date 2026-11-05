@@ -997,3 +997,32 @@ fn a_descriptor_held_only_for_an_instant_does_not_make_the_card_look_in_use() {
         CardLeaseAttempt::Writers
     ));
 }
+
+#[test]
+fn emuwiz_waits_for_its_own_brief_lease_on_the_card_instead_of_refusing() {
+    // A preview check on another thread holds a lease for one /proc scan,
+    // longer than the fork retry window.
+    let world = World::new();
+    let (taken, wait) = std::sync::mpsc::channel();
+    let card = world.card.clone();
+    let preview = std::thread::spawn(move || {
+        let held = lease(&card);
+        taken.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        drop(held);
+    });
+    wait.recv().unwrap();
+    assert!(matches!(
+        CardWriteLease::acquire(&world.card, None),
+        CardLeaseAttempt::Held(_)
+    ));
+    preview.join().unwrap();
+    // The same thread's own lease is not waited for: the probe is refused.
+    let _mine = lease(&world.card);
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        CardWriteLease::acquire(&world.card, None),
+        CardLeaseAttempt::Writers
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
