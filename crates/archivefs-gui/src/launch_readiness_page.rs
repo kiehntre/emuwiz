@@ -399,6 +399,7 @@ impl TypedLaunchRequest {
             }
             Self::Standalone(StandaloneLaunchRequest::Vice(_)) => vec![vice::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Desmume(_)) => vec![desmume::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::SameBoy(_)) => vec![sameboy::LIMITATION],
             _ => Vec::new(),
         }
     }
@@ -408,9 +409,9 @@ impl TypedLaunchRequest {
     /// compatibility warning.
     pub(crate) fn unverified_status_label(&self) -> &'static str {
         match self {
-            Self::Standalone(StandaloneLaunchRequest::Desmume(_)) => {
-                "Ready, identity not DAT-verified"
-            }
+            Self::Standalone(
+                StandaloneLaunchRequest::Desmume(_) | StandaloneLaunchRequest::SameBoy(_),
+            ) => "Ready, identity not DAT-verified",
             _ => "Ready, compatibility unverified",
         }
     }
@@ -800,6 +801,13 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             if let Some(Ok(request)) = desmume::offer_for(plan, candidate) {
                 return Some(TypedLaunchRequest::Standalone(
                     StandaloneLaunchRequest::Desmume(request),
+                ));
+            }
+            // Same request, fresh content-hash recheck, preflight and spawn
+            // as the Gold panel's SameBoy offer.
+            if let Some(Ok(request)) = sameboy::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::SameBoy(request),
                 ));
             }
             if let Some(request) = azahar
