@@ -606,6 +606,23 @@ proves the exact inode and unchanged content metadata when our own unlink advanc
 ctime; other planned aliases receive that transition. Final-link block accounting
 remains separate from retained links. No generic `.bin` exception is introduced.
 
+**Ordering and resume (2026-11-05).** Compiler files in `incremental` may be hardlinks of
+files in `deps`/`build`. Unlinking those other names first drops the link count and advances
+the ctime that the incremental evidence records, so the tool's own earlier deletions looked
+like an external change (`INCREMENTAL_FILE_CHANGED`, PARTIAL). The executor therefore retires
+the `incremental` entry first within a group (other entries keep manifest order); a real
+external change is still refused. A PARTIAL run can still leave one crate directory with a
+session whose `.lock` was already unlinked, which the strict recogniser rejects as a whole.
+`emuwiz-cargo-retire --manifest M --approved-sha256 D --resume-journal J` re-runs the SAME
+approved manifest and accepts only that residue, only if J is the finished journal of that
+manifest on this host with one adjacent intent/outcome pair for the exact incremental path
+(same device/inode) ending PARTIAL / `INCREMENTAL_FILE_CHANGED`. Journals now list the lock files
+and session directories they unlinked (`removed_units`) and every mismatch must be named there;
+older journals only bound it to one crate directory and at most `files+dirs` items. The journal
+is not signed (it relies on the owner-only receipt directory); every other check still applies.
+The flag is ignored for any other path and refuses on any mismatch. It does not depend on where
+`EMUWIZ_TARGET_ROOT` points: identities are compared with the target's own device and inode.
+
 The non-Cargo route `bash scripts/test-cargo-retention.sh` includes realistic
 synthetic rustc layouts and interrupted sessions, lease/completion/owner/pin and
 path refusals, partial prior retirement, plan/execute separation, file replacement,

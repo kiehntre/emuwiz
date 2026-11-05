@@ -476,7 +476,9 @@ class Corrections(Base):
     """F1/F2/F3 of the acceptance of 546bf01d: truthful partial deletion, durable
     interruption evidence and a deletion-time protected-file guard."""
 
-    RELS = ["debug/deps", "debug/.fingerprint", "debug/incremental"]
+    # incremental always retires first (hardlink ordering, see test_emuwiz_cargo_retire_residue), so the
+    # order-sensitive F1/F2/restart/resolution scenarios use a third entry that is not incremental
+    RELS = ["debug/deps", "debug/.fingerprint", "debug/emuwiz"]
 
     def set_hook(self, fn):
         self.mod._hook = fn
@@ -606,7 +608,7 @@ class Corrections(Base):
         states = self.states(journal)
         self.assertEqual(states["debug/deps"], "KNOWN_COMPLETED")
         self.assertEqual(states["debug/.fingerprint"], "KNOWN_UNTOUCHED")
-        self.assertEqual(states["debug/incremental"], "KNOWN_UNTOUCHED")
+        self.assertEqual(states["debug/emuwiz"], "KNOWN_UNTOUCHED")
         self.assertFalse(self.exists(t, "debug/deps"))
         self.assertTrue(self.exists(t, "debug/.fingerprint"))
         self.assertTrue(r["interrupted"])
@@ -680,13 +682,13 @@ class Corrections(Base):
         states = self.states(journal)
         self.assertEqual(states["debug/deps"], "KNOWN_COMPLETED")
         self.assertEqual(states["debug/.fingerprint"], "UNCERTAIN_PARTIALLY_REMOVED")
-        self.assertEqual(states["debug/incremental"], "KNOWN_UNTOUCHED")
+        self.assertEqual(states["debug/emuwiz"], "KNOWN_UNTOUCHED")
         self.assertTrue(self.exists(t, "debug/.fingerprint"))
         # the next execution refuses until the incomplete journal is acknowledged
         rc, r2 = self.run_retire(path, digest, execute=True)
         self.assertEqual(rc, 6)
         self.assertEqual(r2["refused"]["code"], "INCOMPLETE_JOURNAL_PRESENT")
-        self.assertTrue(self.exists(t, "debug/incremental"))
+        self.assertTrue(self.exists(t, "debug/emuwiz"))
         before = open(journal, "rb").read()
         rc, r3 = self.run_retire(path, digest, execute=True, extra_args=["--acknowledge-incomplete-journals"])
         self.assertEqual(open(journal, "rb").read(), before, "incomplete evidence must be preserved")

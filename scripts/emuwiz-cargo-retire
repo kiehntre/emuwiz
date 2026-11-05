@@ -361,6 +361,23 @@ def protected_name(name):
     return lower.endswith(F.DATA_SUFFIXES) or "journal" in lower or name in F.ALWAYS_PRESERVE
 
 
+# What a PARTIAL retirement of an incremental directory records so that a later, journal-attested
+# resume can tell this tool's own removals from damage (see residue_from_journal).
+RESIDUE_LOCK_KEY = re.compile(r"/[^/]+/s-[0-9a-z]{8,16}-[0-9a-z]{6,10}\.lock")
+RESIDUE_SESSION_KEY = re.compile(r"/[^/]+/s-[0-9a-z]{8,16}-[0-9a-z]{6,10}-(?:[0-9a-z]{16,32}|working)")
+RESIDUE_RECORD_MAX = 20000
+RESIDUE = {}  # incremental path -> attested residue allowance, set once by run() from --resume-journal
+
+
+def removed_units(counters):
+    """Outcome fields listing the lock files and session directories this entry unlinked."""
+    if not counters.removed:
+        return {}
+    if len(counters.removed) > RESIDUE_RECORD_MAX:
+        return {"removed_units_truncated": True}
+    return {"removed_units": sorted(counters.removed)}
+
+
 def snapshot_tree(path):
     """key (relative path below `path`, '/'-joined) -> (dev, ino), and counts."""
     snap = {}
@@ -415,6 +432,7 @@ class Counters:
         self.retained = 0
         self.files = 0
         self.dirs = 0
+        self.removed = []  # "/crate/s-..lock" files and "/crate/s-.." session dirs unlinked below incremental
 
 
 class IncrementalFiles(dict):
@@ -526,6 +544,8 @@ def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, 
         if live_identities is not None:
             live_identities.discard((st.st_dev, st.st_ino))
         counters.dirs += 1
+        if incremental_files is not None and RESIDUE_SESSION_KEY.fullmatch(key):
+            counters.removed.append(key)
         return
     if not stat.S_ISREG(st.st_mode):
         raise Refusal("SPECIAL_FILE", name)
@@ -555,6 +575,8 @@ def remove_entry(dir_fd, name, expect, root_dev, counters, top=True, snap=None, 
             else:
                 counters.retained += again.st_blocks * 512
             counters.files += 1
+            if incremental_files is not None and RESIDUE_LOCK_KEY.fullmatch(key):
+                counters.removed.append(key)
             if link_fd is not None:
                 incremental_files.unlinked(again, os.fstat(link_fd))
     finally:
@@ -1140,7 +1162,7 @@ def evaluate_entry(entry_path, group, dev_expect):
     if stat.S_ISLNK(st.st_mode):
         return "SYMLINK", rel
     if stat.S_ISDIR(st.st_mode):
-        problem = F.incremental_evidence(norm)[0] if rel[-1] == "incremental" else F.subtree_problem(norm, st.st_dev)
+        problem = F.incremental_evidence(norm, RESIDUE.get(norm))[0] if rel[-1] == "incremental" else F.subtree_problem(norm, st.st_dev)
         if problem:
             return "SUBTREE_REFUSED: " + problem, rel
     elif not stat.S_ISREG(st.st_mode):
@@ -1187,6 +1209,17 @@ def run(args):
         finish(args, receipt)
         return 3
     receipt["manifest_sha256"] = digest
+    RESIDUE.clear()
+    if args.resume_journal:
+        try:
+            RESIDUE.update(residue_from_journal(args.resume_journal, groups, digest))
+        except (Refusal, OSError) as refusal:
+            code = getattr(refusal, "code", "RESUME_JOURNAL_REFUSED")
+            receipt["refused"] = {"code": code, "detail": getattr(refusal, "detail", str(refusal))}
+            finish(args, receipt)
+            return 3
+        receipt["resume_journal"] = {"journal": os.path.realpath(args.resume_journal),
+                                     "journal_sha256": journal_sha256(args.resume_journal)}
     directories = [os.path.realpath(g["group"]["directory"]) for g in groups]
     sources = [os.path.realpath(s) for g in groups for s in g["sources"]]
     journal = None
@@ -1467,6 +1500,86 @@ def _read_regular(path, limit):
         return None
     finally:
         os.close(fd)
+
+
+def residue_from_journal(journal_path, groups, digest):
+    """Allowance for resuming the PARTIAL retirement of an `incremental` directory, proven by
+    the journal of that very run.  Returns {incremental path: residue} or raises Refusal.
+
+    The journal must be a finished execution of THIS approved manifest on THIS host (one begin,
+    contiguous seq, one final end, no torn line, an owned non-group/world-writable regular file),
+    its group_plan must name the same target and path identities, and the path must have exactly one
+    adjacent intent/outcome pair ending PARTIAL with reason INCREMENTAL_FILE_CHANGED (not an
+    interruption).  New journals list the lock files and session directories they unlinked
+    (`removed_units`): then every mismatch must be named there.  Journals from before that field
+    only bound the residue: at most one crate directory, at most files+dirs recorded items.
+    The journal is not cryptographically signed: like --resolve-journal this relies on the
+    owner-only receipt directory, and the live unit must still pass every other check."""
+    def no(why):
+        raise Refusal("RESUME_JOURNAL_REFUSED", why)
+
+    data = _read_regular(journal_path, JOURNAL_MAX_BYTES)
+    if data is None:
+        no("not a regular file owned by this user, or group/world writable, or oversized")
+    lines = data.split(b"\n")
+    if lines.pop() != b"":
+        no("the final record is torn")
+    records = []
+    for raw in lines:
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            no("a record is not valid JSON")
+        if not isinstance(value, dict) or not isinstance(value.get("event"), str):
+            no("a record is not an event")
+        records.append(value)
+    if len(records) < 3 or records[0]["event"] != "begin" or records[-1]["event"] != "end":
+        no("the journal is not a complete finished execution")
+    if [r.get("seq") for r in records] != list(range(1, len(records) + 1)):
+        no("record sequence numbers are not contiguous")
+    if any(r["event"] in ("begin", "end") for r in records[1:-1]):
+        no("the journal holds a second begin or end record")
+    begin = records[0]
+    if begin.get("host") != os.uname().nodename:
+        no("the journal belongs to another host")
+    if begin.get("manifest_sha256") != digest or begin.get("approved_sha256") != digest:
+        no("the journal was written for a different manifest digest")
+    plans = [r for r in records if r["event"] == "group_plan"]
+    out = {}
+    for entry in groups:
+        group = entry["group"]
+        for item in entry["paths"]:
+            path = item["path"]
+            if os.path.basename(path) != "incremental":
+                continue
+            plan = [r for r in plans if r.get("directory") == group["directory"]]
+            if len(plan) != 1 or (plan[0].get("device"), plan[0].get("inode")) != (group.get("device"), group.get("inode")):
+                no("the journal's group plan is not this target")
+            planned = [x for x in plan[0].get("paths", []) if isinstance(x, dict) and x.get("path") == path]
+            ident = (item.get("device"), item.get("inode"), item.get("mode"))
+            if len(planned) != 1 or (planned[0].get("device"), planned[0].get("inode"), planned[0].get("mode")) != ident:
+                no(f"{path} is not planned with this identity in the journal")
+            marks = [(i, r) for i, r in enumerate(records) if r["event"] in ("intent", "outcome") and r.get("path") == path]
+            if len(marks) != 2 or marks[0][1]["event"] != "intent" or marks[1][1]["event"] != "outcome" or marks[1][0] != marks[0][0] + 1:
+                no(f"{path} has no single adjacent intent/outcome pair")
+            intent, outcome = marks[0][1], marks[1][1]
+            if (intent.get("device"), intent.get("inode"), intent.get("mode")) != ident:
+                no(f"the recorded intent for {path} has another identity")
+            if (outcome.get("outcome"), outcome.get("reason")) != ("PARTIAL", "INCREMENTAL_FILE_CHANGED") or outcome.get("interrupted"):
+                no(f"{path} did not end PARTIAL with INCREMENTAL_FILE_CHANGED")
+            units = outcome.get("removed_units")
+            if isinstance(units, list) and not outcome.get("removed_units_truncated"):
+                if not all(isinstance(u, str) and (RESIDUE_LOCK_KEY.fullmatch(u) or RESIDUE_SESSION_KEY.fullmatch(u)) for u in units):
+                    no("removed_units holds an entry that is not a lock file or session directory")
+                out[path] = {"removed": set(units), "max_items": len(units)}
+            else:
+                files, dirs = outcome.get("files"), outcome.get("dirs")
+                if any(not isinstance(n, int) or isinstance(n, bool) or n < 0 for n in (files, dirs)):
+                    no("the recorded counts are invalid")
+                out[path] = {"removed": None, "max_items": files + dirs}
+    if not out:
+        no("the manifest names no incremental path")
+    return out
 
 
 def journal_sha256(path):
@@ -1956,7 +2069,7 @@ def process_group(entry, registry, args, census, now_ts, execute, journal=None):
                     )
                     incremental_files = None
                     if os.path.basename(item["path"]) == "incremental":
-                        problem, incremental_files = F.incremental_evidence(item["path"])
+                        problem, incremental_files = F.incremental_evidence(item["path"], RESIDUE.get(item["path"]))
                         if problem or len(incremental_files) != nfiles or any(
                             snap.get(key) != stamp[:2] for key, stamp in incremental_files.items()
                         ):
@@ -1966,6 +2079,15 @@ def process_group(entry, registry, args, census, now_ts, execute, journal=None):
                     by_path[item["path"]].update(outcome="HELD", reason="SNAPSHOT_FAILED", detail=str(error))
                     continue
                 chosen.append((item, expect, snap, nfiles, ndirs + (1 if stat.S_ISDIR(expect[2]) else 0), incremental_files))
+            # Defect A: `incremental` goes FIRST.  Its compiler files may be hardlinks of files
+            # in deps/ or build/; unlinking those names earlier would drop their link count
+            # and advance their ctime, which this tool's own evidence (incremental_stamp,
+            # taken above) would then read as an external change.  Retiring incremental
+            # first lets its own re-baselining (IncrementalFiles.unlinked) account for the
+            # only changes it makes; the other groups carry no ctime evidence.  Genuine
+            # external changes are still refused.  sort() is stable: manifest order is
+            # kept otherwise.
+            chosen.sort(key=lambda c: os.path.basename(c[0]["path"]) != "incremental")
             if chosen:
                 fence = RetirementFence(registry, key, target)
                 try:
@@ -2238,7 +2360,7 @@ def execute_group(entry, selected, out, journal, identities=None, mutation_guard
                     try:
                         journal.write({"event": "outcome", "path": item["path"], "outcome": record["outcome"],
                                        "reason": record["reason"], "files": one.files, "dirs": one.dirs,
-                                       "freed": one.freed, "interrupted": True})
+                                       "freed": one.freed, "interrupted": True, **removed_units(one)})
                     except OSError:
                         pass
                 out["accounted_freed_bytes"] = counters.freed
@@ -2263,7 +2385,7 @@ def execute_group(entry, selected, out, journal, identities=None, mutation_guard
                 try:
                     journal.write({"event": "outcome", "path": item["path"], "outcome": outcome,
                                    "reason": reason, "files": one.files, "dirs": one.dirs,
-                                   "freed": one.freed, "retained": one.retained})
+                                   "freed": one.freed, "retained": one.retained, **removed_units(one)})
                 except OSError as error:
                     # the unlink happened but could not be recorded: stop mutating
                     out["aborted"] = "JOURNAL_WRITE_FAILED"
@@ -2370,6 +2492,10 @@ def main(argv=None):
     p.add_argument("--acknowledge-incomplete-journals", action="store_true",
                    help="allow --execute although earlier incomplete journals exist (they are kept)")
     p.add_argument("--execute", action="store_true", help="actually delete (default is a dry run)")
+    p.add_argument("--resume-journal", metavar="FILE",
+                   help="journal of an earlier PARTIAL run of THIS approved manifest: lets its incremental "
+                        "directory be recognised despite the lock/session residue that run left (see "
+                        "residue_from_journal); changes nothing else")
     p.add_argument("--receipt-dir", help="where the receipt JSON goes (required with --execute)")
     p.add_argument("--maintenance-window-attested", action="store_true",
                    help="you attest no non-cargo-iso build can write these targets right now")

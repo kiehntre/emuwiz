@@ -64,7 +64,7 @@ class Restart(R.Corrections):
         states = self.states(journal)
         self.assertEqual(states["debug/deps"], "KNOWN_COMPLETED")
         self.assertEqual(states["debug/.fingerprint"], "KNOWN_PARTIAL")
-        self.assertEqual(states["debug/incremental"], "KNOWN_UNTOUCHED")
+        self.assertEqual(states["debug/emuwiz"], "KNOWN_UNTOUCHED")
         before = slurp(journal)
         rc, r2 = self.run_retire(path, digest, execute=True)
         self.assertNotIn("refused", r2)
@@ -110,7 +110,7 @@ class Restart(R.Corrections):
         t, path, digest, journal = self.interrupted()
         rc, r2 = self.run_retire(path, "0" * 64, execute=True)
         self.assertEqual(r2["refused"]["code"], "MANIFEST_DIGEST_MISMATCH")
-        self.assertTrue(self.exists(t, "debug/incremental"))
+        self.assertTrue(self.exists(t, "debug/emuwiz"))
         self.assertEqual(len(self.journals()), 1, "a refused run must not start a journal")
 
     # ------------------------------------------------------------ refused
@@ -119,7 +119,7 @@ class Restart(R.Corrections):
         self.assert_pending(journal, "did not record its own interruption")
         rc, r2 = self.run_retire(path, digest, execute=True)
         self.assertEqual((rc, r2["refused"]["code"]), (6, "INCOMPLETE_JOURNAL_PRESENT"))
-        self.assertTrue(self.exists(t, "debug/incremental"))
+        self.assertTrue(self.exists(t, "debug/emuwiz"))
 
     def test_untrusted_journal_shapes_stay_pending(self):
         t, path, digest, journal = self.interrupted()
@@ -262,7 +262,7 @@ class Restart(R.Corrections):
                 self.assertEqual(self.mod.incomplete_journals(self.receipts), [journal])
         rc, r2 = self.run_retire(path, digest, execute=True)
         self.assertEqual((rc, r2["refused"]["code"]), (6, "INCOMPLETE_JOURNAL_PRESENT"))
-        self.assertTrue(self.exists(t, "debug/incremental"))
+        self.assertTrue(self.exists(t, "debug/emuwiz"))
 
     def test_receipt_publication_failure_after_interruption_stays_pending(self):
         t, path, digest, journal = self.interrupted()
