@@ -897,6 +897,18 @@ pub struct LaunchedRetroArchProcess {
     staged_cartridge: Option<crate::zip_cartridge_stage::StagedCartridge>,
 }
 
+impl Drop for LaunchedRetroArchProcess {
+    fn drop(&mut self) {
+        // Never delete a zipped cartridge's copy while the emulator may still
+        // be reading it: keep the directory instead.
+        if self.watched.is_running()
+            && let Some(staged) = self.staged_cartridge.take()
+        {
+            staged.keep();
+        }
+    }
+}
+
 impl LaunchedRetroArchProcess {
     /// Non-blocking: returns the exit report once the background reaper
     /// thread has observed the process exit, `None` while it is still
@@ -1142,6 +1154,80 @@ pub fn preflight_retroarch_launch_with_playlist(
     Ok(command)
 }
 
+/// Refuses the staged-zip route unless the chosen RetroArch is a native
+/// install and its own configuration names absolute, separate save and state
+/// directories and does not store them beside the content. Reads the user's
+/// `retroarch.cfg`; never edits it.
+fn staged_launch_is_safe(
+    request: &RetroArchLaunchRequest,
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    environment: &DiscoveryEnvironment,
+) -> Result<(), String> {
+    use crate::emulator_environment::retroarch::{PathPurpose, ResolutionState};
+    use std::io::Read as _;
+
+    if request.profile.profile_kind != ProfileKind::Native {
+        return Err(
+            "a zipped cartridge can only be launched with a native RetroArch \
+                    installation, because an AppImage or Flatpak launcher may exit while \
+                    the game is still running"
+                .into(),
+        );
+    }
+    let report = discover_retroarch_environment(filesystem, environment)
+        .map_err(|error| format!("RetroArch could not be inspected: {error}"))?;
+    let profile = report
+        .profiles
+        .iter()
+        .find(|profile| {
+            profile.profile_kind == request.profile.profile_kind
+                && profile.scope == request.profile.scope
+        })
+        .ok_or("the selected RetroArch settings could not be found")?;
+    for (purpose, key) in [
+        (PathPurpose::Saves, "savefile_directory"),
+        (PathPurpose::SaveStates, "savestate_directory"),
+    ] {
+        let established = profile.paths.iter().any(|finding| {
+            finding.purpose == purpose
+                && finding.resolution == ResolutionState::ConfiguredResolved
+                && finding
+                    .resolved_path
+                    .as_ref()
+                    .is_some_and(|path| Path::new(&path.display).is_absolute())
+        });
+        if !established {
+            return Err(format!(
+                "RetroArch has no explicit absolute `{key}` set, so saves for a zipped \
+                 cartridge would be written to a temporary folder and lost; set it in \
+                 RetroArch first"
+            ));
+        }
+    }
+    let config = Path::new(&profile.config_file.path.display);
+    let mut text = String::new();
+    fs::File::open(config)
+        .and_then(|file| file.take(1024 * 1024).read_to_string(&mut text))
+        .map_err(|error| format!("RetroArch settings could not be read: {error}"))?;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if matches!(
+            key.trim(),
+            "savefiles_in_content_dir" | "savestates_in_content_dir"
+        ) && value.trim().trim_matches('"').eq_ignore_ascii_case("true")
+        {
+            return Err(format!(
+                "RetroArch is set to keep saves beside the game (`{}`), which would lose \
+                 them for a zipped cartridge",
+                key.trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// [`preflight_retroarch_launch_with_playlist`] then [`spawn_retroarch`].
 pub fn preflight_and_launch_retroarch_with_playlist(
     request: &RetroArchLaunchRequest,
@@ -1160,6 +1246,17 @@ pub fn preflight_and_launch_retroarch_with_playlist(
         &request.expected_platform_id,
     ) {
         Ok(staged) => {
+            // The staged copy is deleted at exit, so anything RetroArch would
+            // write beside it (saves, states) would be lost. Only a native
+            // install (whose child is the emulator itself, so the copy is
+            // removed only after a confirmed exit) with explicit save and
+            // state directories may use this route.
+            staged_launch_is_safe(request, filesystem, environment).map_err(|detail| {
+                preflight_error(
+                    LaunchPreflightErrorKind::ContentRequiresMount,
+                    format!("zipped cartridge cannot be launched: {detail}"),
+                )
+            })?;
             let mut staged_request = request.clone();
             staged_request.selected_content_path = staged.path().to_path_buf();
             let command = preflight_retroarch_launch_with_playlist(

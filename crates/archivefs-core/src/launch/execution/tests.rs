@@ -1079,11 +1079,32 @@ fn write_rom_zip(path: &std::path::Path, members: &[(&str, &[u8])]) {
     writer.finish().unwrap();
 }
 
+/// Rewrites the fixture's `retroarch.cfg` with explicit absolute save and
+/// state directories plus `extra` lines.
+fn write_zip_test_config(ready: &ReadyFixture, extra: &str) {
+    let saves = ready.fixture.path("saves");
+    let states = ready.fixture.path("states");
+    fs::create_dir_all(&saves).unwrap();
+    fs::create_dir_all(&states).unwrap();
+    ready.fixture.write(
+        "config/retroarch/retroarch.cfg",
+        format!(
+            "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\nsavefile_directory = \"{}\"\nsavestate_directory = \"{}\"\n{extra}",
+            ready.fixture.path("cores").display(),
+            ready.fixture.path("info").display(),
+            saves.display(),
+            states.display(),
+        )
+        .as_bytes(),
+    );
+}
+
 fn zipped_ready(label: &str, members: &[(&str, &[u8])]) -> (ReadyFixture, PathBuf, Vec<u8>) {
     let mut ready = build_ready_fixture(label);
     let rom = b"synthetic mega drive rom bytes".to_vec();
     let zip = ready.fixture.path("content/game.zip");
     write_rom_zip(&zip, members);
+    write_zip_test_config(&ready, "");
     ready.request.selected_content_path = zip.clone();
     (ready, zip, rom)
 }
@@ -1283,4 +1304,57 @@ fn zipped_cartridge_plan_is_ready_for_retroarch_and_only_when_verified() {
         Some("MegaDrive"),
     );
     assert!(crate::launch::launch_content_ref_for_zipped_cartridge(&loose).is_none());
+}
+
+#[test]
+fn zipped_cartridge_is_refused_when_saves_would_be_lost_or_launcher_may_outlive() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let before = staged_dirs();
+    let rom = b"synthetic mega drive rom bytes";
+    let run = |ready: &ReadyFixture| {
+        preflight_and_launch_retroarch_with_playlist(
+            &ready.request,
+            &HostReadOnlyFilesystem,
+            &ready.environment,
+            None,
+        )
+        .err()
+        .map(|error| format!("{error:?}"))
+    };
+    // Saves stored beside the content.
+    let (ready, _, _) = zipped_ready("zip-in-content", &[("a.md", rom)]);
+    write_zip_test_config(&ready, "savefiles_in_content_dir = \"true\"\n");
+    assert!(run(&ready).unwrap().contains("beside the game"));
+    let (ready, _, _) = zipped_ready("zip-states-in-content", &[("a.md", rom)]);
+    write_zip_test_config(&ready, "savestates_in_content_dir = \"true\"\n");
+    assert!(run(&ready).unwrap().contains("beside the game"));
+    // Save or state directory not set.
+    let (ready, _, _) = zipped_ready("zip-no-dirs", &[("a.md", rom)]);
+    ready.fixture.write(
+        "config/retroarch/retroarch.cfg",
+        format!(
+            "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n",
+            ready.fixture.path("cores").display(),
+            ready.fixture.path("info").display()
+        )
+        .as_bytes(),
+    );
+    assert!(run(&ready).unwrap().contains("savefile_directory"));
+    // A launcher profile may exit while the game runs.
+    let (mut ready, _, _) = zipped_ready("zip-appimage", &[("a.md", rom)]);
+    ready.request.profile.profile_kind = ProfileKind::AppImage;
+    assert!(run(&ready).unwrap().contains("native RetroArch"));
+    assert_eq!(staged_dirs(), before);
+}
+
+#[test]
+fn a_kept_staging_directory_survives_for_a_possibly_running_emulator() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_ready, zip, _) = zipped_ready("zip-keep", &[("a.md", b"synthetic mega drive rom bytes")]);
+    let staged = crate::zip_cartridge_stage::stage_zip_cartridge_for_launch(&zip, "MegaDrive")
+        .expect("stages");
+    let dir = staged.path().parent().unwrap().to_path_buf();
+    staged.keep();
+    assert!(dir.join("a.md").is_file());
+    fs::remove_dir_all(dir).unwrap();
 }

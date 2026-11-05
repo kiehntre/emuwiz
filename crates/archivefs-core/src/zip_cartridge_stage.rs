@@ -28,6 +28,12 @@ impl StagedCartridge {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Leaves the directory in place (used when the emulator may still be
+    /// running); it is then the OS temp cleaner's to remove.
+    pub fn keep(self) {
+        std::mem::forget(self);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
