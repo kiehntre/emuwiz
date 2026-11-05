@@ -34,6 +34,11 @@ pub(super) struct PadShell {
     /// The last input was the controller, not the mouse: only then is an open
     /// dialog made modal for focus, so mouse use behind it is unchanged.
     pad_mode: bool,
+    /// B was pressed over this dialog layer: if it is still open after a few
+    /// frames, Back did not close it (a window EmuWiz has no close rule for).
+    back_pending: Option<(egui::LayerId, u8)>,
+    /// A dialog the controller was let out of with B, so it can never trap.
+    released: Option<egui::LayerId>,
     /// A hold-to-confirm in progress: the control, when it began, its label.
     hold: Option<(egui::Id, f64, String)>,
     #[cfg(test)]
@@ -99,7 +104,7 @@ impl App {
             shell.pad_mode = true;
         }
         if shell.pad_mode {
-            confine_to_dialog(context);
+            confine_to_dialog(context, shell);
         }
         for event in &events {
             match event {
@@ -417,7 +422,15 @@ impl App {
         match command {
             Command::Select => self.pad_shell_select(context),
             Command::Move(_) => page_command(context, command),
-            Command::Back => key_tap(context, egui::Key::Escape),
+            Command::Back => {
+                // If this dialog is still open a few frames from now, B has no
+                // way to close it: let the controller out rather than trap it.
+                let top = context.memory(|m| m.areas().top_layer_id(egui::Order::Middle));
+                if let (Some(layer), Some(shell)) = (top, self.pad_shell.as_mut()) {
+                    shell.back_pending.get_or_insert((layer, 3));
+                }
+                key_tap(context, egui::Key::Escape);
+            }
             Command::PageUp => key_tap(context, egui::Key::PageUp),
             Command::PageDown => key_tap(context, egui::Key::PageDown),
             Command::First => key_tap(context, egui::Key::Home),
@@ -453,11 +466,28 @@ impl App {
 /// (it takes effect from the next frame), so Next/Previous can never step onto
 /// the page behind. The picker and keyboard are `egui::Modal`s and do this
 /// themselves.
-fn confine_to_dialog(context: &egui::Context) {
+fn confine_to_dialog(context: &egui::Context, shell: &mut PadShell) {
     context.memory_mut(|m| {
-        let top = m.areas().top_layer_id(egui::Order::Middle);
+        let top = m
+            .areas()
+            .top_layer_id(egui::Order::Middle)
+            .filter(|layer| m.areas().is_visible(layer));
+        // A release or pending Back only lasts as long as its dialog does.
+        if shell.released.is_some() && shell.released != top {
+            shell.released = None;
+        }
+        if let Some((layer, left)) = shell.back_pending {
+            shell.back_pending = if Some(layer) != top {
+                None
+            } else if left == 0 {
+                shell.released = Some(layer);
+                None
+            } else {
+                Some((layer, left - 1))
+            };
+        }
         if let Some(layer) = top
-            && m.areas().is_visible(&layer)
+            && shell.released != Some(layer)
         {
             m.set_modal_layer(layer);
         }
