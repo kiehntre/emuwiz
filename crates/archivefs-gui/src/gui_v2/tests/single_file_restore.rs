@@ -2,7 +2,7 @@
 //! disposable synthetic cartridge/save only. Worker steps run through the
 //! module's own functions with a fixed closure observer (never the live
 //! process scan), and their outcomes are delivered as the backend would.
-use super::super::save_snapshots::{self, SnapshotReport, snapshot_target};
+use super::super::save_snapshots::{self, snapshot_target};
 use super::super::single_file_restore::{self as sfr, Dirs, Flow, Job, Outcome};
 use super::*;
 use archivefs_core::save_snapshots::tree_restore::safety::{
