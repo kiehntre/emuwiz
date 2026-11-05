@@ -28,7 +28,7 @@ use archivefs_core::{
         plan_ps2_psu_restore,
         restore_guard::{
             Ps2GuardedRestore, Ps2RestoreGuardOptions, apply_ps2_psu_restore_guarded,
-            discover_ps2_restore_journals, undo_ps2_psu_restore_guarded,
+            undo_ps2_psu_restore_guarded,
         },
     },
     persistent_state_inventory::{PersistentStateRecord, PersistentStateType, StateEmulator},
@@ -46,6 +46,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+pub(super) mod panel;
+pub(super) mod recovery;
+pub(super) mod storage;
 #[cfg(test)]
 mod tests;
 
@@ -457,70 +460,45 @@ pub(super) fn apply_restore(
     observer: &dyn QuiescenceProvider,
     options: &Ps2RestoreGuardOptions,
 ) -> Result<Ps2GuardedRestore, String> {
-    let records = discover_ps2_restore_journals(&options.journal_dir);
-    if !records.is_complete() {
-        return Err("EmuWiz could not read every earlier restore record, so it will not change the card. Open the Save Vault and refresh its restore records. Nothing was changed.".into());
-    }
-    // In-flight records (recoverable by the Save Vault) and unreadable ones
-    // (card unknown) block every card. A parked record that needs manual
-    // review is terminal, so it blocks only the physical card it concerns,
-    // matched by resolved path or recorded file identity so another path
-    // spelling (symlink, Flatpak) cannot slip past.
-    if records.records.iter().any(|record| {
-        record.error.is_some()
-            || record.needs_recovery
-            || (record.needs_attention && concerns_card(record, &plan.source_card_path))
-    }) {
-        return Err("An earlier memory card restore was interrupted or needs review. Open the Save Vault and use Check interrupted restores first. Nothing was changed.".into());
-    }
+    records_gate(&options.journal_dir, &plan.source_card_path)?;
     apply_ps2_psu_restore_guarded(plan, observer, options)
         .map_err(|error| psu_restore_error_message(&error))
 }
 
-/// Whether a restore record concerns the physical card at `card`. Anything
-/// that cannot be established counts as "yes".
-fn concerns_card(
-    record: &archivefs_core::memory_card_inventory::restore_guard::Ps2RestoreJournalSummary,
-    card: &Path,
-) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(journal) =
-        archivefs_core::memory_card_inventory::restore_guard::load_ps2_restore_journal(
-            &record.path,
-        )
-    else {
-        return true;
-    };
-    let Ok(live) = fs::metadata(card) else {
-        return true;
-    };
-    let same_path = journal.card_path == card
-        || matches!(
-            (fs::canonicalize(&journal.card_path), fs::canonicalize(card)),
-            (Ok(a), Ok(b)) if a == b
-        );
-    let same_file = [
-        Some(journal.original_identity),
-        journal.post_identity,
-        journal.undo_identity,
-    ]
-    .into_iter()
-    .flatten()
-    .any(|identity| identity.device == live.dev() && identity.inode == live.ino());
-    same_path || same_file
+/// Worker: Core's guarded Undo, bound to the restore journal.
+/// Every card write from Blue (Apply and Undo) passes this first: the record
+/// list must be complete; interrupted and unreadable records block every
+/// card; a parked record blocks its own card unless its review still holds.
+fn records_gate(journal_dir: &Path, card: &Path) -> Result<(), String> {
+    let records = recovery::load_records(journal_dir);
+    if !records.complete() {
+        return Err("EmuWiz could not read every earlier restore record, so it will not change the card. Refresh the restore records below. Nothing was changed.".into());
+    }
+    if records.rows.iter().any(|row| row.blocks(card)) {
+        return Err("An earlier memory card restore was interrupted or needs review. Use Restore records below (Check interrupted restores, or Review). Nothing was changed.".into());
+    }
+    Ok(())
 }
 
-/// Worker: Core's guarded Undo, bound to the restore journal.
 pub(super) fn undo_restore(
     journal: &Path,
     observer: &dyn QuiescenceProvider,
     now_unix_seconds: u64,
 ) -> Result<(), String> {
+    // Undo writes the card too, so it passes the same records gate.
+    let card =
+        archivefs_core::memory_card_inventory::restore_guard::load_ps2_restore_journal(journal)
+            .map_err(|error| psu_restore_error_message(&error))?
+            .card_path;
+    let journal_dir = journal
+        .parent()
+        .ok_or("The restore record has no folder. Nothing was changed.")?;
+    records_gate(journal_dir, &card)?;
     undo_ps2_psu_restore_guarded(journal, observer, now_unix_seconds)
         .map_err(|error| psu_restore_error_message(&error))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes)
         .iter()
@@ -597,6 +575,8 @@ pub(super) struct CardRestoreState {
     pub(super) flow: Flow,
     /// (card, success, message) for the last action on a card.
     pub(super) feedback: Option<(PathBuf, bool, String)>,
+    /// Restore records and retained-storage panels.
+    pub(super) panel: panel::PanelState,
 }
 
 impl CardRestoreState {
@@ -622,6 +602,7 @@ impl CardRestoreState {
 }
 
 pub(super) enum Job {
+    Panel(panel::PanelJob),
     History {
         root: PathBuf,
         locations: Vec<SaveLocation>,
@@ -653,6 +634,7 @@ pub(super) enum Job {
 }
 
 pub(super) enum Outcome {
+    Panel(panel::PanelOutcome),
     History {
         histories: std::collections::BTreeMap<PathBuf, CardHistory>,
         generation: u64,
@@ -689,6 +671,7 @@ fn now() -> u64 {
 pub(super) fn run(job: Job) -> Outcome {
     let observer = archivefs_core::save_snapshots::history::default_closure_observer();
     match job {
+        Job::Panel(job) => Outcome::Panel(panel::run(job)),
         Job::History {
             root,
             locations,
@@ -759,6 +742,7 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
         state.job = None;
     }
     match outcome {
+        Outcome::Panel(outcome) => panel::receive(&mut state.panel, outcome),
         Outcome::History {
             histories,
             generation: loaded,
@@ -817,6 +801,7 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
         },
         Outcome::Applied { location, result } => {
             state.loaded_for = None;
+            state.panel.records_requested = false;
             match result {
                 Ok(restore) => {
                     let message = format!(
@@ -844,6 +829,7 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
             result,
         } => {
             state.loaded_for = None;
+            state.panel.records_requested = false;
             match result {
                 Ok(()) => {
                     let message =

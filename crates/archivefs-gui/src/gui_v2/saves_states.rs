@@ -474,6 +474,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
             })
             .collect();
         super::card_restore::ensure_history(app, locations);
+        super::card_restore::panel::show(ui, app);
     }
     egui::ScrollArea::vertical()
         .id_salt(("v2_saves_states_records", game_id))
