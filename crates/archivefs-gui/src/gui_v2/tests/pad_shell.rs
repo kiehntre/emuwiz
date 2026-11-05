@@ -670,7 +670,9 @@ mod dialog_safety {
         fn focus(&mut self, label: &str) {
             // Walk with the controller's own Down until the label is focused.
             for _ in 0..120 {
+                self.app.pad_shell.as_mut().unwrap().reading_order = true;
                 self.step(Control::Direction(Direction::Down));
+                self.app.pad_shell.as_mut().unwrap().reading_order = false;
                 if self.focused_label().as_deref() == Some(label) {
                     return;
                 }
@@ -893,7 +895,10 @@ mod journey {
         /// Walk focus with Down until a control whose label satisfies `wanted`.
         fn focus(&mut self, wanted: impl Fn(&str) -> bool, what: &str) {
             for _ in 0..200 {
+                // Scan in reading order: egui names a control only then.
+                self.app.pad_shell.as_mut().unwrap().reading_order = true;
                 self.tap(Control::Direction(Direction::Down));
+                self.app.pad_shell.as_mut().unwrap().reading_order = false;
                 if let Some(l) = self.label() {
                     self.seen.push(l);
                 }
@@ -975,5 +980,223 @@ mod journey {
             pad.app.big_picture.is_some(),
             "Big Picture opened from the pad"
         );
+    }
+}
+
+/// Spatial movement on Blue's real Library: sidebar on the left, a grid of
+/// game cards on the right.
+mod spatial {
+    use super::super::super::simple_shell::nav_id;
+    use super::*;
+
+    struct Lib {
+        context: egui::Context,
+        app: App,
+    }
+
+    const LEFT: Control = Control::Direction(Direction::Left);
+    const RIGHT: Control = Control::Direction(Direction::Right);
+    const DOWN: Control = Control::Direction(Direction::Down);
+    const UP: Control = Control::Direction(Direction::Up);
+
+    impl Lib {
+        fn new(games: i64) -> Self {
+            let context = egui::Context::default();
+            let mut app = fixture(&context);
+            app.simple.enabled = true;
+            app.library = Arc::new(Library::new(
+                (1..=games)
+                    .map(|id| archive(id, &format!("Game {id:03}"), Some("SNES")))
+                    .collect(),
+            ));
+            app.artwork.index = Some(Arc::new(MediaIndex::default()));
+            app.loaded = true;
+            app.router.current = Route::BrowsePlay;
+            let mut lib = Self { context, app };
+            lib.frames();
+            lib.frames();
+            lib
+        }
+        fn frames(&mut self) {
+            for _ in 0..3 {
+                let app = &mut self.app;
+                run_ui_frame(&self.context, Vec::new(), |c| app.show(c));
+            }
+        }
+        fn tap(&mut self, control: Control) {
+            let shell = self.app.pad_shell.as_mut().unwrap();
+            shell.inject(PadEvent::Pressed { device: 1, control });
+            shell.inject(PadEvent::Released { device: 1, control });
+            self.frames();
+        }
+        fn focused(&self) -> Option<egui::Id> {
+            self.context.memory(|m| m.focused())
+        }
+        fn rect(&self, id: egui::Id) -> egui::Rect {
+            self.context.read_response(id).expect("drawn").rect
+        }
+        fn on_sidebar(&self) -> bool {
+            self.focused().is_some_and(|id| {
+                self.rect(id).right() <= self.rect(nav_id(Destination::Library)).right() + 1.0
+            })
+        }
+        fn focus_sidebar(&mut self) {
+            let id = nav_id(Destination::Library);
+            self.context.memory_mut(|m| m.request_focus(id));
+            self.frames();
+            assert!(self.on_sidebar());
+            // The controller takes over from here.
+            self.app.pad_shell.as_mut().unwrap().set_pad_mode_for_test();
+        }
+        /// A game card is far taller than any chip or button.
+        fn is_card(&self, id: egui::Id) -> bool {
+            self.rect(id).height() > 100.0
+        }
+        /// Walk Down from the sidebar's Right until a card has focus.
+        fn reach_a_card(&mut self) {
+            self.tap(RIGHT);
+            for _ in 0..40 {
+                if self
+                    .focused()
+                    .is_some_and(|id| !self.on_sidebar() && self.is_card(id))
+                {
+                    return;
+                }
+                self.tap(DOWN);
+            }
+            panic!("never reached a game card");
+        }
+    }
+
+    #[test]
+    fn right_from_the_sidebar_lands_in_the_content_level_with_the_row_you_left() {
+        let mut lib = Lib::new(40);
+        lib.focus_sidebar();
+        let from = lib.rect(lib.focused().unwrap());
+        lib.tap(RIGHT);
+        let id = lib.focused().expect("something has focus");
+        assert!(!lib.on_sidebar(), "Right left the sidebar");
+        let to = lib.rect(id);
+        assert!(
+            to.left() > from.right() - 1.0,
+            "it is to the right of the sidebar"
+        );
+        assert!(
+            (to.center().y - from.center().y).abs() < from.height() * 2.5,
+            "landed level with the sidebar row, not at the top of the page: {from:?} → {to:?}"
+        );
+    }
+
+    #[test]
+    fn grid_moves_by_row_and_column() {
+        let mut lib = Lib::new(40);
+        lib.focus_sidebar();
+        lib.reach_a_card();
+        let first = lib.rect(lib.focused().unwrap());
+        lib.tap(RIGHT);
+        let right_id = lib.focused().unwrap();
+        let right = lib.rect(right_id);
+        assert!(right.left() > first.left() && (right.center().y - first.center().y).abs() < 10.0);
+        lib.tap(DOWN);
+        let below = lib.rect(lib.focused().unwrap());
+        assert!(below.top() > right.top(), "Down goes to the next row");
+        assert!(
+            (below.center().x - right.center().x).abs() < right.width() / 2.0,
+            "same column"
+        );
+        lib.tap(UP);
+        assert_eq!(lib.focused(), Some(right_id), "Up returns to the same card");
+    }
+
+    #[test]
+    fn returning_from_the_sidebar_restores_the_card_without_scrolling() {
+        let mut lib = Lib::new(60);
+        lib.focus_sidebar();
+        lib.reach_a_card();
+        for _ in 0..6 {
+            lib.tap(DOWN); // scroll well down the library
+        }
+        // Walk Left to the sidebar; the last content control passed is the
+        // one we are leaving from.
+        let mut leaving = lib.focused().unwrap();
+        for _ in 0..12 {
+            lib.tap(LEFT);
+            if lib.on_sidebar() {
+                break;
+            }
+            leaving = lib.focused().unwrap();
+        }
+        assert!(lib.on_sidebar(), "Left ends in the sidebar");
+        let before = lib.rect(leaving);
+        assert!(lib.is_card(leaving), "we left from a game card");
+        lib.tap(RIGHT);
+        assert_eq!(
+            lib.focused(),
+            Some(leaving),
+            "the same card is focused again"
+        );
+        // Returning reveals the card where it is; it does not jump to the top
+        // of the page (which would put a row-6 card far below the screen).
+        let now = lib.rect(leaving);
+        assert!(
+            now.bottom() <= SIZE[1] + 1.0 && now.top() >= 0.0,
+            "card on screen: {now:?}"
+        );
+        assert!(
+            now.top() > 300.0,
+            "still deep in the library, not at the top: {now:?} (was {before:?})"
+        );
+    }
+
+    /// Regression: the shelf scrolled to a focused card only for Tab, not for a
+    /// controller move, so on a real-sized library Down left the focused card
+    /// below the screen and the page did not follow.
+    #[test]
+    fn moving_down_a_long_grid_keeps_the_focused_card_on_screen() {
+        let mut lib = Lib::new(300);
+        lib.focus_sidebar();
+        lib.reach_a_card();
+        let mut deepest = 0.0_f32;
+        for step in 0..25 {
+            lib.tap(DOWN);
+            lib.frames(); // the page follows the focus a frame after it moves
+            let id = lib.focused().expect("focus stays on a control");
+            let rect = lib.rect(id);
+            deepest = deepest.max(rect.top());
+            assert!(
+                rect.top() >= 0.0 && rect.bottom() <= SIZE[1] + 1.0,
+                "step {step}: the focused card is off screen: {rect:?}"
+            );
+        }
+        // And it really travelled down the library (the page followed).
+        let id = lib.focused().unwrap();
+        assert!(lib.is_card(id));
+        for _ in 0..25 {
+            lib.tap(UP);
+            lib.frames();
+            let rect = lib.rect(lib.focused().unwrap());
+            assert!(
+                rect.top() >= 0.0 && rect.bottom() <= SIZE[1] + 1.0,
+                "moving back up: off screen {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_remembered_card_that_is_gone_falls_back_safely() {
+        let mut lib = Lib::new(40);
+        lib.focus_sidebar();
+        lib.reach_a_card();
+        // The library changes under us: the card list is replaced by fewer games.
+        lib.app.library = Arc::new(Library::new(
+            (1..=3)
+                .map(|id| archive(100 + id, &format!("New {id}"), Some("SNES")))
+                .collect(),
+        ));
+        lib.frames();
+        lib.focus_sidebar();
+        lib.tap(RIGHT);
+        assert!(lib.focused().is_some(), "focus is not lost");
+        assert!(!lib.on_sidebar(), "and it moved into the content");
     }
 }
