@@ -101,13 +101,16 @@ class Residue(R.Base):
         wt, t, path, digest = self.prepared("wt-a-content")
 
         def hook(stage):
-            if stage.startswith("before-unlink:") and not getattr(hook, "done", False):
-                hook.done = True
+            # Directory listing order differs between filesystems (ext4 vs tmpfs), so do not rely on
+            # which file goes first: let the first unlink pass (progress), then change EVERY file.
+            if not stage.startswith("before-unlink:"):
+                return
+            hook.calls = getattr(hook, "calls", 0) + 1
+            if hook.calls == 2:
                 for root, dirs, files in os.walk(os.path.join(t, "debug", "incremental")):
                     for name in files:
-                        if name == "work-products.bin":
-                            with open(os.path.join(root, name), "ab") as handle:
-                                handle.write(b"external")
+                        with open(os.path.join(root, name), "ab") as handle:
+                            handle.write(b"external")
         self.set_hook(hook)
         rc, r = self.run_retire(path, digest, execute=True)
         self.assertEqual(self.outcome(r), ("PARTIAL", "INCREMENTAL_FILE_CHANGED"), r)
@@ -118,17 +121,17 @@ class Residue(R.Base):
         outside = os.path.join(self.tmp, "external-link")
 
         def hook(stage):
-            if stage.startswith("before-unlink:") and not getattr(hook, "done", False):
-                hook.done = True
+            if not stage.startswith("before-unlink:"):
+                return
+            hook.calls = getattr(hook, "calls", 0) + 1
+            if hook.calls == 2:  # first unlink passes; then every file gets an extra link: content/mtime same, ctime and nlink move
                 for root, dirs, files in os.walk(os.path.join(t, "debug", "incremental")):
                     for name in files:
-                        if name == "query-cache.bin":
-                            os.link(os.path.join(root, name), outside)  # content/mtime unchanged, ctime and nlink move
-                            return
+                        os.link(os.path.join(root, name), f"{outside}-{len(os.listdir(self.tmp))}")
         self.set_hook(hook)
         rc, r = self.run_retire(path, digest, execute=True)
         self.assertEqual(self.outcome(r), ("PARTIAL", "INCREMENTAL_FILE_CHANGED"), r)
-        self.assertTrue(os.path.exists(outside))
+        self.assertTrue(any(n.startswith("external-link") for n in os.listdir(self.tmp)))
 
     # ---- Defect B
     def partial(self, name, crates=3):
@@ -150,7 +153,10 @@ class Residue(R.Base):
                 for session in [e for e in entries if not e.endswith(".lock")]:
                     if f"{session.rsplit('-', 1)[0]}.lock" not in entries:  # lock gone, session still there
                         hook.done = True
-                        os.link(os.path.join(base, crate, session, "dep-graph.bin"), outside)
+                        # every file of that session, so the refusal never depends on which one is unlinked
+                        # first (listing order differs between filesystems); the session stays intact
+                        for n, name in enumerate(original(os.path.join(base, crate, session))):
+                            os.link(os.path.join(base, crate, session, name), f"{outside}-{n}")
                         return
         self.set_hook(hook)
         with mock.patch.object(os, "listdir", locks_first):
