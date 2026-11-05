@@ -1212,14 +1212,15 @@ def run(args):
     RESIDUE.clear()
     if args.resume_journal:
         try:
-            RESIDUE.update(residue_from_journal(args.resume_journal, groups, digest))
+            residue, journal_digest = residue_from_journal(args.resume_journal, groups, digest)
+            RESIDUE.update(residue)
         except (Refusal, OSError) as refusal:
             code = getattr(refusal, "code", "RESUME_JOURNAL_REFUSED")
             receipt["refused"] = {"code": code, "detail": getattr(refusal, "detail", str(refusal))}
             finish(args, receipt)
             return 3
         receipt["resume_journal"] = {"journal": os.path.realpath(args.resume_journal),
-                                     "journal_sha256": journal_sha256(args.resume_journal)}
+                                     "journal_sha256": journal_digest}
     directories = [os.path.realpath(g["group"]["directory"]) for g in groups]
     sources = [os.path.realpath(s) for g in groups for s in g["sources"]]
     journal = None
@@ -1504,7 +1505,8 @@ def _read_regular(path, limit):
 
 def residue_from_journal(journal_path, groups, digest):
     """Allowance for resuming the PARTIAL retirement of an `incremental` directory, proven by
-    the journal of that very run.  Returns {incremental path: residue} or raises Refusal.
+    the journal of that very run.  Returns ({incremental path: residue}, journal_sha256) or
+    raises Refusal.  The journal is read once; validation and the digest use the same bytes.
 
     The journal must be a finished execution of THIS approved manifest on THIS host (one begin,
     contiguous seq, one final end, no torn line, an owned non-group/world-writable regular file),
@@ -1512,12 +1514,18 @@ def residue_from_journal(journal_path, groups, digest):
     adjacent intent/outcome pair ending PARTIAL with reason INCREMENTAL_FILE_CHANGED (not an
     interruption).  New journals list the lock files and session directories they unlinked
     (`removed_units`): then every mismatch must be named there.  Journals from before that field
-    only bound the residue: at most one crate directory, at most files+dirs recorded items.
+    (or with removed_units_truncated) attest exactly one session whose lock is missing, in one crate.
     The journal is not cryptographically signed: like --resolve-journal this relies on the
     owner-only receipt directory, and the live unit must still pass every other check."""
     def no(why):
         raise Refusal("RESUME_JOURNAL_REFUSED", why)
 
+    try:  # same rule as the receipt directory: a real directory of this user, not group/world writable
+        parent = os.lstat(os.path.dirname(os.path.abspath(journal_path)))
+    except OSError as error:
+        no(f"the journal's directory is unreadable: {error.strerror or error}")
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_mode & 0o022:
+        no("the journal's directory is not a real directory owned by this user, or is group/world writable")
     data = _read_regular(journal_path, JOURNAL_MAX_BYTES)
     if data is None:
         no("not a regular file owned by this user, or group/world writable, or oversized")
@@ -1571,15 +1579,15 @@ def residue_from_journal(journal_path, groups, digest):
             if isinstance(units, list) and not outcome.get("removed_units_truncated"):
                 if not all(isinstance(u, str) and (RESIDUE_LOCK_KEY.fullmatch(u) or RESIDUE_SESSION_KEY.fullmatch(u)) for u in units):
                     no("removed_units holds an entry that is not a lock file or session directory")
-                out[path] = {"removed": set(units), "max_items": len(units)}
+                out[path] = {"removed": set(units)}
             else:
                 files, dirs = outcome.get("files"), outcome.get("dirs")
                 if any(not isinstance(n, int) or isinstance(n, bool) or n < 0 for n in (files, dirs)):
                     no("the recorded counts are invalid")
-                out[path] = {"removed": None, "max_items": files + dirs}
+                out[path] = {"removed": None}
     if not out:
         no("the manifest names no incremental path")
-    return out
+    return out, hashlib.sha256(data).hexdigest()
 
 
 def journal_sha256(path):

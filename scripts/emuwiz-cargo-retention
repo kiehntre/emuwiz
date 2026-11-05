@@ -1812,10 +1812,11 @@ def incremental_evidence(path, residue=None):
     by this tool's own earlier PARTIAL retirement of this very directory: a session
     without its `.lock` (or a `.lock` without its session).  It is built only by the
     retire tool from a verified journal (see emuwiz-cargo-retire residue_from_journal):
-      {"removed": set of "/crate/name" keys the journal recorded as unlinked, or None,
-       "max_items": upper bound on explained mismatches when `removed` is None}.
-    With `removed`, every mismatched item must be named in it; without, the bound
-    applies.  Everything else about the unit is checked exactly as before.
+      {"removed": set of "/crate/name" keys the journal recorded as unlinked, or None}.
+    With `removed`, every mismatched item must be named in it.  With None (a journal
+    that did not record them) the tolerance is exactly one session whose lock is
+    missing, in one crate directory; a lock left without its session, or several
+    missing locks, are refused.  Everything else is checked exactly as before.
     """
     files = {}
     inconsistent = []
@@ -1933,8 +1934,8 @@ def incremental_evidence(path, residue=None):
                         fail("session/lock mismatch in more than one crate directory")
                     allowed = residue.get("removed")
                     if allowed is None:
-                        if len(odd) > residue.get("max_items", 0):
-                            fail("session/lock mismatch exceeds the recorded partial removal")
+                        if len(sessions - locks) != 1 or locks - sessions:
+                            fail("session/lock mismatch exceeds the single pair a legacy journal can attest")
                     else:
                         for item in odd:
                             # a session lacking its lock needs the lock recorded as removed,

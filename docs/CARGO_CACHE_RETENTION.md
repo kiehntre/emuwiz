@@ -618,7 +618,7 @@ approved manifest and accepts only that residue, only if J is the finished journ
 manifest on this host with one adjacent intent/outcome pair for the exact incremental path
 (same device/inode) ending PARTIAL / `INCREMENTAL_FILE_CHANGED`. Journals now list the lock files
 and session directories they unlinked (`removed_units`) and every mismatch must be named there;
-older journals only bound it to one crate directory and at most `files+dirs` items. The journal
+older journals (or a truncated list) attest exactly one session whose lock is missing, in one crate directory. The journal
 is not signed (it relies on the owner-only receipt directory); every other check still applies.
 The flag is ignored for any other path and refuses on any mismatch. It does not depend on where
 `EMUWIZ_TARGET_ROOT` points: identities are compared with the target's own device and inode.

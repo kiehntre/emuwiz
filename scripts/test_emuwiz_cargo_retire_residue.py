@@ -10,9 +10,11 @@ journal of the same approved manifest.
 Disposable synthetic targets only (the shared fixtures of test_emuwiz_cargo_retire); no production
 journal, registry or cache is read or written.
 """
+import hashlib
+import inspect
 import json
 import os
-import re
+import shutil
 import sys
 import unittest
 from unittest import mock
@@ -192,15 +194,21 @@ class Residue(R.Base):
         with open(journal, "rb") as handle:
             before = handle.read()
         # dry run with the journal selects, execute removes exactly the target's incremental
+        # the real layout: deps and .fingerprint went in the first run, only incremental is left
+        self.assertFalse(self.exists(t, "debug/deps") or self.exists(t, "debug/.fingerprint"))
         rc, r = self.resume(path, digest, journal, execute=False)
         self.assertEqual(self.outcome(r), ("SELECTED", ""), r)
         self.assertTrue(self.exists(t, INC))
         rc, r = self.resume(path, digest, journal)
         self.assertEqual(self.outcome(r), ("REMOVED", ""), r)
+        for gone in ("debug/deps", "debug/.fingerprint"):  # already retired: not removed again, nothing refused
+            self.assertIn(self.outcome(r, gone), (("ABSENT", "ALREADY_ABSENT"), ("HELD", "NOT_A_COMPILER_ARTIFACT")), r)
+        self.assertNotIn("holds", {k for k, v in r["groups"][0].items() if k == "holds" and v}, r)
         self.assertFalse(self.exists(t, INC))
         with open(journal, "rb") as handle:
             self.assertEqual(handle.read(), before, "the original journal is preserved")
         self.assertEqual(r["resume_journal"]["journal"], os.path.realpath(journal))
+        self.assertEqual(r["resume_journal"]["journal_sha256"], hashlib.sha256(before).hexdigest())
 
     def test_b_legacy_journal_without_removed_units_resumes_within_its_bound(self):
         wt, t, path, digest, journal = self.partial("wt-b-legacy")
@@ -288,6 +296,142 @@ class Residue(R.Base):
         self.assertEqual(tree(t2), before_b)
         self.assertEqual(tree(t), before_a)
 
+
+    # ---- review fixes: legacy cap, opposite mismatch, truncated list, journal directory
+    def lock_name(self, session):
+        return session.rsplit("-", 1)[0] + ".lock"
+
+    def bare_session(self, t, crate, sid):
+        """A session without any lock: one more missing lock in the same crate."""
+        base = os.path.join(t, "debug", "incremental", crate)
+        session = f"s-{sid}-{'fedcba9876543210' * 2}"
+        os.makedirs(os.path.join(base, session))
+        for name in ("dep-graph.bin", "query-cache.bin", "work-products.bin"):
+            with open(os.path.join(base, session, name), "wb") as handle:
+                handle.write(b"RSIC\x00\x00\x051.0.0" + b"x" * 1700)
+        self.age(t, 10)
+        return session
+
+    def lock_only(self, t):
+        """The opposite residue: the session directory is gone and its lock is left behind."""
+        (crate, session), = self.orphans(t)
+        base = os.path.join(t, "debug", "incremental", crate)
+        shutil.rmtree(os.path.join(base, session))
+        with open(os.path.join(base, self.lock_name(session)), "wb"):
+            pass
+        self.age(t, 10)
+        return crate, session
+
+    def outcome_record(self, recs):
+        return [x for x in recs if x["event"] == "outcome" and x["path"].endswith("/incremental")][0]
+
+    def test_b_legacy_journal_accepts_exactly_one_missing_lock(self):
+        wt, t, path, digest, journal = self.partial("wt-b-cap")
+        (crate, _), = self.orphans(t)
+        self.bare_session(t, crate, "hnbyyyyyyy-0xwv2u8")  # a second session without a lock
+        legacy = self.forged(journal, lambda recs: self.outcome_record(recs).pop("removed_units", None))
+        rc, r = self.resume(path, digest, legacy)
+        self.assertEqual(self.outcome(r)[0], "HELD", r)
+        self.assertIn("single pair", self.outcome(r)[1])
+        self.assertTrue(self.exists(t, INC))
+        # the exact journal names only the first lock: the second missing lock is not explained
+        rc, r = self.resume(path, digest, journal)
+        self.assertIn("not explained by the journal", self.outcome(r)[1])
+
+    def test_b_truncated_list_takes_the_capped_legacy_branch(self):
+        wt, t, path, digest, journal = self.partial("wt-b-trunc")
+
+        def truncate(recs):
+            record = self.outcome_record(recs)
+            record.pop("removed_units", None)
+            record["removed_units_truncated"] = True
+        truncated = self.forged(journal, truncate)
+        # a list that is also present is ignored when truncated: still exactly one pair
+        also_listed = self.forged(journal, lambda recs: self.outcome_record(recs).update(removed_units_truncated=True), "listed.jsonl")
+        (crate, _), = self.orphans(t)
+        extra = self.bare_session(t, crate, "hnbyyyyyyy-0xwv2u8")
+        for label, bad in (("truncated", truncated), ("truncated+listed", also_listed)):
+            rc, r = self.resume(path, digest, bad)
+            self.assertEqual(self.outcome(r)[0], "HELD", (label, r))
+            self.assertIn("single pair", self.outcome(r)[1])
+        shutil.rmtree(os.path.join(t, "debug", "incremental", crate, extra))  # back to one missing lock
+        self.age(t, 10)
+        for bad in (truncated, also_listed):
+            rc, r = self.resume(path, digest, bad, execute=False)
+            self.assertEqual(self.outcome(r), ("SELECTED", ""), r)
+        rc, r = self.resume(path, digest, truncated)
+        self.assertEqual(self.outcome(r), ("REMOVED", ""), r)
+
+    def test_b_lock_left_without_its_session_needs_the_journal_to_attest_the_session(self):
+        wt, t, path, digest, journal = self.partial("wt-b-lockonly")
+        crate, session = self.lock_only(t)
+        key = f"/{crate}/{session}"
+        legacy = self.forged(journal, lambda recs: self.outcome_record(recs).pop("removed_units", None))
+        rc, r = self.resume(path, digest, legacy)                      # legacy cannot attest a session removal
+        self.assertIn("single pair", self.outcome(r)[1], r)
+        rc, r = self.resume(path, digest, journal)                     # the lock is attested, the session is not
+        self.assertIn("not explained by the journal", self.outcome(r)[1], r)
+        self.assertTrue(self.exists(t, INC))
+        attested = self.forged(journal, lambda recs: self.outcome_record(recs)["removed_units"].append(key), "attested.jsonl")
+        rc, r = self.resume(path, digest, attested)
+        self.assertEqual(self.outcome(r), ("REMOVED", ""), r)
+        self.assertFalse(self.exists(t, INC))
+
+    def test_b_several_lock_only_mismatches_refuse(self):
+        wt, t, path, digest, journal = self.partial("wt-b-locks")
+        crate, session = self.lock_only(t)
+        base = os.path.join(t, "debug", "incremental", crate)
+        with open(os.path.join(base, "s-hnbqqqqqqq-0xwv2uq.lock"), "wb"):
+            pass
+        self.age(t, 10)
+        legacy = self.forged(journal, lambda recs: self.outcome_record(recs).pop("removed_units", None))
+        rc, r = self.resume(path, digest, legacy)
+        self.assertEqual(self.outcome(r)[0], "HELD", r)
+        self.assertIn("single pair", self.outcome(r)[1])
+        rc, r = self.resume(path, digest, journal)
+        self.assertIn("not explained by the journal", self.outcome(r)[1])
+        self.assertTrue(self.exists(t, INC))
+
+    def test_b_journal_directory_must_be_safe(self):
+        wt, t, path, digest, journal = self.partial("wt-b-dir")
+        for label, mode in (("group writable", 0o770), ("world writable", 0o707)):
+            directory = os.path.join(self.tmp, "j-" + label.split()[0])
+            os.makedirs(directory)
+            copy = os.path.join(directory, "copy.journal.jsonl")
+            shutil.copyfile(journal, copy)
+            os.chmod(copy, 0o600)
+            os.chmod(directory, mode)
+            rc, r = self.resume(path, digest, copy)
+            self.assertEqual((rc, r["refused"]["code"]), (3, "RESUME_JOURNAL_REFUSED"), label)
+            self.assertIn("directory", r["refused"]["detail"])
+            os.chmod(directory, 0o700)
+            rc, r = self.resume(path, digest, copy, execute=False)  # the same bytes in a safe directory pass
+            self.assertEqual(self.outcome(r), ("SELECTED", ""), r)
+        # a symlinked directory is not a real directory
+        real = os.path.join(self.tmp, "j-real")
+        os.makedirs(real)
+        shutil.copyfile(journal, os.path.join(real, "copy.journal.jsonl"))
+        os.chmod(os.path.join(real, "copy.journal.jsonl"), 0o600)
+        link = os.path.join(self.tmp, "j-link")
+        os.symlink(real, link)
+        rc, r = self.resume(path, digest, os.path.join(link, "copy.journal.jsonl"))
+        self.assertEqual((rc, r["refused"]["code"]), (3, "RESUME_JOURNAL_REFUSED"))
+        self.assertTrue(self.exists(t, INC))
+
+    def test_b_journal_is_read_once_and_the_digest_is_of_the_validated_bytes(self):
+        wt, t, path, digest, journal = self.partial("wt-b-once")
+        reads = []
+        original = self.mod._read_regular
+
+        def counting(p, limit):
+            reads.append(p)
+            return original(p, limit)
+        with mock.patch.object(self.mod, "_read_regular", counting):
+            rc, r = self.resume(path, digest, journal, execute=False)
+        self.assertEqual(reads.count(journal), 1, reads)
+        with open(journal, "rb") as handle:
+            self.assertEqual(r["resume_journal"]["journal_sha256"], hashlib.sha256(handle.read()).hexdigest())
+
     # ---- scope
     def test_scope_resume_touches_only_the_authorised_target(self):
         wt, t, path, digest, journal = self.partial("wt-scope-a")
@@ -305,15 +449,10 @@ class Residue(R.Base):
         self.assertTrue(self.exists(t, "debug/.cargo-lock"))
 
 
-class NoRepoOrInstalledWrites(unittest.TestCase):
-    def test_the_tool_text_keeps_incremental_first_and_the_strict_default(self):
-        with open(os.path.join(HERE, "emuwiz-cargo-retire")) as handle:
-            text = handle.read()
-        self.assertIn('chosen.sort(key=lambda c: os.path.basename(c[0]["path"]) != "incremental")', text)
-        with open(os.path.join(HERE, "emuwiz-cargo-retention")) as handle:
-            lib = handle.read()
-        self.assertIn("def incremental_evidence(path, residue=None):", lib)
-        self.assertEqual(len(re.findall(r"incremental_evidence\(", text)), 2)  # the two callers pass RESIDUE only via .get
+class Defaults(R.Base):
+    def test_strict_recognition_is_the_default_and_residue_is_opt_in(self):
+        self.assertIs(inspect.signature(self.mod.F.incremental_evidence).parameters["residue"].default, None)
+        self.assertEqual(self.mod.RESIDUE, {})  # nothing is attested unless --resume-journal named a verified journal
 
 
 if __name__ == "__main__":
