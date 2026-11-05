@@ -3534,3 +3534,17 @@ fn controller_setup_panel_renders_honest_scope_on_pcsx2_candidate() {
     let output = render(&pcsx2_plan_input(plan_with(vec![candidate]), ready.context));
     assert!(rendered_text_contains(&output, "Controller setup"));
 }
+
+#[test]
+fn zipped_cartridge_play_is_ready_plain_and_blocked_with_cheats_or_playlist() {
+    let zipped = request_for("/roms/Game.zip");
+    assert_eq!(zipped_play_block_reason(&zipped, false, false), None);
+    let cheats = zipped_play_block_reason(&zipped, true, false).expect("blocked with cheats");
+    assert!(cheats.contains("cheats and pokes aren't supported for zipped games"));
+    let playlist = zipped_play_block_reason(&zipped, false, true).expect("blocked multi-disc");
+    assert!(playlist.contains("multi-disc"));
+    // A loose ROM keeps every workflow.
+    let loose = request_for("/roms/Game.sfc");
+    assert_eq!(zipped_play_block_reason(&loose, true, true), None);
+    assert!(is_zipped_cartridge_request(&request_for("/roms/GAME.ZIP")));
+}

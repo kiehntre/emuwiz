@@ -1082,10 +1082,16 @@ fn write_rom_zip(path: &std::path::Path, members: &[(&str, &[u8])]) {
 /// Rewrites the fixture's `retroarch.cfg` with explicit absolute save and
 /// state directories plus `extra` lines.
 fn write_zip_test_config(ready: &ReadyFixture, extra: &str) {
-    let saves = ready.fixture.path("saves");
-    let states = ready.fixture.path("states");
-    fs::create_dir_all(&saves).unwrap();
-    fs::create_dir_all(&states).unwrap();
+    // Outside the system temp folder, which the staged route refuses.
+    let unique = ready
+        .fixture
+        .root
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let saves = PathBuf::from("/var/tmp").join(format!("{unique}-saves"));
+    let states = PathBuf::from("/var/tmp").join(format!("{unique}-states"));
     ready.fixture.write(
         "config/retroarch/retroarch.cfg",
         format!(
@@ -1357,4 +1363,80 @@ fn a_kept_staging_directory_survives_for_a_possibly_running_emulator() {
     staged.keep();
     assert!(dir.join("a.md").is_file());
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn zipped_cartridge_save_setup_fails_closed_on_every_unreadable_or_overriding_source() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let rom = b"synthetic mega drive rom bytes";
+    let refusal = |label: &str, setup: &dyn Fn(&ReadyFixture)| -> String {
+        let (ready, _, _) = zipped_ready(label, &[("a.md", rom)]);
+        setup(&ready);
+        preflight_and_launch_retroarch_with_playlist(
+            &ready.request,
+            &HostReadOnlyFilesystem,
+            &ready.environment,
+            None,
+        )
+        .err()
+        .map(|e| format!("{e:?}"))
+        .unwrap_or_default()
+    };
+    // Any override file under <config dir>/config/ refuses without parsing it.
+    let text = refusal("zip-override", &|r| {
+        r.fixture.write(
+            "config/retroarch/config/Core/Core.cfg",
+            b"savefile_directory = \"/x\"\n",
+        );
+    });
+    assert!(text.contains("override"), "{text}");
+    // #include in the main settings.
+    let text = refusal("zip-include", &|r| {
+        write_zip_test_config(r, "#include \"other.cfg\"\n");
+    });
+    assert!(text.contains("include"), "{text}");
+    // Legacy per-user settings file present.
+    let text = refusal("zip-legacy", &|r| {
+        r.fixture.write(".retroarch.cfg", b"");
+    });
+    assert!(text.contains("legacy"), "{text}");
+    // In-content flag set to anything but explicit false, including a comment.
+    for value in ["1", "true # x", "\"yes\""] {
+        let text = refusal("zip-flag", &|r| {
+            write_zip_test_config(r, &format!("savefiles_in_content_dir = {value}\n"));
+        });
+        assert!(text.contains("beside the game"), "{value}: {text}");
+    }
+    // Conflicting duplicate keys.
+    let text = refusal("zip-dup", &|r| {
+        write_zip_test_config(r, "savefile_directory = \"/var/tmp/other\"\n");
+    });
+    assert!(text.contains("more than once"), "{text}");
+    // Same folder for saves and states; folder inside the temp dir.
+    let text = refusal("zip-same", &|r| {
+        r.fixture.write(
+            "config/retroarch/retroarch.cfg",
+            format!(
+                "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\nsavefile_directory = \"/var/tmp/s\"\nsavestate_directory = \"/var/tmp/s\"\n",
+                r.fixture.path("cores").display(),
+                r.fixture.path("info").display()
+            )
+            .as_bytes(),
+        );
+    });
+    assert!(text.contains("separate"), "{text}");
+    let text = refusal("zip-temp", &|r| {
+        let inside = std::env::temp_dir().join("emuwiz-saves-test");
+        r.fixture.write(
+            "config/retroarch/retroarch.cfg",
+            format!(
+                "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\nsavefile_directory = \"{}\"\nsavestate_directory = \"/var/tmp/q\"\n",
+                r.fixture.path("cores").display(),
+                r.fixture.path("info").display(),
+                inside.display()
+            )
+            .as_bytes(),
+        );
+    });
+    assert!(text.contains("temporary folder"), "{text}");
 }

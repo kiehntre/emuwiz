@@ -1154,6 +1154,47 @@ pub fn preflight_retroarch_launch_with_playlist(
     Ok(command)
 }
 
+/// A config value without quotes or a trailing `#` comment.
+fn config_value(raw: &str) -> String {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix('"')
+        && let Some(end) = rest.find('"')
+    {
+        return rest[..end].to_string();
+    }
+    raw.split('#').next().unwrap_or("").trim().to_string()
+}
+
+/// Whether any `*.cfg` exists under `dir` (bounded depth); a folder that
+/// exists but cannot be read counts as unsafe. A missing folder has none.
+fn cfg_files_exist(dir: &Path, depth: usize) -> Result<bool, String> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "RetroArch override settings could not be read: {error}"
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("RetroArch override settings could not be read: {error}"))?;
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("cfg"))
+        {
+            return Ok(true);
+        }
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if is_dir && (depth >= 4 || cfg_files_exist(&path, depth + 1)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Refuses the staged-zip route unless the chosen RetroArch is a native
 /// install and its own configuration names absolute, separate save and state
 /// directories and does not store them beside the content. Reads the user's
@@ -1209,21 +1250,83 @@ fn staged_launch_is_safe(
     fs::File::open(config)
         .and_then(|file| file.take(1024 * 1024).read_to_string(&mut text))
         .map_err(|error| format!("RetroArch settings could not be read: {error}"))?;
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#include") || trimmed.starts_with("#reference") {
+            return Err(
+                "RetroArch settings include other files that are not read, so \
+                        where saves go cannot be proven"
+                    .into(),
+            );
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
             continue;
         };
-        if matches!(
-            key.trim(),
-            "savefiles_in_content_dir" | "savestates_in_content_dir"
-        ) && value.trim().trim_matches('"').eq_ignore_ascii_case("true")
+        let key = key.trim().to_string();
+        let value = config_value(value);
+        if let Some(previous) = seen.insert(key.clone(), value.clone())
+            && previous != value
+            && matches!(
+                key.as_str(),
+                "savefile_directory"
+                    | "savestate_directory"
+                    | "savefiles_in_content_dir"
+                    | "savestates_in_content_dir"
+            )
+        {
+            return Err(format!("RetroArch settings set `{key}` more than once"));
+        }
+    }
+    for key in ["savefiles_in_content_dir", "savestates_in_content_dir"] {
+        if let Some(value) = seen.get(key)
+            && !matches!(value.to_ascii_lowercase().as_str(), "false" | "0")
         {
             return Err(format!(
-                "RetroArch is set to keep saves beside the game (`{}`), which would lose \
-                 them for a zipped cartridge",
-                key.trim()
+                "RetroArch may keep saves beside the game (`{key}` is not explicitly false), \
+                 which would lose them for a zipped cartridge"
             ));
         }
+    }
+    let dir_of = |key: &str| -> Option<PathBuf> {
+        seen.get(key).map(PathBuf::from).filter(|p| p.is_absolute())
+    };
+    let (Some(saves), Some(states)) = (dir_of("savefile_directory"), dir_of("savestate_directory"))
+    else {
+        return Err(
+            "RetroArch save and state directories could not be read from its settings".into(),
+        );
+    };
+    if saves == states {
+        return Err("RetroArch save and state directories must be separate folders".into());
+    }
+    let temp = std::env::temp_dir();
+    if saves.starts_with(&temp) || states.starts_with(&temp) {
+        return Err("RetroArch save or state directory is inside the temporary folder".into());
+    }
+    // Per-core, per-content and per-directory override files can change any of
+    // the above and are never parsed: any of them (or an unreadable folder)
+    // refuses the route. Legacy config locations are refused if present, too.
+    let overrides = config.parent().map(|parent| parent.join("config"));
+    if let Some(dir) = overrides
+        && cfg_files_exist(&dir, 0)?
+    {
+        return Err(
+            "RetroArch has per-core or per-game override settings, which are not \
+                    read; saves for a zipped cartridge cannot be proven safe"
+                .into(),
+        );
+    }
+    // The system-wide file is skipped under test so results do not depend on
+    // the machine running them.
+    let mut legacy = Vec::new();
+    #[cfg(not(test))]
+    legacy.push(PathBuf::from("/etc/retroarch.cfg"));
+    if let Some(home) = &environment.home {
+        legacy.push(PathBuf::from(home).join(".retroarch.cfg"));
+    }
+    if legacy.iter().any(|path| fs::symlink_metadata(path).is_ok()) {
+        return Err("a legacy RetroArch settings file exists and might take precedence".into());
     }
     Ok(())
 }

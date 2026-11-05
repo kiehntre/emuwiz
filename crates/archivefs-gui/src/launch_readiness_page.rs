@@ -5810,6 +5810,38 @@ fn show_amiga_whdload_launch_action(
     }
 }
 
+/// Cheats, pokes and multi-disc playlists are not supported for a zipped
+/// cartridge: launch would refuse the ZIP, so readiness says so up front.
+const ZIPPED_NO_EXTRAS_NOTE: &str =
+    "Cheats and pokes aren't supported for zipped games yet; plain Play works.";
+
+pub(crate) fn is_zipped_cartridge_request(request: &RetroArchLaunchRequest) -> bool {
+    request
+        .selected_content_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+}
+
+/// The reason Play must be Blocked for a zipped cartridge with an unsupported
+/// workflow chosen, or `None` for plain Play (and for any non-ZIP request).
+pub(crate) fn zipped_play_block_reason(
+    request: &RetroArchLaunchRequest,
+    cheats_selected: bool,
+    multi_disc: bool,
+) -> Option<&'static str> {
+    if !is_zipped_cartridge_request(request) {
+        return None;
+    }
+    if cheats_selected {
+        Some("Blocked: cheats and pokes aren't supported for zipped games yet.")
+    } else if multi_disc {
+        Some("Blocked: multi-disc play isn't supported for zipped games.")
+    } else {
+        None
+    }
+}
+
 /// Shown instead of an enabled Play button while another game's RetroArch is
 /// starting or running (one tracked launch at a time).
 pub(crate) const RETROARCH_BUSY_HINT: &str = "RetroArch is already running for another game";
@@ -5826,7 +5858,8 @@ fn show_launch_action(
     playlist: Option<crate::multidisc_launch_view::PlaylistHandoff>,
 ) {
     let busy = launch_state.is_active();
-    if let Some(selected) = launch_state.classic_pokes.show(ui, &request, busy) {
+    let zipped = is_zipped_cartridge_request(&request);
+    if !zipped && let Some(selected) = launch_state.classic_pokes.show(ui, &request, busy) {
         launch_state.start_with_pokes(request.clone(), selected);
     }
     let display = launch_state.display_for(&request);
@@ -5834,13 +5867,25 @@ fn show_launch_action(
     for line in launch_state.cheat_lines(&request) {
         ui.small(line);
     }
-    retroarch_cheats::show_chooser(ui, launch_state, &request, playlist.is_some());
+    if !zipped {
+        retroarch_cheats::show_chooser(ui, launch_state, &request, playlist.is_some());
+    }
     let cheat_count = launch_state
         .cheats
         .as_ref()
         .filter(|choice| choice.matches(&request) && playlist.is_none())
         .map(retroarch_cheats::Choice::ticked_count)
         .filter(|count| *count > 0);
+    if zipped {
+        ui.small(ZIPPED_NO_EXTRAS_NOTE);
+        if let Some(reason) =
+            zipped_play_block_reason(&request, cheat_count.is_some(), playlist.is_some())
+        {
+            ui.add_enabled(false, egui::Button::new("Play — Launch RetroArch"));
+            ui.small(reason);
+            return;
+        }
+    }
     let label = match cheat_count {
         Some(count) => format!("Play — Launch RetroArch with {count} cheat(s)"),
         None => "Play — Launch RetroArch".to_string(),
