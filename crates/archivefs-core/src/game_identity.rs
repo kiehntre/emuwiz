@@ -1037,7 +1037,7 @@ fn inspect_game_identity_with_platform_trust_and_budget(
         }
     }
 
-    if is_loose_cartridge_platform(platform) {
+    if crate::zip_cartridge_select::is_loose_cartridge_platform(platform) {
         if path
             .extension()
             .and_then(|value| value.to_str())
@@ -1674,11 +1674,6 @@ fn inspect_loose_rom(
     inspect_loose_rom_file(report, format, file);
 }
 
-/// Largest decompression ratio accepted for a zipped cartridge member.
-/// Deflate cannot exceed roughly 1032:1, so this only constrains other
-/// methods; the absolute [`MAX_LOOSE_ROM_BYTES`] bound is the real limit.
-const MAX_ZIP_CARTRIDGE_RATIO: u64 = 2_048;
-
 fn add_zip_cartridge_unavailable(
     report: &mut GameIdentityReport,
     status: IdentityStatus,
@@ -1689,139 +1684,6 @@ fn add_zip_cartridge_unavailable(
         status,
         &format!("zipped cartridge ROM: {diagnostic}"),
     );
-}
-
-pub(crate) fn is_loose_cartridge_platform(platform: IdentityPlatform) -> bool {
-    matches!(
-        platform,
-        IdentityPlatform::MegaDrive
-            | IdentityPlatform::Snes
-            | IdentityPlatform::Nes
-            | IdentityPlatform::GameBoy
-            | IdentityPlatform::GameBoyColor
-            | IdentityPlatform::GameBoyAdvance
-            | IdentityPlatform::VirtualBoy
-            | IdentityPlatform::PokemonMini
-            | IdentityPlatform::N64
-            | IdentityPlatform::Atari2600
-            | IdentityPlatform::Atari5200
-            | IdentityPlatform::Atari7800
-            | IdentityPlatform::Atari8Bit
-            | IdentityPlatform::AtariLynx
-            | IdentityPlatform::AtariJaguar
-            | IdentityPlatform::Ngp
-            | IdentityPlatform::Ngpc
-    )
-}
-
-pub(crate) struct ZipCartridgeMember {
-    pub(crate) index: usize,
-    pub(crate) name: Vec<u8>,
-    pub(crate) declared: u64,
-    #[allow(dead_code)]
-    pub(crate) format: &'static str,
-}
-
-/// Validates the whole ZIP directory and selects its single supported ROM
-/// member. Shared by identity inspection and launch-time staging so both
-/// apply exactly the same refusals (encryption, names, duplicates, symlinks,
-/// ambiguity, size and ratio bounds).
-pub(crate) fn select_zip_cartridge_member(
-    archive: &mut ZipArchive<File>,
-    platform: IdentityPlatform,
-    members_seen: &mut usize,
-) -> Result<ZipCartridgeMember, (IdentityStatus, String)> {
-    if archive.len() > MAX_ARCHIVE_MEMBERS {
-        *members_seen = MAX_ARCHIVE_MEMBERS;
-        return Err((
-            IdentityStatus::ResourceLimitReached,
-            ("ZIP member limit reached before identity inspection").to_string(),
-        ));
-    }
-    let mut seen_names = std::collections::HashSet::new();
-    let mut candidates: Vec<(usize, Vec<u8>, u64, u64, &'static str)> = Vec::new();
-    for index in 0..archive.len() {
-        *members_seen += 1;
-        let raw = match archive.by_index_raw(index) {
-            Ok(raw) => raw,
-            Err(error) => {
-                return Err((IdentityStatus::Invalid, error.to_string()));
-            }
-        };
-        if raw.encrypted() {
-            return Err((
-                IdentityStatus::Unsupported,
-                ("encrypted ZIP entries are refused").to_string(),
-            ));
-        }
-        let name_raw = raw.name_raw().to_vec();
-        let name_ok = !name_raw.is_empty()
-            && name_raw.len() <= MAX_PATH_BYTES
-            && !name_raw.contains(&0)
-            && !name_raw.contains(&b'\\')
-            && std::str::from_utf8(&name_raw).is_ok()
-            && raw.enclosed_name().is_some();
-        if !name_ok {
-            return Err((
-                IdentityStatus::Invalid,
-                ("ZIP contains an absolute, traversing, over-long or non-UTF-8 member name")
-                    .to_string(),
-            ));
-        }
-        if !seen_names.insert(name_raw.to_ascii_lowercase()) {
-            return Err((
-                IdentityStatus::Ambiguous,
-                ("ZIP contains duplicate member names; none was selected implicitly").to_string(),
-            ));
-        }
-        if raw.is_symlink() {
-            return Err((
-                IdentityStatus::Unsupported,
-                ("ZIP symbolic-link members are refused").to_string(),
-            ));
-        }
-        if raw.is_dir() {
-            continue;
-        }
-        let member_path = Path::new(std::str::from_utf8(&name_raw).unwrap_or_default());
-        if let Some(format) = supported_loose_rom_format(member_path, platform) {
-            candidates.push((index, name_raw, raw.size(), raw.compressed_size(), format));
-        }
-    }
-    if candidates.is_empty() {
-        return Err((
-            IdentityStatus::Missing,
-            ("ZIP contains no ROM member supported for this platform").to_string(),
-        ));
-    }
-    if candidates.len() != 1 {
-        return Err((
-            IdentityStatus::Ambiguous,
-            ("ZIP contains multiple candidate ROM members; none was selected implicitly")
-                .to_string(),
-        ));
-    }
-    let (index, member_name, declared, compressed, format) = candidates.remove(0);
-    if declared > MAX_LOOSE_ROM_BYTES {
-        return Err((
-            IdentityStatus::ResourceLimitReached,
-            format!(
-                "ROM member declares {declared} bytes; maximum supported size is {MAX_LOOSE_ROM_BYTES} bytes"
-            ),
-        ));
-    }
-    if declared > compressed.saturating_mul(MAX_ZIP_CARTRIDGE_RATIO).max(4096) {
-        return Err((
-            IdentityStatus::ResourceLimitReached,
-            ("ROM member decompression ratio exceeds the safety limit").to_string(),
-        ));
-    }
-    Ok(ZipCartridgeMember {
-        index,
-        name: member_name,
-        declared,
-        format,
-    })
 }
 
 /// Identity for a ZIP holding exactly one cartridge ROM of the trusted
@@ -1872,12 +1734,12 @@ fn inspect_zip_cartridge_rom(
             return;
         }
     };
-    let ZipCartridgeMember {
+    let crate::zip_cartridge_select::ZipCartridgeMember {
         index,
         name: member_name,
         declared,
         format,
-    } = match select_zip_cartridge_member(
+    } = match crate::zip_cartridge_select::select_zip_cartridge_member(
         &mut archive,
         report.platform,
         &mut report.archive_members_inspected,
@@ -1907,6 +1769,14 @@ fn inspect_zip_cartridge_rom(
                 return;
             }
         };
+        if entry.name_raw() != member_name.as_slice() {
+            add_zip_cartridge_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                "ZIP entry changed since it was selected",
+            );
+            return;
+        }
         // Read one byte past the declared size so an entry that inflates
         // beyond its header is detected rather than silently truncated.
         let mut limited = entry.take(declared.saturating_add(1));

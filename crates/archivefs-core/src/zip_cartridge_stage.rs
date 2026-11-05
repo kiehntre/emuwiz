@@ -9,11 +9,9 @@ use std::path::{Path, PathBuf};
 
 use zip::ZipArchive;
 
-use crate::game_identity::{
-    IdentityPlatform, StableFileMetadata, is_loose_cartridge_platform, open_read_only_regular,
-    select_zip_cartridge_member,
-};
+use crate::game_identity::{IdentityPlatform, StableFileMetadata, open_read_only_regular};
 use crate::safe_read::TrustedRoots;
+use crate::zip_cartridge_select::{is_loose_cartridge_platform, select_zip_cartridge_member};
 
 /// Whether a launch request is for a zipped cartridge, i.e. staging applies:
 /// a `.zip` on a loose-cartridge platform. Arcade, disc and other platforms'
@@ -122,6 +120,10 @@ pub fn stage_zip_cartridge_for_launch(
         let entry = archive
             .by_index(member.index)
             .map_err(|error| refuse(error.to_string()))?;
+        // The entry read must be the one the selector validated.
+        if entry.name_raw() != member.name.as_slice() {
+            return Err(refuse("ZIP entry changed since it was selected".into()));
+        }
         let mut limited = entry.take(member.declared.saturating_add(1));
         let copied = io::copy(&mut limited, &mut out)
             .map_err(|error| refuse(format!("ROM member is corrupt or truncated: {error}")))?;
