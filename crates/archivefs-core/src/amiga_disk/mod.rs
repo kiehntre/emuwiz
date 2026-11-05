@@ -408,7 +408,7 @@ pub fn inspect_amiga_floppy_in_roots(
     inspect_amiga_floppy_from_opened(path, file)
 }
 
-fn inspect_amiga_floppy_from_opened(
+pub(crate) fn inspect_amiga_floppy_from_opened(
     path: &Path,
     file: std::fs::File,
 ) -> Result<AmigaFloppyInspection, AmigaFloppyError> {

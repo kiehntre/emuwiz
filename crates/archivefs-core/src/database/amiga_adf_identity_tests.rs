@@ -81,6 +81,26 @@ fn lab(entries: Entries, files: &[(&str, &str, &str)]) -> Lab {
 }
 
 fn lab_in(header: &str, entries: Entries, files: &[(&str, &str, &str)]) -> Lab {
+    lab_hashed(header, entries, files, "sha1")
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// `hash`: which hash the DAT lists: "sha1", "crc" (weak) or "none" (name and size only).
+fn lab_hashed(header: &str, entries: Entries, files: &[(&str, &str, &str)], hash: &str) -> Lab {
     let root = tempfile::tempdir().unwrap().keep();
     for (folder, file, volume) in files {
         let dir = root.join("games").join(folder);
@@ -94,11 +114,21 @@ fn lab_in(header: &str, entries: Entries, files: &[(&str, &str, &str)]) -> Lab {
                 .iter()
                 .map(|(rom, volume)| {
                     let bytes = adf(volume);
-                    format!(
-                        r#"<rom name="{rom}" size="{}" sha1="{}"/>"#,
-                        bytes.len(),
-                        hex(&Sha1::digest(&bytes))
-                    )
+                    if hash == "none" {
+                        format!(r#"<rom name="{rom}" size="{}"/>"#, bytes.len())
+                    } else if hash == "crc" {
+                        format!(
+                            r#"<rom name="{rom}" size="{}" crc="{:08x}"/>"#,
+                            bytes.len(),
+                            crc32(&bytes)
+                        )
+                    } else {
+                        format!(
+                            r#"<rom name="{rom}" size="{}" sha1="{}"/>"#,
+                            bytes.len(),
+                            hex(&Sha1::digest(&bytes))
+                        )
+                    }
                 })
                 .collect();
             format!(r#"<game name="{entry}"><description>{entry}</description>{roms}</game>"#)
@@ -448,6 +478,7 @@ fn request_for(lab: &Lab, emu: &Emulator, key: &str, file: &str) -> FsUaeAdfLaun
         roots: emu.roots.clone(),
         database_path: lab.root.join("library.sqlite3"),
         dat_sources_config: lab.root.join("unused.toml"),
+        route: crate::launch::FsUaeAdfRoute::CatalogueVerified,
     }
 }
 
@@ -607,4 +638,114 @@ fn a_real_tosec_single_disk_adf_reaches_the_fs_uae_command() {
         command.arguments,
         vec![emu.config.clone().into_os_string(), media]
     );
+}
+
+#[test]
+fn a_dat_matched_numbered_disk_never_reaches_the_local_route_even_without_its_dat() {
+    use sha2::Digest as _;
+    let set: [(&str, &[(&str, &str)]); 2] = [
+        (
+            "Lotus (1990)(Gremlin)(Disk 1 of 2)",
+            &[("Lotus (1990)(Gremlin)(Disk 1 of 2).adf", "LOTUS1")],
+        ),
+        (
+            "Lotus (1990)(Gremlin)(Disk 2 of 2)",
+            &[("Lotus (1990)(Gremlin)(Disk 2 of 2).adf", "LOTUS2")],
+        ),
+    ];
+    // A neutral file name: only the DAT knows this is disk 2.
+    let lab = lab(&set, &[("amiga", "neutral.adf", "LOTUS2")]);
+    let path = lab.path("amiga", "neutral.adf");
+    let emu = emulator(&lab, "amiga_model = A500", true);
+    let sha = hex(&Sha256::digest(fs::read(&path).unwrap()));
+    let mut request = request_for(
+        &lab,
+        &emu,
+        &format!("{}{sha}", crate::launch::LOCAL_ADF_KEY_PREFIX),
+        "neutral.adf",
+    );
+    request.route = crate::launch::FsUaeAdfRoute::LocalMedia { sha256: sha };
+    // DAT configured: the catalogue says disk 2 of a set.
+    assert!(matches!(
+        lab.identity("amiga", "neutral.adf"),
+        Err(R::DiskNumbered(_))
+    ));
+    assert!(matches!(
+        preflight_fsuae_adf_launch(&request, &lab.db, &lab.catalogues),
+        Err(FsUaeAdfLaunchError::Identity(R::DiskNumbered(_)))
+    ));
+    // DAT configuration missing or unparseable: no catalogue loads.
+    let none = HashMap::new();
+    assert!(
+        !lab.db
+            .amiga_adf_launch_identity(&path, &none)
+            .unwrap()
+            .expect_err("refused")
+            .permits_local_media()
+    );
+    // The click-time gate refuses outright when no catalogue is loaded.
+    assert!(preflight_fsuae_adf_launch(&request, &lab.db, &none).is_err());
+}
+
+#[test]
+fn weak_dat_evidence_is_never_no_evidence() {
+    let set: [(&str, &[(&str, &str)]); 1] = [(
+        "Lotus (1990)(Gremlin)(Disk 2 of 2)",
+        &[("Lotus (1990)(Gremlin)(Disk 2 of 2).adf", "LOTUS2")],
+    )];
+    let lab = lab_hashed(
+        GAMES_ADF,
+        &set,
+        &[("amiga", "neutral.adf", "LOTUS2")],
+        "crc",
+    );
+    let refusal = lab
+        .identity("amiga", "neutral.adf")
+        .expect_err("a CRC32-only match never verifies");
+    assert!(!refusal.permits_local_media(), "{refusal:?}");
+    assert_ne!(refusal, R::NoCurrentMatch);
+    // The same file with no DAT entry at all is genuinely "no evidence".
+    let other: [(&str, &[(&str, &str)]); 1] = [(
+        "Elsewhere (1990)(Pub)(Disk 1 of 1)",
+        &[("Elsewhere (1990)(Pub)(Disk 1 of 1).adf", "OTHER")],
+    )];
+    let none = lab_hashed(
+        GAMES_ADF,
+        &other,
+        &[("amiga", "neutral.adf", "LOTUS2")],
+        "sha1",
+    );
+    assert_eq!(
+        none.identity("amiga", "neutral.adf"),
+        Err(R::NoCurrentMatch)
+    );
+}
+
+#[test]
+fn a_persisted_filename_only_result_is_not_silence() {
+    let name = "Foo (1990)(Pub)(Disk 1 of 2)";
+    let file = format!("{name}.adf");
+    let entries: [(&str, &[(&str, &str)]); 1] = [(name, &[(file.as_str(), "FOO1")])];
+    // Same file name as the DAT, different bytes, DAT lists no hash.
+    let lab = lab_hashed(
+        GAMES_ADF,
+        &entries,
+        &[("amiga", file.as_str(), "OTHER")],
+        "none",
+    );
+    let decision = lab.identity("amiga", &file);
+    let refusal = decision.expect_err("never verified");
+    // Whatever the saved state is, it must not read as "no evidence" unless
+    // nothing persisted carries evidence about this file.
+    let persisted = lab
+        .db
+        .find_archive_id_by_absolute_path(&lab.path("amiga", &file))
+        .unwrap()
+        .map(|id| lab.db.library_dat_identities_for_item(id).unwrap())
+        .unwrap_or_default();
+    if persisted.iter().any(|p| p.carries_identity()) {
+        assert!(!refusal.permits_local_media(), "{refusal:?}");
+    } else {
+        assert_eq!(refusal, R::NoCurrentMatch);
+    }
 }

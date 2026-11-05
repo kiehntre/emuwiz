@@ -3,6 +3,7 @@ mod activity;
 mod all_tools;
 mod alternative_provider_preview;
 mod amiga_game;
+mod arcade_compat_panel;
 mod arcade_input_details;
 mod archive_inspector;
 mod artwork;
@@ -60,6 +61,7 @@ mod media_sets;
 mod media_sets_tool;
 mod media_sources;
 mod missing_review;
+mod mod_discovery;
 mod mods;
 mod mounts_page;
 mod multi_selection;
@@ -432,6 +434,7 @@ pub(super) struct App {
     playing_library_generation: u64,
     organisation: organisation::OrganisationState,
     arcade_input_details: arcade_input_details::State,
+    arcade_compat_panel: arcade_compat_panel::State,
     classic_trainers: classic_trainers::State,
     recording_integrity: recording_integrity::State,
     game_detail_facts: game_detail_facts::State,
@@ -558,6 +561,7 @@ impl App {
             playing_library_generation: 0,
             organisation: organisation::OrganisationState::default(),
             arcade_input_details: arcade_input_details::State::default(),
+            arcade_compat_panel: arcade_compat_panel::State::default(),
             classic_trainers: classic_trainers::State::default(),
             recording_integrity: recording_integrity::State::default(),
             game_detail_facts: game_detail_facts::State::default(),

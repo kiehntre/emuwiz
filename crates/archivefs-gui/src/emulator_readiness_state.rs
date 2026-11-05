@@ -19,6 +19,7 @@ pub(crate) struct EmulatorReadinessState {
     pub(crate) flycast_gdi: crate::emulator_setup::flycast_gdi::Controller,
     pub(crate) vice: crate::launch_readiness_page::vice::Controller,
     pub(crate) xroar_cassette: crate::emulator_setup::xroar_cassette::Controller,
+    pub(crate) azahar_homebrew: crate::emulator_setup::azahar_homebrew::Controller,
     pub(crate) cemu: crate::emulator_setup::cemu::Controller,
     #[cfg(target_os = "linux")]
     pub(crate) shadps4:
@@ -77,6 +78,7 @@ impl Default for EmulatorReadinessState {
             hatari: Default::default(),
             flycast_gdi: Default::default(),
             xroar_cassette: Default::default(),
+            azahar_homebrew: Default::default(),
             vice: Default::default(),
             #[cfg(target_os = "linux")]
             shadps4: Default::default(),

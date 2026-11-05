@@ -55,6 +55,7 @@ pub(crate) mod dosbox;
 pub(crate) mod flycast;
 mod melonds_cheats;
 mod mgba;
+pub(crate) use mgba::CHECKING_BLOCKER as MGBA_CHECKING_BLOCKER;
 #[cfg(target_os = "linux")]
 mod pcsx2_cheats;
 mod retroarch_cheat_sets;
@@ -63,6 +64,7 @@ mod retroarch_setup;
 mod retroarch_stop;
 #[cfg(test)]
 pub(crate) use retroarch_stop::retroarch_test_request;
+pub(crate) mod azahar;
 pub(crate) mod launch_choice;
 mod rmg;
 mod sameboy;
@@ -70,6 +72,7 @@ pub(crate) mod saturn_core;
 mod scummvm_profile;
 mod stella;
 pub(crate) mod vice;
+pub(crate) mod vita3k;
 pub(crate) mod xroar;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -193,6 +196,7 @@ pub(crate) enum LaunchReadinessInput {
         cemu: Option<cemu::Context>,
         flycast: Option<flycast::Context>,
         xroar: Option<xroar::Context>,
+        azahar: Option<azahar::Context>,
         vice: Option<vice::Context>,
         amiga_whdload: Option<AmigaWHDLoadLaunchContext>,
         #[cfg(target_os = "linux")]
@@ -395,7 +399,29 @@ impl TypedLaunchRequest {
                 request.plan.warnings().to_vec()
             }
             Self::Standalone(StandaloneLaunchRequest::Vice(_)) => vec![vice::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Desmume(_)) => vec![desmume::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::SameBoy(_)) => vec![sameboy::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Mgba(_)) => vec![mgba::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Rmg(_)) => vec![rmg::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Stella(_)) => vec![stella::LIMITATION],
             _ => Vec::new(),
+        }
+    }
+
+    /// Short status for a request that carries caveats: DeSmuME's caveat is
+    /// about identity, not compatibility, so it must not read as a
+    /// compatibility warning.
+    pub(crate) fn unverified_status_label(&self) -> &'static str {
+        match self {
+            Self::Standalone(
+                StandaloneLaunchRequest::Desmume(_) | StandaloneLaunchRequest::SameBoy(_),
+            ) => "Ready, identity not DAT-verified",
+            Self::Standalone(
+                StandaloneLaunchRequest::Mgba(_)
+                | StandaloneLaunchRequest::Rmg(_)
+                | StandaloneLaunchRequest::Stella(_),
+            ) => "Ready, local launch identity",
+            _ => "Ready, compatibility unverified",
         }
     }
 
@@ -678,6 +704,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         cemu,
         flycast,
         xroar,
+        azahar,
         vice,
         amiga_whdload,
         #[cfg(target_os = "linux")]
@@ -777,6 +804,46 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                     StandaloneLaunchRequest::XRoar(request),
                 ));
             }
+            // Same request, preflight and spawn as the Gold panel's DeSmuME
+            // offer; an unready or refused offer simply falls through to the
+            // ordinary blocker below.
+            if let Some(Ok(request)) = desmume::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Desmume(request),
+                ));
+            }
+            // Same request, fresh content-hash recheck, preflight and spawn
+            // as the Gold panel's SameBoy offer.
+            if let Some(Ok(request)) = sameboy::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::SameBoy(request),
+                ));
+            }
+            // mGBA, RMG and Stella: the same Gold-panel requests (click-time
+            // rediscovery, content and identity recheck, Core preflight and spawn).
+            if let Some(Ok(request)) = mgba::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Mgba(request),
+                ));
+            }
+            if let Some(Ok(request)) = rmg::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Rmg(request),
+                ));
+            }
+            if let Some(Ok(request)) = stella::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Stella(request),
+                ));
+            }
+            if let Some(request) = azahar
+                .as_ref()
+                .and_then(|context| context.request(plan, candidate))
+            {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Azahar(request),
+                ));
+            }
             if let Some(request) = cemu
                 .as_ref()
                 .and_then(|context| context.request(plan, candidate))
@@ -810,6 +877,29 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             )
         })
         .collect();
+    // mGBA's offer waits on a one-time Bubblewrap capability check; say so
+    // (and keep repainting) rather than showing a generic blocker.
+    if requests.is_empty() {
+        for candidate in plan.candidates.iter().filter(preferred) {
+            match mgba::offer_for(plan, candidate) {
+                Some(Err(reason)) if mgba::is_checking(&reason) => {
+                    return GamerPlayAction::BlockedTyped(GamerBlocker::new(
+                        GamerBlockerKind::CheckingGame,
+                        mgba::CHECKING_BLOCKER,
+                    ));
+                }
+                // The specific, actionable reason (missing or unsupported
+                // Bubblewrap), as the Gold panel shows it.
+                Some(Err(reason)) if mgba::is_bubblewrap_refusal(&reason) => {
+                    return GamerPlayAction::BlockedTyped(GamerBlocker::new(
+                        GamerBlockerKind::NoSafeEmulator,
+                        reason,
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
     if requests.len() == 1 {
         return GamerPlayAction::Launch(Box::new(
             requests.into_iter().next().expect("one request"),
@@ -1044,6 +1134,8 @@ pub(crate) enum StandaloneProcess {
     Cemu(cemu_stop::Session),
     Flycast(archivefs_core::launch::LaunchedFlycastProcess),
     XRoar(archivefs_core::launch::process_spawn::WatchedProcess),
+    Azahar(archivefs_core::launch::LaunchedAzaharProcess),
+    Vita3k(archivefs_core::launch::process_spawn::WatchedProcess),
     Vice(archivefs_core::launch::process_spawn::WatchedProcess),
     ViceTrainers(
         Box<
@@ -1309,6 +1401,8 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Cemu(p) => p.poll().is_some(),
                     StandaloneProcess::Flycast(p) => p.poll().is_some(),
                     StandaloneProcess::XRoar(p) => p.poll().is_some(),
+                    StandaloneProcess::Azahar(p) => p.poll().is_some(),
+                    StandaloneProcess::Vita3k(p) => p.poll().is_some(),
                     StandaloneProcess::Vice(p) => p.poll().is_some(),
                     StandaloneProcess::ViceTrainers(session) => {
                         let _ = session.poll();
@@ -1523,6 +1617,8 @@ pub(crate) enum StandaloneLaunchRequest {
     Cemu(cemu::Request),
     Flycast(flycast::Request),
     XRoar(xroar::Request),
+    Azahar(azahar::Request),
+    Vita3k(vita3k::Request),
     Vice(vice::Request),
     #[cfg(target_os = "linux")]
     ShadPs4(crate::emulator_setup::shadps4::Request),
@@ -1598,6 +1694,8 @@ impl StandaloneLaunchRequest {
             Self::Cemu(_) => "Cemu",
             Self::Flycast(_) => "Flycast",
             Self::XRoar(_) => "XRoar",
+            Self::Azahar(_) => "Azahar",
+            Self::Vita3k(_) => "Vita3K",
             Self::Vice(_) => "VICE",
             Self::ScummVm(_) => "ScummVM",
             Self::OpenMsx(..) => "openMSX",
@@ -1627,6 +1725,8 @@ impl StandaloneLaunchRequest {
             Self::Cemu(r) => r.key(),
             Self::Flycast(r) => r.key(),
             Self::XRoar(r) => r.key(),
+            Self::Azahar(r) => r.key(),
+            Self::Vita3k(r) => r.key(),
             Self::Vice(r) => r.key(),
             Self::ScummVm(r) => (r.selected_game_folder.clone(), "scummvm".into()),
             Self::OpenMsx(r, _) => (r.selected_content_path.clone(), "openmsx".into()),
@@ -1641,6 +1741,8 @@ impl StandaloneLaunchRequest {
                 .map(StandaloneProcess::Cemu),
             Self::Flycast(r) => r.execute().map(StandaloneProcess::Flycast),
             Self::XRoar(r) => r.execute().map(StandaloneProcess::XRoar),
+            Self::Azahar(r) => r.execute().map(StandaloneProcess::Azahar),
+            Self::Vita3k(r) => r.execute().map(StandaloneProcess::Vita3k),
             Self::Vice(r) => r.execute().map(StandaloneProcess::Vice),
             #[cfg(target_os = "linux")]
             Self::ShadPs4(r) => r
@@ -3438,6 +3540,7 @@ pub(crate) fn show_launch_readiness_panel(
             cemu,
             flycast,
             xroar,
+            azahar,
             vice,
             amiga_whdload,
             #[cfg(target_os = "linux")]
@@ -3463,6 +3566,19 @@ pub(crate) fn show_launch_readiness_panel(
                         candidate.target,
                         LaunchTarget::Standalone {
                             adapter_id: "xroar",
+                            ..
+                        }
+                    ) {
+                        context.show(ui, plan, candidate, standalone_launch_state);
+                    }
+                }
+            }
+            if let Some(context) = azahar {
+                for candidate in &plan.candidates {
+                    if matches!(
+                        candidate.target,
+                        LaunchTarget::Standalone {
+                            adapter_id: "azahar",
                             ..
                         }
                     ) {
@@ -4687,6 +4803,7 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
             "fuse" => Some("Fuse"),
             "tsugaru" => Some("Tsugaru"),
             "xroar" => Some("XRoar"),
+            "azahar" => Some("Azahar"),
             "vice" => Some("VICE"),
             _ => None,
         },
@@ -5226,7 +5343,7 @@ fn exit_line(
     }
 }
 
-fn show_standalone_launch_action(
+pub(crate) fn show_standalone_launch_action(
     ui: &mut egui::Ui,
     state: &mut StandaloneLaunchState,
     mut request: StandaloneLaunchRequest,
@@ -5449,6 +5566,16 @@ fn show_standalone_launch_action(
                 {
                     ui.label(exit_line("openMSX", report));
                 }
+                if let StandaloneProcess::Azahar(process) = process
+                    && let Some(report) = process.poll()
+                {
+                    ui.label(exit_line("Azahar", report));
+                }
+                if let StandaloneProcess::Vita3k(process) = process
+                    && let Some(report) = process.poll()
+                {
+                    ui.label(exit_line("Vita3K", report));
+                }
                 if let StandaloneProcess::DosBox(process) = process
                     && let Some(report) = process.poll()
                 {
@@ -5536,6 +5663,20 @@ fn show_standalone_launch_action(
         if adapter == "amiberry_cd"
             && !state.is_active()
             && ui.button("Launch Amiberry CD again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
+        if adapter == "vita3k"
+            && !state.is_active()
+            && ui.button("Launch Vita3K again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
+        if adapter == "azahar"
+            && !state.is_active()
+            && ui.button("Launch Azahar again (recheck)").clicked()
         {
             state.start(request);
             return;

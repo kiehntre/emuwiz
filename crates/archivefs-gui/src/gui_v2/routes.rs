@@ -784,10 +784,11 @@ pub(super) enum ToolPage {
     OpticalCompare,
     SourceImpact,
     ArcadeShelf,
+    Vita3kTitles,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
@@ -806,6 +807,7 @@ impl ToolPage {
         Self::OpticalCompare,
         Self::SourceImpact,
         Self::ArcadeShelf,
+        Self::Vita3kTitles,
     ];
 
     pub fn title(self) -> &'static str {
@@ -823,11 +825,12 @@ impl ToolPage {
             Self::WhdloadOptions => "WHDLoad ToolType review",
             Self::OpticalCompare => "Compare optical layouts",
             Self::SourceImpact => "Source-location impact preview",
-            Self::HomebrewBrowser => "Offline homebrew catalogue",
+            Self::HomebrewBrowser => "Homebrew",
             Self::NetplayPreview => "Netplay comparison",
             Self::HostDiagnostics => "Host capability diagnostics",
             Self::CheatExtras => "Providers and code previews",
             Self::ArcadeShelf => "Virtual Arcade Shelf",
+            Self::Vita3kTitles => "PlayStation Vita (Vita3K) titles",
         }
     }
 
@@ -861,7 +864,7 @@ impl ToolPage {
                 "Preview one library source at a new folder without relocating anything."
             }
             Self::HomebrewBrowser => {
-                "Search a local catalogue and review dated claims without acquiring games."
+                "Browse homebrew titles offline, or look up a GitHub repository's releases on request. Nothing is downloaded."
             }
             Self::NetplayPreview => {
                 "Compare two manually supplied peer observations without connecting."
@@ -874,6 +877,9 @@ impl ToolPage {
             }
             Self::ArcadeShelf => {
                 "Browse your covers on one shelf per system, then open Game Details for any game."
+            }
+            Self::Vita3kTitles => {
+                "Start a title that is already installed in Vita3K; EmuWiz installs and changes nothing."
             }
         }
     }
@@ -898,6 +904,7 @@ impl ToolPage {
             Self::HostDiagnostics => Section::Setup,
             Self::CheatExtras => Section::Mods,
             Self::ArcadeShelf => Section::Games,
+            Self::Vita3kTitles => Section::Games,
         }
     }
 
@@ -920,6 +927,7 @@ impl ToolPage {
             Self::HostDiagnostics => "Tools",
             Self::CheatExtras => "Enhance",
             Self::ArcadeShelf => "Games & collection",
+            Self::Vita3kTitles => "Games & collection",
         }
     }
 }

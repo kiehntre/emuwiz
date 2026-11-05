@@ -658,6 +658,7 @@ fn discover_executables(roots: &XemuProfileDiscoveryRoots) -> Vec<XemuExecutable
     }
     paths.sort();
     paths.dedup();
+    crate::path_alias::dedup_by_real_path(&mut paths, |entry| entry.as_path());
     paths
         .into_iter()
         .filter(|path| is_regular_file(path))

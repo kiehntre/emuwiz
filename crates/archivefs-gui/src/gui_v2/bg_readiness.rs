@@ -271,6 +271,19 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
         state.xroar_cassette =
             crate::emulator_setup::xroar_cassette::Controller::with_context(path.clone(), context);
     }
+    // Loose .3dsx homebrew needs only the file: the same bounded check the
+    // selected game runs (one small file, hashed once). A catalogue platform
+    // that is not Nintendo 3DS means the folder says otherwise: skip.
+    if crate::launch_readiness_page::azahar::is_three_dsx(&path)
+        && crate::launch_readiness_page::azahar::platform_allows(Some(&job.catalogue_platform))
+    {
+        if cancel.load(Ordering::Relaxed) {
+            return Outcome::Unknown;
+        }
+        let context = crate::launch_readiness_page::azahar::Context::inspect(path.clone());
+        state.azahar_homebrew =
+            crate::emulator_setup::azahar_homebrew::Controller::with_context(path.clone(), context);
+    }
     let evidence = crate::selected_evidence_page::SelectedEvidenceState::Ready {
         generation: 0,
         report: Box::new(report),

@@ -1000,3 +1000,21 @@ fn recovery_refuses_a_lock_owned_by_another_transaction() {
     recover_directory_restore(&path, &e.status, 301).unwrap();
     assert_eq!(fingerprint(&e.dest()).unwrap(), before);
 }
+
+#[test]
+fn a_save_held_by_another_program_is_refused_as_in_use_not_as_a_running_emulator() {
+    assert_eq!(
+        requirement(EmulatorQuiescence::CardInUse),
+        SaveQuiescenceRequirement::InUse
+    );
+    assert_eq!(
+        requirement(EmulatorQuiescence::Running),
+        SaveQuiescenceRequirement::Running
+    );
+    assert!(matches!(
+        check_quiescence(EmulatorQuiescence::CardInUse),
+        Err(TreeRestoreError::Refused(reasons)) if reasons == vec![TreeRestoreRefusal::SaveInUse]
+    ));
+    let text = crate::save_snapshots::SaveRestoreRefusal::SaveInUse.to_string();
+    assert!(text.contains("in use") && !text.to_lowercase().contains("emulator"));
+}

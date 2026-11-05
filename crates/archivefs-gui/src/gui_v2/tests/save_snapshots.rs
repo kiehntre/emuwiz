@@ -133,6 +133,9 @@ fn active_ambiguous_or_unsupported_closure_refuses_without_copying() {
         closure_message(StateEmulator::Pcsx2, Some(EmulatorUseStatus::Running))
             .contains("Close it")
     );
+    let in_use = closure_message(StateEmulator::Pcsx2, Some(EmulatorUseStatus::CardInUse));
+    assert!(in_use.contains("in use") && in_use.contains("Another application"));
+    assert!(!in_use.contains("emulator is running"), "{in_use}");
 }
 
 #[test]

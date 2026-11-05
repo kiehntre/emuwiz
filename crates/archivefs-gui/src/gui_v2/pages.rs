@@ -3048,6 +3048,13 @@ impl App {
             self.organisation.view = super::organisation::OrganisationView::MameHealth;
             self.go(Route::MameWorkflow);
         }
+        self.arcade_compat_panel.show(
+            ui,
+            game.archive.id,
+            super::arcade_input_details::verified_machine(game.archive.identity_report.as_ref()),
+            game.archive.absolute_path.clone(),
+            &self.organisation.mame_health,
+        );
     }
 
     /// "At a glance": saved facts and the file check, never a Play decision.

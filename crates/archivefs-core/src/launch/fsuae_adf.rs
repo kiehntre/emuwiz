@@ -35,6 +35,19 @@ pub struct FsUaeAdfLaunchRequest {
     pub roots: AmigaProfileDiscoveryRoots,
     pub database_path: PathBuf,
     pub dat_sources_config: PathBuf,
+    /// What lets this media start. The click re-derives exactly this.
+    pub route: FsUaeAdfRoute,
+}
+
+/// Which evidence authorises the ADF. A catalogue-verified game and a locally
+/// proven floppy image are different claims; the second never becomes a game
+/// identity (see `fsuae_adf_local`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FsUaeAdfRoute {
+    /// A current DAT match proving a single-disk game.
+    CatalogueVerified,
+    /// The exact bytes (SHA-256) of a validated single Amiga floppy image.
+    LocalMedia { sha256: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +64,8 @@ pub enum FsUaeAdfLaunchError {
     KickstartNotReady(AmigaKickstartState),
     Preflight(FsUaeLaunchPreflightError),
     Spawn(String),
+    /// The local-media route refused; the text says why.
+    LocalMedia(String),
 }
 
 impl FsUaeAdfLaunchError {
@@ -77,6 +92,7 @@ impl FsUaeAdfLaunchError {
                 error.kind, error.detail
             ),
             Self::Spawn(detail) => format!("FS-UAE could not be started: {detail}"),
+            Self::LocalMedia(reason) => reason.clone(),
         }
     }
 }
@@ -138,6 +154,11 @@ pub fn preflight_fsuae_adf_launch(
     database: &Database,
     catalogues: &HashMap<String, ConfiguredCatalogue>,
 ) -> Result<PreparedProcessCommand, FsUaeAdfLaunchError> {
+    if let FsUaeAdfRoute::LocalMedia { sha256 } = &request.route {
+        return crate::launch::fsuae_adf_local::preflight_local_adf(
+            request, sha256, database, catalogues,
+        );
+    }
     let path = &request.fsuae.selected_content_path;
     let is_adf = path
         .extension()
@@ -206,6 +227,27 @@ pub fn current_adf_launch_identity(path: &Path) -> Result<AmigaAdfLaunchIdentity
         .map_err(|refusal| refusal.reason())
 }
 
+/// Like [`current_adf_launch_identity`] but keeps the typed refusal, so a
+/// caller can tell "no DAT proof" from "the catalogue says this is part of a
+/// set". `Err` means the catalogue could not be read at all.
+pub fn current_adf_launch_decision(
+    path: &Path,
+) -> Result<Result<AmigaAdfLaunchIdentity, AmigaAdfIdentityRefusal>, String> {
+    let (database_path, config) = default_adf_identity_paths()
+        .ok_or_else(|| "The library catalogue location is unknown.".to_string())?;
+    let database = Database::open_read_only(database_path)
+        .map_err(|error| format!("The library catalogue could not be read: {error}"))?;
+    let catalogues = crate::dat::configured_catalogues::load_configured_catalogues(&config);
+    // An empty or unloadable catalogue set is "no evidence", which callers
+    // must not mistake for "no evidence against".
+    if catalogues.is_empty() {
+        return Err("No DAT catalogue is configured or it could not be loaded.".into());
+    }
+    database
+        .amiga_adf_launch_identity(path, &catalogues)
+        .map_err(|error| format!("The library catalogue could not be read: {error}"))
+}
+
 /// Builds the click-time request for one discovered FS-UAE profile, binding
 /// the exact media, executable and configuration objects seen now.
 pub fn build_fsuae_adf_request(
@@ -246,5 +288,6 @@ pub fn build_fsuae_adf_request(
         roots: roots.clone(),
         database_path,
         dat_sources_config,
+        route: FsUaeAdfRoute::CatalogueVerified,
     })
 }

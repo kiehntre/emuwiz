@@ -109,6 +109,8 @@ pub enum TreeRestoreRefusal {
     EmptySnapshot,
     TooManyEntries,
     EmulatorRunning,
+    /// Some program has the save open; which program is not established.
+    SaveInUse,
     EmulatorStateUnknown,
     DestinationUnsafe(String),
     UnsafeRelativePath(PathBuf),
@@ -128,7 +130,10 @@ pub enum TreeRestoreRefusal {
     ManifestChanged,
     ManifestTooLarge,
     SnapshotDestinationOverlap,
-    InsufficientSpace { required: u64, available: u64 },
+    InsufficientSpace {
+        required: u64,
+        available: u64,
+    },
     SpaceUnknown,
 }
 
@@ -434,6 +439,7 @@ pub(crate) fn plan_tree_restore(
     match quiescence {
         SaveQuiescenceRequirement::ConfirmedClosed => {}
         SaveQuiescenceRequirement::Running => refusals.push(TreeRestoreRefusal::EmulatorRunning),
+        SaveQuiescenceRequirement::InUse => refusals.push(TreeRestoreRefusal::SaveInUse),
         SaveQuiescenceRequirement::Unknown => {
             refusals.push(TreeRestoreRefusal::EmulatorStateUnknown)
         }
@@ -1276,6 +1282,11 @@ pub(crate) fn undo_with_hook(
         SaveQuiescenceRequirement::Running => {
             return Err(TreeRestoreError::Refused(vec![
                 TreeRestoreRefusal::EmulatorRunning,
+            ]));
+        }
+        SaveQuiescenceRequirement::InUse => {
+            return Err(TreeRestoreError::Refused(vec![
+                TreeRestoreRefusal::SaveInUse,
             ]));
         }
         SaveQuiescenceRequirement::Unknown => {

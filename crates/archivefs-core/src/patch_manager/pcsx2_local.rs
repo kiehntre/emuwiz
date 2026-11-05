@@ -715,6 +715,7 @@ fn discover_pcsx2_local_executables(roots: &Pcsx2ProfileDiscoveryRoots) -> Vec<P
     paths.extend(appimages.iter().map(|found| found.path.clone()));
     paths.sort();
     paths.dedup();
+    crate::path_alias::dedup_by_real_path(&mut paths, |entry| entry.as_path());
     let mut executables: Vec<Pcsx2Executable> = paths
         .into_iter()
         .filter(|path| is_regular_file_no_follow(path))

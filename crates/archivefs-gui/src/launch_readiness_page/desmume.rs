@@ -8,6 +8,10 @@ use archivefs_core::launch::{
 use archivefs_core::platform_evidence_fusion::FusionOutcome;
 use std::io::Read;
 
+/// Shown wherever DeSmuME Play is offered: the identity is the cartridge's own
+/// header game code, not a catalogue or DAT proof.
+pub(crate) const LIMITATION: &str = "Local cartridge identity (the game code in the .nds header), not DAT-verified. DeSmuME is only started; EmuWiz cannot confirm the game runs.";
+
 #[derive(Clone)]
 pub(crate) struct Request {
     plan: LaunchPlan,
@@ -231,11 +235,14 @@ pub(super) fn show_offer(
 ) {
     ui.add_space(6.0);
     match offer {
-        Ok(request) => super::show_standalone_launch_action(
-            ui,
-            state,
-            StandaloneLaunchRequest::Desmume(request),
-        ),
+        Ok(request) => {
+            ui.small(LIMITATION);
+            super::show_standalone_launch_action(
+                ui,
+                state,
+                StandaloneLaunchRequest::Desmume(request),
+            )
+        }
         Err(reason) => {
             ui.colored_label(ui.visuals().warn_fg_color, reason);
         }
@@ -343,6 +350,75 @@ mod tests {
             assert_eq!(report.status.as_ref().unwrap().code(), Some(code));
             assert_eq!(exit_failure(report).is_some(), code != 0);
             assert_eq!(std::fs::read(game).unwrap(), before);
+        }
+    }
+
+    fn blue_play_action(plan: &LaunchPlan) -> GamerPlayAction {
+        gamer_play_action(&LaunchReadinessInput::Plan {
+            plan: plan.clone(),
+            retroarch: None,
+            retroarch_scanned: true,
+            standalone_scans_complete: true,
+            dolphin: None,
+            pcsx2: None,
+            duckstation: None,
+            ppsspp: None,
+            rpcs3: None,
+            xemu: None,
+            xenia: None,
+            melonds: None,
+            cemu: None,
+            flycast: None,
+            xroar: None,
+            azahar: None,
+            vice: None,
+            amiga_whdload: None,
+            #[cfg(target_os = "linux")]
+            shadps4: None,
+        })
+    }
+
+    #[test]
+    fn a_ready_ds_cartridge_reaches_the_blue_play_action_as_local_identity() {
+        let (_dir, _roots, plan, _candidate) = fixture(0);
+        let GamerPlayAction::Launch(request) = blue_play_action(&plan) else {
+            panic!("Blue Play must offer the DeSmuME launch");
+        };
+        assert!(matches!(
+            *request,
+            TypedLaunchRequest::Standalone(StandaloneLaunchRequest::Desmume(_))
+        ));
+        assert_eq!(request.adapter_name(), "DeSmuME");
+        assert_eq!(
+            request.unverified_status_label(),
+            "Ready, identity not DAT-verified"
+        );
+        // The identity is the cartridge's own game code, never a DAT match, and
+        // Blue must say so wherever Play is offered.
+        assert!(
+            request
+                .unverified_warnings()
+                .iter()
+                .any(|line| line.contains("not DAT-verified"))
+        );
+    }
+
+    #[test]
+    fn blue_play_refuses_archives_unready_candidates_and_missing_identity() {
+        let (_dir, _roots, plan, _candidate) = fixture(0);
+        let mut archive = plan.clone();
+        archive.candidates[0].content.container = Some(LaunchContainerKind::Archive);
+        let mut blocked = plan.clone();
+        blocked.candidates[0].readiness = LaunchReadiness::Blocked;
+        let mut keyless = plan.clone();
+        keyless.game_key = None;
+        let mut wrong_platform = plan.clone();
+        wrong_platform.platform_id = Some("Game Boy Advance".into());
+        for refused in [archive, blocked, keyless, wrong_platform] {
+            assert!(
+                !matches!(blue_play_action(&refused), GamerPlayAction::Launch(_)),
+                "{refused:?}"
+            );
         }
     }
 

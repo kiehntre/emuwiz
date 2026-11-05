@@ -275,7 +275,7 @@ pub(crate) fn gamer_readiness_short_label(readiness: &GamerReadiness<'_>) -> &'s
         GamerReadiness::ChooseMember { .. } => "Choose game file",
         GamerReadiness::Unmount => "Mounted",
         GamerReadiness::Ready { request } if !request.unverified_warnings().is_empty() => {
-            "Ready, compatibility unverified"
+            request.unverified_status_label()
         }
         GamerReadiness::Ready { .. } => "Ready to play",
         GamerReadiness::NeedsSetup { .. } => "Needs setup",
@@ -293,6 +293,12 @@ pub(crate) fn show_gamer_launch_blocker(
     ui.colored_label(ui.visuals().warn_fg_color, blocker.heading());
     let next = match blocker.kind {
         launch_readiness_page::GamerBlockerKind::CheckingGame => {
+            // mGBA's Bubblewrap probe finishes on a worker thread, so it must
+            // not wait for the next input event. Other checks are unchanged.
+            if blocker.detail == launch_readiness_page::MGBA_CHECKING_BLOCKER {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+            }
             "EmuWiz is still checking this game."
         }
         launch_readiness_page::GamerBlockerKind::UnknownSystem => {

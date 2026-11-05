@@ -75,6 +75,7 @@ pub mod amiga_whdload_trainer_launch;
 pub mod atari800;
 pub mod azahar_command;
 pub mod azahar_execution;
+pub mod azahar_homebrew;
 #[cfg(target_os = "linux")]
 pub mod b_em;
 #[cfg(target_os = "linux")]
@@ -108,6 +109,7 @@ pub mod flycast_command;
 pub mod flycast_execution;
 pub mod flycast_gdi_readiness;
 pub mod fsuae_adf;
+pub mod fsuae_adf_local;
 pub mod fsuae_command;
 pub mod fsuae_execution;
 pub mod fuse_command;
@@ -191,6 +193,7 @@ pub mod vice_command;
 pub mod vice_execution;
 pub mod vita3k_command;
 pub mod vita3k_execution;
+pub mod vita3k_installed;
 pub mod xemu_command;
 pub mod xemu_execution;
 pub mod xenia_command;
@@ -249,6 +252,11 @@ pub use azahar_command::{
 pub use azahar_execution::{
     AzaharPreflightError, AzaharPreflightErrorKind, LaunchedAzaharProcess, preflight_azahar_launch,
     spawn_azahar,
+};
+pub use azahar_homebrew::{
+    AZAHAR_HOMEBREW_KEY_PREFIX, AzaharHomebrewLaunchError, AzaharHomebrewLaunchRequest,
+    ThreeDsxEvidence, ThreeDsxRefusal, ThreeDsxRefusalKind, preflight_and_launch_azahar_homebrew,
+    verify_three_dsx,
 };
 pub use cemu_command::{
     CEMU_SUPPORTED_PLATFORM_ID, CemuCommand, CemuCommandPlan, CemuCommandSelection,
@@ -359,9 +367,13 @@ pub use flycast_execution::{
     preflight_flycast_launch, spawn_flycast,
 };
 pub use fsuae_adf::{
-    FsUaeAdfLaunchError, FsUaeAdfLaunchRequest, adf_canonical_identity, build_fsuae_adf_request,
-    current_adf_launch_identity, default_adf_identity_paths, fsuae_adf_config,
-    fsuae_adf_profile_refusal, preflight_and_launch_fsuae_adf, preflight_fsuae_adf_launch,
+    FsUaeAdfLaunchError, FsUaeAdfLaunchRequest, FsUaeAdfRoute, adf_canonical_identity,
+    build_fsuae_adf_request, current_adf_launch_decision, current_adf_launch_identity,
+    default_adf_identity_paths, fsuae_adf_config, fsuae_adf_profile_refusal,
+    preflight_and_launch_fsuae_adf, preflight_fsuae_adf_launch,
+};
+pub use fsuae_adf_local::{
+    LOCAL_ADF_KEY_PREFIX, LocalAdfMedia, build_fsuae_local_adf_request, local_adf_media,
 };
 pub use fsuae_command::{
     FSUAE_SUPPORTED_PLATFORM_ID, FsUaeCommand, FsUaeCommandPlan, FsUaeCommandSelection,
@@ -572,6 +584,11 @@ pub use vita3k_command::{
 pub use vita3k_execution::{
     Vita3kLaunchPreflightError, Vita3kLaunchPreflightErrorKind, Vita3kLaunchRequest,
     preflight_vita3k_launch, spawn_vita3k,
+};
+pub use vita3k_installed::{
+    VITA3K_INSTALLED_KEY_PREFIX, Vita3kInstalledEntry, Vita3kInstalledLaunchError,
+    Vita3kInstalledLaunchRequest, Vita3kInventory, Vita3kProfileSummary,
+    preflight_and_launch_vita3k_installed, scan_vita3k_installed_titles,
 };
 pub use xemu_command::{
     XEMU_SUPPORTED_PLATFORM_ID, XemuCommand, XemuCommandPlan, XemuCommandSelection,

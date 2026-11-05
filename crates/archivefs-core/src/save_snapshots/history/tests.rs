@@ -230,3 +230,112 @@ fn reviewed_proc_scan_drives_pcsx2_closure_through_a_synthetic_proc() {
         EmulatorUseStatus::Unknown
     );
 }
+
+// ------------------------------------------- PCSX2 card snapshot under lease
+
+fn card_request(card: &Path, root: &Path) -> SaveSnapshotRequest {
+    SaveSnapshotRequest {
+        location: location(card),
+        game_identity: None,
+        platform: Some("PS2".into()),
+        storage_root: root.to_path_buf(),
+        available_space_bytes: None,
+        snapshot_id: Some("leased".into()),
+        now_unix_seconds: Some(1),
+        emulator_use: EmulatorUseStatus::NotDetected, // replaced by the check
+    }
+}
+
+fn kept_snapshots(root: &Path) -> usize {
+    fs::read_dir(root.join("unknown-game"))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name() == "leased")
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Closed, but starts a program opening the card for writing while the
+/// snapshot's lease is held, and returns once the kernel shows the break.
+struct WriterDuringCopy(std::cell::RefCell<Option<std::thread::JoinHandle<()>>>);
+impl QuiescenceProvider for WriterDuringCopy {
+    fn observe(
+        &self,
+        _: &crate::save_snapshots::tree_restore::safety::DirectorySaveBinding,
+    ) -> EmulatorQuiescence {
+        EmulatorQuiescence::Closed
+    }
+    fn observe_under_card_lease(
+        &self,
+        binding: &crate::save_snapshots::tree_restore::safety::DirectorySaveBinding,
+        _: &crate::memory_card_inventory::restore_guard::CardWriteLease,
+    ) -> EmulatorQuiescence {
+        use std::os::unix::fs::MetadataExt;
+        let card = PathBuf::from(&binding.profile);
+        let needle = format!(":{} ", fs::metadata(&card).unwrap().ino());
+        *self.0.borrow_mut() = Some(std::thread::spawn(move || {
+            drop(fs::OpenOptions::new().write(true).open(card).unwrap());
+        }));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !fs::read_to_string("/proc/locks")
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.contains("BREAKING") && line.contains(&needle))
+        {
+            assert!(std::time::Instant::now() < deadline, "lease never broke");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        EmulatorQuiescence::Closed
+    }
+}
+
+#[test]
+fn a_card_snapshot_is_kept_only_if_no_writer_opened_the_card_during_the_copy() {
+    let dir = tempdir().unwrap();
+    let card = dir.path().join("Mcd001.ps2");
+    fs::write(&card, vec![0x5a; 64 * 1024]).unwrap();
+    let root = dir.path().join("snapshots");
+
+    // A writer arriving during the copy: whatever the timestamps say, the
+    // copy is discarded.
+    let observer = WriterDuringCopy(std::cell::RefCell::new(None));
+    let result =
+        create_snapshot_observed(StateEmulator::Pcsx2, card_request(&card, &root), &observer);
+    observer.0.take().unwrap().join().unwrap();
+    assert!(
+        matches!(result, Err(SaveSnapshotError::CardInUse)),
+        "{result:?}"
+    );
+    assert_eq!(kept_snapshots(&root), 0, "no torn snapshot is kept");
+
+    // Another descriptor on the card, writer or reader, refuses up front.
+    for write in [true, false] {
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .write(write)
+            .open(&card)
+            .unwrap();
+        let result = create_snapshot_observed(
+            StateEmulator::Pcsx2,
+            card_request(&card, &root),
+            &Observed(EmulatorQuiescence::Closed),
+        );
+        assert!(
+            matches!(result, Err(SaveSnapshotError::CardInUse)),
+            "{result:?}"
+        );
+        drop(holder);
+    }
+    assert_eq!(kept_snapshots(&root), 0);
+
+    // Undisturbed: kept.
+    create_snapshot_observed(
+        StateEmulator::Pcsx2,
+        card_request(&card, &root),
+        &Observed(EmulatorQuiescence::Closed),
+    )
+    .unwrap();
+    assert_eq!(kept_snapshots(&root), 1);
+}
