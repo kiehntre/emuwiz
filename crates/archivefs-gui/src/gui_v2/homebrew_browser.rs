@@ -17,7 +17,7 @@ use view::Entry;
 
 const BUILTIN_SOURCE: &str = "Built-in starter catalogue (offline)";
 const LIMIT: &str = "Titles, platforms, rights and links are recorded claims with a stated basis, not verified game identity or permission to acquire or redistribute. Nothing here is downloaded, installed or run.";
-const NETWORK_NOTE: &str = "Looking up GitHub releases contacts api.github.com once, when you press the button. It reads release metadata only and downloads no files.";
+const NETWORK_NOTE: &str = "Looking up GitHub releases contacts api.github.com only when you press the button (a few small metadata requests). It reads release metadata only and downloads no files.";
 
 type LocalResult = Result<Vec<Entry>, String>;
 
@@ -79,6 +79,8 @@ impl State {
 
     fn start_github(&mut self, repository: String, context: &egui::Context) {
         if self.github_pending.is_some() {
+            self.github_error =
+                Some("A GitHub lookup is already running; wait or stop it first.".into());
             return;
         }
         self.github_error = None;
@@ -98,7 +100,7 @@ impl State {
                 self.loading = None;
                 match result {
                     Ok(entries) => self.local = entries,
-                    Err(error) => self.feedback = Some(error),
+                    Err(error) => self.feedback = Some(view::clean(&error)),
                 }
             }
         }
@@ -125,7 +127,7 @@ impl State {
                 self.github.insert(0, entry);
                 self.github_error = None;
             }
-            Err(error) => self.github_error = Some(format!("{repository}: {error}")),
+            Err(error) => self.github_error = Some(view::clean(&format!("{repository}: {error}"))),
         }
     }
 
@@ -198,8 +200,9 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut State) {
         }
         if state.github_pending.is_some() {
             ui.spinner();
-            if ui.button("Cancel").clicked() {
-                // Dropping the receiver discards the late result.
+            if ui.button("Stop waiting").clicked() {
+                // Dropping the receiver discards the late result; the request
+                // already in flight finishes in the background within its timeout.
                 state.github_pending = None;
             }
         }
@@ -241,7 +244,9 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut State) {
             }
         });
     if let Some(repository) = lookup_request {
-        state.github_input = repository.clone();
+        if state.github_pending.is_none() {
+            state.github_input = repository.clone();
+        }
         state.start_github(repository, ui.ctx());
     }
 }
@@ -313,6 +318,27 @@ mod tests {
         assert!(entries.iter().all(|e| e.source == BUILTIN_SOURCE));
         assert!(state.github_pending.is_none() && state.loading.is_none());
         assert!(state.github.is_empty());
+    }
+
+    #[test]
+    fn a_second_lookup_while_one_runs_is_refused_with_a_message() {
+        let (_tx, rx) = mpsc::channel();
+        let mut state = State {
+            github_pending: Some(github::Pending {
+                repository: "a/b".into(),
+                receiver: rx,
+            }),
+            ..Default::default()
+        };
+        state.start_github("c/d".into(), &egui::Context::default());
+        assert_eq!(state.github_pending.as_ref().unwrap().repository, "a/b");
+        assert!(
+            state
+                .github_error
+                .as_deref()
+                .unwrap()
+                .contains("already running")
+        );
     }
 
     #[test]

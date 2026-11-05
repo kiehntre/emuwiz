@@ -43,13 +43,27 @@ pub(super) struct Release {
 pub(super) fn clean(text: &str) -> String {
     let mut out: String = text
         .chars()
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .map(|c| if is_unsafe_char(c) { '\u{fffd}' } else { c })
         .take(MAX_TEXT)
         .collect();
     if text.chars().count() > MAX_TEXT {
         out.push('…');
     }
     out
+}
+
+/// Control characters plus invisible format characters (bidi overrides and
+/// isolates, zero-width marks) that can spoof how a filename or title reads.
+fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        )
 }
 
 pub(super) fn from_catalogue(record: &LocalHomebrewRecord, source: &str) -> Entry {
@@ -68,7 +82,10 @@ pub(super) fn from_catalogue(record: &LocalHomebrewRecord, source: &str) -> Entr
     }
     let github_repository = project_github_repository(record);
     Entry {
-        key: format!("{}/{}", project.id.provider, project.id.provider_id),
+        key: format!(
+            "{source}|{}/{}",
+            project.id.provider, project.id.provider_id
+        ),
         title: clean(&project.title),
         summary: project.summary.as_deref().map(clean),
         source: clean(source),
@@ -151,6 +168,25 @@ pub(super) fn github_repository_from_url(url: &str) -> Option<String> {
     let rest = url.strip_prefix("https://github.com/")?;
     let mut parts = rest.split('/');
     let (owner, repo) = (parts.next()?, parts.next()?);
+    // GitHub's own non-repository top-level paths.
+    const RESERVED: &[&str] = &[
+        "orgs",
+        "topics",
+        "sponsors",
+        "settings",
+        "marketplace",
+        "features",
+        "collections",
+        "explore",
+        "search",
+        "users",
+        "apps",
+        "login",
+        "about",
+    ];
+    if RESERVED.contains(&owner.to_ascii_lowercase().as_str()) {
+        return None;
+    }
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     let candidate = format!("{owner}/{repo}");
     archivefs_core::homebrew_github::GithubRepositoryRef::parse(&candidate)
@@ -374,12 +410,22 @@ mod tests {
         );
         assert_eq!(github_repository_from_url("https://github.com/a"), None);
         assert_eq!(github_repository_from_url("https://github.com/../b"), None);
+        assert_eq!(
+            github_repository_from_url("https://github.com/orgs/x"),
+            None
+        );
+        assert_eq!(
+            github_repository_from_url("https://github.com/topics/gba"),
+            None
+        );
     }
 
     #[test]
     fn untrusted_text_has_controls_replaced_and_is_bounded() {
         let cleaned = clean(&format!("a\u{1b}[31m{}", "x".repeat(1000)));
         assert!(!cleaned.contains('\u{1b}'));
+        assert!(!clean("evil\u{202e}gba.exe").contains('\u{202e}'));
+        assert!(!clean("a\u{200b}b").contains('\u{200b}'));
         assert!(cleaned.chars().count() <= MAX_TEXT + 1);
     }
 
