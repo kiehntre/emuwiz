@@ -4324,11 +4324,11 @@ mod tests {
     /// Builds a native profile with one core whose `.info` is `info_bytes`
     /// and a configured system directory `system/`, then returns the
     /// per-entry presences plus the projected readiness.
-    fn firmware_probe_fixture(
+    fn firmware_report_fixture(
         name: &str,
         info_bytes: &[u8],
         setup: impl FnOnce(&Fixture),
-    ) -> (Fixture, CoreInfoFinding) {
+    ) -> (Fixture, RetroArchEnvironmentReport) {
         let fixture = Fixture::new(name);
         fixture.write(
             ".config/retroarch/retroarch.cfg",
@@ -4353,6 +4353,15 @@ mod tests {
             fixture.snapshot(),
             "discovery must not write anything"
         );
+        (fixture, report)
+    }
+
+    fn firmware_probe_fixture(
+        name: &str,
+        info_bytes: &[u8],
+        setup: impl FnOnce(&Fixture),
+    ) -> (Fixture, CoreInfoFinding) {
+        let (fixture, report) = firmware_report_fixture(name, info_bytes, setup);
         let info = report.profiles[0].cores[0].info.clone();
         (fixture, info)
     }
@@ -4379,7 +4388,11 @@ mod tests {
     impl Fixture {
         fn snapshot(&self) -> Vec<(PathBuf, bool)> {
             fn walk(dir: &Path, out: &mut Vec<(PathBuf, bool)>) {
-                let mut entries: Vec<_> = fs::read_dir(dir).unwrap().flatten().collect();
+                // An unreadable directory (permission tests) is a leaf.
+                let Ok(read_dir) = fs::read_dir(dir) else {
+                    return;
+                };
+                let mut entries: Vec<_> = read_dir.flatten().collect();
                 entries.sort_by_key(|e| e.path());
                 for entry in entries {
                     let meta = fs::symlink_metadata(entry.path()).unwrap();
@@ -4500,6 +4513,107 @@ mod tests {
             presences(&found),
             vec![FirmwarePresence::Unknown, FirmwarePresence::Unknown]
         );
+    }
+
+    // ---- planner-level pins (real filesystem probe -> build_launch_plan) ----
+
+    fn planner_outcome(
+        name: &str,
+        setup: impl FnOnce(&Fixture),
+    ) -> (
+        crate::launch::readiness::LaunchReadiness,
+        Vec<crate::launch::readiness::LaunchBlockerKind>,
+        Vec<crate::launch::readiness::LaunchWarningKind>,
+    ) {
+        use crate::launch::planning::*;
+        let info = "systemname = \"PlayStation 2\"\nfirmware_count = \"1\"\nfirmware0_path = \"bios.bin\"\nfirmware0_opt = \"false\"\n";
+        let (_f, report) = firmware_report_fixture(name, info.as_bytes(), setup);
+        let identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "PS2".to_string(),
+            game_key: "TEST-00001".to_string(),
+        });
+        let content = LaunchContentRef {
+            kind: Some(LaunchContentKind::OpticalDisc),
+            container: Some(LaunchContainerKind::Chd),
+            resolved_path: Some(PathBuf::from("/library/ps2/Game.chd")),
+            requires_mount: false,
+            provenance: "test".to_string(),
+        };
+        let plan = build_launch_plan(&identity, &content, &[], &report, &[]);
+        let candidate = plan
+            .candidates
+            .iter()
+            .find(|c| matches!(c.target, LaunchTarget::RetroArchCore { .. }))
+            .expect("retroarch candidate");
+        (
+            candidate.readiness,
+            candidate.blockers.iter().map(|b| b.kind).collect(),
+            candidate.warnings.iter().map(|w| w.kind).collect(),
+        )
+    }
+
+    #[test]
+    fn planner_blocks_required_firmware_behind_a_dangling_link() {
+        use crate::launch::readiness::*;
+        let (readiness, blockers, _) = planner_outcome("fw-plan-dangling", |f| {
+            std::os::unix::fs::symlink(f.path("elsewhere/gone.bin"), f.path("system/bios.bin"))
+                .unwrap();
+        });
+        assert_eq!(readiness, LaunchReadiness::Blocked);
+        assert!(blockers.contains(&LaunchBlockerKind::RequiredFirmwareMissing));
+    }
+
+    /// PINS today's policy: an unhashed present firmware (real file OR a link
+    /// to one) is `FirmwarePresentUnverified` => `ReadyWithWarnings`, which the
+    /// GUI turns into "no Play". Changing that is the owner's separate
+    /// decision; when it happens this test must change in the same diff.
+    #[test]
+    fn planner_pins_present_unverified_for_real_file_and_readable_link_alike() {
+        use crate::launch::readiness::*;
+        let real = planner_outcome("fw-plan-real", |f| f.write("system/bios.bin", "x"));
+        let linked = planner_outcome("fw-plan-link", |f| {
+            f.write("elsewhere/bios.bin", "x");
+            std::os::unix::fs::symlink(f.path("elsewhere/bios.bin"), f.path("system/bios.bin"))
+                .unwrap();
+        });
+        assert_eq!(real, linked);
+        assert_eq!(real.0, LaunchReadiness::ReadyWithWarnings);
+        assert!(real.1.is_empty());
+        assert_eq!(real.2, vec![LaunchWarningKind::FirmwarePresentUnverified]);
+    }
+
+    #[test]
+    fn unreadable_link_target_is_inaccessible_never_a_pass() {
+        use std::os::unix::fs::PermissionsExt;
+        let info = fw_info(&[("a.bin", false)]);
+        let (_f, found) = firmware_probe_fixture("fw-eacces-open", info.as_bytes(), |f| {
+            f.write("elsewhere/a.bin", "x");
+            fs::set_permissions(f.path("elsewhere/a.bin"), fs::Permissions::from_mode(0o000))
+                .unwrap();
+            std::os::unix::fs::symlink(f.path("elsewhere/a.bin"), f.path("system/a.bin")).unwrap();
+        });
+        let readable_anyway = fs::File::open(
+            std::env::temp_dir()
+                .join(format!(
+                    "archivefs-retroarch-env-fw-eacces-open-{}",
+                    std::process::id()
+                ))
+                .join("elsewhere/a.bin"),
+        )
+        .is_ok(); // running as root ignores mode bits
+        if readable_anyway {
+            return;
+        }
+        assert_eq!(presences(&found), vec![FirmwarePresence::Unknown]);
+
+        // EACCES on canonicalize: a directory component without search permission.
+        let (f2, found2) = firmware_probe_fixture("fw-eacces-canon", info.as_bytes(), |f| {
+            f.write("locked/a.bin", "x");
+            std::os::unix::fs::symlink(f.path("locked/a.bin"), f.path("system/a.bin")).unwrap();
+            fs::set_permissions(f.path("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        });
+        let _ = fs::set_permissions(f2.path("locked"), fs::Permissions::from_mode(0o755));
+        assert_eq!(presences(&found2), vec![FirmwarePresence::Unknown]);
     }
 
     #[test]

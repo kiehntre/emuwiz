@@ -1197,6 +1197,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn link_whose_resolution_is_denied_is_unknown_not_correct() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("src.bin"), b"x").unwrap();
+        let link = dir.path().join("link");
+        symlink(locked.join("src.bin"), &link).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let state = inspect_target(&link);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        if fs::metadata(locked.join("src.bin")).is_ok()
+            && state == BiosTargetState::ExistingCorrectLink
+        {
+            return; // privileged runner ignores mode bits
+        }
+        assert_eq!(state, BiosTargetState::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dangling_or_looping_link_is_not_reported_as_correct() {
         use std::os::unix::fs::symlink;
         let dir = tempdir().unwrap();
