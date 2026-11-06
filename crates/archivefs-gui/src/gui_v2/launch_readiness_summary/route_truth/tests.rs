@@ -202,7 +202,7 @@ fn repeated_frames_run_the_expensive_check_once_and_changes_rerun_it() {
         "a",
         vec![candidate("mesen", &rom, LaunchContainerKind::PlainFile)],
     );
-    let mut cache = RouteCache::with_assessor(counting);
+    let mut cache = RouteCache::with_assessor(counting).with_revalidate(Duration::ZERO);
     let base = RUNS.load(Ordering::SeqCst);
     // 200 repaints while the worker runs, then 200 after it finished.
     for _ in 0..200 {
@@ -218,8 +218,14 @@ fn repeated_frames_run_the_expensive_check_once_and_changes_rerun_it() {
     assert_eq!(RUNS.load(Ordering::SeqCst) - base, 1);
 
     // A changed media file is a new key: Checking, then a fresh run.
+    // The worker's stamp look notices it; the answer is then recomputed.
     std::fs::write(&rom, b"changed contents").unwrap();
-    assert_eq!(cache.poll(1, &rom, &a, None), Answer::Pending);
+    let start = Instant::now();
+    while RUNS.load(Ordering::SeqCst) - base < 2 {
+        let _ = cache.poll(1, &rom, &a, None);
+        assert!(start.elapsed() < Duration::from_secs(10), "no recheck");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     wait_known(&mut cache, 1, &rom, &a);
     assert_eq!(RUNS.load(Ordering::SeqCst) - base, 2);
 
@@ -248,7 +254,8 @@ fn an_outdated_worker_response_is_discarded() {
         "b",
         vec![candidate("mesen", &rom, LaunchContainerKind::PlainFile)],
     );
-    let mut cache = RouteCache::with_assessor(slow_by_key);
+    let mut cache =
+        RouteCache::with_assessor(slow_by_key).with_revalidate(Duration::from_secs(3600));
     assert_eq!(cache.poll(1, &rom, &a, None), Answer::Pending);
     // Selection moves on before A's worker returns: B must never read as
     // A's (Constructible) answer.
@@ -307,4 +314,102 @@ fn a_constructible_route_keeps_its_warning_and_play() {
         ReadinessPresentationState::ReadyWithWarnings
     );
     assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+}
+
+#[test]
+fn adapters_that_accept_warnings_are_not_blamed_on_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let rom = dir.path().join("game.3dsx");
+    std::fs::write(&rom, b"x").unwrap();
+    for adapter in ["azahar", "vita3k", "xroar", "shadps4"] {
+        let input = warned(adapter, &rom);
+        let mut summary = ready_summary(&input);
+        apply(&mut summary, &assess(&input));
+        assert!(
+            !summary.headline.contains("held back by a warning"),
+            "{adapter}: {}",
+            summary.headline
+        );
+    }
+}
+
+static CHECKS: AtomicUsize = AtomicUsize::new(0);
+fn checking_then_constructible(_: &LaunchReadinessInput) -> RouteVerdict {
+    if CHECKS.fetch_add(1, Ordering::SeqCst) == 0 {
+        RouteVerdict::Refused(RouteRefusal {
+            status: ReadinessPresentationState::Checking,
+            headline: "c".into(),
+            explanation: "c".into(),
+            action: ReadinessAction::RecheckReadiness,
+        })
+    } else {
+        RouteVerdict::Constructible
+    }
+}
+
+#[test]
+fn a_still_checking_answer_is_asked_again_not_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let rom = dir.path().join("game.nes");
+    std::fs::write(&rom, b"x").unwrap();
+    let a = input(
+        "a",
+        vec![candidate("mesen", &rom, LaunchContainerKind::PlainFile)],
+    );
+    let mut cache =
+        RouteCache::with_assessor(checking_then_constructible).with_revalidate(Duration::ZERO);
+    let start = Instant::now();
+    loop {
+        if cache.poll(1, &rom, &a, None) == Answer::Known(RouteVerdict::Constructible) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "stuck on Checking"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn panicking(_: &LaunchReadinessInput) -> RouteVerdict {
+    panic!("simulated worker failure");
+}
+
+#[test]
+fn a_panicking_worker_does_not_leave_the_game_checking_for_ever() {
+    let dir = tempfile::tempdir().unwrap();
+    let rom = dir.path().join("game.nes");
+    std::fs::write(&rom, b"x").unwrap();
+    let a = input(
+        "a",
+        vec![candidate("mesen", &rom, LaunchContainerKind::PlainFile)],
+    );
+    let mut cache = RouteCache::with_assessor(panicking).with_revalidate(Duration::from_secs(3600));
+    let RouteVerdict::Refused(refusal) = wait_known(&mut cache, 1, &rom, &a) else {
+        panic!("a failed check must not read as Constructible");
+    };
+    assert_eq!(refusal.status, ReadinessPresentationState::Blocked);
+}
+
+#[test]
+fn the_authoritys_own_reason_wins_over_a_warning_or_route_guess() {
+    use crate::launch_readiness_page::{GamerBlocker, GamerBlockerKind};
+    let dir = tempfile::tempdir().unwrap();
+    let rom = dir.path().join("game.gb");
+    std::fs::write(&rom, b"x").unwrap();
+    let input = warned("sameboy", &rom);
+    let LaunchReadinessInput::Plan { plan, .. } = &input else {
+        unreachable!()
+    };
+    let refusal = refusal_for(
+        plan,
+        &plan.candidates[0],
+        GamerBlocker {
+            kind: GamerBlockerKind::NoSafeEmulator,
+            emulator: None,
+            detail: "Bubblewrap is missing".into(),
+        },
+    );
+    assert!(refusal.explanation.contains("Bubblewrap is missing"));
+    assert!(!refusal.headline.contains("warning"));
 }
