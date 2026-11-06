@@ -707,6 +707,11 @@ impl PlayingLibraryPageState {
         };
         self.dat_platform_identity = Some(resolved.dat_platform_identity());
 
+        // A cancel raised while this job was still queued must not pay for
+        // the source walk first.
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let scan = collect_source_files_reported(std::slice::from_ref(&source_root), 20_000, 16);
         if !scan.incomplete.is_empty() {
             self.error = Some(format!(

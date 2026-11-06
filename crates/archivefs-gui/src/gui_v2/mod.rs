@@ -1490,7 +1490,7 @@ impl App {
         self.playing_library_generation = self.playing_library_generation.wrapping_add(1);
         let generation = self.playing_library_generation;
         let input_fingerprint = self.playing_library.input_fingerprint();
-        let id = self.activity.queue(
+        let id = self.activity.queue_with(
             match kind {
                 PlayingLibraryJobKind::Preview => "Planning your playing library",
                 PlayingLibraryJobKind::Apply => "Building your playing library",
@@ -1508,7 +1508,11 @@ impl App {
             Route::Section(Section::Build),
             // A preview only reads files, so it can stop between files; every
             // other kind writes or undoes and must run to its own safe end.
-            kind == PlayingLibraryJobKind::Preview,
+            if kind == PlayingLibraryJobKind::Preview {
+                activity::CancelPolicy::SafeNow
+            } else {
+                activity::CancelPolicy::NotCancellable
+            },
         );
         self.playing_library_job = Some(PlayingLibraryJob {
             id,
