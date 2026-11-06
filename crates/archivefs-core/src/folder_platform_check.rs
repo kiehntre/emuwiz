@@ -378,17 +378,14 @@ pub fn header_signals(bytes: &[u8]) -> Vec<Signal> {
             "GBA header with the fixed value and a valid complement check",
         ));
     }
-    if let Some(md) = crate::megadrive_header_evidence::parse_megadrive_header(bytes) {
-        if md.console_name_recognized {
-            if let Some(platform) =
-                crate::megadrive_header_evidence::console_name_platform(&md.console_name)
-            {
-                out.push(signal(
-                    platform,
-                    "SEGA console name in the cartridge header",
-                ));
-            }
-        }
+    if let Some(platform) = crate::megadrive_header_evidence::parse_megadrive_header(bytes)
+        .filter(|md| md.console_name_recognized)
+        .and_then(|md| crate::megadrive_header_evidence::console_name_platform(&md.console_name))
+    {
+        out.push(signal(
+            platform,
+            "SEGA console name in the cartridge header",
+        ));
     }
     out
 }
@@ -398,7 +395,7 @@ pub fn header_signals(bytes: &[u8]) -> Vec<Signal> {
 /// a typical start-up opcode. Heuristic: never promoted above Probable.
 pub fn nes_structure(bytes: &[u8]) -> Option<Signal> {
     const BANK: usize = 16 * 1024;
-    if bytes.is_empty() || bytes.len() % 8192 != 0 || bytes.len() > 2 * 1024 * 1024 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(8192) || bytes.len() > 2 * 1024 * 1024 {
         return None;
     }
     if crate::nes_header_evidence::parse_ines_header(bytes).is_some() {
