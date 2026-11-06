@@ -99,8 +99,10 @@ desktop_file="$data_home/applications/$desktop_id.desktop"
 #      starter config is written, because the application refuses to start
 #      on that layout and a starter config in either folder would not help.
 #      "Empty" is a plain directory with no entries; a symlink (dangling or
-#      not), a file, an unreadable directory or one holding anything at all
-#      counts as established.
+#      not), a file, an unreadable or unsearchable directory (listing it
+#      needs search permission here, where the application needs only read
+#      permission - a fail-closed difference) or one holding anything at
+#      all counts as established.
 # The application additionally treats Blue's first-start gui-v2.json as
 # disposable. This script cannot verify that without the binary, so such a
 # folder counts as established here and, beside a legacy one, nothing is
@@ -2989,9 +2991,14 @@ esac
 
 printf '\n'
 printf 'Next steps:\n'
-printf '  1. Edit %s (mount_root). Source folders can be managed entirely\n' "$config_file"
-printf '     from the app from now on - see the Sources page in the GUI, or\n'
-printf '     emuwiz-cli sources / source add / source scan.\n'
+if [ -n "$config_root" ]; then
+    printf '  1. Edit %s (mount_root). Source folders can be managed entirely\n' "$config_file"
+    printf '     from the app from now on - see the Sources page in the GUI, or\n'
+    printf '     emuwiz-cli sources / source add / source scan.\n'
+else
+    printf '  1. Resolve the configuration directory first (see the warning above),\n'
+    printf '     then copy config.toml.example there as config.toml and edit mount_root.\n'
+fi
 if [ "$path_has_bin_dir" -eq 1 ]; then
     printf '  2. Run: emuwiz-cli doctor\n'
     printf '  3. Run: emuwiz-cli config-check\n'
