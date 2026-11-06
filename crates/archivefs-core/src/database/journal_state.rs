@@ -65,15 +65,27 @@ fn regular_len(path: &Path, what: &str) -> Result<Option<u64>> {
     }
 }
 
-/// Refuses when a rollback journal exists that SQLite might treat as hot or
-/// that cannot be read. Accepts: absent, zero-length, or header-zeroed.
-pub(super) fn require_inert_rollback_journal(database_path: &Path) -> Result<()> {
+/// What the rollback journal beside a database currently looks like, without
+/// opening the database through SQLite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RollbackJournalState {
+    /// No `-journal` sidecar.
+    Absent,
+    /// Zero-length or header-zeroed: SQLite ignores it.
+    Inert,
+    /// A non-zero header: SQLite would roll it back on the next open unless a
+    /// writer still holds its RESERVED lock. `bytes` is the journal length.
+    LiveHeader { bytes: u64 },
+}
+
+/// Inspects the rollback journal sidecar. Never opens the database.
+pub(super) fn rollback_journal_state(database_path: &Path) -> Result<RollbackJournalState> {
     let journal = sidecar(database_path, "-journal");
     let Some(len) = regular_len(&journal, "rollback journal")? else {
-        return Ok(());
+        return Ok(RollbackJournalState::Absent);
     };
     if len == 0 {
-        return Ok(());
+        return Ok(RollbackJournalState::Inert);
     }
     let mut file = open_nofollow(&journal).map_err(|error| {
         refuse(format!(
@@ -91,16 +103,198 @@ pub(super) fn require_inert_rollback_journal(database_path: &Path) -> Result<()>
         ))
     })?;
     if head[..wanted].iter().all(|byte| *byte == 0) {
-        return Ok(());
+        return Ok(RollbackJournalState::Inert);
     }
-    Err(refuse(format!(
-        "A rollback journal ({}, {len} bytes) with a live header sits beside the library \
-         database. It may be a hot journal from an interrupted write, and opening the database \
-         would make SQLite roll it back and delete it. EmuWiz will not recover it silently: \
-         preserve the database and the journal together, close other users cleanly, and follow \
-         the copy-first recovery procedure. Nothing was changed.",
-        journal.display()
-    )))
+    Ok(RollbackJournalState::LiveHeader { bytes: len })
+}
+
+/// Byte offsets of SQLite's advisory lock bytes in the main database file
+/// (os_unix.c: `PENDING_BYTE` is 0x40000000; RESERVED follows it; the SHARED
+/// range starts after that). They are fixed by the file format, not tunable.
+const SQLITE_PENDING_BYTE: u64 = 0x4000_0000;
+const SQLITE_RESERVED_BYTE: u64 = SQLITE_PENDING_BYTE + 1;
+
+/// One record lock from `/proc/locks`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordLock {
+    write: bool,
+    /// `None` for open-file-description locks, which `/proc/locks` reports
+    /// without an owning process.
+    pid: Option<u32>,
+    start: u64,
+    /// Inclusive; `None` means to end of file.
+    end: Option<u64>,
+}
+
+impl RecordLock {
+    fn covers(&self, byte: u64) -> bool {
+        self.start <= byte && self.end.is_none_or(|end| byte <= end)
+    }
+}
+
+/// Every record lock currently held on `path`'s inode, read from
+/// `/proc/locks`.
+///
+/// Why not `fcntl(F_GETLK)`: that needs a descriptor on the file, and on
+/// POSIX closing *any* descriptor a process has on a file drops every record
+/// lock that process holds on it. A probe that opened and closed the live
+/// database would therefore silently release the locks of a SQLite
+/// connection in this very process (its own `BEGIN IMMEDIATE`, or a running
+/// scan's transaction). `/proc/locks` answers without touching the file.
+fn record_locks_on(path: &Path) -> Result<Vec<RecordLock>> {
+    use std::os::unix::fs::MetadataExt;
+    let inode = fs::symlink_metadata(path)
+        .map_err(|error| {
+            refuse(format!(
+                "could not inspect {} to read its lock state: {error}. Nothing was changed.",
+                path.display()
+            ))
+        })?
+        .ino();
+    let table = fs::read_to_string("/proc/locks").map_err(|error| {
+        refuse(format!(
+            "could not read /proc/locks to judge who holds the library database: {error}. \
+             Nothing was changed."
+        ))
+    })?;
+    Ok(parse_proc_locks(&table, inode))
+}
+
+/// The record locks on `inode` listed in a `/proc/locks` table.
+fn parse_proc_locks(table: &str, inode: u64) -> Vec<RecordLock> {
+    let mut locks = Vec::new();
+    for line in table.lines() {
+        // "N: POSIX  ADVISORY  WRITE 1234 08:01:5678 1073741825 1073741825"
+        // Waiters are listed as "N: -> ..." and are not holders.
+        let mut fields = line.split_whitespace();
+        let _index = fields.next();
+        let Some(kind) = fields.next() else {
+            continue;
+        };
+        if kind == "->" {
+            continue;
+        }
+        let (Some(_class), Some(access), Some(pid), Some(file), Some(start), Some(end)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        let Some(entry_inode) = file.rsplit(':').next().and_then(|v| v.parse::<u64>().ok()) else {
+            continue;
+        };
+        if entry_inode != inode || !(kind == "POSIX" || kind == "OFDLCK") {
+            continue;
+        }
+        let Ok(start) = start.parse::<u64>() else {
+            continue;
+        };
+        let end = if end == "EOF" {
+            None
+        } else {
+            match end.parse::<u64>() {
+                Ok(end) => Some(end),
+                Err(_) => continue,
+            }
+        };
+        locks.push(RecordLock {
+            write: access == "WRITE",
+            pid: pid.parse::<u32>().ok(),
+            start,
+            end,
+        });
+    }
+    locks
+}
+
+/// Whether any SQLite connection, in this process or another, currently holds
+/// a write lock (RESERVED or PENDING) on the database file. Never takes a
+/// lock, never opens the file.
+pub(super) fn sqlite_write_lock_held(database_path: &Path) -> Result<bool> {
+    Ok(record_locks_on(database_path)?.iter().any(|lock| {
+        lock.write && (lock.covers(SQLITE_RESERVED_BYTE) || lock.covers(SQLITE_PENDING_BYTE))
+    }))
+}
+
+/// Whether *this process* holds any record lock on the database file. While
+/// it does, no code in this process may open and close the file with plain
+/// I/O (hashing, fsync): the close would drop those locks underneath the
+/// SQLite connection that believes it still holds them.
+pub(super) fn own_process_holds_lock(database_path: &Path) -> Result<bool> {
+    let pid = std::process::id();
+    Ok(record_locks_on(database_path)?
+        .iter()
+        .any(|lock| lock.pid == Some(pid)))
+}
+
+/// Why a rollback journal with a live header stopped an operation. Every
+/// variant refuses; the distinction only changes what the user is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LiveJournalVerdict {
+    /// A SQLite write lock is held on the database right now: a writer in
+    /// some process is mid-transaction. Wait and retry.
+    WriterActive,
+    /// No write lock is visible. Either a writer crashed and left a hot
+    /// journal, or a writer EmuWiz cannot see (another locking VFS, a network
+    /// filesystem, an unreadable lock table) is still active. Not decided.
+    ActivityUndetermined,
+}
+
+/// Classifies a live-header journal. The kernel's lock table is the writer
+/// lifecycle signal: SQLite holds its RESERVED lock from the first write of a
+/// transaction until commit or rollback, so "held" is proof of a live writer.
+/// "Not held" proves nothing on its own (a commit between the journal read
+/// and the lock read deletes the journal, and some configurations have no
+/// visible locks), so the journal is re-read and the answer stays neutral.
+pub(super) fn classify_live_journal(database_path: &Path) -> Result<Option<LiveJournalVerdict>> {
+    let RollbackJournalState::LiveHeader { .. } = rollback_journal_state(database_path)? else {
+        return Ok(None);
+    };
+    match sqlite_write_lock_held(database_path) {
+        Ok(true) => Ok(Some(LiveJournalVerdict::WriterActive)),
+        Ok(false) => match rollback_journal_state(database_path)? {
+            RollbackJournalState::LiveHeader { .. } => {
+                Ok(Some(LiveJournalVerdict::ActivityUndetermined))
+            }
+            // The writer committed in between; nothing is left to judge.
+            RollbackJournalState::Absent | RollbackJournalState::Inert => Ok(None),
+        },
+        Err(_) => Ok(Some(LiveJournalVerdict::ActivityUndetermined)),
+    }
+}
+
+/// Refuses when a rollback journal exists that SQLite might treat as hot or
+/// that cannot be read. Accepts: absent, zero-length, or header-zeroed.
+///
+/// A journal with a live header always refuses. The message says "a writer
+/// is active" only when the kernel shows SQLite's write lock held; otherwise
+/// it says database activity cannot be determined. It never claims a crash,
+/// never opens the database and never touches the journal.
+pub(super) fn require_inert_rollback_journal(database_path: &Path) -> Result<()> {
+    let journal = sidecar(database_path, "-journal");
+    match classify_live_journal(database_path)? {
+        None => Ok(()),
+        Some(LiveJournalVerdict::WriterActive) => Err(refuse(format!(
+            "Another EmuWiz worker or process is writing the library database right now (its \
+             rollback journal {} is open and its write lock is held). Wait for that scan or \
+             action to finish and try again. Nothing was changed.",
+            journal.display()
+        ))),
+        Some(LiveJournalVerdict::ActivityUndetermined) => Err(refuse(format!(
+            "Database activity cannot be determined; the library database was not opened. A \
+             rollback journal ({}) with a live header sits beside it and no SQLite write lock \
+             is visible: a writer may have been interrupted, or a writer EmuWiz cannot see may \
+             still be running. Opening the database could make SQLite roll that journal back \
+             and delete it, so EmuWiz will not. Close every other EmuWiz window and process, \
+             preserve the database and the journal together, and follow the copy-first recovery \
+             procedure in docs/DATABASE_RECOVERY.md. Nothing was changed.",
+            journal.display()
+        ))),
+    }
 }
 
 struct WalChecksum {
@@ -258,4 +452,196 @@ pub(super) fn require_consistent_wal(database_path: &Path) -> Result<()> {
 pub(super) fn require_reconcilable_for_migration(database_path: &Path) -> Result<()> {
     require_inert_rollback_journal(database_path)?;
     require_consistent_wal(database_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn database(path: &Path) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE t(v INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        connection
+    }
+
+    #[test]
+    fn write_lock_probe_sees_a_reserved_lock_held_in_this_process() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("library.sqlite3");
+        let writer = database(&path);
+        assert!(!sqlite_write_lock_held(&path).unwrap());
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(sqlite_write_lock_held(&path).unwrap());
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert!(!sqlite_write_lock_held(&path).unwrap());
+    }
+
+    #[test]
+    fn lock_probe_never_touches_the_file_so_it_cannot_drop_our_own_locks() {
+        // POSIX drops a process's record locks on a file when it closes any
+        // descriptor on it. The probe must therefore be side-effect free:
+        // after probing, a second in-process writer must still be refused.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("library.sqlite3");
+        let writer = database(&path);
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(own_process_holds_lock(&path).unwrap());
+        for _ in 0..3 {
+            assert!(sqlite_write_lock_held(&path).unwrap());
+            assert!(own_process_holds_lock(&path).unwrap());
+        }
+        let second = rusqlite::Connection::open(&path).unwrap();
+        second
+            .busy_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        let error = second.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert!(error.to_string().contains("locked"), "{error}");
+        // And the documented hazard really exists: a plain open+close of the
+        // file by this process releases the writer's lock.
+        drop(fs::File::open(&path).unwrap());
+        assert!(!sqlite_write_lock_held(&path).unwrap());
+        assert!(!own_process_holds_lock(&path).unwrap());
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn live_journal_with_running_writer_is_refused_as_busy_not_hot() {
+        // D1-01: a second writer meeting a spilled transaction must be told
+        // the database is busy, not that it has a hot journal to recover.
+        // SQLite leaves the journal header zeroed (inert) until the page
+        // cache spills, so the writer is made to spill with a tiny cache.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("library.sqlite3");
+        let writer = database(&path);
+        writer
+            .execute_batch("PRAGMA cache_size = 10; BEGIN IMMEDIATE;")
+            .unwrap();
+        let payload = "x".repeat(900);
+        let mut spilled = false;
+        for _ in 0..4000 {
+            writer
+                .execute("INSERT INTO t VALUES (?1)", [&payload])
+                .unwrap();
+            if matches!(
+                rollback_journal_state(&path).unwrap(),
+                RollbackJournalState::LiveHeader { .. }
+            ) {
+                spilled = true;
+                break;
+            }
+        }
+        assert!(
+            spilled,
+            "the writer's transaction never spilled to its journal"
+        );
+        assert!(sqlite_write_lock_held(&path).unwrap());
+        assert_eq!(
+            classify_live_journal(&path).unwrap(),
+            Some(LiveJournalVerdict::WriterActive)
+        );
+        let error = require_inert_rollback_journal(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("writing the library database right now"),
+            "{error}"
+        );
+        assert!(!error.contains("cannot be determined"), "{error}");
+        writer.execute_batch("COMMIT").unwrap();
+        assert_eq!(classify_live_journal(&path).unwrap(), None);
+        assert_eq!(
+            rollback_journal_state(&path).unwrap(),
+            RollbackJournalState::Absent
+        );
+        require_inert_rollback_journal(&path).unwrap();
+    }
+
+    #[test]
+    fn proc_locks_parser_reads_holders_only_and_both_lock_families() {
+        let table = "\
+1: POSIX  ADVISORY  WRITE 4242 08:01:777 1073741825 1073741825
+1: -> POSIX  ADVISORY  WRITE 4243 08:01:777 1073741825 1073741825
+2: OFDLCK ADVISORY  READ  -1 08:01:777 1073741826 1073742335
+3: FLOCK  ADVISORY  WRITE 4244 08:01:777 0 EOF
+4: POSIX  ADVISORY  WRITE 4245 08:01:778 0 EOF
+5: LEASE  ACTIVE    WRITE 4246 08:01:777 0 EOF
+garbage line
+";
+        let locks = parse_proc_locks(table, 777);
+        assert_eq!(
+            locks,
+            vec![
+                RecordLock {
+                    write: true,
+                    pid: Some(4242),
+                    start: 1073741825,
+                    end: Some(1073741825)
+                },
+                RecordLock {
+                    write: false,
+                    pid: None,
+                    start: 1073741826,
+                    end: Some(1073742335)
+                },
+            ]
+        );
+        assert!(locks[0].covers(SQLITE_RESERVED_BYTE));
+        assert!(!locks[0].covers(SQLITE_PENDING_BYTE));
+        assert!(locks[1].covers(SQLITE_PENDING_BYTE + 2));
+        assert!(parse_proc_locks("", 777).is_empty());
+        assert_eq!(parse_proc_locks(table, 778).len(), 1);
+        assert!(parse_proc_locks(table, 778)[0].covers(u64::MAX));
+    }
+
+    #[test]
+    fn live_journal_without_a_visible_writer_is_undetermined_and_preserved() {
+        // A crashed writer and an invisible writer look the same from here:
+        // refuse with a neutral message, open nothing, touch nothing.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("library.sqlite3");
+        drop(database(&path));
+        let journal = sidecar(&path, "-journal");
+        let header = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7, 0, 0, 0, 1];
+        fs::write(&journal, header).unwrap();
+        let database_before = fs::read(&path).unwrap();
+        assert_eq!(
+            classify_live_journal(&path).unwrap(),
+            Some(LiveJournalVerdict::ActivityUndetermined)
+        );
+        let error = require_inert_rollback_journal(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Database activity cannot be determined"),
+            "{error}"
+        );
+        assert!(!error.to_lowercase().contains("crash"), "{error}");
+        assert!(!error.contains("hot journal"), "{error}");
+        assert!(error.contains("Nothing was changed"), "{error}");
+        assert_eq!(
+            fs::read(&journal).unwrap(),
+            header,
+            "journal must be preserved byte for byte"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            database_before,
+            "database must not be opened or rolled back"
+        );
+        assert_eq!(fs::metadata(&journal).unwrap().len(), 12);
+        // Zero-length and header-zeroed journals are inert.
+        fs::write(&journal, [0_u8; 12]).unwrap();
+        assert_eq!(
+            rollback_journal_state(&path).unwrap(),
+            RollbackJournalState::Inert
+        );
+        require_inert_rollback_journal(&path).unwrap();
+        fs::write(&journal, b"").unwrap();
+        assert_eq!(
+            rollback_journal_state(&path).unwrap(),
+            RollbackJournalState::Inert
+        );
+    }
 }

@@ -414,16 +414,68 @@ fn database_restore_receipt_operation(
     receipt: &crate::DatabaseRestoreReceipt,
     journal_reference: Option<String>,
 ) -> OperationRecord {
+    use crate::DatabaseRestoreState as Restore;
     let state = match receipt.state {
-        crate::DatabaseRestoreState::Completed => OperationState::Completed,
-        crate::DatabaseRestoreState::RolledBack => OperationState::RolledBack,
-        crate::DatabaseRestoreState::Failed | crate::DatabaseRestoreState::RollbackFailed => {
-            OperationState::Failed
-        }
-        _ => OperationState::Stale,
+        Restore::Completed => OperationState::Completed,
+        Restore::RolledBack => OperationState::RolledBack,
+        Restore::Failed | Restore::RollbackFailed => OperationState::Failed,
+        _ => OperationState::Interrupted,
     };
     let recoverable =
         receipt.emergency_backup_path.is_some() && receipt.emergency_backup_sha256.is_some();
+    // An interrupted receipt is judged against the files as they are now, so
+    // History reports what is on disk rather than the last stage written.
+    let assessment = (!receipt.state.is_terminal())
+        .then(|| {
+            journal_reference
+                .as_deref()
+                .map(Path::new)
+                .and_then(|path| crate::assess_interrupted_restore(path).ok())
+        })
+        .flatten();
+    let summary = match (&assessment, receipt.original_intact) {
+        (Some(assessment), _) => format!("{} Next: {}", assessment.summary, assessment.next_step),
+        (None, Some(true)) if state == OperationState::Failed => {
+            format!("{} (original database intact)", receipt.message)
+        }
+        _ => receipt.message.clone(),
+    };
+    let rollback_available = state == OperationState::Completed && recoverable;
+    let (classification, explanation) = match (state, &assessment) {
+        (OperationState::Completed, _) if rollback_available => (
+            RecoveryClassification::SafeToRollback,
+            "The verified emergency backup can put the pre-restore database back after fresh validation of both files.".to_string(),
+        ),
+        (OperationState::Interrupted, Some(assessment)) => (
+            RecoveryClassification::RequiresReview,
+            if assessment.can_finalise() {
+                "The restore was interrupted; reconcile it to record the truthful outcome. No database file is changed by reconciliation.".to_string()
+            } else {
+                assessment.next_step.clone()
+            },
+        ),
+        (OperationState::Interrupted, None) => (
+            RecoveryClassification::RequiresReview,
+            "The restore was interrupted and its receipt could not be assessed; review the database directory.".to_string(),
+        ),
+        (OperationState::Failed, _) if receipt.original_intact == Some(true) => (
+            RecoveryClassification::Unrecoverable,
+            "Nothing to recover: the restore stopped before the original database was replaced.".to_string(),
+        ),
+        (OperationState::Failed, _) if recoverable => (
+            RecoveryClassification::RequiresReview,
+            "Review this receipt before any further action: the original database is preserved in the verified emergency backup.".to_string(),
+        ),
+        (OperationState::RolledBack, _) => (
+            RecoveryClassification::Unrecoverable,
+            "The original database was put back; the emergency backup is retained as evidence.".to_string(),
+        ),
+        _ => (
+            RecoveryClassification::Unrecoverable,
+            "Restore evidence is incomplete; no automatic recovery action is available.".to_string(),
+        ),
+    };
+    let review_available = recoverable || assessment.as_ref().is_some_and(|a| a.can_finalise());
     OperationRecord {
         schema_version: OPERATION_RECEIPT_SCHEMA_VERSION,
         operation_id: receipt.operation_id.clone(),
@@ -446,6 +498,7 @@ fn database_restore_receipt_operation(
                 format!("live_size:{}", receipt.plan.expected_live_size_bytes),
                 format!("live_sha256:{}", receipt.plan.expected_live_sha256),
                 format!("backup_schema:{}", receipt.plan.backup_schema_version),
+                format!("exclusion_held:{}", receipt.exclusion_held),
             ],
             destination_occupancy_checked: true,
         },
@@ -469,21 +522,18 @@ fn database_restore_receipt_operation(
                 })
                 .collect(),
             journal_reference,
-            summary: receipt.message.clone(),
+            summary,
         },
         recovery: OperationRecoveryStatus {
-            classification: if recoverable {
-                RecoveryClassification::RequiresReview
-            } else {
-                RecoveryClassification::Unrecoverable
-            },
-            explanation: if recoverable {
-                "Review this database restore receipt before any further recovery action. A rollback is only allowed after fresh validation.".into()
-            } else {
-                "Restore evidence is incomplete; no automatic recovery action is available.".into()
-            },
+            classification,
+            explanation,
             actions: OperationActionAvailability {
-                review: if recoverable {
+                review: if review_available {
+                    ActionAvailability::Available
+                } else {
+                    ActionAvailability::Unavailable
+                },
+                rollback: if rollback_available {
                     ActionAvailability::Available
                 } else {
                     ActionAvailability::Unavailable
@@ -819,7 +869,7 @@ fn upgrade_backup_record(
                 true,
                 Some(format!("sha256:{sha256}")),
                 format!(
-                    "Pre-upgrade database backup (schema {from_version} to {to_version}, {len} bytes): ownership receipt, SHA-256 and SQLite integrity verified"
+                    "Pre-upgrade database backup (schema {from_version} to {to_version}, {len} bytes): ownership receipt and SHA-256 verified, SQLite quick_check passed"
                 ),
                 "A complete owned backup is retained. Recognising it in History grants no restore, reuse or migration authority.".to_string(),
                 None,
@@ -1907,6 +1957,131 @@ mod tests {
             ActionAvailability::Unavailable
         );
         assert_eq!(stale.recovery.actions.review, ActionAvailability::Available);
+    }
+
+    fn restore_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("library.sqlite3");
+        let backup = temp.path().join("selected.backup");
+        for path in [&live, &backup] {
+            crate::Database::open_or_create(path)
+                .unwrap()
+                .close()
+                .unwrap();
+        }
+        (temp, live, backup)
+    }
+
+    #[test]
+    fn completed_restore_receipt_offers_rollback_and_names_exclusion() {
+        let (_temp, live, backup) = restore_fixture();
+        let plan = crate::prepare_database_restore(&live, &backup).unwrap();
+        crate::restore_database(&plan, "RESTORE DATABASE").unwrap();
+        let mut registry = OperationRegistry::default();
+        registry.append_database_restore_history(&live);
+        assert_eq!(registry.records.len(), 1, "{:?}", registry.problems);
+        let record = &registry.records[0];
+        assert_eq!(record.kind, OperationKind::DatabaseRecovery);
+        assert_eq!(record.state, OperationState::Completed);
+        assert_eq!(
+            record.recovery.actions.rollback,
+            ActionAvailability::Available
+        );
+        assert_eq!(
+            record.recovery.classification,
+            RecoveryClassification::SafeToRollback
+        );
+        assert!(
+            record
+                .input
+                .freshness_evidence
+                .iter()
+                .any(|e| e == "exclusion_held:true")
+        );
+        assert!(
+            record
+                .output
+                .journal_reference
+                .as_deref()
+                .is_some_and(|p| p.ends_with(".json"))
+        );
+    }
+
+    #[test]
+    fn refused_restore_receipt_says_original_intact_and_offers_nothing() {
+        let (_temp, live, backup) = restore_fixture();
+        let plan = crate::prepare_database_restore(&live, &backup).unwrap();
+        // Replace the backup after review: the restore must refuse before
+        // any change to the live database.
+        std::fs::write(&backup, b"gone").unwrap();
+        crate::restore_database(&plan, "RESTORE DATABASE").unwrap_err();
+        let mut registry = OperationRegistry::default();
+        registry.append_database_restore_history(&live);
+        let record = &registry.records[0];
+        assert_eq!(record.state, OperationState::Failed);
+        assert!(
+            record.output.summary.contains("original database intact"),
+            "{}",
+            record.output.summary
+        );
+        assert_eq!(
+            record.recovery.actions.rollback,
+            ActionAvailability::Unavailable
+        );
+        assert_eq!(
+            record.recovery.classification,
+            RecoveryClassification::Unrecoverable
+        );
+        assert!(record.recovery.explanation.contains("Nothing to recover"));
+    }
+
+    #[test]
+    fn interrupted_restore_receipt_is_assessed_from_disk_not_from_its_last_stage() {
+        let (_temp, live, backup) = restore_fixture();
+        let plan = crate::prepare_database_restore(&live, &backup).unwrap();
+        let crashed = {
+            let _guard = crate::database_restore_fault_injection::install(|stage| {
+                if stage == crate::database_restore_fault_injection::STAGE_AFTER_EXCHANGE {
+                    panic!("simulated crash");
+                }
+                Ok(())
+            });
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::restore_database(&plan, "RESTORE DATABASE")
+            }))
+        };
+        assert!(crashed.is_err());
+        let mut registry = OperationRegistry::default();
+        registry.append_database_restore_history(&live);
+        let record = &registry.records[0];
+        assert_eq!(record.state, OperationState::Interrupted);
+        assert!(
+            record.output.summary.contains("after the replacement"),
+            "{}",
+            record.output.summary
+        );
+        assert!(
+            record.output.summary.contains("Next:"),
+            "{}",
+            record.output.summary
+        );
+        assert_eq!(
+            record.recovery.actions.review,
+            ActionAvailability::Available
+        );
+        assert_eq!(
+            record.recovery.actions.rollback,
+            ActionAvailability::Unavailable
+        );
+        assert_eq!(
+            record.recovery.classification,
+            RecoveryClassification::RequiresReview
+        );
+        assert!(
+            registry
+                .active()
+                .any(|r| r.operation_id == record.operation_id)
+        );
     }
 
     #[test]

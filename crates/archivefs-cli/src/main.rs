@@ -3422,13 +3422,18 @@ fn format_library_status(view: &LibraryStatusView) -> String {
     ));
     if let Some(error) = &view.health.error {
         output.push_str(&format!("  Error: {error}\n"));
+        // An error with an open database means a check could not run (busy,
+        // locked, or recovery pending), not that the catalogue is healthy.
+        output
+            .push_str("  Next: emuwiz-cli database-check (the catalogue was not judged healthy)\n");
     }
 
     if !view.health.database_opens {
         output.push_str(
-            "\nThe database file exists but could not be opened. It is always safe to \
-             delete it and run emuwiz-cli library-scan to rebuild it from your \
-             configured source folders.\n",
+            "\nThe database file exists but could not be opened. Preserve a copy of it \
+             and any -journal/-wal files first (see docs/DATABASE_RECOVERY.md); it can \
+             then be rebuilt with emuwiz-cli library-scan from your configured source \
+             folders.\n",
         );
         return output;
     }

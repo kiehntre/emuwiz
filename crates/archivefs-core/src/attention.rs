@@ -406,8 +406,15 @@ pub fn operation_attention(record: &OperationRecord) -> Option<AttentionItem> {
         OperationKind::DiscConversion => (C::Conversion, D::DiscConversion),
         OperationKind::DiscoveryImport => (C::Recovery, D::History),
     };
+    // A database restore refused before any change (original intact, nothing
+    // to recover) is a notice, not a blocker: no file was touched.
+    let refused_before_change = record.kind == OperationKind::DatabaseRecovery
+        && record.state == OperationState::Failed
+        && record.recovery.classification == RecoveryClassification::Unrecoverable;
     let severity = if resolved {
         AttentionSeverity::Info
+    } else if refused_before_change {
+        AttentionSeverity::ActionNeeded
     } else if record.kind == OperationKind::DatabaseRecovery
         || record.state == OperationState::RollbackBlocked
         || (record.state == OperationState::Failed

@@ -393,6 +393,27 @@ impl ArchiveFsApp {
             || self.setup_action.is_some()
     }
 
+    /// No worker of this window can be writing the library database: the
+    /// catalogue is not loading or scanning, no source, alias, platform,
+    /// missing-removal or library-view action is running, and no mount or
+    /// setup operation is in flight. Database restore, rollback and
+    /// reconciliation require this; writers in other processes are refused
+    /// by the restore's own locks.
+    pub(crate) fn database_writers_idle(&self) -> bool {
+        !self.database_state.is_loading() && !self.is_busy() && self.source_action_available()
+    }
+
+    /// After the live database file was replaced (restore, rollback or a
+    /// reconciled interrupted restore) every cached snapshot is stale.
+    pub(crate) fn reload_catalogue_after_database_replacement(&mut self, context: egui::Context) {
+        self.database_generation = self.database_generation.next();
+        let generation = self.database_generation;
+        let previous = self.database_state.snapshot().cloned().map(Box::new);
+        self.database_state =
+            crate::database_load::start_database_load(context, generation, previous, false);
+        self.shared_history = SharedHistoryState::NotLoaded;
+    }
+
     pub(crate) fn new(context: egui::Context) -> Self {
         Self::new_with_initial_load(context, true)
     }

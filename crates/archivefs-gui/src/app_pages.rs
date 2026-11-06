@@ -1617,6 +1617,8 @@ pub(crate) fn show_pages(
             }
 
             if app.view == MainView::HistoryLogs {
+                let database_writers_busy =
+                    app.database_state.is_loading() || busy || !app.source_action_available();
                 let history_action = show_history_logs_page(
                     ui,
                     &app.shared_history,
@@ -1626,9 +1628,10 @@ pub(crate) fn show_pages(
                     &mut app.history_filters,
                     &mut app.clipboard,
                     &mut app.doctor_repair.database_restore_plan,
+                    &mut app.doctor_repair.database_rollback_receipt,
                     &mut app.doctor_repair.database_restore_confirmation,
                     &mut app.doctor_repair.database_restore_feedback,
-                    app.database_state.is_loading() || busy,
+                    database_writers_busy,
                 );
                 match history_action {
                     Some(HistoryPageAction::PreviewRollback {
@@ -1652,6 +1655,7 @@ pub(crate) fn show_pages(
                         app.shared_history = SharedHistoryState::NotLoaded;
                     }
                     Some(HistoryPageAction::ReviewDatabaseRestore { backup_path }) => {
+                        app.doctor_repair.database_rollback_receipt = None;
                         match default_database_path()
                             .and_then(|live| archivefs_core::prepare_database_restore(live, backup_path))
                         {
@@ -1664,19 +1668,69 @@ pub(crate) fn show_pages(
                         }
                     }
                     Some(HistoryPageAction::ExecuteDatabaseRestore) => {
-                        if app.database_state.is_loading() || app.is_busy() {
-                            app.doctor_repair.database_restore_feedback = Some("Database is busy loading or scanning; restore remains blocked until it is idle.".into());
+                        // In-process writers (catalogue load, scans, source and
+                        // platform actions) are refused here; writers in other
+                        // processes are refused by the restore's own locks.
+                        if !app.database_writers_idle() {
+                            app.doctor_repair.database_restore_feedback = Some("Database is busy loading, scanning or applying an action; restore remains blocked until it is idle.".into());
                         } else if let Some(plan) = app.doctor_repair.database_restore_plan.clone() {
                             match archivefs_core::restore_database(&plan, &app.doctor_repair.database_restore_confirmation) {
                                 Ok(result) => {
                                     app.doctor_repair.database_restore_feedback = Some(format!("{} Emergency backup: {}", result.receipt.message, result.emergency_backup_path.display()));
                                     app.doctor_repair.database_restore_plan = None;
                                     app.doctor_repair.database_restore_confirmation.clear();
-                                    app.database_generation = app.database_generation.next();
-                                    let generation = app.database_generation;
-                                    let previous = app.database_state.snapshot().cloned().map(Box::new);
-                                    app.database_state = start_database_load(context.clone(), generation, previous, false);
+                                    app.reload_catalogue_after_database_replacement(context.clone());
+                                }
+                                Err(error) => {
+                                    // The executor already finalised its receipt; keep the plan so
+                                    // the user can retry once the database is idle.
+                                    app.doctor_repair.database_restore_feedback = Some(error.to_string());
                                     app.shared_history = SharedHistoryState::NotLoaded;
+                                }
+                            }
+                        }
+                    }
+                    Some(HistoryPageAction::ReviewDatabaseRollback { receipt_path }) => {
+                        app.doctor_repair.database_restore_plan = None;
+                        match archivefs_core::review_database_rollback(&receipt_path) {
+                            Ok(receipt) => {
+                                app.doctor_repair.database_rollback_receipt = Some(receipt);
+                                app.doctor_repair.database_restore_confirmation.clear();
+                                app.doctor_repair.database_restore_feedback = None;
+                            }
+                            Err(error) => app.doctor_repair.database_restore_feedback = Some(error.to_string()),
+                        }
+                    }
+                    Some(HistoryPageAction::ExecuteDatabaseRollback) => {
+                        if !app.database_writers_idle() {
+                            app.doctor_repair.database_restore_feedback = Some("Database is busy loading, scanning or applying an action; rollback remains blocked until it is idle.".into());
+                        } else if let Some(receipt) = app.doctor_repair.database_rollback_receipt.clone() {
+                            match archivefs_core::rollback_database_restore(&receipt, &app.doctor_repair.database_restore_confirmation) {
+                                Ok(updated) => {
+                                    app.doctor_repair.database_restore_feedback = Some(updated.message.clone());
+                                    app.doctor_repair.database_rollback_receipt = None;
+                                    app.doctor_repair.database_restore_confirmation.clear();
+                                    app.reload_catalogue_after_database_replacement(context.clone());
+                                }
+                                Err(error) => {
+                                    app.doctor_repair.database_restore_feedback = Some(error.to_string());
+                                    app.shared_history = SharedHistoryState::NotLoaded;
+                                }
+                            }
+                        }
+                    }
+                    Some(HistoryPageAction::ReconcileInterruptedRestore { receipt_path }) => {
+                        if !app.database_writers_idle() {
+                            app.doctor_repair.database_restore_feedback = Some("Database is busy; reconciliation remains blocked until it is idle.".into());
+                        } else {
+                            match archivefs_core::finalise_interrupted_restore(&receipt_path, "RESTORE DATABASE") {
+                                Ok(assessment) => {
+                                    app.doctor_repair.database_restore_feedback = Some(format!("Reconciled: {}", assessment.receipt.message));
+                                    if assessment.receipt.original_intact == Some(false) {
+                                        app.reload_catalogue_after_database_replacement(context.clone());
+                                    } else {
+                                        app.shared_history = SharedHistoryState::NotLoaded;
+                                    }
                                 }
                                 Err(error) => app.doctor_repair.database_restore_feedback = Some(error.to_string()),
                             }

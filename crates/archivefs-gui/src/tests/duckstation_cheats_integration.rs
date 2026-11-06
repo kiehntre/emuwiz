@@ -422,6 +422,7 @@ fn duckstation_cheats_install_a_batch_in_one_operation_and_undo_it_from_one_hist
                 &mut filters,
                 &mut clipboard,
                 &mut None,
+                &mut None,
                 &mut String::new(),
                 &mut None,
                 false,

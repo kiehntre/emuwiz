@@ -1058,6 +1058,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         database_generation: DatabaseGeneration::INITIAL,
         doctor_repair: DoctorRepairState {
             database_restore_plan: None,
+            database_rollback_receipt: None,
             database_restore_confirmation: String::new(),
             database_restore_feedback: None,
             diagnostics: DiagnosticsState::Ready {
