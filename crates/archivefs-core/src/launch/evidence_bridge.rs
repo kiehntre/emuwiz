@@ -150,7 +150,7 @@ fn find_value(resolved: &[(IdentityKind, String)], kind: IdentityKind) -> Option
 
 /// Matches [`crate::platform::Platform::id`]'s existing values for exactly
 /// the platforms [`GameIdentityReport`] can identify - never invented here.
-fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
+pub fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
     match platform {
         IdentityPlatform::PlayStation => Some("PSX"),
         IdentityPlatform::Amiga => Some("Amiga"),

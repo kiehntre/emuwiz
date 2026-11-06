@@ -284,6 +284,18 @@ pub(super) fn identity_next_step(
     }
 }
 
+/// True when identity is unknown for a reason with no identity screen
+/// (no identity check for the system, unsupported file format, Amiga HDF/IPF):
+/// only a readiness recheck applies.
+pub(super) fn has_no_identity_route(input: &launch_readiness_page::LaunchReadinessInput) -> bool {
+    matches!(
+        input,
+        launch_readiness_page::LaunchReadinessInput::IdentityUnknown(reason)
+            if !reason.has_identity_screen()
+                && *reason != launch_readiness_page::IdentityUnknownReason::UnsupportedArchive
+    )
+}
+
 /// True when the identity problem is an archive format with no identity route.
 pub(super) fn is_unsupported_archive(input: &launch_readiness_page::LaunchReadinessInput) -> bool {
     matches!(
@@ -635,7 +647,8 @@ impl NativeWorkflows {
             // a worker error. Let a repaired file use the same bounded retry.
             let retry_readiness = (readiness_error.is_some()
                 || offers_review_identity(&input)
-                || is_unsupported_archive(&input))
+                || is_unsupported_archive(&input)
+                || has_no_identity_route(&input))
                 && ui
                     .add_enabled(!launch_active, egui::Button::new("Retry readiness check"))
                     .clicked();

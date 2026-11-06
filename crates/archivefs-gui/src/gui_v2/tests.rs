@@ -8747,6 +8747,7 @@ fn knowledge(
         ecosystem: Some("No-Intro"),
         candidates: vec!["Amidar (USA)".into(), "Amidar (Europe)".into()],
         technical: "SHA-1 abc".into(),
+        header: Default::default(),
     }
 }
 

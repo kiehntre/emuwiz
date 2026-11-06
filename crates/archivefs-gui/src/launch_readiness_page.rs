@@ -136,20 +136,59 @@ pub(crate) enum IdentityUnknownReason {
     /// The system is known (or hinted) but the file's own evidence did not
     /// confirm which game this is.
     NotConfirmed,
+    /// The system is known but EmuWiz has no identity check for it at all
+    /// (the payload is the system's display name). Nothing is wrong with the
+    /// file and no screen can change that.
+    NoIdentityCheck(&'static str),
+    /// The system has an identity check, but it does not read this file's
+    /// format (the payload is the system's display name).
+    UnsupportedFormat(&'static str),
+    /// A bare Amiga hard-disk image (HDF): not an identity-checked game file.
+    AmigaHardDisk,
+    /// An Amiga IPF preservation image: not an identity-checked game file.
+    AmigaIpf,
 }
 
 impl IdentityUnknownReason {
-    pub(crate) fn blocker_text(self) -> &'static str {
+    /// True when the Review identity screen could show something actionable.
+    /// For the other reasons only a plain "Recheck readiness" is offered.
+    /// The other reasons have no identity route, so no "Verify identity" or
+    /// "Review identity" action is offered for them.
+    pub(crate) fn has_identity_screen(self) -> bool {
+        matches!(self, Self::SystemNotChosen | Self::NotConfirmed)
+    }
+
+    /// Plain sentence under the page for reasons that have no identity
+    /// screen and no action (`None` for the others).
+    pub(crate) fn no_action_note(self) -> Option<String> {
+        match self {
+            Self::NoIdentityCheck(_)
+            | Self::UnsupportedFormat(_)
+            | Self::AmigaHardDisk
+            | Self::AmigaIpf => Some(self.banner_body()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn blocker_text(self) -> String {
         match self {
             Self::SystemNotChosen => {
-                "No system is chosen for this game yet. Choose the system on the identity screen."
+                "No system is chosen for this game yet. Choose the system on the identity screen.".into()
             }
             Self::UnsupportedArchive => {
-                "This archive format is not supported for launch identity. Extract the game or use a supported format, then recheck."
+                "This archive format is not supported for launch identity. Extract the game or use a supported format, then recheck.".into()
             }
             Self::NotConfirmed => {
-                "The game's own file evidence did not confirm which game this is. Verify identity shows what was found."
+                "The game's own file evidence did not confirm which game this is. Verify identity shows what was found.".into()
             }
+            Self::NoIdentityCheck(system) => format!(
+                "EmuWiz has no identity check for {system} yet, so it cannot start this game. This is not caused by missing DAT verification."
+            ),
+            Self::UnsupportedFormat(system) => format!(
+                "EmuWiz's {system} identity check does not read this file format yet, so it cannot start this game."
+            ),
+            Self::AmigaHardDisk => format!("Amiga hard-disk image. {AMIGA_HDF_NOTE}"),
+            Self::AmigaIpf => format!("Amiga IPF image. {AMIGA_IPF_NOTE}"),
         }
     }
 
@@ -158,27 +197,52 @@ impl IdentityUnknownReason {
             Self::SystemNotChosen => "System not chosen",
             Self::UnsupportedArchive => "Archive format not supported",
             Self::NotConfirmed => "Identity unresolved",
+            Self::NoIdentityCheck(_) => "No identity check for this system yet",
+            Self::UnsupportedFormat(_) => "File format not supported yet",
+            Self::AmigaHardDisk => "Amiga hard-disk image",
+            Self::AmigaIpf => "Amiga IPF image",
         }
     }
 
-    pub(crate) fn banner_body(self) -> &'static str {
+    pub(crate) fn banner_body(self) -> String {
         match self {
             Self::SystemNotChosen => {
                 "EmuWiz has no trusted system for this game, so it cannot pick an emulator. \
-                 Choose the system, then check readiness again. This is not about DAT verification."
+                 Choose the system, then check readiness again. This is not about DAT verification.".into()
             }
             Self::UnsupportedArchive => {
                 "EmuWiz cannot read a game identity from this kind of archive and will not guess one. \
                  Extract the game from the archive or use a supported format, then recheck. \
-                 This is not about DAT verification."
+                 This is not about DAT verification.".into()
             }
             Self::NotConfirmed => {
                 "This game's identity could not be verified by the standard scan from its own file evidence. \
-                 Native CD review, when available, checks separate catalogue evidence before offering launch."
+                 Native CD review, when available, checks separate catalogue evidence before offering launch.".into()
             }
+            Self::NoIdentityCheck(system) => format!(
+                "EmuWiz has no identity check for {system} yet, so it cannot start this game. \
+                 This is not caused by missing DAT verification. Support for {system} is not \
+                 available yet. Recheck readiness after any change."
+            ),
+            Self::UnsupportedFormat(system) => format!(
+                "EmuWiz's {system} identity check does not read this file format yet, so it \
+                 cannot confirm which game this is or start it. This is not caused by missing \
+                 DAT verification. Support for this format is not available yet."
+            ),
+            Self::AmigaHardDisk => format!(
+                "{AMIGA_HDF_NOTE} EmuWiz does not check a bare hard-disk image's identity, so it \
+                 cannot start it from here. This is not caused by missing DAT verification."
+            ),
+            Self::AmigaIpf => format!(
+                "{AMIGA_IPF_NOTE} EmuWiz does not check an IPF image's identity, so it \
+                 cannot start it from here. This is not caused by missing DAT verification."
+            ),
         }
     }
 }
+
+const AMIGA_HDF_NOTE: &str = archivefs_core::amiga_game_readiness::HARD_DISK_NOTE;
+const AMIGA_IPF_NOTE: &str = archivefs_core::amiga_game_readiness::IPF_NOTE;
 
 /// Everything [`show_launch_readiness_panel`] needs, gathered by the caller
 /// from existing App/MainView state before this module ever runs. Every
@@ -3607,7 +3671,7 @@ pub(crate) fn show_launch_readiness_panel(
             widgets::banner(
                 ui,
                 reason.banner_title(),
-                reason.banner_body(),
+                &reason.banner_body(),
                 widgets::StatusTone::Pending,
             );
         }

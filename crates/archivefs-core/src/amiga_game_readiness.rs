@@ -716,6 +716,11 @@ fn play_noun(machine: AmigaCdMachine, media: AmigaMediaKind) -> String {
     }
 }
 
+/// Honest explanations of HDF / IPF media, shared with the identity wording.
+pub const HARD_DISK_NOTE: &str = "It needs a hard-drive entry in the emulator's configuration; its contents are not proof of a complete game.";
+pub const IPF_NOTE: &str =
+    "Emulators need the CAPS/SPS library for IPF; EmuWiz cannot confirm it is installed.";
+
 fn media_check(machine: AmigaCdMachine, media: AmigaMediaKind) -> (AmigaCheckState, String) {
     use AmigaCheckState::{Blocked, Ready, Warning};
     let cd_machine = machine != AmigaCdMachine::OrdinaryAmiga;
@@ -744,7 +749,7 @@ fn media_check(machine: AmigaCdMachine, media: AmigaMediaKind) -> (AmigaCheckSta
         ),
         AmigaMediaKind::Ipf => (
             Warning,
-            "IPF preservation image. Emulators need the CAPS/SPS library for IPF; EmuWiz cannot confirm it is installed.".into(),
+            format!("IPF preservation image. {IPF_NOTE}"),
         ),
         AmigaMediaKind::Hfe => (
             Blocked,
@@ -752,7 +757,7 @@ fn media_check(machine: AmigaCdMachine, media: AmigaMediaKind) -> (AmigaCheckSta
         ),
         AmigaMediaKind::HardDisk => (
             Warning,
-            "Hard-disk image. It needs a hard-drive entry in the emulator's configuration; its contents are not proof of a complete game.".into(),
+            format!("Hard-disk image. {HARD_DISK_NOTE}"),
         ),
         AmigaMediaKind::WhdloadPackage => (
             Ready,
