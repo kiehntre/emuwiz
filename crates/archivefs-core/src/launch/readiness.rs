@@ -610,6 +610,12 @@ pub enum LaunchWarningKind {
     CemuKeysPresentUnverified,
     SameBoyRomHeaderChecksumInvalid,
     SameBoyCustomBootRomUnavailable,
+    /// A RetroArch core was matched to CHD content, but whether the installed
+    /// core build can actually read CHD cannot be proven without running it
+    /// (its `.info` lists `chd` for every build, including builds without
+    /// CHD support). Launch is not blocked; a route with known CHD support
+    /// is preferred when one is ready.
+    RetroArchChdSupportUnconfirmed,
 }
 
 impl LaunchWarningKind {

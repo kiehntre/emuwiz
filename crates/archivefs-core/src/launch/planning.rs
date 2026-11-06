@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 
 use crate::emulator_environment::retroarch::{
-    CoreInfoFinding, ProfileRef, RetroArchEnvironmentReport,
+    CoreInfoFinding, ProfileKind, ProfileRef, RetroArchEnvironmentReport,
 };
 use crate::launch::amiga_whdload_command::{SelectedWHDLoadSlave, VerifiedWHDLoadTarget};
 use crate::launch::platform_map::{launch_compatibility_for_platform, retroarch_platform_matches};
@@ -461,6 +461,36 @@ fn matching_retroarch_cores(
     matches
 }
 
+/// Whether a RetroArch core's CHD support is something this planner cannot
+/// vouch for. Only PlayStation is covered: the Beetle PSX build installed by
+/// some distributions predates CHD support while its `.info` still lists
+/// `chd`, so the metadata proves nothing about the binary.
+fn retroarch_chd_support_unconfirmed(
+    platform_id: &str,
+    core_stem: &str,
+    content: &LaunchContentRef,
+) -> bool {
+    platform_id == "PSX"
+        && psx_chd_content(content)
+        && !PSX_CHD_CAPABLE_RETROARCH_CORES.contains(&core_stem)
+}
+
+/// RetroArch PlayStation cores known to read CHD: SwanStation is built on
+/// DuckStation and booted CHD discs in a sandboxed smoke test. Every other
+/// RetroArch PSX core (Beetle PSX and its aliased copies) is not on this list
+/// because some distribution builds predate CHD support while their `.info`
+/// still lists `chd`.
+pub(crate) const PSX_CHD_CAPABLE_RETROARCH_CORES: &[&str] = &["swanstation"];
+
+fn psx_chd_content(content: &LaunchContentRef) -> bool {
+    content.container == Some(LaunchContainerKind::Chd)
+        || content.resolved_path.as_deref().is_some_and(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("chd"))
+        })
+}
+
 fn build_retroarch_candidates(
     platform_id: &'static str,
     content: &LaunchContentRef,
@@ -511,6 +541,15 @@ fn build_retroarch_candidates(
                     ),
                 ));
             }
+            if retroarch_chd_support_unconfirmed(platform_id, &found.core_stem, content) {
+                warnings.push(LaunchWarning::new(
+                    LaunchWarningKind::RetroArchChdSupportUnconfirmed,
+                    format!(
+                        "RetroArch core {} lists CHD as supported, but this installed build may not be able to read CHD; this is not confirmed until it is run",
+                        found.core_stem
+                    ),
+                ));
+            }
             let readiness = readiness_from(&blockers, &warnings);
             let preference = if hinted.contains(&found.core_stem) {
                 CandidatePreference::SoleEligible
@@ -538,6 +577,14 @@ fn build_retroarch_candidates(
 /// surfaces [`LaunchWarningKind::MultipleEligibleProfiles`] when more than
 /// one is eligible and nothing is remembered.
 fn apply_preference(candidates: &mut [LaunchCandidate], remembered: &[RememberedPreference]) {
+    // A blocked candidate can never be the preferred one: a reviewed core hint
+    // on a candidate that cannot launch must not outrank (or hide) a ready
+    // route.
+    for candidate in candidates.iter_mut() {
+        if candidate.readiness == LaunchReadiness::Blocked {
+            candidate.preference = CandidatePreference::Undetermined;
+        }
+    }
     let eligible_indices: Vec<usize> = candidates
         .iter()
         .enumerate()
@@ -565,6 +612,63 @@ fn apply_preference(candidates: &mut [LaunchCandidate], remembered: &[Remembered
         candidates[index].preference = CandidatePreference::Remembered;
         return;
     }
+
+    // PlayStation CHD content: prefer the route with the strongest CHD
+    // evidence, but only when that route can really start. Tier 0 is a known
+    // CHD-capable RetroArch core (SwanStation), tier 1 the standalone
+    // DuckStation adapter, tier 2 every other RetroArch PSX core. The best
+    // tier that has a clean candidate (Ready, no warning, not a Flatpak
+    // profile, which cannot be launched) is kept for automatic selection and
+    // every other PSX CHD candidate is demoted to an explicit choice. When no
+    // candidate is clean nothing is demoted. Other candidates are untouched.
+    let chd_tier = |candidate: &LaunchCandidate| -> Option<u8> {
+        if !psx_chd_content(&candidate.content) {
+            return None;
+        }
+        match &candidate.target {
+            LaunchTarget::RetroArchCore {
+                platform_id,
+                core_stem,
+                ..
+            } if *platform_id == "PSX" => Some(
+                if PSX_CHD_CAPABLE_RETROARCH_CORES.contains(&core_stem.as_str()) {
+                    0
+                } else {
+                    2
+                },
+            ),
+            LaunchTarget::Standalone { adapter_id, .. } if *adapter_id == "duckstation" => Some(1),
+            _ => None,
+        }
+    };
+    let clean = |candidate: &LaunchCandidate| {
+        candidate.readiness == LaunchReadiness::Ready
+            && candidate.warnings.is_empty()
+            && !matches!(
+                &candidate.target,
+                LaunchTarget::RetroArchCore { profile, .. }
+                    if profile.profile_kind == ProfileKind::Flatpak
+            )
+    };
+    let best_clean_tier = eligible_indices
+        .iter()
+        .filter(|&&index| clean(&candidates[index]))
+        .filter_map(|&index| chd_tier(&candidates[index]))
+        .min();
+    let eligible_indices = match best_clean_tier {
+        Some(best) => {
+            let mut kept = Vec::new();
+            for &index in &eligible_indices {
+                match chd_tier(&candidates[index]) {
+                    None => kept.push(index),
+                    Some(tier) if tier == best && clean(&candidates[index]) => kept.push(index),
+                    Some(_) => candidates[index].preference = CandidatePreference::Undetermined,
+                }
+            }
+            kept
+        }
+        None => eligible_indices,
+    };
 
     // `build_retroarch_candidates` has already resolved the reviewed
     // single-hint case. Preserve that deterministic choice instead of

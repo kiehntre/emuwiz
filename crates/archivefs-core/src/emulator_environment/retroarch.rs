@@ -3817,6 +3817,45 @@ mod tests {
     }
 
     #[test]
+    fn aliased_symlink_cores_are_not_offered_as_separate_cores() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("core-alias");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "libretro_directory = \"{}\"\n",
+                fixture.path("cores").display()
+            ),
+        );
+        fixture.mkdir("cores");
+        fixture.write("cores/mednafen_psx_libretro.so", "stub");
+        for alias in ["pcsx_rearmed", "mednafen_psx_hw"] {
+            symlink(
+                fixture.path("cores/mednafen_psx_libretro.so"),
+                fixture.path(&format!("cores/{alias}_libretro.so")),
+            )
+            .unwrap();
+        }
+
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        let stems: Vec<&str> = report.profiles[0]
+            .cores
+            .iter()
+            .map(|core| core.core_stem.as_str())
+            .collect();
+        assert_eq!(stems, ["mednafen_psx"]);
+        assert_eq!(
+            report.profiles[0]
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == "core_symlink_skipped")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn matching_info_file_is_parsed() {
         let fixture = Fixture::new("core-info");
         fixture.write(
