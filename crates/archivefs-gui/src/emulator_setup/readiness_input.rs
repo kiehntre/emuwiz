@@ -1514,10 +1514,10 @@ fn is_archive_container(path: &std::path::Path) -> bool {
 /// record exists at all (`None` outer = no live record, so "no system" cannot
 /// be claimed). "System not chosen" means no platform hint is recorded and
 /// none was identified; it is a reading of that evidence, not a trust grant.
-/// A ZIP is never called unsupported where ZIP cartridges are a route
-/// (a failed or ambiguous cartridge ZIP stays "not confirmed"), and a ZIP
-/// with no platform is a missing system because choosing one makes it
-/// inspectable. Other containers (7z, rar, ...) have no identity route.
+/// A ZIP is never called unsupported (it is native content on many systems);
+/// a ZIP with no platform is a missing system because choosing one makes it
+/// inspectable, otherwise it stays "not confirmed". Only other containers
+/// (7z, rar, ...) have no identity route.
 pub(crate) fn identity_unknown_reason(
     focused: Option<&std::path::Path>,
     report: Option<&archivefs_core::game_identity::GameIdentityReport>,
@@ -1541,6 +1541,9 @@ pub(crate) fn identity_unknown_reason(
         && report.format == IdentityImageFormat::Unsupported
         && is_archive_container(path)
     {
+        // A ZIP is native content on many systems (arcade sets must stay
+        // zipped), so it is never "unsupported"; it falls through to the
+        // system / not-confirmed reasons below.
         let is_zip = path
             .extension()
             .and_then(|x| x.to_str())
@@ -1548,14 +1551,6 @@ pub(crate) fn identity_unknown_reason(
         if !is_zip {
             return Reason::UnsupportedArchive;
         }
-        if !platform_known {
-            return system_missing;
-        }
-        return if archivefs_core::zip_cartridge_select::is_loose_cartridge_platform(platform) {
-            Reason::NotConfirmed
-        } else {
-            Reason::UnsupportedArchive
-        };
     }
     if !platform_known {
         return system_missing;
@@ -1625,17 +1620,30 @@ mod identity_reason_tests {
     }
 
     #[test]
-    fn zip_without_platform_is_choose_system_and_known_non_cartridge_zip_is_unsupported() {
+    fn zip_without_platform_is_choose_system() {
         let r = unsupported(IdentityPlatform::Other);
         assert_eq!(
             identity_unknown_reason(Some(Path::new("/g/a.zip")), Some(&r), Some(None)),
             R::SystemNotChosen
         );
-        let ps = unsupported(IdentityPlatform::PlayStation4);
-        assert_eq!(
-            identity_unknown_reason(Some(Path::new("/g/a.zip")), Some(&ps), Some(None)),
-            R::UnsupportedArchive
-        );
+    }
+
+    #[test]
+    fn zip_on_a_platform_without_an_identity_variant_is_never_unsupported() {
+        // NeoGeo / MasterSystem resolve in the platform registry but map to
+        // IdentityPlatform::Other, so the report stays at Unsupported.
+        let r = unsupported(IdentityPlatform::Other);
+        for hint in ["NeoGeo", "MasterSystem"] {
+            assert_eq!(
+                identity_unknown_reason(
+                    Some(Path::new("/g/kof98.zip")),
+                    Some(&r),
+                    Some(Some(hint))
+                ),
+                R::NotConfirmed,
+                "{hint}"
+            );
+        }
     }
 
     #[test]
