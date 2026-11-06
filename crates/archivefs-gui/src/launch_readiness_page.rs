@@ -70,6 +70,7 @@ mod rmg;
 mod sameboy;
 pub(crate) mod saturn_core;
 mod scummvm_profile;
+mod snes9x;
 mod stella;
 pub(crate) mod vice;
 pub(crate) mod vita3k;
@@ -405,6 +406,7 @@ impl TypedLaunchRequest {
             Self::Standalone(StandaloneLaunchRequest::Mgba(_)) => vec![mgba::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Rmg(_)) => vec![rmg::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Stella(_)) => vec![stella::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Snes9x(_)) => vec![snes9x::LIMITATION],
             _ => Vec::new(),
         }
     }
@@ -420,7 +422,8 @@ impl TypedLaunchRequest {
             Self::Standalone(
                 StandaloneLaunchRequest::Mgba(_)
                 | StandaloneLaunchRequest::Rmg(_)
-                | StandaloneLaunchRequest::Stella(_),
+                | StandaloneLaunchRequest::Stella(_)
+                | StandaloneLaunchRequest::Snes9x(_),
             ) => "Ready, local launch identity",
             _ => "Ready, compatibility unverified",
         }
@@ -838,6 +841,13 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                     StandaloneLaunchRequest::Stella(request),
                 ));
             }
+            // Snes9x: the same click-time rediscovery, content and identity
+            // recheck, Core preflight and spawn as the Gold panel's offer.
+            if let Some(Ok(request)) = snes9x::offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Snes9x(request),
+                ));
+            }
             if let Some(request) = azahar
                 .as_ref()
                 .and_then(|context| context.request(plan, candidate))
@@ -1113,6 +1123,7 @@ pub(crate) enum StandaloneProcess {
     Mgba(archivefs_core::launch::process_spawn::WatchedProcess),
     Desmume(archivefs_core::launch::process_spawn::WatchedProcess),
     Stella(archivefs_core::launch::process_spawn::WatchedProcess),
+    Snes9x(archivefs_core::launch::process_spawn::WatchedProcess),
     SameBoy(archivefs_core::launch::LaunchedSameBoyProcess),
     Rmg(archivefs_core::launch::process_spawn::WatchedProcess),
     AmiberryCd(archivefs_core::launch::LaunchedAmiberryCdProcess),
@@ -1390,6 +1401,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Mgba(p) => p.poll().is_some(),
                     StandaloneProcess::Desmume(p) => p.poll().is_some(),
                     StandaloneProcess::Stella(p) => p.poll().is_some(),
+                    StandaloneProcess::Snes9x(p) => p.poll().is_some(),
                     StandaloneProcess::SameBoy(p) => p.poll().is_some(),
                     StandaloneProcess::Rmg(p) => p.poll().is_some(),
                     StandaloneProcess::AmiberryCd(p) => p.poll().is_some(),
@@ -1462,6 +1474,9 @@ impl StandaloneLaunchState {
             }
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Stella(process)))) => {
                 process.exit_report().and_then(stella::exit_failure)
+            }
+            Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Snes9x(process)))) => {
+                process.exit_report().and_then(snes9x::exit_failure)
             }
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::SameBoy(process)))) => {
                 process.exit_report().and_then(sameboy::exit_failure)
@@ -1637,6 +1652,7 @@ pub(crate) enum StandaloneLaunchRequest {
     Mgba(mgba::Request),
     Desmume(desmume::Request),
     Stella(stella::Request),
+    Snes9x(snes9x::Request),
     SameBoy(sameboy::Request),
     Rmg(rmg::Request),
     AmiberryCd(amiberry_cd::Request),
@@ -1691,6 +1707,7 @@ impl StandaloneLaunchRequest {
             Self::Mgba(_) => "mGBA",
             Self::Desmume(_) => "DeSmuME",
             Self::Stella(_) => "Stella",
+            Self::Snes9x(_) => "Snes9x",
             Self::SameBoy(_) => "SameBoy",
             Self::Rmg(_) => "RMG",
             Self::AmiberryCd(_) => "Amiberry CD",
@@ -1722,6 +1739,7 @@ impl StandaloneLaunchRequest {
             Self::Mgba(r) => r.key(),
             Self::Desmume(r) => r.key(),
             Self::Stella(r) => r.key(),
+            Self::Snes9x(r) => r.key(),
             Self::SameBoy(r) => r.key(),
             Self::Rmg(r) => r.key(),
             Self::AmiberryCd(r) => r.key(),
@@ -1763,6 +1781,7 @@ impl StandaloneLaunchRequest {
             Self::Mgba(r) => r.execute().map(StandaloneProcess::Mgba),
             Self::Desmume(r) => r.execute().map(StandaloneProcess::Desmume),
             Self::Stella(r) => r.execute().map(StandaloneProcess::Stella),
+            Self::Snes9x(r) => r.execute().map(StandaloneProcess::Snes9x),
             Self::SameBoy(r) => r.execute().map(StandaloneProcess::SameBoy),
             Self::Rmg(r) => r.execute().map(StandaloneProcess::Rmg),
             Self::AmiberryCd(r) => r.execute().map(StandaloneProcess::AmiberryCd),
@@ -5089,6 +5108,8 @@ fn show_candidate(
         let desmume_blocked = matches!(desmume_offer, Some(Err(_)));
         let stella_offer = stella::offer_for(plan, candidate);
         let stella_blocked = matches!(stella_offer, Some(Err(_)));
+        let snes9x_offer = snes9x::offer_for(plan, candidate);
+        let snes9x_blocked = matches!(snes9x_offer, Some(Err(_)));
         let sameboy_offer = sameboy::offer_for(plan, candidate);
         let sameboy_blocked = matches!(sameboy_offer, Some(Err(_)));
         let rmg_offer = rmg::offer_for(plan, candidate);
@@ -5098,6 +5119,7 @@ fn show_candidate(
             || mgba_blocked
             || desmume_blocked
             || stella_blocked
+            || snes9x_blocked
             || sameboy_blocked
             || rmg_blocked)
             .then_some(("Needs attention", widgets::StatusTone::Blocked));
@@ -5287,6 +5309,9 @@ fn show_candidate(
         if let Some(offer) = stella_offer {
             stella::show_offer(ui, standalone_launch_state, offer);
         }
+        if let Some(offer) = snes9x_offer {
+            snes9x::show_offer(ui, standalone_launch_state, offer);
+        }
         if let Some(offer) = sameboy_offer {
             sameboy::show_offer(ui, standalone_launch_state, offer);
         }
@@ -5427,6 +5452,13 @@ pub(crate) fn show_standalone_launch_action(
                     "Exited"
                 }
             }
+            Some(StandaloneLaunchStage::Exited(StandaloneProcess::Snes9x(p))) => {
+                if p.exit_report().and_then(snes9x::exit_failure).is_some() {
+                    "Failed"
+                } else {
+                    "Exited"
+                }
+            }
             Some(StandaloneLaunchStage::Exited(StandaloneProcess::SameBoy(p))) => {
                 if p.exit_report().and_then(sameboy::exit_failure).is_some() {
                     "Failed"
@@ -5502,6 +5534,9 @@ pub(crate) fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Stella(p)))) => {
                 stella::show_running(ui, p);
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Snes9x(p)))) => {
+                snes9x::show_running(ui, p);
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::SameBoy(p)))) => {
                 sameboy::show_running(ui, p);
             }
@@ -5552,6 +5587,9 @@ pub(crate) fn show_standalone_launch_action(
                 }
                 if let StandaloneProcess::Stella(p) = process {
                     stella::show_exited(ui, p);
+                }
+                if let StandaloneProcess::Snes9x(p) = process {
+                    snes9x::show_exited(ui, p);
                 }
                 if let StandaloneProcess::SameBoy(p) = process {
                     sameboy::show_exited(ui, p);
@@ -5668,6 +5706,13 @@ pub(crate) fn show_standalone_launch_action(
         if adapter == "stella"
             && !state.is_active()
             && ui.button("Launch Stella again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
+        if adapter == "snes9x"
+            && !state.is_active()
+            && ui.button("Launch Snes9x again (recheck)").clicked()
         {
             state.start(request);
             return;
