@@ -2060,3 +2060,176 @@ fn finished_journal_marks_every_entry_settled_and_old_journals_still_parse() {
     assert_eq!(legacy.settled_entries, 0);
     assert!((0..3).all(|i| legacy.entry_settlement(i) == CheatInstallEntrySettlement::Settled));
 }
+
+// ---------------------------------------------------------------------
+// Rollback: no clobbering after a stale hash check, and a pending rollback
+// record before the first mutation (Night Watch S04-02 / D2-02).
+// ---------------------------------------------------------------------
+
+use crate::patch_manager::cheat_rollback::{
+    FaultPoint as RollbackFaultPoint, inject_rollback_fault_for_test,
+    set_before_destination_mutation_hook_for_test,
+};
+
+fn walk(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(root) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn d2_02_rollback_never_destroys_a_cheat_rewritten_after_its_hash_check() {
+    let fixture = crash_fixture("d2-02", "d2-02");
+    let installed = execute_cheat_install_run(&fixture.entries, &fixture.opts);
+    assert_eq!(installed.run.status, CheatInstallRunStatus::Success);
+
+    let racing = b"cheats = 1\ncheat0_desc = \"EDITED IN RETROARCH\"\n".to_vec();
+    let racing_for_hook = racing.clone();
+    set_before_destination_mutation_hook_for_test(Some(Box::new(move |path: &Path| {
+        fs::write(path, &racing_for_hook).unwrap()
+    })));
+    let outcome = fixture.rollback(true);
+    set_before_destination_mutation_hook_for_test(None);
+
+    let survivors = |root: &Path| -> usize {
+        walk(root)
+            .into_iter()
+            .filter(|p| fs::read(p).ok().as_deref() == Some(&racing[..]))
+            .count()
+    };
+    // All three racing edits (Frogger restore target, Pitfall and Zaxxon
+    // removal targets) must survive, in place or at a reported path.
+    assert_eq!(
+        survivors(&fixture.destination_root)
+            + survivors(&fixture.rollback_dir)
+            + survivors(&fixture.backup_dir),
+        3
+    );
+    assert_eq!(
+        fs::read(fixture.platform_dir().join("Frogger.cht")).unwrap(),
+        racing
+    );
+    assert_eq!(
+        fs::read(fixture.platform_dir().join("Pitfall.cht")).unwrap(),
+        racing
+    );
+    assert_ne!(outcome.run.status, CheatRollbackRunStatus::Success);
+    for entry in &outcome.run.entries {
+        assert_eq!(
+            entry.outcome,
+            CheatRollbackOutcome::FailedDestinationChanged,
+            "{}",
+            entry.message
+        );
+        assert!(!entry.wrote);
+    }
+    // No temp or parked file is left next to the user's cheats.
+    assert_eq!(
+        dir_entries(&fixture.platform_dir()),
+        vec!["Frogger.cht", "Pitfall.cht", "Zaxxon.cht"]
+    );
+    // The truthful rollback record exists and binds to the install.
+    let inspection =
+        inspect_cheat_install_journal(&fixture.journal_path(), &fixture.history_options()).unwrap();
+    assert!(inspection.rollback.exists);
+    assert_eq!(inspection.rollback.completed_successfully, Some(false));
+}
+
+#[test]
+fn rollback_fails_closed_when_its_record_cannot_be_created() {
+    let fixture = crash_fixture("rb-journal-first", "rb-journal-first");
+    execute_cheat_install_run(&fixture.entries, &fixture.opts);
+    let before = dir_entries(&fixture.platform_dir());
+
+    inject_rollback_fault_for_test(Some(RollbackFaultPoint::JournalWrite));
+    let outcome = fixture.rollback(true);
+    inject_rollback_fault_for_test(None);
+
+    assert_eq!(dir_entries(&fixture.platform_dir()), before);
+    assert_eq!(
+        fs::read(fixture.platform_dir().join("Frogger.cht")).unwrap(),
+        b"catalogue content\n",
+        "nothing may be restored without a rollback record"
+    );
+    assert_eq!(outcome.run.status, CheatRollbackRunStatus::Failed);
+    assert!(outcome.journal_path.is_none());
+    assert!(outcome.journal_error.is_some());
+    assert!(outcome.run.entries.iter().all(|entry| {
+        !entry.wrote && entry.error_code.as_deref() == Some("journal_unavailable")
+    }));
+    assert!(dir_entries(&fixture.rollback_dir).is_empty());
+}
+
+#[test]
+fn rollback_killed_mid_way_leaves_a_pending_record_and_can_be_resumed() {
+    let fixture = crash_fixture("rb-crash", "rb-crash");
+    execute_cheat_install_run(&fixture.entries, &fixture.opts);
+
+    inject_rollback_fault_for_test(Some(RollbackFaultPoint::CrashAfterEntry(0)));
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fixture.rollback(true)));
+    inject_rollback_fault_for_test(None);
+    assert!(crashed.is_err());
+
+    // Entry 0 was restored; the record says exactly that and no more.
+    assert_eq!(
+        fs::read(fixture.platform_dir().join("Frogger.cht")).unwrap(),
+        b"USER EDITED\n"
+    );
+    assert!(fixture.platform_dir().join("Pitfall.cht").exists());
+    let journals = dir_entries(&fixture.rollback_dir);
+    assert_eq!(journals, vec!["rb-crash-rollback.json".to_string()]);
+    let pending: crate::patch_manager::CheatRollbackRun =
+        crate::patch_manager::parse_cheat_rollback_run(
+            &fs::read_to_string(fixture.rollback_dir.join(&journals[0])).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(pending.status, CheatRollbackRunStatus::InProgress);
+    assert_eq!(pending.completed_at_unix_seconds, None);
+    assert_eq!(
+        pending.entries[0].outcome,
+        CheatRollbackOutcome::RestoredBackup
+    );
+    assert!(pending.entries[0].wrote);
+    assert_eq!(pending.entries[1].outcome, CheatRollbackOutcome::Pending);
+    assert_eq!(pending.entries[2].outcome, CheatRollbackOutcome::Pending);
+
+    // History binds the pending record and refuses to call it completed.
+    let inspection =
+        inspect_cheat_install_journal(&fixture.journal_path(), &fixture.history_options()).unwrap();
+    assert!(inspection.rollback.exists);
+    assert_eq!(inspection.rollback.completed_successfully, Some(false));
+
+    // A second rollback run finishes the job.
+    let resumed = execute_cheat_rollback_run(
+        &fixture.journal_path(),
+        &CheatRollbackOptions {
+            journal_path: fixture.journal_path(),
+            destination_root: fixture.destination_root.clone(),
+            backup_directory: fixture.backup_dir.clone(),
+            rollback_journal_directory: fixture.rollback_dir.clone(),
+            dry_run: false,
+            confirmed: true,
+            run_id: "rb-crash-rollback-2".into(),
+            started_at_unix_seconds: 1_700_000_200,
+        },
+    );
+    assert_eq!(resumed.run.status, CheatRollbackRunStatus::Success);
+    assert_eq!(
+        resumed.run.entries[0].outcome,
+        CheatRollbackOutcome::AlreadyRestored
+    );
+    assert_eq!(
+        resumed.run.entries[1].outcome,
+        CheatRollbackOutcome::RemovedInstalledFile
+    );
+    fixture.assert_destination_is_pre_run_state();
+}

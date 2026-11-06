@@ -1187,7 +1187,7 @@ fn create_one_directory_level(path: &Path) -> Result<(), (CheatInstallOutcome, S
 /// existence check immediately before a plain `rename` (a small, accepted
 /// TOCTOU gap - see the module doc comment).
 #[cfg(target_os = "linux")]
-fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let from_c = std::ffi::CString::new(from.as_os_str().as_bytes())
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -1213,11 +1213,51 @@ fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     if to.exists() {
         return Err(io::Error::from(io::ErrorKind::AlreadyExists));
     }
     fs::rename(from, to)
+}
+
+/// Atomically swaps the two names (`renameat2(..., RENAME_EXCHANGE)`), so
+/// whatever occupied `b` is afterwards reachable at `a` and can still be
+/// inspected - the primitive `cheat_rollback` uses to replace a file only
+/// if it still holds the expected content, with no check-then-act window.
+/// `Unsupported` where the kernel or filesystem cannot exchange.
+#[cfg(target_os = "linux")]
+pub(crate) fn rename_exchange(a: &Path, b: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let a_c = std::ffi::CString::new(a.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let b_c = std::ffi::CString::new(b.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: valid NUL-terminated C strings owned for the duration of the
+    // call; `AT_FDCWD` with absolute paths is documented `renameat2` usage.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            a_c.as_ptr(),
+            libc::AT_FDCWD,
+            b_c.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP) => {
+            Err(io::Error::new(io::ErrorKind::Unsupported, error))
+        }
+        _ => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn rename_exchange(_a: &Path, _b: &Path) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 #[cfg(test)]
