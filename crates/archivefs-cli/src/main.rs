@@ -3806,6 +3806,13 @@ struct LibraryViewRemoveJson<'a> {
     definition_removed: bool,
 }
 
+/// The core's left-untouched notes all start with "left untouched - ";
+/// the heading above the list already says that once.
+fn left_untouched_reason(error: Option<&str>) -> &str {
+    let error = error.unwrap_or("unknown reason");
+    error.strip_prefix("left untouched - ").unwrap_or(error)
+}
+
 fn count_outcome(report: &LibraryViewApplyReport, outcome: LibraryViewApplyOutcome) -> usize {
     report
         .results
@@ -3942,7 +3949,7 @@ fn print_library_view_apply_report(
             println!(
                 "  {} - {}",
                 result.relative_link_path.display(),
-                result.error.as_deref().unwrap_or("unknown reason")
+                left_untouched_reason(result.error.as_deref())
             );
         }
     }
@@ -4014,7 +4021,7 @@ fn print_library_view_remove_report(
             println!(
                 "  {} - {}",
                 result.relative_link_path.display(),
-                result.error.as_deref().unwrap_or("unknown reason")
+                left_untouched_reason(result.error.as_deref())
             );
         }
     }
