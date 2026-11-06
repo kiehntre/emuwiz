@@ -3032,7 +3032,7 @@ mod tests {
         // nothing accumulates across operations.
         let during = descriptors_under(root.path()).len();
         assert!(
-            during >= idle + 1,
+            during > idle,
             "exclusion connection must be open: {during} vs {idle}"
         );
         // A read-only connection can read; a writer in this process is refused.

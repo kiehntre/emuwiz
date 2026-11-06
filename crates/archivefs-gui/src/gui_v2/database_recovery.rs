@@ -150,14 +150,17 @@ impl State {
         self.rows.iter().any(Row::interrupted)
     }
 
+    #[cfg(test)]
     pub(super) fn rows(&self) -> &[Row] {
         &self.rows
     }
 
+    #[cfg(test)]
     pub(super) fn message(&self) -> &str {
         &self.message
     }
 
+    #[cfg(test)]
     pub(super) fn rollback_review(&self) -> Option<&DatabaseRestoreReceipt> {
         self.rollback_review.as_ref()
     }
@@ -256,6 +259,11 @@ impl State {
             self.message = refused_busy("Rollback");
             return;
         }
+        if !self.rollback_enabled(busy) {
+            self.message =
+                "Rollback needs a passed review and the exact phrase RESTORE DATABASE.".into();
+            return;
+        }
         let Some(receipt) = self.rollback_review.clone() else {
             self.message = "Review the rollback first.".into();
             return;
@@ -287,6 +295,7 @@ impl State {
         });
     }
 
+    #[cfg(test)]
     pub(super) fn set_confirmation(&mut self, text: &str) {
         self.confirmation = text.to_string();
     }
@@ -376,6 +385,12 @@ impl State {
         ui.separator();
         ui.heading("Database restore & recovery");
         ui.small("Receipts of library-database restores. Rollback puts the pre-restore database back from its verified emergency backup; reconciliation records what an interrupted restore left on disk. Both refuse while anything is writing the catalogue, and both need the same confirmation as a restore.");
+        if self.needs_attention() {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "A database restore did not finish. Reconcile it below before restoring again.",
+            );
+        }
         if busy {
             ui.label("Database actions wait until the current load, scan or background job has finished.");
         }
@@ -409,8 +424,11 @@ impl State {
                 ui.label("The pre-restore database will be put back from this verified backup. Changes made since the restore would be lost; the rollback refuses if the restored database has changed.");
                 ui.add(egui::TextEdit::singleline(&mut self.confirmation).hint_text("Type RESTORE DATABASE"));
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(enabled && self.confirmation == CONFIRMATION, egui::Button::new("Roll back restore"))
+                                                            if ui
+                        .add_enabled(
+                            enabled && self.confirmation == CONFIRMATION,
+                            egui::Button::new("Roll back restore"),
+                        )
                         .clicked()
                     {
                         rollback_request = true;
