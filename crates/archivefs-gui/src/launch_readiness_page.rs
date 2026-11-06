@@ -124,6 +124,62 @@ use eframe::egui;
 
 use crate::ui::{components as widgets, theme};
 
+/// Why launch identity is unknown, derived only from evidence already on
+/// record (never guessed). It selects wording and the next action; optional
+/// catalogue (DAT) verification is never the blocker in any of these.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IdentityUnknownReason {
+    /// No trusted platform is on record and nothing identified one.
+    SystemNotChosen,
+    /// An archive container EmuWiz has no identity route for.
+    UnsupportedArchive,
+    /// The system is known (or hinted) but the file's own evidence did not
+    /// confirm which game this is.
+    NotConfirmed,
+}
+
+impl IdentityUnknownReason {
+    pub(crate) fn blocker_text(self) -> &'static str {
+        match self {
+            Self::SystemNotChosen => {
+                "No system is chosen for this game yet. Choose the system on the identity screen."
+            }
+            Self::UnsupportedArchive => {
+                "This archive format is not supported for launch identity. Extract the game or use a supported format, then recheck."
+            }
+            Self::NotConfirmed => {
+                "The game's own file evidence did not confirm which game this is. Verify identity shows what was found."
+            }
+        }
+    }
+
+    pub(crate) fn banner_title(self) -> &'static str {
+        match self {
+            Self::SystemNotChosen => "System not chosen",
+            Self::UnsupportedArchive => "Archive format not supported",
+            Self::NotConfirmed => "Identity unresolved",
+        }
+    }
+
+    pub(crate) fn banner_body(self) -> &'static str {
+        match self {
+            Self::SystemNotChosen => {
+                "EmuWiz has no trusted system for this game, so it cannot pick an emulator. \
+                 Choose the system, then check readiness again. This is not about DAT verification."
+            }
+            Self::UnsupportedArchive => {
+                "EmuWiz cannot read a game identity from this kind of archive and will not guess one. \
+                 Extract the game from the archive or use a supported format, then recheck. \
+                 This is not about DAT verification."
+            }
+            Self::NotConfirmed => {
+                "This game's identity could not be verified by the standard scan from its own file evidence. \
+                 Native CD review, when available, checks separate catalogue evidence before offering launch."
+            }
+        }
+    }
+}
+
 /// Everything [`show_launch_readiness_panel`] needs, gathered by the caller
 /// from existing App/MainView state before this module ever runs. Every
 /// non-[`Self::Plan`] variant is a prerequisite the caller checked *without*
@@ -145,8 +201,10 @@ pub(crate) enum LaunchReadinessInput {
     #[allow(dead_code)]
     RetroArchNotScanned,
     /// `CanonicalIdentityStatus::Unknown` - identity could not be resolved
-    /// at all.
-    IdentityUnknown,
+    /// at all. The reason is derived only from evidence already on record
+    /// and decides the wording and next action; it never changes whether
+    /// launch is allowed.
+    IdentityUnknown(IdentityUnknownReason),
     /// A folder with a DOSBox config is only a candidate for explicit approval.
     DosBoxReview,
     /// A CUE/BIN disc whose files could not be resolved. The text is the
@@ -254,7 +312,7 @@ pub(crate) fn ready_to_play_result(
             save_state_version_sensitive: false,
         },
         LaunchReadinessInput::DosBoxReview
-        | LaunchReadinessInput::IdentityUnknown
+        | LaunchReadinessInput::IdentityUnknown(_)
         | LaunchReadinessInput::DiscFilesUnresolved(_)
         | LaunchReadinessInput::InspectionIncomplete => ReadyToPlayEvidence {
             item_identity,
@@ -736,10 +794,9 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                 GamerBlockerKind::UnknownSystem,
                 "Review and approve the DOSBox folder and start target on the Launch page.",
             ),
-            LaunchReadinessInput::IdentityUnknown => GamerBlocker::new(
-                GamerBlockerKind::UnknownSystem,
-                "Game identity could not be resolved.",
-            ),
+            LaunchReadinessInput::IdentityUnknown(reason) => {
+                GamerBlocker::new(GamerBlockerKind::UnknownSystem, reason.blocker_text())
+            }
             LaunchReadinessInput::DiscFilesUnresolved(detail) => {
                 GamerBlocker::new(GamerBlockerKind::ContentNeedsPreparation, detail.clone())
             }
@@ -3544,14 +3601,13 @@ pub(crate) fn show_launch_readiness_panel(
                 }
             });
         }
-        LaunchReadinessInput::IdentityUnknown => {
+        LaunchReadinessInput::IdentityUnknown(reason) => {
             tsugaru::show_unresolved(ui, standalone_launch_state);
             amiberry_cd::show_unresolved(ui, standalone_launch_state);
             widgets::banner(
                 ui,
-                "Identity unresolved",
-                "This game's identity could not be verified by the standard scan. \
-                 Native CD review, when available, checks separate catalogue evidence before offering launch.",
+                reason.banner_title(),
+                reason.banner_body(),
                 widgets::StatusTone::Pending,
             );
         }
@@ -3840,7 +3896,13 @@ fn show_plan(
             }
         });
     }
-    for candidate in &plan.candidates {
+    let display_order = gba_display_order(plan, |candidate| {
+        retroarch_launch_request_checked(plan, candidate, retroarch).is_ok()
+    });
+    for candidate in display_order
+        .into_iter()
+        .map(|index| &plan.candidates[index])
+    {
         if matches!(
             candidate.target,
             LaunchTarget::Standalone {
@@ -3885,6 +3947,46 @@ fn show_plan(
         );
     }
     open_doctor
+}
+
+/// The GBA RetroArch candidate to recommend: only when no emulator is already
+/// remembered or explicitly chosen (that choice always stands), the platform
+/// is Game Boy Advance, and the candidate is not blocked and builds a real
+/// launch request right now (`launchable`). Display only; it never changes
+/// the plan, a preference, or what Play launches.
+fn recommended_gba_candidate(
+    plan: &LaunchPlan,
+    launchable: impl Fn(&LaunchCandidate) -> bool,
+) -> Option<usize> {
+    if plan.platform_id.as_deref() != Some("Game Boy Advance")
+        || plan
+            .candidates
+            .iter()
+            .any(|c| c.preference == CandidatePreference::Remembered)
+    {
+        return None;
+    }
+    plan.candidates.iter().position(|c| {
+        matches!(c.target, LaunchTarget::RetroArchCore { .. })
+            && c.readiness != LaunchReadiness::Blocked
+            && launchable(c)
+    })
+}
+
+/// Render order for the candidate cards. The plan lists standalone emulators
+/// before RetroArch cores (core `build_launch_plan`), which buried a working
+/// RetroArch below several competing choices. For GBA the recommended
+/// RetroArch card moves to the top; all others keep their relative order.
+fn gba_display_order(
+    plan: &LaunchPlan,
+    launchable: impl Fn(&LaunchCandidate) -> bool,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..plan.candidates.len()).collect();
+    if let Some(index) = recommended_gba_candidate(plan, launchable) {
+        order.retain(|&i| i != index);
+        order.insert(0, index);
+    }
+    order
 }
 
 fn readiness_label_and_tone(readiness: LaunchReadiness) -> (&'static str, widgets::StatusTone) {
@@ -5151,9 +5253,16 @@ fn show_candidate(
         let (readiness_label, readiness_tone) =
             readiness_override.unwrap_or_else(|| readiness_label_and_tone(candidate.readiness));
 
+        let recommended = recommended_gba_candidate(plan, |c| {
+            retroarch_launch_request_checked(plan, c, retroarch).is_ok()
+        })
+        .is_some_and(|index| std::ptr::eq(&plan.candidates[index], candidate));
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(ui, readiness_label, readiness_tone);
             ui.label(egui::RichText::new(&name).strong().size(15.0));
+            if recommended {
+                widgets::status_badge(ui, "Recommended", widgets::StatusTone::Success);
+            }
         });
         ui.label(
             egui::RichText::new(&profile)

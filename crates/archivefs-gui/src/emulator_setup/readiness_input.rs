@@ -324,7 +324,11 @@ impl ReadinessSources<'_> {
                 } else if evidence_freshness.is_incomplete() {
                     LaunchReadinessInput::InspectionIncomplete
                 } else {
-                    LaunchReadinessInput::IdentityUnknown
+                    LaunchReadinessInput::IdentityUnknown(identity_unknown_reason(
+                        focused,
+                        selected_game_identity_report,
+                        focused_record.map(|r| r.mount_plan.archive.identity.platform.as_deref()),
+                    ))
                 };
             }
             archivefs_core::launch::CanonicalIdentityStatus::Conflicting => {
@@ -1491,5 +1495,202 @@ impl ReadinessSources<'_> {
             #[cfg(target_os = "linux")]
             shadps4: shadps4_context,
         }
+    }
+}
+
+/// Archive container extensions EmuWiz may meet but has no identity route for.
+fn is_archive_container(path: &std::path::Path) -> bool {
+    path.extension().and_then(|x| x.to_str()).is_some_and(|x| {
+        matches!(
+            x.to_ascii_lowercase().as_str(),
+            "zip" | "7z" | "rar" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst"
+        )
+    })
+}
+
+/// Why identity is unknown, from existing evidence only.
+///
+/// `recorded_platform` is the live library record's platform hint, if the
+/// record exists at all (`None` outer = no live record, so "no system" cannot
+/// be claimed). "System not chosen" means no platform hint is recorded and
+/// none was identified; it is a reading of that evidence, not a trust grant.
+/// A ZIP is never called unsupported (it is native content on many systems);
+/// a ZIP with no platform is a missing system because choosing one makes it
+/// inspectable, otherwise it stays "not confirmed". Only other containers
+/// (7z, rar, ...) have no identity route.
+pub(crate) fn identity_unknown_reason(
+    focused: Option<&std::path::Path>,
+    report: Option<&archivefs_core::game_identity::GameIdentityReport>,
+    recorded_platform: Option<Option<&str>>,
+) -> crate::launch_readiness_page::IdentityUnknownReason {
+    use crate::launch_readiness_page::IdentityUnknownReason as Reason;
+    use archivefs_core::game_identity::{IdentityImageFormat, IdentityPlatform};
+    let hint = recorded_platform.flatten();
+    let platform = match report.map(|r| r.platform) {
+        Some(p) if p != IdentityPlatform::Other => p,
+        _ => IdentityPlatform::from_catalogue(hint),
+    };
+    let platform_known = platform != IdentityPlatform::Other
+        || hint.is_some_and(|p| archivefs_core::canonical_platform_for_alias(p).is_some());
+    let system_missing = if recorded_platform.is_some() && !platform_known {
+        Reason::SystemNotChosen
+    } else {
+        Reason::NotConfirmed
+    };
+    if let (Some(path), Some(report)) = (focused, report)
+        && report.format == IdentityImageFormat::Unsupported
+        && is_archive_container(path)
+    {
+        // A ZIP is native content on many systems (arcade sets must stay
+        // zipped), so it is never "unsupported"; it falls through to the
+        // system / not-confirmed reasons below.
+        let is_zip = path
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("zip"));
+        if !is_zip {
+            return Reason::UnsupportedArchive;
+        }
+    }
+    if !platform_known {
+        return system_missing;
+    }
+    Reason::NotConfirmed
+}
+
+#[cfg(test)]
+mod identity_reason_tests {
+    use super::identity_unknown_reason;
+    use crate::launch_readiness_page::IdentityUnknownReason as R;
+    use archivefs_core::game_identity::{
+        GameIdentityReport, IdentityImageFormat, IdentityPlatform,
+    };
+    use std::path::Path;
+
+    fn report(platform: IdentityPlatform, format: IdentityImageFormat) -> GameIdentityReport {
+        GameIdentityReport {
+            archive_path: "x".into(),
+            platform,
+            format,
+            evidence: Vec::new(),
+            warnings: Vec::new(),
+            bytes_read: 0,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete: true,
+        }
+    }
+
+    fn unsupported(platform: IdentityPlatform) -> GameIdentityReport {
+        report(platform, IdentityImageFormat::Unsupported)
+    }
+
+    #[test]
+    fn non_zip_archive_is_unsupported() {
+        let r = unsupported(IdentityPlatform::Other);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.7z")), Some(&r), Some(None)),
+            R::UnsupportedArchive
+        );
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.rar")), Some(&r), Some(Some("GBA"))),
+            R::UnsupportedArchive
+        );
+    }
+
+    #[test]
+    fn failed_or_ambiguous_cartridge_zip_is_never_called_unsupported() {
+        // Platform known via the record hint, report still at Unsupported.
+        let r = unsupported(IdentityPlatform::Other);
+        assert_eq!(
+            identity_unknown_reason(
+                Some(Path::new("/g/a.zip")),
+                Some(&r),
+                Some(Some("Game Boy Advance"))
+            ),
+            R::NotConfirmed
+        );
+        // Platform known via the report.
+        let r = unsupported(IdentityPlatform::GameBoyAdvance);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.zip")), Some(&r), Some(None)),
+            R::NotConfirmed
+        );
+    }
+
+    #[test]
+    fn zip_without_platform_is_choose_system() {
+        let r = unsupported(IdentityPlatform::Other);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.zip")), Some(&r), Some(None)),
+            R::SystemNotChosen
+        );
+    }
+
+    #[test]
+    fn zip_on_a_platform_without_an_identity_variant_is_never_unsupported() {
+        // NeoGeo / MasterSystem resolve in the platform registry but map to
+        // IdentityPlatform::Other, so the report stays at Unsupported.
+        let r = unsupported(IdentityPlatform::Other);
+        for hint in ["NeoGeo", "MasterSystem"] {
+            assert_eq!(
+                identity_unknown_reason(
+                    Some(Path::new("/g/kof98.zip")),
+                    Some(&r),
+                    Some(Some(hint))
+                ),
+                R::NotConfirmed,
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_live_record_never_claims_system_not_chosen() {
+        let r = unsupported(IdentityPlatform::Other);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.zip")), Some(&r), None),
+            R::NotConfirmed
+        );
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.bin")), None, None),
+            R::NotConfirmed
+        );
+    }
+
+    #[test]
+    fn no_platform_anywhere_means_choose_system() {
+        let r = unsupported(IdentityPlatform::Other);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.bin")), Some(&r), Some(None)),
+            R::SystemNotChosen
+        );
+        assert_eq!(
+            identity_unknown_reason(
+                Some(Path::new("/g/a.bin")),
+                None,
+                Some(Some("not a platform"))
+            ),
+            R::SystemNotChosen
+        );
+    }
+
+    #[test]
+    fn known_platform_without_confirmation_is_not_confirmed() {
+        let r = report(IdentityPlatform::Other, IdentityImageFormat::Deferred);
+        assert_eq!(
+            identity_unknown_reason(
+                Some(Path::new("/g/a.gba")),
+                Some(&r),
+                Some(Some("Game Boy Advance"))
+            ),
+            R::NotConfirmed
+        );
+        let known = report(IdentityPlatform::PlayStation, IdentityImageFormat::Deferred);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.bin")), Some(&known), Some(None)),
+            R::NotConfirmed
+        );
     }
 }

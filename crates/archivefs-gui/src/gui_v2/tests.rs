@@ -9702,7 +9702,9 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
     assert!(shows(&strings, &format!("{count} verified")), "{strings:?}");
     // Launch: unchanged policy, but never a contradictory "not confirmed"
     use super::launch_readiness_summary::{ReadinessFreshness, note_catalogue_verified, project};
-    let input = crate::launch_readiness_page::LaunchReadinessInput::IdentityUnknown;
+    let input = crate::launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
+        crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+    );
     let mut for_verified = project(&input, ReadinessFreshness::Current);
     note_catalogue_verified(&mut for_verified);
     assert!(
@@ -9738,9 +9740,11 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
         unresolved_summary.explanation
     );
     assert!(!unresolved_summary.headline.contains("Verified"));
+    // Identity is unconfirmed (not conflicting, not a missing system), so the
+    // one fix offered is Verify identity.
     assert_eq!(
         unresolved_summary.primary_action,
-        Some(super::launch_readiness_summary::ReadinessAction::ReviewIdentity)
+        Some(super::launch_readiness_summary::ReadinessAction::VerifyIdentity)
     );
 }
 
