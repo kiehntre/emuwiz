@@ -4529,6 +4529,7 @@ fn plan_proposal(
         sanitisation_notes: Vec::new(),
         actionable: state == ProposalState::Suggested,
         audited_identity: None,
+        audited_fingerprint: None,
         is_outer_archive: false,
     }
 }

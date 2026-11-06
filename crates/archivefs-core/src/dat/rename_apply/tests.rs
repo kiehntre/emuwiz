@@ -56,6 +56,7 @@ fn proposal(source: &str, current: &str, proposed: &str, state: ProposalState) -
         sanitisation_notes: Vec::new(),
         actionable: state == ProposalState::Suggested,
         audited_identity: None,
+        audited_fingerprint: None,
         is_outer_archive: false,
     }
 }
@@ -2569,7 +2570,15 @@ fn a_completed_transaction_cannot_be_applied_twice() {
         &cancel,
     )
     .unwrap_err();
-    assert_eq!(error, ApplyError::NothingApproved);
+    // Identity Lock: the renamed-away source is named with its reason rather
+    // than collapsing into an empty batch.
+    assert_eq!(
+        error,
+        ApplyError::SourceChangedSinceAudit(vec![ChangedSource {
+            path: source.clone(),
+            reason: SourceChangeReason::Missing,
+        }])
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3701,7 +3710,15 @@ fn outer_transaction_construction_refuses_an_object_replaced_after_planning() {
     std::fs::write(&source, b"replacement archive").unwrap();
 
     let error = build_transaction(&plan, &approved_of(&[&source]), 1).unwrap_err();
-    assert_eq!(error, ApplyError::NothingApproved);
+    // Identity Lock: the replaced archive is named with its reason rather
+    // than silently dropped into an empty batch.
+    assert_eq!(
+        error,
+        ApplyError::SourceChangedSinceAudit(vec![ChangedSource {
+            path: source.clone(),
+            reason: SourceChangeReason::IdentityChanged,
+        }])
+    );
 }
 
 #[test]

@@ -60,8 +60,9 @@ pub use exact_resume::{
     inspect_exact_resume, resume_exact_transaction,
 };
 pub use executor::{
-    ApplyError, ApplyExecution, ApplyOutcome, HardConflictMode, apply_transaction,
-    build_transaction, build_transaction_entries, is_approved,
+    ApplyError, ApplyExecution, ApplyOutcome, BuiltEntries, ChangedSource, HardConflictMode,
+    SourceChangeReason, apply_transaction, build_transaction, build_transaction_entries,
+    is_approved,
 };
 pub use history::{
     RECOVERY_HISTORY_STATE_FILE, RecoveryCleanupClassification, RecoveryHistoryState,
@@ -96,6 +97,9 @@ pub use rollback::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod identity_binding_tests;
 
 #[cfg(test)]
 mod integrity_audit_tests;
