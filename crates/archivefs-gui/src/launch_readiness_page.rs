@@ -5040,6 +5040,20 @@ fn gamer_blocker_for_plan(
         return GamerBlocker::new(GamerBlockerKind::ContentNeedsPreparation, detail);
     }
 
+    // Only a RetroArch PlayStation core whose CHD support cannot be confirmed
+    // is available: say so and name the routes that can play it.
+    if plan.candidates.iter().any(|candidate| {
+        candidate
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == LaunchWarningKind::RetroArchChdSupportUnconfirmed)
+    }) {
+        return GamerBlocker::new(
+            GamerBlockerKind::NoSafeEmulator,
+            "The installed RetroArch PlayStation core may not be able to read CHD files, so Play is not offered. Install or set up the SwanStation RetroArch core or DuckStation to play this game.",
+        );
+    }
+
     if let Some(candidate) = plan.candidates.iter().find(|candidate| {
         candidate.preference == CandidatePreference::Undetermined
             && (candidate

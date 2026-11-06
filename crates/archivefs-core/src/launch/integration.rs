@@ -968,7 +968,7 @@ mod tests {
     };
     use crate::emulator_environment::retroarch::{FirmwarePresence, FirmwareRequirement};
     use crate::emulator_environment::{EncodedPath, FsProbe};
-    use crate::launch::planning::CandidatePreference;
+    use crate::launch::planning::{CandidatePreference, LaunchCandidate, RememberedPreference};
     use crate::launch::planning::{
         LaunchContainerKind, LaunchContentKind, LaunchTarget, ResolvedIdentity,
     };
@@ -3465,6 +3465,99 @@ mod tests {
             };
             assert_eq!(candidate.preference, expected, "{name}");
         }
+    }
+
+    fn psx_report_with_swanstation(kind: ProfileKind) -> RetroArchEnvironmentReport {
+        let mut report = retroarch_with_psx_core();
+        let mut swan = report.profiles[0].cores[0].clone();
+        swan.core_stem = "swanstation".to_string();
+        report.profiles[0].cores.push(swan);
+        report.profiles[0].profile_kind = kind;
+        report
+    }
+
+    fn find<'a>(plan: &'a LaunchPlan, name: &str) -> &'a LaunchCandidate {
+        plan.candidates
+            .iter()
+            .find(|c| match &c.target {
+                LaunchTarget::RetroArchCore { core_stem, .. } => core_stem == name,
+                LaunchTarget::Standalone { adapter_id, .. } => *adapter_id == name,
+            })
+            .unwrap_or_else(|| panic!("no {name} candidate"))
+    }
+
+    #[test]
+    fn psx_chd_swanstation_is_ready_without_a_warning_and_is_the_sole_choice() {
+        let plan = build_launch_plan(
+            &resolved("PSX", "SLUS-12345"),
+            &resolved_content(),
+            &[psx_duckstation_input()],
+            &psx_report_with_swanstation(ProfileKind::Native),
+            &[],
+        );
+        let swan = find(&plan, "swanstation");
+        assert_eq!(swan.readiness, LaunchReadiness::Ready);
+        assert!(swan.warnings.is_empty() && swan.blockers.is_empty());
+        assert_eq!(swan.preference, CandidatePreference::SoleEligible);
+        let beetle = find(&plan, "mednafen_psx");
+        assert_eq!(beetle.readiness, LaunchReadiness::ReadyWithWarnings);
+        assert_eq!(beetle.preference, CandidatePreference::Undetermined);
+        assert_eq!(
+            find(&plan, "duckstation").preference,
+            CandidatePreference::Undetermined
+        );
+    }
+
+    #[test]
+    fn psx_chd_unlaunchable_flatpak_swanstation_never_hides_a_ready_duckstation() {
+        let plan = build_launch_plan(
+            &resolved("PSX", "SLUS-12345"),
+            &resolved_content(),
+            &[psx_duckstation_input()],
+            &psx_report_with_swanstation(ProfileKind::Flatpak),
+            &[],
+        );
+        let duck = find(&plan, "duckstation");
+        assert_eq!(duck.readiness, LaunchReadiness::Ready);
+        assert_eq!(duck.preference, CandidatePreference::SoleEligible);
+        assert_eq!(
+            find(&plan, "swanstation").preference,
+            CandidatePreference::Undetermined
+        );
+    }
+
+    #[test]
+    fn psx_chd_remembered_duckstation_is_not_changed_by_the_ordering() {
+        let remembered = [RememberedPreference {
+            adapter_id: "duckstation".to_string(),
+            profile_id: "duckstation".to_string(),
+        }];
+        let plan = build_launch_plan(
+            &resolved("PSX", "SLUS-12345"),
+            &resolved_content(),
+            &[psx_duckstation_input()],
+            &psx_report_with_swanstation(ProfileKind::Native),
+            &remembered,
+        );
+        assert_eq!(
+            find(&plan, "duckstation").preference,
+            CandidatePreference::Remembered
+        );
+    }
+
+    #[test]
+    fn non_psx_retroarch_cores_never_get_the_chd_warning() {
+        let mut report = retroarch_with_snes9x_core();
+        report.profiles[0].cores[0].core_stem = "mednafen_psx".to_string();
+        let content = LaunchContentRef {
+            kind: None,
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(PathBuf::from("/library/game.chd")),
+            requires_mount: false,
+            provenance: "loose".to_string(),
+        };
+        let plan = build_launch_plan(&resolved("SNES", "k"), &content, &[], &report, &[]);
+        assert!(plan.candidates.iter().all(|c| c.warnings.is_empty()));
     }
 
     #[test]

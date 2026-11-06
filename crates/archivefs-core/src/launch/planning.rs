@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 
 use crate::emulator_environment::retroarch::{
-    CoreInfoFinding, ProfileRef, RetroArchEnvironmentReport,
+    CoreInfoFinding, ProfileKind, ProfileRef, RetroArchEnvironmentReport,
 };
 use crate::launch::amiga_whdload_command::{SelectedWHDLoadSlave, VerifiedWHDLoadTarget};
 use crate::launch::platform_map::{launch_compatibility_for_platform, retroarch_platform_matches};
@@ -280,7 +280,7 @@ pub(crate) fn content_blocker(content: &LaunchContentRef) -> Option<LaunchBlocke
 }
 
 /// Message shown when any RetroArch core (FBNeo, MAME libretro cores, ...) is offered an extracted arcade set.
-pub(crate) const ARCADE_SET_NEEDS_ARCHIVE_MESSAGE: &str = "RetroArch needs this arcade set as a ZIP or other supported archive. Your game is stored as an extracted MAME set, so use MAME for this copy (choose the MAME program in Emulator Setup).";
+pub(crate) const ARCADE_SET_NEEDS_ARCHIVE_MESSAGE: &str = "RetroArch needs this arcade set as a ZIP or other supported archive. Your game is stored as an extracted MAME set, so use MAME for this copy.";
 
 /// Blocks RetroArch cores on an extracted arcade set directory. Applies only
 /// to `LaunchContentKind::ExtractedArcadeSet`; other content is untouched.
@@ -408,9 +408,22 @@ fn matching_retroarch_cores(
 /// vouch for. Only PlayStation is covered: the Beetle PSX build installed by
 /// some distributions predates CHD support while its `.info` still lists
 /// `chd`, so the metadata proves nothing about the binary.
-fn retroarch_chd_support_unconfirmed(platform_id: &str, content: &LaunchContentRef) -> bool {
-    platform_id == "PSX" && psx_chd_content(content)
+fn retroarch_chd_support_unconfirmed(
+    platform_id: &str,
+    core_stem: &str,
+    content: &LaunchContentRef,
+) -> bool {
+    platform_id == "PSX"
+        && psx_chd_content(content)
+        && !PSX_CHD_CAPABLE_RETROARCH_CORES.contains(&core_stem)
 }
+
+/// RetroArch PlayStation cores known to read CHD: SwanStation is built on
+/// DuckStation and booted CHD discs in a sandboxed smoke test. Every other
+/// RetroArch PSX core (Beetle PSX and its aliased copies) is not on this list
+/// because some distribution builds predate CHD support while their `.info`
+/// still lists `chd`.
+pub(crate) const PSX_CHD_CAPABLE_RETROARCH_CORES: &[&str] = &["swanstation"];
 
 fn psx_chd_content(content: &LaunchContentRef) -> bool {
     content.container == Some(LaunchContainerKind::Chd)
@@ -468,7 +481,7 @@ fn build_retroarch_candidates(
                     ),
                 ));
             }
-            if retroarch_chd_support_unconfirmed(platform_id, content) {
+            if retroarch_chd_support_unconfirmed(platform_id, &found.core_stem, content) {
                 warnings.push(LaunchWarning::new(
                     LaunchWarningKind::RetroArchChdSupportUnconfirmed,
                     format!(
@@ -541,54 +554,60 @@ fn apply_preference(candidates: &mut [LaunchCandidate], remembered: &[Remembered
     }
 
     // PlayStation CHD content: prefer the route with the strongest CHD
-    // evidence among the eligible ones. Tier 0 is the SwanStation RetroArch
-    // core (built on DuckStation; booted CHD in a sandboxed smoke test), tier 1
-    // the standalone DuckStation adapter, tier 2 every other RetroArch core
-    // (Beetle PSX builds exist without CHD support, and aliased copies of such
-    // a build are common). Only the best tier takes part in automatic
-    // selection; the rest stay available to choose explicitly. Anything else,
-    // and non-CHD content, is tier 0 so ordinary selection is unchanged.
-    let chd_tier = |candidate: &LaunchCandidate| -> u8 {
+    // evidence, but only when that route can really start. Tier 0 is a known
+    // CHD-capable RetroArch core (SwanStation), tier 1 the standalone
+    // DuckStation adapter, tier 2 every other RetroArch PSX core. The best
+    // tier that has a clean candidate (Ready, no warning, not a Flatpak
+    // profile, which cannot be launched) is kept for automatic selection and
+    // every other PSX CHD candidate is demoted to an explicit choice. When no
+    // candidate is clean nothing is demoted. Other candidates are untouched.
+    let chd_tier = |candidate: &LaunchCandidate| -> Option<u8> {
         if !psx_chd_content(&candidate.content) {
-            return 0;
+            return None;
         }
         match &candidate.target {
             LaunchTarget::RetroArchCore {
                 platform_id,
                 core_stem,
                 ..
-            } if *platform_id == "PSX" => {
-                if core_stem == "swanstation" {
+            } if *platform_id == "PSX" => Some(
+                if PSX_CHD_CAPABLE_RETROARCH_CORES.contains(&core_stem.as_str()) {
                     0
                 } else {
                     2
-                }
-            }
-            LaunchTarget::Standalone { adapter_id, .. } if *adapter_id == "duckstation" => 1,
-            _ => 0,
+                },
+            ),
+            LaunchTarget::Standalone { adapter_id, .. } if *adapter_id == "duckstation" => Some(1),
+            _ => None,
         }
     };
-    let best_tier = eligible_indices
+    let clean = |candidate: &LaunchCandidate| {
+        candidate.readiness == LaunchReadiness::Ready
+            && candidate.warnings.is_empty()
+            && !matches!(
+                &candidate.target,
+                LaunchTarget::RetroArchCore { profile, .. }
+                    if profile.profile_kind == ProfileKind::Flatpak
+            )
+    };
+    let best_clean_tier = eligible_indices
         .iter()
-        .map(|&index| chd_tier(&candidates[index]))
+        .filter(|&&index| clean(&candidates[index]))
+        .filter_map(|&index| chd_tier(&candidates[index]))
         .min();
-    let eligible_indices = match best_tier {
-        Some(best)
-            if eligible_indices
-                .iter()
-                .any(|&i| chd_tier(&candidates[i]) > best) =>
-        {
+    let eligible_indices = match best_clean_tier {
+        Some(best) => {
+            let mut kept = Vec::new();
             for &index in &eligible_indices {
-                if chd_tier(&candidates[index]) > best {
-                    candidates[index].preference = CandidatePreference::Undetermined;
+                match chd_tier(&candidates[index]) {
+                    None => kept.push(index),
+                    Some(tier) if tier == best && clean(&candidates[index]) => kept.push(index),
+                    Some(_) => candidates[index].preference = CandidatePreference::Undetermined,
                 }
             }
-            eligible_indices
-                .into_iter()
-                .filter(|&index| chd_tier(&candidates[index]) == best)
-                .collect()
+            kept
         }
-        _ => eligible_indices,
+        None => eligible_indices,
     };
 
     // `build_retroarch_candidates` has already resolved the reviewed

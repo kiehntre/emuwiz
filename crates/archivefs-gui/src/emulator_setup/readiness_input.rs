@@ -1441,6 +1441,13 @@ impl ReadinessSources<'_> {
             launch_readiness_page::amiga_boot::apply(&mut plan, context);
         }
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
+        refine_arcade_set_blocker(
+            &mut plan,
+            self.readiness
+                .emulator_setup_overrides
+                .executable(crate::emulator_setup_overrides::OverridableEmulator::Mame)
+                .is_some(),
+        );
         if let Some(snapshot) = &mesen_context {
             snapshot.apply(&mut plan);
         }
@@ -1552,6 +1559,45 @@ pub(crate) fn identity_unknown_reason(
         return system_missing;
     }
     Reason::NotConfirmed
+}
+
+/// Says precisely what is missing for the MAME route when RetroArch refused an
+/// extracted arcade set and no MAME candidate exists. Wording only: nothing is
+/// unblocked and no candidate is added.
+fn refine_arcade_set_blocker(plan: &mut archivefs_core::launch::LaunchPlan, mame_configured: bool) {
+    use archivefs_core::launch::{LaunchBlockerKind, LaunchReadiness, LaunchTarget};
+    let mame = plan.candidates.iter().find(|candidate| {
+        matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "mame",
+                ..
+            }
+        )
+    });
+    let advice = match mame {
+        Some(mame) if mame.readiness != LaunchReadiness::Blocked => return,
+        Some(mame) => format!(
+            "MAME is set up but cannot start this set yet: {}.",
+            mame.blockers
+                .first()
+                .map_or("see its readiness details", |blocker| blocker.detail.as_str())
+        ),
+        None if !mame_configured => {
+            "Choose the MAME program in Emulator Setup to play this copy.".to_string()
+        }
+        None => "MAME is set up, but this set has no current verified MAME record yet; run the MAME check for this folder first.".to_string(),
+    };
+    for candidate in &mut plan.candidates {
+        if !matches!(candidate.target, LaunchTarget::RetroArchCore { .. }) {
+            continue;
+        }
+        for blocker in &mut candidate.blockers {
+            if blocker.kind == LaunchBlockerKind::RetroArchArcadeSetNeedsArchive {
+                blocker.detail = format!("{} {advice}", blocker.detail);
+            }
+        }
+    }
 }
 
 /// Points `content` at the MAME logical set the persisted DAT join resolved.
@@ -1722,6 +1768,84 @@ mod arcade_set_shape_tests {
             requires_mount: false,
             provenance: "placeholder".into(),
         }
+    }
+
+    fn arcade_plan(mame_blocker: Option<&str>) -> archivefs_core::launch::LaunchPlan {
+        use archivefs_core::emulator_environment::retroarch::{
+            ProfileKind, ProfileRef, ProfileScope,
+        };
+        use archivefs_core::launch::{
+            CandidatePreference, FirmwareReadiness, LaunchBlocker, LaunchBlockerKind,
+            LaunchCandidate, LaunchPlan, LaunchReadiness, LaunchTarget,
+        };
+        let content = LaunchContentRef {
+            kind: Some(LaunchContentKind::ExtractedArcadeSet),
+            container: None,
+            resolved_path: None,
+            requires_mount: false,
+            provenance: String::new(),
+        };
+        let mut candidates = vec![LaunchCandidate {
+            target: LaunchTarget::RetroArchCore {
+                profile: ProfileRef {
+                    profile_kind: ProfileKind::Native,
+                    scope: ProfileScope::User,
+                },
+                core_stem: "fbneo".into(),
+                platform_id: "Arcade",
+            },
+            content: content.clone(),
+            firmware: FirmwareReadiness::NotRequired,
+            blockers: vec![LaunchBlocker::new(
+                LaunchBlockerKind::RetroArchArcadeSetNeedsArchive,
+                "base.",
+            )],
+            warnings: Vec::new(),
+            readiness: LaunchReadiness::Blocked,
+            preference: CandidatePreference::Undetermined,
+        }];
+        if let Some(detail) = mame_blocker {
+            candidates.push(LaunchCandidate {
+                target: LaunchTarget::Standalone {
+                    adapter_id: "mame",
+                    profile_id: "mame".into(),
+                    profile_path: None,
+                },
+                content,
+                firmware: FirmwareReadiness::NotRequired,
+                blockers: vec![LaunchBlocker::new(
+                    LaunchBlockerKind::MameSetVerdictUnavailable,
+                    detail,
+                )],
+                warnings: Vec::new(),
+                readiness: LaunchReadiness::Blocked,
+                preference: CandidatePreference::Undetermined,
+            });
+        }
+        LaunchPlan {
+            platform_id: Some("Arcade".into()),
+            game_key: Some("19xx".into()),
+            summary: Default::default(),
+            candidates,
+            media_topology: None,
+        }
+    }
+
+    #[test]
+    fn arcade_blocker_names_exactly_what_is_missing_for_mame() {
+        let detail = |plan: &archivefs_core::launch::LaunchPlan| {
+            plan.candidates[0].blockers[0].detail.clone()
+        };
+        let mut plan = arcade_plan(None);
+        refine_arcade_set_blocker(&mut plan, false);
+        assert!(detail(&plan).contains("Choose the MAME program in Emulator Setup"));
+        let mut plan = arcade_plan(None);
+        refine_arcade_set_blocker(&mut plan, true);
+        assert!(detail(&plan).contains("no current verified MAME record"));
+        assert!(!detail(&plan).contains("Emulator Setup"));
+        let mut plan = arcade_plan(Some("needs a fresh audit"));
+        refine_arcade_set_blocker(&mut plan, true);
+        assert!(detail(&plan).contains("cannot start this set yet: needs a fresh audit"));
     }
 
     #[test]
