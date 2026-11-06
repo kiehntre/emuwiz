@@ -182,11 +182,17 @@ fn sweep_interrupted_temp_files(
 /// The identity half of one rollback entry (what the install journal
 /// says about it), with outcome `pending` - the state every entry has in
 /// the pending rollback journal written before the first mutation.
+struct PlannedEntry {
+    result: CheatRollbackEntryResult,
+    settlement: CheatInstallEntrySettlement,
+    in_flight: bool,
+}
+
 fn planned_entry(
     index: usize,
     e: &super::cheat_install_result::CheatInstallEntryResult,
     orig: &super::cheat_install_result::CheatInstallRun,
-) -> (CheatRollbackEntryResult, CheatInstallEntrySettlement, bool) {
+) -> PlannedEntry {
     let dest = e.destination_path.clone();
     // An interrupted (`in_progress`) journal is read exactly as the
     // installer wrote it: settled entries are facts, the one in-flight
@@ -218,7 +224,11 @@ fn planned_entry(
         message: "not reached yet".into(),
         retryable: false,
     };
-    (r, settlement, in_flight)
+    PlannedEntry {
+        result: r,
+        settlement,
+        in_flight,
+    }
 }
 
 /// Rolls back one entry. Every destination mutation is atomic with its
@@ -231,10 +241,13 @@ fn rollback_one_entry(
     orig: &super::cheat_install_result::CheatInstallRun,
     options: &CheatRollbackOptions,
     effective_dry: bool,
-    mut r: CheatRollbackEntryResult,
-    settlement: CheatInstallEntrySettlement,
-    in_flight: bool,
+    planned: PlannedEntry,
 ) -> CheatRollbackEntryResult {
+    let PlannedEntry {
+        result: mut r,
+        settlement,
+        in_flight,
+    } = planned;
     let dest = r.destination_path.clone();
     let actionable = matches!(
         e.outcome,
@@ -492,8 +505,10 @@ enum MutationError {
 }
 
 #[cfg(test)]
+type MutationHook = Box<dyn Fn(&Path)>;
+#[cfg(test)]
 thread_local! {
-    static BEFORE_MUTATION_HOOK: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> =
+    static BEFORE_MUTATION_HOOK: std::cell::RefCell<Option<MutationHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -501,7 +516,7 @@ thread_local! {
 /// destination mutation (after the earlier hash check), modelling RetroArch
 /// saving cheat edits inside that window.
 #[cfg(test)]
-pub(crate) fn set_before_destination_mutation_hook_for_test(hook: Option<Box<dyn Fn(&Path)>>) {
+pub(crate) fn set_before_destination_mutation_hook_for_test(hook: Option<MutationHook>) {
     BEFORE_MUTATION_HOOK.with(|cell| *cell.borrow_mut() = hook);
 }
 
@@ -673,7 +688,7 @@ pub fn execute_cheat_rollback(
         .map(|(index, e)| planned_entry(index, e, &orig))
         .collect();
     let entries: Vec<CheatRollbackEntryResult> =
-        planned.iter().map(|(r, _, _)| r.clone()).collect();
+        planned.iter().map(|entry| entry.result.clone()).collect();
     let summary = CheatRollbackSummary::from_entries(&entries);
     let mut run = CheatRollbackRun {
         schema_version: CHEAT_ROLLBACK_RUN_SCHEMA_VERSION,
@@ -719,7 +734,7 @@ pub fn execute_cheat_rollback(
             };
         }
     }
-    for (index, (e, (r, settlement, in_flight))) in orig.entries.iter().zip(planned).enumerate() {
+    for (index, (e, planned)) in orig.entries.iter().zip(planned).enumerate() {
         if let Some(error) = &journal_error {
             let entry = &mut run.entries[index];
             entry.outcome = CheatRollbackOutcome::FailedIo;
@@ -728,16 +743,7 @@ pub fn execute_cheat_rollback(
                 format!("not attempted: an earlier rollback-record update failed ({error})");
             continue;
         }
-        run.entries[index] = rollback_one_entry(
-            index,
-            e,
-            &orig,
-            options,
-            effective_dry,
-            r,
-            settlement,
-            in_flight,
-        );
+        run.entries[index] = rollback_one_entry(index, e, &orig, options, effective_dry, planned);
         if !effective_dry {
             run.summary = CheatRollbackSummary::from_entries(&run.entries);
             if let Err(error) = rewrite_rollback_journal(&run, dir, &path) {
