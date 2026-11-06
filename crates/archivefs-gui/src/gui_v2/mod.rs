@@ -2105,6 +2105,9 @@ impl App {
                                 Payload::MissingUndone(restored) => {
                                     self.missing_undo_done(restored)
                                 }
+                                Payload::MissingReceipts(receipts) => {
+                                    self.missing_receipts_loaded(receipts)
+                                }
                                 Payload::Preferences(preferences) => {
                                     self.restore_preferences(preferences)
                                 }

@@ -5,8 +5,8 @@ use super::{App, Route, Section, backend::Command};
 use crate::ui::theme;
 use archivefs_core::Database;
 use archivefs_core::catalogue_health::{
-    ForgetMissingEntry, ForgetMissingPlan, ForgetMissingResult, MissingClassification,
-    SourceHealthState,
+    ForgetMissingEntry, ForgetMissingPlan, ForgetMissingReceiptSummary, ForgetMissingResult,
+    MissingClassification, SourceHealthState, list_undoable_forget_missing_receipts,
 };
 use eframe::egui::{self, RichText};
 use std::path::{Path, PathBuf};
@@ -18,7 +18,15 @@ pub(super) struct MissingReviewState {
     pub confirm: bool,
     pub result: Option<String>,
     pub error: Option<String>,
+    /// The receipt of the latest forget this session, kept as a fallback
+    /// Undo when the durable list cannot be read.
     pub receipt: Option<PathBuf>,
+    /// Receipts on disk that can still be undone (survive a restart).
+    pub undoable: Vec<ForgetMissingReceiptSummary>,
+    /// False until the durable list has been read, and again after every
+    /// forget or undo, so the panel asks for a fresh list.
+    pub undoable_loaded: bool,
+    pub receipts_inflight: bool,
 }
 
 /// Groups shown, in display order. Only the first may be acted on.
@@ -136,6 +144,14 @@ fn apply_at(
         .map_err(|e| e.to_string())
 }
 
+/// Forget receipts beside the library database that can still be undone.
+/// Never fails: with no resolvable database there is nothing to list.
+pub(super) fn undoable_receipts() -> Vec<ForgetMissingReceiptSummary> {
+    db_path()
+        .map(|db| list_undoable_forget_missing_receipts(&db))
+        .unwrap_or_default()
+}
+
 pub(super) fn undo(receipt: &Path) -> Result<usize, String> {
     let mut database = Database::open_or_create(&db_path()?).map_err(|e| e.to_string())?;
     database
@@ -192,6 +208,25 @@ impl App {
         self.send(id, Command::MissingUndo { receipt });
     }
 
+    /// Reads the durable Undo list (untracked: it is housekeeping, not an
+    /// operation the person asked for).
+    fn start_missing_receipts(&mut self) {
+        if self.missing.receipts_inflight {
+            return;
+        }
+        self.missing.receipts_inflight = true;
+        if !self.send(0, Command::MissingReceipts) {
+            self.missing.receipts_inflight = false;
+            self.missing.undoable_loaded = true;
+        }
+    }
+
+    pub(super) fn missing_receipts_loaded(&mut self, receipts: Vec<ForgetMissingReceiptSummary>) {
+        self.missing.receipts_inflight = false;
+        self.missing.undoable_loaded = true;
+        self.missing.undoable = receipts;
+    }
+
     /// Called from the event loop when a missing-review job fails.
     pub(super) fn missing_failed(&mut self, error: &str) {
         self.missing.job = None;
@@ -202,6 +237,9 @@ impl App {
     }
 
     pub(super) fn missing_review_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.missing.undoable_loaded {
+            self.start_missing_receipts();
+        }
         if self.missing.plan.is_none() && self.missing.job.is_none() && self.missing.error.is_none()
         {
             egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -230,7 +268,15 @@ impl App {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.strong("Missing games");
                 ui.label(message);
-                if let Some(receipt) = self.missing.receipt.clone() {
+                // The durable list below offers this receipt too; the
+                // in-memory button is only a fallback when it does not.
+                let listed = self.missing.receipt.as_ref().is_some_and(|receipt| {
+                    self.missing
+                        .undoable
+                        .iter()
+                        .any(|entry| &entry.receipt_path == receipt)
+                });
+                if let Some(receipt) = self.missing.receipt.clone().filter(|_| !listed) {
                     if ui
                         .add_enabled(
                             self.missing.job.is_none(),
@@ -242,6 +288,29 @@ impl App {
                     }
                     ui.collapsing("Details", |ui| {
                         ui.monospace(format!("Undo receipt: {}", receipt.display()));
+                    });
+                }
+            });
+        }
+        if !self.missing.undoable.is_empty() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.strong("Forgotten games you can restore");
+                ui.label("Each forget is journalled beside the library database, so Undo stays available after a restart. Undo puts the catalogue entries back; no game files are created or changed.");
+                for entry in self.missing.undoable.clone() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("{} · {}", entry.created_at, plural(entry.forgotten)));
+                        if ui
+                            .add_enabled(
+                                self.missing.job.is_none(),
+                                egui::Button::new(format!("Undo — restore {}", plural(entry.forgotten))),
+                            )
+                            .clicked()
+                        {
+                            self.start_missing_undo(entry.receipt_path.clone());
+                        }
+                    });
+                    ui.collapsing(format!("Details — {}", entry.created_at), |ui| {
+                        ui.monospace(format!("Undo receipt: {}", entry.receipt_path.display()));
                     });
                 }
             });
@@ -339,8 +408,9 @@ impl App {
                         )
                         .clicked()
                     {
+                        // The previous forget's result and Undo stay visible:
+                        // opening (or cancelling) the dialog changes nothing.
                         self.missing.confirm = true;
-                        self.missing.result = None;
                     }
                 });
             }
@@ -381,7 +451,12 @@ impl App {
             ),
             None => "Nothing to forget.".into(),
         });
-        self.missing.receipt = result.receipt_path;
+        // "Nothing to forget" wrote no receipt: the earlier one is still the
+        // one that can be undone.
+        if let Some(receipt) = result.receipt_path {
+            self.missing.receipt = Some(receipt);
+        }
+        self.missing.undoable_loaded = false;
         self.load(false);
     }
 
@@ -389,6 +464,7 @@ impl App {
         self.missing.job = None;
         self.missing.plan = None;
         self.missing.receipt = None;
+        self.missing.undoable_loaded = false;
         self.missing.result = Some(format!(
             "Restored {} to EmuWiz's game list. No game files were recreated or changed.",
             plural(restored)
@@ -601,6 +677,175 @@ mod tests {
         let mut db = Database::open_or_create(f.db_path()).unwrap();
         assert_eq!(db.undo_forget_missing(&receipt).unwrap(), 1);
         assert_eq!(f.count(), 2);
+    }
+
+    const PANEL: [f32; 2] = [1280.0, 1200.0];
+
+    fn click_text(context: &egui::Context, app: &mut App, label: &str) {
+        context.style_mut(|style| style.animation_time = 0.0);
+        panel_frame(context, app, PANEL);
+        let layout = panel_frame(context, app, PANEL);
+        let point = super::super::tests::text_bounds(&layout, label)
+            .first()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label} not on screen: {:?}",
+                    super::super::tests::text(&layout)
+                )
+            })
+            .center();
+        for pressed in [true, false] {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(PANEL[0], PANEL[1]),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.missing_review_panel(ui));
+                },
+            );
+        }
+        panel_frame(context, app, PANEL);
+    }
+
+    fn forgot(receipt: Option<PathBuf>, forgotten: usize) -> ForgetMissingResult {
+        ForgetMissingResult {
+            forgotten,
+            archive_ids: Vec::new(),
+            removed: Default::default(),
+            receipt_path: receipt,
+        }
+    }
+
+    /// NW2-B-02: opening the "Forget…" dialog, and cancelling it, must not
+    /// hide the previous forget's Undo.
+    #[test]
+    fn nw2_b02_undo_stays_offered_after_forget_is_clicked_and_cancelled() {
+        use super::super::tests::page_reachability::visible_text;
+        let (f, _) = fixture();
+        let plan = preview_at(&f.db_path(), &f.roots).unwrap();
+        let context = egui::Context::default();
+        context.style_mut(|style| style.debug.warn_if_rect_changes_id = false);
+        let mut app = super::super::tests::fixture(&context);
+        app.missing.undoable_loaded = true;
+        let receipt = f
+            .temp
+            .path()
+            .join("library.sqlite3.forget-missing-earlier.json");
+        app.missing_apply_done(forgot(Some(receipt.clone()), 1));
+        assert_eq!(app.missing.receipt.as_deref(), Some(receipt.as_path()));
+        app.missing.undoable_loaded = true;
+        app.missing.plan = Some(Box::new(plan));
+        let output = panel_frame(&context, &mut app, PANEL);
+        assert!(visible_text(&output, "Undo — restore these entries"));
+
+        click_text(&context, &mut app, "Forget 1 confirmed-missing games…");
+        assert!(app.missing.confirm, "the dialog opened");
+        let output = panel_frame(&context, &mut app, PANEL);
+        assert!(
+            app.missing.result.is_some(),
+            "the previous result was cleared"
+        );
+        assert!(visible_text(&output, "Undo — restore these entries"));
+
+        click_text(&context, &mut app, "Cancel");
+        assert!(!app.missing.confirm, "the dialog closed");
+        let output = panel_frame(&context, &mut app, PANEL);
+        assert!(visible_text(&output, "Undo — restore these entries"));
+        assert_eq!(app.missing.receipt.as_deref(), Some(receipt.as_path()));
+        assert_eq!(f.count(), 2, "nothing was forgotten");
+    }
+
+    /// NW2-B-02: a later apply with nothing to forget writes no receipt and
+    /// must not discard the earlier one.
+    #[test]
+    fn nw2_b02_nothing_to_forget_keeps_the_earlier_undo_receipt() {
+        let context = egui::Context::default();
+        let mut app = super::super::tests::fixture(&context);
+        app.missing.undoable_loaded = true;
+        let earlier = PathBuf::from("/library/library.sqlite3.forget-missing-earlier.json");
+        app.missing_apply_done(forgot(Some(earlier.clone()), 3));
+        assert!(!app.missing.undoable_loaded, "the durable list is re-read");
+        app.missing.undoable_loaded = true;
+        app.missing_apply_done(forgot(None, 0));
+        assert_eq!(app.missing.receipt.as_deref(), Some(earlier.as_path()));
+        assert_eq!(app.missing.result.as_deref(), Some("Nothing to forget."));
+        assert!(!app.missing.undoable_loaded);
+    }
+
+    /// NW2-B-02: after a restart, the receipt journalled beside the database
+    /// is listed from disk and Undo is offered; once undone it is not.
+    #[test]
+    fn nw2_b02_fresh_app_offers_undo_for_receipts_found_on_disk() {
+        use super::super::tests::page_reachability::visible_text;
+        let (f, _) = fixture();
+        let token = preview_at(&f.db_path(), &f.roots).unwrap().token();
+        let result = apply_at(&f.db_path(), &f.roots, &token).unwrap();
+        let receipt = result.receipt_path.clone().unwrap();
+        assert_eq!(f.count(), 1);
+        // A stray file that only resembles a receipt, and a symlink, are skipped.
+        fs::write(
+            f.temp
+                .path()
+                .join("library.sqlite3.forget-missing-garbage.json"),
+            b"not a receipt",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            &receipt,
+            f.temp
+                .path()
+                .join("library.sqlite3.forget-missing-link.json"),
+        )
+        .unwrap();
+
+        let listed = list_undoable_forget_missing_receipts(&f.db_path());
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].receipt_path, receipt);
+        assert_eq!(listed[0].forgotten, 1);
+        assert!(!listed[0].created_at.is_empty());
+
+        // A fresh app, as after a restart: only what the worker read from disk.
+        let context = egui::Context::default();
+        context.style_mut(|style| style.debug.warn_if_rect_changes_id = false);
+        let mut app = super::super::tests::fixture(&context);
+        app.missing.receipts_inflight = true;
+        app.missing_receipts_loaded(listed);
+        assert!(app.missing.undoable_loaded);
+        assert!(!app.missing.receipts_inflight);
+        panel_frame(&context, &mut app, PANEL);
+        let output = panel_frame(&context, &mut app, PANEL);
+        assert!(visible_text(&output, "Forgotten games you can restore"));
+        assert!(visible_text(&output, "Undo — restore 1 entry"));
+        assert!(visible_text(&output, "Check missing-game evidence"));
+
+        click_text(&context, &mut app, "Undo — restore 1 entry");
+        assert!(
+            app.missing.job.is_some(),
+            "Undo started from the durable list"
+        );
+
+        // Once undone, the receipt is marked and no longer listed.
+        let mut db = Database::open_or_create(f.db_path()).unwrap();
+        assert_eq!(db.undo_forget_missing(&receipt).unwrap(), 1);
+        assert_eq!(f.count(), 2);
+        assert!(list_undoable_forget_missing_receipts(&f.db_path()).is_empty());
+        // Another database's receipt is never offered here.
+        assert!(
+            list_undoable_forget_missing_receipts(&f.temp.path().join("other.sqlite3")).is_empty()
+        );
     }
 
     #[test]

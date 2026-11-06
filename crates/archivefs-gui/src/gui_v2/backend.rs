@@ -186,6 +186,8 @@ pub(super) enum Command {
     MissingUndo {
         receipt: PathBuf,
     },
+    /// Read-only: forget-missing receipts on disk that can still be undone.
+    MissingReceipts,
     OpenFolder(PathBuf),
     /// Create the starter configuration the person confirmed, at `expected`.
     CreateStarterConfig {
@@ -294,6 +296,7 @@ pub(super) enum Payload {
     MissingPreview(Box<archivefs_core::catalogue_health::ForgetMissingPlan>),
     MissingApplied(Box<archivefs_core::catalogue_health::ForgetMissingResult>),
     MissingUndone(usize),
+    MissingReceipts(Vec<archivefs_core::catalogue_health::ForgetMissingReceiptSummary>),
     Preferences(Preferences),
     Done,
     PlayingLibraryPreview {
@@ -473,6 +476,9 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
         ))),
         Command::MissingUndo { receipt } => Ok(Payload::MissingUndone(
             super::missing_review::undo(&receipt)?,
+        )),
+        Command::MissingReceipts => Ok(Payload::MissingReceipts(
+            super::missing_review::undoable_receipts(),
         )),
         Command::EnvironmentCheck => Ok(Payload::Environment(crate::gui_v2::environment::gather())),
         Command::LoadRommLibrary => Ok(Payload::RommLibrary(

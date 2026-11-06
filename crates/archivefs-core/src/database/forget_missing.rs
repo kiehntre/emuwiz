@@ -156,6 +156,64 @@ pub struct ForgetMissingResult {
     pub receipt_path: Option<PathBuf>,
 }
 
+/// A forget-missing receipt on disk whose forget has not been undone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetMissingReceiptSummary {
+    pub receipt_path: PathBuf,
+    /// When the forget was journalled (UTC, `YYYY-MM-DDTHH:MM:SSZ`).
+    pub created_at: String,
+    /// Catalogue entries the receipt would put back.
+    pub forgotten: usize,
+}
+
+/// Receipts beside `db` whose forget has not been undone, newest first. The
+/// receipts are what [`Database::apply_forget_confirmed_missing`] journals,
+/// so Undo can be offered after a restart. Read-only; a receipt that cannot
+/// be read, that belongs to another database, or whose name only resembles
+/// a receipt is skipped. Symlinks are not followed.
+pub fn list_undoable_forget_missing_receipts(db: &Path) -> Vec<ForgetMissingReceiptSummary> {
+    let Some(parent) = db.parent() else {
+        return Vec::new();
+    };
+    let name = db.file_name().unwrap_or_default().to_string_lossy();
+    let prefix = format!("{name}.forget-missing-");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut receipts: Vec<ForgetMissingReceiptSummary> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".json"))
+                && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+        })
+        .filter_map(|path| {
+            let receipt = read_receipt(&path).ok()?;
+            if receipt.database_path != db || receipt.state == ReceiptState::Undone {
+                return None;
+            }
+            let forgotten = receipt
+                .tables
+                .iter()
+                .find(|table| table.table == "archives")
+                .map_or(0, |table| table.rows.len());
+            Some(ForgetMissingReceiptSummary {
+                receipt_path: path,
+                created_at: receipt.created_at,
+                forgotten,
+            })
+        })
+        .collect();
+    receipts.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.receipt_path.cmp(&a.receipt_path))
+    });
+    receipts
+}
+
 struct SourceAuthority {
     health: SourceHealthState,
     enabled: bool,
