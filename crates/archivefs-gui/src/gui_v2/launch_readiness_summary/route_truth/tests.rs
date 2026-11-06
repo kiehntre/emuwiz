@@ -256,3 +256,55 @@ fn an_outdated_worker_response_is_discarded() {
     let verdict = wait_known(&mut cache, 1, &rom, &b);
     assert!(matches!(verdict, RouteVerdict::Refused(_)));
 }
+
+fn warned(adapter: &'static str, path: &Path) -> LaunchReadinessInput {
+    let mut candidate = candidate(adapter, path, LaunchContainerKind::PlainFile);
+    candidate.warnings = vec![archivefs_core::launch::LaunchWarning::new(
+        archivefs_core::launch::LaunchWarningKind::FirmwarePresentUnverified,
+        "firmware is present but not verified",
+    )];
+    input("k", vec![candidate])
+}
+
+#[test]
+fn a_warning_the_builder_refuses_blocks_with_the_warning_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let rom = dir.path().join("game.gb");
+    std::fs::write(&rom, b"x").unwrap();
+    // SameBoy's request builder refuses any warned candidate.
+    let input = warned("sameboy", &rom);
+    let mut summary = ready_summary(&input);
+    assert_eq!(
+        summary.status,
+        ReadinessPresentationState::ReadyWithWarnings
+    );
+    apply(&mut summary, &assess(&input));
+    assert_eq!(summary.status, ReadinessPresentationState::Blocked);
+    assert!(summary.headline.contains("held back by a warning"));
+    assert!(
+        summary
+            .explanation
+            .contains("firmware is present but not verified")
+    );
+    assert!(!summary.headline.contains("No Play route"));
+    assert_ne!(summary.primary_action, Some(ReadinessAction::Play));
+}
+
+#[test]
+fn a_constructible_route_keeps_its_warning_and_play() {
+    let dir = tempfile::tempdir().unwrap();
+    let rom = dir.path().join("game.gb");
+    std::fs::write(&rom, b"x").unwrap();
+    let input = warned("sameboy", &rom);
+    let mut summary = ready_summary(&input);
+    let before = summary.clone();
+    // Builders that accept ReadyWithWarnings (XRoar, Azahar, shadPS4) answer
+    // Constructible: the warning stays on the card and Play stays offered.
+    apply(&mut summary, &RouteVerdict::Constructible);
+    assert_eq!(summary, before);
+    assert_eq!(
+        summary.status,
+        ReadinessPresentationState::ReadyWithWarnings
+    );
+    assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+}

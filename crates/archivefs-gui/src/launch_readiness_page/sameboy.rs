@@ -360,7 +360,11 @@ mod tests {
     }
 
     fn blue_play_action(plan: &LaunchPlan) -> GamerPlayAction {
-        gamer_play_action(&LaunchReadinessInput::Plan {
+        gamer_play_action(&blue_input(plan))
+    }
+
+    fn blue_input(plan: &LaunchPlan) -> LaunchReadinessInput {
+        LaunchReadinessInput::Plan {
             plan: plan.clone(),
             retroarch: None,
             retroarch_scanned: true,
@@ -382,7 +386,40 @@ mod tests {
             amiga_whdload: None,
             #[cfg(target_os = "linux")]
             shadps4: None,
-        })
+        }
+    }
+
+    /// Blue's status and the real request builder must agree, with and
+    /// without a warning (the builder refuses warned candidates).
+    #[test]
+    fn blue_status_agrees_with_whether_the_request_builder_accepts() {
+        use crate::gui_v2::launch_readiness_summary::{
+            ReadinessFreshness, ReadinessPresentationState as State, project, route_truth,
+        };
+        let (_dir, _roots, plan, _candidate) = fixture(0);
+        let clean = blue_input(&plan);
+        let mut summary = project(&clean, ReadinessFreshness::Current);
+        route_truth::apply(&mut summary, &route_truth::assess(&clean));
+        assert_eq!(summary.status, State::Ready);
+        assert!(matches!(
+            blue_play_action(&plan),
+            GamerPlayAction::Launch(_)
+        ));
+
+        let mut warned = plan.clone();
+        warned.candidates[0].warnings = vec![archivefs_core::launch::LaunchWarning::new(
+            archivefs_core::launch::LaunchWarningKind::FirmwarePresentUnverified,
+            "test warning",
+        )];
+        let input = blue_input(&warned);
+        let mut summary = project(&input, ReadinessFreshness::Current);
+        route_truth::apply(&mut summary, &route_truth::assess(&input));
+        assert_eq!(summary.status, State::Blocked);
+        assert!(summary.explanation.contains("test warning"));
+        assert!(matches!(
+            blue_play_action(&warned),
+            GamerPlayAction::BlockedTyped(_)
+        ));
     }
 
     #[test]

@@ -114,6 +114,31 @@ fn refusal_for(
         // specific reason from the shared authority when it gave one.
         _ => {
             let specific = (blocker.detail != NO_SAFE_CANDIDATE_DETAIL).then_some(blocker.detail);
+            // Nearly every request builder (SameBoy, mGBA, RMG, Stella,
+            // DeSmuME, Dolphin, PCSX2, RetroArch, the generic standalone
+            // builder...) refuses a candidate that carries a warning, so a
+            // route exists but is held back. Say that, with the warning,
+            // rather than claiming there is no route.
+            let notes: Vec<&str> = candidate
+                .warnings
+                .iter()
+                .map(|warning| warning.detail.as_str())
+                .collect();
+            if !notes.is_empty() {
+                return refuse(
+                    ReadinessPresentationState::Blocked,
+                    format!("{name} is held back by a warning"),
+                    specific.unwrap_or_else(|| {
+                        format!(
+                            "EmuWiz only starts {name} from a clean check, and this one has a \
+                             note: {}. Resolve it, or choose another emulator. Nothing was \
+                             launched.",
+                            notes.join("; ")
+                        )
+                    }),
+                    ReadinessAction::ReviewProblem,
+                );
+            }
             if let Some(media) = unsupported_media(candidate) {
                 return refuse(
                     ReadinessPresentationState::Blocked,
