@@ -392,6 +392,7 @@ mod tests {
             flycast: None,
             xroar: None,
             azahar: None,
+            vita3k: None,
             vice: None,
             amiga_whdload: None,
             #[cfg(target_os = "linux")]
