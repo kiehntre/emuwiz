@@ -145,21 +145,22 @@ pub fn catalogue_from_parsed(
 }
 
 /// Parses the configured catalogues whose derived system is a cartridge
-/// system. Reads DAT files only; skips (never guesses) the rest.
+/// system. Reads DAT files only; skips (never guesses) the rest. The flag is
+/// false when cancelled part-way: such a partial list must not be cached.
 pub fn load_cartridge_catalogues(
     configured: &std::collections::HashMap<
         String,
         crate::dat::configured_catalogues::ConfiguredCatalogue,
     >,
     cancel: &AtomicBool,
-) -> Vec<Catalogue> {
+) -> (Vec<Catalogue>, bool) {
     let wanted = cartridge_platforms();
     let mut ids: Vec<&String> = configured.keys().collect();
     ids.sort();
     let mut out = Vec::new();
     for id in ids {
         if cancel.load(Ordering::Relaxed) {
-            break;
+            return (out, false);
         }
         let row = &configured[id];
         if row.kind != crate::dat::sources::DatSourceKind::File {
@@ -177,7 +178,7 @@ pub fn load_cartridge_catalogues(
             out.push(catalogue);
         }
     }
-    out
+    (out, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +208,15 @@ impl ReadRefusal {
 /// Reads one file for the check: a loose file, or a ZIP holding exactly one
 /// file member (whatever its extension). Bounded by [`MAX_CHECK_BYTES`].
 pub fn read_check_bytes(path: &Path, trusted: &TrustedRoots) -> Result<Vec<u8>, ReadRefusal> {
+    read_check_file(path, trusted).map(|(_, bytes)| bytes)
+}
+
+/// Like [`read_check_bytes`], also returning the ZIP member's name (None for a
+/// loose file). The name is only used for explanatory wording.
+pub fn read_check_file(
+    path: &Path,
+    trusted: &TrustedRoots,
+) -> Result<(Option<String>, Vec<u8>), ReadRefusal> {
     let safe = open_bounded_read(path, trusted)
         .map_err(|refusal| ReadRefusal::Unreadable(refusal.detail()))?;
     let is_zip = path
@@ -215,7 +225,7 @@ pub fn read_check_bytes(path: &Path, trusted: &TrustedRoots) -> Result<Vec<u8>, 
     let length = safe.len();
     let file = safe.into_file();
     if is_zip {
-        return read_single_zip_member(file, length);
+        return read_single_zip_member_named(file, length).map(|(n, b)| (Some(n), b));
     }
     if length > MAX_CHECK_BYTES {
         return Err(ReadRefusal::TooLarge(length));
@@ -229,17 +239,22 @@ pub fn read_check_bytes(path: &Path, trusted: &TrustedRoots) -> Result<Vec<u8>, 
             "the file changed while it was read".into(),
         ));
     }
-    Ok(bytes)
+    Ok((None, bytes))
 }
 
 /// Small bounded helper with the same safety rules as
 /// `zip_cartridge_select`, but without requiring a supported extension:
 /// member-count cap, name sanitation, no encryption, no symlink, declared
 /// size and ratio caps, and bytes actually read are counted.
-pub fn read_single_zip_member(
+pub fn read_single_zip_member(file: std::fs::File, outer_len: u64) -> Result<Vec<u8>, ReadRefusal> {
+    read_single_zip_member_named(file, outer_len).map(|(_, bytes)| bytes)
+}
+
+/// [`read_single_zip_member`] plus the member's name.
+pub fn read_single_zip_member_named(
     file: std::fs::File,
     _outer_len: u64,
-) -> Result<Vec<u8>, ReadRefusal> {
+) -> Result<(String, Vec<u8>), ReadRefusal> {
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| ReadRefusal::Corrupt(e.to_string()))?;
     if archive.len() > MAX_ARCHIVE_MEMBERS {
@@ -316,7 +331,7 @@ pub fn read_single_zip_member(
             "the member size differs from its header".into(),
         ));
     }
-    Ok(bytes)
+    Ok((String::from_utf8_lossy(&name).into_owned(), bytes))
 }
 
 pub fn sha1_hex(bytes: &[u8]) -> String {
@@ -390,34 +405,73 @@ pub fn header_signals(bytes: &[u8]) -> Vec<Signal> {
     out
 }
 
-/// Structural signature for an unheadered NES image: PRG-sized, no iNES
-/// header, and an NES-style vector table with a reset target that begins with
-/// a typical start-up opcode. Heuristic: never promoted above Probable.
+/// Magic numbers of other platforms that veto the NES structure heuristic.
+/// A veto only ever removes a Probable result, so a rare accidental match in
+/// random NES code is the safe direction.
+fn foreign_magic(bytes: &[u8]) -> bool {
+    let at = |offset: usize, magic: &[u8]| bytes.get(offset..offset + magic.len()) == Some(magic);
+    // Master System / Game Gear: "TMR SEGA" at one of three header offsets.
+    [0x1FF0, 0x3FF0, 0x7FF0].iter().any(|o| at(*o, b"TMR SEGA"))
+        // Mega Drive / Genesis / 32X: "SEGA" in the header at 0x100 or 0x101.
+        || at(0x100, b"SEGA") || at(0x101, b"SEGA")
+        // Game Boy Nintendo logo (first 8 bytes) at 0x104.
+        || at(0x104, &[0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B])
+        // GBA: fixed byte 0x96 at 0xB2 together with the logo start 0x24FFAE51.
+        || at(0x04, &[0x24, 0xFF, 0xAE, 0x51])
+        // N64 in any byte order.
+        || [[0x80, 0x37, 0x12, 0x40], [0x37, 0x80, 0x40, 0x12], [0x40, 0x12, 0x37, 0x80], [0x12, 0x40, 0x80, 0x37]]
+            .iter()
+            .any(|m| at(0, m))
+        // Atari 7800 (header byte 1..10), Lynx, Neo Geo Pocket.
+        || at(1, b"ATARI7800") || at(0, b"LYNX")
+        || at(0, b"COPYRIGHT BY SNK") || at(0, b" LICENSED BY SNK")
+        // Plausible SNES internal header (printable title, map mode 0x2x/0x3x)
+        // at the LoROM or HiROM location, even if its checksum is wrong.
+        || [0x7FC0usize, 0xFFC0].iter().any(|base| {
+            bytes.get(*base..*base + 0x20).is_some_and(|h| {
+                h[..21].iter().all(|b| (0x20..0x7F).contains(b))
+                    && matches!(h[0x15] & 0xF0, 0x20 | 0x30)
+            })
+        })
+}
+
+/// Structural signature for an unheadered NES image (heuristic, never above
+/// Probable). Deliberately strict:
+/// - size is a multiple of 8192 and at most 2 MiB; no iNES header;
+/// - no validated header and no foreign magic for any other platform;
+/// - only the fixed last 16 KiB bank is examined: NMI and IRQ vectors at the
+///   file end are >= $8000, RESET is >= $C000, and NMI differs from RESET
+///   (unused-vector layouts, as on the Atari 2600, repeat one address);
+/// - the code at RESET starts with a typical NES power-on sequence: SEI, CLD
+///   (78 D8), CLD, SEI (D8 78), or SEI, LDX #imm (78 A2), the idiom of the
+///   standard "SEI / CLD / LDX #$FF / TXS" init.
 pub fn nes_structure(bytes: &[u8]) -> Option<Signal> {
     const BANK: usize = 16 * 1024;
-    if bytes.is_empty() || !bytes.len().is_multiple_of(8192) || bytes.len() > 2 * 1024 * 1024 {
+    if bytes.len() < BANK || !bytes.len().is_multiple_of(8192) || bytes.len() > 2 * 1024 * 1024 {
         return None;
     }
-    if crate::nes_header_evidence::parse_ines_header(bytes).is_some() {
+    if crate::nes_header_evidence::parse_ines_header(bytes).is_some()
+        || !header_signals(bytes).is_empty()
+        || foreign_magic(bytes)
+    {
         return None;
     }
-    let mut end = BANK;
-    while end <= bytes.len() {
-        let table = &bytes[end - 6..end];
-        let word = |i: usize| u16::from_le_bytes([table[i], table[i + 1]]) as usize;
-        let (nmi, reset, irq) = (word(0), word(2), word(4));
-        if [nmi, reset, irq].iter().all(|v| *v >= 0x8000) && reset >= 0xC000 {
-            let target = end - BANK + (reset - 0xC000);
-            if target < end - 6 && matches!(bytes[target], 0x78 | 0xD8) {
-                return Some(signal(
-                    "NES",
-                    "size is a multiple of 8192, no iNES header, and the NES vector table at a 16 KiB bank end points to start-up code (SEI/CLD)",
-                ));
-            }
-        }
-        end += BANK;
+    let end = bytes.len();
+    let table = &bytes[end - 6..];
+    let word = |i: usize| usize::from(u16::from_le_bytes([table[i], table[i + 1]]));
+    let (nmi, reset, irq) = (word(0), word(2), word(4));
+    if nmi < 0x8000 || irq < 0x8000 || reset < 0xC000 || nmi == reset {
+        return None;
     }
-    None
+    let target = end - BANK + (reset - 0xC000);
+    let start = bytes.get(target..target + 2)?;
+    if target + 2 > end - 6 || !matches!(start, [0x78, 0xD8] | [0xD8, 0x78] | [0x78, 0xA2]) {
+        return None;
+    }
+    Some(signal(
+        "NES",
+        "size is a multiple of 8192, no iNES header or other system's signature, and the fixed last 16 KiB bank has NES-style vectors whose RESET code starts with SEI/CLD/LDX",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -455,8 +509,21 @@ fn consistent(assigned: &str, other: &str) -> bool {
     if same_platform(assigned, other) {
         return true;
     }
-    let family = ["Game Boy", "Game Boy Color"];
-    family.contains(&assigned) && family.contains(&other)
+    // Related systems whose catalogues and headers legitimately overlap.
+    const FAMILIES: [[&str; 2]; 4] = [
+        ["gb", "gbc"],
+        ["mastersystem", "gamegear"],
+        ["megadrive", "32x"],
+        ["ngp", "ngpc"],
+    ];
+    FAMILIES.iter().any(|family| {
+        let ids: Vec<Option<&str>> = family
+            .iter()
+            .map(|alias| crate::canonical_platform_for_alias(alias))
+            .collect();
+        let has = |x: &str| ids.iter().flatten().any(|id| same_platform(id, x));
+        has(assigned) && has(other)
+    })
 }
 
 /// Classifies one game. `None` means no mismatch was found (including: the
@@ -584,6 +651,9 @@ pub struct Finding {
     pub tier: Tier,
     pub detected: String,
     pub lines: Vec<String>,
+    /// The file (or ZIP member) really has a `.unh` extension. Explanatory
+    /// wording only; never evidence.
+    pub has_unh: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -593,6 +663,10 @@ pub struct RunOutput {
     /// Games per folder that were read, to show the disagreeing fraction.
     pub checked_per_folder: std::collections::BTreeMap<PathBuf, usize>,
     pub unreadable: usize,
+    /// Larger than [`MAX_CHECK_BYTES`].
+    pub too_large: usize,
+    /// Multi-member, unsafe or inconsistent ZIPs, or changed files.
+    pub skipped: usize,
     pub cancelled: bool,
 }
 
@@ -620,10 +694,27 @@ pub fn check_candidates(
         out.checked += 1;
         progress(out.checked);
         let folder = folder_of(&candidate.path);
-        let Ok(bytes) = read_check_bytes(&candidate.path, trusted) else {
-            out.unreadable += 1;
-            continue;
+        let (member, bytes) = match read_check_file(&candidate.path, trusted) {
+            Ok(read) => read,
+            Err(ReadRefusal::Unreadable(_)) => {
+                out.unreadable += 1;
+                continue;
+            }
+            Err(ReadRefusal::TooLarge(_)) => {
+                out.too_large += 1;
+                continue;
+            }
+            Err(_) => {
+                out.skipped += 1;
+                continue;
+            }
         };
+        let has_unh = member
+            .as_deref()
+            .map(Path::new)
+            .or(Some(candidate.path.as_path()))
+            .and_then(Path::extension)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("unh"));
         *out.checked_per_folder.entry(folder.clone()).or_default() += 1;
         let sha1 = sha1_hex(&bytes);
         let mut hash_hits = Vec::new();
@@ -657,6 +748,7 @@ pub fn check_candidates(
                 tier: found.tier,
                 detected: found.detected,
                 lines: found.lines,
+                has_unh,
             });
         }
     }

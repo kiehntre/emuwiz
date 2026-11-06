@@ -28,11 +28,13 @@ pub(super) const READ_ONLY_NOTE: &str =
 pub(super) const KNOWN_LIMITS: &str = "Known limits: a renamed or moved file gets a new catalogue id and does not keep a system you chose; removing a source folder deletes the systems recorded for it. The Probable group is a heuristic based on file structure, not a catalogue match.";
 
 /// Why changing the system is not the same as making a game playable.
-pub(super) fn playable_note(detected: &str) -> String {
+pub(super) fn playable_note(detected: &str, has_unh: bool) -> String {
     let mut text = String::from(
         "Changing the system only records the platform for this game. It does not necessarily make the ROM playable: Blue's identity and launch checks for the new system still apply.",
     );
-    if detected == "NES" {
+    // Explanatory wording only: shown when the chosen system is NES and the
+    // game's file or ZIP member really has a .unh extension.
+    if detected == "NES" && has_unh {
         text.push_str(" For example, NES \".unh\" unheadered images are not accepted by Blue's NES identity or launch yet, so such a game stays unlaunchable after the change.");
     }
     text
@@ -70,7 +72,7 @@ pub(super) fn system_change_preview(
         }
         None => lines.push("No folder check result for this game.".into()),
     }
-    lines.push(playable_note(selected));
+    lines.push(playable_note(selected, finding.is_some_and(|f| f.has_unh)));
     lines.push("A renamed or moved file gets a new catalogue id and does not keep this choice; removing a source folder deletes the systems recorded for it.".into());
     lines.push("Your choice outranks the folder name for this one game and is saved only when you confirm. No game file is changed.".into());
     lines
@@ -156,6 +158,35 @@ pub(super) fn cards(findings: &[Finding], dismissed: &HashSet<(PathBuf, u64)>) -
     out
 }
 
+/// The "Checked N of M" line, with a stopped-early notice and each kind of
+/// game that was not examined counted separately.
+pub(super) fn progress_text(
+    done: usize,
+    total: usize,
+    stopped_early: bool,
+    unreadable: usize,
+    too_large: usize,
+    skipped: usize,
+) -> String {
+    let mut text = if stopped_early {
+        format!("Stopped early - {done} of {total} checked.")
+    } else {
+        format!("Checked {done} of {total} cartridge games (up to {DEFAULT_RUN_CAP} per run).")
+    };
+    if unreadable > 0 {
+        text.push_str(&format!(" {unreadable} could not be read."));
+    }
+    if too_large > 0 {
+        text.push_str(&format!(" {too_large} too large to check."));
+    }
+    if skipped > 0 {
+        text.push_str(&format!(
+            " {skipped} skipped (a ZIP with several files, an unsafe or inconsistent ZIP, or a file that changed)."
+        ));
+    }
+    text
+}
+
 /// The share of checked games in a folder that disagree, as text.
 pub(super) fn disagreement_text(disagree: usize, checked: usize) -> String {
     if checked == 0 {
@@ -199,7 +230,7 @@ pub(super) fn candidates_of(games: &[Game]) -> Vec<Candidate> {
 }
 
 enum Message {
-    Done(Result<(Arc<Vec<Catalogue>>, RunOutput), String>),
+    Done(Result<(Arc<Vec<Catalogue>>, bool, RunOutput), String>),
 }
 
 #[derive(Default)]
@@ -210,6 +241,9 @@ pub(super) struct State {
     pub checked_per_folder: BTreeMap<PathBuf, usize>,
     pub checked: usize,
     pub unreadable: usize,
+    pub too_large: usize,
+    pub skipped: usize,
+    pub stopped_early: bool,
     pub error: Option<String>,
     pub ran: bool,
     pub dismissed: HashSet<(PathBuf, u64)>,
@@ -260,6 +294,7 @@ impl State {
                 ..Default::default()
             };
         }
+        self.stopped_early = false;
         let candidates = self.candidates.clone();
         let start = self.next;
         let known = self.catalogues.clone();
@@ -275,15 +310,16 @@ impl State {
                 let trusted = archivefs_core::safe_read::TrustedRoots::from_paths(
                     config.source_folders.clone(),
                 );
-                let catalogues = match known {
-                    Some(c) => c,
+                let (catalogues, complete) = match known {
+                    Some(c) => (c, true),
                     None => {
                         let configured = archivefs_core::dat::sources::default_dat_sources_config_path()
                             .map(|p| {
                                 archivefs_core::dat::configured_catalogues::load_configured_catalogues(&p)
                             })
                             .unwrap_or_default();
-                        Arc::new(fpc::load_cartridge_catalogues(&configured, &cancel))
+                        let (list, complete) = fpc::load_cartridge_catalogues(&configured, &cancel);
+                        (Arc::new(list), complete)
                     }
                 };
                 let output = fpc::check_candidates(
@@ -295,7 +331,7 @@ impl State {
                     &cancel,
                     &mut |n| progress.store(n, Ordering::Relaxed),
                 );
-                Ok((catalogues, output))
+                Ok((catalogues, complete, output))
             })();
             let _ = sender.send(Message::Done(result));
         });
@@ -310,8 +346,14 @@ impl State {
                 self.receiver = None;
                 self.cancel = None;
                 match result {
-                    Ok((catalogues, out)) => {
-                        self.catalogues = Some(catalogues);
+                    Ok((catalogues, complete, out)) => {
+                        // A list cut short by Cancel must never be reused.
+                        if complete && !out.cancelled {
+                            self.catalogues = Some(catalogues);
+                        }
+                        self.stopped_early = out.cancelled;
+                        self.too_large += out.too_large;
+                        self.skipped += out.skipped;
                         self.next += out.checked;
                         self.checked += out.checked;
                         self.unreadable += out.unreadable;
@@ -398,19 +440,13 @@ impl App {
                 } else {
                     0
                 };
-            ui.label(format!(
-                "Checked {} of {} cartridge games (up to {} per run).{}",
+            ui.label(progress_text(
                 done,
                 self.folder_check.total(),
-                DEFAULT_RUN_CAP,
-                if self.folder_check.unreadable > 0 {
-                    format!(
-                        " {} could not be read and were skipped.",
-                        self.folder_check.unreadable
-                    )
-                } else {
-                    String::new()
-                },
+                self.folder_check.stopped_early && !busy,
+                self.folder_check.unreadable,
+                self.folder_check.too_large,
+                self.folder_check.skipped,
             ));
         } else {
             ui.label("Nothing has been read yet. The check reads one capped batch of cartridge games when you start it.");

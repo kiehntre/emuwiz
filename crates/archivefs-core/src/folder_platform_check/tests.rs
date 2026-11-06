@@ -2,10 +2,15 @@ use super::*;
 use std::io::Write;
 
 fn nes_like() -> Vec<u8> {
-    let mut b = vec![0xEA_u8; 32 * 1024];
+    nes_like_sized(32 * 1024)
+}
+
+fn nes_like_sized(len: usize) -> Vec<u8> {
+    let mut b = vec![0xEA_u8; len];
     let end = b.len();
     let target = end - 16 * 1024;
     b[target] = 0x78;
+    b[target + 1] = 0xD8;
     b[end - 6..].copy_from_slice(&[0x00, 0xC1, 0x00, 0xC0, 0x00, 0xC1]);
     b
 }
@@ -364,4 +369,184 @@ fn loose_oversize_file_is_refused() {
     file.set_len(MAX_CHECK_BYTES + 1).unwrap();
     let result = read_check_bytes(&path, &TrustedRoots::none());
     assert!(matches!(result, Err(ReadRefusal::TooLarge(_))));
+}
+
+// ---- Probable tier strictness ---------------------------------------------
+
+fn xorshift(state: &mut u64) -> u8 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    (*state >> 24) as u8
+}
+
+#[test]
+fn random_data_is_never_probable_nes() {
+    let mut false_positives = 0;
+    for seed in 1..=200_u64 {
+        for size in [32 * 1024, 128 * 1024, 512 * 1024] {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let data: Vec<u8> = (0..size).map(|_| xorshift(&mut state)).collect();
+            if nes_structure(&data).is_some() {
+                false_positives += 1;
+            }
+        }
+    }
+    assert_eq!(false_positives, 0);
+}
+
+#[test]
+fn other_systems_signatures_veto_the_nes_structure() {
+    let stamps: Vec<(&str, usize, Vec<u8>)> = vec![
+        ("SMS 0x7FF0", 0x7FF0, b"TMR SEGA".to_vec()),
+        ("GG 0x3FF0", 0x3FF0, b"TMR SEGA".to_vec()),
+        ("SMS 0x1FF0", 0x1FF0, b"TMR SEGA".to_vec()),
+        ("Genesis", 0x100, b"SEGA MEGA DRIVE ".to_vec()),
+        ("Genesis (bad name)", 0x101, b"SEGA".to_vec()),
+        (
+            "Game Boy logo",
+            0x104,
+            vec![0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B],
+        ),
+        ("GBA logo", 0x04, vec![0x24, 0xFF, 0xAE, 0x51]),
+        ("N64", 0, vec![0x80, 0x37, 0x12, 0x40]),
+        ("Atari 7800", 1, b"ATARI7800".to_vec()),
+        ("Lynx", 0, b"LYNX".to_vec()),
+        ("NGP", 0, b"COPYRIGHT BY SNK".to_vec()),
+    ];
+    for size in [32 * 1024, 128 * 1024, 512 * 1024] {
+        assert!(nes_structure(&nes_like_sized(size)).is_some(), "{size}");
+        for (name, offset, bytes) in &stamps {
+            let mut image = nes_like_sized(size);
+            image[*offset..*offset + bytes.len()].copy_from_slice(bytes);
+            assert!(nes_structure(&image).is_none(), "{name} at {size}");
+        }
+        // SNES image with a plausible header but a wrong checksum.
+        let mut snes = nes_like_sized(size);
+        let title = b"SUPER TEST GAME      ";
+        snes[0x7FC0..0x7FC0 + 21].copy_from_slice(title);
+        snes[0x7FD5] = 0x20;
+        assert!(header_signals(&snes).iter().all(|s| s.platform != "SNES"));
+        assert!(nes_structure(&snes).is_none(), "bad-header SNES at {size}");
+    }
+}
+
+#[test]
+fn atari_style_repeated_vectors_and_odd_start_code_are_refused() {
+    let mut atari = nes_like();
+    let end = atari.len();
+    atari[end - 6..].copy_from_slice(&[0x00, 0xC0, 0x00, 0xC0, 0x00, 0xC0]);
+    assert!(nes_structure(&atari).is_none());
+    let mut other_start = nes_like();
+    let target = other_start.len() - 16 * 1024;
+    other_start[target] = 0xA9;
+    assert!(nes_structure(&other_start).is_none());
+    // Size rules.
+    assert!(nes_structure(&nes_like()[..24 * 1024 + 100]).is_none());
+}
+
+// ---- related-system families ---------------------------------------------
+
+fn id(alias: &str) -> String {
+    crate::canonical_platform_for_alias(alias)
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn related_systems_are_not_a_confirmed_mismatch() {
+    for (a, b) in [
+        ("mastersystem", "gamegear"),
+        ("gamegear", "mastersystem"),
+        ("megadrive", "32x"),
+        ("32x", "megadrive"),
+        ("gb", "gbc"),
+        ("ngp", "ngpc"),
+    ] {
+        let mut e = ev(&id(a));
+        e.hash_hits.push(hit(&id(b)));
+        assert!(classify(&e).is_none(), "{a} vs {b}");
+    }
+    let mut e = ev(&id("mastersystem"));
+    e.hash_hits.push(hit("NES"));
+    assert_eq!(classify(&e).unwrap().tier, Tier::Confirmed);
+}
+
+// ---- cancellation, counts, wording support --------------------------------
+
+#[test]
+fn cancelled_catalogue_load_is_reported_incomplete() {
+    use crate::dat::catalogue_selection::CatalogueRef;
+    use crate::dat::configured_catalogues::ConfiguredCatalogue;
+    let mut configured = std::collections::HashMap::new();
+    configured.insert(
+        "x".to_string(),
+        ConfiguredCatalogue {
+            reference: CatalogueRef::local("x"),
+            source_id: "x".into(),
+            display_name: "x".into(),
+            path: PathBuf::from("/nonexistent.dat"),
+            kind: crate::dat::sources::DatSourceKind::File,
+            sha256: None,
+            revision: None,
+        },
+    );
+    let (list, complete) = load_cartridge_catalogues(&configured, &AtomicBool::new(true));
+    assert!(list.is_empty());
+    assert!(!complete);
+    let (_, complete) = load_cartridge_catalogues(&configured, &AtomicBool::new(false));
+    assert!(complete);
+}
+
+#[test]
+fn refusals_are_counted_separately_and_unh_is_a_real_extension_fact() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.bin");
+    let big = dir.path().join("big.bin");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(MAX_CHECK_BYTES + 1)
+        .unwrap();
+    let multi = dir.path().join("multi.zip");
+    write_zip(&multi, &[("a", b"1"), ("b", b"2")]);
+    let unh = dir.path().join("unh.zip");
+    write_zip(&unh, &[("Game.unh", &nes_like())]);
+    let plain = dir.path().join("plain.bin");
+    std::fs::write(&plain, nes_like()).unwrap();
+    let candidates: Vec<Candidate> = [missing, big, multi, unh, plain]
+        .into_iter()
+        .enumerate()
+        .map(|(i, path)| Candidate {
+            archive_id: i as i64,
+            title: format!("g{i}"),
+            path,
+            assigned: "SNES".into(),
+            assigned_source: None,
+        })
+        .collect();
+    let out = check_candidates(
+        &candidates,
+        0,
+        10,
+        &[],
+        &TrustedRoots::none(),
+        &AtomicBool::new(false),
+        &mut |_| {},
+    );
+    assert_eq!((out.unreadable, out.too_large, out.skipped), (1, 1, 1));
+    assert_eq!(out.findings.len(), 2);
+    assert!(
+        out.findings
+            .iter()
+            .find(|f| f.archive_id == 3)
+            .unwrap()
+            .has_unh
+    );
+    assert!(
+        !out.findings
+            .iter()
+            .find(|f| f.archive_id == 4)
+            .unwrap()
+            .has_unh
+    );
 }
