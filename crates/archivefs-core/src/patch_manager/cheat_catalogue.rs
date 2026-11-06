@@ -82,6 +82,8 @@ use super::{
 };
 use crate::canonical_platform_for_alias;
 
+use super::cht_document::{ChtInstallEntry, render_cht_file};
+
 pub const CHEAT_CATALOGUE_FORMAT_VERSION: u32 = 1;
 /// Mirrors `retroarch_inventory::MAX_CHEAT_FILE_BYTES` - one catalogue
 /// `.cht` file or the JSON manifest body, bounded-read.
@@ -1096,6 +1098,91 @@ fn hex_sha256(bytes: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------
+// Installable content
+// ---------------------------------------------------------------------
+
+/// Staging reason for a manifest game none of whose cheats carries a code.
+pub const NO_INSTALLABLE_CHEATS_REASON: &str = "no_installable_cheats";
+/// What a preview shows for such a game.
+pub const NO_USABLE_CHEAT_CODES_LABEL: &str = "Skipped: no usable cheat codes";
+
+/// The `.cht` document an install would write for a JSON-manifest record:
+/// one RetroArch-loadable file holding only *this* game's cheats, rendered
+/// deterministically through [`render_cht_file`]. A manifest describes
+/// many games in one JSON document, so the manifest's own bytes are never
+/// what gets installed as `<game>.cht` (Night Watch D7-01). Returns `None`
+/// for a `.cht`-directory record (its source file *is* the installable
+/// document) and for a manifest game with no cheat that carries a code,
+/// which has nothing RetroArch could load.
+///
+/// Every cheat without a code is left out rather than rendered as an
+/// empty entry; the description falls back to `Cheat N` so the file is
+/// still readable in RetroArch's cheat menu.
+pub fn render_installable_cheat_document(record: &CheatGameRecord) -> Option<Vec<u8>> {
+    match record.format {
+        CheatCatalogueFormat::RetroarchChtDirectory => None,
+        CheatCatalogueFormat::JsonManifest => {
+            let entries: Vec<ChtInstallEntry> = record
+                .cheats
+                .iter()
+                .enumerate()
+                .filter_map(|(index, cheat)| {
+                    let code = cheat
+                        .source_evidence
+                        .iter()
+                        .find_map(|evidence| evidence.original_code.as_deref())
+                        .map(str::trim)
+                        .filter(|code| !code.is_empty())?;
+                    let description = cheat
+                        .description
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|description| !description.is_empty())
+                        .map_or_else(|| format!("Cheat {}", index + 1), str::to_owned);
+                    Some(ChtInstallEntry {
+                        description,
+                        code: code.to_owned(),
+                        enabled: cheat.enabled_by_default,
+                        extra_fields: Vec::new(),
+                    })
+                })
+                .collect();
+            if entries.is_empty() {
+                return None;
+            }
+            let header = vec![format!(
+                "EmuWiz: rendered from a catalogue manifest entry for \"{}\"",
+                record.source_game_name.trim()
+            )];
+            Some(render_cht_file(&entries, &header).into_bytes())
+        }
+    }
+}
+
+/// SHA-256 of the exact bytes an install would write for `record`: the
+/// source `.cht` file's own hash, or the hash of the document
+/// [`render_installable_cheat_document`] renders for a manifest game.
+/// `None` when nothing installable exists (an unreadable `.cht` source, or
+/// a manifest game without a single coded cheat).
+pub fn installable_content_hash(record: &CheatGameRecord) -> Option<String> {
+    match record.format {
+        CheatCatalogueFormat::RetroarchChtDirectory => record.source_file_hash.clone(),
+        CheatCatalogueFormat::JsonManifest => {
+            render_installable_cheat_document(record).map(|bytes| hex_sha256(&bytes))
+        }
+    }
+}
+
+/// The exact `<game>.cht` file name a catalogue record installs as - the
+/// single shared derivation for the staging preview, the installer and
+/// Undo, so the previewed path and the written path can never disagree
+/// (Night Watch D7-02). `None` when the game name is not a safe single
+/// path component.
+pub fn cheat_destination_file_name(record: &CheatGameRecord) -> Option<String> {
+    sanitize_path_component(&record.source_game_name).map(|game| format!("{game}.cht"))
+}
+
+// ---------------------------------------------------------------------
 // Matching
 // ---------------------------------------------------------------------
 
@@ -1721,15 +1808,18 @@ fn discovered_cheat_root(environment: &RetroArchEnvironmentReport) -> Option<Pat
 }
 
 /// Rejects anything unsafe as a single path component: empty, `.`/`..`,
-/// any path separator, or a NUL byte. Used for both the platform-directory
-/// and game-filename components of a computed staging destination, so
-/// neither can escape the destination root or address an unintended path.
+/// any path separator, a NUL byte, or any other control character (a
+/// newline or escape inside a file name survives trimming only at the
+/// ends and would otherwise produce a name that no preview can display
+/// faithfully). Used for both the platform-directory and game-filename
+/// components of a computed staging destination, so neither can escape
+/// the destination root or address an unintended path.
 fn sanitize_path_component(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
         return None;
     }
-    if trimmed.contains(['/', '\\']) || trimmed.contains('\0') {
+    if trimmed.contains(['/', '\\']) || trimmed.chars().any(char::is_control) {
         return None;
     }
     Some(trimmed.to_string())
@@ -1788,12 +1878,9 @@ fn resolve_canonical_cheat_destination(
     // trusting that invariant implicitly.
     let platform_component =
         sanitize_path_component(platform_component).ok_or("destination_traversal_rejected")?;
-    let game_component = sanitize_path_component(&record.source_game_name)
-        .ok_or("destination_traversal_rejected")?;
+    let file_name = cheat_destination_file_name(record).ok_or("destination_traversal_rejected")?;
 
-    Ok(root
-        .join(platform_component)
-        .join(format!("{game_component}.cht")))
+    Ok(root.join(platform_component).join(file_name))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1831,6 +1918,10 @@ pub struct CheatStagingPlan {
     /// destination could be computed at all (e.g. the platform is
     /// unresolved, so there is nothing to join a filename onto).
     pub proposed_destination_path: Option<EncodedPath>,
+    /// SHA-256 of the exact bytes an install would write at the
+    /// destination: a `.cht` source file's own bytes, or for a JSON
+    /// manifest the per-game `.cht` document rendered from it - never the
+    /// manifest file's own hash. See [`installable_content_hash`].
     pub source_file_hash: Option<String>,
     /// `Some` only when the destination already exists as a readable
     /// regular file.
@@ -1940,7 +2031,7 @@ fn probe_and_compare_destination(
             match filesystem.read_bounded(real_path, MAX_CATALOGUE_FILE_BYTES) {
                 BoundedReadResult::Ok(bytes) => {
                     let existing_hash = hex_sha256(&bytes);
-                    if record.source_file_hash.as_deref() == Some(existing_hash.as_str()) {
+                    if installable_content_hash(record).as_deref() == Some(existing_hash.as_str()) {
                         destination_outcome(
                             CheatStagingAction::AlreadyInstalled,
                             CheatInstalledState::ExactFilePresent,
@@ -2011,6 +2102,10 @@ fn resolve_cheat_staging_plan(
                 return staging_plan;
             }
             ArtifactDestinationLookup::One(destination) => {
+                let source_file_hash = match installable_source_hash(record) {
+                    Ok(hash) => hash,
+                    Err(reason) => return not_eligible_plan(record, reason),
+                };
                 let outcome = probe_and_compare_destination(
                     filesystem,
                     record,
@@ -2021,7 +2116,7 @@ fn resolve_cheat_staging_plan(
                 return CheatStagingPlan {
                     source_cheat_path: record.source_file_path.clone(),
                     proposed_destination_path: Some(destination.path.clone()),
-                    source_file_hash: record.source_file_hash.clone(),
+                    source_file_hash: source_file_hash.clone(),
                     existing_destination_hash: outcome.existing_hash,
                     planned_action: outcome.action,
                     reason: staging_reason(outcome.action),
@@ -2033,19 +2128,38 @@ fn resolve_cheat_staging_plan(
 
     match resolve_canonical_cheat_destination(record, advisory_plan, destination_root_override) {
         Ok(path) => {
+            let source_file_hash = match installable_source_hash(record) {
+                Ok(hash) => hash,
+                Err(reason) => return not_eligible_plan(record, reason),
+            };
             let encoded = EncodedPath::from_path(&path);
             let probe = filesystem.probe(&path);
             let outcome = probe_and_compare_destination(filesystem, record, &encoded, probe, false);
             CheatStagingPlan {
                 source_cheat_path: record.source_file_path.clone(),
                 proposed_destination_path: Some(encoded),
-                source_file_hash: record.source_file_hash.clone(),
+                source_file_hash,
                 existing_destination_hash: outcome.existing_hash,
                 planned_action: outcome.action,
                 reason: staging_reason(outcome.action),
             }
         }
         Err(reason) => not_eligible_plan(record, reason),
+    }
+}
+
+/// What an install would actually write for `record`. A `.cht` source
+/// keeps its own file hash (possibly `None` when it could not be
+/// bounded-read, as before); a manifest game is only installable when it
+/// renders to a real per-game document. Checked only once a destination
+/// has been resolved, so an unresolved platform or unsafe name keeps its
+/// own, more specific reason.
+fn installable_source_hash(record: &CheatGameRecord) -> Result<Option<String>, &'static str> {
+    match record.format {
+        CheatCatalogueFormat::RetroarchChtDirectory => Ok(record.source_file_hash.clone()),
+        CheatCatalogueFormat::JsonManifest => installable_content_hash(record)
+            .map(Some)
+            .ok_or(NO_INSTALLABLE_CHEATS_REASON),
     }
 }
 
@@ -2088,6 +2202,11 @@ pub struct CheatAvailabilityEntry {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CheatAvailabilitySummary {
     pub games_in_catalogue: usize,
+    /// Manifest games skipped because none of their listed cheats carries
+    /// a code (see [`NO_INSTALLABLE_CHEATS_REASON`]). Their descriptions
+    /// stay in the catalogue record; nothing is written for them.
+    #[serde(default)]
+    pub no_usable_cheat_codes: usize,
     pub exact_matches: usize,
     pub strong_matches: usize,
     pub weak_matches: usize,
@@ -2213,7 +2332,17 @@ pub fn build_cheat_availability_report(
             CheatStagingAction::InstallNew => summary.not_installed += 1,
             CheatStagingAction::AlreadyInstalled => summary.already_installed += 1,
             CheatStagingAction::Conflict => summary.conflicts += 1,
-            CheatStagingAction::ReplaceDifferent | CheatStagingAction::NotEligible => {}
+            CheatStagingAction::ReplaceDifferent => {}
+            CheatStagingAction::NotEligible
+                if entry.staging_plan.reason == NO_INSTALLABLE_CHEATS_REASON =>
+            {
+                summary.no_usable_cheat_codes += 1;
+                entry.installed_state_detail.push(format!(
+                    "{NO_USABLE_CHEAT_CODES_LABEL} ({} listed, none carries a code; descriptions are kept in the catalogue, nothing is written)",
+                    entry.game.cheat_count
+                ));
+            }
+            CheatStagingAction::NotEligible => {}
         }
         if entry.staging_candidate {
             summary.staging_candidates += 1;

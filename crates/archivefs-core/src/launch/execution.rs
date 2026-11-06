@@ -10,8 +10,10 @@
 //! - One direct loose regular content file
 //!   ([`LaunchContainerKind::PlainFile`], `requires_mount == false`) - no
 //!   archive members, no mounted content, no CUE/BIN multi-file handling.
-//! - Strictly [`LaunchReadiness::Ready`] - `ReadyWithWarnings` and
-//!   `Blocked` are both refused, never silently accepted.
+//! - `LaunchReadiness::Ready`, or `ReadyWithWarnings` whose ONLY warnings
+//!   are allow-listed ([`crate::launch::planning::LaunchCandidate::retroarch_play_eligible`]: a
+//!   readable but unhashed required firmware file); any other warning kind,
+//!   any blocker and `Blocked` are refused, never silently accepted.
 //! - Exactly one requested RetroArch core candidate, matched by profile +
 //!   core stem + platform id - never a silent substitution of a different
 //!   candidate the plan happened to also find.
@@ -51,6 +53,7 @@ use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContainerKind, LaunchContentRef, LaunchTarget, build_launch_plan,
 };
 use crate::launch::process_spawn::{self, WatchedProcess};
+#[cfg(test)]
 use crate::launch::readiness::LaunchReadiness;
 use crate::launch::retroarch_command::{RetroArchCommand, build_retroarch_command_plan};
 
@@ -206,9 +209,9 @@ pub enum LaunchPreflightErrorKind {
     /// profile/core stem/platform id - never substituted with a different
     /// candidate the plan happened to also contain.
     RequestedCandidateNotFound,
-    /// The matched candidate's own readiness is not exactly
-    /// [`LaunchReadiness::Ready`] - covers both `ReadyWithWarnings` and
-    /// `Blocked`.
+    /// The matched candidate is not Play-eligible
+    /// ([`crate::launch::planning::LaunchCandidate::retroarch_play_eligible`]) - `Blocked`, or
+    /// `ReadyWithWarnings` with a warning that is not allow-listed.
     CandidateNotReady,
     /// The matched candidate's content is not the narrow, direct,
     /// non-mounted plain-file shape this phase supports, even though its
@@ -334,8 +337,10 @@ impl From<LaunchSpawnError> for LaunchExecutionError {
 ///    remembered preferences (out of scope for this phase). The candidate
 ///    matching `request.profile`/`core_stem`/`expected_platform_id` is
 ///    found - never substituted with a different one.
-/// 8. That candidate's `readiness` must be exactly [`LaunchReadiness::Ready`]
-///    and its content must still be the narrow direct-plain-file shape
+/// 8. That candidate must be [`crate::launch::planning::LaunchCandidate::retroarch_play_eligible`]
+///    (Ready, or ReadyWithWarnings carrying only the allow-listed
+///    unverified-firmware warning, re-derived from the fresh firmware probe
+///    in step 7) and its content must still be the narrow direct-plain-file shape
 ///    this phase supports.
 /// 9. [`build_retroarch_command_plan`] is rebuilt from the fresh identity/
 ///    candidate/environment; it must report no blockers and a command.
@@ -524,11 +529,11 @@ pub fn preflight_retroarch_launch(
         })?;
 
     // --- 8: strict readiness + content-shape gate ---
-    if candidate.readiness != LaunchReadiness::Ready {
+    if !candidate.retroarch_play_eligible() {
         return Err(preflight_error(
             LaunchPreflightErrorKind::CandidateNotReady,
             format!(
-                "requested candidate readiness is {:?}, not exactly Ready",
+                "requested candidate is not eligible to play (readiness {:?}; it is blocked or carries a warning other than unverified firmware)",
                 candidate.readiness
             ),
         ));

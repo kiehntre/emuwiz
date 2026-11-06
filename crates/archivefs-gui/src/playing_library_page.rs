@@ -631,6 +631,28 @@ impl PlayingLibraryPageState {
     /// filesystem beyond reading the DAT and hashing candidate files -
     /// nothing is written, moved, or created.
     pub(crate) fn preview(&mut self) {
+        self.preview_cancellable(&AtomicBool::new(false));
+    }
+
+    /// `preview`, stopping between candidate files when `cancel` is set.
+    /// Returns `false` when it stopped: no plan is kept, nothing was written,
+    /// and the caller should present the stop rather than a partial preview.
+    pub(crate) fn preview_cancellable(&mut self, cancel: &AtomicBool) -> bool {
+        self.preview_inner(cancel);
+        if cancel.load(Ordering::Relaxed) {
+            // The matcher skips the remaining files once asked to stop, so a
+            // plan built from it would silently cover only part of the folder.
+            self.plan = None;
+            self.preview_transaction = None;
+            self.verified_matches.clear();
+            self.output_projection = None;
+            self.error = None;
+            return false;
+        }
+        true
+    }
+
+    fn preview_inner(&mut self, cancel: &AtomicBool) {
         self.plan = None;
         self.preview_transaction = None;
         self.verified_dat = None;
@@ -685,6 +707,11 @@ impl PlayingLibraryPageState {
         };
         self.dat_platform_identity = Some(resolved.dat_platform_identity());
 
+        // A cancel raised while this job was still queued must not pay for
+        // the source walk first.
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let scan = collect_source_files_reported(std::slice::from_ref(&source_root), 20_000, 16);
         if !scan.incomplete.is_empty() {
             self.error = Some(format!(
@@ -695,12 +722,11 @@ impl PlayingLibraryPageState {
         }
         let candidates = scan.files;
         let trusted = TrustedRoots::from_paths([&source_root]);
-        let outcome_matches = match_loose_files_against_dat(
-            &resolved.parsed,
-            &candidates,
-            &trusted,
-            &AtomicBool::new(false),
-        );
+        let outcome_matches =
+            match_loose_files_against_dat(&resolved.parsed, &candidates, &trusted, cancel);
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
 
         self.source_files_examined = candidates.len();
         self.review_paths = presentation::unrepresented_paths(&candidates, &outcome_matches);

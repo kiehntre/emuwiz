@@ -612,6 +612,18 @@ pub enum LaunchWarningKind {
     SameBoyCustomBootRomUnavailable,
 }
 
+impl LaunchWarningKind {
+    /// Owner-approved policy (option B, 2026-11-06): a readable, regular
+    /// firmware file whose hash is not verified may stay launchable through
+    /// RetroArch with a visible warning. This is the ALLOW-LIST of warning
+    /// kinds that do not withdraw RetroArch Play; every other kind (present
+    /// or future) still does. Add a kind here only with explicit owner
+    /// approval.
+    pub fn permits_retroarch_play(self) -> bool {
+        matches!(self, Self::FirmwarePresentUnverified)
+    }
+}
+
 /// One non-blocking condition on a [`crate::launch::planning::LaunchCandidate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchWarning {
@@ -958,5 +970,37 @@ mod tests {
     #[test]
     fn ppsspp_never_requires_firmware() {
         assert_eq!(ppsspp_firmware_readiness(), FirmwareReadiness::NotRequired);
+    }
+
+    #[test]
+    fn only_unverified_firmware_warning_permits_retroarch_play() {
+        assert!(LaunchWarningKind::FirmwarePresentUnverified.permits_retroarch_play());
+        for kind in [
+            LaunchWarningKind::OptionalFirmwareMissing,
+            LaunchWarningKind::MultipleEligibleProfiles,
+            LaunchWarningKind::PreferredLaunchChoiceUnavailable,
+            LaunchWarningKind::ShadPs4PrerequisitesUnverified,
+            LaunchWarningKind::CemuKeysPresentUnverified,
+            LaunchWarningKind::SameBoyRomHeaderChecksumInvalid,
+        ] {
+            assert!(!kind.permits_retroarch_play(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn unverified_warning_names_the_required_files_only() {
+        let info = core_with(&[
+            (false, FirmwarePresence::PresentUnverified),
+            (true, FirmwarePresence::PresentUnverified),
+        ]);
+        let text = crate::launch::planning::unverified_firmware_detail(&info);
+        assert!(
+            text.starts_with("Firmware found but not verified"),
+            "{text}"
+        );
+        assert!(
+            text.contains("f0.bin") && !text.contains("f1.bin"),
+            "{text}"
+        );
     }
 }
