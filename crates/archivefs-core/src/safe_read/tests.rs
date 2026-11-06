@@ -551,3 +551,57 @@ fn an_opened_regular_file_is_returned_in_blocking_mode() {
     assert!(flags >= 0);
     assert_eq!(flags & libc::O_NONBLOCK, 0);
 }
+
+/// Opens `path` on a worker and fails (instead of hanging the suite) if the
+/// open has not returned within a bounded time.
+#[cfg(unix)]
+fn open_within_deadline(path: &Path, trusted: &TrustedRoots) -> Result<u64, SafeReadRefusal> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let (path, trusted) = (path.to_path_buf(), trusted.clone());
+    std::thread::spawn(move || {
+        let _ = sender.send(open_bounded_read(&path, &trusted).map(|file| file.len()));
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("a safe-read open blocked")
+}
+
+/// Every kind of path the policy meets returns promptly with the expected
+/// verdict, including a regular file that was replaced by a FIFO after it was
+/// first opened. This does not reproduce the narrower swap between the
+/// regular-file check and the open itself; `O_NONBLOCK` covers that by
+/// construction and cannot be timed deterministically here.
+#[cfg(unix)]
+#[test]
+fn every_path_kind_is_answered_promptly_and_a_file_replaced_by_a_fifo_is_refused() {
+    let fixture = Fixture::new("bounded-kinds");
+    let trusted = fixture.trusted();
+    let game = fixture.file("library/game.bin", b"rom");
+    assert_eq!(open_within_deadline(&game, &trusted), Ok(3));
+    let link = fixture.link("library/linked.bin", &game);
+    assert_eq!(open_within_deadline(&link, &trusted), Ok(3));
+    let folder = fixture.path("library/folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    assert_eq!(
+        open_within_deadline(&folder, &trusted),
+        Err(SafeReadRefusal::NotRegularFile)
+    );
+    assert!(open_within_deadline(&fixture.path("library/missing.bin"), &trusted).is_err());
+
+    // Replace the regular file with a FIFO after it was opened once.
+    std::fs::remove_file(&game).unwrap();
+    let name = std::ffi::CString::new(game.as_os_str().as_encoded_bytes()).expect("cstring");
+    // SAFETY: `name` is a valid NUL-terminated path inside a fresh temporary
+    // directory; `mkfifo` only creates the FIFO the test then refuses to read.
+    if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+        return;
+    }
+    assert_eq!(
+        open_within_deadline(&game, &trusted),
+        Err(SafeReadRefusal::NotRegularFile)
+    );
+    assert_eq!(
+        open_within_deadline(&link, &trusted),
+        Err(SafeReadRefusal::NotRegularFile)
+    );
+}

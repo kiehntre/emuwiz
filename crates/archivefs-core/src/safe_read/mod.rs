@@ -401,8 +401,10 @@ fn open_validated(target: &Path, resolved_via_symlink: bool) -> Result<SafeFile,
         // the regular-file check above and this open: a path swapped for a
         // FIFO opens at once (instead of waiting forever for a writer) and is
         // then refused below. It is cleared again once the file is proven
-        // regular, so readers see ordinary blocking reads.
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        // regular, so readers see ordinary blocking reads. `O_NOCTTY` keeps a
+        // terminal swapped in during that window from becoming ours.
+        options
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOCTTY);
     }
     let file = options
         .open(target)

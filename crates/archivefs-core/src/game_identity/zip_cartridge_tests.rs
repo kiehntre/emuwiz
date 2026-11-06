@@ -323,18 +323,20 @@ fn make_fifo(path: &Path) -> bool {
 #[cfg(unix)]
 #[test]
 fn freshness_recheck_refuses_a_zip_swapped_for_a_fifo_or_special_file_without_blocking() {
-    let dir = tempfile::tempdir().unwrap();
-    let zip = write_zip(dir.path(), "game.zip", &[("Game.sfc", &snes_rom(1))]);
+    let temp = tempfile::tempdir().unwrap();
+    // Canonical, so the no-symlink policy accepts it on any host.
+    let dir = temp.path().canonicalize().unwrap();
+    let zip = write_zip(&dir, "game.zip", &[("Game.sfc", &snes_rom(1))]);
     let before = StableFileMetadata::from_file(&fs::File::open(&zip).unwrap()).unwrap();
-    let trusted = TrustedRoots::from_paths([dir.path()]);
+    let trusted = TrustedRoots::from_paths([&dir]);
     assert!(still_same_file(&zip, &TrustedRoots::none(), &before));
     // An external or multi-drive library reached through a trusted symlink
     // still passes when the target is the same file.
-    let link = dir.path().join("linked.zip");
+    let link = dir.join("linked.zip");
     std::os::unix::fs::symlink(&zip, &link).unwrap();
     assert!(still_same_file(&link, &trusted, &before));
 
-    fs::rename(&zip, dir.path().join("moved.zip")).unwrap();
+    fs::rename(&zip, dir.join("moved.zip")).unwrap();
     if !make_fifo(&zip) {
         return;
     }
@@ -353,4 +355,26 @@ fn freshness_recheck_refuses_a_zip_swapped_for_a_fifo_or_special_file_without_bl
     assert!(!within_deadline(move || {
         still_same_file(Path::new("/dev/zero"), &TrustedRoots::none(), &b)
     }));
+}
+
+/// The helper test above cannot time a swap inside either flow, so pin that
+/// both flows recheck through `still_same_file` and never a plain open (which
+/// is what blocked on a FIFO).
+#[test]
+fn both_zip_flows_recheck_freshness_only_through_the_safe_reopen() {
+    for (source, start) in [
+        (
+            include_str!("../game_identity.rs"),
+            "fn inspect_zip_cartridge_rom(",
+        ),
+        (
+            include_str!("../zip_cartridge_stage.rs"),
+            "pub fn stage_zip_cartridge_for_launch(",
+        ),
+    ] {
+        let body = &source[source.find(start).expect(start)..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        assert!(body.contains("still_same_file("), "{start}");
+        assert!(!body.contains("File::open"), "{start}");
+    }
 }
