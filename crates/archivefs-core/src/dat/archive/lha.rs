@@ -445,7 +445,14 @@ impl LhaArchiveSource {
             })?;
         if !safe_member_name(&member.path) {
             return Err(LhaError::Unsupported {
-                detail: format!("unsafe member path: {}", member.path),
+                detail: format!(
+                    "unsafe member path: {} ({})",
+                    member.path,
+                    super::member_path::check_member_name(&member.path)
+                        .err()
+                        .map(|refusal| refusal.detail())
+                        .unwrap_or("refused")
+                ),
             });
         }
         if let Some(reason) = member.kind.refusal_reason() {

@@ -241,7 +241,14 @@ impl RarSession {
             .ok_or(RarError::MemberNotFound { stable_index })?;
         if !safe_member_path(&selected.path) {
             return Err(RarError::UnsupportedArchive {
-                detail: format!("unsafe member path: {}", selected.path),
+                detail: format!(
+                    "unsafe member path: {} ({})",
+                    selected.path,
+                    super::member_path::check_member_name(&selected.path)
+                        .err()
+                        .map(|refusal| refusal.detail())
+                        .unwrap_or("refused")
+                ),
             });
         }
         if selected.size == 0 {
@@ -859,7 +866,14 @@ fn parse_member_listing(output: &str) -> Result<Vec<RarMember>, RarError> {
             let path = required_property(&properties, "Path")?.to_string();
             if !safe_member_path(&path) {
                 return Err(RarError::UnsupportedArchive {
-                    detail: format!("unsafe member path: {path}"),
+                    detail: format!(
+                        "unsafe member path: {} ({})",
+                        path,
+                        super::member_path::check_member_name(&path)
+                            .err()
+                            .map(|refusal| refusal.detail())
+                            .unwrap_or("refused")
+                    ),
                 });
             }
             if marker(required_property(&properties, "Folder")?, "Folder")? {
@@ -924,7 +938,14 @@ fn validate_members(members: &[RarMember]) -> Result<(), RarError> {
         }
         if !safe_member_path(&member.path) {
             return Err(RarError::UnsupportedArchive {
-                detail: format!("unsafe member path: {}", member.path),
+                detail: format!(
+                    "unsafe member path: {} ({})",
+                    member.path,
+                    super::member_path::check_member_name(&member.path)
+                        .err()
+                        .map(|refusal| refusal.detail())
+                        .unwrap_or("refused")
+                ),
             });
         }
         if member.encrypted {

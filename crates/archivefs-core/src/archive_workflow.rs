@@ -55,6 +55,23 @@
 //!   [`tempfile::TempDir`]; nothing is published unless verification passed.
 //!
 //! Anything ambiguous is refused with a named reason, never guessed.
+//!
+//! # Known limits (recorded, not hidden)
+//!
+//! - The listing is provisional until extraction verifies the tree. A 7-Zip
+//!   build that prints raw control characters (p7zip 16.02; 7-Zip 23.01
+//!   replaces them with `_`) could, with a name containing a newline that
+//!   splits one record into two *complete* records, show a member name that
+//!   does not exist; extraction then refuses the real name (control
+//!   character) after decompression. Nothing escapes; the plan can be wrong.
+//! - An archive with trailing data makes 7-Zip append a `Warnings: 1` line,
+//!   which the strict parser refuses as a malformed listing.
+//! - Only the call sites listed in the Night Watch findings were migrated to
+//!   [`crate::external_tools`]; other `PATH` searches in the crate (emulator
+//!   adapters, local package helpers) are a separate follow-up.
+//! - The plan's identity is device/inode/size/mtime. An archive rewritten in
+//!   place with its mtime restored is not detected; the verified names and
+//!   sizes still bound what such a rewrite can achieve.
 
 use serde::Serialize;
 use std::fs;
@@ -152,6 +169,9 @@ pub enum ArchiveEligibility {
     /// The tool opened the archive but cannot decode a compression method
     /// inside it (reported by 7-Zip as "Unsupported Method").
     UnsupportedCodec,
+    /// The external tool could not be started or supervised (spawn failure,
+    /// pipe error, cleanup failure). Says nothing about the archive.
+    ToolFailed,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ArchiveToolStatus {
@@ -782,10 +802,12 @@ fn classify_tool_failure(error: ProcessError) -> ArchiveEligibility {
         ProcessError::Timeout | ProcessError::OutputLimitExceeded { .. } => {
             ArchiveEligibility::ToolLimitExceeded
         }
+        // A tool that could not be run says nothing about the archive; it is
+        // never reported as a malformed archive.
         ProcessError::Io { .. }
         | ProcessError::InvalidLimits
         | ProcessError::Sink { .. }
-        | ProcessError::CleanupFailure { .. } => ArchiveEligibility::MalformedArchive,
+        | ProcessError::CleanupFailure { .. } => ArchiveEligibility::ToolFailed,
     }
 }
 
@@ -1047,8 +1069,9 @@ fn inspect_external_archive_plan(
 ) -> Result<ArchivePlan, String> {
     if looks_like_multipart_archive(source) {
         return Err(format!(
-            "archive inspection failed: {:?}",
-            ArchiveEligibility::MultipartIncomplete
+            "archive inspection failed: {:?}: {} looks like one volume of a multi-volume set (.part1.rar, .r00 ...); multi-volume archives are not supported, supply a single-volume archive",
+            ArchiveEligibility::MultipartIncomplete,
+            source.display()
         ));
     }
     let executable = tools
@@ -1325,9 +1348,25 @@ fn sweep_stale_stages(parent: &Path) {
         if !is_stage || !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
             continue;
         }
-        let Ok(marker) = fs::read_to_string(path.join(STAGE_MARKER_NAME)) else {
+        // The marker is read like any untrusted file in a user-writable
+        // directory: a regular, small file, opened without blocking (a FIFO or
+        // a symlink to a device planted there must not hang or flood this).
+        let marker_path = path.join(STAGE_MARKER_NAME);
+        let Ok(marker_meta) = fs::symlink_metadata(&marker_path) else {
             continue;
         };
+        if !marker_meta.is_file() || marker_meta.len() > 256 {
+            continue;
+        }
+        let Ok(marker_file) = crate::safe_read::open_regular_file_nonblocking(&marker_path, false)
+        else {
+            continue;
+        };
+        let mut marker = String::new();
+        let mut bounded = std::io::Read::take(marker_file, 256);
+        if std::io::Read::read_to_string(&mut bounded, &mut marker).is_err() {
+            continue;
+        }
         let Some(pid) = marker
             .trim()
             .strip_prefix("emuwiz-archive-stage owner-pid=")
@@ -2031,6 +2070,24 @@ mod tests {
             .is_err()
         );
         assert!(verify_staged_tree(&plan, &tree(&[("Game/disc.iso", 5)], &dirs)).is_err());
+    }
+
+    #[test]
+    fn tool_failures_are_never_reported_as_malformed_archives() {
+        assert_eq!(
+            classify_tool_failure(ProcessError::Io {
+                detail: "spawn".into()
+            }),
+            ArchiveEligibility::ToolFailed
+        );
+        assert_eq!(
+            classify_tool_failure(ProcessError::Timeout),
+            ArchiveEligibility::ToolLimitExceeded
+        );
+        assert_eq!(
+            classify_tool_failure(ProcessError::CleanupFailure { detail: "x".into() }),
+            ArchiveEligibility::ToolFailed
+        );
     }
 
     #[test]
