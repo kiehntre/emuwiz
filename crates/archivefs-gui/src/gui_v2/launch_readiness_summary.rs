@@ -1369,7 +1369,7 @@ pub(crate) fn note_catalogue_verified(summary: &mut GameReadinessSummary) {
     {
         summary.identity = IdentitySummary::CatalogueVerified;
         summary.headline = "Verified. Launch also needs the file's own identity".into();
-        summary.explanation = "This game matched trusted identification data exactly. Before it plays, EmuWiz also reads the file's own identity data, and that could not be confirmed yet. The verification itself is fine; Review identity shows what is known.".into();
+        summary.explanation = "This game matched trusted identification data exactly. Before it plays, EmuWiz also reads the file's own identity data, and that could not be confirmed yet. The verification itself is fine; Verify identity shows what is known.".into();
     }
 }
 

@@ -9740,9 +9740,11 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
         unresolved_summary.explanation
     );
     assert!(!unresolved_summary.headline.contains("Verified"));
+    // Identity is unconfirmed (not conflicting, not a missing system), so the
+    // one fix offered is Verify identity.
     assert_eq!(
         unresolved_summary.primary_action,
-        Some(super::launch_readiness_summary::ReadinessAction::ReviewIdentity)
+        Some(super::launch_readiness_summary::ReadinessAction::VerifyIdentity)
     );
 }
 
