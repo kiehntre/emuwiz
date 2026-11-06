@@ -391,6 +391,26 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> (Strin
     }
 }
 
+/// A job ended without an outcome (worker error or cancellation): release
+/// the job slot so Restore and Undo work again, drop a stale Confirm, and say
+/// inline that the step did not finish. Done keeps Undo reachable.
+pub(super) fn job_failed(app: &mut super::App, error: &str) {
+    let state = &mut app.saves_states.single_file;
+    state.job = None;
+    if let Some(path) = state.flow.path().map(Path::to_path_buf) {
+        if matches!(state.flow, Flow::Confirm(_)) {
+            state.flow = Flow::Idle;
+        }
+        state.feedback = Some((
+            path,
+            false,
+            format!(
+                "The step did not finish. Check the save before restoring again; Undo stays available if a restore completed. {error}"
+            ),
+        ));
+    }
+    app.saves_states.snapshots.loaded_for = None;
+}
 
 /// Start a Prepare job for the chosen snapshot.
 pub(super) fn begin_preview(app: &mut super::App, snapshot: SaveSnapshot, target: SnapshotTarget) {

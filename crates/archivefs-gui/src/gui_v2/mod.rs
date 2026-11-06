@@ -2230,6 +2230,9 @@ impl App {
                             if self.saves_states.card_restore.job == Some(id) {
                                 card_restore::job_failed(self, &error);
                             }
+                            if self.saves_states.single_file.job == Some(id) {
+                                single_file_restore::job_failed(self, &error);
+                            }
                             if self.saves_states.snapshots.create_job == Some(id) {
                                 self.saves_states.snapshots.create_job = None;
                                 self.saves_states.snapshots.loaded_for = None;

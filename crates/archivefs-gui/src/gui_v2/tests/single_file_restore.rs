@@ -484,6 +484,26 @@ fn nw2_b03_failed_single_file_restore_is_recorded_as_failed_in_activity() {
     );
 }
 
+/// NW2-B-04: a worker failure must release the single-file job slot.
+#[test]
+fn nw2_b04_worker_failure_releases_single_file_job() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let mut app = world.app(&context);
+    let id = app.activity.queue_with(
+        "Restoring a save",
+        Route::Section(Section::Activity),
+        activity::CancelPolicy::SafeNow,
+    );
+    app.activity.start(id);
+    app.saves_states.single_file.job = Some(id);
+    nw2_deliver(&context, &mut app, id, Err("worker stopped".into()));
+    assert_eq!(
+        app.saves_states.single_file.job, None,
+        "Restore/Undo stay disabled until restart"
+    );
+}
+
 /// NW2-B-03: a snapshot that was not created must reach Activity as a
 /// failure; the inline feedback and the activity entry must agree.
 #[test]
@@ -518,4 +538,42 @@ fn nw2_b03_failed_snapshot_creation_is_recorded_as_failed_in_activity() {
         ))
     );
     assert_eq!(app.activity.jobs[&id].technical, job.summary);
+}
+
+/// NW2-B-04: after a worker failure, a stale Confirm is dropped and the
+/// person is told inline that the step did not finish.
+#[test]
+fn nw2_b04_worker_failure_drops_stale_confirm_and_explains_inline() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let target = snapshot_target(&world.record, &world.game()).unwrap();
+    save_snapshots::create(&world.root(), &target, &CLOSED).unwrap();
+    let mut app = world.app(&context);
+    prepare(&world, &mut app, &CLOSED);
+    assert!(matches!(
+        app.saves_states.single_file.flow,
+        Flow::Confirm(_)
+    ));
+    let id = app.activity.queue_with(
+        "Restoring a save",
+        Route::Section(Section::Activity),
+        activity::CancelPolicy::SafeNow,
+    );
+    app.activity.start(id);
+    app.saves_states.single_file.job = Some(id);
+    nw2_deliver(
+        &context,
+        &mut app,
+        id,
+        Err("The background operation stopped unexpectedly.".into()),
+    );
+    assert_eq!(app.saves_states.single_file.job, None);
+    assert!(matches!(app.saves_states.single_file.flow, Flow::Idle));
+    let (path, ok, message) = app.saves_states.single_file.feedback.clone().unwrap();
+    assert_eq!(path, world.save);
+    assert!(!ok);
+    assert!(message.starts_with("The step did not finish."), "{message}");
+    assert!(message.contains("stopped unexpectedly"), "{message}");
+    assert_eq!(app.saves_states.snapshots.loaded_for, None);
+    assert_eq!(app.activity.failed(), 1);
 }
