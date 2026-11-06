@@ -445,6 +445,13 @@ pub use openmsx_execution::{
     OpenMsxLaunchExecutionError, OpenMsxLaunchPreflightError, OpenMsxLaunchPreflightErrorKind,
     OpenMsxLaunchRequest, preflight_and_launch_openmsx, preflight_openmsx_launch, spawn_openmsx,
 };
+pub use openrct2::{
+    OpenRct2CheckError, OpenRct2Install, OpenRct2LaunchError, OpenRct2LaunchRequest,
+    PinnedOpenRct2, PreparedOpenRct2Launch, Rct2DataReport, check_openrct2,
+    default_search_dirs as openrct2_search_dirs, discover_openrct2, inspect_rct2_data,
+    plan_openrct2, preflight_and_launch_openrct2, preflight_openrct2_launch,
+    probe_openrct2_version, spawn_prepared_openrct2,
+};
 pub use pcsx2_command::{
     PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2Command, Pcsx2CommandPlan, Pcsx2CommandSelection,
     build_pcsx2_command_plan,
@@ -585,13 +592,6 @@ pub use vita3k_command::{
 pub use vita3k_execution::{
     Vita3kLaunchPreflightError, Vita3kLaunchPreflightErrorKind, Vita3kLaunchRequest,
     preflight_vita3k_launch, spawn_vita3k,
-};
-pub use openrct2::{
-    OpenRct2CheckError, OpenRct2Install, OpenRct2LaunchError, OpenRct2LaunchRequest,
-    PinnedOpenRct2, PreparedOpenRct2Launch, Rct2DataReport, check_openrct2, discover_openrct2,
-    default_search_dirs as openrct2_search_dirs, inspect_rct2_data, plan_openrct2,
-    preflight_and_launch_openrct2, preflight_openrct2_launch, probe_openrct2_version,
-    spawn_prepared_openrct2,
 };
 pub use vita3k_installed::{
     VITA3K_INSTALLED_KEY_PREFIX, Vita3kInstalledEntry, Vita3kInstalledLaunchError,
