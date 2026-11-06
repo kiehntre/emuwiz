@@ -716,6 +716,39 @@ pub struct SharedPendingRecoveryPlan {
     pub reason: String,
 }
 
+/// What [`recover_interrupted_shared_applies`] did with one pending apply
+/// journal whose process never wrote the terminal journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedInterruptedApplyOutcome {
+    /// A terminal journal now records exactly which files reached the
+    /// destination, so History shows the operation and Undo can reverse it.
+    SettledForUndo,
+    /// The destination root is still locked by a running apply; nothing
+    /// was touched. Not an error.
+    StillRunning,
+    /// The terminal journal already existed (the interruption came after it
+    /// was written); only the stale pending record was retired.
+    AlreadyRecorded,
+    /// The pending record could not be settled safely (unsafe or missing
+    /// root, unreadable record, journal write failure). It is kept as it is.
+    NeedsReview,
+}
+
+/// One pending apply journal [`recover_interrupted_shared_applies`] looked at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedInterruptedApplyRecovery {
+    pub operation_id: String,
+    pub pending_journal_path: SharedTransactionPath,
+    pub outcome: SharedInterruptedApplyOutcome,
+    /// Per entry, what the destination proves now (see
+    /// [`SharedEntryRecoveryState`]); the order is the plan's.
+    pub entry_states: Vec<SharedEntryRecoveryState>,
+    /// The terminal journal written (or found) for the operation.
+    pub journal_path: Option<SharedTransactionPath>,
+    pub detail: String,
+}
+
 /// The stable filesystem identity of one directory, captured via `fstat` on
 /// an already-open, no-follow-opened descriptor at the moment
 /// [`bootstrap_missing_destination_root`] created it - never re-derived
@@ -2469,14 +2502,42 @@ pub fn preview_shared_rollback(
             .ok()
             .is_some_and(|operation| parent.join(format!("{operation}.rollback.json")).exists())
     });
+    // An Undo interrupted part-way leaves its pending record: entries it
+    // had already settled are recorded `RolledBack` there, which is the
+    // only proof that a now-missing new file was removed by EmuWiz.
+    let recorded_rolled_back: Vec<bool> = journal_path
+        .parent()
+        .zip(safe_identifier(&journal.operation_id).ok())
+        .and_then(|(parent, operation)| {
+            read_pending_journal(&parent.join(format!("{operation}.pending.json"))).ok()
+        })
+        .filter(|pending| {
+            pending.operation_type == "shared_mod_rollback"
+                && pending.rollback_of_operation_id.as_deref()
+                    == Some(journal.operation_id.as_str())
+        })
+        .map(|pending| {
+            pending
+                .entries
+                .iter()
+                .map(|entry| entry.state == SharedEntryRecoveryState::RolledBack)
+                .collect()
+        })
+        .unwrap_or_default();
     let mut entries = Vec::new();
-    for entry in journal.entries.iter().take(SHARED_MAX_ROLLBACK_ENTRIES) {
+    for (index, entry) in journal
+        .entries
+        .iter()
+        .take(SHARED_MAX_ROLLBACK_ENTRIES)
+        .enumerate()
+    {
         entries.push(rollback_entry_preview(
             entry,
             expected_destination_root,
             backup_root,
             root_matches,
             journal.rollback_operation_id.is_some() || rollback_marker_exists,
+            recorded_rolled_back.get(index).copied().unwrap_or(false),
         ));
     }
     let available = entries
@@ -2641,18 +2702,36 @@ pub fn execute_shared_rollback(
         ));
         match (install.outcome, existed_before) {
             (SharedApplyOutcome::InstalledNew, false) => {
-                match remove_and_verify_new_destination(&destination) {
+                match remove_and_verify_new_destination(
+                    &destination,
+                    install
+                        .final_destination_digest
+                        .as_deref()
+                        .unwrap_or_default(),
+                ) {
                     Ok(()) => {
                         rollback.outcome = SharedRollbackOutcome::RemovedInstalledFile;
                         cleanup_created_directories(install, &root);
                     }
-                    Err(kind) => {
+                    Err((kind, kept)) => {
+                        let detail = match (kind, kept) {
+                            (SharedApplyFailureKind::DestinationChanged, _) => format!(
+                                "The file at {} no longer holds what EmuWiz installed, so it was kept as it is and not deleted.",
+                                destination.display()
+                            ),
+                            (SharedApplyFailureKind::DisplacedFileKept, Some(kept)) => format!(
+                                "The file at {} no longer holds what EmuWiz installed, and something else now occupies that name, so the changed file was kept at {} rather than deleted. Review both by hand.",
+                                destination.display(),
+                                kept.display()
+                            ),
+                            (SharedApplyFailureKind::SourceMissing, _) => format!(
+                                "The file at {} is already gone.",
+                                destination.display()
+                            ),
+                            _ => "newly installed destination could not be removed and verified absent".into(),
+                        };
                         rollback.outcome = SharedRollbackOutcome::Failed;
-                        rollback.failure = Some(failure(
-                            kind,
-                            Some(&destination),
-                            "newly installed destination could not be removed and verified absent",
-                        ));
+                        rollback.failure = Some(failure(kind, Some(&destination), &detail));
                     }
                 }
             }
@@ -3144,6 +3223,9 @@ thread_local! {
     /// Runs right after publication, before the final check.
     static AFTER_PUBLISH: std::cell::RefCell<Option<PublishHook>> =
         std::cell::RefCell::new(None);
+    /// Runs right before Undo moves an installed file out of its name.
+    static BEFORE_REMOVE: std::cell::RefCell<Option<PublishHook>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -3163,6 +3245,22 @@ fn after_publish(_destination: &Path) {
 #[cfg(test)]
 fn set_before_publish(hook: Option<PublishHook>) {
     BEFORE_PUBLISH.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn set_before_remove(hook: Option<PublishHook>) {
+    BEFORE_REMOVE.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// Runs between Undo's last observation of an installed file and the moment
+/// that file is moved out of its name, to force a race.
+fn before_remove(_destination: &Path) {
+    #[cfg(test)]
+    BEFORE_REMOVE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(_destination);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -3639,9 +3737,300 @@ pub fn plan_pending_recovery(operation: &SharedPendingOperation) -> SharedPendin
     }
 }
 
-/// A regular file named like this module's temporary publication files in the
-/// destination's folder. They are always removed on the normal paths, so one
-/// that remains marks an interrupted or refused publication.
+/// Settles every apply that was interrupted before its terminal journal was
+/// written (a crash, a kill, a power cut between the first write and the
+/// receipt), so that what it changed is visible in History and can be undone.
+///
+/// For each `<operation>.pending.json` of a `shared_mod_apply` still in
+/// `Planned`/`Applying`/`ApplyFailed`:
+///
+/// 1. The destination root's lock is tried without waiting. A root still
+///    locked belongs to an apply that is running right now; it is left
+///    alone (`StillRunning`).
+/// 2. Every entry is reconciled against the destination exactly as
+///    [`discover_pending_operations`] does: proven applied (destination holds
+///    the planned bytes, and the backup still holds the replaced bytes),
+///    proven untouched, or neither.
+/// 3. A terminal journal is written once from that evidence. Proven-applied
+///    entries become ordinary `InstalledNew`/`ReplacedExisting` entries with
+///    a `JournalFailedAfterSuccessfulWrite` stage, so Undo works as for any
+///    other journal. Untouched entries are recorded as not written. An entry
+///    in any other state is recorded as `PublishedUnverified`, which blocks
+///    Undo of the whole operation until someone has looked at the file: a
+///    destination in an unexplained state is never silently deleted or
+///    overwritten.
+/// 4. The pending record is retired only after the terminal journal is
+///    durable. A write failure keeps the pending record (`NeedsReview`).
+///
+/// Nothing under the destination root is ever modified here; the only
+/// writes are the terminal journal and the pending record in `history_root`.
+/// Per-entry created-directory lists are not recoverable from a pending
+/// record, so Undo of a settled operation removes its files but may leave
+/// an empty directory the apply created.
+pub fn recover_interrupted_shared_applies(
+    history_root: &Path,
+    backup_root: &Path,
+) -> Vec<SharedInterruptedApplyRecovery> {
+    let mut recoveries = Vec::new();
+    for pending in discover_pending_operations(history_root) {
+        if pending.journal.operation_type != "shared_mod_apply"
+            || !matches!(
+                pending.journal.transaction_state,
+                SharedRecoveryState::Planned
+                    | SharedRecoveryState::Applying
+                    | SharedRecoveryState::ApplyFailed
+            )
+        {
+            continue;
+        }
+        let operation_id = pending.journal.operation_id.clone();
+        let mut recovery = SharedInterruptedApplyRecovery {
+            operation_id: operation_id.clone(),
+            pending_journal_path: pending.journal_path.clone(),
+            outcome: SharedInterruptedApplyOutcome::NeedsReview,
+            entry_states: pending.reconciled_entries.clone(),
+            journal_path: None,
+            detail: String::new(),
+        };
+        let Ok(pending_path) = pending.journal_path.to_path_buf() else {
+            recovery.detail = "pending journal path cannot be reconstructed".into();
+            recoveries.push(recovery);
+            continue;
+        };
+        let Ok(root) = pending.journal.destination_root.to_path_buf() else {
+            recovery.detail = "destination root cannot be reconstructed".into();
+            recoveries.push(recovery);
+            continue;
+        };
+        let lock = match RootLock::acquire(&root, Duration::ZERO) {
+            Ok(lock) => lock,
+            Err(SharedApplyFailureKind::LockTimeout) => {
+                recovery.outcome = SharedInterruptedApplyOutcome::StillRunning;
+                recovery.detail = "destination root is locked by a running apply".into();
+                recoveries.push(recovery);
+                continue;
+            }
+            Err(kind) => {
+                recovery.detail = format!("destination root is unavailable or unsafe ({kind:?})");
+                recoveries.push(recovery);
+                continue;
+            }
+        };
+        let Ok(identifier) = safe_identifier(&operation_id) else {
+            recovery.detail = "operation ID is not safe for a journal filename".into();
+            recoveries.push(recovery);
+            continue;
+        };
+        let terminal_path = history_root.join(format!("{identifier}.json"));
+        if fs::symlink_metadata(&terminal_path).is_ok() {
+            // The receipt exists; only its pending twin was left behind.
+            let mut durable = pending.journal.clone();
+            durable.transaction_state = SharedRecoveryState::ApplyFailed;
+            let _ = write_pending_journal(&durable, history_root);
+            let _ = fs::remove_file(&pending_path);
+            recovery.outcome = SharedInterruptedApplyOutcome::AlreadyRecorded;
+            recovery.journal_path = Some(SharedTransactionPath::from_path(&terminal_path));
+            recovery.detail =
+                "terminal journal already existed; stale pending record retired".into();
+            recoveries.push(recovery);
+            drop(lock);
+            continue;
+        }
+        // Re-reconcile under the lock: the discovery pass ran unlocked.
+        let states: Vec<SharedEntryRecoveryState> = pending
+            .journal
+            .entries
+            .iter()
+            .map(|entry| reconcile_durable_entry(entry, pending.journal.transaction_state))
+            .collect();
+        recovery.entry_states = states.clone();
+        let journal = terminal_journal_from_interrupted(&pending.journal, &states, backup_root);
+        match write_journal_once(&journal, history_root) {
+            Ok(path) => {
+                let mut durable = pending.journal.clone();
+                durable.transaction_state = SharedRecoveryState::ApplyFailed;
+                for (entry, state) in durable.entries.iter_mut().zip(&states) {
+                    entry.state = *state;
+                }
+                let _ = write_pending_journal(&durable, history_root);
+                let _ = fs::remove_file(&pending_path);
+                let applied = states
+                    .iter()
+                    .filter(|state| **state == SharedEntryRecoveryState::Applied)
+                    .count();
+                let unsettled = states
+                    .iter()
+                    .filter(|state| {
+                        !matches!(
+                            state,
+                            SharedEntryRecoveryState::Applied | SharedEntryRecoveryState::Planned
+                        )
+                    })
+                    .count();
+                recovery.outcome = SharedInterruptedApplyOutcome::SettledForUndo;
+                recovery.journal_path = Some(SharedTransactionPath::from_path(&path));
+                recovery.detail = format!(
+                    "interrupted install recorded: {applied} file(s) reached the destination, {} were never written{}",
+                    states.len() - applied - unsettled,
+                    if unsettled > 0 {
+                        format!(", {unsettled} need(s) review before Undo")
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            Err(error) => {
+                recovery.detail = format!(
+                    "terminal journal could not be written ({:?}: {}); pending record kept",
+                    error.kind, error.detail
+                );
+            }
+        }
+        drop(lock);
+        recoveries.push(recovery);
+    }
+    recoveries
+}
+
+/// The terminal journal an interrupted apply would have written, rebuilt
+/// from its durable record plus what the destination proves now. Only
+/// evidence is recorded: an entry is `InstalledNew`/`ReplacedExisting` when
+/// the destination holds the planned bytes (and, for a replacement, the
+/// backup holds the replaced bytes); untouched entries are recorded as not
+/// written; anything else is recorded as published-but-unverified so Undo
+/// stays blocked until a person has looked.
+fn terminal_journal_from_interrupted(
+    durable: &SharedDurableJournal,
+    states: &[SharedEntryRecoveryState],
+    backup_root: &Path,
+) -> SharedApplyJournal {
+    let entries: Vec<SharedApplyEntry> = durable
+        .entries
+        .iter()
+        .zip(states)
+        .map(|(entry, state)| {
+            let plan = &entry.plan_entry;
+            let destination = plan
+                .destination_root
+                .to_path_buf()
+                .ok()
+                .zip(plan.destination_relative_path.to_path_buf().ok())
+                .map(|(root, relative)| root.join(relative));
+            let replace = plan.proposed_action == PreviewProposedAction::Replace;
+            let mut result = SharedApplyEntry {
+                plan_entry: plan.clone(),
+                destination_existed_before_apply: entry.destination_existed_before_apply,
+                destination_parent_existed_before_apply: None,
+                observed_source_digest: Some(plan.source_digest.clone()),
+                observed_destination_digest: entry.observed_destination_digest.clone(),
+                backup_path: entry.backup_path.clone(),
+                backup_digest: entry.backup_digest.clone(),
+                destination_pre_mode: entry.destination_pre_mode,
+                temporary_path: entry.temporary_path.clone(),
+                final_destination_digest: None,
+                created_directories: Vec::new(),
+                replacement_approved: replace,
+                verification_succeeded: false,
+                outcome: SharedApplyOutcome::WriteFailed,
+                publication: SharedPublicationState::NotPublished,
+                stages: vec![if replace {
+                    SharedTransactionStage::ReplaceExisting
+                } else {
+                    SharedTransactionStage::InstallNew
+                }],
+                warnings: vec![
+                    "EmuWiz was interrupted before this install's receipt was written; this record was rebuilt from what the files prove.".into(),
+                ],
+                failures: Vec::new(),
+            };
+            match state {
+                SharedEntryRecoveryState::Applied => {
+                    // A replacement without a backup on disk would have
+                    // reconciled as UnsafeToResume, never Applied.
+                    if replace && entry.backup_path.is_none() {
+                        result.publication = SharedPublicationState::PublishedThenFailed;
+                        return fail_result(
+                            result,
+                            SharedApplyOutcome::VerificationFailed,
+                            SharedApplyFailureKind::PublishedUnverified,
+                            destination.as_deref(),
+                            "the file holds EmuWiz's bytes but no backup of the replaced file is recorded; review it by hand before any Undo",
+                        );
+                    }
+                    result.final_destination_digest = Some(
+                        entry
+                            .resulting_destination_digest
+                            .clone()
+                            .unwrap_or_else(|| plan.source_digest.clone()),
+                    );
+                    result.verification_succeeded = true;
+                    result.publication = SharedPublicationState::Published;
+                    result.outcome = match plan.proposed_action {
+                        PreviewProposedAction::Replace => SharedApplyOutcome::ReplacedExisting,
+                        PreviewProposedAction::Skip => SharedApplyOutcome::AlreadyInstalled,
+                        _ => SharedApplyOutcome::InstalledNew,
+                    };
+                    if replace {
+                        result.stages.push(SharedTransactionStage::BackupCreated);
+                    }
+                    result.stages.push(SharedTransactionStage::Success);
+                    result
+                        .stages
+                        .push(SharedTransactionStage::JournalFailedAfterSuccessfulWrite);
+                    result
+                }
+                SharedEntryRecoveryState::Planned => fail_result(
+                    result,
+                    SharedApplyOutcome::WriteFailed,
+                    SharedApplyFailureKind::JournalFailed,
+                    destination.as_deref(),
+                    "EmuWiz was interrupted before this file was written; the destination is unchanged",
+                ),
+                _ => {
+                    result.publication = SharedPublicationState::PublishedThenFailed;
+                    fail_result(
+                        result,
+                        SharedApplyOutcome::VerificationFailed,
+                        SharedApplyFailureKind::PublishedUnverified,
+                        destination.as_deref(),
+                        "EmuWiz was interrupted and this file is in a state the record cannot explain (neither the planned bytes nor the previous ones); review it by hand before any Undo",
+                    )
+                }
+            }
+        })
+        .collect();
+    let _ = backup_root;
+    let any_write = entries.iter().any(|entry| {
+        matches!(
+            entry.outcome,
+            SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
+        )
+    });
+    SharedApplyJournal {
+        schema_version: SHARED_APPLY_SCHEMA_VERSION,
+        operation_id: durable.operation_id.clone(),
+        plan_id: durable.plan_id.clone(),
+        timestamp_unix_seconds: durable.timestamp_unix_seconds,
+        context: durable.context.clone(),
+        approved_source_root: durable.approved_source_root.clone(),
+        destination_root: durable.destination_root.clone(),
+        created_root_directories: durable.created_root_directories.clone(),
+        dry_run: false,
+        entries,
+        // Never Success: the operation did not complete its own receipt.
+        status: if any_write {
+            SharedApplyStatus::PartialFailure
+        } else {
+            SharedApplyStatus::Failed
+        },
+        rollback_operation_id: None,
+    }
+}
+
+/// A regular file named like this module's temporary publication files (or
+/// an Undo quarantine file) in the destination's folder. They are always
+/// removed on the normal paths, so one that remains marks an interrupted or
+/// refused publication or removal.
 fn stray_publication_file_beside(destination: &Path) -> bool {
     let Some(parent) = destination.parent() else {
         return false;
@@ -3650,10 +4039,9 @@ fn stray_publication_file_beside(destination: &Path) -> bool {
         return false;
     };
     entries.flatten().any(|entry| {
-        entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".archivefs-apply-")
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        (name.starts_with(".archivefs-apply-") || name.starts_with(UNDO_QUARANTINE_PREFIX))
             && entry.file_type().is_ok_and(|kind| kind.is_file())
     })
 }
@@ -3810,6 +4198,7 @@ fn rollback_entry_preview(
     backup_root: &Path,
     root_matches: bool,
     already_rolled_back: bool,
+    recorded_rolled_back: bool,
 ) -> SharedRollbackEntry {
     let destination = entry
         .plan_entry
@@ -3922,6 +4311,13 @@ fn rollback_entry_preview(
             }
         }
         Err(SharedApplyFailureKind::SourceMissing) => {
+            // A new file an interrupted Undo had already removed (its
+            // pending record says so): nothing left to do for this file,
+            // so a retry can finish the rest.
+            if entry.outcome == SharedApplyOutcome::InstalledNew && recorded_rolled_back {
+                result.outcome = SharedRollbackOutcome::NoChangeRequired;
+                return result;
+            }
             result.outcome = SharedRollbackOutcome::DestinationMissing;
             return result;
         }
@@ -3962,20 +4358,73 @@ fn rollback_entry_preview(
     result
 }
 
-fn remove_and_verify_new_destination(destination: &Path) -> Result<(), SharedApplyFailureKind> {
-    reject_symlink_components(destination)?;
-    fs::remove_file(destination).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+/// Name prefix of the private file an Undo moves an installed file into
+/// before deleting it. Never shared between operations.
+const UNDO_QUARANTINE_PREFIX: &str = ".archivefs-undo-";
+
+/// Removes the file an apply installed at `destination`, and only that
+/// file. The file is first moved under a private name in the same folder
+/// (`RENAME_NOREPLACE`, so nothing is ever clobbered), then hashed there,
+/// where nothing writing by path can reach it any more. Only a file still
+/// holding `expected_digest` (EmuWiz's own bytes) is deleted. Anything else
+/// is put straight back under its own name; if its name was taken in the
+/// meantime it is kept under the quarantine name, which is returned so the
+/// caller can say where the file is. The check-then-delete window of a
+/// plain `remove_file` (Night Watch S04-05) does not exist here.
+fn remove_and_verify_new_destination(
+    destination: &Path,
+    expected_digest: &str,
+) -> Result<(), (SharedApplyFailureKind, Option<PathBuf>)> {
+    reject_symlink_components(destination).map_err(|kind| (kind, None))?;
+    let parent = destination
+        .parent()
+        .ok_or((SharedApplyFailureKind::InvalidPlan, None))?;
+    let quarantine = parent.join(format!(
+        "{UNDO_QUARANTINE_PREFIX}{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    before_remove(destination);
+    if let Err(error) = rename_no_replace(destination, &quarantine) {
+        return Err((
+            if error.kind() == std::io::ErrorKind::NotFound {
+                SharedApplyFailureKind::SourceMissing
+            } else {
+                SharedApplyFailureKind::WriteFailed
+            },
+            None,
+        ));
+    }
+    let still_ours = stable_hash(
+        &quarantine,
+        SHARED_MAX_SOURCE_BYTES.max(SHARED_MAX_MATERIALIZED_BYTES),
+    )
+    .is_ok_and(|hash| hash.digest == expected_digest);
+    if !still_ours {
+        // Not EmuWiz's file any more: put it back exactly as it is.
+        return Err(match rename_no_replace(&quarantine, destination) {
+            Ok(()) => (SharedApplyFailureKind::DestinationChanged, None),
+            Err(_) => (SharedApplyFailureKind::DisplacedFileKept, Some(quarantine)),
+        });
+    }
+    if let Err(_error) = fs::remove_file(&quarantine) {
+        // Deleting our own quarantined copy failed; it is still ours, so put
+        // it back rather than leave it under a hidden name.
+        return Err(match rename_no_replace(&quarantine, destination) {
+            Ok(()) => (SharedApplyFailureKind::WriteFailed, None),
+            Err(_) => (SharedApplyFailureKind::DisplacedFileKept, Some(quarantine)),
+        });
+    }
     if should_inject(FaultPoint::RollbackRemovalVerification) {
-        fs::write(destination, b"").map_err(|_| SharedApplyFailureKind::VerificationFailed)?;
+        fs::write(destination, b"")
+            .map_err(|_| (SharedApplyFailureKind::VerificationFailed, None))?;
     }
     match fs::symlink_metadata(destination) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = destination.parent() {
-                sync_directory(parent);
-            }
+            sync_directory(parent);
             Ok(())
         }
-        _ => Err(SharedApplyFailureKind::VerificationFailed),
+        _ => Err((SharedApplyFailureKind::VerificationFailed, None)),
     }
 }
 
@@ -4872,18 +5321,19 @@ pub fn generate_shared_operation_id() -> String {
     format!("shared-{}", &digest_text(&material)[..32])
 }
 
+/// Fixture helpers shared by this module's test modules.
 #[cfg(test)]
-mod tests {
+mod tests_support {
     use super::*;
     use crate::patch_manager::{
         PreviewIdentity, PreviewIdentityKind, PreviewIdentityState, PreviewMatchStrength,
         PreviewSourceItem, SharedPreviewRequest, build_shared_preview,
     };
 
-    struct Fixture(PathBuf);
+    pub(super) struct Fixture(pub(super) PathBuf);
 
     impl Fixture {
-        fn new(label: &str) -> Self {
+        pub(super) fn new(label: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
                 "archivefs-shared-transaction-{label}-{}-{}",
                 std::process::id(),
@@ -4893,19 +5343,19 @@ mod tests {
             Self(path)
         }
 
-        fn source_root(&self) -> PathBuf {
+        pub(super) fn source_root(&self) -> PathBuf {
             self.0.join("source")
         }
 
-        fn destination_root(&self) -> PathBuf {
+        pub(super) fn destination_root(&self) -> PathBuf {
             self.0.join("destination")
         }
 
-        fn history_root(&self) -> PathBuf {
+        pub(super) fn history_root(&self) -> PathBuf {
             self.0.join("history")
         }
 
-        fn backup_root(&self) -> PathBuf {
+        pub(super) fn backup_root(&self) -> PathBuf {
             self.0.join("backups")
         }
     }
@@ -4916,7 +5366,7 @@ mod tests {
         }
     }
 
-    fn preview(
+    pub(super) fn preview(
         fixture: &Fixture,
         source_bytes: &[u8],
         existing: Option<&[u8]>,
@@ -4953,7 +5403,10 @@ mod tests {
         .unwrap()
     }
 
-    fn make_plan(fixture: &Fixture, report: &SharedPreviewReport) -> SharedTransactionPlan {
+    pub(super) fn make_plan(
+        fixture: &Fixture,
+        report: &SharedPreviewReport,
+    ) -> SharedTransactionPlan {
         build_shared_transaction_plan(
             report,
             "retroarch-native",
@@ -4963,7 +5416,7 @@ mod tests {
         .unwrap()
     }
 
-    fn options(
+    pub(super) fn options(
         fixture: &Fixture,
         plan: &SharedTransactionPlan,
         operation: &str,
@@ -4985,6 +5438,52 @@ mod tests {
             backup_root: fixture.backup_root(),
         }
     }
+
+    /// `count` new files `Nintendo - NES/game-N.cht` with bytes `new-N`.
+    pub(super) fn multi_preview(fixture: &Fixture, count: usize) -> SharedPreviewReport {
+        fs::create_dir(fixture.source_root()).unwrap();
+        fs::create_dir(fixture.destination_root()).unwrap();
+        let source_items = (0..count)
+            .map(|index| {
+                let source = fixture.source_root().join(format!("source-{index}.cht"));
+                fs::write(&source, format!("new-{index}")).unwrap();
+                PreviewSourceItem {
+                    adapter: PreviewAdapter::RetroArch,
+                    source_path: source,
+                    expected_source_digest: None,
+                    destination_relative_paths: vec![PathBuf::from(format!(
+                        "Nintendo - NES/game-{index}.cht"
+                    ))],
+                    match_strength: PreviewMatchStrength::VerifiedExact,
+                }
+            })
+            .collect();
+        build_shared_preview(&SharedPreviewRequest {
+            adapter: PreviewAdapter::RetroArch,
+            selected_archive: fixture.0.join("selected.zip"),
+            platform: Some("NES".into()),
+            identity: PreviewIdentity {
+                kind: PreviewIdentityKind::RetroArchCatalogueMatch,
+                state: PreviewIdentityState::Verified,
+                value: Some("archive-1".into()),
+                archive_path: fixture.0.join("selected.zip"),
+                revision: None,
+            },
+            destination_root: fixture.destination_root(),
+            source_items,
+        })
+        .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tests_support::*;
+    use super::*;
+    use crate::patch_manager::{
+        PreviewIdentity, PreviewIdentityKind, PreviewIdentityState, PreviewMatchStrength,
+        PreviewSourceItem, SharedPreviewRequest, build_shared_preview,
+    };
 
     #[test]
     fn interrupted_apply_is_discoverable_and_reconciles_without_auto_resume() {
@@ -7917,5 +8416,466 @@ mod tests {
         // must never be removed - identical to `install_new_is_atomic_
         // journaled_and_rollback_is_bound_and_idempotent`'s own assertion.
         assert!(fixture.destination_root().is_dir());
+    }
+}
+
+/// Night Watch Hard Job #3: crash, interruption and restart recovery for
+/// Blue's shared cheat/mod transaction engine, and S04-05 (Undo deletes an
+/// installed file without a fresh check). Every scenario checks exact bytes
+/// before and after, never only a status.
+#[cfg(test)]
+mod crash_recovery_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    fn rollback_options(fixture: &Fixture, id: &str, preview_id: &str) -> SharedRollbackOptions {
+        SharedRollbackOptions {
+            confirmation: SharedRollbackConfirmation {
+                preview_id: preview_id.to_owned(),
+                approved: true,
+            },
+            rollback_operation_id: id.into(),
+            timestamp_unix_seconds: 1_700_000_002,
+            history_root: fixture.history_root(),
+            backup_root: fixture.backup_root(),
+        }
+    }
+
+    fn destination(fixture: &Fixture, name: &str) -> PathBuf {
+        fixture.destination_root().join("Nintendo - NES").join(name)
+    }
+
+    fn history_files(fixture: &Fixture) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(fixture.history_root())
+            .map(|dir| {
+                dir.flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn platform_dir_residue(fixture: &Fixture) -> Vec<String> {
+        let mut names: Vec<String> =
+            fs::read_dir(fixture.destination_root().join("Nintendo - NES"))
+                .map(|dir| {
+                    dir.flatten()
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .filter(|name| name.starts_with('.'))
+                        .collect()
+                })
+                .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Crash between the first and second of three writes, before any
+    /// terminal journal: recovery records exactly which files landed, Undo
+    /// removes them and leaves the never-written one alone.
+    #[test]
+    fn crash_between_writes_is_settled_and_undo_restores_exact_state() {
+        let fixture = Fixture::new("crash-between-writes");
+        let report = multi_preview(&fixture, 3);
+        let plan = make_plan(&fixture, &report);
+        inject_fault_after(FaultPoint::ApplyCheckpoint, 1);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "crash-between", false, true, false),
+        );
+        inject_fault(None);
+        assert!(result.journal_path.is_none(), "no receipt was written");
+        assert_eq!(
+            fs::read(destination(&fixture, "game-0.cht")).unwrap(),
+            b"new-0"
+        );
+        assert_eq!(
+            fs::read(destination(&fixture, "game-1.cht")).unwrap(),
+            b"new-1"
+        );
+        assert!(!destination(&fixture, "game-2.cht").exists());
+        assert!(
+            discover_shared_apply_history(&fixture.history_root())
+                .journals
+                .is_empty(),
+            "before recovery History cannot see the interrupted install"
+        );
+
+        // "Restart": nothing in memory, only the pending record on disk.
+        let recovered =
+            recover_interrupted_shared_applies(&fixture.history_root(), &fixture.backup_root());
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].outcome,
+            SharedInterruptedApplyOutcome::SettledForUndo
+        );
+        assert_eq!(
+            recovered[0].entry_states,
+            vec![
+                SharedEntryRecoveryState::Applied,
+                SharedEntryRecoveryState::Applied,
+                SharedEntryRecoveryState::Planned
+            ]
+        );
+        assert_eq!(
+            history_files(&fixture),
+            vec!["crash-between.json".to_string()]
+        );
+        assert!(discover_pending_operations(&fixture.history_root()).is_empty());
+        // Idempotent: a second pass finds nothing to settle.
+        assert!(
+            recover_interrupted_shared_applies(&fixture.history_root(), &fixture.backup_root())
+                .is_empty()
+        );
+
+        let history = discover_shared_apply_history(&fixture.history_root());
+        assert_eq!(history.journals.len(), 1);
+        let journal = &history.journals[0].1;
+        assert_eq!(journal.status, SharedApplyStatus::PartialFailure);
+        assert_eq!(journal.entries[0].outcome, SharedApplyOutcome::InstalledNew);
+        assert_eq!(journal.entries[1].outcome, SharedApplyOutcome::InstalledNew);
+        assert_eq!(journal.entries[2].outcome, SharedApplyOutcome::WriteFailed);
+        assert!(
+            journal.entries[0]
+                .stages
+                .contains(&SharedTransactionStage::JournalFailedAfterSuccessfulWrite)
+        );
+
+        let journal_path = history.journals[0].0.to_path_buf().unwrap();
+        let preview = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(preview.available, "{:?}", preview.entries);
+        assert_eq!(
+            preview.entries[2].outcome,
+            SharedRollbackOutcome::NoChangeRequired
+        );
+        let undo = execute_shared_rollback(
+            &preview,
+            &rollback_options(&fixture, "crash-between-undo", &preview.preview_id),
+        );
+        assert_eq!(undo.status, SharedApplyStatus::Success);
+        assert!(!destination(&fixture, "game-0.cht").exists());
+        assert!(!destination(&fixture, "game-1.cht").exists());
+        assert!(!destination(&fixture, "game-2.cht").exists());
+        assert!(
+            platform_dir_residue(&fixture).is_empty(),
+            "no hidden residue"
+        );
+    }
+
+    /// Crash immediately after the replacement was published but before the
+    /// receipt: recovery proves the backup and Undo restores the user's
+    /// original bytes exactly.
+    #[test]
+    fn crash_after_replacement_is_settled_and_undo_restores_original_bytes() {
+        let fixture = Fixture::new("crash-after-replace");
+        let report = preview(&fixture, b"catalogue cheats\n", Some(b"USER EDITED\n"));
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::TerminalJournal));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "crash-replace", false, true, true),
+        );
+        inject_fault(None);
+        assert!(result.journal_path.is_none());
+        let file = destination(&fixture, "game.cht");
+        assert_eq!(fs::read(&file).unwrap(), b"catalogue cheats\n");
+
+        let recovered =
+            recover_interrupted_shared_applies(&fixture.history_root(), &fixture.backup_root());
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].outcome,
+            SharedInterruptedApplyOutcome::SettledForUndo
+        );
+        let journal_path = recovered[0]
+            .journal_path
+            .as_ref()
+            .unwrap()
+            .to_path_buf()
+            .unwrap();
+        let journal = read_journal(&journal_path).unwrap();
+        assert_eq!(
+            journal.entries[0].outcome,
+            SharedApplyOutcome::ReplacedExisting
+        );
+        assert_eq!(
+            journal.entries[0].backup_digest.as_deref(),
+            Some(digest_bytes(b"USER EDITED\n").as_str())
+        );
+        assert_ne!(journal.status, SharedApplyStatus::Success);
+
+        let preview = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(preview.available, "{:?}", preview.entries);
+        let undo = execute_shared_rollback(
+            &preview,
+            &rollback_options(&fixture, "crash-replace-undo", &preview.preview_id),
+        );
+        assert_eq!(undo.status, SharedApplyStatus::Success);
+        assert_eq!(fs::read(&file).unwrap(), b"USER EDITED\n");
+    }
+
+    /// A pending record whose destination root is locked belongs to an apply
+    /// that is running right now: recovery leaves it completely alone.
+    #[test]
+    fn recovery_leaves_a_running_apply_alone() {
+        let fixture = Fixture::new("recovery-live-lock");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::TerminalJournal));
+        let _ = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "live-lock", false, true, false),
+        );
+        inject_fault(None);
+        let lock = RootLock::acquire(&fixture.destination_root(), Duration::ZERO).unwrap();
+        let recovered =
+            recover_interrupted_shared_applies(&fixture.history_root(), &fixture.backup_root());
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].outcome,
+            SharedInterruptedApplyOutcome::StillRunning
+        );
+        assert_eq!(
+            history_files(&fixture),
+            vec!["live-lock.pending.json".to_string()]
+        );
+        drop(lock);
+        let recovered =
+            recover_interrupted_shared_applies(&fixture.history_root(), &fixture.backup_root());
+        assert_eq!(
+            recovered[0].outcome,
+            SharedInterruptedApplyOutcome::SettledForUndo
+        );
+    }
+
+    /// The destination was edited after the interrupted install: recovery
+    /// records the file as unexplained, Undo is blocked for the whole
+    /// operation, and the edited bytes are never touched.
+    #[test]
+    fn edited_destination_after_crash_blocks_undo_and_is_preserved() {
+        let fixture = Fixture::new("crash-then-edit");
+        let report = multi_preview(&fixture, 2);
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::TerminalJournal));
+        let _ = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "crash-edit", false, true, false),
+        );
+        inject_fault(None);
+        fs::write(
+            destination(&fixture, "game-1.cht"),
+            b"edited in RetroArch\n",
+        )
+        .unwrap();
+
+        let recovered =
+            recover_interrupted_shared_applies(&fixture.history_root(), &fixture.backup_root());
+        assert_eq!(
+            recovered[0].outcome,
+            SharedInterruptedApplyOutcome::SettledForUndo
+        );
+        assert_eq!(
+            recovered[0].entry_states,
+            vec![
+                SharedEntryRecoveryState::Applied,
+                SharedEntryRecoveryState::NeedsReview
+            ]
+        );
+        let journal_path = recovered[0]
+            .journal_path
+            .as_ref()
+            .unwrap()
+            .to_path_buf()
+            .unwrap();
+        let preview = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(!preview.available);
+        assert_eq!(
+            preview.entries[1].outcome,
+            SharedRollbackOutcome::DestinationChanged
+        );
+        let undo = execute_shared_rollback(
+            &preview,
+            &rollback_options(&fixture, "crash-edit-undo", &preview.preview_id),
+        );
+        assert_eq!(undo.status, SharedApplyStatus::Failed);
+        assert_eq!(
+            fs::read(destination(&fixture, "game-0.cht")).unwrap(),
+            b"new-0"
+        );
+        assert_eq!(
+            fs::read(destination(&fixture, "game-1.cht")).unwrap(),
+            b"edited in RetroArch\n"
+        );
+    }
+
+    /// Recovery itself failing to write the receipt keeps the pending
+    /// record and changes nothing else.
+    #[test]
+    fn recovery_journal_write_failure_keeps_the_pending_record() {
+        let fixture = Fixture::new("recovery-write-fails");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::TerminalJournal));
+        let _ = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "recovery-fail", false, true, false),
+        );
+        inject_fault(None);
+        inject_fault(Some(FaultPoint::JournalWrite));
+        let recovered =
+            recover_interrupted_shared_applies(&fixture.history_root(), &fixture.backup_root());
+        inject_fault(None);
+        assert_eq!(
+            recovered[0].outcome,
+            SharedInterruptedApplyOutcome::NeedsReview
+        );
+        assert_eq!(
+            history_files(&fixture),
+            vec!["recovery-fail.pending.json".to_string()]
+        );
+        assert_eq!(fs::read(destination(&fixture, "game.cht")).unwrap(), b"new");
+        // A later pass succeeds.
+        let recovered =
+            recover_interrupted_shared_applies(&fixture.history_root(), &fixture.backup_root());
+        assert_eq!(
+            recovered[0].outcome,
+            SharedInterruptedApplyOutcome::SettledForUndo
+        );
+    }
+
+    /// S04-05: the installed file is rewritten in the window between Undo's
+    /// last check and the removal. The newer bytes survive in place; Undo
+    /// reports the failure and leaves no hidden quarantine file behind.
+    #[test]
+    fn undo_never_deletes_a_file_rewritten_after_its_check() {
+        let fixture = Fixture::new("undo-race-remove");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "undo-race", false, true, false),
+        );
+        let journal_path = applied.journal_path.unwrap();
+        let preview = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(preview.available);
+        let racing = b"cheats = 1\ncheat0_desc = \"EDITED IN RETROARCH\"\n".to_vec();
+        let racing_for_hook = racing.clone();
+        set_before_remove(Some(Box::new(move |path: &Path| {
+            fs::write(path, &racing_for_hook).unwrap();
+        })));
+        let undo = execute_shared_rollback(
+            &preview,
+            &rollback_options(&fixture, "undo-race-undo", &preview.preview_id),
+        );
+        set_before_remove(None);
+        assert_ne!(undo.status, SharedApplyStatus::Success);
+        assert_eq!(
+            undo.preview.entries[0].outcome,
+            SharedRollbackOutcome::Failed
+        );
+        assert_eq!(
+            undo.preview.entries[0].failure.as_ref().unwrap().kind,
+            SharedApplyFailureKind::DestinationChanged
+        );
+        assert_eq!(fs::read(destination(&fixture, "game.cht")).unwrap(), racing);
+        assert!(
+            platform_dir_residue(&fixture).is_empty(),
+            "no quarantine residue"
+        );
+        // The operation stays undone-able-by-hand: its receipt is still in History.
+        assert!(journal_path.exists());
+    }
+
+    /// An Undo that dies after removing the first of two new files can be
+    /// retried after restart: the removed file counts as done, the other is
+    /// still removable, and the retry completes.
+    #[test]
+    fn undo_interrupted_between_entries_can_be_retried_after_restart() {
+        let fixture = Fixture::new("undo-crash-retry");
+        let report = multi_preview(&fixture, 2);
+        let plan = make_plan(&fixture, &report);
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "undo-crash", false, true, false),
+        );
+        let journal_path = applied.journal_path.unwrap();
+        let preview = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        inject_fault(Some(FaultPoint::RollbackAfterMutation));
+        let first = execute_shared_rollback(
+            &preview,
+            &rollback_options(&fixture, "undo-crash-1", &preview.preview_id),
+        );
+        inject_fault(None);
+        assert_eq!(first.status, SharedApplyStatus::PartialFailure);
+        assert!(!destination(&fixture, "game-0.cht").exists());
+        assert_eq!(
+            fs::read(destination(&fixture, "game-1.cht")).unwrap(),
+            b"new-1"
+        );
+        assert!(!discover_pending_operations(&fixture.history_root()).is_empty());
+
+        let retry = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert_eq!(
+            retry.entries[0].outcome,
+            SharedRollbackOutcome::NoChangeRequired
+        );
+        assert_eq!(retry.entries[1].outcome, SharedRollbackOutcome::Available);
+        assert!(retry.available, "{:?}", retry.entries);
+        let second = execute_shared_rollback(
+            &retry,
+            &rollback_options(&fixture, "undo-crash-2", &retry.preview_id),
+        );
+        assert_eq!(second.status, SharedApplyStatus::Success);
+        assert!(!destination(&fixture, "game-1.cht").exists());
+        assert!(discover_pending_operations(&fixture.history_root()).is_empty());
+        assert!(platform_dir_residue(&fixture).is_empty());
+    }
+
+    /// Failure before the first write (the pending record cannot be
+    /// written) changes nothing and reports Failed, never Success.
+    #[test]
+    fn failure_before_first_write_changes_nothing() {
+        let fixture = Fixture::new("fail-before-write");
+        let report = preview(&fixture, b"new", Some(b"keep me\n"));
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::DurableJournalWrite));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "fail-before", false, true, true),
+        );
+        inject_fault(None);
+        assert_eq!(result.journal.status, SharedApplyStatus::Failed);
+        assert!(result.journal_failure.is_some());
+        assert_eq!(
+            fs::read(destination(&fixture, "game.cht")).unwrap(),
+            b"keep me\n"
+        );
+        assert!(!fixture.backup_root().exists());
+        assert!(platform_dir_residue(&fixture).is_empty());
     }
 }

@@ -39,6 +39,8 @@ mod cheat_consolidation_tests;
 /// Synthetic WHDLoad slave and inspection fixtures shared with the launch tests.
 #[cfg(test)]
 pub(crate) use whdload_trainer_discovery::tests as whdload_trainer_discovery_fixtures;
+#[cfg(unix)]
+pub mod anchored_fs;
 mod cheat_conversion;
 mod cheat_coverage;
 mod cheat_history;
@@ -313,8 +315,9 @@ pub use cheat_catalogue::{
     CheatDefinition, CheatGameMatch, CheatGameRecord, CheatInstalledState, CheatMatchCandidate,
     CheatMatchConfidence, CheatMatchEvidence, CheatStagingAction, CheatStagingPlan,
     JsonManifestSource, MAX_CATALOGUE_EXCLUDED_ENTRIES, MAX_CATALOGUE_EXCLUSION_EXAMPLES,
-    RetroarchChtDirectorySource, build_cheat_availability_report, load_cheat_catalogue_snapshot,
-    match_cheat_game_record, matching_excluded_entry,
+    RetroarchChtDirectorySource, build_cheat_availability_report, cheat_destination_file_name,
+    installable_content_hash, load_cheat_catalogue_snapshot, match_cheat_game_record,
+    matching_excluded_entry, render_installable_cheat_document,
 };
 pub use cheat_compatibility::{
     CheatCompatibilityEntry, CheatCompatibilityOperation, CheatCompatibilityReport, CheatCondition,
@@ -1084,7 +1087,8 @@ pub use shared_transaction::{
     SharedApplyFailureKind, SharedApplyJournal, SharedApplyOptions, SharedApplyOutcome,
     SharedApplyResult, SharedApplyStatus, SharedContentVerification, SharedDestinationOutcome,
     SharedDurableEntry, SharedDurableJournal, SharedEntryDestination, SharedEntryRecoveryState,
-    SharedHistoryReport, SharedJournalWarning, SharedMaterializedOutput, SharedPendingOperation,
+    SharedHistoryReport, SharedInterruptedApplyOutcome, SharedInterruptedApplyRecovery,
+    SharedJournalWarning, SharedMaterializedOutput, SharedPendingOperation,
     SharedPendingRecoveryPlan, SharedPlanEntry, SharedPublicationState, SharedRecoveryState,
     SharedRollbackConfirmation, SharedRollbackEntry, SharedRollbackOptions, SharedRollbackOutcome,
     SharedRollbackPermissions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPath,
@@ -1092,7 +1096,7 @@ pub use shared_transaction::{
     build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
     discover_pending_operations, discover_shared_apply_history, execute_shared_apply,
     execute_shared_materialized_apply, execute_shared_rollback, generate_shared_operation_id,
-    plan_pending_recovery, preview_shared_rollback,
+    plan_pending_recovery, preview_shared_rollback, recover_interrupted_shared_applies,
     require_dolphin_managed_gamehacking_verification, require_local_mod_package_verification,
     require_retroarch_bezel_verification, seal_shared_transaction_plan, shared_destination_outcome,
     shared_entry_destination, shared_rollback_can_reverse,

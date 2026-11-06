@@ -1921,3 +1921,207 @@ fn shared_parser_diagnostics_preserve_mixed_catalogue_evidence_and_source_hash()
         1
     );
 }
+
+// ---------------------------------------------------------------------
+// Night Watch D7-01 / D7-02: what a manifest record installs, and the one
+// shared destination file-name derivation
+// ---------------------------------------------------------------------
+
+fn two_game_coded_manifest(first: &str, second: &str) -> String {
+    format!(
+        r#"{{
+            "source_name": "Coded",
+            "games": [
+                {{
+                    "game_name": "{first}",
+                    "platform": "Atari2600",
+                    "cheats": [
+                        {{"code": "F000:01", "description": "only for {first}", "enabled_by_default": true}},
+                        {{"description": "no code, must be left out"}}
+                    ]
+                }},
+                {{
+                    "game_name": "{second}",
+                    "platform": "Atari2600",
+                    "cheats": [
+                        {{"code": "F001:02", "description": "only for {second}"}}
+                    ]
+                }}
+            ]
+        }}"#
+    )
+}
+
+#[test]
+fn d7_01_manifest_record_renders_a_per_game_cht_document_not_the_manifest() {
+    let root = temp_root("d7-01-render");
+    let path = write_manifest(&root, &two_game_coded_manifest("Frogger", "Pitfall"));
+    let manifest_bytes = fs::read(&path).unwrap();
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Coded", &path);
+    assert_eq!(snapshot.games.len(), 2);
+
+    let frogger = &snapshot.games[0];
+    let rendered = render_installable_cheat_document(frogger).expect("manifest game renders");
+    assert_ne!(
+        rendered, manifest_bytes,
+        "the manifest's own bytes are never the document"
+    );
+    let text = String::from_utf8(rendered.clone()).unwrap();
+    assert!(
+        text.contains("cheats = 1\n"),
+        "only the coded cheat is rendered: {text}"
+    );
+    assert!(text.contains("cheat0_code = \"F000:01\""));
+    assert!(text.contains("cheat0_desc = \"only for Frogger\""));
+    assert!(text.contains("cheat0_enable = true"));
+    assert!(
+        !text.contains("Pitfall"),
+        "another game's cheats must not leak in: {text}"
+    );
+    assert!(
+        !text.contains("no code"),
+        "a cheat without a code is left out: {text}"
+    );
+    // RetroArch can load it back, and it is deterministic.
+    let parsed = super::super::cht_document::parse_cht_bytes(&rendered).unwrap();
+    assert_eq!(parsed.selectable_count(), 1);
+    assert_eq!(
+        render_installable_cheat_document(frogger).unwrap(),
+        rendered
+    );
+
+    // The staging preview's source hash is the rendered document's hash,
+    // never the manifest file's hash, so "already installed" and
+    // "replace different" are decided against what would be written.
+    assert_eq!(
+        installable_content_hash(frogger).as_deref(),
+        Some(hex_sha256(&rendered).as_str())
+    );
+    assert_ne!(installable_content_hash(frogger), frogger.source_file_hash);
+}
+
+#[test]
+fn d7_01_manifest_staging_plan_compares_the_rendered_document_with_the_destination() {
+    let root = temp_root("d7-01-staging");
+    let path = write_manifest(&root, &two_game_coded_manifest("Frogger", "Pitfall"));
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Coded", &path);
+    let games = frogger_games();
+    let destination_root = temp_root("d7-01-staging-dest");
+    let destination_dir = destination_root.join("Atari2600");
+    fs::create_dir_all(&destination_dir).unwrap();
+
+    // Destination holds exactly the rendered document: already installed.
+    let rendered = render_installable_cheat_document(&snapshot.games[0]).unwrap();
+    fs::write(destination_dir.join("Frogger.cht"), &rendered).unwrap();
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    let entry = &report.entries[0];
+    assert_eq!(entry.game.source_game_name, "Frogger");
+    assert_eq!(
+        entry.staging_plan.planned_action,
+        CheatStagingAction::AlreadyInstalled
+    );
+    assert_eq!(
+        entry.staging_plan.source_file_hash.as_deref(),
+        Some(hex_sha256(&rendered).as_str())
+    );
+
+    // Destination holds the raw manifest (what the old installer wrote):
+    // that is a *different* file, to be replaced, not "already installed".
+    fs::write(
+        destination_dir.join("Frogger.cht"),
+        fs::read(&path).unwrap(),
+    )
+    .unwrap();
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    assert_eq!(
+        report.entries[0].staging_plan.planned_action,
+        CheatStagingAction::ReplaceDifferent
+    );
+}
+
+#[test]
+fn d7_01_manifest_game_without_any_coded_cheat_is_not_eligible() {
+    let root = temp_root("d7-01-no-codes");
+    let path = write_manifest(
+        &root,
+        &one_game_manifest("Frogger", "Atari2600", "USA", "CX2600-FROG"),
+    );
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &path);
+    assert!(render_installable_cheat_document(&snapshot.games[0]).is_none());
+    assert!(installable_content_hash(&snapshot.games[0]).is_none());
+
+    let destination_root = temp_root("d7-01-no-codes-dest");
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &frogger_games(),
+        None,
+        Some(&destination_root),
+    );
+    let entry = &report.entries[0];
+    assert_eq!(
+        entry.staging_plan.planned_action,
+        CheatStagingAction::NotEligible
+    );
+    assert_eq!(entry.staging_plan.reason, "no_installable_cheats");
+    assert!(!entry.staging_candidate);
+}
+
+#[test]
+fn d7_02_destination_file_name_is_trimmed_shared_and_rejects_control_characters() {
+    let root = temp_root("d7-02-names");
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+    assert!(snapshot.games.is_empty());
+    let mut record = CheatGameRecord {
+        source_game_name: "  Frogger  ".to_string(),
+        source_platform: Some("Atari2600".to_string()),
+        source_region: None,
+        source_revision: None,
+        source_identifier: None,
+        source_content_hash: None,
+        target_emulator: None,
+        cheat_count: 0,
+        cheats: Vec::new(),
+        enabled_by_default_count: 0,
+        source_file_path: EncodedPath::from_path(&root.join("Frogger.cht")),
+        source_file_hash: None,
+        format: CheatCatalogueFormat::RetroarchChtDirectory,
+        parsing_complete: true,
+        parsing_diagnostics: Vec::new(),
+    };
+    // Leading/trailing whitespace is trimmed, exactly as the preview path
+    // shows it - the installer must derive the written name from the same
+    // helper so the two can never disagree.
+    assert_eq!(
+        cheat_destination_file_name(&record).as_deref(),
+        Some("Frogger.cht")
+    );
+    let destination_root = temp_root("d7-02-names-dest");
+    let path = resolve_canonical_cheat_destination(&record, None, Some(&destination_root)).unwrap();
+    assert_eq!(path, destination_root.join("Atari2600").join("Frogger.cht"));
+
+    for hostile in ["Frogger\n", "Frog\u{1}ger", "Frogger\u{1b}[0m", "Frog\rger"] {
+        record.source_game_name = hostile.to_string();
+        assert!(
+            cheat_destination_file_name(&record).is_none(),
+            "control character accepted in {hostile:?}"
+        );
+        assert_eq!(
+            resolve_canonical_cheat_destination(&record, None, Some(&destination_root)),
+            Err("destination_traversal_rejected")
+        );
+    }
+    assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 0);
+}

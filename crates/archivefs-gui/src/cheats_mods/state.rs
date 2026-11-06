@@ -814,6 +814,9 @@ pub(crate) enum CheatStepResource<T> {
 pub(crate) struct LoadedHistory {
     pub(crate) report: SharedHistoryReport,
     pub(crate) rows: Vec<archivefs_core::patch_manager::GroupedHistoryRow>,
+    /// Installs interrupted before their receipt (a crash or kill) that
+    /// this refresh settled into History so they can be undone.
+    pub(crate) recovered: Vec<archivefs_core::patch_manager::SharedInterruptedApplyRecovery>,
 }
 
 impl LoadedHistory {
@@ -825,7 +828,19 @@ impl LoadedHistory {
     ) -> Self {
         let rows =
             archivefs_core::patch_manager::group_shared_history(&report, receipts, backup_root);
-        Self { report, rows }
+        Self {
+            report,
+            rows,
+            recovered: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_recovered(
+        mut self,
+        recovered: Vec<archivefs_core::patch_manager::SharedInterruptedApplyRecovery>,
+    ) -> Self {
+        self.recovered = recovered;
+        self
     }
 }
 

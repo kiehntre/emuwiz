@@ -180,14 +180,29 @@ impl std::error::Error for StandalonePatchError {}
 pub fn inspect_standalone_patch(
     path: impl AsRef<Path>,
 ) -> Result<StandalonePatchInspection, StandalonePatchError> {
+    inspect_standalone_patch_bytes(path).map(|(inspection, _bytes)| inspection)
+}
+
+/// [`inspect_standalone_patch`] plus the exact bytes it inspected, so an
+/// applier decodes the bytes whose hash it reviewed rather than a second
+/// read of the same path (Night Watch S08-02). The size is checked from
+/// the file's own metadata before anything is read into memory.
+pub fn inspect_standalone_patch_bytes(
+    path: impl AsRef<Path>,
+) -> Result<(StandalonePatchInspection, Vec<u8>), StandalonePatchError> {
     let path = path.as_ref().to_path_buf();
+    let metadata =
+        fs::symlink_metadata(&path).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+    if metadata.len() > MAX_PATCH_BYTES as u64 {
+        return Err(StandalonePatchError::TooLarge);
+    }
     let bytes = fs::read(&path).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
     if bytes.len() > MAX_PATCH_BYTES {
         return Err(StandalonePatchError::TooLarge);
     }
     let sha = hex_digest(&bytes);
     let (format, state, fields) = parse(&bytes);
-    Ok(StandalonePatchInspection {
+    let inspection = StandalonePatchInspection {
         path,
         format,
         state,
@@ -201,7 +216,8 @@ pub fn inspect_standalone_patch(
         metadata: fields.metadata,
         warnings: fields.warnings,
         error: fields.error,
-    })
+    };
+    Ok((inspection, bytes))
 }
 
 /// Match only evidence that can identify the exact source.  `title_or_region`
@@ -427,14 +443,12 @@ pub fn apply_standalone_patch(
             "base changed since review".into(),
         ));
     }
-    let inspection = inspect_standalone_patch(&plan.reviewed.patch_path)?;
+    let (inspection, patch) = inspect_standalone_patch_bytes(&plan.reviewed.patch_path)?;
     if inspection.patch_sha256 != plan.reviewed.patch_sha256 {
         return Err(StandalonePatchError::Malformed(
             "patch changed since review".into(),
         ));
     }
-    let patch =
-        fs::read(&plan.reviewed.patch_path).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
     let patch_input = match plan.reviewed.header_adjustment {
         HeaderAdjustment::None => base.as_slice(),
         HeaderAdjustment::Strip512ByteCopierHeader => base.get(512..).ok_or_else(|| {
@@ -636,14 +650,12 @@ pub fn prepare_standalone_patch_output(
             "base changed since review".into(),
         ));
     }
-    let inspection = inspect_standalone_patch(&plan.reviewed.patch_path)?;
+    let (inspection, patch) = inspect_standalone_patch_bytes(&plan.reviewed.patch_path)?;
     if inspection.patch_sha256 != plan.reviewed.patch_sha256 {
         return Err(StandalonePatchError::Malformed(
             "patch changed since review".into(),
         ));
     }
-    let patch =
-        fs::read(&plan.reviewed.patch_path).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
     let patch_input = match plan.reviewed.header_adjustment {
         HeaderAdjustment::None => base.as_slice(),
         HeaderAdjustment::Strip512ByteCopierHeader => base.get(512..).ok_or_else(|| {
@@ -922,17 +934,30 @@ fn apply_xdelta3(
         ));
     }
     run_xdelta3_decode(&tool, base_path, patch_path, &stage)?;
-    let safe_stage = fs::symlink_metadata(&stage)
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
-    let output = if safe_stage {
-        fs::read(&stage).map_err(|error| StandalonePatchError::Io(error.to_string()))
-    } else {
-        Err(StandalonePatchError::UnsafeOutput(
-            "xdelta produced an unsafe staging object".into(),
-        ))
-    };
+    let output = read_xdelta3_stage(&stage);
     let _ = fs::remove_file(&stage);
     output
+}
+
+/// Reads the decoded stage only when it is a plain file within
+/// [`MAX_APPLY_BYTES`]; the size comes from the stage's own metadata, so an
+/// over-long decode is refused before any of it is loaded into memory.
+fn read_xdelta3_stage(stage: &Path) -> Result<Vec<u8>, StandalonePatchError> {
+    let metadata =
+        fs::symlink_metadata(stage).map_err(|error| StandalonePatchError::Io(error.to_string()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(StandalonePatchError::UnsafeOutput(
+            "xdelta produced an unsafe staging object".into(),
+        ));
+    }
+    if metadata.len() > MAX_APPLY_BYTES {
+        return Err(StandalonePatchError::TooLarge);
+    }
+    let output = fs::read(stage).map_err(|error| StandalonePatchError::Io(error.to_string()))?;
+    if output.len() as u64 > MAX_APPLY_BYTES {
+        return Err(StandalonePatchError::TooLarge);
+    }
+    Ok(output)
 }
 
 /// One supervised `xdelta3 -d -s <base> <patch> <output>` run; structured argv,
@@ -954,13 +979,29 @@ pub(crate) fn run_xdelta3_decode(
     // xdelta3 writes the decoded result to the staging path, so its stdout
     // carries only incidental diagnostics; anything beyond the cap is a
     // misbehaving tool rather than data we need.
+    // The child may not write a file larger than the bounded apply limit:
+    // `RLIMIT_FSIZE` stops a decode that would amplify a small patch into
+    // an unbounded output at the kernel, before it fills the disk
+    // (Night Watch S08-03). The stage is also size-checked before it is
+    // read back.
     let outcome = run_supervised(
         command,
         XDELTA_PROCESS_LIMITS,
         XDELTA_TIMEOUT,
         XDELTA_STDOUT_LIMIT,
         |_chunk| Ok(()),
-        None,
+        Some(Box::new(|| {
+            let limit = libc::rlimit {
+                rlim_cur: MAX_APPLY_BYTES,
+                rlim_max: MAX_APPLY_BYTES,
+            };
+            // SAFETY: runs in the forked child before exec; `limit` is an
+            // initialised stack value and `setrlimit` is async-signal-safe.
+            if unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })),
     );
     let outcome = match outcome {
         Ok(outcome) => outcome,
@@ -1069,6 +1110,13 @@ fn apply_bps(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
     if source != base.len() as u64 || target > MAX_APPLY_BYTES || meta > remaining as u64 {
         return Err(StandalonePatchError::Malformed("BPS size mismatch".into()));
     }
+    // The patch's own checksum is checked before a single action is
+    // decoded, so a corrupt or hostile body is never interpreted.
+    if crc32(&patch[..end + 8]) != u32::from_le_bytes(patch[end + 8..].try_into().unwrap()) {
+        return Err(StandalonePatchError::Malformed(
+            "BPS patch CRC mismatch".into(),
+        ));
+    }
     p += meta as usize;
     let mut out = Vec::with_capacity(target as usize);
     let mut sr = 0i64;
@@ -1077,8 +1125,17 @@ fn apply_bps(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
         let a = read_var(patch, &mut p).map_err(|e| StandalonePatchError::Malformed(e.into()))?;
         let n = (a >> 2)
             .checked_add(1)
-            .ok_or_else(|| StandalonePatchError::Malformed("BPS length overflow".into()))?
-            as usize;
+            .ok_or_else(|| StandalonePatchError::Malformed("BPS length overflow".into()))?;
+        // Every action is bounded by the declared target before it runs,
+        // exactly as `parse_bps` bounds it: a TargetCopy declaring a
+        // length of 2^40 is refused here, never pushed byte by byte until
+        // memory runs out (Night Watch S08-02).
+        if n > target - out.len() as u64 {
+            return Err(StandalonePatchError::Malformed(
+                "BPS output exceeds target".into(),
+            ));
+        }
+        let n = n as usize;
         match a & 3 {
             0 => {
                 if out.len().checked_add(n).is_none_or(|e| e > base.len()) {
@@ -1169,11 +1226,6 @@ fn apply_bps(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
             "BPS output size mismatch".into(),
         ));
     }
-    if crc32(&patch[..end + 8]) != u32::from_le_bytes(patch[end + 8..].try_into().unwrap()) {
-        return Err(StandalonePatchError::Malformed(
-            "BPS patch CRC mismatch".into(),
-        ));
-    }
     Ok(out)
 }
 
@@ -1187,6 +1239,11 @@ fn apply_ups(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
     let t = read_var(patch, &mut p).map_err(|e| StandalonePatchError::Malformed(e.into()))?;
     if s != base.len() as u64 || t > MAX_APPLY_BYTES {
         return Err(StandalonePatchError::Malformed("UPS size mismatch".into()));
+    }
+    if crc32(&patch[..end + 8]) != u32::from_le_bytes(patch[end + 8..].try_into().unwrap()) {
+        return Err(StandalonePatchError::Malformed(
+            "UPS patch CRC mismatch".into(),
+        ));
     }
     let mut out = vec![0; t as usize];
     let initial = base.len().min(out.len());
@@ -1217,11 +1274,6 @@ fn apply_ups(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
             out[at] ^= x;
             at += 1;
         }
-    }
-    if crc32(&patch[..end + 8]) != u32::from_le_bytes(patch[end + 8..].try_into().unwrap()) {
-        return Err(StandalonePatchError::Malformed(
-            "UPS patch CRC mismatch".into(),
-        ));
     }
     Ok(out)
 }
@@ -1632,6 +1684,9 @@ fn crc32(b: &[u8]) -> u32 {
     !crc
 }
 
+#[cfg(test)]
+#[path = "standalone_patch/hostile_regression_tests.rs"]
+mod hostile_regression_tests;
 #[cfg(test)]
 #[path = "standalone_patch/ips_tests.rs"]
 mod ips_tests;

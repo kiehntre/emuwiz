@@ -2192,6 +2192,14 @@ impl ArchiveFsApp {
             "Refreshing bounded shared transaction history.",
         ));
         thread::spawn(move || {
+            // An install EmuWiz was interrupted in (crash, kill, power cut)
+            // left only a pending record. Settle it into a receipt first so
+            // the refresh below lists it and Undo can reverse it. Touches
+            // nothing under any destination root.
+            let recovered = archivefs_core::patch_manager::recover_interrupted_shared_applies(
+                &history_root,
+                &shared_backup_root,
+            );
             let report = discover_shared_apply_history(&history_root);
             // Group DuckStation's two child journals under their receipt so
             // History shows (and undoes) one operation, not two journals.
@@ -2201,7 +2209,8 @@ impl ArchiveFsApp {
                 report,
                 receipts,
                 &shared_backup_root,
-            )));
+            )
+            .with_recovered(recovered)));
             context.request_repaint();
         });
     }
@@ -2212,6 +2221,39 @@ impl ArchiveFsApp {
         };
         match receiver.try_recv() {
             Ok(Ok(loaded)) => {
+                for recovery in &loaded.recovered {
+                    use archivefs_core::patch_manager::SharedInterruptedApplyOutcome;
+                    let (outcome, text) = match recovery.outcome {
+                        SharedInterruptedApplyOutcome::SettledForUndo => (
+                            ActivityOutcome::Completed,
+                            format!(
+                                "An install was interrupted before it finished ({}). {}. It is listed in History; use Undo there to put the files back.",
+                                recovery.operation_id, recovery.detail
+                            ),
+                        ),
+                        SharedInterruptedApplyOutcome::AlreadyRecorded => (
+                            ActivityOutcome::Completed,
+                            format!(
+                                "An interrupted install ({}) already had its receipt; its stale pending record was retired.",
+                                recovery.operation_id
+                            ),
+                        ),
+                        SharedInterruptedApplyOutcome::StillRunning => continue,
+                        SharedInterruptedApplyOutcome::NeedsReview => (
+                            ActivityOutcome::Failed,
+                            format!(
+                                "An interrupted install ({}) could not be settled: {}. Its pending record is kept; nothing was changed.",
+                                recovery.operation_id, recovery.detail
+                            ),
+                        ),
+                    };
+                    self.history.record(HistoryEntry::new(
+                        ActivityAction::CheatInstall,
+                        None,
+                        outcome,
+                        text,
+                    ));
+                }
                 self.history.record(HistoryEntry::new(
                     ActivityAction::Refresh,
                     None,
