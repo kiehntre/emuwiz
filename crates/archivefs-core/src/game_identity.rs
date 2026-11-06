@@ -1813,9 +1813,7 @@ fn inspect_zip_cartridge_rom(
     let first_new = report.evidence.len();
     inspect_loose_rom_file(report, format, temp);
     // The ZIP must be byte-for-byte the same file after the member was read.
-    let unchanged = File::open(&report.archive_path)
-        .and_then(|reopened| StableFileMetadata::from_file(&reopened))
-        .is_ok_and(|after| after == before);
+    let unchanged = still_same_file(&report.archive_path, trusted, &before);
     if !unchanged {
         report.evidence.truncate(first_new);
         report.complete = false;
@@ -2408,7 +2406,7 @@ fn hash_bounded_file(file: &mut File, maximum: u64) -> io::Result<(String, u64)>
     ))
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StableFileMetadata {
     len: u64,
     modified: Option<std::time::SystemTime>,
@@ -2416,6 +2414,23 @@ pub(crate) struct StableFileMetadata {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+}
+
+/// True when `path` still names exactly the file `before` was taken from.
+///
+/// Reopens only through [`open_read_only_regular`] (the safe-read policy:
+/// regular files only, symlinks only inside `trusted`, non-blocking open), so
+/// a path swapped for a FIFO, device, directory or untrusted symlink is
+/// refused at once instead of blocking the worker.
+pub(crate) fn still_same_file(
+    path: &Path,
+    trusted: &TrustedRoots,
+    before: &StableFileMetadata,
+) -> bool {
+    open_read_only_regular(path, trusted)
+        .ok()
+        .and_then(|file| StableFileMetadata::from_file(&file).ok())
+        .is_some_and(|after| &after == before)
 }
 
 impl StableFileMetadata {

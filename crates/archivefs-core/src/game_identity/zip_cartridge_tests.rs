@@ -293,3 +293,88 @@ fn loose_and_disc_zip_behaviour_is_unchanged() {
     let r = inspect(&zip, "PlayStation 2");
     assert_eq!(r.format, IdentityImageFormat::ZipContainingIso);
 }
+
+/// Runs `check` on a worker and fails (instead of hanging the suite) if it
+/// has not returned within a bounded time.
+#[cfg(unix)]
+fn within_deadline(check: impl FnOnce() -> bool + Send + 'static) -> bool {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(check());
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the ZIP freshness recheck blocked on a special file")
+}
+
+/// Creates a FIFO at `path`; `false` where the filesystem cannot host one.
+#[cfg(unix)]
+fn make_fifo(path: &Path) -> bool {
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: `name` is a valid NUL-terminated path inside a fresh temporary
+    // directory; `mkfifo` only creates the FIFO this test then refuses.
+    unsafe { libc::mkfifo(name.as_ptr(), 0o600) == 0 }
+}
+
+/// Codex review on #333: the post-read freshness check reopened the ZIP with
+/// a plain `File::open`, which blocks forever if the path was swapped for a
+/// FIFO. Identity inspection and launch staging now share `still_same_file`,
+/// which only reopens through the non-blocking safe-read policy.
+#[cfg(unix)]
+#[test]
+fn freshness_recheck_refuses_a_zip_swapped_for_a_fifo_or_special_file_without_blocking() {
+    let temp = tempfile::tempdir().unwrap();
+    // Canonical, so the no-symlink policy accepts it on any host.
+    let dir = temp.path().canonicalize().unwrap();
+    let zip = write_zip(&dir, "game.zip", &[("Game.sfc", &snes_rom(1))]);
+    let before = StableFileMetadata::from_file(&fs::File::open(&zip).unwrap()).unwrap();
+    let trusted = TrustedRoots::from_paths([&dir]);
+    assert!(still_same_file(&zip, &TrustedRoots::none(), &before));
+    // An external or multi-drive library reached through a trusted symlink
+    // still passes when the target is the same file.
+    let link = dir.join("linked.zip");
+    std::os::unix::fs::symlink(&zip, &link).unwrap();
+    assert!(still_same_file(&link, &trusted, &before));
+
+    fs::rename(&zip, dir.join("moved.zip")).unwrap();
+    if !make_fifo(&zip) {
+        return;
+    }
+    let (path, roots) = (zip.clone(), TrustedRoots::none());
+    let b = before.clone();
+    assert!(!within_deadline(move || still_same_file(&path, &roots, &b)));
+    // A trusted symlink now pointing at the FIFO is refused too.
+    let (path, roots, b) = (link.clone(), trusted.clone(), before.clone());
+    assert!(!within_deadline(move || still_same_file(&path, &roots, &b)));
+
+    // A directory or device in its place is refused as well.
+    fs::remove_file(&zip).unwrap();
+    fs::create_dir(&zip).unwrap();
+    assert!(!still_same_file(&zip, &TrustedRoots::none(), &before));
+    let b = before.clone();
+    assert!(!within_deadline(move || {
+        still_same_file(Path::new("/dev/zero"), &TrustedRoots::none(), &b)
+    }));
+}
+
+/// The helper test above cannot time a swap inside either flow, so pin that
+/// both flows recheck through `still_same_file` and never a plain open (which
+/// is what blocked on a FIFO).
+#[test]
+fn both_zip_flows_recheck_freshness_only_through_the_safe_reopen() {
+    for (source, start) in [
+        (
+            include_str!("../game_identity.rs"),
+            "fn inspect_zip_cartridge_rom(",
+        ),
+        (
+            include_str!("../zip_cartridge_stage.rs"),
+            "pub fn stage_zip_cartridge_for_launch(",
+        ),
+    ] {
+        let body = &source[source.find(start).expect(start)..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        assert!(body.contains("still_same_file("), "{start}");
+        assert!(!body.contains("File::open"), "{start}");
+    }
+}

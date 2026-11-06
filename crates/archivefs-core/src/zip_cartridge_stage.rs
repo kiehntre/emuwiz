@@ -3,13 +3,14 @@
 //! read-only; this module writes only inside a fresh private temporary
 //! directory and never touches the ZIP.
 
-use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use zip::ZipArchive;
 
-use crate::game_identity::{IdentityPlatform, StableFileMetadata, open_read_only_regular};
+use crate::game_identity::{
+    IdentityPlatform, StableFileMetadata, open_read_only_regular, still_same_file,
+};
 use crate::safe_read::TrustedRoots;
 use crate::zip_cartridge_select::{is_loose_cartridge_platform, select_zip_cartridge_member};
 
@@ -136,10 +137,7 @@ pub fn stage_zip_cartridge_for_launch(
     }
     out.sync_all().ok();
     drop(out);
-    let unchanged = File::open(zip)
-        .and_then(|reopened| StableFileMetadata::from_file(&reopened))
-        .is_ok_and(|after| after == before);
-    if !unchanged {
+    if !still_same_file(zip, &TrustedRoots::none(), &before) {
         return Err(refuse(
             "ZIP changed while the ROM was being extracted".into(),
         ));
