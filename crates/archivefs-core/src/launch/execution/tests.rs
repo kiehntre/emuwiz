@@ -287,6 +287,87 @@ fn native_direct_content_ready_candidate_passes_preflight() {
     );
 }
 
+// --- required firmware: unverified keeps Play, fresh probe decides -----------
+
+/// Declares required firmware on the fixture core. `files` are the firmware
+/// names the core's `.info` lists as required; none is created here.
+fn declare_required_firmware(ready: &ReadyFixture, files: &[&str]) {
+    let cores_dir = ready.fixture.path("cores");
+    let info_dir = ready.fixture.path("info");
+    let system_dir = ready.fixture.path("system");
+    fs::create_dir_all(&system_dir).unwrap();
+    fs::write(
+        ready.fixture.path("config/retroarch/retroarch.cfg"),
+        format!(
+            "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\nsystem_directory = \"{}\"\n",
+            cores_dir.display(),
+            info_dir.display(),
+            system_dir.display()
+        ),
+    )
+    .unwrap();
+    let mut info = String::from("systemname = \"megadrive\"\n");
+    info.push_str(&format!("firmware_count = {}\n", files.len()));
+    for (index, file) in files.iter().enumerate() {
+        info.push_str(&format!(
+            "firmware{index}_path = \"{file}\"\nfirmware{index}_opt = \"false\"\n"
+        ));
+    }
+    fs::write(ready.fixture.path("info/genesis_plus_gx.info"), info).unwrap();
+}
+
+#[test]
+fn readable_unverified_required_firmware_still_passes_preflight() {
+    let ready = build_ready_fixture("fw-unverified");
+    declare_required_firmware(&ready, &["bios.bin"]);
+    fs::write(ready.fixture.path("system/bios.bin"), b"not hashed").unwrap();
+    preflight(&ready).expect("policy B: a readable regular unhashed firmware file keeps Play");
+}
+
+#[test]
+fn firmware_removed_after_planning_is_refused_at_click_time() {
+    // The plan the user saw said PresentUnverified; the fresh probe at click
+    // time must decide, and a now-missing file blocks the launch.
+    let ready = build_ready_fixture("fw-toctou");
+    declare_required_firmware(&ready, &["bios.bin"]);
+    let firmware = ready.fixture.path("system/bios.bin");
+    fs::write(&firmware, b"not hashed").unwrap();
+    preflight(&ready).expect("present at plan time");
+    fs::remove_file(&firmware).unwrap();
+    let error = preflight(&ready).unwrap_err();
+    assert!(
+        matches!(
+            error.kind,
+            LaunchPreflightErrorKind::CandidateNotReady
+                | LaunchPreflightErrorKind::RequestedCandidateNotFound
+                | LaunchPreflightErrorKind::CommandBlocked
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn missing_required_firmware_is_never_launchable() {
+    let ready = build_ready_fixture("fw-missing");
+    declare_required_firmware(&ready, &["bios.bin"]);
+    assert!(preflight(&ready).is_err());
+}
+
+/// PINS TODAY'S BEHAVIOUR, a documented pre-existing gap (not changed here,
+/// separate owner-decided PR): when required firmware is a mix of present and
+/// missing entries the projection is `Unknown`, which adds neither blocker
+/// nor warning, so the launch is not refused.
+#[test]
+fn mixed_present_and_missing_required_firmware_is_unknown_and_not_refused_today() {
+    let ready = build_ready_fixture("fw-mixed");
+    declare_required_firmware(&ready, &["a.bin", "b.bin"]);
+    fs::write(ready.fixture.path("system/a.bin"), b"x").unwrap();
+    assert!(
+        preflight(&ready).is_ok(),
+        "pre-existing Unknown behaviour changed; update the owner-decided gap note"
+    );
+}
+
 // --- exact argv preserved -----------------------------------------------------
 
 #[test]

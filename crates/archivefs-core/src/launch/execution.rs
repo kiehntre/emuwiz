@@ -532,7 +532,7 @@ pub fn preflight_retroarch_launch(
         return Err(preflight_error(
             LaunchPreflightErrorKind::CandidateNotReady,
             format!(
-                "requested candidate readiness is {:?} (or it carries a warning that withholds Play), not Ready",
+                "requested candidate is not eligible to play (readiness {:?}; it is blocked or carries a warning other than unverified firmware)",
                 candidate.readiness
             ),
         ));
