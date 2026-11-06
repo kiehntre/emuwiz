@@ -121,6 +121,7 @@ fn play(lab: &Lab) -> (AdfLaunchInputs, GamerPlayAction) {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: Some(AmigaWHDLoadLaunchContext {
             requests: Vec::new(),
@@ -238,6 +239,7 @@ fn local_play(lab: &Lab) -> (AdfLaunchInputs, GamerPlayAction) {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: Some(AmigaWHDLoadLaunchContext {
             requests: Vec::new(),

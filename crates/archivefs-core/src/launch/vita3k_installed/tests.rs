@@ -1,7 +1,7 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 
-fn sfo(entries: &[(&str, &str)]) -> Vec<u8> {
+pub(crate) fn sfo(entries: &[(&str, &str)]) -> Vec<u8> {
     let index_table_len = entries.len() * 16;
     let key_table_start = 20 + index_table_len;
     let mut key_table = Vec::new();
@@ -46,21 +46,27 @@ fn sfo(entries: &[(&str, &str)]) -> Vec<u8> {
     output
 }
 
-struct Fixture {
-    dir: tempfile::TempDir,
-    roots: Vita3kProfileDiscoveryRoots,
-    config_root: PathBuf,
-    executable: PathBuf,
+pub(crate) struct Fixture {
+    pub(crate) dir: tempfile::TempDir,
+    pub(crate) roots: Vita3kProfileDiscoveryRoots,
+    pub(crate) config_root: PathBuf,
+    pub(crate) executable: PathBuf,
 }
 
-fn fake_vita3k(dir: &Path) -> PathBuf {
+pub(crate) fn fake_vita3k(dir: &Path) -> PathBuf {
     let path = dir.join("Vita3K");
     fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 
-fn install(config_root: &Path, dir_name: &str, title_id: &str, title: &str, category: &str) {
+pub(crate) fn install(
+    config_root: &Path,
+    dir_name: &str,
+    title_id: &str,
+    title: &str,
+    category: &str,
+) {
     let sys = config_root.join("ux0/app").join(dir_name).join("sce_sys");
     fs::create_dir_all(&sys).unwrap();
     fs::write(
@@ -74,7 +80,7 @@ fn install(config_root: &Path, dir_name: &str, title_id: &str, title: &str, cate
     .unwrap();
 }
 
-fn fixture() -> Fixture {
+pub(crate) fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let config_root = dir.path().join("profile-a");
     fs::create_dir_all(config_root.join("vs0/sys/external")).unwrap();
@@ -106,7 +112,7 @@ fn request_for(inventory: &Vita3kInventory, title_id: &str) -> Vita3kInstalledLa
     }
 }
 
-fn wait(mut process: WatchedProcess) -> bool {
+pub(crate) fn wait(mut process: WatchedProcess) -> bool {
     for _ in 0..200 {
         if process.poll().is_some() {
             return true;

@@ -97,6 +97,7 @@ fn valid_fds_surfaces_bios_requirement_but_never_native_authority() {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]

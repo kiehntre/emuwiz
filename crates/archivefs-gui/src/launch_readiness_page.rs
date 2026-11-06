@@ -197,6 +197,7 @@ pub(crate) enum LaunchReadinessInput {
         flycast: Option<flycast::Context>,
         xroar: Option<xroar::Context>,
         azahar: Option<azahar::Context>,
+        vita3k: Option<vita3k::Context>,
         vice: Option<vice::Context>,
         amiga_whdload: Option<AmigaWHDLoadLaunchContext>,
         #[cfg(target_os = "linux")]
@@ -705,6 +706,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         flycast,
         xroar,
         azahar,
+        vita3k,
         vice,
         amiga_whdload,
         #[cfg(target_os = "linux")]
@@ -842,6 +844,14 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             {
                 return Some(TypedLaunchRequest::Standalone(
                     StandaloneLaunchRequest::Azahar(request),
+                ));
+            }
+            if let Some(request) = vita3k
+                .as_ref()
+                .and_then(|context| context.request(plan, candidate))
+            {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Vita3k(request),
                 ));
             }
             if let Some(request) = cemu
@@ -3541,6 +3551,7 @@ pub(crate) fn show_launch_readiness_panel(
             flycast,
             xroar,
             azahar,
+            vita3k,
             vice,
             amiga_whdload,
             #[cfg(target_os = "linux")]
@@ -3579,6 +3590,20 @@ pub(crate) fn show_launch_readiness_panel(
                         candidate.target,
                         LaunchTarget::Standalone {
                             adapter_id: "azahar",
+                            ..
+                        }
+                    ) {
+                        context.show(ui, plan, candidate, standalone_launch_state);
+                    }
+                }
+            }
+            if let Some(context) = vita3k {
+                ui.small(context.status_text());
+                for candidate in &plan.candidates {
+                    if matches!(
+                        candidate.target,
+                        LaunchTarget::Standalone {
+                            adapter_id: "vita3k",
                             ..
                         }
                     ) {
@@ -4804,6 +4829,7 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
             "tsugaru" => Some("Tsugaru"),
             "xroar" => Some("XRoar"),
             "azahar" => Some("Azahar"),
+            "vita3k" => Some("Vita3K"),
             "vice" => Some("VICE"),
             _ => None,
         },

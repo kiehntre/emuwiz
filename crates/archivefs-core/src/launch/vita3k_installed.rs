@@ -380,4 +380,4 @@ pub fn preflight_and_launch_vita3k_installed(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

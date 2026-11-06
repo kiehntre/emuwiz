@@ -217,6 +217,7 @@ pub(super) fn show_controls(
         // never written as a per-game default (use once / system stay available).
         if chosen != Some(LaunchChoiceSource::Game)
             && super::azahar::game_default_allowed(game_key)
+            && super::vita3k::game_default_allowed(game_key)
             && ui.button("Default for this game").clicked()
         {
             action = Some(LaunchChoiceAction::SetDefault(LaunchPreference::game(
