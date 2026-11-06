@@ -63,6 +63,8 @@ pub(super) struct NativeWorkflows {
     launch_was_active: bool,
     launch_kind: Option<LaunchKind>,
     launch_attempts: launch_readiness_summary::AttemptTracker,
+    /// The last "can a launch request be built" answer, for the game shown.
+    route_truth: std::cell::RefCell<launch_readiness_summary::route_truth::RouteCache>,
     source_job: Option<u64>,
     provider_job: Option<u64>,
     metadata_job: Option<u64>,
@@ -386,6 +388,7 @@ impl NativeWorkflows {
             launch_was_active: false,
             launch_kind: None,
             launch_attempts: Default::default(),
+            route_truth: Default::default(),
             source_job: None,
             provider_job: None,
             metadata_job: None,
@@ -859,6 +862,7 @@ impl NativeWorkflows {
         {
             launch_readiness_summary::note_retroarch_installation_refusal(&mut summary, &refusal);
         }
+        self.note_launch_route(&mut summary, game_id, path, &input, Some(context));
         if catalogue_verified {
             launch_readiness_summary::note_catalogue_verified(&mut summary);
         }
@@ -908,10 +912,34 @@ impl NativeWorkflows {
         } else {
             ReadinessFreshness::Current
         };
-        Some(launch_readiness_summary::project(
-            &self.launch_input(),
-            freshness,
-        ))
+        let input = self.launch_input();
+        let mut summary = launch_readiness_summary::project(&input, freshness);
+        self.note_launch_route(&mut summary, game_id, path, &input, None);
+        Some(summary)
+    }
+
+    /// Ready only when a launch request can be built (cached per game).
+    fn note_launch_route(
+        &self,
+        summary: &mut launch_readiness_summary::GameReadinessSummary,
+        game_id: i64,
+        path: &Path,
+        input: &launch_readiness_page::LaunchReadinessInput,
+        repaint: Option<&egui::Context>,
+    ) {
+        use launch_readiness_summary::ReadinessPresentationState::{Ready, ReadyWithWarnings};
+        use launch_readiness_summary::route_truth::{Answer, apply, apply_pending};
+        if matches!(summary.status, Ready | ReadyWithWarnings) {
+            let mut cache = self.route_truth.borrow_mut();
+            let answer = match repaint {
+                Some(context) => cache.poll(game_id, path, input, Some(context)),
+                None => cache.peek(game_id, path, input),
+            };
+            match answer {
+                Answer::Known(verdict) => apply(summary, &verdict),
+                Answer::Pending => apply_pending(summary),
+            }
+        }
     }
 
     pub(super) fn save_state_target(

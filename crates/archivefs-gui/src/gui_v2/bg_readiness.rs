@@ -366,6 +366,13 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
     {
         summary::note_retroarch_installation_refusal(&mut projected, &refusal);
     }
+    if matches!(
+        projected.status,
+        summary::ReadinessPresentationState::Ready
+            | summary::ReadinessPresentationState::ReadyWithWarnings
+    ) {
+        summary::route_truth::apply(&mut projected, &summary::route_truth::assess(&input));
+    }
     if job.dat_exact {
         summary::note_catalogue_verified(&mut projected);
     }

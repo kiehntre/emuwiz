@@ -132,6 +132,7 @@ use crate::ui::{components as widgets, theme};
 // dropped; the `Plan` payload is the real launch plan it must carry. The
 // size gap vs the marker variants has no bearing on a per-frame temporary.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub(crate) enum LaunchReadinessInput {
     AtariSt(crate::emulator_setup::hatari::Snapshot),
     /// `SelectedEvidenceState` is not `Ready` for the focused archive yet.
@@ -299,6 +300,7 @@ pub(crate) enum LaunchReadinessPageAction {
 /// Exact AppImage paths selected from the same RetroArch discovery report as
 /// the launch plan. This binds an AppImage request to one reviewed executable;
 /// it is not a generic AppImage launcher.
+#[derive(Clone)]
 pub(crate) struct RetroArchLaunchContext {
     appimage_executables: Vec<(ProfileRef, PathBuf)>,
     environment: RetroArchEnvironmentReport,
@@ -956,6 +958,7 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
     GamerPlayAction::BlockedTyped(blocker)
 }
 
+#[derive(Clone)]
 pub(crate) struct DuckStationLaunchContext {
     pub(crate) discovery: archivefs_core::patch_manager::DuckStationProfileDiscovery,
     pub(crate) roots: archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots,
@@ -973,28 +976,33 @@ impl DuckStationLaunchContext {
         self.authority.launch_notices()
     }
 }
+#[derive(Clone)]
 pub(crate) struct PpssppLaunchContext {
     pub(crate) discovery: archivefs_core::patch_manager::PpssppProfileDiscovery,
     pub(crate) roots: archivefs_core::patch_manager::PpssppProfileDiscoveryRoots,
     pub(crate) verified_psp_disc_id: Option<String>,
     pub(crate) verified_standalone_pbp_sha256: Option<String>,
 }
+#[derive(Clone)]
 pub(crate) struct MelonDsLaunchContext {
     pub(crate) discovery: archivefs_core::patch_manager::MelonDsProfileDiscovery,
     pub(crate) roots: archivefs_core::patch_manager::MelonDsProfileDiscoveryRoots,
     /// The independently verified Nintendo DS game key, if any.
     pub(crate) verified_game_key: Option<String>,
 }
+#[derive(Clone)]
 pub(crate) struct Rpcs3LaunchContext {
     pub(crate) discovery: archivefs_core::patch_manager::Rpcs3ProfileDiscovery,
     pub(crate) roots: archivefs_core::patch_manager::Rpcs3ProfileDiscoveryRoots,
     pub(crate) verified_ps3_title_id: Option<String>,
 }
+#[derive(Clone)]
 pub(crate) struct XemuLaunchContext {
     pub(crate) discovery: archivefs_core::patch_manager::XemuProfileDiscovery,
     pub(crate) roots: archivefs_core::patch_manager::XemuProfileDiscoveryRoots,
     pub(crate) verified_xbox_title_id: Option<String>,
 }
+#[derive(Clone)]
 pub(crate) struct XeniaLaunchContext {
     pub(crate) discovery: archivefs_core::patch_manager::XeniaProfileDiscovery,
     pub(crate) roots: archivefs_core::patch_manager::XeniaProfileDiscoveryRoots,
@@ -1002,6 +1010,7 @@ pub(crate) struct XeniaLaunchContext {
     pub(crate) verified_xex_media_id: Option<String>,
 }
 
+#[derive(Clone)]
 pub(crate) struct AmigaWHDLoadLaunchContext {
     pub(crate) requests: Vec<(String, String, WHDLoadLaunchInput)>,
     /// FS-UAE requests for a verified single-disk ADF, keyed like `requests`.
@@ -1849,6 +1858,7 @@ impl StandaloneLaunchRequest {
 /// The real, already-gathered Dolphin discovery this panel needs to compute
 /// a launch binding - never (re)discovered by this module itself. See
 /// `main.rs`'s `DolphinLocalProfilesState`.
+#[derive(Clone)]
 pub(crate) struct DolphinLaunchContext {
     pub(crate) discovery: DolphinLocalProfileDiscovery,
     pub(crate) roots: DolphinLocalDiscoveryRoots,
@@ -1859,6 +1869,7 @@ pub(crate) struct DolphinLaunchContext {
 /// own fresh BIOS verification - never (re)discovered or (re)parsed by this
 /// module itself. See `main.rs`'s `Pcsx2LaunchProfilesState` and
 /// `Pcsx2FirmwareEvidenceState`.
+#[derive(Clone)]
 pub(crate) struct Pcsx2LaunchContext {
     pub(crate) discovery: Pcsx2ProfileDiscovery,
     pub(crate) roots: Pcsx2ProfileDiscoveryRoots,
@@ -4856,6 +4867,9 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
     }
 }
 
+/// The generic reason when nothing more specific explains a missing route.
+pub(crate) const NO_SAFE_CANDIDATE_DETAIL: &str = "No safe emulator launch candidate is available.";
+
 fn gamer_blocker_for_plan(
     plan: &LaunchPlan,
     retroarch_scanned: bool,
@@ -5050,10 +5064,7 @@ fn gamer_blocker_for_plan(
             "RetroArch has not been checked yet, and no standalone launch is ready.",
         );
     }
-    GamerBlocker::new(
-        GamerBlockerKind::NoSafeEmulator,
-        "No safe emulator launch candidate is available.",
-    )
+    GamerBlocker::new(GamerBlockerKind::NoSafeEmulator, NO_SAFE_CANDIDATE_DETAIL)
 }
 
 // One immediate-mode render call: the draw target, the plan/candidate being
