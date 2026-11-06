@@ -10,7 +10,7 @@
 //! - One direct loose regular content file
 //!   ([`LaunchContainerKind::PlainFile`], `requires_mount == false`) - no
 //!   archive members, no mounted content, no CUE/BIN multi-file handling.
-//! - [`LaunchReadiness::Ready`], or `ReadyWithWarnings` whose ONLY warnings
+//! - `LaunchReadiness::Ready`, or `ReadyWithWarnings` whose ONLY warnings
 //!   are allow-listed ([`crate::launch::planning::LaunchCandidate::retroarch_play_eligible`]: a
 //!   readable but unhashed required firmware file); any other warning kind,
 //!   any blocker and `Blocked` are refused, never silently accepted.
@@ -53,6 +53,7 @@ use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContainerKind, LaunchContentRef, LaunchTarget, build_launch_plan,
 };
 use crate::launch::process_spawn::{self, WatchedProcess};
+#[cfg(test)]
 use crate::launch::readiness::LaunchReadiness;
 use crate::launch::retroarch_command::{RetroArchCommand, build_retroarch_command_plan};
 
