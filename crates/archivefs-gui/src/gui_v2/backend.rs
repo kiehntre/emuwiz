@@ -428,6 +428,9 @@ impl Queues {
 pub(super) struct Backend {
     queues: Arc<std::sync::Mutex<Queues>>,
     wake: Sender<()>,
+    /// Test seam: a raw request channel standing in for the worker, so a
+    /// test can read the exact command the App sent. Never set in production.
+    raw: Option<Sender<(u64, Command)>>,
     pub rx: Receiver<Event>,
 }
 
@@ -463,7 +466,24 @@ impl Backend {
                 context.request_repaint();
             }
         });
-        Self { queues, wake, rx }
+        Self {
+            queues,
+            wake,
+            raw: None,
+            rx,
+        }
+    }
+    /// A backend whose "worker" is the test: every command goes straight to
+    /// `requests`, and the test answers on the paired `Event` sender.
+    #[cfg(test)]
+    pub fn with_channels(requests: Sender<(u64, Command)>, rx: Receiver<Event>) -> Self {
+        let (wake, _) = mpsc::channel();
+        Self {
+            queues: Arc::new(std::sync::Mutex::new(Queues::default())),
+            wake,
+            raw: Some(requests),
+            rx,
+        }
     }
     /// A backend whose worker is gone: every command is refused before it can
     /// run. Tests use it so nothing reaches the real catalogue or sources.
@@ -474,11 +494,15 @@ impl Backend {
         Self {
             queues: Arc::new(std::sync::Mutex::new(Queues::default())),
             wake,
+            raw: None,
             rx,
         }
     }
     pub fn send(&self, id: u64, command: Command) -> Result<(), String> {
         const GONE: &str = "The background worker is unavailable. Close and reopen GUI v2; your games have not been changed.";
+        if let Some(raw) = &self.raw {
+            return raw.send((id, command)).map_err(|_| GONE.into());
+        }
         self.queues
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
