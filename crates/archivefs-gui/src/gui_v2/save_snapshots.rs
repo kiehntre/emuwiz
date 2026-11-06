@@ -3,8 +3,10 @@
 //! History, integrity and freshness come from
 //! `archivefs_core::save_snapshots::history`, computed by the worker. Creation
 //! uses the reviewed `create_snapshot` copy and is offered only when the
-//! emulator's closure is proven by an existing observer (PCSX2 today).
-//! Snapshots never write to a live save, and restore is not offered here.
+//! emulator's closure is proven by a reviewed observer (PCSX2 and RetroArch).
+//! Snapshots never write to a live save. Restore is offered only for
+//! single-file SRAM with verified cartridge association (see
+//! `single_file_restore`); other save types keep their own routes.
 
 use super::{
     App,
@@ -51,6 +53,8 @@ pub(super) struct SnapshotTarget {
 pub(super) struct RecordSnapshots {
     pub(super) entries: Vec<SnapshotHistoryEntry>,
     pub(super) emulator_use: Option<EmulatorUseStatus>,
+    /// The newest single-file restore that can still be undone.
+    pub(super) undoable: Option<Box<archivefs_core::save_snapshots::SaveRestoreReceipt>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -91,6 +95,9 @@ pub(super) fn snapshot_target(
     record: &PersistentStateRecord,
     game: &Game,
 ) -> Result<SnapshotTarget, &'static str> {
+    if let Some(target) = sram_target(record, game) {
+        return target;
+    }
     let artifact_type = match record.state_type {
         PersistentStateType::MemoryCard => match record.emulator {
             StateEmulator::Pcsx2 | StateEmulator::DuckStation => SaveArtifactType::PsMemoryCard,
@@ -145,6 +152,49 @@ pub(super) fn snapshot_target(
     })
 }
 
+/// A RetroArch SRAM file whose origin was captured with a verified cartridge
+/// that is this game's own verified identity. Anything weaker (no capture,
+/// needs-review, a different cartridge, a directory) returns `None` and falls
+/// through to the generic path, which never treats a file as SRAM.
+fn sram_target(
+    record: &PersistentStateRecord,
+    game: &Game,
+) -> Option<Result<SnapshotTarget, &'static str>> {
+    use archivefs_core::{game_identity::IdentityKind, sram_provenance::OriginState};
+    let origin = record.sram_origin.as_ref()?;
+    if record.state_type != PersistentStateType::NativeSave
+        || record.emulator != StateEmulator::RetroArch
+        || origin.state != OriginState::Associated
+        || origin.context.cartridge_identity.kind != IdentityKind::LooseRomSha256
+        || origin.context.cartridge_identity.status != IdentityStatus::Verified
+        || origin.context.cartridge_identity.value.as_ref()
+            != Some(&origin.context.cartridge.sha256)
+    {
+        return None;
+    }
+    if !record.warnings.is_empty() {
+        return Some(Err(
+            "This save location needs review first. Check the warnings in Advanced details.",
+        ));
+    }
+    let sha = &origin.context.cartridge.sha256;
+    // The same join that puts this record on the game's page: sealed capture
+    // evidence bound to this game's exact file, refusing any disagreeing
+    // cached digest or incomplete inspection. No filename or title joins.
+    let own = super::saves_states::record_belongs_to_game(record, game);
+    if !own {
+        return Some(Err(
+            "This save was made with a cartridge that is not this game's verified file, so EmuWiz will not snapshot or restore it here.",
+        ));
+    }
+    Some(Ok(SnapshotTarget {
+        location: save_location(record, SaveArtifactType::Sram),
+        emulator: record.emulator,
+        game_identity: format!("LooseRomSha256:{sha}"),
+        platform: game.platform.clone(),
+    }))
+}
+
 /// The snapshot location for a live record, keyed by its emulator profile.
 pub(super) fn save_location(
     record: &PersistentStateRecord,
@@ -175,6 +225,7 @@ pub(super) fn load_history(
     root: &std::path::Path,
     targets: &[SnapshotTarget],
     observer: &dyn QuiescenceProvider,
+    receipt_roots: Option<(&std::path::Path, &std::path::Path)>,
 ) -> SnapshotReport {
     let listing = list_snapshots(root);
     let records = targets
@@ -193,6 +244,15 @@ pub(super) fn load_history(
                         &target.location.path,
                         observer,
                     )),
+                    undoable: receipt_roots
+                        .filter(|_| super::single_file_restore::restorable(target))
+                        .and_then(|(receipts, backups)| {
+                            super::single_file_restore::undoable_receipt(
+                                receipts,
+                                backups,
+                                &target.location.path,
+                            )
+                        }),
                 },
             )
         })
@@ -320,9 +380,21 @@ pub(super) fn show(
     if record_snapshots.entries.is_empty() {
         ui.weak("No snapshots of this save yet.");
     }
+    let restorable = super::single_file_restore::restorable(target);
+    let restore_busy = busy || app.saves_states.single_file.job.is_some();
+    let mut preview = None;
     for entry in &record_snapshots.entries {
-        ui.push_id(&entry.snapshot.storage_path, |ui| history_row(ui, entry));
+        let restore = restorable.then_some(!restore_busy);
+        if ui
+            .push_id(&entry.snapshot.storage_path, |ui| {
+                history_row(ui, entry, restore)
+            })
+            .inner
+        {
+            preview = Some(entry.snapshot.clone());
+        }
     }
+    let undoable = record_snapshots.undoable.clone();
     let emulator_use = record_snapshots.emulator_use;
     let create_allowed = !busy && emulator_use == Some(EmulatorUseStatus::NotDetected);
     let mut start = false;
@@ -332,9 +404,36 @@ pub(super) fn show(
             .on_hover_text("Copies this save into EmuWiz's local snapshot folder and verifies it. Your save is only read.")
             .on_disabled_hover_text(closure_message(target.emulator, emulator_use))
             .clicked();
-        ui.add_enabled(false, egui::Button::new("Restore"))
-            .on_disabled_hover_text(restore_unavailable(record.state_type));
+        if !restorable {
+            ui.add_enabled(false, egui::Button::new("Restore"))
+                .on_disabled_hover_text(restore_unavailable(record.state_type));
+        }
     });
+    if restorable {
+        let idle = matches!(
+            app.saves_states.single_file.flow,
+            super::single_file_restore::Flow::Idle
+        );
+        if idle
+            && let Some(receipt) = undoable
+            && ui
+                .add_enabled(!restore_busy, egui::Button::new("Undo last restore"))
+                .on_hover_text("Puts back the save you had before the last EmuWiz restore, if the file has not changed since.")
+                .clicked()
+        {
+            app.start_single_file_restore(
+                "Undoing a save restore",
+                super::single_file_restore::Job::Undo {
+                    receipt,
+                    target: Box::new(target.clone()),
+                },
+            );
+        }
+        super::single_file_restore::show_flow(ui, app, &target.location.path);
+    }
+    if let Some(snapshot) = preview {
+        super::single_file_restore::begin_preview(app, snapshot, target.clone());
+    }
     if !create_allowed && !busy {
         tip(
             ui,
@@ -388,7 +487,10 @@ pub(super) fn closure_message(
     }
 }
 
-fn history_row(ui: &mut egui::Ui, entry: &SnapshotHistoryEntry) {
+/// One snapshot. `restore` is `Some(enabled)` when this save type has a
+/// reviewed restore; the return value is whether Restore was clicked.
+fn history_row(ui: &mut egui::Ui, entry: &SnapshotHistoryEntry, restore: Option<bool>) -> bool {
+    let mut clicked = false;
     let manifest = &entry.snapshot.manifest;
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -438,7 +540,19 @@ fn history_row(ui: &mut egui::Ui, entry: &SnapshotHistoryEntry) {
                 entry.snapshot.storage_path.display()
             ));
         });
+        if let Some(enabled) = restore {
+            clicked = ui
+                .add_enabled(
+                    enabled && entry.compatible(),
+                    egui::Button::new("Preview restore…"),
+                )
+                .on_hover_text(
+                    "Shows exactly what would change. Nothing is written until you confirm.",
+                )
+                .clicked();
+        }
     });
+    clicked
 }
 
 pub(super) fn freshness_label(freshness: SnapshotFreshness) -> &'static str {

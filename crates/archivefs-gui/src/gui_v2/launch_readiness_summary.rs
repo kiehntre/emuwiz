@@ -12,7 +12,9 @@ use eframe::egui;
 
 mod diagnosis;
 pub(crate) mod route_truth;
+mod vita3k_package;
 pub(crate) use diagnosis::{Attempt, AttemptTracker, Finding};
+pub(crate) use vita3k_package::note_vita3k_package;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadinessPresentationState {
@@ -40,6 +42,9 @@ pub(crate) enum ReadinessAction {
     RecheckReadiness,
     ReviewDiscSet,
     OpenActivity,
+    /// Game Details only: bring "Look up online" into view. Never reads a
+    /// file or contacts Hasheous by itself.
+    LookUpOnline,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -827,6 +832,7 @@ pub(crate) fn action_label(action: ReadinessAction) -> &'static str {
         ReadinessAction::RecheckReadiness => "Recheck readiness",
         ReadinessAction::ReviewDiscSet => "Review multi-disc set",
         ReadinessAction::OpenActivity => "Open Activity",
+        ReadinessAction::LookUpOnline => super::hasheous_check::SHORTCUT_LABEL,
     }
 }
 
@@ -918,6 +924,13 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
                 ui.label(format!("Using: {}", emulator.name));
             }
             ui.label(format!("Identity: {}", identity_label(summary.identity)));
+            if ui
+                .small_button(action_label(ReadinessAction::LookUpOnline))
+                .on_hover_text(super::hasheous_check::SHORTCUT_HINT)
+                .clicked()
+            {
+                action = Some(ReadinessAction::LookUpOnline);
+            }
             if summary.firmware != FirmwareSummary::Unknown {
                 ui.label(format!("Firmware: {}", firmware_label(summary.firmware)));
             }
@@ -1429,6 +1442,7 @@ mod tests {
             flycast: None,
             xroar: None,
             azahar: None,
+            vita3k: None,
             vice: None,
             amiga_whdload: None,
             #[cfg(target_os = "linux")]

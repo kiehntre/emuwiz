@@ -113,6 +113,9 @@ pub(super) struct Game {
     /// The audited hashes behind that exact match, from the same current
     /// evidence. Only set alongside `dat_exact`.
     pub dat_exact_hashes: Option<archivefs_core::dat::library_identity_summary::LibraryItemHashes>,
+    /// Hashes from this game's current saved catalogue checks, whatever they
+    /// found. Used only for optional online lookups; never proof.
+    pub saved_hashes: Option<archivefs_core::dat::library_identity_summary::LibraryItemHashes>,
     /// The strongest other saved DAT evidence, when any applies (a negative
     /// only from this game's own platform's catalogue). `None`: not checked.
     pub dat_state: Option<archivefs_core::LibraryDatState>,
@@ -152,6 +155,7 @@ impl Game {
             inspection_incomplete: freshness.is_incomplete(),
             dat_exact: None,
             dat_exact_hashes: None,
+            saved_hashes: None,
             dat_state: None,
             dat_proof_invalidated: false,
             attention,

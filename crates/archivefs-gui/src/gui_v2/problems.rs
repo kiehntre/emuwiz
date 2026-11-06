@@ -677,6 +677,7 @@ pub(in crate::gui_v2) mod tests {
             inspection_incomplete: false,
             dat_exact: None,
             dat_exact_hashes: None,
+            saved_hashes: None,
             dat_state: None,
             dat_proof_invalidated: false,
             attention: missing,

@@ -46,6 +46,7 @@ pub(super) struct SavesStatesState {
     pub(super) error: Option<String>,
     pub(super) snapshots: super::save_snapshots::SnapshotPanelState,
     pub(super) card_restore: super::card_restore::CardRestoreState,
+    pub(super) single_file: super::single_file_restore::State,
     pub(super) compatibility: super::save_compatibility::Panel,
 }
 

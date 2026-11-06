@@ -13,6 +13,10 @@ pub mod tree_restore;
 /// used by the Blue Saves page.
 pub mod history;
 
+/// Guarded single-file restore and Undo: proves the emulator is closed and
+/// keeps the proof across the write.
+pub mod single_file_guard;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -446,6 +450,14 @@ pub fn default_snapshot_root() -> crate::Result<PathBuf> {
     Ok(crate::app_dirs::data_dir()?.join("snapshots"))
 }
 
+/// EmuWiz-owned folders for single-file restores: pre-restore backups and the
+/// receipts (journals) that Undo reads. Kept apart from `snapshots` so a
+/// backup never appears in a game's snapshot history.
+pub fn default_single_file_restore_roots() -> crate::Result<(PathBuf, PathBuf)> {
+    let data = crate::app_dirs::data_dir()?;
+    Ok((data.join("restore-backups"), data.join("restore-receipts")))
+}
+
 pub fn assess_snapshot_readiness(
     location: &SaveLocation,
     available_space_bytes: Option<u64>,
@@ -776,6 +788,19 @@ pub fn apply_single_file_restore(
     preflight: &SaveRestorePreflight,
     options: &SaveRestoreApplyOptions,
 ) -> Result<SaveRestoreResult, SaveRestoreError> {
+    apply_single_file_restore_gated(snapshot, preflight, options, &|| true)
+}
+
+/// [`apply_single_file_restore`] with a last-moment gate. `still_safe` is
+/// called after the journal is durable and immediately before the atomic
+/// publication; if it returns false nothing is published, the journal is
+/// discarded and the restore is refused as `SaveInUse`.
+pub fn apply_single_file_restore_gated(
+    snapshot: &SaveSnapshot,
+    preflight: &SaveRestorePreflight,
+    options: &SaveRestoreApplyOptions,
+    still_safe: &dyn Fn() -> bool,
+) -> Result<SaveRestoreResult, SaveRestoreError> {
     if !preflight.ready() {
         return Err(SaveRestoreError::Refused(
             preflight
@@ -882,8 +907,48 @@ pub fn apply_single_file_restore(
             SaveRestoreRefusal::DestinationChanged,
         ));
     }
+    // Journal first: the receipt is durable before the live save changes, so a
+    // crash after publication still leaves a way to Undo. It names the bytes
+    // the restore is about to publish; Undo re-hashes the target and refuses
+    // unless those exact bytes are there, so a receipt for a restore that
+    // never happened can only be refused, never applied.
+    let receipt_path = options.receipt_root.join(format!("{transaction_id}.json"));
+    let mut receipt = SaveRestoreReceipt {
+        transaction_id,
+        snapshot_id: preflight.snapshot_id.clone(),
+        snapshot_sha256: preflight.snapshot_sha256.clone(),
+        target_binding: preflight.target_binding.clone(),
+        pre_restore_target_sha256: preflight.target_fingerprint.clone(),
+        backup_snapshot_id: backup_snapshot
+            .as_ref()
+            .map(|backup| backup.manifest.snapshot_id.clone()),
+        backup_snapshot_path: backup_snapshot
+            .as_ref()
+            .map(|backup| backup.storage_path.clone()),
+        post_restore_expected_sha256: preflight.snapshot_sha256.clone(),
+        post_restore_actual_sha256: preflight.snapshot_sha256.clone(),
+        quiescence: preflight.quiescence,
+        applied_unix_seconds: options.now_unix_seconds,
+        target_was_missing: !preflight.target_exists,
+        rollback_eligible: true,
+        receipt_path,
+    };
+    if let Err(error) = persist_receipt(&receipt) {
+        let _ = fs::remove_file(&stage);
+        let _ = fs::remove_file(receipt.receipt_path.with_extension("json.partial"));
+        return Err(error);
+    }
+    let discard_journal = |receipt: &SaveRestoreReceipt| {
+        let _ = fs::remove_file(&receipt.receipt_path);
+    };
+    if !still_safe() {
+        let _ = fs::remove_file(&stage);
+        discard_journal(&receipt);
+        return Err(SaveRestoreError::Refused(SaveRestoreRefusal::SaveInUse));
+    }
     if let Err(error) = fs::rename(&stage, target) {
         let _ = fs::remove_file(&stage);
+        discard_journal(&receipt);
         return Err(SaveRestoreError::Io {
             path: target.clone(),
             detail: format!("atomic publication failed: {error}"),
@@ -900,6 +965,7 @@ pub fn apply_single_file_restore(
             let rollback =
                 rollback_after_failed_restore(target, preflight, backup_snapshot.as_ref());
             return Err(if rollback.is_ok() {
+                discard_journal(&receipt);
                 SaveRestoreError::Snapshot(error)
             } else {
                 SaveRestoreError::Refused(SaveRestoreRefusal::RollbackFailed)
@@ -909,36 +975,17 @@ pub fn apply_single_file_restore(
     if actual != preflight.snapshot_sha256 {
         let rollback = rollback_after_failed_restore(target, preflight, backup_snapshot.as_ref());
         return Err(if rollback.is_ok() {
+            discard_journal(&receipt);
             SaveRestoreError::Refused(SaveRestoreRefusal::PostWriteVerificationFailed)
         } else {
             SaveRestoreError::Refused(SaveRestoreRefusal::RollbackFailed)
         });
     }
-
-    let receipt_path = options.receipt_root.join(format!("{transaction_id}.json"));
-    let receipt = SaveRestoreReceipt {
-        transaction_id,
-        snapshot_id: preflight.snapshot_id.clone(),
-        snapshot_sha256: preflight.snapshot_sha256.clone(),
-        target_binding: preflight.target_binding.clone(),
-        pre_restore_target_sha256: preflight.target_fingerprint.clone(),
-        backup_snapshot_id: backup_snapshot
-            .as_ref()
-            .map(|backup| backup.manifest.snapshot_id.clone()),
-        backup_snapshot_path: backup_snapshot
-            .as_ref()
-            .map(|backup| backup.storage_path.clone()),
-        post_restore_expected_sha256: preflight.snapshot_sha256.clone(),
-        post_restore_actual_sha256: actual,
-        quiescence: preflight.quiescence,
-        applied_unix_seconds: options.now_unix_seconds,
-        target_was_missing: !preflight.target_exists,
-        rollback_eligible: true,
-        receipt_path,
-    };
+    receipt.post_restore_actual_sha256 = actual;
     persist_receipt(&receipt).map_err(|error| {
         let rollback = rollback_after_failed_restore(target, preflight, backup_snapshot.as_ref());
         if rollback.is_ok() {
+            discard_journal(&receipt);
             error
         } else {
             SaveRestoreError::Refused(SaveRestoreRefusal::RollbackFailed)
@@ -950,9 +997,94 @@ pub fn apply_single_file_restore(
     })
 }
 
+/// Receipts of single-file restores under `receipt_root`, newest first.
+/// Unreadable or oversized files are skipped; nothing is repaired or removed.
+///
+/// Only receipts this module could have written are returned: a RetroArch
+/// SRAM target, a file named after its transaction, and a backup that lives
+/// under `backup_root` without links or `..`. Undo trusts a receipt's paths,
+/// so anything else is ignored rather than offered.
+pub fn list_single_file_restore_receipts(
+    receipt_root: &Path,
+    backup_root: &Path,
+) -> Vec<SaveRestoreReceipt> {
+    let Ok(entries) = fs::read_dir(receipt_root) else {
+        return Vec::new();
+    };
+    let mut receipts = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+                && fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 1024 * 1024)
+        })
+        .filter_map(|path| {
+            let mut receipt: SaveRestoreReceipt =
+                serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+            // The file's own location decides where it lives, not its contents.
+            let named_for_itself = path.file_stem().and_then(|stem| stem.to_str())
+                == Some(receipt.transaction_id.as_str());
+            let backup_ok = match (&receipt.backup_snapshot_path, receipt.target_was_missing) {
+                (None, true) => true,
+                (Some(backup), false) => {
+                    backup.is_absolute()
+                        && backup.starts_with(backup_root)
+                        && backup
+                            .components()
+                            .all(|part| !matches!(part, Component::ParentDir))
+                        && fs::symlink_metadata(backup).is_ok_and(|metadata| {
+                            metadata.is_dir() && !metadata.file_type().is_symlink()
+                        })
+                }
+                _ => false,
+            };
+            let binding = &receipt.target_binding;
+            if !named_for_itself
+                || !backup_ok
+                || binding.artifact_type != SaveArtifactType::Sram
+                || !binding
+                    .emulator
+                    .as_deref()
+                    .is_some_and(|emulator| emulator.eq_ignore_ascii_case("retroarch"))
+            {
+                return None;
+            }
+            receipt.receipt_path = path;
+            Some(receipt)
+        })
+        .collect::<Vec<_>>();
+    receipts.sort_by(|a, b| {
+        b.applied_unix_seconds
+            .cmp(&a.applied_unix_seconds)
+            .then_with(|| b.transaction_id.cmp(&a.transaction_id))
+    });
+    receipts
+}
+
 /// Undo a completed generic single-file restore only while the destination
 /// still contains the bytes created by that transaction.
-pub fn undo_single_file_restore(receipt: &SaveRestoreReceipt) -> Result<(), SaveRestoreError> {
+pub fn undo_single_file_restore(
+    receipt: &SaveRestoreReceipt,
+    quiescence: SaveQuiescenceRequirement,
+) -> Result<(), SaveRestoreError> {
+    match quiescence {
+        SaveQuiescenceRequirement::ConfirmedClosed => {}
+        SaveQuiescenceRequirement::Running => {
+            return Err(SaveRestoreError::Refused(
+                SaveRestoreRefusal::EmulatorRunning,
+            ));
+        }
+        SaveQuiescenceRequirement::InUse => {
+            return Err(SaveRestoreError::Refused(SaveRestoreRefusal::SaveInUse));
+        }
+        SaveQuiescenceRequirement::Unknown => {
+            return Err(SaveRestoreError::Refused(
+                SaveRestoreRefusal::EmulatorStateUnknown,
+            ));
+        }
+    }
     if !receipt.rollback_eligible {
         return Err(SaveRestoreError::Refused(
             SaveRestoreRefusal::DestinationChanged,
@@ -1247,6 +1379,12 @@ fn persist_receipt(receipt: &SaveRestoreReceipt) -> Result<(), SaveRestoreError>
         path: receipt.receipt_path.clone(),
         detail: error.to_string(),
     })?;
+    if let Some(parent) = receipt.receipt_path.parent() {
+        sync_parent(parent).map_err(|detail| SaveRestoreError::Io {
+            path: parent.to_path_buf(),
+            detail,
+        })?;
+    }
     Ok(())
 }
 
@@ -1655,7 +1793,8 @@ mod tests {
         assert!(result.receipt.rollback_eligible);
         assert!(result.receipt.backup_snapshot_path.is_some());
         assert!(result.receipt.receipt_path.is_file());
-        undo_single_file_restore(&result.receipt).unwrap();
+        undo_single_file_restore(&result.receipt, SaveQuiescenceRequirement::ConfirmedClosed)
+            .unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"changed");
     }
 
@@ -1674,7 +1813,8 @@ mod tests {
         let result =
             apply_single_file_restore(&snapshot, &preflight, &restore_options(dir.path())).unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"save");
-        undo_single_file_restore(&result.receipt).unwrap();
+        undo_single_file_restore(&result.receipt, SaveQuiescenceRequirement::ConfirmedClosed)
+            .unwrap();
         assert!(!source.exists());
     }
 
@@ -1707,7 +1847,7 @@ mod tests {
             apply_single_file_restore(&snapshot, &fresh, &restore_options(dir.path())).unwrap();
         fs::write(&source, b"external-change").unwrap();
         assert!(matches!(
-            undo_single_file_restore(&result.receipt),
+            undo_single_file_restore(&result.receipt, SaveQuiescenceRequirement::ConfirmedClosed),
             Err(SaveRestoreError::Refused(
                 SaveRestoreRefusal::DestinationChanged
             ))

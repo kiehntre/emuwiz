@@ -236,6 +236,7 @@ pub(super) enum Command {
         target: super::save_snapshots::SnapshotTarget,
     },
     CardRestore(Box<super::card_restore::Job>),
+    SingleFileRestore(Box<super::single_file_restore::Job>),
 }
 
 pub(super) enum Payload {
@@ -325,6 +326,7 @@ pub(super) enum Payload {
         result: Result<String, String>,
     },
     CardRestore(Box<super::card_restore::Outcome>),
+    SingleFileRestore(Box<super::single_file_restore::Outcome>),
 }
 
 #[derive(Clone, Debug)]
@@ -936,9 +938,16 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 &root,
                 &targets,
                 &archivefs_core::save_snapshots::history::default_closure_observer(),
+                archivefs_core::save_snapshots::default_single_file_restore_roots()
+                    .ok()
+                    .as_ref()
+                    .map(|(backups, receipts)| (receipts.as_path(), backups.as_path())),
             ),
             generation,
         }),
+        Command::SingleFileRestore(job) => Ok(Payload::SingleFileRestore(Box::new(
+            super::single_file_restore::run(*job),
+        ))),
         Command::CardRestore(job) => Ok(Payload::CardRestore(Box::new(super::card_restore::run(
             *job,
         )))),
@@ -1024,6 +1033,11 @@ pub(super) fn load_library_with_catalogues(
             library.games[index].mark_dat_exact(ecosystem);
             library.games[index].dat_exact_hashes =
                 dat_evidence.exact_hashes.get(&archive_id).cloned();
+        }
+    }
+    for (archive_id, hashes) in dat_evidence.current_hashes {
+        if let Some(index) = library.by_id.get(&archive_id).copied() {
+            library.games[index].saved_hashes = Some(hashes);
         }
     }
     // Other saved DAT evidence, shown as such; never a verification.

@@ -284,6 +284,18 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
         state.azahar_homebrew =
             crate::emulator_setup::azahar_homebrew::Controller::with_context(path.clone(), context);
     }
+    // A Vita .vpk: the same bounded check the selected game runs (ZIP directory
+    // and one param.sfo member, plus a Vita3K rescan).
+    if archivefs_core::launch::is_vpk(&path)
+        && crate::launch_readiness_page::vita3k::platform_allows(Some(&job.catalogue_platform))
+    {
+        if cancel.load(Ordering::Relaxed) {
+            return Outcome::Unknown;
+        }
+        let context = crate::launch_readiness_page::vita3k::Context::inspect(path.clone());
+        state.vita3k_library =
+            crate::emulator_setup::vita3k_library::Controller::with_context(path.clone(), context);
+    }
     let evidence = crate::selected_evidence_page::SelectedEvidenceState::Ready {
         generation: 0,
         report: Box::new(report),

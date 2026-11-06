@@ -50,6 +50,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 pub(super) struct NativeWorkflows {
     pub(super) app: ArchiveFsApp,
+    /// Set by the readiness card's Hasheous shortcut; Game Details takes it.
+    lookup_online_requested: bool,
     native_romm: native_romm::State,
     selected: Option<PathBuf>,
     catalogue_identity_report: Option<archivefs_core::game_identity::GameIdentityReport>,
@@ -374,6 +376,7 @@ impl NativeWorkflows {
         super::readable_style(&context);
         Self {
             app,
+            lookup_online_requested: false,
             native_romm: native_romm::State::default(),
             selected: None,
             catalogue_identity_report: None,
@@ -424,6 +427,13 @@ impl NativeWorkflows {
         self.poll_discovery_import_undo(context);
         crate::pcsx2_page::poll_save_vault(context);
         self.poll_native_repairs(context);
+        let emulator_running = self.app.launch_dolphin.is_active()
+            || self.app.launch_pcsx2.is_active()
+            || self.app.launch_standalone.is_active();
+        self.app
+            .emulator_readiness
+            .emulator_inventory_page
+            .sync_blue(emulator_running);
 
         let changed = self.app.launch_retroarch.poll()
             | self.app.launch_dolphin.poll()
@@ -538,6 +548,10 @@ impl NativeWorkflows {
         self.app
             .emulator_readiness
             .azahar_homebrew
+            .show(ui, Some(path));
+        self.app
+            .emulator_readiness
+            .vita3k_library
             .show(ui, Some(path));
         self.start_launch_readiness(ui.ctx());
 
@@ -656,6 +670,10 @@ impl NativeWorkflows {
             .emulator_readiness
             .azahar_homebrew
             .show(ui, Some(path));
+        self.app
+            .emulator_readiness
+            .vita3k_library
+            .show(ui, Some(path));
         let (mut summary, input) = self.readiness_projection(
             ui.ctx(),
             game_id,
@@ -667,6 +685,20 @@ impl NativeWorkflows {
         );
         if let Some(identity) = saved.dat_identity {
             launch_readiness_summary::note_dat_identity(&mut summary, identity);
+        }
+        if let Some(context) = self
+            .app
+            .emulator_readiness
+            .vita3k_library
+            .context(Some(path))
+            && catalogue_identity_report.is_none_or(|r| {
+                matches!(
+                    r.platform,
+                    archivefs_core::game_identity::IdentityPlatform::Other
+                )
+            })
+        {
+            launch_readiness_summary::note_vita3k_package(&mut summary, &context);
         }
         if saved.file_missing {
             launch_readiness_summary::note_file_missing(&mut summary);
@@ -695,7 +727,7 @@ impl NativeWorkflows {
         catalogue_verified: bool,
         activity: &mut Activity,
     ) -> launch_readiness_summary::CompactReadiness {
-        let (summary, _) = self.readiness_projection(
+        let (mut summary, _) = self.readiness_projection(
             context,
             game_id,
             path,
@@ -704,6 +736,20 @@ impl NativeWorkflows {
             false,
             activity,
         );
+        if let Some(vita) = self
+            .app
+            .emulator_readiness
+            .vita3k_library
+            .context(Some(path))
+            && catalogue_identity_report.is_none_or(|r| {
+                matches!(
+                    r.platform,
+                    archivefs_core::game_identity::IdentityPlatform::Other
+                )
+            })
+        {
+            launch_readiness_summary::note_vita3k_package(&mut summary, &vita);
+        }
         launch_readiness_summary::compact(&summary, self.selected_checksum_pending())
     }
 
@@ -834,7 +880,15 @@ impl NativeWorkflows {
         if action == ReadinessAction::RecheckReadiness {
             self.recheck_readiness_in_place(context);
         }
+        if action == ReadinessAction::LookUpOnline {
+            self.lookup_online_requested = true;
+        }
         route_for_action(action, game_id)
+    }
+
+    /// True once after the card's "Check Hasheous…" shortcut was pressed.
+    pub(super) fn take_lookup_online(&mut self) -> bool {
+        std::mem::take(&mut self.lookup_online_requested)
     }
 
     /// Reuse the same current plan and candidate policy as Launch. Never
@@ -1180,6 +1234,16 @@ impl NativeWorkflows {
         self.app
             .navigate_to_main_view(crate::navigation::MainView::EmulatorSetup);
         self.app.show_emulator_setup_page(ui, &context);
+        // Updates sit below the page's own primary action so that action
+        // stays visible without scrolling.
+        ui.separator();
+        let emulator_running = self.app.launch_dolphin.is_active()
+            || self.app.launch_pcsx2.is_active()
+            || self.app.launch_standalone.is_active();
+        self.app
+            .emulator_readiness
+            .emulator_inventory_page
+            .show_blue(ui, emulator_running);
     }
 
     fn poll_native_repairs(&mut self, context: &egui::Context) {
@@ -4681,7 +4745,7 @@ mod lifecycle_selection_tests {
 /// Review Identity screen.
 pub(super) fn route_for_action(action: ReadinessAction, game_id: i64) -> Option<Route> {
     match action {
-        ReadinessAction::RecheckReadiness => None,
+        ReadinessAction::RecheckReadiness | ReadinessAction::LookUpOnline => None,
         ReadinessAction::ReviewDiscSet => Some(Route::Section(Section::MultiDisc)),
         ReadinessAction::OpenActivity => Some(Route::Section(Section::Activity)),
         ReadinessAction::Play | ReadinessAction::ChooseEmulator => Some(Route::Task {

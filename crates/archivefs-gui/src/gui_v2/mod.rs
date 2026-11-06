@@ -36,6 +36,7 @@ mod game_verification_guidance;
 mod glyph_coverage_tests;
 mod guidance;
 mod hackhash;
+mod hasheous_check;
 mod hdf_contents;
 mod history_discovery_import;
 mod history_duckstation;
@@ -106,6 +107,7 @@ mod setup_portability;
 #[path = "tests/shared_scroll.rs"]
 mod shared_scroll_tests;
 mod simple_shell;
+mod single_file_restore;
 mod source_impact;
 mod sources_providers;
 #[cfg(test)]
@@ -401,6 +403,7 @@ pub(super) struct App {
     moved_game: Option<i64>,
     review: identity_review_page::ReviewUi,
     game_dat_check: game_dat_check::State,
+    hasheous_check: hasheous_check::State,
     notice: Option<Notice>,
     /// Non-alarming confirmation that a separate window was opened; cleared on
     /// navigation or dismissal.
@@ -535,6 +538,7 @@ impl App {
             moved_game: None,
             review: Default::default(),
             game_dat_check: Default::default(),
+            hasheous_check: Default::default(),
             notice: None,
             handoff_status: None,
             confirm_scan: false,
@@ -864,6 +868,18 @@ impl App {
         self.saves_states.card_restore.job = Some(id);
         if !self.send(id, Command::CardRestore(Box::new(job))) {
             self.saves_states.card_restore.job = None;
+        }
+    }
+    fn start_single_file_restore(&mut self, label: &'static str, job: single_file_restore::Job) {
+        if self.saves_states.single_file.job.is_some() {
+            return;
+        }
+        let id = self
+            .activity
+            .queue(label, Route::Section(Section::Saves), false);
+        self.saves_states.single_file.job = Some(id);
+        if !self.send(id, Command::SingleFileRestore(Box::new(job))) {
+            self.saves_states.single_file.job = None;
         }
     }
     fn start_saves_inventory(&mut self) {
@@ -1888,6 +1904,10 @@ impl App {
                                         None,
                                     );
                                 }
+                                Payload::SingleFileRestore(outcome) => {
+                                    let message = single_file_restore::receive(self, id, *outcome);
+                                    self.activity.finish(id, message, None);
+                                }
                                 Payload::CardRestore(outcome) => {
                                     let message = card_restore::receive(self, id, *outcome);
                                     self.activity.finish(id, message, None);
@@ -2436,6 +2456,7 @@ impl eframe::App for App {
         // A finished one-game check saves new evidence even when its page is
         // no longer showing; reload so Game Details reads it.
         self.game_dat_check.poll();
+        self.hasheous_check.poll();
         if self.load_job.is_none() && self.game_dat_check.take_saved() {
             reload_library = true;
         }
