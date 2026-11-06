@@ -413,8 +413,10 @@ impl RomOrganisationPageState {
     /// walk runs on the first Preview (`generate_plan_reporting`) or on
     /// `rescan_sources`, both of which Blue runs on its worker.
     pub(crate) fn load_deferred() -> Self {
-        let mut state = Self::default();
-        state.sources_scanned = false;
+        let mut state = Self {
+            sources_scanned: false,
+            ..Self::default()
+        };
         if let Ok(config) = Config::load_default() {
             state.saved_master_root = config.master_rom_root.clone();
             state.master_root_draft = config
@@ -1307,26 +1309,12 @@ impl RomOrganisationPageState {
 /// paths: regular files and symlink *objects*. Symlinked directories are
 /// collected as link objects but never traversed, so a symlink loop cannot
 /// recurse. Read-only.
-pub(crate) fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
-    collect_source_files_bounded(roots, 2_000, 4)
-}
-
 fn unavailable_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     roots
         .iter()
         .filter(|path| !path.is_dir())
         .cloned()
         .collect()
-}
-
-/// Same conservative collector with explicit bounds for background workflows
-/// that can safely review larger nested collections.
-pub(crate) fn collect_source_files_bounded(
-    roots: &[PathBuf],
-    max_files: usize,
-    max_depth: usize,
-) -> Vec<PathBuf> {
-    collect_source_files_reported(roots, max_files, max_depth).files
 }
 
 pub(crate) struct SourceFileScan {
