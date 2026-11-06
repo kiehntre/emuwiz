@@ -16,6 +16,19 @@ actually on disk without changing any database file. The History page is a
 separate EmuWiz process from Blue, so the protections below are all
 cross-process.
 
+Blue's own History page (the quick view inside Blue) shows the same restore
+receipts under "Database restore & recovery": the state of every restore,
+interrupted restores flagged as "reconciliation required" (or "manual review
+required" when core cannot classify them), `Review rollback` / `Roll back
+restore` for completed restores and `Reconcile interrupted restore` for
+interrupted ones. It reads the same `OperationRegistry` projection (a
+metadata-only preview; it never opens or hashes the database) and calls the
+same core executors with the same confirmation phrase, on a worker thread so
+the page stays responsive. Its actions are additionally refused while Blue's
+own catalogue load, scan or database upgrade is running; core's own refusals
+(locks, freshness, identity) apply unchanged. A rollback reloads Blue's
+library; reconciliation changes no database file.
+
 ## Writer exclusion
 
 A restore must never lose a commit that SQLite acknowledged to another
