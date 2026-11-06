@@ -473,14 +473,15 @@ fn list_args(bare: bool, fd: RawFd) -> Vec<OsString> {
 ///
 /// `-so`: stream the one selected member's decompressed bytes to stdout -
 /// the only extraction mode this provider ever uses (never `e`/`x` to a
-/// directory). `-spd`: do not strip leading dots from names (keeps the
-/// listed path an exact match). `-ssc`: case-sensitive name matching, so
-/// selection can never silently widen to a case-colliding sibling. `--`:
-/// ends option parsing, so a member path that happens to start with `-` is
-/// still an ordinary positional argument, never reinterpreted as a switch.
-/// No shell is ever involved (`Command::new` + `args`), so `*`/`?` in a
-/// member path are inert literal bytes to 7-Zip's own exact-path match -
-/// nothing expands them.
+/// directory). `-spd`: disable 7-Zip's own wildcard matching for file
+/// names, so the member argument is an exact path, never a pattern (without
+/// it 7-Zip reads `*` and `?` in a name argument as wildcards even though no
+/// shell is involved). `-ssc`: case-sensitive name matching, so selection
+/// can never silently widen to a case-colliding sibling. `--`: ends option
+/// parsing, so a member path that happens to start with `-` is still an
+/// ordinary positional argument, never reinterpreted as a switch. On top of
+/// that, [`safe_member_path`] refuses `*` and `?` in member names outright,
+/// so selection does not rest on `-spd` alone.
 fn extract_args(fd: RawFd, member_path: &str) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     for flag in ["x", "-so", "-p-", "-y", "-bd", "-bb0", "-spd", "-ssc", "--"] {
@@ -1047,36 +1048,15 @@ fn validate_extraction(
     Ok(())
 }
 
-/// Accepts only member names whose normalized path stays inside the archive
-/// root. Backslashes are treated as separators for Windows paths even on
-/// Unix, and drive prefixes/absolute roots are refused on every platform.
+/// The crate-wide member-name rule ([`super::member_path`]). Nothing is
+/// normalised: a name with `..`, `.`, an empty component or a backslash is
+/// refused even when it would "stay inside", because the string handed to
+/// 7-Zip must be exactly the string it listed and the duplicate check must
+/// compare names that cannot alias each other (Night Watch S01-03). `*` and
+/// `?` are refused as well, so member selection never depends on `-spd`
+/// alone to stay literal.
 fn safe_member_path(path: &str) -> bool {
-    if path.is_empty() || path.chars().any(char::is_control) {
-        return false;
-    }
-    let normalized = path.replace('\\', "/");
-    if normalized.starts_with('/') {
-        return false;
-    }
-    let first = normalized.split('/').next().unwrap_or_default();
-    let bytes = first.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return false;
-    }
-    let mut depth = 0_usize;
-    for component in normalized.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                let Some(parent) = depth.checked_sub(1) else {
-                    return false;
-                };
-                depth = parent;
-            }
-            _ => depth += 1,
-        }
-    }
-    depth > 0
+    super::member_path::is_safe_member_name(path)
 }
 
 struct StreamingHashes {
@@ -1467,8 +1447,19 @@ mod tests {
         ] {
             assert!(!safe_member_path(unsafe_name), "accepted {unsafe_name:?}");
         }
-        assert!(safe_member_path("folder/../game.rom"));
-        assert!(safe_member_path("folder\\game.rom"));
+        // Night Watch S01-03: names that would need normalising, and names
+        // 7-Zip could read as a wildcard pattern, are refused outright.
+        for ambiguous in [
+            "folder/../game.rom",
+            "folder\\game.rom",
+            "x?.bin",
+            "*.rom",
+            "./a.rom",
+            "a//b.rom",
+        ] {
+            assert!(!safe_member_path(ambiguous), "accepted {ambiguous:?}");
+        }
+        assert!(safe_member_path("folder/game.rom"));
     }
 
     #[test]

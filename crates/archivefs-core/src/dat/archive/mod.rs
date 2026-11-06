@@ -29,6 +29,7 @@ pub mod hash;
 pub mod lha;
 pub mod lha_header;
 pub mod limits;
+pub mod member_path;
 pub mod rar;
 pub mod sevenz;
 pub mod sevenz_preflight;

@@ -946,21 +946,10 @@ fn resolve_executable(candidate: &Path) -> Option<PathBuf> {
     crate::external_tools::resolve_executable(candidate)
 }
 
+/// The crate-wide member-name rule ([`super::member_path`]): plain
+/// relative components only, no control, wildcard or backslash characters.
 fn safe_member_name(name: &str) -> bool {
-    !name.contains('\\')
-        && !name.contains('*')
-        && !name.contains('?')
-        && !name.contains('\0')
-        // Every `/` component must be a plain, non-empty name: no `.`/`..`,
-        // no empty segment, no Windows drive prefix (`C:`), and no absolute
-        // root.  `Path::components` alone silently drops `.` and empty
-        // segments and accepts `C:` on Unix.
-        && name.split('/').all(|part| {
-            !part.is_empty()
-                && part != "."
-                && part != ".."
-                && !matches!(part.as_bytes(), [letter, b':', ..] if letter.is_ascii_alphabetic())
-        })
+    super::member_path::is_safe_member_name(name)
 }
 
 fn is_nested_name(name: &str) -> bool {
