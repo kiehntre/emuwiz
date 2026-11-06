@@ -4,7 +4,9 @@
 use super::*;
 use crate::gui_v2::activity::Phase;
 use crate::gui_v2::backend::DuplicateRepairRecord;
-use crate::gui_v2::quarantine_outcome::tests::{partial_failure, transaction};
+use crate::gui_v2::quarantine_outcome::tests::{
+    cancelled_between_entries, partial_failure, transaction,
+};
 use archivefs_core::dat::rename_apply::model::TransactionState;
 
 fn record(
@@ -49,6 +51,7 @@ fn duplicate_quarantine_that_stopped_part_way_is_not_shown_as_moved() {
         !shown.starts_with("The duplicate copy was moved"),
         "{shown}"
     );
+    assert!(!shown.contains("put back from History"), "{shown}");
     assert_eq!(app.repair_job, None);
     assert_eq!(
         app.repair_history.len(),
@@ -105,7 +108,7 @@ fn duplicate_quarantine_cancelled_between_entries_is_stopped() {
     app.repair_job = Some(id);
     app.activity.jobs[&id].request_cancel();
 
-    app.duplicate_applied(id, record(partial_failure()));
+    app.duplicate_applied(id, record(cancelled_between_entries()));
 
     assert_eq!(phase(&app, id), Phase::Cancelled);
     assert!(

@@ -69,26 +69,30 @@ impl QuarantineOutcome {
                 reason,
                 cancelled,
             } => {
-                let why = if *cancelled {
-                    "you stopped it".to_string()
-                } else {
-                    reason
-                        .clone()
-                        .unwrap_or_else(|| "a file no longer matched its check".into())
-                };
+                let why = why(reason.as_deref(), *cancelled);
+                // History lists a partial quarantine receipt as "needs review";
+                // it does not offer a one-click Undo for it, so do not promise one.
                 format!(
-                    "Stopped part way: moved {applied} of {total} file(s) to EmuWiz quarantine, then stopped because {why}. Nothing was deleted. The moved files can be put back from History; the others were not touched."
+                    "Stopped part way: moved {applied} of {total} file(s) to EmuWiz quarantine, then stopped because {why}. Nothing was deleted. The moved files stay in quarantine; History lists this receipt as needing review until it is checked. The other files were not touched."
                 )
             }
             QuarantineOutcome::NothingMoved { reason, cancelled } => {
-                let why = if *cancelled {
-                    "you stopped it".to_string()
-                } else {
-                    reason
-                        .clone()
-                        .unwrap_or_else(|| "a file no longer matched its check".into())
-                };
+                let why = why(reason.as_deref(), *cancelled);
                 format!("Nothing was moved: {why}. Check the duplicates again before retrying.")
+            }
+        }
+    }
+
+    /// A stop is only "Stopped" when the receipt records no failure of its
+    /// own; a late Stop press never hides a real re-proof or rename failure.
+    fn only_stopped(&self) -> bool {
+        match self {
+            QuarantineOutcome::Moved { .. } => false,
+            QuarantineOutcome::StoppedPartway {
+                reason, cancelled, ..
+            }
+            | QuarantineOutcome::NothingMoved { reason, cancelled } => {
+                *cancelled && reason.is_none()
             }
         }
     }
@@ -97,14 +101,19 @@ impl QuarantineOutcome {
     pub(super) fn settled(&self) -> Settled {
         match self {
             QuarantineOutcome::Moved { .. } => Settled::Done,
-            QuarantineOutcome::StoppedPartway {
-                cancelled: true, ..
-            }
-            | QuarantineOutcome::NothingMoved {
-                cancelled: true, ..
-            } => Settled::Stopped,
+            other if other.only_stopped() => Settled::Stopped,
             other => Settled::Failed(other.message()),
         }
+    }
+}
+
+/// The recorded reason first; the Stop press is added, never substituted.
+fn why(reason: Option<&str>, cancelled: bool) -> String {
+    match (reason, cancelled) {
+        (Some(reason), true) => format!("{reason} (you also pressed Stop)"),
+        (Some(reason), false) => reason.to_string(),
+        (None, true) => "you stopped it".to_string(),
+        (None, false) => "the receipt does not record why".to_string(),
     }
 }
 
@@ -257,18 +266,42 @@ pub(super) mod tests {
         assert!(matches!(outcome.settled(), Settled::Failed(_)));
     }
 
-    #[test]
-    fn a_cancel_between_entries_is_stopped_not_failed() {
-        let t = transaction(
+    pub(in crate::gui_v2) fn cancelled_between_entries() -> RenameTransaction {
+        transaction(
             TransactionState::ApplyFailed,
             vec![
                 entry("a.bin", EntryState::Applied, None),
                 entry("b.bin", EntryState::Planned, None),
             ],
-        );
-        let outcome = classify(&t, true);
+        )
+    }
+
+    #[test]
+    fn a_cancel_between_entries_is_stopped_not_failed() {
+        let outcome = classify(&cancelled_between_entries(), true);
         assert!(matches!(outcome.settled(), Settled::Stopped));
         assert!(outcome.message().contains("you stopped it"));
+        assert!(!outcome.message().contains("put back from History"));
+    }
+
+    #[test]
+    fn a_late_stop_press_never_hides_the_recorded_failure() {
+        let outcome = classify(&partial_failure(), true);
+        assert!(matches!(outcome.settled(), Settled::Failed(_)));
+        let message = outcome.message();
+        assert!(message.contains("changed since the check"), "{message}");
+        assert!(message.contains("you also pressed Stop"), "{message}");
+    }
+
+    #[test]
+    fn a_missing_reason_is_not_invented() {
+        let t = transaction(
+            TransactionState::ApplyFailed,
+            vec![entry("a.bin", EntryState::ApplyFailed, None)],
+        );
+        let message = classify(&t, false).message();
+        assert!(message.contains("does not record why"), "{message}");
+        assert!(!message.contains("no longer matched"), "{message}");
     }
 
     #[test]
