@@ -23,7 +23,6 @@ mod detail_identity;
 mod documents;
 mod dreamcast_ipbin;
 mod duplicate_undo;
-mod quarantine_outcome;
 #[cfg(target_os = "linux")]
 mod electron_preview;
 mod environment;
@@ -91,6 +90,7 @@ mod profile_settings_preview;
 mod ps1_pbp_export;
 mod psp_iso_analyser;
 mod quarantine_confirm;
+mod quarantine_outcome;
 mod r2_rename;
 mod recording_integrity;
 #[cfg(test)]
@@ -786,18 +786,18 @@ impl App {
     }
     /// Applies a finished library load or scan: the catalogue, the
     /// routes that name games, and the one Activity outcome for the job.
-    pub(super) fn library_loaded(&mut self, id: u64, library: SharedLibrary) {
+    fn library_loaded(&mut self, id: u64, library: SharedLibrary) {
         // One settle per job: a scan that skipped
         // unreadable folders is "Needs attention",
         // never a plain success (Night Watch S06-06).
-        let loaded = format!("{} games available to browse. Original game files were not changed.", library.games.len());
+        let loaded = format!(
+            "{} games available to browse. Original game files were not changed.",
+            library.games.len()
+        );
         match &library.scan_warning {
             Some(warning) => {
-                self.activity.finish(
-                    id,
-                    format!("{warning} {loaded}"),
-                    Some(warning.clone()),
-                );
+                self.activity
+                    .finish(id, format!("{warning} {loaded}"), Some(warning.clone()));
                 self.notice = Some(Notice {
                     message: warning.clone(),
                     technical: String::new(),

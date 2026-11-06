@@ -128,7 +128,7 @@ impl super::App {
             .settle(id, outcome.message(), outcome.settled());
     }
 
-    pub(super) fn job_was_cancelled(&self, id: u64) -> bool {
+    fn job_was_cancelled(&self, id: u64) -> bool {
         self.activity
             .jobs
             .get(&id)
