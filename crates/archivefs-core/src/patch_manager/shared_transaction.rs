@@ -2526,7 +2526,8 @@ pub fn preview_shared_rollback(
                 .map(|entry| {
                     matches!(
                         entry.state,
-                        SharedEntryRecoveryState::RolledBack | SharedEntryRecoveryState::RollingBack
+                        SharedEntryRecoveryState::RolledBack
+                            | SharedEntryRecoveryState::RollingBack
                     )
                 })
                 .collect()
