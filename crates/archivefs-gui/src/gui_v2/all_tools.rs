@@ -187,6 +187,12 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         safety: ToolSafety::OpensElsewhere,
     });
     games.tools.push(Tool {
+        route: Route::Tool(ToolPage::FolderCheck),
+        title: ToolPage::FolderCheck.title(),
+        purpose: ToolPage::FolderCheck.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    games.tools.push(Tool {
         route: Route::Tool(ToolPage::ArcadeShelf),
         title: ToolPage::ArcadeShelf.title(),
         purpose: ToolPage::ArcadeShelf.purpose(),

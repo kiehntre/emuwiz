@@ -204,6 +204,7 @@ pub mod save_state_orchestration;
 pub mod save_state_resume_readiness;
 /// Verified ZIP creation and extraction for the Converter page.
 pub mod zip_cartridge_select;
+pub mod folder_platform_check;
 pub mod zip_converter;
 pub(crate) mod zip_member_name;
 pub use archive_member_resolver::{

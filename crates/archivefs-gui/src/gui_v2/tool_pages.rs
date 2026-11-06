@@ -135,6 +135,7 @@ impl App {
             ToolPage::LibraryViews => self.library_views_page(ui),
             ToolPage::ArcadeShelf => self.arcade_shelf_page(ui),
             ToolPage::Vita3kTitles => self.vita3k_titles_page(ui),
+            ToolPage::FolderCheck => self.folder_check_page(ui),
             ToolPage::OpenRct2 => self.openrct2_page(ui),
             ToolPage::ViewHistory => {
                 use super::view_history_page::{Request, show};

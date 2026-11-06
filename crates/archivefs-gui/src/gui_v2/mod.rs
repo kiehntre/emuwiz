@@ -27,6 +27,7 @@ mod duplicate_undo;
 mod electron_preview;
 mod environment;
 mod equivalent_duplicates;
+mod folder_check;
 mod game_dat_check;
 mod game_detail_blue;
 mod game_detail_facts;
@@ -403,6 +404,7 @@ pub(super) struct App {
     moved_game: Option<i64>,
     review: identity_review_page::ReviewUi,
     game_dat_check: game_dat_check::State,
+    folder_check: folder_check::State,
     hasheous_check: hasheous_check::State,
     notice: Option<Notice>,
     /// Non-alarming confirmation that a separate window was opened; cleared on
@@ -538,6 +540,7 @@ impl App {
             moved_game: None,
             review: Default::default(),
             game_dat_check: Default::default(),
+            folder_check: Default::default(),
             hasheous_check: Default::default(),
             notice: None,
             handoff_status: None,
@@ -2456,6 +2459,7 @@ impl eframe::App for App {
         // A finished one-game check saves new evidence even when its page is
         // no longer showing; reload so Game Details reads it.
         self.game_dat_check.poll();
+        self.folder_check.poll();
         self.hasheous_check.poll();
         if self.load_job.is_none() && self.game_dat_check.take_saved() {
             reload_library = true;
