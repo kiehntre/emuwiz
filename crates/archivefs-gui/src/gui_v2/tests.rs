@@ -11925,6 +11925,9 @@ mod blue_single_file_restore;
 #[path = "tests/repair.rs"]
 mod repair;
 
+#[path = "tests/blue_truth_outcomes.rs"]
+mod blue_truth_outcomes;
+
 #[path = "tests/frontend_export.rs"]
 mod frontend_export;
 
