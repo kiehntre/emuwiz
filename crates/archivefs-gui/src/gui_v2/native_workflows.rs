@@ -424,6 +424,13 @@ impl NativeWorkflows {
         self.poll_discovery_import_undo(context);
         crate::pcsx2_page::poll_save_vault(context);
         self.poll_native_repairs(context);
+        let emulator_running = self.app.launch_dolphin.is_active()
+            || self.app.launch_pcsx2.is_active()
+            || self.app.launch_standalone.is_active();
+        self.app
+            .emulator_readiness
+            .emulator_inventory_page
+            .sync_blue(emulator_running);
 
         let changed = self.app.launch_retroarch.poll()
             | self.app.launch_dolphin.poll()
@@ -1199,6 +1206,16 @@ impl NativeWorkflows {
         self.app
             .navigate_to_main_view(crate::navigation::MainView::EmulatorSetup);
         self.app.show_emulator_setup_page(ui, &context);
+        // Updates sit below the page's own primary action so that action
+        // stays visible without scrolling.
+        ui.separator();
+        let emulator_running = self.app.launch_dolphin.is_active()
+            || self.app.launch_pcsx2.is_active()
+            || self.app.launch_standalone.is_active();
+        self.app
+            .emulator_readiness
+            .emulator_inventory_page
+            .show_blue(ui, emulator_running);
     }
 
     fn poll_native_repairs(&mut self, context: &egui::Context) {
