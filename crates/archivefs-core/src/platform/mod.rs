@@ -667,6 +667,8 @@ pub const PLATFORMS: &[Platform] = &[
         display_name: "Atari 8-bit",
         folder_aliases: &[
             "atari8bit",
+            // RetroArch's atari800 core names its system "Atari 8-bit Family".
+            "atari8bitfamily",
             "atari800",
             "atari8",
             "atarixl",

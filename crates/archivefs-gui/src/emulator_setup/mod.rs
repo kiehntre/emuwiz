@@ -36,6 +36,20 @@ pub(crate) mod vita3k_library;
 pub(crate) mod xroar_cassette;
 pub(crate) mod zx_snapshot;
 
+/// Whether the object at `path` has the shape the catalogued `kind` promises
+/// for loose content: a regular file, or - only for an extracted arcade set -
+/// a directory. The directory case is still classified as
+/// `ExtractedArcadeSet` content, so RetroArch cores refuse it with the true
+/// reason instead of the row being treated as an unavailable file.
+pub(crate) fn catalogued_content_shape_ok(
+    kind: archivefs_core::ArchiveKind,
+    path: &std::path::Path,
+) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.is_file() || (kind == archivefs_core::ArchiveKind::ArcadeSetDirectory && meta.is_dir())
+    })
+}
+
 #[allow(unused_imports)]
 pub(crate) use controller::*;
 pub(crate) use state::*;

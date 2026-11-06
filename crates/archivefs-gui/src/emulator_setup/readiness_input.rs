@@ -382,11 +382,7 @@ impl ReadinessSources<'_> {
             },
         };
         if !mame_set_resolutions.is_empty() {
-            content.resolved_path = focused.map(Path::to_path_buf);
-            content.container = Some(archivefs_core::launch::LaunchContainerKind::PlainFile);
-            content.requires_mount = false;
-            content.provenance =
-                "verified MAME logical-set directory from the persisted DAT join".into();
+            apply_mame_set_content(&mut content, focused);
         }
 
         // A ZIP holding exactly one verified cartridge ROM is launchable
@@ -1558,6 +1554,24 @@ pub(crate) fn identity_unknown_reason(
     Reason::NotConfirmed
 }
 
+/// Points `content` at the MAME logical set the persisted DAT join resolved.
+/// The join says which set this is, not what shape it has: an extracted set
+/// directory keeps the `ExtractedArcadeSet` shape, so RetroArch cores (which
+/// cannot load a directory) are refused with the true reason instead of being
+/// shown as Ready.
+fn apply_mame_set_content(
+    content: &mut archivefs_core::launch::LaunchContentRef,
+    focused: Option<&Path>,
+) {
+    content.resolved_path = focused.map(Path::to_path_buf);
+    if focused.is_some_and(|path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())) {
+        content.kind = Some(archivefs_core::launch::LaunchContentKind::ExtractedArcadeSet);
+    }
+    content.container = Some(archivefs_core::launch::LaunchContainerKind::PlainFile);
+    content.requires_mount = false;
+    content.provenance = "verified MAME logical-set directory from the persisted DAT join".into();
+}
+
 #[cfg(test)]
 mod identity_reason_tests {
     use super::identity_unknown_reason;
@@ -1692,5 +1706,52 @@ mod identity_reason_tests {
             identity_unknown_reason(Some(Path::new("/g/a.bin")), Some(&known), Some(None)),
             R::NotConfirmed
         );
+    }
+}
+
+#[cfg(test)]
+mod arcade_set_shape_tests {
+    use super::*;
+    use archivefs_core::launch::{LaunchContentKind, LaunchContentRef};
+
+    fn unresolved() -> LaunchContentRef {
+        LaunchContentRef {
+            kind: None,
+            container: None,
+            resolved_path: None,
+            requires_mount: false,
+            provenance: "placeholder".into(),
+        }
+    }
+
+    #[test]
+    fn joined_set_directory_keeps_the_extracted_arcade_set_shape() {
+        let dir = std::env::temp_dir().join(format!("emuwiz-arcade-shape-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("19xx")).unwrap();
+        std::fs::write(dir.join("19xx.zip"), b"zip").unwrap();
+
+        let mut directory = unresolved();
+        apply_mame_set_content(&mut directory, Some(&dir.join("19xx")));
+        assert_eq!(directory.kind, Some(LaunchContentKind::ExtractedArcadeSet));
+        assert_eq!(directory.resolved_path, Some(dir.join("19xx")));
+
+        let mut archive = unresolved();
+        apply_mame_set_content(&mut archive, Some(&dir.join("19xx.zip")));
+        assert_eq!(archive.kind, None);
+
+        let directory_kind = archivefs_core::ArchiveKind::ArcadeSetDirectory;
+        assert!(crate::emulator_setup::catalogued_content_shape_ok(
+            directory_kind,
+            &dir.join("19xx")
+        ));
+        assert!(!crate::emulator_setup::catalogued_content_shape_ok(
+            archivefs_core::ArchiveKind::DirectGameImage,
+            &dir.join("19xx")
+        ));
+        assert!(crate::emulator_setup::catalogued_content_shape_ok(
+            archivefs_core::ArchiveKind::DirectGameImage,
+            &dir.join("19xx.zip")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

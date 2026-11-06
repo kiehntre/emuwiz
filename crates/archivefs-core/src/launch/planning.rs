@@ -280,7 +280,7 @@ pub(crate) fn content_blocker(content: &LaunchContentRef) -> Option<LaunchBlocke
 }
 
 /// Message shown when any RetroArch core (FBNeo, MAME libretro cores, ...) is offered an extracted arcade set.
-pub(crate) const ARCADE_SET_NEEDS_ARCHIVE_MESSAGE: &str = "RetroArch needs this arcade set as a ZIP or other supported archive. Your game is stored as an extracted MAME set, so use MAME for this copy.";
+pub(crate) const ARCADE_SET_NEEDS_ARCHIVE_MESSAGE: &str = "RetroArch needs this arcade set as a ZIP or other supported archive. Your game is stored as an extracted MAME set, so use MAME for this copy (choose the MAME program in Emulator Setup).";
 
 /// Blocks RetroArch cores on an extracted arcade set directory. Applies only
 /// to `LaunchContentKind::ExtractedArcadeSet`; other content is untouched.
@@ -404,6 +404,23 @@ fn matching_retroarch_cores(
     matches
 }
 
+/// Whether a RetroArch core's CHD support is something this planner cannot
+/// vouch for. Only PlayStation is covered: the Beetle PSX build installed by
+/// some distributions predates CHD support while its `.info` still lists
+/// `chd`, so the metadata proves nothing about the binary.
+fn retroarch_chd_support_unconfirmed(platform_id: &str, content: &LaunchContentRef) -> bool {
+    platform_id == "PSX" && psx_chd_content(content)
+}
+
+fn psx_chd_content(content: &LaunchContentRef) -> bool {
+    content.container == Some(LaunchContainerKind::Chd)
+        || content.resolved_path.as_deref().is_some_and(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("chd"))
+        })
+}
+
 fn build_retroarch_candidates(
     platform_id: &'static str,
     content: &LaunchContentRef,
@@ -451,6 +468,15 @@ fn build_retroarch_candidates(
                     ),
                 ));
             }
+            if retroarch_chd_support_unconfirmed(platform_id, content) {
+                warnings.push(LaunchWarning::new(
+                    LaunchWarningKind::RetroArchChdSupportUnconfirmed,
+                    format!(
+                        "RetroArch core {} lists CHD as supported, but this installed build may not be able to read CHD; this is not confirmed until it is run",
+                        found.core_stem
+                    ),
+                ));
+            }
             let readiness = readiness_from(&blockers, &warnings);
             let preference = if hinted.contains(&found.core_stem) {
                 CandidatePreference::SoleEligible
@@ -478,6 +504,14 @@ fn build_retroarch_candidates(
 /// surfaces [`LaunchWarningKind::MultipleEligibleProfiles`] when more than
 /// one is eligible and nothing is remembered.
 fn apply_preference(candidates: &mut [LaunchCandidate], remembered: &[RememberedPreference]) {
+    // A blocked candidate can never be the preferred one: a reviewed core hint
+    // on a candidate that cannot launch must not outrank (or hide) a ready
+    // route.
+    for candidate in candidates.iter_mut() {
+        if candidate.readiness == LaunchReadiness::Blocked {
+            candidate.preference = CandidatePreference::Undetermined;
+        }
+    }
     let eligible_indices: Vec<usize> = candidates
         .iter()
         .enumerate()
@@ -505,6 +539,57 @@ fn apply_preference(candidates: &mut [LaunchCandidate], remembered: &[Remembered
         candidates[index].preference = CandidatePreference::Remembered;
         return;
     }
+
+    // PlayStation CHD content: prefer the route with the strongest CHD
+    // evidence among the eligible ones. Tier 0 is the SwanStation RetroArch
+    // core (built on DuckStation; booted CHD in a sandboxed smoke test), tier 1
+    // the standalone DuckStation adapter, tier 2 every other RetroArch core
+    // (Beetle PSX builds exist without CHD support, and aliased copies of such
+    // a build are common). Only the best tier takes part in automatic
+    // selection; the rest stay available to choose explicitly. Anything else,
+    // and non-CHD content, is tier 0 so ordinary selection is unchanged.
+    let chd_tier = |candidate: &LaunchCandidate| -> u8 {
+        if !psx_chd_content(&candidate.content) {
+            return 0;
+        }
+        match &candidate.target {
+            LaunchTarget::RetroArchCore {
+                platform_id,
+                core_stem,
+                ..
+            } if *platform_id == "PSX" => {
+                if core_stem == "swanstation" {
+                    0
+                } else {
+                    2
+                }
+            }
+            LaunchTarget::Standalone { adapter_id, .. } if *adapter_id == "duckstation" => 1,
+            _ => 0,
+        }
+    };
+    let best_tier = eligible_indices
+        .iter()
+        .map(|&index| chd_tier(&candidates[index]))
+        .min();
+    let eligible_indices = match best_tier {
+        Some(best)
+            if eligible_indices
+                .iter()
+                .any(|&i| chd_tier(&candidates[i]) > best) =>
+        {
+            for &index in &eligible_indices {
+                if chd_tier(&candidates[index]) > best {
+                    candidates[index].preference = CandidatePreference::Undetermined;
+                }
+            }
+            eligible_indices
+                .into_iter()
+                .filter(|&index| chd_tier(&candidates[index]) == best)
+                .collect()
+        }
+        _ => eligible_indices,
+    };
 
     // `build_retroarch_candidates` has already resolved the reviewed
     // single-hint case. Preserve that deterministic choice instead of
