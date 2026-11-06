@@ -2513,10 +2513,6 @@ impl eframe::App for App {
         let mut reload_library = false;
         let mut reload_artwork = false;
         if let Some(workflows) = &mut self.native_workflows {
-            // Blue's folder scan and database upgrade write the catalogue; the
-            // native Sources page must not start its own writer meanwhile.
-            workflows.catalogue_writer_busy =
-                self.scan_job.is_some() || self.tools.database.upgrading();
             workflows.prepare_blue_history(self.router.current.section() == Section::History);
             workflows.poll(ui.ctx(), &mut self.activity);
             if self.load_job.is_none() {

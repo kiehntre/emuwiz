@@ -321,6 +321,13 @@ impl App {
         self.simple.sync_style(context);
         // Database status's upgrade may finish while another page is shown.
         self.tools.database.settle(context);
+        // Blue's folder scan and database upgrade write the catalogue; the
+        // native Sources page must not start its own writer meanwhile. Set
+        // here, on the one path every frame takes (eframe and tests alike).
+        if let Some(workflows) = &mut self.native_workflows {
+            workflows.catalogue_writer_busy =
+                self.scan_job.is_some() || self.tools.database.upgrading();
+        }
         // Kept until no other load is in flight, so the reload is not lost.
         if self.load_job.is_none() && std::mem::take(&mut self.tools.database.library_changed) {
             self.load(false);
