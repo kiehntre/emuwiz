@@ -321,6 +321,7 @@ fn knowledge(
         ecosystem: Some("No-Intro"),
         candidates: vec!["Candidate A".into(), "Candidate B".into()],
         technical: "Existing catalogue provenance, hash, revision and freshness".into(),
+        header: Default::default(),
     }
 }
 
@@ -458,4 +459,42 @@ fn saved_unicode_fields_wrap_at_narrow_width_and_large_scale() {
         }
         assert_eq!(fields, 2);
     }
+}
+
+#[test]
+fn live_lines_show_found_facts_unreadable_parts_and_bounded_overflow() {
+    use archivefs_core::content_evidence::{
+        ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind,
+    };
+    let mut live = report();
+    live.warnings.push("tape block unreadable".into());
+    let facts = vec![ContentEvidence::new(
+        ContentEvidenceKind::TapeFormat,
+        "TAP",
+        ContentEvidenceConfidence::Weak,
+        "standard tape header",
+    )];
+    let lines = live_evidence_lines(&live, &facts);
+    assert!(lines.iter().any(|l| l.contains("GZLE01")));
+    assert!(lines.iter().any(|l| l.starts_with("Tape format: TAP")));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "Could not read: tape block unreadable")
+    );
+
+    let mut many = report();
+    for _ in 0..20 {
+        many.warnings.push("w".into());
+    }
+    let lines = live_evidence_lines(&many, &[]);
+    assert_eq!(lines.len(), 13);
+    assert!(lines.last().unwrap().contains("more not shown"));
+
+    let mut empty = report();
+    empty.evidence.clear();
+    assert_eq!(
+        live_evidence_lines(&empty, &[]),
+        vec!["EmuWiz read this file and found no identity facts it can use.".to_string()]
+    );
 }

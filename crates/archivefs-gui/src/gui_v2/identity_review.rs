@@ -128,6 +128,85 @@ pub(super) struct DatKnowledge {
     pub candidates: Vec<String>,
     /// CRC / SHA-1 / provenance, for the Technical details section only.
     pub technical: String,
+    /// The saved catalogue header, used only to check which system the
+    /// catalogue is for. Nothing stored is changed.
+    pub header: CatalogueHeader,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct CatalogueHeader {
+    pub names: Vec<String>,
+    pub ecosystem: Option<archivefs_core::dat::model::DatEcosystem>,
+}
+
+/// Whether a saved DAT result comes from a catalogue made for the game's own
+/// system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CataloguePlatformFit {
+    /// The catalogue's system is the game's system (or an equivalent).
+    Matches,
+    /// The catalogue is for another system (the canonical id is carried).
+    Different(String),
+    /// Neither the catalogue's nor the game's system could be confirmed.
+    Unconfirmed,
+}
+
+impl DatKnowledge {
+    pub(super) fn platform_fit(&self, game_platform: Option<&str>) -> CataloguePlatformFit {
+        use archivefs_core::dat::identity::{
+            DatPlatformIdentity, dat_platform_from_catalogue_names, negative_dat_result_applies,
+        };
+        if negative_dat_result_applies(&self.header.names, self.header.ecosystem, game_platform) {
+            return CataloguePlatformFit::Matches;
+        }
+        let game = game_platform.and_then(archivefs_core::canonical_platform_for_alias);
+        match (
+            dat_platform_from_catalogue_names(&self.header.names, self.header.ecosystem),
+            game,
+        ) {
+            (DatPlatformIdentity::Resolved { platform, .. }, Some(_)) => {
+                CataloguePlatformFit::Different(platform)
+            }
+            _ => CataloguePlatformFit::Unconfirmed,
+        }
+    }
+
+    /// One plain sentence about which system the catalogue is for, relative
+    /// to this game. Presentation only.
+    pub(super) fn fit_note(&self, game_platform: Option<&str>) -> Option<String> {
+        match self.platform_fit(game_platform) {
+            CataloguePlatformFit::Matches => None,
+            CataloguePlatformFit::Different(system) if self.is_negative() => Some(format!(
+                "This catalogue is for {system}, not this game's system, so its \"not found\" answer is not shown as evidence."
+            )),
+            CataloguePlatformFit::Different(system) => Some(format!(
+                "This catalogue is for {system}, which differs from this game's system."
+            )),
+            CataloguePlatformFit::Unconfirmed => Some("Catalogue system unconfirmed.".to_string()),
+        }
+    }
+
+    /// A "nothing found" style answer: it only means something when the
+    /// catalogue is for the game's own system. Matches and conflicts are kept.
+    fn is_negative(&self) -> bool {
+        matches!(
+            self.state,
+            DatVerificationState::NoMatch
+                | DatVerificationState::NoUsableEvidence
+                | DatVerificationState::FilenameOnlyNotVerified
+                | DatVerificationState::Probable
+        )
+    }
+
+    /// Drops a negative answer from a catalogue for a different system. It is
+    /// not evidence about this game; the stored row is untouched.
+    pub(super) fn relevant_to(&self, game_platform: Option<&str>) -> bool {
+        !(self.is_negative()
+            && matches!(
+                self.platform_fit(game_platform),
+                CataloguePlatformFit::Different(_)
+            ))
+    }
 }
 
 /// Keep untrusted provenance values within their labelled diagnostic row.
@@ -206,6 +285,10 @@ impl DatKnowledge {
             ecosystem: summary.source.ecosystem.map(|ecosystem| ecosystem.label()),
             candidates: summary.ambiguous_candidates.clone(),
             technical,
+            header: CatalogueHeader {
+                names: summary.source.catalogue_names.clone(),
+                ecosystem: summary.source.ecosystem,
+            },
         }
     }
 
@@ -390,7 +473,9 @@ pub(super) fn review_for(game: &Game, ctx: &IdentityContext, dat: Option<&DatKno
     let class = classify_identity(&facts, ctx.inventory.as_ref());
     let name = game.archive.relative_path.to_string_lossy();
     let apparent_release = release_class(&name);
-    let usable_dat = dat.filter(|knowledge| knowledge.trusted_source && !knowledge.stale);
+    let usable_dat = dat.filter(|knowledge| {
+        knowledge.trusted_source && !knowledge.stale && knowledge.relevant_to(platform)
+    });
 
     // 1. Verified: the file's own evidence, or one exact authoritative hash match.
     let dat_verified = game.dat_exact.is_some()

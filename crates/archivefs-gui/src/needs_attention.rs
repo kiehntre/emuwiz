@@ -327,8 +327,9 @@ fn launch_attention(
                 crate::launch_readiness_page::IdentityUnknownReason::SystemNotChosen => "Launch needs a system",
                 crate::launch_readiness_page::IdentityUnknownReason::UnsupportedArchive => "Archive format not supported for launch",
                 crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed => "Launch needs verified identity",
+                other => other.banner_title(),
             }.into(),
-            reason.blocker_text().into(), AttentionCategory::Launch, AttentionDestination::LaunchReadiness, None),
+            reason.blocker_text(), AttentionCategory::Launch, AttentionDestination::LaunchReadiness, None),
         LaunchReadinessInput::IdentityConflicting => (
             "Launch needs verified identity".into(), "The selected game's identity is unresolved or conflicts. Review the existing identity evidence.".into(), AttentionCategory::Launch, AttentionDestination::LaunchReadiness, None),
         LaunchReadinessInput::Plan { plan, retroarch_scanned, standalone_scans_complete, .. } => {

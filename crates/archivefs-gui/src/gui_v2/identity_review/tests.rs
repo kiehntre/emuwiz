@@ -37,6 +37,7 @@ fn known(state: State, title: Option<&str>) -> DatKnowledge {
         ecosystem: Some("No-Intro"),
         candidates: Vec::new(),
         technical: "technical".into(),
+        header: Default::default(),
     }
 }
 
@@ -581,6 +582,7 @@ fn catalogue_metadata_preserves_verification_freshness_confidence_and_other_fact
                     );
                 }
                 after.technical = before.technical.clone();
+                after.header = before.header.clone();
                 assert_eq!(
                     before, after,
                     "metadata must only change technical presentation"
@@ -902,7 +904,8 @@ fn provenance_spoof_escapes_every_other_free_text_diagnostic_field() {
     assert!(matches!(review.state, ReviewState::Conflict { .. }));
     assert_eq!(
         shown.lines().count(),
-        7,
+        // Seven provenance rows plus the fixed "Catalogue system" note.
+        8,
         "additional diagnostic rows: {shown:?}"
     );
     for expected in [
@@ -927,4 +930,69 @@ fn provenance_spoof_escapes_every_other_free_text_diagnostic_field() {
             .chars()
             .any(|c| (c.is_control() && c != '\n') || matches!(c, '\u{2028}' | '\u{2029}'))
     );
+}
+
+fn with_header(mut k: DatKnowledge, names: &[&str]) -> DatKnowledge {
+    k.header = CatalogueHeader {
+        names: names.iter().map(|n| n.to_string()).collect(),
+        ecosystem: Some(archivefs_core::dat::model::DatEcosystem::NoIntro),
+    };
+    k
+}
+
+#[test]
+fn not_found_from_another_systems_catalogue_is_not_shown_as_evidence() {
+    let gba = with_header(
+        known(State::NoMatch, None),
+        &["Nintendo - Game Boy Advance"],
+    );
+    let pc88 = game(1, "x.zip", "NEC PC-8801");
+    let shown = review_for(&pc88, &ctx(), Some(&gba));
+    assert_ne!(shown.state, ReviewState::NoMatch(NoMatchReason::NotInData));
+    assert!(matches!(
+        gba.platform_fit(Some("NEC PC-8801")),
+        CataloguePlatformFit::Different(_)
+    ));
+    assert!(
+        gba.fit_note(Some("NEC PC-8801"))
+            .unwrap()
+            .contains("not shown as evidence")
+    );
+}
+
+#[test]
+fn not_found_from_the_games_own_catalogue_is_kept() {
+    let gba = with_header(
+        known(State::NoMatch, None),
+        &["Nintendo - Game Boy Advance"],
+    );
+    let own = game(1, "x.zip", "Game Boy Advance");
+    assert_eq!(
+        gba.platform_fit(Some("Game Boy Advance")),
+        CataloguePlatformFit::Matches
+    );
+    assert_eq!(
+        review_for(&own, &ctx(), Some(&gba)).state,
+        ReviewState::NoMatch(NoMatchReason::NotInData)
+    );
+}
+
+#[test]
+fn unknown_catalogue_system_keeps_behaviour_and_is_labelled() {
+    let unknown = known(State::NoMatch, None);
+    let g = game(1, "x.zip", "SNES");
+    assert_eq!(
+        review_for(&g, &ctx(), Some(&unknown)).state,
+        ReviewState::NoMatch(NoMatchReason::NotInData)
+    );
+    assert_eq!(
+        unknown.fit_note(Some("SNES")).as_deref(),
+        Some("Catalogue system unconfirmed.")
+    );
+}
+
+#[test]
+fn a_match_from_any_catalogue_is_never_hidden_by_the_platform_check() {
+    let gba = with_header(exact("Amidar (USA)"), &["Nintendo - Game Boy Advance"]);
+    assert!(gba.relevant_to(Some("NEC PC-8801")));
 }

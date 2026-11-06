@@ -274,6 +274,7 @@ impl App {
         let knowledge = loaded.then(|| self.review.knowledge.clone()).flatten();
         let review =
             review_with_current_knowledge(game, &library.identity_context, knowledge.as_ref());
+        let extras = self.identity_extras(game);
         let mut route = None;
         let mut choose_system = false;
         let mut clear_system = false;
@@ -320,10 +321,11 @@ impl App {
                         guidance.as_ref(),
                         &self.router.current,
                     );
-                    selected_evidence::show(
+                    selected_evidence::show_with(
                         ui,
                         &game.archive.absolute_path,
                         game.archive.identity_report.as_ref(),
+                        &extras,
                     );
                 });
                 ui.collapsing("Technical details", |ui| {
@@ -333,7 +335,12 @@ impl App {
                     ));
                     ui.label(format!("Catalogue id: {}", game.archive.id));
                     match &knowledge {
-                        Some(known) => ui.label(&known.technical),
+                        Some(known) => {
+                            let platform = (game.platform != super::library::UNKNOWN_PLATFORM)
+                                .then_some(game.platform.as_str());
+                            let note = known.fit_note(platform).unwrap_or_default();
+                            ui.label(format!("{}\n{note}", known.technical))
+                        }
                         None => ui.label("No recorded identification-data check for this game."),
                     };
                 });
@@ -373,6 +380,47 @@ impl App {
         self.show_system_chooser(ui.ctx(), id);
         if let Some(route) = route {
             self.go(route);
+        }
+    }
+
+    /// Read-only live evidence and the blocker-specific reason for a game
+    /// with no saved inspection. Only an already-finished live inspection of
+    /// this exact file is used; nothing is started, read or saved here.
+    fn identity_extras(&self, game: &Game) -> selected_evidence::Extras {
+        let saved = game
+            .archive
+            .identity_report
+            .as_ref()
+            .is_some_and(|report| report.archive_path == game.archive.absolute_path);
+        let live =
+            self.native_workflows.as_ref().and_then(|native| {
+                match &native.app.selected_evidence_ui.selected_evidence {
+                    crate::selected_evidence_page::SelectedEvidenceState::Ready {
+                        report, ..
+                    } if report.path == game.archive.absolute_path => Some(report.clone()),
+                    _ => None,
+                }
+            });
+        let platform =
+            (game.platform != super::library::UNKNOWN_PLATFORM).then_some(game.platform.as_str());
+        let reason = crate::emulator_setup::readiness_input::identity_unknown_reason(
+            Some(&game.archive.absolute_path),
+            live.as_ref().map(|report| &report.game_identity_report),
+            Some(platform),
+        );
+        selected_evidence::Extras {
+            live_lines: live
+                .as_ref()
+                .filter(|_| !saved)
+                .map(|report| {
+                    selected_evidence::live_evidence_lines(
+                        &report.game_identity_report,
+                        &report.structural_facts,
+                    )
+                })
+                .unwrap_or_default(),
+            blocker_note: (!reason.has_identity_screen())
+                .then(|| format!("{}: {}", reason.banner_title(), reason.banner_body())),
         }
     }
 

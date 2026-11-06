@@ -1508,6 +1508,21 @@ fn is_archive_container(path: &std::path::Path) -> bool {
     })
 }
 
+/// Systems (canonical platform ids) for which EmuWiz has no identity check and
+/// no other identity route at all: the shared identity inspection has no
+/// platform for them and no emulator-specific route resolves them. Returns the
+/// display name. A ZX Spectrum `.z80` snapshot has its own DAT-backed route,
+/// so it is not claimed here.
+fn system_without_identity_check(id: &'static str, extension: &str) -> Option<&'static str> {
+    match id {
+        "Sharp X68000" | "NEC PC-8801" | "PC-98" | "NEC PC-9801" | "PC Engine"
+        | "TurboGrafx-16" | "MSX" | "MSX2" | "BBC Micro" | "Acorn Archimedes"
+        | "Acorn Electron" => Some(id),
+        "ZX Spectrum" if extension != "z80" => Some(id),
+        _ => None,
+    }
+}
+
 /// Why identity is unknown, from existing evidence only.
 ///
 /// `recorded_platform` is the live library record's platform hint, if the
@@ -1537,6 +1552,36 @@ pub(crate) fn identity_unknown_reason(
     } else {
         Reason::NotConfirmed
     };
+    // Blocker-specific reasons come first: when no identity route exists for
+    // the system or format, extracting an archive or opening Verify identity
+    // cannot help, so the truthful reason must win. Facts used: the platform
+    // and the file extension only.
+    let extension = focused
+        .and_then(|p| p.extension())
+        .and_then(|x| x.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if platform == IdentityPlatform::Amiga {
+        match extension.as_str() {
+            "hdf" => return Reason::AmigaHardDisk,
+            "ipf" => return Reason::AmigaIpf,
+            _ => {}
+        }
+    }
+    if platform == IdentityPlatform::Other
+        && let Some(system) = hint
+            .and_then(archivefs_core::canonical_platform_for_alias)
+            .and_then(|id| system_without_identity_check(id, &extension))
+    {
+        return Reason::NoIdentityCheck(system);
+    }
+    if platform == IdentityPlatform::Atari2600
+        && report.is_some_and(|r| r.format == IdentityImageFormat::Unsupported)
+        && !extension.is_empty()
+        && extension != "a26"
+    {
+        return Reason::UnsupportedFormat(IdentityPlatform::Atari2600.label());
+    }
     if let (Some(path), Some(report)) = (focused, report)
         && report.format == IdentityImageFormat::Unsupported
         && is_archive_container(path)
@@ -1692,5 +1737,82 @@ mod identity_reason_tests {
             identity_unknown_reason(Some(Path::new("/g/a.bin")), Some(&known), Some(None)),
             R::NotConfirmed
         );
+    }
+
+    fn reason(path: &str, platform: IdentityPlatform, hint: Option<&str>) -> R {
+        let r = unsupported(platform);
+        identity_unknown_reason(Some(Path::new(path)), Some(&r), Some(hint))
+    }
+
+    #[test]
+    fn systems_without_an_identity_check_get_the_truthful_reason_first() {
+        let other = IdentityPlatform::Other;
+        for (path, hint, name) in [
+            ("/g/game.zip", "Sharp X68000", "Sharp X68000"),
+            ("/g/game.7z", "NEC PC-8801", "NEC PC-8801"),
+            ("/g/game.tap", "ZX Spectrum", "ZX Spectrum"),
+            ("/g/game.zip", "MSX", "MSX"),
+            ("/g/game.rom", "MSX2", "MSX2"),
+            ("/g/game.zip", "PC Engine", "PC Engine"),
+            ("/g/game.pce", "TurboGrafx-16", "TurboGrafx-16"),
+            ("/g/game.ssd", "BBC Micro", "BBC Micro"),
+            ("/g/game.adf", "Acorn Archimedes", "Acorn Archimedes"),
+        ] {
+            assert_eq!(
+                reason(path, other, Some(hint)),
+                R::NoIdentityCheck(name),
+                "{path}"
+            );
+        }
+        // 7z of such a system is NOT told to extract.
+        assert_ne!(
+            reason("/g/game.7z", other, Some("Sharp X68000")),
+            R::UnsupportedArchive
+        );
+    }
+
+    #[test]
+    fn zx_snapshot_route_and_supported_platforms_are_unaffected() {
+        let other = IdentityPlatform::Other;
+        assert_eq!(
+            reason("/g/a.z80", other, Some("ZX Spectrum")),
+            R::NotConfirmed
+        );
+        assert_eq!(
+            reason("/g/a.zip", IdentityPlatform::GameBoyAdvance, None),
+            R::NotConfirmed
+        );
+        assert_eq!(reason("/g/a.7z", other, Some("GBA")), R::UnsupportedArchive);
+        assert_eq!(reason("/g/a.zip", other, None), R::SystemNotChosen);
+        assert_eq!(
+            reason("/g/a.7z", other, Some("NeoGeo")),
+            R::UnsupportedArchive
+        );
+    }
+
+    #[test]
+    fn amiga_hdf_and_ipf_route_to_the_honest_amiga_reasons() {
+        let amiga = IdentityPlatform::Amiga;
+        assert_eq!(reason("/g/a.hdf", amiga, None), R::AmigaHardDisk);
+        assert_eq!(reason("/g/a.IPF", amiga, None), R::AmigaIpf);
+        assert_eq!(
+            reason("/g/a.hdf", IdentityPlatform::Other, Some("Amiga")),
+            R::AmigaHardDisk
+        );
+        assert_eq!(reason("/g/a.adf", amiga, None), R::NotConfirmed);
+    }
+
+    #[test]
+    fn atari_2600_bin_and_zip_are_an_unsupported_format() {
+        let a = IdentityPlatform::Atari2600;
+        assert_eq!(
+            reason("/g/a.bin", a, None),
+            R::UnsupportedFormat("Atari 2600")
+        );
+        assert_eq!(
+            reason("/g/a.zip", a, None),
+            R::UnsupportedFormat("Atari 2600")
+        );
+        assert_eq!(reason("/g/a.a26", a, None), R::NotConfirmed);
     }
 }
