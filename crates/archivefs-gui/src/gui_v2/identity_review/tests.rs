@@ -1090,6 +1090,14 @@ mod extras {
             extras_for(&hdf, &verified(), None).blocker_note.is_none(),
             "a DAT-verified Amiga HDF must not be told it cannot start"
         );
+        // The "Unknown" sentinel is no platform: never "no identity check".
+        let mut unknown = game(4, "a.zip", "Sharp X68000");
+        unknown.archive.platform = Some(crate::gui_v2::library::UNKNOWN_PLATFORM.to_string());
+        assert!(
+            extras_for(&unknown, &unresolved(), None)
+                .blocker_note
+                .is_none()
+        );
         // A supported platform with a normal reason gets no blocker note.
         let gba = game(3, "a.gba", "Game Boy Advance");
         assert!(extras_for(&gba, &unresolved(), None).blocker_note.is_none());

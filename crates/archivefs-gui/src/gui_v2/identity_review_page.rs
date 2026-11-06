@@ -208,7 +208,12 @@ pub(super) fn extras_for(
     let reason = crate::emulator_setup::readiness_input::identity_unknown_reason(
         Some(&game.archive.absolute_path),
         report,
-        Some(game.archive.platform.as_deref()),
+        Some(
+            game.archive
+                .platform
+                .as_deref()
+                .filter(|platform| *platform != super::library::UNKNOWN_PLATFORM),
+        ),
     );
     selected_evidence::Extras {
         live_lines: live
