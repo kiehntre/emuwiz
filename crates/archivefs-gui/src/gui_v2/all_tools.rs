@@ -76,6 +76,13 @@ pub(super) struct AllToolsState {
     pub filter: ToolFilter,
 }
 
+impl AllToolsState {
+    /// A new visit to All Tools starts from an empty search and the All filter.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Tool {
     pub route: Route,
@@ -563,6 +570,17 @@ mod tests {
         // Browse & Play and Quick Rename are locations without a section.
         assert!(routes.contains(&format!("{:?}", Route::BrowsePlay)));
         assert!(routes.contains(&format!("{:?}", Route::QuickRename)));
+    }
+
+    #[test]
+    fn reset_clears_search_and_filter_for_a_fresh_visit() {
+        let mut state = AllToolsState {
+            query: "emulator".into(),
+            filter: ToolFilter::LookingOnly,
+        };
+        state.reset();
+        assert!(state.query.is_empty());
+        assert_eq!(state.filter, ToolFilter::default());
     }
 
     #[test]

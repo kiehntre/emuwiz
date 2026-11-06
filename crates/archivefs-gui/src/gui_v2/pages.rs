@@ -612,6 +612,10 @@ impl App {
                 Route::Section(
                     Section::Emulators | Section::Sources | Section::Dat | Section::Check
                 ) | Route::Tool(_)
+                    | Route::Task {
+                        section: Section::Launch,
+                        ..
+                    }
             ) || health_page
                 || (blue && !browse_play);
             // These pages own one page scroller. Their introduction must share
@@ -1140,6 +1144,8 @@ impl App {
     /// A fresh visit starts at the top; Back keeps its place.
     pub(super) fn open_all_tools(&mut self) {
         self.simple.all_tools = true;
+        // A fresh visit starts with an empty tool search and the All filter.
+        self.simple.tools.reset();
         self.reset_all_tools_scroll = true;
     }
 
@@ -1169,6 +1175,15 @@ impl App {
             .map(|game| game.title.as_str());
         let breadcrumbs = super::simple_shell::simple_breadcrumb_labels(&route, game_title);
         if breadcrumbs.len() < 2 {
+            // Library: selecting a card adds the trail, which used to push
+            // the chips and cards down under the pointer. Keep the row's
+            // height reserved so the layout is identical either way.
+            if matches!(route, Route::BrowsePlay) {
+                ui.horizontal(|ui| {
+                    ui.label(" ");
+                });
+                ui.add_space(4.0);
+            }
             return;
         }
         ui.push_id("v2_simple_breadcrumbs", |ui| {
@@ -2899,12 +2914,29 @@ impl App {
                 let gap = 20.0;
                 let right = (ui.available_width() * 0.3).clamp(360.0, 440.0);
                 let left = ui.available_width() - right - gap;
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = gap;
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(left, 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
+                // Each column gets an explicit rectangle, so a wide left
+                // column can never push the right-hand controls past the
+                // window edge; overflow is clipped inside its own column.
+                let origin = ui.cursor().min;
+                let total = ui.available_width();
+                let height = ui.available_height();
+                let left_rect = egui::Rect::from_min_size(origin, egui::vec2(left, height));
+                let right_rect = egui::Rect::from_min_size(
+                    egui::pos2(origin.x + left + gap, origin.y),
+                    egui::vec2(right, height),
+                );
+                let left_bottom = ui
+                    .scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(left_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
                         |ui| {
+                            let clip = ui.clip_rect().intersect(egui::Rect::from_x_y_ranges(
+                                left_rect.x_range(),
+                                f32::NEG_INFINITY..=f32::INFINITY,
+                            ));
+                            ui.set_clip_rect(clip);
+                            ui.set_width(left);
                             ui.set_width(left);
                             super::game_detail_blue::hero_card(ui, |ui| {
                                 ui.horizontal_top(|ui| {
@@ -2921,11 +2953,17 @@ impl App {
                             });
                             self.detail_body(ui, game, &key);
                         },
-                    );
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(right, 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
+                    )
+                    .response
+                    .rect
+                    .bottom();
+                let right_bottom = ui
+                    .scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(right_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
                         |ui| {
+                            ui.set_width(right);
                             ui.set_width(right);
                             super::game_detail_blue::side_card(ui, "Can I play it?", |ui| {
                                 self.detail_readiness(ui, game);
@@ -2941,8 +2979,17 @@ impl App {
                                 });
                             });
                         },
-                    );
-                });
+                    )
+                    .response
+                    .rect
+                    .bottom();
+                ui.allocate_rect(
+                    egui::Rect::from_min_max(
+                        origin,
+                        egui::pos2(origin.x + total, left_bottom.max(right_bottom)),
+                    ),
+                    egui::Sense::hover(),
+                );
                 if super::recording_integrity::eligible(game) {
                     super::game_detail_blue::side_card(ui, "Recording integrity", |ui| {
                         self.recording_integrity.show(ui, game);
@@ -3624,6 +3671,12 @@ impl App {
             }
             return;
         };
+        // Read-only: the live readiness the rest of this page already shows.
+        let live_identity = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.readiness_summary(game_id, &game.archive.absolute_path))
+            .map(|summary| (summary.status, summary.identity));
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 // Launch reuses the same bounded cover/platform pipeline as
@@ -3643,11 +3696,7 @@ impl App {
                             ));
                         });
                     });
-                    ui.label(if game.identified {
-                        "Verified identity is available"
-                    } else {
-                        "Game identity needs review"
-                    });
+                    ui.label(launch_identity_line(game.identified, live_identity));
                 });
             });
         });
@@ -4376,6 +4425,78 @@ fn disambiguating_hint(
         .to_string_lossy()
         .into_owned();
     (!folder.is_empty()).then(|| format!("Folder: {folder}"))
+}
+
+/// Identity line in the Launch header. Saved verification is only one source
+/// of identity; when the live readiness read the game file's own identity
+/// (strong local identity), say so rather than claiming review is needed.
+fn launch_identity_line(
+    identified: bool,
+    live: Option<(
+        super::launch_readiness_summary::ReadinessPresentationState,
+        super::launch_readiness_summary::IdentitySummary,
+    )>,
+) -> &'static str {
+    use super::launch_readiness_summary::{IdentitySummary, ReadinessPresentationState};
+    if identified {
+        return "Verified identity is available";
+    }
+    match live {
+        Some((
+            ReadinessPresentationState::Ready | ReadinessPresentationState::ReadyWithWarnings,
+            IdentitySummary::StrongLocal | IdentitySummary::LaunchableWithWarning,
+        )) => "Identity read from the game file. No saved catalogue check yet.",
+        _ => "Game identity needs review",
+    }
+}
+
+#[cfg(test)]
+mod launch_identity_line_tests {
+    use super::launch_identity_line;
+    use crate::gui_v2::launch_readiness_summary::{
+        IdentitySummary::{NeedsReview, StrongLocal},
+        ReadinessPresentationState::{Checking, NeedsIdentityReview, Ready, ReadyWithWarnings},
+    };
+
+    const NEUTRAL: &str = "Identity read from the game file. No saved catalogue check yet.";
+
+    #[test]
+    fn live_ready_identity_without_saved_check_is_neutral() {
+        assert_eq!(
+            launch_identity_line(false, Some((Ready, StrongLocal))),
+            NEUTRAL
+        );
+        assert_eq!(
+            launch_identity_line(false, Some((ReadyWithWarnings, StrongLocal))),
+            NEUTRAL
+        );
+    }
+
+    #[test]
+    fn unknown_or_review_states_still_need_review() {
+        let review = "Game identity needs review";
+        assert_eq!(launch_identity_line(false, None), review);
+        assert_eq!(
+            launch_identity_line(false, Some((Checking, NeedsReview))),
+            review
+        );
+        assert_eq!(
+            launch_identity_line(false, Some((NeedsIdentityReview, NeedsReview))),
+            review
+        );
+        assert_eq!(
+            launch_identity_line(false, Some((Ready, NeedsReview))),
+            review
+        );
+    }
+
+    #[test]
+    fn saved_identity_keeps_the_verified_line() {
+        assert_eq!(
+            launch_identity_line(true, None),
+            "Verified identity is available"
+        );
+    }
 }
 
 #[cfg(test)]

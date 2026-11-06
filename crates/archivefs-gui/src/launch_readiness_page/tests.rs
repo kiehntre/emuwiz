@@ -3680,3 +3680,43 @@ fn other_platforms_keep_core_plan_order() {
     ]);
     assert_eq!(super::gba_display_order(&plan, |_| true), vec![0, 1]);
 }
+
+#[test]
+fn gba_recommendation_follows_the_sole_eligible_core_play_uses() {
+    use CandidatePreference::{SoleEligible, Undetermined};
+    let plan = gba_plan(vec![
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, SoleEligible),
+    ]);
+    assert_eq!(super::recommended_gba_candidate(&plan, |_| true), Some(1));
+    assert_eq!(super::gba_display_order(&plan, |_| true), vec![1, 0]);
+}
+
+#[test]
+fn gba_sole_eligible_not_launchable_recommends_nothing() {
+    use CandidatePreference::{SoleEligible, Undetermined};
+    let plan = gba_plan(vec![
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, SoleEligible),
+    ]);
+    let sole_not_launchable = |c: &LaunchCandidate| c.preference != SoleEligible;
+    assert_eq!(
+        super::recommended_gba_candidate(&plan, sole_not_launchable),
+        None
+    );
+    assert_eq!(
+        super::gba_display_order(&plan, sole_not_launchable),
+        vec![0, 1]
+    );
+}
+
+#[test]
+fn gba_remembered_anywhere_recommends_nothing_even_with_sole_eligible() {
+    use CandidatePreference::{Remembered, SoleEligible, Undetermined};
+    let plan = gba_plan(vec![
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, SoleEligible),
+        gba_candidate(standalone("mgba"), LaunchReadiness::Ready, Remembered),
+    ]);
+    assert_eq!(super::recommended_gba_candidate(&plan, |_| true), None);
+}

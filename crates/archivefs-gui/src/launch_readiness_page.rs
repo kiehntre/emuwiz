@@ -3966,8 +3966,15 @@ fn recommended_gba_candidate(
     {
         return None;
     }
+    // Follow the same preferred set Play uses: when any candidate is the
+    // sole eligible one, only those are considered.
+    let sole_only = plan
+        .candidates
+        .iter()
+        .any(|c| c.preference == CandidatePreference::SoleEligible);
     plan.candidates.iter().position(|c| {
-        matches!(c.target, LaunchTarget::RetroArchCore { .. })
+        (!sole_only || c.preference == CandidatePreference::SoleEligible)
+            && matches!(c.target, LaunchTarget::RetroArchCore { .. })
             && c.readiness != LaunchReadiness::Blocked
             && launchable(c)
     })

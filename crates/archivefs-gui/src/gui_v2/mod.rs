@@ -474,6 +474,8 @@ pub(super) struct App {
     romm_library_job: Option<u64>,
     reset_page_scroll: bool,
     reset_all_tools_scroll: bool,
+    /// Last window size seen, so a resize can ask for a follow-up repaint.
+    last_screen_size: Option<egui::Vec2>,
     scrolled_organisation_view: organisation::OrganisationView,
     manual_viewer: manual_viewer::ManualViewer,
     text_guide_viewer: text_guide_viewer::TextGuideViewer,
@@ -601,6 +603,7 @@ impl App {
             romm_library_job: None,
             reset_page_scroll: false,
             reset_all_tools_scroll: false,
+            last_screen_size: None,
             scrolled_organisation_view: organisation::OrganisationView::default(),
             manual_viewer: manual_viewer::ManualViewer::default(),
             text_guide_viewer: text_guide_viewer::TextGuideViewer::default(),
@@ -1010,6 +1013,18 @@ impl App {
             }
         }
     }
+    /// Some window managers deliver a resize without a following event, which
+    /// left the surface at its old size until the next input. A size change
+    /// asks for an immediate repaint and one settling repaint after it.
+    fn note_window_resize(&mut self, context: &egui::Context) {
+        let size = context.content_rect().size();
+        if resize_needs_repaint(self.last_screen_size, size) {
+            context.request_repaint();
+            context.request_repaint_after(Duration::from_millis(50));
+        }
+        self.last_screen_size = Some(size);
+    }
+
     fn navigation_changed(&mut self) {
         // Choosing any location closes the All Tools browser.
         self.simple.all_tools = false;
@@ -2434,6 +2449,11 @@ impl App {
 }
 
 /// The grouped artwork entry's title once no pictures are loading.
+/// True when the window size differs from the last frame's (not on first run).
+fn resize_needs_repaint(previous: Option<egui::Vec2>, now: egui::Vec2) -> bool {
+    previous.is_some_and(|previous| (previous - now).abs().max_elem() > 0.5)
+}
+
 pub(super) const ARTWORK_FINISHED_TITLE: &str = "Artwork";
 
 impl eframe::App for App {
@@ -2467,6 +2487,7 @@ impl eframe::App for App {
             self.refresh_artwork_index();
         }
         self.poll(ui.ctx());
+        self.note_window_resize(ui.ctx());
         self.show(ui.ctx());
         self.simple.paint_focus_ring(ui.ctx());
         self.finish_frame();

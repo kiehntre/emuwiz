@@ -508,3 +508,48 @@ fn cold_shift_tab_reveals_the_last_library_card_at_160_percent_in_both_profiles(
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Game Details, side-by-side columns: every right-hand control sits inside
+/// the window at 1280x820 in physical pixels (scale 0.8 gives the room for the
+/// two-column layout; the fixture's left column is narrower than a real
+/// library's, so this guards the placement, not the real-library content).
+#[test]
+fn game_details_right_column_stays_inside_the_window_at_1280_by_820() {
+    for scale in [0.8_f32, 1.0] {
+        let size = points((1280.0, 820.0), scale);
+        let context = egui::Context::default();
+        let mut app = populated(&context, true, scale);
+        app.router.current = Route::Game(1);
+        let output = settled(&context, &mut app, size);
+        let heading = text_bounds(&output, "Can I play it?");
+        if scale == 0.8 {
+            assert!(!heading.is_empty(), "two-column layout expected at 0.8");
+        }
+        for rect in heading {
+            assert!(
+                visible(rect, size),
+                "scale {scale}: {rect:?} outside {size:?}"
+            );
+        }
+        assert!(clipped_text(&output, size).is_empty());
+    }
+}
+
+/// Library: selecting a game adds the breadcrumb trail; the controls under it
+/// must not move (the row's height is reserved when there is no selection).
+#[test]
+fn library_controls_do_not_shift_when_a_game_is_selected() {
+    let size = [1280.0, 820.0];
+    let top_of_search = |route: Route| {
+        let context = egui::Context::default();
+        let mut app = populated(&context, true, 1.0);
+        app.router.current = route;
+        let output = settled(&context, &mut app, size);
+        text_bounds(&output, "Search by title or system")
+            .first()
+            .map(|r| r.min.y)
+    };
+    let none = top_of_search(Route::BrowsePlay).expect("search shown");
+    let selected = top_of_search(Route::BrowsePlayGame(1)).expect("search shown");
+    assert!((none - selected).abs() < 1.0, "{none} vs {selected}");
+}
