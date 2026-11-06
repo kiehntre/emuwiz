@@ -460,6 +460,11 @@ impl App {
             });
             if let Some(error) = self.equiv.error.clone() {
                 ui.colored_label(theme::warning(ui), "The duplicate check or move could not finish. Review History before retrying a move; run a fresh check if the source files changed.");
+                // A receipt-based outcome ("moved 1 of 3…") is the fact the
+                // person needs; keep it visible, not only under details.
+                if error.starts_with("Stopped part way") || error.starts_with("Nothing was moved") {
+                    ui.label(error.clone());
+                }
                 crate::ui::components::technical_details(ui, "equivalent_error", |ui| { ui.label(error); });
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Review source folders").clicked() { self.go(Route::Section(Section::Sources)); }

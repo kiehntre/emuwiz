@@ -198,6 +198,8 @@ impl App {
             return;
         }
         self.undo_job = None;
+        // The refusal that pointed at this Undo no longer applies.
+        self.history_view.notice = None;
         if result.outcome.is_err() && result.record.transaction.is_fully_rolled_back() {
             // Readback cannot acknowledge a failed write/sync. This is only the
             // displayed recovery snapshot: retain the actual journal unchanged
