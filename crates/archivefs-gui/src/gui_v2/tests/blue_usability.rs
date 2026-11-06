@@ -288,7 +288,9 @@ fn only_unresolved_identity_offers_review_identity_on_launch() {
     use crate::gui_v2::native_workflows::offers_review_identity;
     use crate::launch_readiness_page::LaunchReadinessInput;
     assert!(offers_review_identity(
-        &LaunchReadinessInput::IdentityUnknown
+        &LaunchReadinessInput::IdentityUnknown(
+            crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed
+        )
     ));
     assert!(offers_review_identity(
         &LaunchReadinessInput::IdentityConflicting

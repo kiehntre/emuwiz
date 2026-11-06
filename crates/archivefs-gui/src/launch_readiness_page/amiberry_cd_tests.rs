@@ -297,7 +297,9 @@ fn full_unresolved_page_keeps_native_action_visible_at_1024_by_600() {
             egui::CentralPanel::default().show(ctx, |ui| {
                 super::super::show_launch_readiness_panel(
                     ui,
-                    &super::super::LaunchReadinessInput::IdentityUnknown,
+                    &super::super::LaunchReadinessInput::IdentityUnknown(
+                        crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+                    ),
                     &mut retroarch,
                     &mut dolphin,
                     &mut pcsx2,

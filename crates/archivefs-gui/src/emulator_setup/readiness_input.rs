@@ -324,7 +324,12 @@ impl ReadinessSources<'_> {
                 } else if evidence_freshness.is_incomplete() {
                     LaunchReadinessInput::InspectionIncomplete
                 } else {
-                    LaunchReadinessInput::IdentityUnknown
+                    LaunchReadinessInput::IdentityUnknown(identity_unknown_reason(
+                        focused,
+                        selected_game_identity_report,
+                        focused_record
+                            .and_then(|r| r.mount_plan.archive.identity.platform.as_deref()),
+                    ))
                 };
             }
             archivefs_core::launch::CanonicalIdentityStatus::Conflicting => {
@@ -1491,5 +1496,115 @@ impl ReadinessSources<'_> {
             #[cfg(target_os = "linux")]
             shadps4: shadps4_context,
         }
+    }
+}
+
+/// Archive container extensions EmuWiz may meet but has no identity route for.
+fn is_archive_container(path: &std::path::Path) -> bool {
+    path.extension().and_then(|x| x.to_str()).is_some_and(|x| {
+        matches!(
+            x.to_ascii_lowercase().as_str(),
+            "zip" | "7z" | "rar" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst"
+        )
+    })
+}
+
+/// Why identity is unknown, from existing evidence only. An archive whose
+/// report says `Unsupported` is an unsupported archive; a file with no
+/// canonical platform on record and none identified is a missing system;
+/// anything else stays an honest "not confirmed".
+pub(crate) fn identity_unknown_reason(
+    focused: Option<&std::path::Path>,
+    report: Option<&archivefs_core::game_identity::GameIdentityReport>,
+    recorded_platform: Option<&str>,
+) -> crate::launch_readiness_page::IdentityUnknownReason {
+    use crate::launch_readiness_page::IdentityUnknownReason as Reason;
+    use archivefs_core::game_identity::{IdentityImageFormat, IdentityPlatform};
+    if let (Some(path), Some(report)) = (focused, report)
+        && report.format == IdentityImageFormat::Unsupported
+        && is_archive_container(path)
+    {
+        return Reason::UnsupportedArchive;
+    }
+    let platform_identified = report.is_some_and(|r| r.platform != IdentityPlatform::Other);
+    let platform_recorded = recorded_platform
+        .is_some_and(|p| archivefs_core::canonical_platform_for_alias(p).is_some());
+    if !platform_identified && !platform_recorded {
+        return Reason::SystemNotChosen;
+    }
+    Reason::NotConfirmed
+}
+
+#[cfg(test)]
+mod identity_reason_tests {
+    use super::identity_unknown_reason;
+    use crate::launch_readiness_page::IdentityUnknownReason as R;
+    use archivefs_core::game_identity::{
+        GameIdentityReport, IdentityImageFormat, IdentityPlatform,
+    };
+    use std::path::Path;
+
+    fn report(platform: IdentityPlatform, format: IdentityImageFormat) -> GameIdentityReport {
+        GameIdentityReport {
+            archive_path: "x".into(),
+            platform,
+            format,
+            evidence: Vec::new(),
+            warnings: Vec::new(),
+            bytes_read: 0,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete: true,
+        }
+    }
+
+    #[test]
+    fn unsupported_archive_is_detected_from_report_and_extension() {
+        let r = report(IdentityPlatform::Other, IdentityImageFormat::Unsupported);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.7z")), Some(&r), None),
+            R::UnsupportedArchive
+        );
+        // Even with a platform on record, an unsupported archive is named.
+        assert_eq!(
+            identity_unknown_reason(
+                Some(Path::new("/g/a.zip")),
+                Some(&r),
+                Some("Game Boy Advance")
+            ),
+            R::UnsupportedArchive
+        );
+    }
+
+    #[test]
+    fn no_platform_anywhere_means_choose_system() {
+        let r = report(IdentityPlatform::Other, IdentityImageFormat::Unsupported);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.bin")), Some(&r), None),
+            R::SystemNotChosen
+        );
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.bin")), None, Some("not a platform")),
+            R::SystemNotChosen
+        );
+    }
+
+    #[test]
+    fn known_platform_without_confirmation_is_not_confirmed() {
+        let r = report(IdentityPlatform::Other, IdentityImageFormat::Deferred);
+        assert_eq!(
+            identity_unknown_reason(
+                Some(Path::new("/g/a.gba")),
+                Some(&r),
+                Some("Game Boy Advance")
+            ),
+            R::NotConfirmed
+        );
+        let known = report(IdentityPlatform::PlayStation, IdentityImageFormat::Deferred);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.bin")), Some(&known), None),
+            R::NotConfirmed
+        );
     }
 }

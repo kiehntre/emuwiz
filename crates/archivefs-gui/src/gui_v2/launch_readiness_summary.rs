@@ -3,7 +3,7 @@
 //! The projector consumes the existing launch input and never performs
 //! discovery, identity resolution, firmware inspection, or launch planning.
 
-use crate::launch_readiness_page::LaunchReadinessInput;
+use crate::launch_readiness_page::{IdentityUnknownReason, LaunchReadinessInput};
 use archivefs_core::launch::{
     CandidatePreference, FirmwareReadiness, LaunchBlockerKind, LaunchCandidate, LaunchPlan,
     LaunchReadiness, LaunchTarget, LaunchWarningKind,
@@ -23,6 +23,8 @@ pub(crate) enum ReadinessPresentationState {
     NeedsEmulator,
     NeedsFirmware,
     NeedsIdentityReview,
+    /// No trusted system is on record for this game.
+    NeedsSystem,
     SourceUnavailable,
     MediaUnreadable,
     Blocked,
@@ -35,6 +37,10 @@ pub(crate) enum ReadinessAction {
     SetUpEmulator,
     CheckFirmware,
     ReviewIdentity,
+    /// Identity unresolved though the system is known: open the evidence.
+    VerifyIdentity,
+    /// No trusted system on record: open the existing Choose system flow.
+    ChooseSystem,
     CheckGamesFolder,
     ReviewProblem,
     ChooseEmulator,
@@ -145,7 +151,7 @@ pub(crate) fn project(
             None,
             Some(ReadinessAction::Play),
         ),
-        LaunchReadinessInput::IdentityUnknown => identity_summary(false),
+        LaunchReadinessInput::IdentityUnknown(reason) => identity_unknown_summary(*reason),
         LaunchReadinessInput::DiscFilesUnresolved(detail) => base(
             ReadinessPresentationState::NeedsIdentityReview,
             "The disc's files need attention",
@@ -233,9 +239,9 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
         .explanation
         .starts_with(archivefs_core::launch::evidence_bridge::CUE_BIN_REFUSED_PREFIX);
     let mut findings = match input {
-        LaunchReadinessInput::IdentityUnknown | LaunchReadinessInput::IdentityConflicting => {
-            diagnosis::single(Cause::IdentityNotConfirmed)
-        }
+        LaunchReadinessInput::IdentityConflicting => diagnosis::single(Cause::IdentityNotConfirmed),
+        // Each reason already carries its own wording and next action.
+        LaunchReadinessInput::IdentityUnknown(_) => Vec::new(),
         // Carries its own named reason and rescan action.
         LaunchReadinessInput::DosBoxReview | LaunchReadinessInput::DiscFilesUnresolved(_) => {
             Vec::new()
@@ -289,6 +295,41 @@ fn checking_summary() -> GameReadinessSummary {
         None,
         None,
     )
+}
+
+fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSummary {
+    match reason {
+        IdentityUnknownReason::SystemNotChosen => base(
+            ReadinessPresentationState::NeedsSystem,
+            "Choose a system for this game",
+            "EmuWiz has no trusted system for this file, so it cannot pick an emulator. Choose system lets you set it after reviewing its confirmation. Optional catalogue (DAT) verification is separate and is not what is stopping Play.",
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::ChooseSystem),
+        ),
+        IdentityUnknownReason::UnsupportedArchive => base(
+            ReadinessPresentationState::Blocked,
+            "This archive format isn't supported for launch identity",
+            "EmuWiz cannot read a game identity from this kind of archive and will not guess one. Extract the game from the archive, or use a supported format, then recheck readiness. Your file is untouched. Optional catalogue (DAT) verification is separate and is not what is stopping Play.",
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::RecheckReadiness),
+        ),
+        IdentityUnknownReason::NotConfirmed => base(
+            ReadinessPresentationState::NeedsIdentityReview,
+            "EmuWiz cannot tell which game this file is yet",
+            "Play needs the file's own identity evidence to choose the right emulator settings. Optional catalogue (DAT) verification is a separate check and is not what is stopping Play. Verify identity shows what EmuWiz found.",
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::VerifyIdentity),
+        ),
+    }
 }
 
 fn identity_summary(conflicting: bool) -> GameReadinessSummary {
@@ -782,6 +823,7 @@ pub(crate) fn status_tone(status: ReadinessPresentationState) -> crate::ui::comp
         ReadinessPresentationState::NeedsEmulator
         | ReadinessPresentationState::NeedsFirmware
         | ReadinessPresentationState::NeedsIdentityReview
+        | ReadinessPresentationState::NeedsSystem
         | ReadinessPresentationState::SourceUnavailable
         | ReadinessPresentationState::MediaUnreadable
         | ReadinessPresentationState::Blocked => crate::ui::components::StatusTone::Blocked,
@@ -797,9 +839,8 @@ pub(crate) fn blue_status_tone(
     match status {
         ReadinessPresentationState::NeedsEmulator
         | ReadinessPresentationState::NeedsFirmware
-        | ReadinessPresentationState::NeedsIdentityReview => {
-            crate::ui::components::StatusTone::Warning
-        }
+        | ReadinessPresentationState::NeedsIdentityReview
+        | ReadinessPresentationState::NeedsSystem => crate::ui::components::StatusTone::Warning,
         other => status_tone(other),
     }
 }
@@ -812,6 +853,7 @@ pub(crate) fn status_label(status: ReadinessPresentationState) -> &'static str {
         ReadinessPresentationState::NeedsEmulator => "Emulator needed",
         ReadinessPresentationState::NeedsFirmware => "Firmware needed",
         ReadinessPresentationState::NeedsIdentityReview => "Identity needs review",
+        ReadinessPresentationState::NeedsSystem => "System needed",
         ReadinessPresentationState::SourceUnavailable => "Game file unavailable",
         ReadinessPresentationState::MediaUnreadable => "Game file unreadable",
         ReadinessPresentationState::Blocked => "Needs attention",
@@ -825,6 +867,8 @@ pub(crate) fn action_label(action: ReadinessAction) -> &'static str {
         ReadinessAction::SetUpEmulator => "Set up emulator",
         ReadinessAction::CheckFirmware => "Check BIOS / Firmware",
         ReadinessAction::ReviewIdentity => "Review identity",
+        ReadinessAction::VerifyIdentity => "Verify identity",
+        ReadinessAction::ChooseSystem => "Choose system",
         ReadinessAction::CheckGamesFolder => "Check games folder",
         ReadinessAction::ReviewProblem => "Review problem",
         ReadinessAction::ChooseEmulator => "Choose emulator",
@@ -1943,7 +1987,9 @@ mod tests {
     #[test]
     fn identity_inputs_are_never_called_verified_by_the_summary() {
         let unknown = project(
-            &LaunchReadinessInput::IdentityUnknown,
+            &LaunchReadinessInput::IdentityUnknown(
+                crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+            ),
             ReadinessFreshness::Current,
         );
         assert_eq!(unknown.identity, IdentitySummary::NeedsReview);
@@ -2212,7 +2258,9 @@ mod tests {
     #[test]
     fn identity_waiting_on_the_checksum_is_not_shown_as_a_refusal() {
         let summary = project(
-            &LaunchReadinessInput::IdentityUnknown,
+            &LaunchReadinessInput::IdentityUnknown(
+                crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+            ),
             ReadinessFreshness::Current,
         );
         assert_eq!(
@@ -2222,11 +2270,11 @@ mod tests {
         let deferred = compact(&summary, true);
         assert_eq!(deferred.badge, "Not fully checked");
         assert!(deferred.play_enabled && deferred.pending);
-        assert_eq!(deferred.fix, Some(ReadinessAction::ReviewIdentity));
+        assert_eq!(deferred.fix, Some(ReadinessAction::VerifyIdentity));
         // Once the checksum has run, the same answer is a current refusal.
         let current = compact(&summary, false);
         assert!(!current.play_enabled && !current.pending);
-        assert_eq!(current.fix, Some(ReadinessAction::ReviewIdentity));
+        assert_eq!(current.fix, Some(ReadinessAction::VerifyIdentity));
     }
 
     #[test]
@@ -2441,5 +2489,100 @@ mod dosbox_approval_tests {
                 .contains("does not verify a game release")
         );
         assert!(compact(&summary, false).play_enabled);
+    }
+}
+
+#[cfg(test)]
+mod identity_reason_wording_tests {
+    use super::*;
+
+    fn summary(reason: IdentityUnknownReason) -> GameReadinessSummary {
+        project(
+            &LaunchReadinessInput::IdentityUnknown(reason),
+            ReadinessFreshness::Current,
+        )
+    }
+
+    #[test]
+    fn system_not_chosen_offers_choose_system_not_identity_review() {
+        let s = summary(IdentityUnknownReason::SystemNotChosen);
+        assert_eq!(s.status, ReadinessPresentationState::NeedsSystem);
+        assert_eq!(status_label(s.status), "System needed");
+        assert_eq!(s.primary_action, Some(ReadinessAction::ChooseSystem));
+        assert_eq!(action_label(ReadinessAction::ChooseSystem), "Choose system");
+        assert!(s.headline.contains("Choose a system"));
+        assert!(s.explanation.contains("separate"));
+        assert_ne!(status_label(s.status), "Identity needs review");
+    }
+
+    #[test]
+    fn unsupported_archive_says_so_and_never_identity_review() {
+        let s = summary(IdentityUnknownReason::UnsupportedArchive);
+        assert_ne!(status_label(s.status), "Identity needs review");
+        assert!(s.headline.contains("archive format isn't supported"));
+        assert!(s.explanation.contains("Extract"));
+        assert!(s.explanation.contains("not what is stopping Play"));
+        assert_eq!(s.primary_action, Some(ReadinessAction::RecheckReadiness));
+        assert!(s.findings.is_empty());
+        assert!(!s.explanation.contains("Review identity"));
+    }
+
+    #[test]
+    fn unconfirmed_identity_offers_verify_identity() {
+        let s = summary(IdentityUnknownReason::NotConfirmed);
+        assert_eq!(s.status, ReadinessPresentationState::NeedsIdentityReview);
+        assert_eq!(s.primary_action, Some(ReadinessAction::VerifyIdentity));
+        assert_eq!(
+            action_label(ReadinessAction::VerifyIdentity),
+            "Verify identity"
+        );
+        assert!(s.explanation.contains("not what is stopping Play"));
+    }
+
+    #[test]
+    fn conflicting_identity_keeps_review_identity() {
+        let s = project(
+            &LaunchReadinessInput::IdentityConflicting,
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(s.primary_action, Some(ReadinessAction::ReviewIdentity));
+        assert_eq!(status_label(s.status), "Identity needs review");
+    }
+
+    #[test]
+    fn chooser_and_verify_actions_route_to_the_identity_screen() {
+        use crate::gui_v2::native_workflows::route_for_action;
+        for action in [
+            ReadinessAction::ChooseSystem,
+            ReadinessAction::VerifyIdentity,
+        ] {
+            assert_eq!(
+                route_for_action(action, 7),
+                Some(crate::gui_v2::routes::Route::ReviewIdentity(7))
+            );
+        }
+    }
+
+    #[test]
+    fn launch_page_blockers_differ_per_reason() {
+        use IdentityUnknownReason as R;
+        let texts: Vec<_> = [R::SystemNotChosen, R::UnsupportedArchive, R::NotConfirmed]
+            .iter()
+            .map(|r| (r.blocker_text(), r.banner_title()))
+            .collect();
+        assert_ne!(texts[0], texts[1]);
+        assert_ne!(texts[1], texts[2]);
+        assert!(
+            R::UnsupportedArchive
+                .blocker_text()
+                .contains("not supported")
+        );
+        for r in [R::SystemNotChosen, R::UnsupportedArchive, R::NotConfirmed] {
+            assert!(
+                !r.blocker_text()
+                    .to_lowercase()
+                    .contains("dat verification is required")
+            );
+        }
     }
 }

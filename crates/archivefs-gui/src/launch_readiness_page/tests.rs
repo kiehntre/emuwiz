@@ -701,10 +701,28 @@ fn retroarch_not_scanned_shows_the_exact_prerequisite_message() {
 
 #[test]
 fn unknown_identity_shows_an_honest_unresolved_message_never_no_emulator_found() {
-    let output = render(&LaunchReadinessInput::IdentityUnknown);
+    let output = render(&LaunchReadinessInput::IdentityUnknown(
+        crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+    ));
     assert!(rendered_text_contains(&output, "Identity unresolved"));
     assert!(rendered_text_contains(&output, "could not be verified"));
     assert!(!rendered_text_contains(&output, "No emulator found"));
+}
+
+#[test]
+fn each_unknown_identity_reason_renders_its_own_banner() {
+    use crate::launch_readiness_page::IdentityUnknownReason as R;
+    let system = render(&LaunchReadinessInput::IdentityUnknown(R::SystemNotChosen));
+    assert!(rendered_text_contains(&system, "System not chosen"));
+    assert!(!rendered_text_contains(&system, "Identity unresolved"));
+    let archive = render(&LaunchReadinessInput::IdentityUnknown(
+        R::UnsupportedArchive,
+    ));
+    assert!(rendered_text_contains(
+        &archive,
+        "Archive format not supported"
+    ));
+    assert!(!rendered_text_contains(&archive, "Identity unresolved"));
 }
 
 // --- conflicting identity ----------------------------------------------------
@@ -953,7 +971,9 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
 #[test]
 fn gamer_blockers_route_identity_content_choice_and_no_safe_states() {
     assert!(matches!(
-        gamer_play_action(&LaunchReadinessInput::IdentityUnknown),
+        gamer_play_action(&LaunchReadinessInput::IdentityUnknown(
+            crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed
+        )),
         GamerPlayAction::BlockedTyped(GamerBlocker {
             kind: GamerBlockerKind::UnknownSystem,
             ..
@@ -3570,4 +3590,93 @@ fn zipped_cartridge_play_is_ready_plain_and_blocked_with_cheats_or_playlist() {
             "{platform}"
         );
     }
+}
+
+fn gba_candidate(
+    target: LaunchTarget,
+    readiness: LaunchReadiness,
+    pref: CandidatePreference,
+) -> LaunchCandidate {
+    LaunchCandidate {
+        target,
+        readiness,
+        preference: pref,
+        blockers: Vec::new(),
+        ..ready_candidate()
+    }
+}
+
+fn standalone(adapter_id: &'static str) -> LaunchTarget {
+    LaunchTarget::Standalone {
+        adapter_id,
+        profile_id: adapter_id.into(),
+        profile_path: None,
+    }
+}
+
+fn gba_plan(candidates: Vec<LaunchCandidate>) -> LaunchPlan {
+    let mut plan = plan_with(candidates);
+    plan.platform_id = Some("Game Boy Advance".into());
+    plan
+}
+
+#[test]
+fn gba_retroarch_moves_first_and_is_recommended_when_launchable() {
+    use CandidatePreference::Undetermined;
+    let plan = gba_plan(vec![
+        gba_candidate(standalone("mgba"), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(standalone("other"), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+    ]);
+    assert_eq!(super::recommended_gba_candidate(&plan, |_| true), Some(2));
+    assert_eq!(super::gba_display_order(&plan, |_| true), vec![2, 0, 1]);
+}
+
+#[test]
+fn gba_order_is_unchanged_without_a_launchable_retroarch() {
+    use CandidatePreference::Undetermined;
+    let plan = gba_plan(vec![
+        gba_candidate(standalone("mgba"), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+    ]);
+    // RetroArch present but not launchable (not scanned/refused).
+    assert_eq!(super::gba_display_order(&plan, |_| false), vec![0, 1]);
+    // RetroArch blocked.
+    let blocked = gba_plan(vec![
+        gba_candidate(standalone("mgba"), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Blocked, Undetermined),
+    ]);
+    assert_eq!(super::gba_display_order(&blocked, |_| true), vec![0, 1]);
+    // No RetroArch candidate at all.
+    let none = gba_plan(vec![gba_candidate(
+        standalone("mgba"),
+        LaunchReadiness::Ready,
+        Undetermined,
+    )]);
+    assert_eq!(super::gba_display_order(&none, |_| true), vec![0]);
+}
+
+#[test]
+fn explicit_or_remembered_choice_is_never_reordered_or_overridden() {
+    use CandidatePreference::{Remembered, Undetermined};
+    let plan = gba_plan(vec![
+        gba_candidate(standalone("mgba"), LaunchReadiness::Ready, Remembered),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+    ]);
+    assert_eq!(super::recommended_gba_candidate(&plan, |_| true), None);
+    assert_eq!(super::gba_display_order(&plan, |_| true), vec![0, 1]);
+}
+
+#[test]
+fn other_platforms_keep_core_plan_order() {
+    use CandidatePreference::Undetermined;
+    let plan = plan_with(vec![
+        gba_candidate(
+            standalone("duckstation"),
+            LaunchReadiness::Ready,
+            Undetermined,
+        ),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+    ]);
+    assert_eq!(super::gba_display_order(&plan, |_| true), vec![0, 1]);
 }

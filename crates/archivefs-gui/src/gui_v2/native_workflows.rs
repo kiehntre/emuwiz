@@ -249,13 +249,45 @@ fn discovery_container_label(container: &archivefs_core::ingestion::ContainerKin
 pub(super) fn offers_review_identity(input: &launch_readiness_page::LaunchReadinessInput) -> bool {
     matches!(
         input,
-        launch_readiness_page::LaunchReadinessInput::IdentityUnknown
-            | launch_readiness_page::LaunchReadinessInput::DiscFilesUnresolved(_)
+        launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
+            launch_readiness_page::IdentityUnknownReason::SystemNotChosen
+                | launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+        ) | launch_readiness_page::LaunchReadinessInput::DiscFilesUnresolved(_)
             | launch_readiness_page::LaunchReadinessInput::IdentityConflicting
     )
 }
 
 pub(super) const REVIEW_IDENTITY: &str = "Review identity";
+
+/// The Launch page's identity button and the sentence above it, per reason.
+/// Unsupported archives have no identity screen to go to, so they offer only
+/// the readiness retry plus the plain instruction.
+pub(super) fn identity_next_step(
+    input: &launch_readiness_page::LaunchReadinessInput,
+) -> (&'static str, &'static str) {
+    use launch_readiness_page::{IdentityUnknownReason as Reason, LaunchReadinessInput as Input};
+    match input {
+        Input::IdentityUnknown(Reason::SystemNotChosen) => (
+            "Choose system",
+            "Next step: Choose system sets the system for this game after you review its confirmation. Without a system EmuWiz cannot pick an emulator.",
+        ),
+        Input::IdentityUnknown(Reason::NotConfirmed) => (
+            "Verify identity",
+            "Next step: Verify identity shows what EmuWiz found for this game and what you can do about it.",
+        ),
+        _ => (REVIEW_IDENTITY, UNVERIFIED_LAUNCH_NEXT_STEP),
+    }
+}
+
+/// True when the identity problem is an archive format with no identity route.
+pub(super) fn is_unsupported_archive(input: &launch_readiness_page::LaunchReadinessInput) -> bool {
+    matches!(
+        input,
+        launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
+            launch_readiness_page::IdentityUnknownReason::UnsupportedArchive
+        )
+    )
+}
 /// Shown with Review identity when Play cannot plan a launch yet.
 pub(super) const UNVERIFIED_LAUNCH_NEXT_STEP: &str = "Next step: Review identity shows why this game is not verified yet and what you can do about it.";
 
@@ -592,7 +624,9 @@ impl NativeWorkflows {
             }
             // A readable but invalid file produces unresolved evidence, not
             // a worker error. Let a repaired file use the same bounded retry.
-            let retry_readiness = (readiness_error.is_some() || offers_review_identity(&input))
+            let retry_readiness = (readiness_error.is_some()
+                || offers_review_identity(&input)
+                || is_unsupported_archive(&input))
                 && ui
                     .add_enabled(!launch_active, egui::Button::new("Retry readiness check"))
                     .clicked();
@@ -625,9 +659,15 @@ impl NativeWorkflows {
             }
             // Unverified identity is not a dead end: the one place a game's
             // identity is explained and finished is Review identity.
+            if is_unsupported_archive(&input) {
+                ui.label(
+                    "Next step: this archive format is not supported for launch identity. Extract the game or use a supported format, then press Retry readiness check.",
+                );
+            }
             let review_identity = offers_review_identity(&input) && {
-                ui.label(UNVERIFIED_LAUNCH_NEXT_STEP);
-                ui.button(REVIEW_IDENTITY).clicked()
+                let (button, note) = identity_next_step(&input);
+                ui.label(note);
+                ui.button(button).clicked()
             };
             (
                 if review_identity {
@@ -3592,7 +3632,7 @@ impl NativeWorkflows {
             launch_readiness_page::LaunchReadinessInput::RetroArchNotScanned => {
                 "RetroArchNotScanned".into()
             }
-            launch_readiness_page::LaunchReadinessInput::IdentityUnknown => {
+            launch_readiness_page::LaunchReadinessInput::IdentityUnknown(_) => {
                 "IdentityUnknown".into()
             }
             launch_readiness_page::LaunchReadinessInput::DiscFilesUnresolved(_) => {
@@ -4726,7 +4766,9 @@ pub(super) fn route_for_action(action: ReadinessAction, game_id: i64) -> Option<
         }),
         ReadinessAction::SetUpEmulator => Some(Route::Section(Section::Emulators)),
         ReadinessAction::CheckFirmware => Some(Route::Section(Section::Firmware)),
-        ReadinessAction::ReviewIdentity => Some(Route::ReviewIdentity(game_id)),
+        ReadinessAction::ReviewIdentity
+        | ReadinessAction::VerifyIdentity
+        | ReadinessAction::ChooseSystem => Some(Route::ReviewIdentity(game_id)),
         ReadinessAction::CheckGamesFolder => Some(Route::Section(Section::Sources)),
         ReadinessAction::ReviewProblem => Some(Route::Section(Section::Problems)),
     }

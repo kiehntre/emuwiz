@@ -100,7 +100,9 @@ fn a_missing_file_replaces_play_and_checking_but_not_a_specific_refusal() {
         ReadinessPresentationState::SourceUnavailable
     );
 
-    let mut refused = project(&LaunchReadinessInput::IdentityUnknown);
+    let mut refused = project(&LaunchReadinessInput::IdentityUnknown(
+        crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+    ));
     let before = refused.clone();
     launch_readiness_summary::note_file_missing(&mut refused);
     assert_eq!(refused, before);

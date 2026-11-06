@@ -322,7 +322,14 @@ fn launch_attention(
         ),
         LaunchReadinessInput::InspectionIncomplete => (
             "Launch needs a rescan".into(), archivefs_core::launch::INSPECTION_INCOMPLETE_REASON.into(), AttentionCategory::Launch, AttentionDestination::LaunchReadiness, None),
-        LaunchReadinessInput::IdentityUnknown | LaunchReadinessInput::IdentityConflicting => (
+        LaunchReadinessInput::IdentityUnknown(reason) => (
+            match reason {
+                crate::launch_readiness_page::IdentityUnknownReason::SystemNotChosen => "Launch needs a system",
+                crate::launch_readiness_page::IdentityUnknownReason::UnsupportedArchive => "Archive format not supported for launch",
+                crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed => "Launch needs verified identity",
+            }.into(),
+            reason.blocker_text().into(), AttentionCategory::Launch, AttentionDestination::LaunchReadiness, None),
+        LaunchReadinessInput::IdentityConflicting => (
             "Launch needs verified identity".into(), "The selected game's identity is unresolved or conflicts. Review the existing identity evidence.".into(), AttentionCategory::Launch, AttentionDestination::LaunchReadiness, None),
         LaunchReadinessInput::Plan { plan, retroarch_scanned, standalone_scans_complete, .. } => {
             if plan.summary.ready + plan.summary.ready_with_warnings > 0 { return snapshot; }

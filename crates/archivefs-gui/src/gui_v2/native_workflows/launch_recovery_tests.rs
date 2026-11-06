@@ -77,7 +77,9 @@ fn retry_current_bytes(repair: bool) {
     let output = frame(&context, &mut workflows, &path, Vec::new());
     assert!(matches!(
         workflows.launch_input(),
-        launch_readiness_page::LaunchReadinessInput::IdentityUnknown
+        launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
+            crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed
+        )
     ));
     let retry = output
         .shapes
