@@ -3580,6 +3580,8 @@ impl NativeWorkflows {
             selected_evidence_page::SelectedEvidenceState::Loading { path: current, .. }
                 if current == &path
         );
+        // An explicit recheck also forgets any cached MAME answer for this game.
+        crate::arcade_mame_probe::invalidate_path(&path);
         if !running {
             self.app.launch_standalone.clear_cue_review();
             self.app.start_selected_evidence_load(context.clone(), path);

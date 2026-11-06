@@ -937,6 +937,14 @@ impl ArchiveFsApp {
         let member_path = |record: &ArchiveRecord| self.resolved_archive_member_path(record);
         let is_scummvm_folder = |path: &Path| self.persisted_scummvm_folder(path).is_some();
         let loose_ref = |path: &Path| self.catalogued_loose_content_ref(path);
+        let is_arcade_set_directory = |path: &Path| {
+            self.database_state.snapshot().is_some_and(|snapshot| {
+                snapshot
+                    .archives
+                    .iter()
+                    .any(|a| a.archive_kind == "arcade_set_directory" && a.absolute_path == path)
+            })
+        };
         super::readiness_input::ReadinessSources {
             readiness: &self.emulator_readiness,
             evidence: &self.selected_evidence_ui.selected_evidence,
@@ -948,6 +956,7 @@ impl ArchiveFsApp {
             member_path: &member_path,
             is_scummvm_folder: &is_scummvm_folder,
             loose_ref: &loose_ref,
+            is_arcade_set_directory: &is_arcade_set_directory,
         }
         .build(live)
     }

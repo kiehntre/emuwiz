@@ -4731,14 +4731,24 @@ fn mame_launch_request(
         )
     })?;
     // An extracted set folder is judged by the installed MAME's own per-set
-    // data; the same cached probe the readiness card used.
-    let arcade_probe = crate::arcade_mame_probe::probe_for_set_directory(&executable, &path);
-    let (resolution, extra_rompaths) = if let Some(probe) = arcade_probe {
-        if probe.verdict.readiness == archivefs_core::arcade_mame_routing::ArcadeReadiness::Blocked
-        {
-            return Err(crate::arcade_mame_probe::blocker_for(&probe.verdict));
+    // data (cached, probed in the background, never on this thread).
+    let arcade_lookup = (platform_id == "Arcade")
+        .then(|| crate::arcade_mame_probe::lookup(&executable, &path))
+        .flatten();
+    let (resolution, extra_rompaths) = if let Some(lookup) = arcade_lookup {
+        match lookup {
+            crate::arcade_mame_probe::Lookup::Checking => {
+                return Err(crate::arcade_mame_probe::checking_blocker());
+            }
+            crate::arcade_mame_probe::Lookup::Done(probe) => {
+                if probe.verdict.readiness
+                    == archivefs_core::arcade_mame_routing::ArcadeReadiness::Blocked
+                {
+                    return Err(crate::arcade_mame_probe::blocker_for(&probe));
+                }
+                (probe.resolution.clone(), probe.extra_rompaths.clone())
+            }
         }
-        (probe.resolution.clone(), probe.extra_rompaths.clone())
     } else {
         let database_path = archivefs_core::default_database_path().map_err(|error| {
             mame_blocker(

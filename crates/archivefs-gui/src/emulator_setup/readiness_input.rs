@@ -26,6 +26,8 @@ pub(crate) struct ReadinessSources<'a> {
     pub(crate) member_path: &'a dyn Fn(&ArchiveRecord) -> Option<PathBuf>,
     pub(crate) is_scummvm_folder: &'a dyn Fn(&Path) -> bool,
     pub(crate) loose_ref: &'a dyn Fn(&Path) -> Option<archivefs_core::launch::LaunchContentRef>,
+    /// True only for a catalogued `arcade_set_directory` at exactly this path.
+    pub(crate) is_arcade_set_directory: &'a dyn Fn(&Path) -> bool,
 }
 
 impl ReadinessSources<'_> {
@@ -164,13 +166,29 @@ impl ReadinessSources<'_> {
         // An extracted Arcade set folder is routed by the installed MAME's own
         // per-set data (driver status, ROM verify incl. extra read-only
         // rompaths), not by the old DAT join. No category is a gate.
-        let arcade_probe = focused.and_then(|path| {
-            let executable = self
-                .readiness
-                .emulator_setup_overrides
-                .executable(crate::emulator_setup_overrides::OverridableEmulator::Mame)?;
-            crate::arcade_mame_probe::probe_for_set_directory(executable, path)
-        });
+        let mame_executable = self
+            .readiness
+            .emulator_setup_overrides
+            .executable(crate::emulator_setup_overrides::OverridableEmulator::Mame);
+        // Only a catalogued Arcade set folder is ever handed to MAME here; any
+        // other game (ScummVM, DOS, PS3 ...) never reaches the probe and its
+        // identity is left exactly as the other routes resolved it.
+        let arcade_target =
+            arcade_probe_target(focused, self.is_arcade_set_directory, mame_executable);
+        // Selection moved on: stop foreground probes for any other folder.
+        crate::arcade_mame_probe::cancel_foreground_except(arcade_target.map(|(path, _)| path));
+        let mut arcade_probe = None;
+        if let Some((path, executable)) = arcade_target {
+            match crate::arcade_mame_probe::lookup(executable, path) {
+                Some(crate::arcade_mame_probe::Lookup::Checking) => {
+                    // Neither Ready nor Blocked: shown as "checking" and
+                    // re-polled when the background probe wakes the UI.
+                    return LaunchReadinessInput::EvidenceNotLoaded;
+                }
+                Some(crate::arcade_mame_probe::Lookup::Done(probe)) => arcade_probe = Some(probe),
+                None => {}
+            }
+        }
         if let Some(probe) = &arcade_probe {
             identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(
                 archivefs_core::launch::ResolvedIdentity {
@@ -1583,6 +1601,18 @@ pub(crate) fn identity_unknown_reason(
     Reason::NotConfirmed
 }
 
+/// The only case in which MAME is asked about a folder: a catalogued Arcade
+/// set directory AND a configured MAME. Any other game yields `None`, so the
+/// probe never runs and identity/set resolutions are never overwritten.
+fn arcade_probe_target<'a>(
+    focused: Option<&'a Path>,
+    is_arcade_set_directory: &dyn Fn(&Path) -> bool,
+    executable: Option<&'a Path>,
+) -> Option<(&'a Path, &'a Path)> {
+    let path = focused.filter(|path| is_arcade_set_directory(path))?;
+    Some((path, executable?))
+}
+
 /// Says precisely what is missing for the MAME route when RetroArch refused an
 /// extracted arcade set and no MAME candidate exists. Wording only: nothing is
 /// unblocked and no candidate is added.
@@ -1851,6 +1881,27 @@ mod arcade_set_shape_tests {
             candidates,
             media_topology: None,
         }
+    }
+
+    #[test]
+    fn only_a_catalogued_arcade_set_directory_is_ever_probed() {
+        let exe = Path::new("/usr/bin/mame");
+        let arcade = Path::new("/lib/arcade/pacman");
+        let is_arcade = |p: &Path| p == arcade;
+        assert_eq!(
+            arcade_probe_target(Some(arcade), &is_arcade, Some(exe)),
+            Some((arcade, exe))
+        );
+        // ScummVM / DOS / PS3 / any other folder: no probe at all.
+        for other in ["/lib/scummvm/monkey", "/lib/dos/doom", "/lib/ps3/game"] {
+            assert_eq!(
+                arcade_probe_target(Some(Path::new(other)), &is_arcade, Some(exe)),
+                None
+            );
+        }
+        assert_eq!(arcade_probe_target(None, &is_arcade, Some(exe)), None);
+        // No MAME configured: nothing to ask.
+        assert_eq!(arcade_probe_target(Some(arcade), &is_arcade, None), None);
     }
 
     #[test]

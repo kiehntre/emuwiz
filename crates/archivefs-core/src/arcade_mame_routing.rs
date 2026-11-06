@@ -178,6 +178,10 @@ pub enum VerifyProblemKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifyProblem {
     pub file: String,
+    /// MAME prints no `(N bytes)` for CHD disk images.
+    pub is_disk: bool,
+    /// Expected size from `(N bytes)`; `None` for disks.
+    pub size: Option<u64>,
     pub kind: VerifyProblemKind,
 }
 
@@ -185,6 +189,23 @@ pub struct VerifyProblem {
 pub struct VerifyReport {
     pub state: VerifyState,
     pub problems: Vec<VerifyProblem>,
+}
+
+/// Splits `file (N bytes) - STATUS` (ROM) or `disk - STATUS` (CHD).
+fn split_problem_line(rest: &str) -> Option<(String, bool, Option<u64>, &str)> {
+    if let Some((file_part, status)) = rest.rsplit_once(" bytes) - ") {
+        let (file, size) = match file_part.rsplit_once(" (") {
+            Some((name, n)) => (name, n.trim().parse::<u64>().ok()),
+            None => (file_part, None),
+        };
+        return Some((file.trim().to_string(), false, size, status));
+    }
+    for marker in [" - NOT FOUND", " - INCORRECT ", " - NO GOOD DUMP"] {
+        if let Some(at) = rest.find(marker) {
+            return Some((rest[..at].trim().to_string(), true, None, &rest[at + 3..]));
+        }
+    }
+    None
 }
 
 pub fn parse_verify_output(output: &str, set: &str) -> VerifyReport {
@@ -211,12 +232,8 @@ pub fn parse_verify_output(output: &str, set: &str) -> VerifyReport {
             };
         } else if let Some((owner, rest)) = line.split_once(" : ")
             && owner.trim() == set
-            && let Some((file_part, status)) = rest.rsplit_once(" bytes) - ")
+            && let Some((file, is_disk, size, status)) = split_problem_line(rest)
         {
-            let file = file_part
-                .rsplit_once(" (")
-                .map_or(file_part, |(name, _)| name)
-                .to_string();
             let kind = if let Some(after) = status.strip_prefix("NOT FOUND") {
                 let after = after.trim();
                 if after.contains("NO GOOD DUMP KNOWN") {
@@ -235,7 +252,12 @@ pub fn parse_verify_output(output: &str, set: &str) -> VerifyReport {
             } else {
                 VerifyProblemKind::Other(status.to_string())
             };
-            problems.push(VerifyProblem { file, kind });
+            problems.push(VerifyProblem {
+                file,
+                is_disk,
+                size,
+                kind,
+            });
         }
     }
     VerifyReport { state, problems }
@@ -326,7 +348,7 @@ pub fn informational_warnings(facts: &MameMachineFacts) -> Vec<String> {
         .next()
         .is_some_and(|dir| FRUIT_DRIVER_DIRS.contains(&dir));
     if has("gambling") || facts.is_mechanical || fruit_family {
-        out.push("gambling/fruit machine: may need special controls or credits".into());
+        out.push("gambling/AWP machine, may need operator setup on first run (special controls or credits)".into());
     }
     if facts.is_mechanical {
         out.push("mechanical machine: reels and lamps are shown only through its layout".into());
@@ -342,6 +364,102 @@ fn block(reason: ArcadeBlockReason, detail: String) -> ArcadeMameVerdict {
         warnings: Vec::new(),
         notes: Vec::new(),
     }
+}
+
+/// What sandbox evidence (claude-d0, 2026-11-06) showed MAME does for one
+/// specific set. Per-set, never per-category.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetOutcome {
+    /// Demonstrated to run; the text qualifies how far (experimental).
+    Warn(&'static str),
+    /// Demonstrated unusable (or unusable without something not installed).
+    Block(&'static str),
+}
+
+/// Sets with a demonstrated MAME outcome, from `wrongdump-sample.md` and
+/// `artwork-sample.md`. Adding or flipping an entry is a data change.
+pub const WRONG_DUMP_EVIDENCE: &[(&str, SetOutcome)] = &[
+    (
+        "3wonders",
+        SetOutcome::Warn(
+            "its only bad file is a small PLD; MAME showed the title and game-select menu after a notice (sandbox grade A)",
+        ),
+    ),
+    (
+        "1943b",
+        SetOutcome::Warn(
+            "experimental: MAME showed a notice then gameplay (sandbox grade B; input not isolated)",
+        ),
+    ),
+    (
+        "gauntletr4",
+        SetOutcome::Warn(
+            "experimental: MAME showed a notice then attract gameplay (sandbox grade B)",
+        ),
+    ),
+    (
+        "sf2cejc",
+        SetOutcome::Warn(
+            "experimental: MAME showed a notice then the attract intro (sandbox grade B)",
+        ),
+    ),
+    (
+        "sailormnot",
+        SetOutcome::Block(
+            "a program ROM is wrong and MAME runs to a near-black, unusable screen (sandbox grade F)",
+        ),
+    ),
+    (
+        "island2a",
+        SetOutcome::Block(
+            "MAME stops at 'INIT MACHINE' with a blank screen (operator initialisation; sandbox grade F)",
+        ),
+    ),
+];
+
+/// Sets known to start but not give usable play, whatever their ROM state.
+pub const KNOWN_FAILED: &[(&str, &str)] = &[(
+    "cluedo",
+    "MAME starts it to a black screen (not normally playable)",
+)];
+
+/// `requiresartwork` sets: block only where missing artwork prevents usable
+/// play (artwork-sample.md). Others, including unlisted ones, only warn.
+pub const ARTWORK_EVIDENCE: &[(&str, SetOutcome)] = &[
+    (
+        "solarwar",
+        SetOutcome::Block(
+            "requires external artwork, not installed: without the backdrop only lamps and score are drawn",
+        ),
+    ),
+    (
+        "videopin",
+        SetOutcome::Block(
+            "requires external artwork, not installed: without the table artwork only flippers and ball are drawn",
+        ),
+    ),
+    (
+        "triplhnt",
+        SetOutcome::Block(
+            "requires external artwork, not installed: its calibration square is not visible and it does not advance",
+        ),
+    ),
+    (
+        "m4conn4",
+        SetOutcome::Block(
+            "requires external artwork, not installed; fruit-machine play also needs an unverified coin/attendant flow",
+        ),
+    ),
+    (
+        "gollygho",
+        SetOutcome::Warn(
+            "MAME asks for external artwork (not installed); the game runs without it; needs a lightgun",
+        ),
+    ),
+];
+
+fn evidence_for(table: &'static [(&'static str, SetOutcome)], set: &str) -> Option<SetOutcome> {
+    table.iter().find(|(name, _)| *name == set).map(|(_, o)| *o)
 }
 
 /// Pure readiness decision. `artwork_present` is only consulted when MAME says
@@ -373,6 +491,10 @@ pub fn evaluate_arcade_set(
             format!("MAME marks {set} as not working (preliminary emulation); it would not play"),
         );
     }
+    if let Some((_, why)) = KNOWN_FAILED.iter().find(|(name, _)| *name == set) {
+        return block(ArcadeBlockReason::NotWorking, format!("{set}: {why}"));
+    }
+    let mut wrong_dump_warning: Option<String> = None;
     match verify.state {
         VerifyState::Good | VerifyState::BestAvailable => {}
         VerifyState::NoOwnFiles => {
@@ -383,7 +505,10 @@ pub fn evaluate_arcade_set(
                 ),
             );
         }
-        VerifyState::Bad => return bad_verdict(set, verify),
+        VerifyState::Bad => match bad_verdict(set, verify) {
+            Ok(warning) => wrong_dump_warning = Some(warning),
+            Err(blocked) => return blocked,
+        },
         _ => {
             return block(
                 ArcadeBlockReason::CheckFailed,
@@ -391,15 +516,21 @@ pub fn evaluate_arcade_set(
             );
         }
     }
+    let mut warnings: Vec<String> = wrong_dump_warning.into_iter().collect();
     if facts.requires_artwork && !artwork_present {
-        return block(
-            ArcadeBlockReason::ArtworkMissing,
-            format!(
-                "MAME says {set} requires external artwork (a layout) and none was found with the set"
-            ),
-        );
+        match evidence_for(ARTWORK_EVIDENCE, set) {
+            Some(SetOutcome::Block(why)) => {
+                return block(ArcadeBlockReason::ArtworkMissing, format!("{set} {why}"));
+            }
+            Some(SetOutcome::Warn(why)) => warnings.push(format!("{set}: {why}")),
+            // No demonstrated failure: MAME asks for artwork, so say so, but
+            // do not claim the game cannot be played.
+            None => warnings.push(format!(
+                "{set} may need external artwork (none found in the set folder or MAME's artwork folders)"
+            )),
+        }
     }
-    let warnings = informational_warnings(facts);
+    warnings.extend(informational_warnings(facts));
     let mut notes = Vec::new();
     if verify.state == VerifyState::BestAvailable {
         notes.push(
@@ -419,11 +550,20 @@ pub fn evaluate_arcade_set(
     }
 }
 
-fn bad_verdict(set: &str, verify: &VerifyReport) -> ArcadeMameVerdict {
+/// `Ok(warning)` only for a wrong-dump-only set with a DEMONSTRATED outcome
+/// (an experimental qualification); everything else is `Err(blocked)` naming
+/// the bad ROMs. The old "small file" size heuristic is deliberately gone: it
+/// was not proof of playability.
+fn bad_verdict(set: &str, verify: &VerifyReport) -> Result<String, ArcadeMameVerdict> {
     let mut deps: Vec<String> = Vec::new();
     let mut own_missing: Vec<String> = Vec::new();
     let mut wrong: Vec<String> = Vec::new();
     for problem in &verify.problems {
+        let label = if problem.is_disk {
+            format!("disk image {}", problem.file)
+        } else {
+            problem.file.clone()
+        };
         match &problem.kind {
             VerifyProblemKind::NotFound {
                 dependency: Some(dep),
@@ -432,44 +572,67 @@ fn bad_verdict(set: &str, verify: &VerifyReport) -> ArcadeMameVerdict {
                     deps.push(dep.clone());
                 }
             }
-            VerifyProblemKind::NotFound { dependency: None } => {
-                own_missing.push(problem.file.clone())
-            }
+            VerifyProblemKind::NotFound { dependency: None } => own_missing.push(label),
             VerifyProblemKind::IncorrectLength | VerifyProblemKind::IncorrectChecksum => {
-                wrong.push(problem.file.clone())
+                let what = if problem.kind == VerifyProblemKind::IncorrectLength {
+                    "the wrong length"
+                } else {
+                    "an incorrect checksum"
+                };
+                wrong.push(format!("{label} has {what}"));
             }
             _ => {}
         }
     }
+    // Every kind of problem is named; none hides another.
+    let mut parts = Vec::new();
     if !own_missing.is_empty() {
-        let mut text = format!("{set} is missing ROM files: {}", list(&own_missing));
-        if !deps.is_empty() {
-            text.push_str(&format!("; also needs BIOS/device set {}", list(&deps)));
-        }
-        return block(ArcadeBlockReason::RomsIncomplete, text);
-    }
-    if !wrong.is_empty() && deps.is_empty() {
-        return block(
-            ArcadeBlockReason::RomsWrongVersion,
-            format!(
-                "{set} has ROM files that differ from what this MAME version expects: {}",
-                list(&wrong)
-            ),
-        );
+        parts.push(format!("missing files: {}", list(&own_missing)));
     }
     if !deps.is_empty() {
-        return block(
-            ArcadeBlockReason::BiosOrDeviceMissing,
-            format!(
-                "{set} needs BIOS/device ROM set {} which MAME could not find",
-                list(&deps)
-            ),
-        );
+        parts.push(format!(
+            "needs BIOS/device set {} which MAME could not find",
+            list(&deps)
+        ));
     }
-    block(
-        ArcadeBlockReason::RomsIncomplete,
-        format!("MAME reports the ROMs for {set} are incomplete or wrong"),
-    )
+    if !wrong.is_empty() {
+        parts.push(format!(
+            "wrong dump version: {} - MAME may refuse or run with a warning",
+            list(&wrong)
+        ));
+    }
+    if parts.is_empty() {
+        return Err(block(
+            ArcadeBlockReason::RomsIncomplete,
+            format!("MAME reports the ROMs for {set} are incomplete or wrong"),
+        ));
+    }
+    let detail = format!("{set}: {}", parts.join("; "));
+    if own_missing.is_empty() && deps.is_empty() {
+        match evidence_for(WRONG_DUMP_EVIDENCE, set) {
+            Some(SetOutcome::Warn(how)) => {
+                return Ok(format!(
+                    "MAME reports incorrect ROM files ({}) and shows a notice; {how}",
+                    list(&wrong)
+                ));
+            }
+            Some(SetOutcome::Block(why)) => {
+                return Err(block(
+                    ArcadeBlockReason::RomsWrongVersion,
+                    format!("{detail}; {why}"),
+                ));
+            }
+            None => {}
+        }
+    }
+    let reason = if !own_missing.is_empty() {
+        ArcadeBlockReason::RomsIncomplete
+    } else if !deps.is_empty() {
+        ArcadeBlockReason::BiosOrDeviceMissing
+    } else {
+        ArcadeBlockReason::RomsWrongVersion
+    };
+    Err(block(reason, detail))
 }
 
 // ---------------------------------------------------------------------------
@@ -571,8 +734,37 @@ pub fn rompath_argument(set_parent: &Path, extra: &[PathBuf]) -> OsString {
 // Artwork presence (only used when MAME says artwork is required)
 // ---------------------------------------------------------------------------
 
+/// Looks for artwork in the places derivable read-only: the set folder
+/// itself (`*.lay` or an `artwork` folder) and `artwork/<set>[.zip]` under the
+/// collection folder, its parent and the executable's folder. MAME's real
+/// artpath cannot be known from here, so "not found" means "not located".
+pub fn artwork_located(set: &str, set_dir: &Path, executable: &Path) -> bool {
+    if set_folder_has_artwork(set_dir) {
+        return true;
+    }
+    let mut bases: Vec<PathBuf> = Vec::new();
+    if let Some(collection) = set_dir.parent() {
+        bases.push(collection.join("artwork"));
+        if let Some(above) = collection.parent() {
+            bases.push(above.join("artwork"));
+        }
+    }
+    if let Some(exe_dir) = executable.parent() {
+        bases.push(exe_dir.join("artwork"));
+    }
+    // MAME 0.264's compiled-in artpath (per `mame -showconfig`).
+    if let Some(home) = std::env::var_os("HOME") {
+        bases.push(PathBuf::from(home).join("mame").join("artwork"));
+    }
+    bases.push(PathBuf::from("/usr/local/share/games/mame/artwork"));
+    bases.push(PathBuf::from("/usr/share/games/mame/artwork"));
+    bases
+        .iter()
+        .any(|base| base.join(format!("{set}.zip")).exists() || base.join(set).is_dir())
+}
+
 /// True when the set folder itself carries a layout (`*.lay`) or an
-/// `artwork` folder. Nothing outside the set folder is guessed at.
+/// `artwork` folder.
 pub fn set_folder_has_artwork(set_dir: &Path) -> bool {
     if set_dir.join("artwork").is_dir() {
         return true;
@@ -632,7 +824,10 @@ fn run_bounded(
         match child.try_wait() {
             Ok(Some(_)) => break true,
             Ok(None) if Instant::now() >= deadline || cancel.load(Ordering::Relaxed) => {
-                let _ = child.kill();
+                // Kill the whole group while the child is still unreaped, so
+                // its pid (= group id) cannot have been reused yet.
+                // SAFETY: the group id is our own just-spawned child's pid.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
                 let _ = child.wait();
                 break false;
             }
@@ -640,6 +835,9 @@ fn run_bounded(
             Err(_) => break false,
         }
     };
+    // After a normal exit the child is already reaped, so there is a tiny pid
+    // reuse window before this group kill; it only matters to reach a
+    // grandchild that kept the pipes open (otherwise the readers would hang).
     // SAFETY: the group id is our own just-spawned child's pid (process_group(0)).
     unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
     let mut bytes = out.join().unwrap_or_default();
@@ -679,6 +877,11 @@ pub fn probe_arcade_set(
     let Some(parent) = set_dir.parent() else {
         return failed("the set folder has no parent collection folder");
     };
+    if parent.to_string_lossy().contains(';') || !parent.is_absolute() {
+        return failed(
+            "the collection folder path contains ';' or is not absolute, so it cannot be a MAME ROM path",
+        );
+    }
     let (extra, _rejected) = validate_extra_rompaths(extra_rompaths);
     let base = [
         OsString::from("-noreadconfig"),
@@ -701,7 +904,7 @@ pub fn probe_arcade_set(
     };
     let verify = parse_verify_output(&verify_text, set);
     let facts = parse_machine_facts(&xml_text, set).unwrap_or(None);
-    let artwork = set_folder_has_artwork(set_dir);
+    let artwork = artwork_located(set, set_dir, executable);
     let verdict = evaluate_arcade_set(set, facts.as_ref(), &verify, artwork);
     ArcadeProbe {
         facts,

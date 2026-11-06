@@ -182,7 +182,7 @@ fn category_is_never_a_gate() {
         assert!(
             v.warnings
                 .iter()
-                .any(|w| w.contains("gambling/fruit machine"))
+                .any(|w| w.contains("gambling/AWP machine"))
         );
     }
     // And the same blockers apply to every category alike.
@@ -217,19 +217,142 @@ fn lightgun_and_mahjong_get_special_controls_warnings() {
 }
 
 #[test]
-fn required_artwork_blocks_only_when_absent() {
+fn artwork_blocks_only_demonstrated_unusable_sets_and_only_until_installed() {
+    for set in ["solarwar", "videopin", "triplhnt", "m4conn4"] {
+        let f = facts(
+            &machine(set, "good", "good", "", "", r#"requiresartwork="yes""#),
+            set,
+        );
+        let blocked = evaluate_arcade_set(set, Some(&f), &good(set), false);
+        assert_eq!(
+            blocked.block_reason,
+            Some(ArcadeBlockReason::ArtworkMissing),
+            "{set}"
+        );
+        assert!(blocked.blockers[0].contains("requires external artwork, not installed"));
+        // Data-driven: once artwork is located the set is no longer blocked.
+        let ok = evaluate_arcade_set(set, Some(&f), &good(set), true);
+        assert_ne!(ok.readiness, ArcadeReadiness::Blocked);
+    }
+    // gollygho runs without it: Play with a warning naming artwork + lightgun.
     let f = facts(
-        &machine("art", "good", "good", "", "", r#"requiresartwork="yes""#),
-        "art",
+        &machine(
+            "gollygho",
+            "good",
+            "good",
+            "",
+            r#"<control type="lightgun"/>"#,
+            r#"requiresartwork="yes""#,
+        ),
+        "gollygho",
     );
-    assert!(f.requires_artwork);
-    let blocked = evaluate_arcade_set("art", Some(&f), &good("art"), false);
-    assert_eq!(
-        blocked.block_reason,
-        Some(ArcadeBlockReason::ArtworkMissing)
+    let v = evaluate_arcade_set("gollygho", Some(&f), &good("gollygho"), false);
+    assert_eq!(v.readiness, ArcadeReadiness::ReadyWithWarning);
+    assert!(v.warnings.iter().any(|w| w.contains("artwork")));
+    assert!(v.warnings.iter().any(|w| w.contains("lightgun")));
+    // An unlisted requiresartwork set is not auto-blocked.
+    let f = facts(
+        &machine("other", "good", "good", "", "", r#"requiresartwork="yes""#),
+        "other",
     );
-    let ok = evaluate_arcade_set("art", Some(&f), &good("art"), true);
-    assert_eq!(ok.readiness, ArcadeReadiness::Ready);
+    let v = evaluate_arcade_set("other", Some(&f), &good("other"), false);
+    assert_eq!(v.readiness, ArcadeReadiness::ReadyWithWarning);
+    assert!(v.warnings[0].contains("may need external artwork"));
+}
+
+#[test]
+fn wrong_dump_only_follows_demonstrated_outcomes_and_otherwise_blocks_naming_the_rom() {
+    let text = |set: &str, file: &str, size: u64| {
+        format!(
+            "romset {set} is bad\n{set:<12}: {file} ({size} bytes) - INCORRECT CHECKSUM:\nEXPECTED: CRC(1)\n   FOUND: CRC(2)\n"
+        )
+    };
+    for set in ["3wonders", "1943b", "gauntletr4", "sf2cejc"] {
+        let f = facts(&machine(set, "good", "good", "", "", ""), set);
+        let v = evaluate_arcade_set(
+            set,
+            Some(&f),
+            &verify_text(&text(set, "x.bin", 260), set),
+            false,
+        );
+        assert_eq!(v.readiness, ArcadeReadiness::ReadyWithWarning, "{set}");
+        assert!(v.warnings[0].contains("x.bin") && v.warnings[0].contains("notice"));
+    }
+    for set in ["sailormnot", "island2a"] {
+        let f = facts(&machine(set, "good", "good", "", "", ""), set);
+        let v = evaluate_arcade_set(
+            set,
+            Some(&f),
+            &verify_text(&text(set, "smprg.u45", 524288), set),
+            false,
+        );
+        assert_eq!(
+            v.block_reason,
+            Some(ArcadeBlockReason::RomsWrongVersion),
+            "{set}"
+        );
+        assert!(v.blockers[0].contains("smprg.u45"));
+    }
+    // No demonstrated outcome: blocked even for a tiny file (size is not proof).
+    let f = facts(&machine("nodata", "good", "good", "", "", ""), "nodata");
+    let v = evaluate_arcade_set(
+        "nodata",
+        Some(&f),
+        &verify_text(&text("nodata", "ioc1.ic1", 260), "nodata"),
+        false,
+    );
+    assert_eq!(v.block_reason, Some(ArcadeBlockReason::RomsWrongVersion));
+    assert!(v.blockers[0].contains("ioc1.ic1") && v.blockers[0].contains("may refuse"));
+}
+
+#[test]
+fn known_failed_sets_are_never_called_playable_whatever_their_category() {
+    let f = facts(
+        &machine(
+            "cluedo",
+            "good",
+            "good",
+            "",
+            r#"<control type="gambling"/>"#,
+            "",
+        ),
+        "cluedo",
+    );
+    let v = evaluate_arcade_set("cluedo", Some(&f), &good("cluedo"), true);
+    assert_eq!(v.readiness, ArcadeReadiness::Blocked);
+    assert!(v.blockers[0].contains("black screen"));
+}
+
+#[test]
+fn chd_lines_without_byte_counts_and_mixed_problems_are_all_named() {
+    let out = "romset a51 [parent] is bad\n\
+a51         : a51site4-2_01 - NOT FOUND\n\
+a51         : lindbios.bin (1024 bytes) - NOT FOUND (lindbios)\n\
+a51         : sound_roms - NOT FOUND (lindbios)\n\
+a51         : w.bin (10 bytes) - INCORRECT LENGTH: 5 bytes\n\
+a51         : z.bin (10 bytes) - INCORRECT CHECKSUM:\nEXPECTED: CRC(1)\n   FOUND: CRC(2)\n";
+    let report = verify_text(out, "a51");
+    assert_eq!(report.problems.len(), 5);
+    assert!(report.problems[0].is_disk && report.problems[0].file == "a51site4-2_01");
+    let f = facts(&machine("a51", "good", "good", "", "", ""), "a51");
+    let v = evaluate_arcade_set("a51", Some(&f), &report, false);
+    let text = &v.blockers[0];
+    assert_eq!(v.block_reason, Some(ArcadeBlockReason::RomsIncomplete));
+    assert!(text.contains("disk image a51site4-2_01"));
+    assert!(text.contains("lindbios"));
+    assert!(
+        text.contains("w.bin has the wrong length")
+            && text.contains("z.bin has an incorrect checksum")
+    );
+}
+
+#[test]
+fn dependency_plus_wrong_dump_lists_both() {
+    let out = "romset q is bad\nq           : b.bin (1 bytes) - NOT FOUND (neogeo)\nq           : w.bin (10 bytes) - INCORRECT CHECKSUM:\n";
+    let f = facts(&machine("q", "good", "good", "", "", ""), "q");
+    let v = evaluate_arcade_set("q", Some(&f), &verify_text(out, "q"), false);
+    assert_eq!(v.block_reason, Some(ArcadeBlockReason::BiosOrDeviceMissing));
+    assert!(v.blockers[0].contains("neogeo") && v.blockers[0].contains("w.bin"));
 }
 
 #[test]
@@ -398,6 +521,52 @@ fn probe_passes_the_extra_rompath_and_readiness_follows_the_verify_result() {
     // Nothing was written into the collection or the BIOS folder.
     assert_eq!(std::fs::read_dir(&bios).unwrap().count(), 0);
     assert_eq!(std::fs::read_dir(&set_dir).unwrap().count(), 0);
+}
+
+#[test]
+fn parent_folder_with_a_semicolon_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = fake_mame(dir.path());
+    let set_dir = dir.path().join("a;b").join("blk");
+    std::fs::create_dir_all(&set_dir).unwrap();
+    let probe = probe_arcade_set(
+        &exe,
+        "blk",
+        &set_dir,
+        &[],
+        Duration::from_secs(5),
+        &AtomicBool::new(false),
+    );
+    assert_eq!(
+        probe.verdict.block_reason,
+        Some(ArcadeBlockReason::CheckFailed)
+    );
+    assert!(probe.verdict.blockers[0].contains("';'"));
+}
+
+#[test]
+fn a_grandchild_holding_the_pipe_does_not_hang_the_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("leaky");
+    std::fs::write(
+        &exe,
+        "#!/bin/sh\ncase \"$*\" in *-listxml*) echo '<mame><machine name=\"x\"><driver status=\"good\" emulation=\"good\"/></machine></mame>';; *) echo 'romset x is good';; esac\n(sleep 30 &)\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let set_dir = dir.path().join("arcade").join("x");
+    std::fs::create_dir_all(&set_dir).unwrap();
+    let started = Instant::now();
+    let probe = probe_arcade_set(
+        &exe,
+        "x",
+        &set_dir,
+        &[],
+        Duration::from_secs(20),
+        &AtomicBool::new(false),
+    );
+    assert_eq!(probe.verdict.readiness, ArcadeReadiness::Ready);
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
 
 #[test]
