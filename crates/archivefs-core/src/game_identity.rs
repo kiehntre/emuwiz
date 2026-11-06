@@ -1680,7 +1680,9 @@ fn validate_game_boy_header(
 /// Extensions that identify a *different* 8-bit Sega system than the trusted
 /// folder platform. A `.sms` in a Game Gear folder (or `.gg` in a Master
 /// System one) is refused as a cross-platform mismatch rather than silently
-/// verified or reported as a bare "unsupported extension".
+/// verified or reported as a bare "unsupported extension". The extension may
+/// simply be wrong (a real Game Gear dump named `.sms`), so the text asks for
+/// a rename and never claims what the file really is.
 pub(crate) fn cross_platform_extension_mismatch(
     path: &Path,
     platform: IdentityPlatform,
@@ -1688,12 +1690,12 @@ pub(crate) fn cross_platform_extension_mismatch(
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     match (platform, extension.as_str()) {
         (IdentityPlatform::GameGear, "sms") => Some(
-            "cross-platform mismatch: a .sms (Master System) ROM is filed under Game Gear; \
-             it was not verified for this platform",
+            "cross-platform mismatch: the .sms extension does not match Game Gear; rename the \
+             file to .gg (or move it to the Master System folder) - EmuWiz does not guess",
         ),
         (IdentityPlatform::MasterSystem, "gg") => Some(
-            "cross-platform mismatch: a .gg (Game Gear) ROM is filed under Master System; \
-             it was not verified for this platform",
+            "cross-platform mismatch: the .gg extension does not match Master System; rename the \
+             file to .sms (or move it to the Game Gear folder) - EmuWiz does not guess",
         ),
         _ => None,
     }

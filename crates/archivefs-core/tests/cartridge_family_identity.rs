@@ -179,7 +179,9 @@ fn sms_under_game_gear_and_gg_under_master_system_are_refused_as_mismatches() {
                 .evidence
                 .iter()
                 .any(|e| e.status == IdentityStatus::Invalid
-                    && e.diagnostic.contains("cross-platform mismatch")),
+                    && e.diagnostic.contains("cross-platform mismatch")
+                    && e.diagnostic.contains("rename the file")
+                    && e.diagnostic.contains("EmuWiz does not guess")),
             "{id}"
         );
         let zip = zip_of(&[(file, &rom(32 * 1024))]);
@@ -335,5 +337,137 @@ fn registry_ids_round_trip_through_identity_and_back() {
             "{id} must be a real Platform::id"
         );
         assert_eq!(IdentityPlatform::from_catalogue(Some(id)), *platform);
+    }
+}
+
+const KIB: usize = 1024;
+const MIB: usize = 1024 * 1024;
+
+fn accepted_loose(dir: &Path, id: &str, ext: &str, len: usize) -> bool {
+    let path = write(dir, &format!("B.{ext}"), &rom(len));
+    let report = inspect_catalogued_game_identity(&path, Some(id));
+    report.complete && report.verified_loose_rom_sha256().is_some()
+}
+
+#[test]
+fn size_boundaries_are_exact() {
+    let dir = scratch();
+    let d = dir.path();
+    // GG and SMS: 1 KiB..=4 MiB in 512-byte steps (copier header = +512).
+    for (id, ext) in [("GameGear", "gg"), ("MasterSystem", "sms")] {
+        assert!(accepted_loose(d, id, ext, KIB), "{id} min");
+        assert!(
+            accepted_loose(d, id, ext, 32 * KIB + 512),
+            "{id} copier header"
+        );
+        assert!(accepted_loose(d, id, ext, 4 * MIB), "{id} max");
+        assert!(!accepted_loose(d, id, ext, 512), "{id} below min");
+        assert!(!accepted_loose(d, id, ext, 4 * MIB + 512), "{id} above max");
+        assert!(
+            !accepted_loose(d, id, ext, 32 * KIB + 1),
+            "{id} not a 512 step"
+        );
+    }
+    // 32X: 512 B..=4 MiB in 512-byte steps.
+    assert!(accepted_loose(d, "Sega 32X", "32x", 512));
+    assert!(accepted_loose(d, "Sega 32X", "32x", 3 * MIB + 512));
+    assert!(accepted_loose(d, "Sega 32X", "32x", 4 * MIB));
+    assert!(!accepted_loose(d, "Sega 32X", "32x", 256));
+    assert!(!accepted_loose(d, "Sega 32X", "32x", 4 * MIB + 512));
+    assert!(!accepted_loose(d, "Sega 32X", "32x", 3_519_728));
+    // HuCard: multiple of 8 KiB (+512 header), 8 KiB..=3 MiB (+512).
+    assert!(accepted_loose(d, "TurboGrafx-16", "pce", 8 * KIB));
+    assert!(accepted_loose(d, "TurboGrafx-16", "pce", 3 * MIB));
+    assert!(accepted_loose(d, "TurboGrafx-16", "pce", 256 * KIB + 512));
+    assert!(!accepted_loose(d, "TurboGrafx-16", "pce", 4 * KIB));
+    assert!(!accepted_loose(
+        d,
+        "TurboGrafx-16",
+        "pce",
+        3 * MIB + 8 * KIB
+    ));
+    assert!(!accepted_loose(d, "TurboGrafx-16", "pce", 256 * KIB + 1));
+    // ColecoVision: 1 KiB..=1 MiB.
+    assert!(accepted_loose(d, "ColecoVision", "col", KIB));
+    assert!(accepted_loose(d, "ColecoVision", "col", MIB));
+    assert!(!accepted_loose(d, "ColecoVision", "col", KIB - 1));
+    assert!(!accepted_loose(d, "ColecoVision", "col", MIB + 1));
+}
+
+#[test]
+fn zipped_member_with_a_refused_size_is_refused_not_verified() {
+    let dir = scratch();
+    // Same size as a real 32X zip that is not a 512-byte multiple. Poorly
+    // compressible bytes keep the zip realistic (no ratio-limit refusal).
+    let mut state = 0x2545_F491_u32;
+    let noisy = |len: usize, state: &mut u32| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                *state ^= *state << 13;
+                *state ^= *state >> 17;
+                *state ^= *state << 5;
+                *state as u8
+            })
+            .collect()
+    };
+    let odd = noisy(3_519_728, &mut state);
+    let zip = zip_of(&[("Odd.32x", &odd)]);
+    let path = write(dir.path(), "Odd.zip", &zip);
+    let report = inspect_catalogued_game_identity(&path, Some("Sega 32X"));
+    assert_eq!(report.verified_value(IdentityKind::LooseRomSha256), None);
+    assert!(!report.complete);
+    assert!(
+        report
+            .evidence
+            .iter()
+            .any(|e| e.status == IdentityStatus::Invalid
+                && e.diagnostic.contains("32X ROM is 3519728 bytes")),
+        "{:#?}",
+        report.evidence
+    );
+    // The same member padded to a 512-byte step is accepted.
+    let ok = noisy(3_520_000, &mut state);
+    let zip = zip_of(&[("Ok.32x", &ok)]);
+    let path = write(dir.path(), "Ok.zip", &zip);
+    let report = inspect_catalogued_game_identity(&path, Some("Sega 32X"));
+    assert_eq!(
+        report.verified_value(IdentityKind::LooseRomSha256),
+        Some(sha(&ok).as_str())
+    );
+}
+
+#[test]
+fn disc_files_in_a_turbografx16_folder_are_never_verified_and_stay_incomplete_like_an_unknown_platform()
+ {
+    // Before this change TurboGrafx-16 resolved to `Other`; the new variant
+    // must not make a .cue/.chd/.iso verify or change its outcome.
+    let dir = scratch();
+    for (name, bytes) in [
+        (
+            "Disc.cue",
+            b"FILE \"Disc.bin\" BINARY\r\n  TRACK 01 MODE1/2352\r\n    INDEX 01 00:00:00\r\n"
+                .to_vec(),
+        ),
+        ("Disc.chd", rom(4 * KIB)),
+        ("Disc.iso", rom(64 * KIB)),
+    ] {
+        let path = write(dir.path(), name, &bytes);
+        let tg = inspect_catalogued_game_identity(&path, Some("TurboGrafx-16"));
+        let other = inspect_catalogued_game_identity(&path, Some("Nonsense Platform"));
+        // Both routes refuse: nothing but the platform fact is Verified and
+        // the report is incomplete. (TurboGrafx-16 now reports the cartridge
+        // refusal kinds instead of the generic unsupported-platform ones.)
+        for report in [&tg, &other] {
+            assert_eq!(report.verified_loose_rom_sha256(), None, "{name}");
+            assert!(!report.complete, "{name}");
+            assert!(
+                report
+                    .evidence
+                    .iter()
+                    .all(|e| e.kind == IdentityKind::Platform
+                        || e.status != IdentityStatus::Verified),
+                "{name}"
+            );
+        }
     }
 }

@@ -1096,6 +1096,16 @@ fn cartridge_family_rows() -> Vec<(
         "Sega 8-bit",
         "Sega - Game Gear|Sega - Master System - Mark III",
     );
+    let gpgx_wide = (
+        "genesis_plus_gx_wide",
+        "Sega 8/16-bit (Various)",
+        "Sega - Game Gear|Sega - Master System - Mark III|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis|Sega - PICO|Sega - SG-1000",
+    );
+    let supergrafx = (
+        "mednafen_supergrafx",
+        "PC Engine SuperGrafx",
+        "NEC - PC Engine SuperGrafx|NEC - PC Engine - TurboGrafx 16|NEC - PC Engine CD - TurboGrafx-CD",
+    );
     let gearsystem = (
         "gearsystem",
         "Sega 8-bit (MS/GG/SG-1000)",
@@ -1126,13 +1136,13 @@ fn cartridge_family_rows() -> Vec<(
         (
             "GameGear",
             "genesis_plus_gx",
-            vec![pico, smsplus, gearsystem],
+            vec![pico, smsplus, gearsystem, gpgx_wide],
             "x.gg",
         ),
         (
             "MasterSystem",
             "genesis_plus_gx",
-            vec![pico, smsplus, gearsystem],
+            vec![pico, smsplus, gearsystem, gpgx_wide],
             "x.sms",
         ),
         ("Sega 32X", "picodrive", vec![], "x.32x"),
@@ -1140,7 +1150,7 @@ fn cartridge_family_rows() -> Vec<(
         (
             "TurboGrafx-16",
             "mednafen_pce_fast",
-            vec![pce, geargrafx],
+            vec![pce, geargrafx, supergrafx],
             "x.pce",
         ),
     ]
