@@ -103,7 +103,17 @@ enum FaultPoint {
     TempDestinationWrite,
     Rename,
     FinalVerification,
+    /// The pending journal cannot be created before the first mutation.
     JournalWrite,
+    /// The per-entry journal rewrite after entry `n` (0-based) fails.
+    JournalUpdate(usize),
+    /// The final journal rewrite (status + completion time) fails.
+    JournalFinalize,
+    /// The process dies after entry `n` was applied but before its journal
+    /// update - modelled as a panic the test catches with `catch_unwind`.
+    CrashBeforeJournalUpdate(usize),
+    /// The process dies right after entry `n`'s journal update.
+    CrashAfterJournalUpdate(usize),
 }
 
 #[cfg(test)]
@@ -155,16 +165,19 @@ pub struct CheatInstallRunOutcome {
     /// Where the journal was written, for a real (non-dry-run) run whose
     /// journal write succeeded. Always `None` for a dry run.
     pub journal_path: Option<PathBuf>,
-    /// Set when a real run's journal write itself failed - the run's own
-    /// entries and summary are still fully valid and already reflect
-    /// exactly what was (or was not) written to the filesystem; only the
-    /// durable record of that run failed to be persisted.
+    /// Set when a real run's journal could not be created or kept up to
+    /// date. The run's own entries and summary are still fully valid and
+    /// reflect exactly what was (or was not) written to the filesystem:
+    /// when the *pending* journal could not be created, nothing was written
+    /// at all (every eligible entry carries reason code
+    /// `journal_unavailable`); when a mid-run update failed, no further
+    /// entry was attempted (reason code `journal_update_failed`).
     pub journal_error: Option<String>,
 }
 
 /// Executes one full installation run: plans every entry (reusing
 /// [`plan_cheat_install_entry`]), revalidates and, if eligible and
-/// permitted, applies each independently, then writes one journal file for
+/// permitted, applies each independently, and keeps one journal file for
 /// a real (non-dry-run, confirmed) run.
 ///
 /// `options.confirmed` is the `--yes` gate: whenever it is `false`, this
@@ -173,9 +186,35 @@ pub struct CheatInstallRunOutcome {
 /// of `options.dry_run` - the two are combined, not layered, so a caller
 /// can never accidentally write by only checking one of them.
 ///
-/// One entry failing never stops another from being processed: every
-/// entry in `entries` is always attempted independently, in the given
-/// (already-deterministic) order.
+/// ## Crash-proof Undo (journal before the first mutation)
+///
+/// A real run never touches the destination before an Undo record exists:
+///
+/// 1. A *pending* journal (`status: in_progress`, every entry in its
+///    planned state, `settled_entries: 0`) is written at the final journal
+///    path before the first filesystem mutation. If that write fails the
+///    run **fails closed**: nothing is written anywhere, every eligible
+///    entry is reported `failed_write` with reason `journal_unavailable`,
+///    and the run's status is `failed`.
+/// 2. After each entry settles the journal is atomically rewritten
+///    (temp file, fsync, rename over the pending file) with
+///    `settled_entries` advanced. If that rewrite fails, no further entry
+///    is attempted (each is reported with reason `journal_update_failed`)
+///    so the on-disk journal never claims less than one entry behind the
+///    truth, and never more than was done.
+/// 3. The journal is finalised once with the derived status and
+///    completion time.
+///
+/// A journal still reading `in_progress` therefore means the process died
+/// (or the final write failed): `entries[..settled_entries]` are final,
+/// `entries[settled_entries]` may or may not have been applied (only the
+/// destination's current hash can tell), and later entries were never
+/// attempted. `cheat_rollback` and `cheat_history` read it exactly that
+/// way.
+///
+/// One entry failing never stops another from being processed (except for
+/// the journal-update failure above): every entry in `entries` is
+/// attempted independently, in the given (already-deterministic) order.
 pub fn execute_cheat_install_run(
     entries: &[CheatAvailabilityEntry],
     options: &CheatInstallOptions,
@@ -183,32 +222,12 @@ pub fn execute_cheat_install_run(
     let effective_dry_run = options.dry_run || !options.confirmed;
     let mut claimed_destinations: BTreeSet<PathBuf> = BTreeSet::new();
 
-    let results: Vec<CheatInstallEntryResult> = entries
-        .iter()
-        .map(|entry| {
-            install_one_entry(entry, options, effective_dry_run, &mut claimed_destinations)
-        })
-        .collect();
-
-    let summary = CheatInstallSummary::from_entries(&results, effective_dry_run);
-    let status = CheatInstallRunStatus::derive(&summary, effective_dry_run);
-    let completed_at_unix_seconds = current_unix_seconds().max(options.started_at_unix_seconds);
-
-    let run = CheatInstallRun {
-        schema_version: CHEAT_INSTALL_RUN_SCHEMA_VERSION,
-        run_id: options.run_id.clone(),
-        started_at_unix_seconds: options.started_at_unix_seconds,
-        completed_at_unix_seconds: Some(completed_at_unix_seconds),
-        dry_run: effective_dry_run,
-        allow_replace_different: options.allow_replace_different,
-        destination_root: Some(CheatInstallPath::from_path(&options.destination_root)),
-        catalogue_source: options.catalogue_source.clone(),
-        entries: results,
-        summary,
-        status,
-    };
-
     if effective_dry_run {
+        let results: Vec<CheatInstallEntryResult> = entries
+            .iter()
+            .map(|entry| install_one_entry(entry, options, true, &mut claimed_destinations))
+            .collect();
+        let run = finished_run(options, results, true);
         return CheatInstallRunOutcome {
             run,
             journal_path: None,
@@ -216,16 +235,180 @@ pub fn execute_cheat_install_run(
         };
     }
 
-    match write_cheat_install_journal(&run, &options.journal_directory) {
-        Ok(path) => CheatInstallRunOutcome {
+    // --- 1. Plan every entry and write the pending journal first. ---
+    let planned: Vec<CheatInstallEntryResult> = entries
+        .iter()
+        .map(|entry| {
+            let mut result = plan_cheat_install_entry(entry, options.allow_replace_different);
+            if result.outcome == CheatInstallOutcome::ReplacedWithBackup
+                && let (Some(destination), Some(previous_hash)) = (
+                    result.destination_path.as_ref(),
+                    result.previous_destination_hash.as_deref(),
+                )
+            {
+                result.planned_backup_path =
+                    Some(CheatInstallPath::from_path(&planned_backup_path(
+                        Path::new(&destination.display),
+                        previous_hash,
+                        &options.backup_directory,
+                        &options.run_id,
+                    )));
+            }
+            result
+        })
+        .collect();
+    let summary = CheatInstallSummary::from_entries(&planned, false);
+    let mut run = CheatInstallRun {
+        schema_version: CHEAT_INSTALL_RUN_SCHEMA_VERSION,
+        run_id: options.run_id.clone(),
+        started_at_unix_seconds: options.started_at_unix_seconds,
+        completed_at_unix_seconds: None,
+        dry_run: false,
+        allow_replace_different: options.allow_replace_different,
+        destination_root: Some(CheatInstallPath::from_path(&options.destination_root)),
+        catalogue_source: options.catalogue_source.clone(),
+        entries: planned,
+        summary,
+        status: CheatInstallRunStatus::InProgress,
+        settled_entries: 0,
+        temp_file_prefix: Some(own_temp_file_prefix()),
+    };
+
+    let journal_path = match create_pending_journal(&run, &options.journal_directory) {
+        Ok(path) => path,
+        Err(error) => {
+            // Fail closed: no Undo record, no mutation.
+            for entry in &mut run.entries {
+                if is_actionable_plan(entry.outcome) {
+                    entry.outcome = CheatInstallOutcome::FailedWrite;
+                    entry.reason_code = JOURNAL_UNAVAILABLE_REASON.to_string();
+                    entry.detail.push(
+                        "not attempted: the install record (journal) could not be created \
+                         before the first change, so nothing was written"
+                            .to_string(),
+                    );
+                }
+            }
+            let run = finished_run(options, run.entries, false);
+            return CheatInstallRunOutcome {
+                run,
+                journal_path: None,
+                journal_error: Some(format!(
+                    "nothing was written: the install record could not be created: {error}"
+                )),
+            };
+        }
+    };
+
+    // --- 2. Apply entries in order, recording each as it settles. ---
+    let mut journal_error: Option<String> = None;
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(error) = &journal_error {
+            let planned = &mut run.entries[index];
+            if is_actionable_plan(planned.outcome) {
+                planned.outcome = CheatInstallOutcome::FailedWrite;
+                planned.reason_code = JOURNAL_UPDATE_FAILED_REASON.to_string();
+                planned.detail.push(format!(
+                    "not attempted: an earlier install-record update failed ({error})"
+                ));
+            }
+            continue;
+        }
+        let planned_backup_path = run.entries[index].planned_backup_path.take();
+        let mut result = install_one_entry(entry, options, false, &mut claimed_destinations);
+        result.planned_backup_path = planned_backup_path;
+        run.entries[index] = result;
+        if should_inject(FaultPoint::CrashBeforeJournalUpdate(index)) {
+            panic!("injected crash after entry {index} was applied, before its journal update");
+        }
+        run.settled_entries = index + 1;
+        run.summary = CheatInstallSummary::from_entries(&run.entries, false);
+        if should_inject(FaultPoint::JournalUpdate(index)) {
+            journal_error = Some(format!(
+                "injected journal update failure after entry {index}"
+            ));
+        } else if let Err(error) = rewrite_journal(&run, &journal_path, &options.journal_directory)
+        {
+            journal_error = Some(format!(
+                "install record could not be updated after entry {index}: {error}"
+            ));
+        }
+        if should_inject(FaultPoint::CrashAfterJournalUpdate(index)) {
+            panic!("injected crash right after entry {index}'s journal update");
+        }
+    }
+
+    // --- 3. Finalise once. ---
+    let run = finished_run(options, run.entries, false);
+    let finalize = if should_inject(FaultPoint::JournalFinalize) {
+        Err("injected journal finalize failure".to_string())
+    } else {
+        rewrite_journal(&run, &journal_path, &options.journal_directory)
+    };
+    match finalize {
+        Ok(()) => CheatInstallRunOutcome {
             run,
-            journal_path: Some(path),
-            journal_error: None,
+            journal_path: Some(journal_path),
+            journal_error,
         },
         Err(error) => CheatInstallRunOutcome {
             run,
             journal_path: None,
-            journal_error: Some(error),
+            journal_error: Some(match journal_error {
+                Some(earlier) => {
+                    format!("{earlier}; final install-record write also failed: {error}")
+                }
+                None => format!(
+                    "the changes were applied but the install record could not be finalised \
+                     (it still reads in_progress): {error}"
+                ),
+            }),
+        },
+    }
+}
+
+/// Reason code on every eligible entry of a run that failed closed because
+/// its pending journal could not be created - nothing was written.
+pub const JOURNAL_UNAVAILABLE_REASON: &str = "journal_unavailable";
+/// Reason code on every entry that was not attempted because an earlier
+/// per-entry journal update failed.
+pub const JOURNAL_UPDATE_FAILED_REASON: &str = "journal_update_failed";
+
+fn is_actionable_plan(outcome: CheatInstallOutcome) -> bool {
+    matches!(
+        outcome,
+        CheatInstallOutcome::InstalledNew
+            | CheatInstallOutcome::AlreadyInstalled
+            | CheatInstallOutcome::ReplacedWithBackup
+    )
+}
+
+fn finished_run(
+    options: &CheatInstallOptions,
+    entries: Vec<CheatInstallEntryResult>,
+    dry_run: bool,
+) -> CheatInstallRun {
+    let summary = CheatInstallSummary::from_entries(&entries, dry_run);
+    let status = CheatInstallRunStatus::derive(&summary, dry_run);
+    let completed_at_unix_seconds = current_unix_seconds().max(options.started_at_unix_seconds);
+    let settled_entries = entries.len();
+    CheatInstallRun {
+        schema_version: CHEAT_INSTALL_RUN_SCHEMA_VERSION,
+        run_id: options.run_id.clone(),
+        started_at_unix_seconds: options.started_at_unix_seconds,
+        completed_at_unix_seconds: Some(completed_at_unix_seconds),
+        dry_run,
+        allow_replace_different: options.allow_replace_different,
+        destination_root: Some(CheatInstallPath::from_path(&options.destination_root)),
+        catalogue_source: options.catalogue_source.clone(),
+        entries,
+        summary,
+        status,
+        settled_entries,
+        temp_file_prefix: if dry_run {
+            None
+        } else {
+            Some(own_temp_file_prefix())
         },
     }
 }
@@ -572,12 +755,6 @@ fn replace_with_backup(
 ) {
     let filesystem = HostReadOnlyFilesystem;
     let previous_hash = result.previous_destination_hash.clone().unwrap_or_default();
-    let file_name = destination
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "cheat".to_string());
-    let hash_prefix: String = previous_hash.chars().take(12).collect();
-    let safe_run_id = sanitize_for_filename(run_id);
 
     if let Err(error) = fs::create_dir_all(backup_directory) {
         result.outcome = CheatInstallOutcome::FailedBackup;
@@ -608,7 +785,7 @@ fn replace_with_backup(
     }
 
     let backup_final_path =
-        backup_directory.join(format!("{file_name}.{safe_run_id}.{hash_prefix}.bak"));
+        planned_backup_path(destination, &previous_hash, backup_directory, run_id);
     let backup_temp_path = backup_directory.join(unique_temp_component("cheat-backup"));
 
     if let Err(error) = write_new_temp_file(&backup_temp_path, &current_destination_bytes) {
@@ -747,7 +924,40 @@ fn replace_with_backup(
 // Journal
 // ---------------------------------------------------------------------
 
-fn write_cheat_install_journal(
+/// The deterministic backup path a `replaced_with_backup` entry uses:
+/// `{file_name}.{safe_run_id}.{hash_prefix}.bak` beneath `backup_directory`.
+/// Recorded in the pending journal (as `planned_backup_path`) before any
+/// mutation and used verbatim by [`replace_with_backup`], so a crash-time
+/// reader and the writer can never disagree about where a backup went.
+fn planned_backup_path(
+    destination: &Path,
+    previous_hash: &str,
+    backup_directory: &Path,
+    run_id: &str,
+) -> PathBuf {
+    let file_name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cheat".to_string());
+    let hash_prefix: String = previous_hash.chars().take(12).collect();
+    let safe_run_id = sanitize_for_filename(run_id);
+    backup_directory.join(format!("{file_name}.{safe_run_id}.{hash_prefix}.bak"))
+}
+
+/// The prefix shared by every destination-side temporary file this process
+/// creates (see [`unique_temp_component`]); recorded in the journal so a
+/// rollback of an interrupted run can sweep exactly this run's leftovers.
+fn own_temp_file_prefix() -> String {
+    format!(".archivefs-cheat-install-{}-", std::process::id())
+}
+
+fn journal_file_name(run_id: &str) -> String {
+    format!("{}.json", sanitize_for_filename(run_id))
+}
+
+/// Creates the pending journal at its final path, refusing to clobber an
+/// existing journal with the same run id. Durable before it returns.
+fn create_pending_journal(
     run: &CheatInstallRun,
     journal_directory: &Path,
 ) -> Result<PathBuf, String> {
@@ -756,30 +966,50 @@ fn write_cheat_install_journal(
     }
     fs::create_dir_all(journal_directory)
         .map_err(|error| format!("could not create journal directory: {error}"))?;
-
-    let file_name = format!("{}.json", sanitize_for_filename(&run.run_id));
-    let final_path = journal_directory.join(&file_name);
-    if final_path.exists() {
+    let final_path = journal_directory.join(journal_file_name(&run.run_id));
+    if fs::symlink_metadata(&final_path).is_ok() {
         return Err(format!(
             "a journal already exists at {}",
             final_path.display()
         ));
     }
+    let temp_path = write_journal_temp(run, journal_directory)?;
+    if let Err(error) = rename_no_replace(&temp_path, &final_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("could not finalize journal: {error}"));
+    }
+    let mut detail = Vec::new();
+    fsync_directory_best_effort(journal_directory, &mut detail);
+    Ok(final_path)
+}
 
+/// Atomically replaces this run's own journal with a newer state: temp
+/// file, fsync, rename over the existing file. A clobbering rename is
+/// correct here - the file being replaced is the one this run created
+/// moments ago - and `rewrite` never produces a journal that claims more
+/// than the run has actually done.
+fn rewrite_journal(
+    run: &CheatInstallRun,
+    journal_path: &Path,
+    journal_directory: &Path,
+) -> Result<(), String> {
+    let temp_path = write_journal_temp(run, journal_directory)?;
+    if let Err(error) = fs::rename(&temp_path, journal_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("could not replace journal: {error}"));
+    }
+    let mut detail = Vec::new();
+    fsync_directory_best_effort(journal_directory, &mut detail);
+    Ok(())
+}
+
+fn write_journal_temp(run: &CheatInstallRun, journal_directory: &Path) -> Result<PathBuf, String> {
     let json = serde_json::to_string_pretty(run)
         .map_err(|error| format!("could not serialize journal: {error}"))?;
     let temp_path = journal_directory.join(unique_temp_component("cheat-journal"));
     write_new_temp_file(&temp_path, json.as_bytes())
         .map_err(|error| format!("could not write journal temp file: {error}"))?;
-
-    if let Err(error) = rename_no_replace(&temp_path, &final_path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(format!("could not finalize journal: {error}"));
-    }
-
-    let mut detail = Vec::new();
-    fsync_directory_best_effort(journal_directory, &mut detail);
-    Ok(final_path)
+    Ok(temp_path)
 }
 
 // ---------------------------------------------------------------------

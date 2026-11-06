@@ -14,8 +14,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::cheat_install_result::{
-    CheatInstallEntryResult, CheatInstallOutcome, CheatInstallPath, CheatInstallRun,
-    CheatInstallSummary, parse_cheat_install_run,
+    CheatInstallEntryResult, CheatInstallEntrySettlement, CheatInstallOutcome, CheatInstallPath,
+    CheatInstallRun, CheatInstallSummary, parse_cheat_install_run,
 };
 use super::cheat_rollback_result::{
     CheatRollbackOutcome, CheatRollbackRun, CheatRollbackRunStatus, parse_cheat_rollback_run,
@@ -104,6 +104,13 @@ pub struct CheatJournalInspection {
     pub catalogue_source: String,
     pub destination_root: Option<CheatInstallPath>,
     pub install_status: super::cheat_install_result::CheatInstallRunStatus,
+    /// `true` when the journal still reads `in_progress`: the install run
+    /// never reached its final write (killed, crashed, or its last journal
+    /// write failed). Such a run needs attention and is never success.
+    pub interrupted: bool,
+    /// How many leading entries the interrupted run had settled; equals
+    /// `entries.len()` for a finished run.
+    pub settled_entries: usize,
     pub install_summary: CheatInstallSummary,
     pub entries: Vec<CheatHistoryEntry>,
     pub rollback: CheatRollbackJournalMatch,
@@ -118,6 +125,10 @@ pub struct CheatHistoryEntry {
     pub destination_path: Option<CheatInstallPath>,
     pub original_outcome: CheatInstallOutcome,
     pub applied: bool,
+    /// Whether the journal's record of this entry is final, was in flight
+    /// when the run was interrupted, or was never started - see
+    /// [`CheatInstallRun::entry_settlement`].
+    pub settlement: CheatInstallEntrySettlement,
     pub previous_hash: Option<String>,
     pub installed_hash: Option<String>,
     pub backup_path: Option<CheatInstallPath>,
@@ -306,14 +317,43 @@ pub fn inspect_cheat_install_journal(
     let entries = run
         .entries
         .iter()
-        .map(|entry| inspect_entry(entry, &run, options, completed, ambiguous))
+        .enumerate()
+        .map(|(index, entry)| {
+            inspect_entry(
+                entry,
+                run.entry_settlement(index),
+                &run,
+                options,
+                completed,
+                ambiguous,
+            )
+        })
         .collect();
 
     let expected_summary = CheatInstallSummary::from_entries(&run.entries, run.dry_run);
     if run.summary != expected_summary {
         warnings.push("install summary does not match entries".into());
     }
-    if run.status
+    let interrupted = run.is_interrupted();
+    let settled_entries = if interrupted {
+        run.settled_entries.min(run.entries.len())
+    } else {
+        run.entries.len()
+    };
+    if interrupted {
+        let mut message = format!(
+            "install run was interrupted before it finished: {settled_entries} of {} entries settled",
+            run.entries.len()
+        );
+        if settled_entries < run.entries.len() {
+            message.push_str(&format!(
+                "; entry {} may have been applied without being recorded (resolved from the destination's current content)",
+                settled_entries + 1
+            ));
+        }
+        message.push_str("; roll it back with retroarch-cheat-rollback, or re-run the install");
+        warnings.push(message);
+    } else if run.status
         != super::cheat_install_result::CheatInstallRunStatus::derive(
             &expected_summary,
             run.dry_run,
@@ -331,6 +371,8 @@ pub fn inspect_cheat_install_journal(
         catalogue_source: run.catalogue_source,
         destination_root: run.destination_root,
         install_status: run.status,
+        interrupted,
+        settled_entries,
         install_summary: run.summary,
         entries,
         rollback,
@@ -387,7 +429,11 @@ fn validate_install_journal_paths(
                 },
             )?;
         }
-        if let Some(backup) = &entry.backup_path {
+        if let Some(backup) = entry
+            .backup_path
+            .as_ref()
+            .or(entry.planned_backup_path.as_ref())
+        {
             reconstruct_direct_child(&options.backup_root, backup).map_err(|message| {
                 CheatJournalInspectionError {
                     code: "invalid_backup_path".into(),
@@ -402,16 +448,33 @@ fn validate_install_journal_paths(
 
 fn inspect_entry(
     entry: &CheatInstallEntryResult,
+    settlement: CheatInstallEntrySettlement,
     run: &CheatInstallRun,
     options: &CheatHistoryOptions,
     rollback_completed: bool,
     rollback_ambiguous: bool,
 ) -> CheatHistoryEntry {
+    let in_flight = settlement == CheatInstallEntrySettlement::InFlight
+        && matches!(
+            entry.outcome,
+            CheatInstallOutcome::InstalledNew | CheatInstallOutcome::ReplacedWithBackup
+        );
+    let effective_backup_path = if in_flight {
+        entry
+            .backup_path
+            .as_ref()
+            .or(entry.planned_backup_path.as_ref())
+    } else {
+        entry.backup_path.as_ref()
+    };
     let (destination, destination_observed_hash) = assess_entry_destination(entry, run);
-    let (backup, backup_observed_hash) = assess_entry_backup(entry, options);
+    let (backup, backup_observed_hash) =
+        assess_entry_backup(entry, effective_backup_path, in_flight, options);
     let mut reasons = Vec::new();
     let availability = rollback_availability(
         entry,
+        settlement,
+        in_flight,
         destination,
         destination_observed_hash.as_deref(),
         backup,
@@ -442,12 +505,13 @@ fn inspect_entry(
         destination_path: entry.destination_path.clone(),
         original_outcome: entry.outcome,
         applied: entry.applied,
+        settlement,
         previous_hash: entry.previous_destination_hash.clone(),
         installed_hash: entry
             .resulting_destination_hash
             .clone()
             .or_else(|| entry.expected_source_hash.clone()),
-        backup_path: entry.backup_path.clone(),
+        backup_path: effective_backup_path.cloned(),
         backup_expected_hash: entry.previous_destination_hash.clone(),
         destination,
         destination_observed_hash,
@@ -500,10 +564,14 @@ fn assess_entry_destination(
 
 fn assess_entry_backup(
     entry: &CheatInstallEntryResult,
+    backup_path: Option<&CheatInstallPath>,
+    in_flight: bool,
     options: &CheatHistoryOptions,
 ) -> (CheatBackupAssessment, Option<String>) {
-    let Some(encoded) = entry.backup_path.as_ref() else {
-        return if entry.outcome == CheatInstallOutcome::ReplacedWithBackup && entry.applied {
+    let Some(encoded) = backup_path else {
+        return if entry.outcome == CheatInstallOutcome::ReplacedWithBackup
+            && (entry.applied || in_flight)
+        {
             (CheatBackupAssessment::Missing, None)
         } else {
             (CheatBackupAssessment::NotApplicable, None)
@@ -535,8 +603,11 @@ fn assess_entry_backup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rollback_availability(
     entry: &CheatInstallEntryResult,
+    settlement: CheatInstallEntrySettlement,
+    in_flight: bool,
     destination: CheatDestinationAssessment,
     destination_observed_hash: Option<&str>,
     backup: CheatBackupAssessment,
@@ -551,15 +622,46 @@ fn rollback_availability(
     if completed {
         return CheatRollbackAvailability::AlreadyCompleted;
     }
-    if !entry.applied
-        || !matches!(
-            entry.outcome,
-            CheatInstallOutcome::InstalledNew | CheatInstallOutcome::ReplacedWithBackup
-        )
+    if settlement == CheatInstallEntrySettlement::NotStarted {
+        reasons.push("install was interrupted before this entry was attempted".into());
+        return CheatRollbackAvailability::Unnecessary;
+    }
+    if !in_flight
+        && (!entry.applied
+            || !matches!(
+                entry.outcome,
+                CheatInstallOutcome::InstalledNew | CheatInstallOutcome::ReplacedWithBackup
+            ))
     {
         return CheatRollbackAvailability::Unnecessary;
     }
-    if entry.resulting_destination_hash.is_none() {
+    if in_flight {
+        // The journal shows the planned state only; the destination's
+        // current content decides whether the write happened.
+        if entry.expected_source_hash.is_none() {
+            reasons.push("interrupted install entry has no expected source hash".into());
+            return CheatRollbackAvailability::BlockedInvalidJournal;
+        }
+        let untouched = match (entry.outcome, destination) {
+            (CheatInstallOutcome::InstalledNew, CheatDestinationAssessment::Missing) => true,
+            (CheatInstallOutcome::ReplacedWithBackup, _) => {
+                destination_observed_hash.is_some()
+                    && destination_observed_hash == entry.previous_destination_hash.as_deref()
+            }
+            _ => false,
+        };
+        if untouched {
+            reasons.push(
+                "install was interrupted before this entry was published; destination untouched"
+                    .into(),
+            );
+            return CheatRollbackAvailability::Unnecessary;
+        }
+        reasons.push(
+            "install was interrupted while this entry was in flight; resolved from the destination's current content"
+                .into(),
+        );
+    } else if entry.resulting_destination_hash.is_none() {
         reasons.push("applied install entry has no resulting destination hash".into());
         return CheatRollbackAvailability::BlockedInvalidJournal;
     }
@@ -718,7 +820,17 @@ fn rollback_binding_is_valid(
             .entries
             .iter()
             .zip(&install.entries)
-            .all(|(rolled, original)| {
+            .enumerate()
+            .all(|(index, (rolled, original))| {
+                let expected_backup =
+                    if install.entry_settlement(index) == CheatInstallEntrySettlement::InFlight {
+                        original
+                            .backup_path
+                            .clone()
+                            .or_else(|| original.planned_backup_path.clone())
+                    } else {
+                        original.backup_path.clone()
+                    };
                 rolled.original_outcome == original.outcome
                     && rolled.destination_path == original.destination_path
                     && rolled.expected_installed_hash
@@ -727,7 +839,7 @@ fn rollback_binding_is_valid(
                             .clone()
                             .or_else(|| original.expected_source_hash.clone())
                     && rolled.expected_previous_hash == original.previous_destination_hash
-                    && rolled.backup_path == original.backup_path
+                    && rolled.backup_path == expected_backup
             })
 }
 
@@ -739,8 +851,21 @@ fn rollback_completed_successfully(rollback: &CheatRollbackRun, install: &CheatI
             .entries
             .iter()
             .zip(&install.entries)
-            .all(
-                |(rolled, original)| match (original.outcome, rolled.outcome) {
+            .enumerate()
+            .all(|(index, (rolled, original))| {
+                if install.entry_settlement(index) == CheatInstallEntrySettlement::InFlight {
+                    // The install never recorded whether this entry was
+                    // applied; the rollback resolved it from the destination
+                    // and either reversed it or found it untouched.
+                    return match rolled.outcome {
+                        CheatRollbackOutcome::RemovedInstalledFile
+                        | CheatRollbackOutcome::RestoredBackup => rolled.wrote,
+                        CheatRollbackOutcome::NoChangeRequired
+                        | CheatRollbackOutcome::AlreadyRestored => !rolled.wrote,
+                        _ => false,
+                    };
+                }
+                match (original.outcome, rolled.outcome) {
                     (
                         CheatInstallOutcome::InstalledNew,
                         CheatRollbackOutcome::RemovedInstalledFile,
@@ -768,8 +893,8 @@ fn rollback_completed_successfully(rollback: &CheatRollbackRun, install: &CheatI
                             && rolled.observed_current_hash == rolled.expected_previous_hash
                     }
                     _ => rolled.outcome == CheatRollbackOutcome::NoChangeRequired && !rolled.wrote,
-                },
-            )
+                }
+            })
 }
 
 fn reconstruct_destination(

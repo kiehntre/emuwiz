@@ -612,6 +612,14 @@ fn print_install_result(outcome: &CheatInstallRunOutcome) {
     if let Some(path) = &outcome.journal_path {
         println!("  install journal: {}", path.display());
     }
+    if let Some(error) = &outcome.journal_error {
+        if outcome.run.summary.writes_attempted == 0 {
+            println!(
+                "  nothing was written: the install record (journal) could not be created, so no cheat file was touched"
+            );
+        }
+        println!("  install record error: {error}");
+    }
 }
 
 fn print_post_install(journal_path: Option<&Path>, destination_root: &Path) {
@@ -836,6 +844,7 @@ fn install_status_label(status: CheatInstallRunStatus) -> &'static str {
         CheatInstallRunStatus::PartialFailure => "partial failure",
         CheatInstallRunStatus::Failed => "failed",
         CheatInstallRunStatus::DryRun => "dry run",
+        CheatInstallRunStatus::InProgress => "interrupted (not finished)",
     }
 }
 

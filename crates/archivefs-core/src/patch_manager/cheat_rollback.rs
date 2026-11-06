@@ -1,4 +1,6 @@
-use super::cheat_install_result::{CheatInstallOutcome, CheatInstallPath, parse_cheat_install_run};
+use super::cheat_install_result::{
+    CheatInstallEntrySettlement, CheatInstallOutcome, CheatInstallPath, parse_cheat_install_run,
+};
 use super::cheat_rollback_result::*;
 use super::destination_safety::assess_destination;
 use sha2::{Digest, Sha256};
@@ -120,6 +122,54 @@ fn safe_backup_path(root: &Path, encoded: &CheatInstallPath) -> Result<PathBuf, 
     Ok(out)
 }
 
+/// Removes temporary files an interrupted install left behind, and only
+/// those: plain files whose names start with the exact prefix that run
+/// recorded (`.archivefs-cheat-install-<pid>-` next to the destination,
+/// `.archivefs-cheat-backup-<pid>-` in the backup directory). Anything
+/// else - other runs' temp files, symlinks, directories - is left alone.
+/// Returns how many files were removed.
+fn sweep_interrupted_temp_files(
+    prefix: Option<&str>,
+    destination_parent: Option<&Path>,
+    backup_directory: &Path,
+) -> usize {
+    let Some(prefix) = prefix else {
+        return 0;
+    };
+    if !prefix.starts_with(".archivefs-cheat-install-") {
+        return 0;
+    }
+    let backup_prefix = prefix.replacen(".archivefs-cheat-install-", ".archivefs-cheat-backup-", 1);
+    let mut removed = 0;
+    for (directory, prefix) in [
+        (destination_parent, prefix),
+        (Some(backup_directory), backup_prefix.as_str()),
+    ] {
+        let Some(directory) = directory else { continue };
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(md) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if md.file_type().is_symlink() || !md.is_file() {
+                continue;
+            }
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 pub fn execute_cheat_rollback(
     journal_path: &Path,
     options: &CheatRollbackOptions,
@@ -138,8 +188,18 @@ pub fn execute_cheat_rollback(
     };
     let effective_dry = options.dry_run || !options.confirmed;
     let mut entries = Vec::new();
-    for e in orig.entries.iter() {
+    for (index, e) in orig.entries.iter().enumerate() {
         let dest = e.destination_path.clone();
+        // An interrupted (`in_progress`) journal is read exactly as the
+        // installer wrote it: settled entries are facts, the one in-flight
+        // entry is resolved from the destination's current content, and
+        // entries after it were never attempted.
+        let settlement = orig.entry_settlement(index);
+        let actionable = matches!(
+            e.outcome,
+            CheatInstallOutcome::InstalledNew | CheatInstallOutcome::ReplacedWithBackup
+        );
+        let in_flight = settlement == CheatInstallEntrySettlement::InFlight && actionable;
         let mut r = CheatRollbackEntryResult {
             original_outcome: e.outcome,
             destination_path: dest.clone(),
@@ -149,19 +209,23 @@ pub fn execute_cheat_rollback(
                 .or(e.expected_source_hash.clone()),
             expected_previous_hash: e.previous_destination_hash.clone(),
             observed_current_hash: None,
-            backup_path: e.backup_path.clone(),
+            backup_path: if in_flight {
+                e.backup_path.clone().or(e.planned_backup_path.clone())
+            } else {
+                e.backup_path.clone()
+            },
             outcome: CheatRollbackOutcome::NoChangeRequired,
             wrote: false,
             error_code: None,
             message: String::new(),
             retryable: false,
         };
-        if !e.applied
-            || !matches!(
-                e.outcome,
-                CheatInstallOutcome::InstalledNew | CheatInstallOutcome::ReplacedWithBackup
-            )
-        {
+        if settlement == CheatInstallEntrySettlement::NotStarted {
+            r.message = "install run was interrupted before this entry was attempted".into();
+            entries.push(r);
+            continue;
+        }
+        if !in_flight && (!e.applied || !actionable) {
             r.message = "original install made no change".into();
             entries.push(r);
             continue;
@@ -178,9 +242,13 @@ pub fn execute_cheat_rollback(
             entries.push(r);
             continue;
         };
-        if e.resulting_destination_hash.is_none() {
+        if r.expected_installed_hash.is_none() {
             r.outcome = CheatRollbackOutcome::FailedInvalidJournal;
-            r.message = "applied install entry has no resulting destination hash".into();
+            r.message = if in_flight {
+                "interrupted install entry has no expected source hash".into()
+            } else {
+                "applied install entry has no resulting destination hash".into()
+            };
             entries.push(r);
             continue;
         }
@@ -230,6 +298,47 @@ pub fn execute_cheat_rollback(
             None
         };
         r.observed_current_hash = cur.clone();
+        if in_flight {
+            if !effective_dry {
+                let swept = sweep_interrupted_temp_files(
+                    orig.temp_file_prefix.as_deref(),
+                    p.parent(),
+                    &options.backup_directory,
+                );
+                if swept > 0 {
+                    r.message = format!(
+                        "removed {swept} temporary file(s) left by the interrupted install; "
+                    );
+                }
+            }
+            let applied_now =
+                cur.is_some() && cur.as_deref() == r.expected_installed_hash.as_deref();
+            if !applied_now {
+                let untouched = match e.outcome {
+                    CheatInstallOutcome::InstalledNew => md.is_none(),
+                    _ => cur.is_some() && cur.as_deref() == e.previous_destination_hash.as_deref(),
+                };
+                if untouched {
+                    r.message.push_str(
+                        "install was interrupted before this entry was published; \
+                         destination untouched",
+                    );
+                } else {
+                    r.outcome = CheatRollbackOutcome::FailedDestinationChanged;
+                    r.message.push_str(
+                        "install was interrupted while this entry was in flight and the \
+                         destination now matches neither the catalogue content nor the \
+                         pre-install content; left unchanged",
+                    );
+                }
+                entries.push(r);
+                continue;
+            }
+            r.message.push_str(
+                "install was interrupted after this entry was published but before it was \
+                 recorded; resolved from the destination's current content. ",
+            );
+        }
         if e.outcome == CheatInstallOutcome::InstalledNew {
             if md.is_none() {
                 r.outcome = CheatRollbackOutcome::AlreadyRestored;
@@ -254,12 +363,12 @@ pub fn execute_cheat_rollback(
                 }
             }
         } else {
-            let Some(bp_enc) = e.backup_path.as_ref() else {
+            let Some(bp_enc) = r.backup_path.clone() else {
                 r.outcome = CheatRollbackOutcome::FailedBackupMissing;
                 entries.push(r);
                 continue;
             };
-            let bp = match safe_backup_path(&options.backup_directory, bp_enc) {
+            let bp = match safe_backup_path(&options.backup_directory, &bp_enc) {
                 Ok(p) => p,
                 Err(msg) => {
                     r.outcome = CheatRollbackOutcome::FailedUnsafeBackupPath;
