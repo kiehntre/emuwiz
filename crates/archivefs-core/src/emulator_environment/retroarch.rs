@@ -1931,14 +1931,21 @@ pub fn firmware_evidence_paths(report: &RetroArchEnvironmentReport) -> Vec<PathB
     paths
 }
 
-/// Read-only, no-follow presence check for one declared firmware file.
+/// Read-only presence check for one declared firmware file.
 ///
-/// Every component is probed with the final-component no-follow `probe`,
-/// starting from the already-validated system directory; a symlink at any
-/// level is `Unknown` (never followed, never trusted). Declared paths come
-/// from user-editable `.info` files, so anything but plain relative
-/// `Normal` components (absolute, `..`, empty, NUL) is `Unknown`. Flatpak
-/// system directories are sandbox-mapped, so no host-side claim is made.
+/// Every component is probed with `probe_firmware_candidate`, starting from
+/// the already-validated system directory. A symlink is resolved and
+/// verified (canonicalized; final target must be a readable regular file,
+/// or a directory for a parent component) and then treated EXACTLY like the
+/// real file/directory it resolves to: a link to a regular file is
+/// `PresentUnverified` (never `Verified` - no content is read, so no
+/// authenticity is claimed; the same level a real unhashed file gets), a
+/// dangling or looping link is `Missing`, and a link to a non-regular target
+/// is `Unknown`, as a non-regular real file is. Real-file outcomes are
+/// unchanged. Declared paths come from user-editable `.info` files, so
+/// anything but plain relative `Normal` components (absolute, `..`, empty,
+/// NUL) is `Unknown`. Flatpak system directories are sandbox-mapped, so no
+/// host-side claim is made.
 fn probe_firmware_presence(
     filesystem: &dyn ReadOnlyHostFilesystem,
     profile: ProfileRef,
@@ -1960,14 +1967,14 @@ fn probe_firmware_presence(
     let mut current = system_dir.clone();
     for parent in parents {
         current.push(parent);
-        match filesystem.probe(&current) {
+        match filesystem.probe_firmware_candidate(&current) {
             FsProbe::PresentDirectory => {}
             FsProbe::Missing => return FirmwarePresence::Missing,
             _ => return FirmwarePresence::Unknown,
         }
     }
     current.push(last);
-    match filesystem.probe(&current) {
+    match filesystem.probe_firmware_candidate(&current) {
         FsProbe::PresentFile => FirmwarePresence::PresentUnverified,
         FsProbe::Missing => FirmwarePresence::Missing,
         _ => FirmwarePresence::Unknown,
@@ -4424,27 +4431,107 @@ mod tests {
         );
     }
 
+    // Symlinked firmware is resolved and then judged exactly like the real
+    // file it resolves to (see `probe_firmware_candidate`). This replaces the
+    // old "never follow symlinks" rule, which made any link `Unknown` (no
+    // block, no warning) while a plain unhashed file was `PresentUnverified`
+    // (warning, Play removed): a link to a good file was treated as LESS
+    // scrutinised than the file itself, and a dangling link never blocked.
     #[test]
-    fn firmware_presence_never_follows_symlinks() {
+    fn firmware_presence_symlinks_are_judged_like_the_resolved_file() {
+        use std::os::unix::fs::symlink;
         let info = fw_info(&[
+            ("real.bin", false),
             ("link.bin", false),
-            ("linkdir/real.bin", false),
+            ("rel.bin", false),
+            ("chain.bin", false),
+            ("dangling.bin", false),
+            ("loop.bin", false),
+            ("dirlink.bin", false),
+            ("linkdir/inner.bin", false),
             ("dirname", false),
         ]);
         let (_f, found) = firmware_probe_fixture("fw-symlink", info.as_bytes(), |f| {
-            f.write("elsewhere/real.bin", "x");
-            std::os::unix::fs::symlink(f.path("elsewhere/real.bin"), f.path("system/link.bin"))
-                .unwrap();
-            std::os::unix::fs::symlink(f.path("elsewhere"), f.path("system/linkdir")).unwrap();
+            f.write("system/real.bin", "x");
+            f.write("elsewhere/target.bin", "x");
+            f.mkdir("elsewhere/adir");
+            symlink(f.path("elsewhere/target.bin"), f.path("system/link.bin")).unwrap();
+            symlink("../elsewhere/target.bin", f.path("system/rel.bin")).unwrap();
+            symlink(f.path("system/link.bin"), f.path("elsewhere/hop.bin")).unwrap();
+            symlink(f.path("elsewhere/hop.bin"), f.path("system/chain.bin")).unwrap();
+            symlink(f.path("elsewhere/nope.bin"), f.path("system/dangling.bin")).unwrap();
+            symlink("loop.bin", f.path("system/loop.bin")).unwrap();
+            symlink(f.path("elsewhere/adir"), f.path("system/dirlink.bin")).unwrap();
+            symlink(f.path("elsewhere"), f.path("system/linkdir")).unwrap();
+            f.write("elsewhere/inner.bin", "x");
             f.mkdir("system/dirname");
         });
         assert_eq!(
             presences(&found),
             vec![
-                FirmwarePresence::Unknown,
-                FirmwarePresence::Unknown,
-                FirmwarePresence::Unknown
+                FirmwarePresence::PresentUnverified, // real file (unchanged)
+                FirmwarePresence::PresentUnverified, // absolute link
+                FirmwarePresence::PresentUnverified, // relative link
+                FirmwarePresence::PresentUnverified, // chain of links
+                FirmwarePresence::Missing,           // dangling
+                FirmwarePresence::Missing,           // loop
+                FirmwarePresence::Unknown,           // link to dir == real dir
+                FirmwarePresence::PresentUnverified, // symlinked parent dir
+                FirmwarePresence::Unknown,           // real dir
             ]
+        );
+    }
+
+    #[test]
+    fn firmware_presence_symlink_to_fifo_is_not_present_and_does_not_hang() {
+        let info = fw_info(&[("fifo.bin", false), ("realfifo.bin", false)]);
+        let (_f, found) = firmware_probe_fixture("fw-symlink-fifo", info.as_bytes(), |f| {
+            f.mkdir("elsewhere");
+            let fifo = f.path("elsewhere/fifo");
+            let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            std::os::unix::fs::symlink(&fifo, f.path("system/fifo.bin")).unwrap();
+            let c2 = std::ffi::CString::new(f.path("system/realfifo.bin").as_os_str().as_bytes())
+                .unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c2.as_ptr(), 0o600) }, 0);
+        });
+        // Same (non-claiming) outcome as a real FIFO; never PresentUnverified.
+        assert_eq!(
+            presences(&found),
+            vec![FirmwarePresence::Unknown, FirmwarePresence::Unknown]
+        );
+    }
+
+    #[test]
+    fn firmware_symlink_gate_equivalence_with_real_file() {
+        use crate::launch::readiness::retroarch_core_firmware_readiness;
+        use std::os::unix::fs::symlink;
+        // Required firmware: real file vs link to that same content, present
+        // vs absent. The readiness (which feeds blocker/warning mapping) of
+        // the link must equal that of the real file / missing file.
+        let info = fw_info(&[("a.bin", false)]);
+        let (_f, real) = firmware_probe_fixture("fw-eq-real", info.as_bytes(), |f| {
+            f.write("system/a.bin", "x");
+        });
+        let (_f2, linked) = firmware_probe_fixture("fw-eq-link", info.as_bytes(), |f| {
+            f.write("elsewhere/a.bin", "x");
+            symlink(f.path("elsewhere/a.bin"), f.path("system/a.bin")).unwrap();
+        });
+        assert_eq!(
+            retroarch_core_firmware_readiness(&real),
+            retroarch_core_firmware_readiness(&linked)
+        );
+        let (_f3, absent) = firmware_probe_fixture("fw-eq-absent", info.as_bytes(), |_| {});
+        let (_f4, dangling) = firmware_probe_fixture("fw-eq-dangling", info.as_bytes(), |f| {
+            symlink(f.path("elsewhere/gone.bin"), f.path("system/a.bin")).unwrap();
+        });
+        assert_eq!(
+            retroarch_core_firmware_readiness(&absent),
+            crate::launch::readiness::FirmwareReadiness::Missing
+        );
+        assert_eq!(
+            retroarch_core_firmware_readiness(&absent),
+            retroarch_core_firmware_readiness(&dangling)
         );
     }
 

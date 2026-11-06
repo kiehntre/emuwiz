@@ -385,7 +385,23 @@ pub fn inspect_target(path: &Path) -> BiosTargetState {
         Err(_) => return BiosTargetState::Unknown,
     };
     if metadata.file_type().is_symlink() {
-        BiosTargetState::ExistingCorrectLink
+        // A link whose target cannot be resolved (dangling, or a loop) is
+        // NOT a working projection, so it must never be reported as
+        // correct. It is reported as `ExistingWrongLink`: a conflict that
+        // projection never overwrites automatically (apply and re-plan
+        // verification both treat it as `TargetConflict`), so the user
+        // repairs it deliberately. Other resolve failures (e.g. permission)
+        // are `Unknown`. The link itself is never modified here.
+        match fs::metadata(path) {
+            Ok(_) => BiosTargetState::ExistingCorrectLink,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                BiosTargetState::ExistingWrongLink
+            }
+            Err(_) => BiosTargetState::Unknown,
+        }
     } else if metadata.is_file() {
         BiosTargetState::ExistingRegularFile
     } else {
@@ -1177,6 +1193,41 @@ mod tests {
             BiosTargetState::ExistingRegularFile
         );
         assert_eq!(fs::read(&file_path).unwrap(), b"existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_or_looping_link_is_not_reported_as_correct() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let good_src = dir.path().join("src.bin");
+        fs::write(&good_src, b"x").unwrap();
+        let good = dir.path().join("good");
+        symlink(&good_src, &good).unwrap();
+        assert_eq!(inspect_target(&good), BiosTargetState::ExistingCorrectLink);
+
+        let dangling = dir.path().join("dangling");
+        symlink(dir.path().join("gone.bin"), &dangling).unwrap();
+        assert_eq!(
+            inspect_target(&dangling),
+            BiosTargetState::ExistingWrongLink
+        );
+        let looped = dir.path().join("loop");
+        symlink("loop", &looped).unwrap();
+        assert_eq!(inspect_target(&looped), BiosTargetState::ExistingWrongLink);
+        // Inspection never repaired or removed the links.
+        assert!(
+            fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(&looped)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[cfg(unix)]
