@@ -217,7 +217,7 @@ fn blue_review_exposes_the_saved_fact_through_its_keyboard_disclosure() {
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(1024.0, 600.0),
+                    egui::vec2(1024.0, 800.0),
                 )),
                 events,
                 ..Default::default()
@@ -239,6 +239,11 @@ fn blue_review_exposes_the_saved_fact_through_its_keyboard_disclosure() {
     assert!(!closed.contains("bounded disc header"));
     // Traverse the real page's controls; Enter activates the disclosure when focused.
     let mut opened = false;
+    // The page's own actions (Change system, Back to game) now come first so
+    // loading evidence never moves them; tab past them without activating.
+    for _ in 0..2 {
+        frame(vec![key(egui::Key::Tab)]);
+    }
     for _ in 0..12 {
         frame(vec![key(egui::Key::Tab)]);
         frame(vec![key(egui::Key::Enter)]);

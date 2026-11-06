@@ -2448,12 +2448,12 @@ impl App {
     }
 }
 
-/// The grouped artwork entry's title once no pictures are loading.
 /// True when the window size differs from the last frame's (not on first run).
 fn resize_needs_repaint(previous: Option<egui::Vec2>, now: egui::Vec2) -> bool {
     previous.is_some_and(|previous| (previous - now).abs().max_elem() > 0.5)
 }
 
+/// The grouped artwork entry's title once no pictures are loading.
 pub(super) const ARTWORK_FINISHED_TITLE: &str = "Artwork";
 
 impl eframe::App for App {

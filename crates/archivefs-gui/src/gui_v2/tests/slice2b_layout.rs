@@ -2,6 +2,7 @@
 //! `App::show` in Blue and Classic, at every saved scale and window size. The
 //! probe measures what is actually painted - clipped text, overlapping
 //! controls and reachable actions - rather than asserting on private layout.
+use super::launch_readiness_summary::{self, ReadinessAction};
 use super::*;
 
 const SCALES: [f32; 4] = [0.8, 1.0, 1.3, 1.6];
@@ -552,4 +553,121 @@ fn library_controls_do_not_shift_when_a_game_is_selected() {
     let none = top_of_search(Route::BrowsePlay).expect("search shown");
     let selected = top_of_search(Route::BrowsePlayGame(1)).expect("search shown");
     assert!((none - selected).abs() < 1.0, "{none} vs {selected}");
+}
+
+fn compact_view(
+    fix: Option<ReadinessAction>,
+    pending: bool,
+    spinner: bool,
+    play_enabled: bool,
+    reason: &str,
+) -> launch_readiness_summary::CompactReadiness {
+    launch_readiness_summary::CompactReadiness {
+        badge: "Status",
+        tone: launch_readiness_summary::ReadinessPresentationState::Ready,
+        spinner,
+        reason: reason.into(),
+        headline: "headline".into(),
+        play_enabled,
+        fix,
+        pending,
+        more_findings: 0,
+    }
+}
+
+/// The Library side panel's Play / Game details positions are identical in
+/// Checking, Ready and a blocked answer with an extra fix button.
+#[test]
+fn side_panel_buttons_do_not_move_when_readiness_resolves() {
+    let long = "Identity could not be confirmed. The file's own identity evidence is missing, \
+        so EmuWiz cannot tell which game this is; review it before playing this game.";
+    for (window, panel) in [
+        ([1280.0_f32, 820.0], 400.0_f32),
+        ([1024.0, 768.0], 320.0),
+        ([900.0, 700.0], 260.0),
+    ] {
+        let states = [
+            (
+                "checking",
+                compact_view(None, true, true, true, "Checking."),
+            ),
+            (
+                "ready",
+                compact_view(None, false, false, true, "Ready to play."),
+            ),
+            (
+                "blocked",
+                compact_view(
+                    Some(ReadinessAction::ReviewIdentity),
+                    false,
+                    false,
+                    false,
+                    long,
+                ),
+            ),
+        ];
+        let mut ys = Vec::new();
+        for (name, view) in &states {
+            let context = egui::Context::default();
+            let mut found = None;
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(window[0], window[1]),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            launch_readiness_summary::show_compact(
+                                ui,
+                                view,
+                                panel,
+                                3,
+                                Some("Game details"),
+                            );
+                        });
+                    },
+                ));
+            }
+            let output = output.unwrap();
+            let play = text_bounds(&output, "Play")[0].min.y;
+            let details = text_bounds(&output, "Game details")[0].min.y;
+            found.replace((play, details));
+            ys.push((*name, found.unwrap()));
+        }
+        for pair in ys.windows(2) {
+            assert!(
+                (pair[0].1.0 - pair[1].1.0).abs() < 1.0 && (pair[0].1.1 - pair[1].1.1).abs() < 1.0,
+                "{window:?}: {:?} vs {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+}
+
+/// Review identity: Change system / Back to game keep their place while the
+/// recorded evidence loads.
+#[test]
+fn review_identity_actions_do_not_move_when_evidence_loads() {
+    for window in [[1280.0_f32, 820.0], [1024.0, 768.0], [900.0, 700.0]] {
+        let mut ys = Vec::new();
+        for loaded in [false, true] {
+            let context = egui::Context::default();
+            let mut app = populated(&context, true, 1.0);
+            app.router.current = Route::ReviewIdentity(1);
+            if loaded {
+                app.review.knowledge_for = Some(1);
+            }
+            let output = settled(&context, &mut app, window);
+            let back = text_bounds(&output, "Back to game");
+            assert!(!back.is_empty(), "{window:?} loaded={loaded}");
+            ys.push(back[0].min.y);
+        }
+        assert!((ys[0] - ys[1]).abs() < 1.0, "{window:?}: {ys:?}");
+    }
 }

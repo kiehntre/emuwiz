@@ -289,6 +289,30 @@ impl App {
                     game.platform.clone()
                 });
                 ui.add_space(8.0);
+                // Actions sit above the status block so loading evidence never
+                // moves them.
+                if game.platform != super::library::UNKNOWN_PLATFORM {
+                    let manual = game.archive.platform_source.as_deref()
+                        == Some(archivefs_core::MANUAL_PLATFORM_SOURCE);
+                    ui.small(system_source_note(game.archive.platform_source.as_deref()));
+                    ui.horizontal(|ui| {
+                        if ui.button("Change system").clicked() {
+                            choose_system = true;
+                        }
+                        if manual
+                            && ui
+                                .button("Use the detected system again")
+                                .on_hover_text("Removes your choice. The system EmuWiz detected before applies again, if there was one.")
+                                .clicked()
+                        {
+                            clear_system = true;
+                        }
+                    });
+                }
+                if ui.button("Back to game").clicked() {
+                    route = Some(Route::Game(id));
+                }
+                ui.add_space(8.0);
                 if !loaded {
                     ui.label("Checking what EmuWiz has recorded for this game…");
                 }
@@ -337,28 +361,6 @@ impl App {
                         None => ui.label("No recorded identification-data check for this game."),
                     };
                 });
-                ui.add_space(8.0);
-                if game.platform != super::library::UNKNOWN_PLATFORM {
-                    let manual = game.archive.platform_source.as_deref()
-                        == Some(archivefs_core::MANUAL_PLATFORM_SOURCE);
-                    ui.small(system_source_note(game.archive.platform_source.as_deref()));
-                    ui.horizontal(|ui| {
-                        if ui.button("Change system").clicked() {
-                            choose_system = true;
-                        }
-                        if manual
-                            && ui
-                                .button("Use the detected system again")
-                                .on_hover_text("Removes your choice. The system EmuWiz detected before applies again, if there was one.")
-                                .clicked()
-                        {
-                            clear_system = true;
-                        }
-                    });
-                }
-                if ui.button("Back to game").clicked() {
-                    route = Some(Route::Game(id));
-                }
             });
         if choose_system {
             self.review.choosing = Some(SystemChoice::default());
