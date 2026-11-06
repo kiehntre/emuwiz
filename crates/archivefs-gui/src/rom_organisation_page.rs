@@ -3029,7 +3029,8 @@ mod tests {
     }
 
     fn collected(roots: &[PathBuf]) -> Vec<String> {
-        collect_source_files(roots)
+        collect_source_files_reported(roots, 2_000, 4)
+            .files
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect()
