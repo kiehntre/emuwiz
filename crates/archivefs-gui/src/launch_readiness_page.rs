@@ -3406,10 +3406,10 @@ fn retroarch_launch_request_unexplained(
     let (Some(platform_id), Some(game_key)) = (&plan.platform_id, &plan.game_key) else {
         return Err(R::NotReady);
     };
-    if candidate.readiness != LaunchReadiness::Ready {
-        return Err(R::NotReady);
-    }
-    if !candidate.blockers.is_empty() || !candidate.warnings.is_empty() {
+    // Ready, or ReadyWithWarnings carrying ONLY the allow-listed
+    // unverified-firmware warning (owner policy B); every other warning kind
+    // and every blocker still refuses.
+    if !candidate.retroarch_play_eligible() {
         return Err(R::NotReady);
     }
     if candidate.content.requires_mount {
