@@ -4151,7 +4151,7 @@ impl App {
             if ui.button("View games").clicked() { self.go(Route::Section(Section::Games)); }
             if section == Section::Sources {
                 ui.label(format!("{} configured game folders are enabled.", self.library.sources));
-                if self.library.sources > 0 && ui.add_enabled(self.load_job.is_none(), egui::Button::new("Scan configured folders…")).clicked() { self.confirm_scan = true; }
+                if self.library.sources > 0 && ui.add_enabled(self.load_job.is_none() && !self.native_catalogue_writer_busy(), egui::Button::new("Scan configured folders…")).clicked() { self.confirm_scan = true; }
                 ui.label("Discovery comes first. You can choose folders manually in the existing workflow if discovery cannot find them.");
             }
             ui.collapsing("Advanced details", |ui| {

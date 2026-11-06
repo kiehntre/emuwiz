@@ -916,6 +916,11 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                     reporter.flush();
                     state.rollback();
                 }
+                super::CanonicalOrganisationJobKind::Rescan => {
+                    reporter.phase("Finding your game files", "folders", None);
+                    reporter.flush();
+                    state.rescan_sources();
+                }
             }
             Ok(Payload::CanonicalOrganisation {
                 state,

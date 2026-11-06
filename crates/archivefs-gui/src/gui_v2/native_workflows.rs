@@ -52,6 +52,10 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 pub(super) struct NativeWorkflows {
     pub(super) app: ArchiveFsApp,
+    /// Set by the Blue host each frame while its own catalogue writer (folder
+    /// scan or database upgrade) runs. Native Sources actions refuse to start
+    /// meanwhile, so two writers never touch the catalogue at once (S06-04).
+    pub(super) catalogue_writer_busy: bool,
     /// Set by the readiness card's Hasheous shortcut; Game Details takes it.
     lookup_online_requested: bool,
     native_romm: native_romm::State,
@@ -423,6 +427,7 @@ impl NativeWorkflows {
         super::readable_style(&context);
         Self {
             app,
+            catalogue_writer_busy: false,
             lookup_online_requested: false,
             native_romm: native_romm::State::default(),
             selected: None,
@@ -459,6 +464,12 @@ impl NativeWorkflows {
             remote_probe_results: BTreeMap::new(),
             remote_probe_jobs: BTreeMap::new(),
         }
+    }
+
+    /// Whether a new Sources-page action may start: the native app's own
+    /// one-writer rule, and no Blue catalogue writer running either.
+    pub(super) fn source_action_available(&self) -> bool {
+        self.app.source_action_available() && !self.catalogue_writer_busy
     }
 
     pub(super) fn poll(&mut self, context: &egui::Context, activity: &mut Activity) {
@@ -1474,7 +1485,7 @@ impl NativeWorkflows {
                 .unwrap_or(&[]),
         );
         let mut health_action = None;
-        let busy = !self.app.source_action_available() || self.collection.preparing();
+        let busy = !self.source_action_available() || self.collection.preparing();
         let mut action = None;
 
         self.poll_remote_source_probes(ui.ctx());

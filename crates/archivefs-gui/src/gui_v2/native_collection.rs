@@ -258,7 +258,7 @@ impl NativeWorkflows {
         ctx: egui::Context,
         action: SourceAction,
     ) {
-        if !self.app.source_action_available() || self.collection.preparing() {
+        if !self.source_action_available() || self.collection.preparing() {
             return;
         }
         if !scans(&action) {
@@ -334,7 +334,7 @@ impl NativeWorkflows {
             return;
         };
         let current = self.review_is_current(review);
-        let available = self.app.source_action_available();
+        let available = self.source_action_available();
         let mut cancel = false;
         let mut confirm = false;
         let response = egui::Modal::new(egui::Id::new("blue_collection_scan_review")).show(ctx, |ui| {
@@ -410,7 +410,7 @@ impl NativeWorkflows {
             && self.collection.import_history.show(
                 ui,
                 Some(&path),
-                !self.app.source_action_available(),
+                !self.source_action_available(),
                 None,
             )
         {
@@ -443,7 +443,7 @@ impl NativeWorkflows {
                 ui.label("Before importing from this folder, review which storage it is on. This is separate from importing and does not scan or change game files.");
                 if ui
                     .add_enabled(
-                        self.app.source_action_available(),
+                        self.source_action_available(),
                         egui::Button::new("Review folder storage…"),
                     )
                     .clicked()
@@ -461,7 +461,7 @@ impl NativeWorkflows {
                         &snapshot.database_path,
                         self.app.database_generation.0,
                         &snapshot.source_views,
-                        !self.app.source_action_available(),
+                        !self.source_action_available(),
                     );
                 });
         }
