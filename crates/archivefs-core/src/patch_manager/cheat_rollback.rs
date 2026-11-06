@@ -1,3 +1,4 @@
+use super::anchored_fs::{DirectoryHandle, DirectoryIdentity};
 use super::cheat_install_result::{
     CheatInstallEntrySettlement, CheatInstallOutcome, CheatInstallPath, parse_cheat_install_run,
 };
@@ -302,6 +303,19 @@ fn rollback_one_entry(
         r.error_code = Some("unsafe_destination".into());
         return r;
     }
+    // Night Watch D7-03: every mutation below is relative to the platform
+    // directory opened now (no-follow, identity-checked against the
+    // assessed root), never by path.
+    let dir = match open_assessed_platform_dir(&options.destination_root, &parts[0]) {
+        Ok(dir) => dir,
+        Err(message) => {
+            r.outcome = CheatRollbackOutcome::FailedUnsafeDestination;
+            r.error_code = Some("unsafe_destination".into());
+            r.message = message;
+            return r;
+        }
+    };
+    let final_name = std::ffi::OsStr::new(&parts[1]);
     let md = match fs::symlink_metadata(&p) {
         Ok(m) => Some(m),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -375,12 +389,20 @@ fn rollback_one_entry(
             r.error_code = Some("injected_removal_failure".into());
         } else {
             let expected = r.expected_installed_hash.clone().unwrap_or_default();
-            let parked = p.parent().unwrap_or(Path::new(".")).join(format!(
+            let parked_name = format!(
                 ".archivefs-rollback-{}-{}-{index}.removed",
                 options.run_id,
                 std::process::id()
-            ));
-            match remove_verified(&p, &expected, &parked) {
+            );
+            let parked = p.parent().unwrap_or(Path::new(".")).join(&parked_name);
+            match remove_verified(
+                &dir,
+                &p,
+                final_name,
+                &expected,
+                std::ffi::OsStr::new(&parked_name),
+                &parked,
+            ) {
                 Ok(()) => {
                     r.outcome = CheatRollbackOutcome::RemovedInstalledFile;
                     r.wrote = true
@@ -433,11 +455,13 @@ fn rollback_one_entry(
             r.outcome = CheatRollbackOutcome::WouldRestoreBackup;
         } else {
             let parent = p.parent().unwrap_or(Path::new("."));
-            let tmp = parent.join(format!(
+            let tmp_name = format!(
                 ".archivefs-rollback-{}-{}",
                 options.run_id,
                 std::process::id()
-            ));
+            );
+            let tmp = parent.join(&tmp_name);
+            let tmp_os = std::ffi::OsStr::new(&tmp_name);
             let expected_installed = r.expected_installed_hash.clone().unwrap_or_default();
             let result = (|| -> Result<(), MutationError> {
                 if should_inject(FaultPoint::TempWrite) {
@@ -446,20 +470,21 @@ fn rollback_one_entry(
                     ));
                 }
                 let bytes = fs::read(&bp).map_err(|e| MutationError::Io(e.to_string()))?;
-                let mut f = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&tmp)
+                let mut f = dir
+                    .create_new_file(tmp_os)
                     .map_err(|e| MutationError::Io(e.to_string()))?;
                 std::io::Write::write_all(&mut f, &bytes)
                     .map_err(|e| MutationError::Io(e.to_string()))?;
                 f.sync_all().map_err(|e| MutationError::Io(e.to_string()))?;
+                drop(f);
                 if should_inject(FaultPoint::Verification) {
                     return Err(MutationError::Verification(
                         "injected restore verification failure".into(),
                     ));
                 }
-                if hash_file(&tmp).ok().as_deref() != e.previous_destination_hash.as_deref() {
+                if hash_in_dir(&dir, tmp_os).ok().as_deref()
+                    != e.previous_destination_hash.as_deref()
+                {
                     return Err(MutationError::Verification(
                         "restore verification hash mismatch".into(),
                     ));
@@ -467,8 +492,8 @@ fn rollback_one_entry(
                 if should_inject(FaultPoint::Rename) {
                     return Err(MutationError::Io("injected restore rename failure".into()));
                 }
-                restore_verified(&tmp, &p, &expected_installed)?;
-                let _ = fs::File::open(parent).and_then(|f| f.sync_all());
+                restore_verified(&dir, &p, tmp_os, &tmp, final_name, &expected_installed)?;
+                let _ = dir.sync();
                 Ok(())
             })();
             match result {
@@ -536,19 +561,53 @@ fn run_before_mutation_hook(path: &Path) {
 /// aside atomically (`RENAME_NOREPLACE` into `parked`), hashed there, and
 /// only then unlinked. Content that no longer matches is moved back (or,
 /// if its name was reused meanwhile, kept at `parked` and reported).
+/// Opens `<root>/<platform>` for mutation: the root is opened once with
+/// no-follow and must be the very directory the read-only assessment
+/// looked at (same device and inode); the platform directory is opened
+/// relative to it and must be a plain directory. Everything the rollback
+/// then does happens relative to the returned handle (Night Watch D7-03).
+fn open_assessed_platform_dir(root: &Path, platform: &str) -> Result<DirectoryHandle, String> {
+    let metadata = fs::symlink_metadata(root).map_err(|e| format!("destination root: {e}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("destination root is not a plain directory".into());
+    }
+    let root = DirectoryHandle::open_verified(root, DirectoryIdentity::of_metadata(&metadata))
+        .map_err(|e| format!("destination root could not be opened safely: {e}"))?;
+    root.open_child_dir(std::ffi::OsStr::new(platform))
+        .map_err(|e| format!("platform directory is not a plain directory: {e}"))
+}
+
+/// Hashes `name` inside `dir` through the handle, never by path.
+fn hash_in_dir(dir: &DirectoryHandle, name: &std::ffi::OsStr) -> Result<String, String> {
+    let mut f = dir.open_file(name).map_err(|e| e.to_string())?;
+    let mut h = Sha256::new();
+    let mut b = [0u8; 8192];
+    loop {
+        let n = f.read(&mut b).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        h.update(&b[..n]);
+    }
+    Ok(h.finalize().iter().map(|b| format!("{:02x}", b)).collect())
+}
+
 fn remove_verified(
+    dir: &DirectoryHandle,
     destination: &Path,
+    final_name: &std::ffi::OsStr,
     expected_hash: &str,
+    parked_name: &std::ffi::OsStr,
     parked: &Path,
 ) -> Result<(), MutationError> {
     run_before_mutation_hook(destination);
-    super::cheat_installer::rename_no_replace(destination, parked)
+    dir.rename_no_replace(final_name, parked_name)
         .map_err(|e| MutationError::Io(format!("could not move the file aside: {e}")))?;
-    match hash_file(parked) {
-        Ok(hash) if hash == expected_hash => {
-            fs::remove_file(parked).map_err(|e| MutationError::Io(e.to_string()))
-        }
-        _ => match super::cheat_installer::rename_no_replace(parked, destination) {
+    match hash_in_dir(dir, parked_name) {
+        Ok(hash) if hash == expected_hash => dir
+            .unlink(parked_name)
+            .map_err(|e| MutationError::Io(e.to_string())),
+        _ => match dir.rename_no_replace(parked_name, final_name) {
             Ok(()) => Err(MutationError::DestinationChanged(
                 "destination changed after the hash check; left in place".into(),
             )),
@@ -567,22 +626,25 @@ fn remove_verified(
 /// concurrent rewrite is never lost; where exchange is unsupported the
 /// destination is re-hashed immediately before a plain rename.
 fn restore_verified(
-    tmp: &Path,
+    dir: &DirectoryHandle,
     destination: &Path,
+    tmp_name: &std::ffi::OsStr,
+    tmp: &Path,
+    final_name: &std::ffi::OsStr,
     expected_installed_hash: &str,
 ) -> Result<(), MutationError> {
     run_before_mutation_hook(destination);
-    match super::cheat_installer::rename_exchange(tmp, destination) {
+    match dir.exchange(tmp_name, final_name) {
         Ok(()) => {
             // `tmp` now holds whatever was at the destination.
-            match hash_file(tmp) {
+            match hash_in_dir(dir, tmp_name) {
                 Ok(hash) if hash == expected_installed_hash => {
-                    let _ = fs::remove_file(tmp);
+                    let _ = dir.unlink(tmp_name);
                     Ok(())
                 }
-                _ => match super::cheat_installer::rename_exchange(tmp, destination) {
+                _ => match dir.exchange(tmp_name, final_name) {
                     Ok(()) => {
-                        let _ = fs::remove_file(tmp);
+                        let _ = dir.unlink(tmp_name);
                         Err(MutationError::DestinationChanged(
                             "destination changed after the hash check; left unchanged".into(),
                         ))
@@ -594,16 +656,15 @@ fn restore_verified(
                 },
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-            if hash_file(destination).ok().as_deref() != Some(expected_installed_hash) {
-                let _ = fs::remove_file(tmp);
-                return Err(MutationError::DestinationChanged(
-                    "destination changed after the hash check; left unchanged".into(),
-                ));
-            }
-            fs::rename(tmp, destination).map_err(|e| MutationError::Io(e.to_string()))
+        Err(e) => {
+            // Only an atomic exchange may displace the installed file: a
+            // filesystem without it refuses rather than falling back to a
+            // check-then-rename.
+            let _ = dir.unlink(tmp_name);
+            Err(MutationError::Io(format!(
+                "could not atomically exchange the restored file into place: {e}"
+            )))
         }
-        Err(e) => Err(MutationError::Io(e.to_string())),
     }
 }
 

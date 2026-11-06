@@ -2233,3 +2233,489 @@ fn rollback_killed_mid_way_leaves_a_pending_record_and_can_be_resumed() {
     );
     fixture.assert_destination_is_pre_run_state();
 }
+
+// ---------------------------------------------------------------------
+// Night Watch D7-01 / D7-02 / D7-03: what the installer writes, under
+// which name, and where - through the real catalogue preview.
+// ---------------------------------------------------------------------
+
+mod d7_wiring {
+    use super::*;
+    use crate::emulator_environment::HostReadOnlyFilesystem;
+    use crate::patch_manager::cheat_catalogue::{
+        NO_INSTALLABLE_CHEATS_REASON, build_cheat_availability_report,
+        load_cheat_catalogue_snapshot, render_installable_cheat_document,
+    };
+    use crate::patch_manager::{
+        CatalogueGameEvidence, CheatRollbackOptions, execute_cheat_rollback_run,
+    };
+    use std::os::unix::fs::symlink;
+
+    fn evidence(archive_id: i64, name: &str) -> CatalogueGameEvidence {
+        CatalogueGameEvidence {
+            archive_id,
+            is_present: true,
+            display_name: name.to_string(),
+            normalized_name: name.to_ascii_lowercase(),
+            platform: Some("Atari2600".to_string()),
+            region: None,
+            serial: None,
+            executable_crc: None,
+        }
+    }
+
+    fn manifest(root: &Path, games: &[(&str, &[(&str, Option<&str>)])]) -> PathBuf {
+        let games_json: Vec<String> = games
+            .iter()
+            .map(|(name, cheats)| {
+                let cheats_json: Vec<String> = cheats
+                    .iter()
+                    .map(|(description, code)| match code {
+                        Some(code) => format!(
+                            r#"{{"description": "{description}", "code": "{code}", "enabled_by_default": true}}"#
+                        ),
+                        None => format!(r#"{{"description": "{description}"}}"#),
+                    })
+                    .collect();
+                format!(
+                    r#"{{"game_name": "{name}", "platform": "Atari2600", "cheats": [{}]}}"#,
+                    cheats_json.join(",")
+                )
+            })
+            .collect();
+        let path = root.join("manifest.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"source_name": "Fixture", "games": [{}]}}"#,
+                games_json.join(",")
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn previewed(
+        manifest_path: &Path,
+        games: &[CatalogueGameEvidence],
+        destination_root: &Path,
+    ) -> Vec<CheatAvailabilityEntry> {
+        let snapshot =
+            load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", manifest_path);
+        build_cheat_availability_report(
+            &HostReadOnlyFilesystem,
+            &snapshot,
+            games,
+            None,
+            Some(destination_root),
+        )
+        .entries
+    }
+
+    #[test]
+    fn d7_01_manifest_install_writes_the_rendered_per_game_cht_not_the_manifest() {
+        let catalogue_root = temp_root("d7-01-manifest");
+        let destination_root = temp_root("d7-01-manifest-dest");
+        let journal_dir = temp_root("d7-01-manifest-journal");
+        let backup_dir = temp_root("d7-01-manifest-backup");
+        let manifest_path = manifest(
+            &catalogue_root,
+            &[
+                (
+                    " Alpha Quest ",
+                    &[("only for Alpha", Some("F000:01")), ("codeless", None)],
+                ),
+                ("Delta", &[("only for Delta", Some("F001:02"))]),
+            ],
+        );
+        let manifest_bytes = fs::read(&manifest_path).unwrap();
+        let entries = previewed(
+            &manifest_path,
+            &[evidence(1, "Alpha Quest"), evidence(2, "Delta")],
+            &destination_root,
+        );
+        assert_eq!(entries.len(), 2);
+        let opts = options(
+            &destination_root,
+            &journal_dir,
+            &backup_dir,
+            false,
+            true,
+            false,
+            "d7-01",
+        );
+        let outcome = execute_cheat_install_run(&entries, &opts);
+        assert_eq!(outcome.run.status, CheatInstallRunStatus::Success);
+        assert!(outcome.journal_error.is_none());
+        let platform_dir = destination_root.join("Atari2600");
+        for (entry, result) in entries.iter().zip(&outcome.run.entries) {
+            assert_eq!(
+                result.outcome,
+                CheatInstallOutcome::InstalledNew,
+                "{result:?}"
+            );
+            assert!(result.applied);
+            // The written path is exactly the previewed path (D7-02):
+            // " Alpha Quest " was previewed and is written as Alpha Quest.cht.
+            let previewed_path = entry
+                .staging_plan
+                .proposed_destination_path
+                .as_ref()
+                .unwrap()
+                .display
+                .clone();
+            assert_eq!(
+                result.destination_path.as_ref().unwrap().display,
+                previewed_path
+            );
+            let written = fs::read(&previewed_path).unwrap();
+            let rendered = render_installable_cheat_document(&entry.game).unwrap();
+            assert_eq!(written, rendered, "exactly the rendered per-game document");
+            assert_ne!(written, manifest_bytes, "never the manifest bytes");
+            let text = String::from_utf8(written).unwrap();
+            assert!(text.contains("cheats = 1\n"), "{text}");
+            assert!(!text.contains("codeless"), "{text}");
+            assert_eq!(
+                result.resulting_destination_hash.as_deref(),
+                Some(hex_sha256(&rendered).as_str())
+            );
+            assert!(
+                result
+                    .detail
+                    .iter()
+                    .any(|line| line.contains("rendered a per-game")),
+                "{:?}",
+                result.detail
+            );
+        }
+        let alpha = fs::read_to_string(platform_dir.join("Alpha Quest.cht")).unwrap();
+        assert!(
+            !alpha.contains("Delta"),
+            "another game's cheats leaked: {alpha}"
+        );
+        assert!(!platform_dir.join(" Alpha Quest .cht").exists());
+        assert!(
+            dir_entries(&platform_dir)
+                .iter()
+                .all(|name| !name.starts_with('.')),
+            "no temporary residue: {:?}",
+            dir_entries(&platform_dir)
+        );
+
+        // A second run sees the rendered file as already installed; a
+        // manifest edited afterwards is refused for the right reason.
+        let again = previewed(
+            &manifest_path,
+            &[evidence(1, "Alpha Quest"), evidence(2, "Delta")],
+            &destination_root,
+        );
+        assert!(
+            again
+                .iter()
+                .all(|entry| entry.staging_plan.planned_action
+                    == CheatStagingAction::AlreadyInstalled)
+        );
+        fs::write(
+            &manifest_path,
+            b"{\"source_name\": \"Fixture\", \"games\": []}",
+        )
+        .unwrap();
+        let opts = options(
+            &destination_root,
+            &journal_dir,
+            &backup_dir,
+            false,
+            true,
+            false,
+            "d7-01-again",
+        );
+        let outcome = execute_cheat_install_run(&again, &opts);
+        assert_eq!(
+            outcome.run.entries[0].outcome,
+            CheatInstallOutcome::SkippedSourceChanged
+        );
+        assert_eq!(
+            outcome.run.entries[0].reason_code,
+            "source_hash_changed_since_preview"
+        );
+    }
+
+    #[test]
+    fn d7_01_codeless_manifest_game_is_reported_skipped_and_never_installed() {
+        let catalogue_root = temp_root("d7-01-codeless");
+        let destination_root = temp_root("d7-01-codeless-dest");
+        let journal_dir = temp_root("d7-01-codeless-journal");
+        let backup_dir = temp_root("d7-01-codeless-backup");
+        let manifest_path = manifest(
+            &catalogue_root,
+            &[("Frogger", &[("Infinite Lives", None), ("Moon Jump", None)])],
+        );
+        let entries = previewed(&manifest_path, &[evidence(1, "Frogger")], &destination_root);
+        assert_eq!(entries[0].staging_plan.reason, NO_INSTALLABLE_CHEATS_REASON);
+        let opts = options(
+            &destination_root,
+            &journal_dir,
+            &backup_dir,
+            false,
+            true,
+            false,
+            "d7-01-codeless",
+        );
+        let outcome = execute_cheat_install_run(&entries, &opts);
+        assert_eq!(
+            outcome.run.entries[0].outcome,
+            CheatInstallOutcome::SkippedNotEligible
+        );
+        assert_eq!(
+            outcome.run.entries[0].reason_code,
+            NO_INSTALLABLE_CHEATS_REASON
+        );
+        assert!(!outcome.run.entries[0].applied);
+        assert_eq!(outcome.run.summary.writes_succeeded, 0);
+        assert!(!destination_root.join("Atari2600").exists());
+    }
+
+    #[test]
+    fn d7_02_a_destination_that_differs_from_the_preview_is_refused_not_noted() {
+        let catalogue_root = temp_root("d7-02-mismatch");
+        let destination_root = temp_root("d7-02-mismatch-dest");
+        let journal_dir = temp_root("d7-02-mismatch-journal");
+        let backup_dir = temp_root("d7-02-mismatch-backup");
+        // A preview that (hypothetically) promised the untrimmed name: the
+        // installer's own derivation differs, so nothing may be written.
+        let entry = install_new_entry(
+            &catalogue_root,
+            &destination_root,
+            " Frogger ",
+            b"cheats = 0\n",
+        );
+        let opts = options(
+            &destination_root,
+            &journal_dir,
+            &backup_dir,
+            false,
+            true,
+            false,
+            "d7-02",
+        );
+        let outcome = execute_cheat_install_run(&[entry], &opts);
+        assert_eq!(
+            outcome.run.entries[0].outcome,
+            CheatInstallOutcome::SkippedDestinationChanged
+        );
+        assert_eq!(
+            outcome.run.entries[0].reason_code,
+            "destination_differs_from_preview"
+        );
+        assert!(!outcome.run.entries[0].applied);
+        assert!(!destination_root.join("Atari2600").exists());
+
+        // A name no helper accepts is refused outright.
+        let entry = install_new_entry(
+            &catalogue_root,
+            &destination_root,
+            "Frog\u{1}ger",
+            b"cheats = 0\n",
+        );
+        let outcome = execute_cheat_install_run(
+            &[entry],
+            &options(
+                &destination_root,
+                &journal_dir,
+                &backup_dir,
+                false,
+                true,
+                false,
+                "d7-02-ctrl",
+            ),
+        );
+        assert_eq!(
+            outcome.run.entries[0].outcome,
+            CheatInstallOutcome::FailedUnsafePath
+        );
+        assert_eq!(
+            outcome.run.entries[0].reason_code,
+            "destination_name_unsafe"
+        );
+        assert!(!destination_root.join("Atari2600").exists());
+    }
+
+    /// D7-03: the platform directory is swapped for a symlink to an outside
+    /// folder after the read-only assessment and before the write.
+    #[test]
+    fn d7_03_platform_directory_swapped_for_a_symlink_after_assessment_writes_nothing() {
+        let catalogue_root = temp_root("d7-03-swap");
+        let destination_root = temp_root("d7-03-swap-dest");
+        let journal_dir = temp_root("d7-03-swap-journal");
+        let backup_dir = temp_root("d7-03-swap-backup");
+        let outside = temp_root("d7-03-swap-outside");
+        let platform_dir = destination_root.join("Atari2600");
+        fs::create_dir_all(&platform_dir).unwrap();
+        let entry = install_new_entry(
+            &catalogue_root,
+            &destination_root,
+            "Frogger",
+            b"cheats = 0\n",
+        );
+        let moved = destination_root.join("Atari2600.moved");
+        let (moved_for_hook, platform_for_hook, outside_for_hook) =
+            (moved.clone(), platform_dir.clone(), outside.clone());
+        set_before_anchor_hook_for_test(Some(Box::new(move |_root: &Path| {
+            if platform_for_hook.exists() && !moved_for_hook.exists() {
+                fs::rename(&platform_for_hook, &moved_for_hook).unwrap();
+                symlink(&outside_for_hook, &platform_for_hook).unwrap();
+            }
+        })));
+        let outcome = execute_cheat_install_run(
+            &[entry],
+            &options(
+                &destination_root,
+                &journal_dir,
+                &backup_dir,
+                false,
+                true,
+                false,
+                "d7-03",
+            ),
+        );
+        set_before_anchor_hook_for_test(None);
+        let result = &outcome.run.entries[0];
+        assert_eq!(
+            result.outcome,
+            CheatInstallOutcome::FailedUnsafePath,
+            "{result:?}"
+        );
+        assert_eq!(result.reason_code, "parent_symlink_rejected");
+        assert!(!result.applied);
+        assert_ne!(outcome.run.status, CheatInstallRunStatus::Success);
+        assert!(
+            fs::read_dir(&outside).unwrap().next().is_none(),
+            "nothing may land where the symlink points"
+        );
+        assert!(
+            dir_entries(&moved).is_empty(),
+            "nothing in the moved directory either"
+        );
+
+        // The same swap of the destination root itself is refused as well.
+        let destination_root2 = temp_root("d7-03-swap-root");
+        let entry = install_new_entry(
+            &catalogue_root,
+            &destination_root2,
+            "Pitfall",
+            b"cheats = 0\n",
+        );
+        let moved_root = temp_root("d7-03-swap-root-moved");
+        let _ = fs::remove_dir(&moved_root);
+        let (root_for_hook, moved_root_for_hook, outside_for_hook) = (
+            destination_root2.clone(),
+            moved_root.clone(),
+            outside.clone(),
+        );
+        set_before_anchor_hook_for_test(Some(Box::new(move |_root: &Path| {
+            if !moved_root_for_hook.exists() {
+                fs::rename(&root_for_hook, &moved_root_for_hook).unwrap();
+                symlink(&outside_for_hook, &root_for_hook).unwrap();
+            }
+        })));
+        let outcome = execute_cheat_install_run(
+            &[entry],
+            &options(
+                &destination_root2,
+                &journal_dir,
+                &backup_dir,
+                false,
+                true,
+                false,
+                "d7-03-root",
+            ),
+        );
+        set_before_anchor_hook_for_test(None);
+        let result = &outcome.run.entries[0];
+        assert_eq!(
+            result.outcome,
+            CheatInstallOutcome::FailedUnsafePath,
+            "{result:?}"
+        );
+        assert!(!result.applied);
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    /// D7-03 for Undo: a platform directory swapped for a symlink right
+    /// before the mutation redirects nothing, because the rollback already
+    /// holds the real directory open; the installed file is removed from
+    /// where it really is and the symlink target stays empty.
+    #[test]
+    fn d7_03_rollback_mutation_stays_in_the_opened_directory_after_a_swap() {
+        let catalogue_root = temp_root("d7-03-rb");
+        let destination_root = temp_root("d7-03-rb-dest");
+        let journal_dir = temp_root("d7-03-rb-journal");
+        let backup_dir = temp_root("d7-03-rb-backup");
+        let rollback_dir = temp_root("d7-03-rb-rollback");
+        let outside = temp_root("d7-03-rb-outside");
+        let entry = install_new_entry(
+            &catalogue_root,
+            &destination_root,
+            "Frogger",
+            b"cheats = 0\n",
+        );
+        let installed = execute_cheat_install_run(
+            &[entry],
+            &options(
+                &destination_root,
+                &journal_dir,
+                &backup_dir,
+                false,
+                true,
+                false,
+                "d7-03-rb",
+            ),
+        );
+        let journal = installed.journal_path.expect("install journal");
+        let platform_dir = destination_root.join("Atari2600");
+        assert_eq!(
+            fs::read(platform_dir.join("Frogger.cht")).unwrap(),
+            b"cheats = 0\n"
+        );
+        let moved = destination_root.join("Atari2600.moved");
+        let (moved_for_hook, platform_for_hook, outside_for_hook) =
+            (moved.clone(), platform_dir.clone(), outside.clone());
+        crate::patch_manager::cheat_rollback::set_before_destination_mutation_hook_for_test(Some(
+            Box::new(move |_path: &Path| {
+                if !moved_for_hook.exists() {
+                    fs::rename(&platform_for_hook, &moved_for_hook).unwrap();
+                    symlink(&outside_for_hook, &platform_for_hook).unwrap();
+                }
+            }),
+        ));
+        let outcome = execute_cheat_rollback_run(
+            &journal,
+            &CheatRollbackOptions {
+                journal_path: journal.clone(),
+                destination_root: destination_root.clone(),
+                backup_directory: backup_dir.clone(),
+                rollback_journal_directory: rollback_dir.clone(),
+                dry_run: false,
+                confirmed: true,
+                run_id: "d7-03-rb-undo".into(),
+                started_at_unix_seconds: 1_700_000_100,
+            },
+        );
+        crate::patch_manager::cheat_rollback::set_before_destination_mutation_hook_for_test(None);
+        assert_eq!(
+            outcome.run.entries[0].outcome,
+            crate::patch_manager::CheatRollbackOutcome::RemovedInstalledFile,
+            "{:?}",
+            outcome.run.entries[0]
+        );
+        assert!(
+            !moved.join("Frogger.cht").exists(),
+            "removed from the real directory"
+        );
+        assert!(
+            fs::read_dir(&outside).unwrap().next().is_none(),
+            "symlink target untouched"
+        );
+        assert!(dir_entries(&moved).is_empty(), "no parked residue");
+    }
+}
