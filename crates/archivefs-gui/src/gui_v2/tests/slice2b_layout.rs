@@ -686,10 +686,19 @@ fn game_details_paints_nothing_beyond_the_window_edge() {
             _ => {}
         }
     }
-    for (width, height) in [(1280.0_f32, 820.0_f32), (1100.0, 800.0), (1500.0, 900.0)] {
-        let size = [width, height];
+    let cases = [
+        (1280.0_f32, 820.0_f32, 1.0_f32),
+        (1100.0, 800.0, 1.0),
+        (1500.0, 900.0, 1.0),
+        (1280.0, 820.0, 0.9),
+        (1280.0, 820.0, 1.1),
+        (1280.0, 820.0, 1.25),
+    ];
+    for (pixels_w, pixels_h, scale) in cases {
+        let size = points((pixels_w, pixels_h), scale);
+        let width = size[0];
         let context = egui::Context::default();
-        let mut app = populated(&context, true, 1.0);
+        let mut app = populated(&context, true, scale);
         app.router.current = Route::Game(1);
         let output = settled(&context, &mut app, size);
         let mut max = 0.0_f32;
@@ -699,13 +708,58 @@ fn game_details_paints_nothing_beyond_the_window_edge() {
             max_right(&clipped.shape, &mut right);
             max = max.max(right.min(clipped.clip_rect.right()));
         }
-        assert!(max <= width + 0.5, "{size:?}: painted to {max}");
+        assert!(max <= width + 0.5, "{size:?} @{scale}: painted to {max}");
         assert!(clipped_text(&output, size).is_empty(), "{size:?}");
-        if width <= 1280.0 {
+        if pixels_w <= 1280.0 && scale == 1.0 {
             assert!(
                 text_bounds(&output, "Can I play it?").is_empty(),
                 "{size:?} must use the stacked layout"
             );
+        }
+    }
+}
+
+/// The readiness card's two action buttons stay inside the card at the widths
+/// the Game Details right column gives it (about 300 points inside), even
+/// when "Set up emulator" and the disabled Play cannot both fit a row.
+#[test]
+fn readiness_card_buttons_stay_inside_a_narrow_card() {
+    for card_width in [200.0_f32, 239.0, 300.0, 330.0, 420.0, 600.0] {
+        let mut summary = launch_readiness_summary::not_started_summary();
+        summary.status = launch_readiness_summary::ReadinessPresentationState::NeedsEmulator;
+        summary.headline = "An emulator is needed".into();
+        summary.primary_action = Some(ReadinessAction::SetUpEmulator);
+        let context = egui::Context::default();
+        let mut output = None;
+        for _ in 0..3 {
+            output = Some(context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.allocate_ui(egui::vec2(card_width, 0.0), |ui| {
+                            launch_readiness_summary::show(ui, &summary);
+                        });
+                    });
+                },
+            ));
+        }
+        let output = output.unwrap();
+        let left = 8.0; // CentralPanel margin
+        for label in ["Set up emulator", "Play"] {
+            let rects = text_bounds(&output, label);
+            assert!(!rects.is_empty(), "{label} at {card_width}");
+            for rect in rects {
+                assert!(
+                    rect.max.x <= left + card_width + 1.0,
+                    "{label} at {card_width}: {rect:?}"
+                );
+            }
         }
     }
 }

@@ -900,12 +900,21 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
         );
         let available = ui.available_width();
         let gap = ui.spacing().item_spacing.x;
-        let slot = if available >= 320.0 && action_count == 2 {
-            (available - gap) / 2.0
+        // Two buttons share the row when each keeps a usable width; otherwise
+        // they stack. `add_sized` does not wrap in a wrapping row, so never
+        // rely on that: a narrow card used to push Play past its edge.
+        let side_by_side = action_count == 2 && available >= 240.0;
+        let slot = if side_by_side {
+            ((available - gap) / 2.0).min(260.0)
         } else {
             available.min(260.0)
         };
-        ui.horizontal_wrapped(|ui| {
+        let button_layout = if action_count == 2 && !side_by_side {
+            egui::Layout::top_down(egui::Align::Min)
+        } else {
+            egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true)
+        };
+        ui.allocate_ui_with_layout(egui::vec2(available, 0.0), button_layout, |ui| {
             if let Some(primary) = summary.primary_action {
                 let fill = crate::ui::theme::primary_action_fill(ui);
                 if ui
