@@ -373,6 +373,21 @@ fn mixed_present_and_missing_required_firmware_is_refused() {
 }
 
 #[test]
+fn beetle_psx_style_region_alternatives_need_only_one_bios() {
+    let ready = build_ready_fixture("fw-psx-one-region");
+    declare_required_firmware(&ready, &["scph5500.bin", "scph5501.bin", "scph5502.bin"]);
+    fs::write(ready.fixture.path("system/scph5501.bin"), b"us").unwrap();
+    preflight(&ready).expect("one regional BIOS of the alternative group is enough");
+}
+
+#[test]
+fn beetle_psx_style_with_no_region_bios_is_refused() {
+    let ready = build_ready_fixture("fw-psx-none");
+    declare_required_firmware(&ready, &["scph5500.bin", "scph5501.bin", "scph5502.bin"]);
+    assert!(preflight(&ready).is_err());
+}
+
+#[test]
 fn all_required_firmware_present_unverified_still_plays() {
     let ready = build_ready_fixture("fw-all-present");
     declare_required_firmware(&ready, &["a.bin", "b.bin"]);
