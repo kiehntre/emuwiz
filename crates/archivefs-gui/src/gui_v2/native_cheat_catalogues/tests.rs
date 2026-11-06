@@ -570,7 +570,7 @@ fn counts_are_worded_correctly() {
 fn action_button_keeps_focus_while_busy_and_ignores_clicks_until_idle() {
     let context = egui::Context::default();
     let id = egui::Id::new("action-button-focus");
-    let mut frame = |idle: bool, focus: bool, press: bool| {
+    let frame = |idle: bool, focus: bool, press: bool| {
         let mut input = egui::RawInput::default();
         if press {
             input.events.push(egui::Event::Key {
