@@ -11912,6 +11912,8 @@ mod blue_save_vault;
 mod blue_card_restore;
 #[path = "tests/save_snapshots.rs"]
 mod blue_save_snapshots;
+#[path = "tests/single_file_restore.rs"]
+mod blue_single_file_restore;
 
 #[path = "tests/repair.rs"]
 mod repair;

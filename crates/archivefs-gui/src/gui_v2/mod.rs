@@ -107,6 +107,7 @@ mod setup_portability;
 #[path = "tests/shared_scroll.rs"]
 mod shared_scroll_tests;
 mod simple_shell;
+mod single_file_restore;
 mod source_impact;
 mod sources_providers;
 #[cfg(test)]
@@ -867,6 +868,18 @@ impl App {
         self.saves_states.card_restore.job = Some(id);
         if !self.send(id, Command::CardRestore(Box::new(job))) {
             self.saves_states.card_restore.job = None;
+        }
+    }
+    fn start_single_file_restore(&mut self, label: &'static str, job: single_file_restore::Job) {
+        if self.saves_states.single_file.job.is_some() {
+            return;
+        }
+        let id = self
+            .activity
+            .queue(label, Route::Section(Section::Saves), false);
+        self.saves_states.single_file.job = Some(id);
+        if !self.send(id, Command::SingleFileRestore(Box::new(job))) {
+            self.saves_states.single_file.job = None;
         }
     }
     fn start_saves_inventory(&mut self) {
@@ -1890,6 +1903,10 @@ impl App {
                                         "Save snapshots checked. No files were changed.".into(),
                                         None,
                                     );
+                                }
+                                Payload::SingleFileRestore(outcome) => {
+                                    let message = single_file_restore::receive(self, id, *outcome);
+                                    self.activity.finish(id, message, None);
                                 }
                                 Payload::CardRestore(outcome) => {
                                     let message = card_restore::receive(self, id, *outcome);
