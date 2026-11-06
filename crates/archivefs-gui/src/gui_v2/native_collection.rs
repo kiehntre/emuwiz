@@ -452,6 +452,9 @@ impl NativeWorkflows {
                 }
             }
         }
+        // Read before the closure: it borrows `self` whole while the closure
+        // needs `self.collection.media` mutably.
+        let source_actions_busy = !self.source_action_available();
         if let DatabaseState::Ready { snapshot, .. } = &self.app.database_state {
             egui::CollapsingHeader::new("Discover missing games and prepare imports")
                 .default_open(latest_saved_scan(snapshot).is_none())
@@ -461,7 +464,7 @@ impl NativeWorkflows {
                         &snapshot.database_path,
                         self.app.database_generation.0,
                         &snapshot.source_views,
-                        !self.source_action_available(),
+                        source_actions_busy,
                     );
                 });
         }
