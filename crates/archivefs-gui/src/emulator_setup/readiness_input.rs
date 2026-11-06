@@ -161,6 +161,25 @@ impl ReadinessSources<'_> {
             );
             mame_set_resolutions.push(resolution);
         }
+        // An extracted Arcade set folder is routed by the installed MAME's own
+        // per-set data (driver status, ROM verify incl. extra read-only
+        // rompaths), not by the old DAT join. No category is a gate.
+        let arcade_probe = focused.and_then(|path| {
+            let executable = self
+                .readiness
+                .emulator_setup_overrides
+                .executable(crate::emulator_setup_overrides::OverridableEmulator::Mame)?;
+            crate::arcade_mame_probe::probe_for_set_directory(executable, path)
+        });
+        if let Some(probe) = &arcade_probe {
+            identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(
+                archivefs_core::launch::ResolvedIdentity {
+                    platform_id: "Arcade".to_string(),
+                    game_key: probe.set.clone(),
+                },
+            );
+            mame_set_resolutions = vec![probe.resolution.clone()];
+        }
 
         // A loose ADF has no header identity; its only launch identity is a
         // current DAT match that also proves a single-disk game.
@@ -1441,6 +1460,9 @@ impl ReadinessSources<'_> {
             launch_readiness_page::amiga_boot::apply(&mut plan, context);
         }
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
+        if let Some(probe) = &arcade_probe {
+            crate::arcade_mame_probe::apply_warnings(&mut plan, probe);
+        }
         refine_arcade_set_blocker(
             &mut plan,
             self.readiness

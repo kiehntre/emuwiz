@@ -616,6 +616,10 @@ pub enum LaunchWarningKind {
     /// CHD support). Launch is not blocked; a route with known CHD support
     /// is preferred when one is ready.
     RetroArchChdSupportUnconfirmed,
+    /// MAME's own driver data flags this machine (imperfect or unemulated
+    /// feature, special controls, gambling/fruit machine). Informational:
+    /// never a launch gate.
+    MameMachineFlagged,
 }
 
 /// One non-blocking condition on a [`crate::launch::planning::LaunchCandidate`].

@@ -48,6 +48,9 @@ pub mod arcade_compatibility;
 pub mod arcade_fbneo_compatibility;
 /// Read-only per-set compatibility against pinned installed MAME evidence.
 pub mod arcade_mame_compatibility;
+/// Per-set routing of extracted Arcade set directories to the installed MAME
+/// from MAME's own `-listxml` / `-verifyroms` data (no category gates).
+pub mod arcade_mame_routing;
 /// Deterministic emulator recommendation from existing arcade evidence.
 pub mod arcade_recommendation;
 /// Bounded Atari 8-bit standard cassette WAV evidence.
