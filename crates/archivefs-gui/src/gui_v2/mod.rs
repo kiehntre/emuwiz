@@ -1506,7 +1506,9 @@ impl App {
                 | PlayingLibraryJobKind::RollbackRetroDeck => "Undoing linked-library changes",
             },
             Route::Section(Section::Build),
-            false,
+            // A preview only reads files, so it can stop between files; every
+            // other kind writes or undoes and must run to its own safe end.
+            kind == PlayingLibraryJobKind::Preview,
         );
         self.playing_library_job = Some(PlayingLibraryJob {
             id,
@@ -1516,7 +1518,11 @@ impl App {
         });
         let state = Box::new(self.playing_library.clone());
         let command = match kind {
-            PlayingLibraryJobKind::Preview => Command::PlayingLibraryPreview { state, generation },
+            PlayingLibraryJobKind::Preview => Command::PlayingLibraryPreview {
+                state,
+                generation,
+                cancel: self.job_cancel_flag(id),
+            },
             PlayingLibraryJobKind::Apply => Command::PlayingLibraryApply { state, generation },
             _ => Command::PlayingLibrarySpecial {
                 state,
