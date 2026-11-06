@@ -1823,16 +1823,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     let (view, report) = remove_library_view_default(&identifier, keep_definition)
                         .map_err(|error| error.to_string())?;
+                    // Read back rather than assumed: the definition stays
+                    // when the removal left anything unreconciled.
+                    let definition_removed = load_library_view_configs_default()
+                        .map(|views| !views.iter().any(|candidate| candidate.id == view.id))
+                        .unwrap_or(false);
                     if json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&LibraryViewApplyJson {
+                            serde_json::to_string_pretty(&LibraryViewRemoveJson {
                                 view: &view,
-                                report: &report
+                                report: &report,
+                                definition_removed,
                             })?
                         );
                     } else {
-                        print_library_view_remove_report(&view, &report, keep_definition);
+                        print_library_view_remove_report(
+                            &view,
+                            &report,
+                            keep_definition,
+                            definition_removed,
+                        );
                     }
                 }
                 other => {
@@ -3777,12 +3788,30 @@ struct LibraryViewPreviewJson<'a> {
     plan: &'a LibraryViewPlan,
 }
 
-/// `view apply`/`view repair`/`view remove --json` output: the view
-/// alongside the resulting report.
+/// `view apply`/`view repair --json` output: the view alongside the
+/// resulting report.
 #[derive(Debug, Serialize)]
 struct LibraryViewApplyJson<'a> {
     view: &'a LibraryViewConfig,
     report: &'a LibraryViewApplyReport,
+}
+
+/// `view remove --json` output: as `LibraryViewApplyJson`, plus whether the
+/// view definition was actually dropped from configuration (it is kept when
+/// the removal left anything unreconciled, or with `--keep-definition`).
+#[derive(Debug, Serialize)]
+struct LibraryViewRemoveJson<'a> {
+    view: &'a LibraryViewConfig,
+    report: &'a LibraryViewApplyReport,
+    definition_removed: bool,
+}
+
+fn count_outcome(report: &LibraryViewApplyReport, outcome: LibraryViewApplyOutcome) -> usize {
+    report
+        .results
+        .iter()
+        .filter(|result| result.outcome == outcome)
+        .count()
 }
 
 fn print_library_views(views: &[LibraryViewConfig]) {
@@ -3887,6 +3916,36 @@ fn print_library_view_apply_report(
     println!("  Removed:   {}", report.removed);
     println!("  Unchanged: {}", report.unchanged);
     println!("  Failed:    {}", report.failed);
+    let recovered = count_outcome(report, LibraryViewApplyOutcome::Recovered);
+    if recovered > 0 {
+        println!(
+            "  Recovered: {recovered} (published by an interrupted earlier apply, recorded now)"
+        );
+    }
+    let temp_links = count_outcome(report, LibraryViewApplyOutcome::TempLinkRemoved);
+    if temp_links > 0 {
+        println!("  Removed {temp_links} leftover temporary link(s) of an interrupted apply.");
+    }
+    let user_owned = count_outcome(report, LibraryViewApplyOutcome::UserOwnedKept);
+    if user_owned > 0 {
+        println!("  User-owned, kept: {user_owned} (symlink(s) made outside EmuWiz, not managed)");
+    }
+    let left_untouched: Vec<_> = report
+        .results
+        .iter()
+        .filter(|result| result.outcome == LibraryViewApplyOutcome::LeftUnchanged)
+        .collect();
+    if !left_untouched.is_empty() {
+        println!();
+        println!("Left untouched:");
+        for result in left_untouched {
+            println!(
+                "  {} - {}",
+                result.relative_link_path.display(),
+                result.error.as_deref().unwrap_or("unknown reason")
+            );
+        }
+    }
     if report.failed > 0 {
         println!();
         println!("Failures:");
@@ -3905,26 +3964,58 @@ fn print_library_view_apply_report(
 fn print_library_view_remove_report(
     view: &LibraryViewConfig,
     report: &LibraryViewApplyReport,
-    kept_definition: bool,
+    keep_definition: bool,
+    definition_removed: bool,
 ) {
     println!("Library View: {} ({})", view.name, view.id);
-    println!("Removed {} managed symlink(s).", report.removed);
-    println!("EmuWiz did not delete any original archive files.");
-    if kept_definition {
-        println!("The view definition was kept - Preview/Apply will recreate its symlinks.");
+    let recovered = count_outcome(report, LibraryViewApplyOutcome::RecoveredRemoved);
+    if recovered > 0 {
+        println!(
+            "Removed {} managed symlink(s): {} recorded in the manifest, {recovered} recovered \
+             from the intent record of an interrupted apply.",
+            report.removed,
+            report.removed - recovered
+        );
     } else {
-        println!("The view definition was also removed from configuration.");
+        println!("Removed {} managed symlink(s).", report.removed);
     }
+    let temp_links = count_outcome(report, LibraryViewApplyOutcome::TempLinkRemoved);
+    if temp_links > 0 {
+        println!("Removed {temp_links} leftover temporary link(s) of an interrupted apply.");
+    }
+    println!("EmuWiz did not delete any original archive files.");
     let left_untouched: Vec<_> = report
         .results
         .iter()
-        .filter(|result| result.outcome == LibraryViewApplyOutcome::LeftUnchanged)
+        .filter(|result| {
+            matches!(
+                result.outcome,
+                LibraryViewApplyOutcome::LeftUnchanged | LibraryViewApplyOutcome::Failed
+            )
+        })
         .collect();
+    if definition_removed {
+        println!("The view definition was also removed from configuration.");
+    } else if keep_definition {
+        println!("The view definition was kept - Preview/Apply will recreate its symlinks.");
+    } else {
+        println!(
+            "The view definition was KEPT: {} object(s) below could not be reconciled, and \
+             removing the definition would orphan them. Resolve them (restore or remove what \
+             replaced the managed links; move any preserved file out of the temporary name) and \
+             run `view remove` again.",
+            left_untouched.len()
+        );
+    }
     if !left_untouched.is_empty() {
         println!();
-        println!("Left untouched (changed since the last apply):");
+        println!("Left untouched:");
         for result in left_untouched {
-            println!("  {}", result.relative_link_path.display());
+            println!(
+                "  {} - {}",
+                result.relative_link_path.display(),
+                result.error.as_deref().unwrap_or("unknown reason")
+            );
         }
     }
 }
