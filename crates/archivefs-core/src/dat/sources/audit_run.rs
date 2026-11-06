@@ -2774,6 +2774,24 @@ fn matched_refs_for_verdict(
         AuditVerdict::Exact { .. } | AuditVerdict::ExactMultipleCandidates { .. } => {
             verified_candidate_refs(known, index)
         }
+        // S03-03: a hash that agrees only with `nodump`/`baddump` records is
+        // refused as identity (the verdict is `Ambiguous`), but the records
+        // it agrees with are still the honest attribution of these bytes.
+        // Set classification needs them to explain "this set is a known bad
+        // dump" instead of losing the member entirely. The verdict itself is
+        // what grants verification, and it does not.
+        AuditVerdict::Ambiguous { .. } => {
+            let collected = crate::dat::audit::collect_crypto_candidates(known, index);
+            if collected.consistent.is_empty() {
+                collected
+                    .unverifiable
+                    .iter()
+                    .map(|(record, _)| record.to_owned_ref())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
         _ => Vec::new(),
     }
 }
@@ -3026,6 +3044,37 @@ mod nested_member_evidence_tests {
         };
         assert!(matched_refs_for_verdict(&filename_only, &known, &index).is_empty());
     }
+    /// S03-03: a member whose hash agrees only with a `baddump` record keeps
+    /// that record as its attribution while the verdict refuses to verify it.
+    #[test]
+    fn bad_dump_attribution_keeps_the_catalogue_record_without_verifying_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.dat");
+        let sha1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        std::fs::write(&path, format!(r#"<datafile><header><name>Synthetic</name></header>
+          <game name="Bad"><rom name="bad.bin" size="4" sha1="{sha1}" status="baddump"/></game></datafile>"#)).unwrap();
+        let parsed = crate::dat::parsers::parse_dat_file(&path, Default::default())
+            .unwrap()
+            .dat;
+        let index = DatIndex::build(&parsed);
+        let known = KnownFileEvidence::new("/synthetic/file.bin", "file.bin").with_sha1(sha1);
+        let verdict = audit_one(&known, &index);
+        assert!(
+            matches!(verdict, AuditVerdict::Ambiguous { .. }),
+            "{verdict:?}"
+        );
+        assert!(verified_candidate_refs(&known, &index).is_empty());
+        let refs = matched_refs_for_verdict(&verdict, &known, &index);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].game_name, "Bad");
+        assert_eq!(refs[0].status.as_deref(), Some("baddump"));
+        // An ordinary conflict carries no attribution.
+        let conflict = AuditVerdict::Ambiguous { detail: "x".into() };
+        let other = KnownFileEvidence::new("/synthetic/other.bin", "other.bin")
+            .with_sha1("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert!(matched_refs_for_verdict(&conflict, &other, &index).is_empty());
+    }
+
     #[test]
     fn conflicting_crypto_candidates_never_return_as_verified_identity_refs() {
         let dir = tempfile::tempdir().unwrap();
