@@ -9,7 +9,7 @@ use std::path::Path;
 /// bounded live inspection already computed, and the blocker-specific reason
 /// the system has no identity check. Neither is persisted or re-read here.
 #[derive(Default)]
-pub(super) struct Extras {
+pub(crate) struct Extras {
     pub live_lines: Vec<String>,
     pub blocker_note: Option<String>,
 }

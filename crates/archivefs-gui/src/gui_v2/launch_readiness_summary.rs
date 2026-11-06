@@ -321,7 +321,7 @@ fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSumma
             Some(ReadinessAction::RecheckReadiness),
         ),
         // No identity route exists for these, so there is nothing for a
-        // "Verify identity" button to open: no primary action is offered.
+        // "Verify identity" button to open: only a safe recheck is offered.
         reason @ (IdentityUnknownReason::NoIdentityCheck(_)
         | IdentityUnknownReason::UnsupportedFormat(_)
         | IdentityUnknownReason::AmigaHardDisk
@@ -341,7 +341,7 @@ fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSumma
             SourceSummary::RecheckNeeded,
             FirmwareSummary::Unknown,
             None,
-            None,
+            Some(ReadinessAction::RecheckReadiness),
         ),
         IdentityUnknownReason::NotConfirmed => base(
             ReadinessPresentationState::NeedsIdentityReview,
@@ -2611,7 +2611,7 @@ mod identity_reason_wording_tests {
     }
 
     #[test]
-    fn no_route_reasons_never_offer_a_dead_end_verify_identity_action() {
+    fn no_route_reasons_offer_only_a_recheck_never_a_dead_end_verify_identity_action() {
         use IdentityUnknownReason as R;
         for r in [
             R::NoIdentityCheck("Sharp X68000"),
@@ -2620,13 +2620,22 @@ mod identity_reason_wording_tests {
             R::AmigaIpf,
         ] {
             let s = summary(r);
-            assert_eq!(s.primary_action, None, "{r:?}");
+            assert_eq!(
+                s.primary_action,
+                Some(ReadinessAction::RecheckReadiness),
+                "{r:?}"
+            );
             assert!(!r.has_identity_screen());
             let text = format!("{} {}", s.headline, s.explanation);
             assert!(!text.contains("cannot tell which game"), "{text}");
             assert!(!text.contains("Extract the game"), "{text}");
             assert!(!text.contains("Verify identity"), "{text}");
-            assert!(text.contains("Nothing about your file is wrong"), "{text}");
+            assert!(!text.contains("Nothing about your file"), "{text}");
+            assert!(!text.contains("Choose system"), "{text}");
+            assert!(
+                text.contains("not caused by missing DAT verification"),
+                "{text}"
+            );
         }
         let s = summary(R::NoIdentityCheck("Sharp X68000"));
         assert!(s.headline.contains("no identity check for Sharp X68000"));
@@ -2659,5 +2668,31 @@ mod identity_reason_wording_tests {
                 .contains("hard-drive entry in the emulator")
         );
         assert!(R::AmigaIpf.blocker_text().contains("CAPS/SPS"));
+    }
+
+    #[test]
+    fn new_reasons_never_enable_play_or_report_ready_like_the_old_ones() {
+        use IdentityUnknownReason as R;
+        for r in [
+            R::SystemNotChosen,
+            R::UnsupportedArchive,
+            R::NotConfirmed,
+            R::NoIdentityCheck("MSX"),
+            R::UnsupportedFormat("Atari 2600"),
+            R::AmigaHardDisk,
+            R::AmigaIpf,
+        ] {
+            let s = summary(r);
+            assert!(!compact(&s, false).play_enabled, "{r:?}");
+            assert_ne!(s.primary_action, Some(ReadinessAction::Play), "{r:?}");
+            assert!(
+                !matches!(
+                    s.status,
+                    ReadinessPresentationState::Ready
+                        | ReadinessPresentationState::ReadyWithWarnings
+                ),
+                "{r:?}"
+            );
+        }
     }
 }

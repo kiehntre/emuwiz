@@ -948,7 +948,12 @@ fn not_found_from_another_systems_catalogue_is_not_shown_as_evidence() {
     );
     let pc88 = game(1, "x.zip", "NEC PC-8801");
     let shown = review_for(&pc88, &ctx(), Some(&gba));
-    assert_ne!(shown.state, ReviewState::NoMatch(NoMatchReason::NotInData));
+    assert_eq!(
+        shown.state,
+        ReviewState::NoData {
+            reference_source_exists: false
+        }
+    );
     assert!(matches!(
         gba.platform_fit(Some("NEC PC-8801")),
         CataloguePlatformFit::Different(_)
@@ -995,4 +1000,153 @@ fn unknown_catalogue_system_keeps_behaviour_and_is_labelled() {
 fn a_match_from_any_catalogue_is_never_hidden_by_the_platform_check() {
     let gba = with_header(exact("Amidar (USA)"), &["Nintendo - Game Boy Advance"]);
     assert!(gba.relevant_to(Some("NEC PC-8801")));
+}
+
+mod extras {
+    use super::*;
+    use crate::gui_v2::identity_review_page::extras_for;
+    use archivefs_core::game_identity::{
+        GameIdentityReport, IdentityImageFormat, IdentityPlatform,
+    };
+    use std::path::Path;
+
+    fn live_report(path: &str) -> GameIdentityReport {
+        GameIdentityReport {
+            archive_path: path.into(),
+            platform: IdentityPlatform::Other,
+            format: IdentityImageFormat::Unsupported,
+            evidence: Vec::new(),
+            warnings: vec!["header unreadable".into()],
+            bytes_read: 0,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete: true,
+        }
+    }
+
+    fn unresolved() -> Review {
+        Review {
+            state: ReviewState::NotCompared,
+            apparent_release: None,
+        }
+    }
+
+    fn verified() -> Review {
+        review_for(
+            &game(1, "x.zip", "SNES"),
+            &ctx(),
+            Some(&exact("Amidar (USA)")),
+        )
+    }
+
+    #[test]
+    fn live_lines_use_only_a_finished_inspection_of_this_exact_file() {
+        let g = game(1, "a.zip", "Sharp X68000");
+        let report = live_report("/games/a.zip");
+        let other = live_report("/games/other.zip");
+        let used = extras_for(
+            &g,
+            &unresolved(),
+            Some((Path::new("/games/a.zip"), &report, &[])),
+        );
+        assert!(
+            used.live_lines
+                .iter()
+                .any(|l| l.contains("header unreadable"))
+        );
+        let wrong = extras_for(
+            &g,
+            &unresolved(),
+            Some((Path::new("/games/other.zip"), &other, &[])),
+        );
+        assert!(wrong.live_lines.is_empty());
+        assert!(extras_for(&g, &unresolved(), None).live_lines.is_empty());
+    }
+
+    #[test]
+    fn a_saved_report_wins_over_live_evidence() {
+        let mut g = game(1, "a.zip", "Sharp X68000");
+        g.archive.identity_report = Some(live_report("/games/a.zip"));
+        let live = live_report("/games/a.zip");
+        let extras = extras_for(
+            &g,
+            &unresolved(),
+            Some((Path::new("/games/a.zip"), &live, &[])),
+        );
+        assert!(extras.live_lines.is_empty());
+    }
+
+    #[test]
+    fn blocker_note_follows_the_launch_inputs_and_is_gated_on_an_unresolved_review() {
+        let x68 = game(1, "a.zip", "Sharp X68000");
+        let note = extras_for(&x68, &unresolved(), None).blocker_note.unwrap();
+        assert!(note.contains("no identity check for Sharp X68000"));
+        assert!(extras_for(&x68, &verified(), None).blocker_note.is_none());
+
+        let hdf = game(2, "a.hdf", "Amiga");
+        assert!(extras_for(&hdf, &unresolved(), None).blocker_note.is_some());
+        assert!(
+            extras_for(&hdf, &verified(), None).blocker_note.is_none(),
+            "a DAT-verified Amiga HDF must not be told it cannot start"
+        );
+        // A supported platform with a normal reason gets no blocker note.
+        let gba = game(3, "a.gba", "Game Boy Advance");
+        assert!(extras_for(&gba, &unresolved(), None).blocker_note.is_none());
+    }
+}
+
+mod platform_fit_through_review {
+    use super::*;
+
+    fn header(k: DatKnowledge, names: &[&str]) -> DatKnowledge {
+        with_header(k, names)
+    }
+
+    #[test]
+    fn mismatched_negative_is_ignored_and_probable_stays_visible() {
+        let gba_names = ["Nintendo - Game Boy Advance"];
+        let pc88 = game(1, "x.zip", "NEC PC-8801");
+        let no_match = header(known(State::NoMatch, None), &gba_names);
+        assert_eq!(
+            review_for(&pc88, &ctx(), Some(&no_match)).state,
+            ReviewState::NoData {
+                reference_source_exists: false
+            }
+        );
+        let probable = header(known(State::Probable, None), &gba_names);
+        assert_eq!(
+            review_for(&pc88, &ctx(), Some(&probable)).state,
+            ReviewState::NoMatch(NoMatchReason::WeakEvidenceOnly)
+        );
+        assert!(
+            probable
+                .fit_note(Some("NEC PC-8801"))
+                .unwrap()
+                .contains("treat it with care")
+        );
+    }
+
+    #[test]
+    fn equivalent_platform_names_count_as_the_same_system() {
+        let pce = header(
+            known(State::NoMatch, None),
+            &["NEC - PC Engine - TurboGrafx-16"],
+        );
+        for (catalogue, game_platform) in [(&pce, "PC Engine"), (&pce, "TurboGrafx-16")] {
+            assert_eq!(
+                catalogue.platform_fit(Some(game_platform)),
+                CataloguePlatformFit::Matches,
+                "{game_platform}"
+            );
+        }
+        let genesis = header(
+            known(State::NoMatch, None),
+            &["Sega - Mega Drive - Genesis"],
+        );
+        assert_eq!(
+            genesis.platform_fit(Some("MegaDrive")),
+            CataloguePlatformFit::Matches
+        );
+    }
 }

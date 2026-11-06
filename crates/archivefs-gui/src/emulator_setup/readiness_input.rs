@@ -1508,19 +1508,46 @@ fn is_archive_container(path: &std::path::Path) -> bool {
     })
 }
 
-/// Systems (canonical platform ids) for which EmuWiz has no identity check and
-/// no other identity route at all: the shared identity inspection has no
-/// platform for them and no emulator-specific route resolves them. Returns the
-/// display name. A ZX Spectrum `.z80` snapshot has its own DAT-backed route,
-/// so it is not claimed here.
-fn system_without_identity_check(id: &'static str, extension: &str) -> Option<&'static str> {
+/// Platforms (canonical ids) whose identity is resolved by a route other than
+/// the shared identity inspection, before the "unknown" outcome is reached
+/// (MAME arcade join, DeSmuME, DOSBox, Cemu, ScummVM, tape/disc adapters and
+/// the ZX `.z80` snapshot adapter). They must never be reported as having no
+/// identity check, even though they have no `IdentityPlatform`.
+fn has_other_identity_route(id: &str, extension: &str) -> bool {
     match id {
-        "Sharp X68000" | "NEC PC-8801" | "PC-98" | "NEC PC-9801" | "PC Engine"
-        | "TurboGrafx-16" | "MSX" | "MSX2" | "BBC Micro" | "Acorn Archimedes"
-        | "Acorn Electron" => Some(id),
-        "ZX Spectrum" if extension != "z80" => Some(id),
-        _ => None,
+        "ZX Spectrum" => extension == "z80",
+        "Arcade"
+        | "NeoGeo"
+        | "NeoGeo64"
+        | "Nintendo DS"
+        | "DOS"
+        | "PC"
+        | "WiiU"
+        | "ScummVM"
+        | "Dragon / Tandy CoCo"
+        | "FM Towns"
+        | "AmigaCD32"
+        | "Commodore CDTV" => true,
+        _ => false,
     }
+}
+
+/// True for platforms whose shared identity check reads only loose ROM files
+/// (cartridge families), derived from `supported_loose_rom_format` itself so a
+/// newly supported platform or extension is picked up automatically.
+fn is_loose_rom_platform(platform: archivefs_core::game_identity::IdentityPlatform) -> bool {
+    const PROBE: &[&str] = &[
+        "md", "gen", "smd", "bin", "sfc", "smc", "nes", "fds", "unf", "gb", "gbc", "gba", "vb",
+        "vboy", "min", "sv", "z64", "v64", "n64", "a26", "a52", "a78", "atr", "atx", "xex", "xfd",
+        "lnx", "lyx", "j64", "jag", "ngp", "ngc",
+    ];
+    PROBE.iter().any(|ext| {
+        archivefs_core::game_identity::supported_loose_rom_format(
+            std::path::Path::new(&format!("x.{ext}")),
+            platform,
+        )
+        .is_some()
+    })
 }
 
 /// Why identity is unknown, from existing evidence only.
@@ -1552,15 +1579,16 @@ pub(crate) fn identity_unknown_reason(
     } else {
         Reason::NotConfirmed
     };
-    // Blocker-specific reasons come first: when no identity route exists for
-    // the system or format, extracting an archive or opening Verify identity
-    // cannot help, so the truthful reason must win. Facts used: the platform
-    // and the file extension only.
+    // Blocker-specific reasons come first and are derived from facts only:
+    // the platform, the file extension and the container kind. When no
+    // identity route exists, extracting an archive or opening Verify identity
+    // cannot help, so the truthful reason must win.
     let extension = focused
         .and_then(|p| p.extension())
         .and_then(|x| x.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
+    let archive = focused.is_some_and(is_archive_container);
     if platform == IdentityPlatform::Amiga {
         match extension.as_str() {
             "hdf" => return Reason::AmigaHardDisk,
@@ -1568,19 +1596,25 @@ pub(crate) fn identity_unknown_reason(
             _ => {}
         }
     }
+    // A known system with no IdentityPlatform and no launch platform id has
+    // no shared identity check at all.
     if platform == IdentityPlatform::Other
-        && let Some(system) = hint
-            .and_then(archivefs_core::canonical_platform_for_alias)
-            .and_then(|id| system_without_identity_check(id, &extension))
+        && archivefs_core::launch::evidence_bridge::launch_platform_id(platform).is_none()
+        && let Some(system) = hint.and_then(archivefs_core::canonical_platform_for_alias)
+        && !has_other_identity_route(system, &extension)
     {
         return Reason::NoIdentityCheck(system);
     }
-    if platform == IdentityPlatform::Atari2600
+    // The system has an identity check but it reads only loose ROM files and
+    // this loose file is not one it reads. Archives keep the archive advice.
+    if platform != IdentityPlatform::Other
+        && !archive
+        && is_loose_rom_platform(platform)
         && report.is_some_and(|r| r.format == IdentityImageFormat::Unsupported)
-        && !extension.is_empty()
-        && extension != "a26"
+        && let Some(path) = focused
+        && archivefs_core::game_identity::supported_loose_rom_format(path, platform).is_none()
     {
-        return Reason::UnsupportedFormat(IdentityPlatform::Atari2600.label());
+        return Reason::UnsupportedFormat(platform.label());
     }
     if let (Some(path), Some(report)) = (focused, report)
         && report.format == IdentityImageFormat::Unsupported
@@ -1675,20 +1709,17 @@ mod identity_reason_tests {
 
     #[test]
     fn zip_on_a_platform_without_an_identity_variant_is_never_unsupported() {
-        // NeoGeo / MasterSystem resolve in the platform registry but map to
-        // IdentityPlatform::Other, so the report stays at Unsupported.
+        // NeoGeo has its own MAME-join route, so it is never called
+        // "no identity check"; MasterSystem has no route at all today.
         let r = unsupported(IdentityPlatform::Other);
-        for hint in ["NeoGeo", "MasterSystem"] {
-            assert_eq!(
-                identity_unknown_reason(
-                    Some(Path::new("/g/kof98.zip")),
-                    Some(&r),
-                    Some(Some(hint))
-                ),
-                R::NotConfirmed,
-                "{hint}"
-            );
-        }
+        let reason_for = |hint| {
+            identity_unknown_reason(Some(Path::new("/g/kof98.zip")), Some(&r), Some(Some(hint)))
+        };
+        assert_eq!(reason_for("NeoGeo"), R::NotConfirmed);
+        assert_eq!(
+            reason_for("MasterSystem"),
+            R::NoIdentityCheck("MasterSystem")
+        );
     }
 
     #[test]
@@ -1749,6 +1780,7 @@ mod identity_reason_tests {
         let other = IdentityPlatform::Other;
         for (path, hint, name) in [
             ("/g/game.zip", "Sharp X68000", "Sharp X68000"),
+            ("/g/game.7z", "Sharp X68000", "Sharp X68000"),
             ("/g/game.7z", "NEC PC-8801", "NEC PC-8801"),
             ("/g/game.tap", "ZX Spectrum", "ZX Spectrum"),
             ("/g/game.zip", "MSX", "MSX"),
@@ -1764,30 +1796,87 @@ mod identity_reason_tests {
                 "{path}"
             );
         }
-        // 7z of such a system is NOT told to extract.
-        assert_ne!(
-            reason("/g/game.7z", other, Some("Sharp X68000")),
+    }
+
+    /// Fails loudly when one of these systems gains an `IdentityPlatform`.
+    /// The reason logic is derived (platform == Other), so it switches to the
+    /// right wording by itself; this list is the signal to prune it and to
+    /// add the new platform's own format tests.
+    #[test]
+    fn systems_reported_as_having_no_identity_check_have_no_identity_platform_today() {
+        for id in [
+            "Sharp X68000",
+            "NEC PC-8801",
+            "PC-98",
+            "NEC PC-9801",
+            "PC Engine",
+            "TurboGrafx-16",
+            "MSX",
+            "MSX2",
+            "BBC Micro",
+            "Acorn Archimedes",
+            "Acorn Electron",
+            "ZX Spectrum",
+            "MasterSystem",
+            "GameGear",
+            "Sega 32X",
+            "ColecoVision",
+        ] {
+            assert_eq!(
+                IdentityPlatform::from_catalogue(Some(id)),
+                IdentityPlatform::Other,
+                "{id} now has an IdentityPlatform: its wording is derived automatically; \
+                 update this list and add format tests"
+            );
+            assert!(
+                archivefs_core::launch::evidence_bridge::launch_platform_id(
+                    IdentityPlatform::from_catalogue(Some(id))
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn archives_of_a_platform_with_an_identity_check_keep_the_extract_advice() {
+        assert_eq!(
+            reason("/g/game.7z", IdentityPlatform::Atari2600, None),
             R::UnsupportedArchive
+        );
+        assert_eq!(
+            reason("/g/game.7z", IdentityPlatform::GameBoyAdvance, None),
+            R::UnsupportedArchive
+        );
+        assert_eq!(
+            reason("/g/game.7z", IdentityPlatform::Other, Some("NEC PC-8801")),
+            R::NoIdentityCheck("NEC PC-8801")
+        );
+        assert_eq!(
+            reason("/g/game.zip", IdentityPlatform::Atari2600, None),
+            R::NotConfirmed
         );
     }
 
     #[test]
-    fn zx_snapshot_route_and_supported_platforms_are_unaffected() {
+    fn zx_snapshot_route_other_routes_and_supported_platforms_are_unaffected() {
         let other = IdentityPlatform::Other;
         assert_eq!(
             reason("/g/a.z80", other, Some("ZX Spectrum")),
             R::NotConfirmed
         );
+        for hint in ["NeoGeo", "Nintendo DS", "DOS", "WiiU"] {
+            assert_eq!(
+                reason("/g/a.zip", other, Some(hint)),
+                R::NotConfirmed,
+                "{hint}"
+            );
+        }
         assert_eq!(
             reason("/g/a.zip", IdentityPlatform::GameBoyAdvance, None),
             R::NotConfirmed
         );
         assert_eq!(reason("/g/a.7z", other, Some("GBA")), R::UnsupportedArchive);
         assert_eq!(reason("/g/a.zip", other, None), R::SystemNotChosen);
-        assert_eq!(
-            reason("/g/a.7z", other, Some("NeoGeo")),
-            R::UnsupportedArchive
-        );
     }
 
     #[test]
@@ -1803,16 +1892,22 @@ mod identity_reason_tests {
     }
 
     #[test]
-    fn atari_2600_bin_and_zip_are_an_unsupported_format() {
-        let a = IdentityPlatform::Atari2600;
+    fn loose_files_a_cartridge_identity_check_does_not_read_are_an_unsupported_format() {
+        for (path, platform, name) in [
+            ("/g/a.bin", IdentityPlatform::Atari2600, "Atari 2600"),
+            ("/g/a.bin", IdentityPlatform::Atari5200, "Atari 5200"),
+            ("/g/a.rom", IdentityPlatform::Atari7800, "Atari 7800"),
+            ("/g/a.bin", IdentityPlatform::AtariLynx, "Atari Lynx"),
+        ] {
+            assert_eq!(
+                reason(path, platform, None),
+                R::UnsupportedFormat(name),
+                "{path}"
+            );
+        }
         assert_eq!(
-            reason("/g/a.bin", a, None),
-            R::UnsupportedFormat("Atari 2600")
+            reason("/g/a.a26", IdentityPlatform::Atari2600, None),
+            R::NotConfirmed
         );
-        assert_eq!(
-            reason("/g/a.zip", a, None),
-            R::UnsupportedFormat("Atari 2600")
-        );
-        assert_eq!(reason("/g/a.a26", a, None), R::NotConfirmed);
     }
 }

@@ -151,6 +151,7 @@ pub(crate) enum IdentityUnknownReason {
 
 impl IdentityUnknownReason {
     /// True when the Review identity screen could show something actionable.
+    /// For the other reasons only a plain "Recheck readiness" is offered.
     /// The other reasons have no identity route, so no "Verify identity" or
     /// "Review identity" action is offered for them.
     pub(crate) fn has_identity_screen(self) -> bool {
@@ -164,10 +165,7 @@ impl IdentityUnknownReason {
             Self::NoIdentityCheck(_)
             | Self::UnsupportedFormat(_)
             | Self::AmigaHardDisk
-            | Self::AmigaIpf => Some(format!(
-                "{} Nothing about your file is wrong.",
-                self.banner_body()
-            )),
+            | Self::AmigaIpf => Some(self.banner_body()),
             _ => None,
         }
     }
@@ -223,8 +221,8 @@ impl IdentityUnknownReason {
             }
             Self::NoIdentityCheck(system) => format!(
                 "EmuWiz has no identity check for {system} yet, so it cannot start this game. \
-                 This is not caused by missing DAT verification. If {system} is the wrong system, \
-                 use Choose system on Game Details; otherwise support is not available yet."
+                 This is not caused by missing DAT verification. Support for {system} is not \
+                 available yet. Recheck readiness after any change."
             ),
             Self::UnsupportedFormat(system) => format!(
                 "EmuWiz's {system} identity check does not read this file format yet, so it \

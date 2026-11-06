@@ -180,21 +180,21 @@ impl DatKnowledge {
                 "This catalogue is for {system}, not this game's system, so its \"not found\" answer is not shown as evidence."
             )),
             CataloguePlatformFit::Different(system) => Some(format!(
-                "This catalogue is for {system}, which differs from this game's system."
+                "This catalogue is for {system}, which differs from this game's system. Its answer is still shown; treat it with care."
             )),
             CataloguePlatformFit::Unconfirmed => Some("Catalogue system unconfirmed.".to_string()),
         }
     }
 
     /// A "nothing found" style answer: it only means something when the
-    /// catalogue is for the game's own system. Matches and conflicts are kept.
+    /// catalogue is for the game's own system. Matches, probable matches,
+    /// conflicts and ambiguity are positive-ish and are always kept.
     fn is_negative(&self) -> bool {
         matches!(
             self.state,
             DatVerificationState::NoMatch
                 | DatVerificationState::NoUsableEvidence
                 | DatVerificationState::FilenameOnlyNotVerified
-                | DatVerificationState::Probable
         )
     }
 

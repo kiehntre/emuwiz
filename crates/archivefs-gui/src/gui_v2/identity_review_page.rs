@@ -16,7 +16,7 @@ use eframe::egui;
 use std::path::Path;
 
 mod contextual_actions;
-mod selected_evidence;
+pub(super) mod selected_evidence;
 
 #[cfg(test)]
 mod dat_freshness_tests;
@@ -177,6 +177,49 @@ pub(super) fn knowledge_with_catalogues(
 
 /// A completed per-game lookup supersedes the library's older DAT flag.
 /// Independent file evidence still goes through the canonical review function.
+/// The live evidence block and blocker note for one game. `live` is the
+/// finished live inspection (path, identity report, structural facts), used
+/// only when it is for this exact file and no report is saved. The blocker
+/// note uses the Launch page's inputs (recorded platform hint plus the report)
+/// and is withheld for any resolved review state.
+pub(super) fn extras_for(
+    game: &Game,
+    review: &Review,
+    live: Option<(
+        &Path,
+        &archivefs_core::game_identity::GameIdentityReport,
+        &[archivefs_core::content_evidence::ContentEvidence],
+    )>,
+) -> selected_evidence::Extras {
+    let saved = game
+        .archive
+        .identity_report
+        .as_ref()
+        .filter(|report| report.archive_path == game.archive.absolute_path);
+    let live = live.filter(|(path, ..)| *path == game.archive.absolute_path);
+    let unresolved = !matches!(
+        review.state,
+        ReviewState::Verified(_)
+            | ReviewState::ReferenceMatched
+            | ReviewState::Conflict { .. }
+            | ReviewState::Ambiguous { .. }
+    );
+    let report = live.map(|(_, report, _)| report).or(saved);
+    let reason = crate::emulator_setup::readiness_input::identity_unknown_reason(
+        Some(&game.archive.absolute_path),
+        report,
+        Some(game.archive.platform.as_deref()),
+    );
+    selected_evidence::Extras {
+        live_lines: live
+            .filter(|_| saved.is_none())
+            .map(|(_, report, facts)| selected_evidence::live_evidence_lines(report, facts))
+            .unwrap_or_default(),
+        blocker_note: (unresolved && !reason.has_identity_screen())
+            .then(|| format!("{}: {}", reason.banner_title(), reason.banner_body())),
+    }
+}
+
 fn review_with_current_knowledge(
     game: &Game,
     context: &super::library::IdentityContext,
@@ -274,7 +317,7 @@ impl App {
         let knowledge = loaded.then(|| self.review.knowledge.clone()).flatten();
         let review =
             review_with_current_knowledge(game, &library.identity_context, knowledge.as_ref());
-        let extras = self.identity_extras(game);
+        let extras = self.identity_extras(game, &review);
         let mut route = None;
         let mut choose_system = false;
         let mut clear_system = false;
@@ -383,45 +426,31 @@ impl App {
         }
     }
 
-    /// Read-only live evidence and the blocker-specific reason for a game
-    /// with no saved inspection. Only an already-finished live inspection of
-    /// this exact file is used; nothing is started, read or saved here.
-    fn identity_extras(&self, game: &Game) -> selected_evidence::Extras {
-        let saved = game
-            .archive
-            .identity_report
-            .as_ref()
-            .is_some_and(|report| report.archive_path == game.archive.absolute_path);
+    /// Read-only live evidence and the blocker-specific reason for a game.
+    /// Only an already-finished live inspection of this exact file is used;
+    /// nothing is started, read or saved here, and the report is borrowed.
+    fn identity_extras(&self, game: &Game, review: &Review) -> selected_evidence::Extras {
+        let native = self.native_workflows.as_ref();
         let live =
-            self.native_workflows.as_ref().and_then(|native| {
-                match &native.app.selected_evidence_ui.selected_evidence {
+            native.and_then(
+                |native| match &native.app.selected_evidence_ui.selected_evidence {
                     crate::selected_evidence_page::SelectedEvidenceState::Ready {
                         report, ..
-                    } if report.path == game.archive.absolute_path => Some(report.clone()),
+                    } => Some(report),
                     _ => None,
-                }
-            });
-        let platform =
-            (game.platform != super::library::UNKNOWN_PLATFORM).then_some(game.platform.as_str());
-        let reason = crate::emulator_setup::readiness_input::identity_unknown_reason(
-            Some(&game.archive.absolute_path),
-            live.as_ref().map(|report| &report.game_identity_report),
-            Some(platform),
-        );
-        selected_evidence::Extras {
-            live_lines: live
-                .as_ref()
-                .filter(|_| !saved)
-                .map(|report| {
-                    selected_evidence::live_evidence_lines(
-                        &report.game_identity_report,
-                        &report.structural_facts,
-                    )
-                })
-                .unwrap_or_default(),
-            blocker_note: (!reason.has_identity_screen())
-                .then(|| format!("{}: {}", reason.banner_title(), reason.banner_body())),
-        }
+                },
+            );
+        extras_for(
+            game,
+            review,
+            live.map(|r| {
+                (
+                    r.path.as_path(),
+                    &r.game_identity_report,
+                    r.structural_facts.as_slice(),
+                )
+            }),
+        )
     }
 
     fn show_system_chooser(&mut self, context: &egui::Context, id: i64) {
