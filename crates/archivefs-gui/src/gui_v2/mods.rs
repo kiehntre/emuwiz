@@ -34,6 +34,7 @@ enum Tab {
     Activation,
     TexturePacks,
     Cheats,
+    Catalogues,
 }
 
 #[derive(Default)]
@@ -151,6 +152,7 @@ pub(super) fn show_mods_page(
                 (Tab::Activation, "Enable / disable"),
                 (Tab::TexturePacks, "Texture packs"),
                 (Tab::Cheats, "Cheats"),
+                (Tab::Catalogues, "Cheat catalogues"),
             ];
             ui.horizontal_wrapped(|ui| {
                 for (tab, label) in tabs {
@@ -192,7 +194,9 @@ pub(super) fn show_mods_page(
             if state.tab == Tab::Cheats && selected_game.is_some() {
                 ui.label("Recognised code syntax does not prove a cheat works in-game. Check the game version, region and emulator before previewing any supported change; installing a file is not proof that a cheat is active.");
             }
-            if state.tab == Tab::Cheats && selected_game.is_none() {
+            if state.tab == Tab::Catalogues {
+                destination = workflows.show_cheat_catalogues(ui).or(destination.take());
+            } else if state.tab == Tab::Cheats && selected_game.is_none() {
                 destination = workflows.show_cheats(ui, selected_game, activity).or(destination.take());
                 show_cheatbase(ui, &mut state.cheatbase, selected_game);
             } else {
@@ -234,6 +238,7 @@ pub(super) fn show_mods_page(
                         destination = workflows.show_cheats(ui, selected_game, activity).or(destination.take());
                         show_cheatbase(ui, &mut state.cheatbase, selected_game);
                     }
+                    Tab::Catalogues => {}
                 }
             }
 
