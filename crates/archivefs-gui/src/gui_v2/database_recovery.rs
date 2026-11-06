@@ -388,7 +388,7 @@ impl State {
         if self.needs_attention() {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
-                "A database restore did not finish. Reconcile it below before restoring again.",
+                "A database restore did not finish. Reconcile or review it below before restoring again.",
             );
         }
         if busy {
@@ -424,7 +424,7 @@ impl State {
                 ui.label("The pre-restore database will be put back from this verified backup. Changes made since the restore would be lost; the rollback refuses if the restored database has changed.");
                 ui.add(egui::TextEdit::singleline(&mut self.confirmation).hint_text("Type RESTORE DATABASE"));
                 ui.horizontal(|ui| {
-                                                            if ui
+                    if ui
                         .add_enabled(
                             enabled && self.confirmation == CONFIRMATION,
                             egui::Button::new("Roll back restore"),
