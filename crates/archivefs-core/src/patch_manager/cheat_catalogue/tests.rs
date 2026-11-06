@@ -2112,7 +2112,16 @@ fn d7_02_destination_file_name_is_trimmed_shared_and_rejects_control_characters(
     let path = resolve_canonical_cheat_destination(&record, None, Some(&destination_root)).unwrap();
     assert_eq!(path, destination_root.join("Atari2600").join("Frogger.cht"));
 
-    for hostile in ["Frogger\n", "Frog\u{1}ger", "Frogger\u{1b}[0m", "Frog\rger"] {
+    // Whitespace at the ends (including a trailing newline, the D7-02
+    // case) is trimmed to the same name the preview shows; the installer
+    // uses this helper, so it can never write `Frogger\n.cht` instead.
+    record.source_game_name = "Frogger\n".to_string();
+    assert_eq!(
+        cheat_destination_file_name(&record).as_deref(),
+        Some("Frogger.cht")
+    );
+    // A control character inside the name can never become a file name.
+    for hostile in ["Frog\u{1}ger", "Frogger\u{1b}[0m", "Frog\rger", "Frog\nger"] {
         record.source_game_name = hostile.to_string();
         assert!(
             cheat_destination_file_name(&record).is_none(),

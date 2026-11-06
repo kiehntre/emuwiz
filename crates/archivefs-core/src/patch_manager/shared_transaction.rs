@@ -2327,7 +2327,8 @@ fn restore_after_failed_verification(
     installed_digest: &str,
 ) -> Result<(), SharedApplyFailureKind> {
     if plan.proposed_action == PreviewProposedAction::Install {
-        return remove_and_verify_new_destination(destination);
+        return remove_and_verify_new_destination(destination, installed_digest)
+            .map_err(|(kind, _kept)| kind);
     }
     let backup = result
         .backup_path
@@ -2502,9 +2503,11 @@ pub fn preview_shared_rollback(
             .ok()
             .is_some_and(|operation| parent.join(format!("{operation}.rollback.json")).exists())
     });
-    // An Undo interrupted part-way leaves its pending record: entries it
-    // had already settled are recorded `RolledBack` there, which is the
-    // only proof that a now-missing new file was removed by EmuWiz.
+    // An Undo interrupted part-way leaves its pending record. An entry it
+    // had reached is recorded `RollingBack` (checkpointed before the
+    // removal) or `RolledBack` (after it); either is the proof that a
+    // now-missing new file was removed by that Undo, which is exactly what
+    // the approved Undo set out to do, and not by something else.
     let recorded_rolled_back: Vec<bool> = journal_path
         .parent()
         .zip(safe_identifier(&journal.operation_id).ok())
@@ -2520,7 +2523,12 @@ pub fn preview_shared_rollback(
             pending
                 .entries
                 .iter()
-                .map(|entry| entry.state == SharedEntryRecoveryState::RolledBack)
+                .map(|entry| {
+                    matches!(
+                        entry.state,
+                        SharedEntryRecoveryState::RolledBack | SharedEntryRecoveryState::RollingBack
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -2652,10 +2660,14 @@ pub fn execute_shared_rollback(
             continue;
         }
         processed.push(index);
-        // The fresh preview found this replaced file already back to its
-        // backup (an earlier, partly finished Undo): nothing to do here.
+        // The fresh preview found nothing left to do for this file: a
+        // replaced file already back to its backup, or a new file an
+        // earlier, partly finished Undo already removed. Never touch it.
         if applied.entries[index].outcome == SharedRollbackOutcome::NoChangeRequired
-            && original.entries[index].outcome == SharedApplyOutcome::ReplacedExisting
+            && matches!(
+                original.entries[index].outcome,
+                SharedApplyOutcome::ReplacedExisting | SharedApplyOutcome::InstalledNew
+            )
         {
             if let Some(entry) = durable.entries.get_mut(index) {
                 entry.state = SharedEntryRecoveryState::RolledBack;
@@ -4314,7 +4326,10 @@ fn rollback_entry_preview(
             // A new file an interrupted Undo had already removed (its
             // pending record says so): nothing left to do for this file,
             // so a retry can finish the rest.
-            if entry.outcome == SharedApplyOutcome::InstalledNew && recorded_rolled_back {
+            if entry.outcome == SharedApplyOutcome::InstalledNew
+                && entry.destination_existed_before_apply == Some(false)
+                && recorded_rolled_back
+            {
                 result.outcome = SharedRollbackOutcome::NoChangeRequired;
                 return result;
             }
