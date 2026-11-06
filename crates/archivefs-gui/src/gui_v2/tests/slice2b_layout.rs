@@ -672,92 +672,131 @@ fn review_identity_actions_do_not_move_when_evidence_loads() {
     }
 }
 
-/// Game Details at the real nav width: stacked at 1280x820, and nothing is
-/// painted beyond the window's right edge at 1280, 1100 or 1500 wide.
+/// Unclipped extents of every Rect and Text shape.
+fn shape_extents(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+    match shape {
+        egui::Shape::Text(t) => out.push(egui::Rect::from_min_size(t.pos, t.galley.size())),
+        egui::Shape::Rect(r) => out.push(r.rect),
+        egui::Shape::Vec(v) => v.iter().for_each(|s| shape_extents(s, out)),
+        _ => {}
+    }
+}
+
+/// Game Details at the real nav width. The layout choice is pinned (stacked at
+/// 1280 px / scale 1.0, two columns at 0.9 and below) and every widget of the
+/// "Can I play it?" column, unclipped, lies inside the window.
 #[test]
 fn game_details_paints_nothing_beyond_the_window_edge() {
-    fn max_right(shape: &egui::Shape, max: &mut f32) {
-        match shape {
-            egui::Shape::Text(t) => {
-                *max = max.max(t.pos.x + t.galley.size().x);
-            }
-            egui::Shape::Rect(r) => *max = max.max(r.rect.max.x),
-            egui::Shape::Vec(v) => v.iter().for_each(|s| max_right(s, max)),
-            _ => {}
-        }
-    }
     let cases = [
-        (1280.0_f32, 820.0_f32, 1.0_f32),
-        (1100.0, 800.0, 1.0),
-        (1500.0, 900.0, 1.0),
-        (1280.0, 820.0, 0.9),
-        (1280.0, 820.0, 1.1),
-        (1280.0, 820.0, 1.25),
+        // (pixels w, pixels h, scale, two columns expected)
+        (1280.0_f32, 820.0_f32, 1.0_f32, false),
+        (1100.0, 800.0, 1.0, false),
+        (1500.0, 900.0, 1.0, true),
+        (1280.0, 820.0, 0.9, true),
+        (1280.0, 820.0, 1.1, false),
+        (1280.0, 820.0, 1.25, false),
     ];
-    for (pixels_w, pixels_h, scale) in cases {
+    for (pixels_w, pixels_h, scale, two_columns) in cases {
         let size = points((pixels_w, pixels_h), scale);
-        let width = size[0];
         let context = egui::Context::default();
         let mut app = populated(&context, true, scale);
         app.router.current = Route::Game(1);
         let output = settled(&context, &mut app, size);
-        let mut max = 0.0_f32;
-        for clipped in &output.shapes {
-            // Painted beyond the clip is invisible; measure what is shown.
-            let mut right = 0.0_f32;
-            max_right(&clipped.shape, &mut right);
-            max = max.max(right.min(clipped.clip_rect.right()));
-        }
-        assert!(max <= width + 0.5, "{size:?} @{scale}: painted to {max}");
-        assert!(clipped_text(&output, size).is_empty(), "{size:?}");
-        if pixels_w <= 1280.0 && scale == 1.0 {
-            assert!(
-                text_bounds(&output, "Can I play it?").is_empty(),
-                "{size:?} must use the stacked layout"
-            );
+        let case = format!("{pixels_w}x{pixels_h} @{scale}");
+        let heading = text_bounds(&output, "Can I play it?");
+        assert_eq!(!heading.is_empty(), two_columns, "{case}: layout choice");
+        assert!(clipped_text(&output, size).is_empty(), "{case}");
+        if let Some(heading) = heading.first() {
+            // Everything from the right card's left edge (its margin is 18)
+            // rightwards belongs to the column; none of it may leave the window.
+            let card_left = heading.min.x - 18.0;
+            let mut extents = Vec::new();
+            for clipped in &output.shapes {
+                shape_extents(&clipped.shape, &mut extents);
+            }
+            let column: Vec<_> = extents
+                .iter()
+                .filter(|r| r.min.x >= card_left - 0.5 && r.width() > 0.0)
+                .collect();
+            assert!(column.len() > 5, "{case}: column widgets found");
+            for rect in column {
+                assert!(
+                    rect.min.x >= 0.0 && rect.max.x <= size[0] + 0.5,
+                    "{case}: {rect:?} outside {size:?}"
+                );
+            }
         }
     }
 }
 
-/// The readiness card's two action buttons stay inside the card at the widths
-/// the Game Details right column gives it (about 300 points inside), even
-/// when "Set up emulator" and the disabled Play cannot both fit a row.
+/// The readiness card's action buttons stay inside the card at the widths the
+/// Game Details right column gives it, in the Checking state, with a fix
+/// button, and when two actions cannot share a row. Checks the buttons' own
+/// rectangles (64 points tall) as well as their labels.
 #[test]
 fn readiness_card_buttons_stay_inside_a_narrow_card() {
-    for card_width in [200.0_f32, 239.0, 300.0, 330.0, 420.0, 600.0] {
-        let mut summary = launch_readiness_summary::not_started_summary();
-        summary.status = launch_readiness_summary::ReadinessPresentationState::NeedsEmulator;
-        summary.headline = "An emulator is needed".into();
-        summary.primary_action = Some(ReadinessAction::SetUpEmulator);
-        let context = egui::Context::default();
-        let mut output = None;
-        for _ in 0..3 {
-            output = Some(context.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1000.0, 800.0),
-                    )),
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        ui.allocate_ui(egui::vec2(card_width, 0.0), |ui| {
-                            launch_readiness_summary::show(ui, &summary);
+    use launch_readiness_summary::ReadinessPresentationState as State;
+    let states: [(&str, State, Option<ReadinessAction>, &str); 3] = [
+        ("checking", State::Checking, None, "Play"),
+        (
+            "emulator",
+            State::NeedsEmulator,
+            Some(ReadinessAction::SetUpEmulator),
+            "Set up emulator",
+        ),
+        (
+            "verify",
+            State::NeedsIdentityReview,
+            Some(ReadinessAction::VerifyIdentity),
+            "Play",
+        ),
+    ];
+    for (name, status, action, label) in states {
+        for card_width in [200.0_f32, 239.0, 300.0, 330.0, 420.0, 600.0] {
+            let mut summary = launch_readiness_summary::not_started_summary();
+            summary.status = status;
+            summary.headline = "headline".into();
+            summary.primary_action = action;
+            let context = egui::Context::default();
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1000.0, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.allocate_ui(egui::vec2(card_width, 0.0), |ui| {
+                                launch_readiness_summary::show(ui, &summary);
+                            });
                         });
-                    });
-                },
-            ));
-        }
-        let output = output.unwrap();
-        let left = 8.0; // CentralPanel margin
-        for label in ["Set up emulator", "Play"] {
-            let rects = text_bounds(&output, label);
-            assert!(!rects.is_empty(), "{label} at {card_width}");
-            for rect in rects {
+                    },
+                ));
+            }
+            let output = output.unwrap();
+            let case = format!("{name} at {card_width}");
+            let left = 8.0; // CentralPanel margin
+            assert!(!text_bounds(&output, label).is_empty(), "{case}: {label}");
+            let mut extents = Vec::new();
+            for clipped in &output.shapes {
+                shape_extents(&clipped.shape, &mut extents);
+            }
+            let buttons: Vec<_> = extents
+                .iter()
+                .filter(|r| (r.height() - 64.0).abs() < 1.0)
+                .collect();
+            assert!(!buttons.is_empty(), "{case}: no button rectangles found");
+            for rect in buttons
+                .into_iter()
+                .chain(text_bounds(&output, label).iter())
+            {
                 assert!(
-                    rect.max.x <= left + card_width + 1.0,
-                    "{label} at {card_width}: {rect:?}"
+                    rect.min.x >= left - 1.0 && rect.max.x <= left + card_width + 1.0,
+                    "{case}: {rect:?}"
                 );
             }
         }
