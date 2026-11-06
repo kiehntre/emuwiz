@@ -249,11 +249,11 @@ pub mod fault_injection {
     }
 
     pub use super::{
-        STAGE_AFTER_EMERGENCY_BACKUP, STAGE_AFTER_EXCHANGE, STAGE_AFTER_EXCLUSION,
-        STAGE_AFTER_STAGING, STAGE_AFTER_VERIFICATION, STAGE_BEFORE_COMPLETED_RECEIPT,
-        STAGE_BEFORE_EXCHANGE, STAGE_BEFORE_SUPERSEDED_REMOVAL, STAGE_BEFORE_VERIFICATION,
-        STAGE_ROLLBACK_AFTER_EXCHANGE, STAGE_ROLLBACK_AFTER_STAGING,
-        STAGE_ROLLBACK_BEFORE_VERIFICATION,
+        STAGE_AFTER_EMERGENCY_BACKUP, STAGE_AFTER_EXCHANGE, STAGE_AFTER_EXCHANGE_BACK,
+        STAGE_AFTER_EXCLUSION, STAGE_AFTER_STAGING, STAGE_AFTER_VERIFICATION,
+        STAGE_BEFORE_COMPLETED_RECEIPT, STAGE_BEFORE_EXCHANGE, STAGE_BEFORE_EXCHANGE_BACK,
+        STAGE_BEFORE_SUPERSEDED_REMOVAL, STAGE_BEFORE_VERIFICATION, STAGE_ROLLBACK_AFTER_EXCHANGE,
+        STAGE_ROLLBACK_AFTER_STAGING, STAGE_ROLLBACK_BEFORE_VERIFICATION,
     };
 
     /// Every restore stage name, in execution order, for tests that sweep them.
@@ -289,6 +289,12 @@ pub const STAGE_BEFORE_COMPLETED_RECEIPT: &str = "before-completed-receipt";
 pub const STAGE_ROLLBACK_AFTER_STAGING: &str = "rollback-after-staging";
 pub const STAGE_ROLLBACK_AFTER_EXCHANGE: &str = "rollback-after-exchange";
 pub const STAGE_ROLLBACK_BEFORE_VERIFICATION: &str = "rollback-before-verification";
+/// Inside a restore's own verification rollback, after the original has
+/// been exchanged back and before it is re-verified.
+pub const STAGE_AFTER_EXCHANGE_BACK: &str = "after-exchange-back";
+/// Inside a restore's own verification rollback, after the receipt says
+/// "Rollback attempted" and before anything is exchanged back.
+pub const STAGE_BEFORE_EXCHANGE_BACK: &str = "before-exchange-back";
 
 #[cfg(any(test, feature = "test-support"))]
 fn restore_stage(stage: &str) -> Result<()> {
@@ -778,7 +784,8 @@ fn roll_back_after_exchange(
     // The superseded original must be the exact pre-restore bytes before it
     // may be put back. The exclusion's connection is open on that very
     // inode, so it is hashed through SQLite's descriptor.
-    let checked = file_identity(staged_old_live, "superseded original")
+    let checked = restore_stage(STAGE_BEFORE_EXCHANGE_BACK)
+        .and_then(|()| file_identity(staged_old_live, "superseded original"))
         .and_then(|identity| Ok((identity, exclusion.locked_inode_sha256()?)))
         .and_then(|(identity, sha)| {
             if sha != expected || Some(identity) != original_identity {
@@ -805,7 +812,10 @@ fn roll_back_after_exchange(
     // Exchanged back: the original is at the live path, the rejected
     // replacement at the staging path.
     receipt.superseded_database_path = None;
-    match fsync_directory(live.parent()).and_then(|()| validate_live_database(&live, schema)) {
+    match fsync_directory(live.parent())
+        .and_then(|()| restore_stage(STAGE_AFTER_EXCHANGE_BACK))
+        .and_then(|()| validate_live_database(&live, schema))
+    {
         Ok(()) => {
             let _ = fs::remove_file(staged_old_live);
             receipt.state = DatabaseRestoreState::RolledBack;
@@ -914,18 +924,22 @@ pub fn rollback_database_restore(
             validate_live_database(&live, schema)
         });
     if let Err(error) = verification {
-        // Put the restored database back; it is at the staging path.
-        let message = match exchange_paths(&staged, &live)
-            .and_then(|()| fsync_directory(live.parent()))
-        {
+        // Put the restored database back; it is at the staging path. The
+        // syscall decides what is where; a failed directory fsync afterwards
+        // is only a durability warning.
+        let message = match exchange_paths(&staged, &live) {
             Ok(()) => {
+                let durability = match fsync_directory(live.parent()) {
+                    Ok(()) => String::new(),
+                    Err(fsync) => format!(" (directory fsync failed afterwards: {fsync})"),
+                };
                 let _ = fs::remove_file(&staged);
                 updated.state = DatabaseRestoreState::Completed;
                 updated.rollback_staging_path = None;
                 updated.rollback_staging_sha256 = None;
                 updated.rollback_identity = None;
                 format!(
-                    "Rollback verification failed ({error}); the restored database was put back. The emergency backup remains at {}.",
+                    "Rollback verification failed ({error}); the restored database was put back{durability}. The emergency backup remains at {}.",
                     emergency.display()
                 )
             }
@@ -1153,13 +1167,42 @@ fn assess_receipt(
             .map(Path::to_path_buf)
     };
 
-    if receipt.state == DatabaseRestoreState::RollbackAttempted {
+    // A user-requested rollback records its own staging path; a restore's
+    // verification rollback (same state, no rollback staging) is judged by
+    // the restore rules below: the original back at the live path is
+    // "original intact", the replacement still there is "replacement".
+    if receipt.state == DatabaseRestoreState::RollbackAttempted
+        && receipt.rollback_staging_path.is_some()
+    {
         return Ok(assess_rollback(assessment, live_identity, depth));
     }
 
-    // The exchange is impossible before the staged hash was durably recorded,
-    // and undone whenever the original inode is back at the live path.
-    let exchange_possible = receipt.staged_replacement_sha256.is_some();
+    // The exchange is impossible before the staged hash was durably recorded
+    // (receipts from the previous build never carry it, so for those the
+    // state order decides), and undone whenever the original inode is back
+    // at the live path.
+    let exchange_possible = receipt.staged_replacement_sha256.is_some()
+        || matches!(
+            receipt.state,
+            DatabaseRestoreState::RestoreApplied
+                | DatabaseRestoreState::Verification
+                | DatabaseRestoreState::RollbackAttempted
+        );
+    if exchange_possible && receipt.original_identity.is_none() {
+        // Written by a build that recorded no file identities: nothing here
+        // can tell the original from the replacement truthfully.
+        assessment.outcome = InterruptedRestoreOutcome::Unrecognised {
+            detail:
+                "the receipt was written by an earlier EmuWiz build and records no file identities"
+                    .into(),
+        };
+        assessment.summary = format!(
+            "Interrupted at '{state_label}' by an earlier EmuWiz build; the exchange may have happened."
+        );
+        assessment.next_step =
+            "Do not finalise automatically; compare the live database with the emergency backup by hand.".into();
+        return Ok(assessment);
+    }
     if !exchange_possible || Some(live_identity) == receipt.original_identity {
         let modified_since = match depth {
             AssessmentDepth::Preview => false,
@@ -1271,15 +1314,19 @@ fn assess_rollback(
         if let Some(path) = staging_present {
             assessment.leftover_paths.push(path.to_path_buf());
         }
-        assessment.outcome = InterruptedRestoreOutcome::ReplacementVerified {
-            modified_since: false,
-        };
-        if depth == AssessmentDepth::Full
-            && let Err(error) = validate_live_database(&live, latest_known_version(MIGRATIONS))
-        {
-            assessment.outcome = InterruptedRestoreOutcome::ReplacementFailedVerification {
-                detail: error.to_string(),
-            };
+        assessment.outcome = InterruptedRestoreOutcome::ReplacementUnverified;
+        if depth == AssessmentDepth::Full {
+            assessment.outcome =
+                match validate_live_database(&live, latest_known_version(MIGRATIONS)) {
+                    Ok(()) => InterruptedRestoreOutcome::ReplacementVerified {
+                        modified_since: live_sha256_by_path(&live)
+                            .map(|sha| Some(sha) != receipt.staged_replacement_sha256)
+                            .unwrap_or(true),
+                    },
+                    Err(error) => InterruptedRestoreOutcome::ReplacementFailedVerification {
+                        detail: error.to_string(),
+                    },
+                };
         }
         assessment.summary =
             "Rollback was interrupted before the exchange: the restored database remains in place."
@@ -2782,6 +2829,139 @@ mod tests {
             assert!(interrupted_restore_receipts(&live).is_empty(), "{stage}");
             let _ = root;
         }
+    }
+
+    #[test]
+    fn verification_rollback_interrupted_after_exchange_back_is_original_intact() {
+        // K1: a restore whose own verification rollback was interrupted after
+        // the original had been exchanged back must reconcile as "original
+        // intact" with the rejected replacement listed as a leftover.
+        let (root, live, _backup, plan) = fixture();
+        let crashed = {
+            let _guard = fault_injection::install(|s| {
+                if s == STAGE_BEFORE_VERIFICATION {
+                    Err("verification could not run".into())
+                } else if s == STAGE_AFTER_EXCHANGE_BACK {
+                    panic!("simulated crash after the exchange back")
+                } else {
+                    Ok(())
+                }
+            });
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                restore_database(&plan, CONFIRMATION)
+            }))
+            .is_err()
+        };
+        assert!(crashed);
+        assert_eq!(marker(&live), "live");
+        let receipt_path = interrupted_restore_receipts(&live).pop().unwrap();
+        let receipt = read_receipt(&receipt_path).unwrap();
+        assert_eq!(receipt.state, DatabaseRestoreState::RollbackAttempted);
+        assert!(receipt.rollback_staging_path.is_none());
+        let staged = receipt.staged_replacement_path.clone().unwrap();
+        assert!(
+            staged.exists(),
+            "the rejected replacement stays at the staging path"
+        );
+        let preview = preview_interrupted_restore(&receipt_path).unwrap();
+        assert_eq!(
+            preview.outcome,
+            InterruptedRestoreOutcome::OriginalIntact {
+                modified_since: false
+            },
+            "{}",
+            preview.summary
+        );
+        assert!(preview.leftover_paths.contains(&staged));
+        let assessment = assess_interrupted_restore(&receipt_path).unwrap();
+        assert_eq!(
+            assessment.outcome,
+            InterruptedRestoreOutcome::OriginalIntact {
+                modified_since: false
+            }
+        );
+        let finalised = finalise_interrupted_restore(&receipt_path, CONFIRMATION).unwrap();
+        assert_eq!(finalised.receipt.state, DatabaseRestoreState::Failed);
+        assert_eq!(finalised.receipt.original_intact, Some(true));
+        assert!(staged.exists(), "finalise deletes nothing");
+        assert!(interrupted_restore_receipts(&live).is_empty());
+        let _ = root;
+
+        // And a verification rollback interrupted before the exchange back
+        // leaves the replacement live; it is judged like any post-exchange
+        // interruption.
+        let (_root, live, _backup, plan) = fixture();
+        let crashed = {
+            let _guard = fault_injection::install(|s| {
+                if s == STAGE_BEFORE_VERIFICATION {
+                    Err("verification could not run".into())
+                } else if s == STAGE_BEFORE_EXCHANGE_BACK {
+                    panic!("simulated crash before the exchange back")
+                } else {
+                    Ok(())
+                }
+            });
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                restore_database(&plan, CONFIRMATION)
+            }))
+            .is_err()
+        };
+        assert!(crashed);
+        assert_eq!(marker(&live), "backup");
+        let receipt_path = interrupted_restore_receipts(&live).pop().unwrap();
+        let receipt = read_receipt(&receipt_path).unwrap();
+        assert_eq!(receipt.state, DatabaseRestoreState::RollbackAttempted);
+        assert!(receipt.rollback_staging_path.is_none());
+        let assessment = assess_interrupted_restore(&receipt_path).unwrap();
+        assert_eq!(
+            assessment.outcome,
+            InterruptedRestoreOutcome::ReplacementVerified {
+                modified_since: false
+            },
+            "{}",
+            assessment.summary
+        );
+        assert!(assessment.superseded_original_present);
+        let finalised = finalise_interrupted_restore(&receipt_path, CONFIRMATION).unwrap();
+        assert_eq!(finalised.receipt.state, DatabaseRestoreState::Completed);
+        let rolled = rollback_database_restore(&finalised.receipt, CONFIRMATION).unwrap();
+        assert_eq!(rolled.state, DatabaseRestoreState::RolledBack);
+        assert_eq!(marker(&live), "live");
+    }
+
+    #[test]
+    fn legacy_receipt_without_identities_is_never_guessed() {
+        // Receipts from the previous build carry neither identities nor the
+        // staged hash. Before the exchange the state proves the original is
+        // intact; from "Restore applied" on nothing can tell, so say so.
+        let (_root, live, backup, plan) = fixture();
+        let mut legacy = receipt_for(&plan, DatabaseRestoreState::Validating, "old build");
+        legacy.operation_id = "database-restore-legacy".into();
+        legacy.exclusion_held = false;
+        let path = receipt_path(&legacy);
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        let assessment = assess_interrupted_restore(&path).unwrap();
+        assert_eq!(
+            assessment.outcome,
+            InterruptedRestoreOutcome::OriginalIntact {
+                modified_since: false
+            }
+        );
+        legacy.state = DatabaseRestoreState::RestoreApplied;
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        let assessment = assess_interrupted_restore(&path).unwrap();
+        assert!(
+            matches!(
+                assessment.outcome,
+                InterruptedRestoreOutcome::Unrecognised { .. }
+            ),
+            "{}",
+            assessment.summary
+        );
+        assert!(!assessment.can_finalise());
+        assert!(finalise_interrupted_restore(&path, CONFIRMATION).is_err());
+        assert_eq!(marker(&live), "live");
+        let _ = backup;
     }
 
     #[test]
