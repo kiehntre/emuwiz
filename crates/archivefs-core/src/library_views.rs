@@ -7282,4 +7282,79 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------
+    // Night Watch II D2-04 / D2-05: links published before the manifest
+    // was saved must stay removable; a symlink EmuWiz never made is never
+    // adopted or removed.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn d2_04_links_created_before_a_failed_manifest_save_are_still_removable() {
+        let root = temp_dir("d2-04");
+        let source_dir = root.join("source");
+        let a = source_dir.join("A.zip");
+        let b = source_dir.join("B.zip");
+        write_file(&a, b"a");
+        write_file(&b, b"b");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let source = make_source(1, &source_dir);
+        let archives = vec![
+            make_archive(1, 1, &a, Some("NES")),
+            make_archive(2, 1, &b, Some("NES")),
+        ];
+        let view = make_view("view-d2", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        // Occupy the manifest path so the end-of-run manifest save fails
+        // (models a crash there).
+        let blocker = library_view_manifest_path(&data_dir, &view.id);
+        fs::create_dir_all(&blocker).unwrap();
+        let plan = plan_library_view(&view, &archives, &[source], &manifest, None);
+        let _ = apply_library_view(&view, &plan, &manifest, &data_dir);
+        fs::remove_dir_all(&blocker).unwrap();
+
+        let recorded = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        let report = remove_library_view_symlinks(&view, &recorded, &data_dir).unwrap();
+        let left: Vec<_> = fs::read_dir(destination.join("NES"))
+            .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            left.is_empty(),
+            "orphaned view objects left after remove: {left:?}"
+        );
+        assert_eq!(report.removed, 2);
+    }
+
+    #[test]
+    fn d2_05_remove_never_deletes_a_symlink_the_view_did_not_create() {
+        let root = temp_dir("d2-05");
+        let source_dir = root.join("source");
+        let a = source_dir.join("A.zip");
+        write_file(&a, b"a");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let user_link = destination.join("NES").join("A.zip");
+        fs::create_dir_all(user_link.parent().unwrap()).unwrap();
+        symlink(&a, &user_link).unwrap(); // user's own link, pre-dating the view
+
+        let source = make_source(1, &source_dir);
+        let view = make_view("view-d2b", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+        let plan = plan_library_view(
+            &view,
+            &[make_archive(1, 1, &a, Some("NES"))],
+            &[source],
+            &manifest,
+            None,
+        );
+        apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        let recorded = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        remove_library_view_symlinks(&view, &recorded, &data_dir).unwrap();
+        assert!(
+            fs::symlink_metadata(&user_link).is_ok(),
+            "user's pre-existing symlink was deleted"
+        );
+    }
 }
