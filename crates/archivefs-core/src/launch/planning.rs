@@ -180,6 +180,36 @@ pub struct LaunchCandidate {
     pub preference: CandidatePreference,
 }
 
+impl LaunchCandidate {
+    /// The single RetroArch Play-eligibility rule, shared by the GUI request
+    /// builder and the click-time preflight.
+    ///
+    /// - no blockers, ever;
+    /// - `Ready` with no warnings (unchanged), or
+    /// - `ReadyWithWarnings` where there is at least one warning, EVERY
+    ///   warning is allow-listed ([`LaunchWarningKind::permits_retroarch_play`])
+    ///   and the candidate's firmware readiness is `PresentUnverified` (the
+    ///   only state that produces that warning). `Blocked`, `Missing`,
+    ///   `Unknown` or any other warning kind never qualify.
+    pub fn retroarch_play_eligible(&self) -> bool {
+        if !self.blockers.is_empty() {
+            return false;
+        }
+        match self.readiness {
+            LaunchReadiness::Ready => self.warnings.is_empty(),
+            LaunchReadiness::ReadyWithWarnings => {
+                !self.warnings.is_empty()
+                    && self.firmware == FirmwareReadiness::PresentUnverified
+                    && self
+                        .warnings
+                        .iter()
+                        .all(|warning| warning.kind.permits_retroarch_play())
+            }
+            LaunchReadiness::Blocked => false,
+        }
+    }
+}
+
 /// Full description of every currently-knowable way to play one game.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPlan {
@@ -322,6 +352,33 @@ fn firmware_condition(
     }
 }
 
+/// Visible text for a RetroArch candidate's unverified-firmware warning,
+/// naming the required files that were found but whose contents EmuWiz did
+/// not verify.
+pub(crate) fn unverified_firmware_detail(
+    info: &crate::emulator_environment::retroarch::CoreInfoFinding,
+) -> String {
+    use crate::emulator_environment::retroarch::{CoreInfoFinding, FirmwarePresence};
+    let names: Vec<&str> = match info {
+        CoreInfoFinding::Found { firmware, .. } => firmware
+            .iter()
+            .filter(|entry| {
+                !entry.optional && entry.presence == FirmwarePresence::PresentUnverified
+            })
+            .filter_map(|entry| entry.path.as_deref())
+            .collect(),
+        _ => Vec::new(),
+    };
+    if names.is_empty() {
+        "Firmware found but not verified: required firmware is present but its contents were not checked.".into()
+    } else {
+        format!(
+            "Firmware found but not verified: {} is present but its contents were not checked.",
+            names.join(", ")
+        )
+    }
+}
+
 fn readiness_from(blockers: &[LaunchBlocker], warnings: &[LaunchWarning]) -> LaunchReadiness {
     if !blockers.is_empty() {
         LaunchReadiness::Blocked
@@ -440,7 +497,10 @@ fn build_retroarch_candidates(
                 blockers.push(blocker);
             }
             let firmware = retroarch_core_firmware_readiness(&found.info);
-            let (firmware_blocker, firmware_warning) = firmware_condition(firmware);
+            let (firmware_blocker, mut firmware_warning) = firmware_condition(firmware);
+            if let Some(warning) = firmware_warning.as_mut() {
+                warning.detail = unverified_firmware_detail(&found.info);
+            }
             blockers.extend(firmware_blocker);
             warnings.extend(firmware_warning);
             if ambiguous {

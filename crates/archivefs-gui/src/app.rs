@@ -25,6 +25,7 @@ pub(crate) struct ArchiveFsApp {
     /// The History & Logs page's filter/sort state.
     pub(crate) history_filters: HistoryLogFilters,
     pub(crate) shared_history: SharedHistoryState,
+    pub(crate) startup_shared_recovery: StartupSharedRecoveryState,
     pub(crate) shared_history_operation: Option<String>,
     pub(crate) shared_rollback: SharedRollbackState,
     /// Activity label for the current shared rollback, chosen from its journal.
@@ -442,7 +443,7 @@ impl ArchiveFsApp {
                 "Loading your library.",
             ));
         }
-        Self {
+        let mut app = Self {
             state: if initial_load {
                 start_load(context.clone(), generation, None)
             } else {
@@ -474,6 +475,7 @@ impl ArchiveFsApp {
             mount_ui: MountUiState::default(),
             history_filters: HistoryLogFilters::default(),
             shared_history: SharedHistoryState::NotLoaded,
+            startup_shared_recovery: StartupSharedRecoveryState::NotStarted,
             shared_history_operation: None,
             shared_rollback: SharedRollbackState::Idle,
             shared_rollback_action: ActivityAction::CheatPreview,
@@ -545,7 +547,15 @@ impl ArchiveFsApp {
             focus_bulk_platform_cancel: false,
             bulk_platform_action_typed_count: String::new(),
             artwork_media: ArtworkMediaState::new(),
+        };
+        if initial_load {
+            // A crash during a cheat/mod install leaves only a pending
+            // record; settle it into History (with Undo available) before
+            // the user has to find the right page. Background worker, no
+            // Undo performed, nothing under any destination root touched.
+            app.start_startup_shared_recovery(context);
         }
+        app
     }
 
     /// The compatibility wrapper for navigating *by tab* - the write

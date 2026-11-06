@@ -3188,10 +3188,12 @@ fn pcsx2_launch_error_message(error: &Pcsx2LaunchExecutionError) -> (&'static st
 /// can never show for a request core's own preflight would refuse. `Some`
 /// only when every Phase-1 condition holds: [`LaunchTarget::RetroArchCore`],
 /// [`ProfileKind::Native`] or an exact, verified RetroArch
-/// [`ProfileKind::AppImage`], strictly [`LaunchReadiness::Ready`] (never
-/// `ReadyWithWarnings`), direct loose/plain content
-/// ([`LaunchContainerKind::PlainFile`], `requires_mount == false`), no
-/// blockers, no warnings, and a resolved plan-level platform/game key.
+/// [`ProfileKind::AppImage`], [`LaunchReadiness::Ready`] with no warnings, or
+/// `ReadyWithWarnings` carrying ONLY the allow-listed unverified-firmware
+/// warning (see `LaunchCandidate::retroarch_play_eligible`), direct
+/// loose/plain content ([`LaunchContainerKind::PlainFile`],
+/// `requires_mount == false`), no blockers, and a resolved plan-level
+/// platform/game key.
 /// The single multi-disc decision for a candidate, used by Preview, Launch and
 /// Game Details alike. Only DuckStation and RetroArch can receive a playlist.
 pub(crate) fn multidisc_decision(
@@ -3406,10 +3408,10 @@ fn retroarch_launch_request_unexplained(
     let (Some(platform_id), Some(game_key)) = (&plan.platform_id, &plan.game_key) else {
         return Err(R::NotReady);
     };
-    if candidate.readiness != LaunchReadiness::Ready {
-        return Err(R::NotReady);
-    }
-    if !candidate.blockers.is_empty() || !candidate.warnings.is_empty() {
+    // Ready, or ReadyWithWarnings carrying ONLY the allow-listed
+    // unverified-firmware warning (owner policy B); every other warning kind
+    // and every blocker still refuses.
+    if !candidate.retroarch_play_eligible() {
         return Err(R::NotReady);
     }
     if candidate.content.requires_mount {

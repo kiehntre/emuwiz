@@ -199,6 +199,20 @@ pub trait ReadOnlyHostFilesystem {
         (self.probe_executable(path) == ExecutableProbe::RegularExecutable)
             .then(|| path.to_path_buf())
     }
+    /// Probe for a *firmware* candidate path: like [`Self::probe`], except
+    /// that a symlink is resolved (see [`HostReadOnlyFilesystem`]'s
+    /// implementation for the full trust rules) and the outcome describes
+    /// the RESOLVED target, so a link to a regular file is `PresentFile`
+    /// (exactly as the real file would be), a link to a directory is
+    /// `PresentDirectory`, and a dangling/looping/non-regular link is
+    /// `Missing`/`WrongType`. Never `Symlink`.
+    ///
+    /// The default is the no-follow [`Self::probe`] (a symlink stays
+    /// `Symlink`, which callers treat as unknown): fakes and any filesystem
+    /// that has not opted in keep the fail-closed behaviour.
+    fn probe_firmware_candidate(&self, path: &Path) -> FsProbe {
+        self.probe(path)
+    }
     /// Reads at most `max_bytes` bytes. `BoundedReadResult::TooLarge` if
     /// the file is larger; the oversized content is never partially
     /// trusted as a truncated prefix.
@@ -279,6 +293,65 @@ impl ReadOnlyHostFilesystem for HostReadOnlyFilesystem {
     }
     fn probe(&self, path: &Path) -> FsProbe {
         Self::probe_metadata(fs::symlink_metadata(path))
+    }
+
+    /// Resolve-and-verify probe for firmware candidates.
+    ///
+    /// Trust decisions (all read-only, no bytes are read, nothing is hashed):
+    /// - A non-symlink is probed exactly as [`Self::probe`] does.
+    /// - A symlink is resolved with `canonicalize` (follows chains and
+    ///   relative links). `NotFound` (dangling) and `ELOOP` (loop) are
+    ///   `Missing`: the firmware is not usable, so a required one blocks
+    ///   launch exactly like an absent file. Permission errors stay
+    ///   `Inaccessible`, other errors `IoError` (both read as unknown by
+    ///   callers, as for real files).
+    /// - The canonical target must be a regular file (or, for a parent
+    ///   component, a directory). Anything else (device, FIFO, socket) is
+    ///   `WrongType`. For a regular file the canonical path is then opened
+    ///   `O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY|O_CLOEXEC` (never blocks
+    ///   on a FIFO; never becomes a controlling tty) and the OPENED
+    ///   descriptor is `fstat`ed, so the thing validated is the thing
+    ///   opened and an unreadable target is not reported present.
+    /// - The target may lie anywhere the user's account can read: the link
+    ///   lives in the user's own RetroArch system directory, which the user
+    ///   controls, and the probe reads zero content bytes - it only learns
+    ///   "a readable regular file is there". Nothing is ever written
+    ///   through a link. Authenticity is NOT inferred: the result is the
+    ///   same `PresentFile` a real unhashed file gets, which callers map to
+    ///   `PresentUnverified`.
+    fn probe_firmware_candidate(&self, path: &Path) -> FsProbe {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let first = self.probe(path);
+        if first != FsProbe::Symlink {
+            return first;
+        }
+        let canonical = match fs::canonicalize(path) {
+            Ok(canonical) => canonical,
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return FsProbe::Missing,
+            Err(error) => return io_error_to_probe(&error),
+        };
+        let resolved = Self::probe_metadata(fs::symlink_metadata(&canonical));
+        match resolved {
+            FsProbe::PresentDirectory => return FsProbe::PresentDirectory,
+            FsProbe::PresentFile => {}
+            // A canonical path is never a symlink; treat a race as unknown.
+            FsProbe::Symlink => return FsProbe::IoError,
+            other => return other,
+        }
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+            .open(&canonical)
+        {
+            Ok(file) => file,
+            Err(error) => return io_error_to_probe(&error),
+        };
+        match file.metadata() {
+            Ok(metadata) if metadata.is_file() => FsProbe::PresentFile,
+            Ok(_) => FsProbe::WrongType,
+            Err(error) => io_error_to_probe(&error),
+        }
     }
 
     fn size_no_follow(&self, path: &Path) -> Option<u64> {

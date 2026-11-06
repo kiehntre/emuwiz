@@ -255,6 +255,7 @@ mod platform_shelf_and_library_shell;
 mod selected;
 mod selected_context_and_bsfree;
 mod selected_page_mount_removal;
+mod startup_shared_recovery;
 mod transactions;
 
 // -- Hoisted shared test fixtures ------------------------------------
@@ -1118,6 +1119,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         mount_ui: MountUiState::default(),
         history_filters: HistoryLogFilters::default(),
         shared_history: SharedHistoryState::NotLoaded,
+        startup_shared_recovery: StartupSharedRecoveryState::NotStarted,
         shared_history_operation: None,
         shared_rollback: SharedRollbackState::Idle,
         shared_rollback_action: ActivityAction::CheatPreview,

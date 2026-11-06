@@ -1601,6 +1601,43 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
     }
 }
 
+/// Like [`supported_loose_rom_format`], for a member inside a ZIP that sits in
+/// a trusted platform folder. The only addition is a bare `.bin` for Atari
+/// 2600: that is the dominant name for 2600 cartridge dumps, and in a trusted
+/// Atari 2600 container it is not ambiguous. A loose `.bin` stays unsupported
+/// (its extension alone says nothing; many cartridge systems share it).
+pub fn supported_zip_member_rom_format(
+    path: &Path,
+    platform: IdentityPlatform,
+) -> Option<&'static str> {
+    supported_loose_rom_format(path, platform).or_else(|| {
+        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+        (platform == IdentityPlatform::Atari2600 && extension == "bin").then_some("bin")
+    })
+}
+
+/// Structural check for a `.bin` Atari 2600 ROM member, from its declared
+/// size alone. Measured over 613 real zipped `.bin` members: every one is a
+/// multiple of 1 KiB from 2 KiB to 64 KiB, except Starpath Supercharger
+/// images (multiples of 8448 bytes: 1, 3 and 4 loads seen) and the one
+/// Pitfall II (DPC) dump of 10495 bytes. Anything else (empty, tiny, odd,
+/// or far larger than any 2600 cartridge) is not accepted as a 2600 ROM.
+pub fn atari_2600_bin_size_problem(len: u64) -> Option<String> {
+    const KIB: u64 = 1024;
+    const SUPERCHARGER_LOAD: u64 = 8448;
+    const DPC_PITFALL_II: u64 = 10_495;
+    let kib_cartridge = len.is_multiple_of(KIB) && (2 * KIB..=256 * KIB).contains(&len);
+    let supercharger = len.is_multiple_of(SUPERCHARGER_LOAD) && len <= 8 * SUPERCHARGER_LOAD;
+    if len > 0 && (kib_cartridge || supercharger || len == DPC_PITFALL_II) {
+        return None;
+    }
+    Some(format!(
+        "a .bin of {len} bytes is not a recognised Atari 2600 cartridge size \
+         (expected a multiple of 1 KiB from 2 KiB to 256 KiB, a Supercharger \
+         image, or the 10495-byte DPC dump)"
+    ))
+}
+
 /// Parses the existing iNES/NES 2.0 header detector from a loose `.nes`
 /// file, but only promotes it when the declared trainer/PRG/CHR payload fits
 /// within the physical file. The parser remains responsible for header
