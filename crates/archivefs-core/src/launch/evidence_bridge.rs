@@ -181,6 +181,13 @@ pub fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::NeoGeoCd => Some("Neo Geo CD"),
         IdentityPlatform::Ngp => Some("Neo Geo Pocket"),
         IdentityPlatform::Ngpc => Some("Neo Geo Pocket Color"),
+        IdentityPlatform::GameGear => Some("GameGear"),
+        IdentityPlatform::MasterSystem => Some("MasterSystem"),
+        IdentityPlatform::Sega32x => Some("Sega 32X"),
+        IdentityPlatform::ColecoVision => Some("ColecoVision"),
+        // Stored libraries use `TurboGrafx-16` for HuCards; `PC Engine` is an
+        // equivalent registry id (EQUIVALENT_PLATFORM_IDS) and CD stays separate.
+        IdentityPlatform::TurboGrafx16 => Some("TurboGrafx-16"),
         IdentityPlatform::Atari2600 => Some("Atari2600"),
         IdentityPlatform::Atari5200 => Some("Atari5200"),
         IdentityPlatform::Atari7800 => Some("Atari7800"),
@@ -393,7 +400,12 @@ fn resolved_identity_for_platform(
                 vec![VerifiedIdentityFact::PcfxDiscHash(disc_hash.to_string())],
             ))
         }
-        IdentityPlatform::Atari2600
+        IdentityPlatform::GameGear
+        | IdentityPlatform::MasterSystem
+        | IdentityPlatform::Sega32x
+        | IdentityPlatform::ColecoVision
+        | IdentityPlatform::TurboGrafx16
+        | IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
         | IdentityPlatform::Atari7800
         | IdentityPlatform::Atari8Bit

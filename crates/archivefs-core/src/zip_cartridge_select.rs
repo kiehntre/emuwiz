@@ -25,7 +25,7 @@
 //! [`MAX_ZIP_CARTRIDGE_RATIO`].
 use crate::game_identity::{
     IdentityPlatform, IdentityStatus, MAX_ARCHIVE_MEMBERS, MAX_LOOSE_ROM_BYTES, MAX_PATH_BYTES,
-    supported_loose_rom_format,
+    cross_platform_extension_mismatch, supported_loose_rom_format,
 };
 use std::fs::File;
 use std::path::Path;
@@ -52,6 +52,11 @@ pub fn is_loose_cartridge_platform(platform: IdentityPlatform) -> bool {
             | IdentityPlatform::VirtualBoy
             | IdentityPlatform::PokemonMini
             | IdentityPlatform::N64
+            | IdentityPlatform::GameGear
+            | IdentityPlatform::MasterSystem
+            | IdentityPlatform::Sega32x
+            | IdentityPlatform::ColecoVision
+            | IdentityPlatform::TurboGrafx16
             | IdentityPlatform::Atari2600
             | IdentityPlatform::Atari5200
             | IdentityPlatform::Atari7800
@@ -100,6 +105,7 @@ pub fn select_zip_cartridge_member(
             format!("ZIP entries are duplicated, overlapping or inconsistent: {error}"),
         ));
     }
+    let mut mismatch: Option<&'static str> = None;
     let mut seen_names = std::collections::HashSet::new();
     let mut candidates: Vec<(usize, Vec<u8>, u64, u64, &'static str)> = Vec::new();
     for index in 0..archive.len() {
@@ -153,9 +159,14 @@ pub fn select_zip_cartridge_member(
         let member_path = Path::new(std::str::from_utf8(&name_raw).unwrap_or_default());
         if let Some(format) = supported_loose_rom_format(member_path, platform) {
             candidates.push((index, name_raw, raw.size(), raw.compressed_size(), format));
+        } else if mismatch.is_none() {
+            mismatch = cross_platform_extension_mismatch(member_path, platform);
         }
     }
     if candidates.is_empty() {
+        if let Some(reason) = mismatch {
+            return Err((IdentityStatus::Invalid, format!("ZIP member: {reason}")));
+        }
         return Err((
             IdentityStatus::Missing,
             ("ZIP contains no ROM member supported for this platform").to_string(),

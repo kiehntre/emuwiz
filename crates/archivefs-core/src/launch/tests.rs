@@ -1056,3 +1056,257 @@ fn remembering_snes9x_keeps_retroarch_listed_as_a_separate_choice() {
         "RetroArch remains a separate, still-listed choice after remembering Snes9x"
     );
 }
+
+// ---------------------------------------------------------------------
+// RetroArch-only cartridge family: Game Gear, Master System, 32X,
+// ColecoVision, TurboGrafx-16 (HuCard)
+// ---------------------------------------------------------------------
+
+fn cartridge_content(file: &str) -> LaunchContentRef {
+    LaunchContentRef {
+        kind: Some(LaunchContentKind::Cartridge),
+        container: Some(LaunchContainerKind::PlainFile),
+        resolved_path: Some(format!("/games/{file}").into()),
+        requires_mount: false,
+        provenance: "direct cartridge ROM".to_string(),
+    }
+}
+
+/// `(platform id, preferred core, other installed cores, systemname, database)`
+/// with the real `.info` strings of the cores installed on the host.
+#[allow(clippy::type_complexity)]
+fn cartridge_family_rows() -> Vec<(
+    &'static str,
+    &'static str,
+    Vec<(&'static str, &'static str, &'static str)>,
+    &'static str,
+)> {
+    let gpgx = (
+        "genesis_plus_gx",
+        "Sega 8/16-bit (Various)",
+        "Sega - Game Gear|Sega - Master System - Mark III|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis|Sega - PICO|Sega - SG-1000",
+    );
+    let pico = (
+        "picodrive",
+        "Sega 8/16-bit + 32X (Various)",
+        "Sega - Master System - Mark III|Sega - Game Gear|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis|Sega - PICO|Sega - 32X",
+    );
+    let smsplus = (
+        "smsplus",
+        "Sega 8-bit",
+        "Sega - Game Gear|Sega - Master System - Mark III",
+    );
+    let gpgx_wide = (
+        "genesis_plus_gx_wide",
+        "Sega 8/16-bit (Various)",
+        "Sega - Game Gear|Sega - Master System - Mark III|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis|Sega - PICO|Sega - SG-1000",
+    );
+    let supergrafx = (
+        "mednafen_supergrafx",
+        "PC Engine SuperGrafx",
+        "NEC - PC Engine SuperGrafx|NEC - PC Engine - TurboGrafx 16|NEC - PC Engine CD - TurboGrafx-CD",
+    );
+    let gearsystem = (
+        "gearsystem",
+        "Sega 8-bit (MS/GG/SG-1000)",
+        "Sega - Game Gear|Sega - Master System - Mark III|Sega - SG-1000",
+    );
+    let pce_fast = (
+        "mednafen_pce_fast",
+        "PC Engine/PCE-CD",
+        "NEC - PC Engine - TurboGrafx 16|NEC - PC Engine CD - TurboGrafx-CD",
+    );
+    let pce = (
+        "mednafen_pce",
+        "PC Engine/SuperGrafx/CD",
+        "NEC - PC Engine SuperGrafx|NEC - PC Engine - TurboGrafx 16|NEC - PC Engine CD - TurboGrafx-CD",
+    );
+    let geargrafx = (
+        "geargrafx",
+        "PC Engine/SuperGrafx",
+        "NEC - PC Engine SuperGrafx|NEC - PC Engine - TurboGrafx 16|NEC - PC Engine CD - TurboGrafx-CD",
+    );
+    let gearcoleco = ("gearcoleco", "ColecoVision", "Coleco - ColecoVision");
+    let bluemsx = (
+        "bluemsx",
+        "MSX/SVI/ColecoVision/SG-1000",
+        "Microsoft - MSX|Microsoft - MSX2|Coleco - ColecoVision|Sega - SG-1000|Spectravideo - SVI-318 - SVI-328",
+    );
+    vec![
+        (
+            "GameGear",
+            "genesis_plus_gx",
+            vec![pico, smsplus, gearsystem, gpgx_wide],
+            "x.gg",
+        ),
+        (
+            "MasterSystem",
+            "genesis_plus_gx",
+            vec![pico, smsplus, gearsystem, gpgx_wide],
+            "x.sms",
+        ),
+        ("Sega 32X", "picodrive", vec![], "x.32x"),
+        ("ColecoVision", "gearcoleco", vec![bluemsx], "x.col"),
+        (
+            "TurboGrafx-16",
+            "mednafen_pce_fast",
+            vec![pce, geargrafx, supergrafx],
+            "x.pce",
+        ),
+    ]
+    .into_iter()
+    .map(|(id, preferred, others, file)| {
+        let mut all = vec![match preferred {
+            "genesis_plus_gx" => gpgx,
+            "picodrive" => pico,
+            "gearcoleco" => gearcoleco,
+            _ => pce_fast,
+        }];
+        all.extend(others);
+        (id, preferred, all, file)
+    })
+    .collect()
+}
+
+fn cartridge_family_cores(all: &[(&'static str, &'static str, &'static str)]) -> Vec<CoreFinding> {
+    all.iter()
+        .map(|(stem, system, database)| core_finding(stem, Some(system), Some(database)))
+        .collect()
+}
+
+#[test]
+fn cartridge_family_plans_one_ready_preferred_retroarch_core() {
+    for (platform_id, preferred, all, file) in cartridge_family_rows() {
+        let plan = build_launch_plan(
+            &resolved(platform_id),
+            &cartridge_content(file),
+            &[],
+            &retroarch_environment_with_cores(cartridge_family_cores(&all)),
+            &[],
+        );
+        let ready: Vec<_> = plan
+            .candidates
+            .iter()
+            .filter(|c| c.preference == CandidatePreference::SoleEligible)
+            .collect();
+        assert_eq!(ready.len(), 1, "{platform_id}");
+        assert!(
+            matches!(
+                ready[0].target,
+                LaunchTarget::RetroArchCore { ref core_stem, platform_id: id, .. }
+                    if core_stem == preferred && id == platform_id
+            ),
+            "{platform_id}"
+        );
+        assert_eq!(ready[0].readiness, LaunchReadiness::Ready, "{platform_id}");
+        assert!(
+            !plan.candidates.iter().any(|c| c
+                .blockers
+                .iter()
+                .any(|b| b.kind == LaunchBlockerKind::AmbiguousCore)),
+            "{platform_id} must not be ambiguous"
+        );
+    }
+}
+
+#[test]
+fn cartridge_family_without_any_matching_core_is_blocked() {
+    for (platform_id, _, _, file) in cartridge_family_rows() {
+        // Only an unrelated core is installed (Atari 2600).
+        let plan = build_launch_plan(
+            &resolved(platform_id),
+            &cartridge_content(file),
+            &[],
+            &retroarch_environment_with_cores(vec![core_finding(
+                "stella",
+                Some("Atari - 2600"),
+                None,
+            )]),
+            &[],
+        );
+        assert_eq!(plan.candidates.len(), 1, "{platform_id}");
+        assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Blocked);
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|b| b.kind == LaunchBlockerKind::NoInstallationCandidate),
+            "{platform_id}"
+        );
+    }
+}
+
+#[test]
+fn colecovision_with_missing_required_bios_still_blocks() {
+    use crate::emulator_environment::retroarch::{FirmwarePresence, FirmwareRequirement};
+    let mut core = core_finding(
+        "gearcoleco",
+        Some("ColecoVision"),
+        Some("Coleco - ColecoVision"),
+    );
+    if let CoreInfoFinding::Found { firmware, .. } = &mut core.info {
+        firmware.push(FirmwareRequirement {
+            index: 0,
+            path: Some("colecovision.rom".to_string()),
+            description: Some("ColecoVision BIOS".to_string()),
+            optional: false,
+            presence: FirmwarePresence::Missing,
+        });
+    }
+    let plan = build_launch_plan(
+        &resolved("ColecoVision"),
+        &cartridge_content("x.col"),
+        &[],
+        &retroarch_environment_with_cores(vec![core]),
+        &[],
+    );
+    assert_eq!(plan.candidates.len(), 1);
+    assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Blocked);
+    assert!(
+        plan.candidates[0]
+            .blockers
+            .iter()
+            .any(|b| b.kind == LaunchBlockerKind::RequiredFirmwareMissing)
+    );
+}
+
+#[test]
+fn turbografx16_and_pc_engine_share_cores_but_pc_engine_cd_stays_separate() {
+    use super::platform_map::{launch_compatibility_for_platform, retroarch_platform_matches};
+    let info = core_finding(
+        "mednafen_pce_fast",
+        Some("PC Engine/PCE-CD"),
+        Some("NEC - PC Engine - TurboGrafx 16|NEC - PC Engine CD - TurboGrafx-CD"),
+    )
+    .info;
+    assert!(retroarch_platform_matches(&info, "TurboGrafx-16"));
+    assert!(retroarch_platform_matches(&info, "PC Engine"));
+    // The existing standalone Mesen route for "PC Engine" is untouched.
+    let pce = launch_compatibility_for_platform("PC Engine").unwrap();
+    assert_eq!(pce.standalone_adapters, &["mesen"]);
+    assert!(pce.retroarch_core_hints.is_empty());
+    let tg16 = launch_compatibility_for_platform("TurboGrafx-16").unwrap();
+    assert!(tg16.standalone_adapters.is_empty());
+    assert_eq!(tg16.retroarch_core_hints, &["mednafen_pce_fast"]);
+    // A cartridge-only core is not a PC Engine CD core.
+    let cd_only = core_finding("x", Some("NEC - PC Engine CD"), None).info;
+    assert!(!retroarch_platform_matches(&cd_only, "TurboGrafx-16"));
+    assert!(!retroarch_platform_matches(&cd_only, "PC Engine"));
+}
+
+#[test]
+fn cartridge_family_platform_map_rows_resolve_installed_core_info() {
+    use super::platform_map::{launch_compatibility_for_platform, retroarch_platform_matches};
+    for (platform_id, preferred, all, _) in cartridge_family_rows() {
+        let row = launch_compatibility_for_platform(platform_id).expect("reviewed row");
+        assert_eq!(row.retroarch_core_hints, &[preferred], "{platform_id}");
+        assert!(row.standalone_adapters.is_empty(), "{platform_id}");
+        for (stem, system, database) in all {
+            let info = core_finding(stem, Some(system), Some(database)).info;
+            assert!(
+                retroarch_platform_matches(&info, platform_id),
+                "{stem} {platform_id}"
+            );
+        }
+    }
+}

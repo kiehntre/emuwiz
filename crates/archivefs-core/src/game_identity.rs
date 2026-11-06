@@ -400,6 +400,11 @@ pub enum IdentityPlatform {
     ThreeDo,
     Pcfx,
     PcEngineCd,
+    GameGear,
+    MasterSystem,
+    Sega32x,
+    ColecoVision,
+    TurboGrafx16,
     NeoGeoCd,
     Ngp,
     Ngpc,
@@ -480,6 +485,26 @@ impl IdentityPlatform {
             | "super cd-rom2"
             | "turbo duo"
             | "turboduo" => Self::PcEngineCd,
+            "game gear" | "gamegear" | "sega game gear" | "segagamegear" | "sega gg" | "segagg"
+            | "gg" => Self::GameGear,
+            "master system" | "mastersystem" | "sega master system" | "segamastersystem"
+            | "sega mark iii" | "sms" => Self::MasterSystem,
+            "32x" | "sega 32x" | "sega32x" | "sega 32" | "sega32" => Self::Sega32x,
+            "colecovision" | "coleco" | "colecovision cv" => Self::ColecoVision,
+            "turbografx-16"
+            | "turbografx16"
+            | "turbografx 16"
+            | "turbografx"
+            | "tg16"
+            | "tg-16"
+            | "nec turbografx-16"
+            | "nec turbografx16"
+            | "pc engine"
+            | "pcengine"
+            | "pce"
+            | "nec pc engine"
+            | "necpcengine"
+            | "pc engine / turbografx-16" => Self::TurboGrafx16,
             "neo geo cd" | "neogeocd" | "neo-geo cd" | "neo geo cd-rom" | "snk neo geo cd"
             | "ngcd" | "neocd" | "neo cd" | "neocdz" => Self::NeoGeoCd,
             "neo geo pocket" | "neogeopocket" | "ngp" => Self::Ngp,
@@ -539,6 +564,11 @@ impl IdentityPlatform {
             Self::ThreeDo => "3DO",
             Self::Pcfx => "PC-FX",
             Self::PcEngineCd => "PC Engine CD / TurboGrafx-CD",
+            Self::GameGear => "Sega Game Gear",
+            Self::MasterSystem => "Sega Master System",
+            Self::Sega32x => "Sega 32X",
+            Self::ColecoVision => "ColecoVision",
+            Self::TurboGrafx16 => "PC Engine / TurboGrafx-16",
             Self::NeoGeoCd => "Neo Geo CD",
             Self::Ngp => "Neo Geo Pocket",
             Self::Ngpc => "Neo Geo Pocket Color",
@@ -1549,6 +1579,11 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::N64, "z64") => Some("z64"),
         (IdentityPlatform::N64, "v64") => Some("v64"),
         (IdentityPlatform::N64, "n64") => Some("n64"),
+        (IdentityPlatform::GameGear, "gg") => Some("gg"),
+        (IdentityPlatform::MasterSystem, "sms") => Some("sms"),
+        (IdentityPlatform::Sega32x, "32x") => Some("32x"),
+        (IdentityPlatform::ColecoVision, "col") => Some("col"),
+        (IdentityPlatform::TurboGrafx16, "pce") => Some("pce"),
         (IdentityPlatform::Atari2600, "a26") => Some("a26"),
         (IdentityPlatform::Atari5200, "a52") => Some("a52"),
         (IdentityPlatform::Atari7800, "a78") => Some("a78"),
@@ -1642,6 +1677,112 @@ fn validate_game_boy_header(
     Ok(())
 }
 
+/// Extensions that identify a *different* 8-bit Sega system than the trusted
+/// folder platform. A `.sms` in a Game Gear folder (or `.gg` in a Master
+/// System one) is refused as a cross-platform mismatch rather than silently
+/// verified or reported as a bare "unsupported extension". The extension may
+/// simply be wrong (a real Game Gear dump named `.sms`), so the text asks for
+/// a rename and never claims what the file really is.
+pub(crate) fn cross_platform_extension_mismatch(
+    path: &Path,
+    platform: IdentityPlatform,
+) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match (platform, extension.as_str()) {
+        (IdentityPlatform::GameGear, "sms") => Some(
+            "cross-platform mismatch: the .sms extension does not match Game Gear; rename the \
+             file to .gg (or move it to the Master System folder) - EmuWiz does not guess",
+        ),
+        (IdentityPlatform::MasterSystem, "gg") => Some(
+            "cross-platform mismatch: the .gg extension does not match Master System; rename the \
+             file to .sms (or move it to the Game Gear folder) - EmuWiz does not guess",
+        ),
+        _ => None,
+    }
+}
+
+/// Structural sanity checks for the Sega 8-bit, 32X, ColecoVision and
+/// HuCard cartridge families, which are verified by exact-byte SHA-256 only.
+///
+/// Only size rules gate (they refuse obviously wrong data). Header magics
+/// (`TMR SEGA`, `SEGA 32X`, the ColecoVision `AA55`/`55AA` marker) are
+/// reported as supporting text and never gate: no header is universal, and
+/// where none exists the trust model is exact size + extension + the trusted
+/// folder platform - local identity from exact bytes, not a known-good dump
+/// claim. Returns the supporting note on success.
+fn validate_cartridge_family_structure(
+    file: &mut File,
+    len: u64,
+    platform: IdentityPlatform,
+) -> Result<Option<String>, String> {
+    const KIB: u64 = 1024;
+    let mut read_at = |offset: u64, count: usize| -> Option<Vec<u8>> {
+        if offset.checked_add(count as u64)? > len {
+            return None;
+        }
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut buf = vec![0_u8; count];
+        file.read_exact(&mut buf).ok()?;
+        Some(buf)
+    };
+    let note = match platform {
+        IdentityPlatform::GameGear | IdentityPlatform::MasterSystem => {
+            if !(KIB..=4 * KIB * KIB).contains(&len) || !len.is_multiple_of(512) {
+                return Err(format!(
+                    "{} ROM is {len} bytes; expected 1 KiB to 4 MiB in 512-byte steps \
+                     (1 KiB banks plus an optional 512-byte copier header)",
+                    platform.label()
+                ));
+            }
+            let header = [0x1FF0_u64, 0x3FF0, 0x7FF0]
+                .iter()
+                .any(|offset| read_at(*offset, 8).is_some_and(|b| b == b"TMR SEGA"));
+            if header {
+                "TMR SEGA header present (supporting evidence only; it cannot separate Master System from Game Gear)"
+            } else {
+                "no TMR SEGA header found; trust is size + extension + trusted folder platform"
+            }
+        }
+        IdentityPlatform::Sega32x => {
+            if !(0x200..=4 * KIB * KIB).contains(&len) || !len.is_multiple_of(512) {
+                return Err(format!(
+                    "32X ROM is {len} bytes; expected 512 bytes to 4 MiB in 512-byte steps"
+                ));
+            }
+            if read_at(0x100, 8).is_some_and(|b| b == b"SEGA 32X") {
+                "SEGA 32X header at 0x100 present (supporting evidence only)"
+            } else {
+                "no SEGA 32X header at 0x100; trust is size + extension + trusted folder platform"
+            }
+        }
+        IdentityPlatform::ColecoVision => {
+            if !(KIB..=KIB * KIB).contains(&len) {
+                return Err(format!(
+                    "ColecoVision ROM is {len} bytes; expected 1 KiB to 1 MiB"
+                ));
+            }
+            if read_at(0, 2).is_some_and(|b| b == [0xAA, 0x55] || b == [0x55, 0xAA]) {
+                "ColecoVision AA55/55AA start marker present (supporting evidence only)"
+            } else {
+                "no ColecoVision start marker; trust is size + extension + trusted folder platform"
+            }
+        }
+        IdentityPlatform::TurboGrafx16 => {
+            let body = len % (8 * KIB);
+            if !(8 * KIB..=3 * KIB * KIB + 512).contains(&len) || (body != 0 && body != 512) {
+                return Err(format!(
+                    "HuCard ROM is {len} bytes; expected a multiple of 8 KiB (plus an optional \
+                     512-byte copier header) up to 3 MiB"
+                ));
+            }
+            "HuCard has no header magic; trust is size + extension + trusted folder platform"
+        }
+        _ => return Ok(None),
+    };
+    file.seek(SeekFrom::Start(0)).ok();
+    Ok(Some(note.to_string()))
+}
+
 fn inspect_loose_rom(
     report: &mut GameIdentityReport,
     trusted_platform: bool,
@@ -1649,6 +1790,12 @@ fn inspect_loose_rom(
 ) {
     report.format = IdentityImageFormat::LooseCartridgeRom;
     let Some(format) = supported_loose_rom_format(&report.archive_path, report.platform) else {
+        if let Some(reason) =
+            cross_platform_extension_mismatch(&report.archive_path, report.platform)
+        {
+            add_loose_rom_unavailable(report, IdentityStatus::Invalid, reason);
+            return;
+        }
         add_loose_rom_unavailable(
             report,
             IdentityStatus::Unsupported,
@@ -1872,6 +2019,14 @@ fn inspect_loose_rom_file(report: &mut GameIdentityReport, format: &'static str,
         add_loose_rom_unavailable(report, IdentityStatus::Invalid, &reason);
         return;
     }
+    let family_note =
+        match validate_cartridge_family_structure(&mut file, before.len, report.platform) {
+            Ok(note) => note,
+            Err(reason) => {
+                add_loose_rom_unavailable(report, IdentityStatus::Invalid, &reason);
+                return;
+            }
+        };
     let mut nes_header = None;
     let mut atari7800_header = None;
     let mut lynx_header = None;
@@ -2046,7 +2201,13 @@ fn inspect_loose_rom_file(report: &mut GameIdentityReport, format: &'static str,
         IdentityStatus::Verified,
         Some(digest),
         IdentityConfidence::ExactBytes,
-        "SHA-256 covers the exact on-disk bytes; it is not a known-good dump claim",
+        &match &family_note {
+            Some(note) => format!(
+                "SHA-256 covers the exact on-disk bytes; it is not a known-good dump claim; {note}"
+            ),
+            None => "SHA-256 covers the exact on-disk bytes; it is not a known-good dump claim"
+                .to_string(),
+        },
         "bounded full-file SHA-256",
     ));
     if let Some(fact) = nes_header {
@@ -4225,6 +4386,11 @@ fn inspect_iso_source(
         | IdentityPlatform::N64
         | IdentityPlatform::Commodore64
         | IdentityPlatform::Vic20
+        | IdentityPlatform::GameGear
+        | IdentityPlatform::MasterSystem
+        | IdentityPlatform::Sega32x
+        | IdentityPlatform::ColecoVision
+        | IdentityPlatform::TurboGrafx16
         | IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
         | IdentityPlatform::Atari7800
@@ -7203,6 +7369,11 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
             &[IdentityKind::LooseRomSha256]
         }
         IdentityPlatform::WataraSupervision => &[IdentityKind::LooseRomSha256],
+        IdentityPlatform::GameGear
+        | IdentityPlatform::MasterSystem
+        | IdentityPlatform::Sega32x
+        | IdentityPlatform::ColecoVision
+        | IdentityPlatform::TurboGrafx16 => &[IdentityKind::LooseRomSha256],
         IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
         | IdentityPlatform::Atari7800
@@ -7439,6 +7610,11 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::Ngp
         | IdentityPlatform::Ngpc
         | IdentityPlatform::ThreeDo
+        | IdentityPlatform::GameGear
+        | IdentityPlatform::MasterSystem
+        | IdentityPlatform::Sega32x
+        | IdentityPlatform::ColecoVision
+        | IdentityPlatform::TurboGrafx16
         | IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
         | IdentityPlatform::Atari7800
