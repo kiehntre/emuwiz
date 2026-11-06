@@ -838,3 +838,54 @@ fn nw2_d03_undo_re_proves_closure_before_publication() {
     assert_eq!(fs::read(&f.save).unwrap(), b"good progress");
     assert!(undo_stages(&f, &receipt).is_empty());
 }
+
+/// NW2-D-02: directory fsync order during a restore. The backup's folders
+/// are made durable innermost first, then backup_root (which lists the
+/// backup), before the receipt that names the backup is persisted, and the
+/// receipt before the live save is replaced. The folders a restore had to
+/// create (and the existing parent that lists the first of them) are
+/// fsynced too.
+#[test]
+fn nw2_d02_backup_folders_are_durable_before_the_receipt_and_the_receipt_before_the_save() {
+    let f = fixture();
+    let observer = proc(f.dir.path(), "closed", &[("10", "bash", b"/bin/bash\0")]);
+    let _ = crate::save_snapshots::sync_log::take();
+    let done = restore(&f, &observer).unwrap();
+    let synced = crate::save_snapshots::sync_log::take();
+    let backup = done
+        .result
+        .backup_snapshot
+        .as_ref()
+        .unwrap()
+        .storage_path
+        .clone();
+    let opts = options(&f);
+    let first = |dir: &Path| {
+        synced
+            .iter()
+            .position(|path| path == dir)
+            .unwrap_or_else(|| panic!("{dir:?} was never fsynced: {synced:?}"))
+    };
+    let after = |start: usize, dir: &Path| {
+        synced
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find(|(_, path)| *path == dir)
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| panic!("{dir:?} was not fsynced after step {start}: {synced:?}"))
+    };
+    // Created ancestors: backups/ and receipts/ are new under the temp dir.
+    assert!(synced.contains(&f.dir.path().to_path_buf()), "{synced:?}");
+    let files = first(&backup.join("files"));
+    let folder = first(&backup);
+    let game_dir = first(backup.parent().unwrap());
+    assert!(
+        files < folder && folder < game_dir,
+        "innermost first: {synced:?}"
+    );
+    let backup_root = after(game_dir, &opts.backup_root);
+    let receipt = after(backup_root, &opts.receipt_root);
+    let save = after(receipt, f.save.parent().unwrap());
+    assert!(backup_root < receipt && receipt < save, "{synced:?}");
+}

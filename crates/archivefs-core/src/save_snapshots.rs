@@ -578,6 +578,19 @@ pub fn create_snapshot_checked(
                 });
             }
             fs::rename(&staging, &final_path).map_err(|error| io_error(&staging, error))?;
+            // The file data is already durable (write_file). Make the
+            // directory entries durable too, innermost first, so a power loss
+            // after a restore cannot lose the backup the receipt names.
+            for dir in [
+                final_path.join("files"),
+                final_path.clone(),
+                game_dir.clone(),
+            ] {
+                sync_parent(&dir).map_err(|detail| SaveSnapshotError::InvalidPath {
+                    path: dir.clone(),
+                    detail: format!("could not make the snapshot folder durable: {detail}"),
+                })?;
+            }
             Ok(SaveSnapshot {
                 manifest,
                 storage_path: final_path,
@@ -843,9 +856,9 @@ pub fn apply_single_file_restore_gated(
         .parent()
         .ok_or_else(|| SaveRestoreError::Refused(SaveRestoreRefusal::TargetPathUnsafe))?;
     ensure_directory(parent)?;
-    ensure_directory(&options.backup_root)
+    ensure_directory_durable(&options.backup_root)
         .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
-    ensure_directory(&options.receipt_root)
+    ensure_directory_durable(&options.receipt_root)
         .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::ReceiptWriteFailed))?;
     verify_snapshot(snapshot)?;
 
@@ -874,6 +887,10 @@ pub fn apply_single_file_restore_gated(
         let backup = create_snapshot(&backup_request)
             .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
         verify_snapshot(&backup)
+            .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
+        // The backup's own folders are durable (create_snapshot); its entry in
+        // backup_root must be too before the receipt that names it is.
+        sync_parent(&options.backup_root)
             .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
         Some(backup)
     } else {
@@ -1258,6 +1275,31 @@ fn live_target_matches(preflight: &SaveRestorePreflight) -> bool {
     }
 }
 
+/// As [`ensure_directory`], and makes every folder it had to create durable
+/// (each new folder and the existing parent that now lists the first one).
+fn ensure_directory_durable(path: &Path) -> Result<(), SaveRestoreError> {
+    let mut created = Vec::new();
+    let mut cursor = path;
+    while fs::symlink_metadata(cursor).is_err() {
+        created.push(cursor.to_path_buf());
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => break,
+        }
+    }
+    ensure_directory(path)?;
+    if created.is_empty() {
+        return Ok(());
+    }
+    for dir in created.iter().chain(std::iter::once(&cursor.to_path_buf())) {
+        sync_parent(dir).map_err(|detail| SaveRestoreError::Io {
+            path: dir.clone(),
+            detail,
+        })?;
+    }
+    Ok(())
+}
+
 fn ensure_directory(path: &Path) -> Result<(), SaveRestoreError> {
     fs::create_dir_all(path).map_err(|error| SaveRestoreError::Io {
         path: path.to_path_buf(),
@@ -1472,10 +1514,30 @@ fn persist_receipt(receipt: &SaveRestoreReceipt) -> Result<(), SaveRestoreError>
     Ok(())
 }
 
+/// fsync of a directory: makes its entries (renames, new files) durable.
 fn sync_parent(path: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    sync_log::record(path);
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| error.to_string())
+}
+
+/// Test-only record of directory fsyncs, in order, for this thread.
+#[cfg(test)]
+pub(crate) mod sync_log {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    thread_local! {
+        static SYNCED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+    pub(super) fn record(path: &Path) {
+        SYNCED.with(|synced| synced.borrow_mut().push(path.to_path_buf()));
+    }
+    /// Directory fsyncs since the last call, oldest first.
+    pub(crate) fn take() -> Vec<PathBuf> {
+        SYNCED.with(|synced| std::mem::take(&mut *synced.borrow_mut()))
+    }
 }
 
 fn validate_source(path: &Path) -> Result<PathBuf, SaveSnapshotError> {
