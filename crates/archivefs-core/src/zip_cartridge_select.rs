@@ -157,6 +157,15 @@ pub fn select_zip_cartridge_member(
             continue;
         }
         let member_path = Path::new(std::str::from_utf8(&name_raw).unwrap_or_default());
+        // A bare `.bin` is a candidate only inside an Atari 2600 ZIP.
+        if platform == IdentityPlatform::Atari2600
+            && let Some(format) =
+                crate::game_identity::supported_zip_member_rom_format(member_path, platform)
+            && format == "bin"
+        {
+            candidates.push((index, name_raw, raw.size(), raw.compressed_size(), format));
+            continue;
+        }
         if let Some(format) = supported_loose_rom_format(member_path, platform) {
             candidates.push((index, name_raw, raw.size(), raw.compressed_size(), format));
         } else if mismatch.is_none() {
@@ -180,6 +189,12 @@ pub fn select_zip_cartridge_member(
         ));
     }
     let (index, member_name, declared, compressed, format) = candidates.remove(0);
+    if platform == IdentityPlatform::Atari2600
+        && format == "bin"
+        && let Some(problem) = crate::game_identity::atari_2600_bin_size_problem(declared)
+    {
+        return Err((IdentityStatus::Invalid, problem));
+    }
     if declared > MAX_LOOSE_ROM_BYTES {
         return Err((
             IdentityStatus::ResourceLimitReached,
