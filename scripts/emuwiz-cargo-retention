@@ -1800,15 +1800,26 @@ def incremental_stamp(st):
     return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
-def incremental_evidence(path):
+def incremental_evidence(path, residue=None):
     """Recognise a complete rustc incremental output unit, not its name alone.
 
     This is artifact classification, NEVER ownership/retirement authority. The
     caller must also pass the unchanged target lifecycle and execution gates.
     Read at most eight header bytes per regular compiler file, via no-follow
     descriptors. Unknown formats, children, owners, links or mounts fail closed.
+
+    `residue` (default None = strict) lets ONE crate directory be left inconsistent
+    by this tool's own earlier PARTIAL retirement of this very directory: a session
+    without its `.lock` (or a `.lock` without its session).  It is built only by the
+    retire tool from a verified journal (see emuwiz-cargo-retire residue_from_journal):
+      {"removed": set of "/crate/name" keys the journal recorded as unlinked, or None}.
+    With `removed`, every mismatched item must be named in it.  With None (a journal
+    that did not record them) the tolerance is exactly one session whose lock is
+    missing, in one crate directory; a lock left without its session, or several
+    missing locks, are refused.  Everything else is checked exactly as before.
     """
     files = {}
+    inconsistent = []
     crate_pattern = re.compile(r"[A-Za-z_][A-Za-z_0-9]*-[0-9a-z]{12,16}\Z")
     session_pattern = re.compile(r"(s-[0-9a-z]{8,16}-[0-9a-z]{6,10})-([0-9a-z]{16,32}|working)\Z")
     object_pattern = re.compile(r"[0-9a-z]{16,32}\.o\Z")
@@ -1914,7 +1925,27 @@ def incremental_evidence(path):
                     else:
                         fail("unknown crate child")
                 if not sessions or sessions != locks:
-                    fail("session/lock mismatch")
+                    if residue is None or not (sessions or locks):
+                        fail("session/lock mismatch")
+                    inconsistent.append(crate)
+                    odd = ["/%s/%s" % (crate, s) for s in sessions - locks] + \
+                          ["/%s/%s.lock" % (crate, s) for s in locks - sessions]
+                    if len(inconsistent) > 1:
+                        fail("session/lock mismatch in more than one crate directory")
+                    allowed = residue.get("removed")
+                    if allowed is None:
+                        if len(sessions - locks) != 1 or locks - sessions:
+                            fail("session/lock mismatch exceeds the single pair a legacy journal can attest")
+                    else:
+                        for item in odd:
+                            # a session lacking its lock needs the lock recorded as removed,
+                            # a lock lacking its session needs the session recorded as removed
+                            if item.endswith(".lock"):
+                                explained = any(k.startswith(item[:-5] + "-") for k in allowed)
+                            else:
+                                explained = item + ".lock" in allowed
+                            if not explained:
+                                fail("session/lock mismatch not explained by the journal")
             finally:
                 os.close(cfd)
         return None, files
