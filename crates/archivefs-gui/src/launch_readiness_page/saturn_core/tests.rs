@@ -167,6 +167,7 @@ fn chosen_saturn_core_bios_blocker_is_not_hidden_by_other_cores() {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]

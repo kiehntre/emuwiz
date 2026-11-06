@@ -163,13 +163,26 @@ fn only_reviewed_closed_evidence_allows_snapshot_creation() {
     for emulator in [
         StateEmulator::DuckStation,
         StateEmulator::Dolphin,
-        StateEmulator::RetroArch,
         StateEmulator::Unknown,
     ] {
         assert!(!snapshot_closure_supported(emulator));
         assert_eq!(
             snapshot_emulator_use(emulator, card, &Observed(EmulatorQuiescence::Closed)),
             EmulatorUseStatus::Unknown
+        );
+    }
+    // RetroArch now has a reviewed observer (see single_file_guard): only a
+    // proved Closed clears it.
+    let save = Path::new("/synthetic/game.srm");
+    assert!(snapshot_closure_supported(StateEmulator::RetroArch));
+    for (observed, expected) in [
+        (EmulatorQuiescence::Closed, EmulatorUseStatus::NotDetected),
+        (EmulatorQuiescence::Running, EmulatorUseStatus::Running),
+        (EmulatorQuiescence::Unknown, EmulatorUseStatus::Unknown),
+    ] {
+        assert_eq!(
+            snapshot_emulator_use(StateEmulator::RetroArch, save, &Observed(observed)),
+            expected
         );
     }
 }

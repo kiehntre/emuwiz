@@ -59,6 +59,7 @@ fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -84,6 +85,7 @@ fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> Launch
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -109,6 +111,7 @@ fn pcsx2_plan_input(plan: LaunchPlan, context: Pcsx2LaunchContext) -> LaunchRead
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -344,6 +347,7 @@ fn verified_pbp_candidate_reaches_the_existing_ppsspp_launch_request() {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -816,6 +820,7 @@ fn gamer_action_can_launch_pcsx2_without_retroarch_discovery() {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -852,6 +857,7 @@ fn gamer_action_can_launch_dolphin_without_retroarch_discovery() {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -890,6 +896,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -927,6 +934,7 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         flycast: None,
         xroar: None,
         azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -3214,6 +3222,7 @@ mod multidisc {
             flycast: None,
             xroar: None,
             azahar: None,
+            vita3k: None,
             vice: None,
             amiga_whdload: None,
             #[cfg(target_os = "linux")]
@@ -3533,4 +3542,32 @@ fn controller_setup_panel_renders_honest_scope_on_pcsx2_candidate() {
     let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
     let output = render(&pcsx2_plan_input(plan_with(vec![candidate]), ready.context));
     assert!(rendered_text_contains(&output, "Controller setup"));
+}
+
+#[test]
+fn zipped_cartridge_play_is_ready_plain_and_blocked_with_cheats_or_playlist() {
+    let mut zipped = request_for("/roms/Game.zip");
+    zipped.expected_platform_id = "SNES".into();
+    assert_eq!(zipped_play_block_reason(&zipped, false, false), None);
+    let cheats = zipped_play_block_reason(&zipped, true, false).expect("blocked with cheats");
+    assert!(cheats.contains("cheats and pokes aren't supported for zipped games"));
+    let playlist = zipped_play_block_reason(&zipped, false, true).expect("blocked multi-disc");
+    assert!(playlist.contains("multi-disc"));
+    // A loose ROM keeps every workflow.
+    let loose = request_for("/roms/Game.sfc");
+    assert_eq!(zipped_play_block_reason(&loose, true, true), None);
+    let mut upper = request_for("/roms/GAME.ZIP");
+    upper.expected_platform_id = "SNES".into();
+    assert!(is_zipped_cartridge_request(&upper));
+    // Arcade/other platforms' ZIPs are native content: nothing changes.
+    for platform in ["Arcade", "MAME", "PlayStation", "Amiga"] {
+        let mut native = request_for("/roms/game.zip");
+        native.expected_platform_id = platform.into();
+        assert!(!is_zipped_cartridge_request(&native), "{platform}");
+        assert_eq!(
+            zipped_play_block_reason(&native, true, true),
+            None,
+            "{platform}"
+        );
+    }
 }

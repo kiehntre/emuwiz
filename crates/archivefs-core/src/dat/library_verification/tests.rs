@@ -1066,6 +1066,29 @@ fn fresh_verification_is_current_evidence() {
 }
 
 #[test]
+fn current_hashes_cover_no_match_rows_but_never_mark_them_exact() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(2, "b.tap", Some(b"different tape"), Some("ZX Spectrum"));
+    f.run();
+    let e = f.evidence();
+    // The unmatched file's audited hashes are available for lookups...
+    let unmatched = e.current_hashes.get(&2).expect("no-match row hashes");
+    assert!(unmatched.sha1.is_some(), "{unmatched:?}");
+    // ...without ever becoming an exact match or its proof hashes.
+    assert!(!e.exact.contains_key(&2) && !e.exact_hashes.contains_key(&2));
+    assert_eq!(e.current_hashes.get(&1), e.exact_hashes.get(&1));
+    // Stripped (non-current) rows contribute no hashes at all.
+    f.strip_proof();
+    assert!(f.evidence().current_hashes.is_empty());
+}
+
+#[test]
 fn legacy_rows_without_proof_are_not_current_and_reverification_restores_them() {
     let f = Fixture::new();
     f.add(

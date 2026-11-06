@@ -203,6 +203,7 @@ pub mod save_state_compatibility;
 pub mod save_state_orchestration;
 pub mod save_state_resume_readiness;
 /// Verified ZIP creation and extraction for the Converter page.
+pub mod zip_cartridge_select;
 pub mod zip_converter;
 pub(crate) mod zip_member_name;
 pub use archive_member_resolver::{
@@ -213,6 +214,7 @@ pub use archive_member_resolver::{
 
 pub mod game_identity;
 pub mod scummvm_detection;
+pub mod zip_cartridge_stage;
 
 mod library_view_history;
 pub use library_view_history::{
