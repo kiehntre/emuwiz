@@ -21,6 +21,8 @@ use archivefs_core::managed_emulator_install::{
 };
 use eframe::egui;
 
+mod blue;
+
 #[derive(Default)]
 pub(crate) struct EmulatorInventoryPageState {
     pub inventory: Option<EmulatorInventory>,
@@ -34,6 +36,8 @@ pub(crate) struct EmulatorInventoryPageState {
     tracked_running: bool,
     /// Durable update records found on disk (survive a restart).
     records: Vec<UpdateRecordEntry>,
+    /// Blue's single background operation and its (test-only) backend override.
+    blue: blue::BlueUpdateState,
 }
 
 #[derive(Clone)]
@@ -142,13 +146,23 @@ impl EmulatorInventoryPageState {
             QuiescenceEvidence::from_tracked_flag(tracked)
                 .combine(probe_executable_quiescence(&executable))
         };
-        match execute_staged_update(
+        let result = execute_staged_update(
             &review.plan,
             &review.installation,
             &review.update,
             evidence,
             &mut downloader,
-        ) {
+        );
+        self.finish_apply(&review.installation.installation_root, result);
+    }
+
+    /// Shared by Gold (synchronous) and Blue (background worker).
+    fn finish_apply(
+        &mut self,
+        root: &std::path::Path,
+        result: Result<UpdateJournal, UpdateExecutionError>,
+    ) {
+        match result {
             Ok(journal) => {
                 self.feedback = Some(format!(
                     "Updated {} from {} to {}. The download matched its published SHA-256, and the previous executable is preserved at {}. Undo is available while the installed file is unchanged.",
@@ -159,6 +173,8 @@ impl EmulatorInventoryPageState {
                 ));
                 self.review = None;
                 self.confirmation.clear();
+                // A phrase typed for an earlier Undo must not arm the new one.
+                self.rollback_confirmation.clear();
                 self.refresh();
                 self.update_report = None;
                 self.review_journal = actionable_undo(&self.records, &journal.target_path);
@@ -167,8 +183,7 @@ impl EmulatorInventoryPageState {
                 // A failure may have followed a real change on disk: reload the
                 // saved evidence and drop every snapshot that could authorise a
                 // later action, then report from the fresh state.
-                let root = review.installation.installation_root.clone();
-                self.reload_after_failed_operation(&root);
+                self.reload_after_failed_operation(root);
                 self.feedback = None;
                 self.error = Some(update_error_message(&error));
             }
@@ -222,7 +237,16 @@ impl EmulatorInventoryPageState {
             self.error = Some(format!("Type {expected} exactly to confirm rollback."));
             return;
         }
-        match rollback_staged_update(&journal, evidence) {
+        let result = rollback_staged_update(&journal, evidence);
+        self.finish_rollback(&journal, result);
+    }
+
+    fn finish_rollback(
+        &mut self,
+        journal: &UpdateJournal,
+        result: Result<UpdateJournal, UpdateExecutionError>,
+    ) {
+        match result {
             Ok(restored) => {
                 let kept = restored
                     .displaced_path
@@ -482,7 +506,11 @@ impl EmulatorInventoryPageState {
         evidence: impl FnMut() -> QuiescenceEvidence,
     ) {
         self.feedback = None;
-        match recover_update(path, evidence) {
+        self.finish_recover(recover_update(path, evidence));
+    }
+
+    fn finish_recover(&mut self, result: Result<UpdateJournal, UpdateExecutionError>) {
+        match result {
             Ok(done) => {
                 self.error = None;
                 self.feedback = Some(format!(

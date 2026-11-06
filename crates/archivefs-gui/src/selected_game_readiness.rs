@@ -388,6 +388,9 @@ impl ArchiveFsApp {
         self.emulator_readiness
             .azahar_homebrew
             .show(ui, self.archive_context.focused.as_deref());
+        self.emulator_readiness
+            .vita3k_library
+            .show(ui, self.archive_context.focused.as_deref());
         let launch_readiness_input = self.build_launch_readiness_input(live_for_launch_readiness);
         if self.launch_retroarch.poll() || self.launch_retroarch.is_active() {
             ui.ctx().request_repaint();
