@@ -664,7 +664,13 @@ fn project_plan(
         .iter()
         .map(|warning| warning.detail.clone())
         .collect::<Vec<_>>();
-    if candidate.firmware == FirmwareReadiness::PresentUnverified {
+    // One clear statement: the candidate's own (file-naming) warning wins; the
+    // generic line is only a fallback for candidates that carry none.
+    if candidate.firmware == FirmwareReadiness::PresentUnverified
+        && !candidate.warnings.iter().any(|warning| {
+            warning.kind == archivefs_core::launch::LaunchWarningKind::FirmwarePresentUnverified
+        })
+    {
         warnings.push("Firmware is present but not verified.".into());
     }
     let has_warning = candidate.readiness == LaunchReadiness::ReadyWithWarnings
@@ -1118,6 +1124,14 @@ pub(crate) fn compact(summary: &GameReadinessSummary, checksum_pending: bool) ->
         },
         status => {
             let ready = summary.primary_action == Some(ReadinessAction::Play);
+            // A launchable-with-warning game states the warning itself (for
+            // example which firmware files are unverified), not only a
+            // generic note, while Play stays enabled.
+            let reason = if status == State::ReadyWithWarnings && ready {
+                summary.warnings.first().cloned().unwrap_or(reason)
+            } else {
+                reason
+            };
             CompactReadiness {
                 badge: status_label(status),
                 tone: status,
@@ -2233,6 +2247,35 @@ mod tests {
         assert_eq!(labels.iter().filter(|label| *label == "Play").count(), 1);
         assert!(labels.iter().any(|label| label.ends_with("Ready to play")));
         assert_eq!(action, Some(ReadinessAction::Play));
+    }
+
+    #[test]
+    fn compact_card_names_the_unverified_firmware_once_and_keeps_play() {
+        let warning = LaunchWarning::new(
+            LaunchWarningKind::FirmwarePresentUnverified,
+            "Firmware found but not verified: kick34005.A500 is present but its contents were not checked.",
+        );
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::ReadyWithWarnings,
+                FirmwareReadiness::PresentUnverified,
+                vec![],
+                vec![warning],
+                CandidatePreference::SoleEligible,
+                Some("/game.adf"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        let unverified = summary
+            .warnings
+            .iter()
+            .filter(|text| text.to_lowercase().contains("not verified"))
+            .count();
+        assert_eq!(unverified, 1, "{:?}", summary.warnings);
+        let view = compact(&summary, false);
+        assert!(view.reason.contains("kick34005.A500"), "{}", view.reason);
+        assert!(view.reason.contains("Firmware found but not verified"));
+        assert!(view.play_enabled);
     }
 
     #[test]
