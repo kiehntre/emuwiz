@@ -253,7 +253,7 @@ impl NativeWorkflows {
     }
     /// All Blue controls that can trigger a source scan pass through the same
     /// review, including Enable (which the existing backend makes a scan).
-    pub(super) fn review_or_start_source_action(
+    pub(in crate::gui_v2) fn review_or_start_source_action(
         &mut self,
         ctx: egui::Context,
         action: SourceAction,

@@ -37,7 +37,7 @@ fn blue_scan_is_refused_while_a_native_sources_action_runs() {
 
     assert!(app.load_job.is_none(), "no scan job was queued");
     assert!(app.scan_job.is_none());
-    let notice = app.notice.clone().expect("the refusal is said");
+    let notice = app.notice.as_ref().expect("the refusal is said");
     assert!(
         notice.message.contains("Sources action is still running"),
         "{}",

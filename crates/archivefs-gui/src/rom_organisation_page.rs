@@ -3928,7 +3928,7 @@ mod tests {
                 show_rom_organisation_page(ui, state);
             });
         });
-        rendered_text(&output)
+        crate::transaction_outcome::test_support::rendered_text(&output)
     }
 
     fn folder_with_files(count: usize) -> tempfile::TempDir {

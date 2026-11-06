@@ -11925,6 +11925,7 @@ mod blue_single_file_restore;
 
 #[path = "tests/repair.rs"]
 mod repair;
+
 #[path = "tests/blue_catalogue_writers.rs"]
 mod blue_catalogue_writers;
 
