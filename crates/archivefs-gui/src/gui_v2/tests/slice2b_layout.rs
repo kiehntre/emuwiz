@@ -671,3 +671,41 @@ fn review_identity_actions_do_not_move_when_evidence_loads() {
         assert!((ys[0] - ys[1]).abs() < 1.0, "{window:?}: {ys:?}");
     }
 }
+
+/// Game Details at the real nav width: stacked at 1280x820, and nothing is
+/// painted beyond the window's right edge at 1280, 1100 or 1500 wide.
+#[test]
+fn game_details_paints_nothing_beyond_the_window_edge() {
+    fn max_right(shape: &egui::Shape, max: &mut f32) {
+        match shape {
+            egui::Shape::Text(t) => {
+                *max = max.max(t.pos.x + t.galley.size().x);
+            }
+            egui::Shape::Rect(r) => *max = max.max(r.rect.max.x),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| max_right(s, max)),
+            _ => {}
+        }
+    }
+    for (width, height) in [(1280.0_f32, 820.0_f32), (1100.0, 800.0), (1500.0, 900.0)] {
+        let size = [width, height];
+        let context = egui::Context::default();
+        let mut app = populated(&context, true, 1.0);
+        app.router.current = Route::Game(1);
+        let output = settled(&context, &mut app, size);
+        let mut max = 0.0_f32;
+        for clipped in &output.shapes {
+            // Painted beyond the clip is invisible; measure what is shown.
+            let mut right = 0.0_f32;
+            max_right(&clipped.shape, &mut right);
+            max = max.max(right.min(clipped.clip_rect.right()));
+        }
+        assert!(max <= width + 0.5, "{size:?}: painted to {max}");
+        assert!(clipped_text(&output, size).is_empty(), "{size:?}");
+        if width <= 1280.0 {
+            assert!(
+                text_bounds(&output, "Can I play it?").is_empty(),
+                "{size:?} must use the stacked layout"
+            );
+        }
+    }
+}

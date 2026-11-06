@@ -4423,12 +4423,23 @@ fn disambiguating_hint(
     (!folder.is_empty()).then(|| format!("Folder: {folder}"))
 }
 
-/// Width really visible to the right of the cursor: the smaller of the layout's
-/// available width and the clip rectangle's (the scroll viewport's) share.
+/// Width really visible to the right of the cursor. The page scroller's own
+/// available width and clip rectangle can both be inflated by content wider
+/// than its viewport, so the window's right edge (less the scroll bar and
+/// panel margin) bounds them as well.
 fn visible_width(ui: &egui::Ui) -> f32 {
-    (ui.clip_rect().right() - ui.cursor().min.x)
-        .min(ui.available_width())
-        .max(0.0)
+    bounded_visible_width(
+        ui.available_width(),
+        ui.clip_rect().right() - ui.cursor().min.x,
+        ui.ctx().content_rect().right() - ui.cursor().min.x - VIEWPORT_RIGHT_MARGIN,
+    )
+}
+
+/// Scroll bar plus central-panel margin at the window's right edge.
+const VIEWPORT_RIGHT_MARGIN: f32 = 16.0;
+
+fn bounded_visible_width(available: f32, clip: f32, window: f32) -> f32 {
+    available.min(clip).min(window).max(0.0)
 }
 
 /// Blue Game Details columns `(left, right, gap)` for a visible width, or
@@ -4451,6 +4462,14 @@ mod game_columns_tests {
         // Real window: layout reported ~1116 while ~1078 was visible.
         assert_eq!(game_columns(true, 1078.0), None);
         assert_eq!(game_columns(false, 1600.0), None);
+    }
+
+    #[test]
+    fn the_window_edge_bounds_an_inflated_scroller() {
+        // Scroller reports 1117 both ways; the window leaves 1070.
+        let width = super::bounded_visible_width(1117.0, 1117.0, 1070.0);
+        assert_eq!(width, 1070.0);
+        assert_eq!(game_columns(true, width), None);
     }
 
     #[test]
