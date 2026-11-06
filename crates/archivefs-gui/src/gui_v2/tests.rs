@@ -152,6 +152,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         romm_library_job: None,
         reset_page_scroll: false,
         reset_all_tools_scroll: false,
+        last_screen_size: None,
         scrolled_organisation_view: organisation::OrganisationView::default(),
         manual_viewer: super::manual_viewer::ManualViewer::default(),
         text_guide_viewer: Default::default(),
@@ -11974,4 +11975,14 @@ fn gui_v2_same_destination_reentry_discards_an_older_preview() {
     );
     assert!(app.playing_library_job.is_none());
     assert!(app.activity.jobs[&id].summary.contains("discarded"));
+}
+
+#[test]
+fn a_window_resize_requests_a_repaint_but_the_first_frame_does_not() {
+    use super::resize_needs_repaint;
+    let a = egui::vec2(1280.0, 820.0);
+    assert!(!resize_needs_repaint(None, a));
+    assert!(!resize_needs_repaint(Some(a), a));
+    assert!(resize_needs_repaint(Some(a), egui::vec2(1800.0, 820.0)));
+    assert!(resize_needs_repaint(Some(a), egui::vec2(1280.0, 1000.0)));
 }

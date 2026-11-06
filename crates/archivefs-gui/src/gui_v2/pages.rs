@@ -612,6 +612,10 @@ impl App {
                 Route::Section(
                     Section::Emulators | Section::Sources | Section::Dat | Section::Check
                 ) | Route::Tool(_)
+                    | Route::Task {
+                        section: Section::Launch,
+                        ..
+                    }
             ) || health_page
                 || (blue && !browse_play);
             // These pages own one page scroller. Their introduction must share
@@ -1140,6 +1144,8 @@ impl App {
     /// A fresh visit starts at the top; Back keeps its place.
     pub(super) fn open_all_tools(&mut self) {
         self.simple.all_tools = true;
+        // A fresh visit starts with an empty tool search and the All filter.
+        self.simple.tools.reset();
         self.reset_all_tools_scroll = true;
     }
 
@@ -1169,6 +1175,15 @@ impl App {
             .map(|game| game.title.as_str());
         let breadcrumbs = super::simple_shell::simple_breadcrumb_labels(&route, game_title);
         if breadcrumbs.len() < 2 {
+            // Library: selecting a card adds the trail, which used to push
+            // the chips and cards down under the pointer. Keep the row's
+            // height reserved so the layout is identical either way.
+            if matches!(route, Route::BrowsePlay) {
+                ui.horizontal(|ui| {
+                    ui.label(" ");
+                });
+                ui.add_space(4.0);
+            }
             return;
         }
         ui.push_id("v2_simple_breadcrumbs", |ui| {
@@ -2895,17 +2910,32 @@ impl App {
             let blue = self.simple.simple_navigation();
             // Blue, with room: the hero beside "Can I play it?", Game
             // information and Advanced details (boards D6/D7-Game-Main).
-            if blue && ui.available_width() >= super::game_detail_blue::SIDE_BY_SIDE_MIN_WIDTH {
-                let gap = 20.0;
-                let right = (ui.available_width() * 0.3).clamp(360.0, 440.0);
-                let left = ui.available_width() - right - gap;
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = gap;
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(left, 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
+            // The page scroller can report more room than its viewport shows
+            // (content that widened it); decide and place by what is visible.
+            let visible = visible_width(ui);
+            if blue && let Some((left, right, gap)) = game_columns(blue, visible) {
+                // Each column gets an explicit rectangle, so a wide left
+                // column can never push the right-hand controls past the
+                // window edge; overflow is clipped inside its own column.
+                let origin = ui.cursor().min;
+                let total = visible;
+                let height = ui.available_height();
+                let left_rect = egui::Rect::from_min_size(origin, egui::vec2(left, height));
+                let right_rect = egui::Rect::from_min_size(
+                    egui::pos2(origin.x + left + gap, origin.y),
+                    egui::vec2(right, height),
+                );
+                let left_bottom = ui
+                    .scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(left_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
                         |ui| {
-                            ui.set_width(left);
+                            let clip = ui.clip_rect().intersect(egui::Rect::from_x_y_ranges(
+                                left_rect.x_range(),
+                                f32::NEG_INFINITY..=f32::INFINITY,
+                            ));
+                            ui.set_clip_rect(clip);
                             super::game_detail_blue::hero_card(ui, |ui| {
                                 ui.horizontal_top(|ui| {
                                     self.detail_cover(ui, game, super::game_detail_blue::HERO_COVER);
@@ -2921,12 +2951,16 @@ impl App {
                             });
                             self.detail_body(ui, game, &key);
                         },
-                    );
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(right, 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
+                    )
+                    .response
+                    .rect
+                    .bottom();
+                let right_bottom = ui
+                    .scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(right_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
                         |ui| {
-                            ui.set_width(right);
                             super::game_detail_blue::side_card(ui, "Can I play it?", |ui| {
                                 self.detail_readiness(ui, game);
                                 self.detail_readiness_notes(ui, game, latest_verification.as_deref());
@@ -2941,8 +2975,17 @@ impl App {
                                 });
                             });
                         },
-                    );
-                });
+                    )
+                    .response
+                    .rect
+                    .bottom();
+                ui.allocate_rect(
+                    egui::Rect::from_min_max(
+                        origin,
+                        egui::pos2(origin.x + total, left_bottom.max(right_bottom)),
+                    ),
+                    egui::Sense::hover(),
+                );
                 if super::recording_integrity::eligible(game) {
                     super::game_detail_blue::side_card(ui, "Recording integrity", |ui| {
                         self.recording_integrity.show(ui, game);
@@ -3624,6 +3667,12 @@ impl App {
             }
             return;
         };
+        // Read-only: the live readiness the rest of this page already shows.
+        let live_identity = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.readiness_summary(game_id, &game.archive.absolute_path))
+            .map(|summary| (summary.status, summary.identity));
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 // Launch reuses the same bounded cover/platform pipeline as
@@ -3643,11 +3692,7 @@ impl App {
                             ));
                         });
                     });
-                    ui.label(if game.identified {
-                        "Verified identity is available"
-                    } else {
-                        "Game identity needs review"
-                    });
+                    ui.label(launch_identity_line(game.identified, live_identity));
                 });
             });
         });
@@ -4376,6 +4421,150 @@ fn disambiguating_hint(
         .to_string_lossy()
         .into_owned();
     (!folder.is_empty()).then(|| format!("Folder: {folder}"))
+}
+
+/// Width really visible to the right of the cursor. The page scroller's own
+/// available width and clip rectangle can both be inflated by content wider
+/// than its viewport, so the window's right edge (less the scroll bar and
+/// panel margin) bounds them as well.
+fn visible_width(ui: &egui::Ui) -> f32 {
+    bounded_visible_width(
+        ui.available_width(),
+        ui.clip_rect().right() - ui.cursor().min.x,
+        ui.ctx().content_rect().right() - ui.cursor().min.x - VIEWPORT_RIGHT_MARGIN,
+    )
+}
+
+/// Scroll bar plus central-panel margin at the window's right edge.
+const VIEWPORT_RIGHT_MARGIN: f32 = 16.0;
+
+fn bounded_visible_width(available: f32, clip: f32, window: f32) -> f32 {
+    available.min(clip).min(window).max(0.0)
+}
+
+/// Blue Game Details columns `(left, right, gap)` for a visible width, or
+/// `None` to use the stacked layout.
+fn game_columns(blue: bool, visible: f32) -> Option<(f32, f32, f32)> {
+    if !blue || visible < super::game_detail_blue::SIDE_BY_SIDE_MIN_WIDTH {
+        return None;
+    }
+    let gap = 20.0;
+    let right = (visible * 0.3).clamp(360.0, 440.0);
+    Some((visible - right - gap, right, gap))
+}
+
+#[cfg(test)]
+mod game_columns_tests {
+    use super::game_columns;
+
+    #[test]
+    fn inflated_available_width_cannot_choose_two_columns() {
+        // Real window: layout reported ~1116 while ~1078 was visible.
+        assert_eq!(game_columns(true, 1078.0), None);
+        assert_eq!(game_columns(false, 1600.0), None);
+    }
+
+    #[test]
+    fn the_window_edge_bounds_an_inflated_scroller() {
+        // Scroller reports 1117 both ways; the window leaves 1070.
+        let width = super::bounded_visible_width(1117.0, 1117.0, 1070.0);
+        assert_eq!(width, 1070.0);
+        assert_eq!(game_columns(true, width), None);
+    }
+
+    #[test]
+    fn columns_always_fit_inside_the_visible_width() {
+        for visible in [1100.0_f32, 1280.0, 1500.0, 1900.0] {
+            let (left, right, gap) = game_columns(true, visible).unwrap();
+            assert!((left + gap + right - visible).abs() < 0.01);
+            assert!(left > 0.0 && right >= 360.0);
+        }
+    }
+}
+
+/// Identity line in the Launch header. Saved verification is only one source
+/// of identity; when the live readiness read the game file's own identity
+/// (strong local identity), say so rather than claiming review is needed.
+fn launch_identity_line(
+    identified: bool,
+    live: Option<(
+        super::launch_readiness_summary::ReadinessPresentationState,
+        super::launch_readiness_summary::IdentitySummary,
+    )>,
+) -> &'static str {
+    use super::launch_readiness_summary::{IdentitySummary, ReadinessPresentationState};
+    if identified {
+        return "Verified identity is available";
+    }
+    match live {
+        Some((
+            ReadinessPresentationState::Ready | ReadinessPresentationState::ReadyWithWarnings,
+            IdentitySummary::StrongLocal,
+        )) => "Identity read from the game file. No saved catalogue check yet.",
+        _ => "Game identity needs review",
+    }
+}
+
+#[cfg(test)]
+mod launch_identity_line_tests {
+    use super::launch_identity_line;
+    use crate::gui_v2::launch_readiness_summary::{
+        IdentitySummary::{LaunchableWithWarning, NeedsReview, StrongLocal},
+        ReadinessPresentationState::{Checking, NeedsIdentityReview, Ready, ReadyWithWarnings},
+    };
+
+    const NEUTRAL: &str = "Identity read from the game file. No saved catalogue check yet.";
+
+    #[test]
+    fn live_ready_identity_without_saved_check_is_neutral() {
+        assert_eq!(
+            launch_identity_line(false, Some((Ready, StrongLocal))),
+            NEUTRAL
+        );
+        assert_eq!(
+            launch_identity_line(false, Some((ReadyWithWarnings, StrongLocal))),
+            NEUTRAL
+        );
+    }
+
+    #[test]
+    fn unknown_or_review_states_still_need_review() {
+        let review = "Game identity needs review";
+        assert_eq!(launch_identity_line(false, None), review);
+        assert_eq!(
+            launch_identity_line(false, Some((Checking, NeedsReview))),
+            review
+        );
+        assert_eq!(
+            launch_identity_line(false, Some((NeedsIdentityReview, NeedsReview))),
+            review
+        );
+        assert_eq!(
+            launch_identity_line(false, Some((Ready, NeedsReview))),
+            review
+        );
+    }
+
+    #[test]
+    fn launchable_with_warning_keeps_the_cautious_wording() {
+        let review = "Game identity needs review";
+        assert_eq!(
+            launch_identity_line(false, Some((Ready, LaunchableWithWarning))),
+            review
+        );
+        assert_eq!(
+            launch_identity_line(false, Some((ReadyWithWarnings, LaunchableWithWarning))),
+            review
+        );
+    }
+
+    #[test]
+    fn saved_identity_keeps_the_verified_line() {
+        assert_eq!(
+            launch_identity_line(true, None),
+            "Verified identity is available"
+        );
+    }
 }
 
 #[cfg(test)]

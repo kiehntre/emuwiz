@@ -900,12 +900,21 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
         );
         let available = ui.available_width();
         let gap = ui.spacing().item_spacing.x;
-        let slot = if available >= 320.0 && action_count == 2 {
-            (available - gap) / 2.0
+        // Two buttons share the row when each keeps a usable width; otherwise
+        // they stack. `add_sized` does not wrap in a wrapping row, so never
+        // rely on that: a narrow card used to push Play past its edge.
+        let side_by_side = action_count == 2 && available >= 240.0;
+        let slot = if side_by_side {
+            ((available - gap) / 2.0).min(260.0)
         } else {
             available.min(260.0)
         };
-        ui.horizontal_wrapped(|ui| {
+        let button_layout = if action_count == 2 && !side_by_side {
+            egui::Layout::top_down(egui::Align::Min)
+        } else {
+            egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true)
+        };
+        ui.allocate_ui_with_layout(egui::vec2(available, 0.0), button_layout, |ui| {
             if let Some(primary) = summary.primary_action {
                 let fill = crate::ui::theme::primary_action_fill(ui);
                 if ui
@@ -1149,16 +1158,27 @@ pub(crate) fn show_compact(
         break_anywhere: false,
         overflow_character: Some('…'),
     };
-    ui.add(egui::Label::new(reason).wrap().selectable(false))
+    let reason_response = ui
+        .add(egui::Label::new(reason).wrap().selectable(false))
         .on_hover_text(view.reason.as_str());
+    // Reserve the full reason block so a longer answer arriving after
+    // "Checking" does not push the buttons down.
+    let row_height = ui.fonts_mut(|fonts| {
+        fonts.row_height(&egui::FontId::proportional(crate::ui::theme::METADATA_SIZE))
+    });
+    let reserved = row_height * reason_rows as f32;
+    if reason_response.rect.height() < reserved {
+        ui.add_space(reserved - reason_response.rect.height());
+    }
     let gap = ui.spacing().item_spacing.x;
     let fill = crate::ui::theme::primary_action_fill(ui);
     let fix_is_primary = view.fix.is_some() && !view.pending;
     let count = 1 + usize::from(view.fix.is_some());
-    let inline_trailing =
-        trailing.is_some() && width >= (count + 1) as f32 * 144.0 + gap * count as f32;
+    let inline_trailing = trailing.is_some() && width >= 3.0 * 144.0 + gap * 2.0;
     let slots = count + usize::from(inline_trailing);
-    let stacked = width < count as f32 * 144.0 + gap * (count - 1) as f32;
+    // Decided for the widest answer (a fix plus Play), so the arrangement does
+    // not change when readiness resolves.
+    let stacked = width < 2.0 * 144.0 + gap;
     let slot = if stacked {
         width
     } else {
@@ -1190,8 +1210,14 @@ pub(crate) fn show_compact(
             egui::Layout::left_to_right(egui::Align::Min)
         },
         |ui| {
-            if fix_is_primary && let Some(clicked) = fix_button(ui, true) {
-                choice = Some(clicked);
+            if fix_is_primary {
+                if let Some(clicked) = fix_button(ui, true) {
+                    choice = Some(clicked);
+                }
+            } else if stacked {
+                // Stacked: keep the fix button's slot so Play and the
+                // trailing button stay put when a fix appears.
+                ui.allocate_space(egui::vec2(slot, 64.0));
             }
             let mut play = egui::Button::new(egui::RichText::new("Play").strong());
             if view.play_enabled && !fix_is_primary {

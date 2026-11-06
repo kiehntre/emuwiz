@@ -2,6 +2,7 @@
 //! `App::show` in Blue and Classic, at every saved scale and window size. The
 //! probe measures what is actually painted - clipped text, overlapping
 //! controls and reachable actions - rather than asserting on private layout.
+use super::launch_readiness_summary::{self, ReadinessAction};
 use super::*;
 
 const SCALES: [f32; 4] = [0.8, 1.0, 1.3, 1.6];
@@ -507,4 +508,297 @@ fn cold_shift_tab_reveals_the_last_library_card_at_160_percent_in_both_profiles(
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Game Details, side-by-side columns: every right-hand control sits inside
+/// the window at 1280x820 in physical pixels (scale 0.8 gives the room for the
+/// two-column layout; the fixture's left column is narrower than a real
+/// library's, so this guards the placement, not the real-library content).
+#[test]
+fn game_details_right_column_stays_inside_the_window_at_1280_by_820() {
+    for scale in [0.8_f32, 1.0] {
+        let size = points((1280.0, 820.0), scale);
+        let context = egui::Context::default();
+        let mut app = populated(&context, true, scale);
+        app.router.current = Route::Game(1);
+        let output = settled(&context, &mut app, size);
+        let heading = text_bounds(&output, "Can I play it?");
+        if scale == 0.8 {
+            assert!(!heading.is_empty(), "two-column layout expected at 0.8");
+        }
+        for rect in heading {
+            assert!(
+                visible(rect, size),
+                "scale {scale}: {rect:?} outside {size:?}"
+            );
+        }
+        assert!(clipped_text(&output, size).is_empty());
+    }
+}
+
+/// Library: selecting a game adds the breadcrumb trail; the controls under it
+/// must not move (the row's height is reserved when there is no selection).
+#[test]
+fn library_controls_do_not_shift_when_a_game_is_selected() {
+    let size = [1280.0, 820.0];
+    let top_of_search = |route: Route| {
+        let context = egui::Context::default();
+        let mut app = populated(&context, true, 1.0);
+        app.router.current = route;
+        let output = settled(&context, &mut app, size);
+        text_bounds(&output, "Search by title or system")
+            .first()
+            .map(|r| r.min.y)
+    };
+    let none = top_of_search(Route::BrowsePlay).expect("search shown");
+    let selected = top_of_search(Route::BrowsePlayGame(1)).expect("search shown");
+    assert!((none - selected).abs() < 1.0, "{none} vs {selected}");
+}
+
+fn compact_view(
+    fix: Option<ReadinessAction>,
+    pending: bool,
+    spinner: bool,
+    play_enabled: bool,
+    reason: &str,
+) -> launch_readiness_summary::CompactReadiness {
+    launch_readiness_summary::CompactReadiness {
+        badge: "Status",
+        tone: launch_readiness_summary::ReadinessPresentationState::Ready,
+        spinner,
+        reason: reason.into(),
+        headline: "headline".into(),
+        play_enabled,
+        fix,
+        pending,
+        more_findings: 0,
+    }
+}
+
+/// The Library side panel's Play / Game details positions are identical in
+/// Checking, Ready and a blocked answer with an extra fix button.
+#[test]
+fn side_panel_buttons_do_not_move_when_readiness_resolves() {
+    let long = "Identity could not be confirmed. The file's own identity evidence is missing, \
+        so EmuWiz cannot tell which game this is; review it before playing this game.";
+    for (window, panel) in [
+        ([1280.0_f32, 820.0], 400.0_f32),
+        ([1024.0, 768.0], 320.0),
+        ([900.0, 700.0], 260.0),
+    ] {
+        let states = [
+            (
+                "checking",
+                compact_view(None, true, true, true, "Checking."),
+            ),
+            (
+                "ready",
+                compact_view(None, false, false, true, "Ready to play."),
+            ),
+            (
+                "blocked",
+                compact_view(
+                    Some(ReadinessAction::ReviewIdentity),
+                    false,
+                    false,
+                    false,
+                    long,
+                ),
+            ),
+        ];
+        let mut ys = Vec::new();
+        for (name, view) in &states {
+            let context = egui::Context::default();
+            let mut found = None;
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(window[0], window[1]),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            launch_readiness_summary::show_compact(
+                                ui,
+                                view,
+                                panel,
+                                3,
+                                Some("Game details"),
+                            );
+                        });
+                    },
+                ));
+            }
+            let output = output.unwrap();
+            let play = text_bounds(&output, "Play")[0].min.y;
+            let details = text_bounds(&output, "Game details")[0].min.y;
+            found.replace((play, details));
+            ys.push((*name, found.unwrap()));
+        }
+        for pair in ys.windows(2) {
+            assert!(
+                (pair[0].1.0 - pair[1].1.0).abs() < 1.0 && (pair[0].1.1 - pair[1].1.1).abs() < 1.0,
+                "{window:?}: {:?} vs {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+}
+
+/// Review identity: Change system / Back to game keep their place while the
+/// recorded evidence loads.
+#[test]
+fn review_identity_actions_do_not_move_when_evidence_loads() {
+    for window in [[1280.0_f32, 820.0], [1024.0, 768.0], [900.0, 700.0]] {
+        let mut ys = Vec::new();
+        for loaded in [false, true] {
+            let context = egui::Context::default();
+            let mut app = populated(&context, true, 1.0);
+            app.router.current = Route::ReviewIdentity(1);
+            if loaded {
+                app.review.knowledge_for = Some(1);
+            }
+            let output = settled(&context, &mut app, window);
+            let back = text_bounds(&output, "Back to game");
+            assert!(!back.is_empty(), "{window:?} loaded={loaded}");
+            ys.push(back[0].min.y);
+        }
+        assert!((ys[0] - ys[1]).abs() < 1.0, "{window:?}: {ys:?}");
+    }
+}
+
+/// Unclipped extents of every Rect and Text shape.
+fn shape_extents(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+    match shape {
+        egui::Shape::Text(t) => out.push(egui::Rect::from_min_size(t.pos, t.galley.size())),
+        egui::Shape::Rect(r) => out.push(r.rect),
+        egui::Shape::Vec(v) => v.iter().for_each(|s| shape_extents(s, out)),
+        _ => {}
+    }
+}
+
+/// Game Details at the real nav width. The layout choice is pinned (stacked at
+/// 1280 px / scale 1.0, two columns at 0.9 and below) and every widget of the
+/// "Can I play it?" column, unclipped, lies inside the window.
+#[test]
+fn game_details_paints_nothing_beyond_the_window_edge() {
+    let cases = [
+        // (pixels w, pixels h, scale, two columns expected)
+        (1280.0_f32, 820.0_f32, 1.0_f32, false),
+        (1100.0, 800.0, 1.0, false),
+        (1500.0, 900.0, 1.0, true),
+        (1280.0, 820.0, 0.9, true),
+        (1280.0, 820.0, 1.1, false),
+        (1280.0, 820.0, 1.25, false),
+    ];
+    for (pixels_w, pixels_h, scale, two_columns) in cases {
+        let size = points((pixels_w, pixels_h), scale);
+        let context = egui::Context::default();
+        let mut app = populated(&context, true, scale);
+        app.router.current = Route::Game(1);
+        let output = settled(&context, &mut app, size);
+        let case = format!("{pixels_w}x{pixels_h} @{scale}");
+        let heading = text_bounds(&output, "Can I play it?");
+        assert_eq!(!heading.is_empty(), two_columns, "{case}: layout choice");
+        assert!(clipped_text(&output, size).is_empty(), "{case}");
+        if let Some(heading) = heading.first() {
+            // Everything from the right card's left edge (its margin is 18)
+            // rightwards belongs to the column; none of it may leave the window.
+            let card_left = heading.min.x - 18.0;
+            let mut extents = Vec::new();
+            for clipped in &output.shapes {
+                shape_extents(&clipped.shape, &mut extents);
+            }
+            let column: Vec<_> = extents
+                .iter()
+                .filter(|r| r.min.x >= card_left - 0.5 && r.width() > 0.0)
+                .collect();
+            assert!(column.len() > 5, "{case}: column widgets found");
+            for rect in column {
+                assert!(
+                    rect.min.x >= 0.0 && rect.max.x <= size[0] + 0.5,
+                    "{case}: {rect:?} outside {size:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The readiness card's action buttons stay inside the card at the widths the
+/// Game Details right column gives it, in the Checking state, with a fix
+/// button, and when two actions cannot share a row. Checks the buttons' own
+/// rectangles (64 points tall) as well as their labels.
+#[test]
+fn readiness_card_buttons_stay_inside_a_narrow_card() {
+    use launch_readiness_summary::ReadinessPresentationState as State;
+    let states: [(&str, State, Option<ReadinessAction>, &str); 3] = [
+        ("checking", State::Checking, None, "Play"),
+        (
+            "emulator",
+            State::NeedsEmulator,
+            Some(ReadinessAction::SetUpEmulator),
+            "Set up emulator",
+        ),
+        (
+            "verify",
+            State::NeedsIdentityReview,
+            Some(ReadinessAction::VerifyIdentity),
+            "Play",
+        ),
+    ];
+    for (name, status, action, label) in states {
+        for card_width in [200.0_f32, 239.0, 300.0, 330.0, 420.0, 600.0] {
+            let mut summary = launch_readiness_summary::not_started_summary();
+            summary.status = status;
+            summary.headline = "headline".into();
+            summary.primary_action = action;
+            let context = egui::Context::default();
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1000.0, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.allocate_ui(egui::vec2(card_width, 0.0), |ui| {
+                                launch_readiness_summary::show(ui, &summary);
+                            });
+                        });
+                    },
+                ));
+            }
+            let output = output.unwrap();
+            let case = format!("{name} at {card_width}");
+            let left = 8.0; // CentralPanel margin
+            assert!(!text_bounds(&output, label).is_empty(), "{case}: {label}");
+            let mut extents = Vec::new();
+            for clipped in &output.shapes {
+                shape_extents(&clipped.shape, &mut extents);
+            }
+            let buttons: Vec<_> = extents
+                .iter()
+                .filter(|r| (r.height() - 64.0).abs() < 1.0)
+                .collect();
+            assert!(!buttons.is_empty(), "{case}: no button rectangles found");
+            for rect in buttons
+                .into_iter()
+                .chain(text_bounds(&output, label).iter())
+            {
+                assert!(
+                    rect.min.x >= left - 1.0 && rect.max.x <= left + card_width + 1.0,
+                    "{case}: {rect:?}"
+                );
+            }
+        }
+    }
 }
