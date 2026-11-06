@@ -242,8 +242,20 @@ impl DirectoryHandle {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
-    /// Opens the regular file `name` for reading, refusing a symlink.
+    /// Opens the regular file `name` for reading, refusing a symlink. The
+    /// entry is checked with `lstat` first so a planted FIFO or device
+    /// never blocks the open.
     pub fn open_file(&self, name: &OsStr) -> io::Result<File> {
+        match self.lstat(name)? {
+            Some(EntryKind::RegularFile { .. }) => {}
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                ));
+            }
+            None => return Err(io::Error::from(io::ErrorKind::NotFound)),
+        }
         let c_name = component(name)?;
         // SAFETY: live descriptor, valid C string.
         let fd = unsafe {

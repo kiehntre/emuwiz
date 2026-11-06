@@ -1529,7 +1529,11 @@ fn execute_shared_apply_internal(
             created_root_directories.truncate(created_root_directories.len() - removed);
         }
     }
-    drop(lock);
+    // The root lock is held until the receipt is durable and the pending
+    // record retired (below): startup recovery in another thread or
+    // process treats a locked root as a running apply and leaves it alone,
+    // so it can never settle this apply as "interrupted" in the window
+    // between the last write and the receipt.
     journal.created_root_directories = created_root_directories
         .iter()
         .map(|entry| SharedCreatedRootDirectory {
@@ -1546,6 +1550,7 @@ fn execute_shared_apply_internal(
         written,
     );
     if effective_dry_run {
+        drop(lock);
         return SharedApplyResult {
             journal,
             journal_path: None,
@@ -1553,6 +1558,7 @@ fn execute_shared_apply_internal(
         };
     }
     if should_inject(FaultPoint::TerminalJournal) {
+        drop(lock);
         return SharedApplyResult {
             journal,
             journal_path: None,
@@ -1563,7 +1569,7 @@ fn execute_shared_apply_internal(
             )),
         };
     }
-    match write_journal_once(&journal, &options.history_root) {
+    let result = match write_journal_once(&journal, &options.history_root) {
         Ok(path) => {
             log::info!(
                 "shared apply {}: journal written to {}",
@@ -1629,7 +1635,9 @@ fn execute_shared_apply_internal(
                 journal_failure: Some(error),
             }
         }
-    }
+    };
+    drop(lock);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3846,9 +3854,6 @@ pub fn recover_interrupted_shared_applies(
         let terminal_path = history_root.join(format!("{identifier}.json"));
         if fs::symlink_metadata(&terminal_path).is_ok() {
             // The receipt exists; only its pending twin was left behind.
-            let mut durable = pending.journal.clone();
-            durable.transaction_state = SharedRecoveryState::ApplyFailed;
-            let _ = write_pending_journal(&durable, history_root);
             let _ = fs::remove_file(&pending_path);
             recovery.outcome = SharedInterruptedApplyOutcome::AlreadyRecorded;
             recovery.journal_path = Some(SharedTransactionPath::from_path(&terminal_path));
@@ -3869,12 +3874,10 @@ pub fn recover_interrupted_shared_applies(
         let journal = terminal_journal_from_interrupted(&pending.journal, &states, backup_root);
         match write_journal_once(&journal, history_root) {
             Ok(path) => {
-                let mut durable = pending.journal.clone();
-                durable.transaction_state = SharedRecoveryState::ApplyFailed;
-                for (entry, state) in durable.entries.iter_mut().zip(&states) {
-                    entry.state = *state;
-                }
-                let _ = write_pending_journal(&durable, history_root);
+                // The receipt is the durable record from here on; the
+                // pending record is simply retired (never rewritten under
+                // its canonical name, which could differ from a hand-renamed
+                // discovered path and be "retired" again every launch).
                 let _ = fs::remove_file(&pending_path);
                 let applied = states
                     .iter()
@@ -3891,13 +3894,34 @@ pub fn recover_interrupted_shared_applies(
                     .count();
                 recovery.outcome = SharedInterruptedApplyOutcome::SettledForUndo;
                 recovery.journal_path = Some(SharedTransactionPath::from_path(&path));
+                let strays: Vec<String> = journal
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.outcome == SharedApplyOutcome::VerificationFailed)
+                    .filter_map(|entry| {
+                        entry.failures.iter().find_map(|failure| {
+                            failure.path.as_ref().and_then(|path| {
+                                stray_publication_file_path(Path::new(&path.display))
+                            })
+                        })
+                    })
+                    .map(|path| path.display().to_string())
+                    .collect();
                 recovery.detail = format!(
-                    "interrupted install recorded: {applied} file(s) reached the destination, {} were never written{}",
+                    "interrupted install recorded: {applied} file(s) reached the destination, {} were never written{}{}",
                     states.len() - applied - unsettled,
                     if unsettled > 0 {
                         format!(", {unsettled} need(s) review before Undo")
                     } else {
                         String::new()
+                    },
+                    if strays.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " (temporary file(s) from the interrupted write still present: {})",
+                            strays.join(", ")
+                        )
                     }
                 );
             }
@@ -4010,12 +4034,22 @@ fn terminal_journal_from_interrupted(
                 ),
                 _ => {
                     result.publication = SharedPublicationState::PublishedThenFailed;
+                    let stray = destination
+                        .as_deref()
+                        .and_then(stray_publication_file_path);
+                    let detail = match stray {
+                        Some(stray) => format!(
+                            "EmuWiz was interrupted while writing in this folder: a temporary file from that write is still beside this file at {}. Check which of the two holds what you want, remove the temporary file by hand, then run Undo from History if needed. Until then Undo stays blocked and nothing is changed.",
+                            stray.display()
+                        ),
+                        None => "EmuWiz was interrupted and this file is in a state the record cannot explain (neither the planned bytes nor the previous ones); review it by hand before any Undo".to_string(),
+                    };
                     fail_result(
                         result,
                         SharedApplyOutcome::VerificationFailed,
                         SharedApplyFailureKind::PublishedUnverified,
                         destination.as_deref(),
-                        "EmuWiz was interrupted and this file is in a state the record cannot explain (neither the planned bytes nor the previous ones); review it by hand before any Undo",
+                        &detail,
                     )
                 }
             }
@@ -4054,18 +4088,26 @@ fn terminal_journal_from_interrupted(
 /// removed on the normal paths, so one that remains marks an interrupted or
 /// refused publication or removal.
 fn stray_publication_file_beside(destination: &Path) -> bool {
-    let Some(parent) = destination.parent() else {
-        return false;
-    };
-    let Ok(entries) = fs::read_dir(parent) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        (name.starts_with(".archivefs-apply-") || name.starts_with(UNDO_QUARANTINE_PREFIX))
-            && entry.file_type().is_ok_and(|kind| kind.is_file())
-    })
+    stray_publication_file_path(destination).is_some()
+}
+
+/// The first such stray file's path, for a message that tells the person
+/// what to look at.
+fn stray_publication_file_path(destination: &Path) -> Option<PathBuf> {
+    let parent = destination.parent()?;
+    let mut strays: Vec<PathBuf> = fs::read_dir(parent)
+        .ok()?
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            (name.starts_with(".archivefs-apply-") || name.starts_with(UNDO_QUARANTINE_PREFIX))
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+        })
+        .map(|entry| entry.path())
+        .collect();
+    strays.sort();
+    strays.into_iter().next()
 }
 
 fn reconcile_durable_entry(
@@ -8879,6 +8921,117 @@ mod crash_recovery_tests {
         assert!(!destination(&fixture, "game-1.cht").exists());
         assert!(discover_pending_operations(&fixture.history_root()).is_empty());
         assert!(platform_dir_residue(&fixture).is_empty());
+    }
+
+    /// Review H1: startup recovery running while an apply is between its
+    /// last write and its receipt must treat the root as still in use
+    /// (the apply holds the lock until the receipt is durable), so the
+    /// apply's own receipt wins and nothing is settled as "interrupted".
+    #[test]
+    fn recovery_during_a_finishing_apply_leaves_it_to_the_apply() {
+        use std::sync::{Arc, Mutex};
+        let fixture = Fixture::new("recovery-vs-finishing-apply");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        let seen: Arc<Mutex<Vec<SharedInterruptedApplyRecovery>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let seen_in_hook = Arc::clone(&seen);
+        let (history, backups) = (fixture.history_root(), fixture.backup_root());
+        // Runs right after publication, inside the apply, before the
+        // receipt: the exact window the review named.
+        set_after_publish(Some(Box::new(move |_destination: &Path| {
+            let recovered = recover_interrupted_shared_applies(&history, &backups);
+            seen_in_hook.lock().unwrap().extend(recovered);
+        })));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "finishing-apply", false, true, false),
+        );
+        set_after_publish(None);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the pending record was visible to recovery");
+        assert_eq!(seen[0].outcome, SharedInterruptedApplyOutcome::StillRunning);
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        assert!(
+            result.journal_path.is_some(),
+            "the apply's own receipt was written"
+        );
+        assert!(result.journal_failure.is_none());
+        assert_eq!(
+            history_files(&fixture),
+            vec!["finishing-apply.json".to_string()]
+        );
+        assert!(discover_pending_operations(&fixture.history_root()).is_empty());
+        let journal = read_journal(&fixture.history_root().join("finishing-apply.json")).unwrap();
+        assert!(
+            !journal.entries[0]
+                .stages
+                .contains(&SharedTransactionStage::JournalFailedAfterSuccessfulWrite),
+            "a completed apply is never recorded as interrupted"
+        );
+    }
+
+    /// Review M1: a crash during the temporary write leaves a stray
+    /// publication file beside the destination. Recovery must fail closed
+    /// for that folder, name the stray file, and block Undo until a person
+    /// has looked; proven-applied bytes are left exactly as they are.
+    #[test]
+    fn stray_temporary_file_after_a_crash_is_named_and_blocks_undo() {
+        let fixture = Fixture::new("stray-temp-after-crash");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::TerminalJournal));
+        let _ = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "stray-temp", false, true, false),
+        );
+        inject_fault(None);
+        let stray = destination(&fixture, ".archivefs-apply-4242-7");
+        fs::write(&stray, b"half-written").unwrap();
+
+        let recovered =
+            recover_interrupted_shared_applies(&fixture.history_root(), &fixture.backup_root());
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].outcome,
+            SharedInterruptedApplyOutcome::SettledForUndo
+        );
+        assert_eq!(
+            recovered[0].entry_states,
+            vec![SharedEntryRecoveryState::NeedsReview]
+        );
+        assert!(
+            recovered[0].detail.contains(&stray.display().to_string()),
+            "{}",
+            recovered[0].detail
+        );
+        let journal_path = recovered[0]
+            .journal_path
+            .as_ref()
+            .unwrap()
+            .to_path_buf()
+            .unwrap();
+        let journal = read_journal(&journal_path).unwrap();
+        let failure = &journal.entries[0].failures[0];
+        assert_eq!(failure.kind, SharedApplyFailureKind::PublishedUnverified);
+        assert!(
+            failure.detail.contains(&stray.display().to_string()),
+            "{}",
+            failure.detail
+        );
+        assert!(failure.detail.contains("remove the temporary file by hand"));
+        let preview = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(!preview.available);
+        assert_eq!(fs::read(destination(&fixture, "game.cht")).unwrap(), b"new");
+        assert_eq!(
+            fs::read(&stray).unwrap(),
+            b"half-written",
+            "the stray file is never removed"
+        );
     }
 
     /// Failure before the first write (the pending record cannot be

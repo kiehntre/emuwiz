@@ -191,8 +191,9 @@ pub fn inspect_standalone_patch_bytes(
     path: impl AsRef<Path>,
 ) -> Result<(StandalonePatchInspection, Vec<u8>), StandalonePatchError> {
     let path = path.as_ref().to_path_buf();
-    let metadata =
-        fs::symlink_metadata(&path).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+    // `metadata` follows a symlink exactly as `fs::read` below does, so the
+    // size checked is the size of what would be read.
+    let metadata = fs::metadata(&path).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
     if metadata.len() > MAX_PATCH_BYTES as u64 {
         return Err(StandalonePatchError::TooLarge);
     }
