@@ -294,6 +294,136 @@ fn loose_and_disc_zip_behaviour_is_unchanged() {
     assert_eq!(r.format, IdentityImageFormat::ZipContainingIso);
 }
 
+fn a2600_rom(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(13) ^ 0x5a)
+        .collect()
+}
+
+#[test]
+fn single_atari_2600_bin_member_is_verified_as_local_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    for len in [2048, 4096, 6144, 8192, 8448, 10_495, 16_384, 25_344, 65_536] {
+        let rom = a2600_rom(len);
+        let zip = write_zip(dir.path(), "Pitfall.zip", &[("Pitfall.bin", &rom)]);
+        let r = inspect(&zip, "Atari2600");
+        assert_eq!(r.format, IdentityImageFormat::ZipContainingCartridgeRom);
+        assert_eq!(
+            r.verified_value(IdentityKind::LooseRomSha256),
+            Some(sha(&rom).as_str()),
+            "size {len}"
+        );
+    }
+    // The stage route accepts the same member and keeps the .bin name.
+    let rom = a2600_rom(4096);
+    let zip = write_zip(dir.path(), "Combat.zip", &[("Combat.bin", &rom)]);
+    #[cfg(unix)]
+    {
+        let staged = crate::zip_cartridge_stage::stage_zip_cartridge_for_launch(&zip, "Atari2600")
+            .expect("stages");
+        assert_eq!(staged.path().file_name().unwrap(), "Combat.bin");
+        assert_eq!(fs::read(staged.path()).unwrap(), rom);
+    }
+}
+
+#[test]
+fn atari_2600_bin_zip_refusals_are_honest() {
+    let dir = tempfile::tempdir().unwrap();
+    for len in [0usize, 1, 1000, 1024, 2049, 4097, 10_494, 262_144 + 1024] {
+        let zip = write_zip(dir.path(), "bad.zip", &[("bad.bin", &a2600_rom(len))]);
+        let r = inspect(&zip, "Atari2600");
+        assert!(refused(&r), "size {len}");
+        assert_eq!(status_of(&r), IdentityStatus::Invalid, "size {len}");
+        #[cfg(unix)]
+        {
+            let err = crate::zip_cartridge_stage::stage_zip_cartridge_for_launch(&zip, "Atari2600")
+                .unwrap_err();
+            let crate::zip_cartridge_stage::StageZipError::Refused(text) = err else {
+                panic!("expected refusal");
+            };
+            assert!(text.contains("not a recognised Atari 2600 cartridge size"));
+        }
+    }
+    let zip = write_zip(
+        dir.path(),
+        "two.zip",
+        &[("a.bin", &a2600_rom(4096)), ("b.a26", &a2600_rom(4096))],
+    );
+    assert_eq!(
+        status_of(&inspect(&zip, "Atari2600")),
+        IdentityStatus::Ambiguous
+    );
+    let zip = write_zip(
+        dir.path(),
+        "two-bin.zip",
+        &[("a.bin", &a2600_rom(4096)), ("b.bin", &a2600_rom(2048))],
+    );
+    assert_eq!(
+        status_of(&inspect(&zip, "Atari2600")),
+        IdentityStatus::Ambiguous
+    );
+}
+
+#[test]
+fn bin_is_accepted_in_a_zip_only_for_atari_2600_and_a26_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let rom = a2600_rom(4096);
+    for platform in [
+        "Atari5200",
+        "Atari7800",
+        "AtariLynx",
+        "Master System",
+        "Atari8Bit",
+    ] {
+        let zip = write_zip(dir.path(), "x.zip", &[("x.bin", &rom)]);
+        let r = inspect(&zip, platform);
+        assert!(
+            r.verified_value(IdentityKind::LooseRomSha256).is_none(),
+            "{platform}"
+        );
+        if let Some(item) = r
+            .evidence
+            .iter()
+            .find(|e| e.kind == IdentityKind::LooseRomSha256)
+        {
+            assert_eq!(item.status, IdentityStatus::Missing, "{platform}");
+        }
+    }
+    let zip = write_zip(dir.path(), "a.zip", &[("a.a26", &rom)]);
+    let r = inspect(&zip, "Atari2600");
+    assert_eq!(
+        r.verified_value(IdentityKind::LooseRomSha256),
+        Some(sha(&rom).as_str())
+    );
+    // An .a26 is not size-checked by the .bin rule.
+    let odd = a2600_rom(1000);
+    let zip = write_zip(dir.path(), "o.zip", &[("o.a26", &odd)]);
+    assert_eq!(
+        inspect(&zip, "Atari2600").verified_value(IdentityKind::LooseRomSha256),
+        Some(sha(&odd).as_str())
+    );
+    // A loose .bin stays unsupported: the extension alone is ambiguous.
+    let loose = dir.path().join("loose.bin");
+    fs::write(&loose, &rom).unwrap();
+    assert!(
+        inspect(&loose, "Atari2600")
+            .verified_value(IdentityKind::LooseRomSha256)
+            .is_none()
+    );
+    assert_eq!(
+        supported_loose_rom_format(Path::new("g.bin"), IdentityPlatform::Atari2600),
+        None
+    );
+    assert_eq!(
+        supported_zip_member_rom_format(Path::new("g.BIN"), IdentityPlatform::Atari2600),
+        Some("bin")
+    );
+    assert_eq!(
+        supported_zip_member_rom_format(Path::new("g.bin"), IdentityPlatform::Atari5200),
+        None
+    );
+}
+
 /// Runs `check` on a worker and fails (instead of hanging the suite) if it
 /// has not returned within a bounded time.
 #[cfg(unix)]
