@@ -626,3 +626,32 @@ fn live_restore_undo_cycle() {
         }
     }
 }
+
+// ---- Night Watch II regression (uncommitted; FAILS on 571d4afb while NW2-D-03 exists) ----
+
+/// NW2-D-03: an Undo interrupted mid-copy (process killed, ENOSPC, EIO)
+/// leaves its stage file. The stage name is the same on every attempt, so a
+/// later Undo must still succeed once the cause has gone away.
+#[test]
+fn nw2_d03_undo_succeeds_after_an_interrupted_undo_left_its_stage_file() {
+    let f = fixture();
+    let observer = proc(f.dir.path(), "closed", &[("10", "bash", b"/bin/bash\0")]);
+    restore(&f, &observer).unwrap();
+    let receipts =
+        list_single_file_restore_receipts(&options(&f).receipt_root, &options(&f).backup_root);
+    let receipt = &receipts[0];
+    // Exactly what a killed Undo leaves behind: a partial copy at the
+    // deterministic stage path next to the save.
+    let stage = f.save.parent().unwrap().join(format!(
+        ".{}.emuwiz-undo-stage-{}",
+        f.save.file_name().unwrap().to_str().unwrap(),
+        crate::save_snapshots::short_path_token(&receipt.receipt_path)
+    ));
+    fs::write(&stage, b"newer pro").unwrap();
+    let retry = undo_single_file_guarded(receipt, StateEmulator::RetroArch, &observer);
+    assert!(
+        retry.is_ok(),
+        "Undo stays blocked by its own leftover stage file {stage:?}: {retry:?}"
+    );
+    assert_eq!(fs::read(&f.save).unwrap(), b"newer progress");
+}

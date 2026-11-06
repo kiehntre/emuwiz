@@ -432,3 +432,90 @@ fn only_witnessed_sram_of_this_game_is_offered_restore() {
     let state_target = snapshot_target(&state, &game);
     assert!(state_target.is_err() || !sfr::restorable(&state_target.unwrap()));
 }
+
+// ---- Night Watch II regressions (uncommitted; FAIL on 571d4afb while the defects exist) ----
+
+fn nw2_deliver(
+    context: &egui::Context,
+    app: &mut App,
+    id: u64,
+    outcome: Result<super::super::backend::Payload, String>,
+) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.backend.rx = receiver;
+    sender
+        .send(super::super::backend::Event::Finished { id, outcome })
+        .unwrap();
+    app.poll(context);
+}
+
+/// NW2-B-03: a failed single-file restore must not be recorded as a success.
+#[test]
+fn nw2_b03_failed_single_file_restore_is_recorded_as_failed_in_activity() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let mut app = world.app(&context);
+    let target = snapshot_target(&world.record, &world.game()).unwrap();
+    let id = app.activity.queue_with(
+        "Restoring a save",
+        Route::Section(Section::Activity),
+        activity::CancelPolicy::SafeNow,
+    );
+    app.activity.start(id);
+    app.saves_states.single_file.job = Some(id);
+    nw2_deliver(
+        &context,
+        &mut app,
+        id,
+        Ok(super::super::backend::Payload::SingleFileRestore(Box::new(
+            Outcome::Applied {
+                target: Box::new(target),
+                result: Err(
+                    "The restore could not be reversed safely. Do not start the emulator.".into(),
+                ),
+            },
+        ))),
+    );
+    assert!(!app.activity.jobs[&id].active(), "job settled");
+    assert_eq!(
+        app.activity.failed(),
+        1,
+        "a failed restore was recorded as a success in Activity"
+    );
+}
+
+/// NW2-B-03: a snapshot that was not created must reach Activity as a
+/// failure; the inline feedback and the activity entry must agree.
+#[test]
+fn nw2_b03_failed_snapshot_creation_is_recorded_as_failed_in_activity() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let mut app = world.app(&context);
+    let id = app.activity.queue_with(
+        "Creating a save snapshot",
+        Route::Section(Section::Activity),
+        activity::CancelPolicy::SafeNow,
+    );
+    app.activity.start(id);
+    app.saves_states.snapshots.create_job = Some(id);
+    nw2_deliver(
+        &context,
+        &mut app,
+        id,
+        Ok(super::super::backend::Payload::SaveSnapshotCreated {
+            result: Err("The emulator is running, so the snapshot was not created.".into()),
+        }),
+    );
+    let job = &app.activity.jobs[&id];
+    assert_eq!(job.phase, activity::Phase::Failed, "{}", job.summary);
+    assert_eq!(app.activity.failed(), 1);
+    assert_eq!(app.saves_states.snapshots.create_job, None);
+    assert_eq!(
+        app.saves_states.snapshots.feedback,
+        Some((
+            false,
+            "The emulator is running, so the snapshot was not created.".to_string()
+        ))
+    );
+    assert_eq!(app.activity.jobs[&id].technical, job.summary);
+}

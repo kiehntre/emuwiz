@@ -888,6 +888,17 @@ impl App {
             self.saves_states.single_file.job = None;
         }
     }
+    /// Records how a save, card or snapshot step ended. A refused or failed
+    /// step is "Needs attention" in Activity and Home, never a green
+    /// "Finished": the message is what the person was shown inline.
+    fn settle_save_step(&mut self, id: u64, message: String, ok: bool) {
+        if ok {
+            self.activity.finish(id, message, None);
+        } else {
+            self.activity
+                .settle(id, message.clone(), activity::Settled::Failed(message));
+        }
+    }
     fn start_saves_inventory(&mut self) {
         if self.saves_states.loading {
             return;
@@ -1923,12 +1934,13 @@ impl App {
                                     );
                                 }
                                 Payload::SingleFileRestore(outcome) => {
-                                    let message = single_file_restore::receive(self, id, *outcome);
-                                    self.activity.finish(id, message, None);
+                                    let (message, ok) =
+                                        single_file_restore::receive(self, id, *outcome);
+                                    self.settle_save_step(id, message, ok);
                                 }
                                 Payload::CardRestore(outcome) => {
-                                    let message = card_restore::receive(self, id, *outcome);
-                                    self.activity.finish(id, message, None);
+                                    let (message, ok) = card_restore::receive(self, id, *outcome);
+                                    self.settle_save_step(id, message, ok);
                                 }
                                 Payload::SaveSnapshotCreated { result } => {
                                     let panel = &mut self.saves_states.snapshots;
@@ -1945,7 +1957,7 @@ impl App {
                                         Err(error) => error.clone(),
                                     };
                                     panel.feedback = Some((result.is_ok(), message.clone()));
-                                    self.activity.finish(id, message, None);
+                                    self.settle_save_step(id, message, result.is_ok());
                                 }
                                 Payload::Library(library) => {
                                     self.activity.finish(id, format!("{} games available to browse. Original game files were not changed.", library.games.len()), None);

@@ -309,7 +309,10 @@ pub(super) fn undoable_receipt(
 }
 
 /// Apply a worker result to the UI state. Returns the activity message.
-pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String {
+/// Settles a finished restore job. Returns the message to record and whether
+/// the step succeeded: a refused or failed restore, Undo or preview must reach
+/// Activity as a failure, never as "Finished".
+pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> (String, bool) {
     let state = &mut app.saves_states.single_file;
     if state.job == Some(id) {
         state.job = None;
@@ -322,12 +325,12 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
             let message = "Restore preview ready. Nothing has been changed.".to_string();
             state.flow = Flow::Confirm(preview);
             state.feedback = None;
-            message
+            (message, true)
         }
         Outcome::Prepared(Err(error)) => {
             state.flow = Flow::Idle;
             state.feedback = None;
-            error
+            (error, false)
         }
         Outcome::Applied { target, result } => match result {
             Ok((receipt, opened)) => {
@@ -343,12 +346,12 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
                     opened_during: opened,
                     undone: false,
                 };
-                message
+                (message, true)
             }
             Err(error) => {
                 state.feedback = Some((target.location.path.clone(), false, error.clone()));
                 state.flow = Flow::Idle;
-                error
+                (error, false)
             }
         },
         Outcome::Undone {
@@ -370,7 +373,7 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
                     opened_during: opened,
                     undone: true,
                 };
-                message
+                (message, true)
             }
             Err(error) => {
                 state.feedback = Some((target.location.path.clone(), false, error.clone()));
@@ -382,11 +385,12 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
                         undone: false,
                     };
                 }
-                error
+                (error, false)
             }
         },
     }
 }
+
 
 /// Start a Prepare job for the chosen snapshot.
 pub(super) fn begin_preview(app: &mut super::App, snapshot: SaveSnapshot, target: SnapshotTarget) {
