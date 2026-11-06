@@ -1496,8 +1496,15 @@ impl StandaloneLaunchState {
             self.tracked = Some((path, adapter, StandaloneLaunchStage::Starting(receiver)));
             return;
         }
+        let plain_error = matches!(request, StandaloneLaunchRequest::OpenRct2(_));
         thread::spawn(move || {
-            let result = request.execute().map_err(|error| format!("{error:?}"));
+            // OpenRCT2 already returns a readable sentence; Debug-formatting
+            // it would wrap it in quotes and escape them.
+            let result = if plain_error {
+                request.execute()
+            } else {
+                request.execute().map_err(|error| format!("{error:?}"))
+            };
             let _ = sender.send(result);
         });
         self.tracked = Some((path, adapter, StandaloneLaunchStage::Starting(receiver)));
@@ -5686,7 +5693,7 @@ pub(crate) fn show_standalone_launch_action(
             state.start(request);
             return;
         }
-        if adapter == openrct2::ADAPTER_KEY
+        if openrct2::is_openrct2(&adapter)
             && !state.is_active()
             && ui.button("Play with OpenRCT2 again (recheck)").clicked()
         {
@@ -5758,7 +5765,7 @@ pub(crate) fn show_standalone_launch_action(
         _ if adapter == "amiberry_cd" => "Launch Amiberry CD".to_string(),
         _ if adapter == dosbox::ADAPTER_KEY => "Play in DOSBox".to_string(),
         _ if adapter == "vice" => "Play in VICE".to_string(),
-        _ if adapter == openrct2::ADAPTER_KEY => {
+        _ if openrct2::is_openrct2(&adapter) => {
             "Play with OpenRCT2 (alternative to the original game)".to_string()
         }
         // ScummVM's Play reads as the product name, like its recheck button.

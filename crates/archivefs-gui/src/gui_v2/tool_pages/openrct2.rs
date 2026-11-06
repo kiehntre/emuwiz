@@ -106,6 +106,38 @@ impl State {
         }
     }
 
+    /// A verified candidate whose file changed after the check is no longer
+    /// verified: drop the evidence so the card asks for a fresh check. Pure
+    /// metadata, nothing is executed. Returns the candidates invalidated.
+    fn invalidate_stale_checks(&mut self) -> usize {
+        let before = self.checks.len();
+        self.checks.retain(|_, check| match check {
+            Check::Verified(install) => install.file_is_current(),
+            _ => true,
+        });
+        before - self.checks.len()
+    }
+
+    /// If the chosen game folder changed after it was inspected, stop treating
+    /// it as usable until the user refreshes. Read-only.
+    fn invalidate_stale_data(&mut self) -> bool {
+        match &self.data {
+            Some(data) if !data.evidence_is_current() => {
+                self.data = Some(Rct2DataReport {
+                    root: data.root.clone(),
+                    root_identity: None,
+                    g1_identity: None,
+                    blocker: Some(
+                        "the folder changed after it was chosen; press Refresh list to inspect it again"
+                            .into(),
+                    ),
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn choose(&mut self, root: PathBuf) {
         self.data = Some(inspect_rct2_data(&root));
     }
@@ -194,6 +226,8 @@ pub(in crate::gui_v2) fn show(
         state.start(ui.ctx(), openrct2_search_dirs());
     }
     state.poll();
+    let stale_checks = state.invalidate_stale_checks();
+    state.invalidate_stale_data();
     ui.label(
         "An alternative way to play RollerCoaster Tycoon 2: the open-source OpenRCT2 engine \
          running your own copy of the game's data. This is a different engine from the original \
@@ -241,6 +275,9 @@ pub(in crate::gui_v2) fn show(
                 }
             }
         }
+    }
+    if stale_checks > 0 {
+        ui.label("An OpenRCT2 file changed after it was checked. Check it again before playing.");
     }
     ui.separator();
     match &state.scan {
@@ -398,6 +435,63 @@ mod tests {
         };
         assert_eq!(install.version.as_deref(), Some("0.4.14"));
         assert!(install.content_sha256.is_some());
+    }
+
+    #[test]
+    fn a_verified_candidate_goes_back_to_not_checked_when_its_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = elf_dir(dir.path());
+        let mut state = State::default();
+        let ctx = egui::Context::default();
+        state.start(&ctx, dirs);
+        wait_scan(&mut state);
+        let Scan::Ready(found) = &state.scan else {
+            unreachable!()
+        };
+        let candidate = found[0].clone();
+        let (probe, _) = counting();
+        state.begin_check(&ctx, candidate.clone(), probe);
+        for _ in 0..500 {
+            state.poll();
+            if matches!(
+                state.checks.get(&candidate.executable),
+                Some(Check::Verified(_))
+            ) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            state.invalidate_stale_checks(),
+            0,
+            "unchanged stays verified"
+        );
+        // Replace the file (new inode, different content).
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"\x7fELF replaced").unwrap();
+        std::fs::rename(&replacement, &candidate.executable).unwrap();
+        assert_eq!(state.invalidate_stale_checks(), 1);
+        assert!(!state.checks.contains_key(&candidate.executable));
+    }
+
+    #[test]
+    fn a_changed_game_folder_stops_being_usable_until_refreshed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("rct2");
+        std::fs::create_dir_all(root.join("Data")).unwrap();
+        std::fs::write(root.join("Data/g1.dat"), b"synthetic").unwrap();
+        let mut state = State::default();
+        state.choose(root.clone());
+        assert!(state.data.as_ref().unwrap().blocker.is_none());
+        assert!(!state.invalidate_stale_data());
+        std::fs::write(root.join("Data/g1.dat"), b"synthetic, now longer").unwrap();
+        assert!(state.invalidate_stale_data());
+        let data = state.data.as_ref().unwrap();
+        assert!(data.blocker.as_deref().unwrap().contains("Refresh"));
+        assert!(data.g1_identity.is_none(), "no stale identity can launch");
+        // Refresh re-inspects the same folder.
+        state.choose(root);
+        assert!(state.data.as_ref().unwrap().blocker.is_none());
     }
 
     #[test]

@@ -193,6 +193,27 @@ pub struct Rct2DataReport {
     pub blocker: Option<String>,
 }
 
+impl Rct2DataReport {
+    /// Whether the folder still looks exactly as it did when inspected
+    /// (cheap re-stat of the root and `Data/g1.dat`; read-only). A report
+    /// that was already blocked has no evidence to go stale.
+    pub fn evidence_is_current(&self) -> bool {
+        self.blocker.is_some() || inspect_rct2_data(&self.root) == *self
+    }
+}
+
+impl OpenRct2Install {
+    /// Whether the file at the discovered path still has the identity it was
+    /// discovered and checked with (read-only stat; not a substitute for the
+    /// hash re-verification that always runs at launch).
+    pub fn file_is_current(&self) -> bool {
+        fs::symlink_metadata(&self.executable).is_ok_and(|m| {
+            !m.file_type().is_symlink()
+                && CapturedFileIdentity::capture(&m) == self.executable_identity
+        })
+    }
+}
+
 /// Owner and mode rules for a pinned executable, read from its descriptor.
 fn check_file_mode(metadata: &fs::Metadata) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
@@ -413,8 +434,13 @@ fn version_supported(version: &str) -> bool {
     matches!((number(parts.next()), number(parts.next())), (Some(a), Some(b)) if (a, b) >= MIN_SUPPORTED)
 }
 
-/// Inspect a user-chosen folder. Never writes, renames or follows symlinks
-/// for the evidence files.
+/// Inspect a user-chosen folder. Never writes or renames anything. The chosen
+/// root, its `Data` directory and `Data/g1.dat` must be real (non-symlink)
+/// entries; the root's own parent path components are the user's choice and
+/// are resolved normally. Files inside `Data` other than `g1.dat` are not
+/// examined, and OpenRCT2 itself later reads the folder with ordinary path
+/// resolution. Read-only, so a symlink cannot make EmuWiz write or exec
+/// anything outside the folder.
 pub fn inspect_rct2_data(root: &Path) -> Rct2DataReport {
     let blocked = |root_identity, blocker: String| Rct2DataReport {
         root: root.to_path_buf(),
@@ -435,6 +461,12 @@ pub fn inspect_rct2_data(root: &Path) -> Rct2DataReport {
     let root_identity = Some(CapturedFileIdentity::capture(&metadata));
     let data = root.join(G1_RELATIVE[0]);
     let g1 = data.join(G1_RELATIVE[1]);
+    if fs::symlink_metadata(&data).is_ok_and(|m| m.file_type().is_symlink()) {
+        return blocked(
+            root_identity,
+            "the Data folder is a symbolic link; choose the folder that really contains it".into(),
+        );
+    }
     match fs::symlink_metadata(&g1) {
         Ok(m) if m.is_file() && !m.file_type().is_symlink() && m.len() > 0 => Rct2DataReport {
             root: root.to_path_buf(),

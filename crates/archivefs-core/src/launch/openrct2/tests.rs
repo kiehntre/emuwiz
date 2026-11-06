@@ -541,3 +541,44 @@ fn a_descendant_left_in_the_group_is_killed_after_a_successful_check() {
         "the leftover descendant must be killed with its group"
     );
 }
+
+#[test]
+fn a_symlinked_data_folder_is_refused_and_its_comment_matches() {
+    let t = tempfile::tempdir().unwrap();
+    let elsewhere = t.path().join("elsewhere/Data");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::write(elsewhere.join("g1.dat"), b"synthetic").unwrap();
+    let root = t.path().join("rct2");
+    fs::create_dir_all(&root).unwrap();
+    symlink(&elsewhere, root.join("Data")).unwrap();
+    let report = inspect_rct2_data(&root);
+    let blocker = report.blocker.expect("a symlinked Data folder is refused");
+    assert!(blocker.contains("symbolic link"), "{blocker}");
+    assert!(report.g1_identity.is_none());
+    // Inspection is read-only: nothing was created inside the chosen folder.
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+}
+
+#[test]
+fn checked_evidence_goes_stale_when_the_file_or_folder_changes() {
+    let t = tempfile::tempdir().unwrap();
+    let bin = elf(&t.path().join("bin"), "true");
+    let root = rct2_data(t.path());
+    let (req, _dirs) = request(&bin, &root);
+    assert!(req.install.file_is_current() && req.data.evidence_is_current());
+    // Replace the executable (new inode): the old verification no longer applies.
+    let replacement = elf(&t.path().join("other"), "false");
+    fs::rename(&replacement, &bin).unwrap();
+    assert!(!req.install.file_is_current());
+    // Swap it for a symlink: also not current.
+    fs::remove_file(&bin).unwrap();
+    symlink("/usr/bin/true", &bin).unwrap();
+    assert!(!req.install.file_is_current());
+    // Changing g1.dat makes the folder evidence stale.
+    fs::write(
+        root.join("Data/g1.dat"),
+        b"a different, longer synthetic file",
+    )
+    .unwrap();
+    assert!(!req.data.evidence_is_current());
+}
