@@ -785,10 +785,11 @@ pub(super) enum ToolPage {
     SourceImpact,
     ArcadeShelf,
     Vita3kTitles,
+    OpenRct2,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
@@ -808,6 +809,7 @@ impl ToolPage {
         Self::SourceImpact,
         Self::ArcadeShelf,
         Self::Vita3kTitles,
+        Self::OpenRct2,
     ];
 
     pub fn title(self) -> &'static str {
@@ -831,6 +833,7 @@ impl ToolPage {
             Self::CheatExtras => "Providers and code previews",
             Self::ArcadeShelf => "Virtual Arcade Shelf",
             Self::Vita3kTitles => "PlayStation Vita (Vita3K) titles",
+            Self::OpenRct2 => "RollerCoaster Tycoon 2 via OpenRCT2 (alternative)",
         }
     }
 
@@ -881,6 +884,9 @@ impl ToolPage {
             Self::Vita3kTitles => {
                 "Start a title that is already installed in Vita3K; EmuWiz installs and changes nothing."
             }
+            Self::OpenRct2 => {
+                "Play RollerCoaster Tycoon 2 with an OpenRCT2 you installed, using your own game folder; nothing is installed or copied."
+            }
         }
     }
 
@@ -905,6 +911,7 @@ impl ToolPage {
             Self::CheatExtras => Section::Mods,
             Self::ArcadeShelf => Section::Games,
             Self::Vita3kTitles => Section::Games,
+            Self::OpenRct2 => Section::Games,
         }
     }
 
@@ -928,6 +935,7 @@ impl ToolPage {
             Self::CheatExtras => "Enhance",
             Self::ArcadeShelf => "Games & collection",
             Self::Vita3kTitles => "Games & collection",
+            Self::OpenRct2 => "Games & collection",
         }
     }
 }

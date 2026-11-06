@@ -136,6 +136,7 @@ pub mod native_support;
 pub mod np2kai;
 pub mod openmsx_command;
 pub mod openmsx_execution;
+pub mod openrct2;
 #[cfg(target_os = "linux")]
 pub mod oricutron;
 pub mod pcsx2_command;
@@ -445,6 +446,13 @@ pub use mgba_execution::{
 pub use openmsx_execution::{
     OpenMsxLaunchExecutionError, OpenMsxLaunchPreflightError, OpenMsxLaunchPreflightErrorKind,
     OpenMsxLaunchRequest, preflight_and_launch_openmsx, preflight_openmsx_launch, spawn_openmsx,
+};
+pub use openrct2::{
+    OpenRct2CheckError, OpenRct2Install, OpenRct2LaunchError, OpenRct2LaunchRequest,
+    PinnedOpenRct2, PreparedOpenRct2Launch, Rct2DataReport, check_openrct2,
+    default_search_dirs as openrct2_search_dirs, discover_openrct2, inspect_rct2_data,
+    plan_openrct2, preflight_and_launch_openrct2, preflight_openrct2_launch,
+    probe_openrct2_version, spawn_prepared_openrct2,
 };
 pub use pcsx2_command::{
     PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2Command, Pcsx2CommandPlan, Pcsx2CommandSelection,
