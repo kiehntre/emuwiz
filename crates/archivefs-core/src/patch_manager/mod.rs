@@ -577,8 +577,8 @@ pub use dolphin_texture_pack::{
     DolphinTexturePackRejectedFile, DolphinTexturePackStaging, build_dolphin_texture_pack_manifest,
     build_dolphin_texture_pack_preview, build_dolphin_texture_pack_transaction_plan,
     describe_missing_texture_pack_source, execute_dolphin_texture_pack_apply,
-    inspect_dolphin_texture_pack_zip, relocate_dolphin_texture_pack_manifest,
-    validate_dolphin_texture_pack_manifest,
+    inspect_dolphin_texture_pack_zip, inspect_dolphin_texture_pack_zip_in,
+    relocate_dolphin_texture_pack_manifest, validate_dolphin_texture_pack_manifest,
 };
 pub use duckstation_cheat::{
     DUCKSTATION_CHEAT_MAX_BYTES, DUCKSTATION_CHEAT_MAX_LINES, DuckStationCheatApplyPlan,

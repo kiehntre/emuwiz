@@ -750,6 +750,26 @@ pub fn inspect_dolphin_texture_pack_zip(
     name: String,
     version: Option<String>,
 ) -> Result<DolphinTexturePackArchivePreview, DolphinTextureModError> {
+    inspect_dolphin_texture_pack_zip_in(
+        archive_path,
+        identity,
+        name,
+        version,
+        &std::env::temp_dir(),
+    )
+}
+
+/// [`inspect_dolphin_texture_pack_zip`] with an explicit parent directory for
+/// the temporary staging (the system temporary directory in production; a
+/// private directory in tests, so lifecycle assertions are deterministic
+/// while other tests create and drop their own stagings).
+pub fn inspect_dolphin_texture_pack_zip_in(
+    archive_path: &Path,
+    identity: &DolphinTextureModIdentity,
+    name: String,
+    version: Option<String>,
+    staging_parent: &Path,
+) -> Result<DolphinTexturePackArchivePreview, DolphinTextureModError> {
     if !archive_path.is_absolute() {
         return Err(pack_error(
             DolphinTextureModErrorKind::SourceOutsideApprovedScope,
@@ -785,8 +805,8 @@ pub fn inspect_dolphin_texture_pack_zip(
         ));
     }
 
-    let staging_root = std::env::temp_dir().join(format!(
-        "archivefs-dolphin-texture-archive-{}-{}",
+    let staging_root = staging_parent.join(format!(
+        "{DOLPHIN_TEXTURE_ARCHIVE_STAGING_PREFIX}{}-{}",
         std::process::id(),
         next_archive_stage_id()
     ));

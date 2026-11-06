@@ -501,49 +501,43 @@ fn zip_archive_builds_existing_manifest_from_one_wrapper_root() {
 /// that used to `?` past the cleanup (no texture root, ambiguous roots).
 #[test]
 fn zip_preview_staging_never_outlives_the_preview() {
+    // A private staging parent: counts here cannot be disturbed by sibling
+    // tests, which stage under the system temporary directory.
     let dir = TestDir::new("archive-staging-lifecycle");
-    let marker_prefix = format!("archivefs-dolphin-texture-archive-{}-", std::process::id());
+    let staging_parent = dir.0.join("staging-parent");
+    std::fs::create_dir_all(&staging_parent).unwrap();
     let staging_dirs = || -> Vec<PathBuf> {
-        std::fs::read_dir(std::env::temp_dir())
+        std::fs::read_dir(&staging_parent)
             .unwrap()
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(&marker_prefix))
-            })
             .collect()
     };
-    let baseline = staging_dirs().len();
+    let inspect = |archive: &Path| {
+        inspect_dolphin_texture_pack_zip_in(
+            archive,
+            &identity("GALE01"),
+            "P".to_string(),
+            None,
+            &staging_parent,
+        )
+    };
     let good = dir.0.join("good.zip");
     write_zip(&good, &[("Pack/Load/Textures/GALE01/a.png", b"a")]);
     for _ in 0..3 {
-        let preview =
-            inspect_dolphin_texture_pack_zip(&good, &identity("GALE01"), "P".to_string(), None)
-                .unwrap();
-        assert_eq!(staging_dirs().len(), baseline + 1);
+        let preview = inspect(&good).unwrap();
+        assert_eq!(staging_dirs().len(), 1);
+        assert!(preview.staging.root().starts_with(&staging_parent));
         drop(preview);
-        assert_eq!(
-            staging_dirs().len(),
-            baseline,
-            "dropped preview left staging"
-        );
+        assert!(staging_dirs().is_empty(), "dropped preview left staging");
     }
     let no_root = dir.0.join("no-root.zip");
     write_zip(
         &no_root,
         &[("Docs/readme.txt", b"x"), ("Other/a.png", b"a")],
     );
-    assert!(
-        inspect_dolphin_texture_pack_zip(&no_root, &identity("GALE01"), "P".to_string(), None)
-            .is_err()
-    );
-    assert_eq!(
-        staging_dirs().len(),
-        baseline,
-        "no-root refusal left staging"
-    );
+    assert!(inspect(&no_root).is_err());
+    assert!(staging_dirs().is_empty(), "no-root refusal left staging");
     let ambiguous = dir.0.join("ambiguous.zip");
     write_zip(
         &ambiguous,
@@ -552,26 +546,16 @@ fn zip_preview_staging_never_outlives_the_preview() {
             ("Two/Load/Textures/GALE01/b.png", b"b"),
         ],
     );
-    assert!(
-        inspect_dolphin_texture_pack_zip(&ambiguous, &identity("GALE01"), "P".to_string(), None)
-            .is_err()
-    );
-    assert_eq!(
-        staging_dirs().len(),
-        baseline,
-        "ambiguous refusal left staging"
-    );
+    assert!(inspect(&ambiguous).is_err());
+    assert!(staging_dirs().is_empty(), "ambiguous refusal left staging");
     let wrong_game = dir.0.join("wrong.zip");
     write_zip(&wrong_game, &[("Load/Textures/GLEE01/texture.png", b"x")]);
-    assert!(
-        inspect_dolphin_texture_pack_zip(&wrong_game, &identity("GALE01"), "P".to_string(), None)
-            .is_err()
-    );
-    assert_eq!(
-        staging_dirs().len(),
-        baseline,
-        "wrong-game refusal left staging"
-    );
+    assert!(inspect(&wrong_game).is_err());
+    assert!(staging_dirs().is_empty(), "wrong-game refusal left staging");
+    let traversal = dir.0.join("traversal.zip");
+    write_zip(&traversal, &[("../GALE01/escape.png", b"x")]);
+    assert!(inspect(&traversal).is_err());
+    assert!(staging_dirs().is_empty(), "refused ZIP left staging");
 }
 
 #[test]
