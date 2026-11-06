@@ -1507,20 +1507,24 @@ fn merge_combined_evidence(
     let mut exact = Vec::new();
     let mut source_ambiguities = Vec::new();
     let mut non_exact = Vec::new();
-    for catalogue in catalogues {
-        match audit_one(known, &catalogue.index) {
+    let per_catalogue: Vec<AuditVerdict> = catalogues
+        .iter()
+        .map(|catalogue| audit_one(known, &catalogue.index))
+        .collect();
+    for (catalogue, verdict) in catalogues.iter().zip(per_catalogue.iter()) {
+        match verdict {
             AuditVerdict::Exact {
                 game_name,
                 rom_name,
                 algorithm,
-            } => exact.push((catalogue, game_name, rom_name, algorithm)),
+            } => exact.push((catalogue, game_name.clone(), rom_name.clone(), *algorithm)),
             AuditVerdict::ExactMultipleCandidates { count, .. } => {
                 source_ambiguities.push(format!(
                     "{} has {count} exact candidates",
                     catalogue.source.source_display_name
                 ))
             }
-            verdict => non_exact.push(verdict),
+            verdict => non_exact.push(verdict.clone()),
         }
     }
     if !source_ambiguities.is_empty() {
@@ -1541,10 +1545,48 @@ fn merge_combined_evidence(
     let Some((first_source, first_game, first_rom, first_algorithm)) = exact.first() else {
         // Keep useful non-exact diagnostics, but never allow a filename-only
         // result from one catalogue to eclipse hash evidence from another.
+        // S03-06: catalogues that each reach a *different* Probable identity
+        // are a disagreement to report, not a race won by whichever source
+        // was configured first.
+        let probable_identities = non_exact
+            .iter()
+            .filter_map(|verdict| match verdict {
+                AuditVerdict::Probable {
+                    game_name,
+                    rom_name,
+                } => Some((game_name.as_str(), rom_name.as_str())),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let probable_disagreement = (probable_identities.len() > 1).then(|| {
+            let details = catalogues
+                .iter()
+                .zip(per_catalogue.iter())
+                .filter_map(|(catalogue, verdict)| match verdict {
+                    AuditVerdict::Probable {
+                        game_name,
+                        rom_name,
+                    } => Some(format!(
+                        "{}: {game_name} / {rom_name}",
+                        catalogue.source.source_display_name
+                    )),
+                    _ => None,
+                })
+                // Sorted so the explanation itself is configuration-order
+                // independent, exactly like the verdict.
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("; ");
+            AuditVerdict::Ambiguous {
+                detail: format!("probable (CRC32) catalogues disagree: {details}"),
+            }
+        });
         let verdict = non_exact
             .iter()
             .find(|verdict| matches!(verdict, AuditVerdict::Ambiguous { .. }))
             .cloned()
+            .or(probable_disagreement)
             .or_else(|| {
                 non_exact
                     .iter()
@@ -2524,38 +2566,22 @@ fn rom_for_key(
     }
 }
 
-/// The candidate catalogue ROMs a cryptographic hash matched, strongest hash
-/// first, mirroring [`crate::dat::audit`]'s evidence priority.
+/// The candidate catalogue ROMs the file's cryptographic hashes matched, in
+/// catalogue order.
 ///
-/// This is deliberately the same algorithm the verdict uses: a file whose
-/// SHA-1 matched is ranked by the same SHA-1 candidates the audit reported,
-/// so the annotation can never disagree with the verdict about what matched.
+/// This is deliberately the same collection the verdict uses
+/// ([`crate::dat::audit::collect_crypto_candidates`]): every shared algorithm
+/// is consulted and the union reported, so the policy annotation and the
+/// persisted matched references can never disagree with the verdict about
+/// what matched, and a record that publishes only a weaker hash is never
+/// hidden (S03-01). `nodump`/`baddump` records are excluded exactly as the
+/// verdict excludes them (S03-03).
 fn verified_candidate_refs(known: &KnownFileEvidence, index: &DatIndex) -> Vec<DatRomRef> {
-    for (value, algorithm) in [
-        (known.sha256.as_deref(), "SHA-256"),
-        (known.sha1.as_deref(), "SHA-1"),
-        (known.md5.as_deref(), "MD5"),
-    ] {
-        let Some(value) =
-            value.and_then(|value| crate::dat::audit::normalise_for_lookup(value, algorithm))
-        else {
-            continue;
-        };
-        let candidates = match algorithm {
-            "SHA-256" => index.lookup_sha256(&value),
-            "SHA-1" => index.lookup_sha1(&value),
-            _ => index.lookup_md5(&value),
-        };
-        let consistent: Vec<_> = candidates
-            .iter()
-            .filter(|candidate| !crate::dat::audit::cryptographic_hash_disagrees(known, candidate))
-            .map(SharedRomRef::to_owned_ref)
-            .collect();
-        if !consistent.is_empty() {
-            return consistent;
-        }
-    }
-    Vec::new()
+    crate::dat::audit::collect_crypto_candidates(known, index)
+        .consistent
+        .iter()
+        .map(SharedRomRef::to_owned_ref)
+        .collect()
 }
 
 /// Judges each loose `.cue` in `report` as one disc. The sheet and every file
@@ -3341,6 +3367,67 @@ game (
         .unwrap();
         assert_eq!(first.report, disabled.report);
         assert_eq!(first.evidence_sources, disabled.evidence_sources);
+    }
+
+    fn crc_only_dat(game: &str, rom: &str, bytes: &[u8]) -> String {
+        format!(
+            r#"<?xml version="1.0"?><datafile><header><name>Fixture</name></header><game name="{game}"><rom name="{rom}" size="{}" crc="{}"/></game></datafile>"#,
+            bytes.len(),
+            crate::identity_source::hashing::Crc32::of(bytes)
+        )
+    }
+
+    /// S03-06: two catalogues whose CRC32-only records name different games
+    /// for the same bytes disagree. The combined verdict must say so in
+    /// either configuration order, never adopt the first catalogue's Probable.
+    #[test]
+    fn s03_06_combined_probable_disagreement_is_ambiguous_in_either_order() {
+        let tree = tempfile::tempdir().unwrap();
+        let games = tree.path().join("games");
+        std::fs::create_dir(&games).unwrap();
+        let bytes = b"same bytes";
+        std::fs::write(games.join("thing.rom"), bytes).unwrap();
+        let first = tree.path().join("first.dat");
+        let second = tree.path().join("second.dat");
+        std::fs::write(&first, crc_only_dat("Alpha", "alpha.rom", bytes)).unwrap();
+        std::fs::write(&second, crc_only_dat("Beta", "beta.rom", bytes)).unwrap();
+
+        let forward = run(
+            vec![source(first.clone(), "one"), source(second.clone(), "two")],
+            games.clone(),
+        );
+        let reverse = run(vec![source(second, "two"), source(first, "one")], games);
+        for outcome in [&forward, &reverse] {
+            assert_eq!(outcome.report.entries.len(), 1);
+            match &outcome.report.entries[0].verdict {
+                AuditVerdict::Ambiguous { detail } => {
+                    assert!(detail.contains("Alpha / alpha.rom"), "{detail}");
+                    assert!(detail.contains("Beta / beta.rom"), "{detail}");
+                }
+                other => panic!("expected a catalogue disagreement, got {other:?}"),
+            }
+            assert!(outcome.evidence_sources.is_empty());
+        }
+        assert_eq!(forward.report, reverse.report);
+    }
+
+    /// Catalogues whose Probable verdicts agree still yield one Probable.
+    #[test]
+    fn s03_06_agreeing_probable_catalogues_stay_probable() {
+        let tree = tempfile::tempdir().unwrap();
+        let games = tree.path().join("games");
+        std::fs::create_dir(&games).unwrap();
+        let bytes = b"same bytes";
+        std::fs::write(games.join("thing.rom"), bytes).unwrap();
+        let first = tree.path().join("first.dat");
+        let second = tree.path().join("second.dat");
+        std::fs::write(&first, crc_only_dat("Alpha", "alpha.rom", bytes)).unwrap();
+        std::fs::write(&second, crc_only_dat("Alpha", "alpha.rom", bytes)).unwrap();
+        let outcome = run(vec![source(first, "one"), source(second, "two")], games);
+        assert!(matches!(
+            outcome.report.entries[0].verdict,
+            AuditVerdict::Probable { ref game_name, .. } if game_name == "Alpha"
+        ));
     }
 
     /// S03-02 / D3-02: a warm cache must not turn a same-size in-place
