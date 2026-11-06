@@ -50,7 +50,7 @@ impl Tier {
     pub fn label(self) -> &'static str {
         match self {
             Self::Confirmed => "Confirmed",
-            Self::Probable => "Probable",
+            Self::Probable => "Probable (heuristic)",
             Self::Ambiguous => "Ambiguous",
         }
     }
@@ -436,18 +436,67 @@ fn foreign_magic(bytes: &[u8]) -> bool {
 }
 
 /// Structural signature for an unheadered NES image (heuristic, never above
-/// Probable). Deliberately strict:
-/// - size is a multiple of 8192 and at most 2 MiB; no iNES header;
-/// - no validated header and no foreign magic for any other platform;
-/// - only the fixed last 16 KiB bank is examined: NMI and IRQ vectors at the
-///   file end are >= $8000, RESET is >= $C000, and NMI differs from RESET
-///   (unused-vector layouts, as on the Atari 2600, repeat one address);
-/// - the code at RESET starts with a typical NES power-on sequence: SEI, CLD
-///   (78 D8), CLD, SEI (D8 78), or SEI, LDX #imm (78 A2), the idiom of the
-///   standard "SEI / CLD / LDX #$FF / TXS" init.
+/// Probable). A headerless dump is PRG followed by any CHR, so every 16 KiB
+/// bank end is examined, not only the end of the file. At a bank end `e`:
+/// - the six bytes before `e` are the 6502 vectors: NMI and IRQ >= $8000,
+///   RESET >= $8000, and NMI != RESET (unused-vector layouts repeat one
+///   address);
+/// - RESET maps into the same window: $C000-$FFFF is the bank ending at `e`;
+///   $8000-$BFFF is the previous bank of a 32 KiB window (or, for a 16 KiB
+///   PRG, the mirror of the same bank);
+/// - the code at RESET starts with a typical NES power-on pair: SEI,CLD
+///   (78 D8), CLD,SEI (D8 78), or SEI followed by LDX #imm (78 A2), LDA #imm
+///   (78 A9) or LDA abs (78 AD). All five are the usual "SEI; CLD; ..." init
+///   idioms, with the CLD sometimes later.
+///
+/// Overall: size is a multiple of 8192 and at most 2 MiB, no iNES header, no
+/// validated header and no foreign magic of another system, and no
+/// 16/32/48 KiB image whose end-of-file vectors look like a headerless Atari
+/// 7800/2600 cartridge (those sizes are vetoed, which also drops genuine
+/// CHR-RAM NROM images of exactly those sizes).
 pub fn nes_structure(bytes: &[u8]) -> Option<Signal> {
     const BANK: usize = 16 * 1024;
-    if bytes.len() < BANK || !bytes.len().is_multiple_of(8192) || bytes.len() > 2 * 1024 * 1024 {
+    let len = bytes.len();
+    if len < BANK || !len.is_multiple_of(8192) || len > 2 * 1024 * 1024 {
+        return None;
+    }
+    let vectors_at = |end: usize| -> Option<(usize, usize, usize)> {
+        let word =
+            |i: usize| usize::from(u16::from_le_bytes([bytes[end - 6 + i], bytes[end - 5 + i]]));
+        let (nmi, reset, irq) = (word(0), word(2), word(4));
+        (nmi >= 0x8000 && irq >= 0x8000 && reset >= 0x8000 && nmi != reset)
+            .then_some((nmi, reset, irq))
+    };
+    let start_ok = |end: usize, reset: usize| -> bool {
+        let target = if reset >= 0xC000 {
+            end - BANK + (reset - 0xC000)
+        } else if end >= 2 * BANK {
+            end - 2 * BANK + (reset - 0x8000)
+        } else {
+            reset - 0x8000
+        };
+        matches!(
+            bytes.get(target..target + 2),
+            Some([0x78, 0xD8] | [0xD8, 0x78] | [0x78, 0xA2] | [0x78, 0xA9] | [0x78, 0xAD])
+        )
+    };
+    let mut found = false;
+    let mut end = BANK;
+    while end <= len {
+        if let Some((_, reset, _)) = vectors_at(end)
+            && start_ok(end, reset)
+        {
+            found = true;
+            break;
+        }
+        end += BANK;
+    }
+    if !found {
+        return None;
+    }
+    // Headerless Atari 7800 / 2600 style: 6502 vectors at the end of a
+    // 16/32/48 KiB image.
+    if matches!(len, 0x4000 | 0x8000 | 0xC000) && vectors_at(len).is_some() {
         return None;
     }
     if crate::nes_header_evidence::parse_ines_header(bytes).is_some()
@@ -456,21 +505,9 @@ pub fn nes_structure(bytes: &[u8]) -> Option<Signal> {
     {
         return None;
     }
-    let end = bytes.len();
-    let table = &bytes[end - 6..];
-    let word = |i: usize| usize::from(u16::from_le_bytes([table[i], table[i + 1]]));
-    let (nmi, reset, irq) = (word(0), word(2), word(4));
-    if nmi < 0x8000 || irq < 0x8000 || reset < 0xC000 || nmi == reset {
-        return None;
-    }
-    let target = end - BANK + (reset - 0xC000);
-    let start = bytes.get(target..target + 2)?;
-    if target + 2 > end - 6 || !matches!(start, [0x78, 0xD8] | [0xD8, 0x78] | [0x78, 0xA2]) {
-        return None;
-    }
     Some(signal(
         "NES",
-        "size is a multiple of 8192, no iNES header or other system's signature, and the fixed last 16 KiB bank has NES-style vectors whose RESET code starts with SEI/CLD/LDX",
+        "size is a multiple of 8192, no iNES header or other system's signature, and a 16 KiB bank end has NES-style vectors whose RESET code starts with SEI/CLD/LDX/LDA (heuristic)",
     ))
 }
 

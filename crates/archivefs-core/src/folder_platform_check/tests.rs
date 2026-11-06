@@ -1,18 +1,37 @@
 use super::*;
 use std::io::Write;
 
-fn nes_like() -> Vec<u8> {
-    nes_like_sized(32 * 1024)
-}
-
-fn nes_like_sized(len: usize) -> Vec<u8> {
-    let mut b = vec![0xEA_u8; len];
-    let end = b.len();
-    let target = end - 16 * 1024;
+/// A headerless NES image: `prg` bytes of PRG (vectors at its end), then `chr`
+/// bytes of CHR. RESET code (SEI, CLD) is placed where the detector maps it.
+fn nes_layout(prg: usize, chr: usize, nmi: u16, reset: u16, irq: u16) -> Vec<u8> {
+    let mut b = vec![0xEA_u8; prg + chr];
+    let r = usize::from(reset);
+    let target = if r >= 0xC000 {
+        prg - 16 * 1024 + (r - 0xC000)
+    } else if prg >= 32 * 1024 {
+        prg - 32 * 1024 + (r - 0x8000)
+    } else {
+        r - 0x8000
+    };
     b[target] = 0x78;
     b[target + 1] = 0xD8;
-    b[end - 6..].copy_from_slice(&[0x00, 0xC1, 0x00, 0xC0, 0x00, 0xC1]);
+    b[prg - 6..prg - 4].copy_from_slice(&nmi.to_le_bytes());
+    b[prg - 4..prg - 2].copy_from_slice(&reset.to_le_bytes());
+    b[prg - 2..prg].copy_from_slice(&irq.to_le_bytes());
     b
+}
+
+fn nes_like() -> Vec<u8> {
+    nes_like_sized(40 * 1024)
+}
+
+/// 40 KiB = 32 KiB PRG + 8 KiB CHR; larger sizes are CHR-RAM style (PRG only).
+fn nes_like_sized(len: usize) -> Vec<u8> {
+    if len % (16 * 1024) == 8 * 1024 {
+        nes_layout(len - 8 * 1024, 8 * 1024, 0x8100, 0x8E19, 0x8F00)
+    } else {
+        nes_layout(len, 0, 0xC100, 0xC000, 0xC100)
+    }
 }
 
 fn hit(platform: &str) -> HashHit {
@@ -380,19 +399,69 @@ fn xorshift(state: &mut u64) -> u8 {
     (*state >> 24) as u8
 }
 
+/// Regression guard, not a proof: 20,000 deterministic pseudo-random images
+/// must never look like NES. Real false-positive rates on real ROMs are not
+/// measured here.
 #[test]
 fn random_data_is_never_probable_nes() {
+    let sizes = [24 * 1024, 40 * 1024, 72 * 1024, 136 * 1024];
     let mut false_positives = 0;
-    for seed in 1..=200_u64 {
-        for size in [32 * 1024, 128 * 1024, 512 * 1024] {
-            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-            let data: Vec<u8> = (0..size).map(|_| xorshift(&mut state)).collect();
-            if nes_structure(&data).is_some() {
-                false_positives += 1;
-            }
+    for seed in 1..=20_000_u64 {
+        let size = sizes[(seed % 4) as usize];
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut data = Vec::with_capacity(size);
+        while data.len() < size {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.extend_from_slice(&state.to_le_bytes());
+        }
+        data.truncate(size);
+        if nes_structure(&data).is_some() {
+            false_positives += 1;
         }
     }
     assert_eq!(false_positives, 0);
+}
+
+#[test]
+fn realistic_nes_layouts_are_probable() {
+    // NROM-128: 16K PRG + 8K CHR, RESET in $8000-$BFFF (mirrored bank).
+    assert!(nes_structure(&nes_layout(16 * 1024, 8 * 1024, 0x8500, 0x8E19, 0x8F00)).is_some());
+    // NROM-256 + CHR.
+    assert!(nes_structure(&nes_layout(32 * 1024, 8 * 1024, 0x8100, 0x8E19, 0x8F00)).is_some());
+    // MMC3-style 128K PRG + 128K CHR: vectors at the end of PRG, not EOF.
+    assert!(nes_structure(&nes_layout(128 * 1024, 128 * 1024, 0xE100, 0xFFE0, 0xF000)).is_some());
+    // CHR-RAM UxROM: 128K PRG only.
+    assert!(nes_structure(&nes_layout(128 * 1024, 0, 0xC100, 0xC000, 0xC200)).is_some());
+    // Other accepted start sequences.
+    for pair in [[0xD8, 0x78], [0x78, 0xA2], [0x78, 0xA9], [0x78, 0xAD]] {
+        let mut image = nes_layout(128 * 1024, 0, 0xC100, 0xC000, 0xC200);
+        let target = image.len() - 16 * 1024;
+        image[target..target + 2].copy_from_slice(&pair);
+        assert!(nes_structure(&image).is_some(), "{pair:02x?}");
+    }
+}
+
+#[test]
+fn atari_and_sms_shaped_images_are_not_probable_nes() {
+    // 48K headerless 7800: 6502 vectors at EOF, SEI/CLD start.
+    assert!(nes_structure(&nes_layout(48 * 1024, 0, 0xF100, 0xF000, 0xF200)).is_none());
+    // 2600/7800-style 16K and 32K with distinct NMI/RESET.
+    assert!(nes_structure(&nes_layout(16 * 1024, 0, 0xF100, 0xF000, 0xF200)).is_none());
+    assert!(nes_structure(&nes_layout(32 * 1024, 0, 0xF100, 0xF000, 0xF200)).is_none());
+    // 2600 repeated vectors.
+    assert!(nes_structure(&nes_layout(32 * 1024, 0, 0xF000, 0xF000, 0xF000)).is_none());
+    // SMS/GG without "TMR SEGA": Z80-looking bytes, no 6502 vectors.
+    let mut state = 0xDEAD_BEEF_u64;
+    let z80: Vec<u8> = (0..128 * 1024)
+        .map(|i| match i % 4 {
+            0 => 0xF3,
+            1 => 0xC3,
+            _ => xorshift(&mut state),
+        })
+        .collect();
+    assert!(nes_structure(&z80).is_none());
 }
 
 #[test]
@@ -414,7 +483,7 @@ fn other_systems_signatures_veto_the_nes_structure() {
         ("Lynx", 0, b"LYNX".to_vec()),
         ("NGP", 0, b"COPYRIGHT BY SNK".to_vec()),
     ];
-    for size in [32 * 1024, 128 * 1024, 512 * 1024] {
+    for size in [40 * 1024, 128 * 1024, 512 * 1024] {
         assert!(nes_structure(&nes_like_sized(size)).is_some(), "{size}");
         for (name, offset, bytes) in &stamps {
             let mut image = nes_like_sized(size);
@@ -432,12 +501,12 @@ fn other_systems_signatures_veto_the_nes_structure() {
 }
 
 #[test]
-fn atari_style_repeated_vectors_and_odd_start_code_are_refused() {
-    let mut atari = nes_like();
-    let end = atari.len();
-    atari[end - 6..].copy_from_slice(&[0x00, 0xC0, 0x00, 0xC0, 0x00, 0xC0]);
-    assert!(nes_structure(&atari).is_none());
-    let mut other_start = nes_like();
+fn repeated_vectors_and_odd_start_code_are_refused() {
+    let mut repeated = nes_layout(128 * 1024, 0, 0xC100, 0xC000, 0xC100);
+    let end = repeated.len();
+    repeated[end - 6..].copy_from_slice(&[0x00, 0xC0, 0x00, 0xC0, 0x00, 0xC0]);
+    assert!(nes_structure(&repeated).is_none());
+    let mut other_start = nes_layout(128 * 1024, 0, 0xC100, 0xC000, 0xC200);
     let target = other_start.len() - 16 * 1024;
     other_start[target] = 0xA9;
     assert!(nes_structure(&other_start).is_none());
