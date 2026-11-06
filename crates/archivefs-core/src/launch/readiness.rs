@@ -772,11 +772,13 @@ pub fn xenia_firmware_readiness() -> FirmwareReadiness {
 /// say which required files are alternatives (e.g. Mednafen PSX lists the
 /// JP, US and EU BIOS all as required, though the core uses the one matching
 /// the disc). EmuWiz does not invent such groups, so:
-/// - every required entry `Missing` is `Missing` (nothing usable exists);
-/// - some `Missing` alongside any present or unjudgeable entry is `Unknown`
-///   (it could be an unused regional alternative - not claimed either way);
+/// - any required entry `Missing` is `Missing`, even when other required
+///   entries are present (owner policy: a missing required file is never a
+///   Play-ready result; the user can install it or the core can be
+///   reviewed - EmuWiz does not guess an unused regional alternative);
 /// - all required entries present is `PresentUnverified`; any other
-///   unjudgeable entry, or an unreadable `.info`, is `Unknown`.
+///   unjudgeable entry (with none missing), or an unreadable `.info`, is
+///   `Unknown`.
 ///
 /// Never `Verified`: file contents are not hashed.
 pub fn retroarch_core_firmware_readiness(info: &CoreInfoFinding) -> FirmwareReadiness {
@@ -790,7 +792,7 @@ pub fn retroarch_core_firmware_readiness(info: &CoreInfoFinding) -> FirmwareRead
         .collect();
     if required.is_empty() {
         FirmwareReadiness::NotRequired
-    } else if required.iter().all(|p| *p == FirmwarePresence::Missing) {
+    } else if required.contains(&FirmwarePresence::Missing) {
         FirmwareReadiness::Missing
     } else if required
         .iter()
@@ -834,15 +836,19 @@ mod tests {
     #[test]
     fn retroarch_core_firmware_projection() {
         use FirmwarePresence::*;
-        let cases: [(&[(bool, FirmwarePresence)], FirmwareReadiness); 8] = [
+        let cases: [(&[(bool, FirmwarePresence)], FirmwareReadiness); 9] = [
             (&[], FirmwareReadiness::NotRequired),
             (&[(true, Missing)], FirmwareReadiness::NotRequired),
             (&[(false, Missing)], FirmwareReadiness::Missing),
             // Mednafen PSX-style: JP/US/EU all "required"; only one installed.
-            // Alternatives are not invented, so this is Unknown, not Missing.
+            // Alternatives are not invented, so a missing required file blocks.
             (
                 &[(false, PresentUnverified), (false, Missing)],
-                FirmwareReadiness::Unknown,
+                FirmwareReadiness::Missing,
+            ),
+            (
+                &[(false, Unknown), (false, Missing)],
+                FirmwareReadiness::Missing,
             ),
             (
                 &[(false, Missing), (false, Missing), (false, Missing)],
