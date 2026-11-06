@@ -479,7 +479,15 @@ fn database_restore_receipt_operation(
             "Restore evidence is incomplete; no automatic recovery action is available.".to_string(),
         ),
     };
-    let review_available = recoverable || assessment.as_ref().is_some_and(|a| a.can_finalise());
+    // An interrupted receipt offers review ("reconcile") only when core can
+    // finalise it truthfully; otherwise the person must look by hand, and no
+    // button should suggest otherwise. Terminal receipts with evidence stay
+    // reviewable as before.
+    let review_available = if state == OperationState::Interrupted {
+        assessment.as_ref().is_some_and(|a| a.can_finalise())
+    } else {
+        recoverable
+    };
     OperationRecord {
         schema_version: OPERATION_RECEIPT_SCHEMA_VERSION,
         operation_id: receipt.operation_id.clone(),
@@ -2037,6 +2045,47 @@ mod tests {
             RecoveryClassification::Unrecoverable
         );
         assert!(record.recovery.explanation.contains("Nothing to recover"));
+    }
+
+    #[test]
+    fn interrupted_receipt_core_cannot_classify_offers_no_reconcile() {
+        // A receipt from the previous build at "Restore applied" records an
+        // emergency backup but no file identities: core's preview is
+        // Unrecognised, so History must not offer reconciliation even
+        // though the receipt is otherwise "recoverable".
+        let (_temp, live, backup) = restore_fixture();
+        let plan = crate::prepare_database_restore(&live, &backup).unwrap();
+        let result = crate::restore_database(&plan, "RESTORE DATABASE").unwrap();
+        let path = crate::database_restore_receipt_path(&result.receipt);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy["state"] = serde_json::json!("restore_applied");
+        for field in [
+            "original_identity",
+            "replacement_identity",
+            "staged_replacement_sha256",
+            "staged_replacement_path",
+        ] {
+            legacy[field] = serde_json::Value::Null;
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        let mut registry = OperationRegistry::default();
+        registry.append_database_restore_history(&live);
+        let record = &registry.records[0];
+        assert_eq!(record.state, OperationState::Interrupted);
+        assert_eq!(
+            record.recovery.actions.review,
+            ActionAvailability::Unavailable
+        );
+        assert_eq!(
+            record.recovery.actions.rollback,
+            ActionAvailability::Unavailable
+        );
+        assert!(
+            record.output.summary.contains("earlier EmuWiz build"),
+            "{}",
+            record.output.summary
+        );
     }
 
     #[test]

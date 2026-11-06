@@ -73,7 +73,7 @@ fn render(context: &egui::Context, state: &mut State, busy: bool) -> (Vec<String
 fn settle(context: &egui::Context, state: &mut State, busy: bool) -> (Vec<String>, bool) {
     let started = Instant::now();
     let mut reload = false;
-        loop {
+    loop {
         let (_, changed) = render(context, state, busy);
         reload |= changed;
         state.poll();
@@ -220,7 +220,10 @@ fn interrupted_restore_is_flagged_and_reconciles_through_core() {
 
     state.request_reconcile(context.clone(), row.receipt_path.clone(), false);
     let (strings, reload) = settle(&context, &mut state, false);
-    assert!(!reload, "reconciliation changes no database file");
+    assert!(
+        reload,
+        "the replacement was found in place; the library in memory may predate it"
+    );
     assert!(
         state.message().starts_with("Reconciled:"),
         "{}",
@@ -252,7 +255,7 @@ fn busy_catalogue_and_stale_review_are_refused_without_changing_anything() {
     assert!(
         strings
             .iter()
-            .any(|s| s.contains("wait until the current load or scan")),
+            .any(|s| s.contains("wait until the current load, scan or background job")),
         "{strings:?}"
     );
     let path = state.rows()[0].receipt_path.clone();

@@ -790,6 +790,15 @@ impl App {
         if self.load_job.is_some() {
             return;
         }
+        // A database rollback or reconciliation holds the catalogue's
+        // exclusion; a load or scan would only be refused by its locks.
+        if self.database_recovery.working() {
+            self.notice = Some(Notice {
+                message: "A database recovery action is running. Load or scan again when it has finished; nothing was started.".into(),
+                technical: "Refused: History's database restore/rollback worker holds the catalogue.".into(),
+            });
+            return;
+        }
         // Database status's upgrade scan writes the same catalogue.
         if scan && self.tools.database.upgrading() {
             self.notice = Some(Notice {

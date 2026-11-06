@@ -326,11 +326,15 @@ impl State {
             }
             Ok(Value::Reconciled(assessment)) => {
                 self.message = format!("Reconciled: {}", assessment.receipt.message);
-                // Reconciliation changes no database file; only a rollback
-                // that was found applied means the live file differs from
-                // what this window loaded before the interruption.
-                self.changed =
-                    assessment.receipt.state == archivefs_core::DatabaseRestoreState::RolledBack;
+                // Reconciliation changes no database file, but a restore or
+                // rollback found applied means the live file differs from
+                // what this window may have loaded before the interruption;
+                // a read-only reload is cheap and never wrong.
+                self.changed = matches!(
+                    assessment.receipt.state,
+                    archivefs_core::DatabaseRestoreState::Completed
+                        | archivefs_core::DatabaseRestoreState::RolledBack
+                );
                 self.loaded = None;
             }
             Err(error) => {
@@ -345,7 +349,13 @@ impl State {
                     self.rollback_review = None;
                     self.confirmation.clear();
                 }
-                self.loaded = None;
+                // A failed listing keeps its cadence (no respawn per frame);
+                // a failed action re-reads the receipts straight away.
+                self.loaded = if matches!(kind, Kind::Load) {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
             }
         }
     }
@@ -367,7 +377,7 @@ impl State {
         ui.heading("Database restore & recovery");
         ui.small("Receipts of library-database restores. Rollback puts the pre-restore database back from its verified emergency backup; reconciliation records what an interrupted restore left on disk. Both refuse while anything is writing the catalogue, and both need the same confirmation as a restore.");
         if busy {
-            ui.label("Database actions wait until the current load or scan has finished.");
+            ui.label("Database actions wait until the current load, scan or background job has finished.");
         }
         if let Some(job) = &self.job {
             ui.horizontal(|ui| {
