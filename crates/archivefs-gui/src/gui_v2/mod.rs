@@ -23,6 +23,7 @@ mod detail_identity;
 mod documents;
 mod dreamcast_ipbin;
 mod duplicate_undo;
+mod quarantine_outcome;
 #[cfg(target_os = "linux")]
 mod electron_preview;
 mod environment;
@@ -782,6 +783,53 @@ impl App {
                     .finish(job_id, error, Some(format!("Unexpected result: {other:?}")));
             }
         }
+    }
+    /// Applies a finished library load or scan: the catalogue, the
+    /// routes that name games, and the one Activity outcome for the job.
+    pub(super) fn library_loaded(&mut self, id: u64, library: SharedLibrary) {
+        // One settle per job: a scan that skipped
+        // unreadable folders is "Needs attention",
+        // never a plain success (Night Watch S06-06).
+        let loaded = format!("{} games available to browse. Original game files were not changed.", library.games.len());
+        match &library.scan_warning {
+            Some(warning) => {
+                self.activity.finish(
+                    id,
+                    format!("{warning} {loaded}"),
+                    Some(warning.clone()),
+                );
+                self.notice = Some(Notice {
+                    message: warning.clone(),
+                    technical: String::new(),
+                });
+            }
+            None => self.activity.finish(id, loaded, None),
+        }
+        self.library = library;
+        self.recording_integrity.clear();
+        // Remembered pages may name a game by an older catalogue
+        // entry; point them at the current copy.
+        let before = self.router.current.game();
+        self.router.remap_games(|id| self.library.resolve(id));
+        let after = self.router.current.game();
+        self.moved_game = (before != after).then_some(after).flatten();
+        self.library_failure = None;
+        self.problem_summary = None;
+        self.missing.plan = None;
+        self.loaded = true;
+        self.indices.clear();
+        self.change_filter();
+        self.detail = None;
+        self.review.verification_guidance.invalidate();
+        self.detail_failed = None;
+        // Artwork discovery walks every provider snapshot and every
+        // catalogue row.  It is useful when the Artwork page is
+        // opened, but it is not needed to make Home or Games usable.
+        // Starting it here made a 132k-game load overlap the library
+        // projection and could retain several full provider indexes.
+        self.artwork.index = None;
+        self.artwork.index_loading = false;
+        self.index_job = None;
     }
     fn load(&mut self, scan: bool) {
         if self.load_job.is_some() {
@@ -1948,43 +1996,7 @@ impl App {
                                     self.activity.finish(id, message, None);
                                 }
                                 Payload::Library(library) => {
-                                    self.activity.finish(id, format!("{} games available to browse. Original game files were not changed.", library.games.len()), None);
-                                    if let Some(warning) = &library.scan_warning {
-                                        self.activity.finish(
-                                            id,
-                                            warning.clone(),
-                                            Some(warning.clone()),
-                                        );
-                                        self.notice = Some(Notice {
-                                            message: warning.clone(),
-                                            technical: String::new(),
-                                        });
-                                    }
-                                    self.library = library;
-                                    self.recording_integrity.clear();
-                                    // Remembered pages may name a game by an older catalogue
-                                    // entry; point them at the current copy.
-                                    let before = self.router.current.game();
-                                    self.router.remap_games(|id| self.library.resolve(id));
-                                    let after = self.router.current.game();
-                                    self.moved_game = (before != after).then_some(after).flatten();
-                                    self.library_failure = None;
-                                    self.problem_summary = None;
-                                    self.missing.plan = None;
-                                    self.loaded = true;
-                                    self.indices.clear();
-                                    self.change_filter();
-                                    self.detail = None;
-                                    self.review.verification_guidance.invalidate();
-                                    self.detail_failed = None;
-                                    // Artwork discovery walks every provider snapshot and every
-                                    // catalogue row.  It is useful when the Artwork page is
-                                    // opened, but it is not needed to make Home or Games usable.
-                                    // Starting it here made a 132k-game load overlap the library
-                                    // projection and could retain several full provider indexes.
-                                    self.artwork.index = None;
-                                    self.artwork.index_loading = false;
-                                    self.index_job = None;
+                                    self.library_loaded(id, library);
                                 }
                                 Payload::Filter {
                                     indices,
@@ -2045,10 +2057,7 @@ impl App {
                                     self.repair_result = None;
                                 }
                                 Payload::DuplicateApplied(record) => {
-                                    self.repair_job = None;
-                                    self.repair_history.push(*record);
-                                    self.repair_preview = None;
-                                    self.repair_result = Some("The duplicate copy was moved to EmuWiz quarantine. Your original content was not deleted, and this change can be undone from History.".into());
+                                    self.duplicate_applied(id, *record);
                                 }
                                 Payload::DuplicateUndone(result) => {
                                     self.duplicate_undo_done(id, *result);

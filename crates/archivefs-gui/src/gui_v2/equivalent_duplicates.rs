@@ -402,13 +402,18 @@ impl App {
 
     pub(super) fn equivalent_applied(&mut self, record: DuplicateRepairRecord) {
         self.equiv.job = None;
-        let count = record.transaction.entries.len();
+        // The shared engine returns a receipt in `ApplyFailed` when it stopped
+        // part way (a CUE/BIN set can be split); read the receipt, never assume
+        // every entry moved (Night Watch S04-03).
+        let outcome = super::quarantine_outcome::classify(&record.transaction, false);
         let transaction_id = record.transaction.transaction_id.clone();
         self.repair_history.push(record);
-        self.equiv.result = Some((
-            format!("Moved {count} file(s) to EmuWiz quarantine. Nothing was deleted."),
-            transaction_id,
-        ));
+        if outcome.is_complete() {
+            self.equiv.result = Some((outcome.message(), transaction_id));
+        } else {
+            self.equiv.result = None;
+            self.equiv.error = Some(outcome.message());
+        }
         // Both reports are now out of date; the user must check again.
         self.equiv.optical = None;
         self.equiv.n64 = None;

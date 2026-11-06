@@ -465,3 +465,56 @@ fn disconnected_enrichment_worker_is_visible_on_the_ready_selection_card() {
         other => panic!("expected visible enrichment failure, got {other:?}"),
     }
 }
+
+#[test]
+fn changing_selection_discards_the_old_files_plan_preview() {
+    // Night Watch S06-01: a Ready plan preview for file A must not survive
+    // into file B's selection, and a load still running for A is detached.
+    let mut app = app_for_operation_tests();
+    let old_path = PathBuf::from("/library/old.zip");
+    let new_path = PathBuf::from("/library/new.zip");
+    app.archive_context.select_only(new_path);
+    app.selected_evidence_ui.selected_evidence_generation = 3;
+    app.selected_evidence_ui.selected_evidence =
+        selected_evidence_page::SelectedEvidenceState::Error {
+            generation: 3,
+            path: old_path,
+            message: "unused".into(),
+        };
+    app.selected_evidence_ui.plan_preview_generation = 11;
+    app.selected_evidence_ui.plan_preview = plan_preview_page::PlanPreviewState::Ready {
+        generation: 11,
+        outcome: plan_preview_page::PlanPreviewOutcome::NoMasterRoot,
+    };
+
+    app.reconcile_selected_evidence_selection();
+
+    assert!(matches!(
+        app.selected_evidence_ui.plan_preview,
+        plan_preview_page::PlanPreviewState::Idle
+    ));
+    assert_eq!(app.selected_evidence_ui.plan_preview_generation, 12);
+}
+
+#[test]
+fn an_unchanged_selection_keeps_its_plan_preview() {
+    let mut app = app_for_operation_tests();
+    let path = PathBuf::from("/library/same.zip");
+    app.archive_context.select_only(path.clone());
+    app.selected_evidence_ui.selected_evidence =
+        selected_evidence_page::SelectedEvidenceState::Error {
+            generation: 3,
+            path,
+            message: "unused".into(),
+        };
+    app.selected_evidence_ui.plan_preview_generation = 11;
+    app.selected_evidence_ui.plan_preview = plan_preview_page::PlanPreviewState::Ready {
+        generation: 11,
+        outcome: plan_preview_page::PlanPreviewOutcome::NoMasterRoot,
+    };
+    app.reconcile_selected_evidence_selection();
+    assert!(matches!(
+        app.selected_evidence_ui.plan_preview,
+        plan_preview_page::PlanPreviewState::Ready { generation: 11, .. }
+    ));
+}
