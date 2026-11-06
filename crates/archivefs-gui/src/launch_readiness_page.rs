@@ -5019,10 +5019,7 @@ fn gamer_blocker_for_plan(
             "RetroArch has not been checked yet, and no standalone launch is ready.",
         );
     }
-    GamerBlocker::new(
-        GamerBlockerKind::NoSafeEmulator,
-        NO_SAFE_CANDIDATE_DETAIL,
-    )
+    GamerBlocker::new(GamerBlockerKind::NoSafeEmulator, NO_SAFE_CANDIDATE_DETAIL)
 }
 
 // One immediate-mode render call: the draw target, the plan/candidate being
