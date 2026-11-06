@@ -192,7 +192,8 @@ pub use database::{
 pub use database::{
     FileIdentity, InterruptedRestoreAssessment, InterruptedRestoreOutcome,
     assess_interrupted_restore, database_restore_receipt_path, finalise_interrupted_restore,
-    interrupted_restore_receipts, read_database_restore_receipt, review_database_rollback,
+    interrupted_restore_receipts, preview_interrupted_restore, read_database_restore_receipt,
+    review_database_rollback,
 };
 
 mod inspector;

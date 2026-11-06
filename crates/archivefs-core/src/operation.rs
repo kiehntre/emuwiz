@@ -425,12 +425,16 @@ fn database_restore_receipt_operation(
         receipt.emergency_backup_path.is_some() && receipt.emergency_backup_sha256.is_some();
     // An interrupted receipt is judged against the files as they are now, so
     // History reports what is on disk rather than the last stage written.
+    // The preview reads metadata only: History is rebuilt every frame, and
+    // opening or hashing the live database here is neither affordable nor
+    // safe (see `live_handles` in database/restore.rs). Verification happens
+    // in the explicit reconcile action.
     let assessment = (!receipt.state.is_terminal())
         .then(|| {
             journal_reference
                 .as_deref()
                 .map(Path::new)
-                .and_then(|path| crate::assess_interrupted_restore(path).ok())
+                .and_then(|path| crate::preview_interrupted_restore(path).ok())
         })
         .flatten();
     let summary = match (&assessment, receipt.original_intact) {

@@ -21,17 +21,29 @@
 //!   whose writer still holds SQLite's write lock is reported as "busy"; with
 //!   no visible lock the verdict is "activity cannot be determined" (never
 //!   "crashed"), and the journal is left untouched for copy-first recovery.
+//! * **No descriptor is ever opened or closed on a live inode by this
+//!   module.** On POSIX, closing any descriptor a process holds on a file
+//!   drops every record lock that process has on it. Hashing the live
+//!   database therefore reads through SQLite's own open file handle
+//!   ([`sqlite_io`]), whose lifetime SQLite manages correctly across every
+//!   connection of this process; lock state is read from `/proc/locks`.
+//!   Nothing is retained, so repeated restores hold no descriptors and free
+//!   superseded inodes as soon as their last SQLite handle closes.
 //! * **Staged upgrade.** A backup at an older schema is copied with SQLite's
 //!   online-backup API into a staging file beside the live database and
 //!   migrated there. The selected backup is only ever opened read-only.
 //! * **Durable recovery record.** Every receipt is written atomically
 //!   (temporary file, fsync, rename, directory fsync) and names the staging
-//!   file, its hash and the emergency backup before the exchange happens, so
-//!   an interruption at any point can be classified after restart by
-//!   [`assess_interrupted_restore`].
+//!   file, its hash and its inode before the exchange happens, so an
+//!   interruption at any point can be classified after restart by
+//!   [`assess_interrupted_restore`] from file identity, even after the
+//!   database has been used again.
 //! * **Fail safe.** Every failure before the exchange leaves the original
 //!   untouched; every failure after it keeps the original reachable (first at
-//!   the staging path, always in the verified emergency backup).
+//!   the staging path, always in the verified emergency backup). The exchange
+//!   syscall is the only destructive boundary: anything that fails after it
+//!   succeeded, including the directory fsync, is a post-exchange failure and
+//!   is rolled back, never reported as "original intact".
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -42,7 +54,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use libc::statvfs;
-use rusqlite::{Connection, MAIN_DB};
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -176,14 +188,22 @@ pub struct DatabaseRestoreReceipt {
     #[serde(default)]
     pub superseded_database_removed: bool,
     /// `Some(true)` when the operation ended with the original database in
-    /// place and unchanged; `Some(false)` when the live database is the
-    /// restored replacement; `None` when the receipt was not finalised.
+    /// place and verified; `Some(false)` when the live database is the
+    /// restored replacement; `None` when neither was established.
     #[serde(default)]
     pub original_intact: Option<bool>,
     /// True when the upgrade lock and the SQLite RESERVED lock were held for
     /// the whole operation (always, for receipts written by this build).
     #[serde(default)]
     pub exclusion_held: bool,
+    /// Rollback of a completed restore: where the emergency backup's copy is
+    /// staged, its hash and its inode, recorded before the rollback exchange.
+    #[serde(default)]
+    pub rollback_staging_path: Option<PathBuf>,
+    #[serde(default)]
+    pub rollback_staging_sha256: Option<String>,
+    #[serde(default)]
+    pub rollback_identity: Option<FileIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,10 +213,10 @@ pub struct DatabaseRestoreResult {
 }
 
 /// Deterministic fault-injection seam for tests. The hook runs at every named
-/// transition of a restore; returning `Err` makes that step fail through the
-/// normal error path, panicking inside it models a crash (the exclusion and
-/// every open handle are dropped by unwinding, exactly as the kernel releases
-/// them when a process dies).
+/// transition of a restore or rollback; returning `Err` makes that step fail
+/// through the normal error path, panicking inside it models a crash (the
+/// exclusion and every open handle are dropped by unwinding, exactly as the
+/// kernel releases them when a process dies).
 #[cfg(any(test, feature = "test-support"))]
 pub mod fault_injection {
     use std::cell::RefCell;
@@ -232,9 +252,11 @@ pub mod fault_injection {
         STAGE_AFTER_EMERGENCY_BACKUP, STAGE_AFTER_EXCHANGE, STAGE_AFTER_EXCLUSION,
         STAGE_AFTER_STAGING, STAGE_AFTER_VERIFICATION, STAGE_BEFORE_COMPLETED_RECEIPT,
         STAGE_BEFORE_EXCHANGE, STAGE_BEFORE_SUPERSEDED_REMOVAL, STAGE_BEFORE_VERIFICATION,
+        STAGE_ROLLBACK_AFTER_EXCHANGE, STAGE_ROLLBACK_AFTER_STAGING,
+        STAGE_ROLLBACK_BEFORE_VERIFICATION,
     };
 
-    /// Every stage name, in execution order, for tests that sweep them.
+    /// Every restore stage name, in execution order, for tests that sweep them.
     pub const STAGES: &[&str] = &[
         super::STAGE_AFTER_EXCLUSION,
         super::STAGE_AFTER_EMERGENCY_BACKUP,
@@ -245,6 +267,13 @@ pub mod fault_injection {
         super::STAGE_AFTER_VERIFICATION,
         super::STAGE_BEFORE_SUPERSEDED_REMOVAL,
         super::STAGE_BEFORE_COMPLETED_RECEIPT,
+    ];
+
+    /// Every rollback stage name, in execution order.
+    pub const ROLLBACK_STAGES: &[&str] = &[
+        super::STAGE_ROLLBACK_AFTER_STAGING,
+        super::STAGE_ROLLBACK_AFTER_EXCHANGE,
+        super::STAGE_ROLLBACK_BEFORE_VERIFICATION,
     ];
 }
 
@@ -257,6 +286,9 @@ pub const STAGE_BEFORE_VERIFICATION: &str = "before-verification";
 pub const STAGE_AFTER_VERIFICATION: &str = "after-verification";
 pub const STAGE_BEFORE_SUPERSEDED_REMOVAL: &str = "before-superseded-removal";
 pub const STAGE_BEFORE_COMPLETED_RECEIPT: &str = "before-completed-receipt";
+pub const STAGE_ROLLBACK_AFTER_STAGING: &str = "rollback-after-staging";
+pub const STAGE_ROLLBACK_AFTER_EXCHANGE: &str = "rollback-after-exchange";
+pub const STAGE_ROLLBACK_BEFORE_VERIFICATION: &str = "rollback-before-verification";
 
 #[cfg(any(test, feature = "test-support"))]
 fn restore_stage(stage: &str) -> Result<()> {
@@ -268,6 +300,90 @@ fn restore_stage(stage: &str) -> Result<()> {
 #[inline(always)]
 fn restore_stage(_stage: &str) -> Result<()> {
     Ok(())
+}
+
+/// Reads a database file through the descriptor SQLite already holds for a
+/// connection, instead of opening a second one.
+///
+/// Why: on POSIX, closing *any* descriptor a process has on a file releases
+/// every record lock that process holds on the file. A plain
+/// `File::open` + drop to hash the live database would therefore silently
+/// release the locks of a SQLite connection in this process (the restore's
+/// own `BEGIN IMMEDIATE`, or a running scan's transaction) while SQLite still
+/// believes it holds them. SQLite's own descriptors are safe: its unix VFS
+/// tracks every connection of this process per inode and defers a close
+/// while any of them holds a lock. `sqlite3_file_control(FILE_POINTER)` hands
+/// out that descriptor's `sqlite3_file`, and the VFS `xRead` is a plain
+/// positional read on it. Nothing is opened, retained or closed here.
+mod sqlite_io {
+    use std::ffi::c_void;
+
+    use rusqlite::{Connection, ffi};
+
+    use super::db;
+    use crate::Result;
+
+    /// SHA-256 of the main database file behind `connection`, read through
+    /// SQLite's descriptor. Byte-identical to hashing the file by path.
+    pub(super) fn sha256(connection: &Connection, label: &str) -> Result<String> {
+        use sha2::Digest;
+        let mut digest = sha2::Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        // SAFETY: `connection` owns a live `sqlite3*`; FILE_POINTER returns
+        // the connection's own `sqlite3_file`, valid while the connection is;
+        // `xRead`/`xFileSize` are the VFS methods SQLite itself calls, given a
+        // buffer of exactly the requested length.
+        unsafe {
+            let handle = connection.handle();
+            let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
+            let rc = ffi::sqlite3_file_control(
+                handle,
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_FILE_POINTER,
+                (&mut file as *mut *mut ffi::sqlite3_file).cast::<c_void>(),
+            );
+            if rc != ffi::SQLITE_OK || file.is_null() || (*file).pMethods.is_null() {
+                return Err(db(format!(
+                    "Could not reach SQLite's file handle for {label} (code {rc})."
+                )));
+            }
+            let methods = &*(*file).pMethods;
+            let (Some(x_read), Some(x_file_size)) = (methods.xRead, methods.xFileSize) else {
+                return Err(db(format!(
+                    "SQLite's file handle for {label} has no read methods."
+                )));
+            };
+            let mut size: ffi::sqlite3_int64 = 0;
+            let rc = x_file_size(file, &mut size);
+            if rc != ffi::SQLITE_OK {
+                return Err(db(format!("Could not size {label} (SQLite code {rc}).")));
+            }
+            let mut offset: ffi::sqlite3_int64 = 0;
+            while offset < size {
+                let chunk = usize::try_from(size - offset)
+                    .unwrap_or(usize::MAX)
+                    .min(buffer.len());
+                let rc = x_read(
+                    file,
+                    buffer.as_mut_ptr().cast::<c_void>(),
+                    chunk as std::ffi::c_int,
+                    offset,
+                );
+                if rc != ffi::SQLITE_OK {
+                    return Err(db(format!(
+                        "Could not hash {label}: SQLite read failed with code {rc} at offset {offset}."
+                    )));
+                }
+                digest.update(&buffer[..chunk]);
+                offset += chunk as ffi::sqlite3_int64;
+            }
+        }
+        Ok(digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
 }
 
 /// Captures all mutable facts needed to detect a stale restore plan.
@@ -293,11 +409,11 @@ pub fn prepare_database_restore(
         let connection = open_read_only_connection(&backup)?;
         verify_backup_connection(&connection)?
     };
-    let live_schema = {
+    let (live_schema, live_sha256) = {
         let connection = open_read_only_connection(&live)?;
-        verify_current_connection(&connection)?
+        let schema = verify_current_connection(&connection)?;
+        (schema, sqlite_io::sha256(&connection, "current database")?)
     };
-    let live_sha256 = sha256_file(&live)?;
     let generated_at = unix_now();
     // Unique per process and per moment: two reviews of the same backup in
     // the same second (or in two processes) must never share a receipt.
@@ -336,12 +452,7 @@ pub fn prepare_database_restore(
 /// Dropping it ends the transaction (a no-op rollback) and releases the lock.
 struct RestoreExclusion {
     _upgrade_lock: backup_ownership::UpgradeLock,
-    _connection: Connection,
-    /// A read handle on the live inode, opened before the SQLite lock and
-    /// kept open for the whole exclusion. All hashing and metadata reads of
-    /// the live database go through it: on POSIX, closing *any* descriptor
-    /// this process has on the file would drop the SQLite lock above.
-    live: File,
+    connection: Connection,
     identity: FileIdentity,
 }
 
@@ -353,8 +464,8 @@ impl RestoreExclusion {
                  this database). Nothing was changed."
             ))
         })?;
-        // A worker in this process holding a SQLite lock would lose it the
-        // moment any descriptor opened below is closed; refuse first.
+        // A worker in this process holding a SQLite lock means this window
+        // is not idle; refuse rather than contend with it.
         refuse_if_this_process_uses(live, "Restore")?;
         let identity_before = file_identity(live, "current database")?;
         // Sidecars are judged before SQLite may touch the file: a hot journal
@@ -362,7 +473,6 @@ impl RestoreExclusion {
         require_no_wal_sidecars(live)?;
         journal_state::require_inert_rollback_journal(live)
             .map_err(|error| db(format!("Restore refused: {error}")))?;
-        let live_handle = open_live_handle(live)?;
         let connection = open_connection_with(live, false)
             .map_err(|error| db(format!("Restore refused: {error}. Nothing was changed.")))?;
         connection
@@ -387,63 +497,22 @@ impl RestoreExclusion {
         require_no_sidecars_at_all(live)?;
         Ok(Self {
             _upgrade_lock: upgrade_lock,
-            _connection: connection,
-            live: live_handle,
+            connection,
             identity,
         })
     }
 
-    /// SHA-256 of the live inode through the held handle (no open, no close).
-    fn live_sha256(&self) -> Result<String> {
-        sha256_of_handle(&self.live)
-    }
-
-    fn live_metadata(&self) -> Result<fs::Metadata> {
-        self.live
-            .metadata()
-            .map_err(|error| db(format!("Could not inspect the current database: {error}")))
+    /// SHA-256 of the inode this exclusion holds locked, read through its
+    /// own SQLite descriptor, wherever that inode's pathname now is.
+    fn locked_inode_sha256(&self) -> Result<String> {
+        sqlite_io::sha256(&self.connection, "locked database")
     }
 }
 
-fn open_live_handle(live: &Path) -> Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(live)
-        .map_err(|error| {
-            db(format!(
-                "Could not open the current database for reading: {error}"
-            ))
-        })
-}
-
-fn sha256_of_handle(file: &File) -> Result<String> {
-    use sha2::Digest;
-    use std::os::unix::fs::FileExt;
-    let mut digest = sha2::Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut offset = 0_u64;
-    loop {
-        let read = file
-            .read_at(&mut buffer, offset)
-            .map_err(|error| db(format!("Could not hash the current database: {error}")))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-        offset += read as u64;
-    }
-    Ok(digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
-/// Plain file I/O on the live database (hash, fsync) is only safe while no
-/// SQLite connection of this process holds a lock on it: closing the
-/// descriptor afterwards would release that lock. Callers that hold the
-/// exclusion read through its handle instead and never hit this.
+/// Refuses to start while a SQLite connection of this process holds any lock
+/// on the live database: a worker of this window is mid-operation and the
+/// catalogue is not idle. A lock table that cannot be read refuses too (the
+/// error names it) rather than guessing.
 fn refuse_if_this_process_uses(live: &Path, operation: &str) -> Result<()> {
     if journal_state::own_process_holds_lock(live)? {
         return Err(db(format!(
@@ -452,6 +521,32 @@ fn refuse_if_this_process_uses(live: &Path, operation: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Collects receipt-write failures that happen after the exchange: the disk
+/// state is what matters then, and the operation must carry on to
+/// verification or rollback rather than stop half-way with a stale receipt.
+struct ReceiptLog {
+    warnings: Vec<String>,
+}
+
+impl ReceiptLog {
+    fn publish(&mut self, receipt: &DatabaseRestoreReceipt) {
+        if let Err(error) = write_receipt(receipt) {
+            self.warnings.push(error.to_string());
+        }
+    }
+
+    fn suffix(&self) -> String {
+        if self.warnings.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Warning: the restore receipt could not be updated ({}); History may lag behind the database directory.",
+                self.warnings.join("; ")
+            )
+        }
+    }
 }
 
 /// Executes only after the user has supplied the strong confirmation phrase
@@ -563,25 +658,33 @@ pub fn restore_database(
         return Err(refuse(&mut receipt, error));
     }
 
-    // ---- destructive boundary: from here the live pathname changes. ----
-    if let Err(error) = atomic_exchange(&staged, &plan.live_database_path) {
-        // renameat2 either happened or did not; an error means it did not.
+    // ---- destructive boundary: the exchange syscall itself. ----
+    if let Err(error) = exchange_paths(&staged, &plan.live_database_path) {
+        // renameat2 reports failure only when nothing was exchanged.
         let _ = fs::remove_file(&staged);
         receipt.staged_replacement_path = None;
         receipt.staged_replacement_sha256 = None;
         receipt.replacement_identity = None;
         return Err(refuse(&mut receipt, error));
     }
+    // From here on the live pathname carries the replacement and the
+    // original sits at the staging path. Every failure, including the
+    // directory fsync and receipt writes, is a post-exchange failure.
+    let mut log = ReceiptLog {
+        warnings: Vec::new(),
+    };
     receipt.state = DatabaseRestoreState::RestoreApplied;
     receipt.superseded_database_path = Some(staged.clone());
     receipt.applied_database_sha256 = receipt.staged_replacement_sha256.clone();
     receipt.message = "Verified database replacement applied atomically; verifying.".into();
-    write_receipt(&receipt)?;
-    restore_stage(STAGE_AFTER_EXCHANGE)?;
-
-    receipt.state = DatabaseRestoreState::Verification;
-    write_receipt(&receipt)?;
-    let verification = restore_stage(STAGE_BEFORE_VERIFICATION)
+    log.publish(&receipt);
+    let verification = fsync_directory(plan.live_database_path.parent())
+        .and_then(|()| restore_stage(STAGE_AFTER_EXCHANGE))
+        .and_then(|()| {
+            receipt.state = DatabaseRestoreState::Verification;
+            log.publish(&receipt);
+            restore_stage(STAGE_BEFORE_VERIFICATION)
+        })
         .and_then(|()| verify_applied_identity(&plan.live_database_path, &receipt))
         .and_then(|()| {
             validate_live_database(&plan.live_database_path, latest_known_version(MIGRATIONS))
@@ -600,10 +703,21 @@ pub fn restore_database(
     // The original is now redundant: the verified emergency backup carries
     // its content and the receipt carries both hashes. Its removal is
     // recorded before and after so a crash in between is explainable.
-    restore_stage(STAGE_BEFORE_SUPERSEDED_REMOVAL)?;
-    let removed = fs::remove_file(&staged).is_ok();
-    fsync_directory(plan.live_database_path.parent())?;
-    restore_stage(STAGE_BEFORE_COMPLETED_RECEIPT)?;
+    let completion = restore_stage(STAGE_BEFORE_SUPERSEDED_REMOVAL).and_then(|()| {
+        let removed = fs::remove_file(&staged).is_ok();
+        fsync_directory(plan.live_database_path.parent())?;
+        restore_stage(STAGE_BEFORE_COMPLETED_RECEIPT)?;
+        Ok(removed)
+    });
+    let removed = match completion {
+        Ok(removed) => removed,
+        Err(error) => {
+            // The replacement is verified and in place; only the tidy-up
+            // failed. Say so rather than fail a restore that happened.
+            log.warnings.push(error.to_string());
+            !staged.exists()
+        }
+    };
     receipt.state = DatabaseRestoreState::Completed;
     receipt.superseded_database_removed = removed;
     receipt.original_intact = Some(false);
@@ -616,7 +730,14 @@ pub fn restore_database(
     } else {
         "Database restored from verified backup; catalogue reload/restart is required.".into()
     };
-    write_receipt(&receipt)?;
+    if !removed {
+        receipt.message.push_str(&format!(
+            " The superseded original is still at {}.",
+            staged.display()
+        ));
+    }
+    log.publish(&receipt);
+    receipt.message.push_str(&log.suffix());
     drop(exclusion);
     Ok(DatabaseRestoreResult {
         receipt,
@@ -644,33 +765,62 @@ fn roll_back_after_exchange(
     emergency: &Path,
     error: ArchiveFsError,
 ) -> ArchiveFsError {
+    let live = receipt.plan.live_database_path.clone();
     receipt.state = DatabaseRestoreState::RollbackAttempted;
     receipt.message = format!(
         "Restore applied but verification failed: {error}. Attempting rollback from the superseded original at {}.",
         staged_old_live.display()
     );
     let _ = write_receipt(receipt);
-    match rollback_exchange(
-        exclusion,
-        staged_old_live,
-        &receipt.plan.live_database_path,
-        receipt.plan.current_live_schema_version,
-        receipt.plan.expected_live_sha256.as_str(),
-    ) {
+    let schema = receipt.plan.current_live_schema_version;
+    let expected = receipt.plan.expected_live_sha256.clone();
+    let original_identity = receipt.original_identity;
+    // The superseded original must be the exact pre-restore bytes before it
+    // may be put back. The exclusion's connection is open on that very
+    // inode, so it is hashed through SQLite's descriptor.
+    let checked = file_identity(staged_old_live, "superseded original")
+        .and_then(|identity| Ok((identity, exclusion.locked_inode_sha256()?)))
+        .and_then(|(identity, sha)| {
+            if sha != expected || Some(identity) != original_identity {
+                return Err(db(
+                    "The superseded original at the staging path no longer matches its pre-restore identity and hash.",
+                ));
+            }
+            validate_database_file(staged_old_live, schema)
+        })
+        .and_then(|()| exchange_paths(staged_old_live, &live));
+    if let Err(rollback_error) = checked {
+        // Nothing was exchanged back: the replacement is still live and the
+        // original still sits at the staging path.
+        receipt.state = DatabaseRestoreState::RollbackFailed;
+        receipt.original_intact = Some(false);
+        receipt.message = format!(
+            "Restore verification failed ({error}) and automatic rollback failed ({rollback_error}). The live database is the rejected replacement; the original database is preserved at {} and in the verified emergency backup {}; review before any further action.",
+            staged_old_live.display(),
+            emergency.display()
+        );
+        let _ = write_receipt(receipt);
+        return db(receipt.message.clone());
+    }
+    // Exchanged back: the original is at the live path, the rejected
+    // replacement at the staging path.
+    receipt.superseded_database_path = None;
+    match fsync_directory(live.parent()).and_then(|()| validate_live_database(&live, schema)) {
         Ok(()) => {
+            let _ = fs::remove_file(staged_old_live);
             receipt.state = DatabaseRestoreState::RolledBack;
-            receipt.superseded_database_path = None;
             receipt.original_intact = Some(true);
             receipt.message = format!(
                 "Restore verification failed ({error}); the original database was put back and verified. The emergency backup {} is retained.",
                 emergency.display()
             );
         }
-        Err(rollback_error) => {
+        Err(verify_error) => {
             receipt.state = DatabaseRestoreState::RollbackFailed;
-            receipt.original_intact = Some(false);
+            receipt.original_intact = None;
             receipt.message = format!(
-                "Restore verification failed ({error}) and automatic rollback failed ({rollback_error}). The original database is preserved at {} and in the verified emergency backup {}; review before any further action.",
+                "Restore verification failed ({error}); the original database is back at {} but could not be verified ({verify_error}). The rejected replacement is at {}; do not copy it over the live database. The verified emergency backup {} holds the pre-restore content.",
+                live.display(),
                 staged_old_live.display(),
                 emergency.display()
             );
@@ -692,6 +842,12 @@ pub fn rollback_database_restore(
             "Rollback requires the exact confirmation phrase RESTORE DATABASE.",
         ));
     }
+    if receipt.state != DatabaseRestoreState::Completed {
+        return Err(db(format!(
+            "Only a completed restore can be rolled back; this receipt is {}.",
+            receipt.state.label()
+        )));
+    }
     let live = receipt.plan.live_database_path.clone();
     let exclusion = RestoreExclusion::acquire(&live)
         .map_err(|error| db(format!("Rollback refused: {error}")))?;
@@ -701,49 +857,101 @@ pub fn rollback_database_restore(
     let mut updated = receipt.clone();
     updated.state = DatabaseRestoreState::RollbackAttempted;
     updated.updated_at_unix = unix_now();
+    updated.rollback_staging_path = Some(staged.clone());
+    updated.rollback_staging_sha256 = None;
+    updated.rollback_identity = None;
+    // The restored database's identity is what an interrupted rollback is
+    // judged against; record it before anything is staged.
+    updated.replacement_identity = Some(exclusion.identity);
     updated.message = format!(
         "Rolling back the completed restore from the verified emergency backup {}.",
         emergency.display()
     );
     write_receipt(&updated)?;
-    if let Err(error) = stage_backup(&emergency, &staged, schema)
+
+    let staging = stage_backup(&emergency, &staged, schema)
+        .and_then(|()| {
+            let sha = sha256_file(&staged)?;
+            let identity = file_identity(&staged, "rollback staging copy")?;
+            updated.rollback_staging_sha256 = Some(sha);
+            updated.rollback_identity = Some(identity);
+            write_receipt(&updated)
+        })
+        .and_then(|()| restore_stage(STAGE_ROLLBACK_AFTER_STAGING))
         .and_then(|()| require_no_sidecars_at_all(&live))
         .and_then(|()| require_no_sidecars_at_all(&staged))
-    {
+        .and_then(|()| exchange_paths(&staged, &live));
+    if let Err(error) = staging {
+        // Nothing was exchanged: the restored database remains in place.
         let _ = fs::remove_file(&staged);
         updated.state = DatabaseRestoreState::Completed;
+        updated.rollback_staging_path = None;
+        updated.rollback_staging_sha256 = None;
+        updated.rollback_identity = None;
         updated.message = format!(
             "Rollback refused before any change ({error}); the restored database remains in place."
         );
         write_receipt(&updated)?;
         return Err(error);
     }
-    atomic_exchange(&staged, &live)?;
-    if let Err(error) = validate_live_database(&live, schema) {
-        // The restored database is still at the staging path; put it back.
-        let message = match atomic_exchange(&staged, &live) {
-            Ok(()) => format!(
-                "Rollback verification failed ({error}); the restored database was put back. The emergency backup remains at {}.",
-                emergency.display()
-            ),
-            Err(undo) => format!(
-                "Rollback verification failed ({error}) and the restored database could not be put back ({undo}); it is preserved at {}.",
-                staged.display()
-            ),
+    // Exchanged: the emergency copy is live, the restored database sits at
+    // the rollback staging path.
+    let mut log = ReceiptLog {
+        warnings: Vec::new(),
+    };
+    updated.message = "Rollback exchange applied; verifying the original.".into();
+    log.publish(&updated);
+    let verification = fsync_directory(live.parent())
+        .and_then(|()| restore_stage(STAGE_ROLLBACK_AFTER_EXCHANGE))
+        .and_then(|()| restore_stage(STAGE_ROLLBACK_BEFORE_VERIFICATION))
+        .and_then(|()| {
+            let identity = file_identity(&live, "live database")?;
+            if Some(identity) != updated.rollback_identity {
+                return Err(db(
+                    "The live pathname does not carry the rollback copy after the exchange.",
+                ));
+            }
+            validate_live_database(&live, schema)
+        });
+    if let Err(error) = verification {
+        // Put the restored database back; it is at the staging path.
+        let message = match exchange_paths(&staged, &live)
+            .and_then(|()| fsync_directory(live.parent()))
+        {
+            Ok(()) => {
+                let _ = fs::remove_file(&staged);
+                updated.state = DatabaseRestoreState::Completed;
+                updated.rollback_staging_path = None;
+                updated.rollback_staging_sha256 = None;
+                updated.rollback_identity = None;
+                format!(
+                    "Rollback verification failed ({error}); the restored database was put back. The emergency backup remains at {}.",
+                    emergency.display()
+                )
+            }
+            Err(undo) => {
+                updated.state = DatabaseRestoreState::RollbackFailed;
+                updated.original_intact = None;
+                format!(
+                    "Rollback verification failed ({error}) and the restored database could not be put back ({undo}); the live file is the unverified rollback copy and the restored database is preserved at {}.",
+                    staged.display()
+                )
+            }
         };
-        updated.state = DatabaseRestoreState::RollbackFailed;
         updated.message = message.clone();
-        write_receipt(&updated)?;
+        let _ = write_receipt(&updated);
         return Err(db(message));
     }
     let _ = fs::remove_file(&staged);
-    fsync_directory(live.parent())?;
+    let _ = fsync_directory(live.parent());
     updated.state = DatabaseRestoreState::RolledBack;
     updated.original_intact = Some(true);
     updated.superseded_database_path = None;
     updated.updated_at_unix = unix_now();
     updated.message = "Database rollback completed from the verified emergency backup; catalogue reload/restart is required.".into();
-    write_receipt(&updated)?;
+    log.publish(&updated);
+    updated.message.push_str(&log.suffix());
+    drop(exclusion);
     Ok(updated)
 }
 
@@ -780,8 +988,8 @@ fn review_rollback_inputs(
         return Err(db("Emergency backup hash no longer matches."));
     }
     let current_hash = match exclusion {
-        Some(exclusion) => exclusion.live_sha256()?,
-        None => sha256_file(&receipt.plan.live_database_path)?,
+        Some(exclusion) => exclusion.locked_inode_sha256()?,
+        None => live_sha256_by_path(&receipt.plan.live_database_path)?,
     };
     if receipt.applied_database_sha256.as_deref() != Some(current_hash.as_str()) {
         return Err(db(
@@ -792,28 +1000,36 @@ fn review_rollback_inputs(
     Ok((emergency, emergency_hash))
 }
 
-/// What an interrupted restore left behind, judged from the receipt's
-/// recorded hashes against the files as they are now.
+/// What an interrupted restore or rollback left behind, judged from the file
+/// identities the receipt recorded against the files as they are now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum InterruptedRestoreOutcome {
     /// The receipt is already final; nothing to reconcile.
     Terminal,
-    /// The exchange never happened: the live database is byte-identical to
-    /// the state the plan was prepared from.
-    OriginalIntact,
-    /// The exchange happened and the replacement now verifies; the receipt
-    /// can be finalised as completed.
-    ReplacementVerified,
+    /// The exchange never happened (or was undone): the live pathname carries
+    /// the original inode. `modified_since` is true when the database has
+    /// been written since the receipt's hash was taken.
+    OriginalIntact { modified_since: bool },
+    /// The exchange happened and the replacement is at the live path, but it
+    /// has not been verified (the cheap preview never opens the database).
+    ReplacementUnverified,
+    /// The exchange happened and the replacement verifies; the receipt can be
+    /// finalised as completed.
+    ReplacementVerified { modified_since: bool },
     /// The exchange happened but the replacement does not verify. The
-    /// original is at `superseded_path` when present, and always in the
-    /// emergency backup when `emergency_verified` is true.
+    /// original is at the staging path when `superseded_original_present`,
+    /// and always in the emergency backup when `emergency_backup_verified`.
     ReplacementFailedVerification { detail: String },
-    /// The live database matches neither recorded hash; manual review only.
+    /// A rollback exchanged the emergency copy into place and it verifies;
+    /// the receipt can be finalised as rolled back.
+    RollbackVerified,
+    /// A rollback exchanged the emergency copy into place but it does not
+    /// verify; the restored database is at the rollback staging path.
+    RollbackFailedVerification { detail: String },
+    /// The live database matches none of the recorded identities; manual
+    /// review only.
     Unrecognised { detail: String },
-    /// Not judged: a worker in this process is using the database, and
-    /// reading the file now could release its lock. Try again when idle.
-    Deferred,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -821,13 +1037,15 @@ pub struct InterruptedRestoreAssessment {
     pub receipt_path: PathBuf,
     pub receipt: DatabaseRestoreReceipt,
     pub outcome: InterruptedRestoreOutcome,
-    pub live_sha256: Option<String>,
+    pub live_identity: Option<FileIdentity>,
     /// The superseded original still exists at its recorded path with its
-    /// recorded hash.
+    /// recorded identity.
     pub superseded_original_present: bool,
-    /// The emergency backup exists with its recorded hash.
+    /// The emergency backup exists with its recorded hash (full assessment
+    /// only; the preview reports existence).
     pub emergency_backup_verified: bool,
-    /// Files this restore created that still exist and are no longer needed.
+    /// Files this operation created that still exist and are no longer
+    /// needed. Never deleted by this module.
     pub leftover_paths: Vec<PathBuf>,
     pub summary: String,
     pub next_step: String,
@@ -839,45 +1057,69 @@ impl InterruptedRestoreAssessment {
     pub fn can_finalise(&self) -> bool {
         matches!(
             self.outcome,
-            InterruptedRestoreOutcome::OriginalIntact
-                | InterruptedRestoreOutcome::ReplacementVerified
+            InterruptedRestoreOutcome::OriginalIntact { .. }
+                | InterruptedRestoreOutcome::ReplacementUnverified
+                | InterruptedRestoreOutcome::ReplacementVerified { .. }
+                | InterruptedRestoreOutcome::RollbackVerified
         )
     }
 }
 
+/// How much work an assessment may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssessmentDepth {
+    /// Metadata only: identities and existence. Safe to run on every History
+    /// frame; never opens or hashes any database file.
+    Preview,
+    /// Opens the live database read-only through SQLite for `quick_check`
+    /// and hashes it through a retained handle; hashes the emergency backup.
+    Full,
+}
+
 /// Classifies a restore receipt after an interruption (crash, kill, power
-/// loss) without changing anything. Hashing the live database is the only
-/// cost; no file is opened for write.
+/// loss) without changing anything and without opening any database file.
+/// Use this for listings; [`assess_interrupted_restore`] verifies.
+pub fn preview_interrupted_restore(receipt_path: &Path) -> Result<InterruptedRestoreAssessment> {
+    let receipt = read_receipt(receipt_path)?;
+    assess_receipt(receipt_path, receipt, AssessmentDepth::Preview)
+}
+
+/// Classifies a restore receipt after an interruption and verifies the live
+/// database (`quick_check`, schema, tables) when the replacement or a
+/// rollback copy is in place. Never writes.
 pub fn assess_interrupted_restore(receipt_path: &Path) -> Result<InterruptedRestoreAssessment> {
     let receipt = read_receipt(receipt_path)?;
-    assess_receipt(receipt_path, receipt, None)
+    assess_receipt(receipt_path, receipt, AssessmentDepth::Full)
 }
 
 fn assess_receipt(
     receipt_path: &Path,
     receipt: DatabaseRestoreReceipt,
-    exclusion: Option<&RestoreExclusion>,
+    depth: AssessmentDepth,
 ) -> Result<InterruptedRestoreAssessment> {
     let live = receipt.plan.live_database_path.clone();
+    let state_label = receipt.state.label();
     let emergency_backup_verified = match (
         &receipt.emergency_backup_path,
         &receipt.emergency_backup_sha256,
     ) {
-        (Some(path), Some(sha)) => {
-            path.is_file() && sha256_file(path).ok().as_deref() == Some(sha.as_str())
-        }
+        (Some(path), Some(sha)) => match depth {
+            AssessmentDepth::Preview => path.is_file(),
+            AssessmentDepth::Full => {
+                path.is_file() && sha256_file(path).ok().as_deref() == Some(sha.as_str())
+            }
+        },
         _ => false,
     };
     let superseded_original_present = receipt
         .staged_replacement_path
         .as_deref()
-        .filter(|path| path.is_file())
-        .and_then(|path| sha256_file(path).ok())
-        .is_some_and(|sha| sha == receipt.plan.expected_live_sha256);
+        .and_then(|path| file_identity(path, "superseded original").ok())
+        .is_some_and(|identity| Some(identity) == receipt.original_identity);
     let mut assessment = InterruptedRestoreAssessment {
         receipt_path: receipt_path.to_path_buf(),
         outcome: InterruptedRestoreOutcome::Terminal,
-        live_sha256: None,
+        live_identity: None,
         superseded_original_present,
         emergency_backup_verified,
         leftover_paths: Vec::new(),
@@ -886,53 +1128,62 @@ fn assess_receipt(
         receipt,
     };
     if assessment.receipt.state.is_terminal() {
-        assessment.summary = format!(
-            "{}: {}",
-            assessment.receipt.state.label(),
-            assessment.receipt.message
-        );
+        assessment.summary = format!("{state_label}: {}", assessment.receipt.message);
         assessment.next_step = "No reconciliation needed.".into();
         return Ok(assessment);
     }
-    if exclusion.is_none() && journal_state::own_process_holds_lock(&live)? {
-        assessment.outcome = InterruptedRestoreOutcome::Deferred;
-        assessment.summary = "Interrupted restore: not judged yet because a worker in this window is using the database.".into();
-        assessment.next_step = "Reopen History when no scan or action is running.".into();
-        return Ok(assessment);
-    }
-    let live_sha =
-        match regular_file_metadata(&live, "current database").and_then(|_| match exclusion {
-            Some(exclusion) => exclusion.live_sha256(),
-            None => sha256_file(&live),
-        }) {
-            Ok(sha) => sha,
-            Err(error) => {
-                assessment.outcome = InterruptedRestoreOutcome::Unrecognised {
-                    detail: format!("the live database could not be read: {error}"),
-                };
-                assessment.summary =
-                    "Interrupted restore: the live database could not be inspected.".into();
-                assessment.next_step =
-                    "Review the database directory by hand before opening EmuWiz again.".into();
-                return Ok(assessment);
-            }
-        };
-    assessment.live_sha256 = Some(live_sha.clone());
-    let state_label = assessment.receipt.state.label();
-    let expected_live_sha = assessment.receipt.plan.expected_live_sha256.clone();
-    let staged_sha = assessment.receipt.staged_replacement_sha256.clone();
-    let staged = assessment.receipt.staged_replacement_path.clone();
-    let emergency = assessment.receipt.emergency_backup_path.clone();
-    if live_sha == expected_live_sha {
-        // Exchange never happened. Anything staged or backed up is surplus.
-        for path in emergency.iter().chain(staged.iter()) {
-            if path.is_file() {
-                assessment.leftover_paths.push(path.clone());
-            }
+    let live_identity = match file_identity(&live, "current database") {
+        Ok(identity) => identity,
+        Err(error) => {
+            assessment.outcome = InterruptedRestoreOutcome::Unrecognised {
+                detail: format!("the live database could not be inspected: {error}"),
+            };
+            assessment.summary =
+                "Interrupted restore: the live database could not be inspected.".into();
+            assessment.next_step =
+                "Review the database directory by hand before opening EmuWiz again.".into();
+            return Ok(assessment);
         }
-        assessment.outcome = InterruptedRestoreOutcome::OriginalIntact;
+    };
+    assessment.live_identity = Some(live_identity);
+    let receipt = assessment.receipt.clone();
+    let existing = |path: &Option<PathBuf>| {
+        path.as_deref()
+            .filter(|p| p.is_file())
+            .map(Path::to_path_buf)
+    };
+
+    if receipt.state == DatabaseRestoreState::RollbackAttempted {
+        return Ok(assess_rollback(assessment, live_identity, depth));
+    }
+
+    // The exchange is impossible before the staged hash was durably recorded,
+    // and undone whenever the original inode is back at the live path.
+    let exchange_possible = receipt.staged_replacement_sha256.is_some();
+    if !exchange_possible || Some(live_identity) == receipt.original_identity {
+        let modified_since = match depth {
+            AssessmentDepth::Preview => false,
+            AssessmentDepth::Full => live_sha256_by_path(&live)
+                .map(|sha| sha != receipt.plan.expected_live_sha256)
+                .unwrap_or(true),
+        };
+        for path in [
+            existing(&receipt.emergency_backup_path),
+            existing(&receipt.staged_replacement_path),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assessment.leftover_paths.push(path);
+        }
+        assessment.outcome = InterruptedRestoreOutcome::OriginalIntact { modified_since };
         assessment.summary = format!(
-            "Interrupted at '{state_label}' before the replacement: the original database is in place and unchanged."
+            "Interrupted at '{state_label}' before the replacement: the original database is in place{}.",
+            if modified_since {
+                " and has been used since"
+            } else {
+                " and unchanged"
+            }
         );
         assessment.next_step = if assessment.leftover_paths.is_empty() {
             "Finalise the receipt; nothing else to do.".into()
@@ -941,53 +1192,162 @@ fn assess_receipt(
         };
         return Ok(assessment);
     }
-    if Some(live_sha.as_str()) == staged_sha.as_deref() {
-        match validate_live_database(&live, latest_known_version(MIGRATIONS)) {
-            Ok(()) => {
-                assessment.outcome = InterruptedRestoreOutcome::ReplacementVerified;
+    if Some(live_identity) == receipt.replacement_identity {
+        match depth {
+            AssessmentDepth::Preview => {
+                assessment.outcome = InterruptedRestoreOutcome::ReplacementUnverified;
                 assessment.summary = format!(
-                    "Interrupted at '{state_label}' after the replacement: the restored database is in place and verifies."
+                    "Interrupted at '{state_label}' after the replacement: the restored database is in place but not yet verified."
                 );
-                assessment.next_step = if superseded_original_present {
-                    "Finalise the receipt as completed; the superseded original is kept at its staging path until you delete it.".into()
-                } else {
-                    "Finalise the receipt as completed.".into()
-                };
+                assessment.next_step = "Reconcile to verify it and record the outcome.".into();
             }
-            Err(error) => {
-                assessment.outcome = InterruptedRestoreOutcome::ReplacementFailedVerification {
-                    detail: error.to_string(),
-                };
-                assessment.summary = format!(
-                    "Interrupted at '{state_label}' after the replacement, and the restored database does not verify."
-                );
-                assessment.next_step = match (superseded_original_present, emergency_backup_verified) {
-                    (true, _) => format!(
-                        "Put the original back from {} (it matches the pre-restore hash), or restore from the emergency backup.",
-                        staged.as_deref().map(|p| p.display().to_string()).unwrap_or_default()
-                    ),
-                    (false, true) => "Restore from the verified emergency backup named in the receipt.".into(),
-                    (false, false) => "Neither the superseded original nor a verified emergency backup is present; recover by hand.".into(),
-                };
+            AssessmentDepth::Full => {
+                match validate_live_database(&live, latest_known_version(MIGRATIONS)) {
+                    Ok(()) => {
+                        let modified_since = live_sha256_by_path(&live)
+                            .map(|sha| Some(sha) != receipt.staged_replacement_sha256)
+                            .unwrap_or(true);
+                        assessment.outcome =
+                            InterruptedRestoreOutcome::ReplacementVerified { modified_since };
+                        assessment.summary = format!(
+                            "Interrupted at '{state_label}' after the replacement: the restored database is in place and verifies{}.",
+                            if modified_since {
+                                " (it has been used since)"
+                            } else {
+                                ""
+                            }
+                        );
+                        assessment.next_step = if superseded_original_present {
+                            "Finalise the receipt as completed; the superseded original is kept at its staging path until you delete it.".into()
+                        } else {
+                            "Finalise the receipt as completed.".into()
+                        };
+                    }
+                    Err(error) => {
+                        assessment.outcome =
+                            InterruptedRestoreOutcome::ReplacementFailedVerification {
+                                detail: error.to_string(),
+                            };
+                        assessment.summary = format!(
+                            "Interrupted at '{state_label}' after the replacement, and the restored database does not verify."
+                        );
+                        assessment.next_step = match (superseded_original_present, emergency_backup_verified) {
+                        (true, _) => format!(
+                            "Put the original back from {} (it is the pre-restore file), or restore from the emergency backup.",
+                            receipt.staged_replacement_path.as_deref().map(|p| p.display().to_string()).unwrap_or_default()
+                        ),
+                        (false, true) => "Restore from the verified emergency backup named in the receipt.".into(),
+                        (false, false) => "Neither the superseded original nor a verified emergency backup is present; recover by hand.".into(),
+                    };
+                    }
+                }
             }
         }
         return Ok(assessment);
     }
     assessment.outcome = InterruptedRestoreOutcome::Unrecognised {
-        detail: "the live database matches neither the pre-restore hash nor the staged replacement"
-            .into(),
+        detail: "the live database is neither the original nor the staged replacement".into(),
     };
-    assessment.summary = format!(
-        "Interrupted at '{state_label}': the live database matches neither recorded state."
-    );
+    assessment.summary =
+        format!("Interrupted at '{state_label}': the live database matches neither recorded file.");
     assessment.next_step =
         "Do not finalise automatically; review the database directory by hand.".into();
     Ok(assessment)
 }
 
+fn assess_rollback(
+    mut assessment: InterruptedRestoreAssessment,
+    live_identity: FileIdentity,
+    depth: AssessmentDepth,
+) -> InterruptedRestoreAssessment {
+    let receipt = assessment.receipt.clone();
+    let live = receipt.plan.live_database_path.clone();
+    let staging_present = receipt
+        .rollback_staging_path
+        .as_deref()
+        .filter(|p| p.is_file());
+    if Some(live_identity) == receipt.replacement_identity {
+        // The rollback never exchanged: the restored database is still live.
+        if let Some(path) = staging_present {
+            assessment.leftover_paths.push(path.to_path_buf());
+        }
+        assessment.outcome = InterruptedRestoreOutcome::ReplacementVerified {
+            modified_since: false,
+        };
+        if depth == AssessmentDepth::Full
+            && let Err(error) = validate_live_database(&live, latest_known_version(MIGRATIONS))
+        {
+            assessment.outcome = InterruptedRestoreOutcome::ReplacementFailedVerification {
+                detail: error.to_string(),
+            };
+        }
+        assessment.summary =
+            "Rollback was interrupted before the exchange: the restored database remains in place."
+                .into();
+        assessment.next_step =
+            "Finalise the receipt as completed; the listed rollback staging file can be deleted afterwards.".into();
+        return assessment;
+    }
+    if Some(live_identity) == receipt.rollback_identity {
+        match depth {
+            AssessmentDepth::Preview => {
+                assessment.outcome = InterruptedRestoreOutcome::ReplacementUnverified;
+                assessment.summary =
+                    "Rollback was interrupted after the exchange: the pre-restore copy is in place but not yet verified.".into();
+                assessment.next_step = "Reconcile to verify it and record the outcome.".into();
+            }
+            AssessmentDepth::Full => {
+                match validate_live_database(&live, receipt.plan.current_live_schema_version) {
+                    Ok(()) => {
+                        assessment.outcome = InterruptedRestoreOutcome::RollbackVerified;
+                        assessment.summary =
+                        "Rollback was interrupted after the exchange: the pre-restore database is in place and verifies.".into();
+                        assessment.next_step = if staging_present.is_some() {
+                            "Finalise the receipt as rolled back; the restored database at the rollback staging path can be deleted afterwards.".into()
+                        } else {
+                            "Finalise the receipt as rolled back.".into()
+                        };
+                    }
+                    Err(error) => {
+                        assessment.outcome =
+                            InterruptedRestoreOutcome::RollbackFailedVerification {
+                                detail: error.to_string(),
+                            };
+                        assessment.summary =
+                        "Rollback was interrupted after the exchange, and the pre-restore copy does not verify.".into();
+                        assessment.next_step = format!(
+                            "The restored database is preserved at {}; the emergency backup is {}. Review by hand.",
+                            receipt
+                                .rollback_staging_path
+                                .as_deref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default(),
+                            receipt
+                                .emergency_backup_path
+                                .as_deref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default()
+                        );
+                    }
+                }
+            }
+        }
+        return assessment;
+    }
+    assessment.outcome = InterruptedRestoreOutcome::Unrecognised {
+        detail: "the live database is neither the restored database nor the rollback copy".into(),
+    };
+    assessment.summary =
+        "Rollback was interrupted and the live database matches neither recorded file.".into();
+    assessment.next_step =
+        "Do not finalise automatically; review the database directory by hand.".into();
+    assessment
+}
+
 /// Brings an interrupted receipt to a truthful terminal state. Only the
 /// receipt is written; no database file is created, changed or deleted. The
-/// assessment is repeated under the restore exclusion so it cannot be stale.
+/// assessment is repeated in full under the restore exclusion so it cannot
+/// be stale.
 pub fn finalise_interrupted_restore(
     receipt_path: &Path,
     confirmation: &str,
@@ -1000,43 +1360,75 @@ pub fn finalise_interrupted_restore(
     let receipt = read_receipt(receipt_path)?;
     let exclusion = RestoreExclusion::acquire(&receipt.plan.live_database_path)
         .map_err(|error| db(format!("Reconciliation refused: {error}")))?;
-    let mut assessment = assess_receipt(receipt_path, receipt, Some(&exclusion))?;
+    let mut assessment = assess_receipt(receipt_path, receipt, AssessmentDepth::Full)?;
     let state_label = assessment.receipt.state.label();
+    let leftovers = if assessment.leftover_paths.is_empty() {
+        "none".to_string()
+    } else {
+        assessment
+            .leftover_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     match &assessment.outcome {
         InterruptedRestoreOutcome::Terminal => return Ok(assessment),
-        InterruptedRestoreOutcome::OriginalIntact => {
+        InterruptedRestoreOutcome::OriginalIntact { modified_since } => {
             assessment.receipt.state = DatabaseRestoreState::Failed;
             assessment.receipt.original_intact = Some(true);
             assessment.receipt.message = format!(
-                "Restore was interrupted at '{state_label}' before the replacement; the original database is intact. Leftover files: {}.",
-                if assessment.leftover_paths.is_empty() {
-                    "none".to_string()
+                "Restore was interrupted at '{state_label}' before the replacement; the original database is in place{}. Leftover files: {leftovers}.",
+                if *modified_since {
+                    " and has been used since"
                 } else {
-                    assessment
-                        .leftover_paths
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    " and unchanged"
                 }
             );
         }
-        InterruptedRestoreOutcome::ReplacementVerified => {
+        InterruptedRestoreOutcome::ReplacementVerified { modified_since } => {
             let superseded_present = assessment.superseded_original_present;
             let superseded_path = assessment.receipt.staged_replacement_path.clone();
             assessment.receipt.state = DatabaseRestoreState::Completed;
             assessment.receipt.original_intact = Some(false);
-            assessment.receipt.applied_database_sha256 = assessment.live_sha256.clone();
+            // The content at exchange time, so a later rollback review can
+            // tell whether the database has been used since.
+            assessment.receipt.applied_database_sha256 =
+                assessment.receipt.staged_replacement_sha256.clone();
             assessment.receipt.superseded_database_path =
                 superseded_present.then_some(superseded_path).flatten();
             assessment.receipt.superseded_database_removed = !superseded_present;
+            assessment.receipt.rollback_staging_path = None;
+            assessment.receipt.rollback_staging_sha256 = None;
+            assessment.receipt.rollback_identity = None;
             assessment.receipt.message = format!(
-                "Restore was interrupted at '{state_label}' after the replacement; the restored database verified after restart. Catalogue reload/restart is required."
+                "Restore was interrupted at '{state_label}' after the replacement; the restored database verified after restart{}. Catalogue reload/restart is required. Leftover files: {leftovers}.",
+                if *modified_since {
+                    " (it has been used since)"
+                } else {
+                    ""
+                }
             );
         }
-        InterruptedRestoreOutcome::ReplacementFailedVerification { .. }
-        | InterruptedRestoreOutcome::Unrecognised { .. }
-        | InterruptedRestoreOutcome::Deferred => {
+        InterruptedRestoreOutcome::RollbackVerified => {
+            assessment.receipt.state = DatabaseRestoreState::RolledBack;
+            assessment.receipt.original_intact = Some(true);
+            assessment.receipt.superseded_database_path = None;
+            assessment.receipt.message = format!(
+                "Rollback was interrupted at '{state_label}' after the exchange; the pre-restore database verified after restart. Catalogue reload/restart is required. The restored database remains at {} until you delete it.",
+                assessment
+                    .receipt
+                    .rollback_staging_path
+                    .as_deref()
+                    .filter(|p| p.is_file())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "no path (already removed)".into())
+            );
+        }
+        InterruptedRestoreOutcome::ReplacementUnverified
+        | InterruptedRestoreOutcome::ReplacementFailedVerification { .. }
+        | InterruptedRestoreOutcome::RollbackFailedVerification { .. }
+        | InterruptedRestoreOutcome::Unrecognised { .. } => {
             return Err(db(format!(
                 "Cannot finalise automatically: {} {}",
                 assessment.summary, assessment.next_step
@@ -1045,6 +1437,7 @@ pub fn finalise_interrupted_restore(
     }
     assessment.receipt.updated_at_unix = unix_now();
     write_receipt(&assessment.receipt)?;
+    drop(exclusion);
     Ok(assessment)
 }
 
@@ -1135,11 +1528,14 @@ fn validate_plan_live_freshness(
     plan: &DatabaseRestorePlan,
     exclusion: &RestoreExclusion,
 ) -> Result<()> {
-    let meta = exclusion.live_metadata()?;
+    let meta = regular_file_metadata(&plan.live_database_path, "current database")?;
     let modified = modified_unix(&meta);
-    if meta.len() != plan.expected_live_size_bytes
+    let identity = file_identity(&plan.live_database_path, "current database")?;
+    let sha = exclusion.locked_inode_sha256()?;
+    if identity != exclusion.identity
+        || meta.len() != plan.expected_live_size_bytes
         || modified != plan.expected_live_modified_unix_seconds
-        || exclusion.live_sha256()? != plan.expected_live_sha256
+        || sha != plan.expected_live_sha256
     {
         return Err(db(
             "Current database changed since this restore was prepared.",
@@ -1185,6 +1581,13 @@ fn ensure_sufficient_space(plan: &DatabaseRestorePlan) -> Result<()> {
     Ok(())
 }
 
+/// SHA-256 of the database at `path` through a read-only SQLite connection
+/// (see [`sqlite_io`]); never opens a plain descriptor on it.
+fn live_sha256_by_path(path: &Path) -> Result<String> {
+    let connection = open_read_only_connection(path)?;
+    sqlite_io::sha256(&connection, "current database")
+}
+
 fn validate_database_file(path: &Path, expected_schema: i64) -> Result<()> {
     let connection = open_read_only_connection(path)?;
     let actual = verify_backup_connection(&connection)?;
@@ -1204,17 +1607,13 @@ fn validate_live_database(path: &Path, expected_schema: i64) -> Result<()> {
 /// staged bytes; anything else means the exchange did not do what was asked.
 fn verify_applied_identity(live: &Path, receipt: &DatabaseRestoreReceipt) -> Result<()> {
     let identity = file_identity(live, "restored database")?;
+    let sha = live_sha256_by_path(live)?;
     if Some(identity) != receipt.replacement_identity {
         return Err(db(
             "The live pathname does not carry the staged replacement after the exchange.",
         ));
     }
-    if sha256_file(live)?.as_str()
-        != receipt
-            .staged_replacement_sha256
-            .as_deref()
-            .unwrap_or_default()
-    {
+    if Some(sha.as_str()) != receipt.staged_replacement_sha256.as_deref() {
         return Err(db(
             "The restored database does not match the verified staged copy.",
         ));
@@ -1271,12 +1670,25 @@ fn require_tables(connection: &Connection) -> Result<()> {
 }
 
 /// Online-backup copy of `source` to `destination`, fsynced and verified at
-/// `schema`. `source` is only opened read-only.
+/// `schema`. `source` is only opened read-only; `destination` is created
+/// without following symlinks.
 fn stage_backup(source: &Path, destination: &Path, schema: i64) -> Result<()> {
     let source_connection = open_read_only_connection(source)?;
-    source_connection
-        .backup(MAIN_DB, destination, None)
-        .map_err(|e| db(format!("Could not stage verified backup: {e}")))?;
+    {
+        let mut destination_connection = Connection::open_with_flags(
+            destination,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|e| db(format!("Could not create the staging copy: {e}")))?;
+        let backup = rusqlite::backup::Backup::new(&source_connection, &mut destination_connection)
+            .map_err(|e| db(format!("Could not stage verified backup: {e}")))?;
+        backup
+            .run_to_completion(256, Duration::from_millis(5), None)
+            .map_err(|e| db(format!("Could not stage verified backup: {e}")))?;
+    }
     drop(source_connection);
     fsync_file(destination)?;
     validate_database_file(destination, schema)
@@ -1435,16 +1847,20 @@ fn require_no_sidecars_at_all(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `renameat2(RENAME_EXCHANGE)`: the syscall only. An error means nothing
+/// was exchanged; success means both pathnames have swapped inodes. Callers
+/// fsync the directory afterwards and treat a failure there as a failure
+/// *after* the exchange.
 #[cfg(target_os = "linux")]
-fn atomic_exchange(left: &Path, right: &Path) -> Result<()> {
+fn exchange_paths(left: &Path, right: &Path) -> Result<()> {
     const AT_FDCWD: i32 = -100;
     const RENAME_EXCHANGE: u32 = 2;
     unsafe extern "C" {
         fn renameat2(
             olddirfd: i32,
-            oldpath: *const i8,
+            oldpath: *const libc::c_char,
             newdirfd: i32,
-            newpath: *const i8,
+            newpath: *const libc::c_char,
             flags: u32,
         ) -> i32;
     }
@@ -1467,47 +1883,34 @@ fn atomic_exchange(left: &Path, right: &Path) -> Result<()> {
             std::io::Error::last_os_error()
         )));
     }
-    fsync_directory(right.parent())
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn atomic_exchange(_left: &Path, _right: &Path) -> Result<()> {
+fn exchange_paths(_left: &Path, _right: &Path) -> Result<()> {
     Err(db(
         "This build cannot provide an atomic database exchange on this platform.",
     ))
 }
 
-/// Exchanges the superseded original (still at the staging path) back into
-/// place after it has been proven to be the pre-restore bytes.
-fn rollback_exchange(
-    exclusion: &RestoreExclusion,
-    staged_old_live: &Path,
-    live: &Path,
-    schema: i64,
-    expected_sha256: &str,
-) -> Result<()> {
-    // The superseded original is the inode the exclusion handle still
-    // refers to, wherever its pathname now is.
-    if exclusion.live_sha256()? != expected_sha256 {
-        return Err(db(
-            "The superseded original at the staging path no longer matches its pre-restore hash.",
-        ));
-    }
-    validate_database_file(staged_old_live, schema)?;
-    atomic_exchange(staged_old_live, live)?;
-    validate_live_database(live, schema)?;
-    let _ = fs::remove_file(staged_old_live);
-    Ok(())
+fn open_nofollow(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
 }
 
+/// Only for files this process holds no SQLite lock on (staging copies,
+/// backups, directories): closing a descriptor on a live inode would drop
+/// this process's locks on it.
 fn fsync_file(path: &Path) -> Result<()> {
-    File::open(path)
+    open_nofollow(path)
         .and_then(|f| f.sync_all())
         .map_err(|e| db(format!("Could not fsync {}: {e}", path.display())))
 }
 fn fsync_directory(path: Option<&Path>) -> Result<()> {
     if let Some(path) = path {
-        File::open(path)
+        open_nofollow(path)
             .and_then(|f| f.sync_all())
             .map_err(|e| db(format!("Could not fsync database directory: {e}")))
     } else {
@@ -1546,6 +1949,9 @@ fn receipt_for(
         superseded_database_removed: false,
         original_intact: None,
         exclusion_held: false,
+        rollback_staging_path: None,
+        rollback_staging_sha256: None,
+        rollback_identity: None,
     }
 }
 pub fn receipt_path(receipt: &DatabaseRestoreReceipt) -> PathBuf {
@@ -1649,32 +2055,50 @@ mod tests {
         found.sort_by_key(|r| r.operation_id.clone());
         found
     }
-
-    #[test]
-    fn verified_restore_exchanges_and_retains_emergency_backup() {
+    fn names(root: &Path) -> Vec<String> {
+        fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+    fn crash_at<R>(stage: &'static str, f: impl FnOnce() -> R) -> bool {
+        let _guard = fault_injection::install(move |s| {
+            if s == stage {
+                panic!("simulated crash at {s}")
+            } else {
+                Ok(())
+            }
+        });
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
+    }
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, DatabaseRestorePlan) {
         let root = tempdir().unwrap();
         let live = root.path().join("library.sqlite3");
         let backup = root.path().join("selected.backup");
         db(&live, "live");
         db(&backup, "backup");
         let plan = prepare_database_restore(&live, &backup).unwrap();
+        (root, live, backup, plan)
+    }
+
+    #[test]
+    fn verified_restore_exchanges_and_retains_emergency_backup() {
+        let (root, live, backup, plan) = fixture();
         assert!(!plan.requires_upgrade());
         let result = restore_database(&plan, CONFIRMATION).unwrap();
         assert_eq!(result.receipt.state, DatabaseRestoreState::Completed);
         assert!(result.receipt.exclusion_held);
         assert_eq!(result.receipt.original_intact, Some(false));
         assert!(result.receipt.superseded_database_removed);
+        assert!(!result.receipt.message.contains("Warning"));
         assert_eq!(marker(&live), "backup");
         assert_eq!(marker(&result.emergency_backup_path), "live");
         // The superseded original is gone; the backup was never written.
         assert!(!result.receipt.staged_replacement_path.unwrap().exists());
         assert_eq!(sha256_file(&backup).unwrap(), plan.selected_backup_sha256);
         // No sidecars or temporary receipts remain.
-        let names: Vec<String> = fs::read_dir(root.path())
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
+        let names = names(root.path());
         assert!(
             names
                 .iter()
@@ -1685,21 +2109,15 @@ mod tests {
 
     #[test]
     fn stale_live_database_is_refused_before_emergency_backup() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let plan = prepare_database_restore(&live, &backup).unwrap();
+        let (root, live, _backup, plan) = fixture();
         db(&live, "changed");
         let error = restore_database(&plan, CONFIRMATION).unwrap_err();
         assert!(error.to_string().contains("changed since"));
-        assert!(!root.path().read_dir().unwrap().any(|e| {
-            e.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains("before-restore")
-        }));
+        assert!(
+            !names(root.path())
+                .iter()
+                .any(|n| n.contains("before-restore"))
+        );
         let receipt = &receipts(root.path())[0];
         assert_eq!(receipt.state, DatabaseRestoreState::Failed);
         assert_eq!(receipt.original_intact, Some(true));
@@ -1708,12 +2126,7 @@ mod tests {
 
     #[test]
     fn hash_mismatch_is_refused() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let mut plan = prepare_database_restore(&live, &backup).unwrap();
+        let (_root, live, backup, mut plan) = fixture();
         fs::write(&backup, b"not sqlite").unwrap();
         plan.selected_backup_sha256 = "bad".into();
         let error = restore_database(&plan, CONFIRMATION).unwrap_err();
@@ -1723,19 +2136,22 @@ mod tests {
 
     #[test]
     fn rollback_requires_unchanged_restored_database_and_round_trips() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let plan = prepare_database_restore(&live, &backup).unwrap();
+        let (root, live, _backup, plan) = fixture();
         let result = restore_database(&plan, CONFIRMATION).unwrap();
         let path = receipt_path(&result.receipt);
         let reviewed = review_database_rollback(&path).unwrap();
         assert_eq!(reviewed, result.receipt);
         let rolled_back = rollback_database_restore(&result.receipt, CONFIRMATION).unwrap();
         assert_eq!(rolled_back.state, DatabaseRestoreState::RolledBack);
+        assert_eq!(rolled_back.original_intact, Some(true));
+        assert!(rolled_back.rollback_staging_path.is_some());
+        assert!(!rolled_back.rollback_staging_path.as_ref().unwrap().exists());
         assert_eq!(marker(&live), "live");
+        assert!(
+            !names(root.path())
+                .iter()
+                .any(|n| n.contains("rollback-staging"))
+        );
         // A second rollback is refused: the live database is no longer the
         // restored replacement.
         let error = review_database_rollback(&path).unwrap_err();
@@ -1744,12 +2160,7 @@ mod tests {
 
     #[test]
     fn rollback_is_refused_when_restored_database_changed() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let plan = prepare_database_restore(&live, &backup).unwrap();
+        let (_root, live, _backup, plan) = fixture();
         let result = restore_database(&plan, CONFIRMATION).unwrap();
         db(&live, "edited after restore");
         let error = rollback_database_restore(&result.receipt, CONFIRMATION).unwrap_err();
@@ -1762,32 +2173,21 @@ mod tests {
 
     #[test]
     fn active_wal_sidecar_blocks_replacement() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
+        let (root, live, _backup, plan) = fixture();
         fs::write(live.with_file_name("library.sqlite3-wal"), b"active").unwrap();
-        let plan = prepare_database_restore(&live, &backup).unwrap();
         let error = restore_database(&plan, CONFIRMATION).unwrap_err();
         assert!(error.to_string().contains("WAL/SHM"));
         assert_eq!(marker(&live), "live");
-        assert!(!root.path().read_dir().unwrap().any(|e| {
-            e.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains("before-restore")
-        }));
+        assert!(
+            !names(root.path())
+                .iter()
+                .any(|n| n.contains("before-restore"))
+        );
     }
 
     #[test]
     fn hot_rollback_journal_without_writer_is_refused_closed() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let plan = prepare_database_restore(&live, &backup).unwrap();
+        let (root, live, _backup, plan) = fixture();
         // A journal with a live header and no lock holder: a crashed writer.
         let journal = live.with_file_name("library.sqlite3-journal");
         fs::write(
@@ -1818,12 +2218,7 @@ mod tests {
 
     #[test]
     fn writer_holding_open_transaction_makes_restore_refuse() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let plan = prepare_database_restore(&live, &backup).unwrap();
+        let (root, live, _backup, plan) = fixture();
         let writer = super::super::Database::open_or_create(&live).unwrap();
         writer
             .connection
@@ -1850,25 +2245,55 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM restore_marker", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 2);
-        assert!(!root.path().read_dir().unwrap().any(|e| {
-            e.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains("before-restore")
-        }));
+        assert!(
+            !names(root.path())
+                .iter()
+                .any(|n| n.contains("before-restore"))
+        );
         let receipt = &receipts(root.path())[0];
         assert_eq!(receipt.state, DatabaseRestoreState::Failed);
         assert_eq!(receipt.original_intact, Some(true));
     }
 
     #[test]
+    fn writer_with_spilled_transaction_makes_restore_refuse_as_busy() {
+        let (_root, live, _backup, plan) = fixture();
+        let writer = super::super::Database::open_or_create(&live).unwrap();
+        writer
+            .connection
+            .execute_batch("PRAGMA cache_size = 10; BEGIN IMMEDIATE;")
+            .unwrap();
+        let payload = "x".repeat(900);
+        let journal = live.with_file_name("library.sqlite3-journal");
+        for _ in 0..4000 {
+            writer
+                .connection
+                .execute("INSERT INTO restore_marker(value) VALUES (?1)", [&payload])
+                .unwrap();
+            if fs::read(&journal)
+                .is_ok_and(|bytes| bytes.len() >= 8 && bytes[..8].iter().any(|b| *b != 0))
+            {
+                break;
+            }
+        }
+        let error = restore_database(&plan, CONFIRMATION)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("using the library database")
+                || error.contains("writing the library database"),
+            "{error}"
+        );
+        assert!(!error.contains("cannot be determined"), "{error}");
+        writer.connection.execute_batch("ROLLBACK").unwrap();
+        drop(writer);
+        assert_eq!(marker(&live), "live");
+        assert_eq!(sha256_file(&live).unwrap(), plan.expected_live_sha256);
+    }
+
+    #[test]
     fn reader_holding_shared_lock_does_not_block_restore() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let plan = prepare_database_restore(&live, &backup).unwrap();
+        let (_root, live, _backup, plan) = fixture();
         // An open read-only connection between statements holds no lock, so
         // it neither blocks the restore nor is disturbed by it.
         let reader = super::super::Database::open_read_only(&live).unwrap();
@@ -1892,12 +2317,7 @@ mod tests {
 
     #[test]
     fn stale_connection_cannot_write_superseded_database_silently() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let plan = prepare_database_restore(&live, &backup).unwrap();
+        let (_root, live, _backup, plan) = fixture();
         let stale = super::super::Database::open_or_create(&live).unwrap();
         let result = restore_database(&plan, CONFIRMATION).unwrap();
         assert_eq!(result.receipt.state, DatabaseRestoreState::Completed);
@@ -1978,11 +2398,7 @@ mod tests {
         assert_eq!(receipt.state, DatabaseRestoreState::Failed);
         assert_eq!(receipt.original_intact, Some(true));
         assert!(receipt.staged_replacement_path.is_none());
-        let names: Vec<String> = fs::read_dir(root.path())
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
+        let names = names(root.path());
         assert!(
             names.iter().all(|n| !n.contains("restore-staging")),
             "{names:?}"
@@ -1991,12 +2407,7 @@ mod tests {
 
     #[test]
     fn missing_or_replaced_backup_is_refused() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let plan = prepare_database_restore(&live, &backup).unwrap();
+        let (_root, live, backup, plan) = fixture();
         fs::remove_file(&backup).unwrap();
         let error = restore_database(&plan, CONFIRMATION).unwrap_err();
         assert!(
@@ -2026,12 +2437,7 @@ mod tests {
 
     #[test]
     fn receipts_are_written_atomically_and_legacy_receipts_still_parse() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let plan = prepare_database_restore(&live, &backup).unwrap();
+        let (_root, live, backup, plan) = fixture();
         let result = restore_database(&plan, CONFIRMATION).unwrap();
         let path = receipt_path(&result.receipt);
         assert!(
@@ -2056,6 +2462,7 @@ mod tests {
         assert!(!parsed.exclusion_held);
         assert_eq!(parsed.original_intact, None);
         assert!(parsed.plan.pending_migrations.is_empty());
+        assert!(parsed.rollback_identity.is_none());
     }
 
     #[test]
@@ -2066,26 +2473,11 @@ mod tests {
             STAGE_AFTER_STAGING,
             STAGE_BEFORE_EXCHANGE,
         ] {
-            let root = tempdir().unwrap();
-            let live = root.path().join("library.sqlite3");
-            let backup = root.path().join("selected.backup");
-            db(&live, "live");
-            db(&backup, "backup");
-            let plan = prepare_database_restore(&live, &backup).unwrap();
-            let crash_at = stage.to_string();
-            let outcome = {
-                let _guard = fault_injection::install(move |s| {
-                    if s == crash_at {
-                        panic!("simulated crash at {s}")
-                    } else {
-                        Ok(())
-                    }
-                });
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    restore_database(&plan, CONFIRMATION)
-                }))
-            };
-            assert!(outcome.is_err(), "{stage}: expected a simulated crash");
+            let (_root, live, backup, plan) = fixture();
+            assert!(
+                crash_at(stage, || restore_database(&plan, CONFIRMATION)),
+                "{stage}: expected a simulated crash"
+            );
             assert_eq!(marker(&live), "live", "{stage}");
             assert_eq!(
                 sha256_file(&live).unwrap(),
@@ -2095,10 +2487,21 @@ mod tests {
             let receipt_path = interrupted_restore_receipts(&live)
                 .pop()
                 .expect("non-terminal receipt");
+            let preview = preview_interrupted_restore(&receipt_path).unwrap();
+            assert_eq!(
+                preview.outcome,
+                InterruptedRestoreOutcome::OriginalIntact {
+                    modified_since: false
+                },
+                "{stage}: {}",
+                preview.summary
+            );
             let assessment = assess_interrupted_restore(&receipt_path).unwrap();
             assert_eq!(
                 assessment.outcome,
-                InterruptedRestoreOutcome::OriginalIntact,
+                InterruptedRestoreOutcome::OriginalIntact {
+                    modified_since: false
+                },
                 "{stage}: {}",
                 assessment.summary
             );
@@ -2136,34 +2539,28 @@ mod tests {
             STAGE_BEFORE_SUPERSEDED_REMOVAL,
             STAGE_BEFORE_COMPLETED_RECEIPT,
         ] {
-            let root = tempdir().unwrap();
-            let live = root.path().join("library.sqlite3");
-            let backup = root.path().join("selected.backup");
-            db(&live, "live");
-            db(&backup, "backup");
-            let plan = prepare_database_restore(&live, &backup).unwrap();
-            let crash_at = stage.to_string();
-            let outcome = {
-                let _guard = fault_injection::install(move |s| {
-                    if s == crash_at {
-                        panic!("simulated crash at {s}")
-                    } else {
-                        Ok(())
-                    }
-                });
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    restore_database(&plan, CONFIRMATION)
-                }))
-            };
-            assert!(outcome.is_err(), "{stage}");
+            let (_root, live, _backup, plan) = fixture();
+            assert!(
+                crash_at(stage, || restore_database(&plan, CONFIRMATION)),
+                "{stage}"
+            );
             assert_eq!(marker(&live), "backup", "{stage}: replacement is in place");
             let receipt_path = interrupted_restore_receipts(&live)
                 .pop()
                 .expect("non-terminal receipt");
+            let preview = preview_interrupted_restore(&receipt_path).unwrap();
+            assert_eq!(
+                preview.outcome,
+                InterruptedRestoreOutcome::ReplacementUnverified,
+                "{stage}: {}",
+                preview.summary
+            );
             let assessment = assess_interrupted_restore(&receipt_path).unwrap();
             assert_eq!(
                 assessment.outcome,
-                InterruptedRestoreOutcome::ReplacementVerified,
+                InterruptedRestoreOutcome::ReplacementVerified {
+                    modified_since: false
+                },
                 "{stage}: {}",
                 assessment.summary
             );
@@ -2177,8 +2574,8 @@ mod tests {
             assert_eq!(finalised.receipt.state, DatabaseRestoreState::Completed);
             assert_eq!(finalised.receipt.original_intact, Some(false));
             assert_eq!(
-                finalised.receipt.applied_database_sha256.as_deref(),
-                Some(sha256_file(&live).unwrap().as_str())
+                finalised.receipt.applied_database_sha256,
+                finalised.receipt.staged_replacement_sha256
             );
             // The finalised receipt supports a rollback, which restores the original.
             let rolled = rollback_database_restore(&finalised.receipt, CONFIRMATION).unwrap();
@@ -2188,54 +2585,276 @@ mod tests {
     }
 
     #[test]
-    fn verification_failure_after_exchange_rolls_back_to_original() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let plan = prepare_database_restore(&live, &backup).unwrap();
+    fn database_used_after_an_interruption_still_reconciles_by_identity() {
+        // Pre-exchange crash, then the catalogue is used (a scan commits):
+        // hashes no longer match, identity still does.
+        let (_root, live, _backup, plan) = fixture();
+        assert!(crash_at(STAGE_BEFORE_EXCHANGE, || restore_database(
+            &plan,
+            CONFIRMATION
+        )));
+        db(&live, "used after crash");
+        let receipt_path = interrupted_restore_receipts(&live).pop().unwrap();
+        let assessment = assess_interrupted_restore(&receipt_path).unwrap();
+        assert_eq!(
+            assessment.outcome,
+            InterruptedRestoreOutcome::OriginalIntact {
+                modified_since: true
+            },
+            "{}",
+            assessment.summary
+        );
+        assert!(assessment.summary.contains("used since"));
+        let finalised = finalise_interrupted_restore(&receipt_path, CONFIRMATION).unwrap();
+        assert_eq!(finalised.receipt.state, DatabaseRestoreState::Failed);
+        assert_eq!(marker(&live), "used after crash");
+
+        // Post-exchange crash, then the restored catalogue is used.
+        let (_root, live, _backup, plan) = fixture();
+        assert!(crash_at(STAGE_AFTER_EXCHANGE, || restore_database(
+            &plan,
+            CONFIRMATION
+        )));
+        db(&live, "restored then used");
+        let receipt_path = interrupted_restore_receipts(&live).pop().unwrap();
+        let assessment = assess_interrupted_restore(&receipt_path).unwrap();
+        assert_eq!(
+            assessment.outcome,
+            InterruptedRestoreOutcome::ReplacementVerified {
+                modified_since: true
+            },
+            "{}",
+            assessment.summary
+        );
+        let finalised = finalise_interrupted_restore(&receipt_path, CONFIRMATION).unwrap();
+        assert_eq!(finalised.receipt.state, DatabaseRestoreState::Completed);
+        // Rollback is refused because the database changed since the exchange.
+        let error = rollback_database_restore(&finalised.receipt, CONFIRMATION).unwrap_err();
+        assert!(error.to_string().contains("changed since"), "{error}");
+        assert_eq!(marker(&live), "restored then used");
+    }
+
+    #[test]
+    fn preview_never_opens_a_database_and_lists_leftovers() {
+        let (_root, live, _backup, plan) = fixture();
+        assert!(crash_at(STAGE_AFTER_STAGING, || restore_database(
+            &plan,
+            CONFIRMATION
+        )));
+        let receipt_path = interrupted_restore_receipts(&live).pop().unwrap();
+        // Corrupt the staging copy: a preview must still classify by
+        // identity without touching it; a full assessment lists it too.
+        let receipt = read_receipt(&receipt_path).unwrap();
+        let staged = receipt.staged_replacement_path.clone().unwrap();
+        fs::write(&staged, b"garbage").unwrap();
+        let preview = preview_interrupted_restore(&receipt_path).unwrap();
+        assert_eq!(
+            preview.outcome,
+            InterruptedRestoreOutcome::OriginalIntact {
+                modified_since: false
+            }
+        );
+        assert!(preview.leftover_paths.contains(&staged));
+        assert!(
+            preview
+                .leftover_paths
+                .contains(receipt.emergency_backup_path.as_ref().unwrap())
+        );
+        assert_eq!(fs::read(&staged).unwrap(), b"garbage");
+    }
+
+    #[test]
+    fn failure_after_exchange_is_rolled_back_never_reported_as_original_intact() {
+        // Any step after a successful exchange (directory fsync, receipt,
+        // verification) failing must roll back and must not unlink the
+        // original or claim it was never replaced.
+        for stage in [
+            STAGE_AFTER_EXCHANGE,
+            STAGE_BEFORE_VERIFICATION,
+            STAGE_AFTER_VERIFICATION,
+        ] {
+            let (root, live, _backup, plan) = fixture();
+            let _guard = fault_injection::install(move |s| {
+                if s == stage {
+                    Err("step failed".into())
+                } else {
+                    Ok(())
+                }
+            });
+            let error = restore_database(&plan, CONFIRMATION).unwrap_err();
+            assert!(
+                error.to_string().contains("put back and verified"),
+                "{stage}: {error}"
+            );
+            assert_eq!(marker(&live), "live", "{stage}");
+            assert_eq!(sha256_file(&live).unwrap(), plan.expected_live_sha256);
+            let receipt = &receipts(root.path())[0];
+            assert_eq!(receipt.state, DatabaseRestoreState::RolledBack, "{stage}");
+            assert_eq!(receipt.original_intact, Some(true));
+            assert!(receipt.superseded_database_path.is_none());
+            assert!(receipt.emergency_backup_path.as_ref().unwrap().exists());
+            assert!(
+                !names(root.path())
+                    .iter()
+                    .any(|n| n.contains("restore-staging")),
+                "{stage}"
+            );
+        }
+    }
+
+    #[test]
+    fn tidy_up_failure_after_verification_still_reports_completed_truthfully() {
+        let (root, live, _backup, plan) = fixture();
         let _guard = fault_injection::install(|s| {
-            if s == STAGE_BEFORE_VERIFICATION {
-                Err("verification could not run".into())
+            if s == STAGE_BEFORE_COMPLETED_RECEIPT {
+                Err("tidy-up failed".into())
             } else {
                 Ok(())
             }
         });
-        let error = restore_database(&plan, CONFIRMATION).unwrap_err();
+        let result = restore_database(&plan, CONFIRMATION).unwrap();
+        assert_eq!(result.receipt.state, DatabaseRestoreState::Completed);
+        assert_eq!(marker(&live), "backup");
         assert!(
-            error.to_string().contains("put back and verified"),
+            result.receipt.message.contains("Warning"),
+            "{}",
+            result.receipt.message
+        );
+        assert_eq!(
+            receipts(root.path())[0].state,
+            DatabaseRestoreState::Completed
+        );
+    }
+
+    #[test]
+    fn rollback_interrupted_at_every_stage_is_recoverable() {
+        for stage in fault_injection::ROLLBACK_STAGES {
+            let (root, live, _backup, plan) = fixture();
+            let result = restore_database(&plan, CONFIRMATION).unwrap();
+            assert!(
+                crash_at(stage, || rollback_database_restore(
+                    &result.receipt,
+                    CONFIRMATION
+                )),
+                "{stage}"
+            );
+            let receipt_path = interrupted_restore_receipts(&live)
+                .pop()
+                .expect("non-terminal rollback receipt");
+            let receipt = read_receipt(&receipt_path).unwrap();
+            assert_eq!(receipt.state, DatabaseRestoreState::RollbackAttempted);
+            assert!(receipt.rollback_staging_path.is_some(), "{stage}");
+            let exchanged = *stage != STAGE_ROLLBACK_AFTER_STAGING;
+            let assessment = assess_interrupted_restore(&receipt_path).unwrap();
+            if exchanged {
+                assert_eq!(marker(&live), "live", "{stage}");
+                assert_eq!(
+                    assessment.outcome,
+                    InterruptedRestoreOutcome::RollbackVerified,
+                    "{stage}: {}",
+                    assessment.summary
+                );
+                let finalised = finalise_interrupted_restore(&receipt_path, CONFIRMATION).unwrap();
+                assert_eq!(finalised.receipt.state, DatabaseRestoreState::RolledBack);
+                assert_eq!(finalised.receipt.original_intact, Some(true));
+                // The restored database is preserved at the staging path.
+                let staged = receipt.rollback_staging_path.clone().unwrap();
+                assert!(staged.exists(), "{stage}");
+                assert_eq!(marker(&staged), "backup");
+            } else {
+                assert_eq!(marker(&live), "backup", "{stage}");
+                assert_eq!(
+                    assessment.outcome,
+                    InterruptedRestoreOutcome::ReplacementVerified {
+                        modified_since: false
+                    },
+                    "{stage}: {}",
+                    assessment.summary
+                );
+                assert!(!assessment.leftover_paths.is_empty(), "{stage}");
+                let finalised = finalise_interrupted_restore(&receipt_path, CONFIRMATION).unwrap();
+                assert_eq!(finalised.receipt.state, DatabaseRestoreState::Completed);
+                // And a fresh rollback still works afterwards.
+                let rolled = rollback_database_restore(&finalised.receipt, CONFIRMATION).unwrap();
+                assert_eq!(rolled.state, DatabaseRestoreState::RolledBack);
+                assert_eq!(marker(&live), "live");
+            }
+            assert!(interrupted_restore_receipts(&live).is_empty(), "{stage}");
+            let _ = root;
+        }
+    }
+
+    #[test]
+    fn rollback_step_failure_after_exchange_puts_restored_database_back() {
+        let (root, live, _backup, plan) = fixture();
+        let result = restore_database(&plan, CONFIRMATION).unwrap();
+        let _guard = fault_injection::install(|s| {
+            if s == STAGE_ROLLBACK_AFTER_EXCHANGE {
+                Err("fsync failed".into())
+            } else {
+                Ok(())
+            }
+        });
+        let error = rollback_database_restore(&result.receipt, CONFIRMATION).unwrap_err();
+        assert!(
+            error.to_string().contains("restored database was put back"),
             "{error}"
         );
+        assert_eq!(marker(&live), "backup");
+        let receipt = receipts(root.path()).into_iter().next().unwrap();
+        assert_eq!(receipt.state, DatabaseRestoreState::Completed);
+        assert!(receipt.rollback_staging_path.is_none());
+        assert!(
+            !names(root.path())
+                .iter()
+                .any(|n| n.contains("rollback-staging"))
+        );
+        drop(_guard);
+        // The restore can still be rolled back once the fault is gone.
+        let rolled = rollback_database_restore(&receipt, CONFIRMATION).unwrap();
+        assert_eq!(rolled.state, DatabaseRestoreState::RolledBack);
         assert_eq!(marker(&live), "live");
-        assert_eq!(sha256_file(&live).unwrap(), plan.expected_live_sha256);
-        let receipt = &receipts(root.path())[0];
-        assert_eq!(receipt.state, DatabaseRestoreState::RolledBack);
-        assert_eq!(receipt.original_intact, Some(true));
-        assert!(receipt.emergency_backup_path.as_ref().unwrap().exists());
-        assert!(!root.path().read_dir().unwrap().any(|e| {
-            e.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains("restore-staging")
-        }));
+    }
+
+    fn descriptors_under(root: &Path) -> Vec<(PathBuf, bool)> {
+        fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| fs::read_link(e.path()).ok())
+            .filter(|target| target.starts_with(root))
+            .map(|target| {
+                let deleted = target.to_string_lossy().ends_with(" (deleted)");
+                (target, deleted)
+            })
+            .collect()
     }
 
     #[test]
     fn hashing_the_live_database_under_the_exclusion_keeps_the_lock() {
         // Closing any descriptor on the file would drop this process's SQLite
-        // locks; the exclusion hashes through its held handle instead.
+        // locks; hashing goes through SQLite's own descriptor instead and
+        // opens nothing new.
         let root = tempdir().unwrap();
         let live = root.path().join("library.sqlite3");
         db(&live, "live");
         let expected = sha256_file(&live).unwrap();
+        let idle = descriptors_under(root.path()).len();
         let held = RestoreExclusion::acquire(&live).unwrap();
-        assert_eq!(held.live_sha256().unwrap(), expected);
-        assert_eq!(
-            held.live_metadata().unwrap().len(),
-            fs::metadata(&live).unwrap().len()
+        for _ in 0..3 {
+            assert_eq!(held.locked_inode_sha256().unwrap(), expected);
+            assert_eq!(live_sha256_by_path(&live).unwrap(), expected);
+            assert!(journal_state::sqlite_write_lock_held(&live).unwrap());
+            assert!(journal_state::own_process_holds_lock(&live).unwrap());
+        }
+        // While the exclusion holds the lock SQLite defers closing the
+        // read-only connections' descriptors (its own protection against the
+        // POSIX close rule); they are closed when the lock is released, so
+        // nothing accumulates across operations.
+        let during = descriptors_under(root.path()).len();
+        assert!(
+            during >= idle + 1,
+            "exclusion connection must be open: {during} vs {idle}"
         );
-        assert!(journal_state::sqlite_write_lock_held(&live).unwrap());
         // A read-only connection can read; a writer in this process is refused.
         let reader = super::super::Database::open_read_only(&live).unwrap();
         reader
@@ -2248,18 +2867,107 @@ mod tests {
         assert!(error.to_string().contains("locked"), "{error}");
         drop(held);
         writer.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+        drop(reader);
+        drop(writer);
+        assert_eq!(
+            descriptors_under(root.path()).len(),
+            idle,
+            "deferred descriptors must be closed once the lock is released"
+        );
+    }
+
+    #[test]
+    fn repeated_restores_retain_no_descriptors_and_free_superseded_inodes() {
+        // Owner directive: bounded lifecycle. After N restore+rollback cycles
+        // this process holds no descriptor on anything in the directory, in
+        // particular none on an unlinked ("(deleted)") superseded database,
+        // so its blocks are freed; the only growth is the retained emergency
+        // backups, which are by design.
+        let root = tempdir().unwrap();
+        let live = root.path().join("library.sqlite3");
+        let backup = root.path().join("selected.backup");
+        db(&live, "live");
+        db(&backup, "backup");
+        let baseline = descriptors_under(root.path());
+        assert!(baseline.is_empty(), "{baseline:?}");
+        let cycles = 12;
+        for cycle in 0..cycles {
+            let plan = prepare_database_restore(&live, &backup).unwrap();
+            let result = restore_database(&plan, CONFIRMATION).unwrap();
+            assert_eq!(
+                result.receipt.state,
+                DatabaseRestoreState::Completed,
+                "cycle {cycle}"
+            );
+            let rolled = rollback_database_restore(&result.receipt, CONFIRMATION).unwrap();
+            assert_eq!(
+                rolled.state,
+                DatabaseRestoreState::RolledBack,
+                "cycle {cycle}"
+            );
+            let open = descriptors_under(root.path());
+            assert!(
+                open.is_empty(),
+                "cycle {cycle}: descriptors retained: {open:?}"
+            );
+        }
+        let names = names(root.path());
+        let emergencies = names
+            .iter()
+            .filter(|n| n.contains("before-restore"))
+            .count();
+        let staging = names.iter().filter(|n| n.contains("staging")).count();
+        let bytes: u64 = fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        eprintln!(
+            "lifecycle measurement: cycles={cycles} retained_descriptors=0 deleted_inodes_held=0 emergency_backups={emergencies} staging_leftovers={staging} directory_bytes={bytes}"
+        );
+        assert_eq!(emergencies, cycles);
+        assert_eq!(staging, 0);
+        assert_eq!(marker(&live), "live");
+    }
+
+    #[test]
+    fn unreadable_lock_table_blocks_restore_and_keeps_journal_verdict_neutral() {
+        // Owner directive: if lock state cannot be established, block and say
+        // so; never guess, never accumulate anything.
+        let (root, live, _backup, plan) = fixture();
+        let _seam = journal_state::test_seam::proc_locks_path(root.path().join("no-such-locks"));
+        let error = restore_database(&plan, CONFIRMATION)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("could not read"), "{error}");
+        assert!(error.contains("Nothing was changed"), "{error}");
+        assert_eq!(marker(&live), "live");
+        let receipt = &receipts(root.path())[0];
+        assert_eq!(receipt.state, DatabaseRestoreState::Failed);
+        assert_eq!(receipt.original_intact, Some(true));
+        assert!(prepare_database_restore(&live, &plan.selected_backup_path).is_err());
+        // A live-header journal under an unreadable lock table is
+        // "undetermined", never "busy" and never "crashed".
+        let journal = live.with_file_name("library.sqlite3-journal");
+        fs::write(
+            &journal,
+            [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7, 0, 0, 0, 1],
+        )
+        .unwrap();
+        let verdict = journal_state::classify_live_journal(&live).unwrap();
+        assert_eq!(
+            verdict,
+            Some(journal_state::LiveJournalVerdict::ActivityUndetermined)
+        );
+        assert_eq!(fs::metadata(&journal).unwrap().len(), 12);
     }
 
     #[test]
     fn restore_is_refused_while_a_worker_of_this_process_holds_any_lock() {
         // An in-process scan holding a read transaction must not have its
         // lock dropped by the restore's own file handling.
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let plan = prepare_database_restore(&live, &backup).unwrap();
+        let (_root, live, _backup, plan) = fixture();
         let worker = super::super::Database::open_read_only(&live).unwrap();
         worker
             .connection
@@ -2285,54 +2993,8 @@ mod tests {
     }
 
     #[test]
-    fn writer_with_spilled_transaction_makes_restore_refuse_as_busy() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let plan = prepare_database_restore(&live, &backup).unwrap();
-        let writer = super::super::Database::open_or_create(&live).unwrap();
-        writer
-            .connection
-            .execute_batch("PRAGMA cache_size = 10; BEGIN IMMEDIATE;")
-            .unwrap();
-        let payload = "x".repeat(900);
-        let journal = live.with_file_name("library.sqlite3-journal");
-        for _ in 0..4000 {
-            writer
-                .connection
-                .execute("INSERT INTO restore_marker(value) VALUES (?1)", [&payload])
-                .unwrap();
-            if fs::read(&journal)
-                .is_ok_and(|bytes| bytes.len() >= 8 && bytes[..8].iter().any(|b| *b != 0))
-            {
-                break;
-            }
-        }
-        let error = restore_database(&plan, CONFIRMATION)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("using the library database")
-                || error.contains("writing the library database"),
-            "{error}"
-        );
-        assert!(!error.contains("hot journal"), "{error}");
-        writer.connection.execute_batch("ROLLBACK").unwrap();
-        drop(writer);
-        assert_eq!(marker(&live), "live");
-        assert_eq!(sha256_file(&live).unwrap(), plan.expected_live_sha256);
-    }
-
-    #[test]
     fn second_restore_is_refused_while_one_holds_the_exclusion() {
-        let root = tempdir().unwrap();
-        let live = root.path().join("library.sqlite3");
-        let backup = root.path().join("selected.backup");
-        db(&live, "live");
-        db(&backup, "backup");
-        let plan = prepare_database_restore(&live, &backup).unwrap();
+        let (_root, live, _backup, plan) = fixture();
         let held = RestoreExclusion::acquire(&live).unwrap();
         let error = restore_database(&plan, CONFIRMATION).unwrap_err();
         assert!(error.to_string().contains("already running"), "{error}");

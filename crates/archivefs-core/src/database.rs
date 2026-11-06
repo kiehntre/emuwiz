@@ -118,9 +118,9 @@ pub use restore::{
     DatabaseRestorePlan, DatabaseRestoreReceipt, DatabaseRestoreResult, DatabaseRestoreState,
     FileIdentity, InterruptedRestoreAssessment, InterruptedRestoreOutcome,
     assess_interrupted_restore, finalise_interrupted_restore, interrupted_restore_receipts,
-    prepare_database_restore, read_receipt as read_database_restore_receipt,
-    receipt_path as database_restore_receipt_path, restore_database, review_database_rollback,
-    rollback_database_restore,
+    prepare_database_restore, preview_interrupted_restore,
+    read_receipt as read_database_restore_receipt, receipt_path as database_restore_receipt_path,
+    restore_database, review_database_rollback, rollback_database_restore,
 };
 
 /// The join evidence for `logical_set_name` with its member observations replaced

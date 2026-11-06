@@ -54,7 +54,7 @@ fn attention_database_restore_refused_before_any_change_is_not_a_blocker() {
     let mut record = record(OperationKind::DatabaseRecovery, OperationState::Failed);
     record.recovery.classification = RecoveryClassification::Unrecoverable;
     let item = operation_attention(&record).unwrap();
-    assert_eq!(item.severity, AttentionSeverity::ActionNeeded);
+    assert_eq!(item.severity, AttentionSeverity::Warning);
     assert_eq!(item.destination, AttentionDestination::History);
     // Any other failed restore (rollback failed, review required) still blocks.
     record.recovery.classification = RecoveryClassification::RequiresReview;

@@ -159,6 +159,84 @@ fn child_restorer_stuck() {
     let _ = restore_database(&plan, CONFIRMATION);
 }
 
+/// A process with a tiny descriptor budget that runs repeated restore and
+/// rollback cycles: any leaked or retained descriptor would exhaust it.
+#[test]
+fn child_fd_limited() {
+    if role().as_deref() != Some("fd_limited") {
+        return;
+    }
+    let db = PathBuf::from(std::env::var_os(DB).unwrap());
+    let log = PathBuf::from(std::env::var_os(LOG).unwrap());
+    let backup = db.with_file_name("selected.backup");
+    let limit = libc::rlimit {
+        rlim_cur: 40,
+        rlim_max: 40,
+    };
+    // SAFETY: plain setrlimit on this process with a fully initialised struct.
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    assert_eq!(
+        rc,
+        0,
+        "setrlimit failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut outcome = String::new();
+    for cycle in 0..15 {
+        let step = (|| -> Result<(), String> {
+            let plan = prepare_database_restore(&db, &backup).map_err(|e| e.to_string())?;
+            let result = restore_database(&plan, CONFIRMATION).map_err(|e| e.to_string())?;
+            archivefs_core::rollback_database_restore(&result.receipt, CONFIRMATION)
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        if let Err(error) = step {
+            outcome = format!("err cycle {cycle}: {error}");
+            break;
+        }
+        let open = fs::read_dir("/proc/self/fd")
+            .map(|d| d.count())
+            .unwrap_or(usize::MAX);
+        outcome = format!("ok cycles={} open_descriptors={open}", cycle + 1);
+    }
+    fs::write(&log, outcome).unwrap();
+}
+
+#[test]
+fn restores_under_a_tiny_descriptor_limit_never_exhaust_it() {
+    if role().is_some() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let live = root.path().join("library.sqlite3");
+    let backup = root.path().join("selected.backup");
+    seed(&live, "live");
+    seed(&backup, "backup");
+    let log = root.path().join("fd.log");
+    let mut limited = child("fd_limited", &[(DB, &live), (LOG, &log)]);
+    assert!(limited.wait().unwrap().success());
+    let outcome = fs::read_to_string(&log).unwrap();
+    assert!(outcome.starts_with("ok cycles=15"), "{outcome}");
+    eprintln!("descriptor-limit measurement: {outcome}");
+    assert_eq!(marker(&live), "live");
+    assert_eq!(quick_check(&live), "ok");
+    // Nothing of the superseded databases survives except the retained
+    // emergency backups; no staging file is left.
+    let names: Vec<String> = fs::read_dir(root.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().all(|n| !n.contains("staging")), "{names:?}");
+    assert_eq!(
+        names
+            .iter()
+            .filter(|n| n.contains("before-restore"))
+            .count(),
+        15
+    );
+}
+
 fn wait_for_file(path: &Path, timeout: Duration) -> bool {
     let started = Instant::now();
     while started.elapsed() < timeout {
@@ -353,7 +431,9 @@ fn restore_process_killed_at_every_stage_is_recoverable_after_restart() {
         if exchanged {
             assert_eq!(
                 assessment.outcome,
-                InterruptedRestoreOutcome::ReplacementVerified,
+                InterruptedRestoreOutcome::ReplacementVerified {
+                    modified_since: false
+                },
                 "{stage}: {}",
                 assessment.summary
             );
@@ -362,7 +442,9 @@ fn restore_process_killed_at_every_stage_is_recoverable_after_restart() {
         } else {
             assert_eq!(
                 assessment.outcome,
-                InterruptedRestoreOutcome::OriginalIntact,
+                InterruptedRestoreOutcome::OriginalIntact {
+                    modified_since: false
+                },
                 "{stage}: {}",
                 assessment.summary
             );

@@ -141,6 +141,55 @@ impl RecordLock {
 /// database would therefore silently release the locks of a SQLite
 /// connection in this very process (its own `BEGIN IMMEDIATE`, or a running
 /// scan's transaction). `/proc/locks` answers without touching the file.
+/// The kernel lock table. Tests may point it elsewhere to model a system
+/// where it cannot be read.
+fn proc_locks_table() -> Result<String> {
+    #[cfg(test)]
+    let path = test_seam::current_proc_locks_path();
+    #[cfg(not(test))]
+    let path = PathBuf::from("/proc/locks");
+    fs::read_to_string(&path).map_err(|error| {
+        refuse(format!(
+            "could not read {} to judge who holds the library database: {error}. \
+             Nothing was changed.",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(test)]
+pub(super) mod test_seam {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static PROC_LOCKS: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn current_proc_locks_path() -> PathBuf {
+        PROC_LOCKS.with(|slot| {
+            slot.borrow()
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/proc/locks"))
+        })
+    }
+
+    /// Reads lock state from `path` instead of `/proc/locks` on this thread
+    /// until the guard drops.
+    pub(crate) fn proc_locks_path(path: PathBuf) -> Guard {
+        PROC_LOCKS.with(|slot| *slot.borrow_mut() = Some(path));
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            PROC_LOCKS.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+}
+
 fn record_locks_on(path: &Path) -> Result<Vec<RecordLock>> {
     use std::os::unix::fs::MetadataExt;
     let inode = fs::symlink_metadata(path)
@@ -151,13 +200,7 @@ fn record_locks_on(path: &Path) -> Result<Vec<RecordLock>> {
             ))
         })?
         .ino();
-    let table = fs::read_to_string("/proc/locks").map_err(|error| {
-        refuse(format!(
-            "could not read /proc/locks to judge who holds the library database: {error}. \
-             Nothing was changed."
-        ))
-    })?;
-    Ok(parse_proc_locks(&table, inode))
+    Ok(parse_proc_locks(&proc_locks_table()?, inode))
 }
 
 /// The record locks on `inode` listed in a `/proc/locks` table.
@@ -225,8 +268,23 @@ pub(super) fn sqlite_write_lock_held(database_path: &Path) -> Result<bool> {
 /// I/O (hashing, fsync): the close would drop those locks underneath the
 /// SQLite connection that believes it still holds them.
 pub(super) fn own_process_holds_lock(database_path: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let inode = fs::symlink_metadata(database_path)
+        .map_err(|error| {
+            refuse(format!(
+                "could not inspect {} to read its lock state: {error}. Nothing was changed.",
+                database_path.display()
+            ))
+        })?
+        .ino();
+    own_process_holds_lock_on_inode(inode)
+}
+
+/// Like [`own_process_holds_lock`] for an inode that may no longer have a
+/// pathname (a superseded database still open somewhere in this process).
+pub(super) fn own_process_holds_lock_on_inode(inode: u64) -> Result<bool> {
     let pid = std::process::id();
-    Ok(record_locks_on(database_path)?
+    Ok(parse_proc_locks(&proc_locks_table()?, inode)
         .iter()
         .any(|lock| lock.pid == Some(pid)))
 }

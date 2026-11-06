@@ -60,11 +60,27 @@ The lock is read from `/proc/locks`, never with `fcntl` on a descriptor of
 the database: on POSIX, closing any descriptor a process holds on a file
 releases every record lock that process has on it, so a probe that opened
 and closed the live database would drop this process's own SQLite locks
-(the exclusion's, or a running scan's). For the same reason the executor
-hashes the live database through one handle held open for the whole
-exclusion, and every entry point that reads the live file with plain I/O
-first refuses if this process holds any lock on it. The normal open path uses
-the same classification, so a live writer is reported as "busy" there too.
+(the exclusion's, or a running scan's). For the same reason this module
+never opens a plain descriptor on a live inode at all: hashing reads through
+the descriptor SQLite already holds for a connection
+(`sqlite3_file_control(SQLITE_FCNTL_FILE_POINTER)` and the VFS `xRead`),
+whose lifetime SQLite manages across every connection of this process (its
+unix VFS defers a close while any connection holds a lock on the inode and
+closes the deferred descriptors when the last lock is released). Nothing is
+retained by EmuWiz: after each restore or rollback this process holds no
+descriptor on the database directory, so a superseded original's blocks are
+freed as soon as it is unlinked. Restore, rollback and their reviews refuse
+to start while a SQLite connection of this process holds any lock on the
+live file (that window is not idle), and refuse when `/proc/locks` cannot be
+read, rather than guessing. The normal open path uses the same
+classification, so a live writer is reported as "busy" there too.
+
+Known window: between the journal inspection and `BEGIN IMMEDIATE` a writer
+that already had the file open could crash and leave a hot journal, which
+SQLite would roll back while the exclusion's transaction begins. No
+acknowledged commit can be lost by that (a DELETE-mode commit is the
+journal's deletion), and the plan's hash is re-checked under the lock, so the
+restore then refuses as stale.
 
 ## Staged upgrade of older backups
 
@@ -92,42 +108,67 @@ classified afterwards.
 3. emergency backup of the live database (online backup, fsync, verify),
    receipt `Emergency backup created`;
 4. staging copy (and upgrade), receipt `Restore staged` with hash and inode;
-5. final sidecar check, `renameat2(RENAME_EXCHANGE)` of staging and live
-   paths, directory fsync, receipt `Restore applied`;
-6. verification of the restored file (inode and hash match the staged copy,
-   `quick_check`, schema, tables); on failure the superseded original, still
-   at the staging path, is hash-checked and exchanged back (`Rolled back`), or
-   if that fails too the receipt names both the original's path and the
-   emergency backup (`Rollback failed`);
+5. final sidecar check, then the `renameat2(RENAME_EXCHANGE)` syscall of
+   staging and live paths. This syscall is the only destructive boundary: if
+   it fails nothing was exchanged; if it succeeds everything after it,
+   including the directory fsync and receipt writes, is a post-exchange step.
+   Receipt `Restore applied` names the superseded original's path;
+6. directory fsync and verification of the restored file (inode and hash
+   match the staged copy, `quick_check`, schema, tables); on any failure the
+   superseded original, still at the staging path, is identity- and
+   hash-checked and exchanged back (`Rolled back`); if the exchange back
+   fails the receipt says the live file is the rejected replacement and names
+   the original's path and the emergency backup (`Rollback failed`); if the
+   exchange back succeeds but the original then fails verification the
+   receipt says the original is back at the live path, names the rejected
+   replacement at the staging path, and warns not to copy it over;
 7. the superseded original is unlinked (its content is in the verified
-   emergency backup), receipt `Completed`.
+   emergency backup), receipt `Completed`. A failure in this tidy-up does not
+   fail a restore that happened: the receipt is `Completed` with the
+   original's remaining path and a warning in the message.
 
 Any failure before step 5 finalises the receipt as `Failed` with
-`original_intact = true`.
+`original_intact = true`. Receipt writes after the exchange are best effort:
+a failed write is reported as a warning in the result, never as a failed
+restore and never by stopping before verification.
 
 ## Recovery after restart
 
 `interrupted_restore_receipts` lists receipts that never reached a terminal
-state. `assess_interrupted_restore` compares the live file's hash with the two
-hashes the receipt recorded:
+state. Classification is by **file identity** (device and inode), which the
+receipt records for the original, the staged replacement and a rollback
+copy before the corresponding exchange, so it stays correct after the
+database has been used again:
 
-* equal to the pre-restore hash: the exchange never happened, the original is
-  intact; leftover emergency/staging files are listed, never deleted;
-* equal to the staged hash and verifies: the replacement is in place; the
-  superseded original is reported if it still sits at the staging path;
+* the staged hash was never recorded, or the live pathname carries the
+  original inode: the exchange never happened (or was undone), the original
+  is in place; `modified_since` says whether it has been written since the
+  receipt's hash; leftover emergency/staging files are listed, never deleted;
+* the live pathname carries the replacement inode: the replacement is in
+  place; `assess_interrupted_restore` verifies it (`quick_check`, schema,
+  tables) and reports whether it has been used since;
+* a `Rollback attempted` receipt is judged the same way against the restored
+  database's identity and the rollback copy's identity;
 * otherwise: manual review.
 
-`finalise_interrupted_restore` repeats the assessment under the exclusion and
-only rewrites the receipt (`Failed` with the original intact, or `Completed`).
-History shows the assessment for every interrupted receipt.
+`preview_interrupted_restore` does the same from metadata only (no database
+file is opened or hashed) and is what History shows, because History is
+rebuilt every frame. `finalise_interrupted_restore` repeats the full
+assessment under the exclusion and only rewrites the receipt (`Failed` with
+the original intact, `Completed`, or `Rolled back`).
 
 ## Rollback
 
 `review_database_rollback` checks, read-only, that the emergency backup exists
 with its recorded hash and that the live database is still the restored
-replacement. `rollback_database_restore` then takes the exclusion, stages the
-emergency backup, exchanges, verifies, and records `Rolled back`; a failed
-verification exchanges the restored database back.
+replacement. `rollback_database_restore` then takes the exclusion, records
+the rollback staging path (and, once staged, its hash and inode) in the
+receipt before the exchange, exchanges, fsyncs, verifies the rollback copy by
+identity and `quick_check`, and records `Rolled back`; a failed verification
+exchanges the restored database back (`Completed` again, with the reason), and
+if that exchange fails the receipt says the live file is the unverified
+rollback copy and where the restored database is preserved. An interrupted
+rollback is classified and finalised like an interrupted restore.
 
 ## Limitations
 
@@ -141,5 +182,11 @@ verification exchanges the restored database back.
 * The emergency backup is recorded in the restore receipt, not under a backup
   ownership receipt, so it is offered through `Review rollback` rather than as
   a History backup entry.
+* `/proc/locks` entries are matched by inode number only (device numbers are
+  not stable across btrfs/overlay mounts); a lock on another filesystem's
+  file with the same inode number can only cause a spurious refusal.
+* A SQLite writer using a locking VFS without record locks (or on a network
+  filesystem) is invisible to both the kernel lock table and the RESERVED
+  lock; its journal is reported as "activity cannot be determined".
 * `renameat2(RENAME_EXCHANGE)` is Linux-only; other platforms refuse before
   any change.

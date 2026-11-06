@@ -414,7 +414,7 @@ pub fn operation_attention(record: &OperationRecord) -> Option<AttentionItem> {
     let severity = if resolved {
         AttentionSeverity::Info
     } else if refused_before_change {
-        AttentionSeverity::ActionNeeded
+        AttentionSeverity::Warning
     } else if record.kind == OperationKind::DatabaseRecovery
         || record.state == OperationState::RollbackBlocked
         || (record.state == OperationState::Failed
