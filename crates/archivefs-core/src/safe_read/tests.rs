@@ -605,3 +605,152 @@ fn every_path_kind_is_answered_promptly_and_a_file_replaced_by_a_fifo_is_refused
         Err(SafeReadRefusal::NotRegularFile)
     );
 }
+
+/// Runs `work` on another thread and fails rather than hangs if it does
+/// not come back within five seconds: the point of every FIFO test here.
+#[cfg(unix)]
+fn within_deadline<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the open blocked instead of refusing")
+}
+
+#[cfg(unix)]
+fn mkfifo(path: &Path) -> bool {
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("cstring");
+    // SAFETY: `name` is a valid NUL-terminated path inside a fresh temporary
+    // directory; `mkfifo` only creates the FIFO the test then refuses to read.
+    unsafe { libc::mkfifo(name.as_ptr(), 0o600) == 0 }
+}
+
+/// Night Watch S01-02: the open itself must refuse a symlinked intermediate
+/// directory, independently of the path-based pre-check that runs first.
+/// This calls the descriptor-level open directly with a path whose
+/// directory component *is* a symlink - the state a swap between the
+/// pre-check and the open leaves behind. The path-based open this replaced
+/// followed it happily.
+#[cfg(unix)]
+#[test]
+fn the_open_itself_refuses_a_symlinked_intermediate_directory() {
+    let fixture = Fixture::new("walk-intermediate");
+    let real = fixture.file("elsewhere/real/game.bin", b"rom");
+    let swapped_dir = fixture.link("library/swapped", real.parent().unwrap());
+    let through_link = swapped_dir.join("game.bin");
+    assert!(
+        std::fs::metadata(&through_link).is_ok(),
+        "fixture reaches the file through the link"
+    );
+    assert_eq!(
+        open_validated(&through_link, false).err(),
+        Some(SafeReadRefusal::SymlinkInPath(swapped_dir.clone()))
+    );
+    // The public entry point reports the same component.
+    assert_eq!(
+        open_bounded_read(&through_link, &TrustedRoots::none()).err(),
+        Some(SafeReadRefusal::SymlinkInPath(swapped_dir))
+    );
+    // And a leaf that became a symlink is refused by the open, not followed.
+    let leaf_link = fixture.link("library/leaf.bin", &real);
+    assert_eq!(
+        open_validated(&leaf_link, false).err(),
+        Some(SafeReadRefusal::SymlinkInPath(leaf_link))
+    );
+    drop(fixture);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_directory_no_symlinks_walks_real_directories_only() {
+    let fixture = Fixture::new("walk-directory");
+    std::fs::create_dir_all(fixture.path("library/sub/deep")).unwrap();
+    let handle = open_directory_no_symlinks(&fixture.path("library/sub/deep")).unwrap();
+    assert!(handle.metadata().unwrap().is_dir());
+    let link = fixture.link("library/alias", &fixture.path("library/sub"));
+    assert_eq!(
+        open_directory_no_symlinks(&link.join("deep")).err(),
+        Some(SafeReadRefusal::SymlinkInPath(link.clone()))
+    );
+    assert_eq!(
+        open_directory_no_symlinks(&link).err(),
+        Some(SafeReadRefusal::SymlinkInPath(link))
+    );
+    assert_eq!(
+        open_directory_no_symlinks(Path::new("library/sub")).err(),
+        Some(SafeReadRefusal::NotAbsolute)
+    );
+    assert_eq!(
+        open_directory_no_symlinks(&fixture.path("library/../library")).err(),
+        Some(SafeReadRefusal::NonNormalComponent)
+    );
+    // A regular file is not a directory.
+    let file = fixture.file("library/file.bin", b"x");
+    assert!(matches!(
+        open_directory_no_symlinks(&file).err(),
+        Some(SafeReadRefusal::Unreadable(_))
+    ));
+    drop(fixture);
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_a_fifo_through_the_walk_refuses_promptly() {
+    let fixture = Fixture::new("walk-fifo");
+    let fifo = fixture.path("library/pipe.bin");
+    if !mkfifo(&fifo) {
+        return;
+    }
+    let target = fifo.clone();
+    assert_eq!(
+        within_deadline(move || open_validated(&target, false).err()),
+        Some(SafeReadRefusal::NotRegularFile)
+    );
+    drop(fixture);
+}
+
+/// Night Watch D7-04: the plain regular-file open used by cache and config
+/// readers must not block on a FIFO, must refuse non-files, and must honour
+/// the caller's symlink choice.
+#[cfg(unix)]
+#[test]
+fn open_regular_file_nonblocking_refuses_fifos_and_respects_follow() {
+    let fixture = Fixture::new("plain-open");
+    let fifo = fixture.path("library/pipe.toml");
+    if !mkfifo(&fifo) {
+        return;
+    }
+    for follow in [true, false] {
+        let target = fifo.clone();
+        let error = within_deadline(move || open_regular_file_nonblocking(&target, follow).err())
+            .expect("a FIFO must be refused");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "follow={follow}"
+        );
+    }
+    let real = fixture.file("library/real.toml", b"a = 1\n");
+    let link = fixture.link("library/link.toml", &real);
+    let fifo_link = fixture.link("library/pipe-link.toml", &fifo);
+    let mut opened = open_regular_file_nonblocking(&link, true).unwrap();
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut opened, &mut text).unwrap();
+    assert_eq!(text, "a = 1\n");
+    assert!(open_regular_file_nonblocking(&link, false).is_err());
+    let target = fifo_link.clone();
+    assert!(within_deadline(move || open_regular_file_nonblocking(
+        &target, true
+    )
+    .is_err()));
+    assert!(open_regular_file_nonblocking(&fixture.path("library"), true).is_err());
+    // Blocking mode is restored: a read on the returned handle is ordinary.
+    let file = open_regular_file_nonblocking(&real, false).unwrap();
+    use std::os::fd::AsRawFd;
+    // SAFETY: querying status flags of a live descriptor owned by `file`.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(flags & libc::O_NONBLOCK, 0);
+    drop(fixture);
+}

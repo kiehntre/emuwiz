@@ -614,3 +614,42 @@ fn provider_adds_no_application_migration() {
         "CheatBase provider must not add an application migration"
     );
 }
+
+/// Night Watch D7-04: a FIFO offered as the local database is refused at
+/// once instead of blocking the import forever.
+#[cfg(unix)]
+#[test]
+fn fifo_local_import_is_refused_promptly() {
+    let root = fixture_root("fifo");
+    fs::create_dir_all(&root).unwrap();
+    let fifo = root.join("selected.db");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let paths = CheatBasePaths::at(root.join("owned"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (thread_paths, thread_fifo) = (paths.clone(), fifo.clone());
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            import_local_with_expected_hash(&thread_paths, &thread_fifo, None)
+                .err()
+                .map(|error| error.kind),
+        );
+    });
+    let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
+    if outcome.is_err() {
+        let _ = fs::OpenOptions::new().read(true).write(true).open(&fifo);
+    }
+    let kind = outcome
+        .expect("CheatBase local import blocked on a FIFO")
+        .expect("a FIFO must be refused");
+    assert!(matches!(
+        kind,
+        CheatBaseErrorKind::SourceUnreadable | CheatBaseErrorKind::UnsafePath
+    ));
+    let _ = fs::remove_dir_all(root);
+}

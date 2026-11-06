@@ -32,9 +32,14 @@
 //!    d. the canonical target also lies inside a trusted root;
 //!    e. the canonical target is a regular file - so a directory, FIFO, socket,
 //!    device or anything else is refused.
-//! 4. The file is opened `O_NOFOLLOW | O_CLOEXEC` on the already-canonical
-//!    path, and its device and inode are re-checked afterwards, so the thing
-//!    that was validated is the thing that was opened.
+//! 4. The file is opened by walking the path one component at a time from
+//!    `/` with `openat(O_DIRECTORY | O_NOFOLLOW)`, and the leaf with
+//!    `openat(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)` on the directory
+//!    descriptor just obtained. Every step is a kernel-level "no symlink
+//!    here" check on the descriptor actually in hand, so a directory swapped
+//!    for a symlink *between* a check and the open (Night Watch S01-02) is
+//!    refused rather than followed, and the file type is taken from the open
+//!    descriptor itself. A path-based pre-check cannot promise either.
 //!
 //! # Fail-closed
 //!
@@ -362,7 +367,10 @@ fn resolve_trusted_symlink(
     Ok(canonical_target)
 }
 
-/// Refuses when any component of `path` is itself a symlink.
+/// Legacy path-based pre-check, kept for the error wording tests and for
+/// the non-Unix build: refuses when any component of `path` is itself a
+/// symlink. On Unix the descriptor walk in [`open_validated`] is the check
+/// that counts; this only provides the earlier, more specific refusal.
 fn refuse_symlinked_components(path: &Path) -> Result<(), SafeReadRefusal> {
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -381,50 +389,212 @@ fn refuse_symlinked_components(path: &Path) -> Result<(), SafeReadRefusal> {
     Ok(())
 }
 
-/// Opens an already-validated, already-canonical path read-only, and confirms
-/// afterwards that the opened file is the one that was validated.
+/// Opens the directory `path` without following a single symlink anywhere
+/// in it, by walking from `/` one component at a time on directory
+/// descriptors. `path` must be absolute with only normal components.
+///
+/// The returned handle is the directory itself, usable with `openat`-style
+/// operations by callers that must create or publish *relative to a
+/// directory they have already verified* (the archive stage publisher does
+/// this), instead of re-resolving a path that may have changed.
+#[cfg(unix)]
+pub fn open_directory_no_symlinks(path: &Path) -> Result<File, SafeReadRefusal> {
+    if !path.is_absolute() {
+        return Err(SafeReadRefusal::NotAbsolute);
+    }
+    let mut current = PathBuf::from("/");
+    let mut directory = open_root()?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                current.push(name);
+                directory = open_child_directory(&directory, name, &current)?;
+            }
+            _ => return Err(SafeReadRefusal::NonNormalComponent),
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_root() -> Result<File, SafeReadRefusal> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC);
+    }
+    options
+        .open("/")
+        .map_err(|error| SafeReadRefusal::Unreadable(format!("/: {error}")))
+}
+
+/// One step of the walk: `name` inside `directory`, which must be a real
+/// directory (not a symlink to one). With `O_NOFOLLOW | O_DIRECTORY` the
+/// kernel refuses a symlink in that place (Linux reports `ENOTDIR`, some
+/// systems `ELOOP`); the refusal is then named by asking the directory
+/// descriptor what the entry is, so the caller can say "symlink" rather
+/// than "unreadable" - the open itself never followed anything.
+#[cfg(unix)]
+fn open_child_directory(
+    directory: &File,
+    name: &std::ffi::OsStr,
+    reached: &Path,
+) -> Result<File, SafeReadRefusal> {
+    openat(
+        directory,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )
+    .map_err(|error| {
+        if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR))
+            && entry_is_symlink(directory, name)
+        {
+            return SafeReadRefusal::SymlinkInPath(reached.to_path_buf());
+        }
+        SafeReadRefusal::Unreadable(format!("{}: {error}", reached.display()))
+    })
+}
+
+/// Whether `name` inside the open `directory` is a symlink right now
+/// (`fstatat` with `AT_SYMLINK_NOFOLLOW`). Diagnostic only: the refusal was
+/// already decided by the kernel's open.
+#[cfg(unix)]
+fn entry_is_symlink(directory: &File, name: &std::ffi::OsStr) -> bool {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
+        return false;
+    };
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `directory` is a live descriptor, `name` a valid C string and
+    // `stat` a writable, correctly sized struct.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    result == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK
+}
+
+/// Opens the subdirectory `name` of an already-open directory handle without
+/// following a symlink in its place (`ELOOP` becomes an error). `name` must
+/// be one plain component. This is the one descriptor-relative primitive
+/// handed to callers that stage and publish inside a directory they pinned
+/// with [`open_directory_no_symlinks`].
+#[cfg(unix)]
+pub fn open_subdirectory_no_follow(
+    directory: &File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<File> {
+    openat(
+        directory,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )
+}
+
+/// `openat(2)` of one single-component `name` relative to `directory`.
+#[cfg(unix)]
+fn openat(directory: &File, name: &std::ffi::OsStr, flags: libc::c_int) -> std::io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.contains(&b'/') || bytes == b"." || bytes == b".." {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "openat name must be one plain path component",
+        ));
+    }
+    let name = std::ffi::CString::new(bytes)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in name"))?;
+    // SAFETY: `directory` is a live descriptor owned by the caller for the
+    // duration of the call and `name` is a valid NUL-terminated string.
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by `openat` and is owned by nothing else.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Opens an already-validated, already-canonical path read-only, without
+/// following a symlink at any component, and takes the file's type and
+/// length from the open descriptor itself.
+#[cfg(unix)]
+fn open_validated(target: &Path, resolved_via_symlink: bool) -> Result<SafeFile, SafeReadRefusal> {
+    let before = std::fs::symlink_metadata(target)
+        .map_err(|error| SafeReadRefusal::Unreadable(format!("{}: {error}", target.display())))?;
+    if before.file_type().is_symlink() {
+        // The caller passes a canonical or already-vetted path; a symlink in
+        // its place now means it changed underneath them.
+        return Err(SafeReadRefusal::SymlinkInPath(target.to_path_buf()));
+    }
+    if !before.is_file() {
+        return Err(SafeReadRefusal::NotRegularFile);
+    }
+    let parent = target.parent().ok_or(SafeReadRefusal::NotAbsolute)?;
+    let leaf = target.file_name().ok_or(SafeReadRefusal::NotAbsolute)?;
+    let directory = open_directory_no_symlinks(parent)?;
+    // `O_NOFOLLOW` refuses a leaf that became a symlink. `O_NONBLOCK` closes
+    // the race between the regular-file check above and this open: a path
+    // swapped for a FIFO opens at once (instead of waiting forever for a
+    // writer) and is then refused below. It is cleared again once the file
+    // is proven regular, so readers see ordinary blocking reads. `O_NOCTTY`
+    // keeps a terminal swapped in during that window from becoming ours.
+    let file = openat(
+        &directory,
+        leaf,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOCTTY,
+    )
+    .map_err(|error| {
+        if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR))
+            && entry_is_symlink(&directory, leaf)
+        {
+            return SafeReadRefusal::SymlinkInPath(target.to_path_buf());
+        }
+        SafeReadRefusal::OpenFailed(error.to_string())
+    })?;
+
+    use std::os::unix::fs::MetadataExt;
+    let after = file
+        .metadata()
+        .map_err(|error| SafeReadRefusal::OpenFailed(error.to_string()))?;
+    if !after.is_file() {
+        return Err(SafeReadRefusal::NotRegularFile);
+    }
+    if before.dev() != after.dev() || before.ino() != after.ino() {
+        return Err(SafeReadRefusal::ChangedWhileOpening);
+    }
+    clear_nonblocking(&file).map_err(|error| SafeReadRefusal::OpenFailed(error.to_string()))?;
+
+    Ok(SafeFile {
+        file,
+        length: after.len(),
+        resolved_via_symlink,
+        #[cfg(test)]
+        path: target.to_path_buf(),
+    })
+}
+
+/// Non-Unix fallback: the path-based open this module had before the
+/// descriptor walk. Kept only so the crate still builds there; the
+/// guarantees documented above are Unix-only.
+#[cfg(not(unix))]
 fn open_validated(target: &Path, resolved_via_symlink: bool) -> Result<SafeFile, SafeReadRefusal> {
     let before = std::fs::symlink_metadata(target)
         .map_err(|error| SafeReadRefusal::Unreadable(format!("{}: {error}", target.display())))?;
     if !before.is_file() {
         return Err(SafeReadRefusal::NotRegularFile);
     }
-
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // The path is canonical, so `O_NOFOLLOW` cannot reject a legitimate
-        // read here - but it is kept as a hard guarantee that nothing is
-        // followed at open time either. `O_NONBLOCK` closes the race between
-        // the regular-file check above and this open: a path swapped for a
-        // FIFO opens at once (instead of waiting forever for a writer) and is
-        // then refused below. It is cleared again once the file is proven
-        // regular, so readers see ordinary blocking reads. `O_NOCTTY` keeps a
-        // terminal swapped in during that window from becoming ours.
-        options
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOCTTY);
-    }
-    let file = options
+    let file = OpenOptions::new()
+        .read(true)
         .open(target)
         .map_err(|error| SafeReadRefusal::OpenFailed(error.to_string()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let after = file
-            .metadata()
-            .map_err(|error| SafeReadRefusal::OpenFailed(error.to_string()))?;
-        if before.dev() != after.dev() || before.ino() != after.ino() {
-            return Err(SafeReadRefusal::ChangedWhileOpening);
-        }
-        if !after.is_file() {
-            return Err(SafeReadRefusal::NotRegularFile);
-        }
-        clear_nonblocking(&file).map_err(|error| SafeReadRefusal::OpenFailed(error.to_string()))?;
-    }
-
     Ok(SafeFile {
         file,
         length: before.len(),
@@ -434,9 +604,42 @@ fn open_validated(target: &Path, resolved_via_symlink: bool) -> Result<SafeFile,
     })
 }
 
+/// Opens `path` read-only for a bounded read of a file the caller already
+/// trusts to *name* (its own config, a cache it wrote), while still refusing
+/// to block on it: the open is `O_NONBLOCK | O_NOCTTY`, the descriptor is
+/// then required to be a regular file (a FIFO, device, socket or directory
+/// is refused instead of hanging the reader), and blocking mode is restored
+/// before the handle is returned. Symlinks are followed when `follow` is
+/// true (a config file kept in a dotfiles repository) and refused with
+/// `O_NOFOLLOW` when it is false.
+///
+/// This is the minimal FIFO-safe open (Night Watch D7-04); it makes no
+/// containment claim. Callers that need containment use
+/// [`open_bounded_read`].
+#[cfg(unix)]
+pub fn open_regular_file_nonblocking(path: &Path, follow: bool) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    let mut flags = libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOCTTY;
+    if !follow {
+        flags |= libc::O_NOFOLLOW;
+    }
+    options.custom_flags(flags);
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    clear_nonblocking(&file)?;
+    Ok(file)
+}
+
 /// Restores blocking mode on a descriptor opened with `O_NONBLOCK`.
 #[cfg(unix)]
-fn clear_nonblocking(file: &File) -> std::io::Result<()> {
+pub(crate) fn clear_nonblocking(file: &File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let fd = file.as_raw_fd();
     // SAFETY: `fd` is a live descriptor owned by `file` for this whole call;
