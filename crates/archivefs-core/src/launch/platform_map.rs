@@ -272,6 +272,42 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         retroarch_core_hints: &["genesis_plus_gx"],
         confidence: MappingConfidence::StronglyKnown,
     },
+    // RetroArch-only single-ROM cartridge systems. One reviewed hint each so
+    // a multi-system core set (genesis_plus_gx, picodrive, smsplus, ...) is
+    // ranked, not ambiguous. Hints never create candidates; the core's own
+    // `.info` metadata must still resolve to the platform.
+    LaunchCompatibility {
+        platform_id: "GameGear",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["genesis_plus_gx"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
+        platform_id: "MasterSystem",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["genesis_plus_gx"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
+        platform_id: "Sega 32X",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["picodrive"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    LaunchCompatibility {
+        platform_id: "ColecoVision",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["gearcoleco"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
+    // HuCards are stored as `TurboGrafx-16`; `PC Engine` (Mesen standalone
+    // row above) is an equivalent id and is left untouched.
+    LaunchCompatibility {
+        platform_id: "TurboGrafx-16",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["mednafen_pce_fast"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
     LaunchCompatibility {
         platform_id: "Atari2600",
         standalone_adapters: &["stella"],
@@ -463,7 +499,12 @@ pub fn retroarch_platform_candidate(info: &CoreInfoFinding) -> Option<&'static s
 /// previous Sega CD-only form of this check is now just one case of the
 /// general rule.)
 pub fn retroarch_platform_matches(info: &CoreInfoFinding, platform_id: &str) -> bool {
-    if retroarch_platform_candidate(info) == Some(platform_id) {
+    // `PC Engine` and `TurboGrafx-16` are the same hardware (registry
+    // equivalence); a core's `NEC - PC Engine - TurboGrafx 16` text resolves
+    // to the former. `PC Engine CD` is a distinct id and is not equivalent.
+    let mut wanted = vec![platform_id];
+    wanted.extend(crate::platform::equivalent_platform_ids(platform_id));
+    if retroarch_platform_candidate(info).is_some_and(|candidate| wanted.contains(&candidate)) {
         return true;
     }
     matches!(
@@ -471,7 +512,8 @@ pub fn retroarch_platform_matches(info: &CoreInfoFinding, platform_id: &str) -> 
         CoreInfoFinding::Found { database: Some(database), .. }
             if database
                 .split('|')
-                .any(|alternative| resolve_info_text(alternative) == Some(platform_id))
+                .any(|alternative| resolve_info_text(alternative)
+                    .is_some_and(|resolved| wanted.contains(&resolved)))
     )
 }
 
