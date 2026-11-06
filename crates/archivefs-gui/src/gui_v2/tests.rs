@@ -1170,6 +1170,7 @@ fn gui_v2_playing_library_preview_runs_on_the_background_worker() {
             super::backend::Command::PlayingLibraryPreview {
                 state: Box::new(state),
                 generation: 9,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         )
         .unwrap();
@@ -11922,6 +11923,8 @@ mod blue_save_snapshots;
 #[path = "tests/single_file_restore.rs"]
 mod blue_single_file_restore;
 
+#[path = "tests/blue_worker_lane.rs"]
+mod blue_worker_lane;
 #[path = "tests/repair.rs"]
 mod repair;
 
