@@ -786,10 +786,11 @@ pub(super) enum ToolPage {
     ArcadeShelf,
     Vita3kTitles,
     OpenRct2,
+    FolderCheck,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
@@ -810,6 +811,7 @@ impl ToolPage {
         Self::ArcadeShelf,
         Self::Vita3kTitles,
         Self::OpenRct2,
+        Self::FolderCheck,
     ];
 
     pub fn title(self) -> &'static str {
@@ -834,6 +836,7 @@ impl ToolPage {
             Self::ArcadeShelf => "Virtual Arcade Shelf",
             Self::Vita3kTitles => "PlayStation Vita (Vita3K) titles",
             Self::OpenRct2 => "RollerCoaster Tycoon 2 via OpenRCT2 (alternative)",
+            Self::FolderCheck => "Smart ROM Folder Check",
         }
     }
 
@@ -887,6 +890,9 @@ impl ToolPage {
             Self::OpenRct2 => {
                 "Play RollerCoaster Tycoon 2 with an OpenRCT2 you installed, using your own game folder; nothing is installed or copied."
             }
+            Self::FolderCheck => {
+                "Look for games whose content belongs to a different system than their folder. Read only: nothing is changed or moved."
+            }
         }
     }
 
@@ -912,6 +918,7 @@ impl ToolPage {
             Self::ArcadeShelf => Section::Games,
             Self::Vita3kTitles => Section::Games,
             Self::OpenRct2 => Section::Games,
+            Self::FolderCheck => Section::Games,
         }
     }
 
@@ -936,6 +943,7 @@ impl ToolPage {
             Self::ArcadeShelf => "Games & collection",
             Self::Vita3kTitles => "Games & collection",
             Self::OpenRct2 => "Games & collection",
+            Self::FolderCheck => "Games & collection",
         }
     }
 }

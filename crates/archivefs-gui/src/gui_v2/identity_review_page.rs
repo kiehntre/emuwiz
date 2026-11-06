@@ -388,6 +388,9 @@ impl App {
         };
         let name = file_name(game);
         let current_system = game.platform.clone();
+        let source_code = game.archive.platform_source.clone();
+        let source_note = system_source_note(source_code.as_deref());
+        let suggestion = self.folder_check.finding_for(id).cloned();
         // Leave room for the heading, search, confirmation text and buttons.
         let list_height = (context.screen_rect().height() - 330.0).clamp(80.0, 260.0);
         let busy = self.review.assign_job.is_some();
@@ -431,6 +434,15 @@ impl App {
                         archivefs_core::platform::display_name_for(selected)
                     ));
                     ui.label("This records your choice for this one game. No game file is changed.");
+                    for line in super::folder_check::system_change_preview(
+                        &current_system,
+                        source_note,
+                        source_code.as_deref(),
+                        selected,
+                        suggestion.as_ref(),
+                    ) {
+                        ui.small(line);
+                    }
                 }
                 ui.horizontal(|ui| {
                     if ui

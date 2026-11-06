@@ -232,6 +232,7 @@ impl App {
                 .color(palette::SECONDARY_TEXT),
         );
         ui.add_space(if compact { 8.0 } else { 14.0 });
+        self.folder_check_cards(ui);
         let width = ui.available_width();
         let right = if width >= 1500.0 {
             RIGHT_COLUMN_WIDE

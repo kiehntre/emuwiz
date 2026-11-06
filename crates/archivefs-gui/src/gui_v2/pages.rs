@@ -1442,6 +1442,7 @@ impl App {
     }
 
     fn setup_doctor(&mut self, ui: &mut egui::Ui) {
+        self.folder_check_cards(ui);
         // A summary that arrived since the last frame goes to the clipboard once.
         if let Some(summary) = self.setup_actions.summary.take() {
             ui.ctx().copy_text(summary);

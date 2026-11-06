@@ -57,6 +57,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         moved_game: None,
         review: Default::default(),
         game_dat_check: Default::default(),
+        folder_check: Default::default(),
         hasheous_check: Default::default(),
         indices: Vec::new(),
         filter: Filter::default(),
