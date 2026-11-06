@@ -158,6 +158,15 @@ pub fn set_test_replaced_checkpoint_fault(enabled: bool) {
     inject_fault(enabled.then_some(FaultPoint::ReplacedCheckpoint));
 }
 
+/// Synthetic GUI tests make an apply on this thread stop right before its
+/// terminal journal is written (every file is already published and
+/// checkpointed), which is what a crash at that moment leaves behind.
+/// Unavailable in ordinary application builds.
+#[cfg(feature = "test-support")]
+pub fn set_test_terminal_journal_fault(enabled: bool) {
+    inject_fault(enabled.then_some(FaultPoint::TerminalJournal));
+}
+
 #[cfg(not(any(test, feature = "test-support")))]
 fn should_inject_after(_point: FaultPoint) -> bool {
     false

@@ -141,6 +141,9 @@ pub struct RetroArchCheatSetupPreviewSummary {
     pub different_existing_files: usize,
     pub replacement_blocked: usize,
     pub conflicts: usize,
+    /// Manifest games skipped because none of their cheats carries a code.
+    #[serde(default)]
+    pub no_usable_cheat_codes: usize,
     pub malformed_or_skipped_entries: usize,
     pub total_writes_proposed: usize,
     pub total_backups_proposed: usize,
@@ -468,6 +471,7 @@ pub fn build_retroarch_cheat_setup_plan(
             different_existing_files
         },
         conflicts: availability.summary.conflicts,
+        no_usable_cheat_codes: availability.summary.no_usable_cheat_codes,
         malformed_or_skipped_entries: skipped.saturating_add(snapshot.diagnostics.len()),
         total_writes_proposed: install_preview
             .iter()

@@ -41,6 +41,7 @@ pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context
     app.reconcile_archive_preparation();
     app.poll_needs_attention(context);
     app.artwork_media.platform_artwork.poll(context);
+    app.poll_startup_shared_recovery();
     app.poll_shared_history();
     // Gamer View's "Undo last change" (docs/GUI_NAVIGATION_RESET_DESIGN.md
     // mandatory risk #2) drives this exact same `shared_rollback` state

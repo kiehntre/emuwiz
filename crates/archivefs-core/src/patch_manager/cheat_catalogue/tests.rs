@@ -2134,3 +2134,91 @@ fn d7_02_destination_file_name_is_trimmed_shared_and_rejects_control_characters(
     }
     assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 0);
 }
+
+#[test]
+fn preview_counts_and_labels_games_skipped_for_having_no_usable_cheat_codes() {
+    let root = temp_root("codeless-summary");
+    // One fully codeless game, one mixed game (one coded, one codeless),
+    // one fully coded game.
+    let path = write_manifest(
+        &root,
+        r#"{
+            "source_name": "Mixed",
+            "games": [
+                {"game_name": "Frogger", "platform": "Atari2600",
+                 "cheats": [{"description": "Infinite Lives"}, {"description": "Moon Jump"}]},
+                {"game_name": "Pitfall", "platform": "Atari2600",
+                 "cheats": [{"code": "F000:01", "description": "Coded"}, {"description": "Codeless"}]},
+                {"game_name": "Adventure", "platform": "Atari2600",
+                 "cheats": [{"code": "F001:02", "description": "Coded"}]}
+            ]
+        }"#,
+    );
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Mixed", &path);
+    let games = vec![
+        evidence(50, "Frogger", Some("Atari2600"), None, None, None),
+        evidence(51, "Pitfall", Some("Atari2600"), None, None, None),
+        evidence(52, "Adventure", Some("Atari2600"), None, None, None),
+    ];
+    let destination_root = temp_root("codeless-summary-dest");
+    let report = build_cheat_availability_report(
+        &HostReadOnlyFilesystem,
+        &snapshot,
+        &games,
+        None,
+        Some(&destination_root),
+    );
+    assert_eq!(report.summary.no_usable_cheat_codes, 1);
+    assert_eq!(report.summary.not_installed, 2);
+    assert_eq!(report.summary.staging_candidates, 2);
+    let by_name = |name: &str| {
+        report
+            .entries
+            .iter()
+            .find(|entry| entry.game.source_game_name == name)
+            .unwrap()
+    };
+    let frogger = by_name("Frogger");
+    assert_eq!(
+        frogger.staging_plan.planned_action,
+        CheatStagingAction::NotEligible
+    );
+    assert_eq!(frogger.staging_plan.reason, NO_INSTALLABLE_CHEATS_REASON);
+    assert!(
+        frogger
+            .installed_state_detail
+            .iter()
+            .any(|line| line.starts_with(NO_USABLE_CHEAT_CODES_LABEL)),
+        "{:?}",
+        frogger.installed_state_detail
+    );
+    // Descriptions are preserved as catalogue information.
+    assert_eq!(frogger.game.cheat_count, 2);
+    assert_eq!(
+        frogger.game.cheats[0].description.as_deref(),
+        Some("Infinite Lives")
+    );
+    // The mixed game installs only its coded cheat; the codeless one is
+    // neither written as an empty entry nor invented.
+    let pitfall = by_name("Pitfall");
+    assert_eq!(
+        pitfall.staging_plan.planned_action,
+        CheatStagingAction::InstallNew
+    );
+    let rendered =
+        String::from_utf8(render_installable_cheat_document(&pitfall.game).unwrap()).unwrap();
+    assert!(rendered.contains("cheats = 1\n"));
+    assert!(!rendered.contains("Codeless"));
+    assert_eq!(pitfall.game.cheat_count, 2, "catalogue still lists both");
+    assert!(
+        !by_name("Adventure")
+            .installed_state_detail
+            .iter()
+            .any(|l| l.contains("Skipped"))
+    );
+    assert_eq!(
+        fs::read_dir(&destination_root).unwrap().count(),
+        0,
+        "preview wrote nothing"
+    );
+}

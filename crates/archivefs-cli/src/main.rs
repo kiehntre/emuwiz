@@ -2534,6 +2534,15 @@ fn format_cheat_availability_report(report: &CheatAvailabilityReport) -> String 
         report.summary.staging_candidates
     )
     .unwrap();
+    if report.summary.no_usable_cheat_codes > 0 {
+        writeln!(
+            &mut output,
+            "{}: {} game(s) in this catalogue list cheats without a code; nothing will be written for them",
+            archivefs_core::patch_manager::NO_USABLE_CHEAT_CODES_LABEL,
+            report.summary.no_usable_cheat_codes
+        )
+        .unwrap();
+    }
 
     for entry in &report.entries {
         writeln!(&mut output).unwrap();

@@ -315,9 +315,10 @@ pub use cheat_catalogue::{
     CheatDefinition, CheatGameMatch, CheatGameRecord, CheatInstalledState, CheatMatchCandidate,
     CheatMatchConfidence, CheatMatchEvidence, CheatStagingAction, CheatStagingPlan,
     JsonManifestSource, MAX_CATALOGUE_EXCLUDED_ENTRIES, MAX_CATALOGUE_EXCLUSION_EXAMPLES,
-    RetroarchChtDirectorySource, build_cheat_availability_report, cheat_destination_file_name,
-    installable_content_hash, load_cheat_catalogue_snapshot, match_cheat_game_record,
-    matching_excluded_entry, render_installable_cheat_document,
+    NO_INSTALLABLE_CHEATS_REASON, NO_USABLE_CHEAT_CODES_LABEL, RetroarchChtDirectorySource,
+    build_cheat_availability_report, cheat_destination_file_name, installable_content_hash,
+    load_cheat_catalogue_snapshot, match_cheat_game_record, matching_excluded_entry,
+    render_installable_cheat_document,
 };
 pub use cheat_compatibility::{
     CheatCompatibilityEntry, CheatCompatibilityOperation, CheatCompatibilityReport, CheatCondition,
@@ -1077,6 +1078,8 @@ pub use shared_preview::{
 pub use shared_transaction::set_test_replaced_checkpoint_fault;
 #[cfg(feature = "test-support")]
 pub use shared_transaction::set_test_rollback_restore_fault;
+#[cfg(feature = "test-support")]
+pub use shared_transaction::set_test_terminal_journal_fault;
 pub use shared_transaction::{
     SHARED_APPLY_SCHEMA_VERSION, SHARED_DURABLE_JOURNAL_SCHEMA_VERSION, SHARED_MAX_BACKUP_BYTES,
     SHARED_MAX_CREATED_DIRECTORIES, SHARED_MAX_ENTRIES, SHARED_MAX_FAILURES,

@@ -1101,6 +1101,11 @@ fn hex_sha256(bytes: &[u8]) -> String {
 // Installable content
 // ---------------------------------------------------------------------
 
+/// Staging reason for a manifest game none of whose cheats carries a code.
+pub const NO_INSTALLABLE_CHEATS_REASON: &str = "no_installable_cheats";
+/// What a preview shows for such a game.
+pub const NO_USABLE_CHEAT_CODES_LABEL: &str = "Skipped: no usable cheat codes";
+
 /// The `.cht` document an install would write for a JSON-manifest record:
 /// one RetroArch-loadable file holding only *this* game's cheats, rendered
 /// deterministically through [`render_cht_file`]. A manifest describes
@@ -2075,17 +2080,6 @@ fn resolve_cheat_staging_plan(
     if !record.parsing_complete {
         return not_eligible_plan(record, "parsing_incomplete");
     }
-    // What an install would actually write. A `.cht` source keeps its own
-    // file hash (possibly `None` when it could not be bounded-read, as
-    // before); a manifest game is only eligible when it renders to a real
-    // per-game document.
-    let source_file_hash = match record.format {
-        CheatCatalogueFormat::RetroarchChtDirectory => record.source_file_hash.clone(),
-        CheatCatalogueFormat::JsonManifest => match installable_content_hash(record) {
-            Some(hash) => Some(hash),
-            None => return not_eligible_plan(record, "no_installable_cheats"),
-        },
-    };
     match game_match.confidence {
         CheatMatchConfidence::Exact | CheatMatchConfidence::Strong => {}
         CheatMatchConfidence::Weak => return not_eligible_plan(record, "weak_match_not_eligible"),
@@ -2108,6 +2102,10 @@ fn resolve_cheat_staging_plan(
                 return staging_plan;
             }
             ArtifactDestinationLookup::One(destination) => {
+                let source_file_hash = match installable_source_hash(record) {
+                    Ok(hash) => hash,
+                    Err(reason) => return not_eligible_plan(record, reason),
+                };
                 let outcome = probe_and_compare_destination(
                     filesystem,
                     record,
@@ -2130,6 +2128,10 @@ fn resolve_cheat_staging_plan(
 
     match resolve_canonical_cheat_destination(record, advisory_plan, destination_root_override) {
         Ok(path) => {
+            let source_file_hash = match installable_source_hash(record) {
+                Ok(hash) => hash,
+                Err(reason) => return not_eligible_plan(record, reason),
+            };
             let encoded = EncodedPath::from_path(&path);
             let probe = filesystem.probe(&path);
             let outcome = probe_and_compare_destination(filesystem, record, &encoded, probe, false);
@@ -2143,6 +2145,21 @@ fn resolve_cheat_staging_plan(
             }
         }
         Err(reason) => not_eligible_plan(record, reason),
+    }
+}
+
+/// What an install would actually write for `record`. A `.cht` source
+/// keeps its own file hash (possibly `None` when it could not be
+/// bounded-read, as before); a manifest game is only installable when it
+/// renders to a real per-game document. Checked only once a destination
+/// has been resolved, so an unresolved platform or unsafe name keeps its
+/// own, more specific reason.
+fn installable_source_hash(record: &CheatGameRecord) -> Result<Option<String>, &'static str> {
+    match record.format {
+        CheatCatalogueFormat::RetroarchChtDirectory => Ok(record.source_file_hash.clone()),
+        CheatCatalogueFormat::JsonManifest => installable_content_hash(record)
+            .map(Some)
+            .ok_or(NO_INSTALLABLE_CHEATS_REASON),
     }
 }
 
@@ -2185,6 +2202,11 @@ pub struct CheatAvailabilityEntry {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CheatAvailabilitySummary {
     pub games_in_catalogue: usize,
+    /// Manifest games skipped because none of their listed cheats carries
+    /// a code (see [`NO_INSTALLABLE_CHEATS_REASON`]). Their descriptions
+    /// stay in the catalogue record; nothing is written for them.
+    #[serde(default)]
+    pub no_usable_cheat_codes: usize,
     pub exact_matches: usize,
     pub strong_matches: usize,
     pub weak_matches: usize,
@@ -2310,7 +2332,17 @@ pub fn build_cheat_availability_report(
             CheatStagingAction::InstallNew => summary.not_installed += 1,
             CheatStagingAction::AlreadyInstalled => summary.already_installed += 1,
             CheatStagingAction::Conflict => summary.conflicts += 1,
-            CheatStagingAction::ReplaceDifferent | CheatStagingAction::NotEligible => {}
+            CheatStagingAction::ReplaceDifferent => {}
+            CheatStagingAction::NotEligible
+                if entry.staging_plan.reason == NO_INSTALLABLE_CHEATS_REASON =>
+            {
+                summary.no_usable_cheat_codes += 1;
+                entry.installed_state_detail.push(format!(
+                    "{NO_USABLE_CHEAT_CODES_LABEL} ({} listed, none carries a code; descriptions are kept in the catalogue, nothing is written)",
+                    entry.game.cheat_count
+                ));
+            }
+            CheatStagingAction::NotEligible => {}
         }
         if entry.staging_candidate {
             summary.staging_candidates += 1;

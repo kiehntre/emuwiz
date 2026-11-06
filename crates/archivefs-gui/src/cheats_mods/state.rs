@@ -844,6 +844,21 @@ impl LoadedHistory {
     }
 }
 
+/// Startup settlement of installs EmuWiz was interrupted in (crash, kill,
+/// power cut), run once per launch on a background worker. It never
+/// performs Undo; it turns a pending record into a reviewable History
+/// entry with Undo available. See
+/// `archivefs_core::patch_manager::recover_interrupted_shared_applies`.
+pub(crate) enum StartupSharedRecoveryState {
+    NotStarted,
+    Running {
+        receiver: Receiver<Vec<archivefs_core::patch_manager::SharedInterruptedApplyRecovery>>,
+    },
+    Done(Vec<archivefs_core::patch_manager::SharedInterruptedApplyRecovery>),
+    /// The managed history folder was unavailable; nothing was examined.
+    Unavailable,
+}
+
 pub(crate) enum SharedHistoryState {
     NotLoaded,
     Loading {
