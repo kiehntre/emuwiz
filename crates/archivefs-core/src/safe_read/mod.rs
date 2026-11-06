@@ -397,8 +397,12 @@ fn open_validated(target: &Path, resolved_via_symlink: bool) -> Result<SafeFile,
         use std::os::unix::fs::OpenOptionsExt;
         // The path is canonical, so `O_NOFOLLOW` cannot reject a legitimate
         // read here - but it is kept as a hard guarantee that nothing is
-        // followed at open time either.
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        // followed at open time either. `O_NONBLOCK` closes the race between
+        // the regular-file check above and this open: a path swapped for a
+        // FIFO opens at once (instead of waiting forever for a writer) and is
+        // then refused below. It is cleared again once the file is proven
+        // regular, so readers see ordinary blocking reads.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     let file = options
         .open(target)
@@ -413,6 +417,10 @@ fn open_validated(target: &Path, resolved_via_symlink: bool) -> Result<SafeFile,
         if before.dev() != after.dev() || before.ino() != after.ino() {
             return Err(SafeReadRefusal::ChangedWhileOpening);
         }
+        if !after.is_file() {
+            return Err(SafeReadRefusal::NotRegularFile);
+        }
+        clear_nonblocking(&file).map_err(|error| SafeReadRefusal::OpenFailed(error.to_string()))?;
     }
 
     Ok(SafeFile {
@@ -422,6 +430,24 @@ fn open_validated(target: &Path, resolved_via_symlink: bool) -> Result<SafeFile,
         #[cfg(test)]
         path: target.to_path_buf(),
     })
+}
+
+/// Restores blocking mode on a descriptor opened with `O_NONBLOCK`.
+#[cfg(unix)]
+fn clear_nonblocking(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is a live descriptor owned by `file` for this whole call;
+    // F_GETFL/F_SETFL only read and change its status flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

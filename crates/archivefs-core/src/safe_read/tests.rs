@@ -533,3 +533,21 @@ fn this_module_contains_no_write_process_or_network_call() {
         );
     }
 }
+
+/// The open uses `O_NONBLOCK` so a path swapped for a FIFO between the
+/// regular-file check and the open cannot block; a file handed to a reader
+/// must be back in ordinary blocking mode.
+#[cfg(unix)]
+#[test]
+fn an_opened_regular_file_is_returned_in_blocking_mode() {
+    use std::os::fd::AsRawFd;
+    let fixture = Fixture::new("blocking-mode");
+    let path = fixture.file("library/game.bin", b"rom");
+    let file = open_bounded_read(&path, &TrustedRoots::none())
+        .unwrap()
+        .into_file();
+    // SAFETY: the descriptor is owned by `file` for this call; F_GETFL reads flags only.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(flags & libc::O_NONBLOCK, 0);
+}
