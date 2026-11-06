@@ -2175,6 +2175,159 @@ impl ArchiveFsApp {
         }
     }
 
+    /// One Activity line per interrupted install the recovery engine
+    /// examined, plus one summary line, so the person knows what was
+    /// recovered for Undo, what is still running, and what needs a look.
+    /// Nothing is recorded when there was nothing to examine.
+    pub(crate) fn record_interrupted_install_recoveries(
+        &mut self,
+        recovered: &[archivefs_core::patch_manager::SharedInterruptedApplyRecovery],
+        route: &str,
+    ) {
+        use archivefs_core::patch_manager::SharedInterruptedApplyOutcome;
+        if recovered.is_empty() {
+            return;
+        }
+        let (mut settled, mut running, mut review) = (0usize, 0usize, 0usize);
+        for recovery in recovered {
+            let (outcome, text) = match recovery.outcome {
+                SharedInterruptedApplyOutcome::SettledForUndo => {
+                    let unexplained = recovery.entry_states.iter().any(|state| {
+                        !matches!(
+                            state,
+                            archivefs_core::patch_manager::SharedEntryRecoveryState::Applied
+                                | archivefs_core::patch_manager::SharedEntryRecoveryState::Planned
+                        )
+                    });
+                    if unexplained {
+                        review += 1;
+                        (
+                            ActivityOutcome::Failed,
+                            format!(
+                                "An install was interrupted before it finished ({}). {}. It is listed in History, but Undo stays blocked until the file(s) in an unexplained state have been reviewed by hand; nothing was changed.",
+                                recovery.operation_id, recovery.detail
+                            ),
+                        )
+                    } else {
+                        settled += 1;
+                        (
+                            ActivityOutcome::Completed,
+                            format!(
+                                "An install was interrupted before it finished ({}). {}. It is listed in History; use Undo there to put the files back.",
+                                recovery.operation_id, recovery.detail
+                            ),
+                        )
+                    }
+                }
+                SharedInterruptedApplyOutcome::AlreadyRecorded => {
+                    settled += 1;
+                    (
+                        ActivityOutcome::Completed,
+                        format!(
+                            "An interrupted install ({}) already had its receipt; its stale pending record was retired.",
+                            recovery.operation_id
+                        ),
+                    )
+                }
+                SharedInterruptedApplyOutcome::StillRunning => {
+                    running += 1;
+                    (
+                        ActivityOutcome::Started,
+                        format!(
+                            "An install ({}) is still running in another EmuWiz process; it was left alone.",
+                            recovery.operation_id
+                        ),
+                    )
+                }
+                SharedInterruptedApplyOutcome::NeedsReview => {
+                    review += 1;
+                    (
+                        ActivityOutcome::Failed,
+                        format!(
+                            "An interrupted install ({}) could not be settled: {}. Its pending record is kept; nothing was changed.",
+                            recovery.operation_id, recovery.detail
+                        ),
+                    )
+                }
+            };
+            self.history.record(HistoryEntry::new(
+                ActivityAction::CheatInstall,
+                None,
+                outcome,
+                text,
+            ));
+        }
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatInstall,
+            None,
+            if review > 0 {
+                ActivityOutcome::Failed
+            } else {
+                ActivityOutcome::Completed
+            },
+            format!(
+                "{route}: {settled} interrupted install(s) recorded for Undo, {running} still running, {review} need(s) attention. No Undo was performed automatically."
+            ),
+        ));
+    }
+
+    /// Startup route: runs the recovery engine once on a background worker
+    /// so the window stays responsive. Safe to call again only after the
+    /// previous run finished; a repeat while running is ignored.
+    pub(crate) fn start_startup_shared_recovery(&mut self, context: egui::Context) {
+        if matches!(
+            self.startup_shared_recovery,
+            StartupSharedRecoveryState::Running { .. }
+        ) {
+            return;
+        }
+        let Some((history_root, backup_root)) =
+            crate::cheats_mods::duckstation_environment::shared_history_roots()
+        else {
+            self.startup_shared_recovery = StartupSharedRecoveryState::Unavailable;
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.startup_shared_recovery = StartupSharedRecoveryState::Running { receiver };
+        thread::spawn(move || {
+            let recovered = archivefs_core::patch_manager::recover_interrupted_shared_applies(
+                &history_root,
+                &backup_root,
+            );
+            let _ = sender.send(recovered);
+            context.request_repaint();
+        });
+    }
+
+    pub(crate) fn poll_startup_shared_recovery(&mut self) {
+        let StartupSharedRecoveryState::Running { receiver } = &self.startup_shared_recovery else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(recovered) => {
+                self.record_interrupted_install_recoveries(&recovered, "Startup check");
+                if !recovered.is_empty()
+                    && matches!(self.shared_history, SharedHistoryState::Ready(_))
+                {
+                    // A History already on screen would otherwise keep
+                    // showing the pre-recovery list.
+                    self.shared_history = SharedHistoryState::NotLoaded;
+                }
+                self.startup_shared_recovery = StartupSharedRecoveryState::Done(recovered);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatInstall,
+                    None,
+                    ActivityOutcome::Failed,
+                    "Startup check for interrupted installs stopped unexpectedly; open History and Logs to run it again.",
+                ));
+                self.startup_shared_recovery = StartupSharedRecoveryState::Unavailable;
+            }
+        }
+    }
+
     pub(crate) fn refresh_shared_history(&mut self, context: egui::Context) {
         let Some((history_root, shared_backup_root)) =
             crate::cheats_mods::duckstation_environment::shared_history_roots()
@@ -2192,6 +2345,14 @@ impl ArchiveFsApp {
             "Refreshing bounded shared transaction history.",
         ));
         thread::spawn(move || {
+            // An install EmuWiz was interrupted in (crash, kill, power cut)
+            // left only a pending record. Settle it into a receipt first so
+            // the refresh below lists it and Undo can reverse it. Touches
+            // nothing under any destination root.
+            let recovered = archivefs_core::patch_manager::recover_interrupted_shared_applies(
+                &history_root,
+                &shared_backup_root,
+            );
             let report = discover_shared_apply_history(&history_root);
             // Group DuckStation's two child journals under their receipt so
             // History shows (and undoes) one operation, not two journals.
@@ -2201,7 +2362,8 @@ impl ArchiveFsApp {
                 report,
                 receipts,
                 &shared_backup_root,
-            )));
+            )
+            .with_recovered(recovered)));
             context.request_repaint();
         });
     }
@@ -2212,6 +2374,7 @@ impl ArchiveFsApp {
         };
         match receiver.try_recv() {
             Ok(Ok(loaded)) => {
+                self.record_interrupted_install_recoveries(&loaded.recovered, "History refresh");
                 self.history.record(HistoryEntry::new(
                     ActivityAction::Refresh,
                     None,
