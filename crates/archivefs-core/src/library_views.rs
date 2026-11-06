@@ -31,7 +31,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -732,6 +732,423 @@ fn save_library_view_manifest_at(data_dir: &Path, manifest: &LibraryViewManifest
     atomic_write_text(&path, &contents)
 }
 
+// ---------------------------------------------------------------------
+// Intent record: what an apply run is about to publish, written durably
+// before its first link is created (Night Watch II D2-04).
+// ---------------------------------------------------------------------
+
+/// The exact intent-record path for one view - `{data_dir}/{id}.intent.json`,
+/// next to the manifest and keyed by `id` for the same reason the manifest
+/// is.
+pub fn library_view_intent_path(data_dir: &Path, view_id: &str) -> PathBuf {
+    data_dir.join(format!("{view_id}.intent.json"))
+}
+
+/// One link an apply run intends to create or repair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryViewIntentEntry {
+    #[serde(with = "path_json")]
+    pub relative_link_path: PathBuf,
+    /// The exact symlink target the run will publish at this path.
+    #[serde(with = "path_json")]
+    pub target_path: PathBuf,
+    /// `Create` or `Repair` - the only two plan actions that publish a link.
+    pub action: LibraryViewPlanAction,
+    pub archive_identity: Option<String>,
+    pub platform: String,
+    #[serde(with = "path_json")]
+    pub source_folder_path: PathBuf,
+}
+
+/// Night Watch II D2-04: `apply_library_view` publishes every link in a
+/// loop and used to save the manifest exactly once, after the loop. A
+/// process killed mid-loop therefore left published links that no
+/// manifest, history or activity record knew about, and a later `remove`
+/// reported "Removed 0", exited 0 and deleted the view definition,
+/// orphaning every one of those links forever.
+///
+/// This record closes that window. Before an apply run creates its first
+/// link, every `Create`/`Repair` it is about to perform is written here
+/// durably (temp + fsync + rename - the same `atomic_write_text` path the
+/// manifest itself uses). The record is cleared only after the run's
+/// manifest has been saved. So whatever the run managed to publish before
+/// dying was recorded somewhere durable *before* it was published, and the
+/// next preview/apply/remove resolves the record against the filesystem
+/// (`reconcile_library_view_intent`), folds every published entry into the
+/// manifest, and sweeps the run's own leftover temporary links.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryViewIntentRecord {
+    pub view_id: String,
+    #[serde(with = "path_json")]
+    pub destination_root: PathBuf,
+    /// The id of the process that wrote this record. `create_or_repair_symlink`
+    /// names its temporary links `.archivefs-link-{pid:x}-{seq:x}.tmp`, so
+    /// this is what identifies the run's own leftover temporary links to
+    /// `sweep_interrupted_temp_links` - never any other process's.
+    pub process_id: u32,
+    pub recorded_at: String,
+    pub entries: Vec<LibraryViewIntentEntry>,
+}
+
+/// `None` when no apply run is pending for this view (the normal state).
+/// An unreadable record is an error, never silently `None`: it may describe
+/// links an interrupted apply published, so it is never ignored.
+pub fn load_library_view_intent_at(
+    data_dir: &Path,
+    view_id: &str,
+) -> Result<Option<LibraryViewIntentRecord>> {
+    let path = library_view_intent_path(data_dir, view_id);
+    match fs::read_to_string(&path) {
+        Ok(contents) => serde_json::from_str(&contents).map(Some).map_err(|error| {
+            ArchiveFsError::Config(format!(
+                "intent record for library view {view_id} is invalid ({}): {error}; it may \
+                 record links an interrupted apply published, so it is never ignored - inspect \
+                 the view's destination before removing the file",
+                path.display()
+            ))
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ArchiveFsError::io(path, error)),
+    }
+}
+
+fn save_library_view_intent_at(data_dir: &Path, record: &LibraryViewIntentRecord) -> Result<()> {
+    let path = library_view_intent_path(data_dir, &record.view_id);
+    let contents = serde_json::to_string_pretty(record).map_err(|error| {
+        ArchiveFsError::Config(format!(
+            "cannot serialize library view intent record: {error}"
+        ))
+    })?;
+    atomic_write_text(&path, &contents)
+}
+
+/// Removes the intent record once the manifest describing the same links
+/// has been saved. An already-absent record is success; the directory
+/// entry change is synced best-effort, like the manifest's own publication.
+fn clear_library_view_intent_at(data_dir: &Path, view_id: &str) -> Result<()> {
+    let path = library_view_intent_path(data_dir, view_id);
+    match fs::remove_file(&path) {
+        Ok(()) => {
+            crate::sync_directory_best_effort(data_dir);
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ArchiveFsError::io(path, error)),
+    }
+}
+
+/// What `reconcile_library_view_intent` found when it resolved a pending
+/// intent record against the filesystem.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryViewIntentReconciliation {
+    /// Links found on disk exactly as the interrupted apply intended them -
+    /// published by EmuWiz, now folded into the manifest as managed.
+    pub recovered: Vec<PathBuf>,
+    /// Links the interrupted apply never got to publish: nothing at the
+    /// path, or (for a repair) the previously managed link still untouched.
+    /// Nothing to own; the next plan simply creates/repairs them again.
+    pub never_published: Vec<PathBuf>,
+    /// Paths holding something other than what the interrupted apply
+    /// intended (and, for a repair, other than the previously managed link):
+    /// reported with a reason, never touched, never adopted.
+    pub unresolved: Vec<(PathBuf, String)>,
+    /// The record was written for a different destination root than the
+    /// view has now. Nothing is reconciled or swept in that case: the links
+    /// live under the old root, and apply/remove refuse until the user
+    /// restores that root (and removes the view) or deals with them by hand.
+    pub destination_root_changed: bool,
+}
+
+impl LibraryViewIntentReconciliation {
+    pub fn is_empty(&self) -> bool {
+        self.recovered.is_empty()
+            && self.never_published.is_empty()
+            && self.unresolved.is_empty()
+            && !self.destination_root_changed
+    }
+}
+
+/// Resolves a pending `intent` record against the filesystem - read-only,
+/// `fs::symlink_metadata`/`fs::read_link` only - and returns `manifest`
+/// with every link the interrupted apply provably published folded in as a
+/// managed entry. A link counts as published only when the path holds a
+/// symlink pointing at exactly the target the record intended; anything
+/// else at the path is reported as unresolved and left alone (a user's
+/// file is never adopted merely for sitting where EmuWiz meant to write).
+pub fn reconcile_library_view_intent(
+    view: &LibraryViewConfig,
+    manifest: &LibraryViewManifest,
+    intent: &LibraryViewIntentRecord,
+) -> (LibraryViewManifest, LibraryViewIntentReconciliation) {
+    let mut reconciliation = LibraryViewIntentReconciliation::default();
+    let mut folded = manifest.clone();
+    if intent.destination_root != view.destination_root {
+        reconciliation.destination_root_changed = true;
+        reconciliation.unresolved = intent
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.relative_link_path.clone(),
+                    format!(
+                        "recorded by an interrupted apply under a different destination root \
+                         ({}) - nothing there is reconciled",
+                        intent.destination_root.display()
+                    ),
+                )
+            })
+            .collect();
+        return (folded, reconciliation);
+    }
+
+    for entry in &intent.entries {
+        let relative = entry.relative_link_path.clone();
+        let destination = view.destination_root.join(&relative);
+        let existing_index = folded
+            .entries
+            .iter()
+            .position(|existing| existing.relative_link_path == relative);
+        let existing_target = existing_index.map(|index| folded.entries[index].target_path.clone());
+        let metadata = match fs::symlink_metadata(&destination) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                reconciliation.never_published.push(relative);
+                continue;
+            }
+            Err(error) => {
+                reconciliation
+                    .unresolved
+                    .push((relative, format!("could not be inspected: {error}")));
+                continue;
+            }
+        };
+        if !metadata.file_type().is_symlink() {
+            reconciliation.unresolved.push((
+                relative,
+                "a real file or directory is at this path, not the link the interrupted apply \
+                 intended"
+                    .to_string(),
+            ));
+            continue;
+        }
+        match fs::read_link(&destination) {
+            Ok(actual_target) if actual_target == entry.target_path => {
+                if existing_target.as_deref() == Some(entry.target_path.as_path()) {
+                    // Already recorded: the run died between saving its
+                    // manifest and clearing this record. Nothing to fold.
+                    continue;
+                }
+                let created_at = existing_index
+                    .map(|index| folded.entries[index].created_at.clone())
+                    .unwrap_or_else(|| intent.recorded_at.clone());
+                let recovered = LibraryViewManifestEntry {
+                    relative_link_path: relative.clone(),
+                    target_path: entry.target_path.clone(),
+                    archive_identity: entry.archive_identity.clone(),
+                    created_at,
+                    updated_at: intent.recorded_at.clone(),
+                    platform: entry.platform.clone(),
+                    source_folder_path: entry.source_folder_path.clone(),
+                    object_kind: LibraryViewObjectKind::Symlink,
+                    content_hash: None,
+                    rendering_version: None,
+                };
+                match existing_index {
+                    Some(index) => folded.entries[index] = recovered,
+                    None => folded.entries.push(recovered),
+                }
+                reconciliation.recovered.push(relative);
+            }
+            Ok(actual_target) if existing_target.as_deref() == Some(actual_target.as_path()) => {
+                // A repair that never happened: the previously managed link
+                // is still exactly what the manifest records.
+                reconciliation.never_published.push(relative);
+            }
+            Ok(_) => reconciliation.unresolved.push((
+                relative,
+                "a symlink at this path points somewhere the interrupted apply never intended"
+                    .to_string(),
+            )),
+            Err(error) => reconciliation.unresolved.push((
+                relative,
+                format!("the symlink at this path could not be read: {error}"),
+            )),
+        }
+    }
+    folded
+        .entries
+        .sort_by(|a, b| a.relative_link_path.cmp(&b.relative_link_path));
+    (folded, reconciliation)
+}
+
+/// Loads the view's manifest together with any pending intent record folded
+/// in (in memory only - nothing is written here), for planning: a link an
+/// interrupted apply published is then manifest-owned to the planner
+/// instead of looking like a symlink made outside EmuWiz.
+fn load_manifest_with_pending_intent_at(
+    view: &LibraryViewConfig,
+    data_dir: &Path,
+) -> Result<(LibraryViewManifest, LibraryViewIntentReconciliation)> {
+    let manifest = load_library_view_manifest_at(data_dir, &view.id)?;
+    match load_library_view_intent_at(data_dir, &view.id)? {
+        Some(intent) => Ok(reconcile_library_view_intent(view, &manifest, &intent)),
+        None => Ok((manifest, LibraryViewIntentReconciliation::default())),
+    }
+}
+
+fn destination_root_changed_error(
+    view: &LibraryViewConfig,
+    intent: &LibraryViewIntentRecord,
+) -> ArchiveFsError {
+    ArchiveFsError::Config(format!(
+        "library view '{}' has an interrupted apply recorded under a different destination \
+         root ({}); its links there cannot be reconciled from the current root ({}). Restore \
+         that destination root and run remove (or apply) once, or deal with the links there \
+         by hand and delete {} - nothing was changed",
+        view.id,
+        intent.destination_root.display(),
+        view.destination_root.display(),
+        library_view_intent_path(Path::new("<data dir>"), &view.id).display(),
+    ))
+}
+
+/// Pushes the unresolved paths of a reconciliation into `report` as
+/// `LeftUnchanged`, so they are visible in the report, in history and to
+/// the fail-closed definition check in `remove_library_view_default`.
+fn report_unresolved_intent(
+    reconciliation: &LibraryViewIntentReconciliation,
+    report: &mut LibraryViewApplyReport,
+) {
+    for (relative_link_path, reason) in &reconciliation.unresolved {
+        report.results.push(LibraryViewApplyEntryResult {
+            relative_link_path: relative_link_path.clone(),
+            outcome: LibraryViewApplyOutcome::LeftUnchanged,
+            error: Some(format!(
+                "left untouched - {reason} (recorded by an interrupted apply)"
+            )),
+        });
+    }
+}
+
+/// The intent entries that are published on disk but not yet in the *saved*
+/// manifest - judged against the manifest file rather than the caller's
+/// copy, which a preview may already have folded the same record into (in
+/// memory only). This is what an apply reports as `Recovered` and a remove
+/// as `RecoveredRemoved`: links the manifest on disk would otherwise never
+/// have known about.
+fn recovered_against_saved_manifest(
+    view: &LibraryViewConfig,
+    data_dir: &Path,
+    intent: &LibraryViewIntentRecord,
+) -> Result<Vec<PathBuf>> {
+    let saved = load_library_view_manifest_at(data_dir, &view.id)?;
+    Ok(reconcile_library_view_intent(view, &saved, intent)
+        .1
+        .recovered)
+}
+
+/// `true` for exactly the names `create_or_repair_symlink` generates for
+/// the process whose prefix is `prefix` (`.archivefs-link-{pid:x}-`):
+/// `prefix`, one or more hex digits, `.tmp`.
+fn is_own_temp_link_name(name: &[u8], prefix: &[u8]) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(b".tmp"))
+        .is_some_and(|sequence| !sequence.is_empty() && sequence.iter().all(u8::is_ascii_hexdigit))
+}
+
+/// Removes the leftover temporary links of the interrupted apply `intent`
+/// records - and only those: names of the form
+/// `.archivefs-link-{pid:x}-{seq:x}.tmp` carrying that run's own process id,
+/// only in the parent directories of the links it planned (each proven
+/// inside the destination root by `verify_destination_containment`), only
+/// when `lstat` says the name is a symlink (never followed), and only when
+/// it points at a target the run (or the manifest, for the same path)
+/// recorded. Anything else found at such a name is reported as
+/// `LeftUnchanged` and never touched: a regular file there may be a user's
+/// file an interrupted repair preserved (see `replace_managed_symlink`).
+fn sweep_interrupted_temp_links(
+    view: &LibraryViewConfig,
+    intent: &LibraryViewIntentRecord,
+    manifest: &LibraryViewManifest,
+    report: &mut LibraryViewApplyReport,
+) {
+    if intent.destination_root != view.destination_root {
+        return;
+    }
+    let prefix = format!(".archivefs-link-{:x}-", intent.process_id);
+    let planned: HashSet<&Path> = intent
+        .entries
+        .iter()
+        .map(|entry| entry.relative_link_path.as_path())
+        .collect();
+    let mut allowed_targets: HashSet<PathBuf> = intent
+        .entries
+        .iter()
+        .map(|entry| entry.target_path.clone())
+        .collect();
+    allowed_targets.extend(
+        manifest
+            .entries
+            .iter()
+            .filter(|entry| planned.contains(entry.relative_link_path.as_path()))
+            .map(|entry| entry.target_path.clone()),
+    );
+    let parents: BTreeSet<PathBuf> = intent
+        .entries
+        .iter()
+        .filter_map(|entry| entry.relative_link_path.parent().map(Path::to_path_buf))
+        .collect();
+
+    for relative_parent in parents {
+        let parent = view.destination_root.join(&relative_parent);
+        if verify_destination_containment(&view.destination_root, &parent).is_err() {
+            continue;
+        }
+        let Ok(read_dir) = fs::read_dir(&parent) else {
+            continue;
+        };
+        let mut names: Vec<OsString> = read_dir.flatten().map(|entry| entry.file_name()).collect();
+        names.sort();
+        for name in names {
+            if !is_own_temp_link_name(name.as_bytes(), prefix.as_bytes()) {
+                continue;
+            }
+            let path = parent.join(&name);
+            let relative_link_path = relative_parent.join(&name);
+            let is_own_link = fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                && fs::read_link(&path).is_ok_and(|target| allowed_targets.contains(&target));
+            if !is_own_link {
+                report.results.push(LibraryViewApplyEntryResult {
+                    relative_link_path,
+                    outcome: LibraryViewApplyOutcome::LeftUnchanged,
+                    error: Some(
+                        "left untouched - this temporary name of an interrupted apply holds \
+                         something EmuWiz did not create"
+                            .to_string(),
+                    ),
+                });
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => report.results.push(LibraryViewApplyEntryResult {
+                    relative_link_path,
+                    outcome: LibraryViewApplyOutcome::TempLinkRemoved,
+                    error: None,
+                }),
+                Err(error) => {
+                    report.failed += 1;
+                    report.results.push(LibraryViewApplyEntryResult {
+                        relative_link_path,
+                        outcome: LibraryViewApplyOutcome::Failed,
+                        error: Some(ArchiveFsError::io(path, error).to_string()),
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn now_utc_string() -> String {
     crate::format_unix_timestamp_utc(
         SystemTime::now()
@@ -1029,6 +1446,12 @@ pub enum LibraryViewPlanAction {
     /// A preservation-only row (an RZX gameplay recording): kept in the
     /// Library but never published into a frontend view as a game.
     SkipPreservationOnly,
+    /// A symlink already points at exactly the archive this view would link
+    /// here, but neither the manifest nor an intent record says EmuWiz made
+    /// it (Night Watch II D2-05). It is the user's own: kept exactly as it
+    /// is, never adopted into the manifest, never re-created, and never
+    /// removed by `remove`. Counted as a skip - nothing managed happens.
+    UserOwnedKept,
 }
 
 impl LibraryViewPlanAction {
@@ -1046,7 +1469,8 @@ impl LibraryViewPlanAction {
             Self::SkipUnknownPlatform
             | Self::SkipMissingSourceArchive
             | Self::SkipInvalidPath
-            | Self::SkipPreservationOnly => LibraryViewCountBucket::Skip,
+            | Self::SkipPreservationOnly
+            | Self::UserOwnedKept => LibraryViewCountBucket::Skip,
         }
     }
 }
@@ -1583,8 +2007,15 @@ fn compute_view_profile_fingerprint_with_resolved_romm_mapping(
 /// candidate wants there:
 /// - nothing there yet -> `Create`.
 /// - a real file (or directory) -> `Collision` (never overwritten).
-/// - a symlink already pointing at `expected_target` -> `AlreadyCorrect`
-///   (adopted/preserved, never re-created).
+/// - a symlink already pointing at `expected_target`, recorded in
+///   `manifest` as ours -> `AlreadyCorrect` (preserved, never re-created).
+/// - a symlink already pointing at `expected_target`, *not* recorded in
+///   `manifest` -> `UserOwnedKept`: left exactly as it is and never adopted
+///   (Night Watch II D2-05 - adoption used to be "by design" here, which
+///   let `remove` delete a link the user made before the view existed).
+///   Links an interrupted apply published are not this case: the caller
+///   folds its intent record into `manifest` first
+///   (`reconcile_library_view_intent`), so they are recorded as ours.
 /// - a symlink pointing elsewhere, recorded in `manifest` as ours ->
 ///   `Repair`.
 /// - a symlink pointing elsewhere, *not* recorded in `manifest` -> a
@@ -1607,9 +2038,17 @@ fn classify_existing_path(
             Some("a real file or directory already exists at this destination".to_string()),
         ),
         Ok(_) => match fs::read_link(destination_path) {
-            Ok(actual_target) if actual_target == expected_target => {
+            Ok(actual_target) if actual_target == expected_target && owned_by_manifest => {
                 (LibraryViewPlanAction::AlreadyCorrect, None)
             }
+            Ok(actual_target) if actual_target == expected_target => (
+                LibraryViewPlanAction::UserOwnedKept,
+                Some(
+                    "a symlink already points at this archive but EmuWiz did not record \
+                     creating it - kept as made outside EmuWiz, not managed by this view"
+                        .to_string(),
+                ),
+            ),
             Ok(_) if owned_by_manifest => (LibraryViewPlanAction::Repair, None),
             Ok(_) => (
                 LibraryViewPlanAction::Collision,
@@ -1825,6 +2264,33 @@ pub enum LibraryViewApplyOutcome {
     /// time).
     LeftUnchanged,
     Failed,
+    /// A link an interrupted earlier apply published (recorded in its
+    /// intent record, found on disk exactly as intended) - folded into the
+    /// manifest as managed by this apply. Counted as unchanged.
+    Recovered,
+    /// As `Recovered`, then removed by this remove. Counted as removed.
+    RecoveredRemoved,
+    /// A leftover `.archivefs-link-*.tmp` symlink of an interrupted apply
+    /// (this view's own, see `sweep_interrupted_temp_links`) was removed.
+    /// Not counted as a managed link.
+    TempLinkRemoved,
+    /// A correct-looking symlink EmuWiz did not record creating was left as
+    /// the user's own - not managed, not counted (Night Watch II D2-05).
+    UserOwnedKept,
+}
+
+impl LibraryViewApplyReport {
+    /// `true` when the operation left something managed-looking it could
+    /// not reconcile (a failure, or a path/temporary name it refused to
+    /// touch). `remove_library_view_default` keeps the view definition in
+    /// that case, since dropping it would orphan those objects.
+    pub fn has_unreconciled_objects(&self) -> bool {
+        self.failed > 0
+            || self
+                .results
+                .iter()
+                .any(|result| result.outcome == LibraryViewApplyOutcome::LeftUnchanged)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1867,6 +2333,16 @@ pub struct LibraryViewApplyReport {
 /// succeed, since leaving a successfully-created symlink unmanaged would be
 /// worse than recording it.
 ///
+/// Crash safety (Night Watch II D2-04): every `Create`/`Repair` this run
+/// will perform is written to the view's intent record *before* the first
+/// link is touched, and the record is cleared only after the manifest has
+/// been saved - so a link published by a run that was killed mid-loop is
+/// always recorded somewhere durable, and the next preview/apply/remove
+/// reconciles it (`LibraryViewIntentRecord`). A pending record from such an
+/// earlier run is reconciled here first: its published links are reported
+/// as `Recovered` and folded into the manifest, its leftover temporary links
+/// are swept, and anything else it left is reported and never touched.
+///
 /// `Collision`/`Skip*` entries are informational only and are never acted
 /// on here - resolving them means changing the view's configuration
 /// (source/platform filters, or a future disambiguation policy) and
@@ -1891,13 +2367,6 @@ pub fn apply_library_view(
     fs::create_dir_all(&view.destination_root)
         .map_err(|source| ArchiveFsError::io(view.destination_root.clone(), source))?;
 
-    let mut entries_by_path: HashMap<PathBuf, LibraryViewManifestEntry> = manifest
-        .entries
-        .iter()
-        .cloned()
-        .map(|entry| (entry.relative_link_path.clone(), entry))
-        .collect();
-
     let mut report = LibraryViewApplyReport {
         view_id: view.id.clone(),
         created: 0,
@@ -1910,18 +2379,115 @@ pub fn apply_library_view(
     };
     let now = now_utc_string();
 
+    // Night Watch II D2-04: an earlier apply may have died mid-loop. Resolve
+    // its intent record first, so every link it published is managed before
+    // this run publishes anything - and persisted before this run's own
+    // record replaces that one, so a second interruption can never lose it.
+    let pending = load_library_view_intent_at(data_dir, &view.id)?;
+    let (base_manifest, recovered_paths) = match &pending {
+        Some(intent) => {
+            let (folded, reconciliation) = reconcile_library_view_intent(view, manifest, intent);
+            if reconciliation.destination_root_changed {
+                return Err(destination_root_changed_error(view, intent));
+            }
+            let recovered = recovered_against_saved_manifest(view, data_dir, intent)?;
+            for relative_link_path in &recovered {
+                report.unchanged += 1;
+                report.results.push(LibraryViewApplyEntryResult {
+                    relative_link_path: relative_link_path.clone(),
+                    outcome: LibraryViewApplyOutcome::Recovered,
+                    error: None,
+                });
+            }
+            report_unresolved_intent(&reconciliation, &mut report);
+            if !recovered.is_empty() {
+                save_library_view_manifest_at(data_dir, &folded)?;
+            }
+            sweep_interrupted_temp_links(view, intent, &folded, &mut report);
+            let recovered: HashSet<PathBuf> = recovered.into_iter().collect();
+            (folded, recovered)
+        }
+        None => (manifest.clone(), HashSet::new()),
+    };
+
+    let mut entries_by_path: HashMap<PathBuf, LibraryViewManifestEntry> = base_manifest
+        .entries
+        .iter()
+        .cloned()
+        .map(|entry| (entry.relative_link_path.clone(), entry))
+        .collect();
+
+    // Intent before mutation: every link this run is about to create or
+    // repair is recorded durably *before* the first one is touched. If the
+    // process dies anywhere in the loop below, the next preview/apply/remove
+    // finds this record and reconciles it (see `LibraryViewIntentRecord`).
+    let intended: Vec<LibraryViewIntentEntry> = plan
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.action,
+                LibraryViewPlanAction::Create | LibraryViewPlanAction::Repair
+            )
+        })
+        .filter_map(|entry| {
+            Some(LibraryViewIntentEntry {
+                relative_link_path: entry.relative_link_path.clone()?,
+                target_path: entry.archive_path.clone()?,
+                action: entry.action,
+                archive_identity: entry.archive_identity.clone(),
+                platform: entry.platform.clone().unwrap_or_default(),
+                source_folder_path: entry.source_folder_path.clone().unwrap_or_default(),
+            })
+        })
+        .collect();
+    if !intended.is_empty() {
+        save_library_view_intent_at(
+            data_dir,
+            &LibraryViewIntentRecord {
+                view_id: view.id.clone(),
+                destination_root: view.destination_root.clone(),
+                process_id: std::process::id(),
+                recorded_at: now.clone(),
+                entries: intended,
+            },
+        )?;
+    }
+    #[cfg(test)]
+    let mut published_this_run: usize = 0;
+
     for entry in &plan.entries {
         match entry.action {
-            LibraryViewPlanAction::AlreadyCorrect => {
+            LibraryViewPlanAction::AlreadyCorrect | LibraryViewPlanAction::UserOwnedKept => {
                 let (Some(relative_link_path), Some(target_path)) =
                     (entry.relative_link_path.clone(), entry.archive_path.clone())
                 else {
                     continue;
                 };
-                let created_at = entries_by_path
-                    .get(&relative_link_path)
-                    .map(|existing| existing.created_at.clone())
-                    .unwrap_or_else(|| now.clone());
+                if recovered_paths.contains(&relative_link_path) {
+                    // Already reported as `Recovered` and already folded
+                    // into `entries_by_path` above.
+                    continue;
+                }
+                // Night Watch II D2-05: a correct-looking symlink is adopted
+                // into the manifest only when EmuWiz recorded creating it
+                // (manifest, or an intent record folded in above). Checked
+                // here again rather than trusting the plan's action alone,
+                // since the plan may have been computed against an older
+                // manifest than the one this apply was given.
+                let Some(existing) = entries_by_path.get(&relative_link_path) else {
+                    report.results.push(LibraryViewApplyEntryResult {
+                        relative_link_path,
+                        outcome: LibraryViewApplyOutcome::UserOwnedKept,
+                        error: Some(
+                            "kept - a symlink already points at this archive but EmuWiz did \
+                             not record creating it, so it is not managed by this view"
+                                .to_string(),
+                        ),
+                    });
+                    continue;
+                };
+                let created_at = existing.created_at.clone();
                 entries_by_path.insert(
                     relative_link_path.clone(),
                     LibraryViewManifestEntry {
@@ -1968,6 +2534,15 @@ pub fn apply_library_view(
                 });
                 match outcome {
                     Ok(()) => {
+                        #[cfg(test)]
+                        {
+                            published_this_run += 1;
+                            if tests::crash_after_published_links() == Some(published_this_run) {
+                                return Err(ArchiveFsError::Config(
+                                    "simulated crash right after publishing a link".to_string(),
+                                ));
+                            }
+                        }
                         let created_at = if is_repair {
                             entries_by_path
                                 .get(&relative_link_path)
@@ -2109,9 +2684,13 @@ pub fn apply_library_view(
         // doc comment) - carried forward unchanged rather than reset, so a
         // later milestone that does start populating it is never silently
         // wiped by an apply from this one.
-        created_directories: manifest.created_directories.clone(),
+        created_directories: base_manifest.created_directories.clone(),
     };
     save_library_view_manifest_at(data_dir, &new_manifest)?;
+    // Only once the manifest records everything this run published may the
+    // intent record go; failing here leaves it for the next run to
+    // reconcile (harmlessly: everything in it is already in the manifest).
+    clear_library_view_intent_at(data_dir, &view.id)?;
     maybe_remove_empty_managed_directories(&view.destination_root, &new_manifest);
     record_apply_history(view, data_dir, plan, &mut report);
 
@@ -2182,6 +2761,12 @@ pub fn repair_library_view(
 /// decides separately whether to also drop it (CLI: `--keep-definition`;
 /// GUI: keeps the definition by default, per the milestone's Remove View
 /// requirement).
+///
+/// Links an interrupted apply published but never recorded in the manifest
+/// are recovered from its intent record first and removed like any other
+/// managed link (reported as `RecoveredRemoved`), and that run's own
+/// leftover temporary links are swept (`TempLinkRemoved`) - Night Watch II
+/// D2-04, where such links were silently orphaned behind "Removed 0".
 pub fn remove_library_view_symlinks(
     view: &LibraryViewConfig,
     manifest: &LibraryViewManifest,
@@ -2197,9 +2782,31 @@ pub fn remove_library_view_symlinks(
         results: Vec::new(),
         history_warning: None,
     };
+
+    // Night Watch II D2-04: links an interrupted apply published but never
+    // got to record in the manifest are recovered from its intent record
+    // and removed here like any other managed link; its leftover temporary
+    // links are swept. See `LibraryViewIntentRecord`.
+    let pending = load_library_view_intent_at(data_dir, &view.id)?;
+    let (base_manifest, recovered_paths) = match &pending {
+        Some(intent) => {
+            let (folded, reconciliation) = reconcile_library_view_intent(view, manifest, intent);
+            if reconciliation.destination_root_changed {
+                return Err(destination_root_changed_error(view, intent));
+            }
+            report_unresolved_intent(&reconciliation, &mut report);
+            sweep_interrupted_temp_links(view, intent, &folded, &mut report);
+            let recovered: HashSet<PathBuf> =
+                recovered_against_saved_manifest(view, data_dir, intent)?
+                    .into_iter()
+                    .collect();
+            (folded, recovered)
+        }
+        None => (manifest.clone(), HashSet::new()),
+    };
     let mut remaining: Vec<LibraryViewManifestEntry> = Vec::new();
 
-    for entry in &manifest.entries {
+    for entry in &base_manifest.entries {
         let destination = view.destination_root.join(&entry.relative_link_path);
         match remove_managed_symlink(&view.destination_root, &destination, &entry.target_path) {
             Ok(ManagedSymlinkRemoval::Removed | ManagedSymlinkRemoval::AlreadyAbsent) => {
@@ -2211,7 +2818,11 @@ pub fn remove_library_view_symlinks(
                 report.removed += 1;
                 report.results.push(LibraryViewApplyEntryResult {
                     relative_link_path: entry.relative_link_path.clone(),
-                    outcome: LibraryViewApplyOutcome::Removed,
+                    outcome: if recovered_paths.contains(&entry.relative_link_path) {
+                        LibraryViewApplyOutcome::RecoveredRemoved
+                    } else {
+                        LibraryViewApplyOutcome::Removed
+                    },
                     error: None,
                 });
             }
@@ -2247,13 +2858,14 @@ pub fn remove_library_view_symlinks(
         // symlinks the previous manifest already owned - so the previous
         // fingerprint/version/directory-ownership bookkeeping is carried
         // forward unchanged rather than reset or recomputed here.
-        view_fingerprint: manifest.view_fingerprint.clone(),
-        profile_version: manifest.profile_version,
-        created_directories: manifest.created_directories.clone(),
+        view_fingerprint: base_manifest.view_fingerprint.clone(),
+        profile_version: base_manifest.profile_version,
+        created_directories: base_manifest.created_directories.clone(),
     };
     save_library_view_manifest_at(data_dir, &new_manifest)?;
+    clear_library_view_intent_at(data_dir, &view.id)?;
     maybe_remove_empty_managed_directories(&view.destination_root, &new_manifest);
-    record_remove_history(view, data_dir, manifest.entries.len(), &mut report);
+    record_remove_history(view, data_dir, base_manifest.entries.len(), &mut report);
 
     Ok(report)
 }
@@ -2401,7 +3013,11 @@ pub fn preview_library_view_default(
     let views = load_library_view_configs_default()?;
     let view = resolve_library_view_identifier(identifier, &views)?;
     let (archives, source_folders) = load_catalogue_for_planning()?;
-    let manifest = load_library_view_manifest_default(&view.id)?;
+    // A pending intent record (an interrupted apply) is folded into the
+    // manifest in memory only, so its published links plan as managed
+    // rather than as symlinks made outside EmuWiz; nothing is written.
+    let data_dir = default_library_views_data_dir()?;
+    let (manifest, pending) = load_manifest_with_pending_intent_at(&view, &data_dir)?;
     // Only a `Romm` profile ever consults this tier - loading it otherwise
     // would be a needless read with no planning effect.
     let romm_identity_cache = if view.profile.kind == FrontendProfileKind::Romm {
@@ -2409,14 +3025,65 @@ pub fn preview_library_view_default(
     } else {
         None
     };
-    let plan = plan_library_view(
+    let mut plan = plan_library_view(
         &view,
         &archives,
         &source_folders,
         &manifest,
         romm_identity_cache.as_ref(),
     );
+    annotate_plan_with_pending_intent(&mut plan, &pending);
     Ok((view, plan))
+}
+
+/// Makes a pending intent record visible in a preview: a recovered link is
+/// shown with a reason saying where it came from, an unresolved path
+/// carries the reconciliation's reason next to the planner's own, and a
+/// record written under a different destination root refuses Apply through
+/// `unsafe_root_error` until it is dealt with.
+fn annotate_plan_with_pending_intent(
+    plan: &mut LibraryViewPlan,
+    pending: &LibraryViewIntentReconciliation,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    if pending.destination_root_changed {
+        let detail = pending
+            .unresolved
+            .first()
+            .map(|(_, reason)| reason.clone())
+            .unwrap_or_default();
+        plan.unsafe_root_error = Some(format!(
+            "an interrupted apply left links to reconcile: {detail}; restore that destination \
+             root and run remove once, or deal with those links by hand and delete the view's \
+             intent record"
+        ));
+        return;
+    }
+    for entry in &mut plan.entries {
+        let Some(relative_link_path) = entry.relative_link_path.as_ref() else {
+            continue;
+        };
+        if pending.recovered.contains(relative_link_path) {
+            entry.reason = Some(
+                "published by an interrupted earlier apply and recovered from its intent record \
+                 - Apply records it in the manifest"
+                    .to_string(),
+            );
+        } else if let Some((_, reason)) = pending
+            .unresolved
+            .iter()
+            .find(|(path, _)| path == relative_link_path)
+        {
+            entry.reason = Some(match entry.reason.take() {
+                Some(existing) => {
+                    format!("{existing}; {reason} (recorded by an interrupted apply)")
+                }
+                None => format!("{reason} (recorded by an interrupted apply)"),
+            });
+        }
+    }
 }
 
 /// Plans and applies the view identified by `identifier` in one step - the
@@ -2442,10 +3109,11 @@ pub fn repair_library_view_default(
 }
 
 /// Removes every managed symlink for the view identified by `identifier`,
-/// and - unless `keep_definition` is set - also drops the view's own
-/// definition from the configured list. The definition is only removed
-/// after the symlink removal has been written, so a failure removing
-/// symlinks never also loses the view's configuration. Never deletes
+/// and - unless `keep_definition` is set, and only when nothing managed-
+/// looking was left unreconciled - also drops the view's own definition
+/// from the configured list. The definition is only removed after the
+/// symlink removal has been written, so a failure removing symlinks never
+/// also loses the view's configuration. Never deletes
 /// original archive files - only the managed symlinks
 /// `remove_library_view_symlinks` itself is already restricted to.
 pub fn remove_library_view_default(
@@ -2458,7 +3126,11 @@ pub fn remove_library_view_default(
     let data_dir = default_library_views_data_dir()?;
     let report = remove_library_view_symlinks(&view, &manifest, &data_dir)?;
 
-    if !keep_definition {
+    // Fail closed (Night Watch II D2-04): while anything managed-looking is
+    // still unreconciled, dropping the definition would orphan it, so the
+    // definition stays and the report says what was left. The caller can
+    // tell which happened from `report.has_unreconciled_objects()`.
+    if !keep_definition && !report.has_unreconciled_objects() {
         views.retain(|candidate| candidate.id != view.id);
         save_library_view_configs_default(&views)?;
     }
@@ -2946,6 +3618,72 @@ mod tests {
         fs::write(path, contents).unwrap();
     }
 
+    thread_local! {
+        static CRASH_AFTER_PUBLISHED_LINKS: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Fault hook for `apply_library_view`: `Some(k)` makes the run return
+    /// an error - modelling a kill - right after it published its k-th link:
+    /// after the intent record was written, before the manifest was saved.
+    /// Thread-local, so parallel tests never see each other's setting.
+    pub(super) fn crash_after_published_links() -> Option<usize> {
+        CRASH_AFTER_PUBLISHED_LINKS.with(|cell| cell.get())
+    }
+
+    fn set_crash_after_published_links(limit: Option<usize>) {
+        CRASH_AFTER_PUBLISHED_LINKS.with(|cell| cell.set(limit));
+    }
+
+    fn intent_entry(relative: &str, target: &Path, source_dir: &Path) -> LibraryViewIntentEntry {
+        LibraryViewIntentEntry {
+            relative_link_path: PathBuf::from(relative),
+            target_path: target.to_path_buf(),
+            action: LibraryViewPlanAction::Create,
+            archive_identity: None,
+            platform: "NES".to_string(),
+            source_folder_path: source_dir.to_path_buf(),
+        }
+    }
+
+    fn seed_intent(
+        data_dir: &Path,
+        view: &LibraryViewConfig,
+        entries: Vec<LibraryViewIntentEntry>,
+    ) {
+        save_library_view_intent_at(
+            data_dir,
+            &LibraryViewIntentRecord {
+                view_id: view.id.clone(),
+                destination_root: view.destination_root.clone(),
+                process_id: std::process::id(),
+                recorded_at: now_utc_string(),
+                entries,
+            },
+        )
+        .unwrap();
+    }
+
+    fn own_temp_name(sequence: u64) -> String {
+        format!(
+            ".archivefs-link-{:x}-{:x}.tmp",
+            std::process::id(),
+            sequence
+        )
+    }
+
+    fn outcomes_for(
+        report: &LibraryViewApplyReport,
+        relative: &str,
+    ) -> Vec<LibraryViewApplyOutcome> {
+        report
+            .results
+            .iter()
+            .filter(|result| result.relative_link_path == Path::new(relative))
+            .map(|result| result.outcome)
+            .collect()
+    }
+
     #[test]
     fn catalogue_planning_load_is_strictly_read_only() {
         let root = temp_dir("catalogue-planning-read-only");
@@ -3181,20 +3919,20 @@ mod tests {
         let source = make_source(1, &source_dir);
         let archive = make_archive(1, 1, &archive_path, Some("NES"));
         let view = make_view("view-1", &destination, vec![], vec![]);
-        // Not previously recorded in any manifest - this symlink was not
-        // created by EmuWiz, but already points exactly where EmuWiz
-        // would put it.
+        // Not previously recorded in any manifest or intent record - this
+        // symlink was not created by EmuWiz, but already points exactly
+        // where EmuWiz would put it. Night Watch II D2-05: it is the user's,
+        // so it is kept as it is and never adopted (adoption let `remove`
+        // delete it later).
         let manifest = empty_manifest(&view.id, &destination);
 
         let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
-        assert_eq!(
-            plan.entries[0].action,
-            LibraryViewPlanAction::AlreadyCorrect
-        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::UserOwnedKept);
 
         let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
-        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.unchanged, 0);
         assert_eq!(report.created, 0);
+        assert_eq!(report.failed, 0);
 
         let ino_after = fs::symlink_metadata(&link_path).unwrap().ino();
         assert_eq!(
@@ -3203,11 +3941,42 @@ mod tests {
         );
 
         let new_manifest = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
-        assert_eq!(
-            new_manifest.entries.len(),
-            1,
-            "an adopted correct symlink must be recorded"
+        assert!(
+            new_manifest.entries.is_empty(),
+            "a correct symlink EmuWiz did not record creating is never adopted"
         );
+
+        // Once the manifest records it (here: seeded as if a previous apply
+        // created it), the same link plans as AlreadyCorrect and is kept.
+        let recorded = LibraryViewManifest {
+            entries: vec![LibraryViewManifestEntry {
+                relative_link_path: PathBuf::from("NES/Game.zip"),
+                target_path: archive_path.clone(),
+                archive_identity: None,
+                created_at: now_utc_string(),
+                updated_at: now_utc_string(),
+                platform: "NES".to_string(),
+                source_folder_path: source_dir.clone(),
+                object_kind: LibraryViewObjectKind::Symlink,
+                content_hash: None,
+                rendering_version: None,
+            }],
+            ..new_manifest
+        };
+        let plan = plan_library_view(
+            &view,
+            &[make_archive(1, 1, &archive_path, Some("NES"))],
+            &[make_source(1, &source_dir)],
+            &recorded,
+            None,
+        );
+        assert_eq!(
+            plan.entries[0].action,
+            LibraryViewPlanAction::AlreadyCorrect
+        );
+        let report = apply_library_view(&view, &plan, &recorded, &data_dir).unwrap();
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(fs::symlink_metadata(&link_path).unwrap().ino(), ino_before);
     }
 
     #[test]
@@ -3963,9 +4732,12 @@ mod tests {
         // produced) but the process crashed before `apply_library_view`
         // ever reached its single end-of-loop `save_library_view_manifest_
         // at` call, so the manifest on disk is still empty and does not
-        // record it. Proves that re-running plan+apply against that empty
-        // manifest reconciles the leftover into the manifest instead of
-        // either recreating/breaking it or refusing to proceed.
+        // record it. What *is* on disk is the intent record the run wrote
+        // before publishing (Night Watch II D2-04) - the only thing that
+        // distinguishes this leftover from a link the user made (D2-05).
+        // Proves that re-running plan+apply reconciles the leftover into
+        // the manifest instead of recreating/breaking it, refusing, or
+        // leaving it unmanaged.
         let root = temp_dir("crash-before-manifest-publish");
         let source_dir = root.join("source");
         let archive_path = source_dir.join("Game.zip");
@@ -3981,7 +4753,19 @@ mod tests {
         let source = make_source(1, &source_dir);
         let archive = make_archive(1, 1, &archive_path, Some("NES"));
         let view = make_view("view-1", &destination, vec![], vec![]);
-        let manifest = empty_manifest(&view.id, &destination); // crash: never published
+        // crash: the manifest was never published, the intent record was.
+        seed_intent(
+            &data_dir,
+            &view,
+            vec![intent_entry("NES/Game.zip", &archive_path, &source_dir)],
+        );
+        let (manifest, reconciliation) =
+            load_manifest_with_pending_intent_at(&view, &data_dir).unwrap();
+        assert_eq!(
+            reconciliation.recovered,
+            vec![PathBuf::from("NES/Game.zip")]
+        );
+        assert!(reconciliation.unresolved.is_empty());
 
         let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
         assert_eq!(
@@ -3993,6 +4777,10 @@ mod tests {
         assert_eq!(report.unchanged, 1);
         assert_eq!(report.created, 0);
         assert_eq!(report.failed, 0);
+        assert_eq!(
+            outcomes_for(&report, "NES/Game.zip"),
+            vec![LibraryViewApplyOutcome::Recovered]
+        );
 
         // The pre-existing symlink was adopted, not recreated.
         let inode_after = fs::symlink_metadata(&link_path).unwrap().ino();
@@ -4003,6 +4791,12 @@ mod tests {
         assert_eq!(
             reloaded.entries[0].relative_link_path,
             PathBuf::from("NES/Game.zip")
+        );
+        assert!(
+            load_library_view_intent_at(&data_dir, &view.id)
+                .unwrap()
+                .is_none(),
+            "the intent record is cleared once the manifest records its links"
         );
     }
 
@@ -4041,7 +4835,8 @@ mod tests {
                         LibraryViewPlanAction::SkipUnknownPlatform
                         | LibraryViewPlanAction::SkipMissingSourceArchive
                         | LibraryViewPlanAction::SkipInvalidPath
-                        | LibraryViewPlanAction::SkipPreservationOnly => counts.skip += 1,
+                        | LibraryViewPlanAction::SkipPreservationOnly
+                        | LibraryViewPlanAction::UserOwnedKept => counts.skip += 1,
                     }
                     counts
                 });
@@ -7355,6 +8150,489 @@ mod tests {
         assert!(
             fs::symlink_metadata(&user_link).is_ok(),
             "user's pre-existing symlink was deleted"
+        );
+    }
+
+    #[test]
+    fn apply_killed_after_k_links_leaves_an_intent_record_that_remove_honours() {
+        // Models the strace SIGKILL reproduction (repro_view_apply_kill.sh,
+        // killed on the 4th rename): links 1..k are published, the k+1-th
+        // temp link exists but was never renamed, no manifest was saved.
+        let root = temp_dir("apply-killed-after-k");
+        let source_dir = root.join("source");
+        let names = ["A.zip", "B.zip", "C.zip", "D.zip"];
+        let archives: Vec<PathBuf> = names.iter().map(|name| source_dir.join(name)).collect();
+        for path in &archives {
+            write_file(path, b"zip");
+        }
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let source = make_source(1, &source_dir);
+        let records: Vec<PersistedArchive> = archives
+            .iter()
+            .enumerate()
+            .map(|(index, path)| make_archive(index as i64 + 1, 1, path, Some("NES")))
+            .collect();
+        let view = make_view("view-k", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+        let plan = plan_library_view(&view, &records, &[source], &manifest, None);
+        assert_eq!(plan.counts.create, 4);
+
+        set_crash_after_published_links(Some(3));
+        let error = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap_err();
+        set_crash_after_published_links(None);
+        assert!(error.to_string().contains("simulated crash"), "{error}");
+        // The temp link of the 4th entry, created but never renamed.
+        let temp_link = destination.join("NES").join(own_temp_name(0xd2_04));
+        symlink(&archives[3], &temp_link).unwrap();
+
+        // Before any recovery: no manifest, but the intent record names all four.
+        assert!(
+            load_library_view_manifest_at(&data_dir, &view.id)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let intent = load_library_view_intent_at(&data_dir, &view.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.entries.len(), 4);
+        assert_eq!(intent.process_id, std::process::id());
+
+        let recorded = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        let report = remove_library_view_symlinks(&view, &recorded, &data_dir).unwrap();
+        assert_eq!(report.removed, 3, "{:?}", report.results);
+        assert_eq!(report.failed, 0, "{:?}", report.results);
+        for name in &names[..3] {
+            assert_eq!(
+                outcomes_for(&report, &format!("NES/{name}")),
+                vec![LibraryViewApplyOutcome::RecoveredRemoved]
+            );
+        }
+        assert!(
+            outcomes_for(&report, "NES/D.zip").is_empty(),
+            "never published"
+        );
+        assert!(report.results.iter().any(|result| {
+            result.outcome == LibraryViewApplyOutcome::TempLinkRemoved
+                && result.relative_link_path == Path::new("NES").join(own_temp_name(0xd2_04))
+        }));
+        assert!(!report.has_unreconciled_objects());
+        assert!(
+            !destination.join("NES").exists(),
+            "every published link, the temp link and the now-empty directory are gone"
+        );
+        assert!(
+            load_library_view_intent_at(&data_dir, &view.id)
+                .unwrap()
+                .is_none()
+        );
+        for path in &archives {
+            assert_eq!(fs::read(path).unwrap(), b"zip", "originals untouched");
+        }
+    }
+
+    #[test]
+    fn pending_intent_record_is_reconciled_by_preview_and_apply() {
+        let root = temp_dir("pending-intent-reconcile");
+        let source_dir = root.join("source");
+        let published = source_dir.join("Published.zip");
+        let never = source_dir.join("Never.zip");
+        let blocked = source_dir.join("Blocked.zip");
+        for path in [&published, &never, &blocked] {
+            write_file(path, b"zip");
+        }
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let nes = destination.join("NES");
+        fs::create_dir_all(&nes).unwrap();
+        symlink(&published, nes.join("Published.zip")).unwrap(); // the interrupted run got this far
+        write_file(&nes.join("Blocked.zip"), b"user file"); // a real file where it meant to link
+
+        let source = make_source(1, &source_dir);
+        let records = vec![
+            make_archive(1, 1, &published, Some("NES")),
+            make_archive(2, 1, &never, Some("NES")),
+            make_archive(3, 1, &blocked, Some("NES")),
+        ];
+        let view = make_view("view-pending", &destination, vec![], vec![]);
+        seed_intent(
+            &data_dir,
+            &view,
+            vec![
+                intent_entry("NES/Published.zip", &published, &source_dir),
+                intent_entry("NES/Never.zip", &never, &source_dir),
+                intent_entry("NES/Blocked.zip", &blocked, &source_dir),
+            ],
+        );
+
+        // Preview: folded in memory, nothing written.
+        let (manifest, pending) = load_manifest_with_pending_intent_at(&view, &data_dir).unwrap();
+        assert_eq!(pending.recovered, vec![PathBuf::from("NES/Published.zip")]);
+        assert_eq!(
+            pending.never_published,
+            vec![PathBuf::from("NES/Never.zip")]
+        );
+        assert_eq!(pending.unresolved.len(), 1);
+        assert_eq!(pending.unresolved[0].0, PathBuf::from("NES/Blocked.zip"));
+        assert!(!pending.destination_root_changed);
+        assert!(
+            load_library_view_manifest_at(&data_dir, &view.id)
+                .unwrap()
+                .entries
+                .is_empty(),
+            "preview writes nothing"
+        );
+        assert!(
+            load_library_view_intent_at(&data_dir, &view.id)
+                .unwrap()
+                .is_some()
+        );
+
+        let mut plan = plan_library_view(&view, &records, &[source], &manifest, None);
+        annotate_plan_with_pending_intent(&mut plan, &pending);
+        let action_for = |relative: &str| {
+            plan.entries
+                .iter()
+                .find(|entry| entry.relative_link_path.as_deref() == Some(Path::new(relative)))
+                .map(|entry| (entry.action, entry.reason.clone()))
+                .unwrap()
+        };
+        let (action, reason) = action_for("NES/Published.zip");
+        assert_eq!(action, LibraryViewPlanAction::AlreadyCorrect);
+        assert!(reason.unwrap().contains("recovered from its intent record"));
+        assert_eq!(action_for("NES/Never.zip").0, LibraryViewPlanAction::Create);
+        let (action, reason) = action_for("NES/Blocked.zip");
+        assert_eq!(action, LibraryViewPlanAction::Collision);
+        assert!(reason.unwrap().contains("recorded by an interrupted apply"));
+        assert!(plan.is_safe_to_apply());
+
+        // Apply: recovered link recorded, never-published link created,
+        // blocked path reported and untouched, record cleared.
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(
+            outcomes_for(&report, "NES/Published.zip"),
+            vec![LibraryViewApplyOutcome::Recovered]
+        );
+        assert_eq!(
+            outcomes_for(&report, "NES/Never.zip"),
+            vec![LibraryViewApplyOutcome::Created]
+        );
+        assert_eq!(
+            outcomes_for(&report, "NES/Blocked.zip"),
+            vec![LibraryViewApplyOutcome::LeftUnchanged]
+        );
+        assert_eq!((report.created, report.unchanged, report.failed), (1, 1, 0));
+        assert_eq!(fs::read(nes.join("Blocked.zip")).unwrap(), b"user file");
+        let reloaded = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        let recorded: Vec<&Path> = reloaded
+            .entries
+            .iter()
+            .map(|entry| entry.relative_link_path.as_path())
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![Path::new("NES/Never.zip"), Path::new("NES/Published.zip")]
+        );
+        assert!(
+            load_library_view_intent_at(&data_dir, &view.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_intent_record_under_a_different_destination_root_fails_closed() {
+        let root = temp_dir("pending-intent-moved-root");
+        let source_dir = root.join("source");
+        let archive = source_dir.join("A.zip");
+        write_file(&archive, b"zip");
+        let old_destination = root.join("old-dest");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let old_link = old_destination.join("NES").join("A.zip");
+        fs::create_dir_all(old_link.parent().unwrap()).unwrap();
+        symlink(&archive, &old_link).unwrap();
+
+        let old_view = make_view("view-moved", &old_destination, vec![], vec![]);
+        seed_intent(
+            &data_dir,
+            &old_view,
+            vec![intent_entry("NES/A.zip", &archive, &source_dir)],
+        );
+        let view = make_view("view-moved", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+        let (_, pending) = load_manifest_with_pending_intent_at(&view, &data_dir).unwrap();
+        assert!(pending.destination_root_changed);
+        let mut plan = plan_library_view(
+            &view,
+            &[make_archive(1, 1, &archive, Some("NES"))],
+            &[make_source(1, &source_dir)],
+            &manifest,
+            None,
+        );
+        annotate_plan_with_pending_intent(&mut plan, &pending);
+        assert!(!plan.is_safe_to_apply());
+        assert!(apply_library_view(&view, &plan, &manifest, &data_dir).is_err());
+        assert!(remove_library_view_symlinks(&view, &manifest, &data_dir).is_err());
+        assert!(
+            fs::symlink_metadata(&old_link).is_ok(),
+            "nothing under the old root is touched"
+        );
+        assert!(
+            load_library_view_intent_at(&data_dir, &view.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn temp_link_sweep_never_removes_a_regular_file_or_a_link_outside_the_destination_root() {
+        let root = temp_dir("temp-sweep-safety");
+        let source_dir = root.join("source");
+        let a = source_dir.join("A.zip");
+        let b = source_dir.join("B.zip");
+        let unrelated = root.join("unrelated.bin");
+        for path in [&a, &b, &unrelated] {
+            write_file(path, b"data");
+        }
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let nes = destination.join("NES");
+        fs::create_dir_all(&nes).unwrap();
+        // A user's file an interrupted repair might have preserved at a temp name.
+        let user_file = nes.join(own_temp_name(1));
+        write_file(&user_file, b"preserved user data");
+        // A temp-named symlink pointing somewhere this view never intended.
+        let foreign_link = nes.join(own_temp_name(2));
+        symlink(&unrelated, &foreign_link).unwrap();
+        // This view's own leftover temp link: the only thing swept.
+        let own_link = nes.join(own_temp_name(3));
+        symlink(&a, &own_link).unwrap();
+        // Another process's temp name, even pointing at our target: not ours.
+        let other_process = nes.join(format!(
+            ".archivefs-link-{:x}-4.tmp",
+            std::process::id() + 1
+        ));
+        symlink(&a, &other_process).unwrap();
+        // The same name outside the destination root entirely.
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let outside_link = outside.join(own_temp_name(5));
+        symlink(&a, &outside_link).unwrap();
+        // A planned parent that is a symlink escaping the destination root.
+        symlink(&outside, destination.join("SNES")).unwrap();
+        let escaped_link = outside.join(own_temp_name(6));
+        symlink(&b, &escaped_link).unwrap();
+
+        let view = make_view("view-sweep", &destination, vec![], vec![]);
+        seed_intent(
+            &data_dir,
+            &view,
+            vec![
+                intent_entry("NES/A.zip", &a, &source_dir),
+                intent_entry("SNES/B.zip", &b, &source_dir),
+            ],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+        let report = remove_library_view_symlinks(&view, &manifest, &data_dir).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&own_link).is_err(),
+            "own temp link swept"
+        );
+        assert_eq!(fs::read(&user_file).unwrap(), b"preserved user data");
+        assert!(fs::symlink_metadata(&foreign_link).is_ok());
+        assert!(fs::symlink_metadata(&other_process).is_ok());
+        assert!(fs::symlink_metadata(&outside_link).is_ok());
+        assert!(fs::symlink_metadata(&escaped_link).is_ok());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"data");
+        let swept: Vec<_> = report
+            .results
+            .iter()
+            .filter(|result| result.outcome == LibraryViewApplyOutcome::TempLinkRemoved)
+            .collect();
+        assert_eq!(swept.len(), 1);
+        assert_eq!(
+            swept[0].relative_link_path,
+            Path::new("NES").join(own_temp_name(3))
+        );
+        // The user's file and the foreign link at our temp names are reported, so
+        // the definition is kept until the user has looked at them.
+        assert_eq!(
+            outcomes_for(&report, &format!("NES/{}", own_temp_name(1))),
+            vec![LibraryViewApplyOutcome::LeftUnchanged]
+        );
+        assert_eq!(
+            outcomes_for(&report, &format!("NES/{}", own_temp_name(2))),
+            vec![LibraryViewApplyOutcome::LeftUnchanged]
+        );
+        assert!(report.has_unreconciled_objects());
+        assert_eq!(report.removed, 0);
+    }
+
+    #[test]
+    fn user_made_symlink_plans_as_user_owned_kept_and_is_never_adopted() {
+        let root = temp_dir("user-owned-kept");
+        let source_dir = root.join("source");
+        let a = source_dir.join("A.zip");
+        write_file(&a, b"a");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let user_link = destination.join("NES").join("A.zip");
+        fs::create_dir_all(user_link.parent().unwrap()).unwrap();
+        symlink(&a, &user_link).unwrap();
+        let inode_before = fs::symlink_metadata(&user_link).unwrap().ino();
+
+        let view = make_view("view-user", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+        let plan = plan_library_view(
+            &view,
+            &[make_archive(1, 1, &a, Some("NES"))],
+            &[make_source(1, &source_dir)],
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::UserOwnedKept);
+        assert!(
+            plan.entries[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("not record")
+        );
+        assert_eq!(
+            (plan.counts.correct, plan.counts.skip, plan.counts.create),
+            (0, 1, 0)
+        );
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(
+            outcomes_for(&report, "NES/A.zip"),
+            vec![LibraryViewApplyOutcome::UserOwnedKept]
+        );
+        assert_eq!((report.created, report.unchanged, report.failed), (0, 0, 0));
+        assert!(
+            load_library_view_manifest_at(&data_dir, &view.id)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert!(
+            load_library_view_intent_at(&data_dir, &view.id)
+                .unwrap()
+                .is_none(),
+            "nothing to intend, nothing recorded"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&user_link).unwrap().ino(),
+            inode_before
+        );
+
+        // A stale plan that still says AlreadyCorrect is not trusted either.
+        let mut stale = plan.clone();
+        stale.entries[0].action = LibraryViewPlanAction::AlreadyCorrect;
+        let report = apply_library_view(&view, &stale, &manifest, &data_dir).unwrap();
+        assert_eq!(
+            outcomes_for(&report, "NES/A.zip"),
+            vec![LibraryViewApplyOutcome::UserOwnedKept]
+        );
+        assert!(
+            load_library_view_manifest_at(&data_dir, &view.id)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn intent_record_is_written_before_the_first_link_and_cleared_after_the_manifest() {
+        let root = temp_dir("intent-before-mutation");
+        let source_dir = root.join("source");
+        let a = source_dir.join("A.zip");
+        let b = source_dir.join("B.zip");
+        write_file(&a, b"a");
+        write_file(&b, b"b");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let view = make_view("view-intent", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+        let plan = plan_library_view(
+            &view,
+            &[
+                make_archive(1, 1, &a, Some("NES")),
+                make_archive(2, 1, &b, Some("NES")),
+            ],
+            &[make_source(1, &source_dir)],
+            &manifest,
+            None,
+        );
+
+        // Killed right after the first link: the record already names both.
+        set_crash_after_published_links(Some(1));
+        let _ = apply_library_view(&view, &plan, &manifest, &data_dir);
+        set_crash_after_published_links(None);
+        let intent = load_library_view_intent_at(&data_dir, &view.id)
+            .unwrap()
+            .unwrap();
+        let intended: Vec<&Path> = intent
+            .entries
+            .iter()
+            .map(|e| e.relative_link_path.as_path())
+            .collect();
+        assert_eq!(
+            intended,
+            vec![Path::new("NES/A.zip"), Path::new("NES/B.zip")]
+        );
+        assert_eq!(intent.entries[0].target_path, a);
+        assert_eq!(intent.entries[0].action, LibraryViewPlanAction::Create);
+        assert!(
+            load_library_view_manifest_at(&data_dir, &view.id)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert!(
+            !fs::read_dir(&data_dir)
+                .unwrap()
+                .flatten()
+                .any(|entry| { entry.file_name().to_string_lossy().contains(".tmp") }),
+            "intent record published atomically, no stray temp file"
+        );
+
+        // A full re-apply recovers A, creates B, records both and clears the record.
+        let (manifest, pending) = load_manifest_with_pending_intent_at(&view, &data_dir).unwrap();
+        assert_eq!(pending.recovered, vec![PathBuf::from("NES/A.zip")]);
+        let plan = plan_library_view(
+            &view,
+            &[
+                make_archive(1, 1, &a, Some("NES")),
+                make_archive(2, 1, &b, Some("NES")),
+            ],
+            &[make_source(1, &source_dir)],
+            &manifest,
+            None,
+        );
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!((report.created, report.unchanged, report.failed), (1, 1, 0));
+        assert_eq!(
+            load_library_view_manifest_at(&data_dir, &view.id)
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+        assert!(
+            load_library_view_intent_at(&data_dir, &view.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_library_view_manifest_at(&data_dir, &view.id)
+                .unwrap()
+                .entries
+                .iter()
+                .all(|e| e.object_kind == LibraryViewObjectKind::Symlink)
         );
     }
 }
