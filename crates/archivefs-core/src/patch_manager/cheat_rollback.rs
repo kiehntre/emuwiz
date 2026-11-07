@@ -22,6 +22,8 @@ pub(crate) enum FaultPoint {
     JournalFinalize,
     /// The process dies right after entry `n` settled (test: panic).
     CrashAfterEntry(usize),
+    /// The filesystem rejects `RENAME_NOREPLACE` (EINVAL/ENOSYS/ENOTSUP).
+    NoReplaceUnsupported,
 }
 #[cfg(test)]
 pub(crate) fn inject_rollback_fault_for_test(point: Option<FaultPoint>) {
@@ -542,8 +544,17 @@ fn remove_verified(
     parked: &Path,
 ) -> Result<(), MutationError> {
     run_before_mutation_hook(destination);
-    super::cheat_installer::rename_no_replace(destination, parked)
-        .map_err(|e| MutationError::Io(format!("could not move the file aside: {e}")))?;
+    match park_no_replace(destination, parked) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            return remove_verified_without_noreplace(destination, expected_hash);
+        }
+        Err(e) => {
+            return Err(MutationError::Io(format!(
+                "could not move the file aside: {e}"
+            )));
+        }
+    }
     match hash_file(parked) {
         Ok(hash) if hash == expected_hash => {
             fs::remove_file(parked).map_err(|e| MutationError::Io(e.to_string()))
@@ -558,6 +569,31 @@ fn remove_verified(
             ))),
         },
     }
+}
+
+/// `rename_no_replace`, with a test hook that models a filesystem lacking
+/// `RENAME_NOREPLACE`.
+fn park_no_replace(destination: &Path, parked: &Path) -> std::io::Result<()> {
+    if should_inject(FaultPoint::NoReplaceUnsupported) {
+        return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+    }
+    super::cheat_installer::rename_no_replace(destination, parked)
+}
+
+/// Fallback for filesystems without `RENAME_NOREPLACE` (some FUSE, NFS,
+/// CIFS mounts), mirroring `restore_verified`'s exchange fallback: the
+/// destination is re-hashed immediately before a plain unlink (a small,
+/// documented check-then-act window instead of failing every Undo there).
+fn remove_verified_without_noreplace(
+    destination: &Path,
+    expected_hash: &str,
+) -> Result<(), MutationError> {
+    if hash_file(destination).ok().as_deref() != Some(expected_hash) {
+        return Err(MutationError::DestinationChanged(
+            "destination changed after the hash check; left in place".into(),
+        ));
+    }
+    fs::remove_file(destination).map_err(|e| MutationError::Io(e.to_string()))
 }
 
 /// Publishes the verified restore file `tmp` at `destination` only if the
@@ -678,6 +714,37 @@ pub fn execute_cheat_rollback(
         Ok(r) => r,
         Err(e) => {
             return failed_run(journal_path, options, e.to_string());
+        }
+    };
+    // Refuse to roll back a run that is still being installed: its
+    // installer holds the journal's lock for the whole run, and the kernel
+    // releases it when the process dies, so interrupted runs stay
+    // rollbackable. The lock (when free) is kept until this rollback ends.
+    let _installer_lock = match super::cheat_installer::InstallerLock::probe(journal_path) {
+        Ok((super::cheat_installer::InstallerLockState::NotHeld, guard)) => guard,
+        Ok((super::cheat_installer::InstallerLockState::HeldByLiveInstaller, _))
+            if orig.is_interrupted() =>
+        {
+            return refused_run(
+                journal_path,
+                options,
+                "install_still_running",
+                "install still running: this install journal is still being written by a live \
+                 install run; nothing was changed - wait for it to finish, then roll back"
+                    .into(),
+            );
+        }
+        // Finished journal: the installer is only releasing its lock.
+        Ok((super::cheat_installer::InstallerLockState::HeldByLiveInstaller, _)) => None,
+        Err(error) => {
+            return refused_run(
+                journal_path,
+                options,
+                "install_lock_unavailable",
+                format!(
+                    "could not check whether the install is still running ({error}); nothing was changed"
+                ),
+            );
         }
     };
     let effective_dry = options.dry_run || !options.confirmed;
@@ -809,6 +876,24 @@ pub fn execute_cheat_rollback_run(
 ) -> CheatRollbackRunOutcome {
     execute_cheat_rollback(journal_path, options)
 }
+/// A rollback that changed nothing because it was refused up front.
+fn refused_run(
+    path: &Path,
+    o: &CheatRollbackOptions,
+    code: &str,
+    msg: String,
+) -> CheatRollbackRunOutcome {
+    let mut outcome = failed_run(path, o, msg);
+    for entry in &mut outcome.run.entries {
+        entry.outcome = CheatRollbackOutcome::FailedIo;
+        entry.error_code = Some(code.into());
+        entry.retryable = true;
+    }
+    outcome.run.summary = CheatRollbackSummary::from_entries(&outcome.run.entries);
+    outcome.run.status = CheatRollbackRunStatus::derive(&outcome.run.summary, outcome.run.dry_run);
+    outcome
+}
+
 fn failed_run(path: &Path, o: &CheatRollbackOptions, msg: String) -> CheatRollbackRunOutcome {
     let e = CheatRollbackEntryResult {
         original_outcome: CheatInstallOutcome::FailedWrite,

@@ -776,6 +776,26 @@ fn discover_rollback_match(
         }
     }
     matches.sort_by(|left, right| left.0.cmp(&right.0));
+    // A rollback killed mid-way leaves an `in_progress` journal; the
+    // documented recovery is a second rollback run. Once exactly one bound
+    // rollback completed successfully, the interrupted ones it superseded
+    // no longer compete with it.
+    if matches.len() > 1 {
+        let successful: Vec<usize> = matches
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, rollback))| rollback_completed_successfully(rollback, install))
+            .map(|(index, _)| index)
+            .collect();
+        if let [winner] = successful[..]
+            && matches.iter().enumerate().all(|(index, (_, rollback))| {
+                index == winner || rollback.status == CheatRollbackRunStatus::InProgress
+            })
+        {
+            let kept = matches.swap_remove(winner);
+            matches = vec![kept];
+        }
+    }
     if matches.len() > 1 {
         return (
             CheatRollbackJournalMatch {
