@@ -222,6 +222,14 @@ pub struct RenameProposal {
     /// Filesystem identity captured for the exact outer archive whose members
     /// were audited. `None` for ordinary loose-file proposals.
     pub audited_identity: Option<crate::dat::rename_apply::ObjectIdentity>,
+    /// The fingerprint (size, mtime, device, inode and change time) the audit
+    /// observed on a loose source file while hashing the bytes that earned
+    /// this proposal's verdict. Apply refuses the proposal, before any
+    /// mutation, unless the file still observes to exactly this fingerprint
+    /// (S03-02 lineage: a same-size rewrite with a restored mtime changes
+    /// the change time). `None` for archive proposals - those carry
+    /// `audited_identity` - and for a proposal built without hash evidence.
+    pub audited_fingerprint: Option<crate::identity_source::hashing::FileFingerprint>,
     /// Whether this proposal renames an outer `.zip`/`.7z` archive as a
     /// whole, derived from Stage 1 set-completeness evidence
     /// ([`crate::dat::set::SetResolution`]) rather than a per-file DAT
