@@ -4477,6 +4477,34 @@ fn standalone_container_allowed(adapter_id: &str, container: Option<LaunchContai
     }
 }
 
+/// Whether the candidate's readiness/blockers/warnings permit building a
+/// standalone launch request. Only MAME's own driver flags are tolerated as
+/// warnings: they are informational by contract
+/// (`LaunchWarningKind::MameMachineFlagged`: "never a launch gate"), and real
+/// "not working" verdicts are blockers, not warnings. Any other warning, for
+/// any adapter, still withdraws Play.
+pub(crate) fn standalone_status_allows_request(candidate: &LaunchCandidate) -> bool {
+    if !candidate.blockers.is_empty() {
+        return false;
+    }
+    if candidate.warnings.is_empty() {
+        return candidate.readiness == LaunchReadiness::Ready;
+    }
+    matches!(
+        candidate.target,
+        LaunchTarget::Standalone {
+            adapter_id: "mame",
+            ..
+        }
+    ) && matches!(
+        candidate.readiness,
+        LaunchReadiness::Ready | LaunchReadiness::ReadyWithWarnings
+    ) && candidate
+        .warnings
+        .iter()
+        .all(|warning| warning.kind == LaunchWarningKind::MameMachineFlagged)
+}
+
 fn standalone_launch_request(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
@@ -4487,11 +4515,7 @@ fn standalone_launch_request(
     xenia: Option<&XeniaLaunchContext>,
     melonds: Option<&MelonDsLaunchContext>,
 ) -> Option<StandaloneLaunchRequest> {
-    if candidate.readiness != LaunchReadiness::Ready
-        || !candidate.blockers.is_empty()
-        || !candidate.warnings.is_empty()
-        || candidate.content.requires_mount
-    {
+    if !standalone_status_allows_request(candidate) || candidate.content.requires_mount {
         return None;
     }
     let path = candidate.content.resolved_path.clone()?;
