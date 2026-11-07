@@ -888,7 +888,10 @@ impl App {
             workflows.app.external_catalogue_writer_busy = true;
         }
         if !self.send(id, Command::Load { scan }) {
-            self.load_job = None;
+            // load_job keeps its existing contract (the refused job stays
+            // recorded, as the disconnected-backend tests rely on). Only the
+            // scan state added for the writer gate is released, so a refused
+            // scan cannot hold the native Sources writers forever.
             self.scan_job = None;
             if let Some(workflows) = &mut self.native_workflows {
                 workflows.app.external_catalogue_writer_busy = false;

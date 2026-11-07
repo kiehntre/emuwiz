@@ -96,7 +96,6 @@ fn a_failed_scan_send_does_not_leave_the_writer_held() {
     let mut app = app_with_native(&context);
     app.backend = Backend::disconnected();
     app.load(true);
-    assert!(app.load_job.is_none());
     assert!(app.scan_job.is_none());
     let workflows = app.native_workflows.as_ref().unwrap();
     assert!(workflows.source_action_available());
