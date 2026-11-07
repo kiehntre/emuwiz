@@ -786,8 +786,32 @@ pub struct LibraryViewIntentRecord {
     /// this is what identifies the run's own leftover temporary links to
     /// `sweep_interrupted_temp_links` - never any other process's.
     pub process_id: u32,
+    /// Process ids of earlier runs whose records were carried into this one
+    /// (`carry_over_intent`): their temporary names are swept too.
+    #[serde(default)]
+    pub carried_process_ids: Vec<u32>,
     pub recorded_at: String,
     pub entries: Vec<LibraryViewIntentEntry>,
+}
+
+impl LibraryViewIntentRecord {
+    fn process_ids(&self) -> Vec<u32> {
+        let mut ids = vec![self.process_id];
+        ids.extend(self.carried_process_ids.iter().copied());
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+}
+
+/// A recorded link path is used only when it is a plain relative path
+/// (no root, no prefix, no `..`/`.`): anything else is never joined onto the
+/// destination root, never folded into the manifest, never swept.
+fn is_plain_relative_link_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 /// `None` when no apply run is pending for this view (the normal state).
@@ -903,6 +927,16 @@ pub fn reconcile_library_view_intent(
 
     for entry in &intent.entries {
         let relative = entry.relative_link_path.clone();
+        if !is_plain_relative_link_path(&relative) {
+            reconciliation.unresolved.push((
+                relative,
+                "its recorded path is not a plain relative path inside the destination root - \
+                 nothing is folded or touched for it; delete the view's intent record by hand \
+                 if this persists"
+                    .to_string(),
+            ));
+            continue;
+        }
         let destination = view.destination_root.join(&relative);
         let existing_index = folded
             .entries
@@ -1066,19 +1100,29 @@ fn is_own_temp_link_name(name: &[u8], prefix: &[u8]) -> bool {
 /// recorded. Anything else found at such a name is reported as
 /// `LeftUnchanged` and never touched: a regular file there may be a user's
 /// file an interrupted repair preserved (see `replace_managed_symlink`).
+///
+/// Returns the relative parent directories in which such a name was left
+/// untouched, so the caller can keep the record alive for them
+/// (`carry_over_intent`) instead of forgetting them.
 fn sweep_interrupted_temp_links(
     view: &LibraryViewConfig,
     intent: &LibraryViewIntentRecord,
     manifest: &LibraryViewManifest,
     report: &mut LibraryViewApplyReport,
-) {
+) -> BTreeSet<PathBuf> {
+    let mut leftover_parents = BTreeSet::new();
     if intent.destination_root != view.destination_root {
-        return;
+        return leftover_parents;
     }
-    let prefix = format!(".archivefs-link-{:x}-", intent.process_id);
+    let prefixes: Vec<String> = intent
+        .process_ids()
+        .into_iter()
+        .map(|pid| format!(".archivefs-link-{pid:x}-"))
+        .collect();
     let planned: HashSet<&Path> = intent
         .entries
         .iter()
+        .filter(|entry| is_plain_relative_link_path(&entry.relative_link_path))
         .map(|entry| entry.relative_link_path.as_path())
         .collect();
     let mut allowed_targets: HashSet<PathBuf> = intent
@@ -1093,10 +1137,9 @@ fn sweep_interrupted_temp_links(
             .filter(|entry| planned.contains(entry.relative_link_path.as_path()))
             .map(|entry| entry.target_path.clone()),
     );
-    let parents: BTreeSet<PathBuf> = intent
-        .entries
+    let parents: BTreeSet<PathBuf> = planned
         .iter()
-        .filter_map(|entry| entry.relative_link_path.parent().map(Path::to_path_buf))
+        .filter_map(|relative| relative.parent().map(Path::to_path_buf))
         .collect();
 
     for relative_parent in parents {
@@ -1110,7 +1153,10 @@ fn sweep_interrupted_temp_links(
         let mut names: Vec<OsString> = read_dir.flatten().map(|entry| entry.file_name()).collect();
         names.sort();
         for name in names {
-            if !is_own_temp_link_name(name.as_bytes(), prefix.as_bytes()) {
+            if !prefixes
+                .iter()
+                .any(|prefix| is_own_temp_link_name(name.as_bytes(), prefix.as_bytes()))
+            {
                 continue;
             }
             let path = parent.join(&name);
@@ -1119,6 +1165,7 @@ fn sweep_interrupted_temp_links(
                 .is_ok_and(|metadata| metadata.file_type().is_symlink())
                 && fs::read_link(&path).is_ok_and(|target| allowed_targets.contains(&target));
             if !is_own_link {
+                leftover_parents.insert(relative_parent.clone());
                 report.results.push(LibraryViewApplyEntryResult {
                     relative_link_path,
                     outcome: LibraryViewApplyOutcome::LeftUnchanged,
@@ -1147,6 +1194,65 @@ fn sweep_interrupted_temp_links(
             }
         }
     }
+    leftover_parents
+}
+
+/// What a reconciled record must go on saying after this run, instead of
+/// being cleared: every entry that could not be resolved (something other
+/// than the intended link is at its path, or it could not be inspected -
+/// possibly a genuine EmuWiz link behind a transient error), and every
+/// entry whose parent directory still holds a temporary name the sweep
+/// would not touch. Rewritten into the record so a second remove sees them
+/// again and keeps the definition, rather than reporting "Removed 0" and
+/// dropping it.
+fn carry_over_intent(
+    intent: &LibraryViewIntentRecord,
+    reconciliation: &LibraryViewIntentReconciliation,
+    leftover_parents: &BTreeSet<PathBuf>,
+) -> Vec<LibraryViewIntentEntry> {
+    let unresolved: HashSet<&Path> = reconciliation
+        .unresolved
+        .iter()
+        .map(|(path, _)| path.as_path())
+        .collect();
+    intent
+        .entries
+        .iter()
+        .filter(|entry| {
+            unresolved.contains(entry.relative_link_path.as_path())
+                || entry
+                    .relative_link_path
+                    .parent()
+                    .is_some_and(|parent| leftover_parents.contains(parent))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Publishes what remains of the intent record after the manifest has been
+/// saved: cleared when nothing is carried over, otherwise rewritten with
+/// only the carried entries (and the process ids whose temporary names
+/// still need sweeping).
+fn persist_remaining_intent(
+    data_dir: &Path,
+    view: &LibraryViewConfig,
+    previous: Option<&LibraryViewIntentRecord>,
+    carried: Vec<LibraryViewIntentEntry>,
+) -> Result<()> {
+    let Some(previous) = previous.filter(|_| !carried.is_empty()) else {
+        return clear_library_view_intent_at(data_dir, &view.id);
+    };
+    save_library_view_intent_at(
+        data_dir,
+        &LibraryViewIntentRecord {
+            view_id: view.id.clone(),
+            destination_root: view.destination_root.clone(),
+            process_id: previous.process_id,
+            carried_process_ids: previous.carried_process_ids.clone(),
+            recorded_at: previous.recorded_at.clone(),
+            entries: carried,
+        },
+    )
 }
 
 fn now_utc_string() -> String {
@@ -2384,7 +2490,7 @@ pub fn apply_library_view(
     // this run publishes anything - and persisted before this run's own
     // record replaces that one, so a second interruption can never lose it.
     let pending = load_library_view_intent_at(data_dir, &view.id)?;
-    let (base_manifest, recovered_paths) = match &pending {
+    let (base_manifest, recovered_paths, carried) = match &pending {
         Some(intent) => {
             let (folded, reconciliation) = reconcile_library_view_intent(view, manifest, intent);
             if reconciliation.destination_root_changed {
@@ -2403,11 +2509,12 @@ pub fn apply_library_view(
             if !recovered.is_empty() {
                 save_library_view_manifest_at(data_dir, &folded)?;
             }
-            sweep_interrupted_temp_links(view, intent, &folded, &mut report);
+            let leftover_parents = sweep_interrupted_temp_links(view, intent, &folded, &mut report);
+            let carried = carry_over_intent(intent, &reconciliation, &leftover_parents);
             let recovered: HashSet<PathBuf> = recovered.into_iter().collect();
-            (folded, recovered)
+            (folded, recovered, carried)
         }
-        None => (manifest.clone(), HashSet::new()),
+        None => (manifest.clone(), HashSet::new(), Vec::new()),
     };
 
     let mut entries_by_path: HashMap<PathBuf, LibraryViewManifestEntry> = base_manifest
@@ -2441,15 +2548,36 @@ pub fn apply_library_view(
             })
         })
         .collect();
-    if !intended.is_empty() {
+    // Entries carried over from the previous record (unresolved paths,
+    // parents with an untouched temporary name) are merged into this run's
+    // record rather than overwritten, so they are never silently forgotten.
+    let intended_paths: HashSet<PathBuf> = intended
+        .iter()
+        .map(|entry| entry.relative_link_path.clone())
+        .collect();
+    let mut record_entries = intended;
+    record_entries.extend(
+        carried
+            .iter()
+            .filter(|entry| !intended_paths.contains(&entry.relative_link_path))
+            .cloned(),
+    );
+    let mut carried_process_ids: Vec<u32> = pending
+        .as_ref()
+        .filter(|_| !carried.is_empty())
+        .map(|previous| previous.process_ids())
+        .unwrap_or_default();
+    carried_process_ids.retain(|pid| *pid != std::process::id());
+    if !record_entries.is_empty() {
         save_library_view_intent_at(
             data_dir,
             &LibraryViewIntentRecord {
                 view_id: view.id.clone(),
                 destination_root: view.destination_root.clone(),
                 process_id: std::process::id(),
+                carried_process_ids,
                 recorded_at: now.clone(),
-                entries: intended,
+                entries: record_entries,
             },
         )?;
     }
@@ -2688,9 +2816,11 @@ pub fn apply_library_view(
     };
     save_library_view_manifest_at(data_dir, &new_manifest)?;
     // Only once the manifest records everything this run published may the
-    // intent record go; failing here leaves it for the next run to
-    // reconcile (harmlessly: everything in it is already in the manifest).
-    clear_library_view_intent_at(data_dir, &view.id)?;
+    // intent record go - and only what was resolved goes; carried entries
+    // stay recorded. Failing here leaves the full record for the next run
+    // to reconcile (harmlessly: everything resolved is in the manifest).
+    let this_run = load_library_view_intent_at(data_dir, &view.id)?;
+    persist_remaining_intent(data_dir, view, this_run.as_ref(), carried)?;
     maybe_remove_empty_managed_directories(&view.destination_root, &new_manifest);
     record_apply_history(view, data_dir, plan, &mut report);
 
@@ -2788,21 +2918,22 @@ pub fn remove_library_view_symlinks(
     // and removed here like any other managed link; its leftover temporary
     // links are swept. See `LibraryViewIntentRecord`.
     let pending = load_library_view_intent_at(data_dir, &view.id)?;
-    let (base_manifest, recovered_paths) = match &pending {
+    let (base_manifest, recovered_paths, carried) = match &pending {
         Some(intent) => {
             let (folded, reconciliation) = reconcile_library_view_intent(view, manifest, intent);
             if reconciliation.destination_root_changed {
                 return Err(destination_root_changed_error(view, intent));
             }
             report_unresolved_intent(&reconciliation, &mut report);
-            sweep_interrupted_temp_links(view, intent, &folded, &mut report);
+            let leftover_parents = sweep_interrupted_temp_links(view, intent, &folded, &mut report);
+            let carried = carry_over_intent(intent, &reconciliation, &leftover_parents);
             let recovered: HashSet<PathBuf> =
                 recovered_against_saved_manifest(view, data_dir, intent)?
                     .into_iter()
                     .collect();
-            (folded, recovered)
+            (folded, recovered, carried)
         }
-        None => (manifest.clone(), HashSet::new()),
+        None => (manifest.clone(), HashSet::new(), Vec::new()),
     };
     let mut remaining: Vec<LibraryViewManifestEntry> = Vec::new();
 
@@ -2863,7 +2994,7 @@ pub fn remove_library_view_symlinks(
         created_directories: base_manifest.created_directories.clone(),
     };
     save_library_view_manifest_at(data_dir, &new_manifest)?;
-    clear_library_view_intent_at(data_dir, &view.id)?;
+    persist_remaining_intent(data_dir, view, pending.as_ref(), carried)?;
     maybe_remove_empty_managed_directories(&view.destination_root, &new_manifest);
     record_remove_history(view, data_dir, base_manifest.entries.len(), &mut report);
 
@@ -3657,6 +3788,7 @@ mod tests {
                 view_id: view.id.clone(),
                 destination_root: view.destination_root.clone(),
                 process_id: std::process::id(),
+                carried_process_ids: Vec::new(),
                 recorded_at: now_utc_string(),
                 entries,
             },
@@ -8334,11 +8466,17 @@ mod tests {
             recorded,
             vec![Path::new("NES/Never.zip"), Path::new("NES/Published.zip")]
         );
-        assert!(
-            load_library_view_intent_at(&data_dir, &view.id)
-                .unwrap()
-                .is_none()
-        );
+        // The blocked entry stays recorded (review condition 1): the next
+        // remove must see it again and keep the definition.
+        let remaining = load_library_view_intent_at(&data_dir, &view.id)
+            .unwrap()
+            .expect("unresolved entry carried over, record not cleared");
+        let kept: Vec<&Path> = remaining
+            .entries
+            .iter()
+            .map(|entry| entry.relative_link_path.as_path())
+            .collect();
+        assert_eq!(kept, vec![Path::new("NES/Blocked.zip")]);
     }
 
     #[test]
@@ -8633,6 +8771,206 @@ mod tests {
                 .entries
                 .iter()
                 .all(|e| e.object_kind == LibraryViewObjectKind::Symlink)
+        );
+    }
+
+    #[test]
+    fn unresolved_intent_entries_survive_consecutive_removes_and_keep_the_definition() {
+        // Review condition (1): a real file at an intent path, and a user's
+        // file at one of the run's temporary names, must still be in the
+        // record after the first remove, so the second remove reports them
+        // again instead of "Removed 0" and dropping the definition.
+        let root = temp_dir("unresolved-carry-over");
+        let source_dir = root.join("source");
+        let a = source_dir.join("A.zip");
+        let b = source_dir.join("B.zip");
+        write_file(&a, b"a");
+        write_file(&b, b"b");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let nes = destination.join("NES");
+        fs::create_dir_all(&nes).unwrap();
+        write_file(&nes.join("A.zip"), b"user file at the intended path");
+        symlink(&b, nes.join("B.zip")).unwrap(); // published by the interrupted run
+        let preserved = nes.join(own_temp_name(7));
+        write_file(&preserved, b"preserved user data");
+
+        let view = make_view("view-carry", &destination, vec![], vec![]);
+        seed_intent(
+            &data_dir,
+            &view,
+            vec![
+                intent_entry("NES/A.zip", &a, &source_dir),
+                intent_entry("NES/B.zip", &b, &source_dir),
+            ],
+        );
+        for round in 1..=2 {
+            let recorded = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+            let report = remove_library_view_symlinks(&view, &recorded, &data_dir).unwrap();
+            assert!(
+                report.has_unreconciled_objects(),
+                "round {round}: the definition must be kept: {:?}",
+                report.results
+            );
+            assert_eq!(
+                outcomes_for(&report, "NES/A.zip"),
+                vec![LibraryViewApplyOutcome::LeftUnchanged],
+                "round {round}"
+            );
+            assert_eq!(
+                outcomes_for(&report, &format!("NES/{}", own_temp_name(7))),
+                vec![LibraryViewApplyOutcome::LeftUnchanged],
+                "round {round}"
+            );
+            let remaining = load_library_view_intent_at(&data_dir, &view.id)
+                .unwrap()
+                .expect("record rewritten, not cleared");
+            let kept: Vec<&Path> = remaining
+                .entries
+                .iter()
+                .map(|entry| entry.relative_link_path.as_path())
+                .collect();
+            assert_eq!(
+                kept,
+                vec![Path::new("NES/A.zip"), Path::new("NES/B.zip")],
+                "round {round}: unresolved entry and the entry whose parent holds a leftover"
+            );
+            assert_eq!(remaining.process_id, std::process::id());
+            assert_eq!(
+                fs::read(nes.join("A.zip")).unwrap(),
+                b"user file at the intended path"
+            );
+            assert_eq!(fs::read(&preserved).unwrap(), b"preserved user data");
+            if round == 1 {
+                assert_eq!(report.removed, 1, "B recovered and removed once");
+                assert!(fs::symlink_metadata(nes.join("B.zip")).is_err());
+            } else {
+                assert_eq!(report.removed, 0);
+            }
+        }
+        // Once the user resolves both, the record is cleared and nothing is left to keep.
+        fs::remove_file(nes.join("A.zip")).unwrap();
+        fs::remove_file(&preserved).unwrap();
+        let recorded = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        let report = remove_library_view_symlinks(&view, &recorded, &data_dir).unwrap();
+        assert!(!report.has_unreconciled_objects(), "{:?}", report.results);
+        assert!(
+            load_library_view_intent_at(&data_dir, &view.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn apply_merges_carried_intent_entries_instead_of_overwriting_them() {
+        let root = temp_dir("carry-into-apply");
+        let source_dir = root.join("source");
+        let a = source_dir.join("A.zip");
+        let c = source_dir.join("C.zip");
+        write_file(&a, b"a");
+        write_file(&c, b"c");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let nes = destination.join("NES");
+        fs::create_dir_all(&nes).unwrap();
+        write_file(&nes.join("A.zip"), b"user file at the intended path");
+
+        let view = make_view("view-merge", &destination, vec![], vec![]);
+        save_library_view_intent_at(
+            &data_dir,
+            &LibraryViewIntentRecord {
+                view_id: view.id.clone(),
+                destination_root: destination.clone(),
+                process_id: std::process::id() + 1, // an earlier, different process
+                carried_process_ids: Vec::new(),
+                recorded_at: now_utc_string(),
+                entries: vec![intent_entry("NES/A.zip", &a, &source_dir)],
+            },
+        )
+        .unwrap();
+        let (manifest, pending) = load_manifest_with_pending_intent_at(&view, &data_dir).unwrap();
+        assert_eq!(pending.unresolved.len(), 1);
+        let plan = plan_library_view(
+            &view,
+            &[
+                make_archive(1, 1, &a, Some("NES")),
+                make_archive(3, 1, &c, Some("NES")),
+            ],
+            &[make_source(1, &source_dir)],
+            &manifest,
+            None,
+        );
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 1, "{:?}", report.results);
+        assert_eq!(
+            outcomes_for(&report, "NES/A.zip"),
+            vec![LibraryViewApplyOutcome::LeftUnchanged]
+        );
+        let remaining = load_library_view_intent_at(&data_dir, &view.id)
+            .unwrap()
+            .expect("the unresolved entry is carried, not overwritten");
+        let kept: Vec<&Path> = remaining
+            .entries
+            .iter()
+            .map(|entry| entry.relative_link_path.as_path())
+            .collect();
+        assert_eq!(kept, vec![Path::new("NES/A.zip")]);
+        assert_eq!(remaining.process_id, std::process::id());
+        assert_eq!(remaining.carried_process_ids, vec![std::process::id() + 1]);
+        assert_eq!(
+            fs::read(nes.join("A.zip")).unwrap(),
+            b"user file at the intended path"
+        );
+        assert_eq!(fs::read_link(nes.join("C.zip")).unwrap(), c);
+    }
+
+    #[test]
+    fn intent_entries_with_escaping_paths_are_never_folded_or_swept() {
+        let root = temp_dir("intent-escaping-paths");
+        let source_dir = root.join("source");
+        let a = source_dir.join("A.zip");
+        write_file(&a, b"a");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let outside_link = outside.join("A.zip");
+        symlink(&a, &outside_link).unwrap(); // looks exactly like a published link
+        let outside_temp = outside.join(own_temp_name(9));
+        symlink(&a, &outside_temp).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+
+        let view = make_view("view-escape", &destination, vec![], vec![]);
+        let absolute = outside_link.clone();
+        seed_intent(
+            &data_dir,
+            &view,
+            vec![
+                intent_entry("../outside/A.zip", &a, &source_dir),
+                intent_entry(absolute.to_str().unwrap(), &a, &source_dir),
+                intent_entry("NES/../../outside/A.zip", &a, &source_dir),
+            ],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+        let (folded, reconciliation) =
+            load_manifest_with_pending_intent_at(&view, &data_dir).unwrap();
+        assert!(
+            folded.entries.is_empty(),
+            "nothing outside the root is ever folded"
+        );
+        assert!(reconciliation.recovered.is_empty());
+        assert_eq!(reconciliation.unresolved.len(), 3);
+
+        let report = remove_library_view_symlinks(&view, &manifest, &data_dir).unwrap();
+        assert_eq!(report.removed, 0);
+        assert!(report.has_unreconciled_objects());
+        assert!(fs::symlink_metadata(&outside_link).is_ok());
+        assert!(fs::symlink_metadata(&outside_temp).is_ok());
+        assert!(
+            load_library_view_manifest_at(&data_dir, &view.id)
+                .unwrap()
+                .entries
+                .is_empty()
         );
     }
 }

@@ -1845,6 +1845,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             definition_removed,
                         );
                     }
+                    if !keep_definition && !definition_removed {
+                        return Err(format!(
+                            "view remove left object(s) unreconciled; the definition of '{}' was \
+                             kept (see the report above)",
+                            view.name
+                        )
+                        .into());
+                    }
                 }
                 other => {
                     return Err(format!(
