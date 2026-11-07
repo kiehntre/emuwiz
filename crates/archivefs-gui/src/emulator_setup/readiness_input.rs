@@ -344,6 +344,22 @@ impl ReadinessSources<'_> {
         {
             identity_status = evidence.identity();
         }
+        // Owner-approved controlled path (2026-11-07): a recognised, safely
+        // inspected ZX tape image may launch with a visible "identity
+        // unverified" warning instead of requiring DAT or header identity.
+        let mut identity_unverified = false;
+        if matches!(
+            identity_status,
+            archivefs_core::launch::CanonicalIdentityStatus::Unknown
+        ) && !evidence_freshness.is_incomplete()
+            && let Some(path) = focused
+            && let Some(hint) = focused_record
+                .and_then(|record| record.mount_plan.archive.identity.platform.as_deref())
+            && let Some(resolved) = crate::emulator_setup::unverified_media::resolve(path, hint)
+        {
+            identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved);
+            identity_unverified = true;
+        }
         match identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
                 // The worker's own report already says which track of a CUE
@@ -1478,6 +1494,9 @@ impl ReadinessSources<'_> {
             launch_readiness_page::amiga_boot::apply(&mut plan, context);
         }
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
+        if identity_unverified {
+            crate::emulator_setup::unverified_media::apply_warning(&mut plan);
+        }
         if let Some(probe) = &arcade_probe {
             crate::arcade_mame_probe::apply_warnings(&mut plan, probe);
         }
