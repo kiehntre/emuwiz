@@ -27,6 +27,24 @@ impl ArchiveFsApp {
         archivefs_core::launch::launch_content_ref_for_unmounted(*kind, path)
     }
 
+    /// Whether `path` is a catalogued `arcade_set_directory`. The page's own
+    /// catalogue row (handed over by Blue) is checked first: the saved-library
+    /// snapshot is not loaded on the v2 Library/Game Details routes, so it
+    /// cannot be the only source or the MAME probe would never be asked.
+    pub(crate) fn is_catalogued_arcade_set_directory(&self, path: &Path) -> bool {
+        self.catalogued_loose_content
+            .as_ref()
+            .is_some_and(|(row_path, kind)| {
+                row_path == path && *kind == archivefs_core::ArchiveKind::ArcadeSetDirectory
+            })
+            || self.database_state.snapshot().is_some_and(|snapshot| {
+                snapshot
+                    .archives
+                    .iter()
+                    .any(|a| a.archive_kind == "arcade_set_directory" && a.absolute_path == path)
+            })
+    }
+
     pub(crate) fn persisted_scummvm_folder(
         &self,
         path: &Path,
@@ -937,14 +955,7 @@ impl ArchiveFsApp {
         let member_path = |record: &ArchiveRecord| self.resolved_archive_member_path(record);
         let is_scummvm_folder = |path: &Path| self.persisted_scummvm_folder(path).is_some();
         let loose_ref = |path: &Path| self.catalogued_loose_content_ref(path);
-        let is_arcade_set_directory = |path: &Path| {
-            self.database_state.snapshot().is_some_and(|snapshot| {
-                snapshot
-                    .archives
-                    .iter()
-                    .any(|a| a.archive_kind == "arcade_set_directory" && a.absolute_path == path)
-            })
-        };
+        let is_arcade_set_directory = |path: &Path| self.is_catalogued_arcade_set_directory(path);
         super::readiness_input::ReadinessSources {
             readiness: &self.emulator_readiness,
             evidence: &self.selected_evidence_ui.selected_evidence,
@@ -2221,3 +2232,7 @@ pub(super) fn disc_files_diagnostic(
     };
     Some(format!("This disc cannot be launched: {text}"))
 }
+
+#[cfg(test)]
+#[path = "controller_arcade_gate_tests.rs"]
+mod arcade_gate_tests;
