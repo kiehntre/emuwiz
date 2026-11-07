@@ -34,7 +34,7 @@ const TAGLINES: [&str; 6] = [
 ];
 
 pub(super) const PLAY_NOTE: &str =
-    "Play opens the usual readiness check. Nothing starts until you confirm.";
+    "Play starts the game once the quick launch check passes.";
 pub(super) const READY_TO_TRY_LABEL: &str = "Only potentially launchable games";
 const READY_TO_TRY_HINT: &str = "Leaves out games whose files are recorded as missing or \
      damaged, recordings, games with no known system, and games whose last check said \
