@@ -1595,10 +1595,12 @@ fn nw2_c01_zipped_cartridge_is_refused_when_retroarch_sorts_saves_by_content_fol
             &ready.environment,
             None,
         );
-        assert!(
-            result.is_err(),
-            "{key} = true: the staged launch went ahead, so saves land in a new per-launch folder"
-        );
+        let Err(error) = result else {
+            panic!(
+                "{key} = true: the staged launch went ahead, so saves land in a new per-launch folder"
+            );
+        };
+        assert!(format!("{error:?}").contains(key), "{error:?}");
     }
 }
 
@@ -1658,4 +1660,31 @@ fn nw2_c01_conflicting_duplicate_sort_by_content_keys_are_refused() {
             Ok(())
         );
     }
+}
+
+/// A UTF-8 byte-order mark on line 1 must not hide a key from the check.
+#[test]
+fn nw2_c01_leading_bom_does_not_hide_sort_by_content_keys() {
+    let bom_config = |label: &str, first: &str| -> Result<(), String> {
+        let (ready, _, _) = zipped_ready(label, &[("a.md", b"synthetic mega drive rom bytes")]);
+        write_zip_test_config(&ready, "");
+        let path = ready.fixture.path("config/retroarch/retroarch.cfg");
+        let body = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("\u{feff}{first}{body}")).unwrap();
+        staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment)
+    };
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+        "savefiles_in_content_dir",
+    ] {
+        let error = bom_config("nw2-c01-bom-true", &format!("{key} = \"true\"\n"))
+            .expect_err("BOM + true must be refused");
+        assert!(error.contains(key), "{error}");
+        assert_eq!(
+            bom_config("nw2-c01-bom-false", &format!("{key} = \"false\"\n")),
+            Ok(())
+        );
+    }
+    assert_eq!(bom_config("nw2-c01-bom-absent", ""), Ok(()));
 }

@@ -1256,6 +1256,8 @@ fn staged_launch_is_safe(
         .and_then(|file| file.take(1024 * 1024).read_to_string(&mut text))
         .map_err(|error| format!("RetroArch settings could not be read: {error}"))?;
     let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // A leading UTF-8 byte-order mark must not hide the first line's key.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("#include") || trimmed.starts_with("#reference") {
