@@ -754,3 +754,71 @@ fn open_regular_file_nonblocking_refuses_fifos_and_respects_follow() {
     assert_eq!(flags & libc::O_NONBLOCK, 0);
     drop(fixture);
 }
+
+/// Regression for the CI failure on #393 (spectrum_bounded_import): the
+/// descriptor walk must work through search-only (`--x`) directories, which
+/// an `O_RDONLY` directory open cannot enter.
+#[cfg(unix)]
+#[test]
+fn the_walk_passes_through_search_only_directories() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("walk-search-only");
+    let game = fixture.file("library/sub/game.bin", b"rom");
+    let sub = fixture.path("library/sub");
+    let library = fixture.path("library");
+    std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o111)).unwrap();
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let result = open_bounded_read(&game, &TrustedRoots::none()).map(|file| file.len());
+    let walked = open_directory_no_symlinks(&sub).is_ok();
+    // Restore before asserting so the fixture can be removed.
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(result, Ok(3));
+    assert!(walked, "the directory walk must not need read permission");
+}
+
+/// The walk must not "open" or enumerate the directories it passes through:
+/// an inotify watch on a parent sees no open event for the parent itself
+/// (only the leaf file's own open).
+#[cfg(unix)]
+#[test]
+fn the_walk_raises_no_directory_open_event_on_parents() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fixture = Fixture::new("walk-inotify");
+    let game = fixture.file("library/sub/game.bin", b"rom");
+    let parent = fixture.path("library/sub");
+    // SAFETY: plain inotify syscalls on descriptors owned by this test.
+    let inotify = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    assert!(inotify >= 0);
+    // SAFETY: `inotify` was just returned by `inotify_init1`.
+    let inotify = unsafe { std::fs::File::from_raw_fd(inotify) };
+    let path = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: valid inotify fd and NUL-terminated path.
+    let watch =
+        unsafe { libc::inotify_add_watch(inotify.as_raw_fd(), path.as_ptr(), libc::IN_OPEN) };
+    assert!(watch >= 0);
+    drop(open_bounded_read(&game, &TrustedRoots::none()).unwrap());
+    let mut buffer = [0u8; 4096];
+    // SAFETY: reading into a local buffer from a non-blocking inotify fd.
+    let count = unsafe {
+        libc::read(
+            inotify.as_raw_fd(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    let mut directory_open_events = 0;
+    let mut offset = 0usize;
+    while count > 0 && offset < count as usize {
+        // SAFETY: the kernel wrote whole `inotify_event` records into `buffer`.
+        let event = unsafe { &*(buffer.as_ptr().add(offset).cast::<libc::inotify_event>()) };
+        if event.mask & libc::IN_ISDIR != 0 {
+            directory_open_events += 1;
+        }
+        offset += std::mem::size_of::<libc::inotify_event>() + event.len as usize;
+    }
+    assert_eq!(
+        directory_open_events, 0,
+        "the walk opened a parent directory"
+    );
+}
