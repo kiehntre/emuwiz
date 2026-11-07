@@ -238,6 +238,37 @@ class D5RepairSafetyEdges(D5Fixture):
         self.assertFalse((self.data / "emuwiz-installer").exists(),
                          "bookkeeping left behind after everything it covered was removed")
 
+    def test_prefix_reached_through_a_symlink_with_a_trailing_line_break_is_refused(self):
+        real = self.root / "real\n"
+        real.mkdir()
+        link = self.root / "link"
+        link.symlink_to(real)
+        result = self.run_sh("--prefix", link)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("line break", result.stderr)
+        self.assertFalse((self.root / "real").exists(), "installed into the sibling the newline was stripped to")
+        self.assertEqual(os.listdir(real), [])
+
+    def test_data_directory_with_a_line_break_is_refused(self):
+        self.env["XDG_DATA_HOME"] = str(self.root / "data\nhome")
+        result = self.run_sh("--prefix", self.bin)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("line break", result.stderr)
+        self.assertFalse(self.bin.exists() and os.listdir(self.bin))
+
+    def test_uninstall_for_another_prefix_leaves_an_interrupted_installs_intent_alone(self):
+        self.interrupt_first_install()
+        intent = self.data / "emuwiz-installer/install-intent"
+        before = intent.read_bytes()
+        result = self.run_sh("--uninstall", "--prefix", self.root / "other/bin")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(self.bin), result.stderr)
+        self.assertEqual(intent.read_bytes(), before)
+        self.assertTrue(self.desktop.exists(), "the other install's launcher was removed")
+        self.assertTrue(self.installed_binary().exists())
+        # The right prefix still adopts its own binaries afterwards.
+        self.assertEqual(self.run_sh("--prefix", self.bin).returncode, 0)
+
     # D5-03 ------------------------------------------------------------------
     def test_an_uncovered_symlinked_icon_is_refused(self):
         icon = self.bundle / "assets/branding/emuwiz-logo-64.png"

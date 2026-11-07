@@ -869,9 +869,11 @@ sweep_stale_staging() {
 # --------------------------------------------------------------------------
 intent_cli_fp=""
 intent_gui_fp=""
+intent_other_install=""
 load_install_intent() {
     intent_cli_fp=""
     intent_gui_fp=""
+    intent_other_install=""
     if [ "$manifest_loaded" -eq 1 ] || [ "$manifest_dir_kind" != dir ]; then return 0; fi
     intent_path=/proc/self/fd/8/install-intent
     if [ ! -f "$intent_path" ] || [ -L "$intent_path" ]; then return 0; fi
@@ -902,7 +904,13 @@ EOF
     done <"$intent_path"
     if [ "$i_ok" -ne 1 ] || [ "$i_version" -ne 1 ] || [ "$i_end" -ne 1 ]; then return 0; fi
     if [ -z "$i_cli" ] || [ -z "$i_gui" ]; then return 0; fi
-    if [ "$i_bin" != "$bin_dir" ] || [ "$i_data" != "$data_home" ]; then return 0; fi
+    if [ "$i_bin" != "$bin_dir" ] || [ "$i_data" != "$data_home" ]; then
+        # A complete intent for another prefix or data directory is another
+        # installation's record (an interrupted install there): never adopted
+        # here, and never removed by this run.
+        intent_other_install="prefix $i_bin, data directory $i_data"
+        return 0
+    fi
     intent_cli_fp=$i_cli
     intent_gui_fp=$i_gui
 }
@@ -1937,6 +1945,10 @@ case "$bin_dir" in
     *'
 '*) fail "the install prefix cannot contain a line break; nothing was installed or changed" ;;
 esac
+case "$data_home" in
+    *'
+'*) fail "the data directory (XDG_DATA_HOME) cannot contain a line break; nothing was installed or changed" ;;
+esac
 
 # Directory containing this script, resolved to an absolute path. Used to
 # find the binaries (and config.toml.example) it was shipped alongside.
@@ -1975,11 +1987,14 @@ if [ "$do_uninstall" -eq 1 ]; then
     # delete its manifest, orphaning its binaries. Refuse and name the
     # recorded installation; nothing is removed or changed.
     if [ -n "$manifest_other_install" ]; then
-        fail "the ownership manifest at $manifest_file belongs to a different installation ($manifest_other_install), not this run's prefix $bin_dir. Nothing was removed or changed. Run --uninstall again with --prefix set to the recorded prefix."
+        fail "the ownership manifest at $manifest_file belongs to a different installation ($manifest_other_install), not this run's prefix $bin_dir. Nothing was removed or changed. Run --uninstall again with --prefix and XDG_DATA_HOME set to the recorded values."
     fi
     if [ "$manifest_dir_kind" = dir ]; then
-        sweep_stale_staging
         load_install_intent
+        if [ -n "$intent_other_install" ]; then
+            fail "an interrupted installation recorded at $manifest_dir/install-intent belongs to a different installation ($intent_other_install), not this run's prefix $bin_dir. Nothing was removed or changed. Run --uninstall again with --prefix and XDG_DATA_HOME set to the recorded values."
+        fi
+        sweep_stale_staging
     fi
 
     removed_any=0
@@ -2750,7 +2765,12 @@ else
 fi
 
 mkdir -p -- "$bin_dir"
-bin_dir=$(CDPATH= cd -- "$bin_dir" && pwd -P) || fail "could not resolve install prefix: $bin_dir"
+# The sentinel keeps a trailing line break in the resolved name, which command
+# substitution would otherwise strip silently (installing into a sibling).
+bin_dir_resolved=$(CDPATH= cd -- "$bin_dir" && { pwd -P; echo x; }) || fail "could not resolve install prefix: $bin_dir"
+bin_dir_resolved=${bin_dir_resolved%x}
+bin_dir=${bin_dir_resolved%"
+"}
 # The resolved physical path may differ from the one given (symlinks); check
 # it too before any managed file is touched.
 case "$bin_dir" in
