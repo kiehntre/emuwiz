@@ -3907,6 +3907,20 @@ mod tests {
     }
 
     #[test]
+    fn play_waits_then_falls_back_to_the_launch_page_instead_of_launching_blind() {
+        let mut workflows = NativeWorkflows::new(egui::Context::default());
+        // No selected game / no loaded evidence: Play must not start anything,
+        // must remember the request, and must route to the Launch page.
+        let route =
+            workflows.readiness_action_route(&egui::Context::default(), ReadinessAction::Play, 5);
+        assert_eq!(workflows.pending_play, Some(5));
+        assert!(matches!(route, Some(Route::Task { game: 5, .. })));
+        assert!(!workflows.launch_active());
+        // A different game's pending request is never carried over.
+        assert_eq!(workflows.try_play(6), PlayOutcome::Waiting);
+    }
+
+    #[test]
     fn dat_name_snapshot_does_not_initialize_recovery_controller() {
         let ctx = egui::Context::default();
         let workflows = NativeWorkflows::new(ctx.clone());
