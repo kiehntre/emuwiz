@@ -78,6 +78,7 @@ pub mod emulator_update;
 /// Deterministic, read-only reconciliation of existing identity, topology and
 /// readiness evidence. This derived layer never mutates the catalogue.
 pub mod evidence_resolution;
+pub mod external_tools;
 /// Adapter evidence for per-game firmware guidance; never changes Launch.
 pub mod game_firmware_adapters;
 /// Structured, read-only per-game firmware readiness projection over an

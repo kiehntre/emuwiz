@@ -938,15 +938,12 @@ fn io_error(error: io::Error) -> LhaError {
     }
 }
 
+/// Locates a 7-Zip candidate under the crate-wide rule
+/// ([`crate::external_tools`]): absolute `PATH` directories only, regular
+/// executable only, absolute result only. A `7zz` sitting in the working
+/// directory is never found through an empty, `.` or relative `PATH` entry.
 fn resolve_executable(candidate: &Path) -> Option<PathBuf> {
-    if candidate.components().count() > 1 {
-        return candidate.is_file().then(|| candidate.to_path_buf());
-    }
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|directory| directory.join(candidate))
-            .find(|path| path.is_file())
-    })
+    crate::external_tools::resolve_executable(candidate)
 }
 
 fn safe_member_name(name: &str) -> bool {
