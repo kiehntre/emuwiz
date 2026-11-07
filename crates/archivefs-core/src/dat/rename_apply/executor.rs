@@ -222,6 +222,9 @@ pub enum SourceChangeReason {
     /// Same object, same size, same modification time, but the change time
     /// differs: the content was rewritten in place and the mtime put back.
     RewrittenInPlace,
+    /// The proposal carries no audit evidence at all (neither a fingerprint
+    /// nor an archive identity), so nothing ties it to the verified bytes.
+    NoAuditEvidence,
     /// The audit recorded a fingerprint without an object stamp, or the
     /// current observation lacks one, so the two cannot be compared.
     FingerprintIncomparable,
@@ -240,6 +243,7 @@ impl SourceChangeReason {
             Self::RewrittenInPlace => {
                 "rewritten in place (change time differs; size and mtime unchanged)"
             }
+            Self::NoAuditEvidence => "no audit evidence is attached to this proposal",
             Self::FingerprintIncomparable => "audit fingerprint cannot be compared",
             Self::IdentityChanged => "archive identity changed since the audit",
         }
@@ -357,7 +361,7 @@ pub fn build_transaction_entries(
             // capturing "current" identity would bless whatever is on disk.
             built.changed_since_audit.push(ChangedSource {
                 path: proposal.source_path.clone(),
-                reason: SourceChangeReason::FingerprintIncomparable,
+                reason: SourceChangeReason::NoAuditEvidence,
             });
             continue;
         }
