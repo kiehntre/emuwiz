@@ -1633,21 +1633,36 @@ fn safe_regular_file_if_present(path: &Path) -> Result<bool, BsFreeError> {
     }
 }
 
+/// Opens a BSFree source or cache file for reading: no symlink is followed
+/// and the open never blocks, so a FIFO put in the file's place is refused
+/// rather than waited on forever (Night Watch D7-04).
 fn open_regular_nofollow(path: &Path) -> Result<File, BsFreeError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
     #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let file = options
-        .open(path)
-        .map_err(|error| BsFreeError::new(BsFreeErrorKind::SourceUnreadable, error.to_string()))?;
-    if !file.metadata().map_err(cache_write_error)?.is_file() {
-        return Err(BsFreeError::new(
-            BsFreeErrorKind::UnsafePath,
-            "BSFree source must be a regular file",
-        ));
+    {
+        crate::safe_read::open_regular_file_nonblocking(path, false).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidInput {
+                BsFreeError::new(
+                    BsFreeErrorKind::UnsafePath,
+                    "BSFree source must be a regular file",
+                )
+            } else {
+                BsFreeError::new(BsFreeErrorKind::SourceUnreadable, error.to_string())
+            }
+        })
     }
-    Ok(file)
+    #[cfg(not(unix))]
+    {
+        let file = OpenOptions::new().read(true).open(path).map_err(|error| {
+            BsFreeError::new(BsFreeErrorKind::SourceUnreadable, error.to_string())
+        })?;
+        if !file.metadata().map_err(cache_write_error)?.is_file() {
+            return Err(BsFreeError::new(
+                BsFreeErrorKind::UnsafePath,
+                "BSFree source must be a regular file",
+            ));
+        }
+        Ok(file)
+    }
 }
 
 fn create_new_nofollow(path: &Path) -> Result<File, BsFreeError> {
@@ -2420,5 +2435,44 @@ mod tests {
         }
         assert!(source.contains("pub fn download_bsfree_database"));
         assert!(!source.contains("pub fn download_bsfree_database_from_url"));
+    }
+
+    /// Night Watch D7-04: a FIFO offered as the local database is refused
+    /// at once instead of blocking the import forever.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_local_import_is_refused_promptly() {
+        let root = fixture_root("fifo");
+        fs::create_dir_all(&root).unwrap();
+        let fifo = root.join("selected.db");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let paths = BsFreePaths::at(root.join("owned"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (thread_paths, thread_fifo) = (paths.clone(), fifo.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                import_local_with_expected_hash(&thread_paths, &thread_fifo, None)
+                    .err()
+                    .map(|error| error.kind),
+            );
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(5));
+        if outcome.is_err() {
+            let _ = fs::OpenOptions::new().read(true).write(true).open(&fifo);
+        }
+        let kind = outcome
+            .expect("BSFree local import blocked on a FIFO")
+            .expect("a FIFO must be refused");
+        assert!(matches!(
+            kind,
+            BsFreeErrorKind::SourceUnreadable | BsFreeErrorKind::UnsafePath
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 }
