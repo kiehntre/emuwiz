@@ -1269,7 +1269,8 @@ fn journal_finalize_failure_leaves_a_truthful_pending_journal() {
     let outcome = execute_cheat_install_run(&[entry], &opts);
     drop(_guard);
 
-    assert!(outcome.journal_path.is_none());
+    // The pending journal is still on disk, so its path is reported (L5).
+    assert_eq!(outcome.journal_path, Some(journal_dir.join("run-26.json")));
     assert!(outcome.journal_error.is_some());
     // The file itself was genuinely installed - the journal failure must
     // not be papered over as if nothing happened, but it also must not
@@ -2232,6 +2233,151 @@ fn rollback_killed_mid_way_leaves_a_pending_record_and_can_be_resumed() {
         CheatRollbackOutcome::RemovedInstalledFile
     );
     fixture.assert_destination_is_pre_run_state();
+
+    // History prefers the completed resumed run over the interrupted one it
+    // superseded: not ambiguous, rollback complete (M2).
+    let after =
+        inspect_cheat_install_journal(&fixture.journal_path(), &fixture.history_options()).unwrap();
+    assert!(after.rollback.exists);
+    assert!(!after.rollback.ambiguous);
+    assert_eq!(after.rollback.completed_successfully, Some(true));
+    assert_eq!(
+        after.rollback.run_id.as_deref(),
+        Some("rb-crash-rollback-2")
+    );
+    assert!(after.entries.iter().all(|entry| entry.rollback_availability
+        == CheatRollbackAvailability::AlreadyCompleted));
+}
+
+// ---------------------------------------------------------------------
+// Installer lock: rollback refuses a still-live install (review M1).
+// ---------------------------------------------------------------------
+
+fn hold_installer_lock(journal_path: &Path) -> fs::File {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(installer_lock_path(journal_path))
+        .unwrap();
+    assert!(try_lock_exclusive(&file).unwrap(), "test must get the lock");
+    file
+}
+
+#[test]
+fn rollback_refuses_an_in_progress_journal_whose_installer_is_still_running() {
+    let fixture = crash_fixture("live-install", "live-install");
+    fixture.run_until_crash(FaultPoint::CrashAfterJournalUpdate(0));
+    assert!(fixture.on_disk_journal().is_interrupted());
+    let journal_before = fs::read(fixture.journal_path()).unwrap();
+    let dest_before = dir_entries(&fixture.platform_dir());
+    let frogger_before = fs::read(fixture.platform_dir().join("Frogger.cht")).unwrap();
+
+    // A live installer holds the journal's lock.
+    let held = hold_installer_lock(&fixture.journal_path());
+    for confirmed in [true, false] {
+        let refused = fixture.rollback(confirmed);
+        assert_ne!(refused.run.status, CheatRollbackRunStatus::Success);
+        assert!(refused.journal_path.is_none());
+        assert!(refused.run.entries.iter().all(|entry| {
+            !entry.wrote
+                && entry.error_code.as_deref() == Some("install_still_running")
+                && entry.message.contains("install still running")
+        }));
+    }
+    assert_eq!(dir_entries(&fixture.platform_dir()), dest_before);
+    assert_eq!(
+        fs::read(fixture.platform_dir().join("Frogger.cht")).unwrap(),
+        frogger_before
+    );
+    assert_eq!(fs::read(fixture.journal_path()).unwrap(), journal_before);
+    assert!(dir_entries(&fixture.rollback_dir).is_empty());
+
+    // The installer ends (a crash releases the lock the same way).
+    drop(held);
+    let outcome = fixture.rollback(true);
+    assert_eq!(outcome.run.status, CheatRollbackRunStatus::Success);
+    fixture.assert_destination_is_pre_run_state();
+}
+
+#[test]
+fn installer_holds_its_lock_for_the_whole_run_and_removes_it_when_done() {
+    let fixture = crash_fixture("installer-lock", "installer-lock");
+    // Someone else holding this run's lock makes the installer fail closed.
+    let held = hold_installer_lock(&fixture.journal_path());
+    let blocked = execute_cheat_install_run(&fixture.entries, &fixture.opts);
+    assert_eq!(blocked.run.status, CheatInstallRunStatus::Failed);
+    assert!(blocked.journal_path.is_none());
+    assert!(!fixture.journal_path().exists());
+    assert!(!fixture.platform_dir().join("Pitfall.cht").exists());
+    drop(held);
+    fs::remove_file(installer_lock_path(&fixture.journal_path())).unwrap();
+
+    let done = execute_cheat_install_run(&fixture.entries, &fixture.opts);
+    assert_eq!(done.run.status, CheatInstallRunStatus::Success);
+    assert_eq!(
+        dir_entries(&fixture.journal_dir),
+        vec!["installer-lock.json".to_string()],
+        "the lock file is removed when the run ends"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Filesystems without RENAME_NOREPLACE (review L1).
+// ---------------------------------------------------------------------
+
+#[test]
+fn rollback_removes_installed_files_where_noreplace_is_unsupported() {
+    let fixture = crash_fixture("noreplace-unsupported", "noreplace-unsupported");
+    let installed = execute_cheat_install_run(&fixture.entries, &fixture.opts);
+    assert_eq!(installed.run.status, CheatInstallRunStatus::Success);
+
+    inject_rollback_fault_for_test(Some(RollbackFaultPoint::NoReplaceUnsupported));
+    let outcome = fixture.rollback(true);
+    inject_rollback_fault_for_test(None);
+
+    assert_eq!(outcome.run.status, CheatRollbackRunStatus::Success);
+    for entry in &outcome.run.entries[1..] {
+        assert_eq!(
+            entry.outcome,
+            CheatRollbackOutcome::RemovedInstalledFile,
+            "{}",
+            entry.message
+        );
+        assert!(entry.wrote);
+    }
+    fixture.assert_destination_is_pre_run_state();
+}
+
+#[test]
+fn noreplace_fallback_never_removes_a_cheat_rewritten_after_its_hash_check() {
+    let fixture = crash_fixture("noreplace-race", "noreplace-race");
+    execute_cheat_install_run(&fixture.entries, &fixture.opts);
+
+    let racing = b"cheats = 1\ncheat0_desc = \"EDITED\"\n".to_vec();
+    let racing_for_hook = racing.clone();
+    set_before_destination_mutation_hook_for_test(Some(Box::new(move |path: &Path| {
+        fs::write(path, &racing_for_hook).unwrap()
+    })));
+    inject_rollback_fault_for_test(Some(RollbackFaultPoint::NoReplaceUnsupported));
+    let outcome = fixture.rollback(true);
+    inject_rollback_fault_for_test(None);
+    set_before_destination_mutation_hook_for_test(None);
+
+    for (entry, name) in outcome.run.entries[1..]
+        .iter()
+        .zip(["Pitfall.cht", "Zaxxon.cht"])
+    {
+        assert_eq!(
+            entry.outcome,
+            CheatRollbackOutcome::FailedDestinationChanged,
+            "{}",
+            entry.message
+        );
+        assert!(!entry.wrote);
+        assert_eq!(fs::read(fixture.platform_dir().join(name)).unwrap(), racing);
+    }
 }
 
 // ---------------------------------------------------------------------

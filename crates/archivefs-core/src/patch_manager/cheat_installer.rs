@@ -186,7 +186,9 @@ pub struct CheatInstallOptions {
 pub struct CheatInstallRunOutcome {
     pub run: CheatInstallRun,
     /// Where the journal was written, for a real (non-dry-run) run whose
-    /// journal write succeeded. Always `None` for a dry run.
+    /// journal exists on disk - including a run whose final write failed
+    /// (the journal then still reads `in_progress`; see `journal_error`).
+    /// `None` for a dry run and for a run that failed closed.
     pub journal_path: Option<PathBuf>,
     /// Set when a real run's journal could not be created or kept up to
     /// date. The run's own entries and summary are still fully valid and
@@ -297,8 +299,20 @@ pub fn execute_cheat_install_run(
         temp_file_prefix: Some(own_temp_file_prefix()),
     };
 
-    let journal_path = match create_pending_journal(&run, &options.journal_directory) {
-        Ok(path) => path,
+    // The installer lock is taken before the journal becomes visible and
+    // held for the whole run, so a rollback can tell a live run from a
+    // crashed one (the kernel releases the lock when the process dies).
+    let lock_and_journal = InstallerLock::acquire(
+        &options.journal_directory,
+        &options
+            .journal_directory
+            .join(journal_file_name(&run.run_id)),
+    )
+    .and_then(|lock| {
+        create_pending_journal(&run, &options.journal_directory).map(|path| (lock, path))
+    });
+    let (_installer_lock, journal_path) = match lock_and_journal {
+        Ok(pair) => pair,
         Err(error) => {
             // Fail closed: no Undo record, no mutation.
             for entry in &mut run.entries {
@@ -374,9 +388,12 @@ pub fn execute_cheat_install_run(
             journal_path: Some(journal_path),
             journal_error,
         },
+        // The last per-entry (`in_progress`) journal is still on disk and
+        // lists every applied entry, so its path is still reported: Undo
+        // stays possible from it.
         Err(error) => CheatInstallRunOutcome {
             run,
-            journal_path: None,
+            journal_path: Some(journal_path),
             journal_error: Some(match journal_error {
                 Some(earlier) => {
                     format!("{earlier}; final install-record write also failed: {error}")
@@ -1213,6 +1230,109 @@ fn own_temp_file_prefix() -> String {
     format!(".archivefs-cheat-install-{}-", std::process::id())
 }
 
+/// The advisory lock file an installer holds for its whole run, beside
+/// its journal: `<journal dir>/.<journal file name>.lock`.
+pub(crate) fn installer_lock_path(journal_path: &Path) -> PathBuf {
+    let name = journal_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    journal_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!(".{name}.lock"))
+}
+
+/// Result of probing an install journal's lock from another run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallerLockState {
+    /// A live installer holds the lock: its run is still in progress.
+    HeldByLiveInstaller,
+    /// No lock file (finished run, or a journal older than the lock) or the
+    /// lock was free (the installer died - the kernel released it).
+    NotHeld,
+}
+
+/// Exclusive `flock` held by an installer for the whole run. Dropping it
+/// unlinks the lock file, then releases the lock.
+pub(crate) struct InstallerLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl InstallerLock {
+    fn acquire(journal_directory: &Path, journal_path: &Path) -> Result<Self, String> {
+        fs::create_dir_all(journal_directory)
+            .map_err(|error| format!("could not create journal directory: {error}"))?;
+        let path = installer_lock_path(journal_path);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| format!("could not create the installer lock: {error}"))?;
+        match try_lock_exclusive(&file) {
+            Ok(true) => Ok(Self { path, _file: file }),
+            Ok(false) => Err(format!(
+                "another run already holds the installer lock {}",
+                path.display()
+            )),
+            Err(error) => Err(format!("could not take the installer lock: {error}")),
+        }
+    }
+
+    /// Probes (non-blocking) whether a live installer holds the lock for
+    /// `journal_path`. On `NotHeld` with an existing lock file, the
+    /// returned guard keeps the lock for the caller's lifetime.
+    pub(crate) fn probe(journal_path: &Path) -> io::Result<(InstallerLockState, Option<File>)> {
+        let path = installer_lock_path(journal_path);
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok((InstallerLockState::NotHeld, None));
+            }
+            Err(error) => return Err(error),
+        };
+        if try_lock_exclusive(&file)? {
+            Ok((InstallerLockState::NotHeld, Some(file)))
+        } else {
+            Ok((InstallerLockState::HeldByLiveInstaller, None))
+        }
+    }
+}
+
+impl Drop for InstallerLock {
+    fn drop(&mut self) {
+        // Unlink while still holding the lock: anyone who opens the path
+        // afterwards finds nothing, anyone who opened it before gets the
+        // lock only once this run is done.
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// `flock(LOCK_EX | LOCK_NB)`: `Ok(false)` when another open file holds it.
+#[cfg(unix)]
+pub(crate) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `file` owns a valid descriptor for the duration of the call.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn try_lock_exclusive(_file: &File) -> io::Result<bool> {
+    Ok(true)
+}
+
 fn journal_file_name(run_id: &str) -> String {
     format!("{}.json", sanitize_for_filename(run_id))
 }
@@ -1445,9 +1565,16 @@ pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
         )
     };
     if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+        return Ok(());
+    }
+    // As in `rename_exchange`: a filesystem without RENAME_NOREPLACE is
+    // reported as `Unsupported` so callers can choose a safe fallback.
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP) => {
+            Err(io::Error::new(io::ErrorKind::Unsupported, error))
+        }
+        _ => Err(error),
     }
 }
 
