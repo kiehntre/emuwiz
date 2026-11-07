@@ -65,6 +65,9 @@ pub(super) struct NativeWorkflows {
     launch_was_active: bool,
     launch_kind: Option<LaunchKind>,
     launch_attempts: launch_readiness_summary::AttemptTracker,
+    /// Set when Play was pressed before the launch plan could be built; the
+    /// Launch page then starts the game itself the moment the plan is ready.
+    pending_play: Option<i64>,
     /// The last "can a launch request be built" answer, for the game shown.
     route_truth: std::cell::RefCell<launch_readiness_summary::route_truth::RouteCache>,
     source_job: Option<u64>,
@@ -435,6 +438,7 @@ impl NativeWorkflows {
             launch_was_active: false,
             launch_kind: None,
             launch_attempts: Default::default(),
+            pending_play: None,
             route_truth: Default::default(),
             source_job: None,
             cheat_catalogues: Default::default(),
@@ -633,6 +637,15 @@ impl NativeWorkflows {
             self.readiness_job = Some(job);
         }
         self.observe_readiness_activity(activity);
+        if self.pending_play == Some(game_id) {
+            match self.try_play(game_id) {
+                PlayOutcome::Started => self.pending_play = None,
+                PlayOutcome::Blocked => self.pending_play = None,
+                PlayOutcome::Waiting => ui.ctx().request_repaint(),
+            }
+        } else {
+            self.pending_play = None;
+        }
 
         let (recovery_route, retry_readiness) = launch_scroll(ui, game_id, |ui| {
             ui.label("Choose an emulator, review its readiness, then launch. EmuWiz will refuse unsafe or incomplete media.");
@@ -949,7 +962,46 @@ impl NativeWorkflows {
         if action == ReadinessAction::LookUpOnline {
             self.lookup_online_requested = true;
         }
+        if action == ReadinessAction::Play {
+            // Play launches. The Launch page is only the fallback for a plan
+            // that is still loading, needs an emulator choice, or is blocked.
+            self.pending_play = Some(game_id);
+            if self.try_play(game_id) == PlayOutcome::Started {
+                self.pending_play = None;
+                return None;
+            }
+        }
         route_for_action(action, game_id)
+    }
+
+    /// Starts the game through the planner's single safe request, exactly as
+    /// Gamer View's Play does. Never picks between equally valid emulators.
+    pub(super) fn try_play(&mut self, game_id: i64) -> PlayOutcome {
+        use launch_readiness_page::{GamerBlockerKind, GamerPlayAction};
+        if self.selected_game != Some(game_id) {
+            return PlayOutcome::Waiting;
+        }
+        if self.launch_active() {
+            return PlayOutcome::Started;
+        }
+        match launch_readiness_page::gamer_play_action(&self.launch_input()) {
+            GamerPlayAction::Launch(request) => {
+                request.start(
+                    &mut self.app.launch_retroarch,
+                    &mut self.app.launch_dolphin,
+                    &mut self.app.launch_pcsx2,
+                    &mut self.app.launch_standalone,
+                    &mut self.app.launch_amiga_whdload,
+                );
+                PlayOutcome::Started
+            }
+            GamerPlayAction::BlockedTyped(blocker) => match blocker.kind {
+                GamerBlockerKind::CheckingGame | GamerBlockerKind::EmulatorNotChecked => {
+                    PlayOutcome::Waiting
+                }
+                _ => PlayOutcome::Blocked,
+            },
+        }
     }
 
     /// True once after the card's "Check Hasheous…" shortcut was pressed.
@@ -4816,6 +4868,13 @@ mod lifecycle_selection_tests {
             Some(Path::new("/home/test/.local/bin/mame"))
         );
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlayOutcome {
+    Started,
+    Waiting,
+    Blocked,
 }
 
 /// Where each readiness action goes. Identity problems always go to the one
