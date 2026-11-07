@@ -28,6 +28,10 @@ pub(crate) struct ReadinessSources<'a> {
     pub(crate) loose_ref: &'a dyn Fn(&Path) -> Option<archivefs_core::launch::LaunchContentRef>,
     /// True only for a catalogued `arcade_set_directory` at exactly this path.
     pub(crate) is_arcade_set_directory: &'a dyn Fn(&Path) -> bool,
+    /// The catalogue's platform for exactly this path. The saved-library
+    /// snapshot is not loaded on the v2 routes, so the live record cannot be
+    /// the only source of the platform.
+    pub(crate) platform_hint: &'a dyn Fn(&Path) -> Option<String>,
 }
 
 impl ReadinessSources<'_> {
@@ -354,8 +358,9 @@ impl ReadinessSources<'_> {
         ) && !evidence_freshness.is_incomplete()
             && let Some(path) = focused
             && let Some(hint) = focused_record
-                .and_then(|record| record.mount_plan.archive.identity.platform.as_deref())
-            && let Some(resolved) = crate::emulator_setup::unverified_media::resolve(path, hint)
+                .and_then(|record| record.mount_plan.archive.identity.platform.clone())
+                .or_else(|| (self.platform_hint)(path))
+            && let Some(resolved) = crate::emulator_setup::unverified_media::resolve(path, &hint)
         {
             identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved);
             identity_unverified = true;
