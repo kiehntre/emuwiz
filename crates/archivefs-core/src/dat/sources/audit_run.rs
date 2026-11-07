@@ -400,6 +400,12 @@ pub struct AuditedFileHashes {
     pub md5: Option<String>,
     pub sha1: Option<String>,
     pub sha256: Option<String>,
+    /// S03-05: set only when this file matched a catalogue after a verified
+    /// header was ignored. The whole-file fields above are unchanged and
+    /// remain the file's identity; this records the headerless comparison
+    /// separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_removal: Option<crate::dat::header_match::HeaderRemovalMatch>,
 }
 
 impl From<&KnownFileEvidence> for AuditedFileHashes {
@@ -411,6 +417,7 @@ impl From<&KnownFileEvidence> for AuditedFileHashes {
             md5: evidence.md5.clone(),
             sha1: evidence.sha1.clone(),
             sha256: evidence.sha256.clone(),
+            header_removal: None,
         }
     }
 }
@@ -1314,6 +1321,17 @@ pub fn run_combined_dat_audit_with_targets(
             verdict: combined.verdict,
         });
     }
+    let header_matches = match_after_header_removal(
+        &mut entries,
+        &mut evidence_sources,
+        &hashed,
+        &loaded,
+        trusted,
+        cancel,
+    );
+    if cancelled(cancel) {
+        return Err(DatAuditError::Cancelled);
+    }
     // An exact whole-package LHA match is meaningful only after the bounded
     // LHA reader has confirmed that the package is structurally safe.  Keep
     // this set narrow: an unmatched LHA does not trigger a costly member walk
@@ -1397,11 +1415,131 @@ pub fn run_combined_dat_audit_with_targets(
             let _ = cache.save();
             cache.metrics.clone()
         },
-        known_hashes: known_hashes_by_path(&hashed.known, &hashed.fingerprints),
+        known_hashes: {
+            let mut known_hashes = known_hashes_by_path(&hashed.known, &hashed.fingerprints);
+            for (path, header_match) in header_matches {
+                if let Some(hashes) = known_hashes.get_mut(&path) {
+                    hashes.header_removal = Some(header_match);
+                }
+            }
+            known_hashes
+        },
         // A combined audit is never persisted as library identity.
         loose_discs: Vec::new(),
     };
     Ok(outcome)
+}
+
+/// S03-05: a second look at files that matched nothing by whole-file hash.
+///
+/// Only a file whose verdict is `NotInDat`, whose extension belongs to the
+/// platform of a catalogue explicitly assigned that platform, and whose header
+/// verifies (magic, no competing magic, declared length equals actual length)
+/// is compared again - by the bytes after the header, against only the
+/// catalogues of that platform. A single exact match becomes an `Exact`
+/// verdict whose algorithm names the header removal; its whole-file identity
+/// is untouched and the headerless hashes are returned for recording
+/// separately. Several candidates or a disagreement stay non-actionable, and
+/// rejected or unreadable headers leave the verdict exactly as it was.
+fn match_after_header_removal(
+    entries: &mut [AuditEntry],
+    evidence_sources: &mut Vec<DatAuditEvidenceSource>,
+    hashed: &HashedLocalScan,
+    loaded: &[LoadedCombinedCatalogue],
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+) -> std::collections::BTreeMap<String, crate::dat::header_match::HeaderRemovalMatch> {
+    use crate::dat::header_match::{
+        HeaderHashOutcome, extension_fits_kind, hash_after_header, header_kind_for_platform,
+        headerless_algorithm_label,
+    };
+    let mut matches = std::collections::BTreeMap::new();
+    let mut groups: Vec<(
+        crate::header_normalization::HeaderNormalizationKind,
+        Vec<&LoadedCombinedCatalogue>,
+    )> = Vec::new();
+    for catalogue in loaded {
+        let Some(kind) = catalogue
+            .source
+            .platform
+            .as_deref()
+            .and_then(header_kind_for_platform)
+        else {
+            continue;
+        };
+        match groups.iter_mut().find(|(existing, _)| *existing == kind) {
+            Some((_, members)) => members.push(catalogue),
+            None => groups.push((kind, vec![catalogue])),
+        }
+    }
+    if groups.is_empty() {
+        return matches;
+    }
+    for entry in entries.iter_mut() {
+        if cancelled(cancel) {
+            break;
+        }
+        if !matches!(entry.verdict, AuditVerdict::NotInDat) {
+            continue;
+        }
+        let path = Path::new(&entry.local_path);
+        let Some(fingerprint) = hashed.fingerprints.get(&entry.local_path) else {
+            continue;
+        };
+        let Some((kind, catalogues)) = groups
+            .iter()
+            .find(|(kind, _)| extension_fits_kind(path, *kind))
+        else {
+            continue;
+        };
+        let HeaderHashOutcome::Hashed(header_match) =
+            hash_after_header(path, trusted, cancel, *kind, fingerprint)
+        else {
+            continue;
+        };
+        let headerless = KnownFileEvidence::new(entry.local_path.clone(), &entry.local_filename)
+            .with_size(header_match.headerless_size)
+            .with_crc32(header_match.headerless_crc32.clone())
+            .with_md5(header_match.headerless_md5.clone())
+            .with_sha1(header_match.headerless_sha1.clone());
+        let merged = merge_combined_evidence_over(&headerless, catalogues);
+        match merged.verdict {
+            AuditVerdict::Exact {
+                game_name,
+                rom_name,
+                algorithm,
+            } => {
+                let label = headerless_algorithm_label(algorithm);
+                entry.verdict = AuditVerdict::Exact {
+                    game_name,
+                    rom_name,
+                    algorithm: label,
+                };
+                evidence_sources.extend(merged.evidence.into_iter().map(|mut evidence| {
+                    evidence.algorithm = label.to_string();
+                    evidence
+                }));
+                matches.insert(entry.local_path.clone(), header_match);
+            }
+            AuditVerdict::Ambiguous { detail } => {
+                entry.verdict = AuditVerdict::Ambiguous {
+                    detail: format!("after header removal: {detail}"),
+                };
+            }
+            AuditVerdict::ExactMultipleCandidates {
+                count, game_names, ..
+            } => {
+                entry.verdict = AuditVerdict::Ambiguous {
+                    detail: format!(
+                        "after header removal: {count} catalogue entries match ({})",
+                        game_names.join(", ")
+                    ),
+                };
+            }
+            _ => {}
+        }
+    }
+    matches
 }
 
 struct LoadedCombinedCatalogue {
@@ -1503,6 +1641,14 @@ struct CombinedEvidenceResult {
 fn merge_combined_evidence(
     known: &KnownFileEvidence,
     catalogues: &[LoadedCombinedCatalogue],
+) -> CombinedEvidenceResult {
+    let refs: Vec<&LoadedCombinedCatalogue> = catalogues.iter().collect();
+    merge_combined_evidence_over(known, &refs)
+}
+
+fn merge_combined_evidence_over(
+    known: &KnownFileEvidence,
+    catalogues: &[&LoadedCombinedCatalogue],
 ) -> CombinedEvidenceResult {
     let mut exact = Vec::new();
     let mut source_ambiguities = Vec::new();
@@ -4300,6 +4446,495 @@ game (
                 reason: "unsafe member path"
             }
         ));
+    }
+
+    // ---- S03-05: header-aware matching (NES, Atari Lynx, Atari 7800) -------
+
+    fn sha1_of(bytes: &[u8]) -> String {
+        use sha1::digest::Digest;
+        let digest = sha1::Sha1::digest(bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Deterministic, non-trivial payload so a wrong offset changes the hash.
+    fn payload(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    fn nes_file(prg: u8, chr: u8, body_len: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut header = vec![0_u8; 16];
+        header[..4].copy_from_slice(b"NES\x1a");
+        header[4] = prg;
+        header[5] = chr;
+        let body = payload(body_len, 7);
+        ([header, body.clone()].concat(), body)
+    }
+
+    fn lynx_file(pages: u16) -> (Vec<u8>, Vec<u8>) {
+        let mut header = vec![0_u8; 64];
+        header[..4].copy_from_slice(b"LYNX");
+        header[4..6].copy_from_slice(&pages.to_le_bytes());
+        let body = payload(usize::from(pages) * 256, 3);
+        ([header, body.clone()].concat(), body)
+    }
+
+    fn a7800_file(body_len: u32) -> (Vec<u8>, Vec<u8>) {
+        let mut header = vec![0_u8; 128];
+        header[1..10].copy_from_slice(b"ATARI7800");
+        header[49..53].copy_from_slice(&body_len.to_be_bytes());
+        let body = payload(body_len as usize, 5);
+        ([header, body.clone()].concat(), body)
+    }
+
+    fn headerless_dat(entries: &[(&str, &str, &[u8])]) -> String {
+        let games: String = entries
+            .iter()
+            .map(|(game, rom, bytes)| {
+                format!(
+                    r#"<game name="{game}"><rom name="{rom}" size="{}" crc="{}" sha1="{}"/></game>"#,
+                    bytes.len(),
+                    Crc32::of(bytes),
+                    sha1_of(bytes)
+                )
+            })
+            .collect();
+        format!(
+            r#"<?xml version="1.0"?><datafile><header><name>Fixture</name></header>{games}</datafile>"#
+        )
+    }
+
+    /// One file in a scan folder, one catalogue. Returns the outcome and the
+    /// file's path.
+    fn header_case(
+        file_name: &str,
+        bytes: &[u8],
+        dat_entries: &[(&str, &str, &[u8])],
+        platform: Option<&str>,
+    ) -> (DatAuditOutcome, PathBuf, tempfile::TempDir) {
+        let tree = tempfile::tempdir().unwrap();
+        let games = tree.path().join("games");
+        std::fs::create_dir(&games).unwrap();
+        let path = games.join(file_name);
+        std::fs::write(&path, bytes).unwrap();
+        let dat = tree.path().join("catalogue.dat");
+        std::fs::write(&dat, headerless_dat(dat_entries)).unwrap();
+        let mut catalogue = source(dat, "one");
+        catalogue.platform = platform.map(str::to_string);
+        (run(vec![catalogue], games), path, tree)
+    }
+
+    fn only_verdict(outcome: &DatAuditOutcome) -> &AuditVerdict {
+        assert_eq!(outcome.report.entries.len(), 1);
+        &outcome.report.entries[0].verdict
+    }
+
+    #[test]
+    fn s03_05_headered_nes_matches_after_header_removal_and_keeps_full_file_identity() {
+        let (full, body) = nes_file(1, 1, 16 * 1024 + 8 * 1024);
+        let (outcome, path, _tree) = header_case(
+            "game.nes",
+            &full,
+            &[("Game (USA)", "Game (USA).nes", &body)],
+            Some("NES"),
+        );
+        let AuditVerdict::Exact {
+            game_name,
+            rom_name,
+            algorithm,
+        } = only_verdict(&outcome)
+        else {
+            panic!("expected an exact match, got {:?}", only_verdict(&outcome));
+        };
+        assert_eq!(game_name, "Game (USA)");
+        assert_eq!(rom_name, "Game (USA).nes");
+        assert_eq!(*algorithm, "SHA-1 after header removal");
+
+        let hashes = &outcome.known_hashes[&path.to_string_lossy().into_owned()];
+        let removal = hashes.header_removal.as_ref().expect("recorded separately");
+        assert_eq!(removal.transform_id, "ines-header-strip-16");
+        assert_eq!(removal.header_len, 16);
+        assert_eq!(removal.headerless_size, body.len() as u64);
+        assert_eq!(removal.headerless_sha1, sha1_of(&body));
+        // The whole-file identity is the headered file's, untouched.
+        assert_eq!(hashes.sha1.as_deref(), Some(sha1_of(&full).as_str()));
+        assert_eq!(hashes.size_bytes, Some(full.len() as u64));
+        assert!(hashes.fingerprint.is_some());
+        // Read-only: the ROM on disk is byte-identical.
+        assert_eq!(std::fs::read(&path).unwrap(), full);
+        // Evidence provenance names the header removal, not a plain SHA-1.
+        assert_eq!(outcome.evidence_sources.len(), 1);
+        assert_eq!(
+            outcome.evidence_sources[0].algorithm,
+            "SHA-1 after header removal"
+        );
+
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(plan.proposals.len(), 1);
+        let proposal = &plan.proposals[0];
+        assert_eq!(
+            proposal.proposed_basename.as_deref(),
+            Some("Game (USA).nes")
+        );
+        assert!(
+            proposal
+                .verdict_label
+                .contains("matched after header removal"),
+            "{}",
+            proposal.verdict_label
+        );
+        assert!(
+            proposal
+                .explanations
+                .iter()
+                .any(|line| line.contains("Matched after header removal")),
+            "{:?}",
+            proposal.explanations
+        );
+        // Bound to the whole-file fingerprint the audit took.
+        assert_eq!(proposal.audited_fingerprint, hashes.fingerprint);
+    }
+
+    #[test]
+    fn s03_05_lynx_and_atari_7800_headers_match_after_removal() {
+        let (lynx, lynx_body) = lynx_file(512);
+        let (outcome, _, _tree) = header_case(
+            "cart.lnx",
+            &lynx,
+            &[("Cart (USA)", "Cart (USA).lnx", &lynx_body)],
+            Some("Atari Lynx"),
+        );
+        assert!(matches!(
+            only_verdict(&outcome),
+            AuditVerdict::Exact {
+                algorithm: "SHA-1 after header removal",
+                ..
+            }
+        ));
+        assert_eq!(
+            outcome
+                .known_hashes
+                .values()
+                .next()
+                .unwrap()
+                .header_removal
+                .as_ref()
+                .unwrap()
+                .header_len,
+            64
+        );
+
+        let (a78, a78_body) = a7800_file(32 * 1024);
+        let (outcome, _, _tree) = header_case(
+            "cart.a78",
+            &a78,
+            &[("Cart (USA)", "Cart (USA).a78", &a78_body)],
+            Some("Atari7800"),
+        );
+        assert!(matches!(
+            only_verdict(&outcome),
+            AuditVerdict::Exact {
+                algorithm: "SHA-1 after header removal",
+                ..
+            }
+        ));
+        assert_eq!(
+            outcome
+                .known_hashes
+                .values()
+                .next()
+                .unwrap()
+                .header_removal
+                .as_ref()
+                .unwrap()
+                .header_len,
+            128
+        );
+    }
+
+    #[test]
+    fn s03_05_unassigned_or_wrong_platform_catalogue_never_claims_a_headered_file() {
+        let (full, body) = nes_file(1, 0, 16 * 1024);
+        let entries: &[(&str, &str, &[u8])] = &[("Game (USA)", "Game (USA).nes", &body)];
+        for platform in [
+            None,
+            Some("Atari Lynx"),
+            Some("Atari7800"),
+            Some("Game Boy"),
+        ] {
+            let (outcome, path, _tree) = header_case("game.nes", &full, entries, platform);
+            assert_eq!(
+                only_verdict(&outcome),
+                &AuditVerdict::NotInDat,
+                "platform {platform:?}"
+            );
+            assert!(
+                outcome.known_hashes[&path.to_string_lossy().into_owned()]
+                    .header_removal
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn s03_05_wrong_extension_for_the_platform_is_not_matched() {
+        let (full, body) = nes_file(1, 0, 16 * 1024);
+        let (outcome, _, _tree) = header_case(
+            "game.gb",
+            &full,
+            &[("Game (USA)", "Game (USA).nes", &body)],
+            Some("NES"),
+        );
+        assert_eq!(only_verdict(&outcome), &AuditVerdict::NotInDat);
+    }
+
+    #[test]
+    fn s03_05_malformed_and_misleading_headers_are_rejected() {
+        // (label, bytes, headerless body the DAT lists)
+        let (good, body) = nes_file(1, 0, 16 * 1024);
+        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+        // Declares two PRG banks but only one follows: length mismatch.
+        let (mut wrong_len, _) = nes_file(2, 0, 16 * 1024);
+        wrong_len[4] = 2;
+        cases.push(("declared length differs from actual", wrong_len));
+        // Trailing junk after a correct payload: the declared length no longer
+        // equals the payload, so it is not guessed at.
+        let mut trailing = good.clone();
+        trailing.extend_from_slice(&[0xAA; 64]);
+        cases.push(("trailing bytes", trailing));
+        // Zero PRG banks.
+        let (mut zero_prg, _) = nes_file(1, 0, 16 * 1024);
+        zero_prg[4] = 0;
+        cases.push(("zero PRG banks", zero_prg));
+        // NES 2.0 marker: size encoding not interpreted.
+        let mut nes2 = good.clone();
+        nes2[7] = 0b0000_1000;
+        cases.push(("NES 2.0 revision", nes2));
+        // Magic missing: the right extension and the right payload, no header.
+        let mut no_magic = good.clone();
+        no_magic[0] = b'X';
+        cases.push(("magic missing", no_magic));
+        // Truncated inside the header.
+        cases.push(("shorter than the header", good[..10].to_vec()));
+        for (label, bytes) in cases {
+            let (outcome, path, _tree) = header_case(
+                "game.nes",
+                &bytes,
+                &[("Game (USA)", "Game (USA).nes", &body)],
+                Some("NES"),
+            );
+            assert_eq!(only_verdict(&outcome), &AuditVerdict::NotInDat, "{label}");
+            assert!(
+                outcome
+                    .known_hashes
+                    .get(&path.to_string_lossy().into_owned())
+                    .is_none_or(|hashes| hashes.header_removal.is_none()),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn s03_05_a_lynx_header_with_a_wrong_declared_size_is_rejected() {
+        let (mut lynx, body) = lynx_file(512);
+        lynx[4..6].copy_from_slice(&511_u16.to_le_bytes());
+        let (outcome, _, _tree) = header_case(
+            "cart.lnx",
+            &lynx,
+            &[("Cart (USA)", "Cart (USA).lnx", &body)],
+            Some("Atari Lynx"),
+        );
+        assert_eq!(only_verdict(&outcome), &AuditVerdict::NotInDat);
+    }
+
+    #[test]
+    fn s03_05_a_headerless_file_still_matches_by_whole_file_without_a_removal_record() {
+        let (_, body) = nes_file(1, 0, 16 * 1024);
+        let (outcome, path, _tree) = header_case(
+            "game.nes",
+            &body,
+            &[("Game (USA)", "Game (USA).nes", &body)],
+            Some("NES"),
+        );
+        assert!(matches!(
+            only_verdict(&outcome),
+            AuditVerdict::Exact {
+                algorithm: "SHA-1",
+                ..
+            }
+        ));
+        assert!(
+            outcome.known_hashes[&path.to_string_lossy().into_owned()]
+                .header_removal
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn s03_05_ambiguous_headerless_matches_stay_non_actionable() {
+        let (full, body) = nes_file(1, 0, 16 * 1024);
+        // Two catalogue entries share the headerless bytes.
+        let (outcome, _, _tree) = header_case(
+            "game.nes",
+            &full,
+            &[
+                ("Game A (USA)", "Game A (USA).nes", &body),
+                ("Game B (USA)", "Game B (USA).nes", &body),
+            ],
+            Some("NES"),
+        );
+        assert!(
+            matches!(only_verdict(&outcome), AuditVerdict::Ambiguous { detail } if detail.starts_with("after header removal")),
+            "{:?}",
+            only_verdict(&outcome)
+        );
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(plan.proposals.is_empty(), "never a rename proposal");
+    }
+
+    #[test]
+    fn s03_05_a_trainer_header_matches_after_removal() {
+        let mut header = vec![0_u8; 16];
+        header[..4].copy_from_slice(b"NES\x1a");
+        header[4] = 1;
+        header[6] = 0b100;
+        let body = payload(512 + 16 * 1024, 11);
+        let full = [header, body.clone()].concat();
+        let (outcome, _, _tree) = header_case(
+            "game.nes",
+            &full,
+            &[("Game (USA)", "Game (USA).nes", &body)],
+            Some("NES"),
+        );
+        assert!(matches!(
+            only_verdict(&outcome),
+            AuditVerdict::Exact {
+                algorithm: "SHA-1 after header removal",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn s03_05_a_7800_header_with_a_wrong_declared_size_is_rejected() {
+        let (mut a78, body) = a7800_file(32 * 1024);
+        a78[49..53].copy_from_slice(&(32 * 1024 - 1_u32).to_be_bytes());
+        let (outcome, _, _tree) = header_case(
+            "cart.a78",
+            &a78,
+            &[("Cart (USA)", "Cart (USA).a78", &body)],
+            Some("Atari7800"),
+        );
+        assert_eq!(only_verdict(&outcome), &AuditVerdict::NotInDat);
+    }
+
+    #[test]
+    fn s03_05_a_header_matched_proposal_is_refused_once_the_file_changes() {
+        let (full, body) = nes_file(1, 0, 16 * 1024);
+        let (outcome, path, _tree) = header_case(
+            "game.nes",
+            &full,
+            &[("Game (USA)", "Game (USA).nes", &body)],
+            Some("NES"),
+        );
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(plan.proposals.len(), 1);
+        // Change the headered file after the audit, keeping the header intact.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut changed = full.clone();
+        *changed.last_mut().unwrap() ^= 0xFF;
+        std::fs::write(&path, &changed).unwrap();
+        let approved: std::collections::BTreeSet<String> =
+            [path.to_string_lossy().into_owned()].into_iter().collect();
+        let error = crate::dat::rename_apply::build_transaction(&plan, &approved, 1).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::dat::rename_apply::ApplyError::SourceChangedSinceAudit(ref changed)
+                    if changed.len() == 1
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            changed,
+            "nothing was renamed"
+        );
+    }
+
+    #[test]
+    fn s03_05_a_baddump_in_one_catalogue_makes_the_headerless_match_ambiguous() {
+        let (full, body) = nes_file(1, 0, 16 * 1024);
+        let tree = tempfile::tempdir().unwrap();
+        let games = tree.path().join("games");
+        std::fs::create_dir(&games).unwrap();
+        std::fs::write(games.join("game.nes"), &full).unwrap();
+        let good = tree.path().join("good.dat");
+        let bad = tree.path().join("bad.dat");
+        std::fs::write(
+            &good,
+            headerless_dat(&[("Game (USA)", "Game (USA).nes", &body)]),
+        )
+        .unwrap();
+        std::fs::write(
+            &bad,
+            headerless_dat(&[("Game (USA)", "Game (USA).nes", &body)])
+                .replace("<rom ", r#"<rom status="baddump" "#),
+        )
+        .unwrap();
+        let mut one = source(good, "one");
+        one.platform = Some("NES".to_string());
+        let mut two = source(bad, "two");
+        two.platform = Some("NES".to_string());
+        let outcome = run(vec![one, two], games);
+        assert!(
+            matches!(only_verdict(&outcome), AuditVerdict::Ambiguous { detail }
+                if detail.starts_with("after header removal")),
+            "{:?}",
+            only_verdict(&outcome)
+        );
+    }
+
+    #[test]
+    fn s03_05_a_changed_file_is_never_matched() {
+        // The audited fingerprint binds the headerless hash to the same
+        // bytes: a file rewritten after the audit fingerprint is refused.
+        use crate::dat::header_match::{HeaderHashOutcome, hash_after_header};
+        use crate::header_normalization::HeaderNormalizationKind;
+        let (full, _) = nes_file(1, 0, 16 * 1024);
+        let tree = tempfile::tempdir().unwrap();
+        let path = tree.path().join("game.nes");
+        std::fs::write(&path, &full).unwrap();
+        let audited = crate::identity_source::hashing::FileFingerprint::observe(&path).unwrap();
+        let mut changed = full.clone();
+        changed.push(0);
+        std::fs::write(&path, &changed).unwrap();
+        assert_eq!(
+            hash_after_header(
+                &path,
+                &TrustedRoots::none(),
+                &AtomicBool::new(false),
+                HeaderNormalizationKind::INes16,
+                &audited,
+            ),
+            HeaderHashOutcome::Refused
+        );
     }
 }
 
