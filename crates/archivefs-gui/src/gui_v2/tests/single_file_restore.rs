@@ -577,3 +577,81 @@ fn nw2_b04_worker_failure_drops_stale_confirm_and_explains_inline() {
     assert_eq!(app.saves_states.snapshots.loaded_for, None);
     assert_eq!(app.activity.failed(), 1);
 }
+
+/// Review of NW2-B-03: a restore or Undo that a program may have opened
+/// during the write is amber inline ("check the save") and must be "Needs
+/// attention" in Activity too, with the same message.
+#[test]
+fn nw2_b03_restore_or_undo_opened_during_the_write_is_recorded_as_needing_attention() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let target = snapshot_target(&world.record, &world.game()).unwrap();
+    save_snapshots::create(&world.root(), &target, &CLOSED).unwrap();
+    // Played on after the snapshot, so there is something to restore.
+    std::fs::write(&world.save, b"CHECKPOINT-TWO-LATER").unwrap();
+    let mut app = world.app(&context);
+    prepare(&world, &mut app, &CLOSED);
+    let Flow::Confirm(preview) = app.saves_states.single_file.flow.clone() else {
+        panic!("preview expected")
+    };
+    let Outcome::Applied { target, result } = sfr::run_with(
+        Job::Apply {
+            preview,
+            dirs: world.dirs(),
+        },
+        &CLOSED,
+    ) else {
+        unreachable!()
+    };
+    let (receipt, _) = result.unwrap();
+
+    for (undo, expected) in [
+        (false, "a program may have opened it during the restore"),
+        (true, "a program may have opened it meanwhile"),
+    ] {
+        let id = app.activity.queue_with(
+            "Restoring a save",
+            Route::Section(Section::Activity),
+            activity::CancelPolicy::SafeNow,
+        );
+        app.activity.start(id);
+        app.saves_states.single_file.job = Some(id);
+        let outcome = if undo {
+            Outcome::Undone {
+                receipt: receipt.clone(),
+                target: target.clone(),
+                result: Ok(true),
+            }
+        } else {
+            Outcome::Applied {
+                target: target.clone(),
+                result: Ok((receipt.clone(), true)),
+            }
+        };
+        nw2_deliver(
+            &context,
+            &mut app,
+            id,
+            Ok(super::super::backend::Payload::SingleFileRestore(Box::new(
+                outcome,
+            ))),
+        );
+        let job = &app.activity.jobs[&id];
+        assert_eq!(job.phase, activity::Phase::Failed, "{}", job.summary);
+        assert!(job.summary.contains(expected), "{}", job.summary);
+        let (_, ok, inline) = app.saves_states.single_file.feedback.clone().unwrap();
+        assert!(!ok);
+        assert_eq!(inline, job.summary);
+        assert!(
+            matches!(
+                app.saves_states.single_file.flow,
+                Flow::Done {
+                    opened_during: true,
+                    ..
+                }
+            ),
+            "Undo stays reachable"
+        );
+    }
+    assert_eq!(app.activity.failed(), 2);
+}

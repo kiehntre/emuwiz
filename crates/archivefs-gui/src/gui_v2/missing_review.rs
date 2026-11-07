@@ -221,6 +221,14 @@ impl App {
         }
     }
 
+    /// The untracked receipts job (id 0) ended without an answer: give up for
+    /// now, so the panel does not re-request it every frame; the next forget
+    /// or undo asks again.
+    pub(super) fn missing_receipts_failed(&mut self) {
+        self.missing.receipts_inflight = false;
+        self.missing.undoable_loaded = true;
+    }
+
     pub(super) fn missing_receipts_loaded(&mut self, receipts: Vec<ForgetMissingReceiptSummary>) {
         self.missing.receipts_inflight = false;
         self.missing.undoable_loaded = true;
@@ -845,6 +853,33 @@ mod tests {
         // Another database's receipt is never offered here.
         assert!(
             list_undoable_forget_missing_receipts(&f.temp.path().join("other.sqlite3")).is_empty()
+        );
+    }
+
+    /// Review of NW2-B-02: if the untracked receipts job dies, the panel
+    /// stops waiting for it (no re-request every frame) and the next forget
+    /// or undo asks again.
+    #[test]
+    fn nw2_b02_worker_death_releases_the_receipts_request() {
+        let context = egui::Context::default();
+        let mut app = super::super::tests::fixture(&context);
+        app.missing.receipts_inflight = true;
+        app.missing.undoable_loaded = false;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.backend.rx = receiver;
+        sender
+            .send(super::super::backend::Event::Finished {
+                id: 0,
+                outcome: Err("The background operation stopped unexpectedly.".into()),
+            })
+            .unwrap();
+        app.poll(&context);
+        assert!(!app.missing.receipts_inflight);
+        assert!(app.missing.undoable_loaded, "not re-requested every frame");
+        app.missing_apply_done(forgot(None, 0));
+        assert!(
+            !app.missing.undoable_loaded,
+            "asked again after the next apply"
         );
     }
 

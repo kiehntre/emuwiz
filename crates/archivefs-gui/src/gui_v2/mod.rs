@@ -2255,6 +2255,10 @@ impl App {
                             if self.missing.job == Some(id) {
                                 self.missing_failed(&error);
                             }
+                            if id == 0 && self.missing.receipts_inflight {
+                                // Untracked jobs share id 0; the flag says ours was out.
+                                self.missing_receipts_failed();
+                            }
                             if self.equiv.job == Some(id) {
                                 self.equivalent_failed(&error);
                             }

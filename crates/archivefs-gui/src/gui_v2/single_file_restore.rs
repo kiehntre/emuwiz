@@ -346,7 +346,9 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> (Strin
                     opened_during: opened,
                     undone: false,
                 };
-                (message, true)
+                // A write that may have raced an open emulator needs the
+                // person's check: Activity says so too, not "Finished".
+                (message, !opened)
             }
             Err(error) => {
                 state.feedback = Some((target.location.path.clone(), false, error.clone()));
@@ -373,7 +375,7 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> (Strin
                     opened_during: opened,
                     undone: true,
                 };
-                (message, true)
+                (message, !opened)
             }
             Err(error) => {
                 state.feedback = Some((target.location.path.clone(), false, error.clone()));

@@ -77,8 +77,10 @@ pub(in super::super) fn run(job: PanelJob) -> PanelOutcome {
             failed: false,
         },
         PanelJob::Recover { journal_dir } => {
-            let (messages, failed) = match recovery::recover(&journal_dir, &observer, now) {
-                Ok(messages) => (messages, false),
+            // A refusal, and a pass that left a record needing manual review,
+            // unchecked or unlisted, are both "Needs attention".
+            let (messages, failed) = match recovery::recover_run(&journal_dir, &observer, now) {
+                Ok(run) => (run.messages, run.attention),
                 Err(refusal) => (vec![refusal], true),
             };
             PanelOutcome::Records {
