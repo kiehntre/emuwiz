@@ -167,7 +167,7 @@ impl FileObjectStamp {
     }
 
     #[cfg(unix)]
-    fn same_object(&self, metadata: &std::fs::Metadata) -> bool {
+    pub(crate) fn same_object(&self, metadata: &std::fs::Metadata) -> bool {
         use std::os::unix::fs::MetadataExt;
         self.device == metadata.dev() && self.inode == metadata.ino()
     }
