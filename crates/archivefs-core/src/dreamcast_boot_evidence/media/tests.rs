@@ -33,12 +33,23 @@ fn iso(root: &Path) -> PathBuf {
 fn package(root: &Path, name: &str) -> PathBuf {
     let path = root.join(name);
     let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
-    zip.start_file("1ST_READ.BIN", zip::write::SimpleFileOptions::default())
-        .unwrap();
+    // Fixed entry timestamp: default options stamp the current time, which made
+    // identical archives differ across a second boundary.
+    let options =
+        zip::write::SimpleFileOptions::default().last_modified_time(zip::DateTime::default());
+    zip.start_file("1ST_READ.BIN", options).unwrap();
     zip.write_all(b"freely created synthetic replacement")
         .unwrap();
     zip.finish().unwrap();
     path
+}
+#[test]
+fn dreamcast_test_package_bytes_are_deterministic_across_creation_time() {
+    let root = tempfile::tempdir().unwrap();
+    let first = fs::read(package(root.path(), "a.dcp")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let second = fs::read(package(root.path(), "b.dcp")).unwrap();
+    assert_eq!(first, second);
 }
 fn gdi(root: &Path, offset: i64) -> PathBuf {
     let path = root.join("synthetic.gdi");
