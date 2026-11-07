@@ -1289,7 +1289,7 @@ mod database_adapter {
             ),
         ] {
             match outcome.status {
-                DatabaseCheckStatus::Failed | DatabaseCheckStatus::Error => {
+                DatabaseCheckStatus::Failed => {
                     findings.push(
                         Finding::new(
                             id,
@@ -1304,6 +1304,36 @@ mod database_adapter {
                         .with_recovery(KnownRecovery::new(
                             None,
                             "Tools › Database Status shows the full report; EmuWiz never repairs the catalogue automatically",
+                        )),
+                    );
+                }
+                // The check never ran (database busy, locked, or read-only
+                // recovery pending): the catalogue was not judged, so this is
+                // not evidence of corruption and must not read as such.
+                DatabaseCheckStatus::Error => {
+                    let detail = report
+                        .diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.message.clone())
+                        .collect::<Vec<_>>();
+                    findings.push(
+                        Finding::new(
+                            id.replace("_failed", "_not_run")
+                                .replace("_reported_problems", "_not_run"),
+                            DoctorCategory::Database,
+                            DoctorSubsystem::DatabaseDiagnostics,
+                            DoctorSeverity::Warning,
+                            format!("{name} could not run"),
+                            format!(
+                                "SQLite's {} did not run, so the catalogue was neither confirmed healthy nor found damaged.",
+                                name.to_lowercase()
+                            ),
+                        )
+                        .with_affected(path.clone())
+                        .with_evidence(detail)
+                        .with_recovery(KnownRecovery::new(
+                            None,
+                            "Wait for any running scan to finish, then run: emuwiz-cli database-check",
                         )),
                     );
                 }

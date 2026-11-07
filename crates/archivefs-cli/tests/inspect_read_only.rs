@@ -670,3 +670,84 @@ fn saves_inspect_of_an_unknown_record_id_is_an_error_in_json_too() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("was not found"));
     }
 }
+
+/// Night Watch D8-01: `inspect` and `game-identity-inspect` on an Amiga
+/// `.lha` never execute a program - in particular not a `7zz`/`7z` reached
+/// through `.`, a relative or an empty `PATH` entry from the working
+/// directory. The stubs record every invocation in a marker file.
+#[cfg(unix)]
+#[test]
+fn amiga_lha_identity_never_runs_a_cwd_or_relative_path_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world();
+    let cwd = w.home.join("cwd");
+    fs::create_dir_all(cwd.join("rel")).unwrap();
+    let lha = w.library.join("Amiga").join("Game.lha");
+    fs::create_dir_all(lha.parent().unwrap()).unwrap();
+    fs::write(&lha, b"not really an lha").unwrap();
+    let marker = w.home.join("SPAWNED");
+    for stub in [
+        cwd.join("7zz"),
+        cwd.join("7z"),
+        cwd.join("rel/7zz"),
+        cwd.join("rel/7z"),
+    ] {
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho \"$0 $*\" >> '{}'\nprintf ' Lzh\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let empty = w.home.join("emptydir");
+    fs::create_dir_all(&empty).unwrap();
+    let empty_entry = format!("{}:", empty.display());
+    let lha_text = lha.to_str().unwrap();
+    for path_value in [".", "rel", empty_entry.as_str(), ":/nonexistent"] {
+        for args in [
+            vec!["inspect", lha_text, "--platform", "amiga", "--json"],
+            vec![
+                "game-identity-inspect",
+                "--path",
+                lha_text,
+                "--platform",
+                "amiga",
+                "--json",
+            ],
+        ] {
+            let out = Command::new(env!("CARGO_BIN_EXE_emuwiz-cli"))
+                .args(&args)
+                .current_dir(&cwd)
+                .env_clear()
+                .env("PATH", path_value)
+                .env("HOME", &w.home)
+                .env("XDG_CONFIG_HOME", w.home.join(".config"))
+                .env("XDG_DATA_HOME", w.home.join(".local/share"))
+                .env("XDG_CACHE_HOME", w.home.join(".cache"))
+                .env("XDG_STATE_HOME", w.home.join(".local/state"))
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                !marker.exists(),
+                "PATH={path_value:?} {args:?} executed: {}",
+                fs::read_to_string(&marker).unwrap_or_default()
+            );
+            if args[0] == "inspect" {
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(
+                    text.contains("external 7-Zip"),
+                    "inspect must say why identity was skipped: {text}"
+                );
+            }
+        }
+    }
+}

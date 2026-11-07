@@ -96,16 +96,18 @@ pub struct ArchiveOperationResult {
     pub warnings: Vec<String>,
 }
 
+/// Finds an archive tool by bare name in the absolute `PATH` directories
+/// only ([`crate::external_tools`]); the found file must additionally be a
+/// non-symlink regular executable, as this inventory has always required.
 fn which(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .take(64)
+    crate::external_tools::process_path_directories()
+        .iter()
         .map(|p| p.join(name))
         .find(|p| {
             fs::symlink_metadata(p)
                 .map(|m| m.is_file() && !m.file_type().is_symlink())
                 .unwrap_or(false)
+                && crate::external_tools::is_regular_executable(p)
         })
 }
 fn tool(name: &str, capabilities: &[&str]) -> ArchiveToolRecord {
