@@ -414,6 +414,7 @@ pub use integration::{
 };
 pub use mame_command::{
     MAME_SUPPORTED_PLATFORM_IDS, MameCommand, MameCommandPlan, build_mame_command_plan,
+    build_mame_command_plan_with_extra,
 };
 pub use mame_execution::{
     MameLaunchExecutionError, MameLaunchPreflightError, MameLaunchRequest,

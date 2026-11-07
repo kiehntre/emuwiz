@@ -323,19 +323,26 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
         archivefs_core::launch::launch_content_ref_for_unmounted(kind, p)
     };
     let cheat_workflow = None;
-    let input = crate::emulator_setup::readiness_input::ReadinessSources {
-        readiness: &state,
-        evidence: &evidence,
-        focused: Some(&path),
-        cheat_workflow: &cheat_workflow,
-        database_snapshot: None,
-        database_generation: 0,
-        freshness_for: &freshness_for,
-        member_path: &member_path,
-        is_scummvm_folder: &is_scummvm_folder,
-        loose_ref: &loose_ref,
-    }
-    .build(None);
+    let is_arcade_set_directory =
+        |p: &Path| archive.archive_kind == "arcade_set_directory" && p == archive.absolute_path;
+    // This worker is off the UI thread, so it may wait for the (cached,
+    // de-duplicated, capped) MAME probe; cancelling the batch cancels the wait.
+    let input = crate::arcade_mame_probe::with_blocking(cancel, || {
+        crate::emulator_setup::readiness_input::ReadinessSources {
+            readiness: &state,
+            evidence: &evidence,
+            focused: Some(&path),
+            cheat_workflow: &cheat_workflow,
+            database_snapshot: None,
+            database_generation: 0,
+            freshness_for: &freshness_for,
+            member_path: &member_path,
+            is_scummvm_folder: &is_scummvm_folder,
+            loose_ref: &loose_ref,
+            is_arcade_set_directory: &is_arcade_set_directory,
+        }
+        .build(None)
+    });
     // Only a resolved plan is an answer. An unresolved identity may be one a
     // selection-bound controller would have supplied, so it is not a verdict.
     let crate::launch_readiness_page::LaunchReadinessInput::Plan {

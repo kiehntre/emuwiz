@@ -925,6 +925,7 @@ impl Drop for ArchiveFsApp {
 
 impl ArchiveFsApp {
     pub(crate) fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::arcade_mame_probe::register_repaint(context);
         app_polling::poll_and_reconcile(self, context);
         self.launch_standalone
             .focus_dosbox_game(self.archive_context.focused.as_deref());

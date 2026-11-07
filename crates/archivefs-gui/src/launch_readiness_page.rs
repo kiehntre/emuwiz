@@ -4796,43 +4796,68 @@ fn mame_launch_request(
             "the MAME logical-set identity is unresolved",
         )
     })?;
-    let database_path = archivefs_core::default_database_path().map_err(|error| {
-        mame_blocker(
-            LaunchBlockerKind::MameSetVerdictUnavailable,
-            format!("the MAME audit database path is unavailable: {error}"),
-        )
-    })?;
-    let database = archivefs_core::Database::open_read_only(database_path).map_err(|error| {
-        mame_blocker(
-            LaunchBlockerKind::MameSetVerdictUnavailable,
-            format!("the MAME audit database cannot be read: {error}"),
-        )
-    })?;
-    let evidence = database
-        .mame_arcade_join_for_archive_path(
-            archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256,
-            &path,
-        )
-        .map_err(|error| {
+    // An extracted set folder is judged by the installed MAME's own per-set
+    // data (cached, probed in the background, never on this thread).
+    // `peek` never starts a probe: only the catalogue-gated readiness build
+    // (arcade_probe_target) does, so an uncatalogued folder is never probed.
+    let arcade_lookup = (platform_id == "Arcade")
+        .then(|| crate::arcade_mame_probe::peek(&executable, &path))
+        .flatten();
+    let (resolution, extra_rompaths) = if let Some(lookup) = arcade_lookup {
+        match lookup {
+            crate::arcade_mame_probe::Lookup::Checking => {
+                return Err(crate::arcade_mame_probe::checking_blocker());
+            }
+            crate::arcade_mame_probe::Lookup::Done(probe) => {
+                if probe.verdict.readiness
+                    == archivefs_core::arcade_mame_routing::ArcadeReadiness::Blocked
+                {
+                    return Err(crate::arcade_mame_probe::blocker_for(&probe));
+                }
+                (probe.resolution.clone(), probe.extra_rompaths.clone())
+            }
+        }
+    } else {
+        let database_path = archivefs_core::default_database_path().map_err(|error| {
             mame_blocker(
                 LaunchBlockerKind::MameSetVerdictUnavailable,
-                format!("the exact MAME audit evidence cannot be read: {error}"),
-            )
-        })?
-        .ok_or_else(|| {
-            mame_blocker(
-                LaunchBlockerKind::MameSetVerdictUnavailable,
-                "no current exact-path MAME audit evidence is available",
+                format!("the MAME audit database path is unavailable: {error}"),
             )
         })?;
-    let resolution =
-        archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(&evidence, &path)
+        let database =
+            archivefs_core::Database::open_read_only(database_path).map_err(|error| {
+                mame_blocker(
+                    LaunchBlockerKind::MameSetVerdictUnavailable,
+                    format!("the MAME audit database cannot be read: {error}"),
+                )
+            })?;
+        let evidence = database
+            .mame_arcade_join_for_archive_path(
+                archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256,
+                &path,
+            )
+            .map_err(|error| {
+                mame_blocker(
+                    LaunchBlockerKind::MameSetVerdictUnavailable,
+                    format!("the exact MAME audit evidence cannot be read: {error}"),
+                )
+            })?
             .ok_or_else(|| {
                 mame_blocker(
                     LaunchBlockerKind::MameSetVerdictUnavailable,
-                    "the persisted MAME audit does not authorize this logical set",
+                    "no current exact-path MAME audit evidence is available",
                 )
             })?;
+        let resolution =
+            archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(&evidence, &path)
+                .ok_or_else(|| {
+                    mame_blocker(
+                        LaunchBlockerKind::MameSetVerdictUnavailable,
+                        "the persisted MAME audit does not authorize this logical set",
+                    )
+                })?;
+        (resolution, Vec::new())
+    };
     let rom_search_path = path.parent().map(Path::to_path_buf).ok_or_else(|| {
         mame_blocker(
             LaunchBlockerKind::MameSearchPathUnconfigured,
@@ -4849,6 +4874,7 @@ fn mame_launch_request(
         selected_content: path,
         expected_content_identity: None,
         rom_search_path,
+        extra_rompaths,
     })
 }
 
