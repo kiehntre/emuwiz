@@ -368,20 +368,48 @@ fn readiness(set: &MediaSet) -> Readiness {
     }
 }
 
-/// The core identity inspector asks the locally installed ScummVM executable
-/// to detect a game *directory* (a subprocess that also writes a temporary
-/// config). `inspect` never spawns processes, so that one path is not taken:
-/// identity (and the media record that reuses it) is skipped and said so.
-fn needs_external_detector(hint: Option<&str>, target: &Target) -> bool {
-    target.kind != "file" && IdentityPlatform::from_catalogue(hint) == IdentityPlatform::ScummVM
+/// The core identity inspector reaches for an external program in two
+/// places: it asks the locally installed ScummVM executable to detect a game
+/// *directory* (a subprocess that also writes a temporary config), and it
+/// lists an Amiga `.lha`/`.lzh` archive through a system 7-Zip to find
+/// WHDLoad slaves. `inspect` never spawns processes, so neither path is
+/// taken: identity (and the media record that reuses it) is skipped and the
+/// report says why (Night Watch D8-01).
+fn needs_external_detector(hint: Option<&str>, target: &Target) -> Option<&'static str> {
+    if target.kind != "file" && IdentityPlatform::from_catalogue(hint) == IdentityPlatform::ScummVM
+    {
+        return Some(
+            "ScummVM directory identity requires running the ScummVM detector executable, which inspect never does",
+        );
+    }
+    if target.kind == "file" && is_lha_archive_name(&target.path) {
+        return Some(
+            "Amiga LHA archive identity requires running an external 7-Zip to list the archive, which inspect never does",
+        );
+    }
+    None
 }
 
-fn skipped_identity(hint: &Option<String>, source: &'static str) -> IdentitySection {
+/// Whether the target name has an LHA/LZH extension, regardless of platform
+/// hint: the identity inspector decides the platform itself and may pick
+/// Amiga from the archive name alone.
+fn is_lha_archive_name(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("lha") || extension.eq_ignore_ascii_case("lzh")
+        })
+}
+
+fn skipped_identity(
+    hint: &Option<String>,
+    source: &'static str,
+    reason: &'static str,
+) -> IdentitySection {
     IdentitySection {
         evaluated: false,
-        not_evaluated_reason: Some(
-            "ScummVM directory identity requires running the ScummVM detector executable, which inspect never does",
-        ),
+        not_evaluated_reason: Some(reason),
         platform_hint: hint.clone(),
         platform_hint_source: source,
         identity_platform: "not evaluated".into(),
@@ -482,12 +510,16 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         _ => (None, "none"),
     };
     let skip_identity = needs_external_detector(hint.as_deref(), &target);
-    let identity = (!skip_identity).then(|| {
+    let identity = skip_identity.is_none().then(|| {
         inspect_catalogued_game_identity_in_roots(&options.path, hint.as_deref(), &trusted)
     });
-    let identity_view = match &identity {
-        Some(report) => identity_section(report, &hint, hint_source),
-        None => skipped_identity(&hint, hint_source),
+    let identity_view = match (&identity, skip_identity) {
+        (Some(report), _) => identity_section(report, &hint, hint_source),
+        (None, reason) => skipped_identity(
+            &hint,
+            hint_source,
+            reason.unwrap_or("identity was not evaluated"),
+        ),
     };
     let identity_evidence: &[_] = identity.as_ref().map_or(&[], |report| &report.evidence);
 
@@ -498,7 +530,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let records = inspect_paths(
         std::slice::from_ref(&options.path),
         // The media record re-runs identity inspection with the same hint.
-        hint.as_deref().filter(|_| !skip_identity),
+        hint.as_deref().filter(|_| skip_identity.is_none()),
         &trusted,
         &limits,
     );

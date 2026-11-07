@@ -18,6 +18,7 @@ mod cheat_extras_page;
 pub(crate) mod classic_trainers;
 #[cfg(test)]
 mod dat_exact_tests;
+mod database_recovery;
 mod database_status_page;
 mod detail_identity;
 mod documents;
@@ -454,6 +455,7 @@ pub(super) struct App {
     canonical_organisation_job: Option<CanonicalOrganisationJob>,
     history_view: history_view::HistoryViewState,
     discovery_import_history: history_discovery_import::State,
+    database_recovery: database_recovery::State,
     duckstation_history: history_duckstation::State,
     canonical_organisation_generation: u64,
     canonical_organisation_history:
@@ -586,6 +588,7 @@ impl App {
             canonical_organisation_job: None,
             history_view: Default::default(),
             discovery_import_history: Default::default(),
+            database_recovery: Default::default(),
             duckstation_history: Default::default(),
             canonical_organisation_generation: 0,
             canonical_organisation_history: Vec::new(),
@@ -833,6 +836,15 @@ impl App {
     }
     fn load(&mut self, scan: bool) {
         if self.load_job.is_some() {
+            return;
+        }
+        // A database rollback or reconciliation holds the catalogue's
+        // exclusion; a load or scan would only be refused by its locks.
+        if self.database_recovery.working() {
+            self.notice = Some(Notice {
+                message: "A database recovery action is running. Load or scan again when it has finished; nothing was started.".into(),
+                technical: "Refused: History's database restore/rollback worker holds the catalogue.".into(),
+            });
             return;
         }
         // Database status's upgrade scan writes the same catalogue.

@@ -814,6 +814,68 @@ fn gamer_action_launches_the_exact_ready_retroarch_request() {
     ));
 }
 
+fn psx_chd_candidate(core: &str, preference: CandidatePreference, warned: bool) -> LaunchCandidate {
+    let mut candidate = ready_candidate();
+    candidate.target = LaunchTarget::RetroArchCore {
+        profile: retroarch_profile(),
+        core_stem: core.to_string(),
+        platform_id: "PSX",
+    };
+    candidate.content = resolved_content("/library/Game.chd");
+    candidate.preference = preference;
+    if warned {
+        candidate.readiness = LaunchReadiness::ReadyWithWarnings;
+        candidate
+            .warnings
+            .push(archivefs_core::launch::LaunchWarning::new(
+                archivefs_core::launch::LaunchWarningKind::RetroArchChdSupportUnconfirmed,
+                "CHD unconfirmed",
+            ));
+    }
+    candidate
+}
+
+#[test]
+fn gamer_action_launches_swanstation_for_psx_chd() {
+    let plan = plan_with(vec![
+        psx_chd_candidate("mednafen_psx", CandidatePreference::Undetermined, true),
+        psx_chd_candidate("swanstation", CandidatePreference::SoleEligible, false),
+    ]);
+    let action = gamer_play_action(&plan_input(plan));
+    assert!(matches!(
+        action,
+        GamerPlayAction::Launch(request)
+            if matches!(
+                request.as_ref(),
+                TypedLaunchRequest::RetroArch(request, _) if request.core_stem == "swanstation"
+            )
+    ));
+}
+
+#[test]
+fn explicit_launch_of_an_unpreferred_swanstation_still_yields_a_request() {
+    let plan = plan_with(vec![psx_chd_candidate(
+        "swanstation",
+        CandidatePreference::Undetermined,
+        false,
+    )]);
+    assert!(retroarch_launch_request(&plan, &plan.candidates[0], None).is_some());
+}
+
+#[test]
+fn only_an_unconfirmed_beetle_core_explains_why_play_is_missing() {
+    let plan = plan_with(vec![psx_chd_candidate(
+        "mednafen_psx",
+        CandidatePreference::SoleEligible,
+        true,
+    )]);
+    let GamerPlayAction::BlockedTyped(blocker) = gamer_play_action(&plan_input(plan)) else {
+        panic!("a CHD-unconfirmed core must not be offered as Play");
+    };
+    assert_eq!(blocker.kind, GamerBlockerKind::NoSafeEmulator);
+    assert!(blocker.detail.contains("SwanStation") && blocker.detail.contains("DuckStation"));
+}
+
 #[test]
 fn gamer_action_can_launch_pcsx2_without_retroarch_discovery() {
     let ready = build_ready_pcsx2_fixture("gamer-pcsx2");
