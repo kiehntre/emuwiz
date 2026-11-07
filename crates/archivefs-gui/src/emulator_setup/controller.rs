@@ -21,7 +21,7 @@ impl ArchiveFsApp {
         path: &Path,
     ) -> Option<archivefs_core::launch::LaunchContentRef> {
         let (row_path, kind) = self.catalogued_loose_content.as_ref()?;
-        if row_path != path || !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()) {
+        if row_path != path || !super::catalogued_content_shape_ok(*kind, path) {
             return None;
         }
         archivefs_core::launch::launch_content_ref_for_unmounted(*kind, path)

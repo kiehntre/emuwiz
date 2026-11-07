@@ -141,7 +141,11 @@ impl BiosProjectionPageState {
                         {
                             ui.label(format!(
                                 "Target state: {}",
-                                target_state_label(bound_requirement.target.current_state)
+                                target_state_text(
+                                    bound_requirement.target.current_state,
+                                    bound_requirement.target.path.as_deref(),
+                                    bound_plan.actions.get(index),
+                                )
                             ));
                         }
                         if let Some(BiosProjectionAction::KeepWritableLocal { .. }) =
@@ -482,6 +486,27 @@ fn match_label(status: bios_projection::BiosMatchStatus) -> &'static str {
         bios_projection::BiosMatchStatus::Missing => "missing",
         bios_projection::BiosMatchStatus::Unknown => "unknown",
     }
+}
+
+/// Presentation only. A link whose recorded destination equals the intended
+/// source but which does not currently resolve (typically an unmounted drive)
+/// is described as such instead of as a "different link"; it is still a
+/// conflict that projection never overwrites automatically.
+fn target_state_text(
+    state: bios_projection::BiosTargetState,
+    target: Option<&std::path::Path>,
+    action: Option<&BiosProjectionAction>,
+) -> String {
+    if state == bios_projection::BiosTargetState::ExistingWrongLink
+        && let (Some(target), Some(BiosProjectionAction::CreateFileLink { source, .. })) =
+            (target, action)
+        && std::fs::read_link(target).is_ok_and(|actual| actual.ends_with(source))
+    {
+        return "link points to the right place but the target is not reachable \
+                (is the drive mounted?)"
+            .to_string();
+    }
+    target_state_label(state).to_string()
 }
 
 fn target_state_label(state: bios_projection::BiosTargetState) -> &'static str {

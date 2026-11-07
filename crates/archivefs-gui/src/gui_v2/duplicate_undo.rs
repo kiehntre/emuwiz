@@ -98,7 +98,13 @@ fn same_receipt(a: &DuplicateRepairRecord, b: &DuplicateRepairRecord) -> bool {
 
 impl App {
     pub(super) fn undo_history_entry(&mut self, transaction_id: &str) {
+        // Every refusal is said out loud: a confirmed Undo that silently did
+        // nothing read as "done" (Night Watch II B-06).
         if self.undo_job.is_some() {
+            self.history_view.notice = Some(
+                "Another Undo is still running. Nothing was started; try again when it has finished."
+                    .into(),
+            );
             return;
         }
         let mut records = self
@@ -106,11 +112,20 @@ impl App {
             .iter()
             .filter(|record| record.transaction.transaction_id == transaction_id);
         let Some(record) = records.next().cloned() else {
+            self.history_view.notice = Some(
+                "This receipt is no longer loaded, so nothing was undone. Reload History and try again."
+                    .into(),
+            );
             return;
         };
         if records.next().is_some() {
+            self.history_view.notice = Some(
+                "Two loaded receipts share this id, so EmuWiz cannot tell which to undo. Nothing was changed."
+                    .into(),
+            );
             return;
         }
+        self.history_view.notice = None;
         self.undo_generation = self.undo_generation.wrapping_add(1);
         let generation = self.undo_generation;
         let id = self.activity.queue(
@@ -183,6 +198,8 @@ impl App {
             return;
         }
         self.undo_job = None;
+        // The refusal that pointed at this Undo no longer applies.
+        self.history_view.notice = None;
         if result.outcome.is_err() && result.record.transaction.is_fully_rolled_back() {
             // Readback cannot acknowledge a failed write/sync. This is only the
             // displayed recovery snapshot: retain the actual journal unchanged

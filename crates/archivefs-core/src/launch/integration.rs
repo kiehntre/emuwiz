@@ -966,11 +966,13 @@ mod tests {
         ConfigFileFinding, ConfigReadOutcome, CoreFinding, CoreInfoFinding, DirectoryProbeFinding,
         Evidence, ProfileKind, ProfileScope, RetroArchPlaylistInventory, RetroArchProfile,
     };
+    use crate::emulator_environment::retroarch::{FirmwarePresence, FirmwareRequirement};
     use crate::emulator_environment::{EncodedPath, FsProbe};
+    use crate::launch::planning::{CandidatePreference, LaunchCandidate, RememberedPreference};
     use crate::launch::planning::{
         LaunchContainerKind, LaunchContentKind, LaunchTarget, ResolvedIdentity,
     };
-    use crate::launch::readiness::{LaunchBlockerKind, LaunchReadiness};
+    use crate::launch::readiness::{LaunchBlockerKind, LaunchReadiness, LaunchWarningKind};
     use crate::patch_manager::{
         DuckStationInstallationType, Pcsx2InstallationType, Pcsx2ProfileScope,
         PpssppInstallationType, PpssppProfileScope, XeniaInstallationType, XeniaProfileScope,
@@ -3316,6 +3318,338 @@ mod tests {
         assert_eq!(
             mame.content.resolved_path,
             Some(PathBuf::from("/mnt/arcade/19xx"))
+        );
+    }
+
+    #[test]
+    fn blocked_hinted_retroarch_core_never_holds_the_preference() {
+        let identity = resolved("Arcade", "19xx");
+        let mame = StandaloneProfileInput {
+            adapter_id: "mame",
+            profile_id: "mame".to_string(),
+            profile_path: Some(PathBuf::from("/usr/bin/mame")),
+            eligible: true,
+            firmware: FirmwareReadiness::NotRequired,
+        };
+        let launch_plan = build_launch_plan(
+            &identity,
+            &extracted_arcade_set_content(),
+            &[mame],
+            &retroarch_with_fbneo_core(),
+            &[],
+        );
+        for candidate in &launch_plan.candidates {
+            match candidate.target {
+                LaunchTarget::RetroArchCore { .. } => assert_eq!(
+                    candidate.preference,
+                    CandidatePreference::Undetermined,
+                    "a blocked core must not hold the preference"
+                ),
+                _ => assert_eq!(candidate.preference, CandidatePreference::SoleEligible),
+            }
+        }
+    }
+
+    fn psx_duckstation_input() -> StandaloneProfileInput {
+        StandaloneProfileInput {
+            adapter_id: "duckstation",
+            profile_id: "duckstation".to_string(),
+            profile_path: Some(PathBuf::from("/usr/bin/duckstation")),
+            eligible: true,
+            firmware: FirmwareReadiness::NotRequired,
+        }
+    }
+
+    fn preference_of(plan: &LaunchPlan, retroarch: bool) -> Vec<CandidatePreference> {
+        plan.candidates
+            .iter()
+            .filter(|c| matches!(c.target, LaunchTarget::RetroArchCore { .. }) == retroarch)
+            .map(|c| c.preference)
+            .collect()
+    }
+
+    #[test]
+    fn psx_chd_prefers_a_ready_duckstation_over_the_unconfirmed_retroarch_core() {
+        let identity = resolved("PSX", "SLUS-12345");
+        let plan = build_launch_plan(
+            &identity,
+            &resolved_content(),
+            &[psx_duckstation_input()],
+            &retroarch_with_psx_core(),
+            &[],
+        );
+        let core = plan
+            .candidates
+            .iter()
+            .find(|c| matches!(c.target, LaunchTarget::RetroArchCore { .. }))
+            .expect("retroarch psx candidate");
+        assert!(
+            core.warnings
+                .iter()
+                .any(|w| w.kind == LaunchWarningKind::RetroArchChdSupportUnconfirmed)
+        );
+        assert_eq!(core.readiness, LaunchReadiness::ReadyWithWarnings);
+        assert_eq!(
+            preference_of(&plan, false),
+            [CandidatePreference::SoleEligible]
+        );
+        assert_eq!(
+            preference_of(&plan, true),
+            [CandidatePreference::Undetermined]
+        );
+    }
+
+    #[test]
+    fn psx_chd_through_retroarch_alone_is_still_offered_but_flagged_unconfirmed() {
+        let identity = resolved("PSX", "SLUS-12345");
+        let plan = build_launch_plan(
+            &identity,
+            &resolved_content(),
+            &[],
+            &retroarch_with_psx_core(),
+            &[],
+        );
+        let core = &plan.candidates[0];
+        assert!(matches!(core.target, LaunchTarget::RetroArchCore { .. }));
+        assert!(core.blockers.is_empty());
+        assert_eq!(core.readiness, LaunchReadiness::ReadyWithWarnings);
+        assert_eq!(core.preference, CandidatePreference::SoleEligible);
+    }
+
+    #[test]
+    fn psx_chd_without_duckstation_prefers_swanstation_over_beetle() {
+        let identity = resolved("PSX", "SLUS-12345");
+        let mut report = retroarch_with_psx_core();
+        let mut swan = report.profiles[0].cores[0].clone();
+        swan.core_stem = "swanstation".to_string();
+        swan.full_path =
+            EncodedPath::from_path(&PathBuf::from("/retroarch/cores/swanstation_libretro.so"));
+        report.profiles[0].cores.push(swan);
+        let plan = build_launch_plan(&identity, &resolved_content(), &[], &report, &[]);
+        for candidate in &plan.candidates {
+            let LaunchTarget::RetroArchCore { core_stem, .. } = &candidate.target else {
+                panic!("only retroarch candidates expected");
+            };
+            let expected = if core_stem == "swanstation" {
+                CandidatePreference::SoleEligible
+            } else {
+                CandidatePreference::Undetermined
+            };
+            assert_eq!(candidate.preference, expected, "{core_stem}");
+        }
+    }
+
+    #[test]
+    fn psx_chd_orders_swanstation_then_duckstation_then_beetle() {
+        let identity = resolved("PSX", "SLUS-12345");
+        let mut report = retroarch_with_psx_core();
+        let mut swan = report.profiles[0].cores[0].clone();
+        swan.core_stem = "swanstation".to_string();
+        report.profiles[0].cores.push(swan);
+        let plan = build_launch_plan(
+            &identity,
+            &resolved_content(),
+            &[psx_duckstation_input()],
+            &report,
+            &[],
+        );
+        for candidate in &plan.candidates {
+            let name = match &candidate.target {
+                LaunchTarget::RetroArchCore { core_stem, .. } => core_stem.as_str(),
+                _ => "duckstation",
+            };
+            let expected = if name == "swanstation" {
+                CandidatePreference::SoleEligible
+            } else {
+                CandidatePreference::Undetermined
+            };
+            assert_eq!(candidate.preference, expected, "{name}");
+        }
+    }
+
+    fn psx_report_with_swanstation(kind: ProfileKind) -> RetroArchEnvironmentReport {
+        let mut report = retroarch_with_psx_core();
+        let mut swan = report.profiles[0].cores[0].clone();
+        swan.core_stem = "swanstation".to_string();
+        report.profiles[0].cores.push(swan);
+        report.profiles[0].profile_kind = kind;
+        report
+    }
+
+    fn find<'a>(plan: &'a LaunchPlan, name: &str) -> &'a LaunchCandidate {
+        plan.candidates
+            .iter()
+            .find(|c| match &c.target {
+                LaunchTarget::RetroArchCore { core_stem, .. } => core_stem == name,
+                LaunchTarget::Standalone { adapter_id, .. } => *adapter_id == name,
+            })
+            .unwrap_or_else(|| panic!("no {name} candidate"))
+    }
+
+    #[test]
+    fn psx_chd_swanstation_is_ready_without_a_warning_and_is_the_sole_choice() {
+        let plan = build_launch_plan(
+            &resolved("PSX", "SLUS-12345"),
+            &resolved_content(),
+            &[psx_duckstation_input()],
+            &psx_report_with_swanstation(ProfileKind::Native),
+            &[],
+        );
+        let swan = find(&plan, "swanstation");
+        assert_eq!(swan.readiness, LaunchReadiness::Ready);
+        assert!(swan.warnings.is_empty() && swan.blockers.is_empty());
+        assert_eq!(swan.preference, CandidatePreference::SoleEligible);
+        let beetle = find(&plan, "mednafen_psx");
+        assert_eq!(beetle.readiness, LaunchReadiness::ReadyWithWarnings);
+        assert_eq!(beetle.preference, CandidatePreference::Undetermined);
+        assert_eq!(
+            find(&plan, "duckstation").preference,
+            CandidatePreference::Undetermined
+        );
+    }
+
+    #[test]
+    fn psx_chd_unlaunchable_flatpak_swanstation_never_hides_a_ready_duckstation() {
+        let plan = build_launch_plan(
+            &resolved("PSX", "SLUS-12345"),
+            &resolved_content(),
+            &[psx_duckstation_input()],
+            &psx_report_with_swanstation(ProfileKind::Flatpak),
+            &[],
+        );
+        let duck = find(&plan, "duckstation");
+        assert_eq!(duck.readiness, LaunchReadiness::Ready);
+        assert_eq!(duck.preference, CandidatePreference::SoleEligible);
+        assert_eq!(
+            find(&plan, "swanstation").preference,
+            CandidatePreference::Undetermined
+        );
+    }
+
+    #[test]
+    fn psx_chd_remembered_duckstation_is_not_changed_by_the_ordering() {
+        let remembered = [RememberedPreference {
+            adapter_id: "duckstation".to_string(),
+            profile_id: "duckstation".to_string(),
+        }];
+        let plan = build_launch_plan(
+            &resolved("PSX", "SLUS-12345"),
+            &resolved_content(),
+            &[psx_duckstation_input()],
+            &psx_report_with_swanstation(ProfileKind::Native),
+            &remembered,
+        );
+        assert_eq!(
+            find(&plan, "duckstation").preference,
+            CandidatePreference::Remembered
+        );
+    }
+
+    #[test]
+    fn non_psx_retroarch_cores_never_get_the_chd_warning() {
+        let mut report = retroarch_with_snes9x_core();
+        report.profiles[0].cores[0].core_stem = "mednafen_psx".to_string();
+        let content = LaunchContentRef {
+            kind: None,
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(PathBuf::from("/library/game.chd")),
+            requires_mount: false,
+            provenance: "loose".to_string(),
+        };
+        let plan = build_launch_plan(&resolved("SNES", "k"), &content, &[], &report, &[]);
+        assert!(plan.candidates.iter().all(|c| c.warnings.is_empty()));
+    }
+
+    #[test]
+    fn psx_cue_disc_through_retroarch_is_not_flagged_for_chd() {
+        let identity = resolved("PSX", "SLUS-12345");
+        let mut content = resolved_content();
+        content.container = Some(LaunchContainerKind::PlainFile);
+        content.resolved_path = Some(PathBuf::from("/library/game.cue"));
+        let plan = build_launch_plan(
+            &identity,
+            &content,
+            &[psx_duckstation_input()],
+            &retroarch_with_psx_core(),
+            &[],
+        );
+        assert!(plan.candidates.iter().all(|c| {
+            !c.warnings
+                .iter()
+                .any(|w| w.kind == LaunchWarningKind::RetroArchChdSupportUnconfirmed)
+        }));
+    }
+
+    #[test]
+    fn atari_8bit_disk_gets_the_installed_atari800_retroarch_core() {
+        let identity = resolved("Atari 8-bit", "A-E");
+        let mut report = retroarch_with_snes9x_core();
+        let core = &mut report.profiles[0].cores[0];
+        core.core_stem = "atari800".to_string();
+        if let CoreInfoFinding::Found {
+            system_name,
+            database,
+            ..
+        } = &mut core.info
+        {
+            *system_name = Some("Atari 8-bit Family".to_string());
+            *database = Some("Atari - 5200|Atari - 8-bit Family".to_string());
+        }
+        let content = LaunchContentRef {
+            kind: None,
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(PathBuf::from("/library/A-E (USA) (Side A).atr")),
+            requires_mount: false,
+            provenance: "loose disk image".to_string(),
+        };
+        let launch_plan = build_launch_plan(&identity, &content, &[], &report, &[]);
+        let candidate = &launch_plan.candidates[0];
+        assert!(
+            matches!(&candidate.target, LaunchTarget::RetroArchCore { core_stem, .. } if core_stem == "atari800"),
+            "{:?}",
+            candidate.target
+        );
+        assert_eq!(candidate.readiness, LaunchReadiness::Ready);
+    }
+
+    #[test]
+    fn atari_8bit_core_with_required_missing_firmware_stays_blocked() {
+        let identity = resolved("Atari 8-bit", "A-E");
+        let mut report = retroarch_with_snes9x_core();
+        let core = &mut report.profiles[0].cores[0];
+        core.core_stem = "atari800".to_string();
+        if let CoreInfoFinding::Found {
+            system_name,
+            firmware,
+            ..
+        } = &mut core.info
+        {
+            *system_name = Some("Atari 8-bit Family".to_string());
+            firmware.push(FirmwareRequirement {
+                index: 0,
+                description: Some("ATARIXL.ROM".to_string()),
+                path: Some("ATARIXL.ROM".to_string()),
+                optional: false,
+                presence: FirmwarePresence::Missing,
+            });
+        }
+        let content = LaunchContentRef {
+            kind: None,
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(PathBuf::from("/library/a.atr")),
+            requires_mount: false,
+            provenance: "loose disk image".to_string(),
+        };
+        let launch_plan = build_launch_plan(&identity, &content, &[], &report, &[]);
+        assert_eq!(
+            launch_plan.candidates[0].readiness,
+            LaunchReadiness::Blocked
+        );
+        assert!(
+            launch_plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|b| b.kind == LaunchBlockerKind::RequiredFirmwareMissing)
         );
     }
 

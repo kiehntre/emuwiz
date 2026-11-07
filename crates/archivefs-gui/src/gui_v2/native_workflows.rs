@@ -2521,6 +2521,15 @@ impl NativeWorkflows {
             return false;
         }
         ui.heading("Cheat activity");
+        if let crate::StartupSharedRecoveryState::Done(recovered) =
+            &self.app.startup_shared_recovery
+            && !recovered.is_empty()
+        {
+            ui.label(format!(
+                "Startup check examined {} install(s) EmuWiz was interrupted in; see the lines below. Undo for a recovered install is in the shared history, never automatic.",
+                recovered.len()
+            ));
+        }
         activity_cards(ui, "cheat-history", entries);
         let undo_available = self.app.cheat_workflow.as_ref().is_some_and(|workflow| {
             matches!(
