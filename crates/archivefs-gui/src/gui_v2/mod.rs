@@ -18,6 +18,7 @@ mod cheat_extras_page;
 pub(crate) mod classic_trainers;
 #[cfg(test)]
 mod dat_exact_tests;
+mod database_recovery;
 mod database_status_page;
 mod detail_identity;
 mod documents;
@@ -459,6 +460,7 @@ pub(super) struct App {
     canonical_organisation_job: Option<CanonicalOrganisationJob>,
     history_view: history_view::HistoryViewState,
     discovery_import_history: history_discovery_import::State,
+    database_recovery: database_recovery::State,
     duckstation_history: history_duckstation::State,
     canonical_organisation_generation: u64,
     canonical_organisation_history:
@@ -595,6 +597,7 @@ impl App {
             canonical_organisation_job: None,
             history_view: Default::default(),
             discovery_import_history: Default::default(),
+            database_recovery: Default::default(),
             duckstation_history: Default::default(),
             canonical_organisation_generation: 0,
             canonical_organisation_history: Vec::new(),
@@ -844,6 +847,15 @@ impl App {
         if self.load_job.is_some() {
             return;
         }
+        // A database rollback or reconciliation holds the catalogue's
+        // exclusion; a load or scan would only be refused by its locks.
+        if self.database_recovery.working() {
+            self.notice = Some(Notice {
+                message: "A database recovery action is running. Load or scan again when it has finished; nothing was started.".into(),
+                technical: "Refused: History's database restore/rollback worker holds the catalogue.".into(),
+            });
+            return;
+        }
         // Database status's upgrade scan writes the same catalogue.
         if scan && self.tools.database.upgrading() {
             self.notice = Some(Notice {
@@ -960,6 +972,17 @@ impl App {
         self.saves_states.single_file.job = Some(id);
         if !self.send(id, Command::SingleFileRestore(Box::new(job))) {
             self.saves_states.single_file.job = None;
+        }
+    }
+    /// Records how a save, card or snapshot step ended. A refused or failed
+    /// step is "Needs attention" in Activity and Home, never a green
+    /// "Finished": the message is what the person was shown inline.
+    fn settle_save_step(&mut self, id: u64, message: String, ok: bool) {
+        if ok {
+            self.activity.finish(id, message, None);
+        } else {
+            self.activity
+                .settle(id, message.clone(), activity::Settled::Failed(message));
         }
     }
     fn start_saves_inventory(&mut self) {
@@ -2029,12 +2052,13 @@ impl App {
                                     );
                                 }
                                 Payload::SingleFileRestore(outcome) => {
-                                    let message = single_file_restore::receive(self, id, *outcome);
-                                    self.activity.finish(id, message, None);
+                                    let (message, ok) =
+                                        single_file_restore::receive(self, id, *outcome);
+                                    self.settle_save_step(id, message, ok);
                                 }
                                 Payload::CardRestore(outcome) => {
-                                    let message = card_restore::receive(self, id, *outcome);
-                                    self.activity.finish(id, message, None);
+                                    let (message, ok) = card_restore::receive(self, id, *outcome);
+                                    self.settle_save_step(id, message, ok);
                                 }
                                 Payload::SaveSnapshotCreated { result } => {
                                     let panel = &mut self.saves_states.snapshots;
@@ -2051,7 +2075,7 @@ impl App {
                                         Err(error) => error.clone(),
                                     };
                                     panel.feedback = Some((result.is_ok(), message.clone()));
-                                    self.activity.finish(id, message, None);
+                                    self.settle_save_step(id, message, result.is_ok());
                                 }
                                 Payload::Library(library) => {
                                     self.library_loaded(id, library);
@@ -2159,6 +2183,9 @@ impl App {
                                 Payload::MissingApplied(result) => self.missing_apply_done(*result),
                                 Payload::MissingUndone(restored) => {
                                     self.missing_undo_done(restored)
+                                }
+                                Payload::MissingReceipts(receipts) => {
+                                    self.missing_receipts_loaded(receipts)
                                 }
                                 Payload::Preferences(preferences) => {
                                     self.restore_preferences(preferences)
@@ -2285,6 +2312,9 @@ impl App {
                             if self.saves_states.card_restore.job == Some(id) {
                                 card_restore::job_failed(self, &error);
                             }
+                            if self.saves_states.single_file.job == Some(id) {
+                                single_file_restore::job_failed(self, &error);
+                            }
                             if self.saves_states.snapshots.create_job == Some(id) {
                                 self.saves_states.snapshots.create_job = None;
                                 self.saves_states.snapshots.loaded_for = None;
@@ -2303,6 +2333,10 @@ impl App {
                             }
                             if self.missing.job == Some(id) {
                                 self.missing_failed(&error);
+                            }
+                            if id == 0 && self.missing.receipts_inflight {
+                                // Untracked jobs share id 0; the flag says ours was out.
+                                self.missing_receipts_failed();
                             }
                             if self.equiv.job == Some(id) {
                                 self.equivalent_failed(&error);

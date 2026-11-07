@@ -121,12 +121,19 @@ pub fn discover_desmume_profiles(roots: &DesmumeProfileDiscoveryRoots) -> Desmum
         .map(|p| (p, DesmumeInstallationType::Explicit))
         .collect();
     if let Some(path_env) = &roots.path_env {
-        paths.extend(env::split_paths(path_env).map(|directory| {
-            (
-                directory.join(NATIVE_EXECUTABLE),
-                DesmumeInstallationType::Native,
-            )
-        }));
+        // Absolute `PATH` entries only: an empty, `.` or relative entry would
+        // make a `desmume` in the working directory a "native installation"
+        // (Night Watch S05-01).
+        paths.extend(
+            crate::external_tools::absolute_path_directories(Some(path_env))
+                .into_iter()
+                .map(|directory| {
+                    (
+                        directory.join(NATIVE_EXECUTABLE),
+                        DesmumeInstallationType::Native,
+                    )
+                }),
+        );
     }
     paths.sort();
     paths.dedup();
@@ -229,5 +236,52 @@ mod tests {
             .profiles[0]
                 .eligible
         );
+    }
+
+    /// A path to `target` that is relative to the process working directory,
+    /// built from `..` components, so a test can hand discovery a *relative*
+    /// `PATH` entry that really does contain the file.
+    #[cfg(unix)]
+    fn relative_from_cwd(target: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.join(target.strip_prefix("/").unwrap())
+    }
+
+    /// Night Watch S05-01: a `desmume` reachable only through a relative,
+    /// `.` or empty `PATH` entry is not a native installation.
+    #[cfg(unix)]
+    #[test]
+    fn relative_and_empty_path_entries_never_yield_a_native_profile() {
+        let dir = tempdir().unwrap();
+        let executable = dir.path().join("desmume");
+        fs::write(&executable, b"x").unwrap();
+        mark_exec(&executable);
+        let relative_dir = relative_from_cwd(dir.path());
+        assert!(
+            relative_dir.join("desmume").is_file(),
+            "the relative entry must really reach the stub for this test to mean anything"
+        );
+        let mut path_env = std::ffi::OsString::new();
+        path_env.push(&relative_dir);
+        path_env.push(":.::");
+        let found = discover_desmume_profiles(&DesmumeProfileDiscoveryRoots {
+            path_env: Some(path_env),
+            ..Default::default()
+        });
+        assert!(
+            found.profiles.is_empty(),
+            "relative PATH entries produced profiles: {:?}",
+            found.profiles
+        );
+        // The same stub through its absolute directory is still found.
+        let found = discover_desmume_profiles(&DesmumeProfileDiscoveryRoots {
+            path_env: Some(dir.path().as_os_str().to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(found.profiles.iter().filter(|p| p.eligible).count(), 1);
     }
 }

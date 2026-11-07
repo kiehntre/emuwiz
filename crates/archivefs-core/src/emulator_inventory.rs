@@ -389,13 +389,19 @@ fn discover_in_path_entries(path_entries: Vec<PathBuf>, probe_versions: bool) ->
         warnings.push(InventoryWarning { message: "PATH is unavailable/empty or exceeds the 64-directory inspection limit; discovery is incomplete.".into() });
     }
     for directory in path_entries.into_iter().take(MAX_PATH_ENTRIES) {
-        if !probe_versions && !directory.is_absolute() {
-            warnings.push(InventoryWarning {
-                message: format!(
-                    "Relative PATH directory was not inspected: {}",
-                    directory.display()
-                ),
-            });
+        // A relative (or empty) `PATH` directory resolves against the working
+        // directory, so it is never inspected and never probed - in either
+        // mode. Read-only mode says so; probe mode has no warning channel for
+        // it and simply skips (Night Watch S05-02).
+        if !directory.is_absolute() {
+            if !probe_versions {
+                warnings.push(InventoryWarning {
+                    message: format!(
+                        "Relative PATH directory was not inspected: {}",
+                        directory.display()
+                    ),
+                });
+            }
             continue;
         }
         for emulator in [
@@ -666,5 +672,48 @@ mod tests {
     #[test]
     fn real_smoke_is_bounded_and_read_only() {
         let _ = discover_installed_emulators();
+    }
+
+    /// Night Watch S05-02: in probe mode a relative `PATH` directory is
+    /// neither inspected nor executed, even when it really contains an
+    /// executable with an emulator's name.
+    #[cfg(unix)]
+    #[test]
+    fn probe_mode_never_inspects_or_runs_a_relative_path_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("SPAWNED");
+        let stub = dir.path().join("mame");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho ran >> '{}'\necho 'MAME v0.264'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        let relative = relative.join(dir.path().strip_prefix("/").unwrap());
+        assert!(relative.join("mame").is_file());
+        let found =
+            discover_in_path_entries(vec![relative, PathBuf::from("."), PathBuf::new()], true);
+        assert!(
+            found.installations.is_empty(),
+            "relative PATH entries produced installations: {:?}",
+            found.installations
+        );
+        assert!(
+            !marker.exists(),
+            "a relative PATH entry's executable was run"
+        );
+        // Through its absolute directory the same stub is inspected and probed.
+        let found = discover_in_path_entries(vec![dir.path().to_path_buf()], true);
+        assert_eq!(found.installations.len(), 1);
+        assert!(marker.exists());
     }
 }

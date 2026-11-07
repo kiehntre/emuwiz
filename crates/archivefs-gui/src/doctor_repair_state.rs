@@ -1,4 +1,4 @@
-use archivefs_core::DatabaseRestorePlan;
+use archivefs_core::{DatabaseRestorePlan, DatabaseRestoreReceipt};
 
 use crate::doctor_repair::DoctorScanState;
 use crate::onboarding::OnboardingState;
@@ -10,6 +10,8 @@ use crate::{DoctorRepairOutcome, DoctorRepairReview, RefreshGeneration};
 /// doctor/repair controllers.
 pub(crate) struct DoctorRepairState {
     pub(crate) database_restore_plan: Option<DatabaseRestorePlan>,
+    /// A completed restore whose rollback inputs passed read-only review.
+    pub(crate) database_rollback_receipt: Option<DatabaseRestoreReceipt>,
     pub(crate) database_restore_confirmation: String,
     pub(crate) database_restore_feedback: Option<String>,
     pub(crate) diagnostics: DiagnosticsState,
@@ -30,6 +32,7 @@ impl Default for DoctorRepairState {
     fn default() -> Self {
         Self {
             database_restore_plan: None,
+            database_rollback_receipt: None,
             database_restore_confirmation: String::new(),
             database_restore_feedback: None,
             diagnostics: DiagnosticsState::Error {
@@ -54,6 +57,7 @@ impl DoctorRepairState {
     pub(crate) fn new(context: eframe::egui::Context, generation: RefreshGeneration) -> Self {
         Self {
             database_restore_plan: None,
+            database_rollback_receipt: None,
             database_restore_confirmation: String::new(),
             database_restore_feedback: None,
             diagnostics: crate::start_diagnostics(context, generation),

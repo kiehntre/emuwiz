@@ -438,3 +438,63 @@ fn a_symlinked_storage_folder_is_never_cleaned() {
     assert!(result.removed.is_empty());
     assert_eq!(fs::read(&precious).unwrap(), b"user's own PSU");
 }
+
+/// Review of NW2-B-03: a recovery pass that could not list, check or resolve
+/// a record is reported as needing attention, not as a finished job; a pass
+/// with nothing in progress is not.
+#[test]
+fn recovery_run_flags_attention_for_unlisted_or_unresolved_records() {
+    let (world, _, _done, _) = restored();
+    let quiet = recovery::recover_run(&world.options.journal_dir, &CLOSED, 5).unwrap();
+    assert!(!quiet.attention, "{:?}", quiet.messages);
+    let garbage = garbage_journal(&world);
+    let run = recovery::recover_run(&world.options.journal_dir, &CLOSED, 6).unwrap();
+    assert!(run.attention, "{:?}", run.messages);
+    assert!(
+        run.messages
+            .iter()
+            .any(|m| m.contains("could not be listed") || m.contains("could not be checked")),
+        "{:?}",
+        run.messages
+    );
+    assert_eq!(fs::read(&garbage).unwrap(), b"not a journal");
+    assert_eq!(
+        recovery::recover(&world.options.journal_dir, &CLOSED, 7).unwrap(),
+        run.messages
+    );
+}
+
+/// Review of #387 condition 1: an interrupted restore whose card is in
+/// neither expected state resolves as NeedsAttention; that Recover pass
+/// settles as a failure ("Needs attention") in Activity, not Finished.
+#[test]
+fn recover_needing_manual_review_settles_as_needs_attention() {
+    let (world, _, done, _) = restored();
+    rewrite_journal(&done.journal_path, |j| {
+        j.phase = Ps2RestorePhase::Publishing
+    });
+    let mut card = world.card_bytes();
+    let last = card.len() - 1;
+    card[last] ^= 0x5a;
+    fs::write(&world.card, &card).unwrap();
+    let run = recovery::recover_run(&world.options.journal_dir, &CLOSED, 5).unwrap();
+    assert!(run.attention, "{:?}", run.messages);
+    assert!(
+        run.messages
+            .iter()
+            .any(|m| m.contains("Needs manual review")),
+        "{:?}",
+        run.messages
+    );
+    assert_eq!(world.card_bytes(), card, "recovery never writes the card");
+    let mut state = crate::gui_v2::card_restore::panel::PanelState::default();
+    let (summary, ok) = crate::gui_v2::card_restore::panel::receive(
+        &mut state,
+        crate::gui_v2::card_restore::panel::PanelOutcome::Records {
+            report: recovery::load_records(&world.options.journal_dir),
+            messages: run.messages.clone(),
+            failed: run.attention,
+        },
+    );
+    assert!(!ok, "settles as Needs attention, not Finished: {summary}");
+}

@@ -53,18 +53,13 @@ const ROLLBACK_CONFIRMATION_PREFIX: &str = "ROLL BACK ";
 impl EmulatorInventoryPageState {
     pub(crate) fn refresh(&mut self) {
         let inventory = emulator_inventory::discover_installed_emulators();
-        let mut remembered = match remembered_installation_roots() {
+        let remembered = match discovery_roots() {
             Ok(roots) => roots,
             Err(e) => {
                 self.error = Some(format!("Update recovery discovery needs review: {e}"));
                 return;
             }
         };
-        remembered.extend(std::env::var_os("PATH").into_iter().flat_map(|p| {
-            std::env::split_paths(&p)
-                .take(emulator_inventory::MAX_PATH_ENTRIES)
-                .collect::<Vec<_>>()
-        }));
         self.refresh_with_inventory(inventory, remembered);
     }
 
@@ -836,6 +831,18 @@ mod tests {
         );
     }
     include!("emulator_inventory_page/recovery_tests.rs");
+}
+
+/// Where update records are looked for besides discovered installations:
+/// the remembered installation roots and the bounded PATH entries.
+fn discovery_roots() -> Result<Vec<std::path::PathBuf>, String> {
+    let mut remembered = remembered_installation_roots().map_err(|e| e.to_string())?;
+    remembered.extend(std::env::var_os("PATH").into_iter().flat_map(|p| {
+        std::env::split_paths(&p)
+            .take(emulator_inventory::MAX_PATH_ENTRIES)
+            .collect::<Vec<_>>()
+    }));
+    Ok(remembered)
 }
 
 fn discover_records(

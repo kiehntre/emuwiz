@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "tests/database_recovery.rs"]
+mod database_recovery;
 #[path = "tests/first_start_preferences.rs"]
 mod first_start_preferences;
 #[path = "tests/visual_polish.rs"]
@@ -133,6 +135,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         canonical_organisation_job: None,
         history_view: Default::default(),
         discovery_import_history: Default::default(),
+        database_recovery: Default::default(),
         duckstation_history: Default::default(),
         canonical_organisation_generation: 0,
         canonical_organisation_history: Vec::new(),
