@@ -4496,11 +4496,13 @@ pub(crate) fn standalone_status_allows_request(candidate: &LaunchCandidate) -> b
             adapter_id: "mame",
             ..
         }
-    ) && candidate.readiness == LaunchReadiness::ReadyWithWarnings
-        && candidate
-            .warnings
-            .iter()
-            .all(|warning| warning.kind == LaunchWarningKind::MameMachineFlagged)
+    ) && matches!(
+        candidate.readiness,
+        LaunchReadiness::Ready | LaunchReadiness::ReadyWithWarnings
+    ) && candidate
+        .warnings
+        .iter()
+        .all(|warning| warning.kind == LaunchWarningKind::MameMachineFlagged)
 }
 
 fn standalone_launch_request(

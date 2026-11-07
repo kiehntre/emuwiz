@@ -3972,6 +3972,11 @@ fn mame_driver_flags_do_not_withdraw_play_but_other_warnings_still_do() {
         vec![flag.clone()],
         LaunchReadiness::ReadyWithWarnings
     )));
+    // The same flag on a candidate the planner labelled plain Ready.
+    assert!(standalone_status_allows_request(&mame(
+        vec![flag.clone()],
+        LaunchReadiness::Ready
+    )));
     // Clean Ready still works.
     assert!(standalone_status_allows_request(&mame(
         vec![],
