@@ -762,6 +762,11 @@ fn open_regular_file_nonblocking_refuses_fifos_and_respects_follow() {
 #[test]
 fn the_walk_passes_through_search_only_directories() {
     use std::os::unix::fs::PermissionsExt;
+    // Root ignores permission bits, which would make this test vacuous.
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
     let fixture = Fixture::new("walk-search-only");
     let game = fixture.file("library/sub/game.bin", b"rom");
     let sub = fixture.path("library/sub");
@@ -798,25 +803,34 @@ fn the_walk_raises_no_directory_open_event_on_parents() {
         unsafe { libc::inotify_add_watch(inotify.as_raw_fd(), path.as_ptr(), libc::IN_OPEN) };
     assert!(watch >= 0);
     drop(open_bounded_read(&game, &TrustedRoots::none()).unwrap());
-    let mut buffer = [0u8; 4096];
-    // SAFETY: reading into a local buffer from a non-blocking inotify fd.
-    let count = unsafe {
-        libc::read(
-            inotify.as_raw_fd(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-        )
-    };
+    // `u64` storage keeps the buffer aligned for `inotify_event` records.
+    let mut storage = [0u64; 512];
+    let buffer = storage.as_mut_ptr().cast::<u8>();
+    let capacity = std::mem::size_of_val(&storage);
+    // SAFETY: reading into a local, correctly sized buffer from a non-blocking inotify fd.
+    let count = unsafe { libc::read(inotify.as_raw_fd(), buffer.cast(), capacity) };
+    assert!(
+        count > 0,
+        "the watch must have seen the leaf file being opened (otherwise this test proves nothing)"
+    );
     let mut directory_open_events = 0;
+    let mut file_open_events = 0;
     let mut offset = 0usize;
-    while count > 0 && offset < count as usize {
-        // SAFETY: the kernel wrote whole `inotify_event` records into `buffer`.
-        let event = unsafe { &*(buffer.as_ptr().add(offset).cast::<libc::inotify_event>()) };
+    while offset < count as usize {
+        // SAFETY: the kernel wrote whole `inotify_event` records into the
+        // aligned buffer; `offset` always lands on a record boundary.
+        let event = unsafe { &*buffer.add(offset).cast::<libc::inotify_event>() };
         if event.mask & libc::IN_ISDIR != 0 {
             directory_open_events += 1;
+        } else {
+            file_open_events += 1;
         }
         offset += std::mem::size_of::<libc::inotify_event>() + event.len as usize;
     }
+    assert!(
+        file_open_events > 0,
+        "the leaf's own open event must be observed"
+    );
     assert_eq!(
         directory_open_events, 0,
         "the walk opened a parent directory"
