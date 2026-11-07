@@ -334,3 +334,97 @@ pub fn headerless_algorithm_label(algorithm: &str) -> &'static str {
         _ => "hash after header removal",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ines(prg: u8, chr: u8, flags6: u8, flags7: u8) -> Vec<u8> {
+        let mut header = vec![0_u8; 16];
+        header[..4].copy_from_slice(b"NES\x1a");
+        header[4] = prg;
+        header[5] = chr;
+        header[6] = flags6;
+        header[7] = flags7;
+        header
+    }
+
+    const INES: HeaderNormalizationKind = HeaderNormalizationKind::INes16;
+
+    #[test]
+    fn ines_trainer_flag_adds_512_bytes_to_the_declared_payload() {
+        let header = ines(1, 1, 0b100, 0);
+        let declared = 16 * 1024 + 8 * 1024 + 512;
+        assert_eq!(validate_header(&header, declared, INES), Ok(()));
+        // Flag set but the trainer is absent: refused, not guessed at.
+        assert_eq!(
+            validate_header(&header, declared - 512, INES),
+            Err(HeaderRejection::LengthMismatch {
+                declared,
+                actual: declared - 512
+            })
+        );
+        // No flag but a trainer-sized surplus: refused as well.
+        assert!(matches!(
+            validate_header(&ines(1, 1, 0, 0), declared, INES),
+            Err(HeaderRejection::LengthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn nes2_headers_are_refused_even_when_the_length_would_fit() {
+        let header = ines(1, 0, 0, 0b0000_1000);
+        assert_eq!(
+            validate_header(&header, 16 * 1024, INES),
+            Err(HeaderRejection::UnsupportedRevision)
+        );
+    }
+
+    #[test]
+    fn lynx_declared_size_sums_both_banks() {
+        let kind = HeaderNormalizationKind::Lynx64;
+        let mut header = vec![0_u8; 64];
+        header[..4].copy_from_slice(b"LYNX");
+        header[4..6].copy_from_slice(&256_u16.to_le_bytes());
+        header[6..8].copy_from_slice(&128_u16.to_le_bytes());
+        let declared = (256 + 128) * 256;
+        assert_eq!(validate_header(&header, declared, kind), Ok(()));
+        assert!(matches!(
+            validate_header(&header, 256 * 256, kind),
+            Err(HeaderRejection::LengthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn atari_7800_declared_size_must_equal_the_payload() {
+        let kind = HeaderNormalizationKind::Atari7800_128;
+        let mut header = vec![0_u8; 128];
+        header[1..10].copy_from_slice(b"ATARI7800");
+        header[49..53].copy_from_slice(&(32 * 1024_u32).to_be_bytes());
+        assert_eq!(validate_header(&header, 32 * 1024, kind), Ok(()));
+        assert!(matches!(
+            validate_header(&header, 32 * 1024 + 1, kind),
+            Err(HeaderRejection::LengthMismatch { .. })
+        ));
+        header[49..53].copy_from_slice(&0_u32.to_be_bytes());
+        assert_eq!(
+            validate_header(&header, 0, kind),
+            Err(HeaderRejection::Malformed)
+        );
+    }
+
+    #[test]
+    fn only_the_three_platforms_have_a_header_kind() {
+        assert_eq!(header_kind_for_platform("NES"), Some(INES));
+        assert_eq!(
+            header_kind_for_platform("Atari Lynx"),
+            Some(HeaderNormalizationKind::Lynx64)
+        );
+        assert_eq!(
+            header_kind_for_platform("Atari7800"),
+            Some(HeaderNormalizationKind::Atari7800_128)
+        );
+        assert_eq!(header_kind_for_platform("Game Boy"), None);
+        assert_eq!(header_kind_for_platform("not a platform"), None);
+    }
+}

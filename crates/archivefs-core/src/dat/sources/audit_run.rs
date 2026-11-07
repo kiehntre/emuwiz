@@ -1329,6 +1329,9 @@ pub fn run_combined_dat_audit_with_targets(
         trusted,
         cancel,
     );
+    if cancelled(cancel) {
+        return Err(DatAuditError::Cancelled);
+    }
     // An exact whole-package LHA match is meaningful only after the bounded
     // LHA reader has confirmed that the package is structurally safe.  Keep
     // this set narrow: an unmatched LHA does not trigger a costly member walk
@@ -4798,6 +4801,114 @@ game (
         )
         .unwrap();
         assert!(plan.proposals.is_empty(), "never a rename proposal");
+    }
+
+    #[test]
+    fn s03_05_a_trainer_header_matches_after_removal() {
+        let mut header = vec![0_u8; 16];
+        header[..4].copy_from_slice(b"NES\x1a");
+        header[4] = 1;
+        header[6] = 0b100;
+        let body = payload(512 + 16 * 1024, 11);
+        let full = [header, body.clone()].concat();
+        let (outcome, _, _tree) = header_case(
+            "game.nes",
+            &full,
+            &[("Game (USA)", "Game (USA).nes", &body)],
+            Some("NES"),
+        );
+        assert!(matches!(
+            only_verdict(&outcome),
+            AuditVerdict::Exact {
+                algorithm: "SHA-1 after header removal",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn s03_05_a_7800_header_with_a_wrong_declared_size_is_rejected() {
+        let (mut a78, body) = a7800_file(32 * 1024);
+        a78[49..53].copy_from_slice(&(32 * 1024 - 1_u32).to_be_bytes());
+        let (outcome, _, _tree) = header_case(
+            "cart.a78",
+            &a78,
+            &[("Cart (USA)", "Cart (USA).a78", &body)],
+            Some("Atari7800"),
+        );
+        assert_eq!(only_verdict(&outcome), &AuditVerdict::NotInDat);
+    }
+
+    #[test]
+    fn s03_05_a_header_matched_proposal_is_refused_once_the_file_changes() {
+        let (full, body) = nes_file(1, 0, 16 * 1024);
+        let (outcome, path, _tree) = header_case(
+            "game.nes",
+            &full,
+            &[("Game (USA)", "Game (USA).nes", &body)],
+            Some("NES"),
+        );
+        let plan = crate::dat::rename_plan::build_rename_plan(
+            &outcome,
+            &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(plan.proposals.len(), 1);
+        // Change the headered file after the audit, keeping the header intact.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut changed = full.clone();
+        *changed.last_mut().unwrap() ^= 0xFF;
+        std::fs::write(&path, &changed).unwrap();
+        let approved: std::collections::BTreeSet<String> =
+            [path.to_string_lossy().into_owned()].into_iter().collect();
+        let error = crate::dat::rename_apply::build_transaction(&plan, &approved, 1).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::dat::rename_apply::ApplyError::SourceChangedSinceAudit(ref changed)
+                    if changed.len() == 1
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            changed,
+            "nothing was renamed"
+        );
+    }
+
+    #[test]
+    fn s03_05_a_baddump_in_one_catalogue_makes_the_headerless_match_ambiguous() {
+        let (full, body) = nes_file(1, 0, 16 * 1024);
+        let tree = tempfile::tempdir().unwrap();
+        let games = tree.path().join("games");
+        std::fs::create_dir(&games).unwrap();
+        std::fs::write(games.join("game.nes"), &full).unwrap();
+        let good = tree.path().join("good.dat");
+        let bad = tree.path().join("bad.dat");
+        std::fs::write(
+            &good,
+            headerless_dat(&[("Game (USA)", "Game (USA).nes", &body)]),
+        )
+        .unwrap();
+        std::fs::write(
+            &bad,
+            headerless_dat(&[("Game (USA)", "Game (USA).nes", &body)])
+                .replace("<rom ", r#"<rom status="baddump" "#),
+        )
+        .unwrap();
+        let mut one = source(good, "one");
+        one.platform = Some("NES".to_string());
+        let mut two = source(bad, "two");
+        two.platform = Some("NES".to_string());
+        let outcome = run(vec![one, two], games);
+        assert!(
+            matches!(only_verdict(&outcome), AuditVerdict::Ambiguous { detail }
+                if detail.starts_with("after header removal")),
+            "{:?}",
+            only_verdict(&outcome)
+        );
     }
 
     #[test]
