@@ -194,10 +194,14 @@ fn source_availability_detail(source: &SourceFolderView) -> String {
 /// source with years of scan history never reads as never scanned.
 const SCAN_HISTORY_NOT_LOADED: &str = "Saved scan history not loaded yet";
 
-/// A catalogue record (an id, a status or a scan time) proves the history was
-/// read; a bare configured path has none of them.
-fn scan_history_loaded(source: &SourceFolderView) -> bool {
-    source.id.is_some() || source.last_scan_status.is_some() || source.last_scan_at.is_some()
+/// The history is known when the library snapshot loaded (a configured source
+/// with no row then truly has never been scanned) or when the record itself
+/// carries history. Only a bare configured path with no snapshot is unknown.
+fn scan_history_loaded(source: &SourceFolderView, catalogue_available: bool) -> bool {
+    catalogue_available
+        || source.id.is_some()
+        || source.last_scan_status.is_some()
+        || source.last_scan_at.is_some()
 }
 
 fn source_scan_label(status: Option<SourceScanStatus>) -> &'static str {
@@ -1687,7 +1691,14 @@ impl NativeWorkflows {
             ui.vertical(|ui| {
                 for source in &source_state.sources {
                     ui.push_id(&source.path, |ui| {
-                        self.show_native_source_card(ui, source, &archives, busy, &mut action);
+                        self.show_native_source_card(
+                            ui,
+                            source,
+                            &archives,
+                            busy,
+                            source_state.catalogue_available,
+                            &mut action,
+                        );
                     });
                 }
             });
@@ -1702,6 +1713,7 @@ impl NativeWorkflows {
         source: &SourceFolderView,
         archives: &[archivefs_core::PersistedArchive],
         busy: bool,
+        catalogue_available: bool,
         action: &mut Option<crate::SourceAction>,
     ) {
         crate::ui::components::card(ui, |ui| {
@@ -1739,7 +1751,7 @@ impl NativeWorkflows {
                     ui.label(source_availability_detail(source));
                     ui.end_row();
                     ui.weak("Last scan");
-                    let history_loaded = scan_history_loaded(source);
+                    let history_loaded = scan_history_loaded(source, catalogue_available);
                     ui.label(source.last_scan_at.as_deref().unwrap_or(if history_loaded {
                         "Not scanned yet"
                     } else {
@@ -3903,13 +3915,15 @@ mod source_presentation_tests {
         )
         .sources
         .remove(0);
-        assert!(!scan_history_loaded(&bare));
+        assert!(!scan_history_loaded(&bare, false));
+        // Once the snapshot has loaded, a source with no row is truly unscanned.
+        assert!(scan_history_loaded(&bare, true));
         let mut recorded = bare.clone();
         recorded.id = Some(22);
-        assert!(scan_history_loaded(&recorded));
+        assert!(scan_history_loaded(&recorded, false));
         let mut scanned = bare;
         scanned.last_scan_at = Some("2026-10-04T23:34:54Z".into());
-        assert!(scan_history_loaded(&scanned));
+        assert!(scan_history_loaded(&scanned, false));
         assert_eq!(
             source_scan_label(Some(SourceScanStatus::Success)),
             "Completed"

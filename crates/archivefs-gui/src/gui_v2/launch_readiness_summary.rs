@@ -1049,7 +1049,7 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
 
 /// Shown while the Library's check has not reached a current answer.
 pub(crate) const PLAY_RUNS_THE_CHECK: &str =
-    "Getting ready. Play starts the game as soon as the quick launch check passes.";
+    "Play checks that this game can start, then starts it. Nothing starts unless the check passes.";
 
 /// The Library's selected-game readiness, before it is drawn.
 #[derive(Clone, Debug, Eq, PartialEq)]

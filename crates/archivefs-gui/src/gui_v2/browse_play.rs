@@ -312,7 +312,7 @@ fn readiness_sentence(game: &Game) -> &'static str {
     } else if game.identified {
         "Play starts this game when it is ready."
     } else if game.platform != super::library::UNKNOWN_PLATFORM {
-        "Play checks whether this game can start. Catalogue (DAT) verification is optional."
+        "Play checks that this game can start, then starts it. Catalogue (DAT) verification is optional."
     } else {
         "More platform evidence is needed. Assign the platform or review the source folder."
     }
@@ -906,7 +906,7 @@ impl App {
                     .width(190.0)
                     // Tall enough for the whole list but never taller than the
                     // window, so the menu is not cut off on short screens.
-                    .height((ui.ctx().screen_rect().height() * 0.75).clamp(240.0, 720.0))
+                    .height((ui.ctx().screen_rect().height() * 0.75).clamp(160.0, 720.0))
                     .show_ui(ui, |ui| {
                         for (name, count) in rest {
                             if ui
