@@ -321,6 +321,13 @@ impl App {
         self.simple.sync_style(context);
         // Database status's upgrade may finish while another page is shown.
         self.tools.database.settle(context);
+        // Blue's folder scan and database upgrade write the catalogue; the
+        // native Sources page must not start its own writer meanwhile. Set
+        // here, on the one path every frame takes (eframe and tests alike).
+        if let Some(workflows) = &mut self.native_workflows {
+            workflows.app.external_catalogue_writer_busy =
+                self.scan_job.is_some() || self.tools.database.upgrading();
+        }
         // Kept until no other load is in flight, so the reload is not lost.
         if self.load_job.is_none() && std::mem::take(&mut self.tools.database.library_changed) {
             self.load(false);
@@ -4151,7 +4158,7 @@ impl App {
             if ui.button("View games").clicked() { self.go(Route::Section(Section::Games)); }
             if section == Section::Sources {
                 ui.label(format!("{} configured game folders are enabled.", self.library.sources));
-                if self.library.sources > 0 && ui.add_enabled(self.load_job.is_none(), egui::Button::new("Scan configured folders…")).clicked() { self.confirm_scan = true; }
+                if self.library.sources > 0 && ui.add_enabled(self.load_job.is_none() && !self.native_catalogue_writer_busy(), egui::Button::new("Scan configured folders…")).clicked() { self.confirm_scan = true; }
                 ui.label("Discovery comes first. You can choose folders manually in the existing workflow if discovery cannot find them.");
             }
             ui.collapsing("Advanced details", |ui| {

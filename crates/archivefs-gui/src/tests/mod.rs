@@ -1200,6 +1200,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         // `~/.config/archivefs/library_views.json` happens to contain.
         library_views: Vec::new(),
         library_view_action: None,
+        external_catalogue_writer_busy: false,
         library_view_last_plan: None,
         library_view_form_dialog: None,
         library_view_remove_dialog: None,

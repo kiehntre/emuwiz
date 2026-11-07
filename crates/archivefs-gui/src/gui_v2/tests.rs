@@ -76,6 +76,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         artwork: Artwork::with_indexer(context.clone(), None, Arc::new(|_| MediaIndex::default())),
         imagery: super::imagery::Imagery::default(),
         load_job: None,
+        scan_job: None,
         artwork_job: None,
         artwork_totals: super::activity::ArtworkTotals::default(),
         index_job: None,
@@ -11930,6 +11931,9 @@ mod blue_single_file_restore;
 mod blue_worker_lane;
 #[path = "tests/repair.rs"]
 mod repair;
+
+#[path = "tests/blue_catalogue_writers.rs"]
+mod blue_catalogue_writers;
 
 #[path = "tests/blue_truth_outcomes.rs"]
 mod blue_truth_outcomes;

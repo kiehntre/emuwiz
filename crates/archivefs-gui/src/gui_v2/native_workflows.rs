@@ -461,6 +461,13 @@ impl NativeWorkflows {
         }
     }
 
+    /// Whether a new Sources-page action may start: the native app's one-writer
+    /// rule, which includes the Blue writer flag (S06-04), so the rebind dialog
+    /// and every other caller are gated by the same answer.
+    pub(super) fn source_action_available(&self) -> bool {
+        self.app.source_action_available()
+    }
+
     pub(super) fn poll(&mut self, context: &egui::Context, activity: &mut Activity) {
         self.scummvm_trainer.poll();
         self.poll_texture_jobs(context);
@@ -1474,7 +1481,7 @@ impl NativeWorkflows {
                 .unwrap_or(&[]),
         );
         let mut health_action = None;
-        let busy = !self.app.source_action_available() || self.collection.preparing();
+        let busy = !self.source_action_available() || self.collection.preparing();
         let mut action = None;
 
         self.poll_remote_source_probes(ui.ctx());
