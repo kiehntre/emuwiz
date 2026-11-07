@@ -189,6 +189,21 @@ fn source_availability_detail(source: &SourceFolderView) -> String {
     }
 }
 
+/// Shown instead of "Not scanned yet" when the saved scan history is simply
+/// not loaded (the library snapshot is still loading or unavailable), so a
+/// source with years of scan history never reads as never scanned.
+const SCAN_HISTORY_NOT_LOADED: &str = "Saved scan history not loaded yet";
+
+/// The history is known when the library snapshot loaded (a configured source
+/// with no row then truly has never been scanned) or when the record itself
+/// carries history. Only a bare configured path with no snapshot is unknown.
+fn scan_history_loaded(source: &SourceFolderView, catalogue_available: bool) -> bool {
+    catalogue_available
+        || source.id.is_some()
+        || source.last_scan_status.is_some()
+        || source.last_scan_at.is_some()
+}
+
 fn source_scan_label(status: Option<SourceScanStatus>) -> &'static str {
     match status {
         None => "Not scanned yet",
@@ -1676,7 +1691,14 @@ impl NativeWorkflows {
             ui.vertical(|ui| {
                 for source in &source_state.sources {
                     ui.push_id(&source.path, |ui| {
-                        self.show_native_source_card(ui, source, &archives, busy, &mut action);
+                        self.show_native_source_card(
+                            ui,
+                            source,
+                            &archives,
+                            busy,
+                            source_state.catalogue_available,
+                            &mut action,
+                        );
                     });
                 }
             });
@@ -1691,6 +1713,7 @@ impl NativeWorkflows {
         source: &SourceFolderView,
         archives: &[archivefs_core::PersistedArchive],
         busy: bool,
+        catalogue_available: bool,
         action: &mut Option<crate::SourceAction>,
     ) {
         crate::ui::components::card(ui, |ui| {
@@ -1728,17 +1751,31 @@ impl NativeWorkflows {
                     ui.label(source_availability_detail(source));
                     ui.end_row();
                     ui.weak("Last scan");
-                    ui.label(source.last_scan_at.as_deref().unwrap_or("Not scanned yet"));
+                    let history_loaded = scan_history_loaded(source, catalogue_available);
+                    ui.label(source.last_scan_at.as_deref().unwrap_or(if history_loaded {
+                        "Not scanned yet"
+                    } else {
+                        SCAN_HISTORY_NOT_LOADED
+                    }));
                     ui.end_row();
                     ui.weak("Scan status");
-                    ui.label(source_scan_label(source.last_scan_status));
+                    ui.label(if history_loaded {
+                        source_scan_label(source.last_scan_status)
+                    } else {
+                        SCAN_HISTORY_NOT_LOADED
+                    });
                     ui.end_row();
                     ui.weak("Game/media count");
-                    ui.label(
-                        source
-                            .last_archive_count
-                            .map_or_else(|| "Not available".into(), |count| count.to_string()),
-                    );
+                    ui.label(source.last_archive_count.map_or_else(
+                        || {
+                            if history_loaded {
+                                "Not available".into()
+                            } else {
+                                SCAN_HISTORY_NOT_LOADED.into()
+                            }
+                        },
+                        |count| count.to_string(),
+                    ));
                     ui.end_row();
                     ui.weak("Remote health");
                     if let Some(result) = self.remote_probe_results.get(&source.path) {
@@ -3870,6 +3907,23 @@ mod source_presentation_tests {
             "Permission denied"
         );
         assert_eq!(source_scan_label(None), "Not scanned yet");
+        // A bare configured path (library snapshot not loaded) is not "never
+        // scanned"; a real record, even with no scan yet, is.
+        let bare = crate::source_state::merge_configured_sources(
+            &[std::path::PathBuf::from("/games")],
+            None,
+        )
+        .sources
+        .remove(0);
+        assert!(!scan_history_loaded(&bare, false));
+        // Once the snapshot has loaded, a source with no row is truly unscanned.
+        assert!(scan_history_loaded(&bare, true));
+        let mut recorded = bare.clone();
+        recorded.id = Some(22);
+        assert!(scan_history_loaded(&recorded, false));
+        let mut scanned = bare;
+        scanned.last_scan_at = Some("2026-10-04T23:34:54Z".into());
+        assert!(scan_history_loaded(&scanned, false));
         assert_eq!(
             source_scan_label(Some(SourceScanStatus::Success)),
             "Completed"

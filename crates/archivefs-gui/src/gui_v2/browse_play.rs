@@ -297,7 +297,7 @@ fn status_text(game: &Game, blue: bool) -> (&'static str, Color32) {
 
 /// Shown under Play in Blue (board `D10-GP-SelectVsPlay`).
 pub(super) const SELECT_VS_PLAY: &str =
-    "Clicking a cover only selects it. Play opens the launch-readiness check first.";
+    "Clicking a cover only selects it. Press Play to start the game when it is ready.";
 /// Preservation-only media has no launch route, so it gets this instead of
 /// a readiness check.
 pub(super) const PRESERVATION_ONLY_SENTENCE: &str = "A recording of a play session, kept for \
@@ -310,9 +310,9 @@ fn readiness_sentence(game: &Game) -> &'static str {
     } else if game.identity_summary() == "Mismatch" {
         "Game identity evidence conflicts. Review it before play."
     } else if game.identified {
-        "Play checks that everything is ready first. Nothing starts until you confirm."
+        "Play starts this game when it is ready."
     } else if game.platform != super::library::UNKNOWN_PLATFORM {
-        "Play checks whether this game can start. Catalogue (DAT) verification is optional."
+        "Play checks that this game can start, then starts it. Catalogue (DAT) verification is optional."
     } else {
         "More platform evidence is needed. Assign the platform or review the source folder."
     }
@@ -904,7 +904,9 @@ impl App {
                     .selected_text(format!("More systems ({})", rest.len()))
                     // A known width lets the wrapping row place it instead of overflowing.
                     .width(190.0)
-                    .height(360.0)
+                    // Tall enough for the whole list but never taller than the
+                    // window, so the menu is not cut off on short screens.
+                    .height((ui.ctx().screen_rect().height() * 0.75).clamp(160.0, 720.0))
                     .show_ui(ui, |ui| {
                         for (name, count) in rest {
                             if ui
@@ -1875,5 +1877,27 @@ mod classic_identity_status_tests {
         exact.mark_dat_exact(Some("DAT"));
         assert_eq!(exact.identity_summary(), "Mismatch");
         assert_eq!(exact.status(), "Identity conflict · review evidence");
+    }
+}
+
+#[cfg(test)]
+mod play_wording_tests {
+    use super::SELECT_VS_PLAY;
+    use crate::gui_v2::launch_readiness_summary::PLAY_RUNS_THE_CHECK;
+
+    /// Play launches directly now; no hint may still promise a detour through
+    /// a readiness page or a confirmation step.
+    #[test]
+    fn play_hints_do_not_describe_the_old_detour() {
+        for text in [
+            SELECT_VS_PLAY,
+            PLAY_RUNS_THE_CHECK,
+            crate::gui_v2::surprise_me::PLAY_NOTE,
+        ] {
+            let lower = text.to_lowercase();
+            assert!(!lower.contains("opens the"), "{text}");
+            assert!(!lower.contains("until you confirm"), "{text}");
+            assert!(!lower.contains("readiness check first"), "{text}");
+        }
     }
 }
