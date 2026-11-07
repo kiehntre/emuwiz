@@ -13,6 +13,8 @@ use super::{
     installation_type_label, rollback_confirmation_phrase, update_artifact,
     update_confirmation_phrase, update_status_label,
 };
+use super::{discover_records, discovery_roots};
+use archivefs_core::emulator_inventory;
 use archivefs_core::emulator_inventory::EmulatorInstallation;
 use archivefs_core::emulator_update::{
     self, HttpsUpdateDownloader, OfficialMetadataProvider, QuiescenceEvidence, UpdateArtifact,
@@ -40,6 +42,12 @@ pub(super) trait UpdateBackend: Send + Sync {
     fn downloader(&self) -> Box<dyn UpdateDownloader + Send>;
     fn apply_quiescence(&self, tracked: bool, executable: &Path) -> QuiescenceEvidence;
     fn journal_quiescence(&self, tracked: bool, journal: &UpdateJournal) -> QuiescenceEvidence;
+    /// Roots to look in for saved update records on first open; `None` uses
+    /// the remembered installation roots and PATH. Tests substitute a
+    /// disposable root.
+    fn record_roots(&self) -> Option<Vec<PathBuf>> {
+        None
+    }
 }
 
 struct LiveBackend;
@@ -126,6 +134,8 @@ pub(super) struct BlueUpdateState {
     /// runs, so a launch started during a long download is still seen.
     tracked: Arc<AtomicBool>,
     backend: Option<Arc<dyn UpdateBackend>>,
+    /// Saved update records have been read once for this page.
+    records_loaded: bool,
 }
 
 /// What the user asked for during one frame; applied after drawing.
@@ -242,6 +252,34 @@ impl EmulatorInventoryPageState {
             }
         }
         false
+    }
+
+    /// Saved update records (an interrupted update needing recovery, and
+    /// Undo) are shown from the first open, without "Check for emulator
+    /// updates": a read-only discovery that contacts no release source and
+    /// runs no emulator. The inventory is left for Check, which probes
+    /// versions.
+    fn ensure_records_loaded(&mut self) {
+        if self.blue.records_loaded {
+            return;
+        }
+        self.blue.records_loaded = true;
+        if self.inventory.is_some() {
+            return;
+        }
+        let roots = match self.backend().record_roots() {
+            Some(roots) => Ok(roots),
+            None => discovery_roots(),
+        };
+        match roots {
+            Ok(roots) => {
+                let inventory = emulator_inventory::discover_installed_emulators_read_only();
+                self.records = discover_records(&inventory, &roots);
+            }
+            Err(e) => {
+                self.error = Some(format!("Update recovery discovery needs review: {e}"));
+            }
+        }
     }
 
     fn start_check(&mut self, ctx: &egui::Context) {
@@ -390,6 +428,7 @@ impl EmulatorInventoryPageState {
     /// the shared state and the background worker.
     pub(crate) fn show_blue(&mut self, ui: &mut egui::Ui, emulator_running: bool) {
         self.set_tracked(emulator_running);
+        self.ensure_records_loaded();
         let busy = self.poll_blue();
         let ctx = ui.ctx().clone();
         let mut intent = None;

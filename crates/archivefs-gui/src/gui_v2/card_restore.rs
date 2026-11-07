@@ -745,7 +745,10 @@ pub(super) fn run(job: Job) -> Outcome {
 }
 
 /// Apply a finished job to the state; returns the activity message.
-pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String {
+/// Settles a finished card job. Returns the message to record and whether the
+/// step succeeded: a refused or failed restore or Undo must reach Activity as
+/// a failure, never as "Finished".
+pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> (String, bool) {
     let generation = app.saves_states.generation;
     let state = &mut app.saves_states.card_restore;
     if state.job == Some(id) {
@@ -762,7 +765,10 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
             } else {
                 state.loaded_for = None;
             }
-            "Memory card snapshots checked. No files were changed.".into()
+            (
+                "Memory card snapshots checked. No files were changed.".into(),
+                true,
+            )
         }
         Outcome::Created { card, result } => {
             state.loaded_for = None;
@@ -773,7 +779,7 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
                 Err(error) => error.clone(),
             };
             state.feedback = Some((card, result.is_ok(), message.clone()));
-            message
+            (message, result.is_ok())
         }
         Outcome::Folders {
             snapshot,
@@ -787,18 +793,21 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
                     location,
                     folders,
                 };
-                "Snapshot card read. Nothing was changed.".into()
+                ("Snapshot card read. Nothing was changed.".into(), true)
             }
             Err(error) => {
                 state.feedback = Some((location.path, false, error.clone()));
-                error
+                (error, false)
             }
         },
         Outcome::Prepared { location, result } => match result {
             Ok(preview) => {
                 state.feedback = None;
                 state.flow = Flow::Confirm { preview, location };
-                "Restore preview ready. Your card has not been changed.".into()
+                (
+                    "Restore preview ready. Your card has not been changed.".into(),
+                    true,
+                )
             }
             Err(error) => {
                 state.feedback = Some((
@@ -806,7 +815,7 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
                     false,
                     format!("{error} Your card was not changed."),
                 ));
-                error
+                (error, false)
             }
         },
         Outcome::Applied { location, result } => {
@@ -824,12 +833,12 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
                         location,
                         undone: false,
                     };
-                    message
+                    (message, true)
                 }
                 Err(error) => {
                     state.flow = Flow::Idle;
                     state.feedback = Some((location.path, false, error.clone()));
-                    error
+                    (error, false)
                 }
             }
         }
@@ -851,7 +860,7 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
                         location,
                         undone: true,
                     };
-                    message
+                    (message, true)
                 }
                 Err(error) => {
                     let message = format!("Undo was not done. {error}");
@@ -861,7 +870,7 @@ pub(super) fn receive(app: &mut super::App, id: u64, outcome: Outcome) -> String
                         location,
                         undone: false,
                     };
-                    message
+                    (message, false)
                 }
             }
         }
