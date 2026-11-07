@@ -2565,8 +2565,11 @@ chmod +x -- "$bin_dir/emuwiz-cli"
 # anything else, so an unreadable bundle binary is refused up front (checked
 # below). To keep exercising "backed up, then the copy fails", a private
 # installer copy makes its own snapshot of emuwiz-cli unreadable just after
-# taking it.
-sed 's|^src_gui="\$release_snapshot/emuwiz"$|&\nchmod 000 -- "$src_cli"|' "$install_sh" >"$work/bundle/install.sh"
+# taking it. The injection sits right after the install intent is written
+# (which fingerprints the snapshot and so needs it readable): a snapshot that
+# is unreadable earlier is refused before anything is touched, which is safe
+# but is not the "backed up, then the copy fails" ordering exercised here.
+sed 's|^write_install_intent "\$intent_cli_digest" "\$intent_gui_digest"$|&\nchmod 000 -- "$src_cli"|' "$install_sh" >"$work/bundle/install.sh"
 grep -q '^chmod 000 -- "\$src_cli"$' "$work/bundle/install.sh" ||
     bad "test setup: could not inject the snapshot failure"
 
