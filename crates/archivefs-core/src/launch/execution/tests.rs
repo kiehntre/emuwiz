@@ -1571,3 +1571,91 @@ fn only_cartridge_platform_zips_count_as_zipped_cartridges() {
     }
     assert!(!zipped(Path::new("/r/g.sfc"), "SNES"));
 }
+
+// ---- NW2-C-01: sort saves/states by content folder ----
+
+/// NW2-C-01: with RetroArch's "sort saves/states by content directory" on,
+/// saves go to <savefile_directory>/<content folder name>/. A staged zipped
+/// cartridge runs from a fresh random `emuwiz-zip-rom-*` folder each launch,
+/// so the save would land somewhere new every time. The staged route must
+/// refuse, as it already does for the *_in_content_dir keys.
+#[test]
+fn nw2_c01_zipped_cartridge_is_refused_when_retroarch_sorts_saves_by_content_folder() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let rom = b"synthetic mega drive rom bytes";
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+    ] {
+        let (ready, _, _) = zipped_ready(&format!("nw2-c01-{key}"), &[("a.md", rom)]);
+        write_zip_test_config(&ready, &format!("{key} = \"true\"\n"));
+        let result = preflight_and_launch_retroarch_with_playlist(
+            &ready.request,
+            &HostReadOnlyFilesystem,
+            &ready.environment,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "{key} = true: the staged launch went ahead, so saves land in a new per-launch folder"
+        );
+    }
+}
+
+/// Runs only the staged-launch safety check against a config with `extra`.
+fn staged_safety_with(label: &str, extra: &str) -> Result<(), String> {
+    let (ready, _, _) = zipped_ready(label, &[("a.md", b"synthetic mega drive rom bytes")]);
+    write_zip_test_config(&ready, extra);
+    staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment)
+}
+
+#[test]
+fn nw2_c01_sort_by_content_keys_accept_only_absent_or_explicit_false() {
+    assert_eq!(staged_safety_with("nw2-c01-absent", ""), Ok(()));
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+    ] {
+        for ok in ["\"false\"", "false", "FALSE", "\"0\"", "0"] {
+            assert_eq!(
+                staged_safety_with("nw2-c01-ok", &format!("{key} = {ok}\n")),
+                Ok(()),
+                "{key} = {ok}"
+            );
+        }
+        for bad in [
+            "\"true\"", "true", "\"1\"", "1", "\"yes\"", "\"\"", "true # x",
+        ] {
+            let error = staged_safety_with("nw2-c01-bad", &format!("{key} = {bad}\n"))
+                .expect_err(&format!("{key} = {bad} must be refused"));
+            assert!(error.contains(key), "{error}");
+            assert!(error.contains("emuwiz-zip-rom-"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn nw2_c01_conflicting_duplicate_sort_by_content_keys_are_refused() {
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+    ] {
+        let error = staged_safety_with(
+            "nw2-c01-dup",
+            &format!("{key} = \"false\"\n{key} = \"true\"\n"),
+        )
+        .expect_err("conflicting duplicates must be refused");
+        assert!(
+            error.contains("more than once") && error.contains(key),
+            "{error}"
+        );
+        // Identical duplicates are not a conflict.
+        assert_eq!(
+            staged_safety_with(
+                "nw2-c01-dup-same",
+                &format!("{key} = \"false\"\n{key} = \"false\"\n")
+            ),
+            Ok(())
+        );
+    }
+}
