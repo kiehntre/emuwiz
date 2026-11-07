@@ -689,7 +689,10 @@ The task's four candidate identity signals, and how this design uses them:
   `library.db.bak-<version>-<timestamp>` sibling first (a plain file copy is safe for
   SQLite when nothing else has the file open, which is guaranteed here since
   EmuWiz is not a daemon).
-- **Recovery from corruption.** `PRAGMA integrity_check` on open. If it fails, the
+- **Recovery from corruption.** *(Historical design note; the shipped code does not run
+  `integrity_check` on open and never renames a database aside. Opens classify the file
+  read-only and refuse; diagnosis runs `quick_check`; recovery is the explicit, verified
+  restore in `DATABASE_RESTORE.md`.)* `PRAGMA integrity_check` on open. If it fails, the
   database is never the source of truth for anything (see
   [section 1](#1-goals-and-non-goals)), so the correct recovery is exactly the same as
   a manual rebuild: rename the corrupt file aside
@@ -744,7 +747,7 @@ completely unchanged until a later stage deliberately wires it in.
    a build-time expression of "mounting must remain independent of database
    availability", not just a runtime one. Deliverable: `schema_migrations` plus the
    empty schema from [section 2](#2-proposed-schema), open/create/migrate functions,
-   `PRAGMA integrity_check`-on-open, and unit tests using
+   `PRAGMA integrity_check`-on-open (not implemented as such; see the note above), and unit tests using
    `Connection::open_in_memory()`. Nothing else in the workspace references this
    module yet, so current behavior is unaffected by construction.
 2. **Archive persistence.** CRUD functions for `source_folders`/`archives`/

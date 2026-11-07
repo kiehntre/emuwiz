@@ -78,52 +78,154 @@ else
 fi
 desktop_id="io.github.kiehntre.emuwiz"
 desktop_file="$data_home/applications/$desktop_id.desktop"
-# EmuWiz config directory. This mirrors the application's own resolution
-# (archivefs-core app_dirs::config_dir) exactly:
-#   1. EMUWIZ_CONFIG_HOME, when set, is the config directory itself;
-#   2. else XDG_CONFIG_HOME, when set, gives $XDG_CONFIG_HOME/emuwiz;
-#   3. else ~/.config/emuwiz, or the legacy ~/.config/archivefs when only
-#      that exists. Any directory entry, including a dangling symlink,
-#      counts as present, so a broken emuwiz entry never silently switches
-#      the profile to the legacy one.
-# Explicit and XDG roots never fall back to the legacy directory. A set but
-# non-absolute override (the application refuses it too) leaves the config
-# location unresolved: the binaries are still installed, no starter config
-# is written, and the run exits non-zero with a clear message.
-config_root=""
-config_unresolved_reason=""
-if [ "${EMUWIZ_CONFIG_HOME+set}" = set ]; then
-    case "$EMUWIZ_CONFIG_HOME" in
-        /*) config_root="$EMUWIZ_CONFIG_HOME" ;;
-        *) config_unresolved_reason="EMUWIZ_CONFIG_HOME is not an absolute path" ;;
-    esac
-fi
-if [ "${XDG_CONFIG_HOME+set}" = set ]; then
-    case "$XDG_CONFIG_HOME" in
-        /*)
-            if [ "${EMUWIZ_CONFIG_HOME+set}" != set ]; then
-                config_root="$XDG_CONFIG_HOME/emuwiz"
-            fi
-            ;;
-        *) config_unresolved_reason="XDG_CONFIG_HOME is not an absolute path" ;;
-    esac
-fi
-if [ "${EMUWIZ_CONFIG_HOME+set}" != set ] && [ "${XDG_CONFIG_HOME+set}" != set ]; then
-    config_root="$HOME/.config/emuwiz"
-    if [ ! -e "$config_root" ] && [ ! -L "$config_root" ] \
-        && { [ -e "$HOME/.config/archivefs" ] || [ -L "$HOME/.config/archivefs" ]; }; then
-        config_root="$HOME/.config/archivefs"
+# EmuWiz config directory. The application decides this (archivefs-core
+# app_dirs::config_dir, the table in that module's documentation). Once the
+# binaries are verified, the starter-config step asks the new emuwiz-cli
+# itself (`emuwiz-cli config-dir`, see resolve_config_dir_with_cli) and uses
+# its answer, so the two cannot drift apart again (Night Watch II NW2-D-01:
+# an installer that followed an older rule wrote a starter config into a
+# folder the application then refused to start on). The rule is mirrored
+# here only so --help and --uninstall can name the directory before any
+# binary exists, and as the fallback when the binary cannot be asked:
+#   1. EMUWIZ_CONFIG_HOME, when set, is the config directory itself, with
+#      no fallback of any kind;
+#   2. else the base is XDG_CONFIG_HOME when set (so a value equal to
+#      ~/.config behaves like an unset variable), or ~/.config, and the two
+#      candidates under it are <base>/emuwiz (new) and <base>/archivefs
+#      (legacy): only one present -> that one; both names one and the same
+#      directory -> the new name; an empty new folder never displaces a
+#      legacy one; an established new folder wins over an empty legacy one;
+#      two established folders are refused - nothing is chosen and no
+#      starter config is written, because the application refuses to start
+#      on that layout and a starter config in either folder would not help.
+#      "Empty" is a plain directory with no entries; a symlink (dangling or
+#      not), a file, an unreadable or unsearchable directory (listing it
+#      needs search permission here, where the application needs only read
+#      permission - a fail-closed difference) or one holding anything at
+#      all counts as established.
+# The application additionally treats Blue's first-start gui-v2.json as
+# disposable. This script cannot verify that without the binary, so such a
+# folder counts as established here and, beside a legacy one, nothing is
+# written (fail closed) - the binary is asked first in any case.
+# A set but non-absolute override (the application refuses it too) leaves the
+# config location unresolved: the binaries are still installed, no starter
+# config is written, and the run exits non-zero with a clear message.
+
+# config_entry_exists PATH - any directory entry at PATH, a dangling symlink
+# included (the application's symlink_metadata view).
+config_entry_exists() {
+    [ -e "$1" ] || [ -L "$1" ]
+}
+
+# config_dir_entries DIR - every entry of DIR, one per line, without
+# recursing (a dangling symlink included). Fails when DIR cannot be listed.
+config_dir_entries() {
+    find "$1/." ! -name . -prune -print
+}
+
+# config_dir_presence DIR - prints absent, empty or established the way the
+# application classifies a configuration folder (see the rule above).
+config_dir_presence() {
+    if ! config_entry_exists "$1"; then
+        printf 'absent\n'
+    elif [ -L "$1" ] || [ ! -d "$1" ]; then
+        printf 'established\n'
+    elif config_presence_entries=$(config_dir_entries "$1" 2>&1) \
+        && [ -z "$config_presence_entries" ]; then
+        printf 'empty\n'
+    else
+        printf 'established\n'
     fi
-fi
-if [ -n "$config_unresolved_reason" ]; then
+}
+
+# config_two_setups_reason NEW LEGACY - the refusal for two established
+# folders, in the application's words: which folder is which, the names
+# (never the contents) of at most five entries that make the new folder
+# count, and the two safe ways out.
+config_two_setups_reason() {
+    config_named=""
+    config_entry_count=0
+    if [ ! -L "$1" ] && [ -d "$1" ]; then
+        config_entry_count=$(config_dir_entries "$1" 2>/dev/null | wc -l | tr -d ' ')
+        config_named=$(config_dir_entries "$1" 2>/dev/null | sed 's|^.*/\./||' | LC_ALL=C sort | head -n 5 \
+            | awk 'NR > 1 { printf ", " } { printf "%s", $0 }')
+    fi
+    if [ -z "$config_named" ]; then
+        config_because=" The EmuWiz folder counts as settings because it is not a plain directory or could not be read."
+    elif [ "$config_entry_count" -gt 5 ]; then
+        config_because=" The EmuWiz folder counts as settings because it holds $config_named and $((config_entry_count - 5)) more."
+    else
+        config_because=" The EmuWiz folder counts as settings because it holds $config_named."
+    fi
+    printf '%s' "EmuWiz found settings in two places and will not choose between them: $1 (the EmuWiz folder) and $2 (the legacy ArchiveFS folder). Nothing was changed.$config_because Either move the entries that are not EmuWiz settings out of $1, or run EmuWiz and this installer with EMUWIZ_CONFIG_HOME set to whichever of the two folders holds your real settings"
+}
+
+# config_choose_dir NEW LEGACY - the application's choose_dir for the
+# configuration folder: sets config_root, or leaves it empty with
+# config_unresolved_reason when both folders are established.
+config_choose_dir() {
+    if ! config_entry_exists "$2"; then
+        config_root="$1"
+    elif ! config_entry_exists "$1"; then
+        config_root="$2"
+    elif [ -d "$1" ] && [ -d "$2" ] && [ "$1" -ef "$2" ]; then
+        # One name a symlink to the other: one setup, not two. (-ef is
+        # supported by dash, bash and busybox sh, the shells this Linux-only
+        # script runs under.)
+        config_root="$1"
+    elif [ "$(config_dir_presence "$1")" != established ]; then
+        config_root="$2"
+    elif [ "$(config_dir_presence "$2")" != established ]; then
+        config_root="$1"
+    else
+        config_root=""
+        config_unresolved_reason=$(config_two_setups_reason "$1" "$2")
+    fi
+}
+
+# resolve_config_dir_mirror - the mirrored rule, from the environment alone.
+resolve_config_dir_mirror() {
     config_root=""
-fi
-config_dir="$config_root"
-config_file="$config_dir/config.toml"
-if [ -z "$config_root" ]; then
-    config_dir="(unresolved configuration directory)"
-    config_file="(unresolved configuration directory)/config.toml"
-fi
+    config_unresolved_reason=""
+    config_resolved_by=script
+    if [ "${EMUWIZ_CONFIG_HOME+set}" = set ]; then
+        case "$EMUWIZ_CONFIG_HOME" in
+            /*) ;;
+            *)
+                config_unresolved_reason="EMUWIZ_CONFIG_HOME is not an absolute path"
+                return 0
+                ;;
+        esac
+    fi
+    config_base="$HOME/.config"
+    if [ "${XDG_CONFIG_HOME+set}" = set ]; then
+        case "$XDG_CONFIG_HOME" in
+            /*) config_base="$XDG_CONFIG_HOME" ;;
+            *)
+                config_unresolved_reason="XDG_CONFIG_HOME is not an absolute path"
+                return 0
+                ;;
+        esac
+    fi
+    if [ "${EMUWIZ_CONFIG_HOME+set}" = set ]; then
+        config_root="$EMUWIZ_CONFIG_HOME"
+        return 0
+    fi
+    config_choose_dir "$config_base/emuwiz" "$config_base/archivefs"
+}
+
+# set_config_paths - derives the displayed directory and file from config_root.
+set_config_paths() {
+    config_dir="$config_root"
+    config_file="$config_dir/config.toml"
+    if [ -z "$config_root" ]; then
+        config_dir="(unresolved configuration directory)"
+        config_file="(unresolved configuration directory)/config.toml"
+    fi
+}
+
+resolve_config_dir_mirror
+set_config_paths
 config_step_failed=0
 
 # --------------------------------------------------------------------------
@@ -371,14 +473,17 @@ Without --uninstall, this script:
      under $manifest_dir, so a later reinstall or uninstall can tell
      EmuWiz-owned paths apart from unrelated ones with the same name -
      never by filename, timestamp or inode alone.
-  5. Creates $config_dir if it does not exist.
+  5. Asks the newly verified emuwiz-cli for its configuration directory
+     (emuwiz-cli config-dir) and creates it if it does not exist. Only when
+     the binary cannot answer does this script apply the same rule itself:
+     EMUWIZ_CONFIG_HOME, else <XDG_CONFIG_HOME or ~/.config>/emuwiz, or the
+     legacy archivefs folder beside it when that one holds the settings.
+     Settings in both folders are refused, exactly as EmuWiz itself refuses
+     to start on that layout: nothing is written and the run says why.
   6. Publishes config.toml.example as $config_file with an atomic,
      no-clobber link, only if nothing exists at that name (a dangling
      symlink counts as existing). An existing config is never overwritten
      or written through, even if it appears while the installer runs.
-     The directory follows the application: EMUWIZ_CONFIG_HOME, else
-     XDG_CONFIG_HOME/emuwiz, else ~/.config/emuwiz (or the legacy
-     ~/.config/archivefs when only that exists).
   7. If a new config was just written and this script is running
      interactively, optionally prompts for one archive source folder to
      add via 'emuwiz-cli source add'. Leave blank to skip - source
@@ -1801,7 +1906,11 @@ if [ "$do_uninstall" -eq 1 ]; then
         rm -f -- "$manifest_file"
         rmdir -- "$manifest_dir" 2>/dev/null || true
     fi
-    printf 'Your configuration at %s was left untouched.\n' "$config_file"
+    if [ -n "$config_root" ]; then
+        printf 'Your configuration at %s was left untouched.\n' "$config_file"
+    else
+        printf 'Your configuration was left untouched.\n'
+    fi
     exit 0
 fi
 
@@ -2735,10 +2844,65 @@ if [ "$skipped_any" -eq 1 ]; then
     printf 'flag "--replace-foreign" to move them aside and install there anyway.\n' >&2
 fi
 
+# resolve_config_dir_with_cli - ask the emuwiz-cli that was just verified
+# where its configuration directory is, so a starter config can only ever
+# land where the application will look (NW2-D-01). The copy in the private
+# verified snapshot is run, never the destination (which may be foreign).
+# An answer is accepted only as exactly one absolute path; a refusal is
+# recognised by the application's own "config error:" prefix and relayed
+# verbatim, with nothing written. Anything else - a build without the
+# command, a binary that cannot run on this machine, odd output - keeps the
+# mirrored rule resolved above. `config-dir` is read-only.
+config_nl='
+'
+resolve_config_dir_with_cli() {
+    [ -n "${src_cli:-}" ] && [ -x "$src_cli" ] || return 0
+    cli_probe_err="$release_snapshot/config-dir.stderr"
+    cli_probe_rc=0
+    cli_probe_out=$("$src_cli" config-dir 2>"$cli_probe_err" </dev/null) || cli_probe_rc=$?
+    if [ "$cli_probe_rc" -eq 0 ]; then
+        case "$cli_probe_out" in
+            *"$config_nl"*) ;;
+            /*)
+                config_root="$cli_probe_out"
+                config_unresolved_reason=""
+                config_resolved_by=cli
+                ;;
+        esac
+    else
+        cli_probe_msg=$(cat -- "$cli_probe_err" 2>/dev/null || true)
+        case "$cli_probe_msg" in
+            *"config error: "*)
+                config_root=""
+                cli_probe_msg="${cli_probe_msg#*config error: }"
+                config_unresolved_reason="emuwiz-cli refuses to choose a configuration directory: ${cli_probe_msg%.}"
+                config_resolved_by=cli
+                ;;
+        esac
+    fi
+    rm -f -- "$cli_probe_err"
+    set_config_paths
+}
+resolve_config_dir_with_cli
+if [ -n "$config_root" ]; then
+    if [ "$config_resolved_by" = cli ]; then
+        printf 'Configuration directory: %s (reported by emuwiz-cli)\n' "$config_root"
+    else
+        printf 'Configuration directory: %s (resolved by this script; emuwiz-cli could not be asked)\n' "$config_root"
+    fi
+fi
+
 wrote_new_config=0
 if [ -z "$config_root" ]; then
     printf '%s: warning: %s; no starter config was written.\n' "$program_name" "$config_unresolved_reason" >&2
-    printf 'Set it to an absolute path (or unset it) and create your config yourself.\n' >&2
+    case "$config_unresolved_reason" in
+        *"not an absolute path"*)
+            printf 'Set it to an absolute path (or unset it) and create your config yourself.\n' >&2
+            ;;
+        *)
+            printf 'EmuWiz refuses to start on this layout until it is resolved; this installer changed nothing in either folder.\n' >&2
+            ;;
+    esac
     printf '%s: note: the binaries and desktop files were installed; only the starter config step was skipped.\n' "$program_name" >&2
     config_step_failed=1
 elif [ -e "$config_file" ] || [ -L "$config_file" ]; then
@@ -2827,9 +2991,14 @@ esac
 
 printf '\n'
 printf 'Next steps:\n'
-printf '  1. Edit %s (mount_root). Source folders can be managed entirely\n' "$config_file"
-printf '     from the app from now on - see the Sources page in the GUI, or\n'
-printf '     emuwiz-cli sources / source add / source scan.\n'
+if [ -n "$config_root" ]; then
+    printf '  1. Edit %s (mount_root). Source folders can be managed entirely\n' "$config_file"
+    printf '     from the app from now on - see the Sources page in the GUI, or\n'
+    printf '     emuwiz-cli sources / source add / source scan.\n'
+else
+    printf '  1. Resolve the configuration directory first (see the warning above),\n'
+    printf '     then copy config.toml.example there as config.toml and edit mount_root.\n'
+fi
 if [ "$path_has_bin_dir" -eq 1 ]; then
     printf '  2. Run: emuwiz-cli doctor\n'
     printf '  3. Run: emuwiz-cli config-check\n'

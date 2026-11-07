@@ -172,6 +172,8 @@ fn is_read_only_invocation(cli: &CliArgs) -> bool {
             | "activity"
             | "history"
             | "config-check"
+            | "config-dir"
+            | "data-dir"
             | "library-status"
             | "database-check"
     )
@@ -472,6 +474,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "config-check" => {
             print_config_check_report(&run_config_check_default());
+        }
+        // One line, the resolved directory, so install.sh can ask this
+        // binary instead of re-implementing app_dirs (NW2-D-01). Read-only;
+        // a refusal (two established setups, an invalid override) is the
+        // resolver's own message on stderr with exit status 1.
+        "config-dir" | "data-dir" => {
+            if let Some(extra) = args.next() {
+                return Err(format!("{command} takes no arguments (got '{extra}')").into());
+            }
+            let dir = if command == "config-dir" {
+                archivefs_core::app_dirs::config_dir()?
+            } else {
+                archivefs_core::app_dirs::data_dir()?
+            };
+            println!("{}", dir.display());
         }
         "cheats" => {
             let mut input_args = args.collect::<Vec<_>>();
@@ -2534,6 +2551,15 @@ fn format_cheat_availability_report(report: &CheatAvailabilityReport) -> String 
         report.summary.staging_candidates
     )
     .unwrap();
+    if report.summary.no_usable_cheat_codes > 0 {
+        writeln!(
+            &mut output,
+            "{}: {} game(s) in this catalogue list cheats without a code; nothing will be written for them",
+            archivefs_core::patch_manager::NO_USABLE_CHEAT_CODES_LABEL,
+            report.summary.no_usable_cheat_codes
+        )
+        .unwrap();
+    }
 
     for entry in &report.entries {
         writeln!(&mut output).unwrap();
@@ -3422,13 +3448,18 @@ fn format_library_status(view: &LibraryStatusView) -> String {
     ));
     if let Some(error) = &view.health.error {
         output.push_str(&format!("  Error: {error}\n"));
+        // An error with an open database means a check could not run (busy,
+        // locked, or recovery pending), not that the catalogue is healthy.
+        output
+            .push_str("  Next: emuwiz-cli database-check (the catalogue was not judged healthy)\n");
     }
 
     if !view.health.database_opens {
         output.push_str(
-            "\nThe database file exists but could not be opened. It is always safe to \
-             delete it and run emuwiz-cli library-scan to rebuild it from your \
-             configured source folders.\n",
+            "\nThe database file exists but could not be opened. Preserve a copy of it \
+             and any -journal/-wal files first (see docs/DATABASE_RECOVERY.md); it can \
+             then be rebuilt with emuwiz-cli library-scan from your configured source \
+             folders.\n",
         );
         return output;
     }
@@ -5946,6 +5977,10 @@ fn print_help() {
     );
     println!("  config-check   Validate EmuWiz configuration");
     println!(
+        "  config-dir     Print the configuration directory this build would use (EMUWIZ_CONFIG_HOME, else XDG_CONFIG_HOME/emuwiz or ~/.config/emuwiz, else the legacy archivefs folder). Read-only; refuses with the reason when settings exist in two places"
+    );
+    println!("  data-dir       Print the data directory this build would use, by the same rule");
+    println!(
         "  cheats source bsfree <status|validate|download|import-local|enable|disable|remove|systems|devices|search|game|gamecube-preview|gamecube-apply|gamecube-rollback|wii-preview|wii-apply|wii-rollback>  Manage and browse the optional immutable BSFree Archive source. GameCube and (verified) Wii hex-pair codes are installable via the existing Dolphin adapter (gamecube/wii-preview/gamecube/wii-apply, --confirm to apply, rollback to restore); all other platforms and formats - including encrypted Wii codes - remain browse-only"
     );
     println!(
@@ -7323,6 +7358,8 @@ mod tests {
             &["database-check"],
             &["library-status"],
             &["config-check"],
+            &["config-dir"],
+            &["data-dir"],
         ] {
             assert!(invocation(read_only), "{read_only:?}");
         }

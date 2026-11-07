@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "tests/database_recovery.rs"]
+mod database_recovery;
 #[path = "tests/first_start_preferences.rs"]
 mod first_start_preferences;
 #[path = "tests/visual_polish.rs"]
@@ -132,6 +134,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         canonical_organisation_job: None,
         history_view: Default::default(),
         discovery_import_history: Default::default(),
+        database_recovery: Default::default(),
         duckstation_history: Default::default(),
         canonical_organisation_generation: 0,
         canonical_organisation_history: Vec::new(),
@@ -1170,6 +1173,7 @@ fn gui_v2_playing_library_preview_runs_on_the_background_worker() {
             super::backend::Command::PlayingLibraryPreview {
                 state: Box::new(state),
                 generation: 9,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         )
         .unwrap();
@@ -11922,8 +11926,13 @@ mod blue_save_snapshots;
 #[path = "tests/single_file_restore.rs"]
 mod blue_single_file_restore;
 
+#[path = "tests/blue_worker_lane.rs"]
+mod blue_worker_lane;
 #[path = "tests/repair.rs"]
 mod repair;
+
+#[path = "tests/blue_truth_outcomes.rs"]
+mod blue_truth_outcomes;
 
 #[path = "tests/frontend_export.rs"]
 mod frontend_export;

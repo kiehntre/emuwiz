@@ -208,6 +208,9 @@ pub(super) enum Command {
     PlayingLibraryPreview {
         state: Box<PlayingLibraryPageState>,
         generation: u64,
+        /// The Activity cancel flag: a preview only reads, so it may stop
+        /// between files (Night Watch S11-04).
+        cancel: Arc<AtomicBool>,
     },
     PlayingLibraryApply {
         state: Box<PlayingLibraryPageState>,
@@ -239,6 +242,35 @@ pub(super) enum Command {
     },
     CardRestore(Box<super::card_restore::Job>),
     SingleFileRestore(Box<super::single_file_restore::Job>),
+    /// Test only: holds the worker until `gate` is released, so queue order
+    /// can be observed deterministically.
+    #[cfg(test)]
+    Block(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>),
+}
+
+impl Command {
+    /// Undo and recovery commands jump the queue: they run before any other
+    /// command still waiting, though never alongside one (Night Watch S11-04).
+    /// They are all small, and a person asking to put something back should
+    /// not wait behind a long preview queued earlier.
+    pub(super) fn is_recovery(&self) -> bool {
+        matches!(
+            self,
+            Command::UndoDuplicateRepair { .. }
+                | Command::MissingUndo { .. }
+                | Command::CanonicalOrganisation {
+                    kind: super::CanonicalOrganisationJobKind::Rollback,
+                    ..
+                }
+                | Command::PlayingLibrarySpecial {
+                    kind: super::PlayingLibraryJobKind::Rollback
+                        | super::PlayingLibraryJobKind::RollbackRomm
+                        | super::PlayingLibraryJobKind::RollbackRetroDeck
+                        | super::PlayingLibraryJobKind::RecoverEsde,
+                    ..
+                }
+        )
+    }
 }
 
 pub(super) enum Payload {
@@ -371,17 +403,57 @@ pub(super) struct VerificationResult {
     pub statuses: HashMap<i64, String>,
 }
 
+/// The two waiting lines for the one worker: recovery commands first, then
+/// everything else in the order it was asked for. One token per queued
+/// command travels over `wake`, so the worker never spins and exits when the
+/// `Backend` is dropped.
+#[derive(Default)]
+struct Queues {
+    recovery: std::collections::VecDeque<(u64, Command)>,
+    ordinary: std::collections::VecDeque<(u64, Command)>,
+}
+
+impl Queues {
+    fn push(&mut self, id: u64, command: Command) {
+        if command.is_recovery() {
+            self.recovery.push_back((id, command));
+        } else {
+            self.ordinary.push_back((id, command));
+        }
+    }
+    fn pop(&mut self) -> Option<(u64, Command)> {
+        self.recovery
+            .pop_front()
+            .or_else(|| self.ordinary.pop_front())
+    }
+}
+
 pub(super) struct Backend {
-    tx: Sender<(u64, Command)>,
+    queues: Arc<std::sync::Mutex<Queues>>,
+    wake: Sender<()>,
+    /// Test seam: a raw request channel standing in for the worker, so a
+    /// test can read the exact command the App sent. Never set in production.
+    raw: Option<Sender<(u64, Command)>>,
     pub rx: Receiver<Event>,
 }
 
 impl Backend {
     pub fn start(context: eframe::egui::Context) -> Self {
-        let (tx, requests) = mpsc::channel();
+        let (wake, tokens) = mpsc::channel::<()>();
         let (answers, rx) = mpsc::channel();
+        let queues = Arc::new(std::sync::Mutex::new(Queues::default()));
+        let worker_queues = Arc::clone(&queues);
         std::thread::spawn(move || {
-            while let Ok((id, command)) = requests.recv() {
+            while tokens.recv().is_ok() {
+                // One token was sent per queued command, so there is always
+                // something to take; recovery work is taken first.
+                let Some((id, command)) = worker_queues
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .pop()
+                else {
+                    continue;
+                };
                 if answers.send(Event::Started(id)).is_err() {
                     break;
                 }
@@ -397,18 +469,58 @@ impl Backend {
                 context.request_repaint();
             }
         });
-        Self { tx, rx }
+        Self {
+            queues,
+            wake,
+            raw: None,
+            rx,
+        }
+    }
+    /// A backend whose "worker" is the test: every command goes straight to
+    /// `requests`, and the test answers on the paired `Event` sender.
+    #[cfg(test)]
+    pub fn with_channels(requests: Sender<(u64, Command)>, rx: Receiver<Event>) -> Self {
+        let (wake, _) = mpsc::channel();
+        Self {
+            queues: Arc::new(std::sync::Mutex::new(Queues::default())),
+            wake,
+            raw: Some(requests),
+            rx,
+        }
     }
     /// A backend whose worker is gone: every command is refused before it can
     /// run. Tests use it so nothing reaches the real catalogue or sources.
     #[cfg(test)]
     pub fn disconnected() -> Self {
-        let (tx, _) = mpsc::channel();
+        let (wake, _) = mpsc::channel();
         let (_, rx) = mpsc::channel();
-        Self { tx, rx }
+        Self {
+            queues: Arc::new(std::sync::Mutex::new(Queues::default())),
+            wake,
+            raw: None,
+            rx,
+        }
     }
     pub fn send(&self, id: u64, command: Command) -> Result<(), String> {
-        self.tx.send((id, command)).map_err(|_| "The background worker is unavailable. Close and reopen GUI v2; your games have not been changed.".into())
+        const GONE: &str = "The background worker is unavailable. Close and reopen GUI v2; your games have not been changed.";
+        if let Some(raw) = &self.raw {
+            return raw.send((id, command)).map_err(|_| GONE.into());
+        }
+        self.queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(id, command);
+        if self.wake.send(()).is_err() {
+            // Nobody will ever take it; do not leave it waiting forever.
+            let mut queues = self
+                .queues
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queues.recovery.retain(|(queued, _)| *queued != id);
+            queues.ordinary.retain(|(queued, _)| *queued != id);
+            return Err(GONE.into());
+        }
+        Ok(())
     }
 }
 
@@ -783,6 +895,17 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 journal_dir: preview.journal_dir,
             })))
         }
+        #[cfg(test)]
+        Command::Block(gate) => {
+            let (open, signal) = &*gate;
+            let mut open = open.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*open {
+                open = signal
+                    .wait(open)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            Ok(Payload::Done)
+        }
         Command::UndoDuplicateRepair {
             record,
             cancel,
@@ -857,8 +980,13 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
         Command::PlayingLibraryPreview {
             mut state,
             generation,
+            cancel,
         } => {
-            state.preview();
+            // A cancelled preview only read files: drop it and keep the
+            // person's previous plan exactly as it was.
+            if !state.preview_cancellable(&cancel) {
+                return Err(super::activity::CANCELLED.to_string());
+            }
             Ok(Payload::PlayingLibraryPreview { state, generation })
         }
         Command::PlayingLibraryApply {

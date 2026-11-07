@@ -585,6 +585,21 @@ fn spawn_watched_process_inner(
     close_inherited_fds: bool,
     pinned_executable: Option<i32>,
 ) -> std::io::Result<WatchedProcess> {
+    // The executable must already be an absolute path. A bare name or a
+    // relative path would make `execvp` repeat a `PATH`/working-directory
+    // search under rules nobody here checked, so the file that was inspected
+    // need not be the file that starts (Night Watch S05-01). A pinned
+    // executable is addressed through `/proc/self/fd` and only keeps the
+    // original path as `argv[0]`, so it is exempt.
+    if pinned_executable.is_none() && !command.executable.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to start a non-absolute executable path: {}",
+                command.executable.display()
+            ),
+        ));
+    }
     // Each test-only ETXTBSY retry needs a fresh command and ownership
     // channel, so a failed exec's descriptor can never name a later child.
     let (mut child, stop_identity) = spawn_child(|| {

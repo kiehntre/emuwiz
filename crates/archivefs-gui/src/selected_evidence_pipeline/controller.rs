@@ -108,6 +108,12 @@ impl ArchiveFsApp {
                 selected_evidence_page::SelectedEvidenceState::Idle;
             self.selected_evidence_ui.selected_evidence_enrichment =
                 SelectedEvidenceEnrichmentState::Idle;
+            // The plan preview was gathered for the old file; its destination
+            // must never be shown under the new selection, and a load still in
+            // flight for the old file is discarded by the generation bump
+            // (Night Watch S06-01).
+            self.selected_evidence_ui.plan_preview_generation += 1;
+            self.selected_evidence_ui.plan_preview = plan_preview_page::PlanPreviewState::Idle;
         }
     }
 

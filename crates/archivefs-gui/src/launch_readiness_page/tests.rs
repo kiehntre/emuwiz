@@ -814,6 +814,68 @@ fn gamer_action_launches_the_exact_ready_retroarch_request() {
     ));
 }
 
+fn psx_chd_candidate(core: &str, preference: CandidatePreference, warned: bool) -> LaunchCandidate {
+    let mut candidate = ready_candidate();
+    candidate.target = LaunchTarget::RetroArchCore {
+        profile: retroarch_profile(),
+        core_stem: core.to_string(),
+        platform_id: "PSX",
+    };
+    candidate.content = resolved_content("/library/Game.chd");
+    candidate.preference = preference;
+    if warned {
+        candidate.readiness = LaunchReadiness::ReadyWithWarnings;
+        candidate
+            .warnings
+            .push(archivefs_core::launch::LaunchWarning::new(
+                archivefs_core::launch::LaunchWarningKind::RetroArchChdSupportUnconfirmed,
+                "CHD unconfirmed",
+            ));
+    }
+    candidate
+}
+
+#[test]
+fn gamer_action_launches_swanstation_for_psx_chd() {
+    let plan = plan_with(vec![
+        psx_chd_candidate("mednafen_psx", CandidatePreference::Undetermined, true),
+        psx_chd_candidate("swanstation", CandidatePreference::SoleEligible, false),
+    ]);
+    let action = gamer_play_action(&plan_input(plan));
+    assert!(matches!(
+        action,
+        GamerPlayAction::Launch(request)
+            if matches!(
+                request.as_ref(),
+                TypedLaunchRequest::RetroArch(request, _) if request.core_stem == "swanstation"
+            )
+    ));
+}
+
+#[test]
+fn explicit_launch_of_an_unpreferred_swanstation_still_yields_a_request() {
+    let plan = plan_with(vec![psx_chd_candidate(
+        "swanstation",
+        CandidatePreference::Undetermined,
+        false,
+    )]);
+    assert!(retroarch_launch_request(&plan, &plan.candidates[0], None).is_some());
+}
+
+#[test]
+fn only_an_unconfirmed_beetle_core_explains_why_play_is_missing() {
+    let plan = plan_with(vec![psx_chd_candidate(
+        "mednafen_psx",
+        CandidatePreference::SoleEligible,
+        true,
+    )]);
+    let GamerPlayAction::BlockedTyped(blocker) = gamer_play_action(&plan_input(plan)) else {
+        panic!("a CHD-unconfirmed core must not be offered as Play");
+    };
+    assert_eq!(blocker.kind, GamerBlockerKind::NoSafeEmulator);
+    assert!(blocker.detail.contains("SwanStation") && blocker.detail.contains("DuckStation"));
+}
+
 #[test]
 fn gamer_action_can_launch_pcsx2_without_retroarch_discovery() {
     let ready = build_ready_pcsx2_fixture("gamer-pcsx2");
@@ -1439,6 +1501,169 @@ fn eligible_candidate_yields_the_exact_expected_retroarch_launch_request_facts()
     assert_eq!(request.expected_game_key, "SLUS-00001");
     assert_eq!(request.profile, retroarch_profile());
     assert_eq!(request.core_stem, "mednafen_psx_hw");
+}
+
+fn warned_retroarch_candidate(
+    firmware: FirmwareReadiness,
+    kinds: &[archivefs_core::launch::LaunchWarningKind],
+    blocked: bool,
+) -> LaunchCandidate {
+    let mut candidate = ready_candidate();
+    candidate.firmware = firmware;
+    candidate.warnings = kinds
+        .iter()
+        .map(|kind| archivefs_core::launch::LaunchWarning::new(*kind, "fixture warning"))
+        .collect();
+    candidate.readiness = if blocked {
+        candidate.blockers = vec![archivefs_core::launch::LaunchBlocker::new(
+            archivefs_core::launch::LaunchBlockerKind::RequiredFirmwareMissing,
+            "required firmware/BIOS is missing",
+        )];
+        LaunchReadiness::Blocked
+    } else if kinds.is_empty() {
+        LaunchReadiness::Ready
+    } else {
+        LaunchReadiness::ReadyWithWarnings
+    };
+    candidate
+}
+
+/// Policy B (owner-approved): only the unverified-firmware warning keeps
+/// RetroArch Play; the gate is equivalent across firmware outcomes x warnings.
+#[test]
+fn only_the_allow_listed_unverified_firmware_warning_keeps_retroarch_play() {
+    use archivefs_core::launch::LaunchWarningKind as K;
+    let plan = plan_with(vec![ready_candidate()]);
+    let unverified = [K::FirmwarePresentUnverified];
+    // (firmware, warnings, blocked, Play expected)
+    let cases: Vec<(FirmwareReadiness, Vec<K>, bool, bool)> = vec![
+        (FirmwareReadiness::Verified, vec![], false, true),
+        (FirmwareReadiness::NotRequired, vec![], false, true),
+        (FirmwareReadiness::Unknown, vec![], false, true), // unchanged legacy behaviour
+        (
+            FirmwareReadiness::PresentUnverified,
+            unverified.to_vec(),
+            false,
+            true,
+        ),
+        (FirmwareReadiness::Missing, vec![], true, false),
+        // Missing can never launch, even if a stray allow-listed warning rides along.
+        (FirmwareReadiness::Missing, unverified.to_vec(), true, false),
+        // A warning from an unverified state with a different firmware state is not trusted.
+        (
+            FirmwareReadiness::Unknown,
+            unverified.to_vec(),
+            false,
+            false,
+        ),
+        (
+            FirmwareReadiness::Verified,
+            unverified.to_vec(),
+            false,
+            false,
+        ),
+        (
+            FirmwareReadiness::NotRequired,
+            unverified.to_vec(),
+            false,
+            false,
+        ),
+        // Any additional warning kind withdraws Play.
+        (
+            FirmwareReadiness::PresentUnverified,
+            vec![K::FirmwarePresentUnverified, K::MultipleEligibleProfiles],
+            false,
+            false,
+        ),
+        (
+            FirmwareReadiness::PresentUnverified,
+            vec![
+                K::FirmwarePresentUnverified,
+                K::PreferredLaunchChoiceUnavailable,
+            ],
+            false,
+            false,
+        ),
+        (
+            FirmwareReadiness::PresentUnverified,
+            vec![K::FirmwarePresentUnverified, K::OptionalFirmwareMissing],
+            false,
+            false,
+        ),
+        (
+            FirmwareReadiness::NotRequired,
+            vec![K::OptionalFirmwareMissing],
+            false,
+            false,
+        ),
+        (
+            FirmwareReadiness::NotRequired,
+            vec![K::MultipleEligibleProfiles],
+            false,
+            false,
+        ),
+    ];
+    for (firmware, kinds, blocked, expected) in cases {
+        let candidate = warned_retroarch_candidate(firmware, &kinds, blocked);
+        assert_eq!(
+            retroarch_launch_request(&plan, &candidate, None).is_some(),
+            expected,
+            "{firmware:?} {kinds:?} blocked={blocked}"
+        );
+        assert_eq!(candidate.retroarch_play_eligible(), expected);
+    }
+    // A blocker on an otherwise allow-listed candidate still refuses, and a
+    // Ready-labelled candidate that carries the warning is not trusted either.
+    let mut with_blocker =
+        warned_retroarch_candidate(FirmwareReadiness::PresentUnverified, &unverified, false);
+    with_blocker.blockers = vec![archivefs_core::launch::LaunchBlocker::new(
+        archivefs_core::launch::LaunchBlockerKind::AmbiguousCore,
+        "ambiguous",
+    )];
+    assert!(retroarch_launch_request(&plan, &with_blocker, None).is_none());
+    let mut ready_labelled =
+        warned_retroarch_candidate(FirmwareReadiness::PresentUnverified, &unverified, false);
+    ready_labelled.readiness = LaunchReadiness::Ready;
+    assert!(retroarch_launch_request(&plan, &ready_labelled, None).is_none());
+}
+
+#[test]
+fn unverified_firmware_candidate_gets_gamer_play_and_shows_the_warning() {
+    use archivefs_core::launch::LaunchWarningKind as K;
+    let mut candidate = warned_retroarch_candidate(
+        FirmwareReadiness::PresentUnverified,
+        &[K::FirmwarePresentUnverified],
+        false,
+    );
+    candidate.warnings[0].detail =
+        "Firmware found but not verified: kick34005.A500 is present but its contents were not checked.".into();
+    let plan = plan_with(vec![candidate]);
+    let input = plan_input(plan);
+    assert!(matches!(
+        gamer_play_action(&input),
+        GamerPlayAction::Launch(_)
+    ));
+    let output = render(&input);
+    assert!(rendered_text_contains(
+        &output,
+        "Firmware found but not verified"
+    ));
+    assert!(rendered_text_contains(&output, "kick34005.A500"));
+}
+
+#[test]
+fn unverified_firmware_with_another_warning_kind_has_no_gamer_play() {
+    use archivefs_core::launch::LaunchWarningKind as K;
+    let candidate = warned_retroarch_candidate(
+        FirmwareReadiness::PresentUnverified,
+        &[K::FirmwarePresentUnverified, K::MultipleEligibleProfiles],
+        false,
+    );
+    let input = plan_input(plan_with(vec![candidate]));
+    assert!(matches!(
+        gamer_play_action(&input),
+        GamerPlayAction::BlockedTyped(_)
+    ));
 }
 
 #[test]

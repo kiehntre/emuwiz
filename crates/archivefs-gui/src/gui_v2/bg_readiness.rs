@@ -315,7 +315,9 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
                     && *kind != archivefs_core::ArchiveKind::ScummVmDirectory
                     && archive.last_verified_missing_at.is_none()
             })?;
-        if p != archive.absolute_path || !std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()) {
+        if p != archive.absolute_path
+            || !crate::emulator_setup::catalogued_content_shape_ok(kind, p)
+        {
             return None;
         }
         archivefs_core::launch::launch_content_ref_for_unmounted(kind, p)

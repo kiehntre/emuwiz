@@ -914,6 +914,8 @@ pub(super) struct HistoryViewState {
     pub confirm_undo: Option<String>,
     /// Session-only links to the existing Activity results, by receipt id.
     pub undo_attempts: BTreeMap<String, u64>,
+    /// Why the last confirmed Undo did not start, until the next attempt.
+    pub notice: Option<String>,
 }
 
 /// Why the row list is empty, so each cause gets its own words.
@@ -1321,6 +1323,25 @@ impl super::App {
                 w.refresh_after_discovery_undo(ui.ctx().clone());
             }
         }
+        if let Some(notice) = self.history_view.notice.clone() {
+            ui.colored_label(ui.visuals().warn_fg_color, notice);
+        }
+        // Library-database restore receipts: the same records and the same
+        // executors as the full History window, gated on this window's own
+        // catalogue writers (a load or scan, the Database status upgrade).
+        // Any running background job counts: several of them (forget
+        // missing, MAME evidence refresh, RomM, repair) write the catalogue
+        // on their own workers, and refusing a few extra cases is cheaper
+        // than listing them.
+        let database_busy = self.load_job.is_some()
+            || self.tools.database.upgrading()
+            || self.activity.running() > 0;
+        if self.database_recovery.show(ui, database_busy) {
+            // The live database file was replaced; the library in memory is
+            // stale.
+            self.load(false);
+        }
+        let has_database_recovery = self.database_recovery.has_records();
         let has_conversion_records =
             super::wiiu_disc::show_conversion_history(ui, game_path.as_deref());
         let scoped_game = match &self.router.current {
@@ -1384,6 +1405,7 @@ impl super::App {
             Err(EmptyCause::NoHistory)
                 if has_cheat_history
                     || has_undo_activity
+                    || has_database_recovery
                     || has_bezel_history
                     || has_trainer_history
                     || self.duckstation_history.is_loading()
@@ -1533,8 +1555,12 @@ impl super::App {
                     } else {
                         "EmuWiz will re-verify the quarantined files and restore them to their original locations. If anything changed unexpectedly it will refuse and tell you why."
                     });
+                    let undo_running = self.undo_job.is_some();
+                    if undo_running {
+                        ui.label("Another Undo is still running. This one can start when it has finished.");
+                    }
                     if ui.add_enabled(
-                        self.playing_library_job.is_none(),
+                        self.playing_library_job.is_none() && !undo_running,
                         egui::Button::new(if library_index.is_some() { "Undo these links" } else { "Undo this repair" }),
                     ).clicked() {
                         confirmed = true;

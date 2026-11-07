@@ -78,6 +78,7 @@ pub mod emulator_update;
 /// Deterministic, read-only reconciliation of existing identity, topology and
 /// readiness evidence. This derived layer never mutates the catalogue.
 pub mod evidence_resolution;
+pub mod external_tools;
 /// Adapter evidence for per-game firmware guidance; never changes Launch.
 pub mod game_firmware_adapters;
 /// Structured, read-only per-game firmware readiness projection over an
@@ -159,6 +160,8 @@ pub mod uef_tape;
 #[cfg(any(test, feature = "test-support"))]
 pub mod verified_game_fixture;
 pub mod whdload_options;
+#[cfg(any(test, feature = "test-support"))]
+pub use database::database_restore_fault_injection;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueStats, CompletedScanSummary,
@@ -186,6 +189,12 @@ pub use database::{
     DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
     DiscoveryImportUndoPreview, DiscoveryImportUndoResult, MissingCleanupTarget,
     PreservationFreshness,
+};
+pub use database::{
+    FileIdentity, InterruptedRestoreAssessment, InterruptedRestoreOutcome,
+    assess_interrupted_restore, database_restore_receipt_path, finalise_interrupted_restore,
+    interrupted_restore_receipts, preview_interrupted_restore, read_database_restore_receipt,
+    review_database_rollback,
 };
 
 mod inspector;

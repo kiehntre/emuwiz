@@ -382,11 +382,7 @@ impl ReadinessSources<'_> {
             },
         };
         if !mame_set_resolutions.is_empty() {
-            content.resolved_path = focused.map(Path::to_path_buf);
-            content.container = Some(archivefs_core::launch::LaunchContainerKind::PlainFile);
-            content.requires_mount = false;
-            content.provenance =
-                "verified MAME logical-set directory from the persisted DAT join".into();
+            apply_mame_set_content(&mut content, focused);
         }
 
         // A ZIP holding exactly one verified cartridge ROM is launchable
@@ -1445,6 +1441,13 @@ impl ReadinessSources<'_> {
             launch_readiness_page::amiga_boot::apply(&mut plan, context);
         }
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
+        refine_arcade_set_blocker(
+            &mut plan,
+            self.readiness
+                .emulator_setup_overrides
+                .executable(crate::emulator_setup_overrides::OverridableEmulator::Mame)
+                .is_some(),
+        );
         if let Some(snapshot) = &mesen_context {
             snapshot.apply(&mut plan);
         }
@@ -1638,6 +1641,63 @@ pub(crate) fn identity_unknown_reason(
         return system_missing;
     }
     Reason::NotConfirmed
+}
+
+/// Says precisely what is missing for the MAME route when RetroArch refused an
+/// extracted arcade set and no MAME candidate exists. Wording only: nothing is
+/// unblocked and no candidate is added.
+fn refine_arcade_set_blocker(plan: &mut archivefs_core::launch::LaunchPlan, mame_configured: bool) {
+    use archivefs_core::launch::{LaunchBlockerKind, LaunchReadiness, LaunchTarget};
+    let mame = plan.candidates.iter().find(|candidate| {
+        matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "mame",
+                ..
+            }
+        )
+    });
+    let advice = match mame {
+        Some(mame) if mame.readiness != LaunchReadiness::Blocked => return,
+        Some(mame) => format!(
+            "MAME is set up but cannot start this set yet: {}.",
+            mame.blockers
+                .first()
+                .map_or("see its readiness details", |blocker| blocker.detail.as_str())
+        ),
+        None if !mame_configured => {
+            "Choose the MAME program in Emulator Setup to play this copy.".to_string()
+        }
+        None => "MAME is set up, but this set has no current verified MAME record yet; run the MAME check for this folder first.".to_string(),
+    };
+    for candidate in &mut plan.candidates {
+        if !matches!(candidate.target, LaunchTarget::RetroArchCore { .. }) {
+            continue;
+        }
+        for blocker in &mut candidate.blockers {
+            if blocker.kind == LaunchBlockerKind::RetroArchArcadeSetNeedsArchive {
+                blocker.detail = format!("{} {advice}", blocker.detail);
+            }
+        }
+    }
+}
+
+/// Points `content` at the MAME logical set the persisted DAT join resolved.
+/// The join says which set this is, not what shape it has: an extracted set
+/// directory keeps the `ExtractedArcadeSet` shape, so RetroArch cores (which
+/// cannot load a directory) are refused with the true reason instead of being
+/// shown as Ready.
+fn apply_mame_set_content(
+    content: &mut archivefs_core::launch::LaunchContentRef,
+    focused: Option<&Path>,
+) {
+    content.resolved_path = focused.map(Path::to_path_buf);
+    if focused.is_some_and(|path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())) {
+        content.kind = Some(archivefs_core::launch::LaunchContentKind::ExtractedArcadeSet);
+    }
+    content.container = Some(archivefs_core::launch::LaunchContainerKind::PlainFile);
+    content.requires_mount = false;
+    content.provenance = "verified MAME logical-set directory from the persisted DAT join".into();
 }
 
 #[cfg(test)]
@@ -2021,5 +2081,130 @@ mod identity_reason_tests {
             });
             assert_eq!(super::is_loose_rom_platform(platform), accepts, "{alias}");
         }
+    }
+}
+
+#[cfg(test)]
+mod arcade_set_shape_tests {
+    use super::*;
+    use archivefs_core::launch::{LaunchContentKind, LaunchContentRef};
+
+    fn unresolved() -> LaunchContentRef {
+        LaunchContentRef {
+            kind: None,
+            container: None,
+            resolved_path: None,
+            requires_mount: false,
+            provenance: "placeholder".into(),
+        }
+    }
+
+    fn arcade_plan(mame_blocker: Option<&str>) -> archivefs_core::launch::LaunchPlan {
+        use archivefs_core::emulator_environment::retroarch::{
+            ProfileKind, ProfileRef, ProfileScope,
+        };
+        use archivefs_core::launch::{
+            CandidatePreference, FirmwareReadiness, LaunchBlocker, LaunchBlockerKind,
+            LaunchCandidate, LaunchPlan, LaunchReadiness, LaunchTarget,
+        };
+        let content = LaunchContentRef {
+            kind: Some(LaunchContentKind::ExtractedArcadeSet),
+            container: None,
+            resolved_path: None,
+            requires_mount: false,
+            provenance: String::new(),
+        };
+        let mut candidates = vec![LaunchCandidate {
+            target: LaunchTarget::RetroArchCore {
+                profile: ProfileRef {
+                    profile_kind: ProfileKind::Native,
+                    scope: ProfileScope::User,
+                },
+                core_stem: "fbneo".into(),
+                platform_id: "Arcade",
+            },
+            content: content.clone(),
+            firmware: FirmwareReadiness::NotRequired,
+            blockers: vec![LaunchBlocker::new(
+                LaunchBlockerKind::RetroArchArcadeSetNeedsArchive,
+                "base.",
+            )],
+            warnings: Vec::new(),
+            readiness: LaunchReadiness::Blocked,
+            preference: CandidatePreference::Undetermined,
+        }];
+        if let Some(detail) = mame_blocker {
+            candidates.push(LaunchCandidate {
+                target: LaunchTarget::Standalone {
+                    adapter_id: "mame",
+                    profile_id: "mame".into(),
+                    profile_path: None,
+                },
+                content,
+                firmware: FirmwareReadiness::NotRequired,
+                blockers: vec![LaunchBlocker::new(
+                    LaunchBlockerKind::MameSetVerdictUnavailable,
+                    detail,
+                )],
+                warnings: Vec::new(),
+                readiness: LaunchReadiness::Blocked,
+                preference: CandidatePreference::Undetermined,
+            });
+        }
+        LaunchPlan {
+            platform_id: Some("Arcade".into()),
+            game_key: Some("19xx".into()),
+            summary: Default::default(),
+            candidates,
+            media_topology: None,
+        }
+    }
+
+    #[test]
+    fn arcade_blocker_names_exactly_what_is_missing_for_mame() {
+        let detail = |plan: &archivefs_core::launch::LaunchPlan| {
+            plan.candidates[0].blockers[0].detail.clone()
+        };
+        let mut plan = arcade_plan(None);
+        refine_arcade_set_blocker(&mut plan, false);
+        assert!(detail(&plan).contains("Choose the MAME program in Emulator Setup"));
+        let mut plan = arcade_plan(None);
+        refine_arcade_set_blocker(&mut plan, true);
+        assert!(detail(&plan).contains("no current verified MAME record"));
+        assert!(!detail(&plan).contains("Emulator Setup"));
+        let mut plan = arcade_plan(Some("needs a fresh audit"));
+        refine_arcade_set_blocker(&mut plan, true);
+        assert!(detail(&plan).contains("cannot start this set yet: needs a fresh audit"));
+    }
+
+    #[test]
+    fn joined_set_directory_keeps_the_extracted_arcade_set_shape() {
+        let dir = std::env::temp_dir().join(format!("emuwiz-arcade-shape-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("19xx")).unwrap();
+        std::fs::write(dir.join("19xx.zip"), b"zip").unwrap();
+
+        let mut directory = unresolved();
+        apply_mame_set_content(&mut directory, Some(&dir.join("19xx")));
+        assert_eq!(directory.kind, Some(LaunchContentKind::ExtractedArcadeSet));
+        assert_eq!(directory.resolved_path, Some(dir.join("19xx")));
+
+        let mut archive = unresolved();
+        apply_mame_set_content(&mut archive, Some(&dir.join("19xx.zip")));
+        assert_eq!(archive.kind, None);
+
+        let directory_kind = archivefs_core::ArchiveKind::ArcadeSetDirectory;
+        assert!(crate::emulator_setup::catalogued_content_shape_ok(
+            directory_kind,
+            &dir.join("19xx")
+        ));
+        assert!(!crate::emulator_setup::catalogued_content_shape_ok(
+            archivefs_core::ArchiveKind::DirectGameImage,
+            &dir.join("19xx")
+        ));
+        assert!(crate::emulator_setup::catalogued_content_shape_ok(
+            archivefs_core::ArchiveKind::DirectGameImage,
+            &dir.join("19xx.zip")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
