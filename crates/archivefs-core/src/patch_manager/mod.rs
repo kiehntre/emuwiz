@@ -574,14 +574,16 @@ pub use dolphin_texture_mod::{
     verified_dolphin_texture_identity,
 };
 pub use dolphin_texture_pack::{
-    DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT, DOLPHIN_TEXTURE_PACK_MAX_MANIFEST_BYTES,
-    DOLPHIN_TEXTURE_PACK_SOURCE_MODE, DolphinTexturePackApplyResult,
-    DolphinTexturePackArchivePreview, DolphinTexturePackBuildPreview,
-    DolphinTexturePackBuildRequest, DolphinTexturePackFile, DolphinTexturePackManifest,
-    DolphinTexturePackPlan, DolphinTexturePackPreviewRequest, DolphinTexturePackRejectedFile,
-    build_dolphin_texture_pack_manifest, build_dolphin_texture_pack_preview,
-    build_dolphin_texture_pack_transaction_plan, execute_dolphin_texture_pack_apply,
-    inspect_dolphin_texture_pack_zip, validate_dolphin_texture_pack_manifest,
+    DOLPHIN_TEXTURE_ARCHIVE_STAGING_PREFIX, DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT,
+    DOLPHIN_TEXTURE_PACK_MAX_MANIFEST_BYTES, DOLPHIN_TEXTURE_PACK_SOURCE_MODE,
+    DolphinTexturePackApplyResult, DolphinTexturePackArchivePreview,
+    DolphinTexturePackBuildPreview, DolphinTexturePackBuildRequest, DolphinTexturePackFile,
+    DolphinTexturePackManifest, DolphinTexturePackPlan, DolphinTexturePackPreviewRequest,
+    DolphinTexturePackRejectedFile, DolphinTexturePackStaging, build_dolphin_texture_pack_manifest,
+    build_dolphin_texture_pack_preview, build_dolphin_texture_pack_transaction_plan,
+    describe_missing_texture_pack_source, execute_dolphin_texture_pack_apply,
+    inspect_dolphin_texture_pack_zip, inspect_dolphin_texture_pack_zip_in,
+    relocate_dolphin_texture_pack_manifest, validate_dolphin_texture_pack_manifest,
 };
 pub use duckstation_cheat::{
     DUCKSTATION_CHEAT_MAX_BYTES, DUCKSTATION_CHEAT_MAX_LINES, DuckStationCheatApplyPlan,
