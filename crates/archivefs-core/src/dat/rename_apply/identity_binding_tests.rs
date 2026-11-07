@@ -334,17 +334,25 @@ fn the_refusal_names_changed_files_with_reasons_and_counts_the_rest() {
     assert!(text.contains("nothing was renamed"), "{text}");
 }
 
-/// A proposal built without a fingerprint (legacy or hand-built) still works
-/// exactly as before: identity is captured at review time and re-verified by
-/// preflight. Fingerprint binding only ever adds a refusal.
+/// A loose proposal with neither a fingerprint nor an archive identity is not
+/// tied to any audited bytes, so it is refused (named, before any mutation)
+/// rather than blessed with whatever is on disk at review time.
 #[test]
-fn a_proposal_without_a_fingerprint_keeps_the_review_time_binding() {
+fn a_proposal_without_a_fingerprint_is_refused_not_rebound() {
     let tree = tempfile::tempdir().unwrap();
     let source = write(tree.path(), "old.bin", b"original bytes");
     let mut proposal = bound_proposal(&source, "Game (Europe).bin");
     proposal.audited_fingerprint = None;
     let plan = plan_of(vec![proposal], tree.path());
-    let tx = build_transaction(&plan, &approved(&[&source]), 1).unwrap();
-    assert_eq!(tx.entries.len(), 1);
-    assert!(tx.entries[0].identity.freshness.is_some());
+    match build_transaction(&plan, &approved(&[&source]), 1) {
+        Err(ApplyError::SourceChangedSinceAudit(changed)) => {
+            assert_eq!(changed.len(), 1);
+            assert_eq!(
+                changed[0].reason,
+                SourceChangeReason::FingerprintIncomparable
+            );
+        }
+        other => panic!("expected a named refusal, got {other:?}"),
+    }
+    assert!(source.exists(), "nothing may be touched");
 }

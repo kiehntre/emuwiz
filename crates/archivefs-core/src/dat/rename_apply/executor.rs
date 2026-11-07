@@ -245,6 +245,19 @@ impl SourceChangeReason {
         }
     }
 
+    /// Whether two fingerprints describe the same, unmodified file: size,
+    /// whole-second mtime and the full object stamp (device, inode, change
+    /// time, mtime nanoseconds). The path is deliberately not compared.
+    fn fingerprints_match(
+        audited: &crate::identity_source::hashing::FileFingerprint,
+        current: &crate::identity_source::hashing::FileFingerprint,
+    ) -> bool {
+        audited.size_bytes == current.size_bytes
+            && audited.modified_unix_seconds == current.modified_unix_seconds
+            && audited.object.is_some()
+            && audited.object == current.object
+    }
+
     fn from_fingerprints(
         audited: &crate::identity_source::hashing::FileFingerprint,
         current: &crate::identity_source::hashing::FileFingerprint,
@@ -329,7 +342,7 @@ pub fn build_transaction_entries(
                     });
                     continue;
                 }
-                Some(current) if &current != audited => {
+                Some(current) if !SourceChangeReason::fingerprints_match(audited, &current) => {
                     built.changed_since_audit.push(ChangedSource {
                         path: proposal.source_path.clone(),
                         reason: SourceChangeReason::from_fingerprints(audited, &current),
@@ -338,6 +351,15 @@ pub fn build_transaction_entries(
                 }
                 Some(_) => {}
             }
+        }
+        if proposal.audited_fingerprint.is_none() && proposal.audited_identity.is_none() {
+            // Nothing ties this proposal to the bytes the audit verified, so
+            // capturing "current" identity would bless whatever is on disk.
+            built.changed_since_audit.push(ChangedSource {
+                path: proposal.source_path.clone(),
+                reason: SourceChangeReason::FingerprintIncomparable,
+            });
+            continue;
         }
         let Ok(current_identity) = capture_identity(&proposal.source_path) else {
             // The source is gone between plan and build; the entry cannot be
@@ -348,6 +370,24 @@ pub fn build_transaction_entries(
             });
             continue;
         };
+        if let Some(audited) = proposal.audited_fingerprint.as_ref() {
+            // The identity was captured after the first observation; observe
+            // again so the bytes are bracketed by two matching fingerprints.
+            let after =
+                crate::identity_source::hashing::FileFingerprint::observe(&proposal.source_path);
+            if !after
+                .as_ref()
+                .is_some_and(|after| SourceChangeReason::fingerprints_match(audited, after))
+            {
+                built.changed_since_audit.push(ChangedSource {
+                    path: proposal.source_path.clone(),
+                    reason: after.map_or(SourceChangeReason::Missing, |after| {
+                        SourceChangeReason::from_fingerprints(audited, &after)
+                    }),
+                });
+                continue;
+            }
+        }
         let identity = if let Some(audited) = proposal.audited_identity.as_ref() {
             if !super::identity::identity_matches(audited, &current_identity) {
                 built.changed_since_audit.push(ChangedSource {
