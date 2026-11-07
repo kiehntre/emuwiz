@@ -87,6 +87,7 @@ fn entry_result_with_outcome(outcome: CheatInstallOutcome) -> CheatInstallEntryR
         previous_destination_state: PreviousDestinationState::Unknown,
         previous_destination_hash: None,
         backup_path: None,
+        planned_backup_path: None,
         resulting_destination_hash: None,
         outcome,
         reason_code: "fixture".to_string(),
@@ -153,6 +154,7 @@ fn every_run_status_serializes_correctly() {
         (CheatInstallRunStatus::PartialFailure, "\"partial_failure\""),
         (CheatInstallRunStatus::Failed, "\"failed\""),
         (CheatInstallRunStatus::DryRun, "\"dry_run\""),
+        (CheatInstallRunStatus::InProgress, "\"in_progress\""),
     ];
     for (status, expected) in cases {
         assert_eq!(serde_json::to_string(&status).unwrap(), expected);

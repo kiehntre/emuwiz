@@ -353,14 +353,15 @@ pub use cheat_install_plan::{
     resolve_cheat_destination, stage_generated_cheat_file,
 };
 pub use cheat_install_result::{
-    CHEAT_INSTALL_RUN_SCHEMA_VERSION, CheatInstallEntryResult, CheatInstallOutcome,
-    CheatInstallPath, CheatInstallRun, CheatInstallRunSchemaError, CheatInstallRunStatus,
-    CheatInstallSummary, PreviousDestinationState, parse_cheat_install_run,
+    CHEAT_INSTALL_RUN_SCHEMA_VERSION, CheatInstallEntryResult, CheatInstallEntrySettlement,
+    CheatInstallOutcome, CheatInstallPath, CheatInstallRun, CheatInstallRunSchemaError,
+    CheatInstallRunStatus, CheatInstallSummary, PreviousDestinationState, parse_cheat_install_run,
     plan_cheat_install_entries, plan_cheat_install_entry, plan_cheat_install_run,
 };
 pub use cheat_installer::{
     CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME, CheatInstallOptions,
-    CheatInstallRunOutcome, execute_cheat_install_run,
+    CheatInstallRunOutcome, JOURNAL_UNAVAILABLE_REASON, JOURNAL_UPDATE_FAILED_REASON,
+    execute_cheat_install_run,
 };
 pub use cheat_ir::{
     CheatApplicability, CheatConversionPreview, CheatDocument, CheatDuplicateKind,
