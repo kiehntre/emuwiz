@@ -1542,6 +1542,44 @@ fn merge_combined_evidence(
             content: None,
         };
     }
+    // S03-03 across catalogues: one catalogue verifying the bytes while
+    // another says those exact bytes are a known bad dump (or a placeholder)
+    // is a disagreement about dump status, not an Exact match that happens to
+    // have a dissenting neighbour. Report it; never let Exact win by default.
+    let unverifiable_only: std::collections::BTreeSet<String> = catalogues
+        .iter()
+        .zip(per_catalogue.iter())
+        .filter(|(_, verdict)| matches!(verdict, AuditVerdict::Ambiguous { .. }))
+        .filter_map(|(catalogue, _)| {
+            let collected = crate::dat::audit::collect_crypto_candidates(known, &catalogue.index);
+            (collected.consistent.is_empty() && !collected.unverifiable.is_empty()).then(|| {
+                format!(
+                    "{}: only unverifiable record(s) {}",
+                    catalogue.source.source_display_name,
+                    collected.unverifiable_detail()
+                )
+            })
+        })
+        .collect();
+    if !exact.is_empty() && !unverifiable_only.is_empty() {
+        let details = exact
+            .iter()
+            .map(|(source, game, rom, _)| {
+                format!("{}: {game} / {rom}", source.source.source_display_name)
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .chain(unverifiable_only)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return CombinedEvidenceResult {
+            verdict: AuditVerdict::Ambiguous {
+                detail: format!("catalogues disagree on dump status: {details}"),
+            },
+            evidence: Vec::new(),
+            content: None,
+        };
+    }
     let Some((first_source, first_game, first_rom, first_algorithm)) = exact.first() else {
         // Keep useful non-exact diagnostics, but never allow a filename-only
         // result from one catalogue to eclipse hash evidence from another.
@@ -3454,6 +3492,45 @@ game (
                     assert!(detail.contains("Beta / beta.rom"), "{detail}");
                 }
                 other => panic!("expected a catalogue disagreement, got {other:?}"),
+            }
+            assert!(outcome.evidence_sources.is_empty());
+        }
+        assert_eq!(forward.report, reverse.report);
+    }
+
+    /// S03-03 across catalogues: a good record in one DAT and a `baddump`
+    /// record with the same hash in another is a dump-status disagreement,
+    /// never an Exact match, in either configuration order.
+    #[test]
+    fn s03_03_exact_in_one_catalogue_and_baddump_in_another_is_ambiguous() {
+        let tree = tempfile::tempdir().unwrap();
+        let games = tree.path().join("games");
+        std::fs::create_dir(&games).unwrap();
+        let bytes = b"disputed bytes";
+        std::fs::write(games.join("thing.rom"), bytes).unwrap();
+        let sha1 = Sha1::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let good = tree.path().join("good.dat");
+        let bad = tree.path().join("bad.dat");
+        std::fs::write(&good, dat_entries(&[("Game", "game.rom", bytes)])).unwrap();
+        std::fs::write(&bad, format!(
+            r#"<?xml version="1.0"?><datafile><header><name>Fixture</name></header><game name="Game"><rom name="game.rom" size="{}" sha1="{sha1}" status="baddump"/></game></datafile>"#,
+            bytes.len()
+        )).unwrap();
+        let forward = run(
+            vec![source(good.clone(), "one"), source(bad.clone(), "two")],
+            games.clone(),
+        );
+        let reverse = run(vec![source(bad, "two"), source(good, "one")], games);
+        for outcome in [&forward, &reverse] {
+            match &outcome.report.entries[0].verdict {
+                AuditVerdict::Ambiguous { detail } => {
+                    assert!(detail.contains("dump status"), "{detail}");
+                    assert!(detail.contains("baddump"), "{detail}");
+                }
+                other => panic!("expected a dump-status disagreement, got {other:?}"),
             }
             assert!(outcome.evidence_sources.is_empty());
         }

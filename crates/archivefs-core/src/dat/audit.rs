@@ -267,15 +267,17 @@ pub struct CryptoCandidates {
     /// Verifiable records whose shared cryptographic hashes all agree with
     /// the caller's. Deduplicated, in catalogue declaration order.
     pub consistent: Vec<super::index::SharedRomRef>,
-    /// The strongest algorithm that confirmed at least one consistent
-    /// record. `None` when `consistent` is empty.
+    /// The label for the evidence behind `consistent`: the strongest
+    /// algorithm that confirmed **every** consistent record, or, when no
+    /// single algorithm did, the union of those needed (e.g. `"SHA-1/MD5"`).
+    /// `None` when `consistent` is empty.
     pub algorithm: Option<&'static str>,
     /// Records a hash matched whose status marks them `nodump`/`baddump`.
     /// They are identity evidence of the *wrong* kind and never become a
     /// match, however strong the hash. Deduplicated, in catalogue order.
     pub unverifiable: Vec<(super::index::SharedRomRef, DumpStatus)>,
-    /// Matched records excluded because another cryptographic hash they
-    /// publish disagrees with the caller's value for the same algorithm.
+    /// Distinct matched records excluded because another cryptographic hash
+    /// they publish disagrees with the caller's value for the same algorithm.
     pub contradicted: usize,
     /// At least one well-formed cryptographic hash was looked up.
     pub compared_any: bool,
@@ -299,7 +301,33 @@ impl CryptoCandidates {
     }
 }
 
-const CRYPTO_ALGORITHMS: [&str; 3] = ["SHA-256", "SHA-1", "MD5"];
+const CRYPTO_ALGORITHM_BITS: [(u8, &str); 3] = [(4, "SHA-256"), (2, "SHA-1"), (1, "MD5")];
+
+/// The evidence label for a set of consistent records, each described by the
+/// bits of the algorithms that confirmed it. A single `Exact` keeps its
+/// familiar strongest-algorithm label; a union label appears only when the
+/// candidate set cannot be explained by any one algorithm, so the GUI's
+/// "this file's {algorithm} hash matches N entries" stays a true sentence.
+fn algorithm_label(confirmed: impl Iterator<Item = u8>) -> Option<&'static str> {
+    let masks: Vec<u8> = confirmed.collect();
+    if masks.is_empty() {
+        return None;
+    }
+    for (bit, algorithm) in CRYPTO_ALGORITHM_BITS {
+        if masks.iter().all(|mask| mask & bit != 0) {
+            return Some(algorithm);
+        }
+    }
+    Some(match masks.iter().fold(0u8, |union, mask| union | mask) {
+        7 => "SHA-256/SHA-1/MD5",
+        6 => "SHA-256/SHA-1",
+        5 => "SHA-256/MD5",
+        3 => "SHA-1/MD5",
+        4 => "SHA-256",
+        2 => "SHA-1",
+        _ => "MD5",
+    })
+}
 
 fn known_value<'a>(known: &'a KnownFileEvidence, algorithm: &str) -> Option<&'a str> {
     match algorithm {
@@ -333,8 +361,12 @@ fn member_order_key(record: &super::index::DatRomRef) -> (usize, u8, usize, usiz
 /// persisted matched-reference list derive their candidate set from, so
 /// none of them can disagree about what the file matched.
 pub fn collect_crypto_candidates(known: &KnownFileEvidence, index: &DatIndex) -> CryptoCandidates {
+    use std::collections::{HashMap, HashSet};
     let mut out = CryptoCandidates::default();
-    for algorithm in CRYPTO_ALGORITHMS {
+    let mut contradicted: HashSet<super::index::DatMemberKey> = HashSet::new();
+    // Which algorithms confirmed each consistent record (one bit each).
+    let mut confirmed_by: HashMap<super::index::DatMemberKey, u8> = HashMap::new();
+    for (bit, algorithm) in CRYPTO_ALGORITHM_BITS {
         let Some(value) = known_value(known, algorithm) else {
             continue;
         };
@@ -349,7 +381,7 @@ pub fn collect_crypto_candidates(known: &KnownFileEvidence, index: &DatIndex) ->
         };
         for candidate in candidates {
             if cryptographic_hash_disagrees(known, candidate) {
-                out.contradicted += 1;
+                contradicted.insert(candidate.key());
                 continue;
             }
             let status = DumpStatus::of(candidate.status.as_deref());
@@ -363,6 +395,7 @@ pub fn collect_crypto_candidates(known: &KnownFileEvidence, index: &DatIndex) ->
                 }
                 continue;
             }
+            *confirmed_by.entry(candidate.key()).or_insert(0) |= bit;
             if out
                 .consistent
                 .iter()
@@ -370,14 +403,11 @@ pub fn collect_crypto_candidates(known: &KnownFileEvidence, index: &DatIndex) ->
             {
                 continue;
             }
-            if out.algorithm.is_none() {
-                // Algorithms are visited strongest first, so the first one to
-                // confirm a consistent record is the strongest that did.
-                out.algorithm = Some(algorithm);
-            }
             out.consistent.push(candidate.clone());
         }
     }
+    out.contradicted = contradicted.len();
+    out.algorithm = algorithm_label(confirmed_by.values().copied());
     out.consistent
         .sort_by_key(|record| member_order_key(record));
     out.unverifiable
@@ -388,7 +418,12 @@ pub fn collect_crypto_candidates(known: &KnownFileEvidence, index: &DatIndex) ->
 pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVerdict {
     let crypto = collect_crypto_candidates(known, index);
     if !crypto.consistent.is_empty() {
-        return handle_candidates(&crypto.consistent, crypto.algorithm.unwrap_or("SHA-1"));
+        return handle_candidates(
+            &crypto.consistent,
+            crypto
+                .algorithm
+                .expect("a non-empty consistent set always has an evidence label"),
+        );
     }
     if !crypto.unverifiable.is_empty() {
         // S03-03 / D3-03: the hash agrees with a record the catalogue itself
@@ -405,7 +440,18 @@ pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVer
             ),
         };
     }
-    let crypto_conflict = crypto.contradicted > 0;
+    if crypto.contradicted > 0 {
+        // A cryptographic hash hit whose sibling hash disagrees is a
+        // contradiction about *this* file. A CRC32 that then agrees with some
+        // other record cannot settle it: the module doc promises a CRC32
+        // match never overrides a cryptographic contradiction, so stop here
+        // rather than report a Probable identity for a file in dispute.
+        return AuditVerdict::Ambiguous {
+            detail: "Cryptographic hash matches exist, but their other published cryptographic \
+                     hashes disagree with this file"
+                .into(),
+        };
+    }
     let mut compared_any = crypto.compared_any;
 
     // CRC32, qualified by size when both are known.
@@ -498,12 +544,6 @@ pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVer
                 },
             };
         }
-    }
-
-    if crypto_conflict {
-        return AuditVerdict::Ambiguous {
-            detail: "Cryptographic hash matches exist, but their other published cryptographic hashes disagree with this file".into(),
-        };
     }
 
     // Something was comparable and none of it found anything: the file is not in
@@ -1094,12 +1134,67 @@ mod tests {
                 count,
                 game_names,
             } => {
-                assert_eq!(algorithm, "SHA-1");
+                // MD5 is the one algorithm that confirmed both records, so
+                // "this file's MD5 hash matches 2 entries" is the true label.
+                assert_eq!(algorithm, "MD5");
                 assert_eq!(count, 2);
                 assert_eq!(game_names, vec!["Game A", "Game B"]);
             }
             other => panic!("expected both candidates, got {other:?}"),
         }
+    }
+
+    /// Records confirmed by disjoint algorithms (one publishes SHA-256 only,
+    /// the other SHA-1 only) are both reported, under a union label.
+    #[test]
+    fn s03_01_disjoint_algorithms_are_unioned_with_a_union_label() {
+        let mut only_sha256 = rom_with("a.bin", None, None);
+        only_sha256.sha256 = Some(SHA256_B.into());
+        let only_sha1 = rom_with("b.bin", Some(SHA1_X), None);
+        let index = index_of(vec![("Game A", only_sha256), ("Game B", only_sha1)]);
+        let known = file_with(Some(SHA1_X), None).with_sha256(SHA256_B);
+        match verdict(known, &index) {
+            AuditVerdict::ExactMultipleCandidates {
+                algorithm,
+                count,
+                game_names,
+            } => {
+                assert_eq!(algorithm, "SHA-256/SHA-1");
+                assert_eq!(count, 2);
+                assert_eq!(game_names, vec!["Game A", "Game B"]);
+            }
+            other => panic!("expected both candidates, got {other:?}"),
+        }
+        // A lone record keeps its strongest single-algorithm label.
+        let single = index_of(vec![(
+            "Game A",
+            rom_with("a.bin", Some(SHA1_X), Some(MD5_X)),
+        )]);
+        assert!(matches!(
+            verdict(file_with(Some(SHA1_X), Some(MD5_X)), &single),
+            AuditVerdict::Exact {
+                algorithm: "SHA-1",
+                ..
+            }
+        ));
+    }
+
+    /// A cryptographic contradiction is never settled by a CRC32 that agrees
+    /// with some other record: the file is in dispute, not probably Game B.
+    #[test]
+    fn a_crc32_match_never_overrides_a_cryptographic_contradiction() {
+        let mut disputed = rom("a.bin", 8, "deadbeef");
+        disputed.sha1 = Some(SHA1_X.into());
+        disputed.md5 = Some(MD5_X.into());
+        let other = rom("b.bin", 8, "deadbeef");
+        let index = index_of(vec![("Game A", disputed), ("Game B", other)]);
+        let known = file_with(Some(SHA1_X), Some(MD5_Z)).with_crc32("deadbeef");
+        assert!(matches!(
+            verdict(known, &index),
+            AuditVerdict::Ambiguous { .. }
+        ));
+        let collected = collect_crypto_candidates(&file_with(Some(SHA1_X), Some(MD5_Z)), &index);
+        assert_eq!(collected.contradicted, 1, "one record, counted once");
     }
 
     /// The union is reported in catalogue order whichever algorithm found a
@@ -1118,7 +1213,7 @@ mod tests {
         }
         let collected = collect_crypto_candidates(&file_with(Some(SHA1_X), Some(MD5_X)), &index);
         assert_eq!(collected.consistent.len(), 2);
-        assert_eq!(collected.algorithm, Some("SHA-1"));
+        assert_eq!(collected.algorithm, Some("MD5"));
         assert!(collected.unverifiable.is_empty());
         assert_eq!(collected.contradicted, 0);
     }
