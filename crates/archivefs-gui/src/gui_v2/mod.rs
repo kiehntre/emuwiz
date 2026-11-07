@@ -32,6 +32,7 @@ mod folder_check;
 mod game_dat_check;
 mod game_detail_blue;
 mod game_detail_facts;
+mod game_doctor;
 mod game_documents;
 mod game_verification_guidance;
 #[cfg(test)]

@@ -65,6 +65,9 @@ pub(super) struct NativeWorkflows {
     launch_was_active: bool,
     launch_kind: Option<LaunchKind>,
     launch_attempts: launch_readiness_summary::AttemptTracker,
+    /// The summary the Game Details readiness card last displayed, keyed by
+    /// game and path; read-only input for the Game Doctor.
+    shown_readiness: Option<(i64, PathBuf, launch_readiness_summary::GameReadinessSummary)>,
     /// The last "can a launch request be built" answer, for the game shown.
     route_truth: std::cell::RefCell<launch_readiness_summary::route_truth::RouteCache>,
     source_job: Option<u64>,
@@ -435,6 +438,7 @@ impl NativeWorkflows {
             launch_was_active: false,
             launch_kind: None,
             launch_attempts: Default::default(),
+            shown_readiness: None,
             route_truth: Default::default(),
             source_job: None,
             cheat_catalogues: Default::default(),
@@ -763,6 +767,15 @@ impl NativeWorkflows {
             launch_readiness_summary::note_file_missing(&mut summary);
         }
         let action = launch_readiness_summary::show(ui, &summary);
+        let unchanged = self
+            .shown_readiness
+            .as_ref()
+            .is_some_and(|(id, shown, last)| *id == game_id && shown == path && *last == summary);
+        if !unchanged {
+            // The Game Doctor may already have drawn this frame from the old answer.
+            ui.ctx().request_repaint();
+            self.shown_readiness = Some((game_id, path.to_path_buf(), summary));
+        }
         launch_readiness_page::show_dolphin_profile_guidance(ui, &input);
         self.show_game_firmware_guidance(ui, game_id, path, &input);
         self.readiness_action_route(ui.ctx(), action?, game_id)
@@ -955,6 +968,18 @@ impl NativeWorkflows {
     #[cfg(test)]
     pub(super) fn launch_was_requested(&self, game_id: i64) -> bool {
         self.launch_active() || self.launch_attempts.for_game(game_id).is_some()
+    }
+
+    /// Exactly what the readiness card last displayed for this game and path.
+    pub(super) fn shown_readiness(
+        &self,
+        game_id: i64,
+        path: &Path,
+    ) -> Option<&launch_readiness_summary::GameReadinessSummary> {
+        self.shown_readiness
+            .as_ref()
+            .filter(|(id, shown, _)| *id == game_id && shown == path)
+            .map(|(_, _, summary)| summary)
     }
 
     /// The current readiness answer for the game on screen, for reading only.
