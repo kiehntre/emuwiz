@@ -30,4 +30,5 @@ interpret, not permission to edit migration files.
    them.
 
 Applied migrations are immutable. Never replay or edit migration 0006 (the
-old PS2 loose-ISO example), and do not invent a migration 0011.
+old PS2 loose-ISO example). Every migration up to the current schema already
+exists under `crates/archivefs-core/src/migrations/`; add new ones only at the end.

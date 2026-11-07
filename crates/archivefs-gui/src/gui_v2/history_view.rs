@@ -1326,6 +1326,22 @@ impl super::App {
         if let Some(notice) = self.history_view.notice.clone() {
             ui.colored_label(ui.visuals().warn_fg_color, notice);
         }
+        // Library-database restore receipts: the same records and the same
+        // executors as the full History window, gated on this window's own
+        // catalogue writers (a load or scan, the Database status upgrade).
+        // Any running background job counts: several of them (forget
+        // missing, MAME evidence refresh, RomM, repair) write the catalogue
+        // on their own workers, and refusing a few extra cases is cheaper
+        // than listing them.
+        let database_busy = self.load_job.is_some()
+            || self.tools.database.upgrading()
+            || self.activity.running() > 0;
+        if self.database_recovery.show(ui, database_busy) {
+            // The live database file was replaced; the library in memory is
+            // stale.
+            self.load(false);
+        }
+        let has_database_recovery = self.database_recovery.has_records();
         let has_conversion_records =
             super::wiiu_disc::show_conversion_history(ui, game_path.as_deref());
         let scoped_game = match &self.router.current {
@@ -1389,6 +1405,7 @@ impl super::App {
             Err(EmptyCause::NoHistory)
                 if has_cheat_history
                     || has_undo_activity
+                    || has_database_recovery
                     || has_bezel_history
                     || has_trainer_history
                     || self.duckstation_history.is_loading()
