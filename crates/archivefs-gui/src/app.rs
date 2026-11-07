@@ -25,6 +25,7 @@ pub(crate) struct ArchiveFsApp {
     /// The History & Logs page's filter/sort state.
     pub(crate) history_filters: HistoryLogFilters,
     pub(crate) shared_history: SharedHistoryState,
+    pub(crate) startup_shared_recovery: StartupSharedRecoveryState,
     pub(crate) shared_history_operation: Option<String>,
     pub(crate) shared_rollback: SharedRollbackState,
     /// Activity label for the current shared rollback, chosen from its journal.
@@ -393,6 +394,27 @@ impl ArchiveFsApp {
             || self.setup_action.is_some()
     }
 
+    /// No worker of this window can be writing the library database: the
+    /// catalogue is not loading or scanning, no source, alias, platform,
+    /// missing-removal or library-view action is running, and no mount or
+    /// setup operation is in flight. Database restore, rollback and
+    /// reconciliation require this; writers in other processes are refused
+    /// by the restore's own locks.
+    pub(crate) fn database_writers_idle(&self) -> bool {
+        !self.database_state.is_loading() && !self.is_busy() && self.source_action_available()
+    }
+
+    /// After the live database file was replaced (restore, rollback or a
+    /// reconciled interrupted restore) every cached snapshot is stale.
+    pub(crate) fn reload_catalogue_after_database_replacement(&mut self, context: egui::Context) {
+        self.database_generation = self.database_generation.next();
+        let generation = self.database_generation;
+        let previous = self.database_state.snapshot().cloned().map(Box::new);
+        self.database_state =
+            crate::database_load::start_database_load(context, generation, previous, false);
+        self.shared_history = SharedHistoryState::NotLoaded;
+    }
+
     pub(crate) fn new(context: egui::Context) -> Self {
         Self::new_with_initial_load(context, true)
     }
@@ -421,7 +443,7 @@ impl ArchiveFsApp {
                 "Loading your library.",
             ));
         }
-        Self {
+        let mut app = Self {
             state: if initial_load {
                 start_load(context.clone(), generation, None)
             } else {
@@ -453,6 +475,7 @@ impl ArchiveFsApp {
             mount_ui: MountUiState::default(),
             history_filters: HistoryLogFilters::default(),
             shared_history: SharedHistoryState::NotLoaded,
+            startup_shared_recovery: StartupSharedRecoveryState::NotStarted,
             shared_history_operation: None,
             shared_rollback: SharedRollbackState::Idle,
             shared_rollback_action: ActivityAction::CheatPreview,
@@ -524,7 +547,15 @@ impl ArchiveFsApp {
             focus_bulk_platform_cancel: false,
             bulk_platform_action_typed_count: String::new(),
             artwork_media: ArtworkMediaState::new(),
+        };
+        if initial_load {
+            // A crash during a cheat/mod install leaves only a pending
+            // record; settle it into History (with Undo available) before
+            // the user has to find the right page. Background worker, no
+            // Undo performed, nothing under any destination root touched.
+            app.start_startup_shared_recovery(context);
         }
+        app
     }
 
     /// The compatibility wrapper for navigating *by tab* - the write

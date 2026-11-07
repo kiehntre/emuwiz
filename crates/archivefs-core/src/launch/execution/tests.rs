@@ -287,6 +287,125 @@ fn native_direct_content_ready_candidate_passes_preflight() {
     );
 }
 
+// --- required firmware: unverified keeps Play, fresh probe decides -----------
+
+/// Declares required firmware on the fixture core. `files` are the firmware
+/// names the core's `.info` lists as required; none is created here.
+fn declare_required_firmware(ready: &ReadyFixture, files: &[&str]) {
+    let cores_dir = ready.fixture.path("cores");
+    let info_dir = ready.fixture.path("info");
+    let system_dir = ready.fixture.path("system");
+    fs::create_dir_all(&system_dir).unwrap();
+    fs::write(
+        ready.fixture.path("config/retroarch/retroarch.cfg"),
+        format!(
+            "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\nsystem_directory = \"{}\"\n",
+            cores_dir.display(),
+            info_dir.display(),
+            system_dir.display()
+        ),
+    )
+    .unwrap();
+    let mut info = String::from("systemname = \"megadrive\"\n");
+    info.push_str(&format!("firmware_count = {}\n", files.len()));
+    for (index, file) in files.iter().enumerate() {
+        info.push_str(&format!(
+            "firmware{index}_path = \"{file}\"\nfirmware{index}_opt = \"false\"\n"
+        ));
+    }
+    fs::write(ready.fixture.path("info/genesis_plus_gx.info"), info).unwrap();
+}
+
+#[test]
+fn readable_unverified_required_firmware_still_passes_preflight() {
+    let ready = build_ready_fixture("fw-unverified");
+    declare_required_firmware(&ready, &["bios.bin"]);
+    fs::write(ready.fixture.path("system/bios.bin"), b"not hashed").unwrap();
+    preflight(&ready).expect("policy B: a readable regular unhashed firmware file keeps Play");
+}
+
+#[test]
+fn firmware_removed_after_planning_is_refused_at_click_time() {
+    // The plan the user saw said PresentUnverified; the fresh probe at click
+    // time must decide, and a now-missing file blocks the launch.
+    let ready = build_ready_fixture("fw-toctou");
+    declare_required_firmware(&ready, &["bios.bin"]);
+    let firmware = ready.fixture.path("system/bios.bin");
+    fs::write(&firmware, b"not hashed").unwrap();
+    preflight(&ready).expect("present at plan time");
+    fs::remove_file(&firmware).unwrap();
+    let error = preflight(&ready).unwrap_err();
+    assert!(
+        matches!(
+            error.kind,
+            LaunchPreflightErrorKind::CandidateNotReady
+                | LaunchPreflightErrorKind::RequestedCandidateNotFound
+                | LaunchPreflightErrorKind::CommandBlocked
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn missing_required_firmware_is_never_launchable() {
+    let ready = build_ready_fixture("fw-missing");
+    declare_required_firmware(&ready, &["bios.bin"]);
+    assert!(preflight(&ready).is_err());
+}
+
+/// Owner policy: any required-and-missing firmware file blocks the launch,
+/// even when other required files are present (fresh probe at click time).
+#[test]
+fn mixed_present_and_missing_required_firmware_is_refused() {
+    let ready = build_ready_fixture("fw-mixed");
+    declare_required_firmware(&ready, &["a.bin", "b.bin"]);
+    fs::write(ready.fixture.path("system/a.bin"), b"x").unwrap();
+    let error = preflight(&ready).unwrap_err();
+    assert!(
+        matches!(
+            error.kind,
+            LaunchPreflightErrorKind::CandidateNotReady
+                | LaunchPreflightErrorKind::RequestedCandidateNotFound
+                | LaunchPreflightErrorKind::CommandBlocked
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn beetle_psx_style_region_alternatives_need_only_one_bios() {
+    let ready = build_ready_fixture("fw-psx-one-region");
+    declare_required_firmware(&ready, &["scph5500.bin", "scph5501.bin", "scph5502.bin"]);
+    fs::write(ready.fixture.path("system/scph5501.bin"), b"us").unwrap();
+    preflight(&ready).expect("one regional BIOS of the alternative group is enough");
+}
+
+#[test]
+fn beetle_psx_style_with_no_region_bios_is_refused() {
+    let ready = build_ready_fixture("fw-psx-none");
+    declare_required_firmware(&ready, &["scph5500.bin", "scph5501.bin", "scph5502.bin"]);
+    assert!(preflight(&ready).is_err());
+}
+
+#[test]
+fn all_required_firmware_present_unverified_still_plays() {
+    let ready = build_ready_fixture("fw-all-present");
+    declare_required_firmware(&ready, &["a.bin", "b.bin"]);
+    fs::write(ready.fixture.path("system/a.bin"), b"x").unwrap();
+    fs::write(ready.fixture.path("system/b.bin"), b"y").unwrap();
+    preflight(&ready).expect("all required present keeps Play");
+}
+
+#[test]
+fn mixed_firmware_becomes_playable_once_the_missing_file_is_installed() {
+    let ready = build_ready_fixture("fw-mixed-fixed");
+    declare_required_firmware(&ready, &["a.bin", "b.bin"]);
+    fs::write(ready.fixture.path("system/a.bin"), b"x").unwrap();
+    assert!(preflight(&ready).is_err());
+    fs::write(ready.fixture.path("system/b.bin"), b"y").unwrap();
+    preflight(&ready).expect("installing the missing file unblocks");
+}
+
 // --- exact argv preserved -----------------------------------------------------
 
 #[test]

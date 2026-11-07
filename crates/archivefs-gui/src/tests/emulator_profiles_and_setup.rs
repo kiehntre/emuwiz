@@ -4144,6 +4144,7 @@ fn render_shared_history(details_open: bool) -> egui::FullOutput {
                 &mut filters,
                 &mut clipboard,
                 &mut None,
+                &mut None,
                 &mut String::new(),
                 &mut None,
                 false,

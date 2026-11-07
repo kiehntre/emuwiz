@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 
 use crate::emulator_environment::retroarch::{
-    CoreInfoFinding, ProfileRef, RetroArchEnvironmentReport,
+    CoreInfoFinding, ProfileKind, ProfileRef, RetroArchEnvironmentReport,
 };
 use crate::launch::amiga_whdload_command::{SelectedWHDLoadSlave, VerifiedWHDLoadTarget};
 use crate::launch::platform_map::{launch_compatibility_for_platform, retroarch_platform_matches};
@@ -180,6 +180,36 @@ pub struct LaunchCandidate {
     pub preference: CandidatePreference,
 }
 
+impl LaunchCandidate {
+    /// The single RetroArch Play-eligibility rule, shared by the GUI request
+    /// builder and the click-time preflight.
+    ///
+    /// - no blockers, ever;
+    /// - `Ready` with no warnings (unchanged), or
+    /// - `ReadyWithWarnings` where there is at least one warning, EVERY
+    ///   warning is allow-listed ([`LaunchWarningKind::permits_retroarch_play`])
+    ///   and the candidate's firmware readiness is `PresentUnverified` (the
+    ///   only state that produces that warning). `Blocked`, `Missing`,
+    ///   `Unknown` or any other warning kind never qualify.
+    pub fn retroarch_play_eligible(&self) -> bool {
+        if !self.blockers.is_empty() {
+            return false;
+        }
+        match self.readiness {
+            LaunchReadiness::Ready => self.warnings.is_empty(),
+            LaunchReadiness::ReadyWithWarnings => {
+                !self.warnings.is_empty()
+                    && self.firmware == FirmwareReadiness::PresentUnverified
+                    && self
+                        .warnings
+                        .iter()
+                        .all(|warning| warning.kind.permits_retroarch_play())
+            }
+            LaunchReadiness::Blocked => false,
+        }
+    }
+}
+
 /// Full description of every currently-knowable way to play one game.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPlan {
@@ -322,6 +352,57 @@ fn firmware_condition(
     }
 }
 
+/// Visible text for a RetroArch candidate's unverified-firmware warning,
+/// naming the required files that were found but whose contents EmuWiz did
+/// not verify.
+pub(crate) fn unverified_firmware_detail(
+    info: &crate::emulator_environment::retroarch::CoreInfoFinding,
+) -> String {
+    use crate::emulator_environment::retroarch::{CoreInfoFinding, FirmwarePresence};
+    let names: Vec<&str> = match info {
+        CoreInfoFinding::Found { firmware, .. } => firmware
+            .iter()
+            .filter(|entry| {
+                !entry.optional && entry.presence == FirmwarePresence::PresentUnverified
+            })
+            .filter_map(|entry| entry.path.as_deref())
+            .collect(),
+        _ => Vec::new(),
+    };
+    if names.is_empty() {
+        "Firmware found but not verified: required firmware is present but its contents were not checked.".into()
+    } else {
+        format!(
+            "Firmware found but not verified: {} is present but its contents were not checked.",
+            names.join(", ")
+        )
+    }
+}
+
+/// Blocker text naming the required files that are missing.
+pub(crate) fn missing_firmware_detail(
+    info: &crate::emulator_environment::retroarch::CoreInfoFinding,
+) -> String {
+    use crate::emulator_environment::retroarch::{CoreInfoFinding, FirmwarePresence};
+    let names: Vec<&str> = match info {
+        CoreInfoFinding::Found { firmware, .. } => {
+            crate::launch::readiness::effective_required_firmware(firmware)
+                .into_iter()
+                .filter(|group| group.presence == FirmwarePresence::Missing)
+                .flat_map(|group| group.members)
+                .filter(|entry| entry.presence == FirmwarePresence::Missing)
+                .filter_map(|entry| entry.path.as_deref())
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    if names.is_empty() {
+        "required firmware/BIOS is missing".into()
+    } else {
+        format!("required firmware/BIOS is missing: {}", names.join(", "))
+    }
+}
+
 fn readiness_from(blockers: &[LaunchBlocker], warnings: &[LaunchWarning]) -> LaunchReadiness {
     if !blockers.is_empty() {
         LaunchReadiness::Blocked
@@ -404,6 +485,36 @@ fn matching_retroarch_cores(
     matches
 }
 
+/// Whether a RetroArch core's CHD support is something this planner cannot
+/// vouch for. Only PlayStation is covered: the Beetle PSX build installed by
+/// some distributions predates CHD support while its `.info` still lists
+/// `chd`, so the metadata proves nothing about the binary.
+fn retroarch_chd_support_unconfirmed(
+    platform_id: &str,
+    core_stem: &str,
+    content: &LaunchContentRef,
+) -> bool {
+    platform_id == "PSX"
+        && psx_chd_content(content)
+        && !PSX_CHD_CAPABLE_RETROARCH_CORES.contains(&core_stem)
+}
+
+/// RetroArch PlayStation cores known to read CHD: SwanStation is built on
+/// DuckStation and booted CHD discs in a sandboxed smoke test. Every other
+/// RetroArch PSX core (Beetle PSX and its aliased copies) is not on this list
+/// because some distribution builds predate CHD support while their `.info`
+/// still lists `chd`.
+pub(crate) const PSX_CHD_CAPABLE_RETROARCH_CORES: &[&str] = &["swanstation"];
+
+fn psx_chd_content(content: &LaunchContentRef) -> bool {
+    content.container == Some(LaunchContainerKind::Chd)
+        || content.resolved_path.as_deref().is_some_and(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("chd"))
+        })
+}
+
 fn build_retroarch_candidates(
     platform_id: &'static str,
     content: &LaunchContentRef,
@@ -440,7 +551,14 @@ fn build_retroarch_candidates(
                 blockers.push(blocker);
             }
             let firmware = retroarch_core_firmware_readiness(&found.info);
-            let (firmware_blocker, firmware_warning) = firmware_condition(firmware);
+            let (firmware_blocker, mut firmware_warning) = firmware_condition(firmware);
+            if let Some(warning) = firmware_warning.as_mut() {
+                warning.detail = unverified_firmware_detail(&found.info);
+            }
+            let firmware_blocker = firmware_blocker.map(|mut blocker| {
+                blocker.detail = missing_firmware_detail(&found.info);
+                blocker
+            });
             blockers.extend(firmware_blocker);
             warnings.extend(firmware_warning);
             if ambiguous {
@@ -448,6 +566,15 @@ fn build_retroarch_candidates(
                     LaunchBlockerKind::AmbiguousCore,
                     format!(
                         "more than one installed RetroArch core resolves to {platform_id} and none is reviewed-preferred"
+                    ),
+                ));
+            }
+            if retroarch_chd_support_unconfirmed(platform_id, &found.core_stem, content) {
+                warnings.push(LaunchWarning::new(
+                    LaunchWarningKind::RetroArchChdSupportUnconfirmed,
+                    format!(
+                        "RetroArch core {} lists CHD as supported, but this installed build may not be able to read CHD; this is not confirmed until it is run",
+                        found.core_stem
                     ),
                 ));
             }
@@ -478,6 +605,14 @@ fn build_retroarch_candidates(
 /// surfaces [`LaunchWarningKind::MultipleEligibleProfiles`] when more than
 /// one is eligible and nothing is remembered.
 fn apply_preference(candidates: &mut [LaunchCandidate], remembered: &[RememberedPreference]) {
+    // A blocked candidate can never be the preferred one: a reviewed core hint
+    // on a candidate that cannot launch must not outrank (or hide) a ready
+    // route.
+    for candidate in candidates.iter_mut() {
+        if candidate.readiness == LaunchReadiness::Blocked {
+            candidate.preference = CandidatePreference::Undetermined;
+        }
+    }
     let eligible_indices: Vec<usize> = candidates
         .iter()
         .enumerate()
@@ -505,6 +640,63 @@ fn apply_preference(candidates: &mut [LaunchCandidate], remembered: &[Remembered
         candidates[index].preference = CandidatePreference::Remembered;
         return;
     }
+
+    // PlayStation CHD content: prefer the route with the strongest CHD
+    // evidence, but only when that route can really start. Tier 0 is a known
+    // CHD-capable RetroArch core (SwanStation), tier 1 the standalone
+    // DuckStation adapter, tier 2 every other RetroArch PSX core. The best
+    // tier that has a clean candidate (Ready, no warning, not a Flatpak
+    // profile, which cannot be launched) is kept for automatic selection and
+    // every other PSX CHD candidate is demoted to an explicit choice. When no
+    // candidate is clean nothing is demoted. Other candidates are untouched.
+    let chd_tier = |candidate: &LaunchCandidate| -> Option<u8> {
+        if !psx_chd_content(&candidate.content) {
+            return None;
+        }
+        match &candidate.target {
+            LaunchTarget::RetroArchCore {
+                platform_id,
+                core_stem,
+                ..
+            } if *platform_id == "PSX" => Some(
+                if PSX_CHD_CAPABLE_RETROARCH_CORES.contains(&core_stem.as_str()) {
+                    0
+                } else {
+                    2
+                },
+            ),
+            LaunchTarget::Standalone { adapter_id, .. } if *adapter_id == "duckstation" => Some(1),
+            _ => None,
+        }
+    };
+    let clean = |candidate: &LaunchCandidate| {
+        candidate.readiness == LaunchReadiness::Ready
+            && candidate.warnings.is_empty()
+            && !matches!(
+                &candidate.target,
+                LaunchTarget::RetroArchCore { profile, .. }
+                    if profile.profile_kind == ProfileKind::Flatpak
+            )
+    };
+    let best_clean_tier = eligible_indices
+        .iter()
+        .filter(|&&index| clean(&candidates[index]))
+        .filter_map(|&index| chd_tier(&candidates[index]))
+        .min();
+    let eligible_indices = match best_clean_tier {
+        Some(best) => {
+            let mut kept = Vec::new();
+            for &index in &eligible_indices {
+                match chd_tier(&candidates[index]) {
+                    None => kept.push(index),
+                    Some(tier) if tier == best && clean(&candidates[index]) => kept.push(index),
+                    Some(_) => candidates[index].preference = CandidatePreference::Undetermined,
+                }
+            }
+            kept
+        }
+        None => eligible_indices,
+    };
 
     // `build_retroarch_candidates` has already resolved the reviewed
     // single-hint case. Preserve that deterministic choice instead of
@@ -664,4 +856,72 @@ pub(crate) fn summarize(candidates: &[LaunchCandidate]) -> LaunchPlanSummary {
         }
     }
     summary
+}
+
+#[cfg(test)]
+mod missing_firmware_detail_tests {
+    use super::missing_firmware_detail;
+    use crate::emulator_environment::retroarch::{
+        CoreInfoFinding, FirmwarePresence, FirmwareRequirement,
+    };
+
+    #[test]
+    fn names_only_required_missing_files() {
+        let entry = |i: u32, p: &str, optional, presence| FirmwareRequirement {
+            index: i,
+            path: Some(p.into()),
+            description: None,
+            optional,
+            presence,
+        };
+        let info = CoreInfoFinding::Found {
+            display_name: None,
+            display_version: None,
+            system_name: None,
+            supported_extensions: Vec::new(),
+            core_name: None,
+            manufacturer: None,
+            categories: None,
+            database: None,
+            firmware: vec![
+                entry(0, "have.bin", false, FirmwarePresence::PresentUnverified),
+                entry(1, "need.bin", false, FirmwarePresence::Missing),
+                entry(2, "extra.bin", true, FirmwarePresence::Missing),
+            ],
+        };
+        assert_eq!(
+            missing_firmware_detail(&info),
+            "required firmware/BIOS is missing: need.bin"
+        );
+    }
+
+    #[test]
+    fn all_missing_alternative_group_names_every_member() {
+        let entry = |i: u32, p: &str| FirmwareRequirement {
+            index: i,
+            path: Some(p.into()),
+            description: None,
+            optional: false,
+            presence: FirmwarePresence::Missing,
+        };
+        let info = CoreInfoFinding::Found {
+            display_name: None,
+            display_version: None,
+            system_name: None,
+            supported_extensions: Vec::new(),
+            core_name: None,
+            manufacturer: None,
+            categories: None,
+            database: None,
+            firmware: vec![
+                entry(0, "scph5500.bin"),
+                entry(1, "scph5501.bin"),
+                entry(2, "scph5502.bin"),
+            ],
+        };
+        assert_eq!(
+            missing_firmware_detail(&info),
+            "required firmware/BIOS is missing: scph5500.bin, scph5501.bin, scph5502.bin"
+        );
+    }
 }
