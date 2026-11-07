@@ -1278,6 +1278,8 @@ fn staged_launch_is_safe(
                     | "savestate_directory"
                     | "savefiles_in_content_dir"
                     | "savestates_in_content_dir"
+                    | "sort_savefiles_by_content_enable"
+                    | "sort_savestates_by_content_enable"
             )
         {
             return Err(format!("RetroArch settings set `{key}` more than once"));
@@ -1290,6 +1292,24 @@ fn staged_launch_is_safe(
             return Err(format!(
                 "RetroArch may keep saves beside the game (`{key}` is not explicitly false), \
                  which would lose them for a zipped cartridge"
+            ));
+        }
+    }
+    // With "sort by content directory" on, RetroArch writes saves into a
+    // folder named after the content's directory, which for a staged zip is a
+    // fresh `emuwiz-zip-rom-*` folder every launch. Fail closed; never rewrite.
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+    ] {
+        if let Some(value) = seen.get(key)
+            && !matches!(value.to_ascii_lowercase().as_str(), "false" | "0")
+        {
+            return Err(format!(
+                "RetroArch sorts saves into a folder named after the game's folder (`{key}` \
+                 is not explicitly false), so saves for a zipped cartridge would land in a \
+                 per-launch emuwiz-zip-rom-* folder and never be found again; turn it off in \
+                 RetroArch first"
             ));
         }
     }
