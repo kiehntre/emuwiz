@@ -348,12 +348,23 @@ mod sqlite_io {
                 ffi::SQLITE_FCNTL_FILE_POINTER,
                 (&mut file as *mut *mut ffi::sqlite3_file).cast::<c_void>(),
             );
-            if rc != ffi::SQLITE_OK || file.is_null() || (*file).pMethods.is_null() {
+            if rc != ffi::SQLITE_OK {
                 return Err(db(format!(
                     "Could not reach SQLite's file handle for {label} (code {rc})."
                 )));
             }
-            let methods = &*(*file).pMethods;
+            // Every pointer is null-checked through `as_ref` before it is
+            // read: the file handle itself, then its method table.
+            let Some(file_ref) = file.as_ref() else {
+                return Err(db(format!(
+                    "SQLite returned no file handle for {label} (code {rc})."
+                )));
+            };
+            let Some(methods) = file_ref.pMethods.as_ref() else {
+                return Err(db(format!(
+                    "SQLite's file handle for {label} has no method table."
+                )));
+            };
             let (Some(x_read), Some(x_file_size)) = (methods.xRead, methods.xFileSize) else {
                 return Err(db(format!(
                     "SQLite's file handle for {label} has no read methods."
