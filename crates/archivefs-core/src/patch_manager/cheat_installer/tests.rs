@@ -2410,7 +2410,10 @@ mod d7_wiring {
         }
     }
 
-    fn manifest(root: &Path, games: &[(&str, &[(&str, Option<&str>)])]) -> PathBuf {
+    type CheatSpec<'a> = (&'a str, Option<&'a str>);
+    type GameSpec<'a> = (&'a str, &'a [CheatSpec<'a>]);
+
+    fn manifest(root: &Path, games: &[GameSpec<'_>]) -> PathBuf {
         let games_json: Vec<String> = games
             .iter()
             .map(|(name, cheats)| {
