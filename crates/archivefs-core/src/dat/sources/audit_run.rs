@@ -1507,20 +1507,24 @@ fn merge_combined_evidence(
     let mut exact = Vec::new();
     let mut source_ambiguities = Vec::new();
     let mut non_exact = Vec::new();
-    for catalogue in catalogues {
-        match audit_one(known, &catalogue.index) {
+    let per_catalogue: Vec<AuditVerdict> = catalogues
+        .iter()
+        .map(|catalogue| audit_one(known, &catalogue.index))
+        .collect();
+    for (catalogue, verdict) in catalogues.iter().zip(per_catalogue.iter()) {
+        match verdict {
             AuditVerdict::Exact {
                 game_name,
                 rom_name,
                 algorithm,
-            } => exact.push((catalogue, game_name, rom_name, algorithm)),
+            } => exact.push((catalogue, game_name.clone(), rom_name.clone(), *algorithm)),
             AuditVerdict::ExactMultipleCandidates { count, .. } => {
                 source_ambiguities.push(format!(
                     "{} has {count} exact candidates",
                     catalogue.source.source_display_name
                 ))
             }
-            verdict => non_exact.push(verdict),
+            verdict => non_exact.push(verdict.clone()),
         }
     }
     if !source_ambiguities.is_empty() {
@@ -1538,13 +1542,89 @@ fn merge_combined_evidence(
             content: None,
         };
     }
+    // S03-03 across catalogues: one catalogue verifying the bytes while
+    // another says those exact bytes are a known bad dump (or a placeholder)
+    // is a disagreement about dump status, not an Exact match that happens to
+    // have a dissenting neighbour. Report it; never let Exact win by default.
+    let unverifiable_only: std::collections::BTreeSet<String> = catalogues
+        .iter()
+        .zip(per_catalogue.iter())
+        .filter(|(_, verdict)| matches!(verdict, AuditVerdict::Ambiguous { .. }))
+        .filter_map(|(catalogue, _)| {
+            let collected = crate::dat::audit::collect_crypto_candidates(known, &catalogue.index);
+            (collected.consistent.is_empty() && !collected.unverifiable.is_empty()).then(|| {
+                format!(
+                    "{}: only unverifiable record(s) {}",
+                    catalogue.source.source_display_name,
+                    collected.unverifiable_detail()
+                )
+            })
+        })
+        .collect();
+    if !exact.is_empty() && !unverifiable_only.is_empty() {
+        let details = exact
+            .iter()
+            .map(|(source, game, rom, _)| {
+                format!("{}: {game} / {rom}", source.source.source_display_name)
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .chain(unverifiable_only)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return CombinedEvidenceResult {
+            verdict: AuditVerdict::Ambiguous {
+                detail: format!("catalogues disagree on dump status: {details}"),
+            },
+            evidence: Vec::new(),
+            content: None,
+        };
+    }
     let Some((first_source, first_game, first_rom, first_algorithm)) = exact.first() else {
         // Keep useful non-exact diagnostics, but never allow a filename-only
         // result from one catalogue to eclipse hash evidence from another.
+        // S03-06: catalogues that each reach a *different* Probable identity
+        // are a disagreement to report, not a race won by whichever source
+        // was configured first.
+        let probable_identities = non_exact
+            .iter()
+            .filter_map(|verdict| match verdict {
+                AuditVerdict::Probable {
+                    game_name,
+                    rom_name,
+                } => Some((game_name.as_str(), rom_name.as_str())),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let probable_disagreement = (probable_identities.len() > 1).then(|| {
+            let details = catalogues
+                .iter()
+                .zip(per_catalogue.iter())
+                .filter_map(|(catalogue, verdict)| match verdict {
+                    AuditVerdict::Probable {
+                        game_name,
+                        rom_name,
+                    } => Some(format!(
+                        "{}: {game_name} / {rom_name}",
+                        catalogue.source.source_display_name
+                    )),
+                    _ => None,
+                })
+                // Sorted so the explanation itself is configuration-order
+                // independent, exactly like the verdict.
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("; ");
+            AuditVerdict::Ambiguous {
+                detail: format!("probable (CRC32) catalogues disagree: {details}"),
+            }
+        });
         let verdict = non_exact
             .iter()
             .find(|verdict| matches!(verdict, AuditVerdict::Ambiguous { .. }))
             .cloned()
+            .or(probable_disagreement)
             .or_else(|| {
                 non_exact
                     .iter()
@@ -2524,38 +2604,22 @@ fn rom_for_key(
     }
 }
 
-/// The candidate catalogue ROMs a cryptographic hash matched, strongest hash
-/// first, mirroring [`crate::dat::audit`]'s evidence priority.
+/// The candidate catalogue ROMs the file's cryptographic hashes matched, in
+/// catalogue order.
 ///
-/// This is deliberately the same algorithm the verdict uses: a file whose
-/// SHA-1 matched is ranked by the same SHA-1 candidates the audit reported,
-/// so the annotation can never disagree with the verdict about what matched.
+/// This is deliberately the same collection the verdict uses
+/// ([`crate::dat::audit::collect_crypto_candidates`]): every shared algorithm
+/// is consulted and the union reported, so the policy annotation and the
+/// persisted matched references can never disagree with the verdict about
+/// what matched, and a record that publishes only a weaker hash is never
+/// hidden (S03-01). `nodump`/`baddump` records are excluded exactly as the
+/// verdict excludes them (S03-03).
 fn verified_candidate_refs(known: &KnownFileEvidence, index: &DatIndex) -> Vec<DatRomRef> {
-    for (value, algorithm) in [
-        (known.sha256.as_deref(), "SHA-256"),
-        (known.sha1.as_deref(), "SHA-1"),
-        (known.md5.as_deref(), "MD5"),
-    ] {
-        let Some(value) =
-            value.and_then(|value| crate::dat::audit::normalise_for_lookup(value, algorithm))
-        else {
-            continue;
-        };
-        let candidates = match algorithm {
-            "SHA-256" => index.lookup_sha256(&value),
-            "SHA-1" => index.lookup_sha1(&value),
-            _ => index.lookup_md5(&value),
-        };
-        let consistent: Vec<_> = candidates
-            .iter()
-            .filter(|candidate| !crate::dat::audit::cryptographic_hash_disagrees(known, candidate))
-            .map(SharedRomRef::to_owned_ref)
-            .collect();
-        if !consistent.is_empty() {
-            return consistent;
-        }
-    }
-    Vec::new()
+    crate::dat::audit::collect_crypto_candidates(known, index)
+        .consistent
+        .iter()
+        .map(SharedRomRef::to_owned_ref)
+        .collect()
 }
 
 /// Judges each loose `.cue` in `report` as one disc. The sheet and every file
@@ -2747,6 +2811,24 @@ fn matched_refs_for_verdict(
     match verdict {
         AuditVerdict::Exact { .. } | AuditVerdict::ExactMultipleCandidates { .. } => {
             verified_candidate_refs(known, index)
+        }
+        // S03-03: a hash that agrees only with `nodump`/`baddump` records is
+        // refused as identity (the verdict is `Ambiguous`), but the records
+        // it agrees with are still the honest attribution of these bytes.
+        // Set classification needs them to explain "this set is a known bad
+        // dump" instead of losing the member entirely. The verdict itself is
+        // what grants verification, and it does not.
+        AuditVerdict::Ambiguous { .. } => {
+            let collected = crate::dat::audit::collect_crypto_candidates(known, index);
+            if collected.consistent.is_empty() {
+                collected
+                    .unverifiable
+                    .iter()
+                    .map(|(record, _)| record.to_owned_ref())
+                    .collect()
+            } else {
+                Vec::new()
+            }
         }
         _ => Vec::new(),
     }
@@ -3000,6 +3082,37 @@ mod nested_member_evidence_tests {
         };
         assert!(matched_refs_for_verdict(&filename_only, &known, &index).is_empty());
     }
+    /// S03-03: a member whose hash agrees only with a `baddump` record keeps
+    /// that record as its attribution while the verdict refuses to verify it.
+    #[test]
+    fn bad_dump_attribution_keeps_the_catalogue_record_without_verifying_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.dat");
+        let sha1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        std::fs::write(&path, format!(r#"<datafile><header><name>Synthetic</name></header>
+          <game name="Bad"><rom name="bad.bin" size="4" sha1="{sha1}" status="baddump"/></game></datafile>"#)).unwrap();
+        let parsed = crate::dat::parsers::parse_dat_file(&path, Default::default())
+            .unwrap()
+            .dat;
+        let index = DatIndex::build(&parsed);
+        let known = KnownFileEvidence::new("/synthetic/file.bin", "file.bin").with_sha1(sha1);
+        let verdict = audit_one(&known, &index);
+        assert!(
+            matches!(verdict, AuditVerdict::Ambiguous { .. }),
+            "{verdict:?}"
+        );
+        assert!(verified_candidate_refs(&known, &index).is_empty());
+        let refs = matched_refs_for_verdict(&verdict, &known, &index);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].game_name, "Bad");
+        assert_eq!(refs[0].status.as_deref(), Some("baddump"));
+        // An ordinary conflict carries no attribution.
+        let conflict = AuditVerdict::Ambiguous { detail: "x".into() };
+        let other = KnownFileEvidence::new("/synthetic/other.bin", "other.bin")
+            .with_sha1("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert!(matched_refs_for_verdict(&conflict, &other, &index).is_empty());
+    }
+
     #[test]
     fn conflicting_crypto_candidates_never_return_as_verified_identity_refs() {
         let dir = tempfile::tempdir().unwrap();
@@ -3341,6 +3454,106 @@ game (
         .unwrap();
         assert_eq!(first.report, disabled.report);
         assert_eq!(first.evidence_sources, disabled.evidence_sources);
+    }
+
+    fn crc_only_dat(game: &str, rom: &str, bytes: &[u8]) -> String {
+        format!(
+            r#"<?xml version="1.0"?><datafile><header><name>Fixture</name></header><game name="{game}"><rom name="{rom}" size="{}" crc="{}"/></game></datafile>"#,
+            bytes.len(),
+            crate::identity_source::hashing::Crc32::of(bytes)
+        )
+    }
+
+    /// S03-06: two catalogues whose CRC32-only records name different games
+    /// for the same bytes disagree. The combined verdict must say so in
+    /// either configuration order, never adopt the first catalogue's Probable.
+    #[test]
+    fn s03_06_combined_probable_disagreement_is_ambiguous_in_either_order() {
+        let tree = tempfile::tempdir().unwrap();
+        let games = tree.path().join("games");
+        std::fs::create_dir(&games).unwrap();
+        let bytes = b"same bytes";
+        std::fs::write(games.join("thing.rom"), bytes).unwrap();
+        let first = tree.path().join("first.dat");
+        let second = tree.path().join("second.dat");
+        std::fs::write(&first, crc_only_dat("Alpha", "alpha.rom", bytes)).unwrap();
+        std::fs::write(&second, crc_only_dat("Beta", "beta.rom", bytes)).unwrap();
+
+        let forward = run(
+            vec![source(first.clone(), "one"), source(second.clone(), "two")],
+            games.clone(),
+        );
+        let reverse = run(vec![source(second, "two"), source(first, "one")], games);
+        for outcome in [&forward, &reverse] {
+            assert_eq!(outcome.report.entries.len(), 1);
+            match &outcome.report.entries[0].verdict {
+                AuditVerdict::Ambiguous { detail } => {
+                    assert!(detail.contains("Alpha / alpha.rom"), "{detail}");
+                    assert!(detail.contains("Beta / beta.rom"), "{detail}");
+                }
+                other => panic!("expected a catalogue disagreement, got {other:?}"),
+            }
+            assert!(outcome.evidence_sources.is_empty());
+        }
+        assert_eq!(forward.report, reverse.report);
+    }
+
+    /// S03-03 across catalogues: a good record in one DAT and a `baddump`
+    /// record with the same hash in another is a dump-status disagreement,
+    /// never an Exact match, in either configuration order.
+    #[test]
+    fn s03_03_exact_in_one_catalogue_and_baddump_in_another_is_ambiguous() {
+        let tree = tempfile::tempdir().unwrap();
+        let games = tree.path().join("games");
+        std::fs::create_dir(&games).unwrap();
+        let bytes = b"disputed bytes";
+        std::fs::write(games.join("thing.rom"), bytes).unwrap();
+        let sha1 = Sha1::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let good = tree.path().join("good.dat");
+        let bad = tree.path().join("bad.dat");
+        std::fs::write(&good, dat_entries(&[("Game", "game.rom", bytes)])).unwrap();
+        std::fs::write(&bad, format!(
+            r#"<?xml version="1.0"?><datafile><header><name>Fixture</name></header><game name="Game"><rom name="game.rom" size="{}" sha1="{sha1}" status="baddump"/></game></datafile>"#,
+            bytes.len()
+        )).unwrap();
+        let forward = run(
+            vec![source(good.clone(), "one"), source(bad.clone(), "two")],
+            games.clone(),
+        );
+        let reverse = run(vec![source(bad, "two"), source(good, "one")], games);
+        for outcome in [&forward, &reverse] {
+            match &outcome.report.entries[0].verdict {
+                AuditVerdict::Ambiguous { detail } => {
+                    assert!(detail.contains("dump status"), "{detail}");
+                    assert!(detail.contains("baddump"), "{detail}");
+                }
+                other => panic!("expected a dump-status disagreement, got {other:?}"),
+            }
+            assert!(outcome.evidence_sources.is_empty());
+        }
+        assert_eq!(forward.report, reverse.report);
+    }
+
+    /// Catalogues whose Probable verdicts agree still yield one Probable.
+    #[test]
+    fn s03_06_agreeing_probable_catalogues_stay_probable() {
+        let tree = tempfile::tempdir().unwrap();
+        let games = tree.path().join("games");
+        std::fs::create_dir(&games).unwrap();
+        let bytes = b"same bytes";
+        std::fs::write(games.join("thing.rom"), bytes).unwrap();
+        let first = tree.path().join("first.dat");
+        let second = tree.path().join("second.dat");
+        std::fs::write(&first, crc_only_dat("Alpha", "alpha.rom", bytes)).unwrap();
+        std::fs::write(&second, crc_only_dat("Alpha", "alpha.rom", bytes)).unwrap();
+        let outcome = run(vec![source(first, "one"), source(second, "two")], games);
+        assert!(matches!(
+            outcome.report.entries[0].verdict,
+            AuditVerdict::Probable { ref game_name, .. } if game_name == "Alpha"
+        ));
     }
 
     /// S03-02 / D3-02: a warm cache must not turn a same-size in-place
