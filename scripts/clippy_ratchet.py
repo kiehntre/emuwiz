@@ -19,6 +19,7 @@ from __future__ import annotations
 import collections
 import json
 import pathlib
+import re
 import sys
 
 Fingerprint = tuple[str, str, str]
@@ -28,6 +29,26 @@ HEADER = (
     "# Fix warnings and regenerate with `scripts/clippy-ratchet.sh --write-baseline`;\n"
     "# that refuses to add entries. Never add entries to make a PR pass.\n"
 )
+
+
+# A warning whose primary span is inside the Rust standard library (for example
+# one raised through a core macro) is reported under CI's remapped source path
+# /rustc/<commit>/library/... but, on a machine with the rust-src component,
+# under <toolchain>/lib/rustlib/src/rust/library/... . Both name the same file,
+# so they share one identity; workspace paths are never rewritten.
+RUST_SOURCE = "<rust-src>/"
+_RUST_SOURCE_PATHS = (
+    re.compile(r"^/rustc/[0-9a-f]{7,64}/(library/.+)$"),
+    re.compile(r"^.+/lib/rustlib/src/rust/(library/.+)$"),
+)
+
+
+def canonical_file(file: str) -> str:
+    for pattern in _RUST_SOURCE_PATHS:
+        match = pattern.match(file)
+        if match:
+            return RUST_SOURCE + match.group(1)
+    return file
 
 
 def warnings(clippy_json: pathlib.Path) -> collections.Counter[Fingerprint]:
@@ -47,7 +68,7 @@ def warnings(clippy_json: pathlib.Path) -> collections.Counter[Fingerprint]:
         span = next((s for s in diag["spans"] if s.get("is_primary")), diag["spans"][0])
         code = (diag.get("code") or {}).get("code", "")
         seen.add((code, span["file_name"], span["line_start"], span["column_start"], diag["message"]))
-    return collections.Counter((code, file, message) for code, file, _, _, message in seen)
+    return collections.Counter((code, canonical_file(file), message) for code, file, _, _, message in seen)
 
 
 def read_baseline(path: pathlib.Path) -> collections.Counter[Fingerprint]:
@@ -58,7 +79,8 @@ def read_baseline(path: pathlib.Path) -> collections.Counter[Fingerprint]:
         item = json.loads(line)
         if not (isinstance(item, list) and len(item) == 3 and all(isinstance(x, str) for x in item)):
             raise ValueError(f"{path}:{number}: expected [lint, file, message]")
-        entries[tuple(item)] += 1
+        code, file, message = item
+        entries[(code, canonical_file(file), message)] += 1
     return entries
 
 
