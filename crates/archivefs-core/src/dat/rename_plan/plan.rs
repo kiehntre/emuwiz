@@ -163,6 +163,18 @@ pub fn build_rename_plan(
                     .known_hashes
                     .get(entry.local_path.as_str())
                     .and_then(|hashes| hashes.fingerprint.clone());
+                // S03-05: say plainly when the match needed a header ignored.
+                if let Some(header_match) = outcome
+                    .known_hashes
+                    .get(entry.local_path.as_str())
+                    .and_then(|hashes| hashes.header_removal.as_ref())
+                {
+                    proposal.verdict_label = format!(
+                        "Exact ({})",
+                        crate::dat::header_match::MATCHED_AFTER_HEADER_REMOVAL.to_ascii_lowercase()
+                    );
+                    proposal.explanations.push(header_match.explanation());
+                }
                 proposals.push(proposal);
             }
             None => proposals.push(blocked_missing_source(
