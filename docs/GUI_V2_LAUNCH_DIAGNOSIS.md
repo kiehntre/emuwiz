@@ -64,3 +64,34 @@ Presentation only: nothing here plans, probes or launches. Code:
 - Structured adapter support/readiness in the plan.
 - Distinct emulator-detection blockers (not installed / not detected / moved /
   unsupported version).
+
+## Game Doctor (Part 1, read-only)
+
+Game Details has a collapsed **Game Doctor** section (`gui_v2/game_doctor.rs`),
+drawn last in the page body so it never moves anything above it, that explains, in one place, what EmuWiz already knows about the selected game.
+It is a projection only: no I/O, probing, hashing, planning, launching,
+persistence or actions.
+
+- **Identity tier** comes from Game Details' own identity answer
+  (`detail_identity::decide`, which applies the DAT current-proof rule), the
+  canonical identity review and the saved catalogue state: *Verified* (current
+  proof only), *Probable* (one likely identity, not verified), *Ambiguous*
+  (several candidates, conflicting evidence, or a saved ambiguous DAT
+  comparison), *Unknown* (file name only, or no trusted system) and *Still
+  being checked* (a saved DAT match whose proof is being re-read).
+- **Launch readiness** is the exact summary the readiness card last displayed
+  for this game and path (a repaint is requested whenever that answer changes,
+  so a Doctor drawn earlier in the frame catches up). Its blockers are listed as
+  *Missing*; a blocked answer with no listed blocker shows the card's own
+  headline and explanation; firmware is *Missing* only when the plan says so
+  (present-but-unverified or unknown firmware is never called missing; the
+  card's own warning is repeated instead). Warnings, a stale answer and the last
+  in-session launch attempt are listed as *Warning*. Until the card has
+  answered, the Doctor says readiness has not been answered yet.
+- Passing checks reads "Launch checks passed", never "Ready to play"; the section always states that
+  EmuWiz keeps no record of gameplay and that recognition and passing launch
+  checks do not prove the game plays.
+
+Not covered yet: repair offers or links (Next Frontier M31 GD-3/GD-4, deferred
+in the Midnight Handoff), a persisted launch-outcome record (NF-38-01), the
+core `diagnostics::Finding` projection (NF-31-01) and a CLI `doctor --game`.
