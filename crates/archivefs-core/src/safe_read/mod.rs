@@ -420,10 +420,15 @@ pub fn open_directory_no_symlinks(path: &Path) -> Result<File, SafeReadRefusal> 
 #[cfg(unix)]
 fn open_root() -> Result<File, SafeReadRefusal> {
     let mut options = OpenOptions::new();
+    // Rust requires an access mode; with `O_PATH` the kernel ignores it.
     options.read(true);
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC);
+        // `O_PATH`: a position in the tree, not an opened directory. It needs
+        // no read permission and raises no inotify open event, which matters
+        // because the walk passes through directories (a library parent, a
+        // search-only folder) that this code must not list or "open".
+        options.custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC);
     }
     options
         .open("/")
@@ -442,10 +447,15 @@ fn open_child_directory(
     name: &std::ffi::OsStr,
     reached: &Path,
 ) -> Result<File, SafeReadRefusal> {
+    // `O_PATH` for every intermediate directory: search permission (`x`) is
+    // enough, no open event is generated, and `O_NOFOLLOW` still refuses a
+    // symlink in the component's place. An `O_PATH` descriptor is valid as the
+    // `dirfd` of `openat`, `fstatat` and `renameat2`, which is all the walk and
+    // its callers use it for.
     openat(
         directory,
         name,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
     )
     .map_err(|error| {
         if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR))
