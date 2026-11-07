@@ -353,19 +353,57 @@ fn missing_required_firmware_is_never_launchable() {
     assert!(preflight(&ready).is_err());
 }
 
-/// PINS TODAY'S BEHAVIOUR, a documented pre-existing gap (not changed here,
-/// separate owner-decided PR): when required firmware is a mix of present and
-/// missing entries the projection is `Unknown`, which adds neither blocker
-/// nor warning, so the launch is not refused.
+/// Owner policy: any required-and-missing firmware file blocks the launch,
+/// even when other required files are present (fresh probe at click time).
 #[test]
-fn mixed_present_and_missing_required_firmware_is_unknown_and_not_refused_today() {
+fn mixed_present_and_missing_required_firmware_is_refused() {
     let ready = build_ready_fixture("fw-mixed");
     declare_required_firmware(&ready, &["a.bin", "b.bin"]);
     fs::write(ready.fixture.path("system/a.bin"), b"x").unwrap();
+    let error = preflight(&ready).unwrap_err();
     assert!(
-        preflight(&ready).is_ok(),
-        "pre-existing Unknown behaviour changed; update the owner-decided gap note"
+        matches!(
+            error.kind,
+            LaunchPreflightErrorKind::CandidateNotReady
+                | LaunchPreflightErrorKind::RequestedCandidateNotFound
+                | LaunchPreflightErrorKind::CommandBlocked
+        ),
+        "{error:?}"
     );
+}
+
+#[test]
+fn beetle_psx_style_region_alternatives_need_only_one_bios() {
+    let ready = build_ready_fixture("fw-psx-one-region");
+    declare_required_firmware(&ready, &["scph5500.bin", "scph5501.bin", "scph5502.bin"]);
+    fs::write(ready.fixture.path("system/scph5501.bin"), b"us").unwrap();
+    preflight(&ready).expect("one regional BIOS of the alternative group is enough");
+}
+
+#[test]
+fn beetle_psx_style_with_no_region_bios_is_refused() {
+    let ready = build_ready_fixture("fw-psx-none");
+    declare_required_firmware(&ready, &["scph5500.bin", "scph5501.bin", "scph5502.bin"]);
+    assert!(preflight(&ready).is_err());
+}
+
+#[test]
+fn all_required_firmware_present_unverified_still_plays() {
+    let ready = build_ready_fixture("fw-all-present");
+    declare_required_firmware(&ready, &["a.bin", "b.bin"]);
+    fs::write(ready.fixture.path("system/a.bin"), b"x").unwrap();
+    fs::write(ready.fixture.path("system/b.bin"), b"y").unwrap();
+    preflight(&ready).expect("all required present keeps Play");
+}
+
+#[test]
+fn mixed_firmware_becomes_playable_once_the_missing_file_is_installed() {
+    let ready = build_ready_fixture("fw-mixed-fixed");
+    declare_required_firmware(&ready, &["a.bin", "b.bin"]);
+    fs::write(ready.fixture.path("system/a.bin"), b"x").unwrap();
+    assert!(preflight(&ready).is_err());
+    fs::write(ready.fixture.path("system/b.bin"), b"y").unwrap();
+    preflight(&ready).expect("installing the missing file unblocks");
 }
 
 // --- exact argv preserved -----------------------------------------------------

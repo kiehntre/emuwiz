@@ -769,6 +769,82 @@ pub fn xenia_firmware_readiness() -> FirmwareReadiness {
     FirmwareReadiness::NotRequired
 }
 
+/// Required `.info` entries that are known regional ALTERNATIVES: the core
+/// needs only one of them, although `.info` lists each as non-optional.
+/// Deliberately a short, conservative table keyed by file name (verified
+/// against libretro info files: Beetle/DuckStation PSX JP/US/EU BIOS and
+/// Beetle Saturn JP vs US/EU BIOS). Everything else is not grouped, so a
+/// missing required file there still blocks.
+const ALTERNATIVE_FIRMWARE_GROUPS: &[&[&str]] = &[
+    &["scph5500.bin", "scph5501.bin", "scph5502.bin"],
+    &["sega_101.bin", "mpr-17933.bin"],
+];
+
+/// One effective requirement: a single required file, or a whole alternative
+/// group collapsed to one judgement.
+pub(crate) struct EffectiveRequirement<'a> {
+    pub members: Vec<&'a crate::emulator_environment::retroarch::FirmwareRequirement>,
+    pub presence: FirmwarePresence,
+}
+
+fn alternative_group_of(path: Option<&str>) -> Option<usize> {
+    let name = path?.rsplit('/').next()?.to_ascii_lowercase();
+    ALTERNATIVE_FIRMWARE_GROUPS
+        .iter()
+        .position(|group| group.contains(&name.as_str()))
+}
+
+/// Collapses required entries into effective requirements. A group only
+/// forms when at least two of its files are listed as required; it is
+/// satisfied by any present member, `Missing` only when every member is
+/// missing, and otherwise `Unknown`.
+pub(crate) fn effective_required_firmware(
+    firmware: &[crate::emulator_environment::retroarch::FirmwareRequirement],
+) -> Vec<EffectiveRequirement<'_>> {
+    let required: Vec<_> = firmware.iter().filter(|entry| !entry.optional).collect();
+    let mut out: Vec<EffectiveRequirement<'_>> = Vec::new();
+    let mut seen_groups: Vec<usize> = Vec::new();
+    for entry in &required {
+        let group = alternative_group_of(entry.path.as_deref()).filter(|g| {
+            required
+                .iter()
+                .filter(|e| alternative_group_of(e.path.as_deref()) == Some(*g))
+                .count()
+                >= 2
+        });
+        match group {
+            None => out.push(EffectiveRequirement {
+                members: vec![*entry],
+                presence: entry.presence,
+            }),
+            Some(g) if seen_groups.contains(&g) => {}
+            Some(g) => {
+                seen_groups.push(g);
+                let members: Vec<_> = required
+                    .iter()
+                    .copied()
+                    .filter(|e| alternative_group_of(e.path.as_deref()) == Some(g))
+                    .collect();
+                let presence = if members
+                    .iter()
+                    .any(|m| m.presence == FirmwarePresence::PresentUnverified)
+                {
+                    FirmwarePresence::PresentUnverified
+                } else if members
+                    .iter()
+                    .all(|m| m.presence == FirmwarePresence::Missing)
+                {
+                    FirmwarePresence::Missing
+                } else {
+                    FirmwarePresence::Unknown
+                };
+                out.push(EffectiveRequirement { members, presence });
+            }
+        }
+    }
+    out
+}
+
 /// Projects a RetroArch core's declared, non-optional `firmwareN_*` entries
 /// onto [`FirmwareReadiness`]. This performs no I/O: discovery already
 /// probed each entry read-only and no-follow under the profile's system
@@ -778,25 +854,28 @@ pub fn xenia_firmware_readiness() -> FirmwareReadiness {
 /// say which required files are alternatives (e.g. Mednafen PSX lists the
 /// JP, US and EU BIOS all as required, though the core uses the one matching
 /// the disc). EmuWiz does not invent such groups, so:
-/// - every required entry `Missing` is `Missing` (nothing usable exists);
-/// - some `Missing` alongside any present or unjudgeable entry is `Unknown`
-///   (it could be an unused regional alternative - not claimed either way);
+/// - known regional alternatives (see `ALTERNATIVE_FIRMWARE_GROUPS`) count
+///   as one requirement, satisfied by any present member;
+/// - any other required entry `Missing` is `Missing`, even when other required
+///   entries are present (owner policy: a missing required file is never a
+///   Play-ready result; the user can install it or the core can be
+///   reviewed - EmuWiz does not guess an unused regional alternative);
 /// - all required entries present is `PresentUnverified`; any other
-///   unjudgeable entry, or an unreadable `.info`, is `Unknown`.
+///   unjudgeable entry (with none missing), or an unreadable `.info`, is
+///   `Unknown`.
 ///
 /// Never `Verified`: file contents are not hashed.
 pub fn retroarch_core_firmware_readiness(info: &CoreInfoFinding) -> FirmwareReadiness {
     let CoreInfoFinding::Found { firmware, .. } = info else {
         return FirmwareReadiness::Unknown;
     };
-    let required: Vec<FirmwarePresence> = firmware
-        .iter()
-        .filter(|entry| !entry.optional)
-        .map(|entry| entry.presence)
+    let required: Vec<FirmwarePresence> = effective_required_firmware(firmware)
+        .into_iter()
+        .map(|group| group.presence)
         .collect();
     if required.is_empty() {
         FirmwareReadiness::NotRequired
-    } else if required.iter().all(|p| *p == FirmwarePresence::Missing) {
+    } else if required.contains(&FirmwarePresence::Missing) {
         FirmwareReadiness::Missing
     } else if required
         .iter()
@@ -840,15 +919,19 @@ mod tests {
     #[test]
     fn retroarch_core_firmware_projection() {
         use FirmwarePresence::*;
-        let cases: [(&[(bool, FirmwarePresence)], FirmwareReadiness); 8] = [
+        let cases: [(&[(bool, FirmwarePresence)], FirmwareReadiness); 9] = [
             (&[], FirmwareReadiness::NotRequired),
             (&[(true, Missing)], FirmwareReadiness::NotRequired),
             (&[(false, Missing)], FirmwareReadiness::Missing),
             // Mednafen PSX-style: JP/US/EU all "required"; only one installed.
-            // Alternatives are not invented, so this is Unknown, not Missing.
+            // Alternatives are not invented, so a missing required file blocks.
             (
                 &[(false, PresentUnverified), (false, Missing)],
-                FirmwareReadiness::Unknown,
+                FirmwareReadiness::Missing,
+            ),
+            (
+                &[(false, Unknown), (false, Missing)],
+                FirmwareReadiness::Missing,
             ),
             (
                 &[(false, Missing), (false, Missing), (false, Missing)],
@@ -874,6 +957,79 @@ mod tests {
         assert_eq!(
             retroarch_core_firmware_readiness(&CoreInfoFinding::Missing),
             FirmwareReadiness::Unknown
+        );
+    }
+
+    fn named_core(entries: &[(&str, FirmwarePresence)]) -> CoreInfoFinding {
+        use crate::emulator_environment::retroarch::FirmwareRequirement;
+        CoreInfoFinding::Found {
+            display_name: None,
+            display_version: None,
+            system_name: None,
+            supported_extensions: Vec::new(),
+            core_name: None,
+            manufacturer: None,
+            categories: None,
+            database: None,
+            firmware: entries
+                .iter()
+                .enumerate()
+                .map(|(i, (path, presence))| FirmwareRequirement {
+                    index: i as u32,
+                    path: Some((*path).into()),
+                    description: None,
+                    optional: false,
+                    presence: *presence,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn beetle_psx_region_alternatives_need_only_one_present() {
+        use FirmwarePresence::*;
+        let psx = |a, b, c| {
+            retroarch_core_firmware_readiness(&named_core(&[
+                ("scph5500.bin", a),
+                ("scph5501.bin", b),
+                ("scph5502.bin", c),
+            ]))
+        };
+        assert_eq!(
+            psx(Missing, PresentUnverified, Missing),
+            FirmwareReadiness::PresentUnverified
+        );
+        assert_eq!(psx(Missing, Missing, Missing), FirmwareReadiness::Missing);
+        assert_eq!(psx(Missing, Unknown, Missing), FirmwareReadiness::Unknown);
+    }
+
+    #[test]
+    fn saturn_alternatives_ok_but_puae_style_mixed_still_blocks() {
+        use FirmwarePresence::*;
+        assert_eq!(
+            retroarch_core_firmware_readiness(&named_core(&[
+                ("sega_101.bin", Missing),
+                ("mpr-17933.bin", PresentUnverified),
+            ])),
+            FirmwareReadiness::PresentUnverified
+        );
+        // Not alternatives: a present Kickstart does not excuse another
+        // required file that is missing.
+        assert_eq!(
+            retroarch_core_firmware_readiness(&named_core(&[
+                ("kick34005.A500", PresentUnverified),
+                ("kick40068.A1200", Missing),
+            ])),
+            FirmwareReadiness::Missing
+        );
+        // An alternative group does not excuse a different missing file.
+        assert_eq!(
+            retroarch_core_firmware_readiness(&named_core(&[
+                ("scph5500.bin", PresentUnverified),
+                ("scph5501.bin", Missing),
+                ("other.bin", Missing),
+            ])),
+            FirmwareReadiness::Missing
         );
     }
 

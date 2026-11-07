@@ -379,6 +379,30 @@ pub(crate) fn unverified_firmware_detail(
     }
 }
 
+/// Blocker text naming the required files that are missing.
+pub(crate) fn missing_firmware_detail(
+    info: &crate::emulator_environment::retroarch::CoreInfoFinding,
+) -> String {
+    use crate::emulator_environment::retroarch::{CoreInfoFinding, FirmwarePresence};
+    let names: Vec<&str> = match info {
+        CoreInfoFinding::Found { firmware, .. } => {
+            crate::launch::readiness::effective_required_firmware(firmware)
+                .into_iter()
+                .filter(|group| group.presence == FirmwarePresence::Missing)
+                .flat_map(|group| group.members)
+                .filter(|entry| entry.presence == FirmwarePresence::Missing)
+                .filter_map(|entry| entry.path.as_deref())
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    if names.is_empty() {
+        "required firmware/BIOS is missing".into()
+    } else {
+        format!("required firmware/BIOS is missing: {}", names.join(", "))
+    }
+}
+
 fn readiness_from(blockers: &[LaunchBlocker], warnings: &[LaunchWarning]) -> LaunchReadiness {
     if !blockers.is_empty() {
         LaunchReadiness::Blocked
@@ -531,6 +555,10 @@ fn build_retroarch_candidates(
             if let Some(warning) = firmware_warning.as_mut() {
                 warning.detail = unverified_firmware_detail(&found.info);
             }
+            let firmware_blocker = firmware_blocker.map(|mut blocker| {
+                blocker.detail = missing_firmware_detail(&found.info);
+                blocker
+            });
             blockers.extend(firmware_blocker);
             warnings.extend(firmware_warning);
             if ambiguous {
@@ -828,4 +856,72 @@ pub(crate) fn summarize(candidates: &[LaunchCandidate]) -> LaunchPlanSummary {
         }
     }
     summary
+}
+
+#[cfg(test)]
+mod missing_firmware_detail_tests {
+    use super::missing_firmware_detail;
+    use crate::emulator_environment::retroarch::{
+        CoreInfoFinding, FirmwarePresence, FirmwareRequirement,
+    };
+
+    #[test]
+    fn names_only_required_missing_files() {
+        let entry = |i: u32, p: &str, optional, presence| FirmwareRequirement {
+            index: i,
+            path: Some(p.into()),
+            description: None,
+            optional,
+            presence,
+        };
+        let info = CoreInfoFinding::Found {
+            display_name: None,
+            display_version: None,
+            system_name: None,
+            supported_extensions: Vec::new(),
+            core_name: None,
+            manufacturer: None,
+            categories: None,
+            database: None,
+            firmware: vec![
+                entry(0, "have.bin", false, FirmwarePresence::PresentUnverified),
+                entry(1, "need.bin", false, FirmwarePresence::Missing),
+                entry(2, "extra.bin", true, FirmwarePresence::Missing),
+            ],
+        };
+        assert_eq!(
+            missing_firmware_detail(&info),
+            "required firmware/BIOS is missing: need.bin"
+        );
+    }
+
+    #[test]
+    fn all_missing_alternative_group_names_every_member() {
+        let entry = |i: u32, p: &str| FirmwareRequirement {
+            index: i,
+            path: Some(p.into()),
+            description: None,
+            optional: false,
+            presence: FirmwarePresence::Missing,
+        };
+        let info = CoreInfoFinding::Found {
+            display_name: None,
+            display_version: None,
+            system_name: None,
+            supported_extensions: Vec::new(),
+            core_name: None,
+            manufacturer: None,
+            categories: None,
+            database: None,
+            firmware: vec![
+                entry(0, "scph5500.bin"),
+                entry(1, "scph5501.bin"),
+                entry(2, "scph5502.bin"),
+            ],
+        };
+        assert_eq!(
+            missing_firmware_detail(&info),
+            "required firmware/BIOS is missing: scph5500.bin, scph5501.bin, scph5502.bin"
+        );
+    }
 }
