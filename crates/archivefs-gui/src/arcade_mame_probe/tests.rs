@@ -391,3 +391,17 @@ fn plan_resolution() -> SetResolution {
         },
     }
 }
+
+#[test]
+fn peek_never_starts_a_probe() {
+    let root = tempfile::tempdir().unwrap();
+    let log = root.path().join("calls");
+    let exe = root.path().join("spy");
+    std::fs::write(&exe, format!("#!/bin/sh\necho x >> {}\n", log.display())).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dir = set_dir(root.path());
+    let (extras, diagnostics) = (Vec::new(), Vec::new());
+    assert!(lookup_inner(&exe, &dir, &extras, &diagnostics, false).is_none());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!log.exists(), "peek must not run MAME");
+}

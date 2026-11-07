@@ -267,23 +267,28 @@ fn wrong_dump_only_follows_demonstrated_outcomes_and_otherwise_blocks_naming_the
             "romset {set} is bad\n{set:<12}: {file} ({size} bytes) - INCORRECT CHECKSUM:\nEXPECTED: CRC(1)\n   FOUND: CRC(2)\n"
         )
     };
-    for set in ["3wonders", "1943b", "gauntletr4", "sf2cejc"] {
+    for (set, file) in [
+        ("3wonders", "ioc1.ic1"),
+        ("1943b", "bm05.4k"),
+        ("gauntletr4", "136037-104.6p"),
+        ("sf2cejc", "ioc1.ic7"),
+    ] {
         let f = facts(&machine(set, "good", "good", "", "", ""), set);
         let v = evaluate_arcade_set(
             set,
             Some(&f),
-            &verify_text(&text(set, "x.bin", 260), set),
+            &verify_text(&text(set, file, 260), set),
             false,
         );
         assert_eq!(v.readiness, ArcadeReadiness::ReadyWithWarning, "{set}");
-        assert!(v.warnings[0].contains("x.bin") && v.warnings[0].contains("notice"));
+        assert!(v.warnings[0].contains(file) && v.warnings[0].contains("notice"));
     }
-    for set in ["sailormnot", "island2a"] {
+    for (set, file) in [("sailormnot", "smprg.u45"), ("island2a", "m48t35")] {
         let f = facts(&machine(set, "good", "good", "", "", ""), set);
         let v = evaluate_arcade_set(
             set,
             Some(&f),
-            &verify_text(&text(set, "smprg.u45", 524288), set),
+            &verify_text(&text(set, file, 524288), set),
             false,
         );
         assert_eq!(
@@ -291,7 +296,7 @@ fn wrong_dump_only_follows_demonstrated_outcomes_and_otherwise_blocks_naming_the
             Some(ArcadeBlockReason::RomsWrongVersion),
             "{set}"
         );
-        assert!(v.blockers[0].contains("smprg.u45"));
+        assert!(v.blockers[0].contains(file));
     }
     // No demonstrated outcome: blocked even for a tiny file (size is not proof).
     let f = facts(&machine("nodata", "good", "good", "", "", ""), "nodata");
@@ -615,4 +620,46 @@ fn probe_is_bounded_and_cancellable() {
         unsafe_name.verdict.block_reason,
         Some(ArcadeBlockReason::CheckFailed)
     );
+}
+
+#[test]
+fn wrong_dump_evidence_applies_only_to_the_evidenced_bad_file() {
+    let report = |set: &str, files: &[(&str, u64)]| {
+        let mut out = format!("romset {set} is bad\n");
+        for (file, size) in files {
+            out.push_str(&format!(
+                "{set:<12}: {file} ({size} bytes) - INCORRECT CHECKSUM:\nEXPECTED: CRC(1)\n   FOUND: CRC(2)\n"
+            ));
+        }
+        verify_text(&out, set)
+    };
+    let f = facts(&machine("3wonders", "good", "good", "", "", ""), "3wonders");
+    // The evidenced PLD: warning.
+    let ok = evaluate_arcade_set(
+        "3wonders",
+        Some(&f),
+        &report("3wonders", &[("ioc1.ic1", 260)]),
+        false,
+    );
+    assert_eq!(ok.readiness, ArcadeReadiness::ReadyWithWarning);
+    // A different bad file (a program ROM) in the same set: Blocked.
+    let other = evaluate_arcade_set(
+        "3wonders",
+        Some(&f),
+        &report("3wonders", &[("prg.bin", 524288)]),
+        false,
+    );
+    assert_eq!(
+        other.block_reason,
+        Some(ArcadeBlockReason::RomsWrongVersion)
+    );
+    assert!(other.blockers[0].contains("prg.bin"));
+    // The evidenced PLD plus an extra bad file: Blocked.
+    let both = evaluate_arcade_set(
+        "3wonders",
+        Some(&f),
+        &report("3wonders", &[("ioc1.ic1", 260), ("prg.bin", 524288)]),
+        false,
+    );
+    assert_eq!(both.readiness, ArcadeReadiness::Blocked);
 }

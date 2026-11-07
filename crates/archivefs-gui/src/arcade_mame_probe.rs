@@ -217,11 +217,29 @@ pub(crate) fn lookup(executable: &Path, set_dir: &Path) -> Option<Lookup> {
     lookup_with(executable, set_dir, &extras, &diagnostics)
 }
 
+/// As [`lookup`] but NEVER starts a probe: only reports an answer or a probe
+/// that the catalogue-gated readiness build already started. Click-time code
+/// uses this so it cannot probe an uncatalogued folder.
+pub(crate) fn peek(executable: &Path, set_dir: &Path) -> Option<Lookup> {
+    let (extras, diagnostics) = configured_extra_rompaths();
+    lookup_inner(executable, set_dir, &extras, &diagnostics, false)
+}
+
 pub(crate) fn lookup_with(
     executable: &Path,
     set_dir: &Path,
     extras: &[PathBuf],
     diagnostics: &[String],
+) -> Option<Lookup> {
+    lookup_inner(executable, set_dir, extras, diagnostics, true)
+}
+
+fn lookup_inner(
+    executable: &Path,
+    set_dir: &Path,
+    extras: &[PathBuf],
+    diagnostics: &[String],
+    may_start: bool,
 ) -> Option<Lookup> {
     let set = plain_set(set_dir)?;
     let id: Id = (
@@ -264,6 +282,9 @@ pub(crate) fn lookup_with(
                     continue;
                 }
             }
+        }
+        if !may_start {
+            return None;
         }
         // Nothing cached or running: start it.
         let cancel = Arc::new(AtomicBool::new(false));

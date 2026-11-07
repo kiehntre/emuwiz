@@ -4732,8 +4732,10 @@ fn mame_launch_request(
     })?;
     // An extracted set folder is judged by the installed MAME's own per-set
     // data (cached, probed in the background, never on this thread).
+    // `peek` never starts a probe: only the catalogue-gated readiness build
+    // (arcade_probe_target) does, so an uncatalogued folder is never probed.
     let arcade_lookup = (platform_id == "Arcade")
-        .then(|| crate::arcade_mame_probe::lookup(&executable, &path))
+        .then(|| crate::arcade_mame_probe::peek(&executable, &path))
         .flatten();
     let (resolution, extra_rompaths) = if let Some(lookup) = arcade_lookup {
         match lookup {

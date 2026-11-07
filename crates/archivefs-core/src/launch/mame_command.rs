@@ -237,6 +237,14 @@ pub fn build_mame_command_plan_with_extra(
             "the selected MAME set is not directly inside the configured ROM/search path",
         ));
     }
+    // MAME reads ';' as a rompath separator, so a collection folder whose path
+    // contains one would silently become two search paths.
+    if rom_search_path.is_some_and(|path| path.to_string_lossy().contains(';')) {
+        blockers.push(blocker(
+            LaunchBlockerKind::MameSearchPathUnconfigured,
+            "the collection folder path contains ';', which MAME reads as a path separator",
+        ));
+    }
     if extra_rompaths
         .iter()
         .any(|path| crate::arcade_mame_routing::validate_extra_rompath(path).as_ref() != Ok(path))

@@ -378,39 +378,45 @@ pub enum SetOutcome {
 
 /// Sets with a demonstrated MAME outcome, from `wrongdump-sample.md` and
 /// `artwork-sample.md`. Adding or flipping an entry is a data change.
-pub const WRONG_DUMP_EVIDENCE: &[(&str, SetOutcome)] = &[
+pub const WRONG_DUMP_EVIDENCE: &[(&str, &str, SetOutcome)] = &[
     (
         "3wonders",
+        "ioc1.ic1",
         SetOutcome::Warn(
-            "its only bad file is a small PLD; MAME showed the title and game-select menu after a notice (sandbox grade A)",
+            "the bad file is a small PLD; MAME showed the title and game-select menu after a notice (sandbox grade A)",
         ),
     ),
     (
         "1943b",
+        "bm05.4k",
         SetOutcome::Warn(
             "experimental: MAME showed a notice then gameplay (sandbox grade B; input not isolated)",
         ),
     ),
     (
         "gauntletr4",
+        "136037-104.6p",
         SetOutcome::Warn(
             "experimental: MAME showed a notice then attract gameplay (sandbox grade B)",
         ),
     ),
     (
         "sf2cejc",
+        "ioc1.ic7",
         SetOutcome::Warn(
             "experimental: MAME showed a notice then the attract intro (sandbox grade B)",
         ),
     ),
     (
         "sailormnot",
+        "smprg.u45",
         SetOutcome::Block(
             "a program ROM is wrong and MAME runs to a near-black, unusable screen (sandbox grade F)",
         ),
     ),
     (
         "island2a",
+        "m48t35",
         SetOutcome::Block(
             "MAME stops at 'INIT MACHINE' with a blank screen (operator initialisation; sandbox grade F)",
         ),
@@ -558,6 +564,7 @@ fn bad_verdict(set: &str, verify: &VerifyReport) -> Result<String, ArcadeMameVer
     let mut deps: Vec<String> = Vec::new();
     let mut own_missing: Vec<String> = Vec::new();
     let mut wrong: Vec<String> = Vec::new();
+    let mut wrong_files: Vec<&str> = Vec::new();
     for problem in &verify.problems {
         let label = if problem.is_disk {
             format!("disk image {}", problem.file)
@@ -580,6 +587,7 @@ fn bad_verdict(set: &str, verify: &VerifyReport) -> Result<String, ArcadeMameVer
                     "an incorrect checksum"
                 };
                 wrong.push(format!("{label} has {what}"));
+                wrong_files.push(problem.file.as_str());
             }
             _ => {}
         }
@@ -609,20 +617,43 @@ fn bad_verdict(set: &str, verify: &VerifyReport) -> Result<String, ArcadeMameVer
     }
     let detail = format!("{set}: {}", parts.join("; "));
     if own_missing.is_empty() && deps.is_empty() {
-        match evidence_for(WRONG_DUMP_EVIDENCE, set) {
-            Some(SetOutcome::Warn(how)) => {
-                return Ok(format!(
-                    "MAME reports incorrect ROM files ({}) and shows a notice; {how}",
-                    list(&wrong)
-                ));
-            }
-            Some(SetOutcome::Block(why)) => {
-                return Err(block(
-                    ArcadeBlockReason::RomsWrongVersion,
-                    format!("{detail}; {why}"),
-                ));
-            }
-            None => {}
+        // Evidence is per (set, bad file): a different bad ROM than the one
+        // that was tried stays Blocked.
+        let outcomes: Vec<Option<SetOutcome>> = wrong_files
+            .iter()
+            .map(|file| {
+                WRONG_DUMP_EVIDENCE
+                    .iter()
+                    .find(|(s, f, _)| *s == set && f == file)
+                    .map(|(_, _, outcome)| *outcome)
+            })
+            .collect();
+        if let Some(Some(SetOutcome::Block(why))) = outcomes
+            .iter()
+            .find(|o| matches!(o, Some(SetOutcome::Block(_))))
+        {
+            return Err(block(
+                ArcadeBlockReason::RomsWrongVersion,
+                format!("{detail}; {why}"),
+            ));
+        }
+        if !outcomes.is_empty()
+            && outcomes
+                .iter()
+                .all(|o| matches!(o, Some(SetOutcome::Warn(_))))
+        {
+            let how: Vec<&str> = outcomes
+                .iter()
+                .filter_map(|o| match o {
+                    Some(SetOutcome::Warn(h)) => Some(*h),
+                    _ => None,
+                })
+                .collect();
+            return Ok(format!(
+                "MAME reports incorrect ROM files ({}) and shows a notice; {}",
+                list(&wrong),
+                how.join("; ")
+            ));
         }
     }
     let reason = if !own_missing.is_empty() {
