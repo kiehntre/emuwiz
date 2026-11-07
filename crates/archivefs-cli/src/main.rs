@@ -42,8 +42,8 @@ use archivefs_core::patch_manager::{
     CheatRollbackOptions, CoreSelectionSource, CoverageGameIdentity, DestinationKind,
     DolphinCatalogueLoad, GameHackingFetchOptions, GameHackingGameCubeFetchOptions,
     GameHackingGameCubeProvider, GameHackingProvider, GameHackingWiiFetchOptions,
-    GameHackingWiiProvider, HttpsMetadataFetcher, ProposedDestination, ReadOnlyPcsx2Adapter,
-    RetroArchAdvisoryPlan, WiiGameIdentity, build_cheat_availability_report,
+    GameHackingWiiProvider, HttpsMetadataFetcher, JOURNAL_UNAVAILABLE_REASON, ProposedDestination,
+    ReadOnlyPcsx2Adapter, RetroArchAdvisoryPlan, WiiGameIdentity, build_cheat_availability_report,
     build_cheat_provider_coverage_report, default_dolphin_catalogue_cache_root,
     default_shared_history_root, discover_cheat_history, discover_shared_apply_history,
     execute_cheat_install_run, execute_cheat_rollback_run, import_wii_game_page_bootstrap_file,
@@ -2759,7 +2759,21 @@ fn format_cheat_install_run(outcome: &CheatInstallRunOutcome) -> String {
     }
     if let Some(error) = &outcome.journal_error {
         writeln!(&mut output).unwrap();
-        writeln!(&mut output, "Journal write failed: {error}").unwrap();
+        let nothing_written = run
+            .entries
+            .iter()
+            .any(|entry| entry.reason_code == JOURNAL_UNAVAILABLE_REASON)
+            || run.summary.writes_attempted == 0;
+        if nothing_written {
+            writeln!(
+                &mut output,
+                "Nothing was written: the install record (journal) could not be created, so no cheat file was touched."
+            )
+            .unwrap();
+            writeln!(&mut output, "Journal error: {error}").unwrap();
+        } else {
+            writeln!(&mut output, "Journal write failed: {error}").unwrap();
+        }
     }
 
     output
@@ -2834,6 +2848,14 @@ fn format_cheat_inspection(inspection: &CheatJournalInspection) -> String {
         inspection.install_status,
         inspection.entries.len()
     );
+    if inspection.interrupted {
+        output.push_str(&format!(
+            "  INTERRUPTED: this install never finished ({} of {} entries recorded); it is not a success - review and roll back with: emuwiz-cli retroarch-cheat-rollback {} --cheat-destination-root <root> --yes\n",
+            inspection.settled_entries,
+            inspection.entries.len(),
+            inspection.journal_path.display
+        ));
+    }
     if inspection.rollback.ambiguous {
         output.push_str("  rollback journal: ambiguous association\n");
     } else if inspection.rollback.exists {
@@ -2869,6 +2891,14 @@ fn format_cheat_inspection(inspection: &CheatJournalInspection) -> String {
             backup_assessment_name(entry.backup),
             rollback_availability_name(entry.rollback_availability),
         ));
+        match entry.settlement {
+            archivefs_core::patch_manager::CheatInstallEntrySettlement::Settled => {}
+            archivefs_core::patch_manager::CheatInstallEntrySettlement::InFlight => output
+                .push_str("      settlement: in flight when the install was interrupted (resolved from the destination's current content)\n"),
+            archivefs_core::patch_manager::CheatInstallEntrySettlement::NotStarted => {
+                output.push_str("      settlement: never attempted (install interrupted earlier)\n")
+            }
+        }
         for reason in &entry.rollback_reasons {
             output.push_str(&format!("        reason: {reason}\n"));
         }
@@ -9999,6 +10029,8 @@ mod tests {
             catalogue_source: "local-catalogue".into(),
             destination_root: Some(CheatInstallPath::from_path(Path::new("/retroarch/cheats"))),
             install_status: CheatInstallRunStatus::Success,
+            interrupted: false,
+            settled_entries: 1,
             install_summary: CheatInstallSummary {
                 requested: 1,
                 eligible: 1,
@@ -10017,6 +10049,7 @@ mod tests {
                 ))),
                 original_outcome: CheatInstallOutcome::InstalledNew,
                 applied: true,
+                settlement: archivefs_core::patch_manager::CheatInstallEntrySettlement::Settled,
                 previous_hash: None,
                 installed_hash: Some("abc".into()),
                 backup_path: None,

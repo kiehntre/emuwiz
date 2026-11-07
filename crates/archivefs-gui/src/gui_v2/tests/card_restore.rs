@@ -425,3 +425,113 @@ fn saves_page_shows_restore_records_review_and_storage_panels() {
     );
     assert_eq!(std::fs::read(&garbage).unwrap(), b"not a journal");
 }
+
+// ---- Night Watch II regressions (uncommitted; FAIL on 571d4afb while the defects exist) ----
+
+/// NW2-B-03: a failed PS2 card restore must not be recorded as a success.
+#[test]
+fn nw2_b03_failed_card_restore_is_recorded_as_failed_in_activity() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let mut app = world.app(&context);
+    let id = app.activity.queue_with(
+        "Restoring a memory-card folder",
+        Route::Section(Section::Activity),
+        activity::CancelPolicy::SafeNow,
+    );
+    app.activity.start(id);
+    app.saves_states.card_restore.job = Some(id);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.backend.rx = receiver;
+    sender
+        .send(super::super::backend::Event::Finished {
+            id,
+            outcome: Ok(super::super::backend::Payload::CardRestore(Box::new(
+                Outcome::Applied {
+                    location: world.location(),
+                    result: Err("rollback failed: the card could not be reversed safely".into()),
+                },
+            ))),
+        })
+        .unwrap();
+    app.poll(&context);
+    assert!(!app.activity.jobs[&id].active(), "job settled");
+    assert_eq!(
+        app.activity.failed(),
+        1,
+        "a failed card restore was recorded as a success in Activity"
+    );
+}
+
+/// NW2-B-03: a refused Undo from the restore-records panel ("Undo was not
+/// done. …") must reach Activity as a failure, not as "Finished".
+#[test]
+fn nw2_b03_refused_panel_undo_is_recorded_as_failed_in_activity() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let mut app = world.app(&context);
+    let id = app.activity.queue_with(
+        "Undoing a memory-card restore",
+        Route::Section(Section::Activity),
+        activity::CancelPolicy::SafeNow,
+    );
+    app.activity.start(id);
+    app.saves_states.card_restore.job = Some(id);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.backend.rx = receiver;
+    sender
+        .send(super::super::backend::Event::Finished {
+            id,
+            outcome: Ok(super::super::backend::Payload::CardRestore(Box::new(
+                Outcome::Panel(card_restore::panel::PanelOutcome::Records {
+                    report: Default::default(),
+                    messages: vec!["Undo was not done. PCSX2 is running.".into()],
+                    failed: true,
+                }),
+            ))),
+        })
+        .unwrap();
+    app.poll(&context);
+    let job = &app.activity.jobs[&id];
+    assert!(!job.active(), "job settled");
+    assert_eq!(job.phase, activity::Phase::Failed, "{}", job.summary);
+    assert_eq!(job.summary, "Undo was not done. PCSX2 is running.");
+    assert_eq!(app.saves_states.card_restore.job, None);
+    // The panel still shows the per-record message inline.
+    assert_eq!(
+        app.saves_states.card_restore.panel.messages,
+        vec!["Undo was not done. PCSX2 is running.".to_string()]
+    );
+}
+
+/// A successful records re-read stays "Finished".
+#[test]
+fn panel_records_reread_is_recorded_as_finished() {
+    let context = egui::Context::default();
+    let world = World::new();
+    let mut app = world.app(&context);
+    let id = app.activity.queue_with(
+        "Checking restore records",
+        Route::Section(Section::Activity),
+        activity::CancelPolicy::SafeNow,
+    );
+    app.activity.start(id);
+    app.saves_states.card_restore.job = Some(id);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.backend.rx = receiver;
+    sender
+        .send(super::super::backend::Event::Finished {
+            id,
+            outcome: Ok(super::super::backend::Payload::CardRestore(Box::new(
+                Outcome::Panel(card_restore::panel::PanelOutcome::Records {
+                    report: Default::default(),
+                    messages: Vec::new(),
+                    failed: false,
+                }),
+            ))),
+        })
+        .unwrap();
+    app.poll(&context);
+    assert_eq!(app.activity.jobs[&id].phase, activity::Phase::Complete);
+    assert_eq!(app.activity.failed(), 0);
+}

@@ -54,7 +54,13 @@ pub(in super::super) enum PanelJob {
 }
 
 pub(in super::super) enum PanelOutcome {
-    Records(RecordsReport, Vec<String>),
+    /// Records re-read after a step; `failed` says the step itself (Recover,
+    /// Mark reviewed, Undo) did not do what was asked.
+    Records {
+        report: RecordsReport,
+        messages: Vec<String>,
+        failed: bool,
+    },
     Review(Result<ReviewPreview, String>),
     Storage(StorageReport),
     Retired(RetireResult, StorageReport),
@@ -65,37 +71,59 @@ pub(in super::super) fn run(job: PanelJob) -> PanelOutcome {
     let observer = archivefs_core::save_snapshots::history::default_closure_observer();
     let now = super::now();
     match job {
-        PanelJob::Records { journal_dir } => {
-            PanelOutcome::Records(recovery::load_records(&journal_dir), Vec::new())
-        }
+        PanelJob::Records { journal_dir } => PanelOutcome::Records {
+            report: recovery::load_records(&journal_dir),
+            messages: Vec::new(),
+            failed: false,
+        },
         PanelJob::Recover { journal_dir } => {
-            let messages = recovery::recover(&journal_dir, &observer, now)
-                .unwrap_or_else(|refusal| vec![refusal]);
-            PanelOutcome::Records(recovery::load_records(&journal_dir), messages)
+            // A refusal, and a pass that left a record needing manual review,
+            // unchecked or unlisted, are both "Needs attention".
+            let (messages, failed) = match recovery::recover_run(&journal_dir, &observer, now) {
+                Ok(run) => (run.messages, run.attention),
+                Err(refusal) => (vec![refusal], true),
+            };
+            PanelOutcome::Records {
+                report: recovery::load_records(&journal_dir),
+                messages,
+                failed,
+            }
         }
         PanelJob::Review { journal } => PanelOutcome::Review(recovery::review_preview(&journal)),
         PanelJob::MarkReviewed {
             preview,
             journal_dir,
         } => {
-            let message = match recovery::mark_reviewed(&preview, now) {
-                Ok(()) => "Marked as reviewed. The record and its backup are kept.".to_string(),
-                Err(error) => error,
+            let (message, failed) = match recovery::mark_reviewed(&preview, now) {
+                Ok(()) => (
+                    "Marked as reviewed. The record and its backup are kept.".to_string(),
+                    false,
+                ),
+                Err(error) => (error, true),
             };
-            PanelOutcome::Records(recovery::load_records(&journal_dir), vec![message])
+            PanelOutcome::Records {
+                report: recovery::load_records(&journal_dir),
+                messages: vec![message],
+                failed,
+            }
         }
         PanelJob::Undo {
             journal,
             journal_dir,
         } => {
-            let message = match super::undo_restore(&journal, &observer, now) {
-                Ok(()) => {
+            let (message, failed) = match super::undo_restore(&journal, &observer, now) {
+                Ok(()) => (
                     "Undo finished: the memory card is back to how it was before that restore."
-                        .to_string()
-                }
-                Err(error) => format!("Undo was not done. {error}"),
+                        .to_string(),
+                    false,
+                ),
+                Err(error) => (format!("Undo was not done. {error}"), true),
             };
-            PanelOutcome::Records(recovery::load_records(&journal_dir), vec![message])
+            PanelOutcome::Records {
+                report: recovery::load_records(&journal_dir),
+                messages: vec![message],
+                failed,
+            }
         }
         PanelJob::Storage {
             dirs,
@@ -114,28 +142,37 @@ pub(in super::super) fn run(job: PanelJob) -> PanelOutcome {
     }
 }
 
-pub(in super::super) fn receive(state: &mut PanelState, outcome: PanelOutcome) -> String {
+/// Settles a finished panel job: the message to record, and whether the step
+/// succeeded (a refused Undo, Recover or Mark reviewed is a failure).
+pub(in super::super) fn receive(state: &mut PanelState, outcome: PanelOutcome) -> (String, bool) {
     match outcome {
-        PanelOutcome::Records(report, messages) => {
+        PanelOutcome::Records {
+            report,
+            messages,
+            failed,
+        } => {
             state.records = Some(report);
             state.review = None;
             let summary = messages.first().cloned();
             state.messages = messages;
-            summary.unwrap_or_else(|| "Restore records checked. Nothing was changed.".into())
+            (
+                summary.unwrap_or_else(|| "Restore records checked. Nothing was changed.".into()),
+                !failed,
+            )
         }
         PanelOutcome::Review(Ok(preview)) => {
             state.review = Some(preview);
-            "Review ready. Nothing was changed.".into()
+            ("Review ready. Nothing was changed.".into(), true)
         }
         PanelOutcome::Review(Err(error)) => {
             state.review = None;
             state.messages = vec![error.clone()];
-            error
+            (error, false)
         }
         PanelOutcome::Storage(report) => {
             state.storage = Some(report);
             state.retire_preview = None;
-            "Restore storage checked. Nothing was changed.".into()
+            ("Restore storage checked. Nothing was changed.".into(), true)
         }
         PanelOutcome::Retired(result, report) => {
             let mut message = format!(
@@ -152,7 +189,7 @@ pub(in super::super) fn receive(state: &mut PanelState, outcome: PanelOutcome) -
             state.storage = Some(report);
             state.retire_preview = None;
             state.storage_message = Some(message.clone());
-            message
+            (message, true)
         }
     }
 }
