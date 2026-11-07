@@ -163,7 +163,7 @@ fn shared_metadata_index_build_measurement() {
             .and_then(|status| {
                 status.lines().find_map(|line| {
                     line.strip_prefix("VmRSS:")
-                        .and_then(|rest| rest.trim().split_whitespace().next())
+                        .and_then(|rest| rest.split_whitespace().next())
                         .and_then(|value| value.parse().ok())
                 })
             })
