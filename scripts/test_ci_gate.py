@@ -162,6 +162,16 @@ class Workflow(unittest.TestCase):
         self.assertNotIn("continue-on-error", gate)
         self.assertNotIn("uses: actions/cache", gate)
 
+    def test_every_job_has_a_bounded_timeout(self) -> None:
+        # A hung test (FIFO, sleep, deadlock) must not burn the 6 h runner default.
+        release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        for name, text in (("ci.yml", WORKFLOW), ("release.yml", release)):
+            for job_id, body in workflow_jobs(text).items():
+                with self.subTest(workflow=name, job=job_id):
+                    found = re.findall(r"(?m)^    timeout-minutes: (\d+)\s*$", body)
+                    self.assertEqual(len(found), 1, "exactly one job-level timeout-minutes")
+                    self.assertTrue(1 <= int(found[0]) <= 120, found[0])
+
 
 if __name__ == "__main__":
     unittest.main()
