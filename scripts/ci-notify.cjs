@@ -31,8 +31,10 @@ async function supersede({github, repo, comments, keep, core}) {
     if (!m || m[0] === keep) continue;
     const body = [`~~Superseded~~ — earlier ${m[3]} snapshot for head \`${m[2]}\` is no longer current.`,
       `<!-- emuwiz-ci-superseded:${m[1]}:${m[2]}:${m[3]} -->`].join('\n');
-    await github.rest.issues.updateComment({...repo, comment_id: c.id, body});
-    core.info(`superseded comment ${c.id}`);
+    try {
+      await github.rest.issues.updateComment({...repo, comment_id: c.id, body});
+      core.info(`superseded comment ${c.id}`);
+    } catch (e) { core.info(`could not supersede comment ${c.id}: ${e.message}`); }
   }
 }
 
@@ -138,7 +140,8 @@ async function notify({github, context, core, dryRun = false}) {
       if (run) runs.push(run);
     }
     if (runs.length !== 2) { core.info(`PR #${pr.number}: PENDING (missing workflow)`);
-      await supersede({github, repo, comments, keep: null, core}); continue; }
+      if (!dryRun) await supersede({github, repo, comments, keep: null, core});
+      continue; }
     const jobs = [];
     for (const run of runs) {
       jobs.push(...await all(github.rest.actions.listJobsForWorkflowRun, {
@@ -169,7 +172,10 @@ async function notify({github, context, core, dryRun = false}) {
       continue;
     }
     const key = marker(pr.number, sha, result.status);
-    if (comments.some(c => isBot(c) && c.body?.includes(key))) continue;
+    if (comments.some(c => isBot(c) && c.body?.includes(key))) {
+      if (!dryRun) await supersede({github, repo, comments, keep: key, core});
+      continue;
+    }
     // Recheck immediately before writing; a stale event must never bless a new head.
     const {data: fresh} = await github.rest.pulls.get({...repo, pull_number: pr.number});
     if (fresh.head.sha !== sha || fresh.base.sha !== current.baseRefOid || fresh.state !== 'open') continue;
