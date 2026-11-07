@@ -347,10 +347,7 @@ fn a_proposal_without_a_fingerprint_is_refused_not_rebound() {
     match build_transaction(&plan, &approved(&[&source]), 1) {
         Err(ApplyError::SourceChangedSinceAudit(changed)) => {
             assert_eq!(changed.len(), 1);
-            assert_eq!(
-                changed[0].reason,
-                SourceChangeReason::FingerprintIncomparable
-            );
+            assert_eq!(changed[0].reason, SourceChangeReason::NoAuditEvidence);
         }
         other => panic!("expected a named refusal, got {other:?}"),
     }
