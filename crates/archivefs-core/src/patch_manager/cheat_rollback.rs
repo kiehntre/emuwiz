@@ -713,7 +713,7 @@ fn restore_verified(
             // check-then-rename.
             let _ = dir.unlink(tmp_name);
             Err(MutationError::Io(format!(
-                "could not atomically exchange the restored file into place: {e}"
+                "could not atomically exchange the restored file into place ({e}); if this folder's filesystem cannot replace files atomically, close RetroArch and copy the original from EmuWiz's backup over the file by hand; the installed file was left exactly as it is"
             )))
         }
     }

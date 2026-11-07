@@ -1,9 +1,8 @@
 //! Target path: crates/archivefs-cli/tests/retroarch_cheat_install_hostile_catalogue.rs
 //!
-//! NOT EXECUTED: needs a build (disk below the cargo-iso floor during Night Watch P3).
-//! The same scenarios WERE executed against the baseline CLI binary
-//! (09bb453) with the shell repro in regressions/D7_repro_install.sh;
-//! recorded output in regressions/D7_repro_install.out.
+//! Executed in CI and locally (Hard Job #3 Part 2). The same scenarios were
+//! executed against the baseline CLI binary (09bb453) during Night Watch with
+//! the shell repro in regressions/D7_repro_install.sh, where they failed.
 //!
 //! Asserts:
 //!  * D7-01: installing from a JSON manifest must not write the manifest's raw
@@ -356,4 +355,20 @@ fn description_only_games_are_skipped_and_mixed_games_install_only_coded_cheats(
         text.contains("Skipped: no usable cheat codes: 1 game(s)"),
         "{text}"
     );
+}
+
+/// Review of Part 2: a relative `--cheat-destination-root` previews relative
+/// paths while the safety assessment works on absolute ones. The same
+/// destination must not be refused as "differs from the preview".
+#[test]
+fn relative_destination_root_installs_at_the_previewed_path() {
+    let env = Env::new();
+    library(&env, &["Alpha Quest (USA)"]);
+    let m = manifest(&env, &["Alpha Quest (USA)"]);
+    let run = install_json(&env, &m, Path::new("dest"));
+    let entries = run["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{run}");
+    assert_eq!(entries[0]["applied"], true, "{run}");
+    assert_eq!(entries[0]["outcome"], "installed_new", "{run}");
+    assert!(env.root.join("dest/SNES/Alpha Quest (USA).cht").is_file());
 }

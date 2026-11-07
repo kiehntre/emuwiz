@@ -552,7 +552,7 @@ fn install_one_entry(
             let Some(rendered) = render_installable_cheat_document(record) else {
                 return reject(
                     result,
-                    CheatInstallOutcome::SkippedSourceChanged,
+                    CheatInstallOutcome::SkippedNotEligible,
                     NO_INSTALLABLE_CHEATS_REASON,
                     "this manifest game lists no cheat with a code, so there is nothing RetroArch could load; nothing was written",
                 );
@@ -628,7 +628,20 @@ fn install_one_entry(
 
     let resolved_destination_path = assessment.proposed_destination.path().to_path_buf();
     let resolved_destination = CheatInstallPath::from_path(&resolved_destination_path);
-    if result.destination_path.as_ref() != Some(&resolved_destination) {
+    // The assessment works on absolute paths; a preview taken with a
+    // relative `--cheat-destination-root` shows the relative form of the
+    // same path. Compare like with like so only a genuinely different
+    // destination is refused.
+    let same_as_preview = result.destination_path.as_ref().is_some_and(|previewed| {
+        previewed == &resolved_destination
+            || (!previewed.lossy
+                && !resolved_destination.lossy
+                && std::path::absolute(Path::new(&previewed.display))
+                    .ok()
+                    .as_deref()
+                    == Some(resolved_destination_path.as_path()))
+    });
+    if !same_as_preview {
         // The approved plan is the previewed path; nothing else is ever
         // written (Night Watch D7-02).
         result.detail.push(format!(
@@ -1162,8 +1175,22 @@ fn replace_with_backup(
     if let Err(error) = dir.exchange(temp, final_name) {
         let _ = dir.unlink(temp);
         result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "rename_failed".to_string();
-        result.detail.push(error.to_string());
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+        ) {
+            // Only an atomic exchange may replace a user's file: without
+            // one EmuWiz refuses rather than check-then-rename, which
+            // could overwrite a change made in between.
+            result.reason_code = "atomic_replace_unsupported".to_string();
+            result.detail.push(
+                "this folder's filesystem cannot replace files atomically, so the existing file was left exactly as it is; to apply the new cheat file, close RetroArch and copy it over the existing one by hand"
+                    .to_string(),
+            );
+        } else {
+            result.reason_code = "rename_failed".to_string();
+            result.detail.push(error.to_string());
+        }
         result.detail.push(backup_note);
         return;
     }
@@ -1186,11 +1213,24 @@ fn replace_with_backup(
                 return;
             }
             Err(error) => {
+                // Our file is live and the user's changed file is still
+                // under the temporary name. Give it a name no cleanup
+                // sweep recognises, and say exactly where it is.
+                let kept_name = format!(
+                    "{}.changed-by-you.{}",
+                    anchor.file_name,
+                    temp_name.trim_start_matches('.')
+                );
+                let kept_at = match dir.rename_no_replace(temp, OsStr::new(&kept_name)) {
+                    Ok(()) => destination.with_file_name(&kept_name),
+                    Err(_) => destination.with_file_name(&temp_name),
+                };
                 result.outcome = CheatInstallOutcome::FailedWrite;
                 result.reason_code = "displaced_file_kept".to_string();
+                result.resulting_destination_hash = Some(source_hash.to_string());
                 result.detail.push(format!(
-                    "the file changed between the check and the replacement and could not be swapped back ({error}); the changed file is kept at {}",
-                    destination.with_file_name(&temp_name).display()
+                    "the file changed between the check and the replacement and could not be swapped back ({error}); the new cheat file IS in place, and the changed file is kept at {} - nothing was deleted",
+                    kept_at.display()
                 ));
                 result.detail.push(backup_note);
                 return;
