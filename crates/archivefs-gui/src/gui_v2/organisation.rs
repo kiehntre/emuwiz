@@ -663,6 +663,8 @@ impl App {
                 RomOrganisationPageAction::Rollback => self.start_canonical_organisation_job(
                     super::CanonicalOrganisationJobKind::Rollback,
                 ),
+                RomOrganisationPageAction::Rescan => self
+                    .start_canonical_organisation_job(super::CanonicalOrganisationJobKind::Rescan),
                 RomOrganisationPageAction::OpenAdvanced => {}
                 RomOrganisationPageAction::OpenDat => {}
                 RomOrganisationPageAction::OpenCheck => {}
@@ -711,6 +713,8 @@ impl App {
                 RomOrganisationPageAction::Rollback => self.start_canonical_organisation_job(
                     super::CanonicalOrganisationJobKind::Rollback,
                 ),
+                RomOrganisationPageAction::Rescan => self
+                    .start_canonical_organisation_job(super::CanonicalOrganisationJobKind::Rescan),
                 RomOrganisationPageAction::OpenAdvanced => {
                     self.organisation.view = OrganisationView::VerifiedGames;
                     self.go(Route::Section(Section::Build));
