@@ -697,6 +697,10 @@ impl RomOrganisationPageState {
             self.error = Some(refusal.clone());
             return;
         }
+        if !self.sources_scanned {
+            self.error = Some("The source folders have not been scanned yet, so this plan may not cover every game. Nothing was changed. Rescan, then preview again.".into());
+            return;
+        }
         if let Some(reason) = self.source_scan_incomplete.first() {
             self.error = Some(format!(
                 "The source scan was incomplete ({reason}), so this plan may not cover every game. Nothing was changed. Narrow the source folders or rescan, then preview again."

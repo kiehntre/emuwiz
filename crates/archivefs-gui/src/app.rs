@@ -291,6 +291,10 @@ pub(crate) struct ArchiveFsApp {
     /// any - mirrors `source_action` exactly, including the "one writer at
     /// a time" convention.
     pub(crate) library_view_action: Option<RunningLibraryViewAction>,
+    /// Set by the Blue shell while it writes the catalogue itself (its folder
+    /// scan, a database upgrade). Part of `source_action_available`, so every
+    /// Sources-page writer (including the reviewed rebind dialog) honours it.
+    pub(crate) external_catalogue_writer_busy: bool,
     /// The most recently computed Preview for a view, if any - both what
     /// the Library Views page shows in its plan table and what "Apply"/
     /// "Repair" act on for that view, and what the Library page's "Show in
@@ -531,6 +535,7 @@ impl ArchiveFsApp {
             gamer_view_scan_pending_review: false,
             library_views: load_library_view_configs_default().unwrap_or_default(),
             library_view_action: None,
+            external_catalogue_writer_busy: false,
             library_view_last_plan: None,
             library_view_form_dialog: None,
             library_view_remove_dialog: None,

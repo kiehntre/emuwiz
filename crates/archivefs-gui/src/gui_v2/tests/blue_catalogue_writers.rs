@@ -74,6 +74,35 @@ fn a_plain_library_load_is_never_a_catalogue_writer() {
 }
 
 #[test]
+fn starting_a_blue_scan_blocks_native_writers_in_the_same_frame() {
+    let context = egui::Context::default();
+    let mut app = app_with_native(&context);
+    let (requests, _worker) = std::sync::mpsc::channel();
+    let (_events, rx) = std::sync::mpsc::channel();
+    app.backend = Backend::with_channels(requests, rx);
+    assert!(!app.native_catalogue_writer_busy(), "fixture starts idle");
+
+    app.load(true);
+
+    // No frame has run: the flag must already be up, not one frame late.
+    assert!(app.scan_job.is_some());
+    let workflows = app.native_workflows.as_ref().unwrap();
+    assert!(!workflows.source_action_available());
+}
+
+#[test]
+fn a_failed_scan_send_does_not_leave_the_writer_held() {
+    let context = egui::Context::default();
+    let mut app = app_with_native(&context);
+    app.backend = Backend::disconnected();
+    app.load(true);
+    assert!(app.load_job.is_none());
+    assert!(app.scan_job.is_none());
+    let workflows = app.native_workflows.as_ref().unwrap();
+    assert!(workflows.source_action_available());
+}
+
+#[test]
 fn native_sources_actions_are_refused_while_blue_scans() {
     let context = egui::Context::default();
     let mut app = app_with_native(&context);
@@ -81,8 +110,18 @@ fn native_sources_actions_are_refused_while_blue_scans() {
     // The per-frame sync passes the writer flag to the native host.
     frame(&context, &mut app, [1280.0, 900.0]);
     let workflows = app.native_workflows.as_mut().unwrap();
-    assert!(workflows.catalogue_writer_busy);
+    assert!(workflows.app.external_catalogue_writer_busy);
     assert!(!workflows.source_action_available());
+    // The reviewed rebind dialog and every direct caller ask the app itself,
+    // so the app-level rule must refuse too (review finding 1).
+    assert!(!workflows.app.source_action_available());
+    workflows
+        .app
+        .start_source_action(context.clone(), SourceAction::ScanAll);
+    assert!(
+        workflows.app.sources_ui.source_action.is_none(),
+        "the app-level gate refuses a direct start while Blue scans"
+    );
 
     workflows.review_or_start_source_action(context.clone(), SourceAction::ScanAll);
 
@@ -94,7 +133,7 @@ fn native_sources_actions_are_refused_while_blue_scans() {
     app.scan_job = None;
     frame(&context, &mut app, [1280.0, 900.0]);
     let workflows = app.native_workflows.as_ref().unwrap();
-    assert!(!workflows.catalogue_writer_busy);
+    assert!(!workflows.app.external_catalogue_writer_busy);
     assert_eq!(
         workflows.source_action_available(),
         workflows.app.source_action_available(),

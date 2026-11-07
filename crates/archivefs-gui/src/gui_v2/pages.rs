@@ -325,7 +325,7 @@ impl App {
         // native Sources page must not start its own writer meanwhile. Set
         // here, on the one path every frame takes (eframe and tests alike).
         if let Some(workflows) = &mut self.native_workflows {
-            workflows.catalogue_writer_busy =
+            workflows.app.external_catalogue_writer_busy =
                 self.scan_job.is_some() || self.tools.database.upgrading();
         }
         // Kept until no other load is in flight, so the reload is not lost.

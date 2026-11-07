@@ -883,7 +883,17 @@ impl App {
         );
         self.load_job = Some(id);
         self.scan_job = scan.then_some(id);
-        self.send(id, Command::Load { scan });
+        if scan && let Some(workflows) = &mut self.native_workflows {
+            // Close the one-frame window before the next per-frame sync.
+            workflows.app.external_catalogue_writer_busy = true;
+        }
+        if !self.send(id, Command::Load { scan }) {
+            self.load_job = None;
+            self.scan_job = None;
+            if let Some(workflows) = &mut self.native_workflows {
+                workflows.app.external_catalogue_writer_busy = false;
+            }
+        }
     }
     /// Whether the embedded native app is writing the catalogue (a Sources
     /// action, an alias or platform change, a missing-entry removal, or a
@@ -891,7 +901,7 @@ impl App {
     fn native_catalogue_writer_busy(&self) -> bool {
         self.native_workflows
             .as_ref()
-            .is_some_and(|workflows| !workflows.app.source_action_available())
+            .is_some_and(|workflows| !workflows.app.native_writers_idle())
     }
     fn refresh_environment(&mut self, context: &egui::Context) {
         if self.environment_job.is_some() {

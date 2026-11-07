@@ -52,10 +52,6 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 pub(super) struct NativeWorkflows {
     pub(super) app: ArchiveFsApp,
-    /// Set by the Blue host each frame while its own catalogue writer (folder
-    /// scan or database upgrade) runs. Native Sources actions refuse to start
-    /// meanwhile, so two writers never touch the catalogue at once (S06-04).
-    pub(super) catalogue_writer_busy: bool,
     /// Set by the readiness card's Hasheous shortcut; Game Details takes it.
     lookup_online_requested: bool,
     native_romm: native_romm::State,
@@ -427,7 +423,6 @@ impl NativeWorkflows {
         super::readable_style(&context);
         Self {
             app,
-            catalogue_writer_busy: false,
             lookup_online_requested: false,
             native_romm: native_romm::State::default(),
             selected: None,
@@ -466,10 +461,11 @@ impl NativeWorkflows {
         }
     }
 
-    /// Whether a new Sources-page action may start: the native app's own
-    /// one-writer rule, and no Blue catalogue writer running either.
+    /// Whether a new Sources-page action may start: the native app's one-writer
+    /// rule, which includes the Blue writer flag (S06-04), so the rebind dialog
+    /// and every other caller are gated by the same answer.
     pub(super) fn source_action_available(&self) -> bool {
-        self.app.source_action_available() && !self.catalogue_writer_busy
+        self.app.source_action_available()
     }
 
     pub(super) fn poll(&mut self, context: &egui::Context, activity: &mut Activity) {
