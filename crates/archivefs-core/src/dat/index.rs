@@ -51,8 +51,13 @@ pub struct DatRomRef {
     pub checksums: Vec<DatChecksum>,
     pub status: Option<String>,
     pub merge: Option<String>,
-    pub content_classification: DatContentClassification,
-    pub original_metadata: DatOriginalMetadata,
+    /// The owning game's classification, shared (not cloned) by every ROM
+    /// reference of that game. S11-08: cloning this and
+    /// `original_metadata` into every ROM dominated index memory on large
+    /// catalogues; `Arc` derefs transparently, so every read is unchanged.
+    pub content_classification: Arc<DatContentClassification>,
+    /// The owning game's verbatim source metadata, shared per game as above.
+    pub original_metadata: Arc<DatOriginalMetadata>,
     /// Batch 12: the owning game entry's own `cloneof`/`cloneofid` value,
     /// verbatim from the DAT source - `None` when the DAT carries no such
     /// relationship for this game, or declares this game itself as a
@@ -326,6 +331,10 @@ impl DatIndex {
         }
 
         for (game_index, game) in dat.games.iter().enumerate() {
+            // One shared copy of the game-level metadata per game, however
+            // many ROMs (and index buckets) point at it.
+            let content_classification = Arc::new(game.content_classification.clone());
+            let original_metadata = Arc::new(game.original_metadata.clone());
             for (rom_index, rom) in game.roms.iter().enumerate() {
                 let rom_ref = DatRomRef {
                     game_index,
@@ -340,8 +349,8 @@ impl DatIndex {
                     checksums: rom.checksums(),
                     status: rom.status.clone(),
                     merge: rom.merge.clone(),
-                    content_classification: game.content_classification.clone(),
-                    original_metadata: game.original_metadata.clone(),
+                    content_classification: Arc::clone(&content_classification),
+                    original_metadata: Arc::clone(&original_metadata),
                     clone_of: game.clone_of.clone(),
                 };
 
@@ -370,8 +379,8 @@ impl DatIndex {
                             checksums: rom.checksums(),
                             status: rom.status.clone(),
                             merge: rom.merge.clone(),
-                            content_classification: game.content_classification.clone(),
-                            original_metadata: game.original_metadata.clone(),
+                            content_classification: Arc::clone(&content_classification),
+                            original_metadata: Arc::clone(&original_metadata),
                             clone_of: game.clone_of.clone(),
                         };
                         index.insert_rom(rom, rom_ref);
@@ -484,6 +493,10 @@ impl DatIndex {
         self.by_sha256.values().filter(|v| v.len() > 1).count()
     }
 }
+
+#[cfg(test)]
+#[path = "index_sharing_tests.rs"]
+mod index_sharing_tests;
 
 #[cfg(test)]
 mod tests {

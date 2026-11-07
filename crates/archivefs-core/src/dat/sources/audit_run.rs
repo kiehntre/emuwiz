@@ -1738,10 +1738,10 @@ fn combined_content_match(
         candidates: vec![DatContentCandidate {
             game_name: candidate.game_name.clone(),
             rom_name: candidate.rom_name.clone(),
-            classification: candidate.content_classification.clone(),
+            classification: candidate.content_classification.as_ref().clone(),
             eligibility: ContentSelectionPolicy::AllEntries
                 .eligibility(&candidate.content_classification),
-            original_metadata: candidate.original_metadata.clone(),
+            original_metadata: candidate.original_metadata.as_ref().clone(),
         }],
     })
 }
@@ -2505,8 +2505,8 @@ fn annotate_content_matches(
                         game_name: candidate.game_name.clone(),
                         rom_name: candidate.rom_name.clone(),
                         eligibility: selection.eligibility(&candidate.content_classification),
-                        classification: candidate.content_classification.clone(),
-                        original_metadata: candidate.original_metadata.clone(),
+                        classification: candidate.content_classification.as_ref().clone(),
+                        original_metadata: candidate.original_metadata.as_ref().clone(),
                     })
                     .collect(),
             })

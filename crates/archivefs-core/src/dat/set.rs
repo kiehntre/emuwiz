@@ -2043,8 +2043,8 @@ mod tests {
             ],
             status: rom.status.clone(),
             merge: rom.merge.clone(),
-            content_classification: game.content_classification.clone(),
-            original_metadata: game.original_metadata.clone(),
+            content_classification: std::sync::Arc::new(game.content_classification.clone()),
+            original_metadata: std::sync::Arc::new(game.original_metadata.clone()),
             clone_of: None,
         }
     }
@@ -2066,8 +2066,8 @@ mod tests {
             ],
             status: rom.status.clone(),
             merge: rom.merge.clone(),
-            content_classification: game.content_classification.clone(),
-            original_metadata: game.original_metadata.clone(),
+            content_classification: std::sync::Arc::new(game.content_classification.clone()),
+            original_metadata: std::sync::Arc::new(game.original_metadata.clone()),
             clone_of: None,
         }
     }
@@ -3423,8 +3423,8 @@ mod tests {
                 checksums: rom.checksums(),
                 status: rom.status.clone(),
                 merge: rom.merge.clone(),
-                content_classification: game.content_classification.clone(),
-                original_metadata: game.original_metadata.clone(),
+                content_classification: std::sync::Arc::new(game.content_classification.clone()),
+                original_metadata: std::sync::Arc::new(game.original_metadata.clone()),
                 clone_of: None,
             }
         }
@@ -3475,8 +3475,8 @@ mod tests {
             checksums: nested.checksums.clone(),
             status: None,
             merge: None,
-            content_classification: games[1].content_classification.clone(),
-            original_metadata: games[1].original_metadata.clone(),
+            content_classification: std::sync::Arc::new(games[1].content_classification.clone()),
+            original_metadata: std::sync::Arc::new(games[1].original_metadata.clone()),
             clone_of: None,
         };
 
