@@ -20,12 +20,10 @@ pub(crate) struct Request {
 impl Request {
     pub(crate) fn new(request: HatariLaunchRequest, game_key: String) -> Self {
         Self {
-            identity: CanonicalIdentityStatus::Resolved(
-                archivefs_core::launch::ResolvedIdentity {
-                    platform_id: "AtariST".into(),
-                    game_key,
-                },
-            ),
+            identity: CanonicalIdentityStatus::Resolved(archivefs_core::launch::ResolvedIdentity {
+                platform_id: "AtariST".into(),
+                game_key,
+            }),
             request,
         }
     }
@@ -35,7 +33,8 @@ impl Request {
     }
 
     pub(crate) fn execute(self) -> Result<WatchedProcess, String> {
-        let roots = HatariProfileDiscoveryRoots::from_environment();
+        let roots = HatariProfileDiscoveryRoots::from_environment()
+            .map_err(|error| format!("Hatari setup could not be located: {error}"))?;
         preflight_and_launch_hatari(&self.request, &roots, &self.identity).map_err(|error| {
             match error {
                 archivefs_core::launch::HatariLaunchExecutionError::Preflight(error) => format!(

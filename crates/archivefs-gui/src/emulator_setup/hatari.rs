@@ -62,9 +62,7 @@ impl Snapshot {
     }
 
     /// A typed isolated-Hatari launch request, or `None` (stay blocked).
-    pub(crate) fn launch_request(
-        &self,
-    ) -> Option<crate::launch_readiness_page::hatari::Request> {
+    pub(crate) fn launch_request(&self) -> Option<crate::launch_readiness_page::hatari::Request> {
         let profile = self.launchable_profile()?;
         Some(crate::launch_readiness_page::hatari::Request::new(
             profile.launch_request.clone()?,

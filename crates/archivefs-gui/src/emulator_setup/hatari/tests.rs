@@ -49,7 +49,7 @@ fn fixture() -> (tempfile::TempDir, Selection, HatariProfileDiscoveryRoots) {
     (temp, selection, roots)
 }
 #[test]
-fn hatari_readiness_binds_media_profile_tos_and_preview_but_cannot_authorise_launch() {
+fn hatari_readiness_binds_media_profile_tos_and_launches_only_through_the_isolated_session() {
     let (_temp, selection, roots) = fixture();
     let snapshot = gather(selection.clone(), roots);
     assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
@@ -62,22 +62,42 @@ fn hatari_readiness_binds_media_profile_tos_and_preview_but_cannot_authorise_lau
     );
     assert!(p.inspection.selected_game.verified_title.is_none());
     let cmd = p.command.as_ref().unwrap();
-    assert_eq!(cmd.arguments[0], "--configfile");
-    assert_eq!(cmd.arguments[1], p.profile.config_path.as_os_str());
-    assert_eq!(cmd.arguments[2], "--disk-a");
-    assert_eq!(cmd.arguments[3], selection.path.as_os_str());
+    // The user's own Hatari configuration is never merged in, and drive B is
+    // switched off; the real spawn swaps the disk for a private read-only copy.
+    let args: Vec<_> = cmd
+        .arguments
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(!args.iter().any(|a| a == "--configfile"));
+    assert!(
+        !args
+            .iter()
+            .any(|a| a == &p.profile.config_path.to_string_lossy())
+    );
+    let disk = args.iter().position(|a| a == "--disk-a").unwrap();
+    assert_eq!(args[disk + 1], selection.path.to_string_lossy());
+    let drive_b = args.iter().position(|a| a == "--drive-b").unwrap();
+    assert_eq!(args[drive_b + 1], "off");
     assert!(
         snapshot
             .media
             .contains("membership, order and completeness are unverified")
     );
     let plan = snapshot.plan();
-    assert_eq!(plan.summary.ready + plan.summary.ready_with_warnings, 0);
-    assert!(plan.candidates.iter().all(|c| !c.blockers.is_empty()));
+    // One fully preflighted profile is launchable, with the visible
+    // identity-unverified warning; nothing is blocked.
+    assert!(plan.summary.ready + plan.summary.ready_with_warnings >= 1);
+    assert!(plan.candidates.iter().all(|c| c.blockers.is_empty()));
+    assert!(plan.candidates.iter().all(|c| {
+        c.warnings
+            .iter()
+            .any(|w| w.kind == launch::LaunchWarningKind::IdentityUnverified)
+    }));
     let input = crate::launch_readiness_page::LaunchReadinessInput::AtariSt(snapshot);
     assert!(matches!(
         crate::launch_readiness_page::gamer_play_action(&input),
-        crate::launch_readiness_page::GamerPlayAction::BlockedTyped(_)
+        crate::launch_readiness_page::GamerPlayAction::Launch(_)
     ));
 }
 #[test]
@@ -86,6 +106,8 @@ fn hatari_missing_firmware_and_malformed_or_unproven_media_remain_explicit() {
     fs::remove_file(temp.path().join("config/hatari/tos104.img")).unwrap();
     let snapshot = gather(selection.clone(), roots.clone());
     assert!(snapshot.profiles[0].command.is_none());
+    // Missing firmware must never yield a launch request.
+    assert!(snapshot.launch_request().is_none());
     assert!(
         snapshot.profiles[0]
             .refusal
@@ -143,7 +165,7 @@ fn hatari_selection_change_discards_late_worker_result() {
 }
 
 #[test]
-fn hatari_actual_blue_builder_and_gamer_summary_preserve_refusal() {
+fn hatari_actual_blue_builder_and_gamer_summary_offer_play_for_one_good_profile() {
     let (_temp, selection, roots) = fixture();
     let snapshot = gather(selection.clone(), roots);
     let mut app = crate::tests::app_for_operation_tests();
@@ -175,8 +197,10 @@ fn hatari_actual_blue_builder_and_gamer_summary_preserve_refusal() {
         &input,
         crate::gui_v2::launch_readiness_summary::ReadinessFreshness::Current,
     );
-    assert!(summary.primary_action.is_none());
-    assert!(summary.explanation.contains("not authorised"));
+    // A single preflighted profile now offers Play (isolated session); the old
+    // blanket "not authorised" refusal is gone.
+    assert!(summary.primary_action.is_some());
+    assert!(!summary.explanation.contains("not authorised"));
     assert!(
         summary
             .details

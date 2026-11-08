@@ -65,6 +65,7 @@ mod retroarch_stop;
 #[cfg(test)]
 pub(crate) use retroarch_stop::retroarch_test_request;
 pub(crate) mod azahar;
+pub(crate) mod hatari;
 pub(crate) mod launch_choice;
 pub(crate) mod openrct2;
 mod rmg;
@@ -72,7 +73,6 @@ mod sameboy;
 pub(crate) mod saturn_core;
 mod scummvm_profile;
 mod snes9x;
-pub(crate) mod hatari;
 mod stella;
 pub(crate) mod vice;
 pub(crate) mod vita3k;

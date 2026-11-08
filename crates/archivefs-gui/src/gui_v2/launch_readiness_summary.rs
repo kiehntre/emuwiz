@@ -131,6 +131,14 @@ pub(crate) fn project(
         LaunchReadinessInput::EvidenceNotLoaded | LaunchReadinessInput::RetroArchNotScanned => {
             checking_summary()
         }
+        // One fully preflighted Hatari profile launches through the isolated
+        // disposable session, so it projects like any other ready plan (with
+        // its visible identity-unverified warning and a Play action).
+        LaunchReadinessInput::AtariSt(snapshot) if snapshot.launch_request().is_some() => {
+            let mut summary = project_plan(&snapshot.plan(), true, true);
+            summary.details.extend(snapshot.details());
+            summary
+        }
         LaunchReadinessInput::AtariSt(snapshot) => {
             let mut summary = project_plan(&snapshot.plan(), true, true);
             summary.status = ReadinessPresentationState::Blocked;
