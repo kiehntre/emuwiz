@@ -1039,10 +1039,28 @@ impl ReadinessSources<'_> {
                 }
             }));
         }
+        // Owner-approved default (2026-11-08): the configured xemu Flatpak is
+        // the preferred original-Xbox emulator. Used only when the user has
+        // saved no xemu choice, and only when its launch binding is proven;
+        // nothing is written to any configuration.
+        let mut xemu_default_profile: Option<String> = None;
         if let Ok(roots) =
             archivefs_core::patch_manager::XemuProfileDiscoveryRoots::from_environment()
         {
             let discovery = archivefs_core::patch_manager::discover_xemu_profiles(&roots);
+            xemu_default_profile = discovery
+                .profiles
+                .iter()
+                .find(|profile| {
+                    profile.installation_type
+                        == archivefs_core::patch_manager::XemuInstallationType::FlatpakUser
+                        && profile.eligible
+                        && archivefs_core::patch_manager::resolve_xemu_native_launch_binding(
+                            profile,
+                        )
+                        .is_ok()
+                })
+                .map(|profile| profile.profile_id.clone());
             standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
                 archivefs_core::launch::StandaloneProfileInput {
                     adapter_id: "xemu",
@@ -1390,7 +1408,7 @@ impl ReadinessSources<'_> {
             | archivefs_core::launch::CanonicalIdentityStatus::Conflicting => false,
         };
 
-        let remembered: Vec<archivefs_core::launch::RememberedPreference> = self
+        let mut remembered: Vec<archivefs_core::launch::RememberedPreference> = self
             .readiness
             .remembered_emulator_profiles
             .iter()
@@ -1399,6 +1417,14 @@ impl ReadinessSources<'_> {
                 profile_id: profile.profile_id.clone(),
             })
             .collect();
+        if let Some(profile_id) = xemu_default_profile
+            && !remembered.iter().any(|entry| entry.adapter_id == "xemu")
+        {
+            remembered.push(archivefs_core::launch::RememberedPreference {
+                adapter_id: "xemu".into(),
+                profile_id,
+            });
+        }
         #[cfg(target_os = "linux")]
         let shadps4_context = if matches!(&identity_status,
             archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity) if identity.platform_id == "PS4")
