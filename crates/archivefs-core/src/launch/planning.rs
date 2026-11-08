@@ -198,8 +198,23 @@ impl LaunchCandidate {
         match self.readiness {
             LaunchReadiness::Ready => self.warnings.is_empty(),
             LaunchReadiness::ReadyWithWarnings => {
+                // The firmware warning needs unverified-but-present firmware
+                // behind it. Without it (the identity warning on its own) the
+                // firmware must already be fine: never missing or unknown.
+                let firmware_warned = self
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.kind == LaunchWarningKind::FirmwarePresentUnverified);
+                let firmware_ok = if firmware_warned {
+                    self.firmware == FirmwareReadiness::PresentUnverified
+                } else {
+                    matches!(
+                        self.firmware,
+                        FirmwareReadiness::NotRequired | FirmwareReadiness::Verified
+                    )
+                };
                 !self.warnings.is_empty()
-                    && self.firmware == FirmwareReadiness::PresentUnverified
+                    && firmware_ok
                     && self
                         .warnings
                         .iter()
@@ -923,5 +938,91 @@ mod missing_firmware_detail_tests {
             missing_firmware_detail(&info),
             "required firmware/BIOS is missing: scph5500.bin, scph5501.bin, scph5502.bin"
         );
+    }
+}
+
+#[cfg(test)]
+mod identity_unverified_eligibility_tests {
+    use super::*;
+    use crate::launch::readiness::{LaunchWarning, LaunchWarningKind};
+
+    fn candidate(
+        firmware: FirmwareReadiness,
+        readiness: LaunchReadiness,
+        warnings: Vec<LaunchWarning>,
+    ) -> LaunchCandidate {
+        LaunchCandidate {
+            target: LaunchTarget::Standalone {
+                adapter_id: "fixture",
+                profile_id: "fixture".into(),
+                profile_path: None,
+            },
+            content: LaunchContentRef {
+                kind: None,
+                container: Some(LaunchContainerKind::PlainFile),
+                resolved_path: Some("/g/game.tap".into()),
+                requires_mount: false,
+                provenance: "fixture".into(),
+            },
+            firmware,
+            blockers: vec![],
+            warnings,
+            readiness,
+            preference: CandidatePreference::SoleEligible,
+        }
+    }
+
+    fn warn(kind: LaunchWarningKind) -> LaunchWarning {
+        LaunchWarning::new(kind, "fixture")
+    }
+
+    #[test]
+    fn the_identity_warning_alone_permits_retroarch_play_without_firmware() {
+        let identity = candidate(
+            FirmwareReadiness::NotRequired,
+            LaunchReadiness::ReadyWithWarnings,
+            vec![warn(LaunchWarningKind::IdentityUnverified)],
+        );
+        assert!(identity.retroarch_play_eligible());
+        // A blocker always wins.
+        let mut blocked = identity.clone();
+        blocked.blockers.push(LaunchBlocker::new(
+            LaunchBlockerKind::ContentNotResolved,
+            "fixture",
+        ));
+        assert!(!blocked.retroarch_play_eligible());
+        // The identity warning never waives missing or unknown firmware.
+        for firmware in [FirmwareReadiness::Missing, FirmwareReadiness::Unknown] {
+            let c = candidate(
+                firmware,
+                LaunchReadiness::ReadyWithWarnings,
+                vec![warn(LaunchWarningKind::IdentityUnverified)],
+            );
+            assert!(!c.retroarch_play_eligible(), "{firmware:?}");
+        }
+    }
+
+    #[test]
+    fn firmware_and_other_warnings_keep_their_existing_rules() {
+        // Firmware warning still needs present-but-unverified firmware.
+        let firmware = |fw| {
+            candidate(
+                fw,
+                LaunchReadiness::ReadyWithWarnings,
+                vec![warn(LaunchWarningKind::FirmwarePresentUnverified)],
+            )
+        };
+        assert!(firmware(FirmwareReadiness::PresentUnverified).retroarch_play_eligible());
+        assert!(!firmware(FirmwareReadiness::NotRequired).retroarch_play_eligible());
+        // Identity warning combined with any non-allow-listed warning withdraws Play.
+        let mixed = candidate(
+            FirmwareReadiness::NotRequired,
+            LaunchReadiness::ReadyWithWarnings,
+            vec![
+                warn(LaunchWarningKind::IdentityUnverified),
+                warn(LaunchWarningKind::MultipleEligibleProfiles),
+            ],
+        );
+        assert!(!mixed.retroarch_play_eligible());
     }
 }

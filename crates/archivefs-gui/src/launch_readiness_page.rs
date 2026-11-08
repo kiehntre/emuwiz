@@ -3469,7 +3469,9 @@ fn retroarch_launch_request_unexplained(
         } else {
             None
         },
-        expected_snapshot_evidence: if platform_id == "ZX Spectrum" {
+        expected_snapshot_evidence: if platform_id == "ZX Spectrum"
+            && !archivefs_core::launch::unverified_media::is_unverified_key(game_key)
+        {
             // An unproven snapshot is a game-level refusal, never an
             // installation one.
             let evidence =

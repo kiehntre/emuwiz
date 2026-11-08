@@ -33,6 +33,10 @@ pub struct RetroArchCommand {
     pub saturn_core_selection: Option<super::saturn_core_selection::SaturnCoreSelection>,
     /// Minted by source-aware preflight, checked again at the spawn boundary.
     pub snapshot_evidence: Option<crate::classic_trainer_evidence::snapshot::SnapshotEvidence>,
+    /// Set only by the preflight for an owner-approved unverified ZX tape
+    /// launch; the spawn step then re-validates the tape instead of a DAT
+    /// snapshot. False for every other command.
+    pub unverified_identity: bool,
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
@@ -345,6 +349,7 @@ pub fn build_retroarch_command_plan(
     RetroArchCommandPlan {
         command: Some(RetroArchCommand {
             saturn_core_selection: None,
+            unverified_identity: false,
             snapshot_evidence: None,
             executable,
             arguments,
