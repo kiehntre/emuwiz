@@ -63,7 +63,6 @@
 //! module implements the first slice of.
 
 pub mod amiberry_cd_command;
-pub mod unverified_media;
 pub mod amiberry_cd_discovery;
 pub mod amiberry_cd_execution;
 pub mod amiberry_cd_profile;
@@ -94,6 +93,7 @@ pub mod dosbox_command;
 pub mod dosbox_execution;
 pub mod dosbox_sandbox;
 pub mod dosbox_target;
+pub mod unverified_media;
 pub use dosbox_target::{DosBoxLaunchIdentity, UserApprovedDosBoxTarget};
 pub mod duckstation_command;
 pub mod duckstation_execution;
