@@ -379,7 +379,19 @@ pub fn preflight_retroarch_launch(
     }
 
     // --- 5: fresh identity re-inspection ---
-    let snapshot_evidence = if request.expected_platform_id == "ZX Spectrum" {
+    // An owner-approved unverified ZX tape launch carries no DAT snapshot; its
+    // identity is re-derived from the file below instead.
+    let unverified_zx_tape = request.expected_platform_id == "ZX Spectrum"
+        && super::unverified_media::is_unverified_key(&request.expected_game_key);
+    let snapshot_evidence = if unverified_zx_tape {
+        if request.expected_snapshot_evidence.is_some() {
+            return Err(preflight_error(
+                LaunchPreflightErrorKind::IdentityMismatch,
+                "An unverified tape launch must not carry snapshot evidence.",
+            ));
+        }
+        None
+    } else if request.expected_platform_id == "ZX Spectrum" {
         let evidence = request
             .expected_snapshot_evidence
             .as_ref()
@@ -413,6 +425,18 @@ pub fn preflight_retroarch_launch(
             ));
         }
         identity
+    } else if unverified_zx_tape {
+        match super::unverified_media::zx_tape_identity(content_path) {
+            Some(identity) if identity.game_key == request.expected_game_key => {
+                CanonicalIdentityStatus::Resolved(identity)
+            }
+            _ => {
+                return Err(preflight_error(
+                    LaunchPreflightErrorKind::IdentityUnresolved,
+                    "The tape image changed or is no longer a valid ZX tape; recheck this game.",
+                ));
+            }
+        }
     } else {
         fresh_identity_status(content_path, request)?
     };
@@ -1048,7 +1072,14 @@ pub(crate) fn spawn_retroarch_guarded(
             .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
     }
     let mut backend_stamps = None;
-    let current_snapshot = if command.selection.platform_id == "ZX Spectrum" {
+    let current_snapshot = if command.selection.platform_id == "ZX Spectrum"
+        && command.snapshot_evidence.is_none()
+        && super::unverified_media::zx_tape_identity(&command.selection.content_path).is_some()
+    {
+        // Owner-approved unverified tape launch: no DAT snapshot exists, and
+        // the tape was just re-validated from the file itself.
+        None
+    } else if command.selection.platform_id == "ZX Spectrum" {
         let evidence = command
             .snapshot_evidence
             .as_ref()

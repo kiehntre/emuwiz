@@ -63,6 +63,7 @@
 //! module implements the first slice of.
 
 pub mod amiberry_cd_command;
+pub mod unverified_media;
 pub mod amiberry_cd_discovery;
 pub mod amiberry_cd_execution;
 pub mod amiberry_cd_profile;
