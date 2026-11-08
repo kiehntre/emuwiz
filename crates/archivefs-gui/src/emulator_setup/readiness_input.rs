@@ -28,6 +28,10 @@ pub(crate) struct ReadinessSources<'a> {
     pub(crate) loose_ref: &'a dyn Fn(&Path) -> Option<archivefs_core::launch::LaunchContentRef>,
     /// True only for a catalogued `arcade_set_directory` at exactly this path.
     pub(crate) is_arcade_set_directory: &'a dyn Fn(&Path) -> bool,
+    /// The catalogue's platform for exactly this path. The saved-library
+    /// snapshot is not loaded on the v2 routes, so the live record cannot be
+    /// the only source of the platform.
+    pub(crate) platform_hint: &'a dyn Fn(&Path) -> Option<String>,
 }
 
 impl ReadinessSources<'_> {
@@ -343,6 +347,23 @@ impl ReadinessSources<'_> {
             && let Some(evidence) = crate::emulator_setup::zx_snapshot::readiness(path)
         {
             identity_status = evidence.identity();
+        }
+        // Owner-approved controlled path (2026-11-07): a recognised, safely
+        // inspected ZX tape image may launch with a visible "identity
+        // unverified" warning instead of requiring DAT or header identity.
+        let mut identity_unverified = false;
+        if matches!(
+            identity_status,
+            archivefs_core::launch::CanonicalIdentityStatus::Unknown
+        ) && !evidence_freshness.is_incomplete()
+            && let Some(path) = focused
+            && let Some(hint) = focused_record
+                .and_then(|record| record.mount_plan.archive.identity.platform.clone())
+                .or_else(|| (self.platform_hint)(path))
+            && let Some(resolved) = crate::emulator_setup::unverified_media::resolve(path, &hint)
+        {
+            identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved);
+            identity_unverified = true;
         }
         match identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
@@ -1478,6 +1499,9 @@ impl ReadinessSources<'_> {
             launch_readiness_page::amiga_boot::apply(&mut plan, context);
         }
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
+        if identity_unverified {
+            crate::emulator_setup::unverified_media::apply_warning(&mut plan);
+        }
         if let Some(probe) = &arcade_probe {
             crate::arcade_mame_probe::apply_warnings(&mut plan, probe);
         }

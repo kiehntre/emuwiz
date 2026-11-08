@@ -93,6 +93,7 @@ pub mod dosbox_command;
 pub mod dosbox_execution;
 pub mod dosbox_sandbox;
 pub mod dosbox_target;
+pub mod unverified_media;
 pub use dosbox_target::{DosBoxLaunchIdentity, UserApprovedDosBoxTarget};
 pub mod duckstation_command;
 pub mod duckstation_execution;

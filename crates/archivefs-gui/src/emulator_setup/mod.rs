@@ -32,6 +32,7 @@ pub(crate) mod readiness_input;
 #[cfg(target_os = "linux")]
 pub(crate) mod shadps4;
 mod state;
+pub(crate) mod unverified_media;
 pub(crate) mod vita3k_library;
 pub(crate) mod xroar_cassette;
 pub(crate) mod zx_snapshot;

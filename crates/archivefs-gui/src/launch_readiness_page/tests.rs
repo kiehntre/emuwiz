@@ -629,6 +629,7 @@ fn render_with_states(
 pub(super) fn spawn_test_process(executable: &str, arguments: &[&str]) -> LaunchedRetroArchProcess {
     let command = RetroArchCommand {
         saturn_core_selection: None,
+        unverified_identity: false,
         snapshot_evidence: None,
         executable: PathBuf::from(executable),
         arguments: arguments

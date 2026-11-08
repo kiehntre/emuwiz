@@ -322,6 +322,11 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
         }
         archivefs_core::launch::launch_content_ref_for_unmounted(kind, p)
     };
+    let platform_hint = |p: &Path| {
+        (p == archive.absolute_path)
+            .then(|| archive.platform.clone())
+            .flatten()
+    };
     let cheat_workflow = None;
     let is_arcade_set_directory =
         |p: &Path| archive.archive_kind == "arcade_set_directory" && p == archive.absolute_path;
@@ -340,6 +345,7 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
             is_scummvm_folder: &is_scummvm_folder,
             loose_ref: &loose_ref,
             is_arcade_set_directory: &is_arcade_set_directory,
+            platform_hint: &platform_hint,
         }
         .build(None)
     });
