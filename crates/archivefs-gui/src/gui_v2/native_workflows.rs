@@ -68,6 +68,10 @@ pub(super) struct NativeWorkflows {
     /// Set when Play was pressed before the launch plan could be built; the
     /// Launch page then starts the game itself the moment the plan is ready.
     pending_play: Option<(i64, std::time::Instant)>,
+    /// Scan history read straight from the library database on a background
+    /// thread, so Sources shows real history while the full library snapshot
+    /// is still loading.
+    saved_source_history: SavedSourceHistory,
     /// The last "can a launch request be built" answer, for the game shown.
     route_truth: std::cell::RefCell<launch_readiness_summary::route_truth::RouteCache>,
     source_job: Option<u64>,
@@ -454,6 +458,7 @@ impl NativeWorkflows {
             launch_kind: None,
             launch_attempts: Default::default(),
             pending_play: None,
+            saved_source_history: SavedSourceHistory::default(),
             route_truth: Default::default(),
             source_job: None,
             cheat_catalogues: Default::default(),
@@ -1523,6 +1528,49 @@ impl NativeWorkflows {
         self.collection.take_route()
     }
 
+    /// While the full library snapshot is missing, loads just the sources'
+    /// scan history in the background; once the snapshot is back it is used
+    /// instead and the cache is dropped so the next gap reloads fresh data.
+    fn poll_saved_source_history(&mut self, context: &egui::Context, snapshot_missing: bool) {
+        // The snapshot supplies the history whenever it is present. The cached
+        // copy is kept (not dropped) across short gaps so a flickering snapshot
+        // never spawns a thread per gap, and is refreshed once it is stale.
+        if !snapshot_missing {
+            return;
+        }
+        if let SavedSourceHistory::Loaded(_, loaded_at) = &self.saved_source_history
+            && loaded_at.elapsed() > std::time::Duration::from_secs(60)
+        {
+            self.saved_source_history = SavedSourceHistory::NotStarted;
+        }
+        match &self.saved_source_history {
+            SavedSourceHistory::NotStarted => {
+                let (sender, receiver) = mpsc::channel();
+                let repaint = context.clone();
+                std::thread::spawn(move || {
+                    let _ = sender.send(load_saved_source_views());
+                    repaint.request_repaint();
+                });
+                self.saved_source_history = SavedSourceHistory::Loading(receiver);
+            }
+            SavedSourceHistory::Loading(receiver) => match receiver.try_recv() {
+                Ok(Some(views)) => {
+                    self.saved_source_history =
+                        SavedSourceHistory::Loaded(views, std::time::Instant::now());
+                }
+                Ok(None) | Err(TryRecvError::Disconnected) => {
+                    self.saved_source_history = SavedSourceHistory::Unavailable;
+                }
+                // The thread also repaints when it finishes; this is the safety
+                // net if that repaint lands before the next frame polls.
+                Err(TryRecvError::Empty) => {
+                    context.request_repaint_after(std::time::Duration::from_millis(250));
+                }
+            },
+            SavedSourceHistory::Loaded(..) | SavedSourceHistory::Unavailable => {}
+        }
+    }
+
     fn show_native_sources(
         &mut self,
         ui: &mut egui::Ui,
@@ -1535,10 +1583,14 @@ impl NativeWorkflows {
             .ok()
             .unwrap_or_default()
             .to_vec();
+        let snapshot_missing = self.app.database_state.snapshot().is_none();
+        self.poll_saved_source_history(ui.ctx(), snapshot_missing);
         let snapshot = self.app.database_state.snapshot();
         let source_state = crate::source_state::merge_configured_sources(
             &configured,
-            snapshot.map(|snapshot| snapshot.source_views.as_slice()),
+            snapshot
+                .map(|snapshot| snapshot.source_views.as_slice())
+                .or_else(|| self.saved_source_history.views()),
         );
         let archives = snapshot
             .map(|snapshot| snapshot.archives.clone())
@@ -4951,6 +5003,39 @@ mod lifecycle_selection_tests {
             Some(Path::new("/home/test/.local/bin/mame"))
         );
     }
+}
+
+/// Saved scan history for the Sources page, loaded off the UI thread.
+#[derive(Default)]
+enum SavedSourceHistory {
+    #[default]
+    NotStarted,
+    Loading(Receiver<Option<Vec<SourceFolderView>>>),
+    Loaded(Vec<SourceFolderView>, std::time::Instant),
+    Unavailable,
+}
+
+impl SavedSourceHistory {
+    fn views(&self) -> Option<&[SourceFolderView]> {
+        match self {
+            Self::Loaded(views, _) => Some(views.as_slice()),
+            _ => None,
+        }
+    }
+}
+
+/// Reads configured sources joined with their saved scan history. Read-only;
+/// `None` when the config or database cannot be read.
+fn load_saved_source_views() -> Option<Vec<SourceFolderView>> {
+    let config = archivefs_core::default_config_path().ok()?;
+    let sources = archivefs_core::load_source_folder_configs_from(config).ok()?;
+    let database =
+        archivefs_core::Database::open_read_only(archivefs_core::default_database_path().ok()?)
+            .ok()?;
+    let records = database.list_source_folders().ok()?;
+    Some(archivefs_core::build_source_folder_views(
+        &sources, &records,
+    ))
 }
 
 /// How long a Play pressed before the plan was ready may wait to start.
