@@ -1,6 +1,6 @@
 //! Atari ST launch through Core's isolated Hatari session with kept saves.
 //!
-//! Hatari runs a private read-only copy of the disk with a fresh `HOME`, no
+//! Hatari runs a private per-game copy of the disk (saves kept) with a fresh `HOME`, no
 //! user configuration, no drive B and no hard disks (see
 //! `archivefs_core::launch::hatari_session`). Nothing the game writes is kept.
 
@@ -9,7 +9,7 @@ use archivefs_core::launch::process_spawn::WatchedProcess;
 use archivefs_core::launch::{HatariLaunchRequest, preflight_and_launch_hatari};
 use archivefs_core::patch_manager::HatariProfileDiscoveryRoots;
 
-pub(crate) const LIMITATION: &str = "Plays a private read-only copy of this disk with no Hatari settings, drive B or hard disks inherited, so nothing is saved and your original is never written to. Game identity is local (the disk's own content), not a DAT check.";
+pub(crate) const LIMITATION: &str = "Plays a private copy of this disk kept just for this game, so saves carry over between plays (the previous state is backed up first). Your original disk is never written, and no drive B, hard disk or storage setting is inherited; only your Hatari hardware preferences are used. Game identity is local (the disk's own content), not a DAT check.";
 
 #[derive(Clone)]
 pub(crate) struct Request {

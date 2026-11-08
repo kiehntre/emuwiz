@@ -63,7 +63,7 @@ fn hatari_readiness_binds_media_profile_tos_and_launches_only_through_the_isolat
     assert!(p.inspection.selected_game.verified_title.is_none());
     let cmd = p.command.as_ref().unwrap();
     // The user's own Hatari configuration is never merged in, and drive B is
-    // switched off; the real spawn swaps the disk for a private read-only copy.
+    // switched off; the real spawn swaps the disk for a private per-game copy.
     let args: Vec<_> = cmd
         .arguments
         .iter()

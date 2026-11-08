@@ -83,7 +83,7 @@ impl Snapshot {
             return format!("Hatari preflight refused: {refusal}. {NOTHING_LAUNCHED}");
         }
         if self.launchable_profile().is_some() {
-            return "Ready: Hatari runs a private read-only copy of this disk.".into();
+            return "Ready: Hatari plays a private copy of this disk with saves kept; your original is never written.".into();
         }
         "Hatari needs exactly one fully set-up profile (Hatari program and TOS). Open Emulator Setup to finish it.".into()
     }
@@ -120,7 +120,7 @@ impl Snapshot {
             for candidate in &mut plan.candidates {
                 candidate.warnings.push(launch::LaunchWarning::new(
                     launch::LaunchWarningKind::IdentityUnverified,
-                    "Game not identified: EmuWiz confirmed this is a valid Atari ST disk image but could not confirm which game it is. It plays a private read-only copy, so nothing is saved.",
+                    "Game not identified: EmuWiz confirmed this is a valid Atari ST disk image but could not confirm which game it is. It plays a private copy kept for this game, so saves carry over; your original is never written.",
                 ));
                 if candidate.readiness == launch::LaunchReadiness::Ready {
                     candidate.readiness = launch::LaunchReadiness::ReadyWithWarnings;
