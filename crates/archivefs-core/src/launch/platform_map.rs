@@ -209,7 +209,12 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
     LaunchCompatibility {
         platform_id: "NES",
         standalone_adapters: &["mesen"],
-        retroarch_core_hints: &["nestopia"],
+        // Reviewed preference, in this order of intent: Nestopia, FCEUmm,
+        // Mesen. Many distributions install Nestopia/FCEUmm only as symlinks to
+        // Mesen, which are (correctly) not counted as separate cores, so
+        // Mesen must be nameable or an install with just Mesen, FixNES and
+        // QuickNES has no preferred core at all.
+        retroarch_core_hints: &["nestopia", "fceumm", "mesen"],
         confidence: MappingConfidence::StronglyKnown,
     },
     LaunchCompatibility {
@@ -703,7 +708,17 @@ mod tests {
             } else {
                 assert!(row.standalone_adapters.is_empty(), "{platform_id}");
             }
-            assert_eq!(row.retroarch_core_hints.len(), 1, "{platform_id}");
+            if platform_id == "NES" {
+                // A ranked reviewed list (first installed name wins): Nestopia
+                // and FCEUmm are often installed only as aliases of Mesen.
+                assert_eq!(
+                    row.retroarch_core_hints,
+                    &["nestopia", "fceumm", "mesen"],
+                    "{platform_id}"
+                );
+            } else {
+                assert_eq!(row.retroarch_core_hints.len(), 1, "{platform_id}");
+            }
             assert_eq!(row.confidence, MappingConfidence::StronglyKnown);
         }
     }

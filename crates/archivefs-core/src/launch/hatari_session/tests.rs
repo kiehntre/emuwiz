@@ -194,7 +194,17 @@ fn a_real_spawn_sees_the_isolated_environment_and_leaves_the_original_alone() {
     for (key, value) in &session.environment {
         child.env(key, value);
     }
-    assert!(child.status().unwrap().success());
+    // A freshly written script can briefly report "text file busy" while another
+    // test thread forks; retry that one transient error.
+    let status = loop {
+        match child.status() {
+            Err(error) if error.raw_os_error() == Some(26) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => break other.unwrap(),
+        }
+    };
+    assert!(status.success());
     let text = std::fs::read_to_string(&report).unwrap();
     assert!(text.contains(&format!("HOME={}", session.working_directory.display())));
     assert!(text.contains(&format!("ARG={}", session.disk_copy.display())));
