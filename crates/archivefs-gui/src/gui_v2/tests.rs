@@ -6121,18 +6121,31 @@ fn hackhash_normal_view_is_plain_english_and_keeps_internals_under_advanced() {
     }
     assert!(!strings.iter().any(|v| v.starts_with("Parser schema")));
     for plain in [
-        "Check for a newer list",
-        "Download list",
-        "Load list from a file…",
+        "Add HackHash list…",
         "Review downloaded list",
         "Use this list",
     ] {
         assert!(strings.iter().any(|v| v == plain), "missing {plain}");
     }
+    // The web-address features only appear once an address is set under
+    // Advanced details, so the normal path never asks for a URL.
+    for hidden in ["Check for a newer list", "Download list"] {
+        assert!(
+            !strings.iter().any(|v| v == hidden),
+            "{hidden} shown without a configured address"
+        );
+    }
     assert!(
-        strings
-            .iter()
-            .any(|v| v.starts_with("Download address: not set"))
+        !strings.iter().any(|v| v.starts_with("Download address")),
+        "the normal view must not ask for a download address"
+    );
+    assert!(
+        strings.iter().any(|v| v.starts_with("Optional. HackHash")),
+        "the page must say HackHash is optional"
+    );
+    assert!(
+        strings.iter().any(|v| v.starts_with("To add it:")),
+        "the page must say how to add the list in one plain step"
     );
     assert!(strings.iter().any(|v| v == "Advanced details"));
 }
