@@ -545,6 +545,11 @@ fn narrow_cores_by_extension(matches: &mut Vec<RetroArchCoreMatch>, content: &La
     else {
         return;
     };
+    // RetroArch extracts archives for cores that never list them, so an
+    // archive extension says nothing about which core can play the game.
+    if matches!(extension.as_str(), "zip" | "7z") {
+        return;
+    }
     let supports = |info: &CoreInfoFinding| match info {
         CoreInfoFinding::Found {
             supported_extensions,

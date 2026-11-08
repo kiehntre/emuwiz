@@ -544,13 +544,14 @@ impl TypedLaunchRequest {
     pub(crate) fn unverified_status_label(&self) -> &'static str {
         match self {
             Self::Standalone(
-                StandaloneLaunchRequest::Desmume(_) | StandaloneLaunchRequest::SameBoy(_),
+                StandaloneLaunchRequest::Desmume(_)
+                | StandaloneLaunchRequest::SameBoy(_)
+                | StandaloneLaunchRequest::Hatari(_),
             ) => "Ready, identity not DAT-verified",
             Self::Standalone(
                 StandaloneLaunchRequest::Mgba(_)
                 | StandaloneLaunchRequest::Rmg(_)
                 | StandaloneLaunchRequest::Stella(_)
-                | StandaloneLaunchRequest::Hatari(_)
                 | StandaloneLaunchRequest::Snes9x(_),
             ) => "Ready, local launch identity",
             _ => "Ready, compatibility unverified",

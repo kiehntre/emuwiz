@@ -172,6 +172,53 @@ fn stale_sessions_are_pruned_but_other_directories_and_fresh_sessions_are_not() 
 }
 
 #[test]
+fn only_the_authorised_bytes_are_booted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let cmd = command(dir.path(), "g.st", &[3u8; 2048]);
+    let good: String = Sha256::digest([3u8; 2048])
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert!(prepare_session_expecting(&cmd, &root, Some(&good)).is_ok());
+    // The file is swapped after it was checked: refused, and no session left.
+    std::fs::write(&cmd.selection.content_path, [9u8; 2048]).unwrap();
+    let before = std::fs::read_dir(&root).unwrap().count();
+    let refused = prepare_session_expecting(&cmd, &root, Some(&good)).unwrap_err();
+    assert!(
+        refused.contains("changed after it was checked"),
+        "{refused}"
+    );
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), before);
+}
+
+#[test]
+fn a_failed_session_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let mut cmd = command(dir.path(), "g.st", &[1u8; 1024]);
+    cmd.selection.machine_model = HatariMachineModel::Unknown;
+    assert!(prepare_session(&cmd, &root).is_err());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn a_running_session_is_never_pruned_and_names_keep_their_extension() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("s");
+    let cmd = command(dir.path(), "g.st", &[1u8; 1024]);
+    let live = prepare_session(&cmd, &root).unwrap();
+    record_session_pid(&live, std::process::id());
+    std::thread::sleep(Duration::from_millis(20));
+    prune_stale_sessions(&root, Duration::from_millis(1));
+    assert!(live.root.exists(), "this process is alive");
+
+    let latin1 = Path::new(std::ffi::OsStr::from_bytes(b"/g/Spiel\xe4.msa"));
+    assert!(copy_file_name(latin1).ends_with(".msa"));
+}
+
+#[test]
 fn a_real_spawn_sees_the_isolated_environment_and_leaves_the_original_alone() {
     let dir = tempfile::tempdir().unwrap();
     let cmd = command(dir.path(), "g.st", &[9u8; 2048]);
@@ -213,4 +260,126 @@ fn a_real_spawn_sees_the_isolated_environment_and_leaves_the_original_alone() {
         std::fs::read(&cmd.selection.content_path).unwrap(),
         vec![9u8; 2048]
     );
+}
+
+#[test]
+fn saves_persist_per_game_and_the_previous_state_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let saves = dir.path().join("saves");
+    let cmd = command(dir.path(), "Game.st", &[5u8; 2048]);
+    let options = SessionOptions {
+        saves_root: Some(&saves),
+        ..SessionOptions::default()
+    };
+    let first = prepare_session_with(&cmd, &dir.path().join("s"), &options).unwrap();
+    let working = first.disk_copy.clone();
+    assert!(working.starts_with(first.save_dir.as_ref().unwrap()));
+    let args: Vec<String> = first
+        .arguments
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let protect = args.iter().position(|a| a == "--protect-floppy").unwrap();
+    assert_eq!(args[protect + 1], "off", "the game may write its saves");
+    assert!(
+        !args
+            .iter()
+            .any(|a| a == "--configfile" || a == "--harddrive")
+    );
+
+    // The game saves: the working disk changes; the original never does.
+    std::fs::set_permissions(&working, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&working, [6u8; 2048]).unwrap();
+    let second = prepare_session_with(&cmd, &dir.path().join("s"), &options).unwrap();
+    assert_eq!(second.disk_copy, working);
+    assert_eq!(
+        std::fs::read(&working).unwrap(),
+        vec![6u8; 2048],
+        "save kept"
+    );
+    let previous = working.with_file_name(format!(
+        "{}.previous",
+        working.file_name().unwrap().to_string_lossy()
+    ));
+    assert_eq!(std::fs::read(previous).unwrap(), vec![6u8; 2048]);
+    assert_eq!(
+        std::fs::read(&cmd.selection.content_path).unwrap(),
+        vec![5u8; 2048]
+    );
+
+    // While that game runs, a second launch of it is refused.
+    record_session_pid(&second, std::process::id());
+    let busy = prepare_session_with(&cmd, &dir.path().join("s"), &options).unwrap_err();
+    assert!(busy.contains("already running"), "{busy}");
+}
+
+#[test]
+fn a_saved_disk_that_is_not_a_regular_file_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let saves = dir.path().join("saves");
+    let cmd = command(dir.path(), "Game.st", &[5u8; 2048]);
+    let options = SessionOptions {
+        saves_root: Some(&saves),
+        ..SessionOptions::default()
+    };
+    let first = prepare_session_with(&cmd, &dir.path().join("s"), &options).unwrap();
+    std::fs::remove_file(&first.disk_copy).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", &first.disk_copy).unwrap();
+    assert!(prepare_session_with(&cmd, &dir.path().join("s"), &options).is_err());
+    assert!(
+        std::fs::symlink_metadata(&first.disk_copy)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn only_validated_hardware_preferences_are_carried_over() {
+    let owner = "[Screen]\nnMonitorType = 2\n[Memory]\nnTTRamSize = 4\nSTRamSize_KB = 4096\n\
+                 [HardDisk]\nbUseHardDiskDirectory = TRUE\nszHardDiskDirectory = /home\n\
+                 [Floppy]\nszDiskBFileName = /x.st\n[System]\nnCpuLevel = 3\nnCpuFreq = 16\n\
+                 bCompatibleCpu = TRUE\nbBlitter = FALSE\nnDSPType = 9\nnFPUType = 68882\n";
+    let args: Vec<String> = hardware_arguments(owner)
+        .into_iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let value_of = |flag: &str| {
+        args.iter()
+            .position(|a| a == flag)
+            .map(|i| args[i + 1].clone())
+    };
+    assert_eq!(value_of("--cpulevel").as_deref(), Some("3"));
+    assert_eq!(value_of("--cpuclock").as_deref(), Some("16"));
+    assert_eq!(value_of("--compatible").as_deref(), Some("true"));
+    assert_eq!(value_of("--blitter").as_deref(), Some("false"));
+    assert_eq!(value_of("--fpu").as_deref(), Some("68882"));
+    assert_eq!(value_of("--memsize").as_deref(), Some("4096"));
+    assert_eq!(value_of("--ttram").as_deref(), Some("4"));
+    assert_eq!(value_of("--monitor").as_deref(), Some("vga"));
+    assert_eq!(value_of("--dsp"), None, "out-of-range value skipped");
+    for line in &args {
+        assert!(!line.contains("/home") && !line.contains("/x.st"), "{line}");
+    }
+    assert!(hardware_arguments("[System]\nnCpuFreq = 7\nnCpuLevel = 5\n").is_empty());
+
+    // Hardware lands after --machine and before the disk.
+    let dir = tempfile::tempdir().unwrap();
+    let cmd = command(dir.path(), "g.st", &[1u8; 1024]);
+    let session = prepare_session_with(
+        &cmd,
+        &dir.path().join("s"),
+        &SessionOptions {
+            hardware: hardware_arguments(owner),
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    let all: Vec<String> = session
+        .arguments
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let at = |flag: &str| all.iter().position(|a| a == flag).unwrap();
+    assert!(at("--machine") < at("--monitor") && at("--monitor") < at("--disk-a"));
 }

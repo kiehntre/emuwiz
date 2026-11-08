@@ -1,4 +1,4 @@
-//! Atari ST launch through Core's isolated, disposable Hatari session.
+//! Atari ST launch through Core's isolated Hatari session with kept saves.
 //!
 //! Hatari runs a private read-only copy of the disk with a fresh `HOME`, no
 //! user configuration, no drive B and no hard disks (see
@@ -51,7 +51,7 @@ impl Request {
 
 pub(super) fn show_running(ui: &mut egui::Ui, process: &WatchedProcess) {
     ui.small(format!("Hatari running · PID {}", process.pid));
-    ui.small("This is a disposable session: changes are not saved.");
+    ui.small("Your game disk is never written. Saves go to a private copy for this game that EmuWiz keeps between plays, with the previous state backed up.");
 }
 
 pub(super) fn show_exited(ui: &mut egui::Ui, process: &mut WatchedProcess) {
