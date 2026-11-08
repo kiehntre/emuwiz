@@ -94,6 +94,12 @@ impl HackHashPageState {
         self.import_file_from(path);
     }
 
+    fn refresh_downloaded_exports(&mut self) {
+        self.downloaded_exports = default_downloads_dir()
+            .map(|dir| find_hackhash_exports_in(&dir))
+            .unwrap_or_default();
+    }
+
     /// Validates a chosen or found export into the review stage. Nothing is
     /// used until the user reviews it and confirms.
     fn import_file_from(&mut self, path: PathBuf) {
@@ -363,8 +369,21 @@ impl HackHashPageState {
                 chosen_download = Some(path.clone());
             }
         }
+        if ui
+            .small_button("Look in Downloads again")
+            .on_hover_text("Checks your Downloads folder for a HackHash file.")
+            .clicked()
+        {
+            self.refresh_downloaded_exports();
+        }
         if let Some(path) = chosen_download {
-            self.import_file_from(path);
+            if path.is_file() {
+                self.import_file_from(path);
+            } else {
+                // The file went away since it was listed: say so, and relist.
+                self.error = Some("That file is no longer in your Downloads folder.".into());
+                self.refresh_downloaded_exports();
+            }
         }
         if let Some(path) = &self.selected_path {
             ui.label(format!("Chosen file: {}", path.display()));
@@ -738,12 +757,38 @@ fn show_apply_status(ui: &mut egui::Ui, result: &archivefs_core::patch_manager::
     crate::shared_apply_warnings::show(ui, &crate::shared_apply_warnings::lines(result));
 }
 
-/// The user's Downloads folder, if it can be determined.
+/// The user's Downloads folder: the environment override, then the desktop's
+/// own `~/.config/user-dirs.dirs` (where a localized or relocated folder is
+/// actually recorded), then `~/Downloads`.
 fn default_downloads_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_DOWNLOAD_DIR")
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    if let Some(dir) = std::env::var_os("XDG_DOWNLOAD_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads")))
+    {
+        return Some(dir);
+    }
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    std::fs::read_to_string(config.join("user-dirs.dirs"))
+        .ok()
+        .and_then(|text| downloads_dir_from_user_dirs(&text, &home))
+        .or_else(|| Some(home.join("Downloads")))
+}
+
+/// Parses `XDG_DOWNLOAD_DIR="$HOME/Downloads"` from `user-dirs.dirs` text.
+fn downloads_dir_from_user_dirs(text: &str, home: &std::path::Path) -> Option<PathBuf> {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("XDG_DOWNLOAD_DIR="))?;
+    let value = line.split_once('=')?.1.trim().trim_matches('"');
+    let resolved = match value.strip_prefix("$HOME") {
+        Some(rest) => home.join(rest.trim_start_matches('/')),
+        None => PathBuf::from(value),
+    };
+    resolved.is_absolute().then_some(resolved)
 }
 
 /// Lists likely HackHash exports directly inside `dir` (no recursion, regular
@@ -755,7 +800,7 @@ fn find_hackhash_exports_in(dir: &std::path::Path) -> Vec<PathBuf> {
     };
     let mut found: Vec<(std::time::SystemTime, PathBuf)> = entries
         .flatten()
-        .take(2_000)
+        .take(20_000)
         .filter_map(|entry| {
             let path = entry.path();
             let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
@@ -826,5 +871,26 @@ mod tests {
         let state = HackHashPageState::default();
         assert!(state.remote_url.trim().is_empty());
         assert!(state.downloaded_exports.is_empty());
+    }
+
+    #[test]
+    fn user_dirs_file_locates_a_relocated_downloads_folder() {
+        let home = std::path::Path::new("/home/someone");
+        assert_eq!(
+            downloads_dir_from_user_dirs(
+                "XDG_DOCUMENTS_DIR=\"$HOME/Docs\"\nXDG_DOWNLOAD_DIR=\"$HOME/Descargas\"\n",
+                home
+            ),
+            Some(PathBuf::from("/home/someone/Descargas"))
+        );
+        assert_eq!(
+            downloads_dir_from_user_dirs("XDG_DOWNLOAD_DIR=\"/mnt/big/dl\"\n", home),
+            Some(PathBuf::from("/mnt/big/dl"))
+        );
+        assert_eq!(
+            downloads_dir_from_user_dirs("XDG_DOWNLOAD_DIR=\"relative\"\n", home),
+            None
+        );
+        assert_eq!(downloads_dir_from_user_dirs("nothing here", home), None);
     }
 }

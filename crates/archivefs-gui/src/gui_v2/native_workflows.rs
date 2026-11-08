@@ -1532,9 +1532,16 @@ impl NativeWorkflows {
     /// scan history in the background; once the snapshot is back it is used
     /// instead and the cache is dropped so the next gap reloads fresh data.
     fn poll_saved_source_history(&mut self, context: &egui::Context, snapshot_missing: bool) {
+        // The snapshot supplies the history whenever it is present. The cached
+        // copy is kept (not dropped) across short gaps so a flickering snapshot
+        // never spawns a thread per gap, and is refreshed once it is stale.
         if !snapshot_missing {
-            self.saved_source_history = SavedSourceHistory::NotStarted;
             return;
+        }
+        if let SavedSourceHistory::Loaded(_, loaded_at) = &self.saved_source_history
+            && loaded_at.elapsed() > std::time::Duration::from_secs(60)
+        {
+            self.saved_source_history = SavedSourceHistory::NotStarted;
         }
         match &self.saved_source_history {
             SavedSourceHistory::NotStarted => {
@@ -1547,13 +1554,20 @@ impl NativeWorkflows {
                 self.saved_source_history = SavedSourceHistory::Loading(receiver);
             }
             SavedSourceHistory::Loading(receiver) => match receiver.try_recv() {
-                Ok(Some(views)) => self.saved_source_history = SavedSourceHistory::Loaded(views),
+                Ok(Some(views)) => {
+                    self.saved_source_history =
+                        SavedSourceHistory::Loaded(views, std::time::Instant::now());
+                }
                 Ok(None) | Err(TryRecvError::Disconnected) => {
                     self.saved_source_history = SavedSourceHistory::Unavailable;
                 }
-                Err(TryRecvError::Empty) => {}
+                // The thread also repaints when it finishes; this is the safety
+                // net if that repaint lands before the next frame polls.
+                Err(TryRecvError::Empty) => {
+                    context.request_repaint_after(std::time::Duration::from_millis(250));
+                }
             },
-            SavedSourceHistory::Loaded(_) | SavedSourceHistory::Unavailable => {}
+            SavedSourceHistory::Loaded(..) | SavedSourceHistory::Unavailable => {}
         }
     }
 
@@ -4997,14 +5011,14 @@ enum SavedSourceHistory {
     #[default]
     NotStarted,
     Loading(Receiver<Option<Vec<SourceFolderView>>>),
-    Loaded(Vec<SourceFolderView>),
+    Loaded(Vec<SourceFolderView>, std::time::Instant),
     Unavailable,
 }
 
 impl SavedSourceHistory {
     fn views(&self) -> Option<&[SourceFolderView]> {
         match self {
-            Self::Loaded(views) => Some(views.as_slice()),
+            Self::Loaded(views, _) => Some(views.as_slice()),
             _ => None,
         }
     }
