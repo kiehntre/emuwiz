@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "tests/database_recovery.rs"]
+mod database_recovery;
 #[path = "tests/first_start_preferences.rs"]
 mod first_start_preferences;
 #[path = "tests/visual_polish.rs"]
@@ -74,6 +76,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         artwork: Artwork::with_indexer(context.clone(), None, Arc::new(|_| MediaIndex::default())),
         imagery: super::imagery::Imagery::default(),
         load_job: None,
+        scan_job: None,
         artwork_job: None,
         artwork_totals: super::activity::ArtworkTotals::default(),
         index_job: None,
@@ -132,6 +135,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         canonical_organisation_job: None,
         history_view: Default::default(),
         discovery_import_history: Default::default(),
+        database_recovery: Default::default(),
         duckstation_history: Default::default(),
         canonical_organisation_generation: 0,
         canonical_organisation_history: Vec::new(),
@@ -6117,18 +6121,31 @@ fn hackhash_normal_view_is_plain_english_and_keeps_internals_under_advanced() {
     }
     assert!(!strings.iter().any(|v| v.starts_with("Parser schema")));
     for plain in [
-        "Check for a newer list",
-        "Download list",
-        "Load list from a file…",
+        "Add HackHash list…",
         "Review downloaded list",
         "Use this list",
     ] {
         assert!(strings.iter().any(|v| v == plain), "missing {plain}");
     }
+    // The web-address features only appear once an address is set under
+    // Advanced details, so the normal path never asks for a URL.
+    for hidden in ["Check for a newer list", "Download list"] {
+        assert!(
+            !strings.iter().any(|v| v == hidden),
+            "{hidden} shown without a configured address"
+        );
+    }
     assert!(
-        strings
-            .iter()
-            .any(|v| v.starts_with("Download address: not set"))
+        !strings.iter().any(|v| v.starts_with("Download address")),
+        "the normal view must not ask for a download address"
+    );
+    assert!(
+        strings.iter().any(|v| v.starts_with("Optional. HackHash")),
+        "the page must say HackHash is optional"
+    );
+    assert!(
+        strings.iter().any(|v| v.starts_with("To add it:")),
+        "the page must say how to add the list in one plain step"
     );
     assert!(strings.iter().any(|v| v == "Advanced details"));
 }
@@ -11927,6 +11944,9 @@ mod blue_single_file_restore;
 mod blue_worker_lane;
 #[path = "tests/repair.rs"]
 mod repair;
+
+#[path = "tests/blue_catalogue_writers.rs"]
+mod blue_catalogue_writers;
 
 #[path = "tests/blue_truth_outcomes.rs"]
 mod blue_truth_outcomes;

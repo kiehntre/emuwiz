@@ -379,7 +379,19 @@ pub fn preflight_retroarch_launch(
     }
 
     // --- 5: fresh identity re-inspection ---
-    let snapshot_evidence = if request.expected_platform_id == "ZX Spectrum" {
+    // An owner-approved unverified ZX tape launch carries no DAT snapshot; its
+    // identity is re-derived from the file below instead.
+    let unverified_zx_tape = request.expected_platform_id == "ZX Spectrum"
+        && super::unverified_media::is_unverified_key(&request.expected_game_key);
+    let snapshot_evidence = if unverified_zx_tape {
+        if request.expected_snapshot_evidence.is_some() {
+            return Err(preflight_error(
+                LaunchPreflightErrorKind::IdentityMismatch,
+                "An unverified tape launch must not carry snapshot evidence.",
+            ));
+        }
+        None
+    } else if request.expected_platform_id == "ZX Spectrum" {
         let evidence = request
             .expected_snapshot_evidence
             .as_ref()
@@ -413,6 +425,18 @@ pub fn preflight_retroarch_launch(
             ));
         }
         identity
+    } else if unverified_zx_tape {
+        match super::unverified_media::zx_tape_identity_fresh(content_path) {
+            Some(identity) if identity.game_key == request.expected_game_key => {
+                CanonicalIdentityStatus::Resolved(identity)
+            }
+            _ => {
+                return Err(preflight_error(
+                    LaunchPreflightErrorKind::IdentityUnresolved,
+                    "The tape image changed or is no longer a valid ZX tape; recheck this game.",
+                ));
+            }
+        }
     } else {
         fresh_identity_status(content_path, request)?
     };
@@ -633,6 +657,7 @@ pub fn preflight_retroarch_launch(
     }
 
     command.snapshot_evidence = snapshot_evidence;
+    command.unverified_identity = unverified_zx_tape;
     Ok(command)
 }
 
@@ -1048,7 +1073,16 @@ pub(crate) fn spawn_retroarch_guarded(
             .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
     }
     let mut backend_stamps = None;
-    let current_snapshot = if command.selection.platform_id == "ZX Spectrum" {
+    let current_snapshot = if command.selection.platform_id == "ZX Spectrum"
+        && command.unverified_identity
+        && command.snapshot_evidence.is_none()
+        && super::unverified_media::zx_tape_identity_fresh(&command.selection.content_path)
+            .is_some()
+    {
+        // Owner-approved unverified tape launch: no DAT snapshot exists, and
+        // the tape was just re-validated from the file itself.
+        None
+    } else if command.selection.platform_id == "ZX Spectrum" {
         let evidence = command
             .snapshot_evidence
             .as_ref()
@@ -1256,6 +1290,8 @@ fn staged_launch_is_safe(
         .and_then(|file| file.take(1024 * 1024).read_to_string(&mut text))
         .map_err(|error| format!("RetroArch settings could not be read: {error}"))?;
     let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // A leading UTF-8 byte-order mark must not hide the first line's key.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("#include") || trimmed.starts_with("#reference") {
@@ -1278,6 +1314,8 @@ fn staged_launch_is_safe(
                     | "savestate_directory"
                     | "savefiles_in_content_dir"
                     | "savestates_in_content_dir"
+                    | "sort_savefiles_by_content_enable"
+                    | "sort_savestates_by_content_enable"
             )
         {
             return Err(format!("RetroArch settings set `{key}` more than once"));
@@ -1290,6 +1328,24 @@ fn staged_launch_is_safe(
             return Err(format!(
                 "RetroArch may keep saves beside the game (`{key}` is not explicitly false), \
                  which would lose them for a zipped cartridge"
+            ));
+        }
+    }
+    // With "sort by content directory" on, RetroArch writes saves into a
+    // folder named after the content's directory, which for a staged zip is a
+    // fresh `emuwiz-zip-rom-*` folder every launch. Fail closed; never rewrite.
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+    ] {
+        if let Some(value) = seen.get(key)
+            && !matches!(value.to_ascii_lowercase().as_str(), "false" | "0")
+        {
+            return Err(format!(
+                "RetroArch sorts saves into a folder named after the game's folder (`{key}` \
+                 is not explicitly false), so saves for a zipped cartridge would land in a \
+                 per-launch emuwiz-zip-rom-* folder and never be found again; turn it off in \
+                 RetroArch first"
             ));
         }
     }

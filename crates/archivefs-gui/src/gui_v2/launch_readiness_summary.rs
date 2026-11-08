@@ -131,6 +131,14 @@ pub(crate) fn project(
         LaunchReadinessInput::EvidenceNotLoaded | LaunchReadinessInput::RetroArchNotScanned => {
             checking_summary()
         }
+        // One fully preflighted Hatari profile launches through the isolated
+        // disposable session, so it projects like any other ready plan (with
+        // its visible identity-unverified warning and a Play action).
+        LaunchReadinessInput::AtariSt(snapshot) if snapshot.launch_request().is_some() => {
+            let mut summary = project_plan(&snapshot.plan(), true, true);
+            summary.details.extend(snapshot.details());
+            summary
+        }
         LaunchReadinessInput::AtariSt(snapshot) => {
             let mut summary = project_plan(&snapshot.plan(), true, true);
             summary.status = ReadinessPresentationState::Blocked;
@@ -1049,7 +1057,7 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
 
 /// Shown while the Library's check has not reached a current answer.
 pub(crate) const PLAY_RUNS_THE_CHECK: &str =
-    "Play runs the full launch check first. Nothing starts unless it passes.";
+    "Play checks that this game can start, then starts it. Nothing starts unless the check passes.";
 
 /// The Library's selected-game readiness, before it is drawn.
 #[derive(Clone, Debug, Eq, PartialEq)]

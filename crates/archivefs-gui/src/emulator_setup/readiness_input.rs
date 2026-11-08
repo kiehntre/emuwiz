@@ -26,6 +26,12 @@ pub(crate) struct ReadinessSources<'a> {
     pub(crate) member_path: &'a dyn Fn(&ArchiveRecord) -> Option<PathBuf>,
     pub(crate) is_scummvm_folder: &'a dyn Fn(&Path) -> bool,
     pub(crate) loose_ref: &'a dyn Fn(&Path) -> Option<archivefs_core::launch::LaunchContentRef>,
+    /// True only for a catalogued `arcade_set_directory` at exactly this path.
+    pub(crate) is_arcade_set_directory: &'a dyn Fn(&Path) -> bool,
+    /// The catalogue's platform for exactly this path. The saved-library
+    /// snapshot is not loaded on the v2 routes, so the live record cannot be
+    /// the only source of the platform.
+    pub(crate) platform_hint: &'a dyn Fn(&Path) -> Option<String>,
 }
 
 impl ReadinessSources<'_> {
@@ -160,6 +166,41 @@ impl ReadinessSources<'_> {
                 },
             );
             mame_set_resolutions.push(resolution);
+        }
+        // An extracted Arcade set folder is routed by the installed MAME's own
+        // per-set data (driver status, ROM verify incl. extra read-only
+        // rompaths), not by the old DAT join. No category is a gate.
+        let mame_executable = self
+            .readiness
+            .emulator_setup_overrides
+            .executable(crate::emulator_setup_overrides::OverridableEmulator::Mame);
+        // Only a catalogued Arcade set folder is ever handed to MAME here; any
+        // other game (ScummVM, DOS, PS3 ...) never reaches the probe and its
+        // identity is left exactly as the other routes resolved it.
+        let arcade_target =
+            arcade_probe_target(focused, self.is_arcade_set_directory, mame_executable);
+        // Selection moved on: stop foreground probes for any other folder.
+        crate::arcade_mame_probe::cancel_foreground_except(arcade_target.map(|(path, _)| path));
+        let mut arcade_probe = None;
+        if let Some((path, executable)) = arcade_target {
+            match crate::arcade_mame_probe::lookup(executable, path) {
+                Some(crate::arcade_mame_probe::Lookup::Checking) => {
+                    // Neither Ready nor Blocked: shown as "checking" and
+                    // re-polled when the background probe wakes the UI.
+                    return LaunchReadinessInput::EvidenceNotLoaded;
+                }
+                Some(crate::arcade_mame_probe::Lookup::Done(probe)) => arcade_probe = Some(probe),
+                None => {}
+            }
+        }
+        if let Some(probe) = &arcade_probe {
+            identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(
+                archivefs_core::launch::ResolvedIdentity {
+                    platform_id: "Arcade".to_string(),
+                    game_key: probe.set.clone(),
+                },
+            );
+            mame_set_resolutions = vec![probe.resolution.clone()];
         }
 
         // A loose ADF has no header identity; its only launch identity is a
@@ -306,6 +347,23 @@ impl ReadinessSources<'_> {
             && let Some(evidence) = crate::emulator_setup::zx_snapshot::readiness(path)
         {
             identity_status = evidence.identity();
+        }
+        // Owner-approved controlled path (2026-11-07): a recognised, safely
+        // inspected ZX tape image may launch with a visible "identity
+        // unverified" warning instead of requiring DAT or header identity.
+        let mut identity_unverified = false;
+        if matches!(
+            identity_status,
+            archivefs_core::launch::CanonicalIdentityStatus::Unknown
+        ) && !evidence_freshness.is_incomplete()
+            && let Some(path) = focused
+            && let Some(hint) = focused_record
+                .and_then(|record| record.mount_plan.archive.identity.platform.clone())
+                .or_else(|| (self.platform_hint)(path))
+            && let Some(resolved) = crate::emulator_setup::unverified_media::resolve(path, &hint)
+        {
+            identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved);
+            identity_unverified = true;
         }
         match identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
@@ -981,10 +1039,28 @@ impl ReadinessSources<'_> {
                 }
             }));
         }
+        // Owner-approved default (2026-11-08): the configured xemu Flatpak is
+        // the preferred original-Xbox emulator. Used only when the user has
+        // saved no xemu choice, and only when its launch binding is proven;
+        // nothing is written to any configuration.
+        let mut xemu_default_profile: Option<String> = None;
         if let Ok(roots) =
             archivefs_core::patch_manager::XemuProfileDiscoveryRoots::from_environment()
         {
             let discovery = archivefs_core::patch_manager::discover_xemu_profiles(&roots);
+            xemu_default_profile = discovery
+                .profiles
+                .iter()
+                .find(|profile| {
+                    profile.installation_type
+                        == archivefs_core::patch_manager::XemuInstallationType::FlatpakUser
+                        && profile.eligible
+                        && archivefs_core::patch_manager::resolve_xemu_native_launch_binding(
+                            profile,
+                        )
+                        .is_ok()
+                })
+                .map(|profile| profile.profile_id.clone());
             standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
                 archivefs_core::launch::StandaloneProfileInput {
                     adapter_id: "xemu",
@@ -1332,7 +1408,7 @@ impl ReadinessSources<'_> {
             | archivefs_core::launch::CanonicalIdentityStatus::Conflicting => false,
         };
 
-        let remembered: Vec<archivefs_core::launch::RememberedPreference> = self
+        let mut remembered: Vec<archivefs_core::launch::RememberedPreference> = self
             .readiness
             .remembered_emulator_profiles
             .iter()
@@ -1341,6 +1417,14 @@ impl ReadinessSources<'_> {
                 profile_id: profile.profile_id.clone(),
             })
             .collect();
+        if let Some(profile_id) = xemu_default_profile
+            && !remembered.iter().any(|entry| entry.adapter_id == "xemu")
+        {
+            remembered.push(archivefs_core::launch::RememberedPreference {
+                adapter_id: "xemu".into(),
+                profile_id,
+            });
+        }
         #[cfg(target_os = "linux")]
         let shadps4_context = if matches!(&identity_status,
             archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity) if identity.platform_id == "PS4")
@@ -1441,6 +1525,12 @@ impl ReadinessSources<'_> {
             launch_readiness_page::amiga_boot::apply(&mut plan, context);
         }
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
+        if identity_unverified {
+            crate::emulator_setup::unverified_media::apply_warning(&mut plan);
+        }
+        if let Some(probe) = &arcade_probe {
+            crate::arcade_mame_probe::apply_warnings(&mut plan, probe);
+        }
         refine_arcade_set_blocker(
             &mut plan,
             self.readiness
@@ -1641,6 +1731,18 @@ pub(crate) fn identity_unknown_reason(
         return system_missing;
     }
     Reason::NotConfirmed
+}
+
+/// The only case in which MAME is asked about a folder: a catalogued Arcade
+/// set directory AND a configured MAME. Any other game yields `None`, so the
+/// probe never runs and identity/set resolutions are never overwritten.
+fn arcade_probe_target<'a>(
+    focused: Option<&'a Path>,
+    is_arcade_set_directory: &dyn Fn(&Path) -> bool,
+    executable: Option<&'a Path>,
+) -> Option<(&'a Path, &'a Path)> {
+    let path = focused.filter(|path| is_arcade_set_directory(path))?;
+    Some((path, executable?))
 }
 
 /// Says precisely what is missing for the MAME route when RetroArch refused an
@@ -2158,6 +2260,27 @@ mod arcade_set_shape_tests {
             candidates,
             media_topology: None,
         }
+    }
+
+    #[test]
+    fn only_a_catalogued_arcade_set_directory_is_ever_probed() {
+        let exe = Path::new("/usr/bin/mame");
+        let arcade = Path::new("/lib/arcade/pacman");
+        let is_arcade = |p: &Path| p == arcade;
+        assert_eq!(
+            arcade_probe_target(Some(arcade), &is_arcade, Some(exe)),
+            Some((arcade, exe))
+        );
+        // ScummVM / DOS / PS3 / any other folder: no probe at all.
+        for other in ["/lib/scummvm/monkey", "/lib/dos/doom", "/lib/ps3/game"] {
+            assert_eq!(
+                arcade_probe_target(Some(Path::new(other)), &is_arcade, Some(exe)),
+                None
+            );
+        }
+        assert_eq!(arcade_probe_target(None, &is_arcade, Some(exe)), None);
+        // No MAME configured: nothing to ask.
+        assert_eq!(arcade_probe_target(Some(arcade), &is_arcade, None), None);
     }
 
     #[test]

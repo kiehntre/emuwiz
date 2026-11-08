@@ -246,26 +246,41 @@ pub(super) fn show_likely_match(
 ) -> Option<Route> {
     let id = game.archive.id;
     let mut route = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.strong(format!("{LIKELY_MATCH_QUESTION} {}", game.title));
-        ui.small(basis_text(guess.basis));
+    // Stacked, each part wrapping to the column width: a single wrapped row
+    // let the long question and the small notes overlap in the narrow
+    // right-hand panel.
+    ui.vertical(|ui| {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!("{LIKELY_MATCH_QUESTION} {}", game.title)).strong(),
+            )
+            .wrap(),
+        );
+        ui.add(egui::Label::new(egui::RichText::new(basis_text(guess.basis)).small()).wrap());
         if !guess.alternatives.is_empty() {
-            ui.small(format!("Or: {}", guess.alternatives.join(" · ")));
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("Or: {}", guess.alternatives.join(" · "))).small(),
+                )
+                .wrap(),
+            );
         }
-        if ui
-            .small_button(CHOOSE_ANOTHER_MATCH)
-            .on_hover_text(LOOKS_RIGHT_NOTE)
-            .clicked()
-        {
-            route = Some(Route::ReviewIdentity(id));
-        }
-        if ui
-            .small_button(CHECK_THIS_GAME)
-            .on_hover_text(LOOKS_RIGHT_NOTE)
-            .clicked()
-        {
-            route = Some(Route::GameCheck(id));
-        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .small_button(CHOOSE_ANOTHER_MATCH)
+                .on_hover_text(LOOKS_RIGHT_NOTE)
+                .clicked()
+            {
+                route = Some(Route::ReviewIdentity(id));
+            }
+            if ui
+                .small_button(CHECK_THIS_GAME)
+                .on_hover_text(LOOKS_RIGHT_NOTE)
+                .clicked()
+            {
+                route = Some(Route::GameCheck(id));
+            }
+        });
     });
     route
 }

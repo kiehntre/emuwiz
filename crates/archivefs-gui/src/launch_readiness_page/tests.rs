@@ -629,6 +629,7 @@ fn render_with_states(
 pub(super) fn spawn_test_process(executable: &str, arguments: &[&str]) -> LaunchedRetroArchProcess {
     let command = RetroArchCommand {
         saturn_core_selection: None,
+        unverified_identity: false,
         snapshot_evidence: None,
         executable: PathBuf::from(executable),
         arguments: arguments
@@ -3944,4 +3945,63 @@ fn gba_remembered_anywhere_recommends_nothing_even_with_sole_eligible() {
         gba_candidate(standalone("mgba"), LaunchReadiness::Ready, Remembered),
     ]);
     assert_eq!(super::recommended_gba_candidate(&plan, |_| true), None);
+}
+
+#[test]
+fn mame_driver_flags_do_not_withdraw_play_but_other_warnings_still_do() {
+    let mame = |warnings: Vec<LaunchWarning>, readiness| LaunchCandidate {
+        target: LaunchTarget::Standalone {
+            adapter_id: "mame",
+            profile_id: "mame:/x/mame".into(),
+            profile_path: Some("/x/mame".into()),
+        },
+        content: LaunchContentRef {
+            kind: None,
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some("/x/set".into()),
+            requires_mount: false,
+            provenance: "fixture".into(),
+        },
+        firmware: FirmwareReadiness::NotRequired,
+        blockers: vec![],
+        warnings,
+        readiness,
+        preference: CandidatePreference::SoleEligible,
+    };
+    let flag = LaunchWarning::new(LaunchWarningKind::MameMachineFlagged, "sound imperfect");
+    assert!(standalone_status_allows_request(&mame(
+        vec![flag.clone()],
+        LaunchReadiness::ReadyWithWarnings
+    )));
+    // The same flag on a candidate the planner labelled plain Ready.
+    assert!(standalone_status_allows_request(&mame(
+        vec![flag.clone()],
+        LaunchReadiness::Ready
+    )));
+    // Clean Ready still works.
+    assert!(standalone_status_allows_request(&mame(
+        vec![],
+        LaunchReadiness::Ready
+    )));
+    // Any other warning kind still withdraws Play.
+    let other = LaunchWarning::new(LaunchWarningKind::FirmwarePresentUnverified, "bios");
+    assert!(!standalone_status_allows_request(&mame(
+        vec![flag.clone(), other.clone()],
+        LaunchReadiness::ReadyWithWarnings
+    )));
+    // A blocker always wins.
+    let mut blocked = mame(vec![flag.clone()], LaunchReadiness::ReadyWithWarnings);
+    blocked.blockers.push(LaunchBlocker::new(
+        LaunchBlockerKind::MameSetVerdictUnavailable,
+        "x",
+    ));
+    assert!(!standalone_status_allows_request(&blocked));
+    // Another adapter's MAME-style flag is not tolerated.
+    let mut dolphin = mame(vec![flag], LaunchReadiness::ReadyWithWarnings);
+    dolphin.target = LaunchTarget::Standalone {
+        adapter_id: "dolphin",
+        profile_id: "d".into(),
+        profile_path: Some("/x/d".into()),
+    };
+    assert!(!standalone_status_allows_request(&dolphin));
 }

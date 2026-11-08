@@ -913,6 +913,17 @@ pub(crate) enum HistoryPageAction {
         backup_path: PathBuf,
     },
     ExecuteDatabaseRestore,
+    /// Read-only review of a completed restore's rollback inputs.
+    ReviewDatabaseRollback {
+        receipt_path: PathBuf,
+    },
+    /// Puts the pre-restore database back from the verified emergency backup.
+    ExecuteDatabaseRollback,
+    /// Records the truthful outcome of a restore that was interrupted; it
+    /// never changes a database file.
+    ReconcileInterruptedRestore {
+        receipt_path: PathBuf,
+    },
 }
 
 /// The Details "Game ID" row's three-way state - distinct from

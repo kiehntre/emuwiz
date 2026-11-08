@@ -65,6 +65,7 @@ mod retroarch_stop;
 #[cfg(test)]
 pub(crate) use retroarch_stop::retroarch_test_request;
 pub(crate) mod azahar;
+pub(crate) mod hatari;
 pub(crate) mod launch_choice;
 pub(crate) mod openrct2;
 mod rmg;
@@ -531,6 +532,7 @@ impl TypedLaunchRequest {
             Self::Standalone(StandaloneLaunchRequest::Mgba(_)) => vec![mgba::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Rmg(_)) => vec![rmg::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Stella(_)) => vec![stella::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Hatari(_)) => vec![hatari::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Snes9x(_)) => vec![snes9x::LIMITATION],
             _ => Vec::new(),
         }
@@ -542,7 +544,9 @@ impl TypedLaunchRequest {
     pub(crate) fn unverified_status_label(&self) -> &'static str {
         match self {
             Self::Standalone(
-                StandaloneLaunchRequest::Desmume(_) | StandaloneLaunchRequest::SameBoy(_),
+                StandaloneLaunchRequest::Desmume(_)
+                | StandaloneLaunchRequest::SameBoy(_)
+                | StandaloneLaunchRequest::Hatari(_),
             ) => "Ready, identity not DAT-verified",
             Self::Standalone(
                 StandaloneLaunchRequest::Mgba(_)
@@ -817,6 +821,15 @@ pub(crate) fn gamer_resolver_notice(
 /// carries the exact typed request that the selected adapter preflights again
 /// before spawning anything.
 pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction {
+    // Atari ST: a single, fully preflighted Hatari profile launches through
+    // the isolated disposable session (see `hatari`).
+    if let LaunchReadinessInput::AtariSt(snapshot) = input
+        && let Some(request) = snapshot.launch_request()
+    {
+        return GamerPlayAction::Launch(Box::new(TypedLaunchRequest::Standalone(
+            StandaloneLaunchRequest::Hatari(request),
+        )));
+    }
     let LaunchReadinessInput::Plan {
         plan,
         retroarch,
@@ -1254,6 +1267,7 @@ pub(crate) enum StandaloneProcess {
     Mgba(archivefs_core::launch::process_spawn::WatchedProcess),
     Desmume(archivefs_core::launch::process_spawn::WatchedProcess),
     Stella(archivefs_core::launch::process_spawn::WatchedProcess),
+    Hatari(archivefs_core::launch::process_spawn::WatchedProcess),
     Snes9x(archivefs_core::launch::process_spawn::WatchedProcess),
     SameBoy(archivefs_core::launch::LaunchedSameBoyProcess),
     Rmg(archivefs_core::launch::process_spawn::WatchedProcess),
@@ -1533,6 +1547,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Mgba(p) => p.poll().is_some(),
                     StandaloneProcess::Desmume(p) => p.poll().is_some(),
                     StandaloneProcess::Stella(p) => p.poll().is_some(),
+                    StandaloneProcess::Hatari(p) => p.poll().is_some(),
                     StandaloneProcess::Snes9x(p) => p.poll().is_some(),
                     StandaloneProcess::SameBoy(p) => p.poll().is_some(),
                     StandaloneProcess::Rmg(p) => p.poll().is_some(),
@@ -1607,6 +1622,9 @@ impl StandaloneLaunchState {
             }
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Stella(process)))) => {
                 process.exit_report().and_then(stella::exit_failure)
+            }
+            Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Hatari(process)))) => {
+                process.exit_report().and_then(hatari::exit_failure)
             }
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Snes9x(process)))) => {
                 process.exit_report().and_then(snes9x::exit_failure)
@@ -1793,6 +1811,7 @@ pub(crate) enum StandaloneLaunchRequest {
     Mgba(mgba::Request),
     Desmume(desmume::Request),
     Stella(stella::Request),
+    Hatari(hatari::Request),
     Snes9x(snes9x::Request),
     SameBoy(sameboy::Request),
     Rmg(rmg::Request),
@@ -1848,6 +1867,7 @@ impl StandaloneLaunchRequest {
             Self::Mgba(_) => "mGBA",
             Self::Desmume(_) => "DeSmuME",
             Self::Stella(_) => "Stella",
+            Self::Hatari(_) => "Hatari",
             Self::Snes9x(_) => "Snes9x",
             Self::SameBoy(_) => "SameBoy",
             Self::Rmg(_) => "RMG",
@@ -1881,6 +1901,7 @@ impl StandaloneLaunchRequest {
             Self::Mgba(r) => r.key(),
             Self::Desmume(r) => r.key(),
             Self::Stella(r) => r.key(),
+            Self::Hatari(r) => r.key(),
             Self::Snes9x(r) => r.key(),
             Self::SameBoy(r) => r.key(),
             Self::Rmg(r) => r.key(),
@@ -1925,6 +1946,7 @@ impl StandaloneLaunchRequest {
             Self::Mgba(r) => r.execute().map(StandaloneProcess::Mgba),
             Self::Desmume(r) => r.execute().map(StandaloneProcess::Desmume),
             Self::Stella(r) => r.execute().map(StandaloneProcess::Stella),
+            Self::Hatari(r) => r.execute().map(StandaloneProcess::Hatari),
             Self::Snes9x(r) => r.execute().map(StandaloneProcess::Snes9x),
             Self::SameBoy(r) => r.execute().map(StandaloneProcess::SameBoy),
             Self::Rmg(r) => r.execute().map(StandaloneProcess::Rmg),
@@ -3448,7 +3470,9 @@ fn retroarch_launch_request_unexplained(
         } else {
             None
         },
-        expected_snapshot_evidence: if platform_id == "ZX Spectrum" {
+        expected_snapshot_evidence: if platform_id == "ZX Spectrum"
+            && !archivefs_core::launch::unverified_media::is_unverified_key(game_key)
+        {
             // An unproven snapshot is a game-level refusal, never an
             // installation one.
             let evidence =
@@ -4477,6 +4501,34 @@ fn standalone_container_allowed(adapter_id: &str, container: Option<LaunchContai
     }
 }
 
+/// Whether the candidate's readiness/blockers/warnings permit building a
+/// standalone launch request. Only MAME's own driver flags are tolerated as
+/// warnings: they are informational by contract
+/// (`LaunchWarningKind::MameMachineFlagged`: "never a launch gate"), and real
+/// "not working" verdicts are blockers, not warnings. Any other warning, for
+/// any adapter, still withdraws Play.
+pub(crate) fn standalone_status_allows_request(candidate: &LaunchCandidate) -> bool {
+    if !candidate.blockers.is_empty() {
+        return false;
+    }
+    if candidate.warnings.is_empty() {
+        return candidate.readiness == LaunchReadiness::Ready;
+    }
+    matches!(
+        candidate.target,
+        LaunchTarget::Standalone {
+            adapter_id: "mame",
+            ..
+        }
+    ) && matches!(
+        candidate.readiness,
+        LaunchReadiness::Ready | LaunchReadiness::ReadyWithWarnings
+    ) && candidate
+        .warnings
+        .iter()
+        .all(|warning| warning.kind == LaunchWarningKind::MameMachineFlagged)
+}
+
 fn standalone_launch_request(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
@@ -4487,11 +4539,7 @@ fn standalone_launch_request(
     xenia: Option<&XeniaLaunchContext>,
     melonds: Option<&MelonDsLaunchContext>,
 ) -> Option<StandaloneLaunchRequest> {
-    if candidate.readiness != LaunchReadiness::Ready
-        || !candidate.blockers.is_empty()
-        || !candidate.warnings.is_empty()
-        || candidate.content.requires_mount
-    {
+    if !standalone_status_allows_request(candidate) || candidate.content.requires_mount {
         return None;
     }
     let path = candidate.content.resolved_path.clone()?;
@@ -4796,43 +4844,68 @@ fn mame_launch_request(
             "the MAME logical-set identity is unresolved",
         )
     })?;
-    let database_path = archivefs_core::default_database_path().map_err(|error| {
-        mame_blocker(
-            LaunchBlockerKind::MameSetVerdictUnavailable,
-            format!("the MAME audit database path is unavailable: {error}"),
-        )
-    })?;
-    let database = archivefs_core::Database::open_read_only(database_path).map_err(|error| {
-        mame_blocker(
-            LaunchBlockerKind::MameSetVerdictUnavailable,
-            format!("the MAME audit database cannot be read: {error}"),
-        )
-    })?;
-    let evidence = database
-        .mame_arcade_join_for_archive_path(
-            archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256,
-            &path,
-        )
-        .map_err(|error| {
+    // An extracted set folder is judged by the installed MAME's own per-set
+    // data (cached, probed in the background, never on this thread).
+    // `peek` never starts a probe: only the catalogue-gated readiness build
+    // (arcade_probe_target) does, so an uncatalogued folder is never probed.
+    let arcade_lookup = (platform_id == "Arcade")
+        .then(|| crate::arcade_mame_probe::peek(&executable, &path))
+        .flatten();
+    let (resolution, extra_rompaths) = if let Some(lookup) = arcade_lookup {
+        match lookup {
+            crate::arcade_mame_probe::Lookup::Checking => {
+                return Err(crate::arcade_mame_probe::checking_blocker());
+            }
+            crate::arcade_mame_probe::Lookup::Done(probe) => {
+                if probe.verdict.readiness
+                    == archivefs_core::arcade_mame_routing::ArcadeReadiness::Blocked
+                {
+                    return Err(crate::arcade_mame_probe::blocker_for(&probe));
+                }
+                (probe.resolution.clone(), probe.extra_rompaths.clone())
+            }
+        }
+    } else {
+        let database_path = archivefs_core::default_database_path().map_err(|error| {
             mame_blocker(
                 LaunchBlockerKind::MameSetVerdictUnavailable,
-                format!("the exact MAME audit evidence cannot be read: {error}"),
-            )
-        })?
-        .ok_or_else(|| {
-            mame_blocker(
-                LaunchBlockerKind::MameSetVerdictUnavailable,
-                "no current exact-path MAME audit evidence is available",
+                format!("the MAME audit database path is unavailable: {error}"),
             )
         })?;
-    let resolution =
-        archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(&evidence, &path)
+        let database =
+            archivefs_core::Database::open_read_only(database_path).map_err(|error| {
+                mame_blocker(
+                    LaunchBlockerKind::MameSetVerdictUnavailable,
+                    format!("the MAME audit database cannot be read: {error}"),
+                )
+            })?;
+        let evidence = database
+            .mame_arcade_join_for_archive_path(
+                archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256,
+                &path,
+            )
+            .map_err(|error| {
+                mame_blocker(
+                    LaunchBlockerKind::MameSetVerdictUnavailable,
+                    format!("the exact MAME audit evidence cannot be read: {error}"),
+                )
+            })?
             .ok_or_else(|| {
                 mame_blocker(
                     LaunchBlockerKind::MameSetVerdictUnavailable,
-                    "the persisted MAME audit does not authorize this logical set",
+                    "no current exact-path MAME audit evidence is available",
                 )
             })?;
+        let resolution =
+            archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(&evidence, &path)
+                .ok_or_else(|| {
+                    mame_blocker(
+                        LaunchBlockerKind::MameSetVerdictUnavailable,
+                        "the persisted MAME audit does not authorize this logical set",
+                    )
+                })?;
+        (resolution, Vec::new())
+    };
     let rom_search_path = path.parent().map(Path::to_path_buf).ok_or_else(|| {
         mame_blocker(
             LaunchBlockerKind::MameSearchPathUnconfigured,
@@ -4849,6 +4922,7 @@ fn mame_launch_request(
         selected_content: path,
         expected_content_identity: None,
         rom_search_path,
+        extra_rompaths,
     })
 }
 
@@ -5673,6 +5747,13 @@ pub(crate) fn show_standalone_launch_action(
                     "Exited"
                 }
             }
+            Some(StandaloneLaunchStage::Exited(StandaloneProcess::Hatari(p))) => {
+                if p.exit_report().and_then(hatari::exit_failure).is_some() {
+                    "Failed"
+                } else {
+                    "Exited"
+                }
+            }
             Some(StandaloneLaunchStage::Exited(StandaloneProcess::Snes9x(p))) => {
                 if p.exit_report().and_then(snes9x::exit_failure).is_some() {
                     "Failed"
@@ -5755,6 +5836,9 @@ pub(crate) fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Stella(p)))) => {
                 stella::show_running(ui, p);
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Hatari(p)))) => {
+                hatari::show_running(ui, p);
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Snes9x(p)))) => {
                 snes9x::show_running(ui, p);
             }
@@ -5808,6 +5892,9 @@ pub(crate) fn show_standalone_launch_action(
                 }
                 if let StandaloneProcess::Stella(p) = process {
                     stella::show_exited(ui, p);
+                }
+                if let StandaloneProcess::Hatari(p) = process {
+                    hatari::show_exited(ui, p);
                 }
                 if let StandaloneProcess::Snes9x(p) = process {
                     snes9x::show_exited(ui, p);

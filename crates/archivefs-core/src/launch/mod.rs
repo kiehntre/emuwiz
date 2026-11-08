@@ -93,6 +93,7 @@ pub mod dosbox_command;
 pub mod dosbox_execution;
 pub mod dosbox_sandbox;
 pub mod dosbox_target;
+pub mod unverified_media;
 pub use dosbox_target::{DosBoxLaunchIdentity, UserApprovedDosBoxTarget};
 pub mod duckstation_command;
 pub mod duckstation_execution;
@@ -115,6 +116,7 @@ pub mod fsuae_execution;
 pub mod fuse_command;
 pub mod hatari_command;
 pub mod hatari_execution;
+pub mod hatari_session;
 pub mod input_projection;
 pub mod integration;
 pub mod mame_command;
@@ -414,6 +416,7 @@ pub use integration::{
 };
 pub use mame_command::{
     MAME_SUPPORTED_PLATFORM_IDS, MameCommand, MameCommandPlan, build_mame_command_plan,
+    build_mame_command_plan_with_extra,
 };
 pub use mame_execution::{
     MameLaunchExecutionError, MameLaunchPreflightError, MameLaunchRequest,

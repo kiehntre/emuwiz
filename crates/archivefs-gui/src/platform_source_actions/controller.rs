@@ -371,6 +371,12 @@ impl ArchiveFsApp {
     /// already running (and vice versa via the other `*_available`
     /// checks, once updated).
     pub(crate) fn source_action_available(&self) -> bool {
+        !self.external_catalogue_writer_busy && self.native_writers_idle()
+    }
+
+    /// The native app's own writers only, ignoring any writer the embedding
+    /// shell reports through `external_catalogue_writer_busy`.
+    pub(crate) fn native_writers_idle(&self) -> bool {
         self.sources_ui.source_action.is_none()
             && self.library_ui.alias_action.is_none()
             && self.library_ui.platform_action.is_none()

@@ -9,6 +9,9 @@ pub const CHEAT_ROLLBACK_RUN_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheatRollbackOutcome {
+    /// Only ever present in a pending (`in_progress`) rollback journal:
+    /// the entry had not been reached when the journal was last written.
+    Pending,
     WouldRemoveInstalledFile,
     RemovedInstalledFile,
     WouldRestoreBackup,
@@ -110,6 +113,10 @@ pub enum CheatRollbackRunStatus {
     PartialFailure,
     Failed,
     DryRun,
+    /// The pending rollback journal written before the first mutation and
+    /// rewritten after every entry; a journal still carrying it was
+    /// interrupted. Never produced by [`Self::derive`].
+    InProgress,
 }
 
 impl CheatRollbackRunStatus {
@@ -187,7 +194,11 @@ pub fn parse_cheat_rollback_run(
             "summary does not match entries".to_string(),
         ));
     }
-    if run.status != CheatRollbackRunStatus::derive(&summary, run.dry_run) {
+    // A pending (`in_progress`) journal is the truthful record of an
+    // interrupted rollback: its status is never derived, and it is never
+    // a dry run.
+    let pending = run.status == CheatRollbackRunStatus::InProgress && !run.dry_run;
+    if !pending && run.status != CheatRollbackRunStatus::derive(&summary, run.dry_run) {
         return Err(CheatRollbackRunSchemaError::Malformed(
             "status does not match entries and dry_run".to_string(),
         ));

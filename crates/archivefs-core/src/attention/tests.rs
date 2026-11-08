@@ -47,6 +47,24 @@ fn attention_database_recovery_failure_blocks_without_inventing_backup_safety() 
 }
 
 #[test]
+fn attention_database_restore_refused_before_any_change_is_not_a_blocker() {
+    // A restore refused while nothing had been touched (writer active, stale
+    // plan, hash mismatch) records Failed with "No recovery action"; it needs
+    // attention, but it must not read as a damaged catalogue.
+    let mut record = record(OperationKind::DatabaseRecovery, OperationState::Failed);
+    record.recovery.classification = RecoveryClassification::Unrecoverable;
+    let item = operation_attention(&record).unwrap();
+    assert_eq!(item.severity, AttentionSeverity::Warning);
+    assert_eq!(item.destination, AttentionDestination::History);
+    // Any other failed restore (rollback failed, review required) still blocks.
+    record.recovery.classification = RecoveryClassification::RequiresReview;
+    assert_eq!(
+        operation_attention(&record).unwrap().severity,
+        AttentionSeverity::Blocking
+    );
+}
+
+#[test]
 fn attention_failed_operation_with_stale_recovery_blocks() {
     let mut record = record(OperationKind::RepairApply, OperationState::Failed);
     record.recovery.classification = RecoveryClassification::Stale;

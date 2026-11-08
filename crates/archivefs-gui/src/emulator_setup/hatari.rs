@@ -17,7 +17,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-pub(crate) const RUNTIME_BLOCKER: &str = "Native Hatari launch is not authorised: --configfile adds to previously loaded settings. The current backend does not isolate inherited storage, automatic drive-B insertion or media writeback. No emulator was launched and no disk was modified.";
+pub(crate) const NOTHING_LAUNCHED: &str = "No emulator was launched and no disk was modified.";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Selection {
     pub path: PathBuf,
@@ -29,6 +29,8 @@ struct Profile {
     profile: HatariProfile,
     inspection: HatariGameInspection,
     command: Option<launch::HatariCommand>,
+    /// The fully preflighted request this profile would launch with.
+    launch_request: Option<launch::HatariLaunchRequest>,
     refusal: Option<String>,
 }
 #[derive(Clone, Default)]
@@ -48,6 +50,26 @@ impl Snapshot {
             ..Default::default()
         }
     }
+    /// The one profile that passed every preflight, when there is exactly one
+    /// and the media validated. Never picks between profiles.
+    fn launchable_profile(&self) -> Option<&Profile> {
+        if self.error.is_some() || self.key.is_none() || self.profiles.len() != 1 {
+            return None;
+        }
+        let profile = &self.profiles[0];
+        (profile.refusal.is_none() && profile.command.is_some() && profile.launch_request.is_some())
+            .then_some(profile)
+    }
+
+    /// A typed isolated-Hatari launch request, or `None` (stay blocked).
+    pub(crate) fn launch_request(&self) -> Option<crate::launch_readiness_page::hatari::Request> {
+        let profile = self.launchable_profile()?;
+        Some(crate::launch_readiness_page::hatari::Request::new(
+            profile.launch_request.clone()?,
+            self.key.clone()?,
+        ))
+    }
+
     pub(crate) fn reason(&self) -> String {
         if let Some(error) = &self.error {
             return error.clone();
@@ -58,9 +80,12 @@ impl Snapshot {
         if self.profiles.len() == 1
             && let Some(refusal) = &self.profiles[0].refusal
         {
-            return format!("Hatari preflight refused: {refusal}. {RUNTIME_BLOCKER}");
+            return format!("Hatari preflight refused: {refusal}. {NOTHING_LAUNCHED}");
         }
-        RUNTIME_BLOCKER.into()
+        if self.launchable_profile().is_some() {
+            return "Ready: Hatari plays a private copy of this disk with saves kept; your original is never written.".into();
+        }
+        "Hatari needs exactly one fully set-up profile (Hatari program and TOS). Open Emulator Setup to finish it.".into()
     }
     pub(crate) fn plan(&self) -> LaunchPlan {
         let identity = self
@@ -91,6 +116,36 @@ impl Snapshot {
             diagnostics: vec![],
         };
         let mut plan = launch::build_launch_plan(&identity, &content, &inputs, &env, &[]);
+        if self.launchable_profile().is_some() {
+            for candidate in &mut plan.candidates {
+                candidate.warnings.push(launch::LaunchWarning::new(
+                    launch::LaunchWarningKind::IdentityUnverified,
+                    "Game not identified: EmuWiz confirmed this is a valid Atari ST disk image but could not confirm which game it is. It plays a private copy kept for this game, so saves carry over; your original is never written.",
+                ));
+                if candidate.readiness == launch::LaunchReadiness::Ready {
+                    candidate.readiness = launch::LaunchReadiness::ReadyWithWarnings;
+                }
+            }
+            plan.summary = launch::LaunchPlanSummary {
+                candidates: plan.candidates.len(),
+                ready: plan
+                    .candidates
+                    .iter()
+                    .filter(|c| c.readiness == launch::LaunchReadiness::Ready)
+                    .count(),
+                ready_with_warnings: plan
+                    .candidates
+                    .iter()
+                    .filter(|c| c.readiness == launch::LaunchReadiness::ReadyWithWarnings)
+                    .count(),
+                blocked: plan
+                    .candidates
+                    .iter()
+                    .filter(|c| c.readiness == launch::LaunchReadiness::Blocked)
+                    .count(),
+            };
+            return plan;
+        }
         for candidate in &mut plan.candidates {
             candidate.blockers.insert(
                 0,
@@ -321,24 +376,25 @@ pub(crate) fn gather(selection: Selection, roots: HatariProfileDiscoveryRoots) -
             .first()
             .ok_or_else(|| "No Hatari executable discovered".into())
             .and_then(|exe| {
+                let request = launch::HatariLaunchRequest {
+                    selected_content_path: selection.path.clone(),
+                    expected_platform_id: "AtariST".into(),
+                    profile_id: profile.profile_id.clone(),
+                    expected_executable: exe.path.clone(),
+                    expected_config_path: profile.config_path.clone(),
+                    expected_machine_model: inspection.config.machine.model,
+                    disk_drive: 'A',
+                    ipf_backend_available: false,
+                    expected_content_identity: std::fs::symlink_metadata(&selection.path)
+                        .ok()
+                        .map(|m| launch::process_spawn::CapturedFileIdentity::capture(&m)),
+                    expected_config_identity: std::fs::symlink_metadata(&profile.config_path)
+                        .ok()
+                        .map(|m| launch::process_spawn::CapturedFileIdentity::capture(&m)),
+                    tos_references: vec![],
+                };
                 launch::preflight_hatari_launch(
-                    &launch::HatariLaunchRequest {
-                        selected_content_path: selection.path.clone(),
-                        expected_platform_id: "AtariST".into(),
-                        profile_id: profile.profile_id.clone(),
-                        expected_executable: exe.path.clone(),
-                        expected_config_path: profile.config_path.clone(),
-                        expected_machine_model: inspection.config.machine.model,
-                        disk_drive: 'A',
-                        ipf_backend_available: false,
-                        expected_content_identity: std::fs::symlink_metadata(&selection.path)
-                            .ok()
-                            .map(|m| launch::process_spawn::CapturedFileIdentity::capture(&m)),
-                        expected_config_identity: std::fs::symlink_metadata(&profile.config_path)
-                            .ok()
-                            .map(|m| launch::process_spawn::CapturedFileIdentity::capture(&m)),
-                        tos_references: vec![],
-                    },
+                    &request,
                     &roots,
                     &CanonicalIdentityStatus::Resolved(launch::ResolvedIdentity {
                         platform_id: "AtariST".into(),
@@ -354,18 +410,19 @@ pub(crate) fn gather(selection: Selection, roots: HatariProfileDiscoveryRoots) -
                     {
                         Err("Profile changed during inspection; re-check".into())
                     } else {
-                        Ok(command)
+                        Ok((command, request))
                     }
                 })
             });
-        let (command, refusal) = match command {
-            Ok(c) => (Some(c), None),
-            Err(e) => (None, Some(e)),
+        let (command, launch_request, refusal) = match command {
+            Ok((c, r)) => (Some(c), Some(r), None),
+            Err(e) => (None, None, Some(e)),
         };
         result.profiles.push(Profile {
             profile,
             inspection,
             command,
+            launch_request,
             refusal,
         });
     }

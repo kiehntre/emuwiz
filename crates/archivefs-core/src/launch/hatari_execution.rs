@@ -10,9 +10,7 @@ use crate::launch::planning::{
     CandidatePreference, CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind,
     LaunchContentRef, LaunchTarget,
 };
-use crate::launch::process_spawn::{
-    CapturedFileIdentity, PreparedProcessCommand, WatchedProcess, spawn_watched_process,
-};
+use crate::launch::process_spawn::{CapturedFileIdentity, PreparedProcessCommand, WatchedProcess};
 use crate::launch::readiness::{FirmwareReadiness, LaunchReadiness};
 use crate::patch_manager::{
     HatariIdentityState, HatariMachineModel, HatariProfileDiscoveryRoots,
@@ -162,14 +160,11 @@ pub fn preflight_hatari_launch(
         HatariLaunchPreflightErrorKind::ConfigurationMissing,
         HatariLaunchPreflightErrorKind::ConfigurationChanged,
     )?;
-    if let Some(expected) = request.expected_config_identity
-        && CapturedFileIdentity::capture(&config_meta) != expected
-    {
-        return Err(error(
-            HatariLaunchPreflightErrorKind::ConfigurationChanged,
-            "Hatari configuration changed since authorization",
-        ));
-    }
+    // The session never loads this file: only allow-listed hardware keys
+    // are read from it at spawn, and the machine model is re-checked below.
+    // Hatari rewriting it (any instance saving on exit) is therefore not a
+    // reason to refuse; only a changed machine model is.
+    let _ = (&config_meta, request.expected_config_identity);
     let executable = profile
         .executable_candidates
         .iter()
@@ -253,12 +248,71 @@ pub fn preflight_hatari_launch(
     }
 }
 
+/// Spawns Hatari inside a private, disposable session: fresh `HOME`/`XDG_*`,
+/// a read-only copy of the selected disk, drive B off, floppy write
+/// protection on, and no inherited configuration. The command's own
+/// `arguments` are a preview and are never passed through.
 pub fn spawn_hatari(command: &HatariCommand) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process(&PreparedProcessCommand {
-        executable: command.executable.clone(),
-        arguments: command.arguments.clone(),
-        working_directory: command.working_directory.clone(),
-    })
+    let sessions_root = crate::app_dirs::data_dir()
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .join("hatari-sessions");
+    spawn_hatari_in(command, &sessions_root)
+}
+
+pub fn spawn_hatari_in(
+    command: &HatariCommand,
+    sessions_root: &Path,
+) -> std::io::Result<WatchedProcess> {
+    spawn_hatari_session(
+        command,
+        sessions_root,
+        &crate::launch::hatari_session::SessionOptions::default(),
+    )
+}
+
+fn spawn_hatari_session(
+    command: &HatariCommand,
+    sessions_root: &Path,
+    options: &crate::launch::hatari_session::SessionOptions<'_>,
+) -> std::io::Result<WatchedProcess> {
+    let session =
+        crate::launch::hatari_session::prepare_session_with(command, sessions_root, options)
+            .map_err(std::io::Error::other)?;
+    let spawned = crate::launch::process_spawn::spawn_watched_process_with_environment(
+        &PreparedProcessCommand {
+            executable: command.executable.clone(),
+            arguments: session.arguments.clone(),
+            working_directory: Some(session.working_directory.clone()),
+        },
+        &session.environment,
+    );
+    let process = match spawned {
+        Ok(process) => process,
+        Err(error) => {
+            if let Some(save_dir) = &session.save_dir {
+                crate::launch::hatari_session::release_game_lock(save_dir);
+            }
+            return Err(error);
+        }
+    };
+    // Hatari is already running on the saved disk; a lock-record failure is
+    // logged but must not orphan the running game.
+    if let Err(error) = crate::launch::hatari_session::record_session_pid(&session, process.pid) {
+        eprintln!("archivefs: {error}");
+    }
+    Ok(process)
+}
+
+/// The full-file SHA-256 the authorised identity was derived from, when the
+/// identity is a local media hash.
+fn authorised_media_sha256(identity: &CanonicalIdentityStatus) -> Option<String> {
+    match identity {
+        CanonicalIdentityStatus::Resolved(value) => value
+            .game_key
+            .strip_prefix("media-sha256:")
+            .map(str::to_string),
+        _ => None,
+    }
 }
 pub fn preflight_and_launch_hatari(
     request: &HatariLaunchRequest,
@@ -267,7 +321,24 @@ pub fn preflight_and_launch_hatari(
 ) -> Result<WatchedProcess, HatariLaunchExecutionError> {
     let command = preflight_hatari_launch(request, roots, identity)
         .map_err(HatariLaunchExecutionError::Preflight)?;
-    spawn_hatari(&command).map_err(HatariLaunchExecutionError::Spawn)
+    let data_dir = crate::app_dirs::data_dir().map_err(|error| {
+        HatariLaunchExecutionError::Spawn(std::io::Error::other(error.to_string()))
+    })?;
+    let expected = authorised_media_sha256(identity);
+    let saves_root = data_dir.join("hatari-saves");
+    spawn_hatari_session(
+        &command,
+        &data_dir.join("hatari-sessions"),
+        &crate::launch::hatari_session::SessionOptions {
+            expected_sha256: expected.as_deref(),
+            saves_root: Some(&saves_root),
+            hardware: crate::launch::hatari_session::read_hardware_arguments(
+                &request.expected_config_path,
+                request.expected_machine_model,
+            ),
+        },
+    )
+    .map_err(HatariLaunchExecutionError::Spawn)
 }
 
 #[cfg(test)]

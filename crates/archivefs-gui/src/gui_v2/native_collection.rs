@@ -253,12 +253,12 @@ impl NativeWorkflows {
     }
     /// All Blue controls that can trigger a source scan pass through the same
     /// review, including Enable (which the existing backend makes a scan).
-    pub(super) fn review_or_start_source_action(
+    pub(in crate::gui_v2) fn review_or_start_source_action(
         &mut self,
         ctx: egui::Context,
         action: SourceAction,
     ) {
-        if !self.app.source_action_available() || self.collection.preparing() {
+        if !self.source_action_available() || self.collection.preparing() {
             return;
         }
         if !scans(&action) {
@@ -334,7 +334,7 @@ impl NativeWorkflows {
             return;
         };
         let current = self.review_is_current(review);
-        let available = self.app.source_action_available();
+        let available = self.source_action_available();
         let mut cancel = false;
         let mut confirm = false;
         let response = egui::Modal::new(egui::Id::new("blue_collection_scan_review")).show(ctx, |ui| {
@@ -410,7 +410,7 @@ impl NativeWorkflows {
             && self.collection.import_history.show(
                 ui,
                 Some(&path),
-                !self.app.source_action_available(),
+                !self.source_action_available(),
                 None,
             )
         {
@@ -443,7 +443,7 @@ impl NativeWorkflows {
                 ui.label("Before importing from this folder, review which storage it is on. This is separate from importing and does not scan or change game files.");
                 if ui
                     .add_enabled(
-                        self.app.source_action_available(),
+                        self.source_action_available(),
                         egui::Button::new("Review folder storage…"),
                     )
                     .clicked()
@@ -452,6 +452,9 @@ impl NativeWorkflows {
                 }
             }
         }
+        // Read before the closure: it borrows `self` whole while the closure
+        // needs `self.collection.media` mutably.
+        let source_actions_busy = !self.source_action_available();
         if let DatabaseState::Ready { snapshot, .. } = &self.app.database_state {
             egui::CollapsingHeader::new("Discover missing games and prepare imports")
                 .default_open(latest_saved_scan(snapshot).is_none())
@@ -461,7 +464,7 @@ impl NativeWorkflows {
                         &snapshot.database_path,
                         self.app.database_generation.0,
                         &snapshot.source_views,
-                        !self.app.source_action_available(),
+                        source_actions_busy,
                     );
                 });
         }

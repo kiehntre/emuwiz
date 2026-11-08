@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 mod path_probe;
 pub use crate::database::forget_missing::{
     FORGET_PLAN_STALE, ForgetEvidence, ForgetMissingCounts, ForgetMissingEntry, ForgetMissingPlan,
-    ForgetMissingResult, MissingClassification, RelatedRows,
+    ForgetMissingReceiptSummary, ForgetMissingResult, MissingClassification, RelatedRows,
+    list_undoable_forget_missing_receipts,
 };
 pub(crate) use path_probe::{BoundRoot, NestedState, directory_mount};
 

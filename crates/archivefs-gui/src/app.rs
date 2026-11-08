@@ -291,6 +291,10 @@ pub(crate) struct ArchiveFsApp {
     /// any - mirrors `source_action` exactly, including the "one writer at
     /// a time" convention.
     pub(crate) library_view_action: Option<RunningLibraryViewAction>,
+    /// Set by the Blue shell while it writes the catalogue itself (its folder
+    /// scan, a database upgrade). Part of `source_action_available`, so every
+    /// Sources-page writer (including the reviewed rebind dialog) honours it.
+    pub(crate) external_catalogue_writer_busy: bool,
     /// The most recently computed Preview for a view, if any - both what
     /// the Library Views page shows in its plan table and what "Apply"/
     /// "Repair" act on for that view, and what the Library page's "Show in
@@ -392,6 +396,27 @@ impl ArchiveFsApp {
             || self.mount_ui.mount_all.is_some()
             || self.mount_ui.unmount_all.is_some()
             || self.setup_action.is_some()
+    }
+
+    /// No worker of this window can be writing the library database: the
+    /// catalogue is not loading or scanning, no source, alias, platform,
+    /// missing-removal or library-view action is running, and no mount or
+    /// setup operation is in flight. Database restore, rollback and
+    /// reconciliation require this; writers in other processes are refused
+    /// by the restore's own locks.
+    pub(crate) fn database_writers_idle(&self) -> bool {
+        !self.database_state.is_loading() && !self.is_busy() && self.source_action_available()
+    }
+
+    /// After the live database file was replaced (restore, rollback or a
+    /// reconciled interrupted restore) every cached snapshot is stale.
+    pub(crate) fn reload_catalogue_after_database_replacement(&mut self, context: egui::Context) {
+        self.database_generation = self.database_generation.next();
+        let generation = self.database_generation;
+        let previous = self.database_state.snapshot().cloned().map(Box::new);
+        self.database_state =
+            crate::database_load::start_database_load(context, generation, previous, false);
+        self.shared_history = SharedHistoryState::NotLoaded;
     }
 
     pub(crate) fn new(context: egui::Context) -> Self {
@@ -510,6 +535,7 @@ impl ArchiveFsApp {
             gamer_view_scan_pending_review: false,
             library_views: load_library_view_configs_default().unwrap_or_default(),
             library_view_action: None,
+            external_catalogue_writer_busy: false,
             library_view_last_plan: None,
             library_view_form_dialog: None,
             library_view_remove_dialog: None,
@@ -904,6 +930,7 @@ impl Drop for ArchiveFsApp {
 
 impl ArchiveFsApp {
     pub(crate) fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::arcade_mame_probe::register_repaint(context);
         app_polling::poll_and_reconcile(self, context);
         self.launch_standalone
             .focus_dosbox_game(self.archive_context.focused.as_deref());

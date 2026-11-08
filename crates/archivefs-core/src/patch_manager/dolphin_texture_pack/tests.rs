@@ -486,9 +486,120 @@ fn zip_archive_builds_existing_manifest_from_one_wrapper_root() {
         PathBuf::from("a.PNG")
     );
     assert_eq!(preview.build.total_bytes, 2);
-    assert!(preview.staging_root.exists());
+    assert!(preview.staging.root().exists());
     assert_eq!(std::fs::read(&archive).unwrap(), before);
-    let _ = std::fs::remove_dir_all(preview.staging_root);
+    let staging_root = preview.staging.root().to_path_buf();
+    drop(preview);
+    assert!(
+        !staging_root.exists(),
+        "dropped preview must remove its staging"
+    );
+}
+
+/// Night Watch NW2-A-01: every way out of a ZIP preview removes the
+/// extracted copy - a dropped preview, a refused ZIP, and the two error paths
+/// that used to `?` past the cleanup (no texture root, ambiguous roots).
+#[test]
+fn zip_preview_staging_never_outlives_the_preview() {
+    // A private staging parent: counts here cannot be disturbed by sibling
+    // tests, which stage under the system temporary directory.
+    let dir = TestDir::new("archive-staging-lifecycle");
+    let staging_parent = dir.0.join("staging-parent");
+    std::fs::create_dir_all(&staging_parent).unwrap();
+    let staging_dirs = || -> Vec<PathBuf> {
+        std::fs::read_dir(&staging_parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect()
+    };
+    let inspect = |archive: &Path| {
+        inspect_dolphin_texture_pack_zip_in(
+            archive,
+            &identity("GALE01"),
+            "P".to_string(),
+            None,
+            &staging_parent,
+        )
+    };
+    let good = dir.0.join("good.zip");
+    write_zip(&good, &[("Pack/Load/Textures/GALE01/a.png", b"a")]);
+    for _ in 0..3 {
+        let preview = inspect(&good).unwrap();
+        assert_eq!(staging_dirs().len(), 1);
+        assert!(preview.staging.root().starts_with(&staging_parent));
+        drop(preview);
+        assert!(staging_dirs().is_empty(), "dropped preview left staging");
+    }
+    let no_root = dir.0.join("no-root.zip");
+    write_zip(
+        &no_root,
+        &[("Docs/readme.txt", b"x"), ("Other/a.png", b"a")],
+    );
+    assert!(inspect(&no_root).is_err());
+    assert!(staging_dirs().is_empty(), "no-root refusal left staging");
+    let ambiguous = dir.0.join("ambiguous.zip");
+    write_zip(
+        &ambiguous,
+        &[
+            ("One/Load/Textures/GALE01/a.png", b"a"),
+            ("Two/Load/Textures/GALE01/b.png", b"b"),
+        ],
+    );
+    assert!(inspect(&ambiguous).is_err());
+    assert!(staging_dirs().is_empty(), "ambiguous refusal left staging");
+    let wrong_game = dir.0.join("wrong.zip");
+    write_zip(&wrong_game, &[("Load/Textures/GLEE01/texture.png", b"x")]);
+    assert!(inspect(&wrong_game).is_err());
+    assert!(staging_dirs().is_empty(), "wrong-game refusal left staging");
+    let traversal = dir.0.join("traversal.zip");
+    write_zip(&traversal, &[("../GALE01/escape.png", b"x")]);
+    assert!(inspect(&traversal).is_err());
+    assert!(staging_dirs().is_empty(), "refused ZIP left staging");
+}
+
+#[test]
+fn retained_staging_moves_the_files_and_removes_the_temporary_copy() {
+    let dir = TestDir::new("archive-staging-retain");
+    let archive = dir.0.join("pack.zip");
+    write_zip(&archive, &[("Pack/Load/Textures/GALE01/a.png", b"a")]);
+    let preview =
+        inspect_dolphin_texture_pack_zip(&archive, &identity("GALE01"), "P".to_string(), None)
+            .unwrap();
+    let staging_root = preview.staging.root().to_path_buf();
+    let retained_root = dir.0.join("retained").join("pack-1");
+    let retained = preview.staging.retain_into(&retained_root).unwrap();
+    assert_eq!(retained, retained_root);
+    assert!(!staging_root.exists(), "temporary staging must be gone");
+    assert!(
+        retained_root
+            .join("Pack/Load/Textures/GALE01/a.png")
+            .is_file()
+    );
+    // An existing retained location is refused and the staging still cleaned.
+    let preview =
+        inspect_dolphin_texture_pack_zip(&archive, &identity("GALE01"), "P".to_string(), None)
+            .unwrap();
+    let staging_root = preview.staging.root().to_path_buf();
+    assert!(preview.staging.retain_into(&retained_root).is_err());
+    assert!(!staging_root.exists());
+    assert!(
+        retained_root
+            .join("Pack/Load/Textures/GALE01/a.png")
+            .is_file()
+    );
+    // A relative retained location is refused the same way.
+    let preview =
+        inspect_dolphin_texture_pack_zip(&archive, &identity("GALE01"), "P".to_string(), None)
+            .unwrap();
+    let staging_root = preview.staging.root().to_path_buf();
+    assert!(
+        preview
+            .staging
+            .retain_into(Path::new("relative/x"))
+            .is_err()
+    );
+    assert!(!staging_root.exists());
 }
 
 #[test]
@@ -543,4 +654,99 @@ fn zip_archive_rejects_ambiguous_texture_roots() {
     )
     .unwrap_err();
     assert!(error.detail.contains("multiple ambiguous"));
+}
+
+/// Reviewer finding F1 / owner decision: a manifest saved from a ZIP preview
+/// must not point into the temporary staging anywhere - root *and* files -
+/// and must validate against its retained location, so it survives a
+/// restart.
+#[test]
+fn relocated_manifest_points_every_file_at_the_retained_root_and_validates() {
+    let dir = TestDir::new("archive-relocate");
+    let archive = dir.0.join("pack.zip");
+    write_zip(
+        &archive,
+        &[
+            ("Pack/Load/Textures/GALE01/a.png", b"a"),
+            ("Pack/Load/Textures/GALE01/sub/b.png", b"bb"),
+        ],
+    );
+    let preview =
+        inspect_dolphin_texture_pack_zip(&archive, &identity("GALE01"), "P".to_string(), None)
+            .unwrap();
+    let staging_root = preview.staging.root().to_path_buf();
+    let old_source_root = preview.build.manifest.source_root.clone();
+    assert!(old_source_root.starts_with(&staging_root));
+    let suffix = old_source_root
+        .strip_prefix(&staging_root)
+        .unwrap()
+        .to_path_buf();
+    let retained = dir.0.join("retained").join("pack-1");
+    let retained = preview.staging.retain_into(&retained).unwrap();
+    let new_root = retained.join(suffix);
+    let relocated = relocate_dolphin_texture_pack_manifest(
+        &preview.build.manifest,
+        &identity("GALE01"),
+        &new_root,
+    )
+    .unwrap();
+    assert_eq!(relocated.source_root, new_root);
+    assert!(!relocated.files.is_empty());
+    for file in &relocated.files {
+        assert!(
+            file.source_path.starts_with(&new_root),
+            "{:?}",
+            file.source_path
+        );
+        assert!(
+            !file.source_path.starts_with(&staging_root)
+                && !file.source_path.components().any(|component| {
+                    component.as_os_str().to_str().is_some_and(|name| {
+                        name.starts_with(DOLPHIN_TEXTURE_ARCHIVE_STAGING_PREFIX)
+                    })
+                }),
+            "{:?}",
+            file.source_path
+        );
+        assert!(file.source_path.is_file());
+    }
+    // The relocated manifest loads exactly as a fresh one would (survives a
+    // "restart": nothing references the staging any more).
+    validate_dolphin_texture_pack_manifest(&relocated, &identity("GALE01"), &new_root).unwrap();
+    assert!(!staging_root.exists());
+    // The old manifest, by contrast, now points at nothing and says so.
+    let explanation = describe_missing_texture_pack_source(&old_source_root).unwrap();
+    assert!(
+        explanation.contains("before EmuWiz kept the extracted files"),
+        "{explanation}"
+    );
+    assert!(
+        explanation.contains("Nothing was installed"),
+        "{explanation}"
+    );
+    assert!(
+        validate_dolphin_texture_pack_manifest(
+            &preview.build.manifest,
+            &identity("GALE01"),
+            &old_source_root
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn missing_source_descriptions_distinguish_legacy_staging_from_other_folders() {
+    let dir = TestDir::new("archive-missing-source");
+    assert!(describe_missing_texture_pack_source(&dir.0).is_none());
+    let legacy = std::env::temp_dir()
+        .join(format!("{DOLPHIN_TEXTURE_ARCHIVE_STAGING_PREFIX}1-2"))
+        .join("Pack/Load/Textures/GALE01");
+    let text = describe_missing_texture_pack_source(&legacy).unwrap();
+    assert!(text.contains("temporary folder"), "{text}");
+    assert!(text.contains("Choose texture-pack ZIP"), "{text}");
+    let other = dir.0.join("gone");
+    let text = describe_missing_texture_pack_source(&other).unwrap();
+    assert!(text.contains("source folder"), "{text}");
+    assert!(text.contains("Nothing was installed"), "{text}");
+    assert!(!text.contains("temporary folder"), "{text}");
 }

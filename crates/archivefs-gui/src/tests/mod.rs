@@ -1059,6 +1059,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         database_generation: DatabaseGeneration::INITIAL,
         doctor_repair: DoctorRepairState {
             database_restore_plan: None,
+            database_rollback_receipt: None,
             database_restore_confirmation: String::new(),
             database_restore_feedback: None,
             diagnostics: DiagnosticsState::Ready {
@@ -1199,6 +1200,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         // `~/.config/archivefs/library_views.json` happens to contain.
         library_views: Vec::new(),
         library_view_action: None,
+        external_catalogue_writer_busy: false,
         library_view_last_plan: None,
         library_view_form_dialog: None,
         library_view_remove_dialog: None,

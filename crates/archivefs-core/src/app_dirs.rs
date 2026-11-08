@@ -522,17 +522,102 @@ fn choose_dir(primary: &Path, legacy: &Path, kind: Kind) -> Result<PathBuf> {
     }
     match presence(legacy, kind) {
         Absent | Empty => Ok(primary.to_path_buf()),
-        Established => Err(ArchiveFsError::Config(format!(
-            "EmuWiz found {noun} in two places and will not choose between them: {primary} and {legacy}. \
-             Nothing was changed. Start EmuWiz with {env} set to the folder you want to use, \
-             or move the folder you no longer use out of {base}.",
-            noun = kind.noun(),
-            primary = primary.display(),
-            legacy = legacy.display(),
-            env = kind.override_env(),
-            base = primary.parent().unwrap_or(primary).display(),
+        Established => Err(ArchiveFsError::Config(two_setups_message(
+            primary, legacy, kind,
         ))),
     }
+}
+
+/// At most this many entry names are quoted in a two-setups refusal.
+const NAMED_ENTRIES: usize = 5;
+
+/// The refusal for two established setups. It says which folder is the
+/// EmuWiz one and which the legacy one, names the entries that make the
+/// EmuWiz folder count (names only, never contents, at most
+/// [`NAMED_ENTRIES`]), and gives the two safe ways out: move entries that are
+/// not EmuWiz's out of the EmuWiz folder, or point the override at the
+/// folder holding the real settings. It never suggests moving a folder of
+/// real settings aside (NW2-E-01).
+fn two_setups_message(primary: &Path, legacy: &Path, kind: Kind) -> String {
+    let noun = kind.noun();
+    let env = kind.override_env();
+    let because = match meaningful_entry_names(primary, kind) {
+        Some(names) if !names.is_empty() => {
+            let shown = names
+                .iter()
+                .take(NAMED_ENTRIES)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rest = names.len().saturating_sub(NAMED_ENTRIES);
+            if rest > 0 {
+                format!(
+                    " The EmuWiz folder counts as {noun} because it holds {shown} and {rest} more."
+                )
+            } else {
+                format!(" The EmuWiz folder counts as {noun} because it holds {shown}.")
+            }
+        }
+        Some(_) => String::new(),
+        None => format!(
+            " The EmuWiz folder counts as {noun} because it is not a plain directory or could not be read."
+        ),
+    };
+    format!(
+        "EmuWiz found {noun} in two places and will not choose between them: \
+         {primary} (the EmuWiz folder) and {legacy} (the legacy ArchiveFS folder). \
+         Nothing was changed.{because} Either move the entries that are not EmuWiz {noun} out of \
+         {primary}, or start EmuWiz with {env} set to whichever of the two folders holds your \
+         real {noun}.",
+        primary = primary.display(),
+        legacy = legacy.display(),
+    )
+}
+
+/// Names of the entries that make a folder established (everything that is
+/// not provably disposable), sorted; `None` when the folder is not a plain
+/// directory or cannot be listed. Read-only, names only: used for the
+/// two-setups refusal, never for the decision itself.
+fn meaningful_entry_names(path: &Path, kind: Kind) -> Option<Vec<String>> {
+    use crate::dat::rename_apply::seal::SEAL_STORE_FILENAME;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_dir() {
+        return None;
+    }
+    let seal_wal = format!("{SEAL_STORE_FILENAME}-wal");
+    let seal_shm = format!("{SEAL_STORE_FILENAME}-shm");
+    let mut empty_seal_store: Option<bool> = None;
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(path).ok()? {
+        let Ok(entry) = entry else {
+            names.push("(an unreadable entry)".to_string());
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let file_type = entry.file_type().ok();
+        let is_dir = file_type.is_some_and(|kind| kind.is_dir());
+        let is_file = file_type.is_some_and(|kind| kind.is_file());
+        if kind.disposable().contains(&name.as_str()) && is_dir {
+            continue;
+        }
+        let disposable = is_file
+            && match kind {
+                Kind::Config => {
+                    name == GUI_PREFERENCES_FILE && holds_first_start_gui_preferences(&entry.path())
+                }
+                Kind::Data => {
+                    (name == SEAL_STORE_FILENAME || name == seal_wal || name == seal_shm)
+                        && *empty_seal_store.get_or_insert_with(|| {
+                            seal_store_records_nothing(&path.join(SEAL_STORE_FILENAME))
+                        })
+                }
+            };
+        if !disposable {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Some(names)
 }
 
 fn resolve(
@@ -1703,6 +1788,133 @@ mod tests {
         assert_eq!(
             data_dir_in(&home).unwrap(),
             home.join(".local/share/archivefs")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// NW2-E-01 (characterisation test from the Night Watch II Phase 2
+    /// audit, session davedap-eb): the owner machine's layout. Host Cargo
+    /// tooling keeps `cargo-env.sh` in ~/.config/emuwiz beside an
+    /// established ~/.config/archivefs. Today that one tooling file makes the
+    /// EmuWiz folder established, so startup refuses ("two places") and
+    /// changes nothing. If tooling files are ever exempted, flip the
+    /// assertion; the other three states stay pinned.
+    #[test]
+    fn nw2_e01_cargo_tooling_file_beside_legacy_settings_is_refused_today() {
+        let env = "export EMUWIZ_TARGET_ROOT=/mnt/x\nexport EMUWIZ_MIN_FREE_GB=210\n";
+        assert!(ambiguous_beside_legacy(
+            "nw2-e01-cargo-env",
+            Kind::Config,
+            &["cargo-env.sh"],
+            env
+        ));
+        // Legacy only and legacy plus an empty EmuWiz folder keep legacy.
+        let home = home_with("nw2-e01-empty", &[&[".config", "emuwiz"]]);
+        legacy_install(&home);
+        assert_eq!(
+            config_dir_in(&home).unwrap(),
+            home.join(".config/archivefs")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        // Genuine conflict stays a refusal.
+        assert!(ambiguous_beside_legacy(
+            "nw2-e01-genuine",
+            Kind::Config,
+            &["config.toml"],
+            "[archive]\n"
+        ));
+
+        // The fix: the refusal names the entry that made the EmuWiz folder
+        // count (name only, never its contents), says which folder is which,
+        // and gives both ways out without inviting the user to move the
+        // folder of real settings aside.
+        let home = home_with("nw2-e01-message", &[]);
+        legacy_install(&home);
+        put(&home, &[".config", "emuwiz", "cargo-env.sh"], env);
+        let error = config_dir_in(&home).unwrap_err().to_string();
+        let primary = home.join(".config/emuwiz");
+        let legacy = home.join(".config/archivefs");
+        assert!(error.contains("holds cargo-env.sh."), "{error}");
+        assert!(!error.contains("EMUWIZ_TARGET_ROOT"), "{error}");
+        assert!(
+            error.contains(&format!("{} (the EmuWiz folder)", primary.display())),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "{} (the legacy ArchiveFS folder)",
+                legacy.display()
+            )),
+            "{error}"
+        );
+        assert!(error.contains("Nothing was changed"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "move the entries that are not EmuWiz settings out of {}",
+                primary.display()
+            )),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "{CONFIG_ROOT_OVERRIDE_ENV} set to whichever of the two folders holds your real settings"
+            )),
+            "{error}"
+        );
+        assert!(!error.contains("move the folder"), "{error}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The named entries are bounded, sorted, and skip what is provably
+    /// disposable; the data side names its own kind.
+    #[test]
+    fn two_setups_refusal_names_a_bounded_sorted_list_of_entries() {
+        let home = home_with("named-entries", &[]);
+        legacy_install(&home);
+        for name in [
+            "g.txt", "b.txt", "a.txt", "f.txt", "c.txt", "d.txt", "e.txt",
+        ] {
+            put(&home, &[".config", "emuwiz", name], "x");
+        }
+        // A first-start settings file is disposable and so never named.
+        put(
+            &home,
+            &[".config", "emuwiz", GUI_PREFERENCES_FILE],
+            FIRST_START_GUI_PREFERENCES_JSON,
+        );
+        let error = config_dir_in(&home).unwrap_err().to_string();
+        assert!(
+            error.contains("holds a.txt, b.txt, c.txt, d.txt, e.txt and 2 more."),
+            "{error}"
+        );
+        assert!(!error.contains(GUI_PREFERENCES_FILE), "{error}");
+
+        put(
+            &home,
+            &[".local", "share", "emuwiz", "library.sqlite3"],
+            "new-db",
+        );
+        let error = data_dir_in(&home).unwrap_err().to_string();
+        assert!(
+            error.contains("counts as library data because it holds library.sqlite3."),
+            "{error}"
+        );
+        assert!(error.contains(DATA_ROOT_OVERRIDE_ENV), "{error}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A dangling symlink at the EmuWiz name is established without being
+    /// listable; the refusal still says why.
+    #[cfg(unix)]
+    #[test]
+    fn two_setups_refusal_explains_an_unlistable_emuwiz_entry() {
+        let home = home_with("unlistable", &[]);
+        legacy_install(&home);
+        std::os::unix::fs::symlink(home.join("gone"), home.join(".config/emuwiz")).unwrap();
+        let error = config_dir_in(&home).unwrap_err().to_string();
+        assert!(
+            error.contains("is not a plain directory or could not be read"),
+            "{error}"
         );
         let _ = std::fs::remove_dir_all(&home);
     }

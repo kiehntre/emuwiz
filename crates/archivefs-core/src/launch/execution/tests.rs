@@ -353,19 +353,57 @@ fn missing_required_firmware_is_never_launchable() {
     assert!(preflight(&ready).is_err());
 }
 
-/// PINS TODAY'S BEHAVIOUR, a documented pre-existing gap (not changed here,
-/// separate owner-decided PR): when required firmware is a mix of present and
-/// missing entries the projection is `Unknown`, which adds neither blocker
-/// nor warning, so the launch is not refused.
+/// Owner policy: any required-and-missing firmware file blocks the launch,
+/// even when other required files are present (fresh probe at click time).
 #[test]
-fn mixed_present_and_missing_required_firmware_is_unknown_and_not_refused_today() {
+fn mixed_present_and_missing_required_firmware_is_refused() {
     let ready = build_ready_fixture("fw-mixed");
     declare_required_firmware(&ready, &["a.bin", "b.bin"]);
     fs::write(ready.fixture.path("system/a.bin"), b"x").unwrap();
+    let error = preflight(&ready).unwrap_err();
     assert!(
-        preflight(&ready).is_ok(),
-        "pre-existing Unknown behaviour changed; update the owner-decided gap note"
+        matches!(
+            error.kind,
+            LaunchPreflightErrorKind::CandidateNotReady
+                | LaunchPreflightErrorKind::RequestedCandidateNotFound
+                | LaunchPreflightErrorKind::CommandBlocked
+        ),
+        "{error:?}"
     );
+}
+
+#[test]
+fn beetle_psx_style_region_alternatives_need_only_one_bios() {
+    let ready = build_ready_fixture("fw-psx-one-region");
+    declare_required_firmware(&ready, &["scph5500.bin", "scph5501.bin", "scph5502.bin"]);
+    fs::write(ready.fixture.path("system/scph5501.bin"), b"us").unwrap();
+    preflight(&ready).expect("one regional BIOS of the alternative group is enough");
+}
+
+#[test]
+fn beetle_psx_style_with_no_region_bios_is_refused() {
+    let ready = build_ready_fixture("fw-psx-none");
+    declare_required_firmware(&ready, &["scph5500.bin", "scph5501.bin", "scph5502.bin"]);
+    assert!(preflight(&ready).is_err());
+}
+
+#[test]
+fn all_required_firmware_present_unverified_still_plays() {
+    let ready = build_ready_fixture("fw-all-present");
+    declare_required_firmware(&ready, &["a.bin", "b.bin"]);
+    fs::write(ready.fixture.path("system/a.bin"), b"x").unwrap();
+    fs::write(ready.fixture.path("system/b.bin"), b"y").unwrap();
+    preflight(&ready).expect("all required present keeps Play");
+}
+
+#[test]
+fn mixed_firmware_becomes_playable_once_the_missing_file_is_installed() {
+    let ready = build_ready_fixture("fw-mixed-fixed");
+    declare_required_firmware(&ready, &["a.bin", "b.bin"]);
+    fs::write(ready.fixture.path("system/a.bin"), b"x").unwrap();
+    assert!(preflight(&ready).is_err());
+    fs::write(ready.fixture.path("system/b.bin"), b"y").unwrap();
+    preflight(&ready).expect("installing the missing file unblocks");
 }
 
 // --- exact argv preserved -----------------------------------------------------
@@ -1532,4 +1570,121 @@ fn only_cartridge_platform_zips_count_as_zipped_cartridges() {
         assert!(!zipped(Path::new("/r/g.zip"), platform), "{platform}");
     }
     assert!(!zipped(Path::new("/r/g.sfc"), "SNES"));
+}
+
+// ---- NW2-C-01: sort saves/states by content folder ----
+
+/// NW2-C-01: with RetroArch's "sort saves/states by content directory" on,
+/// saves go to <savefile_directory>/<content folder name>/. A staged zipped
+/// cartridge runs from a fresh random `emuwiz-zip-rom-*` folder each launch,
+/// so the save would land somewhere new every time. The staged route must
+/// refuse, as it already does for the *_in_content_dir keys.
+#[test]
+fn nw2_c01_zipped_cartridge_is_refused_when_retroarch_sorts_saves_by_content_folder() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let rom = b"synthetic mega drive rom bytes";
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+    ] {
+        let (ready, _, _) = zipped_ready(&format!("nw2-c01-{key}"), &[("a.md", rom)]);
+        write_zip_test_config(&ready, &format!("{key} = \"true\"\n"));
+        let result = preflight_and_launch_retroarch_with_playlist(
+            &ready.request,
+            &HostReadOnlyFilesystem,
+            &ready.environment,
+            None,
+        );
+        let Err(error) = result else {
+            panic!(
+                "{key} = true: the staged launch went ahead, so saves land in a new per-launch folder"
+            );
+        };
+        assert!(format!("{error:?}").contains(key), "{error:?}");
+    }
+}
+
+/// Runs only the staged-launch safety check against a config with `extra`.
+fn staged_safety_with(label: &str, extra: &str) -> Result<(), String> {
+    let (ready, _, _) = zipped_ready(label, &[("a.md", b"synthetic mega drive rom bytes")]);
+    write_zip_test_config(&ready, extra);
+    staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment)
+}
+
+#[test]
+fn nw2_c01_sort_by_content_keys_accept_only_absent_or_explicit_false() {
+    assert_eq!(staged_safety_with("nw2-c01-absent", ""), Ok(()));
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+    ] {
+        for ok in ["\"false\"", "false", "FALSE", "\"0\"", "0"] {
+            assert_eq!(
+                staged_safety_with("nw2-c01-ok", &format!("{key} = {ok}\n")),
+                Ok(()),
+                "{key} = {ok}"
+            );
+        }
+        for bad in [
+            "\"true\"", "true", "\"1\"", "1", "\"yes\"", "\"\"", "true # x",
+        ] {
+            let error = staged_safety_with("nw2-c01-bad", &format!("{key} = {bad}\n"))
+                .expect_err(&format!("{key} = {bad} must be refused"));
+            assert!(error.contains(key), "{error}");
+            assert!(error.contains("emuwiz-zip-rom-"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn nw2_c01_conflicting_duplicate_sort_by_content_keys_are_refused() {
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+    ] {
+        let error = staged_safety_with(
+            "nw2-c01-dup",
+            &format!("{key} = \"false\"\n{key} = \"true\"\n"),
+        )
+        .expect_err("conflicting duplicates must be refused");
+        assert!(
+            error.contains("more than once") && error.contains(key),
+            "{error}"
+        );
+        // Identical duplicates are not a conflict.
+        assert_eq!(
+            staged_safety_with(
+                "nw2-c01-dup-same",
+                &format!("{key} = \"false\"\n{key} = \"false\"\n")
+            ),
+            Ok(())
+        );
+    }
+}
+
+/// A UTF-8 byte-order mark on line 1 must not hide a key from the check.
+#[test]
+fn nw2_c01_leading_bom_does_not_hide_sort_by_content_keys() {
+    let bom_config = |label: &str, first: &str| -> Result<(), String> {
+        let (ready, _, _) = zipped_ready(label, &[("a.md", b"synthetic mega drive rom bytes")]);
+        write_zip_test_config(&ready, "");
+        let path = ready.fixture.path("config/retroarch/retroarch.cfg");
+        let body = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("\u{feff}{first}{body}")).unwrap();
+        staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment)
+    };
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+        "savefiles_in_content_dir",
+    ] {
+        let error = bom_config("nw2-c01-bom-true", &format!("{key} = \"true\"\n"))
+            .expect_err("BOM + true must be refused");
+        assert!(error.contains(key), "{error}");
+        assert_eq!(
+            bom_config("nw2-c01-bom-false", &format!("{key} = \"false\"\n")),
+            Ok(())
+        );
+    }
+    assert_eq!(bom_config("nw2-c01-bom-absent", ""), Ok(()));
 }

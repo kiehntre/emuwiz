@@ -112,9 +112,15 @@ mod restore;
 #[cfg(test)]
 #[path = "database/topology_evidence_tests.rs"]
 mod topology_evidence_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub use restore::fault_injection as database_restore_fault_injection;
 pub use restore::{
     DatabaseRestorePlan, DatabaseRestoreReceipt, DatabaseRestoreResult, DatabaseRestoreState,
-    prepare_database_restore, restore_database, rollback_database_restore,
+    FileIdentity, InterruptedRestoreAssessment, InterruptedRestoreOutcome,
+    assess_interrupted_restore, finalise_interrupted_restore, interrupted_restore_receipts,
+    prepare_database_restore, preview_interrupted_restore,
+    read_receipt as read_database_restore_receipt, receipt_path as database_restore_receipt_path,
+    restore_database, review_database_rollback, rollback_database_restore,
 };
 
 /// The join evidence for `logical_set_name` with its member observations replaced

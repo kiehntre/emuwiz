@@ -131,7 +131,10 @@ fn scummvm_play_journey_in_blue() {
         lab.run(scenario);
         assert_eq!(
             lab.root().join("record/argv.txt").exists(),
-            matches!(scenario, "plain" | "failure" | "profile" | "untick"),
+            matches!(
+                scenario,
+                "details-play" | "plain" | "failure" | "profile" | "untick"
+            ),
             "{scenario}: unexpected ScummVM recording state"
         );
         assert_eq!(lab.game_bytes(), before, "{scenario}: game files unchanged");
@@ -165,14 +168,28 @@ fn child_entry() {
         game: 9,
     };
     if scenario == "details-play" {
-        // Game Details: the readiness card's Play routes to the Launch page,
-        // which then offers the ScummVM launch; nothing starts on the way.
+        // Game Details: the readiness card's Play launches directly (the
+        // planner's single safe request, plain command, no trainer). It does
+        // not detour through the Launch page; the optional trainer profile
+        // stays reachable from the Launch page.
         let mut blue = Blue::open(&folder, Route::Game(9));
         blue.wait_until(|b| b.shown("Play"), 45);
+        blue.guard_executable(&root);
         blue.click("Play");
-        assert_eq!(blue.app.router.current, launch);
-        blue.wait_for_readiness();
-        assert!(!argv.exists());
+        assert_ne!(
+            blue.app.router.current, launch,
+            "Play must launch, not navigate"
+        );
+        // Game Details words the end of a run differently from the Launch
+        // page, so wait for the recorded argv itself.
+        blue.wait_until(|_| argv.exists(), 30);
+        let args: Vec<String> = fs::read_to_string(&argv)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(args.first().map(String::as_str), Some("-p"), "{args:?}");
+        assert!(args.iter().any(|a| Path::new(a) == folder), "{args:?}");
         println!("journey {scenario}: ok");
         return;
     }

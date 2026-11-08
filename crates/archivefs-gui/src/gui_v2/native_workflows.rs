@@ -65,6 +65,13 @@ pub(super) struct NativeWorkflows {
     launch_was_active: bool,
     launch_kind: Option<LaunchKind>,
     launch_attempts: launch_readiness_summary::AttemptTracker,
+    /// Set when Play was pressed before the launch plan could be built; the
+    /// Launch page then starts the game itself the moment the plan is ready.
+    pending_play: Option<(i64, std::time::Instant)>,
+    /// Scan history read straight from the library database on a background
+    /// thread, so Sources shows real history while the full library snapshot
+    /// is still loading.
+    saved_source_history: SavedSourceHistory,
     /// The last "can a launch request be built" answer, for the game shown.
     route_truth: std::cell::RefCell<launch_readiness_summary::route_truth::RouteCache>,
     source_job: Option<u64>,
@@ -184,6 +191,21 @@ fn source_availability_detail(source: &SourceFolderView) -> String {
         SourceAvailability::PermissionDenied => "The path exists but cannot be read.".into(),
         SourceAvailability::ScanFailed => "The last scan failed; review the warning below.".into(),
     }
+}
+
+/// Shown instead of "Not scanned yet" when the saved scan history is simply
+/// not loaded (the library snapshot is still loading or unavailable), so a
+/// source with years of scan history never reads as never scanned.
+const SCAN_HISTORY_NOT_LOADED: &str = "Saved scan history not loaded yet";
+
+/// The history is known when the library snapshot loaded (a configured source
+/// with no row then truly has never been scanned) or when the record itself
+/// carries history. Only a bare configured path with no snapshot is unknown.
+fn scan_history_loaded(source: &SourceFolderView, catalogue_available: bool) -> bool {
+    catalogue_available
+        || source.id.is_some()
+        || source.last_scan_status.is_some()
+        || source.last_scan_at.is_some()
 }
 
 fn source_scan_label(status: Option<SourceScanStatus>) -> &'static str {
@@ -435,6 +457,8 @@ impl NativeWorkflows {
             launch_was_active: false,
             launch_kind: None,
             launch_attempts: Default::default(),
+            pending_play: None,
+            saved_source_history: SavedSourceHistory::default(),
             route_truth: Default::default(),
             source_job: None,
             cheat_catalogues: Default::default(),
@@ -459,6 +483,13 @@ impl NativeWorkflows {
             remote_probe_results: BTreeMap::new(),
             remote_probe_jobs: BTreeMap::new(),
         }
+    }
+
+    /// Whether a new Sources-page action may start: the native app's one-writer
+    /// rule, which includes the Blue writer flag (S06-04), so the rebind dialog
+    /// and every other caller are gated by the same answer.
+    pub(super) fn source_action_available(&self) -> bool {
+        self.app.source_action_available()
     }
 
     pub(super) fn poll(&mut self, context: &egui::Context, activity: &mut Activity) {
@@ -626,6 +657,18 @@ impl NativeWorkflows {
             self.readiness_job = Some(job);
         }
         self.observe_readiness_activity(activity);
+        // A Play pressed while the plan was still loading is honoured only
+        // briefly and only for this game; it can never fire on a later visit.
+        if pending_play_is_live(self.pending_play, game_id) {
+            match self.try_play(game_id) {
+                PlayOutcome::Started | PlayOutcome::Blocked => self.pending_play = None,
+                PlayOutcome::Waiting => ui
+                    .ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100)),
+            }
+        } else {
+            self.pending_play = None;
+        }
 
         let (recovery_route, retry_readiness) = launch_scroll(ui, game_id, |ui| {
             ui.label("Choose an emulator, review its readiness, then launch. EmuWiz will refuse unsafe or incomplete media.");
@@ -942,7 +985,47 @@ impl NativeWorkflows {
         if action == ReadinessAction::LookUpOnline {
             self.lookup_online_requested = true;
         }
+        if action == ReadinessAction::Play {
+            // Play launches. The Launch page is only the fallback for a plan
+            // that is still loading, needs an emulator choice, or is blocked.
+            self.pending_play = Some((game_id, std::time::Instant::now()));
+            if self.try_play(game_id) == PlayOutcome::Started {
+                self.pending_play = None;
+                return None;
+            }
+        }
         route_for_action(action, game_id)
+    }
+
+    /// Starts the game through the planner's single safe request, exactly as
+    /// Gamer View's Play does. Never picks between equally valid emulators.
+    pub(super) fn try_play(&mut self, game_id: i64) -> PlayOutcome {
+        use launch_readiness_page::{GamerBlockerKind, GamerPlayAction};
+        if self.selected_game != Some(game_id) {
+            return PlayOutcome::Waiting;
+        }
+        if self.launch_active() {
+            // Never swallow Play: the Launch page says a launch is running.
+            return PlayOutcome::Blocked;
+        }
+        match launch_readiness_page::gamer_play_action(&self.launch_input()) {
+            GamerPlayAction::Launch(request) => {
+                request.start(
+                    &mut self.app.launch_retroarch,
+                    &mut self.app.launch_dolphin,
+                    &mut self.app.launch_pcsx2,
+                    &mut self.app.launch_standalone,
+                    &mut self.app.launch_amiga_whdload,
+                );
+                PlayOutcome::Started
+            }
+            GamerPlayAction::BlockedTyped(blocker) => match blocker.kind {
+                GamerBlockerKind::CheckingGame | GamerBlockerKind::EmulatorNotChecked => {
+                    PlayOutcome::Waiting
+                }
+                _ => PlayOutcome::Blocked,
+            },
+        }
     }
 
     /// True once after the card's "Check Hasheous…" shortcut was pressed.
@@ -1445,6 +1528,49 @@ impl NativeWorkflows {
         self.collection.take_route()
     }
 
+    /// While the full library snapshot is missing, loads just the sources'
+    /// scan history in the background; once the snapshot is back it is used
+    /// instead and the cache is dropped so the next gap reloads fresh data.
+    fn poll_saved_source_history(&mut self, context: &egui::Context, snapshot_missing: bool) {
+        // The snapshot supplies the history whenever it is present. The cached
+        // copy is kept (not dropped) across short gaps so a flickering snapshot
+        // never spawns a thread per gap, and is refreshed once it is stale.
+        if !snapshot_missing {
+            return;
+        }
+        if let SavedSourceHistory::Loaded(_, loaded_at) = &self.saved_source_history
+            && loaded_at.elapsed() > std::time::Duration::from_secs(60)
+        {
+            self.saved_source_history = SavedSourceHistory::NotStarted;
+        }
+        match &self.saved_source_history {
+            SavedSourceHistory::NotStarted => {
+                let (sender, receiver) = mpsc::channel();
+                let repaint = context.clone();
+                std::thread::spawn(move || {
+                    let _ = sender.send(load_saved_source_views());
+                    repaint.request_repaint();
+                });
+                self.saved_source_history = SavedSourceHistory::Loading(receiver);
+            }
+            SavedSourceHistory::Loading(receiver) => match receiver.try_recv() {
+                Ok(Some(views)) => {
+                    self.saved_source_history =
+                        SavedSourceHistory::Loaded(views, std::time::Instant::now());
+                }
+                Ok(None) | Err(TryRecvError::Disconnected) => {
+                    self.saved_source_history = SavedSourceHistory::Unavailable;
+                }
+                // The thread also repaints when it finishes; this is the safety
+                // net if that repaint lands before the next frame polls.
+                Err(TryRecvError::Empty) => {
+                    context.request_repaint_after(std::time::Duration::from_millis(250));
+                }
+            },
+            SavedSourceHistory::Loaded(..) | SavedSourceHistory::Unavailable => {}
+        }
+    }
+
     fn show_native_sources(
         &mut self,
         ui: &mut egui::Ui,
@@ -1457,10 +1583,14 @@ impl NativeWorkflows {
             .ok()
             .unwrap_or_default()
             .to_vec();
+        let snapshot_missing = self.app.database_state.snapshot().is_none();
+        self.poll_saved_source_history(ui.ctx(), snapshot_missing);
         let snapshot = self.app.database_state.snapshot();
         let source_state = crate::source_state::merge_configured_sources(
             &configured,
-            snapshot.map(|snapshot| snapshot.source_views.as_slice()),
+            snapshot
+                .map(|snapshot| snapshot.source_views.as_slice())
+                .or_else(|| self.saved_source_history.views()),
         );
         let archives = snapshot
             .map(|snapshot| snapshot.archives.clone())
@@ -1474,7 +1604,7 @@ impl NativeWorkflows {
                 .unwrap_or(&[]),
         );
         let mut health_action = None;
-        let busy = !self.app.source_action_available() || self.collection.preparing();
+        let busy = !self.source_action_available() || self.collection.preparing();
         let mut action = None;
 
         self.poll_remote_source_probes(ui.ctx());
@@ -1613,7 +1743,14 @@ impl NativeWorkflows {
             ui.vertical(|ui| {
                 for source in &source_state.sources {
                     ui.push_id(&source.path, |ui| {
-                        self.show_native_source_card(ui, source, &archives, busy, &mut action);
+                        self.show_native_source_card(
+                            ui,
+                            source,
+                            &archives,
+                            busy,
+                            source_state.catalogue_available,
+                            &mut action,
+                        );
                     });
                 }
             });
@@ -1628,6 +1765,7 @@ impl NativeWorkflows {
         source: &SourceFolderView,
         archives: &[archivefs_core::PersistedArchive],
         busy: bool,
+        catalogue_available: bool,
         action: &mut Option<crate::SourceAction>,
     ) {
         crate::ui::components::card(ui, |ui| {
@@ -1665,17 +1803,31 @@ impl NativeWorkflows {
                     ui.label(source_availability_detail(source));
                     ui.end_row();
                     ui.weak("Last scan");
-                    ui.label(source.last_scan_at.as_deref().unwrap_or("Not scanned yet"));
+                    let history_loaded = scan_history_loaded(source, catalogue_available);
+                    ui.label(source.last_scan_at.as_deref().unwrap_or(if history_loaded {
+                        "Not scanned yet"
+                    } else {
+                        SCAN_HISTORY_NOT_LOADED
+                    }));
                     ui.end_row();
                     ui.weak("Scan status");
-                    ui.label(source_scan_label(source.last_scan_status));
+                    ui.label(if history_loaded {
+                        source_scan_label(source.last_scan_status)
+                    } else {
+                        SCAN_HISTORY_NOT_LOADED
+                    });
                     ui.end_row();
                     ui.weak("Game/media count");
-                    ui.label(
-                        source
-                            .last_archive_count
-                            .map_or_else(|| "Not available".into(), |count| count.to_string()),
-                    );
+                    ui.label(source.last_archive_count.map_or_else(
+                        || {
+                            if history_loaded {
+                                "Not available".into()
+                            } else {
+                                SCAN_HISTORY_NOT_LOADED.into()
+                            }
+                        },
+                        |count| count.to_string(),
+                    ));
                     ui.end_row();
                     ui.weak("Remote health");
                     if let Some(result) = self.remote_probe_results.get(&source.path) {
@@ -3602,6 +3754,8 @@ impl NativeWorkflows {
             selected_evidence_page::SelectedEvidenceState::Loading { path: current, .. }
                 if current == &path
         );
+        // An explicit recheck also forgets any cached MAME answer for this game.
+        crate::arcade_mame_probe::invalidate_path(&path);
         if !running {
             self.app.launch_standalone.clear_cue_review();
             self.app.start_selected_evidence_load(context.clone(), path);
@@ -3805,6 +3959,23 @@ mod source_presentation_tests {
             "Permission denied"
         );
         assert_eq!(source_scan_label(None), "Not scanned yet");
+        // A bare configured path (library snapshot not loaded) is not "never
+        // scanned"; a real record, even with no scan yet, is.
+        let bare = crate::source_state::merge_configured_sources(
+            &[std::path::PathBuf::from("/games")],
+            None,
+        )
+        .sources
+        .remove(0);
+        assert!(!scan_history_loaded(&bare, false));
+        // Once the snapshot has loaded, a source with no row is truly unscanned.
+        assert!(scan_history_loaded(&bare, true));
+        let mut recorded = bare.clone();
+        recorded.id = Some(22);
+        assert!(scan_history_loaded(&recorded, false));
+        let mut scanned = bare;
+        scanned.last_scan_at = Some("2026-10-04T23:34:54Z".into());
+        assert!(scan_history_loaded(&scanned, false));
         assert_eq!(
             source_scan_label(Some(SourceScanStatus::Success)),
             "Completed"
@@ -3843,6 +4014,31 @@ mod tests {
         workflows.observe_launch_activity(&mut activity);
         assert!(workflows.launch_attempts.for_game(1).is_some());
         assert!(workflows.launch_attempts.for_game(2).is_none());
+    }
+
+    #[test]
+    fn play_waits_then_falls_back_to_the_launch_page_instead_of_launching_blind() {
+        let mut workflows = NativeWorkflows::new(egui::Context::default());
+        // No selected game / no loaded evidence: Play must not start anything,
+        // must remember the request, and must route to the Launch page.
+        let route =
+            workflows.readiness_action_route(&egui::Context::default(), ReadinessAction::Play, 5);
+        assert_eq!(workflows.pending_play.map(|(game, _)| game), Some(5));
+        assert!(matches!(route, Some(Route::Task { game: 5, .. })));
+        assert!(!workflows.launch_active());
+        // A different game's pending request is never carried over.
+        assert_eq!(workflows.try_play(6), PlayOutcome::Waiting);
+    }
+
+    #[test]
+    fn a_pending_play_expires_and_never_applies_to_another_game() {
+        let now = std::time::Instant::now();
+        assert!(pending_play_is_live(Some((5, now)), 5));
+        assert!(!pending_play_is_live(Some((5, now)), 6));
+        assert!(!pending_play_is_live(None, 5));
+        if let Some(old) = now.checked_sub(PLAY_WAIT + std::time::Duration::from_secs(1)) {
+            assert!(!pending_play_is_live(Some((5, old)), 5));
+        }
     }
 
     #[test]
@@ -4807,6 +5003,54 @@ mod lifecycle_selection_tests {
             Some(Path::new("/home/test/.local/bin/mame"))
         );
     }
+}
+
+/// Saved scan history for the Sources page, loaded off the UI thread.
+#[derive(Default)]
+enum SavedSourceHistory {
+    #[default]
+    NotStarted,
+    Loading(Receiver<Option<Vec<SourceFolderView>>>),
+    Loaded(Vec<SourceFolderView>, std::time::Instant),
+    Unavailable,
+}
+
+impl SavedSourceHistory {
+    fn views(&self) -> Option<&[SourceFolderView]> {
+        match self {
+            Self::Loaded(views, _) => Some(views.as_slice()),
+            _ => None,
+        }
+    }
+}
+
+/// Reads configured sources joined with their saved scan history. Read-only;
+/// `None` when the config or database cannot be read.
+fn load_saved_source_views() -> Option<Vec<SourceFolderView>> {
+    let config = archivefs_core::default_config_path().ok()?;
+    let sources = archivefs_core::load_source_folder_configs_from(config).ok()?;
+    let database =
+        archivefs_core::Database::open_read_only(archivefs_core::default_database_path().ok()?)
+            .ok()?;
+    let records = database.list_source_folders().ok()?;
+    Some(archivefs_core::build_source_folder_views(
+        &sources, &records,
+    ))
+}
+
+/// How long a Play pressed before the plan was ready may wait to start.
+const PLAY_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A pending Play is live only for its own game and only for [`PLAY_WAIT`].
+fn pending_play_is_live(pending: Option<(i64, std::time::Instant)>, game: i64) -> bool {
+    pending.is_some_and(|(pending_game, since)| pending_game == game && since.elapsed() < PLAY_WAIT)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlayOutcome {
+    Started,
+    Waiting,
+    Blocked,
 }
 
 /// Where each readiness action goes. Identity problems always go to the one

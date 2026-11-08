@@ -121,13 +121,20 @@ Before publication:
 7. record `SKIPPED: <reason>` when GUI smoke cannot run;
 8. confirm no source-tree-only path or network dependency is required.
 
-The installer resolves the starter-config directory exactly as the
-application does: `EMUWIZ_CONFIG_HOME` (the directory itself), else
-`XDG_CONFIG_HOME/emuwiz`, else `~/.config/emuwiz` (or legacy
-`~/.config/archivefs` when only that exists). A set but non-absolute override
-is refused by both: the installer then installs binaries, writes no config and
-exits non-zero. The starter config is created with a no-clobber link and never
-replaces or writes through an existing file or dangling symlink.
+The installer asks the verified `emuwiz-cli` for the starter-config directory
+(`emuwiz-cli config-dir`, one absolute path; `data-dir` is its data-side
+twin) so it can only ever write where the application will look. A refusal
+from the binary - settings in two places (`~/.config/emuwiz` and the legacy
+`~/.config/archivefs` both established), or a set but non-absolute override -
+is relayed verbatim: binaries are installed, nothing is written in either
+folder, and the run exits non-zero. Only when the binary cannot answer does
+the installer fall back to its own mirror of `app_dirs::choose_dir`
+(`EMUWIZ_CONFIG_HOME` as given; else `<XDG_CONFIG_HOME or ~/.config>/emuwiz`
+versus `archivefs`, where an empty new folder never displaces a legacy one and
+two established folders are refused the same way). The run prints which
+directory was chosen and who decided it. The starter config is created with a
+no-clobber link and never replaces or writes through an existing file or
+dangling symlink.
 
 ### Release integrity and upgrade preservation
 
