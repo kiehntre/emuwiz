@@ -426,7 +426,15 @@ impl App {
                                 widgets::StatusTone::Info,
                             )),
                             None,
-                            |_ui| {},
+                            |ui| {
+                                if ui
+                                    .button("Organise my games")
+                                    .on_hover_text("Move misfiled games to their system's folder after a preview.")
+                                    .clicked()
+                                {
+                                    open_organise_games = true;
+                                }
+                            },
                             |_ui| {},
                         );
                     }

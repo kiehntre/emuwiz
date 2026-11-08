@@ -366,6 +366,18 @@ fn candidate_executable(process: &Path) -> Result<Option<PathBuf>, String> {
             if std::fs::metadata(process).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
                 return Ok(None);
             }
+            // A non-dumpable process of this user (for example the systemd
+            // user manager, which starts as root and switches to the user)
+            // hides `exe` even from its own user. Its command line stays
+            // readable; when that names a program that is plainly not
+            // EmuWiz, it is not a writer. Anything unreadable still refuses.
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                && std::fs::read(process.join("cmdline"))
+                    .ok()
+                    .is_some_and(|cmdline| cmdline_is_plainly_not_emuwiz(&cmdline))
+            {
+                return Ok(None);
+            }
             let zombie = std::fs::read_to_string(process.join("stat"))
                 .ok()
                 .and_then(|stat| {
@@ -380,6 +392,26 @@ fn candidate_executable(process: &Path) -> Result<Option<PathBuf>, String> {
             }
         }
     }
+}
+
+/// Whether a `/proc/<pid>/cmdline` names a program that cannot be EmuWiz:
+/// its first argument is present and its file name neither is one of the
+/// EmuWiz executables nor mentions emuwiz or archivefs.
+fn cmdline_is_plainly_not_emuwiz(cmdline: &[u8]) -> bool {
+    let Some(first) = cmdline.split(|b| *b == 0).next().filter(|a| !a.is_empty()) else {
+        return false;
+    };
+    let first = String::from_utf8_lossy(first);
+    let name = first
+        .split_whitespace()
+        .next()
+        .and_then(|p| p.rsplit('/').next())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !name.is_empty()
+        && !EMUWIZ_EXECUTABLES.contains(&name.as_str())
+        && !name.contains("emuwiz")
+        && !name.contains("archivefs")
 }
 
 /// Running EmuWiz processes of this user (other than this one) that cannot
@@ -773,6 +805,23 @@ pub(crate) mod tests {
         assert!(candidate_executable(&process).unwrap().is_none());
         std::fs::remove_dir_all(&process).unwrap();
         assert!(candidate_executable(&process).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_hidden_executable_is_skipped_only_when_the_command_line_is_plainly_not_emuwiz() {
+        assert!(cmdline_is_plainly_not_emuwiz(
+            b"/usr/lib/systemd/systemd\0--user\0"
+        ));
+        assert!(cmdline_is_plainly_not_emuwiz(b"(sd-pam)\0"));
+        assert!(!cmdline_is_plainly_not_emuwiz(b"/opt/x/emuwiz-v2\0"));
+        assert!(!cmdline_is_plainly_not_emuwiz(b"/opt/x/EmuWiz.AppImage\0"));
+        assert!(!cmdline_is_plainly_not_emuwiz(b"archivefs-cli\0scan\0"));
+        assert!(!cmdline_is_plainly_not_emuwiz(b""));
+        for name in EMUWIZ_EXECUTABLES {
+            assert!(!cmdline_is_plainly_not_emuwiz(
+                format!("/bin/{name}\0").as_bytes()
+            ));
+        }
     }
 
     /// Writes the registration a sealing-capable instance would write.

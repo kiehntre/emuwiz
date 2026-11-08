@@ -81,7 +81,17 @@ pub fn relink_text(
             Some((file, member)) => (file, Some(member)),
             None => (path, None),
         };
-        if let Some(new) = moves.get(Path::new(file)) {
+        // The file itself moved, or it sits inside a moved game folder.
+        let moved = Path::new(file).ancestors().find_map(|ancestor| {
+            let new = moves.get(ancestor)?;
+            let rest = Path::new(file).strip_prefix(ancestor).ok()?;
+            Some(if rest.as_os_str().is_empty() {
+                new.clone()
+            } else {
+                new.join(rest)
+            })
+        });
+        if let Some(new) = moved {
             let mut new_path = new.to_string_lossy().into_owned();
             if let Some(member) = member {
                 new_path.push('#');
@@ -218,6 +228,19 @@ mod tests {
         assert_eq!(v["items"][0]["crc32"], "00|crc");
         assert_eq!(v["items"][1]["path"], "/games/snes/Other.zip");
         assert_eq!(v["version"], "1.5");
+    }
+
+    #[test]
+    fn entries_inside_a_moved_game_folder_follow_it() {
+        let moves = BTreeMap::from([(
+            PathBuf::from("/games/mixed/Game [BLES1]"),
+            PathBuf::from("/games/ps3/Game [BLES1]"),
+        )]);
+        let text = r#"{"items":[{"path":"/games/mixed/Game [BLES1]/PS3_GAME/USRDIR/EBOOT.BIN"},{"path":"/games/mixed/Game [BLES10]/x"}]}"#;
+        let (out, n) = relink_text(text, &moves).unwrap().unwrap();
+        assert_eq!(n, 1);
+        assert!(out.contains("/games/ps3/Game [BLES1]/PS3_GAME/USRDIR/EBOOT.BIN"));
+        assert!(out.contains("/games/mixed/Game [BLES10]/x"));
     }
 
     #[test]

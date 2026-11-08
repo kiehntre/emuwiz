@@ -2604,6 +2604,9 @@ impl eframe::App for App {
             self.folder_check.unknown.clear();
             self.folder_check.candidates.clear();
             self.folder_check.next = 0;
+            // Picked folders and sets were part of that run.
+            self.folder_check.picked_files.clear();
+            self.folder_check.picked_folders.clear();
         }
         self.hasheous_check.poll();
         if self.load_job.is_none() && self.game_dat_check.take_saved() {

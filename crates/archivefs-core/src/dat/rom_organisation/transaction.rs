@@ -47,7 +47,13 @@ pub fn is_organisation_transaction(transaction: &RenameTransaction) -> bool {
         && crate::dat::rename_apply::seal::workflow_of(transaction) == "rename_apply"
         && transaction.entries.iter().all(|entry| {
             matches!(entry.operation, TransactionOperation::RenameMove)
-                && entry.unknown.contains_key("organisation_catalogue_v1")
+                && (entry.unknown.contains_key("organisation_catalogue_v1")
+                    || entry
+                        .unknown
+                        .contains_key(crate::database::organisation_paths::COMPANION_KEY)
+                    || entry
+                        .unknown
+                        .contains_key(crate::database::organisation_paths::UNCATALOGUED_KEY))
         })
 }
 

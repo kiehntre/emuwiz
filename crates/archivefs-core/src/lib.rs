@@ -702,6 +702,8 @@ pub mod mod_history;
 pub mod classic_poke_family;
 /// Per-game, read-only view of classic POKE trainers (never applies anything).
 pub mod classic_trainer_evidence;
+/// Game package boundaries (single file, CUE/GDI/M3U set, game folder).
+pub mod game_package;
 /// Manual system choices kept outside the database (survive rebuilds).
 pub mod manual_platform_choices;
 /// Provider-neutral, metadata-only catalogue records for future mod sources.

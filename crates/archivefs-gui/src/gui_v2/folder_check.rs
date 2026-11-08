@@ -27,7 +27,7 @@ mod tests;
 
 pub(super) const READ_ONLY_NOTE: &str =
     "Checking only reads. Nothing moves until you review the preview and approve it.";
-pub(super) const KNOWN_LIMITS: &str = "Games EmuWiz moves keep their records, favourites and history, and Undo puts them back. A system you choose yourself is remembered by the game's content, so a renamed or moved file, a rescan or a rebuilt library keeps it. The Probable group is a heuristic based on file structure, not a catalogue match, and never moves on its own. Only single cartridge files and single-file ZIPs are read; other games keep the system the scan gave them.";
+pub(super) const KNOWN_LIMITS: &str = "Games EmuWiz moves keep their records, favourites and history, and Undo puts them back. A system you choose yourself is remembered by the game's content, so a renamed or moved file, a rescan or a rebuilt library keeps it. The Probable group is a heuristic based on file structure, not a catalogue match, and never moves on its own. Only single cartridge files and single-file ZIPs are read for identification; disc and folder games keep the system the scan gave them unless you choose one. Disc sets (.cue, .gdi, .m3u) move with every track they name, and game folders move whole, by rename on the same drive only; a set that names files in a sub-folder, a folder holding other games, links or another drive is left where it is with the reason.";
 
 /// Why changing the system is not the same as making a game playable.
 pub(super) fn playable_note(detected: &str, has_unh: bool) -> String {
@@ -264,6 +264,16 @@ pub(super) struct State {
     pub left_here: HashSet<i64>,
     pub organise: super::organise::State,
     pub preferences: super::organise::Preferences,
+    /// Game folders the person picked and gave a system (this session).
+    pub picked_folders: Vec<fpc::organise::FolderCandidate>,
+    /// Disc sets or files the person picked and gave a system (this session).
+    pub picked_files: Vec<fpc::organise::ChosenGame>,
+    /// A folder being picked: its path and the system chosen so far.
+    pub pick: Option<(PathBuf, String)>,
+    /// Typed path, for when no file chooser is available.
+    pub typed_path: String,
+    /// Filter for the system list when picking.
+    pub system_filter: String,
     /// Run automatic organising when the current check finishes.
     auto_after_run: bool,
     /// The running pass is a recheck of a few games, not the next batch.
@@ -314,6 +324,8 @@ impl State {
                 left_here: std::mem::take(&mut self.left_here),
                 organise: std::mem::take(&mut self.organise),
                 preferences: std::mem::take(&mut self.preferences),
+                picked_folders: std::mem::take(&mut self.picked_folders),
+                picked_files: std::mem::take(&mut self.picked_files),
                 candidates: candidates_of(games),
                 ran: true,
                 ..Default::default()
@@ -435,7 +447,13 @@ impl State {
                                 .cloned()
                                 .collect();
                             if !confirmed.is_empty() {
-                                self.organise.plan(confirmed, Vec::new(), Vec::new(), true);
+                                self.organise.plan(
+                                    confirmed,
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Vec::new(),
+                                    true,
+                                );
                             }
                         }
                     }
@@ -663,7 +681,7 @@ impl App {
                 .collect();
             self.folder_check
                 .organise
-                .plan(one, Vec::new(), Vec::new(), false);
+                .plan(one, Vec::new(), Vec::new(), Vec::new(), false);
         }
         if let Some(id) = unknown_to_folder {
             let one: Vec<fpc::organise::UnknownGame> = self
@@ -678,7 +696,7 @@ impl App {
                 .collect();
             self.folder_check
                 .organise
-                .plan(Vec::new(), Vec::new(), one, false);
+                .plan(Vec::new(), Vec::new(), one, Vec::new(), false);
         }
         if let Some(id) = open {
             self.go(super::routes::Route::ReviewIdentity(id));
@@ -697,11 +715,12 @@ impl App {
             .filter(|f| f.tier.is_movable() && !left_here.contains(&f.archive_id))
             .cloned()
             .collect();
-        let chosen: Vec<fpc::organise::ChosenGame> =
+        let mut chosen: Vec<fpc::organise::ChosenGame> =
             super::organise::chosen_games(&self.library.games)
                 .into_iter()
                 .filter(|g| !left_here.contains(&g.archive_id))
                 .collect();
+        chosen.extend(self.folder_check.picked_files.iter().cloned());
         let unknown: Vec<fpc::organise::UnknownGame> = self
             .folder_check
             .unknown
@@ -712,6 +731,8 @@ impl App {
                 path: u.path.clone(),
             })
             .collect();
+        let picked = self.folder_check.picked_folders.clone();
+        self.game_folder_picker(ui, checking);
         let organise = &mut self.folder_check.organise;
         ui.add_space(6.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -725,23 +746,25 @@ impl App {
                         unknown.len()
                     ));
                     ui.checkbox(&mut organise.include_unknown, "Also move unknown games to Unnamed/Unknown (their original location is journalled, and Recheck can still find their system later)");
-                    let any = !movable.is_empty() || !chosen.is_empty() || (organise.include_unknown && !unknown.is_empty());
+                    ui.small("Game folders (such as PS3 disc folders found by their PARAM.SFO layout) and disc sets (a .cue, .gdi or .m3u with its tracks) are included and always move complete.");
                     if ui
-                        .add_enabled(any && !checking && !organise.busy(), egui::Button::new("2. Review and move all confirmed games"))
+                        .add_enabled(!checking && !organise.busy(), egui::Button::new("2. Review and move all confirmed games"))
                         .clicked()
                     {
                         let unknown = if organise.include_unknown { unknown.clone() } else { Vec::new() };
-                        organise.plan(movable.clone(), chosen.clone(), unknown, false);
+                        organise.plan(movable.clone(), chosen.clone(), unknown, picked.clone(), false);
                     }
                 }
                 Phase::Working(text) => {
                     ui.label(*text);
                 }
-                Phase::Preview(_, _) => {}
+                Phase::Preview(..) => {}
             }
             let mut approve = false;
             let mut discard = false;
-            if let Phase::Preview(plans, summary) = &organise.phase {
+            if let Phase::Preview(plans, folders, summary) = &organise.phase {
+                let (folder_moves, folders_in_place, folders_refused) =
+                    super::organise::folder_counts(folders);
                 ui.label(format!(
                     "Preview: {} game(s) will move to their system folder and {} to Unnamed/Unknown. {} are already in the right place, {} would collide with an existing file and stay where they are, and {} are left for you to review.",
                     summary.to_move,
@@ -750,8 +773,44 @@ impl App {
                     summary.collisions,
                     summary.left_alone + summary.blocked
                 ));
-                egui::ScrollArea::vertical().id_salt("v2_organise_preview").max_height(260.0).show(ui, |ui| {
+                if folder_moves + folders_in_place + folders_refused > 0 {
+                    ui.label(format!(
+                        "Game folders: {folder_moves} will move whole, {folders_in_place} already in place, {folders_refused} stay where they are."
+                    ));
+                }
+                egui::ScrollArea::vertical().id_salt("v2_organise_preview").min_scrolled_height(220.0).max_height(320.0).show(ui, |ui| {
+                    for (candidate, preview) in folders {
+                        use archivefs_core::folder_platform_check::organise::folder_move::FolderPreview;
+                        let why = if candidate.chosen { "your choice" } else { candidate.evidence.as_str() };
+                        match preview {
+                            FolderPreview::Move(plan) => {
+                                ui.label(format!(
+                                    "Whole folder {} -> {} ({} files, {}){}. System: {} ({why}).",
+                                    candidate.path.display(),
+                                    plan.destination.display(),
+                                    plan.layout.entries.iter().filter(|e| !e.is_dir).count(),
+                                    human_bytes(plan.layout.total_bytes),
+                                    if plan.creates_folder { ", new folder created on approval" } else { "" },
+                                    display_name_for(&plan.platform),
+                                ));
+                            }
+                            FolderPreview::AlreadyInPlace => {
+                                ui.small(format!("Already in place: {}", candidate.path.display()));
+                            }
+                            FolderPreview::Refused(reason) => {
+                                ui.small(format!("Stays: {} - {reason}", candidate.path.display()));
+                            }
+                        }
+                    }
                     for plan in plans {
+                        for (lead, members) in plan.sets.iter().take(50) {
+                            ui.small(format!(
+                                "Set: {} moves with {} track/disc file{}.",
+                                lead.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                                members.len(),
+                                if members.len() == 1 { "" } else { "s" }
+                            ));
+                        }
                         let mut by_folder: BTreeMap<PathBuf, usize> = BTreeMap::new();
                         for e in plan.plan.suggested() {
                             if let Some(parent) = e.destination_path.parent() {
@@ -775,8 +834,9 @@ impl App {
                     }
                 });
                 ui.horizontal(|ui| {
-                    let label = format!("3. Organise {} game(s)", summary.to_move + summary.to_unknown);
-                    if ui.add_enabled(summary.to_move + summary.to_unknown > 0, egui::Button::new(label)).clicked() {
+                    let total = summary.to_move + summary.to_unknown + folder_moves;
+                    let label = format!("3. Organise {total} game(s)");
+                    if ui.add_enabled(total > 0, egui::Button::new(label)).clicked() {
                         approve = true;
                     }
                     if ui.button("Not now").clicked() {
@@ -799,12 +859,165 @@ impl App {
             if let Phase::Failed(error) = &organise.phase {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
-            if !organise.applied.is_empty() && !organise.busy() && ui.button("Undo this organisation").clicked() {
+            if (!organise.applied.is_empty() || !organise.applied_folders.is_empty())
+                && !organise.busy()
+                && ui.button("Undo this organisation").clicked()
+            {
                 organise.undo();
             }
             if let Some(message) = &organise.undo_message {
                 ui.label(message);
             }
         });
+    }
+
+    /// Pick a game folder and give it a system; it joins the next preview.
+    fn game_folder_picker(&mut self, ui: &mut egui::Ui, checking: bool) {
+        let state = &mut self.folder_check;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!checking && !state.organise.busy(), egui::Button::new("Add a game folder..."))
+                .on_hover_text("For a game stored as a folder (for example a PS3 disc folder): choose its system and EmuWiz moves the whole folder into that system's folder after the preview.")
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new().set_title("Choose one game's folder").pick_folder()
+            {
+                state.pick = Some((path, String::new()));
+            }
+            if ui
+                .add_enabled(!checking && !state.organise.busy(), egui::Button::new("Add a disc set or file..."))
+                .on_hover_text("For a .cue, .gdi or .m3u (its tracks and discs move with it) or any single game file the library has not identified: choose its system and it joins the preview.")
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new().set_title("Choose a disc set (.cue, .gdi, .m3u) or a game file").pick_file()
+            {
+                state.pick = Some((path, String::new()));
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut state.typed_path)
+                    .hint_text("or type a game folder or file path")
+                    .desired_width(260.0),
+            );
+            let typed = PathBuf::from(state.typed_path.trim());
+            if ui
+                .add_enabled(typed.is_absolute() && typed.exists(), egui::Button::new("Use this path"))
+                .clicked()
+            {
+                state.pick = Some((typed, String::new()));
+                state.typed_path.clear();
+            }
+            for (i, file) in state.picked_files.clone().iter().enumerate() {
+                ui.small(format!("{} -> {}", file.path.display(), display_name_for(&file.platform)));
+                if ui.small_button("Remove").clicked() {
+                    state.picked_files.remove(i);
+                }
+            }
+            for (i, folder) in state.picked_folders.clone().iter().enumerate() {
+                ui.small(format!(
+                    "{} -> {}",
+                    folder.path.display(),
+                    display_name_for(&folder.platform)
+                ));
+                if ui.small_button("Remove").clicked() {
+                    state.picked_folders.remove(i);
+                }
+            }
+        });
+        let mut add = None;
+        let mut cancel = false;
+        if let Some((path, platform)) = &mut state.pick {
+            ui.group(|ui| {
+                let is_folder = path.is_dir();
+                ui.label(format!(
+                    "{}: {}",
+                    if is_folder {
+                        "Game folder"
+                    } else {
+                        "Game file"
+                    },
+                    path.display()
+                ));
+                if let Some(title) = archivefs_core::game_package::ps3_game_folder(path) {
+                    ui.small(format!(
+                        "Its layout is a PS3 disc folder (title ID {title})."
+                    ));
+                }
+                let filter = &mut state.system_filter;
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(filter)
+                            .hint_text("Filter systems")
+                            .desired_width(140.0),
+                    );
+                    let needle = filter.trim().to_ascii_lowercase();
+                    let mut systems: Vec<_> = archivefs_core::platform::PLATFORMS
+                        .iter()
+                        .filter(|p| {
+                            needle.is_empty()
+                                || p.display_name.to_ascii_lowercase().contains(&needle)
+                                || p.id.to_ascii_lowercase().contains(&needle)
+                        })
+                        .collect();
+                    systems.sort_by_key(|p| p.display_name);
+                    egui::ComboBox::from_id_salt("v2_pick_folder_system")
+                        .selected_text(if platform.is_empty() {
+                            "Choose system".to_string()
+                        } else {
+                            display_name_for(platform).to_string()
+                        })
+                        .height(360.0)
+                        .show_ui(ui, |ui| {
+                            for p in systems {
+                                ui.selectable_value(platform, p.id.to_string(), p.display_name);
+                            }
+                        });
+                    if ui
+                        .add_enabled(
+                            !platform.is_empty(),
+                            egui::Button::new("Add to the preview"),
+                        )
+                        .clicked()
+                    {
+                        add = Some(fpc::organise::FolderCandidate {
+                            path: path.clone(),
+                            platform: platform.clone(),
+                            evidence: "your system choice".into(),
+                            chosen: true,
+                        });
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        }
+        if let Some(candidate) = add {
+            if candidate.path.is_dir() {
+                state.picked_folders.retain(|f| f.path != candidate.path);
+                state.picked_folders.push(candidate);
+            } else {
+                state.picked_files.retain(|f| f.path != candidate.path);
+                state.picked_files.push(fpc::organise::ChosenGame {
+                    archive_id: 0,
+                    path: candidate.path,
+                    platform: candidate.platform,
+                });
+            }
+            state.pick = None;
+        }
+        if cancel {
+            state.pick = None;
+        }
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else {
+        format!("{bytes} bytes")
     }
 }

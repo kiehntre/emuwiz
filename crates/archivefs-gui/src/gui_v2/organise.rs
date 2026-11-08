@@ -7,8 +7,11 @@
 
 use archivefs_core::dat::rename_apply::EntryState;
 use archivefs_core::folder_platform_check::Finding;
+use archivefs_core::folder_platform_check::organise::folder_move::{
+    self, FolderMoveRecord, FolderPreview,
+};
 use archivefs_core::folder_platform_check::organise::{
-    self as org, ChosenGame, RootPlan, Summary, UnknownGame,
+    self as org, ChosenGame, FolderCandidate, RootPlan, Summary, UnknownGame,
 };
 use archivefs_core::retroarch_playlist_relink::{self as relink, RelinkReport};
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,6 +61,12 @@ pub(super) struct Report {
     /// Systems RomM should rescan (old and new folders).
     pub romm_platforms: BTreeSet<String>,
     pub transactions: Vec<String>,
+    /// Whole game folders moved.
+    pub folders_moved: usize,
+    /// Set members (tracks, discs) that moved with their set.
+    pub set_members_moved: usize,
+    /// Interrupted earlier folder moves settled before this run.
+    pub recovered: Vec<String>,
 }
 
 impl Report {
@@ -75,6 +84,29 @@ impl Report {
             self.left_alone,
             self.failed.len()
         ));
+        if self.folders_moved > 0 {
+            lines.push(format!(
+                "{} of these {} whole game folder{}, moved as one unit with every file inside unchanged.",
+                self.folders_moved,
+                if self.folders_moved == 1 { "is a" } else { "are" },
+                if self.folders_moved == 1 { "" } else { "s" }
+            ));
+        }
+        if self.set_members_moved > 0 {
+            lines.push(format!(
+                "{} track or disc file{} moved together with {} set.",
+                self.set_members_moved,
+                if self.set_members_moved == 1 { "" } else { "s" },
+                if self.set_members_moved == 1 {
+                    "its"
+                } else {
+                    "their"
+                }
+            ));
+        }
+        for line in &self.recovered {
+            lines.push(line.clone());
+        }
         for folder in &self.created_folders {
             lines.push(format!("Created folder {}.", folder.display()));
         }
@@ -114,11 +146,15 @@ impl Report {
     }
 }
 
+/// Game folders in a preview, with what will happen to each.
+pub(super) type FolderPreviews = Vec<(FolderCandidate, FolderPreview)>;
+
 enum Message {
-    Planned(Result<Vec<RootPlan>, String>, bool),
+    Planned(Result<(Vec<RootPlan>, FolderPreviews), String>, bool),
     Applied(
         Report,
         Vec<archivefs_core::dat::rename_apply::RenameTransaction>,
+        Vec<FolderMoveRecord>,
     ),
 }
 
@@ -127,9 +163,22 @@ pub(super) enum Phase {
     #[default]
     Idle,
     Working(&'static str),
-    Preview(Vec<RootPlan>, Summary),
+    Preview(Vec<RootPlan>, FolderPreviews, Summary),
     Done(Report),
     Failed(String),
+}
+
+/// Folder moves in a preview: (to move, already in place, refused).
+pub(super) fn folder_counts(folders: &FolderPreviews) -> (usize, usize, usize) {
+    let mut counts = (0, 0, 0);
+    for (_, preview) in folders {
+        match preview {
+            FolderPreview::Move(_) => counts.0 += 1,
+            FolderPreview::AlreadyInPlace => counts.1 += 1,
+            FolderPreview::Refused(_) => counts.2 += 1,
+        }
+    }
+    counts
 }
 
 #[derive(Default)]
@@ -141,6 +190,8 @@ pub(super) struct State {
     pub library_changed: bool,
     /// The last applied transactions, for Undo.
     pub applied: Vec<archivefs_core::dat::rename_apply::RenameTransaction>,
+    /// The last run's folder moves, for Undo.
+    pub applied_folders: Vec<FolderMoveRecord>,
     pub undo_message: Option<String>,
     receiver: Option<Receiver<Message>>,
 }
@@ -158,6 +209,7 @@ impl State {
         findings: Vec<Finding>,
         chosen: Vec<ChosenGame>,
         unknown: Vec<UnknownGame>,
+        picked_folders: Vec<FolderCandidate>,
         then_apply: bool,
     ) {
         if self.busy() {
@@ -171,8 +223,27 @@ impl State {
                 let config = archivefs_core::Config::load_default().map_err(|e| e.to_string())?;
                 let roots = config.source_folders.clone();
                 let refs: Vec<&Finding> = findings.iter().filter(|f| f.tier.is_movable()).collect();
+                // Games that are folders move as whole folders.
+                let (chosen_folders, chosen_files): (Vec<ChosenGame>, Vec<ChosenGame>) = chosen
+                    .into_iter()
+                    .partition(|g| std::fs::symlink_metadata(&g.path).is_ok_and(|m| m.is_dir()));
+                let mut folders: Vec<FolderCandidate> = picked_folders;
+                folders.extend(chosen_folders.into_iter().map(|g| FolderCandidate {
+                    path: g.path,
+                    platform: g.platform,
+                    evidence: "your system choice".into(),
+                    chosen: true,
+                }));
+                // Automatic runs only ever move confirmed single games.
+                if !then_apply {
+                    for found in org::found_game_folders(&roots) {
+                        if !folders.iter().any(|f| f.path == found.path) {
+                            folders.push(found);
+                        }
+                    }
+                }
                 let mut plans =
-                    org::plan_organisation_with_choices(&refs, &chosen, &unknown, &roots, 1);
+                    org::plan_organisation_with_choices(&refs, &chosen_files, &unknown, &roots, 1);
                 for f in findings.iter().filter(|f| !f.tier.is_movable()) {
                     if let Some(first) = plans.first_mut() {
                         first.left_alone.push((
@@ -191,7 +262,8 @@ impl State {
                         })?;
                     }
                 }
-                Ok(plans)
+                let folder_previews = org::preview_folders(&database, &roots, &folders);
+                Ok((plans, folder_previews))
             })();
             let _ = sender.send(Message::Planned(result, then_apply));
         });
@@ -199,19 +271,19 @@ impl State {
 
     /// The person's one approval for every Suggested entry in the preview.
     pub(super) fn approve(&mut self) {
-        let Phase::Preview(plans, _) = std::mem::take(&mut self.phase) else {
+        let Phase::Preview(plans, folders, _) = std::mem::take(&mut self.phase) else {
             return;
         };
-        self.start_apply(plans);
+        self.start_apply(plans, folders);
     }
 
-    fn start_apply(&mut self, plans: Vec<RootPlan>) {
+    fn start_apply(&mut self, plans: Vec<RootPlan>, folders: FolderPreviews) {
         self.phase = Phase::Working("Moving the approved games. Each move is journalled.");
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         std::thread::spawn(move || {
-            let (report, transactions) = apply_plans(&plans);
-            let _ = sender.send(Message::Applied(report, transactions));
+            let (report, transactions, records) = apply_plans(&plans, &folders);
+            let _ = sender.send(Message::Applied(report, transactions, records));
         });
     }
 
@@ -223,20 +295,21 @@ impl State {
             Ok(Message::Planned(result, then_apply)) => {
                 self.receiver = None;
                 match result {
-                    Ok(plans) if then_apply => self.start_apply(plans),
-                    Ok(plans) => {
+                    Ok((plans, folders)) if then_apply => self.start_apply(plans, folders),
+                    Ok((plans, folders)) => {
                         let summary = org::summarise(&plans);
-                        self.phase = Phase::Preview(plans, summary);
+                        self.phase = Phase::Preview(plans, folders, summary);
                     }
                     Err(error) => self.phase = Phase::Failed(error),
                 }
             }
-            Ok(Message::Applied(report, transactions)) => {
+            Ok(Message::Applied(report, transactions, records)) => {
                 self.receiver = None;
                 if report.organised + report.to_unknown > 0 {
                     self.library_changed = true;
                 }
                 self.applied = transactions;
+                self.applied_folders = records;
                 self.phase = Phase::Done(report);
             }
             Err(TryRecvError::Empty) => {}
@@ -264,6 +337,13 @@ impl State {
         };
         let mut restored = 0;
         let mut problems = Vec::new();
+        // Folder moves ran last, so they are undone first.
+        for mut record in std::mem::take(&mut self.applied_folders).into_iter().rev() {
+            match folder_move::undo(&mut record, &journal) {
+                Ok(()) => restored += 1,
+                Err(why) => problems.push(format!("{}: {why}", record.destination.display())),
+            }
+        }
         for mut transaction in std::mem::take(&mut self.applied).into_iter().rev() {
             let root = PathBuf::from(&transaction.source_scan_root);
             let moved = transaction
@@ -305,11 +385,11 @@ impl State {
         self.library_changed = true;
         self.undo_message = Some(if problems.is_empty() {
             format!(
-                "Undo put {restored} game(s) back where they were, with their previous systems."
+                "Undo reversed {restored} move(s): every game, set and game folder is back where it was, with its previous system."
             )
         } else {
             format!(
-                "Undo put {restored} game(s) back; some need History: {}",
+                "Undo reversed {restored} move(s); some need History: {}",
                 problems.join("; ")
             )
         });
@@ -320,12 +400,15 @@ impl State {
 /// for what actually moved.
 fn apply_plans(
     plans: &[RootPlan],
+    folders: &FolderPreviews,
 ) -> (
     Report,
     Vec<archivefs_core::dat::rename_apply::RenameTransaction>,
+    Vec<FolderMoveRecord>,
 ) {
     let mut report = Report::default();
     let mut transactions = Vec::new();
+    let mut records = Vec::new();
     let summary = org::summarise(plans);
     report.already_correct = summary.already_correct;
     report.collisions = summary.collisions;
@@ -338,7 +421,7 @@ fn apply_plans(
             report
                 .failed
                 .push(format!("the library database could not be opened: {error}"));
-            return (report, transactions);
+            return (report, transactions, records);
         }
     };
     let journal = match archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
@@ -348,9 +431,22 @@ fn apply_plans(
             report
                 .failed
                 .push(format!("the journal folder is not available: {error}"));
-            return (report, transactions);
+            return (report, transactions, records);
         }
     };
+    // Settle any folder move an earlier run left interrupted.
+    for mut record in folder_move::interrupted(&journal) {
+        match folder_move::recover(&mut record, &journal) {
+            Ok(state) => report.recovered.push(format!(
+                "An interrupted earlier move of {} was settled: {state:?}.",
+                record.source.display()
+            )),
+            Err(why) => report.failed.push(format!(
+                "An interrupted earlier move of {} needs review: {why}",
+                record.source.display()
+            )),
+        }
+    }
     let mut moves: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     for plan in plans {
         let approved: BTreeSet<String> = plan
@@ -394,7 +490,12 @@ fn apply_plans(
             .created_folders
             .extend(transaction.created_directories.iter().cloned());
         for entry in &transaction.entries {
-            if entry.state == EntryState::Applied {
+            if entry.state == EntryState::Applied
+                && entry.unknown.contains_key("organisation_companion_v1")
+            {
+                report.set_members_moved += 1;
+                moves.insert(entry.source_path.clone(), entry.destination_path.clone());
+            } else if entry.state == EntryState::Applied {
                 match platforms.get(entry.source_path.as_path()) {
                     Some((Some(_), name)) => {
                         report.organised += 1;
@@ -409,13 +510,40 @@ fn apply_plans(
                     .push(format!("{}: {reason}", entry.source_path.display()));
             }
         }
-        report.transactions.push(transaction.transaction_id.clone());
-        transactions.push(transaction);
+        // Only a transaction that moved something has anything to undo.
+        if transaction.applied_count() > 0 {
+            report.transactions.push(transaction.transaction_id.clone());
+            transactions.push(transaction);
+        }
+    }
+    let database_path = database.path().to_path_buf();
+    drop(database);
+    for (candidate, preview) in folders {
+        let FolderPreview::Move(plan) = preview else {
+            continue;
+        };
+        match folder_move::apply(plan, &database_path, &journal) {
+            Ok(record) => {
+                report.organised += 1;
+                report.folders_moved += 1;
+                report.romm_platforms.insert(
+                    archivefs_core::platform::display_name_for(&candidate.platform).to_string(),
+                );
+                report
+                    .created_folders
+                    .extend(record.created_dirs.iter().cloned());
+                moves.insert(record.source.clone(), record.destination.clone());
+                records.push(record);
+            }
+            Err(why) => report
+                .failed
+                .push(format!("{}: {why}", candidate.path.display())),
+        }
     }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         report.retroarch = relink::relink_playlists(&relink::playlist_dirs(&home), &moves);
     }
-    (report, transactions)
+    (report, transactions, records)
 }
 
 /// Games the person assigned to a system that sit outside that system's

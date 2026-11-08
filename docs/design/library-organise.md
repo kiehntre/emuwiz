@@ -98,11 +98,41 @@ choice is shown as a conflict and nothing changes without approval.
    (path as a hint only). A rebuilt or rescanned library re-applies a choice
    only when the content matches exactly. Verified evidence that disagrees
    later is shown as a conflict; nothing changes without approval.
-8. **Choose system on any game, including packages** — choosing a system
-   (for example PS3) offers to move the whole package (a game folder, or a
-   `.cue` with its tracks, or an `.m3u` with its discs) into that system's
-   folder, creating it inside the approved library root. A package moves as one
-   unit or not at all.
+8. **Game packages move complete** (`game_package.rs`,
+   `folder_platform_check/organise/folder_move.rs`).
+   - *Boundary first, never "every parent folder is one game".* A file set is
+     a `.cue`/`.gdi`/`.m3u` plus exactly the files it names (an `.m3u`'s
+     `.cue`/`.gdi` discs bring their tracks), all in the descriptor's own
+     folder. A game folder is a folder whose validated layout says it is one
+     game (PS3: `PS3_GAME/PARAM.SFO` parses with a `TITLE_ID` and
+     `PS3_GAME/USRDIR/EBOOT.BIN` exists) or a folder the person picked and
+     gave a system. No disc image is hashed to recognise a package.
+   - *Refused, source untouched, reason shown:* a descriptor naming a
+     missing, unsafe or sub-folder file; a file another descriptor also
+     uses; a track or disc chosen on its own (choose its set); a folder that
+     holds other library games, is a system/library folder, contains links,
+     special files or a mount point, holds a second game folder, or would
+     land on another filesystem; any existing destination (also by case).
+   - *File sets* move in one organiser transaction: the lead plus members
+     marked `organisation_companion_v1` (a member with its own library row
+     keeps its catalogue binding). Approving a set approves exactly its
+     files; a failure part-way rolls the whole transaction back. A picked
+     game the library has no row for (for example a `.cue` outside a
+     PlayStation folder, which the scanner never catalogues) is marked
+     `organisation_uncatalogued_v1` and moves with no catalogue change.
+   - *Game folders* move by one `renameat2(RENAME_NOREPLACE)` on the same
+     filesystem (no copy fallback). Journal of intent first
+     (`<journal>/folder-moves/`), created system folders recorded after
+     creation, library path changes staged in an open SQLite transaction,
+     the rename, the folder layout (paths, sizes, times, inodes) re-checked
+     at the destination, then commit; any failure puts the folder back.
+     Undo reverses it and refuses if the folder changed; an interrupted move
+     is settled from disk + library state before the next run.
+   - Blue: game folders are found automatically; "Add a game folder…",
+     "Add a disc set or file…" (or a typed path) with a filterable system
+     list add others. The preview lists each folder/set and why.
+   - RetroArch: playlist entries inside a moved folder follow it.
+
 9. **Proof before production** — a disposable fixture library drives the
    whole import → identify → preview → approve → move → verify → undo journey
    in the real Blue interface before any further production moves. Production
@@ -115,5 +145,8 @@ docker) it can queue that targeted scan, refusing while another scan runs.
 
 ## Out of scope here / follow-ups
 
-Cross-filesystem moves (refused, as today); gamelist.xml/Pegasus rewriting;
-SNES/NES multicart identity.
+Cross-filesystem moves (refused: folders and files are only ever renamed);
+sets naming files in sub-folders; game-folder recognition beyond PS3 layouts
+(other folder games are picked and given a system); History page listing of
+folder moves (Undo is on the Organise page and the journal is durable);
+gamelist.xml/Pegasus rewriting by EmuWiz; SNES/NES multicart identity.
