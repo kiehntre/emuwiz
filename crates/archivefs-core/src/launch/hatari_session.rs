@@ -44,8 +44,13 @@ pub const STALE_SESSION_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 const SESSION_PREFIX: &str = "session-";
 
-/// Records the Hatari process id so pruning never removes a live session.
+/// Owner record (`"<pid> <start time>"`) of a session or a game's saves:
+/// the running Hatari, or EmuWiz while it prepares the launch. Liveness is
+/// the pid AND its kernel start time, so a reused pid never counts.
 pub const SESSION_PID_FILE: &str = "hatari.pid";
+
+/// Short-lived guard serialising lock acquisition between EmuWiz processes.
+const LOCK_GUARD_FILE: &str = ".lock-guard";
 
 /// Hatari reads this system-wide file before any user configuration, and no
 /// command-line flag switches off the hard-disk, GEMDOS, ACSI or IDE settings
@@ -82,7 +87,10 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// Reads only the allow-listed hardware keys from a Hatari configuration
 /// file (no symlinks, bounded). Unreadable or odd files yield no flags, so
 /// Hatari's defaults for the authorised machine apply.
-pub fn read_hardware_arguments(config_path: &Path) -> Vec<OsString> {
+pub fn read_hardware_arguments(
+    config_path: &Path,
+    authorised: HatariMachineModel,
+) -> Vec<OsString> {
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -101,7 +109,31 @@ pub fn read_hardware_arguments(config_path: &Path) -> Vec<OsString> {
     {
         return Vec::new();
     }
+    // The preferences belong to the machine they were saved for; if the file
+    // now describes another machine, use the authorised machine's defaults.
+    if config_machine(&text) != Some(authorised) {
+        return Vec::new();
+    }
     hardware_arguments(&text)
+}
+
+/// The machine model a `hatari.cfg` text describes (same mapping as the
+/// profile inspection that authorised the launch).
+pub fn config_machine(config_text: &str) -> Option<HatariMachineModel> {
+    let mut section = "";
+    let mut model = None;
+    for line in config_text.lines() {
+        let line = line.trim();
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = name.trim();
+        } else if section == "System"
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "nModelType"
+        {
+            model = crate::patch_manager::hatari_local::machine_model(value);
+        }
+    }
+    model
 }
 
 /// Translates allow-listed `hatari.cfg` hardware keys into Hatari flags.
@@ -387,8 +419,15 @@ fn build_session(
         Some(saves_root) => {
             let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
             let save_dir = saves_root.join(hex);
-            let disk = persistent_disk(&save_dir, source, bytes, digest)?;
-            (disk, Some(save_dir))
+            private_dir(&save_dir)?;
+            acquire_game_lock(&save_dir)?;
+            match persistent_disk(&save_dir, source, bytes, digest) {
+                Ok(disk) => (disk, Some(save_dir)),
+                Err(error) => {
+                    release_game_lock(&save_dir);
+                    return Err(error);
+                }
+            }
         }
         None => (disposable_copy(&media, source, bytes, digest)?, None),
     };
@@ -430,17 +469,16 @@ fn build_session(
 /// The game's persistent working disk: created once from the verified
 /// original bytes, otherwise reused (with the last state backed up first).
 /// An existing working disk is never replaced, so saves are never lost.
+/// The caller must already hold the game's lock ([`acquire_game_lock`]).
 fn persistent_disk(
     save_dir: &Path,
     source: &Path,
     bytes: &[u8],
     digest: &[u8],
 ) -> Result<PathBuf, String> {
-    private_dir(save_dir)?;
-    if session_is_live(save_dir) {
-        return Err("this game is already running in Hatari; close it before playing again".into());
-    }
-    let working = save_dir.join(copy_file_name(source));
+    // A fixed name: saves follow the game's content, not its file name, so a
+    // rename never hides them. Hatari only needs the extension.
+    let working = save_dir.join(format!("disk.{}", disk_extension(source)));
     match std::fs::symlink_metadata(&working) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() || metadata.len() > MAX_DISK_BYTES {
@@ -449,50 +487,105 @@ fn persistent_disk(
                     working.display()
                 ));
             }
+            // Raw images never change size when written; an empty or resized
+            // one is damaged and must not replace the last good backup.
+            let raw = matches!(disk_extension(source).as_str(), "st" | "dim");
+            if metadata.len() == 0 || (raw && metadata.len() != bytes.len() as u64) {
+                return Err(format!(
+                    "the saved disk {} looks damaged (its size changed); nothing was launched \
+                     and the previous good copy (.previous) was kept",
+                    working.display()
+                ));
+            }
             backup_previous(save_dir)?;
         }
-        Err(_) => {
-            let mut out = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&working)
-                .map_err(|e| format!("cannot create the saved disk: {e}"))?;
-            out.write_all(bytes).map_err(|e| e.to_string())?;
-            out.sync_all().map_err(|e| e.to_string())?;
-            drop(out);
-            let written = std::fs::read(&working).map_err(|e| e.to_string())?;
-            if Sha256::digest(&written).as_slice() != digest {
-                let _ = std::fs::remove_file(&working);
-                return Err(
-                    "the saved disk did not match the original; nothing was launched".into(),
-                );
-            }
-        }
+        Err(_) => seed_working_disk(save_dir, &working, bytes, digest)?,
     }
     Ok(working)
 }
 
+fn disk_extension(source: &Path) -> String {
+    let ext: String = source
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    if ext.is_empty() { "st".into() } else { ext }
+}
+
+/// Writes the verified bytes to a temporary file, checks them, and only then
+/// links them into place (never replacing an existing file). A failure at any
+/// point leaves no partial saved disk behind.
+fn seed_working_disk(
+    save_dir: &Path,
+    working: &Path,
+    bytes: &[u8],
+    digest: &[u8],
+) -> Result<(), String> {
+    let temp = save_dir.join(format!("seed-{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let result = (|| {
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temp)
+            .map_err(|e| format!("cannot create the saved disk: {e}"))?;
+        out.write_all(bytes).map_err(|e| e.to_string())?;
+        out.sync_all().map_err(|e| e.to_string())?;
+        drop(out);
+        let written = std::fs::read(&temp).map_err(|e| e.to_string())?;
+        if Sha256::digest(&written).as_slice() != digest {
+            return Err(
+                "the saved disk did not match the original; nothing was launched".to_string(),
+            );
+        }
+        std::fs::hard_link(&temp, working).map_err(|e| format!("cannot create the saved disk: {e}"))
+    })();
+    let _ = std::fs::remove_file(&temp);
+    result
+}
+
 /// Copies every working file (the disk and any Hatari write overlay) to
 /// `<name>.previous` atomically, so one bad session can always be undone.
+/// Never follows a symlink.
 fn backup_previous(save_dir: &Path) -> Result<(), String> {
     let entries = std::fs::read_dir(save_dir).map_err(|e| e.to_string())?;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with("disk-") || name.ends_with(".previous") || name.ends_with(".tmp") {
+        if !name.starts_with("disk") || name.ends_with(".previous") || name.ends_with(".tmp") {
             continue;
         }
-        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+        let Ok(mut from) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(entry.path())
+        else {
             continue;
         };
-        if !metadata.file_type().is_file() {
+        if !from.metadata().is_ok_and(|m| m.file_type().is_file()) {
             continue;
         }
         let temp = save_dir.join(format!("{name}.previous.tmp"));
         let _ = std::fs::remove_file(&temp);
-        std::fs::copy(entry.path(), &temp)
-            .and_then(|_| std::fs::rename(&temp, save_dir.join(format!("{name}.previous"))))
-            .map_err(|e| format!("cannot back up the saved disk: {e}"))?;
+        let copied = (|| {
+            let mut to = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temp)?;
+            std::io::copy(&mut (&mut from).take(MAX_DISK_BYTES + 1), &mut to)?;
+            to.sync_all()?;
+            std::fs::rename(&temp, save_dir.join(format!("{name}.previous")))
+        })();
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("cannot back up the saved disk: {e}"));
+        }
     }
     Ok(())
 }
@@ -550,20 +643,96 @@ pub fn prune_stale_sessions(sessions_root: &Path, max_age: Duration) {
     }
 }
 
-/// True while the Hatari recorded for this session is still running.
-fn session_is_live(session: &Path) -> bool {
-    std::fs::read_to_string(session.join(SESSION_PID_FILE))
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok())
-        .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
+/// `"<pid> <start time>"` for a running (not zombie) process.
+fn process_identity(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    let state = fields.next()?;
+    if matches!(state, "Z" | "X" | "x") {
+        return None;
+    }
+    // Field 22 (starttime); `state` was field 3.
+    let start = fields.nth(18)?;
+    Some(format!("{pid} {start}"))
 }
 
-/// Records the spawned Hatari's pid in its session (best effort).
-pub fn record_session_pid(session: &HatariSession, pid: u32) {
-    let _ = std::fs::write(session.root.join(SESSION_PID_FILE), pid.to_string());
-    if let Some(save_dir) = &session.save_dir {
-        let _ = std::fs::write(save_dir.join(SESSION_PID_FILE), pid.to_string());
+fn owner_is_live(record: &str) -> bool {
+    let mut parts = record.split_whitespace();
+    let (Some(pid), Some(start)) = (
+        parts.next().and_then(|p| p.parse::<u32>().ok()),
+        parts.next(),
+    ) else {
+        return false;
+    };
+    process_identity(pid).is_some_and(|live| live == format!("{pid} {start}"))
+}
+
+/// True while the owner recorded in `dir` is still running.
+fn session_is_live(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join(SESSION_PID_FILE)).is_ok_and(|record| owner_is_live(&record))
+}
+
+/// Atomically replaces `dir`'s owner record (temp file + rename).
+fn write_owner(dir: &Path, record: &str) -> std::io::Result<()> {
+    let temp = dir.join(format!("{SESSION_PID_FILE}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)?;
+    out.write_all(record.as_bytes())?;
+    out.sync_all()?;
+    std::fs::rename(&temp, dir.join(SESSION_PID_FILE))
+}
+
+/// Takes the game's save lock for this EmuWiz process, or refuses when a
+/// live Hatari (or another EmuWiz preparing a launch) already owns it. A
+/// stale record (owner exited, pid reused, zombie) is replaced. Check and
+/// take happen under an exclusive `flock`, so two launches never both win.
+pub fn acquire_game_lock(save_dir: &Path) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let guard = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(save_dir.join(LOCK_GUARD_FILE))
+        .map_err(|e| format!("cannot lock this game's saves: {e}"))?;
+    // SAFETY: flock on a descriptor this function owns; released on drop.
+    if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err("cannot lock this game's saves".into());
     }
+    if session_is_live(save_dir) {
+        return Err("this game is already running in Hatari; close it before playing again".into());
+    }
+    let me = process_identity(std::process::id())
+        .ok_or("cannot identify this EmuWiz process to lock the game's saves")?;
+    write_owner(save_dir, &me).map_err(|e| format!("cannot lock this game's saves: {e}"))
+}
+
+/// Drops a lock this process took when the launch did not start.
+pub fn release_game_lock(save_dir: &Path) {
+    let lock = save_dir.join(SESSION_PID_FILE);
+    if std::fs::read_to_string(&lock).ok().as_deref()
+        == process_identity(std::process::id()).as_deref()
+    {
+        let _ = std::fs::remove_file(lock);
+    }
+}
+
+/// Hands the session and the game's save lock to the spawned Hatari.
+pub fn record_session_pid(session: &HatariSession, pid: u32) -> Result<(), String> {
+    let record = process_identity(pid).unwrap_or_else(|| format!("{pid} 0"));
+    let _ = write_owner(&session.root, &record);
+    if let Some(save_dir) = &session.save_dir {
+        write_owner(save_dir, &record)
+            .map_err(|e| format!("cannot record the running game's save lock: {e}"))?;
+    }
+    Ok(())
 }
 
 fn make_tree_removable(path: &Path) -> std::io::Result<()> {

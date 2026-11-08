@@ -278,15 +278,28 @@ fn spawn_hatari_session(
     let session =
         crate::launch::hatari_session::prepare_session_with(command, sessions_root, options)
             .map_err(std::io::Error::other)?;
-    let process = crate::launch::process_spawn::spawn_watched_process_with_environment(
+    let spawned = crate::launch::process_spawn::spawn_watched_process_with_environment(
         &PreparedProcessCommand {
             executable: command.executable.clone(),
             arguments: session.arguments.clone(),
             working_directory: Some(session.working_directory.clone()),
         },
         &session.environment,
-    )?;
-    crate::launch::hatari_session::record_session_pid(&session, process.pid);
+    );
+    let process = match spawned {
+        Ok(process) => process,
+        Err(error) => {
+            if let Some(save_dir) = &session.save_dir {
+                crate::launch::hatari_session::release_game_lock(save_dir);
+            }
+            return Err(error);
+        }
+    };
+    // Hatari is already running on the saved disk; a lock-record failure is
+    // logged but must not orphan the running game.
+    if let Err(error) = crate::launch::hatari_session::record_session_pid(&session, process.pid) {
+        eprintln!("archivefs: {error}");
+    }
     Ok(process)
 }
 
@@ -321,6 +334,7 @@ pub fn preflight_and_launch_hatari(
             saves_root: Some(&saves_root),
             hardware: crate::launch::hatari_session::read_hardware_arguments(
                 &request.expected_config_path,
+                request.expected_machine_model,
             ),
         },
     )

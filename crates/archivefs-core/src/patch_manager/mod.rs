@@ -101,7 +101,7 @@ mod gamehacking_provider;
 mod gamehacking_shared;
 mod gamehacking_wii_provider;
 mod gecko_document;
-mod hatari_local;
+pub(crate) mod hatari_local;
 mod import_safety;
 mod local_cheat_install;
 mod local_cheat_install_dolphin;

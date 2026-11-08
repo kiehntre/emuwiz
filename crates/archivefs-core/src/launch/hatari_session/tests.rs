@@ -209,7 +209,7 @@ fn a_running_session_is_never_pruned_and_names_keep_their_extension() {
     let root = dir.path().join("s");
     let cmd = command(dir.path(), "g.st", &[1u8; 1024]);
     let live = prepare_session(&cmd, &root).unwrap();
-    record_session_pid(&live, std::process::id());
+    record_session_pid(&live, std::process::id()).unwrap();
     std::thread::sleep(Duration::from_millis(20));
     prune_stale_sessions(&root, Duration::from_millis(1));
     assert!(live.root.exists(), "this process is alive");
@@ -290,6 +290,7 @@ fn saves_persist_per_game_and_the_previous_state_is_kept() {
     // The game saves: the working disk changes; the original never does.
     std::fs::set_permissions(&working, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::write(&working, [6u8; 2048]).unwrap();
+    release_game_lock(first.save_dir.as_ref().unwrap()); // the first game exited
     let second = prepare_session_with(&cmd, &dir.path().join("s"), &options).unwrap();
     assert_eq!(second.disk_copy, working);
     assert_eq!(
@@ -308,7 +309,7 @@ fn saves_persist_per_game_and_the_previous_state_is_kept() {
     );
 
     // While that game runs, a second launch of it is refused.
-    record_session_pid(&second, std::process::id());
+    record_session_pid(&second, std::process::id()).unwrap();
     let busy = prepare_session_with(&cmd, &dir.path().join("s"), &options).unwrap_err();
     assert!(busy.contains("already running"), "{busy}");
 }
@@ -382,4 +383,80 @@ fn only_validated_hardware_preferences_are_carried_over() {
         .collect();
     let at = |flag: &str| all.iter().position(|a| a == flag).unwrap();
     assert!(at("--machine") < at("--monitor") && at("--monitor") < at("--disk-a"));
+}
+
+#[test]
+fn saves_follow_the_game_content_not_its_file_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let saves = dir.path().join("saves");
+    let options = SessionOptions {
+        saves_root: Some(&saves),
+        ..SessionOptions::default()
+    };
+    let first = command(dir.path(), "Old Name.st", &[5u8; 2048]);
+    let session = prepare_session_with(&first, &dir.path().join("s"), &options).unwrap();
+    release_game_lock(session.save_dir.as_ref().unwrap());
+    std::fs::write(&session.disk_copy, [8u8; 2048]).unwrap();
+    // Same bytes under a new name (a rename or duplicate): same saved disk.
+    let renamed = command(dir.path(), "New Name.st", &[5u8; 2048]);
+    let again = prepare_session_with(&renamed, &dir.path().join("s"), &options).unwrap();
+    assert_eq!(again.disk_copy, session.disk_copy);
+    assert_eq!(std::fs::read(&again.disk_copy).unwrap(), vec![8u8; 2048]);
+}
+
+#[test]
+fn a_damaged_saved_disk_is_refused_and_the_good_backup_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let saves = dir.path().join("saves");
+    let options = SessionOptions {
+        saves_root: Some(&saves),
+        ..SessionOptions::default()
+    };
+    let cmd = command(dir.path(), "g.st", &[5u8; 2048]);
+    let first = prepare_session_with(&cmd, &dir.path().join("s"), &options).unwrap();
+    let save_dir = first.save_dir.clone().unwrap();
+    release_game_lock(&save_dir);
+    let second = prepare_session_with(&cmd, &dir.path().join("s"), &options).unwrap();
+    release_game_lock(&save_dir);
+    let previous = save_dir.join("disk.st.previous");
+    assert_eq!(std::fs::read(&previous).unwrap(), vec![5u8; 2048]);
+    // A crashed session truncated the working disk.
+    std::fs::write(&second.disk_copy, [1u8; 100]).unwrap();
+    let refused = prepare_session_with(&cmd, &dir.path().join("s"), &options).unwrap_err();
+    assert!(refused.contains("looks damaged"), "{refused}");
+    assert_eq!(std::fs::read(&previous).unwrap(), vec![5u8; 2048]);
+    // ...and the refusal released the lock.
+    assert!(!session_is_live(&save_dir));
+}
+
+#[test]
+fn a_stale_or_reused_pid_never_blocks_the_game() {
+    let dir = tempfile::tempdir().unwrap();
+    let saves = dir.path().join("saves");
+    let options = SessionOptions {
+        saves_root: Some(&saves),
+        ..SessionOptions::default()
+    };
+    let cmd = command(dir.path(), "g.st", &[5u8; 2048]);
+    let first = prepare_session_with(&cmd, &dir.path().join("s"), &options).unwrap();
+    let save_dir = first.save_dir.clone().unwrap();
+    // A live pid (this process) but the wrong start time: a reused pid.
+    std::fs::write(
+        save_dir.join(SESSION_PID_FILE),
+        format!("{} 1", std::process::id()),
+    )
+    .unwrap();
+    assert!(prepare_session_with(&cmd, &dir.path().join("s"), &options).is_ok());
+    // While this process holds it for real, a second launch is refused.
+    let busy = prepare_session_with(&cmd, &dir.path().join("s"), &options).unwrap_err();
+    assert!(busy.contains("already running"), "{busy}");
+}
+
+#[test]
+fn hardware_preferences_apply_only_to_the_machine_they_were_saved_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("hatari.cfg");
+    std::fs::write(&cfg, "[System]\nnModelType = 0\nnCpuFreq = 16\n").unwrap();
+    assert!(!read_hardware_arguments(&cfg, HatariMachineModel::St).is_empty());
+    assert!(read_hardware_arguments(&cfg, HatariMachineModel::Falcon).is_empty());
 }
