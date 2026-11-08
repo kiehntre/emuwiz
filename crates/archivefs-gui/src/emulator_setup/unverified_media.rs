@@ -16,8 +16,7 @@ use archivefs_core::launch::{
     LaunchPlan, LaunchReadiness, LaunchWarning, LaunchWarningKind, ResolvedIdentity,
 };
 
-/// The only platform and extensions this path accepts.
-const ZX_PLATFORM: &str = "ZX Spectrum";
+use archivefs_core::launch::unverified_media::ZX_PLATFORM;
 
 pub(crate) const WARNING_TEXT: &str = "Game not identified: EmuWiz confirmed this is a valid ZX Spectrum tape image but could not confirm which game it is. It will still play; catalogue (DAT) verification is optional.";
 
@@ -33,7 +32,18 @@ pub(crate) fn resolve(path: &Path, platform_hint: &str) -> Option<ResolvedIdenti
 /// blocker, never touches a blocked candidate) and refreshes the summary.
 pub(crate) fn apply_warning(plan: &mut LaunchPlan) {
     for candidate in &mut plan.candidates {
-        if candidate.readiness == LaunchReadiness::Blocked {
+        // Only the RetroArch route was approved; standalone routes keep their
+        // own (stricter) rules and never receive the warning.
+        if candidate.readiness == LaunchReadiness::Blocked
+            || !matches!(
+                candidate.target,
+                archivefs_core::launch::LaunchTarget::RetroArchCore { .. }
+            )
+            || candidate
+                .warnings
+                .iter()
+                .any(|w| w.kind == LaunchWarningKind::IdentityUnverified)
+        {
             continue;
         }
         candidate.warnings.push(LaunchWarning::new(

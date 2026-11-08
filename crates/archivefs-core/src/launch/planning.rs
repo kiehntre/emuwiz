@@ -198,14 +198,23 @@ impl LaunchCandidate {
         match self.readiness {
             LaunchReadiness::Ready => self.warnings.is_empty(),
             LaunchReadiness::ReadyWithWarnings => {
-                // Only the firmware warning needs unverified-but-present
-                // firmware behind it; the identity warning stands alone.
+                // The firmware warning needs unverified-but-present firmware
+                // behind it. Without it (the identity warning on its own) the
+                // firmware must already be fine: never missing or unknown.
                 let firmware_warned = self
                     .warnings
                     .iter()
                     .any(|warning| warning.kind == LaunchWarningKind::FirmwarePresentUnverified);
+                let firmware_ok = if firmware_warned {
+                    self.firmware == FirmwareReadiness::PresentUnverified
+                } else {
+                    matches!(
+                        self.firmware,
+                        FirmwareReadiness::NotRequired | FirmwareReadiness::Verified
+                    )
+                };
                 !self.warnings.is_empty()
-                    && (!firmware_warned || self.firmware == FirmwareReadiness::PresentUnverified)
+                    && firmware_ok
                     && self
                         .warnings
                         .iter()
@@ -982,6 +991,15 @@ mod identity_unverified_eligibility_tests {
             "fixture",
         ));
         assert!(!blocked.retroarch_play_eligible());
+        // The identity warning never waives missing or unknown firmware.
+        for firmware in [FirmwareReadiness::Missing, FirmwareReadiness::Unknown] {
+            let c = candidate(
+                firmware,
+                LaunchReadiness::ReadyWithWarnings,
+                vec![warn(LaunchWarningKind::IdentityUnverified)],
+            );
+            assert!(!c.retroarch_play_eligible(), "{firmware:?}");
+        }
     }
 
     #[test]

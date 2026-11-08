@@ -426,7 +426,7 @@ pub fn preflight_retroarch_launch(
         }
         identity
     } else if unverified_zx_tape {
-        match super::unverified_media::zx_tape_identity(content_path) {
+        match super::unverified_media::zx_tape_identity_fresh(content_path) {
             Some(identity) if identity.game_key == request.expected_game_key => {
                 CanonicalIdentityStatus::Resolved(identity)
             }
@@ -657,6 +657,7 @@ pub fn preflight_retroarch_launch(
     }
 
     command.snapshot_evidence = snapshot_evidence;
+    command.unverified_identity = unverified_zx_tape;
     Ok(command)
 }
 
@@ -1073,8 +1074,10 @@ pub(crate) fn spawn_retroarch_guarded(
     }
     let mut backend_stamps = None;
     let current_snapshot = if command.selection.platform_id == "ZX Spectrum"
+        && command.unverified_identity
         && command.snapshot_evidence.is_none()
-        && super::unverified_media::zx_tape_identity(&command.selection.content_path).is_some()
+        && super::unverified_media::zx_tape_identity_fresh(&command.selection.content_path)
+            .is_some()
     {
         // Owner-approved unverified tape launch: no DAT snapshot exists, and
         // the tape was just re-validated from the file itself.
