@@ -115,6 +115,7 @@ pub mod fsuae_execution;
 pub mod fuse_command;
 pub mod hatari_command;
 pub mod hatari_execution;
+pub mod hatari_session;
 pub mod input_projection;
 pub mod integration;
 pub mod mame_command;

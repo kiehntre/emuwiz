@@ -72,6 +72,7 @@ mod sameboy;
 pub(crate) mod saturn_core;
 mod scummvm_profile;
 mod snes9x;
+pub(crate) mod hatari;
 mod stella;
 pub(crate) mod vice;
 pub(crate) mod vita3k;
@@ -531,6 +532,7 @@ impl TypedLaunchRequest {
             Self::Standalone(StandaloneLaunchRequest::Mgba(_)) => vec![mgba::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Rmg(_)) => vec![rmg::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Stella(_)) => vec![stella::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Hatari(_)) => vec![hatari::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Snes9x(_)) => vec![snes9x::LIMITATION],
             _ => Vec::new(),
         }
@@ -548,6 +550,7 @@ impl TypedLaunchRequest {
                 StandaloneLaunchRequest::Mgba(_)
                 | StandaloneLaunchRequest::Rmg(_)
                 | StandaloneLaunchRequest::Stella(_)
+                | StandaloneLaunchRequest::Hatari(_)
                 | StandaloneLaunchRequest::Snes9x(_),
             ) => "Ready, local launch identity",
             _ => "Ready, compatibility unverified",
@@ -817,6 +820,15 @@ pub(crate) fn gamer_resolver_notice(
 /// carries the exact typed request that the selected adapter preflights again
 /// before spawning anything.
 pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction {
+    // Atari ST: a single, fully preflighted Hatari profile launches through
+    // the isolated disposable session (see `hatari`).
+    if let LaunchReadinessInput::AtariSt(snapshot) = input
+        && let Some(request) = snapshot.launch_request()
+    {
+        return GamerPlayAction::Launch(Box::new(TypedLaunchRequest::Standalone(
+            StandaloneLaunchRequest::Hatari(request),
+        )));
+    }
     let LaunchReadinessInput::Plan {
         plan,
         retroarch,
@@ -1254,6 +1266,7 @@ pub(crate) enum StandaloneProcess {
     Mgba(archivefs_core::launch::process_spawn::WatchedProcess),
     Desmume(archivefs_core::launch::process_spawn::WatchedProcess),
     Stella(archivefs_core::launch::process_spawn::WatchedProcess),
+    Hatari(archivefs_core::launch::process_spawn::WatchedProcess),
     Snes9x(archivefs_core::launch::process_spawn::WatchedProcess),
     SameBoy(archivefs_core::launch::LaunchedSameBoyProcess),
     Rmg(archivefs_core::launch::process_spawn::WatchedProcess),
@@ -1533,6 +1546,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Mgba(p) => p.poll().is_some(),
                     StandaloneProcess::Desmume(p) => p.poll().is_some(),
                     StandaloneProcess::Stella(p) => p.poll().is_some(),
+                    StandaloneProcess::Hatari(p) => p.poll().is_some(),
                     StandaloneProcess::Snes9x(p) => p.poll().is_some(),
                     StandaloneProcess::SameBoy(p) => p.poll().is_some(),
                     StandaloneProcess::Rmg(p) => p.poll().is_some(),
@@ -1607,6 +1621,9 @@ impl StandaloneLaunchState {
             }
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Stella(process)))) => {
                 process.exit_report().and_then(stella::exit_failure)
+            }
+            Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Hatari(process)))) => {
+                process.exit_report().and_then(hatari::exit_failure)
             }
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Snes9x(process)))) => {
                 process.exit_report().and_then(snes9x::exit_failure)
@@ -1793,6 +1810,7 @@ pub(crate) enum StandaloneLaunchRequest {
     Mgba(mgba::Request),
     Desmume(desmume::Request),
     Stella(stella::Request),
+    Hatari(hatari::Request),
     Snes9x(snes9x::Request),
     SameBoy(sameboy::Request),
     Rmg(rmg::Request),
@@ -1848,6 +1866,7 @@ impl StandaloneLaunchRequest {
             Self::Mgba(_) => "mGBA",
             Self::Desmume(_) => "DeSmuME",
             Self::Stella(_) => "Stella",
+            Self::Hatari(_) => "Hatari",
             Self::Snes9x(_) => "Snes9x",
             Self::SameBoy(_) => "SameBoy",
             Self::Rmg(_) => "RMG",
@@ -1881,6 +1900,7 @@ impl StandaloneLaunchRequest {
             Self::Mgba(r) => r.key(),
             Self::Desmume(r) => r.key(),
             Self::Stella(r) => r.key(),
+            Self::Hatari(r) => r.key(),
             Self::Snes9x(r) => r.key(),
             Self::SameBoy(r) => r.key(),
             Self::Rmg(r) => r.key(),
@@ -1925,6 +1945,7 @@ impl StandaloneLaunchRequest {
             Self::Mgba(r) => r.execute().map(StandaloneProcess::Mgba),
             Self::Desmume(r) => r.execute().map(StandaloneProcess::Desmume),
             Self::Stella(r) => r.execute().map(StandaloneProcess::Stella),
+            Self::Hatari(r) => r.execute().map(StandaloneProcess::Hatari),
             Self::Snes9x(r) => r.execute().map(StandaloneProcess::Snes9x),
             Self::SameBoy(r) => r.execute().map(StandaloneProcess::SameBoy),
             Self::Rmg(r) => r.execute().map(StandaloneProcess::Rmg),
@@ -5723,6 +5744,13 @@ pub(crate) fn show_standalone_launch_action(
                     "Exited"
                 }
             }
+            Some(StandaloneLaunchStage::Exited(StandaloneProcess::Hatari(p))) => {
+                if p.exit_report().and_then(hatari::exit_failure).is_some() {
+                    "Failed"
+                } else {
+                    "Exited"
+                }
+            }
             Some(StandaloneLaunchStage::Exited(StandaloneProcess::Snes9x(p))) => {
                 if p.exit_report().and_then(snes9x::exit_failure).is_some() {
                     "Failed"
@@ -5805,6 +5833,9 @@ pub(crate) fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Stella(p)))) => {
                 stella::show_running(ui, p);
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Hatari(p)))) => {
+                hatari::show_running(ui, p);
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Snes9x(p)))) => {
                 snes9x::show_running(ui, p);
             }
@@ -5858,6 +5889,9 @@ pub(crate) fn show_standalone_launch_action(
                 }
                 if let StandaloneProcess::Stella(p) = process {
                     stella::show_exited(ui, p);
+                }
+                if let StandaloneProcess::Hatari(p) = process {
+                    hatari::show_exited(ui, p);
                 }
                 if let StandaloneProcess::Snes9x(p) = process {
                     snes9x::show_exited(ui, p);

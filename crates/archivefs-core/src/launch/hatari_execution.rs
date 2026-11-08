@@ -10,9 +10,7 @@ use crate::launch::planning::{
     CandidatePreference, CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind,
     LaunchContentRef, LaunchTarget,
 };
-use crate::launch::process_spawn::{
-    CapturedFileIdentity, PreparedProcessCommand, WatchedProcess, spawn_watched_process,
-};
+use crate::launch::process_spawn::{CapturedFileIdentity, PreparedProcessCommand, WatchedProcess};
 use crate::launch::readiness::{FirmwareReadiness, LaunchReadiness};
 use crate::patch_manager::{
     HatariIdentityState, HatariMachineModel, HatariProfileDiscoveryRoots,
@@ -253,12 +251,31 @@ pub fn preflight_hatari_launch(
     }
 }
 
+/// Spawns Hatari inside a private, disposable session: fresh `HOME`/`XDG_*`,
+/// a read-only copy of the selected disk, drive B off, floppy write
+/// protection on, and no inherited configuration. The command's own
+/// `arguments` are a preview and are never passed through.
 pub fn spawn_hatari(command: &HatariCommand) -> std::io::Result<WatchedProcess> {
-    spawn_watched_process(&PreparedProcessCommand {
-        executable: command.executable.clone(),
-        arguments: command.arguments.clone(),
-        working_directory: command.working_directory.clone(),
-    })
+    let sessions_root = crate::app_dirs::data_dir()
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .join("hatari-sessions");
+    spawn_hatari_in(command, &sessions_root)
+}
+
+pub fn spawn_hatari_in(
+    command: &HatariCommand,
+    sessions_root: &Path,
+) -> std::io::Result<WatchedProcess> {
+    let session = crate::launch::hatari_session::prepare_session(command, sessions_root)
+        .map_err(std::io::Error::other)?;
+    crate::launch::process_spawn::spawn_watched_process_with_environment(
+        &PreparedProcessCommand {
+            executable: command.executable.clone(),
+            arguments: session.arguments.clone(),
+            working_directory: Some(session.working_directory.clone()),
+        },
+        &session.environment,
+    )
 }
 pub fn preflight_and_launch_hatari(
     request: &HatariLaunchRequest,
