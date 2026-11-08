@@ -76,6 +76,7 @@ mod nkit;
 mod onboarding;
 mod optical_compare;
 mod organisation;
+mod organise;
 mod osk;
 mod pad_mouse;
 mod pad_shell;
@@ -2594,6 +2595,16 @@ impl eframe::App for App {
         // no longer showing; reload so Game Details reads it.
         self.game_dat_check.poll();
         self.folder_check.poll();
+        self.folder_check.organise.poll();
+        if self.load_job.is_none() && self.folder_check.organise.take_library_changed() {
+            // Moved games have new paths: reload, and check again from fresh.
+            reload_library = true;
+            self.folder_check.ran = false;
+            self.folder_check.findings.clear();
+            self.folder_check.unknown.clear();
+            self.folder_check.candidates.clear();
+            self.folder_check.next = 0;
+        }
         self.hasheous_check.poll();
         if self.load_job.is_none() && self.game_dat_check.take_saved() {
             reload_library = true;

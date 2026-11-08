@@ -1568,6 +1568,9 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::Nes, "nes") => Some("nes"),
         (IdentityPlatform::Nes, "fds") => Some("fds"),
         (IdentityPlatform::Nes, "unf") => Some("unf"),
+        // No-Intro headerless dump: cores supply the mapper from their own
+        // game database, so it is staged as `.nes` (bytes unchanged).
+        (IdentityPlatform::Nes, "unh") => Some("unh"),
         (IdentityPlatform::GameBoy, "gb") => Some("gb"),
         (IdentityPlatform::GameBoyColor, "gb") => Some("gb"),
         (IdentityPlatform::GameBoyColor, "gbc") => Some("gbc"),

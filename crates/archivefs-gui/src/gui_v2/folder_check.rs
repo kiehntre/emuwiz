@@ -1,16 +1,18 @@
-//! Smart ROM Folder Check in Blue (phases 1-2, read only).
+//! "Organise my games" in Blue: identify, preview, approve, move, verify.
 //!
-//! Compares each cartridge game's bytes with the catalogues and with a few
-//! content structures, and lists games whose evidence points at a different
-//! system than the folder's. It only looks: nothing is assigned, moved or
-//! saved. Results live in memory; dismissal lasts for this session only (a
-//! persisted dismissal would need a new preferences field, which this change
-//! deliberately avoids). Changing a system still goes through the existing
-//! Review identity -> Choose system -> manual assignment path.
+//! Checking compares each game's bytes with every installed catalogue, with
+//! validated headers and with calibrated content checks, so a game is judged
+//! on its content and never on its folder, name or extension. Checking only
+//! reads. Confirmed games (a catalogue hash, or a calibrated validator that
+//! establishes the system without identifying the game) can then be moved to
+//! their system's folder after one approval of a readable preview; games with
+//! no identifiable system can go to `Unnamed/Unknown/` when the person asks.
+//! Probable and Ambiguous results never move: they are shown with their
+//! evidence and the person can Choose system, Recheck or Leave here.
 
 use super::{App, library::Game};
 use archivefs_core::folder_platform_check::{
-    self as fpc, Candidate, Catalogue, DEFAULT_RUN_CAP, Finding, RunOutput, Tier,
+    self as fpc, Candidate, Catalogue, Finding, RunOutput, Tier, UnknownResult,
 };
 use archivefs_core::platform::display_name_for;
 use eframe::egui;
@@ -24,8 +26,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 mod tests;
 
 pub(super) const READ_ONLY_NOTE: &str =
-    "This only looks for mismatches. Nothing is changed or moved.";
-pub(super) const KNOWN_LIMITS: &str = "Known limits: a renamed or moved file gets a new catalogue id and does not keep a system you chose; removing a source folder deletes the systems recorded for it. The Probable group is a heuristic based on file structure, not a catalogue match.";
+    "Checking only reads. Nothing moves until you review the preview and approve it.";
+pub(super) const KNOWN_LIMITS: &str = "Games EmuWiz moves keep their records, favourites and history, and Undo puts them back. A system you choose yourself is remembered by the game's content, so a renamed or moved file, a rescan or a rebuilt library keeps it. The Probable group is a heuristic based on file structure, not a catalogue match, and never moves on its own. Only single cartridge files and single-file ZIPs are read; other games keep the system the scan gave them.";
 
 /// Why changing the system is not the same as making a game playable.
 pub(super) fn playable_note(detected: &str, has_unh: bool) -> String {
@@ -35,7 +37,7 @@ pub(super) fn playable_note(detected: &str, has_unh: bool) -> String {
     // Explanatory wording only: shown when the chosen system is NES and the
     // game's file or ZIP member really has a .unh extension.
     if detected == "NES" && has_unh {
-        text.push_str(" For example, NES \".unh\" unheadered images are not accepted by Blue's NES identity or launch yet, so such a game stays unlaunchable after the change.");
+        text.push_str(" NES \".unh\" unheadered images are staged for the emulator as \".nes\" without changing their bytes; the emulator supplies the mapper from its own game database, so a game it does not know (some homebrew) may still not start.");
     }
     text
 }
@@ -73,7 +75,7 @@ pub(super) fn system_change_preview(
         None => lines.push("No folder check result for this game.".into()),
     }
     lines.push(playable_note(selected, finding.is_some_and(|f| f.has_unh)));
-    lines.push("A renamed or moved file gets a new catalogue id and does not keep this choice; removing a source folder deletes the systems recorded for it.".into());
+    lines.push("Your choice is remembered by the game's content, so a rename, a move, a rescan or a rebuilt library keeps it. Organise my games then offers to move it to that system's folder.".into());
     lines.push("Your choice outranks the folder name for this one game and is saved only when you confirm. No game file is changed.".into());
     lines
 }
@@ -171,7 +173,7 @@ pub(super) fn progress_text(
     let mut text = if stopped_early {
         format!("Stopped early - {done} of {total} checked.")
     } else {
-        format!("Checked {done} of {total} cartridge games (up to {DEFAULT_RUN_CAP} per run).")
+        format!("Checked {done} of {total} games.")
     };
     if unreadable > 0 {
         text.push_str(&format!(" {unreadable} could not be read."));
@@ -210,17 +212,26 @@ pub(super) fn grouped(findings: &[Finding]) -> BTreeMap<String, BTreeMap<Tier, V
     out
 }
 
+/// Cartridge games (judged against every system) and games with no system
+/// at all (so they can be identified, or offered as Unknown). A system the
+/// person chose is never second-guessed here.
 pub(super) fn candidates_of(games: &[Game]) -> Vec<Candidate> {
     let cartridge = fpc::cartridge_platforms();
     let mut out: Vec<Candidate> = games
         .iter()
+        .filter(|g| g.archive.platform_source.as_deref() != Some("manual"))
         .filter_map(|g| {
-            let assigned = archivefs_core::canonical_platform_for_alias(&g.platform)?;
-            cartridge.contains(&assigned).then(|| Candidate {
+            let assigned = archivefs_core::canonical_platform_for_alias(&g.platform);
+            let assigned = match assigned {
+                Some(platform) if cartridge.contains(&platform) => platform.to_string(),
+                Some(_) => return None,
+                None => String::new(),
+            };
+            Some(Candidate {
                 archive_id: g.archive.id,
                 title: g.title.clone(),
                 path: g.archive.absolute_path.clone(),
-                assigned: assigned.to_string(),
+                assigned,
                 assigned_source: g.archive.platform_source.clone(),
             })
         })
@@ -247,6 +258,17 @@ pub(super) struct State {
     pub error: Option<String>,
     pub ran: bool,
     pub dismissed: HashSet<(PathBuf, u64)>,
+    /// Checked games with no recorded system and no platform evidence.
+    pub unknown: Vec<UnknownResult>,
+    /// Games the person chose to leave where they are (this session).
+    pub left_here: HashSet<i64>,
+    pub organise: super::organise::State,
+    pub preferences: super::organise::Preferences,
+    /// Run automatic organising when the current check finishes.
+    auto_after_run: bool,
+    /// The running pass is a recheck of a few games, not the next batch.
+    rechecking: bool,
+    pub preferences_loaded: bool,
     catalogues: Option<Arc<Vec<Catalogue>>>,
     progress: Arc<AtomicUsize>,
     cancel: Option<Arc<AtomicBool>>,
@@ -281,7 +303,7 @@ impl State {
         }
     }
 
-    /// Starts one capped pass over the next games. Read only.
+    /// Checks every remaining game (Cancel stops between games). Read only.
     pub(super) fn start(&mut self, games: &[Game]) {
         if self.busy() {
             return;
@@ -289,14 +311,44 @@ impl State {
         if !self.ran {
             *self = Self {
                 dismissed: std::mem::take(&mut self.dismissed),
+                left_here: std::mem::take(&mut self.left_here),
+                organise: std::mem::take(&mut self.organise),
+                preferences: std::mem::take(&mut self.preferences),
                 candidates: candidates_of(games),
                 ran: true,
                 ..Default::default()
             };
         }
-        self.stopped_early = false;
+        self.auto_after_run = self.preferences.auto_organise_confirmed;
+        self.rechecking = false;
         let candidates = self.candidates.clone();
         let start = self.next;
+        self.spawn_check(candidates, start);
+    }
+
+    /// Rechecks the given games with the current catalogues and detectors,
+    /// replacing their earlier results. Read only.
+    pub(super) fn recheck(&mut self, ids: &HashSet<i64>) {
+        if self.busy() {
+            return;
+        }
+        let subset: Vec<Candidate> = self
+            .candidates
+            .iter()
+            .filter(|c| ids.contains(&c.archive_id))
+            .cloned()
+            .collect();
+        if subset.is_empty() {
+            return;
+        }
+        self.rechecking = true;
+        // A recheck after new catalogues must not reuse the cached list.
+        self.catalogues = None;
+        self.spawn_check(subset, 0);
+    }
+
+    fn spawn_check(&mut self, candidates: Vec<Candidate>, start: usize) {
+        self.stopped_early = false;
         let known = self.catalogues.clone();
         let progress = Arc::new(AtomicUsize::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -325,7 +377,7 @@ impl State {
                 let output = fpc::check_candidates(
                     &candidates,
                     start,
-                    DEFAULT_RUN_CAP,
+                    candidates.len().saturating_sub(start),
                     &catalogues,
                     &trusted,
                     &cancel,
@@ -352,15 +404,40 @@ impl State {
                             self.catalogues = Some(catalogues);
                         }
                         self.stopped_early = out.cancelled;
-                        self.too_large += out.too_large;
-                        self.skipped += out.skipped;
-                        self.next += out.checked;
-                        self.checked += out.checked;
-                        self.unreadable += out.unreadable;
-                        for (folder, n) in out.checked_per_folder {
-                            *self.checked_per_folder.entry(folder).or_default() += n;
+                        if !std::mem::take(&mut self.rechecking) {
+                            self.too_large += out.too_large;
+                            self.skipped += out.skipped;
+                            self.next += out.checked;
+                            self.checked += out.checked;
+                            self.unreadable += out.unreadable;
+                            for (folder, n) in out.checked_per_folder.clone() {
+                                *self.checked_per_folder.entry(folder).or_default() += n;
+                            }
                         }
+                        // A recheck replaces the earlier result for that game.
+                        let rechecked: HashSet<i64> = out
+                            .findings
+                            .iter()
+                            .map(|f| f.archive_id)
+                            .chain(out.unknown.iter().map(|u| u.archive_id))
+                            .collect();
+                        self.findings.retain(|f| !rechecked.contains(&f.archive_id));
+                        self.unknown.retain(|u| !rechecked.contains(&u.archive_id));
                         self.findings.extend(out.findings);
+                        self.unknown.extend(out.unknown);
+                        if std::mem::take(&mut self.auto_after_run) && !out.cancelled {
+                            let confirmed: Vec<Finding> = self
+                                .findings
+                                .iter()
+                                .filter(|f| {
+                                    f.tier.is_movable() && !self.left_here.contains(&f.archive_id)
+                                })
+                                .cloned()
+                                .collect();
+                            if !confirmed.is_empty() {
+                                self.organise.plan(confirmed, Vec::new(), Vec::new(), true);
+                            }
+                        }
                     }
                     Err(error) => self.error = Some(error),
                 }
@@ -409,23 +486,38 @@ impl App {
 
     pub(in crate::gui_v2) fn folder_check_page(&mut self, ui: &mut egui::Ui) {
         self.folder_check.poll();
-        if self.folder_check.busy() {
+        self.folder_check.organise.poll();
+        if !self.folder_check.preferences_loaded {
+            self.folder_check.preferences_loaded = true;
+            self.folder_check.preferences =
+                super::organise::load_preferences(super::organise::preferences_path().as_deref());
+        }
+        let busy = self.folder_check.busy();
+        let organising = self.folder_check.organise.busy();
+        if busy || organising {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
-        ui.label(READ_ONLY_NOTE);
-        ui.small("Evidence tiers: Confirmed = the file's SHA-1 is in a catalogue for another system and nothing contradicts it. Probable = the file's structure points at another system but no catalogue hash matched. Ambiguous = signals conflict. A file name or extension alone is never evidence.");
+        ui.label("Select a folder by adding it as a source in Setup; EmuWiz then identifies every game by its content, shows where each one belongs, and moves only what you approve.");
+        ui.small(READ_ONLY_NOTE);
+        ui.small("Results: Confirmed = the game's SHA-1 is in a catalogue for that system. Platform confirmed = a calibrated content check establishes the system, though not the exact game. Probable = only the file structure suggests a system. Ambiguous = the evidence disagrees. Unknown = nothing matched any system. A file name, extension or folder alone is never evidence, and no catalogue match never means \"unknown system\".");
         ui.small(KNOWN_LIMITS);
         ui.add_space(6.0);
-        let busy = self.folder_check.busy();
         ui.horizontal(|ui| {
-            let label = if self.folder_check.ran {
-                "Check the next games"
+            let label = if !self.folder_check.ran {
+                "1. Identify my games"
+            } else if self.folder_check.has_more() {
+                "Continue identifying"
             } else {
-                "Run folder check"
+                "Identify again"
             };
-            let can = !busy && (!self.folder_check.ran || self.folder_check.has_more());
-            if ui.add_enabled(can, egui::Button::new(label)).clicked() {
+            if ui
+                .add_enabled(!busy && !organising, egui::Button::new(label))
+                .clicked()
+            {
+                if self.folder_check.ran && !self.folder_check.has_more() {
+                    self.folder_check.ran = false;
+                }
                 let games = self.library.games.clone();
                 self.folder_check.start(&games);
             }
@@ -433,6 +525,19 @@ impl App {
                 self.folder_check.cancel();
             }
         });
+        let mut auto = self.folder_check.preferences.auto_organise_confirmed;
+        if ui
+            .checkbox(&mut auto, "Automatically organise newly confirmed games after each check (off unless you switch it on; Probable, Ambiguous and Unknown games are never moved automatically)")
+            .changed()
+        {
+            self.folder_check.preferences.auto_organise_confirmed = auto;
+            if let Some(path) = super::organise::preferences_path()
+                && let Err(error) =
+                    super::organise::save_preferences(&path, &self.folder_check.preferences)
+            {
+                self.folder_check.error = Some(format!("The setting could not be saved: {error}"));
+            }
+        }
         if self.folder_check.ran {
             let done = self.folder_check.next
                 + if busy {
@@ -449,42 +554,38 @@ impl App {
                 self.folder_check.skipped,
             ));
         } else {
-            ui.label("Nothing has been read yet. The check reads one capped batch of cartridge games when you start it.");
+            ui.label("Nothing has been read yet.");
         }
         if let Some(error) = &self.folder_check.error {
             ui.colored_label(egui::Color32::LIGHT_RED, error);
         }
+        self.organise_panel(ui, busy);
+        let left_here = self.folder_check.left_here.clone();
         let mut open: Option<i64> = None;
-        for (folder, checked) in &self.folder_check.checked_per_folder {
-            let disagree = self
-                .folder_check
-                .findings
-                .iter()
-                .filter(|f| &f.folder == folder)
-                .count();
-            if disagree > 0 {
-                ui.small(format!(
-                    "{}: {}",
-                    folder_label(folder),
-                    disagreement_text(disagree, *checked)
-                ));
-            }
-        }
+        let mut move_one: Option<i64> = None;
+        let mut leave: Option<i64> = None;
+        let mut recheck: Option<i64> = None;
+        let mut unknown_to_folder: Option<i64> = None;
         egui::ScrollArea::vertical()
             .id_salt("v2_folder_check_results")
             .show(ui, |ui| {
                 for (detected, tiers) in grouped(&self.folder_check.findings) {
-                    ui.heading(format!("Look like {}", display_name_for(&detected)));
+                    ui.heading(format!("Belong in {}", display_name_for(&detected)));
                     for (tier, items) in tiers {
+                        let items: Vec<&&Finding> = items.iter().filter(|f| !left_here.contains(&f.archive_id)).collect();
+                        if items.is_empty() {
+                            continue;
+                        }
                         egui::CollapsingHeader::new(format!("{} ({})", tier.label(), items.len()))
                             .id_salt((detected.clone(), tier))
-                            .default_open(tier == Tier::Confirmed)
+                            .default_open(tier.is_movable())
                             .show(ui, |ui| {
                                 for f in items.iter().take(100) {
                                     ui.group(|ui| {
                                         ui.strong(&f.title);
                                         ui.label(format!(
-                                            "Folder system: {} (source: {}). Detected: {}.",
+                                            "Now in {} (recorded as {}, source: {}). Content says: {}.",
+                                            folder_label(&f.folder),
                                             display_name_for(&f.assigned),
                                             f.assigned_source.as_deref().unwrap_or("not recorded"),
                                             display_name_for(&f.detected),
@@ -492,20 +593,218 @@ impl App {
                                         for line in &f.lines {
                                             ui.small(line);
                                         }
-                                        if ui.button("Review identity").clicked() {
-                                            open = Some(f.archive_id);
-                                        }
+                                        ui.horizontal(|ui| {
+                                            if tier.is_movable() && ui.button("Move to correct folder").clicked() {
+                                                move_one = Some(f.archive_id);
+                                            }
+                                            if ui.button("Review").clicked() {
+                                                open = Some(f.archive_id);
+                                            }
+                                            if ui.button("Choose system").clicked() {
+                                                open = Some(f.archive_id);
+                                            }
+                                            if ui.button("Leave here").clicked() {
+                                                leave = Some(f.archive_id);
+                                            }
+                                        });
                                     });
                                 }
                                 if items.len() > 100 {
-                                    ui.small(format!("Showing 100 of {}.", items.len()));
+                                    ui.small(format!("Showing 100 of {}. Organise my games covers all of them.", items.len()));
                                 }
                             });
                     }
                 }
+                let unknown: Vec<&UnknownResult> = self
+                    .folder_check
+                    .unknown
+                    .iter()
+                    .filter(|u| !left_here.contains(&u.archive_id))
+                    .collect();
+                if !unknown.is_empty() {
+                    ui.heading(format!("Unknown games ({})", unknown.len()));
+                    ui.small("Nothing identified these yet. Recheck after adding catalogues, choose the system yourself, move them to Unnamed/Unknown, or leave them here.");
+                    for u in unknown.iter().take(100) {
+                        ui.group(|ui| {
+                            ui.strong(&u.title);
+                            ui.small(u.path.display().to_string());
+                            ui.small(&u.reason);
+                            ui.horizontal(|ui| {
+                                if ui.button("Recheck").clicked() {
+                                    recheck = Some(u.archive_id);
+                                }
+                                if ui.button("Choose system").clicked() {
+                                    open = Some(u.archive_id);
+                                }
+                                if ui.button("Move to Unnamed/Unknown").clicked() {
+                                    unknown_to_folder = Some(u.archive_id);
+                                }
+                                if ui.button("Leave here").clicked() {
+                                    leave = Some(u.archive_id);
+                                }
+                            });
+                        });
+                    }
+                }
             });
+        if let Some(id) = leave {
+            self.folder_check.left_here.insert(id);
+        }
+        if let Some(id) = recheck {
+            self.folder_check.recheck(&HashSet::from([id]));
+        }
+        if let Some(id) = move_one {
+            let one: Vec<Finding> = self
+                .folder_check
+                .findings
+                .iter()
+                .filter(|f| f.archive_id == id)
+                .cloned()
+                .collect();
+            self.folder_check
+                .organise
+                .plan(one, Vec::new(), Vec::new(), false);
+        }
+        if let Some(id) = unknown_to_folder {
+            let one: Vec<fpc::organise::UnknownGame> = self
+                .folder_check
+                .unknown
+                .iter()
+                .filter(|u| u.archive_id == id)
+                .map(|u| fpc::organise::UnknownGame {
+                    archive_id: u.archive_id,
+                    path: u.path.clone(),
+                })
+                .collect();
+            self.folder_check
+                .organise
+                .plan(Vec::new(), Vec::new(), one, false);
+        }
         if let Some(id) = open {
             self.go(super::routes::Route::ReviewIdentity(id));
         }
+    }
+
+    /// Organise my games: the batch button, the preview with one approval,
+    /// the result and Undo.
+    fn organise_panel(&mut self, ui: &mut egui::Ui, checking: bool) {
+        use super::organise::Phase;
+        let left_here = &self.folder_check.left_here;
+        let movable: Vec<Finding> = self
+            .folder_check
+            .findings
+            .iter()
+            .filter(|f| f.tier.is_movable() && !left_here.contains(&f.archive_id))
+            .cloned()
+            .collect();
+        let chosen: Vec<fpc::organise::ChosenGame> =
+            super::organise::chosen_games(&self.library.games)
+                .into_iter()
+                .filter(|g| !left_here.contains(&g.archive_id))
+                .collect();
+        let unknown: Vec<fpc::organise::UnknownGame> = self
+            .folder_check
+            .unknown
+            .iter()
+            .filter(|u| !left_here.contains(&u.archive_id))
+            .map(|u| fpc::organise::UnknownGame {
+                archive_id: u.archive_id,
+                path: u.path.clone(),
+            })
+            .collect();
+        let organise = &mut self.folder_check.organise;
+        ui.add_space(6.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong("Organise my games");
+            match &organise.phase {
+                Phase::Idle | Phase::Failed(_) | Phase::Done(_) => {
+                    ui.label(format!(
+                        "{} confirmed game(s) are outside their system's folder; {} game(s) you assigned yourself are outside theirs; {} unknown.",
+                        movable.len(),
+                        chosen.len(),
+                        unknown.len()
+                    ));
+                    ui.checkbox(&mut organise.include_unknown, "Also move unknown games to Unnamed/Unknown (their original location is journalled, and Recheck can still find their system later)");
+                    let any = !movable.is_empty() || !chosen.is_empty() || (organise.include_unknown && !unknown.is_empty());
+                    if ui
+                        .add_enabled(any && !checking && !organise.busy(), egui::Button::new("2. Review and move all confirmed games"))
+                        .clicked()
+                    {
+                        let unknown = if organise.include_unknown { unknown.clone() } else { Vec::new() };
+                        organise.plan(movable.clone(), chosen.clone(), unknown, false);
+                    }
+                }
+                Phase::Working(text) => {
+                    ui.label(*text);
+                }
+                Phase::Preview(_, _) => {}
+            }
+            let mut approve = false;
+            let mut discard = false;
+            if let Phase::Preview(plans, summary) = &organise.phase {
+                ui.label(format!(
+                    "Preview: {} game(s) will move to their system folder and {} to Unnamed/Unknown. {} are already in the right place, {} would collide with an existing file and stay where they are, and {} are left for you to review.",
+                    summary.to_move,
+                    summary.to_unknown,
+                    summary.already_correct,
+                    summary.collisions,
+                    summary.left_alone + summary.blocked
+                ));
+                egui::ScrollArea::vertical().id_salt("v2_organise_preview").max_height(260.0).show(ui, |ui| {
+                    for plan in plans {
+                        let mut by_folder: BTreeMap<PathBuf, usize> = BTreeMap::new();
+                        for e in plan.plan.suggested() {
+                            if let Some(parent) = e.destination_path.parent() {
+                                *by_folder.entry(parent.to_path_buf()).or_default() += 1;
+                            }
+                        }
+                        for (folder, n) in &by_folder {
+                            let new = if folder.exists() { "" } else { " (new folder, created on approval)" };
+                            ui.label(format!("{n} game(s) -> {}{new}", folder.display()));
+                        }
+                        for e in plan.plan.entries.iter().filter(|e| e.status != archivefs_core::dat::rom_organisation::OrganisationStatus::Suggested && e.status != archivefs_core::dat::rom_organisation::OrganisationStatus::AlreadyOrganised).take(50) {
+                            ui.small(format!(
+                                "Stays: {} - {}",
+                                e.source_path.display(),
+                                e.reason.as_deref().unwrap_or(e.status.label())
+                            ));
+                        }
+                        for (path, why) in plan.left_alone.iter().take(50) {
+                            ui.small(format!("Stays: {} - {why}", path.display()));
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let label = format!("3. Organise {} game(s)", summary.to_move + summary.to_unknown);
+                    if ui.add_enabled(summary.to_move + summary.to_unknown > 0, egui::Button::new(label)).clicked() {
+                        approve = true;
+                    }
+                    if ui.button("Not now").clicked() {
+                        discard = true;
+                    }
+                });
+                ui.small("Nothing is overwritten, renamed, extracted or recompressed. Each move is checked against the file you previewed and journalled; Undo puts every game and its system back.");
+            }
+            if approve {
+                organise.approve();
+            }
+            if discard {
+                organise.phase = Phase::Idle;
+            }
+            if let Phase::Done(report) = &organise.phase {
+                for line in report.lines() {
+                    ui.label(line);
+                }
+            }
+            if let Phase::Failed(error) = &organise.phase {
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+            if !organise.applied.is_empty() && !organise.busy() && ui.button("Undo this organisation").clicked() {
+                organise.undo();
+            }
+            if let Some(message) = &organise.undo_message {
+                ui.label(message);
+            }
+        });
     }
 }

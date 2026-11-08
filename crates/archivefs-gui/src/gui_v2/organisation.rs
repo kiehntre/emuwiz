@@ -385,6 +385,7 @@ impl App {
         let mut canonical_action = None;
         let mut playing_action = None;
         let mut review_pending = false;
+        let mut open_organise_games = false;
         let mut open_history = false;
         let mut open_mame_history = false;
 
@@ -523,6 +524,14 @@ impl App {
                         }
                     });
                     ui.add_space(theme::SPACE_SM);
+                    widgets::workflow_card(ui, theme::accent(ui), |ui| {
+                        ui.heading("Organise my games");
+                        ui.label("Mixed or misfiled folders: EmuWiz identifies each game by its content and moves it to its system's folder after one preview and approval.");
+                        if ui.button("Organise my games").clicked() {
+                            open_organise_games = true;
+                        }
+                    });
+                    ui.add_space(theme::SPACE_SM);
                     ui.collapsing("Advanced organisation options", |ui| {
                         ui.label("Everything here happens in this window.");
                         ui.label("Choose where the result goes, look at the preview, then confirm.");
@@ -644,6 +653,9 @@ impl App {
                     self.organisation.view = OrganisationView::PlayingLibrary;
                 }
             }
+        }
+        if open_organise_games {
+            self.go(Route::Tool(super::routes::ToolPage::FolderCheck));
         }
         if review_pending {
             self.organisation.view = OrganisationView::PlayingLibrary;

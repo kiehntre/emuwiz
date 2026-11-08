@@ -9,6 +9,39 @@ use std::ffi::OsStr;
 use std::os::unix::fs::MetadataExt;
 
 const KEY: &str = "organisation_catalogue_v1";
+/// Optional request, set by the platform-correction workflow before binding:
+/// `{"platform": "<canonical id>", "source": "verified_dat" | "header_identity"}`.
+/// The new assignment commits in the same SQLite transaction as the path
+/// change and Undo restores the assignment that was current at bind time.
+pub const PLATFORM_CHANGE_KEY: &str = "organisation_platform_v1";
+const PLATFORM_CHANGE_SOURCES: [&str; 2] = [VERIFIED_DAT_PLATFORM_SOURCE, "header_identity"];
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PlatformChange {
+    platform: String,
+    source: String,
+    /// The `platform_assignments` row current at bind time, if any.
+    previous: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct PlatformChangeRequest {
+    platform: String,
+    source: String,
+}
+
+fn current_assignment(
+    c: &Connection,
+    archive: i64,
+) -> std::result::Result<Option<(i64, String, String)>, String> {
+    c.query_row(
+        "SELECT id,platform,source FROM platform_assignments WHERE archive_id=?1 AND is_current=1",
+        [archive],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
 // Scan-run discovery rows and immutable import receipts retain observed paths.
 // Current MAME member evidence remains at its observed path, so it cannot
 // silently acquire authority for a different archive/location.
@@ -32,6 +65,8 @@ struct Binding {
     new: Association,
     projections: Vec<Vec<i64>>,
     fingerprint: bool,
+    #[serde(default)]
+    platform: Option<PlatformChange>,
 }
 
 impl Binding {
@@ -144,6 +179,35 @@ pub(crate) fn bind(
             .iter()
             .map(|(t, p)| row_ids(c, t, p, &old.absolute))
             .collect::<std::result::Result<_, _>>()?;
+        let platform = match entry.unknown.get(PLATFORM_CHANGE_KEY) {
+            None => None,
+            Some(value) => {
+                let request: PlatformChangeRequest = serde_json::from_value(value.clone())
+                    .map_err(|e| format!("invalid platform change: {e}"))?;
+                if !PLATFORM_CHANGE_SOURCES.contains(&request.source.as_str())
+                    || crate::platform::platform_by_id(&request.platform).is_none()
+                {
+                    return Err(
+                        "platform change must name a registry platform and evidence source".into(),
+                    );
+                }
+                let current = current_assignment(c, ids[0])?;
+                if current.as_ref().is_some_and(|(_, platform, source)| {
+                    source == MANUAL_PLATFORM_SOURCE && *platform != request.platform
+                }) {
+                    return Err(
+                        "this game has a manual system choice that the new evidence contradicts; \
+                         review it before moving"
+                            .into(),
+                    );
+                }
+                Some(PlatformChange {
+                    platform: request.platform,
+                    source: request.source,
+                    previous: current.map(|(id, _, _)| id),
+                })
+            }
+        };
         let binding = Binding {
             database: path.clone(),
             device: meta.dev(),
@@ -153,6 +217,7 @@ pub(crate) fn bind(
             old,
             new,
             projections,
+            platform,
         };
         let guard = CatalogueMove::open(binding.clone(), entry, false, false)?;
         drop(guard);
@@ -257,6 +322,23 @@ impl CatalogueMove {
         if conflict {
             return Err("catalogue relative path collision".into());
         }
+        if let Some(change) = &b.platform {
+            let current = current_assignment(&c, b.archive)?;
+            let applied = current.as_ref().is_some_and(|(_, platform, source)| {
+                *platform == change.platform && *source == change.source
+            });
+            // Forward and not yet committed: the bind-time row is still current.
+            // Reverse, or recovery after commit: the new row is current.
+            let expect_applied = reverse != already;
+            let ok = if expect_applied {
+                applied
+            } else {
+                current.map(|(id, _, _)| id) == change.previous
+            };
+            if !ok {
+                return Err("platform assignment changed since preview; regenerate it".into());
+            }
+        }
         for (i, (t, p)) in PROJECTIONS.iter().enumerate() {
             if row_ids(&c, t, p, &at.absolute)? != b.projections[i]
                 || !row_ids(&c, t, p, &free.absolute)?.is_empty()
@@ -294,6 +376,9 @@ impl CatalogueMove {
             if b.fingerprint {
                 self.connection.execute("UPDATE scan_fingerprints SET source_folder_id=?1,relative_path=?2 WHERE source_folder_id=?3 AND relative_path=?4",params![to.folder,to.relative,from.folder,from.relative]).map_err(|e|e.to_string())?;
             }
+            if let Some(change) = &b.platform {
+                self.commit_platform(change, to)?;
+            }
             for (i, (t, p)) in PROJECTIONS.iter().enumerate() {
                 for id in &b.projections[i] {
                     let n = self
@@ -314,6 +399,74 @@ impl CatalogueMove {
             .execute_batch("COMMIT")
             .map_err(|e| format!("catalogue commit failed; recovery required: {e}"))?;
         self.binding.verify_storage()
+    }
+}
+
+impl CatalogueMove {
+    fn commit_platform(
+        &self,
+        change: &PlatformChange,
+        at: &Association,
+    ) -> std::result::Result<(), String> {
+        let c = &self.connection;
+        let archive = self.binding.archive;
+        let e = |e: rusqlite::Error| e.to_string();
+        let platform: Option<String> = if self.reverse {
+            let removed = c
+                .execute(
+                    "DELETE FROM platform_assignments WHERE archive_id=?1 AND is_current=1 \
+                     AND platform=?2 AND source=?3",
+                    params![archive, change.platform, change.source],
+                )
+                .map_err(e)?;
+            if removed != 1 {
+                return Err("platform assignment compare-and-swap failed".into());
+            }
+            match change.previous {
+                Some(id) => {
+                    c.execute(
+                        "UPDATE platform_assignments SET is_current=1 WHERE id=?1 AND archive_id=?2",
+                        params![id, archive],
+                    )
+                    .map_err(e)?;
+                    c.query_row(
+                        "SELECT platform FROM platform_assignments WHERE id=?1",
+                        [id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(e)?
+                }
+                None => None,
+            }
+        } else {
+            if let Some(id) = change.previous {
+                let n = c
+                    .execute(
+                        "UPDATE platform_assignments SET is_current=0 WHERE id=?1 AND is_current=1",
+                        [id],
+                    )
+                    .map_err(e)?;
+                if n != 1 {
+                    return Err("platform assignment compare-and-swap failed".into());
+                }
+            }
+            c.execute(
+                "INSERT INTO platform_assignments(archive_id,platform,source,confidence,is_current,assigned_at) \
+                 VALUES (?1,?2,?3,NULL,1,?4)",
+                params![archive, change.platform, change.source, now_utc_string()],
+            )
+            .map_err(e)?;
+            Some(change.platform.clone())
+        };
+        if self.binding.fingerprint {
+            c.execute(
+                "UPDATE scan_fingerprints SET platform=?1 WHERE source_folder_id=?2 AND relative_path=?3",
+                params![platform, at.folder, at.relative],
+            )
+            .map_err(e)?;
+        }
+        Ok(())
     }
 }
 

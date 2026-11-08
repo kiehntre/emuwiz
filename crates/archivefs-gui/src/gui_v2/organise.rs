@@ -1,0 +1,487 @@
+//! "Organise my games": preview, one approval, move, verify, Undo.
+//!
+//! Planning runs on a worker and only reads. Nothing moves until the person
+//! presses the approval button on the preview (or has explicitly switched on
+//! automatic organising of confirmed games). Moves go through the shared
+//! journalled organiser, so every batch appears in History with Undo.
+
+use archivefs_core::dat::rename_apply::EntryState;
+use archivefs_core::folder_platform_check::Finding;
+use archivefs_core::folder_platform_check::organise::{
+    self as org, ChosenGame, RootPlan, Summary, UnknownGame,
+};
+use archivefs_core::retroarch_playlist_relink::{self as relink, RelinkReport};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+/// Preferences kept beside the library database. Automatic organising is
+/// off unless the person switches it on.
+pub(super) const PREFERENCES_FILE: &str = "organise-preferences.json";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct Preferences {
+    #[serde(default)]
+    pub auto_organise_confirmed: bool,
+}
+
+pub(super) fn preferences_path() -> Option<PathBuf> {
+    archivefs_core::default_database_path()
+        .ok()
+        .map(|db| db.with_file_name(PREFERENCES_FILE))
+}
+
+pub(super) fn load_preferences(path: Option<&Path>) -> Preferences {
+    path.and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+pub(super) fn save_preferences(path: &Path, preferences: &Preferences) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(preferences).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| e.to_string())
+}
+
+/// What one approved run did, in the person's terms.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Report {
+    pub organised: usize,
+    pub to_unknown: usize,
+    pub already_correct: usize,
+    pub collisions: usize,
+    pub left_alone: usize,
+    pub failed: Vec<String>,
+    /// Destination folders that the run created.
+    pub created_folders: Vec<PathBuf>,
+    pub retroarch: RelinkReport,
+    /// Systems RomM should rescan (old and new folders).
+    pub romm_platforms: BTreeSet<String>,
+    pub transactions: Vec<String>,
+}
+
+impl Report {
+    pub(super) fn lines(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "Organised {} game{} into their system folders; {} moved to Unnamed/Unknown.",
+            self.organised,
+            if self.organised == 1 { "" } else { "s" },
+            self.to_unknown
+        )];
+        lines.push(format!(
+            "Already correct: {}. Collisions left untouched: {}. Left for you to review: {}. Failed: {}.",
+            self.already_correct,
+            self.collisions,
+            self.left_alone,
+            self.failed.len()
+        ));
+        for folder in &self.created_folders {
+            lines.push(format!("Created folder {}.", folder.display()));
+        }
+        for failure in self.failed.iter().take(20) {
+            lines.push(format!("Not moved: {failure}"));
+        }
+        if self.retroarch.retroarch_running {
+            lines.push("RetroArch is open, so its playlists were not updated. Close RetroArch and run Organise again to re-link them; nothing else is affected.".into());
+        } else if !self.retroarch.rewritten.is_empty() {
+            lines.push(format!(
+                "RetroArch: re-linked {} playlist entr{} in {} file{} (the previous version of each is kept beside it).",
+                self.retroarch.items,
+                if self.retroarch.items == 1 { "y" } else { "ies" },
+                self.retroarch.rewritten.len(),
+                if self.retroarch.rewritten.len() == 1 { "" } else { "s" },
+            ));
+        }
+        for (file, why) in &self.retroarch.skipped {
+            lines.push(format!(
+                "RetroArch playlist {} was not changed: {why}.",
+                file.display()
+            ));
+        }
+        if !self.romm_platforms.is_empty() && self.organised + self.to_unknown > 0 {
+            lines.push(format!(
+                "RomM: run a Quick scan of {} so it sees the new locations. EmuWiz never edits RomM's database.",
+                self.romm_platforms.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !self.transactions.is_empty() {
+            lines.push(
+                "Every move is journalled. To put everything back, use Undo here or in History."
+                    .into(),
+            );
+        }
+        lines
+    }
+}
+
+enum Message {
+    Planned(Result<Vec<RootPlan>, String>, bool),
+    Applied(
+        Report,
+        Vec<archivefs_core::dat::rename_apply::RenameTransaction>,
+    ),
+}
+
+#[derive(Default)]
+pub(super) enum Phase {
+    #[default]
+    Idle,
+    Working(&'static str),
+    Preview(Vec<RootPlan>, Summary),
+    Done(Report),
+    Failed(String),
+}
+
+#[derive(Default)]
+pub(super) struct State {
+    pub phase: Phase,
+    /// Also move checked games with no identifiable system to Unnamed/Unknown.
+    pub include_unknown: bool,
+    /// Set after a run changed the library, so Blue reloads it.
+    pub library_changed: bool,
+    /// The last applied transactions, for Undo.
+    pub applied: Vec<archivefs_core::dat::rename_apply::RenameTransaction>,
+    pub undo_message: Option<String>,
+    receiver: Option<Receiver<Message>>,
+}
+
+impl State {
+    pub(super) fn busy(&self) -> bool {
+        self.receiver.is_some()
+    }
+
+    /// Builds the preview on a worker. With `then_apply`, applies it straight
+    /// away (only used when the person enabled automatic organising, and then
+    /// only for confirmed games).
+    pub(super) fn plan(
+        &mut self,
+        findings: Vec<Finding>,
+        chosen: Vec<ChosenGame>,
+        unknown: Vec<UnknownGame>,
+        then_apply: bool,
+    ) {
+        if self.busy() {
+            return;
+        }
+        self.phase = Phase::Working("Preparing the preview. Nothing is moved yet.");
+        let (sender, receiver) = mpsc::channel();
+        self.receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let result = (|| {
+                let config = archivefs_core::Config::load_default().map_err(|e| e.to_string())?;
+                let roots = config.source_folders.clone();
+                let refs: Vec<&Finding> = findings.iter().filter(|f| f.tier.is_movable()).collect();
+                let mut plans =
+                    org::plan_organisation_with_choices(&refs, &chosen, &unknown, &roots, 1);
+                for f in findings.iter().filter(|f| !f.tier.is_movable()) {
+                    if let Some(first) = plans.first_mut() {
+                        first.left_alone.push((
+                            f.path.clone(),
+                            format!("{}: not moved ({}).", f.title, f.tier.label()),
+                        ));
+                    }
+                }
+                let database = archivefs_core::default_database_path()
+                    .and_then(archivefs_core::Database::open_read_only)
+                    .map_err(|e| e.to_string())?;
+                for plan in &mut plans {
+                    if plan.plan.suggested().next().is_some() {
+                        org::prepare(plan, &database).map_err(|reason| {
+                            format!("The preview for {} could not be sealed: {reason}. Nothing was moved.", plan.root.display())
+                        })?;
+                    }
+                }
+                Ok(plans)
+            })();
+            let _ = sender.send(Message::Planned(result, then_apply));
+        });
+    }
+
+    /// The person's one approval for every Suggested entry in the preview.
+    pub(super) fn approve(&mut self) {
+        let Phase::Preview(plans, _) = std::mem::take(&mut self.phase) else {
+            return;
+        };
+        self.start_apply(plans);
+    }
+
+    fn start_apply(&mut self, plans: Vec<RootPlan>) {
+        self.phase = Phase::Working("Moving the approved games. Each move is journalled.");
+        let (sender, receiver) = mpsc::channel();
+        self.receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let (report, transactions) = apply_plans(&plans);
+            let _ = sender.send(Message::Applied(report, transactions));
+        });
+    }
+
+    pub(super) fn poll(&mut self) {
+        let Some(receiver) = &self.receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Message::Planned(result, then_apply)) => {
+                self.receiver = None;
+                match result {
+                    Ok(plans) if then_apply => self.start_apply(plans),
+                    Ok(plans) => {
+                        let summary = org::summarise(&plans);
+                        self.phase = Phase::Preview(plans, summary);
+                    }
+                    Err(error) => self.phase = Phase::Failed(error),
+                }
+            }
+            Ok(Message::Applied(report, transactions)) => {
+                self.receiver = None;
+                if report.organised + report.to_unknown > 0 {
+                    self.library_changed = true;
+                }
+                self.applied = transactions;
+                self.phase = Phase::Done(report);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.receiver = None;
+                self.phase = Phase::Failed(
+                    "Organising stopped unexpectedly. Any move already made is journalled; open History to review or Undo it.".into(),
+                );
+            }
+        }
+    }
+
+    pub(super) fn take_library_changed(&mut self) -> bool {
+        std::mem::take(&mut self.library_changed)
+    }
+
+    /// Undo of the last run, newest transaction first. Also reverses the
+    /// platform corrections sealed into each move.
+    pub(super) fn undo(&mut self) {
+        let Ok(journal) =
+            archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
+        else {
+            self.undo_message = Some("The journal folder is not available; use History.".into());
+            return;
+        };
+        let mut restored = 0;
+        let mut problems = Vec::new();
+        for mut transaction in std::mem::take(&mut self.applied).into_iter().rev() {
+            let root = PathBuf::from(&transaction.source_scan_root);
+            let moved = transaction
+                .entries
+                .iter()
+                .filter(|e| e.state == EntryState::Applied)
+                .count();
+            use archivefs_core::dat::rename_apply::RollbackResult;
+            match archivefs_core::dat::rom_organisation::rollback_organisation_transaction(
+                &mut transaction,
+                &journal,
+                &AtomicBool::new(false),
+                &root,
+            ) {
+                Ok(outcome) => match outcome.rollback.result {
+                    RollbackResult::FullyRolledBack => restored += moved,
+                    RollbackResult::PartiallyRolledBack {
+                        rolled_back,
+                        failed,
+                    } => {
+                        restored += rolled_back.len();
+                        problems.extend(
+                            failed
+                                .into_iter()
+                                .map(|(p, why)| format!("{}: {why}", p.display())),
+                        );
+                    }
+                    RollbackResult::RollbackFailed { failed } => {
+                        problems.extend(
+                            failed
+                                .into_iter()
+                                .map(|(p, why)| format!("{}: {why}", p.display())),
+                        );
+                    }
+                },
+                Err(error) => problems.push(error),
+            }
+        }
+        self.library_changed = true;
+        self.undo_message = Some(if problems.is_empty() {
+            format!(
+                "Undo put {restored} game(s) back where they were, with their previous systems."
+            )
+        } else {
+            format!(
+                "Undo put {restored} game(s) back; some need History: {}",
+                problems.join("; ")
+            )
+        });
+    }
+}
+
+/// Applies every root's approved entries, then re-links RetroArch playlists
+/// for what actually moved.
+fn apply_plans(
+    plans: &[RootPlan],
+) -> (
+    Report,
+    Vec<archivefs_core::dat::rename_apply::RenameTransaction>,
+) {
+    let mut report = Report::default();
+    let mut transactions = Vec::new();
+    let summary = org::summarise(plans);
+    report.already_correct = summary.already_correct;
+    report.collisions = summary.collisions;
+    report.left_alone = summary.left_alone + summary.blocked;
+    let database = match archivefs_core::default_database_path()
+        .and_then(archivefs_core::Database::open_read_only)
+    {
+        Ok(db) => db,
+        Err(error) => {
+            report
+                .failed
+                .push(format!("the library database could not be opened: {error}"));
+            return (report, transactions);
+        }
+    };
+    let journal = match archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
+    {
+        Ok(dir) => dir,
+        Err(error) => {
+            report
+                .failed
+                .push(format!("the journal folder is not available: {error}"));
+            return (report, transactions);
+        }
+    };
+    let mut moves: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    for plan in plans {
+        let approved: BTreeSet<String> = plan
+            .plan
+            .suggested()
+            .map(|e| e.source_path.to_string_lossy().into_owned())
+            .collect();
+        if approved.is_empty() {
+            continue;
+        }
+        let platforms: BTreeMap<&Path, (&Option<String>, &str)> = plan
+            .plan
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.source_path.as_path(),
+                    (&e.platform, e.platform_display_name.as_str()),
+                )
+            })
+            .collect();
+        let transaction = match org::apply(
+            plan,
+            &approved,
+            &database,
+            &journal,
+            &AtomicBool::new(false),
+        ) {
+            Ok(outcome) => outcome.transaction,
+            Err((error, transaction)) => {
+                report
+                    .failed
+                    .push(format!("{}: {error}", plan.root.display()));
+                match transaction {
+                    Some(t) => t,
+                    None => continue,
+                }
+            }
+        };
+        report
+            .created_folders
+            .extend(transaction.created_directories.iter().cloned());
+        for entry in &transaction.entries {
+            if entry.state == EntryState::Applied {
+                match platforms.get(entry.source_path.as_path()) {
+                    Some((Some(_), name)) => {
+                        report.organised += 1;
+                        report.romm_platforms.insert((*name).to_string());
+                    }
+                    _ => report.to_unknown += 1,
+                }
+                moves.insert(entry.source_path.clone(), entry.destination_path.clone());
+            } else if let Some(reason) = &entry.failure_reason {
+                report
+                    .failed
+                    .push(format!("{}: {reason}", entry.source_path.display()));
+            }
+        }
+        report.transactions.push(transaction.transaction_id.clone());
+        transactions.push(transaction);
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        report.retroarch = relink::relink_playlists(&relink::playlist_dirs(&home), &moves);
+    }
+    (report, transactions)
+}
+
+/// Games the person assigned to a system that sit outside that system's
+/// folder, so "Organise my games" can offer to move them too.
+pub(super) fn chosen_games(games: &[super::library::Game]) -> Vec<ChosenGame> {
+    games
+        .iter()
+        .filter(|g| g.archive.platform_source.as_deref() == Some("manual"))
+        .filter_map(|g| {
+            let platform = archivefs_core::canonical_platform_for_alias(&g.platform)?;
+            let folder = g
+                .archive
+                .absolute_path
+                .parent()?
+                .file_name()?
+                .to_string_lossy()
+                .into_owned();
+            let in_place = archivefs_core::platform::detect::platform_for_folder_name(&folder)
+                .is_some_and(|p| p.id == platform);
+            (!in_place).then(|| ChosenGame {
+                archive_id: g.archive.id,
+                path: g.archive.absolute_path.clone(),
+                platform: platform.to_string(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_organising_is_off_until_switched_on() {
+        assert!(!load_preferences(None).auto_organise_confirmed);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PREFERENCES_FILE);
+        assert!(!load_preferences(Some(&path)).auto_organise_confirmed);
+        save_preferences(
+            &path,
+            &Preferences {
+                auto_organise_confirmed: true,
+            },
+        )
+        .unwrap();
+        assert!(load_preferences(Some(&path)).auto_organise_confirmed);
+    }
+
+    #[test]
+    fn report_states_every_outcome_and_the_romm_next_step() {
+        let report = Report {
+            organised: 3,
+            to_unknown: 1,
+            already_correct: 2,
+            collisions: 1,
+            left_alone: 4,
+            failed: vec!["x: busy".into()],
+            romm_platforms: BTreeSet::from(["Nintendo Entertainment System".to_string()]),
+            transactions: vec!["t".into()],
+            ..Default::default()
+        };
+        let text = report.lines().join("\n");
+        assert!(text.contains("Organised 3 games"));
+        assert!(text.contains("1 moved to Unnamed/Unknown"));
+        assert!(text.contains("Already correct: 2. Collisions left untouched: 1. Left for you to review: 4. Failed: 1."));
+        assert!(text.contains("RomM: run a Quick scan of Nintendo Entertainment System"));
+        assert!(text.contains("Undo"));
+    }
+}

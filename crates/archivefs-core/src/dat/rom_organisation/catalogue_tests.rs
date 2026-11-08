@@ -1031,3 +1031,168 @@ fn reopening_history_after_an_interrupted_undo_allows_a_safe_retry() {
     f.reload();
     assert!(f.tx.is_fully_rolled_back());
 }
+
+// --- Platform correction sealed into the catalogue move ---------------------
+
+struct Correction {
+    temp: tempfile::TempDir,
+    db: crate::Database,
+    plan: OrganisationPlan,
+    approved: BTreeSet<String>,
+    id: i64,
+}
+
+fn correction_fixture(initial_source: &str) -> Result<Correction, String> {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("games");
+    std::fs::create_dir_all(root.join("snes")).unwrap();
+    std::fs::create_dir_all(root.join("nes")).unwrap();
+    let cand = candidate(
+        &root.join("snes"),
+        "Game (USA).zip",
+        resolved("NES", PlatformIdentitySource::VerifiedDat),
+    );
+    let mut db = crate::Database::open_or_create(temp.path().join("fixture.sqlite3")).unwrap();
+    db.register_source_folders(std::slice::from_ref(&root))
+        .unwrap();
+    let folder = db.list_source_folders().unwrap()[0].id;
+    let archive = crate::Archive::from_path_in_root(&cand.source_path, &root).unwrap();
+    let id = db
+        .upsert_archive(folder, &root, &archive)
+        .unwrap()
+        .archive_id;
+    {
+        let c = Connection::open(db.path()).unwrap();
+        c.execute("DELETE FROM platform_assignments WHERE archive_id=?1", [id])
+            .unwrap();
+        c.execute(
+            "INSERT INTO platform_assignments(archive_id,platform,source,confidence,is_current,assigned_at) \
+             VALUES (?1,'SNES',?2,NULL,1,'2026-01-01T00:00:00Z')",
+            params![id, initial_source],
+        )
+        .unwrap();
+    }
+    let mut plan = plan_for(
+        &root,
+        OrganisationMode::MoveRealFile,
+        std::slice::from_ref(&cand),
+        1,
+    );
+    let corrections = std::collections::BTreeMap::from([(
+        cand.source_path.clone(),
+        PlatformCorrection {
+            platform: "NES".into(),
+            source: "verified_dat",
+        },
+    )]);
+    prepare_organisation_catalogue_with_platforms(&mut plan, &db, &corrections)?;
+    let approved = approved_of(&[&cand.source_path]);
+    Ok(Correction {
+        temp,
+        db,
+        plan,
+        approved,
+        id,
+    })
+}
+
+fn current_platform(db: &crate::Database, id: i64) -> (String, String) {
+    Connection::open(db.path())
+        .unwrap()
+        .query_row(
+            "SELECT platform,source FROM platform_assignments WHERE archive_id=?1 AND is_current=1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn platform_correction_commits_with_the_move_and_undo_restores_it() {
+    let f = correction_fixture("folder_alias").unwrap();
+    let mut tx = build_organisation_transaction(&f.plan, &f.approved, 1).unwrap();
+    let destination = tx.entries[0].destination_path.clone();
+    assert!(destination.ends_with("nes/Game (USA).zip"));
+    let journal = f.temp.path().join("journal");
+    super::super::transaction::apply_organisation_transaction(
+        &mut tx,
+        &f.approved,
+        1,
+        TrustedRoots::from_paths([f.plan.master_root.clone()]),
+        &journal,
+        &no_cancel(),
+        f.plan.mode,
+        &f.plan.master_root,
+        &f.db,
+    )
+    .unwrap();
+    assert!(destination.exists());
+    assert_eq!(
+        current_platform(&f.db, f.id),
+        ("NES".into(), "verified_dat".into())
+    );
+    assert_eq!(
+        f.db.find_archive_id_by_absolute_path(&destination).unwrap(),
+        Some(f.id)
+    );
+    let mut tx = tx;
+    rollback_organisation_transaction(&mut tx, &journal, &no_cancel(), &f.plan.master_root)
+        .unwrap();
+    assert!(!destination.exists());
+    assert_eq!(
+        current_platform(&f.db, f.id),
+        ("SNES".into(), "folder_alias".into())
+    );
+    let history: i64 = Connection::open(f.db.path())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM platform_assignments WHERE archive_id=?1",
+            [f.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        history, 1,
+        "undo removes the correction row and keeps the original"
+    );
+}
+
+#[test]
+fn a_contradicted_manual_choice_is_never_overridden_by_a_correction() {
+    let error = correction_fixture("manual").err().expect("refused");
+    assert!(error.contains("manual system choice"), "{error}");
+}
+
+#[test]
+fn a_platform_change_after_preview_refuses_the_apply() {
+    let f = correction_fixture("folder_alias").unwrap();
+    let mut tx = build_organisation_transaction(&f.plan, &f.approved, 1).unwrap();
+    {
+        let c = Connection::open(f.db.path()).unwrap();
+        c.execute(
+            "UPDATE platform_assignments SET is_current=0 WHERE archive_id=?1",
+            [f.id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO platform_assignments(archive_id,platform,source,confidence,is_current,assigned_at) \
+             VALUES (?1,'Game Boy','manual',NULL,1,'2026-01-02T00:00:00Z')",
+            [f.id],
+        )
+        .unwrap();
+    }
+    let journal = f.temp.path().join("journal");
+    let result = super::super::transaction::apply_organisation_transaction(
+        &mut tx,
+        &f.approved,
+        1,
+        TrustedRoots::from_paths([f.plan.master_root.clone()]),
+        &journal,
+        &no_cancel(),
+        f.plan.mode,
+        &f.plan.master_root,
+        &f.db,
+    );
+    assert!(result.is_err());
+    assert!(f.plan.entries[0].source_path.exists(), "nothing moved");
+}
