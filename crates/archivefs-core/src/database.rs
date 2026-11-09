@@ -5783,6 +5783,37 @@ impl Database {
             .map_err(|error| db_error("failed to look up current platform assignment", error))
     }
 
+    /// Present games of exactly `size` bytes whose current platform is not a
+    /// manual choice, with their absolute paths. Used to restore remembered
+    /// manual choices after a rebuild without reading unrelated files.
+    pub fn archives_without_manual_platform_of_size(
+        &self,
+        size: u64,
+    ) -> Result<Vec<(i64, PathBuf)>> {
+        let size = i64::try_from(size).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT a.id, a.absolute_path_cached FROM archives a \
+                 WHERE a.size_bytes = ?1 AND a.last_verified_missing_at IS NULL \
+                 AND a.absolute_path_cached IS NOT NULL \
+                 AND NOT EXISTS (SELECT 1 FROM platform_assignments p WHERE p.archive_id = a.id \
+                 AND p.is_current = 1 AND p.source = ?2) ORDER BY a.id",
+            )
+            .map_err(|error| db_error("failed to prepare manual-choice lookup", error))?;
+        let rows = statement
+            .query_map(params![size, MANUAL_PLATFORM_SOURCE], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|error| db_error("failed to look up games by size", error))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, path) = row.map_err(|error| db_error("failed to read game path", error))?;
+            out.push((id, PathBuf::from(std::ffi::OsString::from_vec(path))));
+        }
+        Ok(out)
+    }
+
     /// Looks up the current `archives.id` for the archive whose
     /// `absolute_path_cached` exactly matches `path` (exact bytes - never
     /// a lossy display string; see `Path::as_os_str`/`OsStrExt::as_bytes`).
@@ -9510,6 +9541,15 @@ pub(crate) fn scan_and_persist_folders_with_skipped(
             if let Err(error) = database.commit_catalogue_refresh() {
                 database.rollback_catalogue_refresh();
                 return Err(error);
+            }
+            // Manual system choices outlive the database: restore any the
+            // catalogue lost (rebuild, restore, re-added folder). Best effort;
+            // only same-size files are read.
+            let store = crate::manual_platform_choices::store_path(database.path());
+            if store.exists()
+                && let Err(error) = crate::manual_platform_choices::restore(database, &store)
+            {
+                eprintln!("emuwiz: remembered system choices not restored: {error}");
             }
             Ok(summary)
         }

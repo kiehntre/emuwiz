@@ -639,6 +639,7 @@ impl RomOrganisationPageState {
                     archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
                 candidates: &candidates,
                 generation: self.plan_generation,
+                unknown_folder: None,
             },
             cancel,
             progress,

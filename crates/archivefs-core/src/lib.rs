@@ -702,6 +702,10 @@ pub mod mod_history;
 pub mod classic_poke_family;
 /// Per-game, read-only view of classic POKE trainers (never applies anything).
 pub mod classic_trainer_evidence;
+/// Game package boundaries (single file, CUE/GDI/M3U set, game folder).
+pub mod game_package;
+/// Manual system choices kept outside the database (survive rebuilds).
+pub mod manual_platform_choices;
 /// Provider-neutral, metadata-only catalogue records for future mod sources.
 pub mod mod_catalogue;
 /// Provider-neutral, metadata-only discovery and user-acquisition handoff.
@@ -712,6 +716,8 @@ pub mod mod_provider;
 pub mod moddb;
 /// Legal/open cheat-provider metadata and conservative local projections.
 pub mod open_retro_cheat_providers;
+/// Re-points RetroArch JSON playlists at games EmuWiz moved.
+pub mod retroarch_playlist_relink;
 /// Bounded import of user-supplied local ROM-hack metadata.
 pub mod rom_hack_catalogue;
 

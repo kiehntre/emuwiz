@@ -63,6 +63,7 @@ fn plan_for(library_root: &Path, candidates: &[OrganisationCandidate]) -> Organi
         content_policy: crate::dat::classification::ContentSelectionPolicy::AllEntries,
         candidates,
         generation: 1,
+        unknown_folder: None,
     })
 }
 
@@ -246,6 +247,7 @@ fn existing_move_mode_still_emits_rename_move_operations() {
         content_policy: crate::dat::classification::ContentSelectionPolicy::AllEntries,
         candidates: std::slice::from_ref(&candidate),
         generation: 1,
+        unknown_folder: None,
     });
     let approved = approved_of(&[&source]);
     let tx = build_tx(&plan, &approved);

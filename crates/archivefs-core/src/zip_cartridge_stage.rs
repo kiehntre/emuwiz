@@ -109,6 +109,17 @@ pub fn stage_zip_cartridge_for_launch(
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .map_err(|error| refuse(format!("could not secure the private directory: {error}")))?;
     }
+    // Cores only accept headerless No-Intro NES dumps under `.nes`; the
+    // bytes are not changed (no header is added).
+    let name = if member.format == "unh" {
+        format!(
+            "{}.nes",
+            name.rsplit_once('.')
+                .map_or(name.as_str(), |(stem, _)| stem)
+        )
+    } else {
+        name
+    };
     let path = dir.path().join(&name);
     let mut out = std::fs::OpenOptions::new()
         .write(true)
