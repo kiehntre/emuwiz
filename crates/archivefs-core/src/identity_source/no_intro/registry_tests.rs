@@ -223,3 +223,48 @@ fn unchanged_registry_yields_a_stable_fingerprint() {
     let second = no_intro_selection_fingerprint(&registry, Some("Game Boy"));
     assert_eq!(first, second);
 }
+
+/// 2026-11-09: a 450-DAT pack import left unassigned made every new system
+/// re-parse every DAT (~25 s per system in Blue). A pack catalogue whose
+/// unchanged import name names another system is skipped; a changed file,
+/// or one named for this system, is still read.
+#[test]
+fn unassigned_pack_catalogues_for_other_systems_are_not_reparsed() {
+    let dir = tempdir().unwrap();
+    let pack = |id: &str, name: &str, system: &str, xml: &str| {
+        let path = write_dat(dir.path(), name, xml);
+        let mut entry = DatSourceEntry::new(
+            id.to_string(),
+            format!("No-Intro: {system}"),
+            path.clone(),
+            DatSourceKind::File,
+        );
+        entry.origin = Some("browser-assisted No-Intro pack import".to_string());
+        let metadata = std::fs::metadata(&path).unwrap();
+        entry.health.observed_size_bytes = Some(metadata.len());
+        entry.health.observed_modified_unix_seconds = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        entry
+    };
+    // A real Game Boy DAT mislabelled as SNES at import stands in for "a DAT
+    // that would match if it were read": skipping it is observable.
+    let snes_named = pack("snes", "snes.dat", "Nintendo - Super Nintendo Entertainment System", GB_NO_INTRO_XML);
+    let gb_named = pack("gb", "gb.dat", "Nintendo - Game Boy", GB_NO_INTRO_XML_OTHER);
+    let registry = { let mut r = DatSourceRegistry::new(); for e in [snes_named.clone(), gb_named] { r.add(e).unwrap(); } r };
+    let loaded = super::registry::load_no_intro_sources(&registry, Some("Game Boy"));
+    let ids: Vec<_> = loaded.iter().map(|(label, _)| label.source_id.as_str()).collect();
+    assert_eq!(ids, ["gb"], "the SNES-named pack DAT is not parsed for Game Boy");
+
+    // Changed since import: never skipped on its old name.
+    let mut changed = snes_named;
+    changed.health.observed_size_bytes = Some(1);
+    let registry = { let mut r = DatSourceRegistry::new(); for e in [changed] { r.add(e).unwrap(); } r };
+    let loaded = super::registry::load_no_intro_sources(&registry, Some("Game Boy"));
+    assert_eq!(loaded.len(), 1);
+    // No platform asked: everything is read as before.
+    let registry = { let mut r = DatSourceRegistry::new(); for e in [pack("x", "x.dat", "Nintendo - Super Nintendo Entertainment System", GB_NO_INTRO_XML)] { r.add(e).unwrap(); } r };
+    assert_eq!(super::registry::load_no_intro_sources(&registry, None).len(), 1);
+}

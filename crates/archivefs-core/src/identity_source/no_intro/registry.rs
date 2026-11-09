@@ -143,6 +143,18 @@ pub fn load_no_intro_sources(
         Some(id) => registry.sorted_enabled_for_platform(id),
         None => registry.sorted_enabled(),
     };
+    // An unassigned catalogue applies to every system, so without this each
+    // new system re-parsed every unassigned DAT in the registry (about 25 s
+    // per system for a 450-DAT No-Intro pack). Its last validated header,
+    // read without opening the DAT, already says which system it lists; only
+    // a catalogue whose unchanged header names other systems is skipped.
+    let entries: Vec<&DatSourceEntry> = match platform_id {
+        Some(id) => entries
+            .into_iter()
+            .filter(|entry| entry.platform.is_some() || !header_names_other_systems(entry, id))
+            .collect(),
+        None => entries,
+    };
     let mut matches = Vec::new();
     for candidate in candidates_for(&entries) {
         match import_no_intro_dat(&candidate.path) {
@@ -164,6 +176,45 @@ pub fn load_no_intro_sources(
             .then_with(|| a.artifact_path.cmp(&b.artifact_path))
     });
     matches
+}
+
+/// The `origin` the No-Intro pack import writes for each catalogue.
+const PACK_IMPORT_ORIGIN: &str = "browser-assisted No-Intro pack import";
+
+/// True only when this file catalogue's recorded, still-current header names
+/// one or more systems and none of them is `platform_id`. Anything unchecked,
+/// changed, unrecognised or multi-system is kept (never skipped on a guess).
+fn header_names_other_systems(entry: &DatSourceEntry, platform_id: &str) -> bool {
+    use crate::dat::catalogue_recognition::{CatalogueRecognition as R, same_platform};
+    use crate::dat::sources::recognition::{RecognitionState, recognition_state};
+    let wanted = crate::canonical_platform_for_alias(platform_id).unwrap_or(platform_id);
+    let recognition = match recognition_state(entry) {
+        RecognitionState::Recognised(recognition) => recognition,
+        // A pack-imported catalogue is named "No-Intro: <its own header
+        // system name>" at import. That name is used only while the file is
+        // still exactly the one validated then (same size and mtime).
+        RecognitionState::NotChecked
+            if entry.kind == DatSourceKind::File
+                && entry.origin.as_deref() == Some(PACK_IMPORT_ORIGIN)
+                && entry.health.observed_size_bytes.is_some()
+                && entry.path.is_file()
+                && !entry.health.is_stale_for(&entry.path, entry.kind) =>
+        {
+            let Some(name) = entry.display_name.strip_prefix("No-Intro: ") else {
+                return false;
+            };
+            crate::dat::catalogue_recognition::recognise_catalogue(Some(name), None)
+        }
+        _ => return false,
+    };
+    match recognition {
+        R::Games { platform } | R::Extras { platform, .. } | R::NeedsReview { platform, .. } => {
+            !same_platform(platform, wanted)
+        }
+        R::Ambiguous { platforms } => !platforms.iter().any(|p| same_platform(p, wanted)),
+        R::NotGames { .. } => true,
+        R::SeveralSystems | R::NotRecognised { .. } | R::NoName => false,
+    }
 }
 
 /// A cheap fingerprint of exactly the registry state
