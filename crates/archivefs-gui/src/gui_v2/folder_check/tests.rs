@@ -84,17 +84,6 @@ fn review_list_groups_by_detected_system_then_tier() {
 }
 
 #[test]
-fn mixed_folder_reports_fraction_not_a_verdict() {
-    let text = disagreement_text(3, 10);
-    assert!(text.starts_with("3 of 10 checked games"));
-    assert!(text.contains("each game is judged on its own"));
-    assert_eq!(
-        disagreement_text(0, 0),
-        "No games were read in this folder."
-    );
-}
-
-#[test]
 fn playable_note_explains_unh_for_nes_only() {
     assert!(playable_note("NES", true).contains(".unh"));
     assert!(playable_note("NES", true).contains("staged for the emulator"));

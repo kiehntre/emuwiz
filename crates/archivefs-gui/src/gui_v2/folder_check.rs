@@ -189,16 +189,6 @@ pub(super) fn progress_text(
     text
 }
 
-/// The share of checked games in a folder that disagree, as text.
-pub(super) fn disagreement_text(disagree: usize, checked: usize) -> String {
-    if checked == 0 {
-        return "No games were read in this folder.".into();
-    }
-    format!(
-        "{disagree} of {checked} checked games in this folder disagree with its system. The folder may hold several systems; each game is judged on its own."
-    )
-}
-
 /// Review-list grouping: detected system, then tier.
 pub(super) fn grouped(findings: &[Finding]) -> BTreeMap<String, BTreeMap<Tier, Vec<&Finding>>> {
     let mut out: BTreeMap<String, BTreeMap<Tier, Vec<&Finding>>> = BTreeMap::new();

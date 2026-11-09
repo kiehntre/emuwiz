@@ -38,7 +38,7 @@ fn library(files: &[&str]) -> Library {
         .unwrap();
     let folder = db.list_source_folders().unwrap()[0].id;
     for f in files {
-        let a = crate::Archive::from_path_in_root(&root.join(f), &root).unwrap();
+        let a = crate::Archive::from_path_in_root(root.join(f), &root).unwrap();
         db.upsert_archive(folder, &root, &a).unwrap();
     }
     let journal = temp.path().join("journal");

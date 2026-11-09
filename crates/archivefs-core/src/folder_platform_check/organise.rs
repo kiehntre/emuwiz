@@ -147,6 +147,14 @@ pub fn plan_organisation(
 }
 
 /// [`plan_organisation`] plus games whose system the person chose.
+/// One root's planning inputs: candidates, platform corrections, and the
+/// games left alone with their reasons.
+type RootParts = (
+    Vec<OrganisationCandidate>,
+    BTreeMap<PathBuf, PlatformCorrection>,
+    Vec<(PathBuf, String)>,
+);
+
 pub fn plan_organisation_with_choices(
     findings: &[&Finding],
     chosen: &[ChosenGame],
@@ -154,14 +162,7 @@ pub fn plan_organisation_with_choices(
     roots: &[PathBuf],
     generation: u64,
 ) -> Vec<RootPlan> {
-    let mut by_root: BTreeMap<
-        PathBuf,
-        (
-            Vec<OrganisationCandidate>,
-            BTreeMap<PathBuf, PlatformCorrection>,
-            Vec<(PathBuf, String)>,
-        ),
-    > = BTreeMap::new();
+    let mut by_root: BTreeMap<PathBuf, RootParts> = BTreeMap::new();
     let mut orphans = Vec::new();
     // Package boundaries first: a set moves whole, a member never alone, and
     // anything that cannot be bounded stays put with the reason.
@@ -522,7 +523,7 @@ pub fn apply(
     ApplyOutcome,
     (
         ApplyError,
-        Option<crate::dat::rename_apply::RenameTransaction>,
+        Option<Box<crate::dat::rename_apply::RenameTransaction>>,
     ),
 > {
     let plan = &root_plan.plan;
@@ -594,7 +595,7 @@ pub fn apply(
                 &plan.master_root,
             );
         }
-        (error, Some(transaction))
+        (error, Some(Box::new(transaction)))
     })
 }
 

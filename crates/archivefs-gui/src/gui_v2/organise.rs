@@ -152,7 +152,7 @@ pub(super) type FolderPreviews = Vec<(FolderCandidate, FolderPreview)>;
 enum Message {
     Planned(Result<(Vec<RootPlan>, FolderPreviews), String>, bool),
     Applied(
-        Report,
+        Box<Report>,
         Vec<archivefs_core::dat::rename_apply::RenameTransaction>,
         Vec<FolderMoveRecord>,
     ),
@@ -283,7 +283,7 @@ impl State {
         self.receiver = Some(receiver);
         std::thread::spawn(move || {
             let (report, transactions, records) = apply_plans(&plans, &folders);
-            let _ = sender.send(Message::Applied(report, transactions, records));
+            let _ = sender.send(Message::Applied(Box::new(report), transactions, records));
         });
     }
 
@@ -310,7 +310,7 @@ impl State {
                 }
                 self.applied = transactions;
                 self.applied_folders = records;
-                self.phase = Phase::Done(report);
+                self.phase = Phase::Done(*report);
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
@@ -481,7 +481,7 @@ fn apply_plans(
                     .failed
                     .push(format!("{}: {error}", plan.root.display()));
                 match transaction {
-                    Some(t) => t,
+                    Some(t) => *t,
                     None => continue,
                 }
             }

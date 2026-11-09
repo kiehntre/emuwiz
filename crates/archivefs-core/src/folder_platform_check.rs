@@ -539,7 +539,7 @@ const NES_WRITE_REGISTERS: [u16; 6] = [0x2000, 0x2001, 0x2006, 0x2007, 0x4014, 0
 pub fn nes_register_signature(bytes: &[u8]) -> Option<Signal> {
     let mut seen = [false; NES_WRITE_REGISTERS.len()];
     for window in bytes.windows(3) {
-        if matches!(window[0], 0x8D | 0x8E | 0x8C) {
+        if matches!(window[0], 0x8C..=0x8E) {
             let address = u16::from_le_bytes([window[1], window[2]]);
             if let Some(slot) = NES_WRITE_REGISTERS.iter().position(|r| *r == address) {
                 seen[slot] = true;

@@ -1135,7 +1135,6 @@ fn platform_correction_commits_with_the_move_and_undo_restores_it() {
         f.db.find_archive_id_by_absolute_path(&destination).unwrap(),
         Some(f.id)
     );
-    let mut tx = tx;
     rollback_organisation_transaction(&mut tx, &journal, &no_cancel(), &f.plan.master_root)
         .unwrap();
     assert!(!destination.exists());
