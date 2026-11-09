@@ -629,7 +629,16 @@ pub fn preview_folders(
 
 /// PS3 disc folders found by layout in the library roots (read-only).
 pub fn found_game_folders(roots: &[PathBuf]) -> Vec<FolderCandidate> {
-    crate::game_package::find_game_folders(roots, 3)
+    let start = std::time::Instant::now();
+    let (found, cost) = crate::game_package::find_game_folders_measured(roots, 3);
+    log::info!(
+        "organise: PS3 folder search listed {} folders, made {} layout checks, found {} in {} ms",
+        cost.directories_read,
+        cost.layout_checks,
+        found.len(),
+        start.elapsed().as_millis()
+    );
+    found
         .into_iter()
         .map(|f| FolderCandidate {
             path: f.path,

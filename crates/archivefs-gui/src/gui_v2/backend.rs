@@ -1158,7 +1158,13 @@ pub(super) fn load_library_with_catalogues(
     .filter(|result| !result.stale)
     .filter_map(|result| result.archive_id)
     .collect();
-    let mut library = Library::with_history(archives, &renames, Some(&configured));
+    // An old-location row is retired only when its path is confirmed absent;
+    // any other error (permission, I/O) keeps it listed.
+    let mut library =
+        Library::with_history_retiring(archives, &renames, Some(&configured), |path| {
+            std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        });
     library.identity_context = super::library::IdentityContext {
         inventory: crate::dat_catalogue_picker::reference_inventory(),
         matched,

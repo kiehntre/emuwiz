@@ -1236,6 +1236,14 @@ impl App {
             {
                 self.filter.select_platform(String::new());
             }
+            if let Some((note, detail)) = retired_note(&self.library) {
+                ui.label(
+                    RichText::new(note)
+                        .size(theme::METADATA_SIZE)
+                        .color(theme::SECONDARY_TEXT),
+                )
+                .on_hover_text(detail);
+            }
             if let Some(note) = self.browse_play.cover_note.as_deref() {
                 ui.label(
                     RichText::new(format!("Some covers cannot load right now: {note}"))
@@ -1769,6 +1777,33 @@ fn readiness_filter_hint(filter: ReadinessFilter) -> &'static str {
         ReadinessFilter::NeedsAttention => "Show only games that need attention.",
         ReadinessFilter::NotChecked => "Games with no passed launch check yet.",
     }
+}
+
+/// How many records of removed library locations are not listed, and why.
+/// The records are kept; this only says they exist.
+pub(super) fn retired_note(library: &super::library::Library) -> Option<(String, String)> {
+    use archivefs_core::catalogue_supersession::Retirement;
+    if library.retired.is_empty() {
+        return None;
+    }
+    let count = |reason| {
+        library
+            .retired_reasons
+            .values()
+            .filter(|r| **r == reason)
+            .count()
+    };
+    Some((
+        format!(
+            "{} older records not listed: their library location was removed and the files are no longer there.",
+            thousands(library.retired.len())
+        ),
+        format!(
+            "Kept in the database, not deleted. {} have a file with the same name in your library that could not be confirmed as the same game; {} were not found in your library.",
+            thousands(count(Retirement::UnresolvedCopies)),
+            thousands(count(Retirement::NotFoundAnywhere))
+        ),
+    ))
 }
 
 /// Said under every readiness view that could be mistaken for a verdict on

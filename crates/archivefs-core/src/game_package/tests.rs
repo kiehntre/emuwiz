@@ -168,3 +168,144 @@ fn a_folder_layout_records_every_entry_and_refuses_links() {
             .contains("link")
     );
 }
+
+fn ps3_game(folder: &Path, title_id: &str) {
+    std::fs::create_dir_all(folder.join("PS3_GAME/USRDIR")).unwrap();
+    std::fs::write(folder.join("PS3_GAME/USRDIR/EBOOT.BIN"), b"x").unwrap();
+    std::fs::write(
+        folder.join("PS3_GAME/PARAM.SFO"),
+        sfo_bytes(&[("TITLE_ID", title_id)]),
+    )
+    .unwrap();
+}
+
+#[test]
+fn ps3_games_misfiled_under_other_systems_are_found_with_each_folder_listed_once() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().to_path_buf();
+    for set in 0..20 {
+        write(&root, &format!("arcade/set{set}/rom.bin"), "r");
+    }
+    // Misfiled under other systems' folders, at depths 2 and 3.
+    ps3_game(&root.join("arcade/BLUS00001"), "BLUS00001");
+    ps3_game(&root.join("snes/Collection/BLES00002"), "BLES00002");
+    // Correctly filed.
+    ps3_game(&root.join("PS3/BCES00003"), "BCES00003");
+    std::fs::create_dir_all(root.join("psx")).unwrap();
+    // A PS3_GAME without a valid layout is listed through, not reported.
+    std::fs::create_dir_all(root.join("zxs/Fake/PS3_GAME")).unwrap();
+    // Beyond the depth limit, as before.
+    ps3_game(&root.join("deep/a/b/BLUS00004"), "BLUS00004");
+
+    let (found, cost) = find_game_folders_measured(std::slice::from_ref(&root), 3);
+    let found: Vec<_> = found.iter().map(|f| f.path.clone()).collect();
+    assert_eq!(
+        found,
+        vec![
+            root.join("PS3/BCES00003"),
+            root.join("arcade/BLUS00001"),
+            root.join("snes/Collection/BLES00002"),
+        ]
+    );
+    // Listed: the root, its 6 folders, and the 26 folders below them
+    // (20 sets, BLUS00001, Collection, BCES00003, Fake, a; zxs/Fake's PS3_GAME
+    // sits at the depth limit). Checked: the three folders whose listing holds
+    // PS3_GAME, plus the depth-limit folders BLES00002, Fake/PS3_GAME and b.
+    assert_eq!(
+        cost,
+        FolderSearchCost {
+            directories_read: 1 + 6 + 25,
+            layout_checks: 3 + 3,
+        }
+    );
+    assert_eq!(found_paths(&root), found, "the plain entry point agrees");
+}
+
+fn found_paths(root: &PathBuf) -> Vec<PathBuf> {
+    find_game_folders(std::slice::from_ref(root), 3)
+        .into_iter()
+        .map(|f| f.path)
+        .collect()
+}
+
+/// Read-only cost of the PS3 search on a real library (not part of the normal
+/// run): `REAL_GAMES_ROOT=/mnt/usbdrive/games cargo test -p archivefs-core --lib
+/// -- --ignored real_library_ps3_search_cost --nocapture`. Prints the previous
+/// algorithm's cost first (re-implemented here only for comparison), then this
+/// one's; `PS3_SEARCH_ONLY=previous|now` runs one of them, so each can be timed
+/// from a comparable cache state. Only lists folders and checks paths; nothing
+/// is written.
+#[test]
+#[ignore]
+fn real_library_ps3_search_cost() {
+    let root = PathBuf::from(std::env::var("REAL_GAMES_ROOT").expect("REAL_GAMES_ROOT"));
+    let previous = |root: &Path| {
+        let (mut reads, mut checks, mut found) = (0usize, 0usize, 0usize);
+        let mut pending = vec![(root.to_path_buf(), 0usize)];
+        while let Some((dir, depth)) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            reads += 1;
+            for entry in entries.flatten() {
+                if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    continue;
+                }
+                checks += 1;
+                if ps3_game_folder(&entry.path()).is_some() {
+                    found += 1;
+                } else if depth + 1 < 3 {
+                    pending.push((entry.path(), depth + 1));
+                }
+            }
+        }
+        (reads, checks, found)
+    };
+    let only = std::env::var("PS3_SEARCH_ONLY").ok();
+    let mut previous_found = None;
+    if only.as_deref() != Some("now") {
+        let start = std::time::Instant::now();
+        let (reads, checks, found) = previous(&root);
+        println!(
+            "previous: directories_read={reads} layout_checks={checks} found={found} elapsed={:?}",
+            start.elapsed()
+        );
+        if only.is_some() {
+            return;
+        }
+        previous_found = Some(found);
+    }
+    let start = std::time::Instant::now();
+    let (now, cost) = find_game_folders_measured(std::slice::from_ref(&root), 3);
+    println!(
+        "now:      directories_read={} layout_checks={} found={} elapsed={:?}",
+        cost.directories_read,
+        cost.layout_checks,
+        now.len(),
+        start.elapsed()
+    );
+    if let Some(found) = previous_found {
+        assert_eq!(now.len(), found, "both find the same folders");
+    }
+}
+
+#[test]
+fn a_ps3_game_entry_in_any_letter_case_is_still_checked() {
+    // On a case-insensitive filesystem `ps3_game` resolves as PS3_GAME, so a
+    // folder listing it must be checked like before; here (case-sensitive) the
+    // check runs and correctly finds no layout.
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().to_path_buf();
+    std::fs::create_dir_all(root.join("snes/Game/ps3_game")).unwrap();
+    let (found, cost) = find_game_folders_measured(std::slice::from_ref(&root), 3);
+    assert!(found.is_empty());
+    // Listed: root, snes, Game. Checked: Game (its listing holds ps3_game)
+    // and Game/ps3_game at the depth limit.
+    assert_eq!(
+        cost,
+        FolderSearchCost {
+            directories_read: 3,
+            layout_checks: 2,
+        }
+    );
+}

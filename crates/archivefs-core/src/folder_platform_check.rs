@@ -199,6 +199,8 @@ pub fn load_cartridge_catalogues(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadRefusal {
+    /// Nothing exists at the recorded path any more.
+    Missing,
     Unreadable(String),
     TooLarge(u64),
     NotSingleMember(&'static str),
@@ -209,6 +211,7 @@ pub enum ReadRefusal {
 impl ReadRefusal {
     pub fn describe(&self) -> String {
         match self {
+            Self::Missing => "is no longer at this location".to_string(),
             Self::Unreadable(e) => format!("could not be read: {e}"),
             Self::TooLarge(n) => format!("{n} bytes is larger than this check reads"),
             Self::NotSingleMember(w) | Self::Unsafe(w) => (*w).to_string(),
@@ -229,8 +232,17 @@ pub fn read_check_file(
     path: &Path,
     trusted: &TrustedRoots,
 ) -> Result<(Option<String>, Vec<u8>), ReadRefusal> {
-    let safe = open_bounded_read(path, trusted)
-        .map_err(|refusal| ReadRefusal::Unreadable(refusal.detail()))?;
+    let safe = open_bounded_read(path, trusted).map_err(|refusal| {
+        // Only a confirmed absence is reported as missing; any other failure
+        // (permission, I/O, an unsafe link) stays "could not be read".
+        if std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            ReadRefusal::Missing
+        } else {
+            ReadRefusal::Unreadable(refusal.detail())
+        }
+    })?;
     let is_zip = path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
@@ -844,6 +856,8 @@ pub struct RunOutput {
     /// Games per folder that were read, to show the disagreeing fraction.
     pub checked_per_folder: std::collections::BTreeMap<PathBuf, usize>,
     pub unreadable: usize,
+    /// No file at the recorded path any more (counted apart from unreadable).
+    pub missing: usize,
     /// Larger than [`MAX_CHECK_BYTES`].
     pub too_large: usize,
     /// Multi-member, unsafe or inconsistent ZIPs, or changed files.
@@ -897,6 +911,7 @@ pub fn check_candidates(
             Ok(read) => read,
             Err(refusal) => {
                 match &refusal {
+                    ReadRefusal::Missing => out.missing += 1,
                     ReadRefusal::Unreadable(_) => out.unreadable += 1,
                     ReadRefusal::TooLarge(_) => out.too_large += 1,
                     _ => out.skipped += 1,

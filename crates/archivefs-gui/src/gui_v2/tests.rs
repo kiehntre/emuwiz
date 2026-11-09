@@ -7898,6 +7898,116 @@ fn real_catalogue_supersession_counts() {
         .filter(|game| game.archive.last_verified_missing_at.is_some())
         .count();
     println!("missing rows still visible (unresolved)={still_missing}");
+    let mut retired = std::collections::BTreeMap::new();
+    for reason in after.retired_reasons.values() {
+        *retired.entry(format!("{reason:?}")).or_insert(0usize) += 1;
+    }
+    println!(
+        "retired old-location rows={} (kept, not listed) by reason: {retired:?}",
+        after.retired.len()
+    );
+    // Optional: a TSV whose first column is an archive id, to show where each
+    // listed row now sits (superseded, retired, or still listed).
+    if let Ok(list) = std::env::var("STALE_ROWS") {
+        let ids: Vec<i64> = std::fs::read_to_string(list)
+            .expect("STALE_ROWS")
+            .lines()
+            .filter_map(|line| line.split('\t').next()?.parse().ok())
+            .collect();
+        let mut outcome = std::collections::BTreeMap::new();
+        for id in &ids {
+            let key = if after.historical_links.contains_key(id) {
+                "superseded by a current row".to_string()
+            } else if let Some(reason) = after.retired_reasons.get(id) {
+                format!("retired: {reason:?}")
+            } else if after.by_id.contains_key(id) {
+                "still listed".to_string()
+            } else {
+                "not in catalogue".to_string()
+            };
+            *outcome.entry(key).or_insert(0usize) += 1;
+        }
+        println!("stale rows={} outcome: {outcome:?}", ids.len());
+    }
+}
+
+#[test]
+fn absent_rows_of_a_removed_source_are_retired_not_listed_and_not_organised() {
+    use archivefs_core::catalogue_supersession::Retirement;
+    let removed = |id, rel: &str, platform: &str| {
+        let mut row = moved_row(id, rel, 10 + id as u64, false);
+        row.source_folder_id = 9;
+        row.platform = Some(platform.into());
+        row.platform_source = Some("folder".into());
+        row
+    };
+    let current = |id, rel: &str, size, platform: &str| {
+        let mut row = moved_row(id, rel, size, false);
+        row.platform = Some(platform.into());
+        row.platform_source = Some("folder".into());
+        row
+    };
+    let rows = vec![
+        // Labelled SNES at the old location, NES at the new one.
+        removed(1, "roms/snes/Mario.nes", "SNES"),
+        current(2, "nes/Mario.nes", 11, "NES"),
+        removed(3, "roms/snes/Gone.sfc", "SNES"),
+        // Still on disk at the old path: stays listed.
+        removed(4, "roms/snes/Here.sfc", "SNES"),
+        current(5, "snes/Real.sfc", 50, "SNES"),
+    ];
+    let configured = std::collections::HashSet::from([1]);
+    let library = Library::with_history_retiring(rows, &[], Some(&configured), |path| {
+        !path.ends_with("Here.sfc")
+    });
+    let mut listed: Vec<i64> = library.games.iter().map(|g| g.archive.id).collect();
+    listed.sort_unstable();
+    assert_eq!(listed, vec![2, 4, 5]);
+    assert_eq!(
+        library.retired_reasons,
+        std::collections::HashMap::from([
+            (1, Retirement::UnresolvedCopies),
+            (3, Retirement::NotFoundAnywhere)
+        ])
+    );
+    assert_eq!(library.retired.len(), 2, "kept, not deleted");
+    let (note, detail) = super::browse_play::retired_note(&library).expect("a note");
+    assert!(note.starts_with("2 older records not listed"), "{note}");
+    assert!(
+        detail.contains("not deleted")
+            && detail.contains("1 have a file with the same name")
+            && detail.contains("1 were not found"),
+        "{detail}"
+    );
+    assert!(super::browse_play::retired_note(&Library::default()).is_none());
+    let snes = &library
+        .games
+        .iter()
+        .find(|g| g.archive.id == 5)
+        .unwrap()
+        .platform;
+    assert_eq!(
+        library.platforms.get(snes),
+        Some(&2),
+        "{:?}",
+        library.platforms
+    );
+    assert!(library.historical.is_empty() && library.resolve(1) == 1);
+    let organised: Vec<i64> = super::folder_check::candidates_of(&library.games)
+        .iter()
+        .map(|c| c.archive_id)
+        .collect();
+    assert!(
+        !organised.contains(&1) && !organised.contains(&3),
+        "{organised:?}"
+    );
+    // Without an absence check nothing is retired (the previous behaviour).
+    let plain = Library::with_history(
+        library.retired.iter().map(|g| g.archive.clone()).collect(),
+        &[],
+        Some(&configured),
+    );
+    assert_eq!(plain.games.len(), 2);
 }
 
 #[test]

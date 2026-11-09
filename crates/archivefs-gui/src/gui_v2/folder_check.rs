@@ -166,6 +166,7 @@ pub(super) fn progress_text(
     done: usize,
     total: usize,
     stopped_early: bool,
+    missing: usize,
     unreadable: usize,
     too_large: usize,
     skipped: usize,
@@ -175,6 +176,11 @@ pub(super) fn progress_text(
     } else {
         format!("Checked {done} of {total} games.")
     };
+    if missing > 0 {
+        text.push_str(&format!(
+            " {missing} no longer at their recorded location (not read)."
+        ));
+    }
     if unreadable > 0 {
         text.push_str(&format!(" {unreadable} could not be read."));
     }
@@ -241,6 +247,7 @@ pub(super) struct State {
     pub findings: Vec<Finding>,
     pub checked_per_folder: BTreeMap<PathBuf, usize>,
     pub checked: usize,
+    pub missing: usize,
     pub unreadable: usize,
     pub too_large: usize,
     pub skipped: usize,
@@ -411,6 +418,7 @@ impl State {
                             self.skipped += out.skipped;
                             self.next += out.checked;
                             self.checked += out.checked;
+                            self.missing += out.missing;
                             self.unreadable += out.unreadable;
                             for (folder, n) in out.checked_per_folder.clone() {
                                 *self.checked_per_folder.entry(folder).or_default() += n;
@@ -557,6 +565,7 @@ impl App {
                 done,
                 self.folder_check.total(),
                 self.folder_check.stopped_early && !busy,
+                self.folder_check.missing,
                 self.folder_check.unreadable,
                 self.folder_check.too_large,
                 self.folder_check.skipped,
