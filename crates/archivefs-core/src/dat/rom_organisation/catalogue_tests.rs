@@ -116,7 +116,7 @@ impl Fixture {
     fn metadata(&self, id: i64) -> Vec<String> {
         let c = self.sql();
         let mut stmt = c.prepare("SELECT * FROM archives WHERE id=?1").unwrap();
-        let columns: Vec<_> = stmt.column_names().iter().map(|n| n.to_string()).collect();
+        let columns: Vec<_> = stmt.column_names().map(|n| n.to_string()).collect();
         stmt.query_row([id], |r| {
             Ok(columns
                 .iter()

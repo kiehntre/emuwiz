@@ -759,7 +759,7 @@ fn dump(connection: &Connection, table: &str, column: &str, ids: &str) -> Result
             "SELECT * FROM {table} WHERE {column} IN ({ids}) ORDER BY rowid"
         ))
         .map_err(|e| db_error("snapshot rows", e))?;
-    let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+    let columns: Vec<String> = stmt.column_names().map(|c| c.to_string()).collect();
     let rows = stmt
         .query_map([], |r| {
             (0..columns.len())

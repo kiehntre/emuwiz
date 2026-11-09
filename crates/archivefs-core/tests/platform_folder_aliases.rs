@@ -211,7 +211,11 @@ fn audit_database_copy_read_only() {
     let owned = tempfile::tempdir().unwrap();
     let validation_path = owned.path().join("validation.sqlite3");
     connection
-        .backup(rusqlite::MAIN_DB, &validation_path, None)
+        .backup(
+            rusqlite::MAIN_DB,
+            &validation_path,
+            None::<fn(rusqlite::backup::Progress)>,
+        )
         .unwrap();
     let mut validation = Database::open_or_create(&validation_path).unwrap();
     let evidence =

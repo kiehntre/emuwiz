@@ -2057,7 +2057,11 @@ fn upgrade_library_database_with_migrations(
         &source_identity,
     )?;
     let backup_path = reservation.backup_path.clone();
-    if let Err(error) = source.backup(MAIN_DB, &backup_path, None) {
+    if let Err(error) = source.backup(
+        MAIN_DB,
+        &backup_path,
+        None::<fn(rusqlite::backup::Progress)>,
+    ) {
         reservation.discard();
         return Err(ArchiveFsError::Database(format!(
             "Could not create a safe pre-upgrade database backup. The library database was not \
