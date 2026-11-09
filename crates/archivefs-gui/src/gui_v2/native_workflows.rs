@@ -278,13 +278,17 @@ pub(super) fn offers_review_identity(input: &launch_readiness_page::LaunchReadin
         input,
         launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
             launch_readiness_page::IdentityUnknownReason::SystemNotChosen
-                | launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+                | launch_readiness_page::IdentityUnknownReason::NotConfirmed
+                | launch_readiness_page::IdentityUnknownReason::FolderOnly(_)
+                | launch_readiness_page::IdentityUnknownReason::MediaConflict { .. },
         ) | launch_readiness_page::LaunchReadinessInput::DiscFilesUnresolved(_)
             | launch_readiness_page::LaunchReadinessInput::IdentityConflicting
     )
 }
 
 pub(super) const REVIEW_IDENTITY: &str = "Review identity";
+pub(super) const CHANGE_SYSTEM_PERMANENTLY: &str = "Change system permanently…";
+pub(super) const TRY_ANYWAY: &str = "Try anyway (this launch only)";
 
 /// The Launch page's identity button and the sentence above it, per reason.
 /// Unsupported archives have no identity screen to go to, so they offer only
@@ -297,6 +301,14 @@ pub(super) fn identity_next_step(
         Input::IdentityUnknown(Reason::SystemNotChosen) => (
             "Choose system",
             "Next step: Choose system sets the system for this game after you review its confirmation. Without a system EmuWiz cannot pick an emulator.",
+        ),
+        Input::IdentityUnknown(Reason::FolderOnly(_)) => (
+            CHANGE_SYSTEM_PERMANENTLY,
+            "Or change the system permanently: Review identity saves your choice for this game. It then outranks later automatic detection until you choose \"Use the detected system again\".",
+        ),
+        Input::IdentityUnknown(Reason::MediaConflict { .. }) => (
+            REVIEW_IDENTITY,
+            "Next step: the file's own header names another system. Review identity lets you change the system to match the file.",
         ),
         Input::IdentityUnknown(Reason::NotConfirmed) => (
             "Verify identity",
@@ -365,11 +377,16 @@ impl NativeWorkflows {
             .platform
             .clone()
             .map(|platform| (archive.absolute_path.clone(), platform));
+        let platform_source = archive
+            .platform_source
+            .clone()
+            .map(|source| (archive.absolute_path.clone(), source));
         // A cached identity was gathered under the earlier catalogue hint.
         // A changed or withdrawn choice must revoke that authority before
         // this same path can supply a launch key again.
         if self.selected.as_deref() == Some(archive.absolute_path.as_path())
-            && self.app.catalogued_platform_hint != platform_hint
+            && (self.app.catalogued_platform_hint != platform_hint
+                || self.app.catalogued_platform_source != platform_source)
         {
             self.app.cancel_selected_evidence_work();
             self.app.selected_evidence_ui.selected_evidence_generation += 1;
@@ -380,6 +397,7 @@ impl NativeWorkflows {
             self.app.launch_standalone.clear_cue_review();
         }
         self.app.catalogued_platform_hint = platform_hint;
+        self.app.catalogued_platform_source = platform_source;
         self.app.catalogued_row_health = Some((
             archive.absolute_path.clone(),
             archive.last_known_health.clone(),
@@ -619,6 +637,17 @@ impl NativeWorkflows {
             );
         }
         self.select(path);
+        // A "Try anyway" belongs to one file and one launch attempt: leaving
+        // the game or starting a launch consumes it. Nothing was ever saved.
+        if self
+            .app
+            .launch_system_trial
+            .as_ref()
+            .is_some_and(|(tried, _)| tried != path)
+            || (self.launch_active() && self.app.launch_system_trial.is_some())
+        {
+            self.app.launch_system_trial = None;
+        }
         self.app.launch_standalone.focus_dosbox_game(Some(path));
         self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
         self.app.emulator_readiness.vice.show(ui, Some(path));
@@ -637,6 +666,30 @@ impl NativeWorkflows {
         self.start_launch_readiness(ui.ctx());
 
         let input = self.launch_input();
+        let folder_only = matches!(
+            input,
+            launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
+                launch_readiness_page::IdentityUnknownReason::FolderOnly(_)
+            )
+        );
+        let trial_systems = if folder_only {
+            let recorded = self
+                .app
+                .catalogued_platform_hint
+                .as_ref()
+                .filter(|(hinted, _)| hinted == path)
+                .map(|(_, platform)| platform.as_str());
+            crate::emulator_setup::unverified_media::trial_systems(path, recorded)
+        } else {
+            Vec::new()
+        };
+        let active_trial = self
+            .app
+            .launch_system_trial
+            .as_ref()
+            .filter(|(tried, _)| tried == path)
+            .map(|(_, system)| *system);
+        let mut trial_pick: Option<Option<&'static str>> = None;
         let readiness_error = self.readiness_error();
         if readiness_error.is_none()
             && matches!(
@@ -729,6 +782,34 @@ impl NativeWorkflows {
                     "Next step: this archive format is not supported for launch identity. Extract the game or use a supported format, then press Retry readiness check.",
                 );
             }
+            if folder_only && !trial_systems.is_empty() {
+                ui.label(format!(
+                    "{TRY_ANYWAY}: EmuWiz will not start this game on a folder guess alone. Pick a system to try it once; you will see a warning, nothing is saved, and later scans are unaffected."
+                ));
+                ui.horizontal_wrapped(|ui| {
+                    for system in trial_systems.iter().take(8) {
+                        if ui
+                            .button(format!(
+                                "Try once as {}",
+                                archivefs_core::platform::display_name_for(system)
+                            ))
+                            .on_hover_text("One launch attempt only. Your library, the game's recorded system and catalogue evidence do not change. Launch safety checks still apply.")
+                            .clicked()
+                        {
+                            trial_pick = Some(Some(*system));
+                        }
+                    }
+                });
+            }
+            if let Some(system) = active_trial {
+                ui.label(format!(
+                    "One-time try as {} is set for this game. It is used for the next launch only and is never saved.",
+                    archivefs_core::platform::display_name_for(system)
+                ));
+                if ui.button("Cancel this try").clicked() {
+                    trial_pick = Some(None);
+                }
+            }
             let review_identity = offers_review_identity(&input) && {
                 let (button, note) = identity_next_step(&input);
                 ui.label(note);
@@ -743,6 +824,10 @@ impl NativeWorkflows {
                 retry_readiness,
             )
         });
+        if let Some(pick) = trial_pick {
+            self.app.launch_system_trial = pick.map(|system| (path.to_path_buf(), system));
+            self.recheck_readiness_in_place(ui.ctx());
+        }
         if retry_readiness {
             self.recheck_readiness_in_place(ui.ctx());
         }
@@ -1017,6 +1102,8 @@ impl NativeWorkflows {
                     &mut self.app.launch_standalone,
                     &mut self.app.launch_amiga_whdload,
                 );
+                // A one-time "Try anyway" is consumed by this attempt.
+                self.app.launch_system_trial = None;
                 PlayOutcome::Started
             }
             GamerPlayAction::BlockedTyped(blocker) => match blocker.kind {
@@ -5060,7 +5147,7 @@ pub(super) fn route_for_action(action: ReadinessAction, game_id: i64) -> Option<
         ReadinessAction::RecheckReadiness | ReadinessAction::LookUpOnline => None,
         ReadinessAction::ReviewDiscSet => Some(Route::Section(Section::MultiDisc)),
         ReadinessAction::OpenActivity => Some(Route::Section(Section::Activity)),
-        ReadinessAction::Play | ReadinessAction::ChooseEmulator => Some(Route::Task {
+        ReadinessAction::Play | ReadinessAction::ChooseEmulator | ReadinessAction::TryAnyway => Some(Route::Task {
             section: Section::Launch,
             game: game_id,
         }),

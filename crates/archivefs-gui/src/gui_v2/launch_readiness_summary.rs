@@ -42,6 +42,10 @@ pub(crate) enum ReadinessAction {
     VerifyIdentity,
     /// No trusted system on record: open the existing Choose system flow.
     ChooseSystem,
+    /// The system came from the folder name only: open the Launch page,
+    /// which offers a one-launch "Try anyway" (nothing saved) beside the
+    /// permanent Change system.
+    TryAnyway,
     CheckGamesFolder,
     ReviewProblem,
     ChooseEmulator,
@@ -350,6 +354,26 @@ fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSumma
             FirmwareSummary::Unknown,
             None,
             Some(ReadinessAction::RecheckReadiness),
+        ),
+        IdentityUnknownReason::FolderOnly(system) => base(
+            ReadinessPresentationState::NeedsSystem,
+            &format!("The {system} system is only a guess from the folder"),
+            &format!("EmuWiz only knows the system from the folder this file is in, and the file format is shared with other systems, so Play is not offered on that guess alone. Try anyway starts it once as {system} (or another compatible system) with a warning and saves nothing. To make it lasting, change the system permanently on Review identity. Catalogue (DAT) verification is not required."),
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::TryAnyway),
+        ),
+        IdentityUnknownReason::MediaConflict { recorded, content } => base(
+            ReadinessPresentationState::Blocked,
+            &format!("This file is a {content} game, not {recorded}"),
+            &format!("The file's own header says {content}, but the game is recorded as {recorded}. EmuWiz will not start it with a {recorded} emulator. Review identity lets you change the system."),
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::ReviewIdentity),
         ),
         IdentityUnknownReason::NotConfirmed => base(
             ReadinessPresentationState::NeedsIdentityReview,
@@ -907,6 +931,7 @@ pub(crate) fn action_label(action: ReadinessAction) -> &'static str {
         ReadinessAction::ReviewIdentity => "Review identity",
         ReadinessAction::VerifyIdentity => "Verify identity",
         ReadinessAction::ChooseSystem => "Choose system",
+        ReadinessAction::TryAnyway => "Try anyway",
         ReadinessAction::CheckGamesFolder => "Check games folder",
         ReadinessAction::ReviewProblem => "Review problem",
         ReadinessAction::ChooseEmulator => "Choose emulator",

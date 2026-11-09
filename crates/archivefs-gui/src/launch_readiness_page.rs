@@ -148,6 +148,17 @@ pub(crate) enum IdentityUnknownReason {
     AmigaHardDisk,
     /// An Amiga IPF preservation image: not an identity-checked game file.
     AmigaIpf,
+    /// Only the folder (or another automatic hint) says which system this is,
+    /// and the file's format is shared with other systems (payload: the
+    /// system's display name). The person must confirm the system first;
+    /// a folder guess never becomes trusted platform identity by itself.
+    FolderOnly(&'static str),
+    /// The file's own header names a different system from the one recorded
+    /// for it (payloads: recorded system, the file's own system).
+    MediaConflict {
+        recorded: &'static str,
+        content: &'static str,
+    },
 }
 
 impl IdentityUnknownReason {
@@ -156,7 +167,13 @@ impl IdentityUnknownReason {
     /// The other reasons have no identity route, so no "Verify identity" or
     /// "Review identity" action is offered for them.
     pub(crate) fn has_identity_screen(self) -> bool {
-        matches!(self, Self::SystemNotChosen | Self::NotConfirmed)
+        matches!(
+            self,
+            Self::SystemNotChosen
+                | Self::NotConfirmed
+                | Self::FolderOnly(_)
+                | Self::MediaConflict { .. }
+        )
     }
 
     /// Plain sentence under the page for reasons that have no identity
@@ -190,6 +207,12 @@ impl IdentityUnknownReason {
             ),
             Self::AmigaHardDisk => format!("Amiga hard-disk image. {AMIGA_HDF_NOTE}"),
             Self::AmigaIpf => format!("Amiga IPF image. {AMIGA_IPF_NOTE}"),
+            Self::FolderOnly(system) => format!(
+                "Only the folder name says this is a {system} game, and this file format is used by other systems too. Confirm the system on the identity screen to try launching it."
+            ),
+            Self::MediaConflict { recorded, content } => format!(
+                "This game is recorded as {recorded}, but the file's own header says {content}. EmuWiz will not start it as {recorded}. Change the system on the identity screen."
+            ),
         }
     }
 
@@ -202,6 +225,8 @@ impl IdentityUnknownReason {
             Self::UnsupportedFormat(_) => "File format not supported yet",
             Self::AmigaHardDisk => "Amiga hard-disk image",
             Self::AmigaIpf => "Amiga IPF image",
+            Self::FolderOnly(_) => "System taken from the folder name",
+            Self::MediaConflict { .. } => "The file says it is for another system",
         }
     }
 
@@ -237,6 +262,18 @@ impl IdentityUnknownReason {
             Self::AmigaIpf => format!(
                 "{AMIGA_IPF_NOTE} EmuWiz does not check an IPF image's identity, so it \
                  cannot start it from here. This is not caused by missing DAT verification."
+            ),
+            Self::FolderOnly(system) => format!(
+                "EmuWiz only knows this is a {system} game from the folder it is in, and this \
+                 file format is shared with other systems, so it will not trust the folder on its \
+                 own. If it really is a {system} game, confirm the system and it can be started \
+                 with a \"game not identified\" warning. Your choice does not identify the game \
+                 or count as catalogue (DAT) verification."
+            ),
+            Self::MediaConflict { recorded, content } => format!(
+                "This game is recorded as {recorded}, but the file's own header says it is a \
+                 {content} game. EmuWiz will not start it with a {recorded} emulator. Change the \
+                 system to match the file, or check whether the file was put in the wrong folder."
             ),
         }
     }

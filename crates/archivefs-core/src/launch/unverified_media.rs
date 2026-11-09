@@ -304,6 +304,106 @@ fn cached(path: &Path, platform_id: &str) -> Option<ResolvedIdentity> {
     })
 }
 
+/// What the file's own bytes and format say about the system it is filed
+/// under. Folder names, catalogue hints and user choices are never consulted
+/// here; this is the "media evidence" tier of the owner's 2026-11-09 policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaSystemEvidence {
+    /// A decisive signature or structure names this system, or the file's
+    /// format is one only this system uses.
+    Agrees,
+    /// Decisive evidence names a different system (and nothing names this one).
+    Contradicts(&'static str),
+    /// Nothing in the file settles the system either way.
+    Silent,
+}
+
+/// Reads bounded signatures and structural checks (never the folder name) and
+/// compares them with `platform_id`.
+pub fn media_system_evidence(path: &Path, platform_id: &str) -> MediaSystemEvidence {
+    use crate::platform::detect::{DetectionRequest, DetectionSource, detect_platform_report};
+    let same = |other: &str| {
+        other == platform_id || crate::platform::equivalent_platform_ids(platform_id).contains(&other)
+    };
+    // The file itself is the source root, so no folder alias can be read.
+    let report = detect_platform_report(&DetectionRequest::new(path, path).inspecting_content());
+    let content: Vec<_> = report
+        .evidence
+        .iter()
+        .filter(|e| e.source == DetectionSource::Signature)
+        .collect();
+    if content.iter().any(|e| same(e.platform)) {
+        if content.iter().any(|e| same(e.platform) && e.conclusive) {
+            return MediaSystemEvidence::Agrees;
+        }
+    } else if let Some(other) = content.iter().find(|e| e.conclusive).map(|e| e.platform) {
+        return MediaSystemEvidence::Contradicts(other);
+    }
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|extension| format_only_this_system_uses(platform_id, extension))
+    {
+        return MediaSystemEvidence::Agrees;
+    }
+    MediaSystemEvidence::Silent
+}
+
+/// [`media_system_evidence`] cached by (path, size, mtime, platform), for
+/// readiness rebuilds. Click-time checks call the uncached form.
+pub fn media_system_evidence_cached(path: &Path, platform_id: &str) -> MediaSystemEvidence {
+    type Key = (PathBuf, u64, u128, String);
+    static CACHE: OnceLock<Mutex<HashMap<Key, MediaSystemEvidence>>> = OnceLock::new();
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return MediaSystemEvidence::Silent;
+    };
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let key = (path.to_path_buf(), metadata.len(), mtime, platform_id.to_string());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(hit) = guard.get(&key)
+    {
+        return *hit;
+    }
+    let answer = media_system_evidence(path, platform_id);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= CACHE_LIMIT {
+            guard.clear();
+        }
+        guard.insert(key, answer);
+    }
+    answer
+}
+
+/// A strong, non-shared extension listed by this system and by no other.
+fn format_only_this_system_uses(platform_id: &str, extension: &str) -> bool {
+    let extension = extension.to_ascii_lowercase();
+    if crate::platform::is_shared_extension(&extension) {
+        return false;
+    }
+    let Some(platform) = crate::platform::platform_by_id(platform_id) else {
+        return false;
+    };
+    let listed = |p: &crate::platform::Platform| {
+        p.strong_extensions
+            .iter()
+            .chain(p.weak_extensions.iter())
+            .any(|listed| listed.eq_ignore_ascii_case(&extension))
+    };
+    platform
+        .strong_extensions
+        .iter()
+        .any(|listed| listed.eq_ignore_ascii_case(&extension))
+        && crate::platform::PLATFORMS
+            .iter()
+            .filter(|p| p.id != platform.id)
+            .all(|p| !listed(p))
+}
+
 /// Whether `extension` is one of the formats the platform registry lists.
 pub fn platform_lists_extension(platform_id: &str, extension: &str) -> bool {
     let Some(platform) = crate::platform::platform_by_id(platform_id) else {
@@ -430,6 +530,51 @@ mod platform_media_tests {
         file.set_len(40 * 1024 * 1024).unwrap();
         let resolved = platform_media_identity_fresh(&path, "PS2").expect("iso is a PS2 format");
         assert!(is_unverified_key(&resolved.game_key));
+    }
+
+    fn ines(name: &str, dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let mut bytes = b"NES\x1a".to_vec();
+        bytes.resize(16 + 16 * 1024, 0);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_nes_header_contradicts_the_snes_folder_whatever_the_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        // NES game renamed into the SNES collection.
+        let renamed = ines("Misfiled (USA).sfc", &dir);
+        assert_eq!(
+            media_system_evidence(&renamed, "SNES"),
+            MediaSystemEvidence::Contradicts("NES")
+        );
+        // The same bytes under the system they belong to agree.
+        assert_eq!(media_system_evidence(&renamed, "NES"), MediaSystemEvidence::Agrees);
+        let proper = ines("Proper (USA).nes", &dir);
+        assert_eq!(media_system_evidence(&proper, "NES"), MediaSystemEvidence::Agrees);
+    }
+
+    #[test]
+    fn shared_formats_are_silent_and_only_one_system_s_own_format_agrees() {
+        let dir = tempfile::tempdir().unwrap();
+        // A CHD names no system in its container bytes: folder alone decides.
+        let chd = dir.path().join("Disc (Europe).chd");
+        std::fs::write(&chd, vec![0u8; 4096]).unwrap();
+        assert_eq!(media_system_evidence(&chd, "Dreamcast"), MediaSystemEvidence::Silent);
+        assert_eq!(media_system_evidence(&chd, "Philips CD-i"), MediaSystemEvidence::Silent);
+        // A ZIP is a shared container, never format evidence.
+        let zip = dir.path().join("Game (USA).zip");
+        std::fs::write(&zip, b"PK\x03\x04rest").unwrap();
+        assert_eq!(media_system_evidence(&zip, "SNES"), MediaSystemEvidence::Silent);
+        // A Dreamcast-only disc format agrees.
+        let cdi = dir.path().join("Disc (Europe).cdi");
+        std::fs::write(&cdi, vec![0u8; 4096]).unwrap();
+        assert_eq!(media_system_evidence(&cdi, "Dreamcast"), MediaSystemEvidence::Agrees);
+        // An extension another system also lists never agrees on its own.
+        let iso = dir.path().join("Disc.iso");
+        std::fs::write(&iso, vec![0u8; 4096]).unwrap();
+        assert_eq!(media_system_evidence(&iso, "PS2"), MediaSystemEvidence::Silent);
     }
 
     #[test]

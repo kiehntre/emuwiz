@@ -32,6 +32,12 @@ pub(crate) struct ReadinessSources<'a> {
     /// snapshot is not loaded on the v2 routes, so the live record cannot be
     /// the only source of the platform.
     pub(crate) platform_hint: &'a dyn Fn(&Path) -> Option<String>,
+    /// How the catalogue's platform for exactly this path was set
+    /// (`platform_assignments.source`: "manual", "folder_alias", ...).
+    pub(crate) platform_source: &'a dyn Fn(&Path) -> Option<String>,
+    /// A one-launch "Try anyway" system for exactly this path (in memory
+    /// only; see `unverified_media`). Background workers never have one.
+    pub(crate) system_trial: &'a dyn Fn(&Path) -> Option<&'static str>,
 }
 
 impl ReadinessSources<'_> {
@@ -349,27 +355,90 @@ impl ReadinessSources<'_> {
             identity_status = evidence.identity();
         }
         // Owner-approved controlled path (ZX tapes 2026-11-07, every system
-        // 2026-11-09): a single-file game whose system is established may
-        // launch with a visible "identity unverified" warning instead of
-        // requiring DAT or header identity. The file's own content must not
-        // point to another system.
-        let mut identity_unverified = false;
+        // 2026-11-09, see `unverified_media`): a single-file game whose system
+        // is established by its own media or the person's choice may launch
+        // with a visible "game not identified" warning instead of requiring
+        // DAT or header identity. A folder-only system must be confirmed
+        // first, and content naming another system is refused.
+        let mut identity_unverified = None;
+        // Reported in place of the generic reason, after the disc-file and
+        // DOS checks below have had their say.
+        let mut lane_reason = None;
         if matches!(
             identity_status,
             archivefs_core::launch::CanonicalIdentityStatus::Unknown
         ) && !evidence_freshness.is_incomplete()
             && let Some(path) = focused
-            && let Some(hint) = focused_record
-                .and_then(|record| record.mount_plan.archive.identity.platform.clone())
-                .or_else(|| (self.platform_hint)(path))
-            && let Some(resolved) = crate::emulator_setup::unverified_media::resolve(
-                path,
-                &hint,
-                selected_game_identity_report.map(|report| report.platform),
-            )
         {
-            identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved);
-            identity_unverified = true;
+            let catalogued = (self.platform_hint)(path);
+            let hint = focused_record
+                .and_then(|record| record.mount_plan.archive.identity.platform.clone())
+                .or_else(|| catalogued.clone());
+            // A format EmuWiz explicitly does not start from here (Amiga HDF
+            // and IPF, unsupported archives, cartridge formats the system's
+            // check does not read) stays unsupported: the unverified lane
+            // never manufactures launch support (owner rule 7, 2026-11-09).
+            let format_unsupported = matches!(
+                identity_unknown_reason(
+                    focused,
+                    selected_game_identity_report,
+                    Some(hint.as_deref()),
+                ),
+                launch_readiness_page::IdentityUnknownReason::AmigaHardDisk
+                    | launch_readiness_page::IdentityUnknownReason::AmigaIpf
+                    | launch_readiness_page::IdentityUnknownReason::UnsupportedArchive
+                    | launch_readiness_page::IdentityUnknownReason::UnsupportedFormat(_)
+            );
+            if let Some(hint) = hint.filter(|_| !format_unsupported) {
+                // The recorded source only describes the catalogue's own value.
+                let source = (catalogued.as_deref() == Some(hint.as_str()))
+                    .then(|| (self.platform_source)(path))
+                    .flatten();
+                use crate::emulator_setup::unverified_media::Outcome;
+                match crate::emulator_setup::unverified_media::resolve(
+                    path,
+                    &hint,
+                    source.as_deref(),
+                    selected_game_identity_report.map(|report| report.platform),
+                    (self.system_trial)(path),
+                ) {
+                    Outcome::Allowed(resolved, basis) => {
+                        identity_status =
+                            archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved);
+                        identity_unverified = Some(basis);
+                    }
+                    Outcome::NeedsConfirmation(platform) => {
+                        lane_reason = Some(launch_readiness_page::IdentityUnknownReason::FolderOnly(
+                            archivefs_core::platform::display_name_for(platform),
+                        ));
+                    }
+                    Outcome::Contradicted { recorded, content } => {
+                        lane_reason =
+                            Some(launch_readiness_page::IdentityUnknownReason::MediaConflict {
+                                recorded: archivefs_core::platform::display_name_for(recorded),
+                                content: archivefs_core::platform::display_name_for(content),
+                            });
+                    }
+                    Outcome::NotApplicable => {}
+                }
+            }
+        }
+        // Whatever route resolved it, a plain file whose own header names a
+        // different system is refused (owner policy 2026-11-09), e.g. an NES
+        // ROM renamed into the SNES collection.
+        if let archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved) = &identity_status
+            && let Some(path) = focused
+            && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+            && let Some(recorded) = archivefs_core::canonical_platform_for_alias(&resolved.platform_id)
+            && let archivefs_core::launch::unverified_media::MediaSystemEvidence::Contradicts(content) =
+                archivefs_core::launch::unverified_media::media_system_evidence_cached(path, recorded)
+        {
+            return LaunchReadinessInput::IdentityUnknown(
+                launch_readiness_page::IdentityUnknownReason::MediaConflict {
+                    recorded: archivefs_core::platform::display_name_for(recorded),
+                    content: archivefs_core::platform::display_name_for(content),
+                },
+            );
         }
         match identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
@@ -388,11 +457,14 @@ impl ReadinessSources<'_> {
                 } else if evidence_freshness.is_incomplete() {
                     LaunchReadinessInput::InspectionIncomplete
                 } else {
-                    LaunchReadinessInput::IdentityUnknown(identity_unknown_reason(
-                        focused,
-                        selected_game_identity_report,
-                        focused_record.map(|r| r.mount_plan.archive.identity.platform.as_deref()),
-                    ))
+                    LaunchReadinessInput::IdentityUnknown(lane_reason.unwrap_or_else(|| {
+                        identity_unknown_reason(
+                            focused,
+                            selected_game_identity_report,
+                            focused_record
+                                .map(|r| r.mount_plan.archive.identity.platform.as_deref()),
+                        )
+                    }))
                 };
             }
             archivefs_core::launch::CanonicalIdentityStatus::Conflicting => {
@@ -1531,8 +1603,8 @@ impl ReadinessSources<'_> {
             launch_readiness_page::amiga_boot::apply(&mut plan, context);
         }
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
-        if identity_unverified {
-            crate::emulator_setup::unverified_media::apply_warning(&mut plan);
+        if let Some(basis) = identity_unverified {
+            crate::emulator_setup::unverified_media::apply_warning(&mut plan, basis);
         }
         if let Some(probe) = &arcade_probe {
             crate::arcade_mame_probe::apply_warnings(&mut plan, probe);

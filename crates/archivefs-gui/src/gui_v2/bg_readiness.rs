@@ -389,6 +389,11 @@ pub(super) fn build_input(
             .then(|| archive.platform.clone())
             .flatten()
     };
+    let platform_source = |p: &Path| {
+        (p == archive.absolute_path)
+            .then(|| archive.platform_source.clone())
+            .flatten()
+    };
     let cheat_workflow = None;
     let is_arcade_set_directory =
         |p: &Path| archive.archive_kind == "arcade_set_directory" && p == archive.absolute_path;
@@ -408,6 +413,8 @@ pub(super) fn build_input(
             loose_ref: &loose_ref,
             is_arcade_set_directory: &is_arcade_set_directory,
             platform_hint: &platform_hint,
+            platform_source: &platform_source,
+            system_trial: &|_| None,
         }
         .build(None)
     });
@@ -602,9 +609,20 @@ mod tests {
     }
 
     fn on_disk(dir: &tempfile::TempDir, name: &str, platform: &str, bytes: &[u8]) -> Job {
+        on_disk_from(dir, name, platform, Some("folder_alias"), bytes)
+    }
+
+    fn on_disk_from(
+        dir: &tempfile::TempDir,
+        name: &str,
+        platform: &str,
+        source: Option<&str>,
+        bytes: &[u8],
+    ) -> Job {
         let path = dir.path().join(name);
         std::fs::write(&path, bytes).unwrap();
         let mut archive = archive(41, platform);
+        archive.platform_source = source.map(str::to_string);
         archive.absolute_path = path.clone();
         archive.relative_path = name.into();
         archive.archive_kind = "direct_game_image".into();
@@ -628,12 +646,21 @@ mod tests {
     fn a_game_of_a_known_system_without_catalogue_identity_reaches_a_plan() {
         let dir = tempfile::tempdir().unwrap();
         // A CD-i disc image: no header serial, no loose-ROM hash identity.
-        let job = on_disk(
-            &dir,
-            "7th Guest The (USA) (Disc 1).chd",
-            "Philips CD-i",
-            &[0u8; 512],
-        );
+        // Owner policy 2026-11-09: the folder alone is not enough for a shared
+        // disc format - the background check reports it, never plans it.
+        let name = "7th Guest The (USA) (Disc 1).chd";
+        let folder = on_disk(&dir, name, "Philips CD-i", &[0u8; 512]);
+        assert!(matches!(
+            build_input(&env(), &folder, &AtomicBool::new(false)),
+            Ok((
+                crate::launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
+                    crate::launch_readiness_page::IdentityUnknownReason::FolderOnly("Philips CD-i")
+                ),
+                _
+            ))
+        ));
+        // The person's own saved system choice reaches a plan.
+        let job = on_disk_from(&dir, name, "Philips CD-i", Some(archivefs_core::MANUAL_PLATFORM_SOURCE), &[0u8; 512]);
         let plan = planned(&job).expect("a launch plan, not Identity unresolved");
         assert_eq!(plan.platform_id.as_deref(), Some("Philips CD-i"));
         let key = plan.game_key.clone().unwrap_or_default();
@@ -641,6 +668,46 @@ mod tests {
             archivefs_core::launch::unverified_media::is_unverified_key(&key),
             "key {key:?}"
         );
+    }
+
+    /// Owner regression list 2026-11-09: NES games misfiled under SNES.
+    #[test]
+    fn an_nes_game_renamed_into_the_snes_folder_never_plans_as_snes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ines = b"NES\x1a".to_vec();
+        ines.resize(16 + 32 * 1024, 0);
+        for (name, source) in [
+            ("Misfiled (USA).sfc", Some("folder_alias")),
+            ("Misfiled (USA).sfc", Some(archivefs_core::MANUAL_PLATFORM_SOURCE)),
+            ("Misfiled (USA).bin", Some("folder_alias")),
+        ] {
+            let job = on_disk_from(&dir, name, "SNES", source, &ines);
+            let input = build_input(&env(), &job, &AtomicBool::new(false));
+            let as_snes = matches!(
+                &input,
+                Ok((crate::launch_readiness_page::LaunchReadinessInput::Plan { plan, .. }, _))
+                    if plan.platform_id.as_deref() == Some("SNES")
+            );
+            assert!(!as_snes, "{name} {source:?} planned as SNES");
+        }
+    }
+
+    /// Owner rule 7 (2026-11-09): formats EmuWiz explicitly does not start
+    /// from here stay unsupported even with a saved system choice.
+    #[test]
+    fn amiga_hard_disk_and_ipf_images_stay_explicitly_unsupported() {
+        use crate::launch_readiness_page::{IdentityUnknownReason as R, LaunchReadinessInput as I};
+        let dir = tempfile::tempdir().unwrap();
+        for (name, expected) in [("20000 Leagues.hdf", R::AmigaHardDisk), ("Game.ipf", R::AmigaIpf)] {
+            for source in [Some("folder_alias"), Some(archivefs_core::MANUAL_PLATFORM_SOURCE)] {
+                let job = on_disk_from(&dir, name, "Amiga", source, &[0u8; 4096]);
+                match build_input(&env(), &job, &AtomicBool::new(false)) {
+                    Ok((I::IdentityUnknown(reason), _)) => assert_eq!(reason, expected, "{name}"),
+                    Ok((I::Plan { .. }, _)) => panic!("{name} {source:?} planned"),
+                    _ => panic!("{name} {source:?}: unexpected input"),
+                }
+            }
+        }
     }
 
     #[test]

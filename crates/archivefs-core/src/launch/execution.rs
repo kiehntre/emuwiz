@@ -443,6 +443,20 @@ pub fn preflight_retroarch_launch(
     } else {
         fresh_identity_status(content_path, request)?
     };
+    // Whatever route identified it, a file whose own header names another
+    // system is never started as this one (owner policy 2026-11-09).
+    if let super::unverified_media::MediaSystemEvidence::Contradicts(other) =
+        super::unverified_media::media_system_evidence(content_path, &request.expected_platform_id)
+    {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::IdentityUnresolved,
+            format!(
+                "The game file's own header says it is for {}, not {}; EmuWiz will not start it with this system.",
+                crate::platform::display_name_for(other),
+                crate::platform::display_name_for(&request.expected_platform_id),
+            ),
+        ));
+    }
     super::nkit_readiness::check_raw_nkit_launch(&request.expected_platform_id, content_path)
         .map_err(|detail| {
             preflight_error(
@@ -1085,6 +1099,13 @@ pub(crate) fn spawn_retroarch_guarded(
                 &command.selection.platform_id,
             )
             .is_none()
+            || matches!(
+                super::unverified_media::media_system_evidence(
+                    &command.selection.content_path,
+                    &command.selection.platform_id,
+                ),
+                super::unverified_media::MediaSystemEvidence::Contradicts(_)
+            )
         {
             return Err(LaunchSpawnError::Spawn(std::io::Error::other(
                 "The game file changed since it was checked; recheck this game.",
