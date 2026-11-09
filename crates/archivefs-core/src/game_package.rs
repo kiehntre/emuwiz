@@ -423,7 +423,7 @@ pub fn find_game_folders(roots: &[PathBuf], max_depth: usize) -> Vec<FoundFolder
 
 /// [`find_game_folders`] plus what it cost. Each folder is listed at most once:
 /// a folder that is listed anyway is checked for a PS3 layout only when its own
-/// listing holds `PS3_GAME`, and only folders at the depth limit (which are not
+/// listing holds `PS3_GAME` (in any letter case) or could not be completed, and only folders at the depth limit (which are not
 /// listed) are checked directly. Sub-folders are visited in inode order, which
 /// on ext4 keeps neighbouring metadata reads together on a spinning disk.
 pub fn find_game_folders_measured(
@@ -460,15 +460,25 @@ pub fn find_game_folders_measured(
                 continue;
             };
             cost.directories_read += 1;
-            let mut holds_ps3_game = false;
+            // Checked whenever the listing might hold PS3_GAME: in any letter
+            // case (a case-insensitive filesystem resolves the checked path
+            // whatever its case), or when the listing could not be completed.
+            let mut maybe_ps3_game = false;
             let mut children = Vec::new();
-            for entry in entries.flatten() {
-                holds_ps3_game |= entry.file_name() == "PS3_GAME";
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    maybe_ps3_game = true;
+                    continue;
+                };
+                maybe_ps3_game |= entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .eq_ignore_ascii_case(b"PS3_GAME");
                 if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                     children.push((entry.ino(), entry.path()));
                 }
             }
-            if depth > 0 && holds_ps3_game && check(dir, &mut cost, &mut found) {
+            if depth > 0 && maybe_ps3_game && check(dir, &mut cost, &mut found) {
                 continue;
             }
             children.sort_unstable();

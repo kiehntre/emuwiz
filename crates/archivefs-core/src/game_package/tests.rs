@@ -288,3 +288,24 @@ fn real_library_ps3_search_cost() {
         assert_eq!(now.len(), found, "both find the same folders");
     }
 }
+
+#[test]
+fn a_ps3_game_entry_in_any_letter_case_is_still_checked() {
+    // On a case-insensitive filesystem `ps3_game` resolves as PS3_GAME, so a
+    // folder listing it must be checked like before; here (case-sensitive) the
+    // check runs and correctly finds no layout.
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().to_path_buf();
+    std::fs::create_dir_all(root.join("snes/Game/ps3_game")).unwrap();
+    let (found, cost) = find_game_folders_measured(std::slice::from_ref(&root), 3);
+    assert!(found.is_empty());
+    // Listed: root, snes, Game. Checked: Game (its listing holds ps3_game)
+    // and Game/ps3_game at the depth limit.
+    assert_eq!(
+        cost,
+        FolderSearchCost {
+            directories_read: 3,
+            layout_checks: 2,
+        }
+    );
+}
