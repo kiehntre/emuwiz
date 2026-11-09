@@ -405,40 +405,90 @@ pub struct FoundFolder {
     pub evidence: String,
 }
 
-/// Looks up to `max_depth` folders below each root for PS3 disc folders.
-/// Read-only; does not descend into a found game folder.
+/// Directory listings and PS3 layout checks made by one [`find_game_folders`]
+/// search, for measuring its cost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FolderSearchCost {
+    pub directories_read: usize,
+    pub layout_checks: usize,
+}
+
+/// Looks up to `max_depth` folders below each root for PS3 disc folders, in
+/// every folder whatever it is named (a PS3 game misfiled under another
+/// system's folder is found too). Read-only; does not descend into a found
+/// game folder.
 pub fn find_game_folders(roots: &[PathBuf], max_depth: usize) -> Vec<FoundFolder> {
+    find_game_folders_measured(roots, max_depth).0
+}
+
+/// [`find_game_folders`] plus what it cost. Each folder is listed at most once:
+/// a folder that is listed anyway is checked for a PS3 layout only when its own
+/// listing holds `PS3_GAME`, and only folders at the depth limit (which are not
+/// listed) are checked directly. Sub-folders are visited in inode order, which
+/// on ext4 keeps neighbouring metadata reads together on a spinning disk.
+pub fn find_game_folders_measured(
+    roots: &[PathBuf],
+    max_depth: usize,
+) -> (Vec<FoundFolder>, FolderSearchCost) {
+    use std::os::unix::fs::DirEntryExt;
     let mut found = Vec::new();
+    let mut cost = FolderSearchCost::default();
+    fn check(path: PathBuf, cost: &mut FolderSearchCost, found: &mut Vec<FoundFolder>) -> bool {
+        cost.layout_checks += 1;
+        let Some(title_id) = ps3_game_folder(&path) else {
+            return false;
+        };
+        found.push(FoundFolder {
+            path,
+            platform: "PS3".into(),
+            evidence: format!(
+                "PS3 disc layout: PS3_GAME/PARAM.SFO (title ID {title_id}) and PS3_GAME/USRDIR/EBOOT.BIN"
+            ),
+        });
+        true
+    }
     for root in roots {
+        // The root itself is a library folder, never a game folder.
         let mut pending = vec![(root.clone(), 0usize)];
         while let Some((dir, depth)) = pending.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
+                // A folder that can be entered but not listed can still hold
+                // a PS3 layout.
+                if depth > 0 {
+                    check(dir, &mut cost, &mut found);
+                }
                 continue;
             };
+            cost.directories_read += 1;
+            let mut holds_ps3_game = false;
+            let mut children = Vec::new();
             for entry in entries.flatten() {
-                let Ok(kind) = entry.file_type() else {
-                    continue;
-                };
-                if !kind.is_dir() {
-                    continue;
+                holds_ps3_game |= entry.file_name() == "PS3_GAME";
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    children.push((entry.ino(), entry.path()));
                 }
-                let path = entry.path();
-                if let Some(title_id) = ps3_game_folder(&path) {
-                    found.push(FoundFolder {
-                        path,
-                        platform: "PS3".into(),
-                        evidence: format!(
-                            "PS3 disc layout: PS3_GAME/PARAM.SFO (title ID {title_id}) and PS3_GAME/USRDIR/EBOOT.BIN"
-                        ),
-                    });
-                } else if depth + 1 < max_depth {
-                    pending.push((path, depth + 1));
+            }
+            if depth > 0 && holds_ps3_game && check(dir, &mut cost, &mut found) {
+                continue;
+            }
+            children.sort_unstable();
+            if depth + 1 < max_depth {
+                // Pushed in reverse so the lowest inode is listed first.
+                pending.extend(
+                    children
+                        .into_iter()
+                        .rev()
+                        .map(|(_, path)| (path, depth + 1)),
+                );
+            } else {
+                for (_, path) in children {
+                    check(path, &mut cost, &mut found);
                 }
             }
         }
     }
     found.sort_by(|a, b| a.path.cmp(&b.path));
-    found
+    (found, cost)
 }
 
 #[cfg(test)]

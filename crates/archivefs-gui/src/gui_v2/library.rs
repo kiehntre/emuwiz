@@ -301,6 +301,10 @@ pub(super) struct Library {
     pub historical: Vec<Game>,
     pub historical_links: HashMap<i64, HistoricalLink>,
     pub(super) historical_of: HashMap<i64, Vec<usize>>,
+    /// Rows of removed library locations whose file is gone and that no
+    /// current row confidently replaces: kept for provenance, not listed.
+    pub retired: Vec<Game>,
+    pub retired_reasons: HashMap<i64, archivefs_core::catalogue_supersession::Retirement>,
     /// What the identity classification needs beyond the rows themselves.
     pub identity_context: IdentityContext,
 }
@@ -317,7 +321,7 @@ pub(super) struct IdentityContext {
 
 impl Library {
     pub fn new(archives: Vec<PersistedArchive>) -> Self {
-        Self::with_history(archives, &[], None)
+        Self::with_history_retiring(archives, &[], None, |_| false)
     }
 
     /// Builds the library from every persisted row. `renames` are EmuWiz's own
@@ -325,16 +329,38 @@ impl Library {
     /// configuration (`None`: all of them); both are evidence that an old row has
     /// been replaced. Nothing is deleted: replaced rows move to
     /// [`Self::historical`].
+    #[cfg(test)]
     pub fn with_history(
         archives: Vec<PersistedArchive>,
         renames: &[(std::path::PathBuf, std::path::PathBuf)],
         configured_sources: Option<&std::collections::HashSet<i64>>,
     ) -> Self {
-        let links = archivefs_core::catalogue_supersession::derive_supersessions(
-            &archives,
-            renames,
-            configured_sources,
-        );
+        Self::with_history_retiring(archives, renames, configured_sources, |_| false)
+    }
+
+    /// [`Self::with_history`], also moving rows of sources that are no longer
+    /// configured to [`Self::retired`] when `is_absent` reports their old path
+    /// gone and no current row replaces them. Nothing is deleted.
+    pub fn with_history_retiring(
+        archives: Vec<PersistedArchive>,
+        renames: &[(std::path::PathBuf, std::path::PathBuf)],
+        configured_sources: Option<&std::collections::HashSet<i64>>,
+        is_absent: impl Fn(&std::path::Path) -> bool,
+    ) -> Self {
+        use archivefs_core::catalogue_supersession as supersession;
+        let links = supersession::derive_supersessions(&archives, renames, configured_sources);
+        let retired_reasons: HashMap<i64, supersession::Retirement> = configured_sources
+            .map(|configured| {
+                supersession::retire_absent_old_location_rows(
+                    &archives, &links, configured, is_absent,
+                )
+                .into_iter()
+                .collect()
+            })
+            .unwrap_or_default();
+        let (retired, archives): (Vec<_>, Vec<_>) = archives
+            .into_iter()
+            .partition(|archive| retired_reasons.contains_key(&archive.id));
         let (old, current): (Vec<_>, Vec<_>) = archives
             .into_iter()
             .partition(|archive| links.contains_key(&archive.id));
@@ -343,9 +369,13 @@ impl Library {
         games.sort_by_cached_key(|game| (game.title.to_lowercase(), game.archive.id));
         let mut historical: Vec<_> = old.into_iter().map(Game::from_archive).collect();
         historical.sort_by_cached_key(|game| game.archive.id);
+        let mut retired: Vec<_> = retired.into_iter().map(Game::from_archive).collect();
+        retired.sort_by_cached_key(|game| game.archive.id);
         let mut library = Self {
             games,
             historical,
+            retired,
+            retired_reasons,
             ..Self::default()
         };
         library.platforms = platform_projection

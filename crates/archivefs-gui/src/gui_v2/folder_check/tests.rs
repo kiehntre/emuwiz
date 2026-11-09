@@ -164,12 +164,14 @@ fn unh_note_in_preview_needs_nes_and_a_real_unh_file() {
 
 #[test]
 fn progress_text_separates_each_kind_and_shows_stopped_early() {
-    let t = progress_text(40, 100, true, 1, 2, 3);
+    let t = progress_text(40, 100, true, 4, 1, 2, 3);
     assert!(t.starts_with("Stopped early - 40 of 100 checked."));
+    assert!(t.contains("4 no longer at their recorded location"));
     assert!(t.contains("1 could not be read."));
     assert!(t.contains("2 too large to check."));
     assert!(t.contains("3 skipped"));
-    let ok = progress_text(100, 100, false, 0, 0, 0);
+    let ok = progress_text(100, 100, false, 0, 0, 0, 0);
+    assert!(!ok.contains("location"));
     assert!(ok.starts_with("Checked 100 of 100"));
     assert!(!ok.contains("too large") && !ok.contains("skipped") && !ok.contains("read"));
 }

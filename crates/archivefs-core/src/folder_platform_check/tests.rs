@@ -602,7 +602,19 @@ fn refusals_are_counted_separately_and_unh_is_a_real_extension_fact() {
         &AtomicBool::new(false),
         &mut |_| {},
     );
-    assert_eq!((out.unreadable, out.too_large, out.skipped), (1, 1, 1));
+    // The absent file is reported as missing, not as unreadable.
+    assert_eq!(
+        (out.missing, out.unreadable, out.too_large, out.skipped),
+        (1, 0, 1, 1)
+    );
+    assert_eq!(
+        read_check_bytes(&candidates[0].path, &TrustedRoots::none()),
+        Err(ReadRefusal::Missing)
+    );
+    assert_eq!(
+        ReadRefusal::Missing.describe(),
+        "is no longer at this location"
+    );
     assert_eq!(out.findings.len(), 2);
     assert!(
         out.findings
