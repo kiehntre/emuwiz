@@ -379,11 +379,11 @@ pub fn preflight_retroarch_launch(
     }
 
     // --- 5: fresh identity re-inspection ---
-    // An owner-approved unverified ZX tape launch carries no DAT snapshot; its
-    // identity is re-derived from the file below instead.
-    let unverified_zx_tape = request.expected_platform_id == "ZX Spectrum"
-        && super::unverified_media::is_unverified_key(&request.expected_game_key);
-    let snapshot_evidence = if unverified_zx_tape {
+    // An owner-approved unverified launch (a ZX tape, or since 2026-11-09 any
+    // single-file game whose system is established) carries no DAT snapshot;
+    // its identity is re-derived from the file below instead.
+    let unverified_media = super::unverified_media::is_unverified_key(&request.expected_game_key);
+    let snapshot_evidence = if unverified_media {
         if request.expected_snapshot_evidence.is_some() {
             return Err(preflight_error(
                 LaunchPreflightErrorKind::IdentityMismatch,
@@ -425,15 +425,18 @@ pub fn preflight_retroarch_launch(
             ));
         }
         identity
-    } else if unverified_zx_tape {
-        match super::unverified_media::zx_tape_identity_fresh(content_path) {
+    } else if unverified_media {
+        match super::unverified_media::platform_media_identity_fresh(
+            content_path,
+            &request.expected_platform_id,
+        ) {
             Some(identity) if identity.game_key == request.expected_game_key => {
                 CanonicalIdentityStatus::Resolved(identity)
             }
             _ => {
                 return Err(preflight_error(
                     LaunchPreflightErrorKind::IdentityUnresolved,
-                    "The tape image changed or is no longer a valid ZX tape; recheck this game.",
+                    "The game file changed or is no longer a format this system accepts; recheck this game.",
                 ));
             }
         }
@@ -657,7 +660,7 @@ pub fn preflight_retroarch_launch(
     }
 
     command.snapshot_evidence = snapshot_evidence;
-    command.unverified_identity = unverified_zx_tape;
+    command.unverified_identity = unverified_media;
     Ok(command)
 }
 
@@ -1073,12 +1076,20 @@ pub(crate) fn spawn_retroarch_guarded(
             .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
     }
     let mut backend_stamps = None;
-    let current_snapshot = if command.selection.platform_id == "ZX Spectrum"
-        && command.unverified_identity
-        && command.snapshot_evidence.is_none()
-        && super::unverified_media::zx_tape_identity_fresh(&command.selection.content_path)
-            .is_some()
-    {
+    let current_snapshot = if command.unverified_identity {
+        // An unverified launch must still be the same accepted file now, and
+        // never carries snapshot evidence.
+        if command.snapshot_evidence.is_some()
+            || super::unverified_media::platform_media_identity_fresh(
+                &command.selection.content_path,
+                &command.selection.platform_id,
+            )
+            .is_none()
+        {
+            return Err(LaunchSpawnError::Spawn(std::io::Error::other(
+                "The game file changed since it was checked; recheck this game.",
+            )));
+        }
         // Owner-approved unverified tape launch: no DAT snapshot exists, and
         // the tape was just re-validated from the file itself.
         None

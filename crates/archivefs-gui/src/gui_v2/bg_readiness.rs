@@ -244,17 +244,79 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
     if job.multidisc || selection_bound_platform(&job.catalogue_platform) {
         return Outcome::Skipped;
     }
+    let (input, pending_checksum) = match build_input(env, job, cancel) {
+        Ok(built) => built,
+        Err(outcome) => return outcome,
+    };
+    // Only a resolved plan is an answer. An unresolved identity may be one a
+    // selection-bound controller would have supplied, so it is not a verdict.
+    let crate::launch_readiness_page::LaunchReadinessInput::Plan {
+        plan, retroarch, ..
+    } = &input
+    else {
+        return Outcome::Unknown;
+    };
+    if plan
+        .platform_id
+        .as_deref()
+        .is_some_and(selection_bound_platform)
+    {
+        return Outcome::Skipped;
+    }
+    let mut projected = summary::project(
+        &input,
+        super::launch_readiness_summary::ReadinessFreshness::Current,
+    );
+    if let Some(candidate) = summary::selected_candidate(plan)
+        && matches!(
+            candidate.target,
+            archivefs_core::launch::LaunchTarget::RetroArchCore { .. }
+        )
+        && let Err(refusal) = crate::launch_readiness_page::retroarch_launch_request_checked(
+            plan,
+            candidate,
+            retroarch.as_ref(),
+        )
+    {
+        summary::note_retroarch_installation_refusal(&mut projected, &refusal);
+    }
+    if matches!(
+        projected.status,
+        summary::ReadinessPresentationState::Ready
+            | summary::ReadinessPresentationState::ReadyWithWarnings
+    ) {
+        summary::route_truth::apply(&mut projected, &summary::route_truth::assess(&input));
+    }
+    if job.dat_exact {
+        summary::note_catalogue_verified(&mut projected);
+    }
+    match CheckedReadiness::from_compact(&summary::compact(&projected, pending_checksum)) {
+        Some(result) => Outcome::Known(result),
+        None => Outcome::Unknown,
+    }
+}
+
+/// The readiness input a background check plans from: the same sources and
+/// builder the selected game uses, from this job's file and the snapshot.
+/// `Err` carries the outcome when nothing honest can be said (unreadable or
+/// cancelled: Unknown; a selection-bound identity: Skipped). The flag is whether the whole-file checksum is
+/// still pending.
+pub(super) fn build_input(
+    env: &EnvSnapshot,
+    job: &Job,
+    cancel: &AtomicBool,
+) -> Result<(crate::launch_readiness_page::LaunchReadinessInput, bool), Outcome> {
     let path = job.archive.absolute_path.clone();
     let hint = job.archive.platform.as_deref();
     let Ok(report) = crate::selected_evidence_page::gather_selected_evidence_fast(&path, hint)
     else {
-        return Outcome::Unknown;
+        return Err(Outcome::Unknown);
     };
     if cancel.load(Ordering::Relaxed) {
-        return Outcome::Unknown;
+        return Err(Outcome::Unknown);
     }
     if selection_bound_identity(report.game_identity_report.platform) {
-        return Outcome::Skipped;
+        return Err(Outcome::Skipped);
     }
     let mut state = env.to_state();
     // Dragon/CoCo cassette evidence needs only the file: run the same bounded
@@ -265,7 +327,7 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
             .eq_ignore_ascii_case(archivefs_core::launch::DRAGON_COCO_PLATFORM_ID)
     {
         if cancel.load(Ordering::Relaxed) {
-            return Outcome::Unknown;
+            return Err(Outcome::Unknown);
         }
         let context = crate::launch_readiness_page::xroar::Context::inspect(path.clone());
         state.xroar_cassette =
@@ -278,7 +340,7 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
         && crate::launch_readiness_page::azahar::platform_allows(Some(&job.catalogue_platform))
     {
         if cancel.load(Ordering::Relaxed) {
-            return Outcome::Unknown;
+            return Err(Outcome::Unknown);
         }
         let context = crate::launch_readiness_page::azahar::Context::inspect(path.clone());
         state.azahar_homebrew =
@@ -290,7 +352,7 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
         && crate::launch_readiness_page::vita3k::platform_allows(Some(&job.catalogue_platform))
     {
         if cancel.load(Ordering::Relaxed) {
-            return Outcome::Unknown;
+            return Err(Outcome::Unknown);
         }
         let context = crate::launch_readiness_page::vita3k::Context::inspect(path.clone());
         state.vita3k_library =
@@ -349,48 +411,6 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
         }
         .build(None)
     });
-    // Only a resolved plan is an answer. An unresolved identity may be one a
-    // selection-bound controller would have supplied, so it is not a verdict.
-    let crate::launch_readiness_page::LaunchReadinessInput::Plan {
-        plan, retroarch, ..
-    } = &input
-    else {
-        return Outcome::Unknown;
-    };
-    if plan
-        .platform_id
-        .as_deref()
-        .is_some_and(selection_bound_platform)
-    {
-        return Outcome::Skipped;
-    }
-    let mut projected = summary::project(
-        &input,
-        super::launch_readiness_summary::ReadinessFreshness::Current,
-    );
-    if let Some(candidate) = summary::selected_candidate(plan)
-        && matches!(
-            candidate.target,
-            archivefs_core::launch::LaunchTarget::RetroArchCore { .. }
-        )
-        && let Err(refusal) = crate::launch_readiness_page::retroarch_launch_request_checked(
-            plan,
-            candidate,
-            retroarch.as_ref(),
-        )
-    {
-        summary::note_retroarch_installation_refusal(&mut projected, &refusal);
-    }
-    if matches!(
-        projected.status,
-        summary::ReadinessPresentationState::Ready
-            | summary::ReadinessPresentationState::ReadyWithWarnings
-    ) {
-        summary::route_truth::apply(&mut projected, &summary::route_truth::assess(&input));
-    }
-    if job.dat_exact {
-        summary::note_catalogue_verified(&mut projected);
-    }
     // Whole-file checksum pending means identity is not final: not a verdict.
     let pending_checksum = match &evidence {
         crate::selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
@@ -398,10 +418,7 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
         }
         _ => false,
     };
-    match CheckedReadiness::from_compact(&summary::compact(&projected, pending_checksum)) {
-        Some(result) => Outcome::Known(result),
-        None => Outcome::Unknown,
-    }
+    Ok((input, pending_checksum))
 }
 
 /// Whether the foreground checker would plan `path` with multi-disc set
@@ -582,6 +599,55 @@ mod tests {
             remembered: Vec::new(),
             launch_choices: Default::default(),
         }
+    }
+
+    fn on_disk(dir: &tempfile::TempDir, name: &str, platform: &str, bytes: &[u8]) -> Job {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let mut archive = archive(41, platform);
+        archive.absolute_path = path.clone();
+        archive.relative_path = name.into();
+        archive.archive_kind = "direct_game_image".into();
+        Job::for_game(&Game::from_archive(archive))
+    }
+
+    fn planned(job: &Job) -> Option<archivefs_core::launch::LaunchPlan> {
+        match build_input(&env(), job, &AtomicBool::new(false)) {
+            Ok((crate::launch_readiness_page::LaunchReadinessInput::Plan { plan, .. }, _)) => {
+                Some(plan)
+            }
+            _ => None,
+        }
+    }
+
+    /// Owner evidence 2026-11-09 (PC Engine CD, CD-i, Dreamcast, ScummVM,
+    /// SNES): a game whose system is known but which has no header serial or
+    /// catalogue match must reach a launch plan, never the identity loop. Its
+    /// identity stays explicitly unverified.
+    #[test]
+    fn a_game_of_a_known_system_without_catalogue_identity_reaches_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        // A CD-i disc image: no header serial, no loose-ROM hash identity.
+        let job = on_disk(
+            &dir,
+            "7th Guest The (USA) (Disc 1).chd",
+            "Philips CD-i",
+            &[0u8; 512],
+        );
+        let plan = planned(&job).expect("a launch plan, not Identity unresolved");
+        assert_eq!(plan.platform_id.as_deref(), Some("Philips CD-i"));
+        let key = plan.game_key.clone().unwrap_or_default();
+        assert!(
+            archivefs_core::launch::unverified_media::is_unverified_key(&key),
+            "key {key:?}"
+        );
+    }
+
+    #[test]
+    fn a_format_the_system_does_not_list_still_needs_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = on_disk(&dir, "notes.txt", "Philips CD-i", b"hello");
+        assert!(planned(&job).is_none());
     }
 
     #[test]

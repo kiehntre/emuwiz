@@ -227,6 +227,220 @@ fn validate_tap(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// How many bytes from each end of a large file the content binding reads.
+const EDGE_BYTES: u64 = 1024 * 1024;
+
+/// Launch-only identity for a single-file game whose system is established
+/// but whose exact game is not (owner, 2026-11-09, generalising the ZX tape
+/// decision: catalogue identity must not gate a safe launch). `platform_id`
+/// must be the canonical platform the library and any manual choice already
+/// give the file; this function never infers one. It accepts the file only
+/// when it is a non-empty regular file (opened without following a final
+/// symlink or blocking on a FIFO) whose extension that platform's registry
+/// entry lists as one of its formats. ZX tapes keep their stricter structural
+/// validation. The key is `unverified:`-prefixed and bound to the content:
+/// whole-file SHA-256 up to 16 MiB, otherwise size plus the first and last
+/// MiB. Never a verified identity; every candidate built from it carries the
+/// visible identity-unverified warning.
+pub fn platform_media_identity(path: &Path, platform_id: &str) -> Option<ResolvedIdentity> {
+    if platform_id == ZX_PLATFORM
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "tap" | "tzx"))
+    {
+        return zx_tape_identity(path);
+    }
+    cached(path, platform_id)
+}
+
+/// The same answer read from the file now (click-time preflight and spawn).
+pub fn platform_media_identity_fresh(path: &Path, platform_id: &str) -> Option<ResolvedIdentity> {
+    if platform_id == ZX_PLATFORM
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "tap" | "tzx"))
+    {
+        return zx_tape_identity_fresh(path);
+    }
+    platform_media_key(path, platform_id).map(|game_key| ResolvedIdentity {
+        platform_id: platform_id.to_string(),
+        game_key,
+    })
+}
+
+fn cached(path: &Path, platform_id: &str) -> Option<ResolvedIdentity> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    // The platform is part of the key: the same file under another system
+    // is a different question.
+    let mut keyed = path.as_os_str().to_owned();
+    keyed.push("\0");
+    keyed.push(platform_id);
+    let key = (PathBuf::from(keyed), metadata.len(), mtime);
+    if let Ok(guard) = cache().lock()
+        && let Some(hit) = guard.get(&key)
+    {
+        return hit.clone().map(|game_key| ResolvedIdentity {
+            platform_id: platform_id.to_string(),
+            game_key,
+        });
+    }
+    let derived = platform_media_key(path, platform_id);
+    if let Ok(mut guard) = cache().lock() {
+        if guard.len() >= CACHE_LIMIT {
+            guard.clear();
+        }
+        guard.insert(key, derived.clone());
+    }
+    derived.map(|game_key| ResolvedIdentity {
+        platform_id: platform_id.to_string(),
+        game_key,
+    })
+}
+
+/// Whether `extension` is one of the formats the platform registry lists.
+pub fn platform_lists_extension(platform_id: &str, extension: &str) -> bool {
+    let Some(platform) = crate::platform::platform_by_id(platform_id) else {
+        return false;
+    };
+    let extension = extension.to_ascii_lowercase();
+    platform
+        .strong_extensions
+        .iter()
+        .chain(platform.weak_extensions.iter())
+        .any(|listed| listed.eq_ignore_ascii_case(&extension))
+}
+
+fn platform_media_key(path: &Path, platform_id: &str) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    let extension = path.extension()?.to_str()?;
+    if !platform_lists_extension(platform_id, extension) {
+        return None;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 {
+        return None;
+    }
+    let size = metadata.len();
+    let mut hasher = Sha256::new();
+    hasher.update(size.to_le_bytes());
+    if size <= MAX_TAPE_BYTES {
+        let mut bytes = Vec::with_capacity(size as usize);
+        (&mut file)
+            .take(MAX_TAPE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 != size {
+            return None;
+        }
+        hasher.update(&bytes);
+    } else {
+        let mut head = vec![0u8; EDGE_BYTES as usize];
+        file.read_exact(&mut head).ok()?;
+        hasher.update(&head);
+        file.seek(SeekFrom::Start(size - EDGE_BYTES)).ok()?;
+        let mut tail = vec![0u8; EDGE_BYTES as usize];
+        file.read_exact(&mut tail).ok()?;
+        hasher.update(&tail);
+    }
+    let stem: String = path
+        .file_stem()?
+        .to_str()?
+        .chars()
+        .take(48)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let digest = hasher.finalize();
+    let short: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    Some(format!("{UNVERIFIED_KEY_PREFIX}{stem}:{short}"))
+}
+
+#[cfg(test)]
+mod platform_media_tests {
+    use super::*;
+
+    #[test]
+    fn a_listed_format_resolves_an_unverified_content_bound_key_for_that_platform_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Bokosuka Wars (Japan).sfc");
+        std::fs::write(&path, vec![7u8; 4096]).unwrap();
+        let resolved = platform_media_identity_fresh(&path, "SNES").expect("listed format");
+        assert_eq!(resolved.platform_id, "SNES");
+        assert!(is_unverified_key(&resolved.game_key));
+        // Not a format that platform lists.
+        assert!(platform_media_identity_fresh(&path, "PS2").is_none());
+        // Unknown platform id: never inferred.
+        assert!(platform_media_identity_fresh(&path, "Not A System").is_none());
+        // Cached and fresh answers agree.
+        assert_eq!(
+            platform_media_identity(&path, "SNES").unwrap().game_key,
+            resolved.game_key
+        );
+    }
+
+    #[test]
+    fn the_key_follows_content_and_refuses_empty_files_directories_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.sfc");
+        std::fs::write(&path, [1u8, 2, 3]).unwrap();
+        let before = platform_media_identity_fresh(&path, "SNES")
+            .unwrap()
+            .game_key;
+        std::fs::write(&path, [1u8, 2, 4]).unwrap();
+        let after = platform_media_identity_fresh(&path, "SNES")
+            .unwrap()
+            .game_key;
+        assert_ne!(before, after);
+
+        let empty = dir.path().join("empty.sfc");
+        std::fs::write(&empty, []).unwrap();
+        assert!(platform_media_identity_fresh(&empty, "SNES").is_none());
+
+        let folder = dir.path().join("folder.sfc");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(platform_media_identity_fresh(&folder, "SNES").is_none());
+
+        let link = dir.path().join("link.sfc");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(platform_media_identity_fresh(&link, "SNES").is_none());
+    }
+
+    #[test]
+    fn a_large_file_is_bound_by_size_and_both_ends_without_reading_it_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disc.iso");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(40 * 1024 * 1024).unwrap();
+        let resolved = platform_media_identity_fresh(&path, "PS2").expect("iso is a PS2 format");
+        assert!(is_unverified_key(&resolved.game_key));
+    }
+
+    #[test]
+    fn zx_tapes_keep_their_structural_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.tap");
+        std::fs::write(&bad, [0u8, 0, 0]).unwrap();
+        assert!(platform_media_identity_fresh(&bad, ZX_PLATFORM).is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

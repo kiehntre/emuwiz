@@ -923,7 +923,7 @@ impl NativeWorkflows {
     /// project the current launch input. Owns no readiness facts. `checksum`
     /// also starts the deferred whole-file checksum pass.
     #[allow(clippy::too_many_arguments)]
-    fn readiness_projection(
+    pub(super) fn readiness_projection(
         &mut self,
         context: &egui::Context,
         game_id: i64,

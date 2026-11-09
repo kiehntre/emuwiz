@@ -12069,6 +12069,8 @@ mod nkit_gui;
 
 #[path = "tests/big_picture.rs"]
 mod big_picture_journey;
+#[path = "tests/launch_census.rs"]
+mod launch_census;
 #[path = "tests/launch_focus.rs"]
 mod launch_focus;
 #[path = "tests/pad_shell.rs"]

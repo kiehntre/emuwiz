@@ -348,9 +348,11 @@ impl ReadinessSources<'_> {
         {
             identity_status = evidence.identity();
         }
-        // Owner-approved controlled path (2026-11-07): a recognised, safely
-        // inspected ZX tape image may launch with a visible "identity
-        // unverified" warning instead of requiring DAT or header identity.
+        // Owner-approved controlled path (ZX tapes 2026-11-07, every system
+        // 2026-11-09): a single-file game whose system is established may
+        // launch with a visible "identity unverified" warning instead of
+        // requiring DAT or header identity. The file's own content must not
+        // point to another system.
         let mut identity_unverified = false;
         if matches!(
             identity_status,
@@ -360,7 +362,11 @@ impl ReadinessSources<'_> {
             && let Some(hint) = focused_record
                 .and_then(|record| record.mount_plan.archive.identity.platform.clone())
                 .or_else(|| (self.platform_hint)(path))
-            && let Some(resolved) = crate::emulator_setup::unverified_media::resolve(path, &hint)
+            && let Some(resolved) = crate::emulator_setup::unverified_media::resolve(
+                path,
+                &hint,
+                selected_game_identity_report.map(|report| report.platform),
+            )
         {
             identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved);
             identity_unverified = true;
