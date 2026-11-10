@@ -25,6 +25,25 @@ pub fn is_zipped_cartridge_request(content: &Path, platform_id: &str) -> bool {
         && is_loose_cartridge_platform(IdentityPlatform::from_catalogue(Some(platform_id)))
 }
 
+/// Whether `zip` holds exactly one ROM member that `platform_id`'s zipped
+/// cartridge staging would accept: `None` when staging does not apply to that
+/// system (not a `.zip`, or not a loose-cartridge platform), otherwise
+/// whether [`select_zip_cartridge_member`] selects a member. Reads only the
+/// central directory; nothing is decompressed or written.
+pub fn zip_cartridge_member_fits(zip: &Path, platform_id: &str) -> Option<bool> {
+    if !is_zipped_cartridge_request(zip, platform_id) {
+        return None;
+    }
+    let platform = IdentityPlatform::from_catalogue(Some(platform_id));
+    let Ok(file) = open_read_only_regular(zip, &TrustedRoots::none()) else {
+        return Some(false);
+    };
+    let Ok(mut archive) = ZipArchive::new(file) else {
+        return Some(false);
+    };
+    Some(select_zip_cartridge_member(&mut archive, platform, &mut 0).is_ok())
+}
+
 /// A zipped cartridge ROM extracted for one launch into a private, owner-only
 /// temporary directory outside the library. Dropping it removes the directory,
 /// so failure paths and process exit clean up. The ZIP is never modified.
@@ -52,6 +71,9 @@ pub enum StageZipError {
     NotApplicable,
     /// The ZIP is not safe to stage; the text says why.
     Refused(String),
+    /// The caller's check of the opened ZIP (its content-bound key) failed:
+    /// it is not the file that was approved.
+    NotAccepted,
 }
 
 fn staged_file_name(member_name: &[u8]) -> Option<String> {
@@ -84,6 +106,21 @@ pub fn stage_zip_cartridge_for_launch(
     zip: &Path,
     platform_hint: &str,
 ) -> Result<StagedCartridge, StageZipError> {
+    stage_zip_cartridge_for_launch_checked(zip, platform_hint, |_| true)
+}
+
+/// [`stage_zip_cartridge_for_launch`], with `accept` first run on the very
+/// handle the member is then extracted from (before anything is read or
+/// written). A launch whose authority is a content-bound key re-derives it
+/// here, so a ZIP renamed over the approved one cannot be extracted in its
+/// place. `accept` returning `false` refuses the launch.
+#[cfg(unix)]
+pub fn stage_zip_cartridge_for_launch_checked(
+    zip: &Path,
+    platform_hint: &str,
+    accept: impl FnOnce(&mut std::fs::File) -> bool,
+) -> Result<StagedCartridge, StageZipError> {
+    use std::io::{Seek, SeekFrom};
     use std::os::unix::fs::OpenOptionsExt;
 
     let platform = IdentityPlatform::from_catalogue(Some(platform_hint));
@@ -91,8 +128,13 @@ pub fn stage_zip_cartridge_for_launch(
         return Err(StageZipError::NotApplicable);
     }
     let refuse = |message: String| StageZipError::Refused(message);
-    let file = open_read_only_regular(zip, &TrustedRoots::none()).map_err(refuse)?;
+    let mut file = open_read_only_regular(zip, &TrustedRoots::none()).map_err(refuse)?;
     let before = StableFileMetadata::from_file(&file).map_err(|e| refuse(e.to_string()))?;
+    if !accept(&mut file) {
+        return Err(StageZipError::NotAccepted);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| refuse(format!("could not re-read the ZIP: {error}")))?;
     let mut archive =
         ZipArchive::new(file).map_err(|error| refuse(format!("invalid ZIP: {error}")))?;
     let mut seen = 0;
@@ -160,6 +202,15 @@ pub fn stage_zip_cartridge_for_launch(
 pub fn stage_zip_cartridge_for_launch(
     _zip: &Path,
     _platform_hint: &str,
+) -> Result<StagedCartridge, StageZipError> {
+    Err(StageZipError::NotApplicable)
+}
+
+#[cfg(not(unix))]
+pub fn stage_zip_cartridge_for_launch_checked(
+    _zip: &Path,
+    _platform_hint: &str,
+    _accept: impl FnOnce(&mut std::fs::File) -> bool,
 ) -> Result<StagedCartridge, StageZipError> {
     Err(StageZipError::NotApplicable)
 }

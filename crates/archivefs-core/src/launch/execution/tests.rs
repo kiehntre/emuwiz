@@ -1688,3 +1688,216 @@ fn nw2_c01_leading_bom_does_not_hide_sort_by_content_keys() {
     }
     assert_eq!(bom_config("nw2-c01-bom-absent", ""), Ok(()));
 }
+
+// ---------------------------------------------------------------------------
+// Unverified (one-time try / remembered / saved system) launches: the
+// content-bound `unverified:` key is held from readiness to the spawn
+// ---------------------------------------------------------------------------
+
+fn unverified_key(path: &std::path::Path) -> String {
+    let identity =
+        crate::launch::unverified_media::platform_media_identity_fresh(path, "MegaDrive")
+            .expect("the format is one Mega Drive lists");
+    assert!(crate::launch::unverified_media::is_unverified_key(
+        &identity.game_key
+    ));
+    identity.game_key
+}
+
+/// Replaces the fake RetroArch with one that records the content it was
+/// handed (its last argument): the path and that file's bytes.
+fn record_handoff(ready: &ReadyFixture) -> (PathBuf, PathBuf) {
+    let path_out = ready.fixture.path("handoff-path.txt");
+    let bytes_out = ready.fixture.path("handoff-bytes.bin");
+    ready.fixture.write_executable(
+        "bin/retroarch",
+        format!(
+            "#!/bin/sh\nfor a; do last=\"$a\"; done\nprintf '%s' \"$last\" > '{}'\ncat \"$last\" > '{}'\nexit 0\n",
+            path_out.display(),
+            bytes_out.display()
+        )
+        .as_bytes(),
+    );
+    (path_out, bytes_out)
+}
+
+fn wait_for_exit(process: &mut LaunchedRetroArchProcess) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while process.poll().is_none() {
+        assert!(std::time::Instant::now() < deadline, "fake script exits");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn an_unverified_zipped_cartridge_reaches_the_emulator_and_changed_zips_are_refused() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let before = staged_dirs();
+    let rom = b"synthetic mega drive rom bytes";
+
+    // Unchanged ZIP, one valid member, unverified key bound to the ZIP: the
+    // member itself is what RetroArch receives, from a private copy.
+    let (mut ready, zip, _) = zipped_ready("zip-unverified-ok", &[("Game (USA).md", rom)]);
+    ready.request.expected_game_key = unverified_key(&zip);
+    let (path_out, bytes_out) = record_handoff(&ready);
+    let zip_before = fs::read(&zip).unwrap();
+    let mut process = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .expect("an unchanged zipped cartridge tried as Mega Drive launches");
+    let staged = process
+        .staged_cartridge
+        .as_ref()
+        .expect("staged copy travels with the process")
+        .path()
+        .to_path_buf();
+    wait_for_exit(&mut process);
+    assert_eq!(
+        fs::read(&bytes_out).unwrap(),
+        rom,
+        "the member reached RetroArch"
+    );
+    assert_eq!(
+        PathBuf::from(fs::read_to_string(&path_out).unwrap()),
+        staged
+    );
+    assert_ne!(staged, zip, "never the ZIP itself");
+    assert_eq!(fs::read(&zip).unwrap(), zip_before, "ZIP never modified");
+
+    // The ZIP was replaced after readiness (a different member): refused.
+    let (mut ready, zip, _) = zipped_ready("zip-unverified-member", &[("a.md", rom)]);
+    ready.request.expected_game_key = unverified_key(&zip);
+    let (_, bytes_out) = record_handoff(&ready);
+    write_rom_zip(&zip, &[("a.md", b"a different rom entirely")]);
+    let error = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .err()
+    .expect("a ZIP whose member changed must not launch");
+    assert!(
+        format!("{error:?}").contains("IdentityUnresolved"),
+        "{error:?}"
+    );
+    assert!(!bytes_out.exists(), "nothing was started");
+
+    // Same member, different archive bytes (a member added): refused.
+    let (mut ready, zip, _) = zipped_ready("zip-unverified-archive", &[("a.md", rom)]);
+    ready.request.expected_game_key = unverified_key(&zip);
+    write_rom_zip(&zip, &[("a.md", rom), ("readme.txt", b"hello")]);
+    let error = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .err()
+    .expect("a changed ZIP must not launch");
+    assert!(
+        format!("{error:?}").contains("IdentityUnresolved"),
+        "{error:?}"
+    );
+
+    // The member's key is never accepted in place of the ZIP's.
+    let (mut ready, _, _) = zipped_ready("zip-unverified-wrong-key", &[("a.md", rom)]);
+    let loose = ready.fixture.write("content/member.md", rom);
+    ready.request.expected_game_key = unverified_key(&loose);
+    let error = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .err()
+    .expect("a key for other bytes never authorises the ZIP");
+    assert!(
+        format!("{error:?}").contains("IdentityUnresolved"),
+        "{error:?}"
+    );
+    assert_eq!(staged_dirs(), before, "no staging directory left behind");
+}
+
+#[test]
+fn an_unverified_file_changed_between_preflight_and_spawn_is_refused() {
+    let mut ready = build_ready_fixture("unverified-spawn-swap");
+    let content = ready.request.selected_content_path.clone();
+    ready.request.expected_game_key = unverified_key(&content);
+    let command = preflight(&ready).expect("unchanged unverified file passes preflight");
+    assert_eq!(
+        command.unverified_game_key.as_deref(),
+        Some(ready.request.expected_game_key.as_str())
+    );
+    // Different bytes of the same listed format, same path.
+    fs::write(&content, b"other mega drive rom bytes!!!!").unwrap();
+    assert!(
+        spawn_retroarch(command).is_err(),
+        "spawn re-derives the key and refuses a different file"
+    );
+}
+
+#[test]
+fn an_unverified_file_whose_header_names_another_system_is_refused_at_preflight() {
+    let mut rom = vec![0u8; 0x400];
+    rom[0x100..0x109].copy_from_slice(b"SEGA PICO");
+    let mut ready = build_ready_fixture("unverified-pico");
+    let content = ready.request.selected_content_path.clone();
+    fs::write(&content, &rom).unwrap();
+    ready.request.expected_game_key = unverified_key(&content);
+    let error = preflight(&ready).unwrap_err();
+    assert_eq!(error.kind, LaunchPreflightErrorKind::IdentityUnresolved);
+    assert!(error.detail.contains("Sega Pico"), "{}", error.detail);
+}
+
+/// A ZIP renamed over the approved one after the key was checked can never
+/// be extracted in its place: the key is read through staging's own handle,
+/// and a path that no longer names that handle's file is refused.
+#[test]
+fn a_zip_swapped_in_after_its_key_was_checked_is_never_extracted() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let before = staged_dirs();
+    let (ready, zip, _) = zipped_ready("zip-swap-race", &[("a.md", b"approved rom bytes")]);
+    let approved = unverified_key(&zip);
+    let other = ready.fixture.path("content/other.zip");
+    write_rom_zip(&other, &[("a.md", b"a different rom entirely")]);
+    let result = crate::zip_cartridge_stage::stage_zip_cartridge_for_launch_checked(
+        &zip,
+        "MegaDrive",
+        |file| {
+            let keyed = crate::launch::unverified_media::platform_media_key_of_open_file(
+                file,
+                &zip,
+                "MegaDrive",
+            );
+            // The swap lands after the handle was opened.
+            fs::rename(&other, &zip).unwrap();
+            keyed.as_deref() == Some(approved.as_str())
+        },
+    );
+    match result {
+        Ok(staged) => panic!(
+            "extracted {:?} from a swapped ZIP",
+            fs::read(staged.path()).unwrap()
+        ),
+        Err(error) => assert!(
+            matches!(error, crate::zip_cartridge_stage::StageZipError::Refused(_)),
+            "{error:?}"
+        ),
+    }
+    // A key that does not match is refused before anything is extracted.
+    let (_ready, zip, _) = zipped_ready("zip-swap-key", &[("a.md", b"approved rom bytes")]);
+    assert_eq!(
+        crate::zip_cartridge_stage::stage_zip_cartridge_for_launch_checked(
+            &zip,
+            "MegaDrive",
+            |_| false
+        )
+        .err(),
+        Some(crate::zip_cartridge_stage::StageZipError::NotAccepted)
+    );
+    assert_eq!(staged_dirs(), before, "no staging directory left behind");
+}

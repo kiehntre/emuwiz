@@ -962,6 +962,27 @@ impl ArchiveFsApp {
                 .filter(|(hinted, _)| hinted == path)
                 .map(|(_, platform)| platform.clone())
         };
+        let platform_source = |path: &Path| {
+            self.catalogued_platform_source
+                .as_ref()
+                .filter(|(hinted, _)| hinted == path)
+                .map(|(_, source)| source.clone())
+        };
+        let system_unknown = |path: &Path| {
+            self.catalogued_row_health
+                .as_ref()
+                .is_some_and(|(row, _)| row == path)
+                && self
+                    .catalogued_platform_hint
+                    .as_ref()
+                    .is_none_or(|(hinted, _)| hinted != path)
+        };
+        let system_trial = |path: &Path| {
+            self.launch_system_trial
+                .as_ref()
+                .filter(|(tried, _)| tried == path)
+                .map(|(_, system)| *system)
+        };
         super::readiness_input::ReadinessSources {
             readiness: &self.emulator_readiness,
             evidence: &self.selected_evidence_ui.selected_evidence,
@@ -975,6 +996,11 @@ impl ArchiveFsApp {
             loose_ref: &loose_ref,
             is_arcade_set_directory: &is_arcade_set_directory,
             platform_hint: &platform_hint,
+            platform_source: &platform_source,
+            system_trial: &system_trial,
+            remembered_system:
+                &archivefs_core::launch::remembered_launch_system::remembered_launch_system,
+            system_unknown: &system_unknown,
         }
         .build(live)
     }

@@ -379,11 +379,11 @@ pub fn preflight_retroarch_launch(
     }
 
     // --- 5: fresh identity re-inspection ---
-    // An owner-approved unverified ZX tape launch carries no DAT snapshot; its
-    // identity is re-derived from the file below instead.
-    let unverified_zx_tape = request.expected_platform_id == "ZX Spectrum"
-        && super::unverified_media::is_unverified_key(&request.expected_game_key);
-    let snapshot_evidence = if unverified_zx_tape {
+    // An owner-approved unverified launch (a ZX tape, or since 2026-11-09 any
+    // single-file game whose system is established) carries no DAT snapshot;
+    // its identity is re-derived from the file below instead.
+    let unverified_media = super::unverified_media::is_unverified_key(&request.expected_game_key);
+    let snapshot_evidence = if unverified_media {
         if request.expected_snapshot_evidence.is_some() {
             return Err(preflight_error(
                 LaunchPreflightErrorKind::IdentityMismatch,
@@ -425,21 +425,38 @@ pub fn preflight_retroarch_launch(
             ));
         }
         identity
-    } else if unverified_zx_tape {
-        match super::unverified_media::zx_tape_identity_fresh(content_path) {
+    } else if unverified_media {
+        match super::unverified_media::platform_media_identity_fresh(
+            content_path,
+            &request.expected_platform_id,
+        ) {
             Some(identity) if identity.game_key == request.expected_game_key => {
                 CanonicalIdentityStatus::Resolved(identity)
             }
             _ => {
                 return Err(preflight_error(
                     LaunchPreflightErrorKind::IdentityUnresolved,
-                    "The tape image changed or is no longer a valid ZX tape; recheck this game.",
+                    "The game file changed or is no longer a format this system accepts; recheck this game.",
                 ));
             }
         }
     } else {
         fresh_identity_status(content_path, request)?
     };
+    // Whatever route identified it, a file whose own header names another
+    // system is never started as this one (owner policy 2026-11-09).
+    if let super::unverified_media::MediaSystemEvidence::Contradicts(other) =
+        super::unverified_media::media_system_evidence(content_path, &request.expected_platform_id)
+    {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::IdentityUnresolved,
+            format!(
+                "The game file's own header says it is for {}, not {}; EmuWiz will not start it with this system.",
+                crate::platform::display_name_for(other),
+                crate::platform::display_name_for(&request.expected_platform_id),
+            ),
+        ));
+    }
     super::nkit_readiness::check_raw_nkit_launch(&request.expected_platform_id, content_path)
         .map_err(|detail| {
             preflight_error(
@@ -657,7 +674,7 @@ pub fn preflight_retroarch_launch(
     }
 
     command.snapshot_evidence = snapshot_evidence;
-    command.unverified_identity = unverified_zx_tape;
+    command.unverified_game_key = unverified_media.then(|| request.expected_game_key.clone());
     Ok(command)
 }
 
@@ -1073,12 +1090,28 @@ pub(crate) fn spawn_retroarch_guarded(
             .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
     }
     let mut backend_stamps = None;
-    let current_snapshot = if command.selection.platform_id == "ZX Spectrum"
-        && command.unverified_identity
-        && command.snapshot_evidence.is_none()
-        && super::unverified_media::zx_tape_identity_fresh(&command.selection.content_path)
-            .is_some()
-    {
+    let current_snapshot = if let Some(expected_key) = &command.unverified_game_key {
+        // An unverified launch must still be the same accepted file now (the
+        // content-bound key it was checked with), and never carries snapshot
+        // evidence.
+        if command.snapshot_evidence.is_some()
+            || super::unverified_media::platform_media_identity_fresh(
+                &command.selection.content_path,
+                &command.selection.platform_id,
+            )
+            .is_none_or(|identity| &identity.game_key != expected_key)
+            || matches!(
+                super::unverified_media::media_system_evidence(
+                    &command.selection.content_path,
+                    &command.selection.platform_id,
+                ),
+                super::unverified_media::MediaSystemEvidence::Contradicts(_)
+            )
+        {
+            return Err(LaunchSpawnError::Spawn(std::io::Error::other(
+                "The game file changed since it was checked; recheck this game.",
+            )));
+        }
         // Owner-approved unverified tape launch: no DAT snapshot exists, and
         // the tape was just re-validated from the file itself.
         None
@@ -1417,9 +1450,22 @@ pub fn preflight_and_launch_retroarch_with_playlist(
     // A zipped cartridge is extracted to a private temporary file for this
     // launch only; the normal preflight then re-verifies that file's identity
     // against `expected_game_key`. Anything else takes the unchanged route.
-    match crate::zip_cartridge_stage::stage_zip_cartridge_for_launch(
+    // An unverified key is bound to the ZIP's bytes, not the member's: it is
+    // re-derived through the handle staging extracts from, so the member
+    // launched comes from the very archive that was checked.
+    let unverified_zip = super::unverified_media::is_unverified_key(&request.expected_game_key);
+    match crate::zip_cartridge_stage::stage_zip_cartridge_for_launch_checked(
         &request.selected_content_path,
         &request.expected_platform_id,
+        |file| {
+            !unverified_zip
+                || super::unverified_media::platform_media_key_of_open_file(
+                    file,
+                    &request.selected_content_path,
+                    &request.expected_platform_id,
+                )
+                .is_some_and(|key| key == request.expected_game_key)
+        },
     ) {
         Ok(staged) => {
             // The staged copy is deleted at exit, so anything RetroArch would
@@ -1435,6 +1481,22 @@ pub fn preflight_and_launch_retroarch_with_playlist(
             })?;
             let mut staged_request = request.clone();
             staged_request.selected_content_path = staged.path().to_path_buf();
+            // The ZIP's key was checked on staging's own handle (and staging
+            // refused a ZIP that changed while extracting); the extracted
+            // member is now held to its own key from here to spawn.
+            if unverified_zip {
+                let member = super::unverified_media::platform_media_identity_fresh(
+                    staged.path(),
+                    &request.expected_platform_id,
+                )
+                .ok_or_else(|| {
+                    preflight_error(
+                        LaunchPreflightErrorKind::IdentityUnresolved,
+                        "The game file changed or is no longer a format this system accepts; recheck this game.",
+                    )
+                })?;
+                staged_request.expected_game_key = member.game_key;
+            }
             let command = preflight_retroarch_launch_with_playlist(
                 &staged_request,
                 filesystem,
@@ -1446,6 +1508,13 @@ pub fn preflight_and_launch_retroarch_with_playlist(
             return Ok(process);
         }
         Err(crate::zip_cartridge_stage::StageZipError::NotApplicable) => {}
+        Err(crate::zip_cartridge_stage::StageZipError::NotAccepted) => {
+            return Err(preflight_error(
+                LaunchPreflightErrorKind::IdentityUnresolved,
+                "The game file changed or is no longer a format this system accepts; recheck this game.",
+            )
+            .into());
+        }
         Err(crate::zip_cartridge_stage::StageZipError::Refused(detail)) => {
             return Err(preflight_error(
                 LaunchPreflightErrorKind::ContentRequiresMount,

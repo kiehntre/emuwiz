@@ -32,6 +32,18 @@ pub(crate) struct ReadinessSources<'a> {
     /// snapshot is not loaded on the v2 routes, so the live record cannot be
     /// the only source of the platform.
     pub(crate) platform_hint: &'a dyn Fn(&Path) -> Option<String>,
+    /// How the catalogue's platform for exactly this path was set
+    /// (`platform_assignments.source`: "manual", "folder_alias", ...).
+    pub(crate) platform_source: &'a dyn Fn(&Path) -> Option<String>,
+    /// A one-launch "Try anyway" system for exactly this path (in memory
+    /// only; see `unverified_media`). Background workers never have one.
+    pub(crate) system_trial: &'a dyn Fn(&Path) -> Option<&'static str>,
+    /// The person's saved "Remember this launch choice" for this unchanged
+    /// file, if any (see `archivefs_core::launch::remembered_launch_system`).
+    pub(crate) remembered_system: &'a dyn Fn(&Path) -> Option<&'static str>,
+    /// The catalogue row for this file is known and records no system at all
+    /// (distinct from "not loaded yet").
+    pub(crate) system_unknown: &'a dyn Fn(&Path) -> bool,
 }
 
 impl ReadinessSources<'_> {
@@ -348,22 +360,131 @@ impl ReadinessSources<'_> {
         {
             identity_status = evidence.identity();
         }
-        // Owner-approved controlled path (2026-11-07): a recognised, safely
-        // inspected ZX tape image may launch with a visible "identity
-        // unverified" warning instead of requiring DAT or header identity.
-        let mut identity_unverified = false;
+        // Owner-approved controlled path (ZX tapes 2026-11-07, every system
+        // 2026-11-09, see `unverified_media`): a single-file game whose system
+        // is established by its own media or the person's choice may launch
+        // with a visible "game not identified" warning instead of requiring
+        // DAT or header identity. A folder-only system must be confirmed
+        // first, and content naming another system is refused.
+        let mut identity_unverified = None;
+        // Reported in place of the generic reason, after the disc-file and
+        // DOS checks below have had their say.
+        let mut lane_reason = None;
         if matches!(
             identity_status,
             archivefs_core::launch::CanonicalIdentityStatus::Unknown
         ) && !evidence_freshness.is_incomplete()
             && let Some(path) = focused
-            && let Some(hint) = focused_record
-                .and_then(|record| record.mount_plan.archive.identity.platform.clone())
-                .or_else(|| (self.platform_hint)(path))
-            && let Some(resolved) = crate::emulator_setup::unverified_media::resolve(path, &hint)
         {
-            identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved);
-            identity_unverified = true;
+            let catalogued = (self.platform_hint)(path);
+            let hint = focused_record
+                .and_then(|record| record.mount_plan.archive.identity.platform.clone())
+                .or_else(|| catalogued.clone());
+            // A format EmuWiz explicitly does not start from here (Amiga HDF
+            // and IPF, unsupported archives, cartridge formats the system's
+            // check does not read) stays unsupported: the unverified lane
+            // never manufactures launch support (owner rule 7, 2026-11-09).
+            let format_unsupported = matches!(
+                identity_unknown_reason(
+                    focused,
+                    selected_game_identity_report,
+                    Some(hint.as_deref()),
+                ),
+                launch_readiness_page::IdentityUnknownReason::AmigaHardDisk
+                    | launch_readiness_page::IdentityUnknownReason::AmigaIpf
+                    | launch_readiness_page::IdentityUnknownReason::UnsupportedArchive
+                    | launch_readiness_page::IdentityUnknownReason::UnsupportedFormat(_)
+            );
+            // No system recorded at all (owner decision 2026-11-10): the same
+            // lane, with no recorded system to confirm - the person picks one
+            // for a try or remembers it; nothing is saved as the system.
+            let system_unknown = hint.is_none() && (self.system_unknown)(path);
+            let lane_hint = hint.clone().or_else(|| system_unknown.then(String::new));
+            if let Some(hint) = lane_hint.filter(|_| !format_unsupported) {
+                // The recorded source only describes the catalogue's own value.
+                let source = (catalogued.as_deref() == Some(hint.as_str()))
+                    .then(|| (self.platform_source)(path))
+                    .flatten();
+                use crate::emulator_setup::unverified_media::Outcome;
+                match crate::emulator_setup::unverified_media::resolve(
+                    path,
+                    &hint,
+                    source.as_deref(),
+                    selected_game_identity_report.map(|report| report.platform),
+                    (self.system_trial)(path),
+                    (self.remembered_system)(path),
+                ) {
+                    Outcome::Allowed(resolved, basis) => {
+                        identity_status =
+                            archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved);
+                        identity_unverified = Some(basis);
+                    }
+                    Outcome::NeedsConfirmation(platform) => {
+                        lane_reason =
+                            Some(launch_readiness_page::IdentityUnknownReason::FolderOnly(
+                                archivefs_core::platform::display_name_for(platform),
+                            ));
+                    }
+                    Outcome::Contradicted { recorded, content } => {
+                        lane_reason = Some(
+                            launch_readiness_page::IdentityUnknownReason::MediaConflict {
+                                recorded: archivefs_core::platform::display_name_for(recorded),
+                                content: archivefs_core::platform::display_name_for(content),
+                            },
+                        );
+                    }
+                    Outcome::NotApplicable => {
+                        if system_unknown
+                            && !crate::emulator_setup::unverified_media::trial_systems(
+                                path,
+                                None,
+                                &|system| {
+                                    archivefs_core::launch::planning::retroarch_core_installed_for(
+                                        system,
+                                        retroarch_environment,
+                                    )
+                                },
+                            )
+                            .is_empty()
+                        {
+                            lane_reason =
+                                Some(launch_readiness_page::IdentityUnknownReason::SystemUnknown);
+                        } else if system_unknown
+                            && archivefs_core::launch::unverified_media::is_sega_pico_rom(path)
+                        {
+                            // The header names the Pico and rules out every
+                            // other system: say so instead of a generic
+                            // "choose a system" (owner ruling 2026-11-10).
+                            lane_reason =
+                                Some(launch_readiness_page::IdentityUnknownReason::NoLaunchRoute(
+                                    archivefs_core::launch::unverified_media::SEGA_PICO_PLATFORM,
+                                ));
+                        }
+                    }
+                }
+            }
+        }
+        // Whatever route resolved it, a plain file whose own header names a
+        // different system is refused (owner policy 2026-11-09), e.g. an NES
+        // ROM renamed into the SNES collection.
+        if let archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved) =
+            &identity_status
+            && let Some(path) = focused
+            && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+            && let Some(recorded) =
+                archivefs_core::canonical_platform_for_alias(&resolved.platform_id)
+            && let archivefs_core::launch::unverified_media::MediaSystemEvidence::Contradicts(
+                content,
+            ) = archivefs_core::launch::unverified_media::media_system_evidence_cached(
+                path, recorded,
+            )
+        {
+            return LaunchReadinessInput::IdentityUnknown(
+                launch_readiness_page::IdentityUnknownReason::MediaConflict {
+                    recorded: archivefs_core::platform::display_name_for(recorded),
+                    content: archivefs_core::platform::display_name_for(content),
+                },
+            );
         }
         match identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
@@ -382,11 +503,25 @@ impl ReadinessSources<'_> {
                 } else if evidence_freshness.is_incomplete() {
                     LaunchReadinessInput::InspectionIncomplete
                 } else {
-                    LaunchReadinessInput::IdentityUnknown(identity_unknown_reason(
-                        focused,
-                        selected_game_identity_report,
-                        focused_record.map(|r| r.mount_plan.archive.identity.platform.as_deref()),
-                    ))
+                    // Blue has no live record; the catalogue row's system is
+                    // what the lane above used, so the reason uses it too.
+                    let catalogued = focused.and_then(|p| (self.platform_hint)(p));
+                    LaunchReadinessInput::IdentityUnknown(lane_reason.unwrap_or_else(|| {
+                        identity_unknown_reason(
+                            focused,
+                            selected_game_identity_report,
+                            focused_record
+                                .map(|r| r.mount_plan.archive.identity.platform.as_deref())
+                                .or_else(|| catalogued.as_deref().map(Some))
+                                // Blue knows when the catalogue row has no
+                                // system at all.
+                                .or_else(|| {
+                                    focused
+                                        .is_some_and(|p| (self.system_unknown)(p))
+                                        .then_some(None)
+                                }),
+                        )
+                    }))
                 };
             }
             archivefs_core::launch::CanonicalIdentityStatus::Conflicting => {
@@ -444,13 +579,39 @@ impl ReadinessSources<'_> {
         }
 
         // A ZIP holding exactly one verified cartridge ROM is launchable
-        // through RetroArch by extracting that member at Play time.
-        if content.requires_mount
+        // through RetroArch by extracting that member at Play time. Blue
+        // loads no live record, so its content is unresolved rather than
+        // "requires mount"; the report for this exact path (complete, exactly
+        // one verified ROM) is what authorises the substitution either way.
+        // Before 2026-11-09 every zipped cartridge in Blue stopped at "No
+        // runnable game file has been resolved".
+        if (content.requires_mount || content.resolved_path.is_none())
             && let Some(zipped) = selected_game_identity_report
                 .filter(|report| focused.is_some_and(|path| report.archive_path == path))
                 .and_then(archivefs_core::launch::launch_content_ref_for_zipped_cartridge)
         {
             content = zipped;
+        } else if (content.requires_mount || content.resolved_path.is_none())
+            && identity_unverified.is_some()
+            && let archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved) =
+                &identity_status
+            && let Some(path) = focused
+            && archivefs_core::zip_cartridge_stage::zip_cartridge_member_fits(
+                path,
+                &resolved.platform_id,
+            ) == Some(true)
+        {
+            // The same extraction for a zipped cartridge the unverified lane
+            // resolved (a try, a remembered or a saved choice): staging still
+            // demands one complete member this system's check accepts, and
+            // the extracted file passes the click-time header re-check.
+            content = archivefs_core::launch::LaunchContentRef {
+                kind: Some(archivefs_core::launch::LaunchContentKind::Cartridge),
+                container: Some(archivefs_core::launch::LaunchContainerKind::PlainFile),
+                resolved_path: Some(path.to_path_buf()),
+                requires_mount: false,
+                provenance: archivefs_core::launch::ZIPPED_CARTRIDGE_PROVENANCE.to_string(),
+            };
         }
 
         if let Some((_, selected_content)) = flycast_inputs {
@@ -1525,8 +1686,8 @@ impl ReadinessSources<'_> {
             launch_readiness_page::amiga_boot::apply(&mut plan, context);
         }
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
-        if identity_unverified {
-            crate::emulator_setup::unverified_media::apply_warning(&mut plan);
+        if let Some(basis) = identity_unverified {
+            crate::emulator_setup::unverified_media::apply_warning(&mut plan, basis, focused);
         }
         if let Some(probe) = &arcade_probe {
             crate::arcade_mame_probe::apply_warnings(&mut plan, probe);
@@ -1726,6 +1887,22 @@ pub(crate) fn identity_unknown_reason(
         if !is_zip {
             return Reason::UnsupportedArchive;
         }
+    }
+    // A recorded system that does not use this file's format at all (a ZIP of
+    // BBC disk images, an Atari 5200 `.a52` filed under Game Gear) cannot be
+    // started as it is stored. Saying "cannot tell which game" would send the
+    // person to identity review for nothing (census 2026-11-10).
+    if let Some(system) = hint.and_then(archivefs_core::canonical_platform_for_alias)
+        && !extension.is_empty()
+        && !archivefs_core::launch::unverified_media::platform_lists_extension(system, &extension)
+        && !has_other_identity_route(system, &extension)
+        && report.is_none_or(|r| r.format == IdentityImageFormat::Unsupported)
+    {
+        return if archive {
+            Reason::UnsupportedArchive
+        } else {
+            Reason::UnsupportedFormat(archivefs_core::platform::display_name_for(system))
+        };
     }
     if !platform_known {
         return system_missing;
@@ -2089,6 +2266,44 @@ mod identity_reason_tests {
         );
         assert_eq!(reason("/g/a.7z", other, Some("GBA")), R::UnsupportedArchive);
         assert_eq!(reason("/g/a.zip", other, None), R::SystemNotChosen);
+    }
+
+    #[test]
+    fn a_format_the_recorded_system_never_uses_is_unsupported_not_unconfirmed() {
+        // Census 2026-11-10: zipped BBC/Electron/Archimedes disk images and
+        // an Atari 5200 `.a52` filed under Game Gear read "cannot tell which
+        // game", sending the person to identity review for nothing.
+        let other = IdentityPlatform::Other;
+        // Systems with no identity check say so first.
+        for hint in ["BBC Micro", "Acorn Electron", "Acorn Archimedes"] {
+            assert!(
+                matches!(reason("/g/a.zip", other, Some(hint)), R::NoIdentityCheck(_)),
+                "{hint}"
+            );
+        }
+        // A system with a check that never reads this archive.
+        assert_eq!(
+            reason(
+                "/g/a.zip",
+                IdentityPlatform::Ngpc,
+                Some("Neo Geo Pocket Color")
+            ),
+            R::NotConfirmed
+        );
+        assert_eq!(
+            reason("/g/Ms. Pac-Man (USA).a52", other, Some("GameGear")),
+            R::UnsupportedFormat("Sega Game Gear")
+        );
+        // Formats the system lists, and systems with another identity route,
+        // are unaffected.
+        assert!(matches!(
+            reason("/g/a.ssd", other, Some("BBC Micro")),
+            R::NoIdentityCheck(_)
+        ));
+        assert_eq!(
+            reason("/g/a.zip", other, Some("AmigaCD32")),
+            R::NotConfirmed
+        );
     }
 
     #[test]

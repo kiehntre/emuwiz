@@ -652,6 +652,7 @@ pub mod nkit_readiness;
 
 /// Explicit user choice between tied launch candidates.
 pub mod launch_choice;
+pub mod remembered_launch_system;
 
 /// Dolphin profiles are launch options only with a provable binding.
 pub mod dolphin_binding_readiness;

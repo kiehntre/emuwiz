@@ -42,6 +42,10 @@ pub(crate) enum ReadinessAction {
     VerifyIdentity,
     /// No trusted system on record: open the existing Choose system flow.
     ChooseSystem,
+    /// The system came from the folder name only: open the Launch page,
+    /// which offers a one-launch "Try anyway" (nothing saved) beside the
+    /// permanent Change system.
+    TryAnyway,
     CheckGamesFolder,
     ReviewProblem,
     ChooseEmulator,
@@ -265,7 +269,19 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
                     Vec::new()
                 }
             } else {
+                // An option blocked only by a core tie can be chosen, so it
+                // speaks for the game before an option that cannot open the
+                // file at all (Stella refusing a zipped 2600 cartridge must
+                // not turn the action into "Check games folder").
                 selected_candidate(plan)
+                    .or_else(|| {
+                        plan.candidates.iter().find(|c| {
+                            !c.blockers.is_empty()
+                                && c.blockers
+                                    .iter()
+                                    .all(|b| b.kind == LaunchBlockerKind::AmbiguousCore)
+                        })
+                    })
                     .or_else(|| plan.candidates.iter().find(|c| !c.blockers.is_empty()))
                     .map(findings_for)
                     .unwrap_or_default()
@@ -333,11 +349,15 @@ fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSumma
         reason @ (IdentityUnknownReason::NoIdentityCheck(_)
         | IdentityUnknownReason::UnsupportedFormat(_)
         | IdentityUnknownReason::AmigaHardDisk
-        | IdentityUnknownReason::AmigaIpf) => base(
+        | IdentityUnknownReason::AmigaIpf
+        | IdentityUnknownReason::NoLaunchRoute(_)) => base(
             ReadinessPresentationState::Blocked,
             &match reason {
                 IdentityUnknownReason::NoIdentityCheck(system) => {
                     format!("EmuWiz has no identity check for {system} yet")
+                }
+                IdentityUnknownReason::NoLaunchRoute(system) => {
+                    format!("This is a {system} game, which EmuWiz cannot start yet")
                 }
                 IdentityUnknownReason::UnsupportedFormat(_) => {
                     "EmuWiz does not read this file format yet".to_string()
@@ -350,6 +370,40 @@ fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSumma
             FirmwareSummary::Unknown,
             None,
             Some(ReadinessAction::RecheckReadiness),
+        ),
+        IdentityUnknownReason::FolderOnly(system) => base(
+            ReadinessPresentationState::NeedsSystem,
+            &format!("The {system} system is only a guess from the folder"),
+            &format!(
+                "EmuWiz only knows the system from the folder this file is in, and the file format is shared with other systems, so Play is not offered on that guess alone. Try anyway starts it once as {system} (or another compatible system) with a warning and saves nothing. To make it lasting, change the system permanently on Review identity. Catalogue (DAT) verification is not required."
+            ),
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::TryAnyway),
+        ),
+        IdentityUnknownReason::SystemUnknown => base(
+            ReadinessPresentationState::NeedsSystem,
+            "The system for this game is not known",
+            "No system is recorded for this game and the file does not name one, so Play is not offered on a guess. Try anyway starts it once as a compatible system you pick (only systems that use this file format and have an installed emulator), with a warning, and saves nothing unless you tick Remember this launch choice. Neither sets the game's system; choose it permanently on Review identity. Catalogue (DAT) verification is not required.",
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::TryAnyway),
+        ),
+        IdentityUnknownReason::MediaConflict { recorded, content } => base(
+            ReadinessPresentationState::Blocked,
+            &format!("This file is a {content} game, not {recorded}"),
+            &format!(
+                "The file's own header says {content}, but the game is recorded as {recorded}. EmuWiz will not start it with a {recorded} emulator. Review identity lets you change the system."
+            ),
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::ReviewIdentity),
         ),
         IdentityUnknownReason::NotConfirmed => base(
             ReadinessPresentationState::NeedsIdentityReview,
@@ -493,23 +547,31 @@ fn project_plan(
         );
     }
 
-    if let Some(candidate) = plan.candidates.iter().find(|candidate| {
-        candidate.blockers.iter().any(|blocker| {
-            matches!(
-                blocker.kind,
-                LaunchBlockerKind::ContentNotResolved | LaunchBlockerKind::NoInstallationCandidate
-            )
-        })
-    }) && candidate
-        .blockers
+    // One option's own content refusal (a zipped cartridge on a standalone
+    // emulator that cannot open ZIPs) says nothing about the game when another
+    // option can start it, or is blocked for its own reason (a core tie): the
+    // card then follows those options, exactly as the Launch page does.
+    let no_usable_option = plan
+        .candidates
         .iter()
-        .any(|blocker| blocker.kind == LaunchBlockerKind::ContentNotResolved)
+        .all(|candidate| candidate.readiness == LaunchReadiness::Blocked);
+    let content_unresolved = |candidate: &LaunchCandidate| {
+        candidate
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == LaunchBlockerKind::ContentNotResolved)
+    };
+    if no_usable_option
+        && plan.candidates.iter().all(content_unresolved)
+        && let Some(candidate) = plan.candidates.first()
     {
+        // A file confirmed missing gets its own message (`note_file_missing`);
+        // here only "no route can open it as stored" is known.
         return with_details(
             base(
                 ReadinessPresentationState::SourceUnavailable,
-                "The game file is unavailable",
-                "The library remembers this game, but its current folder cannot be reached.",
+                "No emulator here can open this game file",
+                "None of the installed emulators can start this file as it is stored. A game kept in an archive (such as a ZIP of a disc image) may need extracting, and a moved or disconnected folder must be reconnected.",
                 IdentitySummary::StrongLocal,
                 SourceSummary::Unavailable,
                 firmware_for(candidate),
@@ -520,7 +582,7 @@ fn project_plan(
         );
     }
 
-    if let Some(candidate) = plan.candidates.iter().find(|candidate| {
+    let media_refused = |candidate: &LaunchCandidate| {
         candidate.blockers.iter().any(|blocker| {
             matches!(
                 blocker.kind,
@@ -529,7 +591,13 @@ fn project_plan(
                     | LaunchBlockerKind::ContentNotResolved
             )
         })
-    }) {
+    };
+    // Only when every option refuses the media itself; an option blocked for
+    // its own reason (a core tie) is reported by the branches below.
+    if no_usable_option
+        && plan.candidates.iter().all(media_refused)
+        && let Some(candidate) = plan.candidates.first()
+    {
         return with_details(
             base(
                 ReadinessPresentationState::MediaUnreadable,
@@ -907,6 +975,7 @@ pub(crate) fn action_label(action: ReadinessAction) -> &'static str {
         ReadinessAction::ReviewIdentity => "Review identity",
         ReadinessAction::VerifyIdentity => "Verify identity",
         ReadinessAction::ChooseSystem => "Choose system",
+        ReadinessAction::TryAnyway => "Try anyway",
         ReadinessAction::CheckGamesFolder => "Check games folder",
         ReadinessAction::ReviewProblem => "Review problem",
         ReadinessAction::ChooseEmulator => "Choose emulator",
@@ -1643,6 +1712,75 @@ mod tests {
         let summary = project(&plan(vec![mame, fbneo]), ReadinessFreshness::Current);
         assert_eq!(summary.status, ReadinessPresentationState::Ready);
         assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+    }
+
+    /// Census 2026-11-10 (NES/Game Gear/... zips): the Launch page offered
+    /// Play through RetroArch while Game Details said "The game file is
+    /// unavailable", taken from the standalone option's own ZIP refusal.
+    #[test]
+    fn a_zipped_cartridge_refused_by_one_option_stays_playable_through_another() {
+        let mesen = candidate(
+            LaunchReadiness::Blocked,
+            FirmwareReadiness::NotRequired,
+            vec![LaunchBlocker::new(
+                LaunchBlockerKind::ContentNotResolved,
+                "a zipped cartridge launches through RetroArch only",
+            )],
+            vec![],
+            CandidatePreference::Undetermined,
+            Some("/mnt/nes/Game.zip"),
+        );
+        let retroarch = candidate(
+            LaunchReadiness::Ready,
+            FirmwareReadiness::NotRequired,
+            vec![],
+            vec![],
+            CandidatePreference::SoleEligible,
+            Some("/mnt/nes/Game.zip"),
+        );
+        let summary = project(
+            &plan(vec![mesen.clone(), retroarch]),
+            ReadinessFreshness::Current,
+        );
+        assert_ne!(
+            summary.status,
+            ReadinessPresentationState::SourceUnavailable
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+        // Atari 2600 zip: the other options are blocked by a core tie, not by
+        // the file, so the card must not say the file cannot be opened.
+        let tied = candidate(
+            LaunchReadiness::Blocked,
+            FirmwareReadiness::NotRequired,
+            vec![LaunchBlocker::new(
+                LaunchBlockerKind::AmbiguousCore,
+                "more than one installed RetroArch core resolves to Atari2600",
+            )],
+            vec![],
+            CandidatePreference::Undetermined,
+            Some("/mnt/a2600/Game.zip"),
+        );
+        let summary = project(
+            &plan(vec![mesen.clone(), tied]),
+            ReadinessFreshness::Current,
+        );
+        assert_ne!(
+            summary.status,
+            ReadinessPresentationState::SourceUnavailable
+        );
+        // Census 2026-11-10: the media branch said "could not be read" here.
+        assert_ne!(summary.status, ReadinessPresentationState::MediaUnreadable);
+        // Census 2026-11-10 (059ae25a): the action followed the option that
+        // cannot open ZIPs ("Check games folder"); the tie can be chosen.
+        assert_eq!(
+            summary.primary_action,
+            Some(ReadinessAction::ChooseEmulator)
+        );
+        // With nothing else, the refusal is still reported - without claiming
+        // the folder is unreachable (the file may simply be an archive).
+        let alone = project(&plan(vec![mesen]), ReadinessFreshness::Current);
+        assert_eq!(alone.status, ReadinessPresentationState::SourceUnavailable);
+        assert!(!alone.explanation.contains("cannot be reached"));
     }
 
     #[test]

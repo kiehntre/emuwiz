@@ -148,6 +148,27 @@ pub(crate) enum IdentityUnknownReason {
     AmigaHardDisk,
     /// An Amiga IPF preservation image: not an identity-checked game file.
     AmigaIpf,
+    /// Only the folder (or another automatic hint) says which system this is,
+    /// and the file's format is shared with other systems (payload: the
+    /// system's display name). The person must confirm the system first;
+    /// a folder guess never becomes trusted platform identity by itself.
+    FolderOnly(&'static str),
+    /// No system is recorded for this game at all, but its format is one that
+    /// at least one system with an installed launch route lists, and its own
+    /// bytes rule none of those out. The person may try it once as one of
+    /// them, or remember that choice; nothing is ever saved as the game's
+    /// system (owner decision 2026-11-10).
+    SystemUnknown,
+    /// The file's own header names a system EmuWiz has no launch route for
+    /// (payload: that system's name, e.g. Sega Pico). Every other system is
+    /// contradicted by that header, so nothing is offered to try.
+    NoLaunchRoute(&'static str),
+    /// The file's own header names a different system from the one recorded
+    /// for it (payloads: recorded system, the file's own system).
+    MediaConflict {
+        recorded: &'static str,
+        content: &'static str,
+    },
 }
 
 impl IdentityUnknownReason {
@@ -156,7 +177,14 @@ impl IdentityUnknownReason {
     /// The other reasons have no identity route, so no "Verify identity" or
     /// "Review identity" action is offered for them.
     pub(crate) fn has_identity_screen(self) -> bool {
-        matches!(self, Self::SystemNotChosen | Self::NotConfirmed)
+        matches!(
+            self,
+            Self::SystemNotChosen
+                | Self::NotConfirmed
+                | Self::FolderOnly(_)
+                | Self::SystemUnknown
+                | Self::MediaConflict { .. }
+        )
     }
 
     /// Plain sentence under the page for reasons that have no identity
@@ -166,7 +194,8 @@ impl IdentityUnknownReason {
             Self::NoIdentityCheck(_)
             | Self::UnsupportedFormat(_)
             | Self::AmigaHardDisk
-            | Self::AmigaIpf => Some(self.banner_body()),
+            | Self::AmigaIpf
+            | Self::NoLaunchRoute(_) => Some(self.banner_body()),
             _ => None,
         }
     }
@@ -190,6 +219,18 @@ impl IdentityUnknownReason {
             ),
             Self::AmigaHardDisk => format!("Amiga hard-disk image. {AMIGA_HDF_NOTE}"),
             Self::AmigaIpf => format!("Amiga IPF image. {AMIGA_IPF_NOTE}"),
+            Self::FolderOnly(system) => format!(
+                "Only the folder name says this is a {system} game, and this file format is used by other systems too. Confirm the system on the identity screen to try launching it."
+            ),
+            Self::SystemUnknown => {
+                "No system is recorded for this game. Try it once as a compatible system, or choose the system on the identity screen.".into()
+            }
+            Self::NoLaunchRoute(system) => format!(
+                "The file's own header says this is a {system} game. EmuWiz cannot start {system} games yet and will not start it as another system."
+            ),
+            Self::MediaConflict { recorded, content } => format!(
+                "This game is recorded as {recorded}, but the file's own header says {content}. EmuWiz will not start it as {recorded}. Change the system on the identity screen."
+            ),
         }
     }
 
@@ -202,6 +243,10 @@ impl IdentityUnknownReason {
             Self::UnsupportedFormat(_) => "File format not supported yet",
             Self::AmigaHardDisk => "Amiga hard-disk image",
             Self::AmigaIpf => "Amiga IPF image",
+            Self::FolderOnly(_) => "System taken from the folder name",
+            Self::SystemUnknown => "System not known",
+            Self::NoLaunchRoute(_) => "No launch route for this system yet",
+            Self::MediaConflict { .. } => "The file says it is for another system",
         }
     }
 
@@ -237,6 +282,32 @@ impl IdentityUnknownReason {
             Self::AmigaIpf => format!(
                 "{AMIGA_IPF_NOTE} EmuWiz does not check an IPF image's identity, so it \
                  cannot start it from here. This is not caused by missing DAT verification."
+            ),
+            Self::FolderOnly(system) => format!(
+                "EmuWiz only knows this is a {system} game from the folder it is in, and this \
+                 file format is shared with other systems, so it will not trust the folder on its \
+                 own. If it really is a {system} game, confirm the system and it can be started \
+                 with a \"game not identified\" warning. Your choice does not identify the game \
+                 or count as catalogue (DAT) verification."
+            ),
+            Self::SystemUnknown => {
+                "EmuWiz has no system recorded for this game and the file does not say which \
+                 system it is for. You can try it once as one of the compatible systems listed \
+                 below (only systems that use this file format and have an installed emulator), \
+                 with a warning, or tick \"Remember this launch choice\" to keep that choice for \
+                 this unchanged file. Neither sets the game's system or identifies the game; \
+                 choose the system permanently on the identity screen for that.".into()
+            }
+            Self::NoLaunchRoute(system) => format!(
+                "The file's own header says this is a {system} game. EmuWiz has no {system} \
+                 launch route yet, and the header rules out every other system, so nothing is \
+                 offered to try and nothing is remembered. Nothing is wrong with the file. \
+                 This is not caused by missing DAT verification."
+            ),
+            Self::MediaConflict { recorded, content } => format!(
+                "This game is recorded as {recorded}, but the file's own header says it is a \
+                 {content} game. EmuWiz will not start it with a {recorded} emulator. Change the \
+                 system to match the file, or check whether the file was put in the wrong folder."
             ),
         }
     }
@@ -3640,6 +3711,23 @@ fn launch_error_message(error: &LaunchExecutionError) -> (&'static str, String) 
     }
 }
 
+/// The panel's one-line introduction. The DOSBox folder-approval note is
+/// only for DOS games: shown everywhere it read as if a Wii or Acorn game
+/// needed DOSBox (owner screenshot 08, 2026-11-07).
+fn panel_intro(input: &LaunchReadinessInput) -> &'static str {
+    const BASE: &str = "Ways this game can be played. Check emulator readiness and content.";
+    const DOS: &str = "Ways this game can be played. Check emulator readiness and content. DOSBox also requires explicit approval of its local folder and start target; that approval does not verify a release.";
+    let dos = match input {
+        LaunchReadinessInput::DosBoxReview => true,
+        LaunchReadinessInput::Plan { plan, .. } => plan
+            .platform_id
+            .as_deref()
+            .is_some_and(|platform| matches!(platform, "DOS" | "PC")),
+        _ => false,
+    };
+    if dos { DOS } else { BASE }
+}
+
 // The panel's inputs are the read-only launch input, each emulator's own
 // launch tracker and the read-only emulator choices; nothing else.
 #[allow(clippy::too_many_arguments)]
@@ -3659,13 +3747,7 @@ pub(crate) fn show_launch_readiness_panel(
         standalone_launch_state.show_cemu_lifecycle(ui);
         retroarch_launch_state.show_stop_control(ui);
     }
-    widgets::section_header(
-        ui,
-        "Play / Launch readiness",
-        Some(
-            "Ways this game can be played. Check emulator readiness and content. DOSBox also requires explicit approval of its local folder and start target; that approval does not verify a release.",
-        ),
-    );
+    widgets::section_header(ui, "Play / Launch readiness", Some(panel_intro(input)));
 
     match input {
         LaunchReadinessInput::AtariSt(snapshot) => snapshot.show(ui),
@@ -6687,3 +6769,20 @@ pub(crate) fn show_dolphin_profile_guidance(ui: &mut egui::Ui, input: &LaunchRea
 mod amiga_retry_tests;
 
 pub(crate) mod amiga_boot;
+
+#[cfg(test)]
+mod panel_intro_tests {
+    use super::*;
+
+    #[test]
+    fn the_dosbox_approval_note_is_only_for_dos_games() {
+        assert!(panel_intro(&LaunchReadinessInput::DosBoxReview).contains("DOSBox"));
+        for other in [
+            LaunchReadinessInput::IdentityUnknown(IdentityUnknownReason::NotConfirmed),
+            LaunchReadinessInput::IdentityConflicting,
+            LaunchReadinessInput::EvidenceNotLoaded,
+        ] {
+            assert!(!panel_intro(&other).contains("DOSBox"));
+        }
+    }
+}

@@ -518,7 +518,7 @@ fn both_zip_flows_recheck_freshness_only_through_the_safe_reopen() {
         ),
         (
             include_str!("../zip_cartridge_stage.rs"),
-            "pub fn stage_zip_cartridge_for_launch(",
+            "pub fn stage_zip_cartridge_for_launch_checked(",
         ),
     ] {
         let body = &source[source.find(start).expect(start)..];

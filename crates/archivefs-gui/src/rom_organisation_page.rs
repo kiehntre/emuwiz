@@ -560,7 +560,14 @@ impl RomOrganisationPageState {
     /// Re-reads the configured source folders and re-scans them for
     /// candidate files.
     pub(crate) fn rescan_sources(&mut self) {
-        if let Ok(config) = Config::load_default() {
+        self.rescan_sources_with(Config::load_default().ok().as_ref());
+    }
+
+    /// [`Self::rescan_sources`] from an already-read configuration (`None`:
+    /// none could be read, so the current folders are kept). Tests pass their
+    /// own: the default configuration is shared by every test in the process.
+    pub(crate) fn rescan_sources_with(&mut self, config: Option<&Config>) {
+        if let Some(config) = config {
             self.source_roots = config.source_folders.clone();
         }
         self.scan_sources();
@@ -3991,7 +3998,10 @@ mod tests {
             .with_deferred_source_roots(vec![dir.path().to_path_buf()]);
         state.scan_sources_bounded(1, 4);
         assert!(!state.sources_complete());
-        state.rescan_sources();
+        // Not `rescan_sources()`: it reads the process-wide test config, which
+        // other tests seed with `source_folders = []` (the cause of this
+        // test's order-dependent failures in the full suite).
+        state.rescan_sources_with(None);
         assert!(state.sources_complete());
         assert_eq!(state.source_count(), 2);
     }

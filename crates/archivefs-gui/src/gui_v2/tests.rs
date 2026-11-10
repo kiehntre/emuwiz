@@ -6833,6 +6833,56 @@ fn gui_v2_browse_play_many_platforms_do_not_push_the_selected_game_off_screen() 
     );
 }
 
+/// Owner screenshots 03/04/15 (7 Nov build): after picking a system from
+/// "More systems", the dropdown went off-screen and its list covered the
+/// selected-game panel. With a non-top system selected, the dropdown and the
+/// selected game's Play must both stay on screen at the owner's widths.
+#[test]
+fn gui_v2_browse_play_a_system_picked_from_more_systems_keeps_the_dropdown_on_screen() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(
+        (1..=200)
+            .map(|id| {
+                archive(
+                    id,
+                    &format!("Game {id}"),
+                    Some(&format!("Platform {}", id % 70)),
+                )
+            })
+            .collect(),
+    ));
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.filter.select_platform("Platform 69".to_string());
+    app.indices = (0..app.library.games.len())
+        .filter(|&i| app.library.games[i].platform == "Platform 69")
+        .collect();
+    let game = app.library.games[app.indices[0]].archive.id;
+    for width in [2048.0, 1880.0, 1400.0] {
+        app.router.current = Route::BrowsePlayGame(game);
+        let output = frame(&context, &mut app, [width, 1100.0]);
+        let more = text(&output)
+            .into_iter()
+            .find(|t| t.starts_with("More systems"))
+            .unwrap_or_else(|| "More systems".to_string());
+        for needle in [more.as_str(), "Play"] {
+            let bounds = text_bounds(&output, needle);
+            assert!(
+                !bounds.is_empty(),
+                "{needle} must be drawn at {width}px; drawn: {:?}",
+                text(&output)
+                    .iter()
+                    .filter(|t| t.contains("Platform") || t.contains("systems"))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                bounds.iter().all(|rect| rect.max.x <= width),
+                "{needle} must be on screen at {width}px: {bounds:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn gui_v2_browse_play_says_loading_while_the_library_loads() {
     let context = egui::Context::default();
@@ -12069,6 +12119,8 @@ mod nkit_gui;
 
 #[path = "tests/big_picture.rs"]
 mod big_picture_journey;
+#[path = "tests/launch_census.rs"]
+mod launch_census;
 #[path = "tests/launch_focus.rs"]
 mod launch_focus;
 #[path = "tests/pad_shell.rs"]

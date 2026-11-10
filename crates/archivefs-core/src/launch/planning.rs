@@ -478,6 +478,17 @@ struct RetroArchCoreMatch {
     info: CoreInfoFinding,
 }
 
+/// Whether any installed RetroArch core in `environment` resolves to
+/// `platform_id` - the route an unidentified game's one-time try or
+/// remembered launch choice can use. Says nothing about firmware, content or
+/// any other check, which the plan still performs.
+pub fn retroarch_core_installed_for(
+    platform_id: &str,
+    environment: &RetroArchEnvironmentReport,
+) -> bool {
+    !matching_retroarch_cores(platform_id, environment).is_empty()
+}
+
 fn matching_retroarch_cores(
     platform_id: &str,
     environment: &RetroArchEnvironmentReport,

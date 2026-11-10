@@ -378,19 +378,28 @@ fn an_explicit_choice_outranks_an_unrelated_remembered_profile() {
 }
 
 #[test]
-fn platforms_not_yet_adopted_are_untouched() {
+fn every_platform_can_resolve_a_tie_by_choice_and_a_plan_without_one_is_untouched() {
+    // Owner screenshot 2026-11-09: PS2 with three PCSX2 installs showed
+    // "Choice needed" and no way to choose. Every platform now resolves a tie
+    // the same way GameCube and Wii always did.
     for platform in ["Saturn", "PS2", "NES"] {
         let mut plan = tie();
         plan.platform_id = Some(platform.into());
-        let before = plan.clone();
         let preferences = [LaunchPreference::system(platform, &option(APPIMAGE))];
-        assert_eq!(
+        assert!(matches!(
             apply(&mut plan, saved(&preferences)),
-            LaunchChoiceOutcome::NotAdopted
-        );
-        assert_eq!(plan, before);
-        assert!(!is_choosable(&plan, &plan.candidates[0]));
+            LaunchChoiceOutcome::Applied { .. }
+        ));
+        assert!(is_choosable(&plan, &plan.candidates[0]));
     }
+    let mut plan = tie();
+    plan.platform_id = None;
+    let before = plan.clone();
+    assert_eq!(
+        apply(&mut plan, saved(&[])),
+        LaunchChoiceOutcome::NotAdopted
+    );
+    assert_eq!(plan, before);
 }
 
 #[test]
@@ -619,4 +628,352 @@ fn a_save_that_would_exceed_the_read_limit_is_refused_and_keeps_the_old_file() {
     assert!(std::fs::metadata(&path).unwrap().len() <= MAX_FILE_BYTES);
     let reloaded = load_launch_preferences_at(&path).expect("the old file stays readable");
     assert_eq!(reloaded.len(), saved_count);
+}
+
+fn core_tied(mut plan: LaunchPlan, extra: Option<LaunchBlockerKind>) -> LaunchPlan {
+    for c in &mut plan.candidates {
+        c.warnings.clear();
+        c.blockers
+            .push(crate::launch::readiness::LaunchBlocker::new(
+                LaunchBlockerKind::AmbiguousCore,
+                "more than one installed RetroArch core resolves to this system",
+            ));
+        if let Some(kind) = extra {
+            c.blockers
+                .push(crate::launch::readiness::LaunchBlocker::new(kind, "other"));
+        }
+        c.readiness = LaunchReadiness::Blocked;
+    }
+    plan
+}
+
+fn once(platform: &str, profile: &str) -> LaunchOnceChoice {
+    LaunchOnceChoice {
+        platform_id: platform.into(),
+        game_key: GAME.into(),
+        option_id: option(profile),
+    }
+}
+
+/// Census 2026-11-10 (Atari 2600 zip, Neo Geo Pocket Color): several
+/// installed cores and no reviewed preference left every option Blocked with
+/// "Choice needed" and no way to choose. The person's choice answers exactly
+/// that tie, on the option it names only.
+#[test]
+fn a_core_tie_is_answered_by_an_explicit_choice_and_nothing_else_is_unblocked() {
+    let mut plan = core_tied(tie(), None);
+    assert!(plan.candidates.iter().all(|c| is_choosable(&plan, c)));
+    let choice = once("GameCube", APPIMAGE);
+    apply(
+        &mut plan,
+        LaunchChoiceInputs {
+            once: Some(&choice),
+            preferences: Ok(&[]),
+        },
+    );
+    assert_eq!(launchable(&plan), vec![option(APPIMAGE)]);
+    assert_eq!(candidate(&plan, NATIVE).readiness, LaunchReadiness::Blocked);
+
+    // Any other blocker beside the tie still refuses, chosen or not.
+    let mut plan = core_tied(tie(), Some(LaunchBlockerKind::RequiredFirmwareMissing));
+    assert!(plan.candidates.iter().all(|c| !is_choosable(&plan, c)));
+    apply(
+        &mut plan,
+        LaunchChoiceInputs {
+            once: Some(&choice),
+            preferences: Ok(&[]),
+        },
+    );
+    assert!(
+        plan.candidates
+            .iter()
+            .all(|c| c.readiness == LaunchReadiness::Blocked)
+    );
+
+    // Saturn keeps its own validated native core selection.
+    let mut saturn = core_tied(
+        plan_with(
+            "Saturn",
+            content("/games/Saturn.chd", false),
+            &[APPIMAGE, NATIVE],
+            &[],
+        ),
+        None,
+    );
+    assert!(saturn.candidates.iter().all(|c| !is_choosable(&saturn, c)));
+    let choice = once("Saturn", APPIMAGE);
+    apply(
+        &mut saturn,
+        LaunchChoiceInputs {
+            once: Some(&choice),
+            preferences: Ok(&[]),
+        },
+    );
+    assert!(
+        saturn
+            .candidates
+            .iter()
+            .all(|c| c.readiness == LaunchReadiness::Blocked)
+    );
+}
+
+/// Real-planner fixtures for the core-tie choice (owner review 2026-11-10).
+mod core_tie_review {
+    use super::*;
+    use crate::emulator_environment::retroarch::{
+        ConfigFileFinding, ConfigReadOutcome, CoreFinding, CoreInfoFinding, DirectoryProbeFinding,
+        Evidence, RetroArchPlaylistInventory, RetroArchProfile,
+    };
+    use crate::emulator_environment::{EncodedPath, FsProbe};
+    use std::path::PathBuf;
+
+    fn core(stem: &str, database: &str) -> CoreFinding {
+        CoreFinding {
+            file_name: EncodedPath::from_path(&PathBuf::from(format!("{stem}_libretro.so"))),
+            full_path: EncodedPath::from_path(&PathBuf::from(format!(
+                "/retroarch/cores/{stem}_libretro.so"
+            ))),
+            core_stem: stem.to_string(),
+            info: CoreInfoFinding::Found {
+                display_name: None,
+                display_version: None,
+                system_name: None,
+                supported_extensions: Vec::new(),
+                core_name: Some(stem.to_string()),
+                manufacturer: None,
+                categories: None,
+                database: Some(database.to_string()),
+                firmware: Vec::new(),
+            },
+        }
+    }
+
+    fn environment(kind: ProfileKind, cores: Vec<CoreFinding>) -> RetroArchEnvironmentReport {
+        RetroArchEnvironmentReport {
+            format_version: 1,
+            profiles: vec![RetroArchProfile {
+                profile_kind: kind,
+                scope: ProfileScope::User,
+                evidence: Evidence {
+                    executables: vec![EncodedPath::from_path(&PathBuf::from("/usr/bin/retroarch"))],
+                    flatpak_metadata_found: false,
+                    config_directory_found: true,
+                    config_file_found: true,
+                },
+                config_directory: DirectoryProbeFinding {
+                    path: EncodedPath::from_path(&PathBuf::from("/retroarch")),
+                    probe: FsProbe::PresentDirectory,
+                },
+                config_file: ConfigFileFinding {
+                    path: EncodedPath::from_path(&PathBuf::from("/retroarch/retroarch.cfg")),
+                    probe: FsProbe::PresentFile,
+                    read: ConfigReadOutcome::NotAttempted,
+                },
+                paths: Vec::new(),
+                cores,
+                playlists: RetroArchPlaylistInventory {
+                    directory: None,
+                    playlists: Vec::new(),
+                    diagnostics: Vec::new(),
+                    complete: true,
+                },
+                app_images: Vec::new(),
+                diagnostics: Vec::new(),
+            }],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn plan(platform: &str, file: &str, environment: &RetroArchEnvironmentReport) -> LaunchPlan {
+        build_launch_plan(
+            &CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+                platform_id: platform.into(),
+                game_key: GAME.into(),
+            }),
+            &LaunchContentRef {
+                kind: Some(LaunchContentKind::Cartridge),
+                container: Some(LaunchContainerKind::PlainFile),
+                resolved_path: Some(file.into()),
+                requires_mount: false,
+                provenance: "synthetic fixture".into(),
+            },
+            &[],
+            environment,
+            &[],
+        )
+    }
+
+    fn ra(kind: ProfileKind, stem: &str) -> String {
+        retroarch_option_id(
+            ProfileRef {
+                profile_kind: kind,
+                scope: ProfileScope::User,
+            },
+            stem,
+        )
+    }
+
+    fn usable(plan: &LaunchPlan) -> Vec<String> {
+        plan.candidates
+            .iter()
+            .filter(|c| c.readiness != LaunchReadiness::Blocked)
+            .map(|c| launch_option_id(&c.target))
+            .collect()
+    }
+
+    fn choose_once(plan: &mut LaunchPlan, platform: &str, option: &str) -> LaunchChoiceOutcome {
+        let once = LaunchOnceChoice {
+            platform_id: platform.into(),
+            game_key: GAME.into(),
+            option_id: option.into(),
+        };
+        apply(
+            plan,
+            LaunchChoiceInputs {
+                once: Some(&once),
+                preferences: Ok(&[]),
+            },
+        )
+    }
+
+    fn all_tied(plan: &LaunchPlan) -> bool {
+        plan.candidates.len() >= 2
+            && plan.candidates.iter().all(|c| {
+                c.readiness == LaunchReadiness::Blocked
+                    && c.blockers
+                        .iter()
+                        .all(|b| b.kind == LaunchBlockerKind::AmbiguousCore)
+            })
+    }
+
+    #[test]
+    fn atari_2600_and_neo_geo_pocket_color_core_ties_are_answered_by_a_choice() {
+        for (platform, file, a, b, database) in [
+            (
+                "Atari2600",
+                "/games/Moonsweeper (USA).a26",
+                "core_a2600_x",
+                "core_a2600_y",
+                "Atari - 2600",
+            ),
+            (
+                "Neo Geo Pocket Color",
+                "/games/Big Bang Pro Wrestling (Japan).ngc",
+                "core_ngpc_x",
+                "core_ngpc_y",
+                "SNK - Neo Geo Pocket Color",
+            ),
+        ] {
+            let env = environment(
+                ProfileKind::Native,
+                vec![core(a, database), core(b, database)],
+            );
+            let mut tied = plan(platform, file, &env);
+            assert!(all_tied(&tied), "{platform}: {:?}", tied.candidates);
+            assert!(
+                usable(&tied).is_empty(),
+                "{platform}: nothing is picked automatically"
+            );
+            assert!(tied.candidates.iter().all(|c| is_choosable(&tied, c)));
+            assert!(matches!(
+                choose_once(&mut tied, platform, &ra(ProfileKind::Native, b)),
+                LaunchChoiceOutcome::Applied { .. }
+            ));
+            assert_eq!(
+                usable(&tied),
+                vec![ra(ProfileKind::Native, b)],
+                "{platform}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_saved_choice_never_authorises_a_removed_or_changed_core() {
+        let database = "Atari - 2600";
+        let file = "/games/Moonsweeper (USA).a26";
+        let saved_choice = [LaunchPreference::system(
+            "Atari2600",
+            &ra(ProfileKind::Native, "core_a2600_x"),
+        )];
+        // The chosen core was uninstalled; two others still tie.
+        let env = environment(
+            ProfileKind::Native,
+            vec![
+                core("core_a2600_y", database),
+                core("core_a2600_z", database),
+            ],
+        );
+        let mut removed = plan("Atari2600", file, &env);
+        assert!(matches!(
+            apply(&mut removed, saved(&saved_choice)),
+            LaunchChoiceOutcome::PreferredUnavailable { .. }
+        ));
+        assert!(usable(&removed).is_empty(), "no other core is substituted");
+        // The same core stem under a different installation (Flatpak instead
+        // of native) is a different option: not authorised by the old choice.
+        let env = environment(
+            ProfileKind::Flatpak,
+            vec![
+                core("core_a2600_x", database),
+                core("core_a2600_y", database),
+            ],
+        );
+        let mut moved = plan("Atari2600", file, &env);
+        assert!(matches!(
+            apply(&mut moved, saved(&saved_choice)),
+            LaunchChoiceOutcome::PreferredUnavailable { .. }
+        ));
+        assert!(usable(&moved).is_empty());
+    }
+
+    #[test]
+    fn missing_bios_and_duplicate_installs_still_refuse_after_a_choice() {
+        let database = "SNK - Neo Geo Pocket Color";
+        let file = "/games/Big Bang Pro Wrestling (Japan).ngc";
+        let env = environment(
+            ProfileKind::Native,
+            vec![core("core_ngpc_x", database), core("core_ngpc_y", database)],
+        );
+        // Required firmware missing on the chosen core: still refused.
+        let mut bios = plan("Neo Geo Pocket Color", file, &env);
+        for c in &mut bios.candidates {
+            c.blockers
+                .push(crate::launch::readiness::LaunchBlocker::new(
+                    LaunchBlockerKind::RequiredFirmwareMissing,
+                    "required BIOS is missing",
+                ));
+        }
+        assert!(bios.candidates.iter().all(|c| !is_choosable(&bios, c)));
+        choose_once(
+            &mut bios,
+            "Neo Geo Pocket Color",
+            &ra(ProfileKind::Native, "core_ngpc_x"),
+        );
+        assert!(usable(&bios).is_empty());
+        // The same core installed twice under one stem is not a tie a choice
+        // answers: the planner sees one stem, and the click-time command
+        // builder refuses the duplicate (retroarch_command
+        // `ambiguous_core`), whatever was chosen.
+        let env = environment(
+            ProfileKind::Native,
+            vec![core("core_ngpc_x", database), core("core_ngpc_x", database)],
+        );
+        let duplicate = plan("Neo Geo Pocket Color", file, &env);
+        assert!(!all_tied(&duplicate));
+        let candidate = duplicate.candidates.first().expect("a candidate");
+        let command = crate::launch::retroarch_command::build_retroarch_command_plan(
+            &CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+                platform_id: "Neo Geo Pocket Color".into(),
+                game_key: GAME.into(),
+            }),
+            candidate,
+            &env,
+        );
+        assert!(
+            command
+                .blockers
+                .iter()
+                .any(|b| b.kind == LaunchBlockerKind::AmbiguousCore)
+        );
+    }
 }

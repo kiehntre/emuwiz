@@ -227,6 +227,510 @@ fn validate_tap(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// How many bytes from each end of a large file the content binding reads.
+const EDGE_BYTES: u64 = 1024 * 1024;
+
+/// Launch-only identity for a single-file game whose system is established
+/// but whose exact game is not (owner, 2026-11-09, generalising the ZX tape
+/// decision: catalogue identity must not gate a safe launch). `platform_id`
+/// must be the canonical platform the library and any manual choice already
+/// give the file; this function never infers one. It accepts the file only
+/// when it is a non-empty regular file (opened without following a final
+/// symlink or blocking on a FIFO) whose extension that platform's registry
+/// entry lists as one of its formats. ZX tapes keep their stricter structural
+/// validation. The key is `unverified:`-prefixed and bound to the content:
+/// whole-file SHA-256 up to 16 MiB, otherwise size plus the first and last
+/// MiB. Never a verified identity; every candidate built from it carries the
+/// visible identity-unverified warning.
+pub fn platform_media_identity(path: &Path, platform_id: &str) -> Option<ResolvedIdentity> {
+    if platform_id == ZX_PLATFORM
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "tap" | "tzx"))
+    {
+        return zx_tape_identity(path);
+    }
+    cached(path, platform_id)
+}
+
+/// The same answer read from the file now (click-time preflight and spawn).
+pub fn platform_media_identity_fresh(path: &Path, platform_id: &str) -> Option<ResolvedIdentity> {
+    if platform_id == ZX_PLATFORM
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "tap" | "tzx"))
+    {
+        return zx_tape_identity_fresh(path);
+    }
+    platform_media_key(path, platform_id).map(|game_key| ResolvedIdentity {
+        platform_id: platform_id.to_string(),
+        game_key,
+    })
+}
+
+fn cached(path: &Path, platform_id: &str) -> Option<ResolvedIdentity> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    // The platform is part of the key: the same file under another system
+    // is a different question.
+    let mut keyed = path.as_os_str().to_owned();
+    keyed.push("\0");
+    keyed.push(platform_id);
+    let key = (PathBuf::from(keyed), metadata.len(), mtime);
+    if let Ok(guard) = cache().lock()
+        && let Some(hit) = guard.get(&key)
+    {
+        return hit.clone().map(|game_key| ResolvedIdentity {
+            platform_id: platform_id.to_string(),
+            game_key,
+        });
+    }
+    let derived = platform_media_key(path, platform_id);
+    if let Ok(mut guard) = cache().lock() {
+        if guard.len() >= CACHE_LIMIT {
+            guard.clear();
+        }
+        guard.insert(key, derived.clone());
+    }
+    derived.map(|game_key| ResolvedIdentity {
+        platform_id: platform_id.to_string(),
+        game_key,
+    })
+}
+
+/// What the file's own bytes and format say about the system it is filed
+/// under. Folder names, catalogue hints and user choices are never consulted
+/// here; this is the "media evidence" tier of the owner's 2026-11-09 policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaSystemEvidence {
+    /// A decisive signature or structure names this system, or the file's
+    /// format is one only this system uses.
+    Agrees,
+    /// Decisive evidence names a different system (and nothing names this one).
+    Contradicts(&'static str),
+    /// Nothing in the file settles the system either way.
+    Silent,
+}
+
+/// Reads bounded signatures and structural checks (never the folder name) and
+/// compares them with `platform_id`.
+pub fn media_system_evidence(path: &Path, platform_id: &str) -> MediaSystemEvidence {
+    use crate::platform::detect::{DetectionRequest, DetectionSource, detect_platform_report};
+    let same = |other: &str| {
+        other == platform_id
+            || crate::platform::equivalent_platform_ids(platform_id).contains(&other)
+    };
+    // Launch-only: a VICE cartridge image names its machine in its first 16
+    // bytes. Read here rather than added to the shared platform registry so
+    // library scans classify `.crt` files exactly as before.
+    if let Some(machine) = vice_crt_machine(path) {
+        return if same(machine) {
+            MediaSystemEvidence::Agrees
+        } else {
+            MediaSystemEvidence::Contradicts(machine)
+        };
+    }
+    // Launch-only: a Sega Pico cartridge shares the Mega Drive `.md` format
+    // and the `SEGA` header prefix but names PICO in its header. It is no
+    // other system's game (owner ruling 2026-11-10: the extension is not
+    // hardware compatibility), so every other system is contradicted.
+    if is_sega_pico_rom(path) {
+        return if platform_id == SEGA_PICO_PLATFORM {
+            MediaSystemEvidence::Agrees
+        } else {
+            MediaSystemEvidence::Contradicts(SEGA_PICO_PLATFORM)
+        };
+    }
+    // The file itself is the source root, so no folder alias can be read.
+    let report = detect_platform_report(&DetectionRequest::new(path, path).inspecting_content());
+    let content: Vec<_> = report
+        .evidence
+        .iter()
+        .filter(|e| e.source == DetectionSource::Signature)
+        .collect();
+    if content.iter().any(|e| same(e.platform)) {
+        if content.iter().any(|e| same(e.platform) && e.conclusive) {
+            return MediaSystemEvidence::Agrees;
+        }
+    } else if let Some(other) = content.iter().find(|e| e.conclusive).map(|e| e.platform) {
+        return MediaSystemEvidence::Contradicts(other);
+    }
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|extension| format_only_this_system_uses(platform_id, extension))
+    {
+        return MediaSystemEvidence::Agrees;
+    }
+    MediaSystemEvidence::Silent
+}
+
+/// The Sega Pico, named here only for launch decisions. It is deliberately not
+/// a platform-registry entry: adding one would reclassify library scans,
+/// which is a separate, reviewed change.
+pub const SEGA_PICO_PLATFORM: &str = "Sega Pico";
+
+/// Bytes read from the start of a cartridge ROM for header checks: enough for
+/// every registry signature offset, bounded so nothing large is read.
+const HEADER_PROBE_BYTES: u64 = 0x10000;
+
+/// The first [`HEADER_PROBE_BYTES`] of the cartridge ROM `path` holds for
+/// `platform_id`: the file itself, or the single ROM member of a ZIP exactly
+/// as zipped-cartridge staging would select it for that system (the same
+/// refusals apply). Never writes anything; only that bounded prefix of the
+/// member is decompressed.
+fn cartridge_leading_bytes(path: &Path, platform_id: &str) -> Option<Vec<u8>> {
+    use crate::game_identity::IdentityPlatform;
+    use crate::zip_cartridge_select::{is_loose_cartridge_platform, select_zip_cartridge_member};
+    let file = super::process_spawn::open_regular_file_nonblocking(path).ok()?;
+    let mut bytes = Vec::new();
+    if crate::zip_cartridge_stage::is_zipped_cartridge_request(path, platform_id) {
+        let platform = IdentityPlatform::from_catalogue(Some(platform_id));
+        if !is_loose_cartridge_platform(platform) {
+            return None;
+        }
+        let mut archive = zip::ZipArchive::new(file).ok()?;
+        let member = select_zip_cartridge_member(&mut archive, platform, &mut 0).ok()?;
+        let entry = archive.by_index(member.index).ok()?;
+        entry
+            .take(HEADER_PROBE_BYTES)
+            .read_to_end(&mut bytes)
+            .ok()?;
+    } else {
+        file.take(HEADER_PROBE_BYTES).read_to_end(&mut bytes).ok()?;
+    }
+    Some(bytes)
+}
+
+/// Whether the Mega Drive-format ROM `path` holds (loose, or the single ROM
+/// of a ZIP) names PICO in its header system field (`SEGA PICO`,
+/// `SEGATOYS PICO`, `SAMSUNG PICO`, ...).
+pub fn is_sega_pico_rom(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !matches!(
+        extension.as_str(),
+        "md" | "bin" | "gen" | "smd" | "68k" | "pco" | "zip"
+    ) {
+        return false;
+    }
+    cartridge_leading_bytes(path, "MegaDrive").is_some_and(|bytes| names_sega_pico(&bytes))
+}
+
+fn names_sega_pico(bytes: &[u8]) -> bool {
+    bytes
+        .get(0x100..0x110)
+        .is_some_and(|field| field.windows(4).any(|w| w == b"PICO"))
+}
+
+/// The machine a VICE `.crt` cartridge image declares in its 16-byte
+/// signature (VICE CRT format), or `None` for anything else.
+fn vice_crt_machine(path: &Path) -> Option<&'static str> {
+    use std::io::Read;
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("crt"))
+    {
+        return None;
+    }
+    let file = super::process_spawn::open_regular_file_nonblocking(path).ok()?;
+    let mut signature = [0u8; 16];
+    file.take(16).read_exact(&mut signature).ok()?;
+    match &signature {
+        b"C64 CARTRIDGE   " => Some("Commodore 64"),
+        b"C128 CARTRIDGE  " => Some("Commodore 128"),
+        b"VIC20 CARTRIDGE " => Some("VIC-20"),
+        _ => None,
+    }
+}
+
+/// [`media_system_evidence`] cached by (path, size, mtime, platform), for
+/// readiness rebuilds. Click-time checks call the uncached form.
+pub fn media_system_evidence_cached(path: &Path, platform_id: &str) -> MediaSystemEvidence {
+    type Key = (PathBuf, u64, u128, String);
+    static CACHE: OnceLock<Mutex<HashMap<Key, MediaSystemEvidence>>> = OnceLock::new();
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return MediaSystemEvidence::Silent;
+    };
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let key = (
+        path.to_path_buf(),
+        metadata.len(),
+        mtime,
+        platform_id.to_string(),
+    );
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(hit) = guard.get(&key)
+    {
+        return *hit;
+    }
+    let answer = media_system_evidence(path, platform_id);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= CACHE_LIMIT {
+            guard.clear();
+        }
+        guard.insert(key, answer);
+    }
+    answer
+}
+
+/// A strong, non-shared extension listed by this system and by no other.
+fn format_only_this_system_uses(platform_id: &str, extension: &str) -> bool {
+    let extension = extension.to_ascii_lowercase();
+    if crate::platform::is_shared_extension(&extension) {
+        return false;
+    }
+    let Some(platform) = crate::platform::platform_by_id(platform_id) else {
+        return false;
+    };
+    let listed = |p: &crate::platform::Platform| {
+        p.strong_extensions
+            .iter()
+            .chain(p.weak_extensions.iter())
+            .any(|listed| listed.eq_ignore_ascii_case(&extension))
+    };
+    platform
+        .strong_extensions
+        .iter()
+        .any(|listed| listed.eq_ignore_ascii_case(&extension))
+        && crate::platform::PLATFORMS
+            .iter()
+            .filter(|p| p.id != platform.id)
+            .all(|p| !listed(p))
+}
+
+/// Whether `extension` is one of the formats the platform registry lists.
+pub fn platform_lists_extension(platform_id: &str, extension: &str) -> bool {
+    let Some(platform) = crate::platform::platform_by_id(platform_id) else {
+        return false;
+    };
+    let extension = extension.to_ascii_lowercase();
+    platform
+        .strong_extensions
+        .iter()
+        .chain(platform.weak_extensions.iter())
+        .any(|listed| listed.eq_ignore_ascii_case(&extension))
+}
+
+fn platform_media_key(path: &Path, platform_id: &str) -> Option<String> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    platform_media_key_of_open_file(&mut file, path, platform_id)
+}
+
+/// The same content-bound key, read through an already open handle (for
+/// example the one zipped-cartridge staging then extracts from, so the
+/// bytes keyed are the bytes launched). `path` supplies only the name and
+/// extension. The handle is left at an unspecified position.
+pub fn platform_media_key_of_open_file(
+    file: &mut std::fs::File,
+    path: &Path,
+    platform_id: &str,
+) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    let extension = path.extension()?.to_str()?;
+    if !platform_lists_extension(platform_id, extension) {
+        return None;
+    }
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut file = file;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 {
+        return None;
+    }
+    let size = metadata.len();
+    let mut hasher = Sha256::new();
+    hasher.update(size.to_le_bytes());
+    if size <= MAX_TAPE_BYTES {
+        let mut bytes = Vec::with_capacity(size as usize);
+        (&mut file)
+            .take(MAX_TAPE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 != size {
+            return None;
+        }
+        hasher.update(&bytes);
+    } else {
+        let mut head = vec![0u8; EDGE_BYTES as usize];
+        file.read_exact(&mut head).ok()?;
+        hasher.update(&head);
+        file.seek(SeekFrom::Start(size - EDGE_BYTES)).ok()?;
+        let mut tail = vec![0u8; EDGE_BYTES as usize];
+        file.read_exact(&mut tail).ok()?;
+        hasher.update(&tail);
+    }
+    let stem: String = path
+        .file_stem()?
+        .to_str()?
+        .chars()
+        .take(48)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let digest = hasher.finalize();
+    let short: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    Some(format!("{UNVERIFIED_KEY_PREFIX}{stem}:{short}"))
+}
+
+#[cfg(test)]
+mod platform_media_tests {
+    use super::*;
+
+    #[test]
+    fn a_listed_format_resolves_an_unverified_content_bound_key_for_that_platform_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Bokosuka Wars (Japan).sfc");
+        std::fs::write(&path, vec![7u8; 4096]).unwrap();
+        let resolved = platform_media_identity_fresh(&path, "SNES").expect("listed format");
+        assert_eq!(resolved.platform_id, "SNES");
+        assert!(is_unverified_key(&resolved.game_key));
+        // Not a format that platform lists.
+        assert!(platform_media_identity_fresh(&path, "PS2").is_none());
+        // Unknown platform id: never inferred.
+        assert!(platform_media_identity_fresh(&path, "Not A System").is_none());
+        // Cached and fresh answers agree.
+        assert_eq!(
+            platform_media_identity(&path, "SNES").unwrap().game_key,
+            resolved.game_key
+        );
+    }
+
+    #[test]
+    fn the_key_follows_content_and_refuses_empty_files_directories_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.sfc");
+        std::fs::write(&path, [1u8, 2, 3]).unwrap();
+        let before = platform_media_identity_fresh(&path, "SNES")
+            .unwrap()
+            .game_key;
+        std::fs::write(&path, [1u8, 2, 4]).unwrap();
+        let after = platform_media_identity_fresh(&path, "SNES")
+            .unwrap()
+            .game_key;
+        assert_ne!(before, after);
+
+        let empty = dir.path().join("empty.sfc");
+        std::fs::write(&empty, []).unwrap();
+        assert!(platform_media_identity_fresh(&empty, "SNES").is_none());
+
+        let folder = dir.path().join("folder.sfc");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(platform_media_identity_fresh(&folder, "SNES").is_none());
+
+        let link = dir.path().join("link.sfc");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(platform_media_identity_fresh(&link, "SNES").is_none());
+    }
+
+    #[test]
+    fn a_large_file_is_bound_by_size_and_both_ends_without_reading_it_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disc.iso");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(40 * 1024 * 1024).unwrap();
+        let resolved = platform_media_identity_fresh(&path, "PS2").expect("iso is a PS2 format");
+        assert!(is_unverified_key(&resolved.game_key));
+    }
+
+    fn ines(name: &str, dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let mut bytes = b"NES\x1a".to_vec();
+        bytes.resize(16 + 16 * 1024, 0);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_nes_header_contradicts_the_snes_folder_whatever_the_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        // NES game renamed into the SNES collection.
+        let renamed = ines("Misfiled (USA).sfc", &dir);
+        assert_eq!(
+            media_system_evidence(&renamed, "SNES"),
+            MediaSystemEvidence::Contradicts("NES")
+        );
+        // The same bytes under the system they belong to agree.
+        assert_eq!(
+            media_system_evidence(&renamed, "NES"),
+            MediaSystemEvidence::Agrees
+        );
+        let proper = ines("Proper (USA).nes", &dir);
+        assert_eq!(
+            media_system_evidence(&proper, "NES"),
+            MediaSystemEvidence::Agrees
+        );
+    }
+
+    #[test]
+    fn shared_formats_are_silent_and_only_one_system_s_own_format_agrees() {
+        let dir = tempfile::tempdir().unwrap();
+        // A CHD names no system in its container bytes: folder alone decides.
+        let chd = dir.path().join("Disc (Europe).chd");
+        std::fs::write(&chd, vec![0u8; 4096]).unwrap();
+        assert_eq!(
+            media_system_evidence(&chd, "Dreamcast"),
+            MediaSystemEvidence::Silent
+        );
+        assert_eq!(
+            media_system_evidence(&chd, "Philips CD-i"),
+            MediaSystemEvidence::Silent
+        );
+        // A ZIP is a shared container, never format evidence.
+        let zip = dir.path().join("Game (USA).zip");
+        std::fs::write(&zip, b"PK\x03\x04rest").unwrap();
+        assert_eq!(
+            media_system_evidence(&zip, "SNES"),
+            MediaSystemEvidence::Silent
+        );
+        // A Dreamcast-only disc format agrees.
+        let cdi = dir.path().join("Disc (Europe).cdi");
+        std::fs::write(&cdi, vec![0u8; 4096]).unwrap();
+        assert_eq!(
+            media_system_evidence(&cdi, "Dreamcast"),
+            MediaSystemEvidence::Agrees
+        );
+        // An extension another system also lists never agrees on its own.
+        let iso = dir.path().join("Disc.iso");
+        std::fs::write(&iso, vec![0u8; 4096]).unwrap();
+        assert_eq!(
+            media_system_evidence(&iso, "PS2"),
+            MediaSystemEvidence::Silent
+        );
+    }
+
+    #[test]
+    fn zx_tapes_keep_their_structural_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.tap");
+        std::fs::write(&bad, [0u8, 0, 0]).unwrap();
+        assert!(platform_media_identity_fresh(&bad, ZX_PLATFORM).is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +849,88 @@ mod tests {
         assert_eq!(zx_tape_identity(&path).unwrap().game_key, first);
         std::fs::write(&path, tap(&[&[0, 1, 2, 3, 4, 5]])).unwrap();
         assert_ne!(zx_tape_identity(&path).unwrap().game_key, first);
+    }
+
+    fn vice_crt(
+        dir: &Path,
+        folder: &str,
+        name: &str,
+        signature: Option<&[u8; 16]>,
+    ) -> std::path::PathBuf {
+        let folder = dir.join(folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut bytes = signature.map_or_else(|| vec![0u8; 16], |s| s.to_vec());
+        bytes.extend_from_slice(&[0, 0, 0, 0x40, 1, 0, 0, 0, 0, 1]);
+        bytes.resize(0x40 + 0x10 + 0x2000, 0);
+        let path = folder.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// Owner review gate 2026-11-10: the C64/VIC-20 cartridge launch fix
+    /// reads the VICE signature for launch only. Library scan detection of
+    /// `.crt` files (folder + extension evidence, no signature) must stay
+    /// exactly as on main, so no future scan reassigns a cartridge.
+    #[test]
+    fn crt_signatures_decide_launch_evidence_without_changing_scan_detection() {
+        use crate::platform::detect::{DetectionRequest, DetectionSource, detect_platform_report};
+        let root = tempfile::tempdir().unwrap();
+        // (folder, file, signature, recorded system, launch evidence)
+        let cases = [
+            (
+                "c64",
+                "1942.crt",
+                Some(b"C64 CARTRIDGE   "),
+                "Commodore 64",
+                MediaSystemEvidence::Agrees,
+            ),
+            (
+                "vic20",
+                "Gorf (USA, Europe).crt",
+                Some(b"C64 CARTRIDGE   "),
+                "VIC-20",
+                MediaSystemEvidence::Contradicts("Commodore 64"),
+            ),
+            (
+                "vic20",
+                "Omega Race.crt",
+                Some(b"VIC20 CARTRIDGE "),
+                "VIC-20",
+                MediaSystemEvidence::Agrees,
+            ),
+            (
+                "c64",
+                "Unsigned.crt",
+                None,
+                "Commodore 64",
+                MediaSystemEvidence::Agrees,
+            ),
+        ];
+        for (folder, name, signature, recorded, launch) in cases {
+            let path = vice_crt(root.path(), folder, name, signature);
+            let scan = detect_platform_report(
+                &DetectionRequest::new(&path, root.path()).inspecting_content(),
+            );
+            // Scan: decided by the folder alone, as on main; never by bytes.
+            assert_eq!(scan.platform, Some(recorded), "{folder}/{name}");
+            assert_eq!(
+                scan.deciding_source,
+                Some(DetectionSource::FolderAlias),
+                "{folder}/{name}"
+            );
+            assert!(
+                !scan
+                    .evidence
+                    .iter()
+                    .any(|e| e.source == DetectionSource::Signature),
+                "{folder}/{name}: scan detection must not read the CRT signature"
+            );
+            // Launch: the signature decides.
+            assert_eq!(
+                media_system_evidence(&path, recorded),
+                launch,
+                "{folder}/{name}"
+            );
+        }
     }
 }

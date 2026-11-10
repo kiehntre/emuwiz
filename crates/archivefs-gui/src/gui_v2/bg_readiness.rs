@@ -244,111 +244,10 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
     if job.multidisc || selection_bound_platform(&job.catalogue_platform) {
         return Outcome::Skipped;
     }
-    let path = job.archive.absolute_path.clone();
-    let hint = job.archive.platform.as_deref();
-    let Ok(report) = crate::selected_evidence_page::gather_selected_evidence_fast(&path, hint)
-    else {
-        return Outcome::Unknown;
+    let (input, pending_checksum) = match build_input(env, job, cancel) {
+        Ok(built) => built,
+        Err(outcome) => return outcome,
     };
-    if cancel.load(Ordering::Relaxed) {
-        return Outcome::Unknown;
-    }
-    if selection_bound_identity(report.game_identity_report.platform) {
-        return Outcome::Skipped;
-    }
-    let mut state = env.to_state();
-    // Dragon/CoCo cassette evidence needs only the file: run the same bounded
-    // path-only check the selected game runs (one small file, hashed once).
-    if crate::emulator_setup::xroar_cassette::is_cas(&path)
-        && archivefs_core::canonical_platform_for_alias(&job.catalogue_platform)
-            .unwrap_or(&job.catalogue_platform)
-            .eq_ignore_ascii_case(archivefs_core::launch::DRAGON_COCO_PLATFORM_ID)
-    {
-        if cancel.load(Ordering::Relaxed) {
-            return Outcome::Unknown;
-        }
-        let context = crate::launch_readiness_page::xroar::Context::inspect(path.clone());
-        state.xroar_cassette =
-            crate::emulator_setup::xroar_cassette::Controller::with_context(path.clone(), context);
-    }
-    // Loose .3dsx homebrew needs only the file: the same bounded check the
-    // selected game runs (one small file, hashed once). A catalogue platform
-    // that is not Nintendo 3DS means the folder says otherwise: skip.
-    if crate::launch_readiness_page::azahar::is_three_dsx(&path)
-        && crate::launch_readiness_page::azahar::platform_allows(Some(&job.catalogue_platform))
-    {
-        if cancel.load(Ordering::Relaxed) {
-            return Outcome::Unknown;
-        }
-        let context = crate::launch_readiness_page::azahar::Context::inspect(path.clone());
-        state.azahar_homebrew =
-            crate::emulator_setup::azahar_homebrew::Controller::with_context(path.clone(), context);
-    }
-    // A Vita .vpk: the same bounded check the selected game runs (ZIP directory
-    // and one param.sfo member, plus a Vita3K rescan).
-    if archivefs_core::launch::is_vpk(&path)
-        && crate::launch_readiness_page::vita3k::platform_allows(Some(&job.catalogue_platform))
-    {
-        if cancel.load(Ordering::Relaxed) {
-            return Outcome::Unknown;
-        }
-        let context = crate::launch_readiness_page::vita3k::Context::inspect(path.clone());
-        state.vita3k_library =
-            crate::emulator_setup::vita3k_library::Controller::with_context(path.clone(), context);
-    }
-    let evidence = crate::selected_evidence_page::SelectedEvidenceState::Ready {
-        generation: 0,
-        report: Box::new(report),
-        hasheous: Default::default(),
-    };
-    let archive = &job.archive;
-    let scummvm = archive.archive_kind == "scummvm_directory";
-    let freshness_for = |_: &Path, _: Option<&LoadedData>| {
-        archivefs_core::launch::EvidenceFreshness::from_stored_health(&archive.last_known_health)
-    };
-    let member_path = |_: &ArchiveRecord| None;
-    let is_scummvm_folder = |p: &Path| scummvm && p == archive.absolute_path;
-    let loose_ref = |p: &Path| {
-        let kind =
-            archivefs_core::ArchiveKind::from_storage(&archive.archive_kind).filter(|kind| {
-                !kind.is_mount_input()
-                    && *kind != archivefs_core::ArchiveKind::ScummVmDirectory
-                    && archive.last_verified_missing_at.is_none()
-            })?;
-        if p != archive.absolute_path
-            || !crate::emulator_setup::catalogued_content_shape_ok(kind, p)
-        {
-            return None;
-        }
-        archivefs_core::launch::launch_content_ref_for_unmounted(kind, p)
-    };
-    let platform_hint = |p: &Path| {
-        (p == archive.absolute_path)
-            .then(|| archive.platform.clone())
-            .flatten()
-    };
-    let cheat_workflow = None;
-    let is_arcade_set_directory =
-        |p: &Path| archive.archive_kind == "arcade_set_directory" && p == archive.absolute_path;
-    // This worker is off the UI thread, so it may wait for the (cached,
-    // de-duplicated, capped) MAME probe; cancelling the batch cancels the wait.
-    let input = crate::arcade_mame_probe::with_blocking(cancel, || {
-        crate::emulator_setup::readiness_input::ReadinessSources {
-            readiness: &state,
-            evidence: &evidence,
-            focused: Some(&path),
-            cheat_workflow: &cheat_workflow,
-            database_snapshot: None,
-            database_generation: 0,
-            freshness_for: &freshness_for,
-            member_path: &member_path,
-            is_scummvm_folder: &is_scummvm_folder,
-            loose_ref: &loose_ref,
-            is_arcade_set_directory: &is_arcade_set_directory,
-            platform_hint: &platform_hint,
-        }
-        .build(None)
-    });
     // Only a resolved plan is an answer. An unresolved identity may be one a
     // selection-bound controller would have supplied, so it is not a verdict.
     let crate::launch_readiness_page::LaunchReadinessInput::Plan {
@@ -391,6 +290,139 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
     if job.dat_exact {
         summary::note_catalogue_verified(&mut projected);
     }
+    match CheckedReadiness::from_compact(&summary::compact(&projected, pending_checksum)) {
+        Some(result) => Outcome::Known(result),
+        None => Outcome::Unknown,
+    }
+}
+
+/// The readiness input a background check plans from: the same sources and
+/// builder the selected game uses, from this job's file and the snapshot.
+/// `Err` carries the outcome when nothing honest can be said (unreadable or
+/// cancelled: Unknown; a selection-bound identity: Skipped). The flag is whether the whole-file checksum is
+/// still pending.
+pub(super) fn build_input(
+    env: &EnvSnapshot,
+    job: &Job,
+    cancel: &AtomicBool,
+) -> Result<(crate::launch_readiness_page::LaunchReadinessInput, bool), Outcome> {
+    let path = job.archive.absolute_path.clone();
+    let hint = job.archive.platform.as_deref();
+    let Ok(report) = crate::selected_evidence_page::gather_selected_evidence_fast(&path, hint)
+    else {
+        return Err(Outcome::Unknown);
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return Err(Outcome::Unknown);
+    }
+    if selection_bound_identity(report.game_identity_report.platform) {
+        return Err(Outcome::Skipped);
+    }
+    let mut state = env.to_state();
+    // Dragon/CoCo cassette evidence needs only the file: run the same bounded
+    // path-only check the selected game runs (one small file, hashed once).
+    if crate::emulator_setup::xroar_cassette::is_cas(&path)
+        && archivefs_core::canonical_platform_for_alias(&job.catalogue_platform)
+            .unwrap_or(&job.catalogue_platform)
+            .eq_ignore_ascii_case(archivefs_core::launch::DRAGON_COCO_PLATFORM_ID)
+    {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Outcome::Unknown);
+        }
+        let context = crate::launch_readiness_page::xroar::Context::inspect(path.clone());
+        state.xroar_cassette =
+            crate::emulator_setup::xroar_cassette::Controller::with_context(path.clone(), context);
+    }
+    // Loose .3dsx homebrew needs only the file: the same bounded check the
+    // selected game runs (one small file, hashed once). A catalogue platform
+    // that is not Nintendo 3DS means the folder says otherwise: skip.
+    if crate::launch_readiness_page::azahar::is_three_dsx(&path)
+        && crate::launch_readiness_page::azahar::platform_allows(Some(&job.catalogue_platform))
+    {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Outcome::Unknown);
+        }
+        let context = crate::launch_readiness_page::azahar::Context::inspect(path.clone());
+        state.azahar_homebrew =
+            crate::emulator_setup::azahar_homebrew::Controller::with_context(path.clone(), context);
+    }
+    // A Vita .vpk: the same bounded check the selected game runs (ZIP directory
+    // and one param.sfo member, plus a Vita3K rescan).
+    if archivefs_core::launch::is_vpk(&path)
+        && crate::launch_readiness_page::vita3k::platform_allows(Some(&job.catalogue_platform))
+    {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Outcome::Unknown);
+        }
+        let context = crate::launch_readiness_page::vita3k::Context::inspect(path.clone());
+        state.vita3k_library =
+            crate::emulator_setup::vita3k_library::Controller::with_context(path.clone(), context);
+    }
+    let evidence = crate::selected_evidence_page::SelectedEvidenceState::Ready {
+        generation: 0,
+        report: Box::new(report),
+        hasheous: Default::default(),
+    };
+    let archive = &job.archive;
+    let scummvm = archive.archive_kind == "scummvm_directory";
+    let freshness_for = |_: &Path, _: Option<&LoadedData>| {
+        archivefs_core::launch::EvidenceFreshness::from_stored_health(&archive.last_known_health)
+    };
+    let member_path = |_: &ArchiveRecord| None;
+    let is_scummvm_folder = |p: &Path| scummvm && p == archive.absolute_path;
+    let loose_ref = |p: &Path| {
+        let kind =
+            archivefs_core::ArchiveKind::from_storage(&archive.archive_kind).filter(|kind| {
+                !kind.is_mount_input()
+                    && *kind != archivefs_core::ArchiveKind::ScummVmDirectory
+                    && archive.last_verified_missing_at.is_none()
+            })?;
+        if p != archive.absolute_path
+            || !crate::emulator_setup::catalogued_content_shape_ok(kind, p)
+        {
+            return None;
+        }
+        archivefs_core::launch::launch_content_ref_for_unmounted(kind, p)
+    };
+    let platform_hint = |p: &Path| {
+        (p == archive.absolute_path)
+            .then(|| archive.platform.clone())
+            .flatten()
+    };
+    let platform_source = |p: &Path| {
+        (p == archive.absolute_path)
+            .then(|| archive.platform_source.clone())
+            .flatten()
+    };
+    let cheat_workflow = None;
+    let is_arcade_set_directory =
+        |p: &Path| archive.archive_kind == "arcade_set_directory" && p == archive.absolute_path;
+    // This worker is off the UI thread, so it may wait for the (cached,
+    // de-duplicated, capped) MAME probe; cancelling the batch cancels the wait.
+    let input = crate::arcade_mame_probe::with_blocking(cancel, || {
+        crate::emulator_setup::readiness_input::ReadinessSources {
+            readiness: &state,
+            evidence: &evidence,
+            focused: Some(&path),
+            cheat_workflow: &cheat_workflow,
+            database_snapshot: None,
+            database_generation: 0,
+            freshness_for: &freshness_for,
+            member_path: &member_path,
+            is_scummvm_folder: &is_scummvm_folder,
+            loose_ref: &loose_ref,
+            is_arcade_set_directory: &is_arcade_set_directory,
+            platform_hint: &platform_hint,
+            platform_source: &platform_source,
+            system_trial: &|_| None,
+            // A saved "Remember this launch choice" is the person's lasting
+            // answer for this unchanged file, so the list shows it too.
+            remembered_system:
+                &archivefs_core::launch::remembered_launch_system::remembered_launch_system,
+            system_unknown: &|p| p == archive.absolute_path && archive.platform.is_none(),
+        }
+        .build(None)
+    });
     // Whole-file checksum pending means identity is not final: not a verdict.
     let pending_checksum = match &evidence {
         crate::selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
@@ -398,10 +430,7 @@ pub(super) fn check(env: &EnvSnapshot, job: &Job, cancel: &AtomicBool) -> Outcom
         }
         _ => false,
     };
-    match CheckedReadiness::from_compact(&summary::compact(&projected, pending_checksum)) {
-        Some(result) => Outcome::Known(result),
-        None => Outcome::Unknown,
-    }
+    Ok((input, pending_checksum))
 }
 
 /// Whether the foreground checker would plan `path` with multi-disc set
@@ -582,6 +611,268 @@ mod tests {
             remembered: Vec::new(),
             launch_choices: Default::default(),
         }
+    }
+
+    fn on_disk(dir: &tempfile::TempDir, name: &str, platform: &str, bytes: &[u8]) -> Job {
+        on_disk_from(dir, name, platform, Some("folder_alias"), bytes)
+    }
+
+    fn on_disk_from(
+        dir: &tempfile::TempDir,
+        name: &str,
+        platform: &str,
+        source: Option<&str>,
+        bytes: &[u8],
+    ) -> Job {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let mut archive = archive(41, platform);
+        archive.platform_source = source.map(str::to_string);
+        archive.absolute_path = path.clone();
+        archive.relative_path = name.into();
+        archive.archive_kind = "direct_game_image".into();
+        Job::for_game(&Game::from_archive(archive))
+    }
+
+    fn planned(job: &Job) -> Option<archivefs_core::launch::LaunchPlan> {
+        match build_input(&env(), job, &AtomicBool::new(false)) {
+            Ok((crate::launch_readiness_page::LaunchReadinessInput::Plan { plan, .. }, _)) => {
+                Some(plan)
+            }
+            _ => None,
+        }
+    }
+
+    /// Owner evidence 2026-11-09 (PC Engine CD, CD-i, Dreamcast, ScummVM,
+    /// SNES): a game whose system is known but which has no header serial or
+    /// catalogue match must reach a launch plan, never the identity loop. Its
+    /// identity stays explicitly unverified.
+    #[test]
+    fn a_game_of_a_known_system_without_catalogue_identity_reaches_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        // A CD-i disc image: no header serial, no loose-ROM hash identity.
+        // Owner policy 2026-11-09: the folder alone is not enough for a shared
+        // disc format - the background check reports it, never plans it.
+        let name = "7th Guest The (USA) (Disc 1).chd";
+        let folder = on_disk(&dir, name, "Philips CD-i", &[0u8; 512]);
+        assert!(matches!(
+            build_input(&env(), &folder, &AtomicBool::new(false)),
+            Ok((
+                crate::launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
+                    crate::launch_readiness_page::IdentityUnknownReason::FolderOnly("Philips CD-i")
+                ),
+                _
+            ))
+        ));
+        // The person's own saved system choice reaches a plan.
+        let job = on_disk_from(
+            &dir,
+            name,
+            "Philips CD-i",
+            Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
+            &[0u8; 512],
+        );
+        let plan = planned(&job).expect("a launch plan, not Identity unresolved");
+        assert_eq!(plan.platform_id.as_deref(), Some("Philips CD-i"));
+        let key = plan.game_key.clone().unwrap_or_default();
+        assert!(
+            archivefs_core::launch::unverified_media::is_unverified_key(&key),
+            "key {key:?}"
+        );
+    }
+
+    /// Owner decision 2026-11-10: a ticked "Remember this launch choice"
+    /// saves the system for this unchanged file, so a folder-only game is not
+    /// confirmed again on every play. It never becomes verified identity and
+    /// stops applying when forgotten or when the file changes.
+    #[test]
+    fn a_remembered_launch_choice_plans_a_folder_only_game_until_forgotten_or_changed() {
+        use archivefs_core::launch::remembered_launch_system as remembered;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "7th Guest The (USA) (Disc 1).chd";
+        let job = on_disk(&dir, name, "Philips CD-i", &[0u8; 512]);
+        let path = job.archive.absolute_path.clone();
+        let folder_only = |job: &Job| {
+            matches!(
+                build_input(&env(), job, &AtomicBool::new(false)),
+                Ok((
+                    crate::launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
+                        crate::launch_readiness_page::IdentityUnknownReason::FolderOnly(_)
+                    ),
+                    _
+                ))
+            )
+        };
+        assert!(folder_only(&job));
+
+        let store = remembered::default_remembered_launch_systems_path().unwrap();
+        let entry =
+            remembered::RememberedLaunchSystem::for_current_file(&path, "Philips CD-i").unwrap();
+        remembered::remember_launch_system_at(&store, &entry).unwrap();
+        let plan = planned(&job).expect("a remembered choice reaches a launch plan");
+        assert_eq!(plan.platform_id.as_deref(), Some("Philips CD-i"));
+        let key = plan.game_key.clone().unwrap_or_default();
+        assert!(
+            archivefs_core::launch::unverified_media::is_unverified_key(&key),
+            "never a verified identity: {key:?}"
+        );
+
+        // A changed file is not the file that was chosen.
+        std::fs::write(&path, [1u8; 600]).unwrap();
+        assert!(folder_only(&job));
+        // Forgetting restores the question.
+        let entry =
+            remembered::RememberedLaunchSystem::for_current_file(&path, "Philips CD-i").unwrap();
+        remembered::remember_launch_system_at(&store, &entry).unwrap();
+        assert!(planned(&job).is_some());
+        remembered::forget_launch_system_at(&store, &path).unwrap();
+        assert!(folder_only(&job));
+    }
+
+    /// Owner decision 2026-11-10 (1,815 games with no system): Blue said
+    /// "Identity unresolved / Verify identity" because it had no live record
+    /// to show the system was missing. It now says no system is chosen and,
+    /// with a remembered launch choice, plans as that system - unverified.
+    #[test]
+    fn a_game_with_no_recorded_system_says_so_and_a_remembered_choice_plans_it() {
+        use archivefs_core::launch::remembered_launch_system as remembered;
+        let dir = tempfile::tempdir().unwrap();
+        let mut job = on_disk_from(
+            &dir,
+            "Avenger (Japan).chd",
+            "PC Engine CD",
+            None,
+            &[0u8; 512],
+        );
+        job.archive.platform = None;
+        job.catalogue_platform = String::new();
+        // No RetroArch in the test environment: no system can be offered for
+        // a try, so the truthful reason is "no system chosen".
+        assert!(matches!(
+            build_input(&env(), &job, &AtomicBool::new(false)),
+            Ok((
+                crate::launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
+                    crate::launch_readiness_page::IdentityUnknownReason::SystemNotChosen
+                ),
+                _
+            ))
+        ));
+        let path = job.archive.absolute_path.clone();
+        let store = remembered::default_remembered_launch_systems_path().unwrap();
+        let entry =
+            remembered::RememberedLaunchSystem::for_current_file(&path, "PC Engine CD").unwrap();
+        remembered::remember_launch_system_at(&store, &entry).unwrap();
+        let plan = planned(&job).expect("a remembered choice reaches a launch plan");
+        assert_eq!(plan.platform_id.as_deref(), Some("PC Engine CD"));
+        assert!(archivefs_core::launch::unverified_media::is_unverified_key(
+            plan.game_key.as_deref().unwrap_or_default()
+        ));
+        // The library row is untouched: still no system.
+        assert!(job.archive.platform.is_none());
+        remembered::forget_launch_system_at(&store, &path).unwrap();
+    }
+
+    /// Owner regression list 2026-11-09: NES games misfiled under SNES.
+    #[test]
+    fn an_nes_game_renamed_into_the_snes_folder_never_plans_as_snes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ines = b"NES\x1a".to_vec();
+        ines.resize(16 + 32 * 1024, 0);
+        for (name, source) in [
+            ("Misfiled (USA).sfc", Some("folder_alias")),
+            (
+                "Misfiled (USA).sfc",
+                Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
+            ),
+            ("Misfiled (USA).bin", Some("folder_alias")),
+        ] {
+            let job = on_disk_from(&dir, name, "SNES", source, &ines);
+            let input = build_input(&env(), &job, &AtomicBool::new(false));
+            let as_snes = matches!(
+                &input,
+                Ok((crate::launch_readiness_page::LaunchReadinessInput::Plan { plan, .. }, _))
+                    if plan.platform_id.as_deref() == Some("SNES")
+            );
+            assert!(!as_snes, "{name} {source:?} planned as SNES");
+        }
+    }
+
+    /// Owner rule 7 (2026-11-09): formats EmuWiz explicitly does not start
+    /// from here stay unsupported even with a saved system choice.
+    #[test]
+    fn amiga_hard_disk_and_ipf_images_stay_explicitly_unsupported() {
+        use crate::launch_readiness_page::{IdentityUnknownReason as R, LaunchReadinessInput as I};
+        let dir = tempfile::tempdir().unwrap();
+        for (name, expected) in [
+            ("20000 Leagues.hdf", R::AmigaHardDisk),
+            ("Game.ipf", R::AmigaIpf),
+        ] {
+            for source in [
+                Some("folder_alias"),
+                Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
+            ] {
+                let job = on_disk_from(&dir, name, "Amiga", source, &[0u8; 4096]);
+                match build_input(&env(), &job, &AtomicBool::new(false)) {
+                    Ok((I::IdentityUnknown(reason), _)) => assert_eq!(reason, expected, "{name}"),
+                    Ok((I::Plan { .. }, _)) => panic!("{name} {source:?} planned"),
+                    _ => panic!("{name} {source:?}: unexpected input"),
+                }
+            }
+        }
+    }
+
+    /// Before 2026-11-09 every zipped cartridge in Blue stopped at "No
+    /// runnable game file has been resolved" (13 systems in the census).
+    #[test]
+    fn a_zip_with_one_verified_cartridge_resolves_its_content_without_a_live_record() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let mut rom = vec![0u8; 0x8000];
+        let logo = [
+            0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83, 0x00, 0x0C,
+            0x00, 0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E, 0xDC, 0xCC, 0x6E, 0xE6,
+            0xDD, 0xDD, 0xD9, 0x99, 0xBB, 0xBB, 0x67, 0x63, 0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC,
+            0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+        ];
+        rom[0x104..0x134].copy_from_slice(&logo);
+        rom[0x14D] = archivefs_core::gb_header_evidence::compute_header_checksum(&rom).unwrap();
+        let path = dir.path().join("Game (World).zip");
+        {
+            let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            writer
+                .start_file("Game (World).gb", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&rom).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut archive = archive(41, "Game Boy");
+        archive.absolute_path = path.clone();
+        archive.relative_path = "Game (World).zip".into();
+        archive.archive_kind = "zip".into();
+        let job = Job::for_game(&Game::from_archive(archive));
+        let plan = planned(&job).expect("a launch plan");
+        // No RetroArch is installed in the test environment, so the only
+        // remaining content blocker is the "RetroArch only" route note.
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|c| c.blockers.iter().all(|b| b.kind
+                    != archivefs_core::launch::LaunchBlockerKind::ContentNotResolved
+                    || b.detail.contains("RetroArch only"))),
+            "content must resolve to the zip for extraction at Play"
+        );
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|c| c.content.resolved_path.as_deref() == Some(path.as_path()))
+        );
+    }
+
+    #[test]
+    fn a_format_the_system_does_not_list_still_needs_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = on_disk(&dir, "notes.txt", "Philips CD-i", b"hello");
+        assert!(planned(&job).is_none());
     }
 
     #[test]
