@@ -226,7 +226,7 @@ impl IdentityUnknownReason {
                 "No system is recorded for this game. Try it once as a compatible system, or choose the system on the identity screen.".into()
             }
             Self::NoLaunchRoute(system) => format!(
-                "The file's own header says this is a {system} game. EmuWiz cannot start {system} games yet and will not start it as another system."
+                "The file's own header says this is a {system} game. No emulator installed here starts {system} games, and EmuWiz will not start it as another system. Install one that does (for {system}, the PicoDrive core in RetroArch), then press Retry readiness check."
             ),
             Self::MediaConflict { recorded, content } => format!(
                 "This game is recorded as {recorded}, but the file's own header says {content}. EmuWiz will not start it as {recorded}. Change the system on the identity screen."
@@ -245,7 +245,7 @@ impl IdentityUnknownReason {
             Self::AmigaIpf => "Amiga IPF image",
             Self::FolderOnly(_) => "System taken from the folder name",
             Self::SystemUnknown => "System not known",
-            Self::NoLaunchRoute(_) => "No launch route for this system yet",
+            Self::NoLaunchRoute(_) => "No emulator installed for this system",
             Self::MediaConflict { .. } => "The file says it is for another system",
         }
     }
@@ -299,9 +299,9 @@ impl IdentityUnknownReason {
                  choose the system permanently on the identity screen for that.".into()
             }
             Self::NoLaunchRoute(system) => format!(
-                "The file's own header says this is a {system} game. EmuWiz has no {system} \
-                 launch route yet, and the header rules out every other system, so nothing is \
-                 offered to try and nothing is remembered. Nothing is wrong with the file. \
+                "The file's own header says this is a {system} game. No installed emulator \
+                 starts {system} games, and the header rules out every other system, so nothing \
+                 is offered to try and nothing is remembered. Nothing is wrong with the file. \
                  This is not caused by missing DAT verification."
             ),
             Self::MediaConflict { recorded, content } => format!(
