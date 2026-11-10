@@ -1957,3 +1957,115 @@ fn a_sega_pico_zip_reaches_picodrive_and_never_runs_as_mega_drive() {
     .expect("a Pico ROM never runs as Mega Drive");
     assert!(format!("{error:?}").contains("Sega Pico"), "{error:?}");
 }
+
+/// Writes a `retroarch.cfg` whose save/state keys are given verbatim and points
+/// the discovery home at a folder outside the system temp folder (the staged
+/// route refuses saves under it). Returns the fixture and that home.
+fn tilde_config_ready(label: &str, save_keys: &str) -> (ReadyFixture, PathBuf) {
+    let (mut ready, _, _) = zipped_ready(label, &[("a.md", b"synthetic mega drive rom bytes")]);
+    let unique = ready
+        .fixture
+        .root
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let home = PathBuf::from("/var/tmp").join(format!("{unique}-home"));
+    fs::create_dir_all(&home).unwrap();
+    ready.environment.home = Some(home.clone().into_os_string());
+    ready.fixture.write(
+        "config/retroarch/retroarch.cfg",
+        format!(
+            "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n{save_keys}",
+            ready.fixture.path("cores").display(),
+            ready.fixture.path("info").display(),
+        )
+        .as_bytes(),
+    );
+    (ready, home)
+}
+
+/// The exact save/state lines from the 2026-11-10 production smoke test
+/// (`~/.config/retroarch/retroarch.cfg`), which refused every zipped cartridge.
+const SMOKE_TEST_TILDE_SAVE_KEYS: &str = "savefile_directory = \"~/.config/retroarch/saves\"\n\
+savefiles_in_content_dir = \"false\"\n\
+savestate_directory = \"~/.config/retroarch/states\"\n\
+savestates_in_content_dir = \"false\"\n\
+sort_savefiles_by_content_enable = \"false\"\n\
+sort_savefiles_enable = \"false\"\n\
+sort_savestates_by_content_enable = \"false\"\n\
+sort_savestates_enable = \"false\"\n";
+
+#[test]
+fn zipped_cartridge_accepts_retroarch_tilde_save_dirs_from_the_smoke_test_config() {
+    let (ready, home) = tilde_config_ready("zip-tilde-smoke", SMOKE_TEST_TILDE_SAVE_KEYS);
+    assert_eq!(
+        staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment),
+        Ok(()),
+        "`~/` save and state folders are expanded against the user's home, as RetroArch does"
+    );
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut process = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .expect("a zipped cartridge launches with RetroArch-style `~/` save folders");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while process.poll().is_none() {
+        assert!(std::time::Instant::now() < deadline, "fake script exits");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn zipped_cartridge_still_refuses_unexpandable_or_unsafe_save_dirs() {
+    let refused = |label: &str, saves: &str, states: &str| -> String {
+        let (ready, home) = tilde_config_ready(
+            label,
+            &format!("savefile_directory = \"{saves}\"\nsavestate_directory = \"{states}\"\n"),
+        );
+        let result =
+            staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment);
+        let _ = fs::remove_dir_all(home);
+        result.expect_err(&format!("{saves} / {states} must be refused"))
+    };
+    // Forms RetroArch's own `~` expansion does not cover stay refused.
+    for (saves, states) in [
+        ("~other/saves", "~/states"),
+        ("~/saves", "~other/states"),
+        (":/saves", "~/states"),
+        ("saves", "~/states"),
+        ("", "~/states"),
+    ] {
+        refused("zip-tilde-bad", saves, states);
+    }
+    // Expansion happens before the existing checks, which still apply.
+    let same = refused("zip-tilde-same", "~/retroarch/saves", "~/retroarch/saves");
+    assert!(same.contains("separate"), "{same}");
+}
+
+#[test]
+fn zipped_cartridge_tilde_save_dirs_inside_a_temporary_home_are_refused() {
+    // Home itself under the system temp folder: the expanded folders are
+    // temporary, so the existing temporary-folder refusal must still fire.
+    let (mut ready, _, _) = zipped_ready(
+        "zip-tilde-temp-home",
+        &[("a.md", b"synthetic mega drive rom bytes")],
+    );
+    ready.fixture.write(
+        "config/retroarch/retroarch.cfg",
+        format!(
+            "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n{SMOKE_TEST_TILDE_SAVE_KEYS}",
+            ready.fixture.path("cores").display(),
+            ready.fixture.path("info").display(),
+        )
+        .as_bytes(),
+    );
+    ready.environment.home = Some(ready.fixture.root.clone().into_os_string());
+    let error = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment)
+        .expect_err("saves under the temporary folder are refused");
+    assert!(error.contains("temporary"), "{error}");
+}
