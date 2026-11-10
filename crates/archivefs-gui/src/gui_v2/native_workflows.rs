@@ -293,11 +293,11 @@ pub(super) const TRY_ANYWAY: &str = "Try anyway (this launch only)";
 pub(super) const REMEMBER_LAUNCH_CHOICE: &str = "Remember this launch choice";
 pub(super) const FORGET_LAUNCH_CHOICE: &str = "Forget this launch choice";
 
-/// Saves (`Some`) or forgets (`None`) the person's remembered launch system
-/// for `path` as it is now. Never touches the library or identity.
 /// Shown before a try of an archive EmuWiz cannot unpack as one cartridge.
 pub(super) const ARCHIVE_TRY_NOTE: &str = "This archive is not a single cartridge EmuWiz can unpack, and EmuWiz cannot open other archives for launch from here yet. A try is likely to stop at \"No runnable game file\"; extracting the game first works today. The file itself is not the problem.";
 
+/// Saves (`Some`) or forgets (`None`) the person's remembered launch system
+/// for `path` as it is now. Never touches the library or identity.
 fn save_remembered_launch_choice(path: &Path, system: Option<&'static str>) -> Result<(), String> {
     use archivefs_core::launch::remembered_launch_system as remembered;
     let store = remembered::default_remembered_launch_systems_path()?;
@@ -839,6 +839,14 @@ impl NativeWorkflows {
             if launch_active {
                 ui.label("A launch is already in progress. Wait for it to finish before starting another.");
             }
+            if matches!(
+                &input,
+                launch_readiness_page::LaunchReadinessInput::Plan { plan, .. }
+                    if plan.platform_id.as_deref()
+                        == Some(archivefs_core::launch::unverified_media::SEGA_PICO_PLATFORM)
+            ) {
+                ui.label(crate::emulator_setup::unverified_media::SEGA_PICO_CONTROLS);
+            }
             // Unverified identity is not a dead end: the one place a game's
             // identity is explained and finished is Review identity.
             if is_unsupported_archive(&input) {
@@ -872,16 +880,28 @@ impl NativeWorkflows {
                         trial_systems.len()
                     ));
                 }
-                let folder_hint =
-                    crate::emulator_setup::unverified_media::folder_hint_without_route(path);
+                let folder_hint = crate::emulator_setup::unverified_media::folder_hint(path);
                 if let Some(hint) = folder_hint {
-                    ui.label(format!(
-                        "The folder name suggests {hint} (a hint only, not identification). EmuWiz cannot start {hint} games yet, and the systems below may not run them. A try is one launch only; it cannot be remembered for this file."
-                    ));
-                    self.app.launch_remember_choice = None;
+                    if trial_systems.contains(&hint) {
+                        ui.label(format!(
+                            "The folder name suggests {hint} (a hint only, not identification). Nothing in the file confirms it; try it as {hint} first. Another system may not run it, and only {hint} can be remembered for this file."
+                        ));
+                    } else {
+                        ui.label(format!(
+                            "The folder name suggests {hint} (a hint only, not identification). No installed emulator starts {hint} games, and the systems below may not run them. A try is one launch only; it cannot be remembered for this file."
+                        ));
+                    }
+                    if self
+                        .app
+                        .launch_remember_choice
+                        .as_deref()
+                        .is_some_and(|_| !trial_systems.contains(&hint))
+                    {
+                        self.app.launch_remember_choice = None;
+                    }
                 }
                 let mut remember = self.app.launch_remember_choice.as_deref() == Some(path);
-                if folder_hint.is_none()
+                if folder_hint.is_none_or(|hint| trial_systems.contains(&hint))
                     && ui
                     .checkbox(&mut remember, REMEMBER_LAUNCH_CHOICE)
                     .on_hover_text("Saves the system you press next for this file only, so you are not asked again. It applies only while the file is unchanged, is not game identification, never changes the library's recorded system, and anything the file itself shows still wins. Launch safety checks still apply. You can forget it here later.")
@@ -891,6 +911,15 @@ impl NativeWorkflows {
                 }
                 ui.horizontal_wrapped(|ui| {
                     for system in &trial_systems {
+                        // With remembering ticked, only systems that may be
+                        // remembered for this file are offered.
+                        if remember
+                            && !crate::emulator_setup::unverified_media::remembering_allowed(
+                                path, system,
+                            )
+                        {
+                            continue;
+                        }
                         let name = archivefs_core::platform::display_name_for(system);
                         let (label, hover) = if remember {
                             (

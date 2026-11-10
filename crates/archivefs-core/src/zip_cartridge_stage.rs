@@ -14,6 +14,18 @@ use crate::game_identity::{
 use crate::safe_read::TrustedRoots;
 use crate::zip_cartridge_select::{is_loose_cartridge_platform, select_zip_cartridge_member};
 
+/// The cartridge format whose member rules stage `platform_id`'s ZIPs. A
+/// Sega Pico ROM is a Mega Drive-format cartridge (same header layout, `.md`
+/// member), so its ZIP is staged under the Mega Drive member rules; the
+/// launch itself stays Sega Pico, and the Pico-versus-Mega Drive decision is
+/// the separate header check (`launch::unverified_media::is_sega_pico_rom`).
+fn staging_platform(platform_id: &str) -> IdentityPlatform {
+    if platform_id == crate::launch::unverified_media::SEGA_PICO_PLATFORM {
+        return IdentityPlatform::MegaDrive;
+    }
+    IdentityPlatform::from_catalogue(Some(platform_id))
+}
+
 /// Whether a launch request is for a zipped cartridge, i.e. staging applies:
 /// a `.zip` on a loose-cartridge platform. Arcade, disc and other platforms'
 /// ZIPs are native content and never match.
@@ -22,7 +34,7 @@ pub fn is_zipped_cartridge_request(content: &Path, platform_id: &str) -> bool {
         .extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case("zip"))
-        && is_loose_cartridge_platform(IdentityPlatform::from_catalogue(Some(platform_id)))
+        && is_loose_cartridge_platform(staging_platform(platform_id))
 }
 
 /// Whether `zip` holds exactly one ROM member that `platform_id`'s zipped
@@ -34,7 +46,7 @@ pub fn zip_cartridge_member_fits(zip: &Path, platform_id: &str) -> Option<bool> 
     if !is_zipped_cartridge_request(zip, platform_id) {
         return None;
     }
-    let platform = IdentityPlatform::from_catalogue(Some(platform_id));
+    let platform = staging_platform(platform_id);
     let Ok(file) = open_read_only_regular(zip, &TrustedRoots::none()) else {
         return Some(false);
     };
@@ -123,7 +135,7 @@ pub fn stage_zip_cartridge_for_launch_checked(
     use std::io::{Seek, SeekFrom};
     use std::os::unix::fs::OpenOptionsExt;
 
-    let platform = IdentityPlatform::from_catalogue(Some(platform_hint));
+    let platform = staging_platform(platform_hint);
     if !is_zipped_cartridge_request(zip, platform_hint) {
         return Err(StageZipError::NotApplicable);
     }

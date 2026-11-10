@@ -1901,3 +1901,59 @@ fn a_zip_swapped_in_after_its_key_was_checked_is_never_extracted() {
     );
     assert_eq!(staged_dirs(), before, "no staging directory left behind");
 }
+
+/// A Sega Pico ZIP (owner approval 2026-11-10) goes to PicoDrive: its one
+/// `.md` member is staged under the Mega Drive member rules, the launch stays
+/// Sega Pico, and the same key and header checks hold.
+#[test]
+fn a_sega_pico_zip_reaches_picodrive_and_never_runs_as_mega_drive() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rom = vec![0u8; 0x400];
+    rom[0x100..0x110].copy_from_slice(b"SEGA PICO       ");
+    let (mut ready, zip, _) = zipped_ready("pico-zip", &[("Anpanman (Japan).md", &rom)]);
+    ready
+        .fixture
+        .write("cores/picodrive_libretro.so", b"stub core");
+    ready.fixture.write(
+        "info/picodrive.info",
+        b"systemname = \"Sega 8/16-bit + 32X (Various)\"\ndatabase = \"Sega - Mega Drive - Genesis|Sega - PICO|Sega - 32X\"\n",
+    );
+    let key = crate::launch::unverified_media::platform_media_identity_fresh(&zip, "Sega Pico")
+        .expect("Sega Pico lists zip")
+        .game_key;
+    ready.request.expected_platform_id = "Sega Pico".into();
+    ready.request.core_stem = "picodrive".into();
+    ready.request.expected_game_key = key.clone();
+    let (path_out, bytes_out) = record_handoff(&ready);
+    let mut process = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .expect("a Pico ZIP launches through PicoDrive");
+    wait_for_exit(&mut process);
+    assert_eq!(
+        fs::read(&bytes_out).unwrap(),
+        rom,
+        "the Pico ROM reached PicoDrive"
+    );
+    assert!(
+        fs::read_to_string(&path_out)
+            .unwrap()
+            .ends_with("Anpanman (Japan).md")
+    );
+    // The same file as Mega Drive is refused by its own header.
+    ready.request.expected_platform_id = "MegaDrive".into();
+    ready.request.core_stem = "genesis_plus_gx".into();
+    ready.request.expected_game_key = unverified_key(&zip);
+    let error = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .err()
+    .expect("a Pico ROM never runs as Mega Drive");
+    assert!(format!("{error:?}").contains("Sega Pico"), "{error:?}");
+}

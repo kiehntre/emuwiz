@@ -306,6 +306,14 @@ pub(crate) fn trial_systems(
         systems.retain(|_| fits.next() != Some(Some(false)));
     }
     let mut systems: Vec<&'static str> = systems.into_iter().map(|(id, _)| id).collect();
+    // The system a folder suggests is listed first (a hint orders, never
+    // decides); a recorded system still comes before it.
+    if let Some(hint) = folder_hint(path)
+        && let Some(index) = systems.iter().position(|id| *id == hint)
+    {
+        let first = systems.remove(index);
+        systems.insert(0, first);
+    }
     if let Some(recorded) = recorded
         && let Some(index) = systems.iter().position(|id| *id == recorded)
     {
@@ -315,10 +323,11 @@ pub(crate) fn trial_systems(
     systems
 }
 
-/// A system a folder name suggests but EmuWiz has no launch route for (today
-/// only the Sega Pico): shown as a non-authoritative hint next to the systems
-/// offered for a try, never used to choose, offer or refuse one.
-pub(crate) fn folder_hint_without_route(path: &Path) -> Option<&'static str> {
+/// A system a folder name suggests for a file EmuWiz cannot tell apart from
+/// another system by its bytes alone (today only the Sega Pico, whose ROMs
+/// are Mega Drive-format): shown as a non-authoritative caution next to the
+/// systems offered for a try, never used to choose, offer or refuse one.
+pub(crate) fn folder_hint(path: &Path) -> Option<&'static str> {
     path.parent()?
         .components()
         .filter_map(|c| c.as_os_str().to_str())
@@ -331,6 +340,35 @@ pub(crate) fn folder_hint_without_route(path: &Path) -> Option<&'static str> {
         .then_some(archivefs_core::launch::unverified_media::SEGA_PICO_PLATFORM)
 }
 
+/// What the Launch page says about playing a Sega Pico game. PicoDrive's own
+/// Pico controls (its input descriptors: pen moved with the D-pad, Storyware
+/// pages on L/R); EmuWiz changes no emulator or controller setting.
+pub(crate) const SEGA_PICO_CONTROLS: &str = "Sega Pico controls (PicoDrive): the Pico pen and Storyware book are emulated on the controller. Y puts the pen on the Storyware page, X puts it on the drawing pad, and the D-pad then moves it; Start lifts or lowers the pen and A is the pen button. L and R turn to the previous and next Storyware page. EmuWiz does not change PicoDrive's or RetroArch's input settings; a page or pen may not behave exactly like the real toy.";
+
+/// The warning the "Choose system" dialog shows before a lasting manual
+/// choice of `selected` for this file (owner ruling 2026-11-10). The choice
+/// stays available; it never overrides the file: a header naming another
+/// system is still refused at launch, and the dialog says so.
+pub(crate) fn manual_choice_warning(path: &Path, selected: &str) -> Option<String> {
+    let chosen = archivefs_core::platform::display_name_for(selected);
+    if let MediaSystemEvidence::Contradicts(other) =
+        archivefs_core::launch::unverified_media::media_system_evidence_cached(path, selected)
+    {
+        let other = archivefs_core::platform::display_name_for(other);
+        return Some(format!(
+            "Warning: this file's own header says it is a {other} game, not {chosen}. You can still save {chosen}, but EmuWiz will refuse to start this file as {chosen}."
+        ));
+    }
+    folder_hint(path)
+        .filter(|hint| *hint != selected)
+        .map(|hint| {
+            let hint = archivefs_core::platform::display_name_for(hint);
+            format!(
+                "Caution: this file is in a {hint} folder. Nothing in the file confirms {chosen}; if it is a {hint} game, {chosen} may not run it correctly."
+            )
+        })
+}
+
 /// Whether "Remember this launch choice" may save (or apply) `system` for
 /// this file. A folder that names a system EmuWiz has no route for (a
 /// `sega-pico` folder) is a caution, not identification: such a file may
@@ -338,13 +376,13 @@ pub(crate) fn folder_hint_without_route(path: &Path) -> Option<&'static str> {
 /// Mega Drive guess never becomes the file's standing launch answer
 /// (owner ruling 2026-11-10). The file's own header is checked separately.
 pub(crate) fn remembering_allowed(path: &Path, system: &str) -> bool {
-    folder_hint_without_route(path).is_none_or(|hint| hint == system)
+    folder_hint(path).is_none_or(|hint| hint == system)
 }
 
 /// The extra caution a one-time try carries when the folder names a system
 /// EmuWiz cannot start.
 pub(crate) fn folder_hint_caution(path: &Path) -> Option<String> {
-    folder_hint_without_route(path).map(|hint| {
+    folder_hint(path).map(|hint| {
         format!(
             " This file is in a {hint} folder: it may be a {hint} game, which this system may not run correctly. This try cannot be remembered."
         )
@@ -362,11 +400,25 @@ const STANDALONE_TRUSTS_CALLER_IDENTITY: &[&str] = &[
 ];
 
 /// Why a standalone route is blocked for a system this lane resolved.
-fn standalone_unconfirmed_reason(adapter_id: &str) -> &'static str {
-    if STANDALONE_TRUSTS_CALLER_IDENTITY.contains(&adapter_id) {
-        "This emulator does not re-check the game file when you press Play, so EmuWiz will not start a file whose system is not confirmed with it. RetroArch re-checks the file and can start it."
-    } else {
-        "This emulator starts only a game its own check identifies when you press Play (for example a disc serial or title ID), and this file has not passed that check. RetroArch can start it with the warning."
+/// `retroarch_usable` says whether the plan has a usable RetroArch candidate
+/// to point to; no other route is promised.
+fn standalone_unconfirmed_reason(adapter_id: &str, retroarch_usable: bool) -> &'static str {
+    match (
+        STANDALONE_TRUSTS_CALLER_IDENTITY.contains(&adapter_id),
+        retroarch_usable,
+    ) {
+        (true, true) => {
+            "This emulator does not re-check the game file when you press Play, so EmuWiz will not start a file whose system is not confirmed with it. RetroArch re-checks the file and can start it."
+        }
+        (true, false) => {
+            "This emulator does not re-check the game file when you press Play, so EmuWiz will not start a file whose system is not confirmed with it. No other installed emulator can start it either; confirm the system or identify the game first."
+        }
+        (false, true) => {
+            "This emulator starts only a game its own check identifies when you press Play (for example a disc serial or title ID), and this file has not passed that check. RetroArch can start it with the warning."
+        }
+        (false, false) => {
+            "This emulator starts only a game its own check identifies when you press Play (for example a disc serial or title ID), and this file has not passed that check."
+        }
     }
 }
 
@@ -374,6 +426,13 @@ fn standalone_unconfirmed_reason(adapter_id: &str) -> &'static str {
 /// removes a blocker, never touches a blocked candidate), blocks every other
 /// route, and refreshes the summary.
 pub(crate) fn apply_warning(plan: &mut LaunchPlan, basis: SystemBasis, path: Option<&Path>) {
+    let retroarch_usable = plan.candidates.iter().any(|candidate| {
+        candidate.readiness != LaunchReadiness::Blocked
+            && matches!(
+                candidate.target,
+                archivefs_core::launch::LaunchTarget::RetroArchCore { .. }
+            )
+    });
     let caution = path
         .filter(|_| basis == SystemBasis::Trial)
         .and_then(folder_hint_caution)
@@ -391,7 +450,7 @@ pub(crate) fn apply_warning(plan: &mut LaunchPlan, basis: SystemBasis, path: Opt
                     .blockers
                     .push(archivefs_core::launch::LaunchBlocker::new(
                         archivefs_core::launch::LaunchBlockerKind::IdentityUnresolved,
-                        standalone_unconfirmed_reason(adapter_id),
+                        standalone_unconfirmed_reason(adapter_id, retroarch_usable),
                     ));
                 candidate.readiness = LaunchReadiness::Blocked;
             }
@@ -996,8 +1055,21 @@ mod tests {
                 "Wan-chan (Japan).md",
                 &md_rom(header),
             );
-            // CONTRADICTED: nothing is offered, not even Mega Drive.
-            assert!(trial_systems(&zip, None, &|_| true).is_empty());
+            // CONTRADICTED for every other system: with a Pico route only
+            // Sega Pico is offered, without one nothing is.
+            assert_eq!(trial_systems(&zip, None, &|_| true), vec!["Sega Pico"]);
+            assert!(trial_systems(&zip, None, &|s| s != "Sega Pico").is_empty());
+            // The header agrees with Sega Pico: a recorded (or chosen) Sega
+            // Pico plays with the "game not identified" warning, and Sega
+            // Pico may be remembered.
+            assert!(matches!(
+                resolve(&zip, "Sega Pico", FOLDER, None, None, None),
+                Outcome::Allowed(_, SystemBasis::Media)
+            ));
+            assert!(matches!(
+                resolve(&zip, "", None, None, None, Some("Sega Pico")),
+                Outcome::Allowed(_, SystemBasis::Remembered)
+            ));
             // Picking or remembering Mega Drive is refused, never allowed.
             for outcome in [
                 resolve(&zip, "", None, None, Some("MegaDrive"), None),
@@ -1042,7 +1114,7 @@ mod tests {
         );
         let offered = trial_systems(&blank, None, &|_| true);
         assert!(offered.contains(&"MegaDrive"), "{offered:?}");
-        assert_eq!(folder_hint_without_route(&blank), Some("Sega Pico"));
+        assert_eq!(folder_hint(&blank), Some("Sega Pico"));
         assert!(matches!(
             resolve(&blank, "", None, None, Some("MegaDrive"), None),
             Outcome::Allowed(_, SystemBasis::Trial)
@@ -1057,7 +1129,7 @@ mod tests {
         assert!(trial_systems(&genesis, None, &|_| true).contains(&"MegaDrive"));
         // No hint outside a Pico folder.
         let elsewhere = zip_one(dir.path(), "Other.zip", "Other.md", &md_rom(b""));
-        assert_eq!(folder_hint_without_route(&elsewhere), None);
+        assert_eq!(folder_hint(&elsewhere), None);
     }
 
     /// The 22 `sega-pico` files whose header does not name the Pico (blank,
@@ -1080,10 +1152,9 @@ mod tests {
                 &format!("{name}.md"),
                 &md_rom(header),
             );
-            assert!(
-                trial_systems(&path, None, &|_| true).contains(&"MegaDrive"),
-                "{name}"
-            );
+            let offered = trial_systems(&path, None, &|_| true);
+            assert!(offered.contains(&"MegaDrive"), "{name}: {offered:?}");
+            assert_eq!(offered.first(), Some(&"Sega Pico"), "{name}: hint first");
             assert!(matches!(
                 resolve(&path, "", None, None, Some("MegaDrive"), None),
                 Outcome::Allowed(_, SystemBasis::Trial)
@@ -1162,8 +1233,46 @@ mod tests {
         }
     }
 
-    /// Standalone preflights trust the identity they are handed, so a file
-    /// this lane resolved never reaches them; RetroArch keeps its warning.
+    /// A lasting manual Mega Drive choice stays available in a Pico folder,
+    /// with a contradiction warning when the header names the Pico.
+    #[test]
+    fn a_manual_mega_drive_choice_for_a_pico_file_warns_and_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("sega-pico");
+        std::fs::create_dir(&folder).unwrap();
+        let pico = zip_one(&folder, "Pico.zip", "Pico.md", &md_rom(b"SEGA PICO       "));
+        let text = manual_choice_warning(&pico, "MegaDrive").expect("warned");
+        assert!(
+            text.starts_with("Warning:") && text.contains("Sega Pico"),
+            "{text}"
+        );
+        assert!(text.contains("refuse to start"), "{text}");
+        // Saved anyway, the launch is still refused.
+        assert!(matches!(
+            resolve(
+                &pico,
+                "MegaDrive",
+                Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
+                None,
+                None,
+                None
+            ),
+            Outcome::Contradicted { .. }
+        ));
+        assert_eq!(manual_choice_warning(&pico, "Sega Pico"), None);
+        // A silent header in the folder: a softer caution only.
+        let blank = zip_one(&folder, "Blank.zip", "Blank.md", &md_rom(b""));
+        let text = manual_choice_warning(&blank, "MegaDrive").expect("caution");
+        assert!(text.starts_with("Caution:"), "{text}");
+        // Elsewhere, nothing to say.
+        let other = zip_one(dir.path(), "Other.zip", "Other.md", &md_rom(b""));
+        assert_eq!(manual_choice_warning(&other, "MegaDrive"), None);
+    }
+
+    /// A file this lane resolved never reaches a standalone route (some
+    /// trust the identity they are handed, the rest only accept their own
+    /// identification); RetroArch keeps its warning, and the reason points
+    /// to RetroArch only when it is usable.
     #[test]
     fn an_unconfirmed_system_blocks_every_standalone_route() {
         let dir = tempfile::tempdir().unwrap();
@@ -1196,6 +1305,12 @@ mod tests {
             );
             assert_eq!(plan.summary.blocked, 1);
             assert_eq!(plan.summary.ready_with_warnings, 1);
+            let mut alone = plan_with(vec![standalone_candidate(&path)]);
+            apply_warning(&mut alone, basis, Some(&path));
+            assert!(
+                !alone.candidates[0].blockers[0].detail.contains("RetroArch"),
+                "no RetroArch route is promised when none is usable"
+            );
         }
     }
 

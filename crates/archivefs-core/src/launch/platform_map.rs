@@ -299,6 +299,14 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         retroarch_core_hints: &["picodrive"],
         confidence: MappingConfidence::StronglyKnown,
     },
+    // PicoDrive is the only core whose `.info` database lists `Sega - PICO`
+    // (Genesis Plus GX does not); it emulates the pen and Storyware pages.
+    LaunchCompatibility {
+        platform_id: "Sega Pico",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["picodrive"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
     LaunchCompatibility {
         platform_id: "ColecoVision",
         standalone_adapters: &[],
@@ -937,5 +945,31 @@ mod tests {
         assert!(retroarch_platform_matches(&snes9x, "SNES"));
         assert!(!retroarch_platform_matches(&snes9x, "NES"));
         assert!(!retroarch_platform_matches(&snes9x, "Game Boy"));
+    }
+
+    #[test]
+    fn only_a_core_listing_the_pico_database_runs_sega_pico() {
+        let picodrive = found(
+            Some("Sega 8/16-bit + 32X (Various)"),
+            Some(
+                "Sega - Master System - Mark III|Sega - Game Gear|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis|Sega - PICO|Sega - 32X",
+            ),
+        );
+        let genesis_plus_gx = found(
+            Some("Sega 8/16-bit (Various)"),
+            Some(
+                "Sega - Master System - Mark III|Sega - Game Gear|Sega - Mega Drive - Genesis|Sega - Mega-CD - Sega CD",
+            ),
+        );
+        assert!(retroarch_platform_matches(&picodrive, "Sega Pico"));
+        assert!(!retroarch_platform_matches(&genesis_plus_gx, "Sega Pico"));
+        // PicoDrive still runs the Mega Drive; the Pico entry takes nothing away.
+        assert!(retroarch_platform_matches(&picodrive, "MegaDrive"));
+        assert_eq!(
+            launch_compatibility_for_platform("Sega Pico")
+                .unwrap()
+                .retroarch_core_hints,
+            &["picodrive"]
+        );
     }
 }

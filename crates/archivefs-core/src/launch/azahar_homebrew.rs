@@ -546,7 +546,12 @@ mod tests {
             Err(AzaharHomebrewLaunchError::Executable(_))
         ));
         // Same path, replaced file (new inode): the existing drift check refuses.
-        fs::remove_file(&exe).unwrap();
+        // The old file is kept (renamed aside), so the filesystem cannot hand
+        // the replacement the freed inode: a same-size file with a reused
+        // inode and an equal mtime is indistinguishable by (dev, inode, size,
+        // mtime), which made this test fail under heavy load.
+        let aside = dir.path().join("azahar.old");
+        fs::rename(&exe, &aside).unwrap();
         fake_azahar(dir.path(), 1);
         assert!(matches!(
             preflight_and_launch_azahar_homebrew(&req, &roots(&exe, dir.path())),

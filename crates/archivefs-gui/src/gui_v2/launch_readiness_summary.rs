@@ -357,7 +357,7 @@ fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSumma
                     format!("EmuWiz has no identity check for {system} yet")
                 }
                 IdentityUnknownReason::NoLaunchRoute(system) => {
-                    format!("This is a {system} game, which EmuWiz cannot start yet")
+                    format!("This is a {system} game; no installed emulator starts it")
                 }
                 IdentityUnknownReason::UnsupportedFormat(_) => {
                     "EmuWiz does not read this file format yet".to_string()

@@ -474,6 +474,7 @@ impl App {
         };
         let name = file_name(game);
         let current_system = game.platform.clone();
+        let archive_path = game.archive.absolute_path.clone();
         let source_code = game.archive.platform_source.clone();
         let source_note = system_source_note(source_code.as_deref());
         let suggestion = self.folder_check.finding_for(id).cloned();
@@ -528,6 +529,14 @@ impl App {
                         suggestion.as_ref(),
                     ) {
                         ui.small(line);
+                    }
+                    if let Some(warning) =
+                        crate::emulator_setup::unverified_media::manual_choice_warning(
+                            &archive_path,
+                            selected,
+                        )
+                    {
+                        ui.colored_label(ui.visuals().warn_fg_color, warning);
                     }
                 }
                 ui.horizontal(|ui| {
