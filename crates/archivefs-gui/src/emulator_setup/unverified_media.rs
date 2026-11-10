@@ -76,10 +76,29 @@ fn source_is_media_evidence(source: &str) -> bool {
 }
 
 /// The warning every candidate of an unverified launch carries.
+#[cfg(test)]
 pub(crate) fn warning_text(platform_id: &str, basis: SystemBasis) -> String {
+    warning_text_with_header(platform_id, basis, false)
+}
+
+/// [`warning_text`], where `header_agrees` says the file's own header names
+/// `platform_id` (for example `SEGA PICO`). A try or a remembered choice then
+/// must not claim that nothing in the file confirms the system: only the game
+/// is unconfirmed.
+pub(crate) fn warning_text_with_header(
+    platform_id: &str,
+    basis: SystemBasis,
+    header_agrees: bool,
+) -> String {
     let name = archivefs_core::platform::platform_by_id(platform_id)
         .map_or(platform_id, |p| p.display_name);
     match basis {
+        SystemBasis::Remembered if header_agrees => format!(
+            "Game not identified: you chose to remember {name} as the launch choice for this unchanged file, and the file's own header says it is a {name} game. EmuWiz could not confirm which game it is; your choice is not identification, and it stops applying if the file changes."
+        ),
+        SystemBasis::Trial if header_agrees => format!(
+            "Game not identified: this is a one-time try as {name}, and the file's own header says it is a {name} game. EmuWiz has no system recorded for it yet and could not confirm which game it is; nothing is saved."
+        ),
         SystemBasis::Media => format!(
             "Game not identified: the file itself shows it is a {name} game EmuWiz can start, but EmuWiz could not confirm which game it is. It will still play; catalogue (DAT) verification is optional."
         ),
@@ -345,6 +364,48 @@ pub(crate) fn folder_hint(path: &Path) -> Option<&'static str> {
 /// pages on L/R); EmuWiz changes no emulator or controller setting.
 pub(crate) const SEGA_PICO_CONTROLS: &str = "Sega Pico controls (PicoDrive): the Pico pen and Storyware book are emulated on the controller. Y puts the pen on the Storyware page, X puts it on the drawing pad, and the D-pad then moves it; Start lifts or lowers the pen and A is the pen button. L and R turn to the previous and next Storyware page. EmuWiz does not change PicoDrive's or RetroArch's input settings; a page or pen may not behave exactly like the real toy.";
 
+/// The reviewed Sega Pico RetroArch core (the platform map's only hint). Its
+/// pen and Storyware controls are the ones [`SEGA_PICO_CONTROLS`] describes.
+pub(crate) const SEGA_PICO_REVIEWED_CORE: &str = "picodrive";
+
+/// The Sega Pico controls note for the emulator the Launch page has selected:
+/// an explicit choice (Remembered) first, otherwise the reviewed-preferred
+/// card, otherwise the first card that is not blocked. PicoDrive gets its own
+/// pen/Storyware controls; any other core gets a note that those controls are
+/// PicoDrive's and that EmuWiz has not checked how this core maps the pen.
+/// `None` when no Sega Pico card can be selected.
+pub(crate) fn sega_pico_controls_note(plan: &LaunchPlan) -> Option<String> {
+    use archivefs_core::launch::{CandidatePreference, LaunchTarget};
+    if plan.platform_id.as_deref()
+        != Some(archivefs_core::launch::unverified_media::SEGA_PICO_PLATFORM)
+    {
+        return None;
+    }
+    let usable =
+        |c: &&archivefs_core::launch::LaunchCandidate| c.readiness != LaunchReadiness::Blocked;
+    let selected = plan
+        .candidates
+        .iter()
+        .filter(usable)
+        .find(|c| c.preference == CandidatePreference::Remembered)
+        .or_else(|| {
+            plan.candidates
+                .iter()
+                .filter(usable)
+                .find(|c| c.preference == CandidatePreference::SoleEligible)
+        })
+        .or_else(|| plan.candidates.iter().find(usable))?;
+    match &selected.target {
+        LaunchTarget::RetroArchCore { core_stem, .. } if core_stem == SEGA_PICO_REVIEWED_CORE => {
+            Some(SEGA_PICO_CONTROLS.to_string())
+        }
+        LaunchTarget::RetroArchCore { core_stem, .. } => Some(format!(
+            "Sega Pico with {core_stem}: this core's RetroArch information lists Sega Pico, but EmuWiz has not checked how it emulates the Pico pen and Storyware pages, so it may not be fully playable. The pen controls EmuWiz describes (Y/X pen, D-pad, L/R pages) are PicoDrive's; choose the picodrive card to use them. EmuWiz does not change RetroArch's input settings."
+        )),
+        LaunchTarget::Standalone { .. } => None,
+    }
+}
+
 /// The warning the "Choose system" dialog shows before a lasting manual
 /// choice of `selected` for this file (owner ruling 2026-11-10). The choice
 /// stays available; it never overrides the file: a header naming another
@@ -381,8 +442,9 @@ pub(crate) fn remembering_allowed(path: &Path, system: &str) -> bool {
 
 /// The extra caution a one-time try carries when the folder names a system
 /// EmuWiz cannot start.
-pub(crate) fn folder_hint_caution(path: &Path) -> Option<String> {
-    folder_hint(path).map(|hint| {
+pub(crate) fn folder_hint_caution(path: &Path, system: &str) -> Option<String> {
+    // Trying the folder's own system is not a reason for this caution.
+    folder_hint(path).filter(|hint| *hint != system).map(|hint| {
         format!(
             " This file is in a {hint} folder: it may be a {hint} game, which this system may not run correctly. This try cannot be remembered."
         )
@@ -433,10 +495,15 @@ pub(crate) fn apply_warning(plan: &mut LaunchPlan, basis: SystemBasis, path: Opt
                 archivefs_core::launch::LaunchTarget::RetroArchCore { .. }
             )
     });
+    let platform_id = plan.platform_id.clone().unwrap_or_default();
     let caution = path
         .filter(|_| basis == SystemBasis::Trial)
-        .and_then(folder_hint_caution)
+        .and_then(|path| folder_hint_caution(path, &platform_id))
         .unwrap_or_default();
+    let header_agrees = path.is_some_and(|path| {
+        archivefs_core::launch::unverified_media::media_system_evidence_cached(path, &platform_id)
+            == MediaSystemEvidence::Agrees
+    });
     for candidate in &mut plan.candidates {
         // Only the RetroArch route was approved for an unconfirmed system: its
         // click-time preflight and spawn re-derive the file's key and re-check
@@ -464,7 +531,7 @@ pub(crate) fn apply_warning(plan: &mut LaunchPlan, basis: SystemBasis, path: Opt
         {
             continue;
         }
-        let text = warning_text(plan.platform_id.as_deref().unwrap_or_default(), basis) + &caution;
+        let text = warning_text_with_header(&platform_id, basis, header_agrees) + &caution;
         candidate.warnings.push(LaunchWarning::new(
             LaunchWarningKind::IdentityUnverified,
             text,
@@ -1381,5 +1448,47 @@ mod tests {
         assert!(!offered.contains(&"Amiga"), "{offered:?}");
         let hdf = write(&dir, "Game.hdf", &[0u8; 4096]);
         assert!(!trial_systems(&hdf, None, &|_| true).contains(&"Amiga"));
+    }
+
+    /// The 2026-11-10 smoke test: a `SEGA PICO`-headed ZIP in the sega-pico
+    /// folder, with no system recorded, tried once as Sega Pico, was told that
+    /// nothing in the file confirmed Sega Pico and that "this system" might not
+    /// run a Sega Pico game.
+    #[test]
+    fn a_pico_header_try_as_sega_pico_says_the_header_confirms_the_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("sega-pico");
+        std::fs::create_dir(&folder).unwrap();
+        let zip = zip_one(
+            &folder,
+            "3-choume no Tama (Japan) (Rev 1).zip",
+            "3-choume no Tama (Japan) (Rev 1).md",
+            &md_rom(b"SEGA PICO       "),
+        );
+        for basis in [SystemBasis::Trial, SystemBasis::Remembered] {
+            let mut plan = plan_with(vec![retroarch_candidate(&zip)]);
+            plan.platform_id = Some("Sega Pico".into());
+            apply_warning(&mut plan, basis, Some(&zip));
+            let text = &plan.candidates[0].warnings[0].detail;
+            assert!(
+                text.contains("the file's own header says it is a Sega Pico game"),
+                "{text}"
+            );
+            assert!(text.contains("could not confirm which game"), "{text}");
+            assert!(!text.contains("Neither the system"), "{text}");
+            assert!(!text.contains("may not run correctly"), "{text}");
+        }
+        // A silent header in the Pico folder, tried as Sega Pico: the system is
+        // honestly unconfirmed, but trying the folder's own system carries no
+        // "this system may not run it" caution.
+        let silent = zip_one(&folder, "Blank.zip", "Blank.md", &md_rom(b""));
+        let mut plan = plan_with(vec![retroarch_candidate(&silent)]);
+        plan.platform_id = Some("Sega Pico".into());
+        apply_warning(&mut plan, SystemBasis::Trial, Some(&silent));
+        let text = &plan.candidates[0].warnings[0].detail;
+        assert!(text.contains("Neither the system nor the game"), "{text}");
+        assert!(!text.contains("Sega Pico folder"), "{text}");
+        assert_eq!(folder_hint_caution(&silent, "Sega Pico"), None);
+        assert!(folder_hint_caution(&silent, "MegaDrive").is_some());
     }
 }

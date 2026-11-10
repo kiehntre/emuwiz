@@ -839,13 +839,13 @@ impl NativeWorkflows {
             if launch_active {
                 ui.label("A launch is already in progress. Wait for it to finish before starting another.");
             }
-            if matches!(
-                &input,
-                launch_readiness_page::LaunchReadinessInput::Plan { plan, .. }
-                    if plan.platform_id.as_deref()
-                        == Some(archivefs_core::launch::unverified_media::SEGA_PICO_PLATFORM)
-            ) {
-                ui.label(crate::emulator_setup::unverified_media::SEGA_PICO_CONTROLS);
+            // The controls note follows the emulator the page has selected
+            // (an explicit choice first, then the reviewed PicoDrive card).
+            if let launch_readiness_page::LaunchReadinessInput::Plan { plan, .. } = &input
+                && let Some(note) =
+                    crate::emulator_setup::unverified_media::sega_pico_controls_note(plan)
+            {
+                ui.label(note);
             }
             // Unverified identity is not a dead end: the one place a game's
             // identity is explained and finished is Review identity.
@@ -882,7 +882,15 @@ impl NativeWorkflows {
                 }
                 let folder_hint = crate::emulator_setup::unverified_media::folder_hint(path);
                 if let Some(hint) = folder_hint {
-                    if trial_systems.contains(&hint) {
+                    let header_agrees =
+                        archivefs_core::launch::unverified_media::media_system_evidence_cached(
+                            path, hint,
+                        ) == archivefs_core::launch::unverified_media::MediaSystemEvidence::Agrees;
+                    if trial_systems.contains(&hint) && header_agrees {
+                        ui.label(format!(
+                            "The file's own header says this is a {hint} game, and the folder name agrees. EmuWiz has no system recorded for it yet, so try it as {hint}; only {hint} can be remembered for this file."
+                        ));
+                    } else if trial_systems.contains(&hint) {
                         ui.label(format!(
                             "The folder name suggests {hint} (a hint only, not identification). Nothing in the file confirms it; try it as {hint} first. Another system may not run it, and only {hint} can be remembered for this file."
                         ));
