@@ -351,6 +351,25 @@ pub(crate) fn folder_hint_caution(path: &Path) -> Option<String> {
     })
 }
 
+/// Standalone adapters whose click-time preflight does not re-derive the
+/// game's identity from the file (it trusts the identity it is handed).
+/// Every other standalone adapter re-identifies the file with its own check
+/// (a PS1 serial, an Xbox title ID, a verified ROM hash, ...) and refuses a
+/// key that check does not produce, so an `unverified:` key can never pass
+/// it; that is their safety contract, not a gap.
+const STANDALONE_TRUSTS_CALLER_IDENTITY: &[&str] = &[
+    "amiberry", "azahar", "cemu", "fuse", "hatari", "sameboy", "tsugaru", "xroar",
+];
+
+/// Why a standalone route is blocked for a system this lane resolved.
+fn standalone_unconfirmed_reason(adapter_id: &str) -> &'static str {
+    if STANDALONE_TRUSTS_CALLER_IDENTITY.contains(&adapter_id) {
+        "This emulator does not re-check the game file when you press Play, so EmuWiz will not start a file whose system is not confirmed with it. RetroArch re-checks the file and can start it."
+    } else {
+        "This emulator starts only a game its own check identifies when you press Play (for example a disc serial or title ID), and this file has not passed that check. RetroArch can start it with the warning."
+    }
+}
+
 /// Adds the visible warning to every usable RetroArch candidate (never
 /// removes a blocker, never touches a blocked candidate), blocks every other
 /// route, and refreshes the summary.
@@ -364,15 +383,16 @@ pub(crate) fn apply_warning(plan: &mut LaunchPlan, basis: SystemBasis, path: Opt
         // click-time preflight and spawn re-derive the file's key and re-check
         // its header. Standalone preflights trust the identity they are
         // handed, so they never start a file this lane resolved.
-        if !matches!(
-            candidate.target,
-            archivefs_core::launch::LaunchTarget::RetroArchCore { .. }
-        ) {
+        if let archivefs_core::launch::LaunchTarget::Standalone { adapter_id, .. } =
+            &candidate.target
+        {
             if candidate.readiness != LaunchReadiness::Blocked {
-                candidate.blockers.push(archivefs_core::launch::LaunchBlocker::new(
-                    archivefs_core::launch::LaunchBlockerKind::IdentityUnresolved,
-                    "This emulator only starts games whose system is confirmed; a game started without that check can only use RetroArch.",
-                ));
+                candidate
+                    .blockers
+                    .push(archivefs_core::launch::LaunchBlocker::new(
+                        archivefs_core::launch::LaunchBlockerKind::IdentityUnresolved,
+                        standalone_unconfirmed_reason(adapter_id),
+                    ));
                 candidate.readiness = LaunchReadiness::Blocked;
             }
             continue;
@@ -1167,6 +1187,12 @@ mod tests {
             assert_eq!(
                 plan.candidates[1].readiness,
                 LaunchReadiness::ReadyWithWarnings
+            );
+            assert!(
+                plan.candidates[0].blockers[0]
+                    .detail
+                    .contains("does not re-check"),
+                "tsugaru trusts the identity it is handed"
             );
             assert_eq!(plan.summary.blocked, 1);
             assert_eq!(plan.summary.ready_with_warnings, 1);
