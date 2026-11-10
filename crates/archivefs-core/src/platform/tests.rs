@@ -3319,6 +3319,20 @@ fn a_sega_pico_folder_is_sega_pico_and_mega_drive_folders_are_unchanged() {
     for folder in ["megadrive", "genesis", "md"] {
         assert_eq!(platform_for_folder(folder), Some("MegaDrive"), "{folder}");
     }
+    // Extension-only files: a `.pco` is Sega Pico; an `.md`/`.gen` outside
+    // any system folder is reported as before plus the Pico as a candidate.
+    let pco = detect(&format!("{ROOT}/misc/Game.pco"));
+    assert_eq!(pco.platform, Some("Sega Pico"), "{pco:?}");
+    // `.md` was already ambiguous (Sega 32X lists it too); the Pico is one
+    // more named candidate, never a new decision.
+    let md = detect(&format!("{ROOT}/misc/Game.md"));
+    assert_eq!(md.platform, None, "{md:?}");
+    let named: Vec<_> = md.candidates.iter().map(|c| c.platform).collect();
+    assert_eq!(named, ["MegaDrive", "Sega 32X", "Sega Pico"]);
+    assert_eq!(
+        detect(&format!("{ROOT}/misc/Game.smd")).platform,
+        Some("MegaDrive")
+    );
     let tree = TempTree::new("pico-header-registry");
     let mut rom = vec![0u8; 0x400];
     rom[0x100..0x109].copy_from_slice(b"SEGA PICO");
