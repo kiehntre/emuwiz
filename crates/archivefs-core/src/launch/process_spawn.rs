@@ -79,13 +79,19 @@ pub fn open_regular_file_nonblocking(path: &Path) -> std::io::Result<fs::File> {
 /// comparable meaning), size and modification time are always real.
 ///
 /// `changed` is the Unix status-change time (ctime, seconds + nanoseconds).
-/// Unlike mtime it cannot be set by an ordinary program: the kernel moves it
-/// on every write, truncate, chmod, link or rename. So a same-size rewrite
-/// whose mtime was reset, or a replacement handed the freed inode with an
-/// equal mtime, no longer compares equal. It is a freshness signal, not a
-/// cryptographic identity: root, a clock change or a coarse timestamp tick
-/// can still collide. `None` on non-Unix (and in persisted snapshots, which
-/// never stored it).
+/// Unlike mtime, an ordinary program cannot set it to a chosen value: the
+/// kernel moves it to "now" on every write, truncate, chmod, owner or
+/// timestamp change, and on adding, removing or renaming a name of the
+/// file. So a same-size rewrite whose mtime was reset, or a replacement
+/// handed the freed inode with an equal mtime, no longer compares equal.
+///
+/// It is a freshness signal, not a cryptographic identity: root, a clock
+/// change or a rewrite inside one kernel timestamp tick can still collide.
+/// It also moves on harmless metadata-only changes (chmod, a hard link made
+/// or removed by a publish, repair or Undo, a rename away and back), so an
+/// identity captured before one of those is refused as changed; the caller
+/// re-checks the file and captures afresh. `None` on non-Unix (and in
+/// persisted snapshots, which never stored it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapturedFileIdentity {
     pub device: u64,
@@ -1083,7 +1089,10 @@ mod captured_identity_ctime_tests {
     }
 
     /// A same-size replacement with the original mtime, renamed over the
-    /// checked file, is a different identity.
+    /// checked file, is a different identity (by inode here: the
+    /// replacement was created while the original still held its inode;
+    /// the ctime-only case is pinned by the forged-metadata tests in
+    /// `azahar_homebrew` and `game_identity`).
     #[test]
     fn a_same_size_replacement_with_the_old_mtime_is_a_different_identity() {
         let dir = tempfile::tempdir().unwrap();
@@ -1098,6 +1107,7 @@ mod captured_identity_ctime_tests {
         fs::rename(&staged, &path).unwrap();
         let now = capture(&path);
         assert_eq!((now.size, now.modified), (checked.size, checked.modified));
+        assert_ne!(now.inode, checked.inode);
         assert_ne!(now, checked);
     }
 }

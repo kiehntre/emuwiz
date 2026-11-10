@@ -587,10 +587,9 @@ fn blue_bridge_rechecks_title_metadata_even_when_stat_is_restored() {
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(modified))
         .unwrap();
-    assert!(
-        !inspection.stamp.is_stale(),
-        "same inode, length and restored mtime is not a cryptographic stamp"
-    );
+    // The stamp may or may not see this (only ctime moved, and only when
+    // the kernel's timestamp tick did); the bridge re-reads the title
+    // metadata either way.
     assert!(
         launch_bridge::inputs(&selected, &CanonicalIdentityStatus::Unknown, &inspection).is_none()
     );

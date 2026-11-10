@@ -586,7 +586,8 @@ mod tests {
         assert_eq!(old_check(&req.executable_identity), old_check(&now));
         assert!(matches!(
             preflight_and_launch_azahar_homebrew(&req, &roots(&exe, dir.path())),
-            Err(AzaharHomebrewLaunchError::Preflight(_))
+            Err(AzaharHomebrewLaunchError::Preflight(error))
+                if error.kind == crate::launch::azahar_execution::AzaharPreflightErrorKind::ExecutableDrift
         ));
     }
 
