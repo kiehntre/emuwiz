@@ -345,6 +345,30 @@ pub(crate) fn folder_hint(path: &Path) -> Option<&'static str> {
 /// pages on L/R); EmuWiz changes no emulator or controller setting.
 pub(crate) const SEGA_PICO_CONTROLS: &str = "Sega Pico controls (PicoDrive): the Pico pen and Storyware book are emulated on the controller. Y puts the pen on the Storyware page, X puts it on the drawing pad, and the D-pad then moves it; Start lifts or lowers the pen and A is the pen button. L and R turn to the previous and next Storyware page. EmuWiz does not change PicoDrive's or RetroArch's input settings; a page or pen may not behave exactly like the real toy.";
 
+/// The warning the "Choose system" dialog shows before a lasting manual
+/// choice of `selected` for this file (owner ruling 2026-11-10). The choice
+/// stays available; it never overrides the file: a header naming another
+/// system is still refused at launch, and the dialog says so.
+pub(crate) fn manual_choice_warning(path: &Path, selected: &str) -> Option<String> {
+    let chosen = archivefs_core::platform::display_name_for(selected);
+    if let MediaSystemEvidence::Contradicts(other) =
+        archivefs_core::launch::unverified_media::media_system_evidence_cached(path, selected)
+    {
+        let other = archivefs_core::platform::display_name_for(other);
+        return Some(format!(
+            "Warning: this file's own header says it is a {other} game, not {chosen}. You can still save {chosen}, but EmuWiz will refuse to start this file as {chosen}."
+        ));
+    }
+    folder_hint(path)
+        .filter(|hint| *hint != selected)
+        .map(|hint| {
+            let hint = archivefs_core::platform::display_name_for(hint);
+            format!(
+                "Caution: this file is in a {hint} folder. Nothing in the file confirms {chosen}; if it is a {hint} game, {chosen} may not run it correctly."
+            )
+        })
+}
+
 /// Whether "Remember this launch choice" may save (or apply) `system` for
 /// this file. A folder that names a system EmuWiz has no route for (a
 /// `sega-pico` folder) is a caution, not identification: such a file may
@@ -1186,6 +1210,42 @@ mod tests {
             summary: Default::default(),
             media_topology: None,
         }
+    }
+
+    /// A lasting manual Mega Drive choice stays available in a Pico folder,
+    /// with a contradiction warning when the header names the Pico.
+    #[test]
+    fn a_manual_mega_drive_choice_for_a_pico_file_warns_and_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("sega-pico");
+        std::fs::create_dir(&folder).unwrap();
+        let pico = zip_one(&folder, "Pico.zip", "Pico.md", &md_rom(b"SEGA PICO       "));
+        let text = manual_choice_warning(&pico, "MegaDrive").expect("warned");
+        assert!(
+            text.starts_with("Warning:") && text.contains("Sega Pico"),
+            "{text}"
+        );
+        assert!(text.contains("refuse to start"), "{text}");
+        // Saved anyway, the launch is still refused.
+        assert!(matches!(
+            resolve(
+                &pico,
+                "MegaDrive",
+                Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
+                None,
+                None,
+                None
+            ),
+            Outcome::Contradicted { .. }
+        ));
+        assert_eq!(manual_choice_warning(&pico, "Sega Pico"), None);
+        // A silent header in the folder: a softer caution only.
+        let blank = zip_one(&folder, "Blank.zip", "Blank.md", &md_rom(b""));
+        let text = manual_choice_warning(&blank, "MegaDrive").expect("caution");
+        assert!(text.starts_with("Caution:"), "{text}");
+        // Elsewhere, nothing to say.
+        let other = zip_one(dir.path(), "Other.zip", "Other.md", &md_rom(b""));
+        assert_eq!(manual_choice_warning(&other, "MegaDrive"), None);
     }
 
     /// Standalone preflights trust the identity they are handed, so a file
