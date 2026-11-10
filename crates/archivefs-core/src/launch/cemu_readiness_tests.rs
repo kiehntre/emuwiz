@@ -574,7 +574,7 @@ fn blue_bridge_rechecks_title_metadata_even_when_stat_is_restored() {
     let (_temp, root, roots) = fixture();
     let selected = root.join("code/game.rpx");
     cafe_rpx(&selected);
-    let inspection = inspect_cemu_readiness(&root, None, &roots);
+    let mut inspection = inspect_cemu_readiness(&root, None, &roots);
     let meta = root.join("meta/meta.xml");
     let modified = fs::metadata(&meta).unwrap().modified().unwrap();
     let old = fs::read_to_string(&meta).unwrap();
@@ -587,9 +587,10 @@ fn blue_bridge_rechecks_title_metadata_even_when_stat_is_restored() {
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(modified))
         .unwrap();
-    // The stamp may or may not see this (only ctime moved, and only when
-    // the kernel's timestamp tick did); the bridge re-reads the title
-    // metadata either way.
+    // The stamp usually sees this through ctime. Re-stamp the edited state
+    // so only the bridge's own title-metadata re-read can refuse it.
+    inspection.stamp = crate::wiiu_content_readiness::WiiUContentStamp::capture(&root);
+    assert!(!inspection.stamp.is_stale());
     assert!(
         launch_bridge::inputs(&selected, &CanonicalIdentityStatus::Unknown, &inspection).is_none()
     );

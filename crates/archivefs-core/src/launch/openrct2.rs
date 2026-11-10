@@ -194,9 +194,10 @@ impl PinnedOpenRct2 {
         if !only_ctime(identity) || self.hash_through_descriptor()? != self.sha256 {
             return modified();
         }
+        // Nothing, not even ctime, may move while the bytes were re-hashed.
         let after = self.file.metadata().map_err(|e| e.to_string())?;
         check_file_mode(&after)?;
-        if !only_ctime(CapturedFileIdentity::capture(&after)) {
+        if CapturedFileIdentity::capture(&after) != identity {
             return modified();
         }
         Ok(())
