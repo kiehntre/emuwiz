@@ -400,11 +400,25 @@ const STANDALONE_TRUSTS_CALLER_IDENTITY: &[&str] = &[
 ];
 
 /// Why a standalone route is blocked for a system this lane resolved.
-fn standalone_unconfirmed_reason(adapter_id: &str) -> &'static str {
-    if STANDALONE_TRUSTS_CALLER_IDENTITY.contains(&adapter_id) {
-        "This emulator does not re-check the game file when you press Play, so EmuWiz will not start a file whose system is not confirmed with it. RetroArch re-checks the file and can start it."
-    } else {
-        "This emulator starts only a game its own check identifies when you press Play (for example a disc serial or title ID), and this file has not passed that check. RetroArch can start it with the warning."
+/// `retroarch_usable` says whether the plan has a usable RetroArch candidate
+/// to point to; no other route is promised.
+fn standalone_unconfirmed_reason(adapter_id: &str, retroarch_usable: bool) -> &'static str {
+    match (
+        STANDALONE_TRUSTS_CALLER_IDENTITY.contains(&adapter_id),
+        retroarch_usable,
+    ) {
+        (true, true) => {
+            "This emulator does not re-check the game file when you press Play, so EmuWiz will not start a file whose system is not confirmed with it. RetroArch re-checks the file and can start it."
+        }
+        (true, false) => {
+            "This emulator does not re-check the game file when you press Play, so EmuWiz will not start a file whose system is not confirmed with it. No other installed emulator can start it either; confirm the system or identify the game first."
+        }
+        (false, true) => {
+            "This emulator starts only a game its own check identifies when you press Play (for example a disc serial or title ID), and this file has not passed that check. RetroArch can start it with the warning."
+        }
+        (false, false) => {
+            "This emulator starts only a game its own check identifies when you press Play (for example a disc serial or title ID), and this file has not passed that check."
+        }
     }
 }
 
@@ -412,6 +426,13 @@ fn standalone_unconfirmed_reason(adapter_id: &str) -> &'static str {
 /// removes a blocker, never touches a blocked candidate), blocks every other
 /// route, and refreshes the summary.
 pub(crate) fn apply_warning(plan: &mut LaunchPlan, basis: SystemBasis, path: Option<&Path>) {
+    let retroarch_usable = plan.candidates.iter().any(|candidate| {
+        candidate.readiness != LaunchReadiness::Blocked
+            && matches!(
+                candidate.target,
+                archivefs_core::launch::LaunchTarget::RetroArchCore { .. }
+            )
+    });
     let caution = path
         .filter(|_| basis == SystemBasis::Trial)
         .and_then(folder_hint_caution)
@@ -429,7 +450,7 @@ pub(crate) fn apply_warning(plan: &mut LaunchPlan, basis: SystemBasis, path: Opt
                     .blockers
                     .push(archivefs_core::launch::LaunchBlocker::new(
                         archivefs_core::launch::LaunchBlockerKind::IdentityUnresolved,
-                        standalone_unconfirmed_reason(adapter_id),
+                        standalone_unconfirmed_reason(adapter_id, retroarch_usable),
                     ));
                 candidate.readiness = LaunchReadiness::Blocked;
             }
@@ -1248,8 +1269,10 @@ mod tests {
         assert_eq!(manual_choice_warning(&other, "MegaDrive"), None);
     }
 
-    /// Standalone preflights trust the identity they are handed, so a file
-    /// this lane resolved never reaches them; RetroArch keeps its warning.
+    /// A file this lane resolved never reaches a standalone route (some
+    /// trust the identity they are handed, the rest only accept their own
+    /// identification); RetroArch keeps its warning, and the reason points
+    /// to RetroArch only when it is usable.
     #[test]
     fn an_unconfirmed_system_blocks_every_standalone_route() {
         let dir = tempfile::tempdir().unwrap();
@@ -1282,6 +1305,12 @@ mod tests {
             );
             assert_eq!(plan.summary.blocked, 1);
             assert_eq!(plan.summary.ready_with_warnings, 1);
+            let mut alone = plan_with(vec![standalone_candidate(&path)]);
+            apply_warning(&mut alone, basis, Some(&path));
+            assert!(
+                !alone.candidates[0].blockers[0].detail.contains("RetroArch"),
+                "no RetroArch route is promised when none is usable"
+            );
         }
     }
 

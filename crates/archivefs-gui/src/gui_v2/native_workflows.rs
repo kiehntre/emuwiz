@@ -293,11 +293,11 @@ pub(super) const TRY_ANYWAY: &str = "Try anyway (this launch only)";
 pub(super) const REMEMBER_LAUNCH_CHOICE: &str = "Remember this launch choice";
 pub(super) const FORGET_LAUNCH_CHOICE: &str = "Forget this launch choice";
 
-/// Saves (`Some`) or forgets (`None`) the person's remembered launch system
-/// for `path` as it is now. Never touches the library or identity.
 /// Shown before a try of an archive EmuWiz cannot unpack as one cartridge.
 pub(super) const ARCHIVE_TRY_NOTE: &str = "This archive is not a single cartridge EmuWiz can unpack, and EmuWiz cannot open other archives for launch from here yet. A try is likely to stop at \"No runnable game file\"; extracting the game first works today. The file itself is not the problem.";
 
+/// Saves (`Some`) or forgets (`None`) the person's remembered launch system
+/// for `path` as it is now. Never touches the library or identity.
 fn save_remembered_launch_choice(path: &Path, system: Option<&'static str>) -> Result<(), String> {
     use archivefs_core::launch::remembered_launch_system as remembered;
     let store = remembered::default_remembered_launch_systems_path()?;
