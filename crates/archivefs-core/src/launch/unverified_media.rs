@@ -528,16 +528,30 @@ pub fn platform_lists_extension(platform_id: &str, extension: &str) -> bool {
 }
 
 fn platform_media_key(path: &Path, platform_id: &str) -> Option<String> {
-    use std::io::{Seek, SeekFrom};
-    let extension = path.extension()?.to_str()?;
-    if !platform_lists_extension(platform_id, extension) {
-        return None;
-    }
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .ok()?;
+    platform_media_key_of_open_file(&mut file, path, platform_id)
+}
+
+/// The same content-bound key, read through an already open handle (for
+/// example the one zipped-cartridge staging then extracts from, so the
+/// bytes keyed are the bytes launched). `path` supplies only the name and
+/// extension. The handle is left at an unspecified position.
+pub fn platform_media_key_of_open_file(
+    file: &mut std::fs::File,
+    path: &Path,
+    platform_id: &str,
+) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    let extension = path.extension()?.to_str()?;
+    if !platform_lists_extension(platform_id, extension) {
+        return None;
+    }
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut file = file;
     let metadata = file.metadata().ok()?;
     if !metadata.file_type().is_file() || metadata.len() == 0 {
         return None;

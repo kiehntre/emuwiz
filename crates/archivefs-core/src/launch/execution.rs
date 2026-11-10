@@ -1450,9 +1450,22 @@ pub fn preflight_and_launch_retroarch_with_playlist(
     // A zipped cartridge is extracted to a private temporary file for this
     // launch only; the normal preflight then re-verifies that file's identity
     // against `expected_game_key`. Anything else takes the unchanged route.
-    match crate::zip_cartridge_stage::stage_zip_cartridge_for_launch(
+    // An unverified key is bound to the ZIP's bytes, not the member's: it is
+    // re-derived through the handle staging extracts from, so the member
+    // launched comes from the very archive that was checked.
+    let unverified_zip = super::unverified_media::is_unverified_key(&request.expected_game_key);
+    match crate::zip_cartridge_stage::stage_zip_cartridge_for_launch_checked(
         &request.selected_content_path,
         &request.expected_platform_id,
+        |file| {
+            !unverified_zip
+                || super::unverified_media::platform_media_key_of_open_file(
+                    file,
+                    &request.selected_content_path,
+                    &request.expected_platform_id,
+                )
+                .is_some_and(|key| key == request.expected_game_key)
+        },
     ) {
         Ok(staged) => {
             // The staged copy is deleted at exit, so anything RetroArch would
@@ -1468,21 +1481,14 @@ pub fn preflight_and_launch_retroarch_with_playlist(
             })?;
             let mut staged_request = request.clone();
             staged_request.selected_content_path = staged.path().to_path_buf();
-            // An unverified key is bound to the ZIP's bytes, not the member's:
-            // the ZIP must still be the file that was checked (staging also
-            // refused a ZIP that changed while extracting), and the member is
-            // then held to its own key from here to spawn.
-            if super::unverified_media::is_unverified_key(&request.expected_game_key) {
-                let zip_unchanged = super::unverified_media::platform_media_identity_fresh(
-                    &request.selected_content_path,
-                    &request.expected_platform_id,
-                )
-                .is_some_and(|identity| identity.game_key == request.expected_game_key);
+            // The ZIP's key was checked on staging's own handle (and staging
+            // refused a ZIP that changed while extracting); the extracted
+            // member is now held to its own key from here to spawn.
+            if unverified_zip {
                 let member = super::unverified_media::platform_media_identity_fresh(
                     staged.path(),
                     &request.expected_platform_id,
                 )
-                .filter(|_| zip_unchanged)
                 .ok_or_else(|| {
                     preflight_error(
                         LaunchPreflightErrorKind::IdentityUnresolved,
@@ -1502,6 +1508,13 @@ pub fn preflight_and_launch_retroarch_with_playlist(
             return Ok(process);
         }
         Err(crate::zip_cartridge_stage::StageZipError::NotApplicable) => {}
+        Err(crate::zip_cartridge_stage::StageZipError::NotAccepted) => {
+            return Err(preflight_error(
+                LaunchPreflightErrorKind::IdentityUnresolved,
+                "The game file changed or is no longer a format this system accepts; recheck this game.",
+            )
+            .into());
+        }
         Err(crate::zip_cartridge_stage::StageZipError::Refused(detail)) => {
             return Err(preflight_error(
                 LaunchPreflightErrorKind::ContentRequiresMount,

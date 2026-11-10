@@ -1790,30 +1790,34 @@ fn an_unverified_zipped_cartridge_reaches_the_emulator_and_changed_zips_are_refu
     let (mut ready, zip, _) = zipped_ready("zip-unverified-archive", &[("a.md", rom)]);
     ready.request.expected_game_key = unverified_key(&zip);
     write_rom_zip(&zip, &[("a.md", rom), ("readme.txt", b"hello")]);
+    let error = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .err()
+    .expect("a changed ZIP must not launch");
     assert!(
-        preflight_and_launch_retroarch_with_playlist(
-            &ready.request,
-            &HostReadOnlyFilesystem,
-            &ready.environment,
-            None
-        )
-        .is_err(),
-        "a changed ZIP must not launch"
+        format!("{error:?}").contains("IdentityUnresolved"),
+        "{error:?}"
     );
 
     // The member's key is never accepted in place of the ZIP's.
     let (mut ready, _, _) = zipped_ready("zip-unverified-wrong-key", &[("a.md", rom)]);
     let loose = ready.fixture.write("content/member.md", rom);
     ready.request.expected_game_key = unverified_key(&loose);
+    let error = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .err()
+    .expect("a key for other bytes never authorises the ZIP");
     assert!(
-        preflight_and_launch_retroarch_with_playlist(
-            &ready.request,
-            &HostReadOnlyFilesystem,
-            &ready.environment,
-            None
-        )
-        .is_err(),
-        "a key for other bytes never authorises the ZIP"
+        format!("{error:?}").contains("IdentityUnresolved"),
+        "{error:?}"
     );
     assert_eq!(staged_dirs(), before, "no staging directory left behind");
 }
@@ -1847,4 +1851,53 @@ fn an_unverified_file_whose_header_names_another_system_is_refused_at_preflight(
     let error = preflight(&ready).unwrap_err();
     assert_eq!(error.kind, LaunchPreflightErrorKind::IdentityUnresolved);
     assert!(error.detail.contains("Sega Pico"), "{}", error.detail);
+}
+
+/// A ZIP renamed over the approved one after the key was checked can never
+/// be extracted in its place: the key is read through staging's own handle,
+/// and a path that no longer names that handle's file is refused.
+#[test]
+fn a_zip_swapped_in_after_its_key_was_checked_is_never_extracted() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let before = staged_dirs();
+    let (ready, zip, _) = zipped_ready("zip-swap-race", &[("a.md", b"approved rom bytes")]);
+    let approved = unverified_key(&zip);
+    let other = ready.fixture.path("content/other.zip");
+    write_rom_zip(&other, &[("a.md", b"a different rom entirely")]);
+    let result = crate::zip_cartridge_stage::stage_zip_cartridge_for_launch_checked(
+        &zip,
+        "MegaDrive",
+        |file| {
+            let keyed = crate::launch::unverified_media::platform_media_key_of_open_file(
+                file,
+                &zip,
+                "MegaDrive",
+            );
+            // The swap lands after the handle was opened.
+            fs::rename(&other, &zip).unwrap();
+            keyed.as_deref() == Some(approved.as_str())
+        },
+    );
+    match result {
+        Ok(staged) => panic!(
+            "extracted {:?} from a swapped ZIP",
+            fs::read(staged.path()).unwrap()
+        ),
+        Err(error) => assert!(
+            matches!(error, crate::zip_cartridge_stage::StageZipError::Refused(_)),
+            "{error:?}"
+        ),
+    }
+    // A key that does not match is refused before anything is extracted.
+    let (_ready, zip, _) = zipped_ready("zip-swap-key", &[("a.md", b"approved rom bytes")]);
+    assert_eq!(
+        crate::zip_cartridge_stage::stage_zip_cartridge_for_launch_checked(
+            &zip,
+            "MegaDrive",
+            |_| false
+        )
+        .err(),
+        Some(crate::zip_cartridge_stage::StageZipError::NotAccepted)
+    );
+    assert_eq!(staged_dirs(), before, "no staging directory left behind");
 }
