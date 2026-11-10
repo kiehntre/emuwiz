@@ -565,6 +565,31 @@ mod tests {
         ));
     }
 
+    /// The `executable_swap_or_move_refuses` flake, made deterministic: the
+    /// emulator file that is there now matches the checked one on device,
+    /// inode, size and mtime (a same-size rewrite with a reset mtime, or a
+    /// replacement given the freed inode), and differs only in ctime. The
+    /// old four-field check would accept it; the launch must refuse it.
+    #[test]
+    fn an_executable_matching_on_inode_size_and_mtime_but_not_ctime_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "game.3dsx", &sample_3dsx());
+        let exe = fake_azahar(dir.path(), 0);
+        let evidence = verify_three_dsx(&path).unwrap();
+        let mut req = request(evidence, &exe);
+        let now = req.executable_identity;
+        req.executable_identity.changed = now
+            .changed
+            .map(|ctime| ctime - std::time::Duration::from_nanos(1));
+        assert!(now.changed.is_some(), "ctime must be captured on Unix");
+        let old_check = |i: &CapturedFileIdentity| (i.device, i.inode, i.size, i.modified);
+        assert_eq!(old_check(&req.executable_identity), old_check(&now));
+        assert!(matches!(
+            preflight_and_launch_azahar_homebrew(&req, &roots(&exe, dir.path())),
+            Err(AzaharHomebrewLaunchError::Preflight(_))
+        ));
+    }
+
     #[test]
     fn unreadable_config_blocks_launch() {
         let dir = tempfile::tempdir().unwrap();

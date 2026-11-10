@@ -2611,6 +2611,9 @@ fn hash_bounded_file(file: &mut File, maximum: u64) -> io::Result<(String, u64)>
 pub(crate) struct StableFileMetadata {
     len: u64,
     modified: Option<std::time::SystemTime>,
+    /// Unix ctime (see `CapturedFileIdentity::changed`): catches a same-size
+    /// rewrite with a reset mtime and a replacement given the freed inode.
+    changed: Option<std::time::SystemTime>,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -2642,6 +2645,7 @@ impl StableFileMetadata {
         Ok(Self {
             len: metadata.len(),
             modified: metadata.modified().ok(),
+            changed: crate::launch::process_spawn::status_change_time(&metadata),
             #[cfg(unix)]
             device: metadata.dev(),
             #[cfg(unix)]
@@ -12428,6 +12432,28 @@ mod tests {
             item.kind == IdentityKind::LooseRomSha256
                 && item.status == IdentityStatus::ResourceLimitReached
         }));
+    }
+
+    /// ZIP staging and loose-ROM reads re-check the file with
+    /// `still_same_file`. A file equal on device, inode, size and mtime but
+    /// with a different ctime (same-size rewrite with a reset mtime, or a
+    /// replacement given the freed inode) passed the old check; it must not.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_matching_on_inode_size_and_mtime_but_not_ctime_is_not_the_same_file() {
+        let directory = FixtureDir::new("ctime-reuse");
+        let path = write_fixture(&directory, "Replaced.zip", b"replacement bytes");
+        let now = StableFileMetadata::from_file(&File::open(&path).unwrap()).unwrap();
+        assert!(now.changed.is_some(), "ctime must be captured on Unix");
+        let mut before = now.clone();
+        before.changed = now
+            .changed
+            .map(|ctime| ctime - std::time::Duration::from_nanos(1));
+        let old_check = |m: &StableFileMetadata| (m.device, m.inode, m.len, m.modified);
+        assert_eq!(old_check(&before), old_check(&now));
+        assert!(!still_same_file(&path, &TrustedRoots::none(), &before));
+        assert!(!loose_rom_read_was_stable(&before, &now, now.len));
+        assert!(still_same_file(&path, &TrustedRoots::none(), &now));
     }
 
     #[test]

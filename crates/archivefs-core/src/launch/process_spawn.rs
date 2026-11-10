@@ -77,12 +77,39 @@ pub fn open_regular_file_nonblocking(path: &Path) -> std::io::Result<fs::File> {
 /// `dolphin_local`'s `DolphinDirectoryIdentity`) - device/inode are the
 /// *only* platform-specific part (`0` on non-Unix, where they carry no
 /// comparable meaning), size and modification time are always real.
+///
+/// `changed` is the Unix status-change time (ctime, seconds + nanoseconds).
+/// Unlike mtime it cannot be set by an ordinary program: the kernel moves it
+/// on every write, truncate, chmod, link or rename. So a same-size rewrite
+/// whose mtime was reset, or a replacement handed the freed inode with an
+/// equal mtime, no longer compares equal. It is a freshness signal, not a
+/// cryptographic identity: root, a clock change or a coarse timestamp tick
+/// can still collide. `None` on non-Unix (and in persisted snapshots, which
+/// never stored it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapturedFileIdentity {
     pub device: u64,
     pub inode: u64,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    pub changed: Option<SystemTime>,
+}
+
+/// The Unix status-change time (ctime) of `metadata`, to the nanosecond.
+/// `None` on non-Unix or for a value `SystemTime` cannot hold.
+pub(crate) fn status_change_time(metadata: &fs::Metadata) -> Option<SystemTime> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let seconds = u64::try_from(metadata.ctime()).ok()?;
+        let nanos = u32::try_from(metadata.ctime_nsec()).ok()?;
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(seconds, nanos))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 
 impl CapturedFileIdentity {
@@ -99,6 +126,7 @@ impl CapturedFileIdentity {
             inode,
             size: metadata.len(),
             modified: metadata.modified().ok(),
+            changed: status_change_time(metadata),
         }
     }
 }
@@ -1024,5 +1052,52 @@ mod open_regular_tests {
             .read_to_string(&mut text)
             .unwrap();
         assert_eq!(text, "payload");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod captured_identity_ctime_tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+
+    fn capture(path: &Path) -> CapturedFileIdentity {
+        CapturedFileIdentity::capture(&fs::symlink_metadata(path).unwrap())
+    }
+
+    /// An ordinary unchanged game or emulator keeps its identity: opening,
+    /// reading and re-stating it never moves ctime, so Play is not refused.
+    #[test]
+    fn an_unchanged_file_keeps_its_identity_when_read_and_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.bin");
+        fs::write(&path, b"cartridge bytes").unwrap();
+        let checked = capture(&path);
+        assert!(checked.changed.is_some());
+        let mut bytes = Vec::new();
+        fs::File::open(&path)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        drop(fs::File::open(&path).unwrap());
+        assert_eq!(capture(&path), checked);
+    }
+
+    /// A same-size replacement with the original mtime, renamed over the
+    /// checked file, is a different identity.
+    #[test]
+    fn a_same_size_replacement_with_the_old_mtime_is_a_different_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("emulator");
+        fs::write(&path, b"original!").unwrap();
+        let checked = capture(&path);
+        let staged = dir.path().join("emulator.new");
+        let mut file = fs::File::create(&staged).unwrap();
+        file.write_all(b"replaced!").unwrap();
+        file.set_modified(checked.modified.unwrap()).unwrap();
+        drop(file);
+        fs::rename(&staged, &path).unwrap();
+        let now = capture(&path);
+        assert_eq!((now.size, now.modified), (checked.size, checked.modified));
+        assert_ne!(now, checked);
     }
 }
