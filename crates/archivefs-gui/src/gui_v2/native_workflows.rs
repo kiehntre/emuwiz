@@ -5147,10 +5147,12 @@ pub(super) fn route_for_action(action: ReadinessAction, game_id: i64) -> Option<
         ReadinessAction::RecheckReadiness | ReadinessAction::LookUpOnline => None,
         ReadinessAction::ReviewDiscSet => Some(Route::Section(Section::MultiDisc)),
         ReadinessAction::OpenActivity => Some(Route::Section(Section::Activity)),
-        ReadinessAction::Play | ReadinessAction::ChooseEmulator | ReadinessAction::TryAnyway => Some(Route::Task {
-            section: Section::Launch,
-            game: game_id,
-        }),
+        ReadinessAction::Play | ReadinessAction::ChooseEmulator | ReadinessAction::TryAnyway => {
+            Some(Route::Task {
+                section: Section::Launch,
+                game: game_id,
+            })
+        }
         ReadinessAction::SetUpEmulator => Some(Route::Section(Section::Emulators)),
         ReadinessAction::CheckFirmware => Some(Route::Section(Section::Firmware)),
         ReadinessAction::ReviewIdentity

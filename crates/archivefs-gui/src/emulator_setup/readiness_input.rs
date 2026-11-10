@@ -408,16 +408,18 @@ impl ReadinessSources<'_> {
                         identity_unverified = Some(basis);
                     }
                     Outcome::NeedsConfirmation(platform) => {
-                        lane_reason = Some(launch_readiness_page::IdentityUnknownReason::FolderOnly(
-                            archivefs_core::platform::display_name_for(platform),
-                        ));
+                        lane_reason =
+                            Some(launch_readiness_page::IdentityUnknownReason::FolderOnly(
+                                archivefs_core::platform::display_name_for(platform),
+                            ));
                     }
                     Outcome::Contradicted { recorded, content } => {
-                        lane_reason =
-                            Some(launch_readiness_page::IdentityUnknownReason::MediaConflict {
+                        lane_reason = Some(
+                            launch_readiness_page::IdentityUnknownReason::MediaConflict {
                                 recorded: archivefs_core::platform::display_name_for(recorded),
                                 content: archivefs_core::platform::display_name_for(content),
-                            });
+                            },
+                        );
                     }
                     Outcome::NotApplicable => {}
                 }
@@ -426,12 +428,17 @@ impl ReadinessSources<'_> {
         // Whatever route resolved it, a plain file whose own header names a
         // different system is refused (owner policy 2026-11-09), e.g. an NES
         // ROM renamed into the SNES collection.
-        if let archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved) = &identity_status
+        if let archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved) =
+            &identity_status
             && let Some(path) = focused
             && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
-            && let Some(recorded) = archivefs_core::canonical_platform_for_alias(&resolved.platform_id)
-            && let archivefs_core::launch::unverified_media::MediaSystemEvidence::Contradicts(content) =
-                archivefs_core::launch::unverified_media::media_system_evidence_cached(path, recorded)
+            && let Some(recorded) =
+                archivefs_core::canonical_platform_for_alias(&resolved.platform_id)
+            && let archivefs_core::launch::unverified_media::MediaSystemEvidence::Contradicts(
+                content,
+            ) = archivefs_core::launch::unverified_media::media_system_evidence_cached(
+                path, recorded,
+            )
         {
             return LaunchReadinessInput::IdentityUnknown(
                 launch_readiness_page::IdentityUnknownReason::MediaConflict {
@@ -522,8 +529,13 @@ impl ReadinessSources<'_> {
         }
 
         // A ZIP holding exactly one verified cartridge ROM is launchable
-        // through RetroArch by extracting that member at Play time.
-        if content.requires_mount
+        // through RetroArch by extracting that member at Play time. Blue
+        // loads no live record, so its content is unresolved rather than
+        // "requires mount"; the report for this exact path (complete, exactly
+        // one verified ROM) is what authorises the substitution either way.
+        // Before 2026-11-09 every zipped cartridge in Blue stopped at "No
+        // runnable game file has been resolved".
+        if (content.requires_mount || content.resolved_path.is_none())
             && let Some(zipped) = selected_game_identity_report
                 .filter(|report| focused.is_some_and(|path| report.archive_path == path))
                 .and_then(archivefs_core::launch::launch_content_ref_for_zipped_cartridge)

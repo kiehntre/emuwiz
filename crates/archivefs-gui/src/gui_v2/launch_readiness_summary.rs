@@ -358,7 +358,9 @@ fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSumma
         IdentityUnknownReason::FolderOnly(system) => base(
             ReadinessPresentationState::NeedsSystem,
             &format!("The {system} system is only a guess from the folder"),
-            &format!("EmuWiz only knows the system from the folder this file is in, and the file format is shared with other systems, so Play is not offered on that guess alone. Try anyway starts it once as {system} (or another compatible system) with a warning and saves nothing. To make it lasting, change the system permanently on Review identity. Catalogue (DAT) verification is not required."),
+            &format!(
+                "EmuWiz only knows the system from the folder this file is in, and the file format is shared with other systems, so Play is not offered on that guess alone. Try anyway starts it once as {system} (or another compatible system) with a warning and saves nothing. To make it lasting, change the system permanently on Review identity. Catalogue (DAT) verification is not required."
+            ),
             IdentitySummary::NeedsReview,
             SourceSummary::RecheckNeeded,
             FirmwareSummary::Unknown,
@@ -368,7 +370,9 @@ fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSumma
         IdentityUnknownReason::MediaConflict { recorded, content } => base(
             ReadinessPresentationState::Blocked,
             &format!("This file is a {content} game, not {recorded}"),
-            &format!("The file's own header says {content}, but the game is recorded as {recorded}. EmuWiz will not start it with a {recorded} emulator. Review identity lets you change the system."),
+            &format!(
+                "The file's own header says {content}, but the game is recorded as {recorded}. EmuWiz will not start it with a {recorded} emulator. Review identity lets you change the system."
+            ),
             IdentitySummary::NeedsReview,
             SourceSummary::RecheckNeeded,
             FirmwareSummary::Unknown,

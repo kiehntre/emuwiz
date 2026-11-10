@@ -660,7 +660,13 @@ mod tests {
             ))
         ));
         // The person's own saved system choice reaches a plan.
-        let job = on_disk_from(&dir, name, "Philips CD-i", Some(archivefs_core::MANUAL_PLATFORM_SOURCE), &[0u8; 512]);
+        let job = on_disk_from(
+            &dir,
+            name,
+            "Philips CD-i",
+            Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
+            &[0u8; 512],
+        );
         let plan = planned(&job).expect("a launch plan, not Identity unresolved");
         assert_eq!(plan.platform_id.as_deref(), Some("Philips CD-i"));
         let key = plan.game_key.clone().unwrap_or_default();
@@ -678,7 +684,10 @@ mod tests {
         ines.resize(16 + 32 * 1024, 0);
         for (name, source) in [
             ("Misfiled (USA).sfc", Some("folder_alias")),
-            ("Misfiled (USA).sfc", Some(archivefs_core::MANUAL_PLATFORM_SOURCE)),
+            (
+                "Misfiled (USA).sfc",
+                Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
+            ),
             ("Misfiled (USA).bin", Some("folder_alias")),
         ] {
             let job = on_disk_from(&dir, name, "SNES", source, &ines);
@@ -698,8 +707,14 @@ mod tests {
     fn amiga_hard_disk_and_ipf_images_stay_explicitly_unsupported() {
         use crate::launch_readiness_page::{IdentityUnknownReason as R, LaunchReadinessInput as I};
         let dir = tempfile::tempdir().unwrap();
-        for (name, expected) in [("20000 Leagues.hdf", R::AmigaHardDisk), ("Game.ipf", R::AmigaIpf)] {
-            for source in [Some("folder_alias"), Some(archivefs_core::MANUAL_PLATFORM_SOURCE)] {
+        for (name, expected) in [
+            ("20000 Leagues.hdf", R::AmigaHardDisk),
+            ("Game.ipf", R::AmigaIpf),
+        ] {
+            for source in [
+                Some("folder_alias"),
+                Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
+            ] {
                 let job = on_disk_from(&dir, name, "Amiga", source, &[0u8; 4096]);
                 match build_input(&env(), &job, &AtomicBool::new(false)) {
                     Ok((I::IdentityUnknown(reason), _)) => assert_eq!(reason, expected, "{name}"),
@@ -708,6 +723,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Before 2026-11-09 every zipped cartridge in Blue stopped at "No
+    /// runnable game file has been resolved" (13 systems in the census).
+    #[test]
+    fn a_zip_with_one_verified_cartridge_resolves_its_content_without_a_live_record() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let mut rom = vec![0u8; 0x8000];
+        let logo = [
+            0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83, 0x00, 0x0C,
+            0x00, 0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E, 0xDC, 0xCC, 0x6E, 0xE6,
+            0xDD, 0xDD, 0xD9, 0x99, 0xBB, 0xBB, 0x67, 0x63, 0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC,
+            0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+        ];
+        rom[0x104..0x134].copy_from_slice(&logo);
+        rom[0x14D] = archivefs_core::gb_header_evidence::compute_header_checksum(&rom).unwrap();
+        let path = dir.path().join("Game (World).zip");
+        {
+            let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            writer
+                .start_file("Game (World).gb", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&rom).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut archive = archive(41, "Game Boy");
+        archive.absolute_path = path.clone();
+        archive.relative_path = "Game (World).zip".into();
+        archive.archive_kind = "zip".into();
+        let job = Job::for_game(&Game::from_archive(archive));
+        let plan = planned(&job).expect("a launch plan");
+        // No RetroArch is installed in the test environment, so the only
+        // remaining content blocker is the "RetroArch only" route note.
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|c| c.blockers.iter().all(|b| b.kind
+                    != archivefs_core::launch::LaunchBlockerKind::ContentNotResolved
+                    || b.detail.contains("RetroArch only"))),
+            "content must resolve to the zip for extraction at Play"
+        );
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|c| c.content.resolved_path.as_deref() == Some(path.as_path()))
+        );
     }
 
     #[test]
