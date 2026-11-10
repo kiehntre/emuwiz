@@ -989,6 +989,8 @@ impl ArchiveFsApp {
             platform_hint: &platform_hint,
             platform_source: &platform_source,
             system_trial: &system_trial,
+            remembered_system:
+                &archivefs_core::launch::remembered_launch_system::remembered_launch_system,
         }
         .build(live)
     }

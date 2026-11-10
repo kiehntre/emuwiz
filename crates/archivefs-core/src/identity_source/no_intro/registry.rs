@@ -158,10 +158,11 @@ pub fn load_no_intro_sources(
     let mut matches = Vec::new();
     for candidate in candidates_for(&entries) {
         let observed = file_observation(&candidate.path);
-        if observed
-            .as_ref()
-            .is_some_and(|key| not_no_intro_memo().lock().is_ok_and(|memo| memo.contains(key)))
-        {
+        if observed.as_ref().is_some_and(|key| {
+            not_no_intro_memo()
+                .lock()
+                .is_ok_and(|memo| memo.contains(key))
+        }) {
             continue;
         }
         match import_no_intro_dat(&candidate.path) {
@@ -201,7 +202,9 @@ type FileObservation = (PathBuf, u64, u128);
 
 /// (path, size, mtime) of a regular file, or `None` when it cannot be read.
 fn file_observation(path: &std::path::Path) -> Option<FileObservation> {
-    let metadata = std::fs::metadata(path).ok().filter(std::fs::Metadata::is_file)?;
+    let metadata = std::fs::metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)?;
     let mtime = metadata
         .modified()
         .ok()?

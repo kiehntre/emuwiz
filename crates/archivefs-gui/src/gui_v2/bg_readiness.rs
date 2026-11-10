@@ -415,6 +415,10 @@ pub(super) fn build_input(
             platform_hint: &platform_hint,
             platform_source: &platform_source,
             system_trial: &|_| None,
+            // A saved "Remember this launch choice" is the person's lasting
+            // answer for this unchanged file, so the list shows it too.
+            remembered_system:
+                &archivefs_core::launch::remembered_launch_system::remembered_launch_system,
         }
         .build(None)
     });
@@ -674,6 +678,54 @@ mod tests {
             archivefs_core::launch::unverified_media::is_unverified_key(&key),
             "key {key:?}"
         );
+    }
+
+    /// Owner decision 2026-11-10: a ticked "Remember this launch choice"
+    /// saves the system for this unchanged file, so a folder-only game is not
+    /// confirmed again on every play. It never becomes verified identity and
+    /// stops applying when forgotten or when the file changes.
+    #[test]
+    fn a_remembered_launch_choice_plans_a_folder_only_game_until_forgotten_or_changed() {
+        use archivefs_core::launch::remembered_launch_system as remembered;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "7th Guest The (USA) (Disc 1).chd";
+        let job = on_disk(&dir, name, "Philips CD-i", &[0u8; 512]);
+        let path = job.archive.absolute_path.clone();
+        let folder_only = |job: &Job| {
+            matches!(
+                build_input(&env(), job, &AtomicBool::new(false)),
+                Ok((
+                    crate::launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
+                        crate::launch_readiness_page::IdentityUnknownReason::FolderOnly(_)
+                    ),
+                    _
+                ))
+            )
+        };
+        assert!(folder_only(&job));
+
+        let store = remembered::default_remembered_launch_systems_path().unwrap();
+        let entry =
+            remembered::RememberedLaunchSystem::for_current_file(&path, "Philips CD-i").unwrap();
+        remembered::remember_launch_system_at(&store, &entry).unwrap();
+        let plan = planned(&job).expect("a remembered choice reaches a launch plan");
+        assert_eq!(plan.platform_id.as_deref(), Some("Philips CD-i"));
+        let key = plan.game_key.clone().unwrap_or_default();
+        assert!(
+            archivefs_core::launch::unverified_media::is_unverified_key(&key),
+            "never a verified identity: {key:?}"
+        );
+
+        // A changed file is not the file that was chosen.
+        std::fs::write(&path, [1u8; 600]).unwrap();
+        assert!(folder_only(&job));
+        // Forgetting restores the question.
+        let entry =
+            remembered::RememberedLaunchSystem::for_current_file(&path, "Philips CD-i").unwrap();
+        remembered::remember_launch_system_at(&store, &entry).unwrap();
+        assert!(planned(&job).is_some());
+        remembered::forget_launch_system_at(&store, &path).unwrap();
+        assert!(folder_only(&job));
     }
 
     /// Owner regression list 2026-11-09: NES games misfiled under SNES.

@@ -323,7 +323,8 @@ pub enum MediaSystemEvidence {
 pub fn media_system_evidence(path: &Path, platform_id: &str) -> MediaSystemEvidence {
     use crate::platform::detect::{DetectionRequest, DetectionSource, detect_platform_report};
     let same = |other: &str| {
-        other == platform_id || crate::platform::equivalent_platform_ids(platform_id).contains(&other)
+        other == platform_id
+            || crate::platform::equivalent_platform_ids(platform_id).contains(&other)
     };
     // The file itself is the source root, so no folder alias can be read.
     let report = detect_platform_report(&DetectionRequest::new(path, path).inspecting_content());
@@ -362,7 +363,12 @@ pub fn media_system_evidence_cached(path: &Path, platform_id: &str) -> MediaSyst
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos());
-    let key = (path.to_path_buf(), metadata.len(), mtime, platform_id.to_string());
+    let key = (
+        path.to_path_buf(),
+        metadata.len(),
+        mtime,
+        platform_id.to_string(),
+    );
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock()
         && let Some(hit) = guard.get(&key)
@@ -550,9 +556,15 @@ mod platform_media_tests {
             MediaSystemEvidence::Contradicts("NES")
         );
         // The same bytes under the system they belong to agree.
-        assert_eq!(media_system_evidence(&renamed, "NES"), MediaSystemEvidence::Agrees);
+        assert_eq!(
+            media_system_evidence(&renamed, "NES"),
+            MediaSystemEvidence::Agrees
+        );
         let proper = ines("Proper (USA).nes", &dir);
-        assert_eq!(media_system_evidence(&proper, "NES"), MediaSystemEvidence::Agrees);
+        assert_eq!(
+            media_system_evidence(&proper, "NES"),
+            MediaSystemEvidence::Agrees
+        );
     }
 
     #[test]
@@ -561,20 +573,35 @@ mod platform_media_tests {
         // A CHD names no system in its container bytes: folder alone decides.
         let chd = dir.path().join("Disc (Europe).chd");
         std::fs::write(&chd, vec![0u8; 4096]).unwrap();
-        assert_eq!(media_system_evidence(&chd, "Dreamcast"), MediaSystemEvidence::Silent);
-        assert_eq!(media_system_evidence(&chd, "Philips CD-i"), MediaSystemEvidence::Silent);
+        assert_eq!(
+            media_system_evidence(&chd, "Dreamcast"),
+            MediaSystemEvidence::Silent
+        );
+        assert_eq!(
+            media_system_evidence(&chd, "Philips CD-i"),
+            MediaSystemEvidence::Silent
+        );
         // A ZIP is a shared container, never format evidence.
         let zip = dir.path().join("Game (USA).zip");
         std::fs::write(&zip, b"PK\x03\x04rest").unwrap();
-        assert_eq!(media_system_evidence(&zip, "SNES"), MediaSystemEvidence::Silent);
+        assert_eq!(
+            media_system_evidence(&zip, "SNES"),
+            MediaSystemEvidence::Silent
+        );
         // A Dreamcast-only disc format agrees.
         let cdi = dir.path().join("Disc (Europe).cdi");
         std::fs::write(&cdi, vec![0u8; 4096]).unwrap();
-        assert_eq!(media_system_evidence(&cdi, "Dreamcast"), MediaSystemEvidence::Agrees);
+        assert_eq!(
+            media_system_evidence(&cdi, "Dreamcast"),
+            MediaSystemEvidence::Agrees
+        );
         // An extension another system also lists never agrees on its own.
         let iso = dir.path().join("Disc.iso");
         std::fs::write(&iso, vec![0u8; 4096]).unwrap();
-        assert_eq!(media_system_evidence(&iso, "PS2"), MediaSystemEvidence::Silent);
+        assert_eq!(
+            media_system_evidence(&iso, "PS2"),
+            MediaSystemEvidence::Silent
+        );
     }
 
     #[test]

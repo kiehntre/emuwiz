@@ -1146,6 +1146,8 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         catalogued_platform_hint: None,
         catalogued_platform_source: None,
         launch_system_trial: None,
+        launch_remember_choice: None,
+        launch_remember_error: None,
         catalogued_row_health: None,
         catalogued_loose_content: None,
         refresh_generation: RefreshGeneration::INITIAL,

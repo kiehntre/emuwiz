@@ -289,6 +289,27 @@ pub(super) fn offers_review_identity(input: &launch_readiness_page::LaunchReadin
 pub(super) const REVIEW_IDENTITY: &str = "Review identity";
 pub(super) const CHANGE_SYSTEM_PERMANENTLY: &str = "Change system permanently…";
 pub(super) const TRY_ANYWAY: &str = "Try anyway (this launch only)";
+pub(super) const REMEMBER_LAUNCH_CHOICE: &str = "Remember this launch choice";
+pub(super) const FORGET_LAUNCH_CHOICE: &str = "Forget this launch choice";
+
+/// Saves (`Some`) or forgets (`None`) the person's remembered launch system
+/// for `path` as it is now. Never touches the library or identity.
+fn save_remembered_launch_choice(path: &Path, system: Option<&'static str>) -> Result<(), String> {
+    use archivefs_core::launch::remembered_launch_system as remembered;
+    let store = remembered::default_remembered_launch_systems_path()?;
+    match system {
+        Some(system) => {
+            let entry = remembered::RememberedLaunchSystem::for_current_file(path, system)
+                .ok_or_else(|| {
+                    "This launch choice cannot be remembered: the game file could not be read."
+                        .to_string()
+                })?;
+            remembered::remember_launch_system_at(&store, &entry)
+        }
+        None => remembered::forget_launch_system_at(&store, path),
+    }
+    .map_err(|error| format!("The launch choice was not saved: {error}"))
+}
 
 /// The Launch page's identity button and the sentence above it, per reason.
 /// Unsupported archives have no identity screen to go to, so they offer only
@@ -648,6 +669,24 @@ impl NativeWorkflows {
         {
             self.app.launch_system_trial = None;
         }
+        if self
+            .app
+            .launch_remember_choice
+            .as_deref()
+            .is_some_and(|p| p != path)
+        {
+            self.app.launch_remember_choice = None;
+        }
+        if self
+            .app
+            .launch_remember_error
+            .as_ref()
+            .is_some_and(|(p, _)| p != path)
+        {
+            self.app.launch_remember_error = None;
+        }
+        let remembered_system =
+            archivefs_core::launch::remembered_launch_system::remembered_launch_system(path);
         self.app.launch_standalone.focus_dosbox_game(Some(path));
         self.app.emulator_readiness.flycast_gdi.show(ui, Some(path));
         self.app.emulator_readiness.vice.show(ui, Some(path));
@@ -690,6 +729,7 @@ impl NativeWorkflows {
             .filter(|(tried, _)| tried == path)
             .map(|(_, system)| *system);
         let mut trial_pick: Option<Option<&'static str>> = None;
+        let mut remember_pick: Option<Option<&'static str>> = None;
         let readiness_error = self.readiness_error();
         if readiness_error.is_none()
             && matches!(
@@ -786,20 +826,54 @@ impl NativeWorkflows {
                 ui.label(format!(
                     "{TRY_ANYWAY}: EmuWiz will not start this game on a folder guess alone. Pick a system to try it once; you will see a warning, nothing is saved, and later scans are unaffected."
                 ));
+                let mut remember = self.app.launch_remember_choice.as_deref() == Some(path);
+                if ui
+                    .checkbox(&mut remember, REMEMBER_LAUNCH_CHOICE)
+                    .on_hover_text("Saves the system you press next for this file only, so you are not asked again. It applies only while the file is unchanged, is not game identification, never changes the library's recorded system, and anything the file itself shows still wins. Launch safety checks still apply. You can forget it here later.")
+                    .changed()
+                {
+                    self.app.launch_remember_choice = remember.then(|| path.to_path_buf());
+                }
                 ui.horizontal_wrapped(|ui| {
                     for system in trial_systems.iter().take(8) {
-                        if ui
-                            .button(format!(
-                                "Try once as {}",
-                                archivefs_core::platform::display_name_for(system)
-                            ))
-                            .on_hover_text("One launch attempt only. Your library, the game's recorded system and catalogue evidence do not change. Launch safety checks still apply.")
-                            .clicked()
-                        {
-                            trial_pick = Some(Some(*system));
+                        let name = archivefs_core::platform::display_name_for(system);
+                        let (label, hover) = if remember {
+                            (
+                                format!("Remember as {name}"),
+                                "Saves this launch choice for this unchanged file. Your library, the game's recorded system and catalogue evidence do not change. Launch safety checks still apply.",
+                            )
+                        } else {
+                            (
+                                format!("Try once as {name}"),
+                                "One launch attempt only. Your library, the game's recorded system and catalogue evidence do not change. Launch safety checks still apply.",
+                            )
+                        };
+                        if ui.button(label).on_hover_text(hover).clicked() {
+                            if remember {
+                                remember_pick = Some(Some(*system));
+                            } else {
+                                trial_pick = Some(Some(*system));
+                            }
                         }
                     }
                 });
+            }
+            if let Some(system) = remembered_system {
+                ui.label(format!(
+                    "Remembered launch choice: this file starts as {} while it is unchanged. This is your choice, not game identification.",
+                    archivefs_core::platform::display_name_for(system)
+                ));
+                if ui.button(FORGET_LAUNCH_CHOICE).clicked() {
+                    remember_pick = Some(None);
+                }
+            }
+            if let Some((_, error)) = self
+                .app
+                .launch_remember_error
+                .as_ref()
+                .filter(|(p, _)| p == path)
+            {
+                ui.colored_label(ui.visuals().error_fg_color, error.as_str());
             }
             if let Some(system) = active_trial {
                 ui.label(format!(
@@ -826,6 +900,12 @@ impl NativeWorkflows {
         });
         if let Some(pick) = trial_pick {
             self.app.launch_system_trial = pick.map(|system| (path.to_path_buf(), system));
+            self.recheck_readiness_in_place(ui.ctx());
+        }
+        if let Some(pick) = remember_pick {
+            let result = save_remembered_launch_choice(path, pick);
+            self.app.launch_remember_error = result.err().map(|error| (path.to_path_buf(), error));
+            self.app.launch_remember_choice = None;
             self.recheck_readiness_in_place(ui.ctx());
         }
         if retry_readiness {

@@ -43,6 +43,9 @@ pub(crate) enum SystemBasis {
     /// A one-launch "Try anyway" for a system the person picked on the
     /// Launch page. Held in memory only; nothing is saved.
     Trial,
+    /// The person ticked "Remember this launch choice" for this unchanged
+    /// file (owner decision 2026-11-10). Launch-only; never identity.
+    Remembered,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +86,9 @@ pub(crate) fn warning_text(platform_id: &str, basis: SystemBasis) -> String {
         SystemBasis::Chosen => format!(
             "Game not identified: you chose {name} for this file, and EmuWiz could not confirm which game it is. It will still play; your choice is not catalogue (DAT) verification."
         ),
+        SystemBasis::Remembered => format!(
+            "System not confirmed: you chose to remember {name} as the launch choice for this unchanged file. Neither the system nor the game was confirmed from the file; your choice is not identification, and it stops applying if the file changes."
+        ),
         SystemBasis::Trial => format!(
             "System not confirmed: this is a one-time try as {name}. Neither the system nor the game was confirmed from the file, and nothing is saved; the game may not start correctly."
         ),
@@ -97,7 +103,41 @@ pub(crate) fn warning_text(platform_id: &str, basis: SystemBasis) -> String {
 /// replaces the recorded system for this plan only and passes the same
 /// format, content and media checks; anything the file says about itself
 /// still wins over it.
+///
+/// `remembered` is the person's saved "Remember this launch choice" for this
+/// unchanged file. It is consulted only where the recorded system alone would
+/// need confirmation (a folder-only guess): a manual system choice, the
+/// file's own evidence and a one-time try all come first, and it passes the
+/// same format, content and media checks as a try.
 pub(crate) fn resolve(
+    path: &Path,
+    platform_hint: &str,
+    platform_source: Option<&str>,
+    content_platform: Option<IdentityPlatform>,
+    trial: Option<&'static str>,
+    remembered: Option<&'static str>,
+) -> Outcome {
+    let outcome = resolve_for(
+        path,
+        platform_hint,
+        platform_source,
+        content_platform,
+        trial,
+    );
+    match (outcome, remembered) {
+        (Outcome::NeedsConfirmation(_), Some(system)) => {
+            match resolve_for(path, system, None, content_platform, Some(system)) {
+                Outcome::Allowed(identity, _) => {
+                    Outcome::Allowed(identity, SystemBasis::Remembered)
+                }
+                other => other,
+            }
+        }
+        (outcome, _) => outcome,
+    }
+}
+
+fn resolve_for(
     path: &Path,
     platform_hint: &str,
     platform_source: Option<&str>,
@@ -233,6 +273,17 @@ pub(crate) fn apply_warning(plan: &mut LaunchPlan, basis: SystemBasis) {
 
 #[cfg(test)]
 mod tests {
+    /// The five-input form, with nothing remembered.
+    fn resolve5(
+        path: &Path,
+        hint: &str,
+        source: Option<&str>,
+        content: Option<IdentityPlatform>,
+        trial: Option<&'static str>,
+    ) -> Outcome {
+        resolve(path, hint, source, content, trial, None)
+    }
+
     use super::*;
 
     const FOLDER: Option<&str> = Some("folder_alias");
@@ -267,16 +318,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tap = write(&dir, "Jetpac.tap", &[2u8, 0, 0, 1]);
         assert_eq!(
-            allowed(&resolve(&tap, "ZX Spectrum", FOLDER, None, None)),
+            allowed(&resolve5(&tap, "ZX Spectrum", FOLDER, None, None)),
             Some(SystemBasis::Media)
         );
         let tzx = write(&dir, "Jetpac.tzx", b"ZXTape!\x1a\x01\x14\x20\x00\x00");
         assert_eq!(
-            allowed(&resolve(&tzx, "ZX Spectrum", None, None, None)),
+            allowed(&resolve5(&tzx, "ZX Spectrum", None, None, None)),
             Some(SystemBasis::Media)
         );
         assert_eq!(
-            resolve(&tzx, "Commodore 64", FOLDER, None, None),
+            resolve5(&tzx, "Commodore 64", FOLDER, None, None),
             Outcome::NotApplicable
         );
     }
@@ -287,18 +338,18 @@ mod tests {
         // Confirmed platform (folder), unknown game, shared disc format.
         let chd = write(&dir, "The 7th Guest (Europe).chd", &[0u8; 4096]);
         assert_eq!(
-            resolve(&chd, "Philips CD-i", FOLDER, None, None),
+            resolve5(&chd, "Philips CD-i", FOLDER, None, None),
             Outcome::NeedsConfirmation("Philips CD-i")
         );
         // Ambiguous ZIP in a cartridge folder.
         let zip = write(&dir, "Game (USA).zip", b"PK\x03\x04rest-of-archive");
         assert_eq!(
-            resolve(&zip, "SNES", FOLDER, None, None),
+            resolve5(&zip, "SNES", FOLDER, None, None),
             Outcome::NeedsConfirmation("SNES")
         );
         // An unrecorded source is no better than a folder.
         assert_eq!(
-            resolve(&chd, "Dreamcast", None, None, None),
+            resolve5(&chd, "Dreamcast", None, None, None),
             Outcome::NeedsConfirmation("Dreamcast")
         );
     }
@@ -308,12 +359,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let chd = write(&dir, "Jet Set Radio (Europe).chd", &[0u8; 4096]);
         assert_eq!(
-            allowed(&resolve(&chd, "Dreamcast", MANUAL, None, None)),
+            allowed(&resolve5(&chd, "Dreamcast", MANUAL, None, None)),
             Some(SystemBasis::Chosen)
         );
         let zip = write(&dir, "Game (USA).zip", b"PK\x03\x04rest-of-archive");
         assert_eq!(
-            allowed(&resolve(&zip, "SNES", MANUAL, None, None)),
+            allowed(&resolve5(&zip, "SNES", MANUAL, None, None)),
             Some(SystemBasis::Chosen)
         );
         assert!(
@@ -328,13 +379,13 @@ mod tests {
         // A Dreamcast-only disc format in a Dreamcast folder.
         let cdi = write(&dir, "Headhunter (Europe).cdi", &[0u8; 4096]);
         assert_eq!(
-            allowed(&resolve(&cdi, "Dreamcast", FOLDER, None, None)),
+            allowed(&resolve5(&cdi, "Dreamcast", FOLDER, None, None)),
             Some(SystemBasis::Media)
         );
         // A header-detected platform recorded by the scan.
         let chd = write(&dir, "Disc.chd", &[0u8; 4096]);
         assert_eq!(
-            allowed(&resolve(
+            allowed(&resolve5(
                 &chd,
                 "Dreamcast",
                 Some("header_identity"),
@@ -353,16 +404,16 @@ mod tests {
         // even for a saved choice or a trial.
         let gb = write(&dir, "Broken.gb", &[0x55; 0x8000]);
         assert_eq!(
-            resolve(&gb, "Game Boy", MANUAL, None, None),
+            resolve5(&gb, "Game Boy", MANUAL, None, None),
             Outcome::NotApplicable
         );
         assert_eq!(
-            resolve(&gb, "Game Boy", FOLDER, None, Some("Game Boy")),
+            resolve5(&gb, "Game Boy", FOLDER, None, Some("Game Boy")),
             Outcome::NotApplicable
         );
         let nes = ines(&dir, "Game (USA).nes");
         assert_eq!(
-            resolve(&nes, "NES", FOLDER, None, None),
+            resolve5(&nes, "NES", FOLDER, None, None),
             Outcome::NotApplicable
         );
     }
@@ -373,7 +424,7 @@ mod tests {
         // A .nes file in the SNES folder: not a format SNES lists.
         let nes = ines(&dir, "Misfiled (USA).nes");
         assert_eq!(
-            resolve(&nes, "SNES", FOLDER, None, None),
+            resolve5(&nes, "SNES", FOLDER, None, None),
             Outcome::NotApplicable
         );
         // An NES game zipped/renamed under a shared SNES format: its own
@@ -383,8 +434,8 @@ mod tests {
             recorded: "SNES",
             content: "NES",
         };
-        assert_eq!(resolve(&renamed, "SNES", FOLDER, None, None), conflict);
-        assert_eq!(resolve(&renamed, "SNES", MANUAL, None, None), conflict);
+        assert_eq!(resolve5(&renamed, "SNES", FOLDER, None, None), conflict);
+        assert_eq!(resolve5(&renamed, "SNES", MANUAL, None, None), conflict);
     }
 
     #[test]
@@ -392,9 +443,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write(&dir, "Disc (Europe).cdi", &[1u8; 64]);
         // .cdi is Dreamcast-only, so the format itself establishes the system.
-        assert!(allowed(&resolve(&path, "Dreamcast", FOLDER, None, None)).is_some());
+        assert!(allowed(&resolve5(&path, "Dreamcast", FOLDER, None, None)).is_some());
         assert!(
-            allowed(&resolve(
+            allowed(&resolve5(
                 &path,
                 "Dreamcast",
                 FOLDER,
@@ -404,7 +455,7 @@ mod tests {
             .is_some()
         );
         assert!(matches!(
-            resolve(
+            resolve5(
                 &path,
                 "Dreamcast",
                 MANUAL,
@@ -417,7 +468,7 @@ mod tests {
             }
         ));
         assert_eq!(
-            resolve(&path, "a folder name that is no system", MANUAL, None, None),
+            resolve5(&path, "a folder name that is no system", MANUAL, None, None),
             Outcome::NotApplicable
         );
     }
@@ -428,7 +479,7 @@ mod tests {
         // The Acorn systems do not list .zip: nothing is manufactured.
         let zip = write(&dir, "Acheton.zip", b"PK\x03\x04rest-of-archive");
         assert_eq!(
-            resolve(&zip, "Acorn Archimedes", MANUAL, None, None),
+            resolve5(&zip, "Acorn Archimedes", MANUAL, None, None),
             Outcome::NotApplicable
         );
     }
@@ -439,12 +490,12 @@ mod tests {
         let chd = write(&dir, "Avenger (Japan).chd", &[0u8; 4096]);
         // Folder-only: blocked until the person tries it.
         assert_eq!(
-            resolve(&chd, "PC Engine CD", FOLDER, None, None),
+            resolve5(&chd, "PC Engine CD", FOLDER, None, None),
             Outcome::NeedsConfirmation("PC Engine CD")
         );
         // A trial of the recorded system plans with the trial warning.
         assert_eq!(
-            allowed(&resolve(
+            allowed(&resolve5(
                 &chd,
                 "PC Engine CD",
                 FOLDER,
@@ -455,7 +506,7 @@ mod tests {
         );
         // A temporary *different* system that lists the format is allowed for
         // that one plan; its identity names the trial system, not the folder.
-        match resolve(&chd, "PC Engine CD", FOLDER, None, Some("Dreamcast")) {
+        match resolve5(&chd, "PC Engine CD", FOLDER, None, Some("Dreamcast")) {
             Outcome::Allowed(identity, SystemBasis::Trial) => {
                 assert_eq!(identity.platform_id, "Dreamcast")
             }
@@ -463,17 +514,17 @@ mod tests {
         }
         // Without the trial (next plan, later rescan) nothing was remembered.
         assert_eq!(
-            resolve(&chd, "PC Engine CD", FOLDER, None, None),
+            resolve5(&chd, "PC Engine CD", FOLDER, None, None),
             Outcome::NeedsConfirmation("PC Engine CD")
         );
         // A format the trial system does not list is never manufactured.
         assert_eq!(
-            resolve(&chd, "PC Engine CD", FOLDER, None, Some("SNES")),
+            resolve5(&chd, "PC Engine CD", FOLDER, None, Some("SNES")),
             Outcome::NotApplicable
         );
         // Content identification after a rescan outranks a trial.
         assert!(matches!(
-            resolve(
+            resolve5(
                 &chd,
                 "PC Engine CD",
                 FOLDER,
@@ -493,7 +544,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let renamed = ines(&dir, "Misfiled (USA).bin");
         assert_eq!(
-            resolve(&renamed, "SNES", FOLDER, None, Some("SNES")),
+            resolve5(&renamed, "SNES", FOLDER, None, Some("SNES")),
             Outcome::Contradicted {
                 recorded: "SNES",
                 content: "NES"
@@ -507,6 +558,80 @@ mod tests {
         assert!(
             systems.contains(&"NES"),
             "an ambiguous ZIP may be tried as another system: {systems:?}"
+        );
+    }
+
+    #[test]
+    fn a_remembered_launch_choice_replaces_try_anyway_only_for_a_folder_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        let chd = write(&dir, "Jet Set Radio.chd", &[0u8; 4096]);
+        let remembered = Some("Dreamcast");
+        assert_eq!(
+            allowed(&resolve(&chd, "Dreamcast", FOLDER, None, None, remembered)),
+            Some(SystemBasis::Remembered)
+        );
+        // It may name another system that lists the format; the identity
+        // names that system, and it is still launch-only.
+        match resolve(&chd, "PC Engine CD", FOLDER, None, None, remembered) {
+            Outcome::Allowed(identity, SystemBasis::Remembered) => {
+                assert_eq!(identity.platform_id, "Dreamcast");
+                assert!(identity.game_key.starts_with("unverified:"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A manual (permanent) system choice and a one-time try come first.
+        assert_eq!(
+            allowed(&resolve(
+                &chd,
+                "PC Engine CD",
+                MANUAL,
+                None,
+                None,
+                remembered
+            )),
+            Some(SystemBasis::Chosen)
+        );
+        assert_eq!(
+            allowed(&resolve(
+                &chd,
+                "PC Engine CD",
+                FOLDER,
+                None,
+                Some("PC Engine CD"),
+                remembered
+            )),
+            Some(SystemBasis::Trial)
+        );
+        // Content identification still wins over the remembered choice.
+        assert!(matches!(
+            resolve(
+                &chd,
+                "Dreamcast",
+                FOLDER,
+                Some(IdentityPlatform::PlayStation2),
+                None,
+                remembered
+            ),
+            Outcome::Contradicted { .. }
+        ));
+        // A remembered system that does not list the format offers nothing.
+        assert_eq!(
+            resolve(&chd, "Dreamcast", FOLDER, None, None, Some("SNES")),
+            Outcome::NotApplicable
+        );
+        assert!(warning_text("Dreamcast", SystemBasis::Remembered).contains("not identification"));
+    }
+
+    #[test]
+    fn a_remembered_choice_never_overrides_a_header_naming_another_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let renamed = ines(&dir, "Misfiled (USA).bin");
+        assert_eq!(
+            resolve(&renamed, "SNES", FOLDER, None, None, Some("SNES")),
+            Outcome::Contradicted {
+                recorded: "SNES",
+                content: "NES"
+            }
         );
     }
 }

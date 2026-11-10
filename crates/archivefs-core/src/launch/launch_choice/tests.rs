@@ -395,7 +395,10 @@ fn every_platform_can_resolve_a_tie_by_choice_and_a_plan_without_one_is_untouche
     let mut plan = tie();
     plan.platform_id = None;
     let before = plan.clone();
-    assert_eq!(apply(&mut plan, saved(&[])), LaunchChoiceOutcome::NotAdopted);
+    assert_eq!(
+        apply(&mut plan, saved(&[])),
+        LaunchChoiceOutcome::NotAdopted
+    );
     assert_eq!(plan, before);
 }
 

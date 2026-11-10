@@ -38,6 +38,9 @@ pub(crate) struct ReadinessSources<'a> {
     /// A one-launch "Try anyway" system for exactly this path (in memory
     /// only; see `unverified_media`). Background workers never have one.
     pub(crate) system_trial: &'a dyn Fn(&Path) -> Option<&'static str>,
+    /// The person's saved "Remember this launch choice" for this unchanged
+    /// file, if any (see `archivefs_core::launch::remembered_launch_system`).
+    pub(crate) remembered_system: &'a dyn Fn(&Path) -> Option<&'static str>,
 }
 
 impl ReadinessSources<'_> {
@@ -401,6 +404,7 @@ impl ReadinessSources<'_> {
                     source.as_deref(),
                     selected_game_identity_report.map(|report| report.platform),
                     (self.system_trial)(path),
+                    (self.remembered_system)(path),
                 ) {
                     Outcome::Allowed(resolved, basis) => {
                         identity_status =

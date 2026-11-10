@@ -174,6 +174,11 @@ pub(crate) struct ArchiveFsApp {
     /// A one-launch "Try anyway" system for one file. In memory only: never
     /// saved, never a manual choice, consumed by the next launch attempt.
     pub(crate) launch_system_trial: Option<(PathBuf, &'static str)>,
+    /// The Launch page's "Remember this launch choice" tick box, for one
+    /// file. Unticked by default; only a tick plus a system press saves.
+    pub(crate) launch_remember_choice: Option<PathBuf>,
+    /// Why saving or forgetting a remembered launch choice failed, per file.
+    pub(crate) launch_remember_error: Option<(PathBuf, String)>,
     /// The page's own catalogue row's stored health, handed over with the row
     /// (Blue does not load the library snapshot on the Launch route). The
     /// freshest word on whether that file's last inspection completed.
@@ -515,6 +520,8 @@ impl ArchiveFsApp {
             catalogued_platform_hint: None,
             catalogued_platform_source: None,
             launch_system_trial: None,
+            launch_remember_choice: None,
+            launch_remember_error: None,
             catalogued_row_health: None,
             catalogued_loose_content: None,
             refresh_generation: generation,
