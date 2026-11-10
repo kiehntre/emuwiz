@@ -24,7 +24,15 @@ fn raw_input() -> eframe::egui::RawInput {
     eframe::egui::RawInput {
         screen_rect: Some(eframe::egui::Rect::from_min_size(
             eframe::egui::Pos2::ZERO,
-            eframe::egui::vec2(SIZE[0], SIZE[1]),
+            // CENSUS_HEIGHT: a taller page paints controls a scrolled page
+            // would not (egui skips widgets outside the visible area).
+            eframe::egui::vec2(
+                SIZE[0],
+                std::env::var("CENSUS_HEIGHT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(SIZE[1]),
+            ),
         )),
         ..Default::default()
     }
@@ -157,7 +165,12 @@ fn real_library_launch_census() {
     // for representative games with no recorded system).
     let fragments: Vec<String> = std::env::var("CENSUS_PATHS")
         .ok()
-        .map(|v| v.split('|').map(str::to_string).filter(|f| !f.is_empty()).collect())
+        .map(|v| {
+            v.split('|')
+                .map(str::to_string)
+                .filter(|f| !f.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     for fragment in &fragments {
         let members: Vec<usize> = groups
