@@ -4161,11 +4161,43 @@ fn gba_display_order(
     launchable: impl Fn(&LaunchCandidate) -> bool,
 ) -> Vec<usize> {
     let mut order: Vec<usize> = (0..plan.candidates.len()).collect();
-    if let Some(index) = recommended_gba_candidate(plan, launchable) {
+    if let Some(index) =
+        recommended_gba_candidate(plan, launchable).or_else(|| sega_pico_first_candidate(plan))
+    {
         order.retain(|&i| i != index);
         order.insert(0, index);
     }
     order
+}
+
+/// The Sega Pico card to show first. Cores are listed alphabetically, so a
+/// Genesis Plus GX build whose `.info` lists `Sega - PICO` came before
+/// PicoDrive, the reviewed Pico core whose pen and Storyware controls the page
+/// describes. An explicit saved or one-time choice (Remembered) always comes
+/// first; otherwise the reviewed-preferred PicoDrive card does. Blocked cards
+/// never move. Display only: it never changes the plan, a preference, or what
+/// Play launches, and every other core stays listed as a choice.
+fn sega_pico_first_candidate(plan: &LaunchPlan) -> Option<usize> {
+    if plan.platform_id.as_deref()
+        != Some(archivefs_core::launch::unverified_media::SEGA_PICO_PLATFORM)
+    {
+        return None;
+    }
+    let usable = |c: &LaunchCandidate| c.readiness != LaunchReadiness::Blocked;
+    plan.candidates
+        .iter()
+        .position(|c| usable(c) && c.preference == CandidatePreference::Remembered)
+        .or_else(|| {
+            plan.candidates.iter().position(|c| {
+                usable(c)
+                    && c.preference == CandidatePreference::SoleEligible
+                    && matches!(
+                        &c.target,
+                        LaunchTarget::RetroArchCore { core_stem, .. }
+                            if core_stem == crate::emulator_setup::unverified_media::SEGA_PICO_REVIEWED_CORE
+                    )
+            })
+        })
 }
 
 fn readiness_label_and_tone(readiness: LaunchReadiness) -> (&'static str, widgets::StatusTone) {

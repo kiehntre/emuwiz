@@ -4005,3 +4005,167 @@ fn mame_driver_flags_do_not_withdraw_play_but_other_warnings_still_do() {
     };
     assert!(!standalone_status_allows_request(&dolphin));
 }
+
+// ---- Sega Pico: PicoDrive first, explicit defaults kept, controls follow the core ----
+
+fn pico_core(core_stem: &str) -> LaunchTarget {
+    LaunchTarget::RetroArchCore {
+        profile: retroarch_profile(),
+        core_stem: core_stem.to_string(),
+        platform_id: "Sega Pico",
+    }
+}
+
+/// The three cores the 2026-11-10 smoke test listed, in planner order
+/// (alphabetical), with PicoDrive as the reviewed-preferred core.
+fn smoke_test_pico_plan() -> LaunchPlan {
+    use CandidatePreference::{SoleEligible, Undetermined};
+    let mut plan = plan_with(vec![
+        gba_candidate(
+            pico_core("genesis_plus_gx"),
+            LaunchReadiness::ReadyWithWarnings,
+            Undetermined,
+        ),
+        gba_candidate(
+            pico_core("genesis_plus_gx_wide"),
+            LaunchReadiness::ReadyWithWarnings,
+            Undetermined,
+        ),
+        gba_candidate(
+            pico_core("picodrive"),
+            LaunchReadiness::ReadyWithWarnings,
+            SoleEligible,
+        ),
+    ]);
+    plan.platform_id = Some("Sega Pico".into());
+    plan.game_key = Some("unverified:sega-pico-test".into());
+    plan
+}
+
+fn core_at(plan: &LaunchPlan, index: usize) -> &str {
+    match &plan.candidates[index].target {
+        LaunchTarget::RetroArchCore { core_stem, .. } => core_stem,
+        LaunchTarget::Standalone { adapter_id, .. } => adapter_id,
+    }
+}
+
+#[test]
+fn sega_pico_picodrive_card_is_listed_first_and_alternatives_stay() {
+    let plan = smoke_test_pico_plan();
+    let order = super::gba_display_order(&plan, |_| true);
+    assert_eq!(order, vec![2, 0, 1]);
+    assert_eq!(core_at(&plan, order[0]), "picodrive");
+    // Genesis Plus GX cores remain listed as choices; nothing is removed or
+    // re-ranked in the plan itself.
+    assert_eq!(order.len(), 3);
+    assert_eq!(
+        plan.candidates[0].preference,
+        CandidatePreference::Undetermined
+    );
+}
+
+#[test]
+fn sega_pico_order_leaves_a_blocked_picodrive_and_other_platforms_alone() {
+    let mut plan = smoke_test_pico_plan();
+    plan.candidates[2].readiness = LaunchReadiness::Blocked;
+    assert_eq!(super::gba_display_order(&plan, |_| true), vec![0, 1, 2]);
+    let mut md = smoke_test_pico_plan();
+    md.platform_id = Some("MegaDrive".into());
+    assert_eq!(super::gba_display_order(&md, |_| true), vec![0, 1, 2]);
+}
+
+/// Saves "Default for Sega Pico" on `core` through the real choice state and
+/// preferences file, reloads it, and applies it to a fresh smoke-test plan.
+fn plan_with_saved_pico_default(
+    label: &str,
+    core: &str,
+) -> (
+    LaunchPlan,
+    Vec<archivefs_core::launch::launch_choice::LaunchPreference>,
+) {
+    use archivefs_core::launch::launch_choice as core_choice;
+    let dir = std::env::temp_dir().join(format!(
+        "emuwiz-pico-default-{label}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("launch_preferences.json");
+    let mut state = launch_choice::LaunchChoiceState::load_at(path.clone());
+    let option_id = core_choice::launch_option_id(&pico_core(core));
+    state.handle(launch_choice::LaunchChoiceAction::SetDefault(
+        core_choice::LaunchPreference::system("Sega Pico", &option_id),
+    ));
+    let reloaded = launch_choice::LaunchChoiceState::load_at(path);
+    let saved = reloaded.preferences.clone().expect("preferences readable");
+    let mut plan = smoke_test_pico_plan();
+    core_choice::apply(&mut plan, reloaded.inputs());
+    let _ = std::fs::remove_dir_all(&dir);
+    (plan, saved)
+}
+
+#[test]
+fn sega_pico_default_saves_the_explicitly_selected_core() {
+    use archivefs_core::launch::launch_choice as core_choice;
+    for core in ["picodrive", "genesis_plus_gx"] {
+        let (plan, saved) = plan_with_saved_pico_default(core, core);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].platform_id, "Sega Pico");
+        assert_eq!(
+            saved[0].option_id,
+            core_choice::launch_option_id(&pico_core(core))
+        );
+        let remembered: Vec<&str> = (0..plan.candidates.len())
+            .filter(|&i| plan.candidates[i].preference == CandidatePreference::Remembered)
+            .map(|i| core_at(&plan, i))
+            .collect();
+        assert_eq!(
+            remembered,
+            vec![core],
+            "only the selected core is the default"
+        );
+    }
+}
+
+#[test]
+fn sega_pico_existing_user_default_stays_first_and_keeps_its_controls_note() {
+    // A user who chose Genesis Plus GX keeps it: it is listed first, PicoDrive
+    // stays available, and the controls note no longer claims PicoDrive's pen.
+    let (plan, _) = plan_with_saved_pico_default("gpgx-kept", "genesis_plus_gx");
+    let order = super::gba_display_order(&plan, |_| true);
+    assert_eq!(core_at(&plan, order[0]), "genesis_plus_gx");
+    assert!(order.iter().any(|&i| core_at(&plan, i) == "picodrive"));
+    let note = crate::emulator_setup::unverified_media::sega_pico_controls_note(&plan).unwrap();
+    assert!(note.starts_with("Sega Pico with genesis_plus_gx"), "{note}");
+    assert!(note.contains("choose the picodrive card"), "{note}");
+    assert_ne!(
+        note,
+        crate::emulator_setup::unverified_media::SEGA_PICO_CONTROLS
+    );
+}
+
+#[test]
+fn sega_pico_controls_note_describes_picodrive_only_when_picodrive_is_selected() {
+    use crate::emulator_setup::unverified_media::{SEGA_PICO_CONTROLS, sega_pico_controls_note};
+    let plan = smoke_test_pico_plan();
+    assert_eq!(
+        sega_pico_controls_note(&plan).as_deref(),
+        Some(SEGA_PICO_CONTROLS)
+    );
+    let (picked, _) = plan_with_saved_pico_default("pd-kept", "picodrive");
+    assert_eq!(
+        sega_pico_controls_note(&picked).as_deref(),
+        Some(SEGA_PICO_CONTROLS)
+    );
+    // No PicoDrive installed: the first usable core is named, not PicoDrive's pen.
+    let mut no_pd = smoke_test_pico_plan();
+    no_pd.candidates.pop();
+    let note = sega_pico_controls_note(&no_pd).unwrap();
+    assert!(
+        note.starts_with("Sega Pico with genesis_plus_gx:"),
+        "{note}"
+    );
+    // Not a Pico plan: no note.
+    no_pd.platform_id = Some("MegaDrive".into());
+    assert_eq!(sega_pico_controls_note(&no_pd), None);
+}
