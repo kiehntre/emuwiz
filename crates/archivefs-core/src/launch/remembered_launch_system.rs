@@ -310,4 +310,38 @@ mod tests {
             RememberedLaunchSystem::for_current_file(Path::new("a.chd"), "Dreamcast").is_none()
         );
     }
+
+    /// Older EmuWiz builds read `launch_preferences.json` strictly
+    /// (`deny_unknown_fields`, version 1) and never this file. Remembering a
+    /// launch choice must leave that file byte-for-byte unchanged.
+    #[test]
+    fn remembering_never_touches_the_emulator_preferences_older_builds_read() {
+        use crate::launch::launch_choice::{
+            LAUNCH_PREFERENCES_FILE, LaunchPreference, load_launch_preferences_at,
+            set_launch_preference_at,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let preferences = config.join(LAUNCH_PREFERENCES_FILE);
+        set_launch_preference_at(
+            &preferences,
+            &LaunchPreference::system("PS2", "standalone/pcsx2/x"),
+        )
+        .unwrap();
+        let before = std::fs::read(&preferences).unwrap();
+
+        let file = game(&dir, "Avenger (Japan).chd", b"chd");
+        let store = config.join(REMEMBERED_LAUNCH_SYSTEMS_FILE);
+        let entry = RememberedLaunchSystem::for_current_file(&file, "PC Engine CD").unwrap();
+        remember_launch_system_at(&store, &entry).unwrap();
+        forget_launch_system_at(&store, &file).unwrap();
+        remember_launch_system_at(&store, &entry).unwrap();
+
+        assert_eq!(std::fs::read(&preferences).unwrap(), before);
+        assert_eq!(load_launch_preferences_at(&preferences).unwrap().len(), 1);
+        assert_ne!(REMEMBERED_LAUNCH_SYSTEMS_FILE, LAUNCH_PREFERENCES_FILE);
+        // The store is self-describing and versioned for later builds.
+        let text = std::fs::read_to_string(&store).unwrap();
+        assert!(text.contains("\"version\": 1"), "{text}");
+    }
 }
