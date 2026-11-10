@@ -13,9 +13,12 @@
 //!
 //! # Safety rules
 //!
-//! - A choice only clears the tie warning from the one candidate it names.
-//!   Every other blocker and warning survives, a blocked candidate is never
-//!   made usable, and launch preflight still revalidates from scratch.
+//! - A choice only clears the tie from the one candidate it names: the tie
+//!   warning, or the RetroArch core tie ([`LaunchBlockerKind::AmbiguousCore`],
+//!   2026-11-10; never for Saturn, which has its own validated selection).
+//!   Every other blocker and warning survives, a candidate blocked for any
+//!   other reason is never made usable, and launch preflight still
+//!   revalidates from scratch.
 //! - A choice that names a missing, changed or blocked option never falls
 //!   back to another one: every remaining candidate receives
 //!   [`LaunchWarningKind::PreferredLaunchChoiceUnavailable`] (so strict
@@ -45,7 +48,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::planning::{CandidatePreference, LaunchCandidate, LaunchPlan, LaunchTarget};
-use super::readiness::{LaunchReadiness, LaunchWarning, LaunchWarningKind};
+use super::readiness::{LaunchBlockerKind, LaunchReadiness, LaunchWarning, LaunchWarningKind};
 use crate::emulator_environment::retroarch::{ProfileKind, ProfileScope};
 
 /// File name inside the EmuWiz configuration directory.
@@ -210,9 +213,27 @@ pub fn is_adopted(plan: &LaunchPlan) -> bool {
 }
 
 /// Whether the user may choose `candidate` for `plan`: an adopted platform
-/// with a verified game identity, and a candidate that is not blocked.
+/// with a game key, and a candidate that is not blocked - or is blocked only
+/// because several installed RetroArch cores fit and none is
+/// reviewed-preferred ([`LaunchBlockerKind::AmbiguousCore`]).
 pub fn is_choosable(plan: &LaunchPlan, candidate: &LaunchCandidate) -> bool {
-    is_adopted(plan) && plan.game_key.is_some() && candidate.readiness != LaunchReadiness::Blocked
+    is_adopted(plan) && plan.game_key.is_some() && usable_if_chosen(plan, candidate)
+}
+
+/// A candidate a choice may name: not blocked, or blocked by nothing but the
+/// core tie. That tie means "do not pick a core automatically"; the person's
+/// explicit choice is exactly the answer it waits for (as the reviewed native
+/// Saturn core selection already does). Saturn keeps its own validated core
+/// authority, and every other blocker - firmware, content, executable,
+/// a core installed twice under one name - still refuses.
+fn usable_if_chosen(plan: &LaunchPlan, candidate: &LaunchCandidate) -> bool {
+    candidate.readiness != LaunchReadiness::Blocked
+        || (plan.platform_id.as_deref() != Some("Saturn")
+            && !candidate.blockers.is_empty()
+            && candidate
+                .blockers
+                .iter()
+                .all(|blocker| blocker.kind == LaunchBlockerKind::AmbiguousCore))
 }
 
 /// The choice that applies to `(platform_id, game_key)` by precedence, or
@@ -266,7 +287,7 @@ pub fn apply(plan: &mut LaunchPlan, inputs: LaunchChoiceInputs<'_>) -> LaunchCho
         Ok(Some((source, option_id))) => {
             let option_id = option_id.to_owned();
             let usable = plan.candidates.iter().position(|candidate| {
-                candidate.readiness != LaunchReadiness::Blocked
+                usable_if_chosen(plan, candidate)
                     && launch_option_id(&candidate.target) == option_id
             });
             match usable {
@@ -321,6 +342,10 @@ pub fn chosen_source(
 fn choose(plan: &mut LaunchPlan, index: usize) {
     for (position, candidate) in plan.candidates.iter_mut().enumerate() {
         if position == index {
+            // Only the tie the person just answered; see `usable_if_chosen`.
+            candidate
+                .blockers
+                .retain(|blocker| blocker.kind != LaunchBlockerKind::AmbiguousCore);
             candidate.warnings.retain(|warning| {
                 !matches!(
                     warning.kind,

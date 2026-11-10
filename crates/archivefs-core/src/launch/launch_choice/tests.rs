@@ -629,3 +629,90 @@ fn a_save_that_would_exceed_the_read_limit_is_refused_and_keeps_the_old_file() {
     let reloaded = load_launch_preferences_at(&path).expect("the old file stays readable");
     assert_eq!(reloaded.len(), saved_count);
 }
+
+fn core_tied(mut plan: LaunchPlan, extra: Option<LaunchBlockerKind>) -> LaunchPlan {
+    for c in &mut plan.candidates {
+        c.warnings.clear();
+        c.blockers
+            .push(crate::launch::readiness::LaunchBlocker::new(
+                LaunchBlockerKind::AmbiguousCore,
+                "more than one installed RetroArch core resolves to this system",
+            ));
+        if let Some(kind) = extra {
+            c.blockers
+                .push(crate::launch::readiness::LaunchBlocker::new(kind, "other"));
+        }
+        c.readiness = LaunchReadiness::Blocked;
+    }
+    plan
+}
+
+fn once(platform: &str, profile: &str) -> LaunchOnceChoice {
+    LaunchOnceChoice {
+        platform_id: platform.into(),
+        game_key: GAME.into(),
+        option_id: option(profile),
+    }
+}
+
+/// Census 2026-11-10 (Atari 2600 zip, Neo Geo Pocket Color): several
+/// installed cores and no reviewed preference left every option Blocked with
+/// "Choice needed" and no way to choose. The person's choice answers exactly
+/// that tie, on the option it names only.
+#[test]
+fn a_core_tie_is_answered_by_an_explicit_choice_and_nothing_else_is_unblocked() {
+    let mut plan = core_tied(tie(), None);
+    assert!(plan.candidates.iter().all(|c| is_choosable(&plan, c)));
+    let choice = once("GameCube", APPIMAGE);
+    apply(
+        &mut plan,
+        LaunchChoiceInputs {
+            once: Some(&choice),
+            preferences: Ok(&[]),
+        },
+    );
+    assert_eq!(launchable(&plan), vec![option(APPIMAGE)]);
+    assert_eq!(candidate(&plan, NATIVE).readiness, LaunchReadiness::Blocked);
+
+    // Any other blocker beside the tie still refuses, chosen or not.
+    let mut plan = core_tied(tie(), Some(LaunchBlockerKind::RequiredFirmwareMissing));
+    assert!(plan.candidates.iter().all(|c| !is_choosable(&plan, c)));
+    apply(
+        &mut plan,
+        LaunchChoiceInputs {
+            once: Some(&choice),
+            preferences: Ok(&[]),
+        },
+    );
+    assert!(
+        plan.candidates
+            .iter()
+            .all(|c| c.readiness == LaunchReadiness::Blocked)
+    );
+
+    // Saturn keeps its own validated native core selection.
+    let mut saturn = core_tied(
+        plan_with(
+            "Saturn",
+            content("/games/Saturn.chd", false),
+            &[APPIMAGE, NATIVE],
+            &[],
+        ),
+        None,
+    );
+    assert!(saturn.candidates.iter().all(|c| !is_choosable(&saturn, c)));
+    let choice = once("Saturn", APPIMAGE);
+    apply(
+        &mut saturn,
+        LaunchChoiceInputs {
+            once: Some(&choice),
+            preferences: Ok(&[]),
+        },
+    );
+    assert!(
+        saturn
+            .candidates
+            .iter()
+            .all(|c| c.readiness == LaunchReadiness::Blocked)
+    );
+}
