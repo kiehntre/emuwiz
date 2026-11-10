@@ -81,6 +81,7 @@ mod key_and_error_tests {
         OpenRct2Install {
             executable: path.into(),
             executable_identity: CapturedFileIdentity {
+                changed: None,
                 device: 1,
                 inode: 2,
                 size: 3,

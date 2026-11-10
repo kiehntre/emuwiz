@@ -155,10 +155,13 @@ fn same_size_change_with_restored_mtime_still_fails_hash_validation() {
     host_fs::write(&f.source, vec![b'x'; metadata.len() as usize]).unwrap();
     file.set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
         .unwrap();
+    // The identity check now sees the rewrite through ctime whenever the
+    // kernel's timestamp tick moved; within one tick the hash still does.
     assert!(matches!(
         f.manager.prepare(&plan),
         Err(SafeLaunchSandboxError::ScratchVerificationFailed {
-            reason: VerificationFailureReason::SourceContentDrifted,
+            reason: VerificationFailureReason::SourceIdentityDrifted
+                | VerificationFailureReason::SourceContentDrifted,
             ..
         })
     ));

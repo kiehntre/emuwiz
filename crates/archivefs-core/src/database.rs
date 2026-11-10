@@ -11702,6 +11702,7 @@ mod tests {
 
     fn captured(device: u64, inode: u64, size: u64, mtime: u64) -> CapturedFileIdentity {
         CapturedFileIdentity {
+            changed: None,
             device,
             inode,
             size,
