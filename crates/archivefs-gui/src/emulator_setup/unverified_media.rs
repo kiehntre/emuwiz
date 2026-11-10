@@ -160,6 +160,11 @@ fn resolve_for(
                 };
             }
             Some(_) => {}
+            // No launch identity kind exists for this system (C64, VIC-20,
+            // ...), but a report that names the very system recorded - for
+            // example the library's own platform context - is no
+            // contradiction; the file's bytes are still checked below.
+            None if content == IdentityPlatform::from_catalogue(Some(platform)) => {}
             None => return Outcome::NotApplicable,
         }
     }
@@ -173,12 +178,10 @@ fn resolve_for(
     {
         return Outcome::NotApplicable;
     }
-    // The format must be one this system lists; otherwise nothing is offered.
-    let Some(identity) =
-        archivefs_core::launch::unverified_media::platform_media_identity(path, platform)
-    else {
-        return Outcome::NotApplicable;
-    };
+    // Content naming another system is refused first, even for a format
+    // this system does not list (a C64 cartridge filed under VIC-20): the
+    // conflict is explained instead of a generic review. Refusing is never
+    // a launch permission.
     let media =
         archivefs_core::launch::unverified_media::media_system_evidence_cached(path, platform);
     if let MediaSystemEvidence::Contradicts(other) = media {
@@ -187,6 +190,12 @@ fn resolve_for(
             content: other,
         };
     }
+    // The format must be one this system lists; otherwise nothing is offered.
+    let Some(identity) =
+        archivefs_core::launch::unverified_media::platform_media_identity(path, platform)
+    else {
+        return Outcome::NotApplicable;
+    };
     // A ZX tape that passed the strict structural validator is media evidence.
     let zx_tape = platform == archivefs_core::launch::unverified_media::ZX_PLATFORM
         && path
@@ -421,11 +430,16 @@ mod tests {
     #[test]
     fn nes_games_misfiled_under_snes_are_refused_or_never_offered() {
         let dir = tempfile::tempdir().unwrap();
-        // A .nes file in the SNES folder: not a format SNES lists.
+        // A .nes file in the SNES folder: not a format SNES lists, and its
+        // own header names NES, so the conflict is explained (2026-11-10:
+        // content conflicts are reported before the format check).
         let nes = ines(&dir, "Misfiled (USA).nes");
         assert_eq!(
             resolve5(&nes, "SNES", FOLDER, None, None),
-            Outcome::NotApplicable
+            Outcome::Contradicted {
+                recorded: "SNES",
+                content: "NES"
+            }
         );
         // An NES game zipped/renamed under a shared SNES format: its own
         // header contradicts the folder, even when the person chose SNES.
@@ -632,6 +646,81 @@ mod tests {
                 recorded: "SNES",
                 content: "NES"
             }
+        );
+    }
+
+    fn crt(dir: &tempfile::TempDir, name: &str, signature: &[u8; 16]) -> std::path::PathBuf {
+        let mut bytes = signature.to_vec();
+        bytes.extend_from_slice(&[0, 0, 0, 0x40, 1, 0, 0, 0, 0, 1]);
+        bytes.resize(0x40 + 0x10 + 0x2000, 0);
+        write(dir, name, &bytes)
+    }
+
+    /// Census 2026-11-10: every C64 and VIC-20 cartridge stopped at "identity
+    /// needs review" because these systems have no launch identity kind and
+    /// the library's own platform context was read as a contradiction.
+    #[test]
+    fn commodore_cartridges_follow_their_own_crt_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let c64 = crt(&dir, "1942.crt", b"C64 CARTRIDGE   ");
+        let vic = crt(&dir, "Omega Race.crt", b"VIC20 CARTRIDGE ");
+        assert_eq!(
+            allowed(&resolve5(
+                &c64,
+                "Commodore 64",
+                FOLDER,
+                Some(IdentityPlatform::Commodore64),
+                None
+            )),
+            Some(SystemBasis::Media)
+        );
+        // VIC-20 has no `.crt` launch format in the shared registry; that is
+        // deliberately unchanged so library scans classify `.crt` as before.
+        assert_eq!(
+            resolve5(&vic, "VIC-20", FOLDER, Some(IdentityPlatform::Vic20), None),
+            Outcome::NotApplicable
+        );
+        // A VIC-20 cartridge is never started as a C64 one, even by choice.
+        assert_eq!(
+            resolve5(&vic, "Commodore 64", MANUAL, None, None),
+            Outcome::Contradicted {
+                recorded: "Commodore 64",
+                content: "VIC-20"
+            }
+        );
+        // A C64 cartridge filed under VIC-20 (real library: Gorf) is refused
+        // with the conflict named, not left at a generic review.
+        assert_eq!(
+            resolve5(&c64, "VIC-20", FOLDER, Some(IdentityPlatform::Vic20), None),
+            Outcome::Contradicted {
+                recorded: "VIC-20",
+                content: "Commodore 64"
+            }
+        );
+        assert_eq!(
+            resolve(&c64, "VIC-20", FOLDER, None, None, Some("VIC-20")),
+            Outcome::Contradicted {
+                recorded: "VIC-20",
+                content: "Commodore 64"
+            }
+        );
+        // Without a signature the format decides exactly as before: `.crt`
+        // is a strong extension only the C64 lists.
+        let bare = write(&dir, "Unknown.crt", &[0u8; 128]);
+        assert_eq!(
+            allowed(&resolve5(&bare, "Commodore 64", FOLDER, None, None)),
+            Some(SystemBasis::Media)
+        );
+        // A report naming another system without a launch kind still stops.
+        assert_eq!(
+            resolve5(
+                &bare,
+                "Commodore 64",
+                FOLDER,
+                Some(IdentityPlatform::Enterprise),
+                None
+            ),
+            Outcome::NotApplicable
         );
     }
 }

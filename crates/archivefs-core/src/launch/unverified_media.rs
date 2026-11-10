@@ -326,6 +326,16 @@ pub fn media_system_evidence(path: &Path, platform_id: &str) -> MediaSystemEvide
         other == platform_id
             || crate::platform::equivalent_platform_ids(platform_id).contains(&other)
     };
+    // Launch-only: a VICE cartridge image names its machine in its first 16
+    // bytes. Read here rather than added to the shared platform registry so
+    // library scans classify `.crt` files exactly as before.
+    if let Some(machine) = vice_crt_machine(path) {
+        return if same(machine) {
+            MediaSystemEvidence::Agrees
+        } else {
+            MediaSystemEvidence::Contradicts(machine)
+        };
+    }
     // The file itself is the source root, so no folder alias can be read.
     let report = detect_platform_report(&DetectionRequest::new(path, path).inspecting_content());
     let content: Vec<_> = report
@@ -348,6 +358,28 @@ pub fn media_system_evidence(path: &Path, platform_id: &str) -> MediaSystemEvide
         return MediaSystemEvidence::Agrees;
     }
     MediaSystemEvidence::Silent
+}
+
+/// The machine a VICE `.crt` cartridge image declares in its 16-byte
+/// signature (VICE CRT format), or `None` for anything else.
+fn vice_crt_machine(path: &Path) -> Option<&'static str> {
+    use std::io::Read;
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("crt"))
+    {
+        return None;
+    }
+    let file = super::process_spawn::open_regular_file_nonblocking(path).ok()?;
+    let mut signature = [0u8; 16];
+    file.take(16).read_exact(&mut signature).ok()?;
+    match &signature {
+        b"C64 CARTRIDGE   " => Some("Commodore 64"),
+        b"C128 CARTRIDGE  " => Some("Commodore 128"),
+        b"VIC20 CARTRIDGE " => Some("VIC-20"),
+        _ => None,
+    }
 }
 
 /// [`media_system_evidence`] cached by (path, size, mtime, platform), for
@@ -731,5 +763,88 @@ mod tests {
         assert_eq!(zx_tape_identity(&path).unwrap().game_key, first);
         std::fs::write(&path, tap(&[&[0, 1, 2, 3, 4, 5]])).unwrap();
         assert_ne!(zx_tape_identity(&path).unwrap().game_key, first);
+    }
+
+    fn vice_crt(
+        dir: &Path,
+        folder: &str,
+        name: &str,
+        signature: Option<&[u8; 16]>,
+    ) -> std::path::PathBuf {
+        let folder = dir.join(folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut bytes = signature.map_or_else(|| vec![0u8; 16], |s| s.to_vec());
+        bytes.extend_from_slice(&[0, 0, 0, 0x40, 1, 0, 0, 0, 0, 1]);
+        bytes.resize(0x40 + 0x10 + 0x2000, 0);
+        let path = folder.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// Owner review gate 2026-11-10: the C64/VIC-20 cartridge launch fix
+    /// reads the VICE signature for launch only. Library scan detection of
+    /// `.crt` files (folder + extension evidence, no signature) must stay
+    /// exactly as on main, so no future scan reassigns a cartridge.
+    #[test]
+    fn crt_signatures_decide_launch_evidence_without_changing_scan_detection() {
+        use crate::platform::detect::{DetectionRequest, DetectionSource, detect_platform_report};
+        let root = tempfile::tempdir().unwrap();
+        // (folder, file, signature, recorded system, launch evidence)
+        let cases = [
+            (
+                "c64",
+                "1942.crt",
+                Some(b"C64 CARTRIDGE   "),
+                "Commodore 64",
+                MediaSystemEvidence::Agrees,
+            ),
+            (
+                "vic20",
+                "Gorf (USA, Europe).crt",
+                Some(b"C64 CARTRIDGE   "),
+                "VIC-20",
+                MediaSystemEvidence::Contradicts("Commodore 64"),
+            ),
+            (
+                "vic20",
+                "Omega Race.crt",
+                Some(b"VIC20 CARTRIDGE "),
+                "VIC-20",
+                MediaSystemEvidence::Agrees,
+            ),
+            (
+                "c64",
+                "Unsigned.crt",
+                None,
+                "Commodore 64",
+                MediaSystemEvidence::Agrees,
+            ),
+        ];
+        for (folder, name, signature, recorded, launch) in cases {
+            let path = vice_crt(root.path(), folder, name, signature);
+            let scan = detect_platform_report(
+                &DetectionRequest::new(&path, root.path()).inspecting_content(),
+            );
+            // Scan: decided by the folder alone, as on main; never by bytes.
+            assert_eq!(scan.platform, Some(recorded), "{folder}/{name}");
+            assert_eq!(
+                scan.deciding_source,
+                Some(DetectionSource::FolderAlias),
+                "{folder}/{name}"
+            );
+            assert!(
+                !scan
+                    .evidence
+                    .iter()
+                    .any(|e| e.source == DetectionSource::Signature),
+                "{folder}/{name}: scan detection must not read the CRT signature"
+            );
+            // Launch: the signature decides.
+            assert_eq!(
+                media_system_evidence(&path, recorded),
+                launch,
+                "{folder}/{name}"
+            );
+        }
     }
 }
