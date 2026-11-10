@@ -102,7 +102,7 @@ impl World {
         std::fs::write(&core, b"original fixture core").unwrap();
         RetroArchCommand {
             saturn_core_selection: None,
-            unverified_identity: false,
+            unverified_game_key: None,
             snapshot_evidence: Some(self.load().unwrap()),
             executable,
             arguments: vec![],

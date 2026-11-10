@@ -300,6 +300,12 @@ fn save_remembered_launch_choice(path: &Path, system: Option<&'static str>) -> R
     let store = remembered::default_remembered_launch_systems_path()?;
     match system {
         Some(system) => {
+            if !crate::emulator_setup::unverified_media::remembering_allowed(path, system) {
+                return Err(format!(
+                    "This launch choice cannot be remembered: the folder suggests another system, so {} can only be tried once for this file.",
+                    archivefs_core::platform::display_name_for(system)
+                ));
+            }
             let entry = remembered::RememberedLaunchSystem::for_current_file(path, system)
                 .ok_or_else(|| {
                     "This launch choice cannot be remembered: the game file could not be read."
@@ -847,15 +853,17 @@ impl NativeWorkflows {
                         trial_systems.len()
                     ));
                 }
-                if let Some(hint) =
-                    crate::emulator_setup::unverified_media::folder_hint_without_route(path)
-                {
+                let folder_hint =
+                    crate::emulator_setup::unverified_media::folder_hint_without_route(path);
+                if let Some(hint) = folder_hint {
                     ui.label(format!(
-                        "The folder name suggests {hint} (a hint only, not identification). EmuWiz cannot start {hint} games yet, and the systems below may not run them."
+                        "The folder name suggests {hint} (a hint only, not identification). EmuWiz cannot start {hint} games yet, and the systems below may not run them. A try is one launch only; it cannot be remembered for this file."
                     ));
+                    self.app.launch_remember_choice = None;
                 }
                 let mut remember = self.app.launch_remember_choice.as_deref() == Some(path);
-                if ui
+                if folder_hint.is_none()
+                    && ui
                     .checkbox(&mut remember, REMEMBER_LAUNCH_CHOICE)
                     .on_hover_text("Saves the system you press next for this file only, so you are not asked again. It applies only while the file is unchanged, is not game identification, never changes the library's recorded system, and anything the file itself shows still wins. Launch safety checks still apply. You can forget it here later.")
                     .changed()
@@ -3940,7 +3948,7 @@ impl NativeWorkflows {
     /// already running is never duplicated; a new one gets a new generation, so
     /// a late result for an older check or another game is dropped by the
     /// selected-evidence pipeline.
-    fn recheck_readiness_in_place(&mut self, context: &egui::Context) {
+    pub(super) fn recheck_readiness_in_place(&mut self, context: &egui::Context) {
         let Some(path) = self.selected.clone() else {
             return;
         };

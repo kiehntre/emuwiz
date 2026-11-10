@@ -591,6 +591,27 @@ impl ReadinessSources<'_> {
                 .and_then(archivefs_core::launch::launch_content_ref_for_zipped_cartridge)
         {
             content = zipped;
+        } else if (content.requires_mount || content.resolved_path.is_none())
+            && identity_unverified.is_some()
+            && let archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved) =
+                &identity_status
+            && let Some(path) = focused
+            && archivefs_core::zip_cartridge_stage::zip_cartridge_member_fits(
+                path,
+                &resolved.platform_id,
+            ) == Some(true)
+        {
+            // The same extraction for a zipped cartridge the unverified lane
+            // resolved (a try, a remembered or a saved choice): staging still
+            // demands one complete member this system's check accepts, and
+            // the extracted file passes the click-time header re-check.
+            content = archivefs_core::launch::LaunchContentRef {
+                kind: Some(archivefs_core::launch::LaunchContentKind::Cartridge),
+                container: Some(archivefs_core::launch::LaunchContainerKind::PlainFile),
+                resolved_path: Some(path.to_path_buf()),
+                requires_mount: false,
+                provenance: archivefs_core::launch::ZIPPED_CARTRIDGE_PROVENANCE.to_string(),
+            };
         }
 
         if let Some((_, selected_content)) = flycast_inputs {
@@ -1666,7 +1687,7 @@ impl ReadinessSources<'_> {
         }
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
         if let Some(basis) = identity_unverified {
-            crate::emulator_setup::unverified_media::apply_warning(&mut plan, basis);
+            crate::emulator_setup::unverified_media::apply_warning(&mut plan, basis, focused);
         }
         if let Some(probe) = &arcade_probe {
             crate::arcade_mame_probe::apply_warnings(&mut plan, probe);

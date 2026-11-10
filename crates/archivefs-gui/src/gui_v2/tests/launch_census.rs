@@ -206,7 +206,7 @@ fn real_library_launch_census() {
     let mut file = std::fs::File::create(&out).expect("CENSUS_OUT");
     writeln!(
         file,
-        "platform\text\tgroup_size\tid\tpath\tstatus\tprimary_action\theadline\tidentity\tfirmware\temulator\tplay_shown\tchoose_emulator_shown\tsettle_ms\tinput\tcard_text\tlaunch_play_button\tlaunch_identity_unresolved\tlaunch_choice_needed\tlaunch_choice_controls\ttry_anyway_shown\tlaunch_text"
+        "platform\text\tgroup_size\tid\tpath\tstatus\tprimary_action\theadline\tidentity\tfirmware\temulator\tplay_shown\tchoose_emulator_shown\tsettle_ms\tinput\tcard_text\tlaunch_play_button\tlaunch_identity_unresolved\tlaunch_choice_needed\tlaunch_choice_controls\ttry_anyway_shown\tlaunch_text\ttry_system\ttry_plan_ready\ttry_text"
     )
     .unwrap();
 
@@ -374,12 +374,70 @@ fn real_library_launch_census() {
         // choice can actually be made is shown by the controls themselves.
         let launch_choice_controls = launch_frame.iter().any(|t| t == "Use once");
         let try_anyway_shown = launch_frame.iter().any(|t| t.starts_with("Try once as "));
+        // "Try once offered" is not "Try once works": hold the first offered
+        // system as a one-time try in memory (what pressing the button does;
+        // nothing is saved) and record whether the Launch page then offers a
+        // launch. Nothing is clicked or started.
+        let mut try_system = String::new();
+        let mut try_plan_ready = String::new();
+        let mut try_text: Vec<String> = Vec::new();
+        if let Some(name) = launch_frame
+            .iter()
+            .find_map(|t| t.strip_prefix("Try once as "))
+            .map(str::to_string)
+            && let Some(system) = archivefs_core::platform::PLATFORMS
+                .iter()
+                .find(|p| p.display_name == name)
+                .map(|p| p.id)
+            && let Some(workflows) = app.native_workflows.as_mut()
+        {
+            try_system = system.to_string();
+            workflows.app.launch_system_trial = Some((game.archive.absolute_path.clone(), system));
+            workflows.recheck_readiness_in_place(&context);
+            let try_started = Instant::now();
+            let mut previous: Vec<String> = Vec::new();
+            let mut same_frames = 0;
+            let mut frame;
+            loop {
+                frame = paint(&mut app, &context);
+                let checking = frame
+                    .iter()
+                    .any(|t| t.contains("Checking") || t.contains("checking"));
+                if frame == previous && !checking {
+                    same_frames += 1;
+                    if same_frames >= 8 {
+                        break;
+                    }
+                } else {
+                    same_frames = 0;
+                }
+                previous = frame.clone();
+                if try_started.elapsed() > Duration::from_secs(seconds) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            try_plan_ready = frame
+                .iter()
+                .any(|t| t.starts_with("Play —") || t.starts_with("Launch "))
+                .to_string();
+            try_text = frame
+                .iter()
+                .skip_while(|t| !t.starts_with("Play / Launch readiness"))
+                .take(60)
+                .cloned()
+                .collect();
+            if let Some(workflows) = app.native_workflows.as_mut() {
+                workflows.app.launch_system_trial = None;
+            }
+        }
         writeln!(
             file,
-            "{platform}\t{ext}\t{size}\t{id}\t{}\t{status}\t{action}\t{headline}\t{identity}\t{firmware}\t{emulator}\t{play_shown}\t{choose_shown}\t{settle_ms}\t{input}\t{}\t{launch_play}\t{launch_identity_unresolved}\t{launch_choice_needed}\t{launch_choice_controls}\t{try_anyway_shown}\t{}",
+            "{platform}\t{ext}\t{size}\t{id}\t{}\t{status}\t{action}\t{headline}\t{identity}\t{firmware}\t{emulator}\t{play_shown}\t{choose_shown}\t{settle_ms}\t{input}\t{}\t{launch_play}\t{launch_identity_unresolved}\t{launch_choice_needed}\t{launch_choice_controls}\t{try_anyway_shown}\t{}\t{try_system}\t{try_plan_ready}\t{}",
             clean(&game.archive.absolute_path.display().to_string()),
             clean(&card.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ¦ ")),
             clean(&launch_text.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ¦ ")),
+            clean(&try_text.join(" ¦ ")),
         )
         .unwrap();
         file.flush().unwrap();

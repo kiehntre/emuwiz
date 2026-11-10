@@ -117,6 +117,9 @@ pub(crate) fn resolve(
     trial: Option<&'static str>,
     remembered: Option<&'static str>,
 ) -> Outcome {
+    // A manual system choice saved after a try was pressed outranks that try
+    // (the try is a one-launch guess; the choice is the person's decision).
+    let trial = trial.filter(|_| platform_source != Some(archivefs_core::MANUAL_PLATFORM_SOURCE));
     let outcome = resolve_for(
         path,
         platform_hint,
@@ -136,6 +139,9 @@ pub(crate) fn resolve(
     match (outcome, remembered) {
         (outcome, Some(system)) if remembered_applies(&outcome) => {
             match resolve_for(path, system, None, content_platform, Some(system)) {
+                // A choice remembered before the folder rule existed is not
+                // applied; a contradiction is still explained.
+                Outcome::Allowed(..) if !remembering_allowed(path, system) => outcome,
                 Outcome::Allowed(identity, _) => {
                     Outcome::Allowed(identity, SystemBasis::Remembered)
                 }
@@ -325,17 +331,53 @@ pub(crate) fn folder_hint_without_route(path: &Path) -> Option<&'static str> {
         .then_some(archivefs_core::launch::unverified_media::SEGA_PICO_PLATFORM)
 }
 
-/// Adds the visible warning to every usable candidate (never removes a
-/// blocker, never touches a blocked candidate) and refreshes the summary.
-pub(crate) fn apply_warning(plan: &mut LaunchPlan, basis: SystemBasis) {
+/// Whether "Remember this launch choice" may save (or apply) `system` for
+/// this file. A folder that names a system EmuWiz has no route for (a
+/// `sega-pico` folder) is a caution, not identification: such a file may
+/// still be tried once, but no other system is remembered for it, so a
+/// Mega Drive guess never becomes the file's standing launch answer
+/// (owner ruling 2026-11-10). The file's own header is checked separately.
+pub(crate) fn remembering_allowed(path: &Path, system: &str) -> bool {
+    folder_hint_without_route(path).is_none_or(|hint| hint == system)
+}
+
+/// The extra caution a one-time try carries when the folder names a system
+/// EmuWiz cannot start.
+pub(crate) fn folder_hint_caution(path: &Path) -> Option<String> {
+    folder_hint_without_route(path).map(|hint| {
+        format!(
+            " This file is in a {hint} folder: it may be a {hint} game, which this system may not run correctly. This try cannot be remembered."
+        )
+    })
+}
+
+/// Adds the visible warning to every usable RetroArch candidate (never
+/// removes a blocker, never touches a blocked candidate), blocks every other
+/// route, and refreshes the summary.
+pub(crate) fn apply_warning(plan: &mut LaunchPlan, basis: SystemBasis, path: Option<&Path>) {
+    let caution = path
+        .filter(|_| basis == SystemBasis::Trial)
+        .and_then(folder_hint_caution)
+        .unwrap_or_default();
     for candidate in &mut plan.candidates {
-        // Only the RetroArch route was approved; standalone routes keep their
-        // own (stricter) rules and never receive the warning.
+        // Only the RetroArch route was approved for an unconfirmed system: its
+        // click-time preflight and spawn re-derive the file's key and re-check
+        // its header. Standalone preflights trust the identity they are
+        // handed, so they never start a file this lane resolved.
+        if !matches!(
+            candidate.target,
+            archivefs_core::launch::LaunchTarget::RetroArchCore { .. }
+        ) {
+            if candidate.readiness != LaunchReadiness::Blocked {
+                candidate.blockers.push(archivefs_core::launch::LaunchBlocker::new(
+                    archivefs_core::launch::LaunchBlockerKind::IdentityUnresolved,
+                    "This emulator only starts games whose system is confirmed; a game started without that check can only use RetroArch.",
+                ));
+                candidate.readiness = LaunchReadiness::Blocked;
+            }
+            continue;
+        }
         if candidate.readiness == LaunchReadiness::Blocked
-            || !matches!(
-                candidate.target,
-                archivefs_core::launch::LaunchTarget::RetroArchCore { .. }
-            )
             || candidate
                 .warnings
                 .iter()
@@ -343,7 +385,7 @@ pub(crate) fn apply_warning(plan: &mut LaunchPlan, basis: SystemBasis) {
         {
             continue;
         }
-        let text = warning_text(plan.platform_id.as_deref().unwrap_or_default(), basis);
+        let text = warning_text(plan.platform_id.as_deref().unwrap_or_default(), basis) + &caution;
         candidate.warnings.push(LaunchWarning::new(
             LaunchWarningKind::IdentityUnverified,
             text,
@@ -996,6 +1038,161 @@ mod tests {
         // No hint outside a Pico folder.
         let elsewhere = zip_one(dir.path(), "Other.zip", "Other.md", &md_rom(b""));
         assert_eq!(folder_hint_without_route(&elsewhere), None);
+    }
+
+    /// The 22 `sega-pico` files whose header does not name the Pico (blank,
+    /// odd or Genesis-headed): a one-time try stays, with the folder as a
+    /// visible caution, but no other system is ever remembered for them
+    /// (owner ruling 2026-11-10).
+    #[test]
+    fn a_pico_folder_file_may_be_tried_once_but_never_remembered_as_mega_drive() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("sega-pico");
+        std::fs::create_dir(&folder).unwrap();
+        for (name, header) in [
+            ("Blank (Japan)", &b""[..]),
+            ("Odd (Japan)", &b"IMA IKUNOUJYUKU "[..]),
+            ("Genesis (USA)", &b"SEGA GENESIS    "[..]),
+        ] {
+            let path = zip_one(
+                &folder,
+                &format!("{name}.zip"),
+                &format!("{name}.md"),
+                &md_rom(header),
+            );
+            assert!(
+                trial_systems(&path, None, &|_| true).contains(&"MegaDrive"),
+                "{name}"
+            );
+            assert!(matches!(
+                resolve(&path, "", None, None, Some("MegaDrive"), None),
+                Outcome::Allowed(_, SystemBasis::Trial)
+            ));
+            assert!(!remembering_allowed(&path, "MegaDrive"), "{name}");
+            assert!(remembering_allowed(&path, "Sega Pico"), "{name}");
+            // A Mega Drive choice remembered before this rule is not applied.
+            assert!(
+                !matches!(
+                    resolve(&path, "", None, None, None, Some("MegaDrive")),
+                    Outcome::Allowed(..)
+                ),
+                "{name}"
+            );
+            // The try's warning carries the folder caution.
+            let mut plan = plan_with(vec![retroarch_candidate(&path)]);
+            apply_warning(&mut plan, SystemBasis::Trial, Some(&path));
+            let text = &plan.candidates[0].warnings[0].detail;
+            assert!(text.contains("one-time try as Sega Mega Drive"), "{text}");
+            assert!(text.contains("Sega Pico folder"), "{text}");
+            assert!(text.contains("cannot be remembered"), "{text}");
+        }
+        // Outside a Pico folder remembering works as before.
+        let elsewhere = zip_one(dir.path(), "Other.zip", "Other.md", &md_rom(b""));
+        assert!(remembering_allowed(&elsewhere, "MegaDrive"));
+        assert!(matches!(
+            resolve(&elsewhere, "", None, None, None, Some("MegaDrive")),
+            Outcome::Allowed(_, SystemBasis::Remembered)
+        ));
+    }
+
+    fn retroarch_candidate(path: &Path) -> archivefs_core::launch::LaunchCandidate {
+        archivefs_core::launch::LaunchCandidate {
+            target: archivefs_core::launch::LaunchTarget::RetroArchCore {
+                profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+                    profile_kind:
+                        archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+                    scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+                },
+                core_stem: "genesis_plus_gx".into(),
+                platform_id: "MegaDrive",
+            },
+            ..standalone_candidate(path)
+        }
+    }
+
+    fn standalone_candidate(path: &Path) -> archivefs_core::launch::LaunchCandidate {
+        archivefs_core::launch::LaunchCandidate {
+            target: archivefs_core::launch::LaunchTarget::Standalone {
+                adapter_id: "tsugaru",
+                profile_id: "p".into(),
+                profile_path: None,
+            },
+            content: archivefs_core::launch::LaunchContentRef {
+                kind: None,
+                container: Some(archivefs_core::launch::LaunchContainerKind::PlainFile),
+                resolved_path: Some(path.to_path_buf()),
+                requires_mount: false,
+                provenance: "test".into(),
+            },
+            firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+            readiness: LaunchReadiness::Ready,
+            preference: archivefs_core::launch::CandidatePreference::SoleEligible,
+        }
+    }
+
+    fn plan_with(candidates: Vec<archivefs_core::launch::LaunchCandidate>) -> LaunchPlan {
+        LaunchPlan {
+            platform_id: Some("MegaDrive".into()),
+            game_key: Some("unverified:test".into()),
+            candidates,
+            summary: Default::default(),
+            media_topology: None,
+        }
+    }
+
+    /// Standalone preflights trust the identity they are handed, so a file
+    /// this lane resolved never reaches them; RetroArch keeps its warning.
+    #[test]
+    fn an_unconfirmed_system_blocks_every_standalone_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(&dir, "Disc.chd", &[0u8; 64]);
+        for basis in [
+            SystemBasis::Trial,
+            SystemBasis::Remembered,
+            SystemBasis::Chosen,
+            SystemBasis::Media,
+        ] {
+            let mut plan = plan_with(vec![
+                standalone_candidate(&path),
+                retroarch_candidate(&path),
+            ]);
+            apply_warning(&mut plan, basis, Some(&path));
+            assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Blocked);
+            assert_eq!(
+                plan.candidates[0].blockers[0].kind,
+                archivefs_core::launch::LaunchBlockerKind::IdentityUnresolved
+            );
+            assert_eq!(
+                plan.candidates[1].readiness,
+                LaunchReadiness::ReadyWithWarnings
+            );
+            assert_eq!(plan.summary.blocked, 1);
+            assert_eq!(plan.summary.ready_with_warnings, 1);
+        }
+    }
+
+    /// A manual system choice saved after "Try once" was pressed wins over
+    /// the held try for the same file.
+    #[test]
+    fn a_manual_system_choice_outranks_a_held_try() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = zip_one(dir.path(), "Game.zip", "Game.md", &md_rom(b""));
+        let manual = Some(archivefs_core::MANUAL_PLATFORM_SOURCE);
+        // A held try names some other system.
+        let other = "SNES";
+        match resolve(&path, "MegaDrive", manual, None, Some(other), None) {
+            Outcome::Allowed(identity, SystemBasis::Chosen) => {
+                assert_eq!(identity.platform_id, "MegaDrive")
+            }
+            other => panic!("{other:?}"),
+        }
+        // Without a manual choice the try still applies.
+        assert!(matches!(
+            resolve(&path, "MegaDrive", None, None, Some(other), None),
+            Outcome::Allowed(_, SystemBasis::Trial)
+        ));
     }
 
     #[test]

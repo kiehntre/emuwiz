@@ -674,7 +674,7 @@ pub fn preflight_retroarch_launch(
     }
 
     command.snapshot_evidence = snapshot_evidence;
-    command.unverified_identity = unverified_media;
+    command.unverified_game_key = unverified_media.then(|| request.expected_game_key.clone());
     Ok(command)
 }
 
@@ -1090,15 +1090,16 @@ pub(crate) fn spawn_retroarch_guarded(
             .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
     }
     let mut backend_stamps = None;
-    let current_snapshot = if command.unverified_identity {
-        // An unverified launch must still be the same accepted file now, and
-        // never carries snapshot evidence.
+    let current_snapshot = if let Some(expected_key) = &command.unverified_game_key {
+        // An unverified launch must still be the same accepted file now (the
+        // content-bound key it was checked with), and never carries snapshot
+        // evidence.
         if command.snapshot_evidence.is_some()
             || super::unverified_media::platform_media_identity_fresh(
                 &command.selection.content_path,
                 &command.selection.platform_id,
             )
-            .is_none()
+            .is_none_or(|identity| &identity.game_key != expected_key)
             || matches!(
                 super::unverified_media::media_system_evidence(
                     &command.selection.content_path,
@@ -1467,6 +1468,29 @@ pub fn preflight_and_launch_retroarch_with_playlist(
             })?;
             let mut staged_request = request.clone();
             staged_request.selected_content_path = staged.path().to_path_buf();
+            // An unverified key is bound to the ZIP's bytes, not the member's:
+            // the ZIP must still be the file that was checked (staging also
+            // refused a ZIP that changed while extracting), and the member is
+            // then held to its own key from here to spawn.
+            if super::unverified_media::is_unverified_key(&request.expected_game_key) {
+                let zip_unchanged = super::unverified_media::platform_media_identity_fresh(
+                    &request.selected_content_path,
+                    &request.expected_platform_id,
+                )
+                .is_some_and(|identity| identity.game_key == request.expected_game_key);
+                let member = super::unverified_media::platform_media_identity_fresh(
+                    staged.path(),
+                    &request.expected_platform_id,
+                )
+                .filter(|_| zip_unchanged)
+                .ok_or_else(|| {
+                    preflight_error(
+                        LaunchPreflightErrorKind::IdentityUnresolved,
+                        "The game file changed or is no longer a format this system accepts; recheck this game.",
+                    )
+                })?;
+                staged_request.expected_game_key = member.game_key;
+            }
             let command = preflight_retroarch_launch_with_playlist(
                 &staged_request,
                 filesystem,
