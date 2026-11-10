@@ -25,6 +25,25 @@ pub fn is_zipped_cartridge_request(content: &Path, platform_id: &str) -> bool {
         && is_loose_cartridge_platform(IdentityPlatform::from_catalogue(Some(platform_id)))
 }
 
+/// Whether `zip` holds exactly one ROM member that `platform_id`'s zipped
+/// cartridge staging would accept: `None` when staging does not apply to that
+/// system (not a `.zip`, or not a loose-cartridge platform), otherwise
+/// whether [`select_zip_cartridge_member`] selects a member. Reads only the
+/// central directory; nothing is decompressed or written.
+pub fn zip_cartridge_member_fits(zip: &Path, platform_id: &str) -> Option<bool> {
+    if !is_zipped_cartridge_request(zip, platform_id) {
+        return None;
+    }
+    let platform = IdentityPlatform::from_catalogue(Some(platform_id));
+    let Ok(file) = open_read_only_regular(zip, &TrustedRoots::none()) else {
+        return Some(false);
+    };
+    let Ok(mut archive) = ZipArchive::new(file) else {
+        return Some(false);
+    };
+    Some(select_zip_cartridge_member(&mut archive, platform, &mut 0).is_ok())
+}
+
 /// A zipped cartridge ROM extracted for one launch into a private, owner-only
 /// temporary directory outside the library. Dropping it removes the directory,
 /// so failure paths and process exit clean up. The ZIP is never modified.

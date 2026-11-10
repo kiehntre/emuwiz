@@ -252,6 +252,22 @@ pub(crate) fn trial_systems(
             archivefs_core::launch::unverified_media::platform_lists_extension(id, extension)
         })
         .filter(|id| has_route(id))
+        // A format the system's route explicitly does not start (Amiga IPF
+        // and HDF, unsupported archives or cartridge formats) is never offered:
+        // trying cannot manufacture launch support (owner rule 7).
+        .filter(|id| {
+            !matches!(
+                crate::emulator_setup::readiness_input::identity_unknown_reason(
+                    Some(path),
+                    None,
+                    Some(Some(id)),
+                ),
+                crate::launch_readiness_page::IdentityUnknownReason::AmigaHardDisk
+                    | crate::launch_readiness_page::IdentityUnknownReason::AmigaIpf
+                    | crate::launch_readiness_page::IdentityUnknownReason::UnsupportedArchive
+                    | crate::launch_readiness_page::IdentityUnknownReason::UnsupportedFormat(_)
+            )
+        })
         .filter(|id| {
             matches!(
                 resolve_for(path, id, None, None, Some(id)),
@@ -268,6 +284,21 @@ pub(crate) fn trial_systems(
     if systems.iter().any(|(_, agrees)| *agrees) {
         systems.retain(|(_, agrees)| *agrees);
     }
+    // A ZIP holding one cartridge ROM is evidence too: offer only the
+    // cartridge systems whose staging would accept that member (a Sega Pico
+    // `.md` is not an Atari 2600 game), and drop cartridge systems that would
+    // refuse it at launch anyway.
+    let fits: Vec<Option<bool>> = systems
+        .iter()
+        .map(|(id, _)| archivefs_core::zip_cartridge_stage::zip_cartridge_member_fits(path, id))
+        .collect();
+    if fits.contains(&Some(true)) {
+        let mut fits = fits.into_iter();
+        systems.retain(|_| fits.next() == Some(Some(true)));
+    } else {
+        let mut fits = fits.into_iter();
+        systems.retain(|_| fits.next() != Some(Some(false)));
+    }
     let mut systems: Vec<&'static str> = systems.into_iter().map(|(id, _)| id).collect();
     if let Some(recorded) = recorded
         && let Some(index) = systems.iter().position(|id| *id == recorded)
@@ -276,6 +307,22 @@ pub(crate) fn trial_systems(
         systems.insert(0, first);
     }
     systems
+}
+
+/// A system a folder name suggests but EmuWiz has no launch route for (today
+/// only the Sega Pico): shown as a non-authoritative hint next to the systems
+/// offered for a try, never used to choose, offer or refuse one.
+pub(crate) fn folder_hint_without_route(path: &Path) -> Option<&'static str> {
+    path.parent()?
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .any(|name| {
+            matches!(
+                archivefs_core::platform::normalize_alias(name).as_str(),
+                "segapico" | "pico" | "kidspico"
+            )
+        })
+        .then_some(archivefs_core::launch::unverified_media::SEGA_PICO_PLATFORM)
 }
 
 /// Adds the visible warning to every usable candidate (never removes a
@@ -597,12 +644,26 @@ mod tests {
         );
         // The trial list never offers a system the header rules out.
         assert!(!trial_systems(&renamed, Some("SNES"), &|_| true).contains(&"SNES"));
-        let zip = write(&dir, "Game (USA).zip", b"PK\x03\x04rest-of-archive");
+        // A ZIP whose single member an SNES staging accepts lists SNES first.
+        let zip = dir.path().join("Game (USA).zip");
+        {
+            let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+            writer
+                .start_file("Game (USA).sfc", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut writer, &[0u8; 0x8000]).unwrap();
+            writer.finish().unwrap();
+        }
         let systems = trial_systems(&zip, Some("SNES"), &|_| true);
-        assert_eq!(systems.first(), Some(&"SNES"));
+        assert_eq!(systems.first(), Some(&"SNES"), "{systems:?}");
+        assert!(!systems.contains(&"NES"), "{systems:?}");
+        // An unreadable ZIP would be refused by every cartridge staging, so
+        // no cartridge system is offered for it.
+        let broken = write(&dir, "Broken (USA).zip", b"PK\x03\x04rest-of-archive");
+        let systems = trial_systems(&broken, Some("SNES"), &|_| true);
         assert!(
-            systems.contains(&"NES"),
-            "an ambiguous ZIP may be tried as another system: {systems:?}"
+            !systems.contains(&"SNES") && !systems.contains(&"NES"),
+            "{systems:?}"
         );
     }
 
@@ -812,5 +873,175 @@ mod tests {
         // Formats no system lists offer nothing.
         let odd = write(&dir, "notes.xyz", b"hello");
         assert!(trial_systems(&odd, None, &|_| true).is_empty());
+    }
+
+    #[test]
+    fn a_zipped_cartridge_offers_only_systems_that_accept_its_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Wan-chan (Japan).zip");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            zip.start_file(
+                "Wan-chan (Japan).md",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            std::io::Write::write_all(&mut zip, &[0u8; 4096]).unwrap();
+            zip.finish().unwrap();
+        }
+        let offered = trial_systems(&path, None, &|_| true);
+        assert!(offered.contains(&"MegaDrive"), "{offered:?}");
+        for never in ["Atari2600", "Arcade", "AtariST", "NES"] {
+            assert!(!offered.contains(&never), "{never} offered: {offered:?}");
+        }
+    }
+
+    /// A Mega Drive-format ROM of `len` bytes with `system` at 0x100.
+    fn md_rom(system: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x8000];
+        bytes[0x100..0x100 + system.len()].copy_from_slice(system);
+        bytes
+    }
+
+    fn zip_one(
+        dir: &std::path::Path,
+        name: &str,
+        member: &str,
+        bytes: &[u8],
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file(member, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, bytes).unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn a_pico_header_rules_out_mega_drive_for_offers_tries_and_remembered_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("sega-pico");
+        std::fs::create_dir(&folder).unwrap();
+        for header in [
+            &b"SEGA PICO       "[..],
+            b"SEGATOYS PICO   ",
+            b"SAMSUNG PICO    ",
+        ] {
+            let zip = zip_one(
+                &folder,
+                "Wan-chan (Japan).zip",
+                "Wan-chan (Japan).md",
+                &md_rom(header),
+            );
+            // CONTRADICTED: nothing is offered, not even Mega Drive.
+            assert!(trial_systems(&zip, None, &|_| true).is_empty());
+            // Picking or remembering Mega Drive is refused, never allowed.
+            for outcome in [
+                resolve(&zip, "", None, None, Some("MegaDrive"), None),
+                resolve(&zip, "", None, None, None, Some("MegaDrive")),
+                resolve(&zip, "MegaDrive", None, None, None, None),
+            ] {
+                assert!(
+                    matches!(
+                        outcome,
+                        Outcome::Contradicted {
+                            content: "Sega Pico",
+                            ..
+                        }
+                    ),
+                    "{outcome:?}"
+                );
+            }
+            std::fs::remove_file(&zip).unwrap();
+        }
+        // The same for a loose Pico ROM.
+        let loose = folder.join("Loose (Japan).md");
+        std::fs::write(&loose, md_rom(b"SEGA PICO       ")).unwrap();
+        assert!(!trial_systems(&loose, None, &|_| true).contains(&"MegaDrive"));
+        assert!(archivefs_core::launch::unverified_media::is_sega_pico_rom(
+            &loose
+        ));
+    }
+
+    #[test]
+    fn an_ambiguous_pico_folder_zip_keeps_try_once_with_the_folder_as_a_hint_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("sega-pico");
+        std::fs::create_dir(&folder).unwrap();
+        // AMBIGUOUS: a blank header names nothing, so the systems that accept
+        // the member stay available as a one-time try, with the folder shown
+        // only as a hint (it never chooses or refuses a system).
+        let blank = zip_one(
+            &folder,
+            "Blank (Japan).zip",
+            "Blank (Japan).md",
+            &md_rom(b""),
+        );
+        let offered = trial_systems(&blank, None, &|_| true);
+        assert!(offered.contains(&"MegaDrive"), "{offered:?}");
+        assert_eq!(folder_hint_without_route(&blank), Some("Sega Pico"));
+        assert!(matches!(
+            resolve(&blank, "", None, None, Some("MegaDrive"), None),
+            Outcome::Allowed(_, SystemBasis::Trial)
+        ));
+        // POSITIVE: a Genesis header is still offered as Mega Drive.
+        let genesis = zip_one(
+            &folder,
+            "Genesis (USA).zip",
+            "Genesis (USA).md",
+            &md_rom(b"SEGA GENESIS    "),
+        );
+        assert!(trial_systems(&genesis, None, &|_| true).contains(&"MegaDrive"));
+        // No hint outside a Pico folder.
+        let elsewhere = zip_one(dir.path(), "Other.zip", "Other.md", &md_rom(b""));
+        assert_eq!(folder_hint_without_route(&elsewhere), None);
+    }
+
+    #[test]
+    fn ambiguous_chd_ipf_dsk_and_zip_games_with_no_system_keep_try_once() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes, expect) in [
+            ("Disc (Japan).chd", vec![0u8; 4096], "PC Engine CD"),
+            ("Disk (Europe).ipf", vec![0u8; 4096], "AtariST"),
+            ("Disk (Japan).dsk", vec![0u8; 4096], "MSX"),
+        ] {
+            let path = write(&dir, name, &bytes);
+            let offered = trial_systems(&path, None, &|_| true);
+            // IPF keeps Atari ST only: Amiga IPF is unsupported (rule 7).
+            assert!(
+                offered.len() > 1 || name.ends_with(".ipf"),
+                "{name}: {offered:?}"
+            );
+            assert!(!offered.contains(&"Amiga"), "{name}: {offered:?}");
+            assert!(offered.contains(&expect), "{name}: {offered:?}");
+            assert!(matches!(
+                resolve(&path, "", None, None, Some(expect), None),
+                Outcome::Allowed(_, SystemBasis::Trial)
+            ));
+        }
+        // A multi-file set (an arcade-style ZIP) is ambiguous too.
+        let path = dir.path().join("ace.zip");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            for member in ["sa.txt", "sa_a3_u1.bin", "sa_a3_u2.bin"] {
+                zip.start_file(member, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zip, &[0u8; 512]).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let offered = trial_systems(&path, None, &|_| true);
+        assert!(offered.contains(&"Arcade"), "{offered:?}");
+    }
+
+    #[test]
+    fn a_format_the_system_does_not_start_is_never_offered_for_a_try() {
+        let dir = tempfile::tempdir().unwrap();
+        let ipf = write(&dir, "5th Gear (Europe).ipf", &[0u8; 4096]);
+        let offered = trial_systems(&ipf, None, &|_| true);
+        assert!(!offered.contains(&"Amiga"), "{offered:?}");
+        let hdf = write(&dir, "Game.hdf", &[0u8; 4096]);
+        assert!(!trial_systems(&hdf, None, &|_| true).contains(&"Amiga"));
     }
 }

@@ -841,6 +841,19 @@ impl NativeWorkflows {
                 ui.label(format!(
                     "{TRY_ANYWAY}: EmuWiz will not start this game on a folder guess alone. Pick a system to try it once; you will see a warning, nothing is saved, and later scans are unaffected."
                 ));
+                if trial_systems.len() > 1 {
+                    ui.label(format!(
+                        "EmuWiz cannot tell which system this file is for: {} systems with an installed emulator use this format and nothing in the file rules them out. A try may not start correctly.",
+                        trial_systems.len()
+                    ));
+                }
+                if let Some(hint) =
+                    crate::emulator_setup::unverified_media::folder_hint_without_route(path)
+                {
+                    ui.label(format!(
+                        "The folder name suggests {hint} (a hint only, not identification). EmuWiz cannot start {hint} games yet, and the systems below may not run them."
+                    ));
+                }
                 let mut remember = self.app.launch_remember_choice.as_deref() == Some(path);
                 if ui
                     .checkbox(&mut remember, REMEMBER_LAUNCH_CHOICE)
@@ -850,7 +863,7 @@ impl NativeWorkflows {
                     self.app.launch_remember_choice = remember.then(|| path.to_path_buf());
                 }
                 ui.horizontal_wrapped(|ui| {
-                    for system in trial_systems.iter().take(8) {
+                    for system in &trial_systems {
                         let name = archivefs_core::platform::display_name_for(system);
                         let (label, hover) = if remember {
                             (

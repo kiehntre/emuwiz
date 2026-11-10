@@ -449,6 +449,16 @@ impl ReadinessSources<'_> {
                         {
                             lane_reason =
                                 Some(launch_readiness_page::IdentityUnknownReason::SystemUnknown);
+                        } else if system_unknown
+                            && archivefs_core::launch::unverified_media::is_sega_pico_rom(path)
+                        {
+                            // The header names the Pico and rules out every
+                            // other system: say so instead of a generic
+                            // "choose a system" (owner ruling 2026-11-10).
+                            lane_reason =
+                                Some(launch_readiness_page::IdentityUnknownReason::NoLaunchRoute(
+                                    archivefs_core::launch::unverified_media::SEGA_PICO_PLATFORM,
+                                ));
                         }
                     }
                 }

@@ -269,7 +269,19 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
                     Vec::new()
                 }
             } else {
+                // An option blocked only by a core tie can be chosen, so it
+                // speaks for the game before an option that cannot open the
+                // file at all (Stella refusing a zipped 2600 cartridge must
+                // not turn the action into "Check games folder").
                 selected_candidate(plan)
+                    .or_else(|| {
+                        plan.candidates.iter().find(|c| {
+                            !c.blockers.is_empty()
+                                && c.blockers
+                                    .iter()
+                                    .all(|b| b.kind == LaunchBlockerKind::AmbiguousCore)
+                        })
+                    })
                     .or_else(|| plan.candidates.iter().find(|c| !c.blockers.is_empty()))
                     .map(findings_for)
                     .unwrap_or_default()
@@ -337,11 +349,15 @@ fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSumma
         reason @ (IdentityUnknownReason::NoIdentityCheck(_)
         | IdentityUnknownReason::UnsupportedFormat(_)
         | IdentityUnknownReason::AmigaHardDisk
-        | IdentityUnknownReason::AmigaIpf) => base(
+        | IdentityUnknownReason::AmigaIpf
+        | IdentityUnknownReason::NoLaunchRoute(_)) => base(
             ReadinessPresentationState::Blocked,
             &match reason {
                 IdentityUnknownReason::NoIdentityCheck(system) => {
                     format!("EmuWiz has no identity check for {system} yet")
+                }
+                IdentityUnknownReason::NoLaunchRoute(system) => {
+                    format!("This is a {system} game, which EmuWiz cannot start yet")
                 }
                 IdentityUnknownReason::UnsupportedFormat(_) => {
                     "EmuWiz does not read this file format yet".to_string()
@@ -1754,6 +1770,12 @@ mod tests {
         );
         // Census 2026-11-10: the media branch said "could not be read" here.
         assert_ne!(summary.status, ReadinessPresentationState::MediaUnreadable);
+        // Census 2026-11-10 (059ae25a): the action followed the option that
+        // cannot open ZIPs ("Check games folder"); the tie can be chosen.
+        assert_eq!(
+            summary.primary_action,
+            Some(ReadinessAction::ChooseEmulator)
+        );
         // With nothing else, the refusal is still reported - without claiming
         // the folder is unreachable (the file may simply be an archive).
         let alone = project(&plan(vec![mesen]), ReadinessFreshness::Current);

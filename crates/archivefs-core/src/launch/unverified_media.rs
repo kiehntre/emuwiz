@@ -336,6 +336,17 @@ pub fn media_system_evidence(path: &Path, platform_id: &str) -> MediaSystemEvide
             MediaSystemEvidence::Contradicts(machine)
         };
     }
+    // Launch-only: a Sega Pico cartridge shares the Mega Drive `.md` format
+    // and the `SEGA` header prefix but names PICO in its header. It is no
+    // other system's game (owner ruling 2026-11-10: the extension is not
+    // hardware compatibility), so every other system is contradicted.
+    if is_sega_pico_rom(path) {
+        return if platform_id == SEGA_PICO_PLATFORM {
+            MediaSystemEvidence::Agrees
+        } else {
+            MediaSystemEvidence::Contradicts(SEGA_PICO_PLATFORM)
+        };
+    }
     // The file itself is the source root, so no folder alias can be read.
     let report = detect_platform_report(&DetectionRequest::new(path, path).inspecting_content());
     let content: Vec<_> = report
@@ -358,6 +369,67 @@ pub fn media_system_evidence(path: &Path, platform_id: &str) -> MediaSystemEvide
         return MediaSystemEvidence::Agrees;
     }
     MediaSystemEvidence::Silent
+}
+
+/// The Sega Pico, named here only for launch decisions. It is deliberately not
+/// a platform-registry entry: adding one would reclassify library scans,
+/// which is a separate, reviewed change.
+pub const SEGA_PICO_PLATFORM: &str = "Sega Pico";
+
+/// Bytes read from the start of a cartridge ROM for header checks: enough for
+/// every registry signature offset, bounded so nothing large is read.
+const HEADER_PROBE_BYTES: u64 = 0x10000;
+
+/// The first [`HEADER_PROBE_BYTES`] of the cartridge ROM `path` holds for
+/// `platform_id`: the file itself, or the single ROM member of a ZIP exactly
+/// as zipped-cartridge staging would select it for that system (the same
+/// refusals apply). Never writes anything; only that bounded prefix of the
+/// member is decompressed.
+fn cartridge_leading_bytes(path: &Path, platform_id: &str) -> Option<Vec<u8>> {
+    use crate::game_identity::IdentityPlatform;
+    use crate::zip_cartridge_select::{is_loose_cartridge_platform, select_zip_cartridge_member};
+    let file = super::process_spawn::open_regular_file_nonblocking(path).ok()?;
+    let mut bytes = Vec::new();
+    if crate::zip_cartridge_stage::is_zipped_cartridge_request(path, platform_id) {
+        let platform = IdentityPlatform::from_catalogue(Some(platform_id));
+        if !is_loose_cartridge_platform(platform) {
+            return None;
+        }
+        let mut archive = zip::ZipArchive::new(file).ok()?;
+        let member = select_zip_cartridge_member(&mut archive, platform, &mut 0).ok()?;
+        let entry = archive.by_index(member.index).ok()?;
+        entry
+            .take(HEADER_PROBE_BYTES)
+            .read_to_end(&mut bytes)
+            .ok()?;
+    } else {
+        file.take(HEADER_PROBE_BYTES).read_to_end(&mut bytes).ok()?;
+    }
+    Some(bytes)
+}
+
+/// Whether the Mega Drive-format ROM `path` holds (loose, or the single ROM
+/// of a ZIP) names PICO in its header system field (`SEGA PICO`,
+/// `SEGATOYS PICO`, `SAMSUNG PICO`, ...).
+pub fn is_sega_pico_rom(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !matches!(
+        extension.as_str(),
+        "md" | "bin" | "gen" | "smd" | "68k" | "pco" | "zip"
+    ) {
+        return false;
+    }
+    cartridge_leading_bytes(path, "MegaDrive").is_some_and(|bytes| names_sega_pico(&bytes))
+}
+
+fn names_sega_pico(bytes: &[u8]) -> bool {
+    bytes
+        .get(0x100..0x110)
+        .is_some_and(|field| field.windows(4).any(|w| w == b"PICO"))
 }
 
 /// The machine a VICE `.crt` cartridge image declares in its 16-byte

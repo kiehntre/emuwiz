@@ -159,6 +159,10 @@ pub(crate) enum IdentityUnknownReason {
     /// them, or remember that choice; nothing is ever saved as the game's
     /// system (owner decision 2026-11-10).
     SystemUnknown,
+    /// The file's own header names a system EmuWiz has no launch route for
+    /// (payload: that system's name, e.g. Sega Pico). Every other system is
+    /// contradicted by that header, so nothing is offered to try.
+    NoLaunchRoute(&'static str),
     /// The file's own header names a different system from the one recorded
     /// for it (payloads: recorded system, the file's own system).
     MediaConflict {
@@ -190,7 +194,8 @@ impl IdentityUnknownReason {
             Self::NoIdentityCheck(_)
             | Self::UnsupportedFormat(_)
             | Self::AmigaHardDisk
-            | Self::AmigaIpf => Some(self.banner_body()),
+            | Self::AmigaIpf
+            | Self::NoLaunchRoute(_) => Some(self.banner_body()),
             _ => None,
         }
     }
@@ -220,6 +225,9 @@ impl IdentityUnknownReason {
             Self::SystemUnknown => {
                 "No system is recorded for this game. Try it once as a compatible system, or choose the system on the identity screen.".into()
             }
+            Self::NoLaunchRoute(system) => format!(
+                "The file's own header says this is a {system} game. EmuWiz cannot start {system} games yet and will not start it as another system."
+            ),
             Self::MediaConflict { recorded, content } => format!(
                 "This game is recorded as {recorded}, but the file's own header says {content}. EmuWiz will not start it as {recorded}. Change the system on the identity screen."
             ),
@@ -237,6 +245,7 @@ impl IdentityUnknownReason {
             Self::AmigaIpf => "Amiga IPF image",
             Self::FolderOnly(_) => "System taken from the folder name",
             Self::SystemUnknown => "System not known",
+            Self::NoLaunchRoute(_) => "No launch route for this system yet",
             Self::MediaConflict { .. } => "The file says it is for another system",
         }
     }
@@ -289,6 +298,12 @@ impl IdentityUnknownReason {
                  this unchanged file. Neither sets the game's system or identifies the game; \
                  choose the system permanently on the identity screen for that.".into()
             }
+            Self::NoLaunchRoute(system) => format!(
+                "The file's own header says this is a {system} game. EmuWiz has no {system} \
+                 launch route yet, and the header rules out every other system, so nothing is \
+                 offered to try and nothing is remembered. Nothing is wrong with the file. \
+                 This is not caused by missing DAT verification."
+            ),
             Self::MediaConflict { recorded, content } => format!(
                 "This game is recorded as {recorded}, but the file's own header says it is a \
                  {content} game. EmuWiz will not start it with a {recorded} emulator. Change the \
