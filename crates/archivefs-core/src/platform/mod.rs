@@ -1669,7 +1669,7 @@ pub const PLATFORMS: &[Platform] = &[
         display_name: "Sega Pico",
         folder_aliases: &["segapico", "pico", "kidspico", "segatoyspico"],
         filename_aliases: &[],
-        strong_extensions: &["pco"],
+        strong_extensions: &[],
         weak_extensions: &["md", "bin", "zip"],
         magic: &[],
         layout: &[],

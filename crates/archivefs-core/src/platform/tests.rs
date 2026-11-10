@@ -3319,10 +3319,7 @@ fn a_sega_pico_folder_is_sega_pico_and_mega_drive_folders_are_unchanged() {
     for folder in ["megadrive", "genesis", "md"] {
         assert_eq!(platform_for_folder(folder), Some("MegaDrive"), "{folder}");
     }
-    // Extension-only files: a `.pco` is Sega Pico; an `.md`/`.gen` outside
-    // any system folder is reported as before plus the Pico as a candidate.
-    let pco = detect(&format!("{ROOT}/misc/Game.pco"));
-    assert_eq!(pco.platform, Some("Sega Pico"), "{pco:?}");
+    // Extension-only files outside any system folder:
     // `.md` was already ambiguous (Sega 32X lists it too); the Pico is one
     // more named candidate, never a new decision.
     let md = detect(&format!("{ROOT}/misc/Game.md"));
@@ -3343,5 +3340,5 @@ fn a_sega_pico_folder_is_sega_pico_and_mega_drive_folders_are_unchanged() {
     let pico = platform_by_id("Sega Pico").expect("registered");
     assert!(pico.magic.is_empty());
     assert!(pico.conflicts_with.contains(&"MegaDrive"));
-    assert!(pico.accepts_extension("pco") && pico.accepts_extension("zip"));
+    assert!(pico.accepts_extension("zip") && !pico.accepts_extension("pco"));
 }
