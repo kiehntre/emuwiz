@@ -295,6 +295,9 @@ pub(super) const FORGET_LAUNCH_CHOICE: &str = "Forget this launch choice";
 
 /// Saves (`Some`) or forgets (`None`) the person's remembered launch system
 /// for `path` as it is now. Never touches the library or identity.
+/// Shown before a try of an archive EmuWiz cannot unpack as one cartridge.
+pub(super) const ARCHIVE_TRY_NOTE: &str = "This archive is not a single cartridge EmuWiz can unpack, and EmuWiz cannot open other archives for launch from here yet. A try is likely to stop at \"No runnable game file\"; extracting the game first works today. The file itself is not the problem.";
+
 fn save_remembered_launch_choice(path: &Path, system: Option<&'static str>) -> Result<(), String> {
     use archivefs_core::launch::remembered_launch_system as remembered;
     let store = remembered::default_remembered_launch_systems_path()?;
@@ -847,6 +850,22 @@ impl NativeWorkflows {
                 ui.label(format!(
                     "{TRY_ANYWAY}: EmuWiz will not start this game on a folder guess alone. Pick a system to try it once; you will see a warning, nothing is saved, and later scans are unaffected."
                 ));
+                // A ZIP or 7z that is not one cartridge EmuWiz unpacks cannot
+                // be opened for launch from here yet (archive mounting is the
+                // separate ArchiveFS follow-up): say so before the try, so a
+                // try that stops at "No runnable game file" is not a surprise.
+                let archive = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("zip") || e.eq_ignore_ascii_case("7z"));
+                if archive
+                    && !trial_systems.iter().any(|system| {
+                        archivefs_core::zip_cartridge_stage::zip_cartridge_member_fits(path, system)
+                            == Some(true)
+                    })
+                {
+                    ui.label(ARCHIVE_TRY_NOTE);
+                }
                 if trial_systems.len() > 1 {
                     ui.label(format!(
                         "EmuWiz cannot tell which system this file is for: {} systems with an installed emulator use this format and nothing in the file rules them out. A try may not start correctly.",
