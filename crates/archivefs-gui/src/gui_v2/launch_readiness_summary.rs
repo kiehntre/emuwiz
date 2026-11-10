@@ -521,23 +521,31 @@ fn project_plan(
         );
     }
 
-    if let Some(candidate) = plan.candidates.iter().find(|candidate| {
-        candidate.blockers.iter().any(|blocker| {
-            matches!(
-                blocker.kind,
-                LaunchBlockerKind::ContentNotResolved | LaunchBlockerKind::NoInstallationCandidate
-            )
-        })
-    }) && candidate
-        .blockers
+    // One option's own content refusal (a zipped cartridge on a standalone
+    // emulator that cannot open ZIPs) says nothing about the game when another
+    // option can start it, or is blocked for its own reason (a core tie): the
+    // card then follows those options, exactly as the Launch page does.
+    let no_usable_option = plan
+        .candidates
         .iter()
-        .any(|blocker| blocker.kind == LaunchBlockerKind::ContentNotResolved)
+        .all(|candidate| candidate.readiness == LaunchReadiness::Blocked);
+    let content_unresolved = |candidate: &LaunchCandidate| {
+        candidate
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == LaunchBlockerKind::ContentNotResolved)
+    };
+    if no_usable_option
+        && plan.candidates.iter().all(content_unresolved)
+        && let Some(candidate) = plan.candidates.first()
     {
+        // A file confirmed missing gets its own message (`note_file_missing`);
+        // here only "no route can open it as stored" is known.
         return with_details(
             base(
                 ReadinessPresentationState::SourceUnavailable,
-                "The game file is unavailable",
-                "The library remembers this game, but its current folder cannot be reached.",
+                "No emulator here can open this game file",
+                "None of the installed emulators can start this file as it is stored. A game kept in an archive (such as a ZIP of a disc image) may need extracting, and a moved or disconnected folder must be reconnected.",
                 IdentitySummary::StrongLocal,
                 SourceSummary::Unavailable,
                 firmware_for(candidate),
@@ -548,16 +556,18 @@ fn project_plan(
         );
     }
 
-    if let Some(candidate) = plan.candidates.iter().find(|candidate| {
-        candidate.blockers.iter().any(|blocker| {
-            matches!(
-                blocker.kind,
-                LaunchBlockerKind::MediaTopologyBlocked
-                    | LaunchBlockerKind::MediaTopologyReviewRequired
-                    | LaunchBlockerKind::ContentNotResolved
-            )
+    if no_usable_option
+        && let Some(candidate) = plan.candidates.iter().find(|candidate| {
+            candidate.blockers.iter().any(|blocker| {
+                matches!(
+                    blocker.kind,
+                    LaunchBlockerKind::MediaTopologyBlocked
+                        | LaunchBlockerKind::MediaTopologyReviewRequired
+                        | LaunchBlockerKind::ContentNotResolved
+                )
+            })
         })
-    }) {
+    {
         return with_details(
             base(
                 ReadinessPresentationState::MediaUnreadable,
@@ -1672,6 +1682,67 @@ mod tests {
         let summary = project(&plan(vec![mame, fbneo]), ReadinessFreshness::Current);
         assert_eq!(summary.status, ReadinessPresentationState::Ready);
         assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+    }
+
+    /// Census 2026-11-10 (NES/Game Gear/... zips): the Launch page offered
+    /// Play through RetroArch while Game Details said "The game file is
+    /// unavailable", taken from the standalone option's own ZIP refusal.
+    #[test]
+    fn a_zipped_cartridge_refused_by_one_option_stays_playable_through_another() {
+        let mesen = candidate(
+            LaunchReadiness::Blocked,
+            FirmwareReadiness::NotRequired,
+            vec![LaunchBlocker::new(
+                LaunchBlockerKind::ContentNotResolved,
+                "a zipped cartridge launches through RetroArch only",
+            )],
+            vec![],
+            CandidatePreference::Undetermined,
+            Some("/mnt/nes/Game.zip"),
+        );
+        let retroarch = candidate(
+            LaunchReadiness::Ready,
+            FirmwareReadiness::NotRequired,
+            vec![],
+            vec![],
+            CandidatePreference::SoleEligible,
+            Some("/mnt/nes/Game.zip"),
+        );
+        let summary = project(
+            &plan(vec![mesen.clone(), retroarch]),
+            ReadinessFreshness::Current,
+        );
+        assert_ne!(
+            summary.status,
+            ReadinessPresentationState::SourceUnavailable
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+        // Atari 2600 zip: the other options are blocked by a core tie, not by
+        // the file, so the card must not say the file cannot be opened.
+        let tied = candidate(
+            LaunchReadiness::Blocked,
+            FirmwareReadiness::NotRequired,
+            vec![LaunchBlocker::new(
+                LaunchBlockerKind::AmbiguousCore,
+                "more than one installed RetroArch core resolves to Atari2600",
+            )],
+            vec![],
+            CandidatePreference::Undetermined,
+            Some("/mnt/a2600/Game.zip"),
+        );
+        let summary = project(
+            &plan(vec![mesen.clone(), tied]),
+            ReadinessFreshness::Current,
+        );
+        assert_ne!(
+            summary.status,
+            ReadinessPresentationState::SourceUnavailable
+        );
+        // With nothing else, the refusal is still reported - without claiming
+        // the folder is unreachable (the file may simply be an archive).
+        let alone = project(&plan(vec![mesen]), ReadinessFreshness::Current);
+        assert_eq!(alone.status, ReadinessPresentationState::SourceUnavailable);
+        assert!(!alone.explanation.contains("cannot be reached"));
     }
 
     #[test]
