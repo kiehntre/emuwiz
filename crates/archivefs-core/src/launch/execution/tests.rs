@@ -1209,8 +1209,13 @@ fn write_zip_test_config(ready: &ReadyFixture, extra: &str) {
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    let saves = PathBuf::from("/var/tmp").join(format!("{unique}-saves"));
-    let states = PathBuf::from("/var/tmp").join(format!("{unique}-states"));
+    let _ = unique;
+    // Shared, fixed folders (RetroArch ignores a missing one, so the staged
+    // route requires them to exist); never removed, so tests cannot race.
+    let saves = PathBuf::from("/var/tmp/emuwiz-zip-test-saves");
+    let states = PathBuf::from("/var/tmp/emuwiz-zip-test-states");
+    fs::create_dir_all(&saves).unwrap();
+    fs::create_dir_all(&states).unwrap();
     ready.fixture.write(
         "config/retroarch/retroarch.cfg",
         format!(
@@ -1971,7 +1976,8 @@ fn tilde_config_ready(label: &str, save_keys: &str) -> (ReadyFixture, PathBuf) {
         .to_string_lossy()
         .into_owned();
     let home = PathBuf::from("/var/tmp").join(format!("{unique}-home"));
-    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(home.join(".config/retroarch/saves")).unwrap();
+    fs::create_dir_all(home.join(".config/retroarch/states")).unwrap();
     ready.environment.home = Some(home.clone().into_os_string());
     ready.fixture.write(
         "config/retroarch/retroarch.cfg",
@@ -2068,4 +2074,176 @@ fn zipped_cartridge_tilde_save_dirs_inside_a_temporary_home_are_refused() {
     let error = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment)
         .expect_err("saves under the temporary folder are refused");
     assert!(error.contains("temporary"), "{error}");
+}
+
+// ---- 2026-11-10: real-configuration ZIP preflight (false /etc refusal) ----
+
+/// The owner's real `~/.config/retroarch/retroarch.cfg` lines that bear on the
+/// staged route (RetroArch 1.22.2, Ubuntu package): `~/` save folders, the
+/// override folder named through `rgui_config_directory`, auto overrides on.
+const REAL_WORLD_USER_KEYS: &str = "config_save_on_exit = \"true\"\n\
+auto_overrides_enable = \"true\"\n\
+rgui_config_directory = \"~/.config/retroarch/config/\"\n";
+
+#[test]
+fn zip_preflight_accepts_the_real_world_user_config_even_with_a_packaged_etc_skeleton() {
+    // Ubuntu's retroarch package installs /etc/retroarch.cfg, a template that
+    // RetroArch only copies when it must create a user settings file; with
+    // the user's own file present it is never opened (checked with strace on
+    // 1.22.2). This test runs unchanged on machines with that file.
+    let (ready, home) = tilde_config_ready(
+        "zip-real-world",
+        &format!("{SMOKE_TEST_TILDE_SAVE_KEYS}{REAL_WORLD_USER_KEYS}"),
+    );
+    // Per-core folders RetroArch created, with no override files in them.
+    fs::create_dir_all(home.join(".config/retroarch/config/PicoDrive")).unwrap();
+    fs::create_dir_all(home.join(".config/retroarch/config/Genesis Plus GX")).unwrap();
+    let result = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment);
+    let _ = fs::remove_dir_all(&home);
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn zip_preflight_still_refuses_a_legacy_home_retroarch_cfg() {
+    let (ready, home) = tilde_config_ready("zip-legacy-home", SMOKE_TEST_TILDE_SAVE_KEYS);
+    fs::write(home.join(".retroarch.cfg"), b"").unwrap();
+    let result = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment);
+    let _ = fs::remove_dir_all(&home);
+    assert!(result.expect_err("legacy file refused").contains("legacy"));
+}
+
+#[test]
+fn zip_preflight_refuses_save_folders_that_do_not_exist() {
+    let (ready, home) = tilde_config_ready("zip-missing-dir", SMOKE_TEST_TILDE_SAVE_KEYS);
+    fs::remove_dir(home.join(".config/retroarch/states")).unwrap();
+    let result = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment);
+    let _ = fs::remove_dir_all(&home);
+    let error = result.expect_err("a missing states folder is refused");
+    assert!(
+        error.contains("savestate_directory") && error.contains("does not exist"),
+        "{error}"
+    );
+    assert!(!error.contains("savefile_directory"), "{error}");
+}
+
+#[test]
+fn zip_preflight_refuses_overrides_in_the_configured_rgui_config_directory() {
+    let (ready, home) = tilde_config_ready(
+        "zip-rgui-overrides",
+        &format!(
+            "{SMOKE_TEST_TILDE_SAVE_KEYS}rgui_config_directory = \"~/elsewhere/overrides/\"\n"
+        ),
+    );
+    let core = home.join("elsewhere/overrides/PicoDrive");
+    fs::create_dir_all(&core).unwrap();
+    fs::write(core.join("PicoDrive.cfg"), b"savefile_directory = \"/x\"\n").unwrap();
+    let result = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment);
+    let _ = fs::remove_dir_all(&home);
+    assert!(result.expect_err("override refused").contains("override"));
+}
+
+#[test]
+fn zip_preflight_reports_every_problem_together() {
+    let (ready, home) = tilde_config_ready(
+        "zip-all-findings",
+        "savefile_directory = \"~/.config/retroarch/saves\"\n\
+         savestate_directory = \"~/.config/retroarch/nostates\"\n\
+         savefiles_in_content_dir = \"true\"\n\
+         sort_savestates_by_content_enable = \"true\"\n",
+    );
+    // `config/` beside the settings file the discovery read.
+    ready
+        .fixture
+        .write("config/retroarch/config/PicoDrive/PicoDrive.cfg", b"");
+    fs::write(home.join(".retroarch.cfg"), b"").unwrap();
+    let result = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment);
+    let _ = fs::remove_dir_all(&home);
+    let error = result.expect_err("refused");
+    for expected in [
+        "beside the game",
+        "sort_savestates_by_content_enable",
+        "does not exist",
+        "override",
+        "legacy",
+    ] {
+        assert!(error.contains(expected), "missing {expected:?} in: {error}");
+    }
+}
+
+/// Read-only diagnostic of the complete ZIP launch preflight against this
+/// machine's real RetroArch, settings, PicoDrive core and a real Pico ZIP.
+/// Nothing is launched and nothing is written outside a private temporary
+/// extraction that is removed on return. Run with
+/// `EMUWIZ_TEST_REAL_ENVIRONMENT=1 ... -- --ignored --nocapture`.
+#[test]
+#[ignore = "reads the real RetroArch installation and library; opt-in only"]
+fn real_environment_pico_zip_preflight_diagnostic() {
+    use crate::emulator_environment::retroarch::DiscoveryEnvironment as Env;
+    if std::env::var_os("EMUWIZ_TEST_REAL_ENVIRONMENT").is_none() {
+        eprintln!("EMUWIZ_TEST_REAL_ENVIRONMENT not set; skipped");
+        return;
+    }
+    let zip = PathBuf::from(std::env::var("EMUWIZ_TEST_REAL_ZIP").unwrap_or_else(|_| {
+        "/mnt/usbdrive/games/sega-pico/3-choume no Tama - Momo-chan wa Doko! (Japan) (Rev 1).zip"
+            .into()
+    }));
+    let environment = Env::from_process_environment();
+    let report = discover_retroarch_environment(&HostReadOnlyFilesystem, &environment)
+        .expect("RetroArch discovery");
+    let profile = report
+        .profiles
+        .iter()
+        .find(|p| p.profile_kind == ProfileKind::Native)
+        .expect("a native RetroArch profile");
+    eprintln!("config file: {}", profile.config_file.path.display);
+    let platform = "Sega Pico";
+    let mut file = fs::File::open(&zip).expect("real ZIP opens");
+    let key =
+        super::super::unverified_media::platform_media_key_of_open_file(&mut file, &zip, platform)
+            .expect("real ZIP has an unverified media key");
+    let executable = match profile.evidence.executables.as_slice() {
+        [one] => {
+            Some(RetroArchExecutableBinding::capture(PathBuf::from(&one.display)).expect("binding"))
+        }
+        _ => None,
+    };
+    eprintln!("program: {:?}", executable.as_ref().map(|b| &b.path));
+    let request = RetroArchLaunchRequest {
+        saturn_core_selection: None,
+        launch_choice: None,
+        expected_snapshot_evidence: None,
+        selected_content_path: zip.clone(),
+        expected_platform_id: platform.into(),
+        expected_game_key: key,
+        profile: ProfileRef {
+            profile_kind: profile.profile_kind,
+            scope: profile.scope,
+        },
+        core_stem: "picodrive".into(),
+        expected_appimage_executable: None,
+        expected_executable_binding: executable,
+        expected_configuration_file: Some(PathBuf::from(&profile.config_file.path.display)),
+    };
+    let findings = staged_launch_findings(&request, &HostReadOnlyFilesystem, &environment);
+    eprintln!("save-safety findings ({}):", findings.len());
+    for finding in &findings {
+        eprintln!("  - {finding}");
+    }
+    match prepare_retroarch_launch_with_playlist(
+        &request,
+        &HostReadOnlyFilesystem,
+        &environment,
+        None,
+    ) {
+        Ok(prepared) => {
+            eprintln!("COMPLETE PREFLIGHT: PASS");
+            eprintln!("arguments: {:?}", prepared.command.arguments);
+            eprintln!("staged: {:?}", prepared.staged_content_path());
+        }
+        Err(error) => {
+            eprintln!("COMPLETE PREFLIGHT: REFUSED: {error:?}");
+            panic!("complete preflight refused");
+        }
+    }
+    assert!(findings.is_empty());
 }

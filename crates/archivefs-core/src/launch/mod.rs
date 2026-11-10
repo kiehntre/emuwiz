@@ -349,9 +349,10 @@ pub use evidence_freshness::{
 pub use execution::{
     LAUNCH_STDERR_CAPTURE_LIMIT, LaunchCommandFacts, LaunchContentIdentity, LaunchExecutionError,
     LaunchExitReport, LaunchPreflightError, LaunchPreflightErrorKind, LaunchSpawnError,
-    LaunchedRetroArchProcess, RetroArchLaunchRequest, preflight_and_launch_retroarch,
-    preflight_and_launch_retroarch_with_playlist, preflight_retroarch_launch,
-    preflight_retroarch_launch_with_playlist, spawn_retroarch,
+    LaunchedRetroArchProcess, PreparedRetroArchLaunch, RetroArchLaunchRequest,
+    preflight_and_launch_retroarch, preflight_and_launch_retroarch_with_playlist,
+    preflight_retroarch_launch, preflight_retroarch_launch_with_playlist,
+    prepare_retroarch_launch_with_playlist, spawn_retroarch,
 };
 pub use fbneo_command::{
     FBNEO_SUPPORTED_PLATFORM_ID, FbneoCommand, FbneoCommandPlan, FbneoIdentityEvidence,
