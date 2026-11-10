@@ -566,17 +566,21 @@ fn project_plan(
         );
     }
 
-    if no_usable_option
-        && let Some(candidate) = plan.candidates.iter().find(|candidate| {
-            candidate.blockers.iter().any(|blocker| {
-                matches!(
-                    blocker.kind,
-                    LaunchBlockerKind::MediaTopologyBlocked
-                        | LaunchBlockerKind::MediaTopologyReviewRequired
-                        | LaunchBlockerKind::ContentNotResolved
-                )
-            })
+    let media_refused = |candidate: &LaunchCandidate| {
+        candidate.blockers.iter().any(|blocker| {
+            matches!(
+                blocker.kind,
+                LaunchBlockerKind::MediaTopologyBlocked
+                    | LaunchBlockerKind::MediaTopologyReviewRequired
+                    | LaunchBlockerKind::ContentNotResolved
+            )
         })
+    };
+    // Only when every option refuses the media itself; an option blocked for
+    // its own reason (a core tie) is reported by the branches below.
+    if no_usable_option
+        && plan.candidates.iter().all(media_refused)
+        && let Some(candidate) = plan.candidates.first()
     {
         return with_details(
             base(
@@ -1748,6 +1752,8 @@ mod tests {
             summary.status,
             ReadinessPresentationState::SourceUnavailable
         );
+        // Census 2026-11-10: the media branch said "could not be read" here.
+        assert_ne!(summary.status, ReadinessPresentationState::MediaUnreadable);
         // With nothing else, the refusal is still reported - without claiming
         // the folder is unreachable (the file may simply be an archive).
         let alone = project(&plan(vec![mesen]), ReadinessFreshness::Current);
