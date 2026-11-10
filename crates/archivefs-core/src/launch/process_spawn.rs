@@ -1064,7 +1064,7 @@ mod open_regular_tests {
 #[cfg(all(test, unix))]
 mod captured_identity_ctime_tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
 
     fn capture(path: &Path) -> CapturedFileIdentity {
         CapturedFileIdentity::capture(&fs::symlink_metadata(path).unwrap())
