@@ -281,9 +281,7 @@ fn unassigned_pack_catalogues_for_other_systems_are_not_reparsed() {
     changed.health.observed_size_bytes = Some(1);
     let registry = {
         let mut r = DatSourceRegistry::new();
-        for e in [changed] {
-            r.add(e).unwrap();
-        }
+        r.add(changed).unwrap();
         r
     };
     let loaded = super::registry::load_no_intro_sources(&registry, Some("Game Boy"));
@@ -291,14 +289,13 @@ fn unassigned_pack_catalogues_for_other_systems_are_not_reparsed() {
     // No platform asked: everything is read as before.
     let registry = {
         let mut r = DatSourceRegistry::new();
-        for e in [pack(
+        r.add(pack(
             "x",
             "x.dat",
             "Nintendo - Super Nintendo Entertainment System",
             GB_NO_INTRO_XML,
-        )] {
-            r.add(e).unwrap();
-        }
+        ))
+        .unwrap();
         r
     };
     assert_eq!(
