@@ -503,14 +503,18 @@ impl ReadinessSources<'_> {
                 } else if evidence_freshness.is_incomplete() {
                     LaunchReadinessInput::InspectionIncomplete
                 } else {
+                    // Blue has no live record; the catalogue row's system is
+                    // what the lane above used, so the reason uses it too.
+                    let catalogued = focused.and_then(|p| (self.platform_hint)(p));
                     LaunchReadinessInput::IdentityUnknown(lane_reason.unwrap_or_else(|| {
                         identity_unknown_reason(
                             focused,
                             selected_game_identity_report,
                             focused_record
                                 .map(|r| r.mount_plan.archive.identity.platform.as_deref())
-                                // Blue has no live record, but knows the
-                                // catalogue row has no system at all.
+                                .or_else(|| catalogued.as_deref().map(Some))
+                                // Blue knows when the catalogue row has no
+                                // system at all.
                                 .or_else(|| {
                                     focused
                                         .is_some_and(|p| (self.system_unknown)(p))
@@ -1863,6 +1867,22 @@ pub(crate) fn identity_unknown_reason(
             return Reason::UnsupportedArchive;
         }
     }
+    // A recorded system that does not use this file's format at all (a ZIP of
+    // BBC disk images, an Atari 5200 `.a52` filed under Game Gear) cannot be
+    // started as it is stored. Saying "cannot tell which game" would send the
+    // person to identity review for nothing (census 2026-11-10).
+    if let Some(system) = hint.and_then(archivefs_core::canonical_platform_for_alias)
+        && !extension.is_empty()
+        && !archivefs_core::launch::unverified_media::platform_lists_extension(system, &extension)
+        && !has_other_identity_route(system, &extension)
+        && report.is_none_or(|r| r.format == IdentityImageFormat::Unsupported)
+    {
+        return if archive {
+            Reason::UnsupportedArchive
+        } else {
+            Reason::UnsupportedFormat(archivefs_core::platform::display_name_for(system))
+        };
+    }
     if !platform_known {
         return system_missing;
     }
@@ -2225,6 +2245,44 @@ mod identity_reason_tests {
         );
         assert_eq!(reason("/g/a.7z", other, Some("GBA")), R::UnsupportedArchive);
         assert_eq!(reason("/g/a.zip", other, None), R::SystemNotChosen);
+    }
+
+    #[test]
+    fn a_format_the_recorded_system_never_uses_is_unsupported_not_unconfirmed() {
+        // Census 2026-11-10: zipped BBC/Electron/Archimedes disk images and
+        // an Atari 5200 `.a52` filed under Game Gear read "cannot tell which
+        // game", sending the person to identity review for nothing.
+        let other = IdentityPlatform::Other;
+        // Systems with no identity check say so first.
+        for hint in ["BBC Micro", "Acorn Electron", "Acorn Archimedes"] {
+            assert!(
+                matches!(reason("/g/a.zip", other, Some(hint)), R::NoIdentityCheck(_)),
+                "{hint}"
+            );
+        }
+        // A system with a check that never reads this archive.
+        assert_eq!(
+            reason(
+                "/g/a.zip",
+                IdentityPlatform::Ngpc,
+                Some("Neo Geo Pocket Color")
+            ),
+            R::NotConfirmed
+        );
+        assert_eq!(
+            reason("/g/Ms. Pac-Man (USA).a52", other, Some("GameGear")),
+            R::UnsupportedFormat("Sega Game Gear")
+        );
+        // Formats the system lists, and systems with another identity route,
+        // are unaffected.
+        assert!(matches!(
+            reason("/g/a.ssd", other, Some("BBC Micro")),
+            R::NoIdentityCheck(_)
+        ));
+        assert_eq!(
+            reason("/g/a.zip", other, Some("AmigaCD32")),
+            R::NotConfirmed
+        );
     }
 
     #[test]
