@@ -157,6 +157,13 @@ pub fn load_no_intro_sources(
     };
     let mut matches = Vec::new();
     for candidate in candidates_for(&entries) {
+        let observed = file_observation(&candidate.path);
+        if observed
+            .as_ref()
+            .is_some_and(|key| not_no_intro_memo().lock().is_ok_and(|memo| memo.contains(key)))
+        {
+            continue;
+        }
         match import_no_intro_dat(&candidate.path) {
             Ok(imported) => matches.push((
                 NoIntroSourceLabel {
@@ -166,8 +173,20 @@ pub fn load_no_intro_sources(
                 },
                 imported,
             )),
-            Err(NoIntroImportError::NotNoIntro { .. } | NoIntroImportError::Io { .. })
-            | Err(NoIntroImportError::Parse(_)) => {}
+            Err(NoIntroImportError::NotNoIntro { .. }) => {
+                // The same unchanged file always gives the same answer; a
+                // TOSEC, Redump or MAME catalogue was otherwise hashed and
+                // fully parsed again on every selected system (~100 MB here).
+                if let Some(key) = observed
+                    && let Ok(mut memo) = not_no_intro_memo().lock()
+                {
+                    if memo.len() >= 4096 {
+                        memo.clear();
+                    }
+                    memo.insert(key);
+                }
+            }
+            Err(NoIntroImportError::Io { .. }) | Err(NoIntroImportError::Parse(_)) => {}
         }
     }
     matches.sort_by(|(a, _), (b, _)| {
@@ -176,6 +195,27 @@ pub fn load_no_intro_sources(
             .then_with(|| a.artifact_path.cmp(&b.artifact_path))
     });
     matches
+}
+
+type FileObservation = (PathBuf, u64, u128);
+
+/// (path, size, mtime) of a regular file, or `None` when it cannot be read.
+fn file_observation(path: &std::path::Path) -> Option<FileObservation> {
+    let metadata = std::fs::metadata(path).ok().filter(std::fs::Metadata::is_file)?;
+    let mtime = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((path.to_path_buf(), metadata.len(), mtime))
+}
+
+/// Files already found not to be No-Intro catalogues, per process.
+fn not_no_intro_memo() -> &'static std::sync::Mutex<std::collections::HashSet<FileObservation>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<FileObservation>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
 }
 
 /// The `origin` the No-Intro pack import writes for each catalogue.

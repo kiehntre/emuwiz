@@ -3677,6 +3677,23 @@ fn launch_error_message(error: &LaunchExecutionError) -> (&'static str, String) 
     }
 }
 
+/// The panel's one-line introduction. The DOSBox folder-approval note is
+/// only for DOS games: shown everywhere it read as if a Wii or Acorn game
+/// needed DOSBox (owner screenshot 08, 2026-11-07).
+fn panel_intro(input: &LaunchReadinessInput) -> &'static str {
+    const BASE: &str = "Ways this game can be played. Check emulator readiness and content.";
+    const DOS: &str = "Ways this game can be played. Check emulator readiness and content. DOSBox also requires explicit approval of its local folder and start target; that approval does not verify a release.";
+    let dos = match input {
+        LaunchReadinessInput::DosBoxReview => true,
+        LaunchReadinessInput::Plan { plan, .. } => plan
+            .platform_id
+            .as_deref()
+            .is_some_and(|platform| matches!(platform, "DOS" | "PC")),
+        _ => false,
+    };
+    if dos { DOS } else { BASE }
+}
+
 // The panel's inputs are the read-only launch input, each emulator's own
 // launch tracker and the read-only emulator choices; nothing else.
 #[allow(clippy::too_many_arguments)]
@@ -3696,13 +3713,7 @@ pub(crate) fn show_launch_readiness_panel(
         standalone_launch_state.show_cemu_lifecycle(ui);
         retroarch_launch_state.show_stop_control(ui);
     }
-    widgets::section_header(
-        ui,
-        "Play / Launch readiness",
-        Some(
-            "Ways this game can be played. Check emulator readiness and content. DOSBox also requires explicit approval of its local folder and start target; that approval does not verify a release.",
-        ),
-    );
+    widgets::section_header(ui, "Play / Launch readiness", Some(panel_intro(input)));
 
     match input {
         LaunchReadinessInput::AtariSt(snapshot) => snapshot.show(ui),
@@ -6724,3 +6735,20 @@ pub(crate) fn show_dolphin_profile_guidance(ui: &mut egui::Ui, input: &LaunchRea
 mod amiga_retry_tests;
 
 pub(crate) mod amiga_boot;
+
+#[cfg(test)]
+mod panel_intro_tests {
+    use super::*;
+
+    #[test]
+    fn the_dosbox_approval_note_is_only_for_dos_games() {
+        assert!(panel_intro(&LaunchReadinessInput::DosBoxReview).contains("DOSBox"));
+        for other in [
+            LaunchReadinessInput::IdentityUnknown(IdentityUnknownReason::NotConfirmed),
+            LaunchReadinessInput::IdentityConflicting,
+            LaunchReadinessInput::EvidenceNotLoaded,
+        ] {
+            assert!(!panel_intro(&other).contains("DOSBox"));
+        }
+    }
+}

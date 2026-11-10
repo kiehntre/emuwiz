@@ -206,7 +206,7 @@ fn real_library_launch_census() {
     for (n, (platform, ext, size, index)) in picks.iter().enumerate() {
         let game = app.library.games[*index].clone();
         let id = game.archive.id;
-        app.router.current = Route::BrowsePlayGame(id);
+        app.router.current = Route::Game(id);
         let started = Instant::now();
         let deadline = started + Duration::from_secs(seconds);
         let mut last_summary: Option<(GameReadinessSummary, String)> = None;

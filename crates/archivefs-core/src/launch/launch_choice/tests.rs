@@ -378,19 +378,25 @@ fn an_explicit_choice_outranks_an_unrelated_remembered_profile() {
 }
 
 #[test]
-fn platforms_not_yet_adopted_are_untouched() {
+fn every_platform_can_resolve_a_tie_by_choice_and_a_plan_without_one_is_untouched() {
+    // Owner screenshot 2026-11-09: PS2 with three PCSX2 installs showed
+    // "Choice needed" and no way to choose. Every platform now resolves a tie
+    // the same way GameCube and Wii always did.
     for platform in ["Saturn", "PS2", "NES"] {
         let mut plan = tie();
         plan.platform_id = Some(platform.into());
-        let before = plan.clone();
         let preferences = [LaunchPreference::system(platform, &option(APPIMAGE))];
-        assert_eq!(
+        assert!(matches!(
             apply(&mut plan, saved(&preferences)),
-            LaunchChoiceOutcome::NotAdopted
-        );
-        assert_eq!(plan, before);
-        assert!(!is_choosable(&plan, &plan.candidates[0]));
+            LaunchChoiceOutcome::Applied { .. }
+        ));
+        assert!(is_choosable(&plan, &plan.candidates[0]));
     }
+    let mut plan = tie();
+    plan.platform_id = None;
+    let before = plan.clone();
+    assert_eq!(apply(&mut plan, saved(&[])), LaunchChoiceOutcome::NotAdopted);
+    assert_eq!(plan, before);
 }
 
 #[test]

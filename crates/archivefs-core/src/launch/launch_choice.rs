@@ -21,8 +21,11 @@
 //!   [`LaunchWarningKind::PreferredLaunchChoiceUnavailable`] (so strict
 //!   launch gates refuse) until the user chooses again. Unreadable saved
 //!   choices are treated the same way.
-//! - Only platforms in [`ADOPTED_PLATFORMS`] use this facility so far. Every
-//!   other platform's plan is returned unchanged.
+//! - Every platform uses this facility (2026-11-09; first adopted for
+//!   GameCube and Wii). Before that, any other system with more than one
+//!   usable emulator showed "Choice needed" with no way to choose, so Play
+//!   was never offered (owner screenshot: PS2 with native, Flatpak and
+//!   portable PCSX2). A plan without a platform is returned unchanged.
 //!
 //! # Identity
 //!
@@ -47,7 +50,8 @@ use crate::emulator_environment::retroarch::{ProfileKind, ProfileScope};
 
 /// File name inside the EmuWiz configuration directory.
 pub const LAUNCH_PREFERENCES_FILE: &str = "launch_preferences.json";
-/// Platforms whose launch pages use this facility. Others are untouched.
+/// The platforms that first used this facility; kept for reference only.
+/// Every platform now uses it (see [`is_adopted`]).
 pub const ADOPTED_PLATFORMS: &[&str] = &["GameCube", "Wii"];
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 const FORMAT_VERSION: u32 = 1;
@@ -202,9 +206,7 @@ pub fn retroarch_option_id(
 }
 
 pub fn is_adopted(plan: &LaunchPlan) -> bool {
-    plan.platform_id
-        .as_deref()
-        .is_some_and(|platform| ADOPTED_PLATFORMS.contains(&platform))
+    plan.platform_id.is_some()
 }
 
 /// Whether the user may choose `candidate` for `plan`: an adopted platform

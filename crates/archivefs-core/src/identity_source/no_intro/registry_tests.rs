@@ -268,3 +268,20 @@ fn unassigned_pack_catalogues_for_other_systems_are_not_reparsed() {
     let registry = { let mut r = DatSourceRegistry::new(); for e in [pack("x", "x.dat", "Nintendo - Super Nintendo Entertainment System", GB_NO_INTRO_XML)] { r.add(e).unwrap(); } r };
     assert_eq!(super::registry::load_no_intro_sources(&registry, None).len(), 1);
 }
+
+/// A catalogue that is not No-Intro is not re-parsed for the next system,
+/// but a changed file is read again.
+#[test]
+fn a_non_no_intro_catalogue_is_parsed_once_per_unchanged_file() {
+    let dir = tempdir().unwrap();
+    let path = write_dat(dir.path(), "tosec.dat", TOSEC_XML);
+    let mut registry = DatSourceRegistry::new();
+    registry.add(file_entry("tosec", path.clone(), None)).unwrap();
+    assert!(super::registry::load_no_intro_sources(&registry, Some("Game Boy")).is_empty());
+    // Same bytes again: still not No-Intro (now from the memo).
+    assert!(super::registry::load_no_intro_sources(&registry, Some("NES")).is_empty());
+    // Replaced by a real No-Intro catalogue: read again and found.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&path, GB_NO_INTRO_XML).unwrap();
+    assert_eq!(super::registry::load_no_intro_sources(&registry, Some("Game Boy")).len(), 1);
+}
