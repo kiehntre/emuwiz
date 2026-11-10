@@ -153,6 +153,12 @@ pub(crate) enum IdentityUnknownReason {
     /// system's display name). The person must confirm the system first;
     /// a folder guess never becomes trusted platform identity by itself.
     FolderOnly(&'static str),
+    /// No system is recorded for this game at all, but its format is one that
+    /// at least one system with an installed launch route lists, and its own
+    /// bytes rule none of those out. The person may try it once as one of
+    /// them, or remember that choice; nothing is ever saved as the game's
+    /// system (owner decision 2026-11-10).
+    SystemUnknown,
     /// The file's own header names a different system from the one recorded
     /// for it (payloads: recorded system, the file's own system).
     MediaConflict {
@@ -172,6 +178,7 @@ impl IdentityUnknownReason {
             Self::SystemNotChosen
                 | Self::NotConfirmed
                 | Self::FolderOnly(_)
+                | Self::SystemUnknown
                 | Self::MediaConflict { .. }
         )
     }
@@ -210,6 +217,9 @@ impl IdentityUnknownReason {
             Self::FolderOnly(system) => format!(
                 "Only the folder name says this is a {system} game, and this file format is used by other systems too. Confirm the system on the identity screen to try launching it."
             ),
+            Self::SystemUnknown => {
+                "No system is recorded for this game. Try it once as a compatible system, or choose the system on the identity screen.".into()
+            }
             Self::MediaConflict { recorded, content } => format!(
                 "This game is recorded as {recorded}, but the file's own header says {content}. EmuWiz will not start it as {recorded}. Change the system on the identity screen."
             ),
@@ -226,6 +236,7 @@ impl IdentityUnknownReason {
             Self::AmigaHardDisk => "Amiga hard-disk image",
             Self::AmigaIpf => "Amiga IPF image",
             Self::FolderOnly(_) => "System taken from the folder name",
+            Self::SystemUnknown => "System not known",
             Self::MediaConflict { .. } => "The file says it is for another system",
         }
     }
@@ -270,6 +281,14 @@ impl IdentityUnknownReason {
                  with a \"game not identified\" warning. Your choice does not identify the game \
                  or count as catalogue (DAT) verification."
             ),
+            Self::SystemUnknown => {
+                "EmuWiz has no system recorded for this game and the file does not say which \
+                 system it is for. You can try it once as one of the compatible systems listed \
+                 below (only systems that use this file format and have an installed emulator), \
+                 with a warning, or tick \"Remember this launch choice\" to keep that choice for \
+                 this unchanged file. Neither sets the game's system or identifies the game; \
+                 choose the system permanently on the identity screen for that.".into()
+            }
             Self::MediaConflict { recorded, content } => format!(
                 "This game is recorded as {recorded}, but the file's own header says it is a \
                  {content} game. EmuWiz will not start it with a {recorded} emulator. Change the \

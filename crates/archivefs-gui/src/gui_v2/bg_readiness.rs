@@ -419,6 +419,7 @@ pub(super) fn build_input(
             // answer for this unchanged file, so the list shows it too.
             remembered_system:
                 &archivefs_core::launch::remembered_launch_system::remembered_launch_system,
+            system_unknown: &|p| p == archive.absolute_path && archive.platform.is_none(),
         }
         .build(None)
     });
@@ -726,6 +727,49 @@ mod tests {
         assert!(planned(&job).is_some());
         remembered::forget_launch_system_at(&store, &path).unwrap();
         assert!(folder_only(&job));
+    }
+
+    /// Owner decision 2026-11-10 (1,815 games with no system): Blue said
+    /// "Identity unresolved / Verify identity" because it had no live record
+    /// to show the system was missing. It now says no system is chosen and,
+    /// with a remembered launch choice, plans as that system - unverified.
+    #[test]
+    fn a_game_with_no_recorded_system_says_so_and_a_remembered_choice_plans_it() {
+        use archivefs_core::launch::remembered_launch_system as remembered;
+        let dir = tempfile::tempdir().unwrap();
+        let mut job = on_disk_from(
+            &dir,
+            "Avenger (Japan).chd",
+            "PC Engine CD",
+            None,
+            &[0u8; 512],
+        );
+        job.archive.platform = None;
+        job.catalogue_platform = String::new();
+        // No RetroArch in the test environment: no system can be offered for
+        // a try, so the truthful reason is "no system chosen".
+        assert!(matches!(
+            build_input(&env(), &job, &AtomicBool::new(false)),
+            Ok((
+                crate::launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
+                    crate::launch_readiness_page::IdentityUnknownReason::SystemNotChosen
+                ),
+                _
+            ))
+        ));
+        let path = job.archive.absolute_path.clone();
+        let store = remembered::default_remembered_launch_systems_path().unwrap();
+        let entry =
+            remembered::RememberedLaunchSystem::for_current_file(&path, "PC Engine CD").unwrap();
+        remembered::remember_launch_system_at(&store, &entry).unwrap();
+        let plan = planned(&job).expect("a remembered choice reaches a launch plan");
+        assert_eq!(plan.platform_id.as_deref(), Some("PC Engine CD"));
+        assert!(archivefs_core::launch::unverified_media::is_unverified_key(
+            plan.game_key.as_deref().unwrap_or_default()
+        ));
+        // The library row is untouched: still no system.
+        assert!(job.archive.platform.is_none());
+        remembered::forget_launch_system_at(&store, &path).unwrap();
     }
 
     /// Owner regression list 2026-11-09: NES games misfiled under SNES.

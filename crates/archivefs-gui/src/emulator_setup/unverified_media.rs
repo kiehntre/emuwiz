@@ -124,8 +124,17 @@ pub(crate) fn resolve(
         content_platform,
         trial,
     );
+    // No system recorded at all (owner decision 2026-11-10): a remembered
+    // choice answers that exactly as it answers a folder guess.
+    let system_unknown =
+        trial.is_none() && archivefs_core::canonical_platform_for_alias(platform_hint).is_none();
+    let remembered_applies = |outcome: &Outcome| match outcome {
+        Outcome::NeedsConfirmation(_) => true,
+        Outcome::NotApplicable => system_unknown,
+        _ => false,
+    };
     match (outcome, remembered) {
-        (Outcome::NeedsConfirmation(_), Some(system)) => {
+        (outcome, Some(system)) if remembered_applies(&outcome) => {
             match resolve_for(path, system, None, content_platform, Some(system)) {
                 Outcome::Allowed(identity, _) => {
                     Outcome::Allowed(identity, SystemBasis::Remembered)
@@ -217,27 +226,49 @@ fn resolve_for(
     Outcome::NeedsConfirmation(platform)
 }
 
-/// Systems a one-time "Try anyway" may use for this file: those that list
-/// its format and that the file's own bytes do not rule out, recorded system
-/// first. Display order otherwise follows the registry.
-pub(crate) fn trial_systems(path: &Path, recorded: Option<&str>) -> Vec<&'static str> {
+/// Systems a one-time "Try anyway" (or a remembered launch choice) may use
+/// for this file, recorded system first:
+///
+/// - the system lists the file's format, a try as it would pass every check
+///   of this lane (loose-ROM header rules, content naming another system),
+///   and `has_route` says an installed launch route exists for it;
+/// - when the file's own bytes or a format only some systems use point at
+///   particular systems ([`MediaSystemEvidence::Agrees`]), only those.
+///
+/// Display order otherwise follows the registry.
+pub(crate) fn trial_systems(
+    path: &Path,
+    recorded: Option<&str>,
+    has_route: &dyn Fn(&str) -> bool,
+) -> Vec<&'static str> {
     let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
         return Vec::new();
     };
     let recorded = recorded.and_then(archivefs_core::canonical_platform_for_alias);
-    let mut systems: Vec<&'static str> = archivefs_core::platform::PLATFORMS
+    let mut systems: Vec<(&'static str, bool)> = archivefs_core::platform::PLATFORMS
         .iter()
         .map(|p| p.id)
         .filter(|id| {
             archivefs_core::launch::unverified_media::platform_lists_extension(id, extension)
         })
+        .filter(|id| has_route(id))
         .filter(|id| {
-            !matches!(
-                archivefs_core::launch::unverified_media::media_system_evidence_cached(path, id),
-                MediaSystemEvidence::Contradicts(_)
+            matches!(
+                resolve_for(path, id, None, None, Some(id)),
+                Outcome::Allowed(..)
             )
         })
+        .map(|id| {
+            let agrees =
+                archivefs_core::launch::unverified_media::media_system_evidence_cached(path, id)
+                    == MediaSystemEvidence::Agrees;
+            (id, agrees)
+        })
         .collect();
+    if systems.iter().any(|(_, agrees)| *agrees) {
+        systems.retain(|(_, agrees)| *agrees);
+    }
+    let mut systems: Vec<&'static str> = systems.into_iter().map(|(id, _)| id).collect();
     if let Some(recorded) = recorded
         && let Some(index) = systems.iter().position(|id| *id == recorded)
     {
@@ -565,9 +596,9 @@ mod tests {
             }
         );
         // The trial list never offers a system the header rules out.
-        assert!(!trial_systems(&renamed, Some("SNES")).contains(&"SNES"));
+        assert!(!trial_systems(&renamed, Some("SNES"), &|_| true).contains(&"SNES"));
         let zip = write(&dir, "Game (USA).zip", b"PK\x03\x04rest-of-archive");
-        let systems = trial_systems(&zip, Some("SNES"));
+        let systems = trial_systems(&zip, Some("SNES"), &|_| true);
         assert_eq!(systems.first(), Some(&"SNES"));
         assert!(
             systems.contains(&"NES"),
@@ -722,5 +753,64 @@ mod tests {
             ),
             Outcome::NotApplicable
         );
+    }
+
+    /// Owner decision 2026-11-10: the 1,815 games with no system at all use
+    /// the same lane. Nothing is offered on a guess; the person picks a
+    /// compatible system for one try or remembers it for the unchanged file.
+    #[test]
+    fn a_game_with_no_system_can_be_tried_or_remembered_but_never_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let chd = write(&dir, "Avenger (Japan).chd", &[0u8; 4096]);
+        assert_eq!(
+            resolve(&chd, "", None, None, None, None),
+            Outcome::NotApplicable
+        );
+        match resolve(&chd, "", None, None, Some("PC Engine CD"), None) {
+            Outcome::Allowed(identity, SystemBasis::Trial) => {
+                assert_eq!(identity.platform_id, "PC Engine CD");
+                assert!(identity.game_key.starts_with("unverified:"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            allowed(&resolve(&chd, "", None, None, None, Some("Dreamcast"))),
+            Some(SystemBasis::Remembered)
+        );
+        // The file's own header still wins over a try or a remembered choice.
+        let nes = ines(&dir, "Unknown (USA).bin");
+        assert!(matches!(
+            resolve(&nes, "", None, None, None, Some("SNES")),
+            Outcome::Contradicted { content: "NES", .. }
+        ));
+        assert!(matches!(
+            resolve(&nes, "", None, None, Some("SNES"), None),
+            Outcome::Contradicted { content: "NES", .. }
+        ));
+    }
+
+    #[test]
+    fn only_systems_the_media_allows_and_an_installed_route_serves_are_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let chd = write(&dir, "Avenger (Japan).chd", &[0u8; 4096]);
+        let every = trial_systems(&chd, None, &|_| true);
+        assert!(
+            every.len() > 1 && every.contains(&"PC Engine CD"),
+            "{every:?}"
+        );
+        // Only systems with an installed launch route.
+        assert_eq!(
+            trial_systems(&chd, None, &|system| system == "PC Engine CD"),
+            vec!["PC Engine CD"]
+        );
+        assert!(trial_systems(&chd, None, &|_| false).is_empty());
+        // A file whose own header names its system offers that system only,
+        // never one it rules out.
+        let rom = ines(&dir, "Unknown (USA).nes");
+        let offered = trial_systems(&rom, None, &|_| true);
+        assert!(!offered.contains(&"SNES"), "{offered:?}");
+        // Formats no system lists offer nothing.
+        let odd = write(&dir, "notes.xyz", b"hello");
+        assert!(trial_systems(&odd, None, &|_| true).is_empty());
     }
 }

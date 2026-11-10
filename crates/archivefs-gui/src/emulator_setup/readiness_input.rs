@@ -41,6 +41,9 @@ pub(crate) struct ReadinessSources<'a> {
     /// The person's saved "Remember this launch choice" for this unchanged
     /// file, if any (see `archivefs_core::launch::remembered_launch_system`).
     pub(crate) remembered_system: &'a dyn Fn(&Path) -> Option<&'static str>,
+    /// The catalogue row for this file is known and records no system at all
+    /// (distinct from "not loaded yet").
+    pub(crate) system_unknown: &'a dyn Fn(&Path) -> bool,
 }
 
 impl ReadinessSources<'_> {
@@ -392,7 +395,12 @@ impl ReadinessSources<'_> {
                     | launch_readiness_page::IdentityUnknownReason::UnsupportedArchive
                     | launch_readiness_page::IdentityUnknownReason::UnsupportedFormat(_)
             );
-            if let Some(hint) = hint.filter(|_| !format_unsupported) {
+            // No system recorded at all (owner decision 2026-11-10): the same
+            // lane, with no recorded system to confirm - the person picks one
+            // for a try or remembers it; nothing is saved as the system.
+            let system_unknown = hint.is_none() && (self.system_unknown)(path);
+            let lane_hint = hint.clone().or_else(|| system_unknown.then(String::new));
+            if let Some(hint) = lane_hint.filter(|_| !format_unsupported) {
                 // The recorded source only describes the catalogue's own value.
                 let source = (catalogued.as_deref() == Some(hint.as_str()))
                     .then(|| (self.platform_source)(path))
@@ -425,7 +433,24 @@ impl ReadinessSources<'_> {
                             },
                         );
                     }
-                    Outcome::NotApplicable => {}
+                    Outcome::NotApplicable => {
+                        if system_unknown
+                            && !crate::emulator_setup::unverified_media::trial_systems(
+                                path,
+                                None,
+                                &|system| {
+                                    archivefs_core::launch::planning::retroarch_core_installed_for(
+                                        system,
+                                        retroarch_environment,
+                                    )
+                                },
+                            )
+                            .is_empty()
+                        {
+                            lane_reason =
+                                Some(launch_readiness_page::IdentityUnknownReason::SystemUnknown);
+                        }
+                    }
                 }
             }
         }
@@ -473,7 +498,14 @@ impl ReadinessSources<'_> {
                             focused,
                             selected_game_identity_report,
                             focused_record
-                                .map(|r| r.mount_plan.archive.identity.platform.as_deref()),
+                                .map(|r| r.mount_plan.archive.identity.platform.as_deref())
+                                // Blue has no live record, but knows the
+                                // catalogue row has no system at all.
+                                .or_else(|| {
+                                    focused
+                                        .is_some_and(|p| (self.system_unknown)(p))
+                                        .then_some(None)
+                                }),
                         )
                     }))
                 };

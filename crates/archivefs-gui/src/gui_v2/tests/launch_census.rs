@@ -152,7 +152,32 @@ fn real_library_launch_census() {
             .push(index);
     }
     let mut picks = Vec::new();
-    for ((platform, ext), members) in &groups {
+    // CENSUS_PATHS: '|'-separated path fragments; the first CENSUS_PER_GROUP
+    // games of each fragment are taken instead of stratified groups (used
+    // for representative games with no recorded system).
+    let fragments: Vec<String> = std::env::var("CENSUS_PATHS")
+        .ok()
+        .map(|v| v.split('|').map(str::to_string).filter(|f| !f.is_empty()).collect())
+        .unwrap_or_default();
+    for fragment in &fragments {
+        let members: Vec<usize> = groups
+            .values()
+            .flatten()
+            .copied()
+            .filter(|&index| {
+                library.games[index]
+                    .archive
+                    .absolute_path
+                    .to_string_lossy()
+                    .contains(fragment.as_str())
+            })
+            .collect();
+        for &index in members.iter().take(per_group) {
+            let game = &library.games[index];
+            picks.push((game.platform.clone(), extension(game), members.len(), index));
+        }
+    }
+    for ((platform, ext), members) in groups.iter().filter(|_| fragments.is_empty()) {
         let take = per_group.min(members.len());
         for k in 0..take {
             let index = members[k * members.len() / take];

@@ -280,6 +280,7 @@ pub(super) fn offers_review_identity(input: &launch_readiness_page::LaunchReadin
             launch_readiness_page::IdentityUnknownReason::SystemNotChosen
                 | launch_readiness_page::IdentityUnknownReason::NotConfirmed
                 | launch_readiness_page::IdentityUnknownReason::FolderOnly(_)
+                | launch_readiness_page::IdentityUnknownReason::SystemUnknown
                 | launch_readiness_page::IdentityUnknownReason::MediaConflict { .. },
         ) | launch_readiness_page::LaunchReadinessInput::DiscFilesUnresolved(_)
             | launch_readiness_page::LaunchReadinessInput::IdentityConflicting
@@ -323,7 +324,7 @@ pub(super) fn identity_next_step(
             "Choose system",
             "Next step: Choose system sets the system for this game after you review its confirmation. Without a system EmuWiz cannot pick an emulator.",
         ),
-        Input::IdentityUnknown(Reason::FolderOnly(_)) => (
+        Input::IdentityUnknown(Reason::FolderOnly(_) | Reason::SystemUnknown) => (
             CHANGE_SYSTEM_PERMANENTLY,
             "Or change the system permanently: Review identity saves your choice for this game. It then outranks later automatic detection until you choose \"Use the detected system again\".",
         ),
@@ -705,10 +706,13 @@ impl NativeWorkflows {
         self.start_launch_readiness(ui.ctx());
 
         let input = self.launch_input();
+        // A folder guess or no system at all: the person picks the system for
+        // one try (or remembers it); see `unverified_media`.
         let folder_only = matches!(
             input,
             launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
                 launch_readiness_page::IdentityUnknownReason::FolderOnly(_)
+                    | launch_readiness_page::IdentityUnknownReason::SystemUnknown
             )
         );
         let trial_systems = if folder_only {
@@ -718,7 +722,18 @@ impl NativeWorkflows {
                 .as_ref()
                 .filter(|(hinted, _)| hinted == path)
                 .map(|(_, platform)| platform.as_str());
-            crate::emulator_setup::unverified_media::trial_systems(path, recorded)
+            let environment = match &self.app.emulator_readiness.retroarch_profiles {
+                RetroArchProfilesState::Ready(discovery) => Some(&discovery.environment),
+                _ => None,
+            };
+            crate::emulator_setup::unverified_media::trial_systems(path, recorded, &|system| {
+                environment.is_some_and(|environment| {
+                    archivefs_core::launch::planning::retroarch_core_installed_for(
+                        system,
+                        environment,
+                    )
+                })
+            })
         } else {
             Vec::new()
         };

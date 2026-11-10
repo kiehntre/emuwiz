@@ -152,6 +152,7 @@ pub fn remember_launch_system_at(
     entry: &RememberedLaunchSystem,
 ) -> Result<(), String> {
     entry.validate()?;
+    let _writer = write_lock();
     let mut entries = load_remembered_launch_systems_at(path)?;
     entries.retain(|existing| existing.path != entry.path);
     entries.push(entry.clone());
@@ -160,6 +161,7 @@ pub fn remember_launch_system_at(
 
 /// Forgets the remembered choice for exactly `file`.
 pub fn forget_launch_system_at(path: &Path, file: &Path) -> Result<(), String> {
+    let _writer = write_lock();
     let mut entries = load_remembered_launch_systems_at(path)?;
     let before = entries.len();
     entries.retain(|existing| existing.path != file);
@@ -189,6 +191,14 @@ fn write_entries(path: &Path, mut entries: Vec<RememberedLaunchSystem>) -> Resul
     crate::atomic_write_text(path, &text).map_err(|error| error.to_string())?;
     invalidate_cache();
     Ok(())
+}
+
+/// Serialises read-modify-write within this process, so two saves (for
+/// example from the UI and a background task) never drop each other's entry.
+fn write_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 type Snapshot = (PathBuf, Option<(u64, u64)>, Vec<RememberedLaunchSystem>);

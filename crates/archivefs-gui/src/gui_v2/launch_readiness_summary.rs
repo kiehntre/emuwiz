@@ -367,6 +367,16 @@ fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSumma
             None,
             Some(ReadinessAction::TryAnyway),
         ),
+        IdentityUnknownReason::SystemUnknown => base(
+            ReadinessPresentationState::NeedsSystem,
+            "The system for this game is not known",
+            "No system is recorded for this game and the file does not name one, so Play is not offered on a guess. Try anyway starts it once as a compatible system you pick (only systems that use this file format and have an installed emulator), with a warning, and saves nothing unless you tick Remember this launch choice. Neither sets the game's system; choose it permanently on Review identity. Catalogue (DAT) verification is not required.",
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::TryAnyway),
+        ),
         IdentityUnknownReason::MediaConflict { recorded, content } => base(
             ReadinessPresentationState::Blocked,
             &format!("This file is a {content} game, not {recorded}"),
