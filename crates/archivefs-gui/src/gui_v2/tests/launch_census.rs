@@ -168,7 +168,7 @@ fn real_library_launch_census() {
     let mut file = std::fs::File::create(&out).expect("CENSUS_OUT");
     writeln!(
         file,
-        "platform\text\tgroup_size\tid\tpath\tstatus\tprimary_action\theadline\tidentity\tfirmware\temulator\tplay_shown\tchoose_emulator_shown\tsettle_ms\tinput\tcard_text\tlaunch_play_button\tlaunch_identity_unresolved\tlaunch_choice_needed\tlaunch_text"
+        "platform\text\tgroup_size\tid\tpath\tstatus\tprimary_action\theadline\tidentity\tfirmware\temulator\tplay_shown\tchoose_emulator_shown\tsettle_ms\tinput\tcard_text\tlaunch_play_button\tlaunch_identity_unresolved\tlaunch_choice_needed\tlaunch_choice_controls\ttry_anyway_shown\tlaunch_text"
     )
     .unwrap();
 
@@ -332,9 +332,13 @@ fn real_library_launch_census() {
             .iter()
             .any(|t| t.contains("Identity unresolved"));
         let launch_choice_needed = launch_frame.iter().any(|t| t.contains("Choice needed"));
+        // The "Choice needed" label is printed on every tied card; whether a
+        // choice can actually be made is shown by the controls themselves.
+        let launch_choice_controls = launch_frame.iter().any(|t| t == "Use once");
+        let try_anyway_shown = launch_frame.iter().any(|t| t.starts_with("Try once as "));
         writeln!(
             file,
-            "{platform}\t{ext}\t{size}\t{id}\t{}\t{status}\t{action}\t{headline}\t{identity}\t{firmware}\t{emulator}\t{play_shown}\t{choose_shown}\t{settle_ms}\t{input}\t{}\t{launch_play}\t{launch_identity_unresolved}\t{launch_choice_needed}\t{}",
+            "{platform}\t{ext}\t{size}\t{id}\t{}\t{status}\t{action}\t{headline}\t{identity}\t{firmware}\t{emulator}\t{play_shown}\t{choose_shown}\t{settle_ms}\t{input}\t{}\t{launch_play}\t{launch_identity_unresolved}\t{launch_choice_needed}\t{launch_choice_controls}\t{try_anyway_shown}\t{}",
             clean(&game.archive.absolute_path.display().to_string()),
             clean(&card.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ¦ ")),
             clean(&launch_text.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ¦ ")),
