@@ -1382,8 +1382,26 @@ fn staged_launch_is_safe(
             ));
         }
     }
+    // RetroArch expands a leading `~` (`~` or `~/...`) to the user's home
+    // directory, so the same values are read here with the same resolver and
+    // home the environment discovery used for this native profile. Anything
+    // else that is not absolute (`~user`, `:/` aliases, relative values) is
+    // still refused, as is a missing home directory.
+    let tilde_home = environment
+        .home
+        .as_ref()
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute());
     let dir_of = |key: &str| -> Option<PathBuf> {
-        seen.get(key).map(PathBuf::from).filter(|p| p.is_absolute())
+        let raw = seen.get(key)?;
+        let resolved = match &tilde_home {
+            Some(home) => {
+                crate::emulator_environment::retroarch::resolve_configured_value(raw, home)?
+            }
+            None => PathBuf::from(raw),
+        };
+        Some(resolved).filter(|path| path.is_absolute())
     };
     let (Some(saves), Some(states)) = (dir_of("savefile_directory"), dir_of("savestate_directory"))
     else {
