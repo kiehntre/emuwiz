@@ -125,6 +125,12 @@ pub(crate) struct GameReadinessSummary {
     pub(crate) findings: Vec<Finding>,
     /// What happened the last time Play was pressed for this game.
     pub(crate) attempt: Option<Attempt>,
+    /// Play is ready and at least one other emulator could also be chosen
+    /// for this game (the shared launch-choice gate, so a blocked or
+    /// unavailable one never counts). The card then also offers "Choose
+    /// emulator", which opens the Launch page's per-emulator choice controls;
+    /// without it a planner's sole pick left no way to set a default.
+    pub(crate) other_emulator_choosable: bool,
 }
 
 pub(crate) fn project(
@@ -780,6 +786,10 @@ fn project_plan(
     );
     summary.warnings = warnings;
     summary.details = details;
+    summary.other_emulator_choosable = plan.candidates.iter().any(|other| {
+        !std::ptr::eq(other, candidate)
+            && archivefs_core::launch::launch_choice::is_choosable(plan, other)
+    });
     if !has_warning && let Some(emulator) = &summary.emulator {
         summary.explanation = format!(
             "EmuWiz can now prepare this game for {}. Checking readiness does not change your game files.",
@@ -813,6 +823,7 @@ fn base(
         freshness: ReadinessFreshness::Current,
         findings: Vec::new(),
         attempt: None,
+        other_emulator_choosable: false,
     }
 }
 
@@ -1000,9 +1011,12 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
         });
         // The action sits directly under the state so it stays on screen in a
         // short window; the explanation and evidence chips follow it.
+        let offers_choice = summary.primary_action == Some(ReadinessAction::Play)
+            && summary.other_emulator_choosable;
         let action_count = 1 + usize::from(
-            summary.primary_action.is_some()
-                && summary.primary_action != Some(ReadinessAction::Play),
+            (summary.primary_action.is_some()
+                && summary.primary_action != Some(ReadinessAction::Play))
+                || offers_choice,
         );
         let available = ui.available_width();
         let gap = ui.spacing().item_spacing.x;
@@ -1034,6 +1048,17 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
                 {
                     action = Some(primary);
                 }
+            }
+            if offers_choice
+                && ui
+                    .add_sized(
+                        [slot, 64.0],
+                        egui::Button::new(action_label(ReadinessAction::ChooseEmulator)).wrap(),
+                    )
+                    .on_hover_text("Other emulators can also start this game. Choose one for this launch, or save it as the default for this game or system.")
+                    .clicked()
+            {
+                action = Some(ReadinessAction::ChooseEmulator);
             }
             // Play is always on screen so the page never changes shape: when
             // it cannot run, it is disabled and the headline above says why.
@@ -2337,6 +2362,71 @@ mod tests {
         let (labels, action) = click_card_button(&summary, "Play");
         assert_eq!(labels.iter().filter(|label| *label == "Play").count(), 1);
         assert_eq!(action, Some(ReadinessAction::Play));
+    }
+
+    /// Owner 2026-11-11: PS1 showed one Play for the planner's sole pick
+    /// (a reviewed SwanStation core) while standalone DuckStation was also
+    /// ready, so "Default for PSX" was unreachable. Another choosable
+    /// emulator now adds "Choose emulator" beside Play; a blocked or
+    /// unavailable one never does.
+    #[test]
+    fn a_ready_sole_pick_offers_choose_emulator_only_when_another_is_choosable() {
+        let sole = candidate(
+            LaunchReadiness::Ready,
+            FirmwareReadiness::NotRequired,
+            vec![],
+            vec![],
+            CandidatePreference::SoleEligible,
+            Some("/game.chd"),
+        );
+        let other_ready = candidate(
+            LaunchReadiness::Ready,
+            FirmwareReadiness::Verified,
+            vec![],
+            vec![],
+            CandidatePreference::Undetermined,
+            Some("/game.chd"),
+        );
+        let summary = project(
+            &plan(vec![sole.clone(), other_ready]),
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+        assert!(summary.other_emulator_choosable);
+        let (labels, action) = click_card_button(&summary, "Choose emulator");
+        assert_eq!(action, Some(ReadinessAction::ChooseEmulator), "{labels:?}");
+        let (labels, action) = click_card_button(&summary, "Play");
+        assert_eq!(labels.iter().filter(|label| *label == "Play").count(), 1);
+        assert_eq!(action, Some(ReadinessAction::Play));
+
+        for unavailable in [
+            LaunchBlocker::new(
+                LaunchBlockerKind::NoInstallationCandidate,
+                "the chosen DuckStation is no longer installed",
+            ),
+            LaunchBlocker::new(LaunchBlockerKind::RequiredFirmwareMissing, "no BIOS"),
+        ] {
+            let blocked = candidate(
+                LaunchReadiness::Blocked,
+                FirmwareReadiness::Missing,
+                vec![unavailable],
+                vec![],
+                CandidatePreference::Undetermined,
+                Some("/game.chd"),
+            );
+            let summary = project(
+                &plan(vec![sole.clone(), blocked]),
+                ReadinessFreshness::Current,
+            );
+            assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+            assert!(!summary.other_emulator_choosable);
+            let (labels, action) = click_card_button(&summary, "Choose emulator");
+            assert_eq!(action, None);
+            assert!(!labels.iter().any(|label| label == "Choose emulator"));
+        }
+
+        let alone = project(&plan(vec![sole]), ReadinessFreshness::Current);
+        assert!(!alone.other_emulator_choosable);
     }
 
     #[test]

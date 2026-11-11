@@ -307,10 +307,6 @@ pub fn hash_firmware_file(
     max_bytes: u64,
     chunk_bytes: usize,
 ) -> Result<ComputedFirmwareDigests, String> {
-    use md5::Md5;
-    use sha1::Sha1;
-    use sha1::digest::Digest;
-
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
