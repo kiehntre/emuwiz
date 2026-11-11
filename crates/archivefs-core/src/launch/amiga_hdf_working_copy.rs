@@ -221,6 +221,42 @@ fn ambiguous_identity(identity: &FolderIdentity) -> bool {
     identity.fsid == 0 || identity.fsid == kernel_encoded
 }
 
+const AMBIGUOUS_DRIVE: &str = "EmuWiz cannot reliably recognise the drive this folder is on: drives in this format (for example FAT or exFAT) look the same as any other drive plugged in at the same place, so saves could end up on the wrong drive. Choose a folder on a Linux-formatted drive (ext4 or btrfs) in Settings > Amiga hard-disk game copies.";
+
+/// Refuses a storage folder whose drive cannot be told apart from another.
+fn refuse_ambiguous(identity: &FolderIdentity) -> Result<(), String> {
+    if ambiguous_identity(identity) {
+        return Err(format!("{}: {AMBIGUOUS_DRIVE}", identity.path.display()));
+    }
+    Ok(())
+}
+
+/// Every Play: each storage folder other than EmuWiz's own data folder
+/// (chosen, override, earlier or used ones) must be on a drive EmuWiz can
+/// recognise, or a different drive could be mistaken for it and saves
+/// split. When the copies folder does not exist yet, the folder it would be
+/// created in is checked instead.
+fn refuse_ambiguous_storage(storage: &EffectiveStorage, default: &Path) -> Result<(), String> {
+    let mut folders: Vec<&Path> = vec![storage.root.as_path()];
+    folders.extend(storage.earlier_roots.iter().map(PathBuf::as_path));
+    folders.extend(storage.used_roots.iter().map(PathBuf::as_path));
+    for folder in folders {
+        if folder == default {
+            continue;
+        }
+        let checked = match identify_folder(folder) {
+            Ok(identity) => identity,
+            Err(_) if folder == storage.root => match folder.parent().map(identify_folder) {
+                Some(Ok(identity)) => identity,
+                _ => continue,
+            },
+            Err(_) => continue,
+        };
+        refuse_ambiguous(&checked)?;
+    }
+    Ok(())
+}
+
 const RECONNECT_HELP: &str = "Reconnect or mount the drive and try again. If the folder really moved, choose it again in Settings > Amiga hard-disk game copies (or use \"Accept as it is now\" there); if it is gone for good, choose Forget there, and its saves will no longer be used.";
 
 /// Refuses unless `folder` (and its parent, when that was the folder the
@@ -533,6 +569,7 @@ pub fn redirect_for_launch(
         return Ok(None);
     }
     let storage = effective_storage()?;
+    refuse_ambiguous_storage(&storage, &default_root()?)?;
     let copy = working_copy_in(
         content,
         &storage.root,
@@ -806,6 +843,7 @@ fn accept_storage_folder_in(path: &Path, folder: &Path) -> Result<(), String> {
         }
         let now = identify_folder(folder)
             .map_err(|e| format!("{} is not available: {e}", folder.display()))?;
+        refuse_ambiguous(&now)?;
         save_settings_to(&path, &with_identity(&settings, now))
     })
 }
@@ -997,12 +1035,7 @@ pub fn choose_storage(folder: Option<&Path>) -> Result<EffectiveStorage, String>
                 // it from an empty mount point when the drive is absent.
                 let picked = identify_folder(folder)
                     .map_err(|e| format!("cannot use {}: {e}", folder.display()))?;
-                if ambiguous_identity(&picked) {
-                    return Err(format!(
-                        "EmuWiz cannot reliably recognise the drive {} is on (FAT or exFAT drives look the same as any other drive in that port), so saves could end up on the wrong drive. Choose a folder on a Linux-formatted drive (ext4 or btrfs).",
-                        folder.display()
-                    ));
-                }
+                refuse_ambiguous(&picked)?;
                 next = with_identity(&next, picked);
                 Some(folder.join(CHOSEN_SUBFOLDER))
             }
@@ -1825,7 +1858,14 @@ mod tests {
         }
         assert!(std::fs::read_dir(&empty).unwrap().next().is_none());
 
-        // The right folder, holding copies, is accepted with its live identity.
+        // The right folder, holding copies, is accepted with its live identity
+        // (unless this test's own drive is one EmuWiz cannot tell apart, e.g.
+        // a tmpfs /tmp: then it is refused too and nothing changes).
+        if ambiguous_identity(&identify_folder(&real).unwrap()) {
+            assert!(accept_storage_folder_in(&settings_file, &real).is_err());
+            assert_eq!(std::fs::read(&settings_file).unwrap(), before);
+            return;
+        }
         accept_storage_folder_in(&settings_file, &real).unwrap();
         let after = load_settings_from(&settings_file).unwrap();
         let now = after.identities.iter().find(|i| i.path == real).unwrap();
@@ -1880,6 +1920,41 @@ mod tests {
                 .file_type()
                 .is_file()
         );
+    }
+
+    #[test]
+    fn play_refuses_storage_on_a_drive_that_cannot_be_told_apart() {
+        let stick = FolderIdentity {
+            path: PathBuf::from("/media/stick"),
+            dev: 0x0821,
+            ino: 1,
+            fsid: 0x0821,
+        };
+        assert!(refuse_ambiguous(&stick).is_err());
+
+        let base = tempfile::tempdir().unwrap();
+        let default = base.path().join("data").join("amiga-hdf-working");
+        let picked = base.path().join("picked");
+        std::fs::create_dir(&picked).unwrap();
+        let storage = |root: PathBuf, earlier: Vec<PathBuf>| EffectiveStorage {
+            root,
+            source: StorageSource::Chosen,
+            earlier_roots: earlier,
+            used_roots: Vec::new(),
+            identities: Vec::new(),
+        };
+        // The copies folder does not exist yet: the picked folder is judged.
+        let pending = storage(picked.join(CHOSEN_SUBFOLDER), vec![default.clone()]);
+        let here_ambiguous = ambiguous_identity(&identify_folder(&picked).unwrap());
+        assert_eq!(
+            refuse_ambiguous_storage(&pending, &default).is_err(),
+            here_ambiguous
+        );
+        // EmuWiz's own data folder is never judged, and missing folders are
+        // left to the availability checks.
+        std::fs::create_dir_all(&default).unwrap();
+        let own = storage(default.clone(), vec![base.path().join("gone")]);
+        assert!(refuse_ambiguous_storage(&own, &default).is_ok());
     }
 
     #[test]
