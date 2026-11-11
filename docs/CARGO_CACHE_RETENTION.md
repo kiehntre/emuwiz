@@ -347,6 +347,38 @@ non-participating targets stay held with an explanation. Incomplete journals are
 auto-acknowledged. `status`, `plan`, `run --dry-run` and `history` report decisions, held reasons
 (actionable), reclaimed space and the last cleanup.
 
+**Free-space trigger (optional).** `--reserve-trigger-free-gib T` (T must not exceed
+`--reserve-free-gib R`) adds `limits.reserve_trigger_free_bytes`: the free-space reserve asks for
+nothing while free space is at or above T, and once it falls below T a cycle aims to restore R
+(`need = R - free`), still within the per-cycle caps, so it can take several cycles. Without it the
+trigger is R itself (the original behaviour); existing policies, and their digests, are unchanged.
+The soft budget remains a separate trigger: a cycle runs when either one asks for space.
+
+**A second target root (policy instance).** One policy covers one target root. For another root
+(e.g. `/mnt/nvme2/emuwiz-cargo-targets`, where `cargo-env.sh` sends builds) set
+`EMUWIZ_MAINTENANCE_INSTANCE=NAME` together with `EMUWIZ_TARGET_ROOT=<root>`. The instance keeps its
+own policy, enablement, history, manifests and receipts in `<registry>/maintenance-NAME/` over the
+same shared lifecycle registry (target records, pins and locks), so the two policies never share
+authority: each only plans targets directly under its own root (`OUTSIDE_POLICY_ROOT` otherwise),
+and an instance whose policy names a root other than `EMUWIZ_TARGET_ROOT` is invalid (fail closed).
+The default instance (no variable) is `<registry>/maintenance/`, unchanged. `units` run with both
+variables writes `emuwiz-cargo-maintain-NAME.service`/`.timer` carrying them and
+`ReadWritePaths=<registry> <root>`. Commands for an instance (`policy`, `plan`, `status`, `run`,
+`history`, and `worktree-check` for a target that instance retired) need the same two variables;
+without them the retirement evidence is not found and the gate stays HOLD.
+
+Owner-approved /mnt/nvme2 numbers (180 GiB cache budget; clean below 240 GiB free, restore 260 GiB;
+3 targets / 20 GB per cycle). `--soft-gb` is decimal GB, so 180 GiB is 193.274 GB; the hard budget
+only drives the advisory admission note and must exceed the soft one:
+
+```
+EMUWIZ_MAINTENANCE_INSTANCE=nvme2 EMUWIZ_TARGET_ROOT=/mnt/nvme2/emuwiz-cargo-targets \
+  emuwiz-cargo-maintain policy approve --owners davedap --soft-gb 193.274 --hard-gb 214.748 \
+  --reserve-free-gib 260 --reserve-trigger-free-gib 240 --max-targets 3 --max-gb 20
+```
+
+The build guards (`cargo-iso`/`emuwiz-cargo-guard`, `EMUWIZ_MIN_FREE_GB`) are separate and unchanged.
+
 ### Admission and the minimum-free guard (ADVISORY ONLY)
 `cargo-iso` calls `emuwiz-cargo-maintain admit` for a new or re-created (artifact-free) target.
 The check is **advisory**: if allocated storage plus an allowance (3 GB default;
