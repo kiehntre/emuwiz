@@ -1031,7 +1031,19 @@ fn a_shallow_bios_folder_never_trusts_a_broad_parent() {
         root("/home/user/bios"),
         Some(PathBuf::from("/home/user/bios"))
     );
-    assert_eq!(root("/mnt/x"), Some(PathBuf::from("/mnt/x")));
+    // Final review: a mount root or the home folder is never trusted itself.
+    assert_eq!(root("/mnt/x"), None);
+    assert_eq!(root("/var/home/user"), None);
+    assert_eq!(root("/var/home"), None);
+    assert_eq!(root("/media/user/disk"), None);
+    assert_eq!(
+        root("/media/user/disk/bios"),
+        Some(PathBuf::from("/media/user/disk/bios"))
+    );
+    assert_eq!(
+        root("/mnt/x/bios"),
+        Some(PathBuf::from("/mnt/x/bios"))
+    );
     assert_eq!(root("/mnt"), None);
     assert_eq!(root("/"), None);
     // Re-review: a deep parent can still be the whole home folder or every
@@ -1040,10 +1052,7 @@ fn a_shallow_bios_folder_never_trusts_a_broad_parent() {
         root("/var/home/user/bios"),
         Some(PathBuf::from("/var/home/user/bios"))
     );
-    assert_eq!(
-        root("/run/media/user/USB"),
-        Some(PathBuf::from("/run/media/user/USB"))
-    );
+    assert_eq!(root("/run/media/user/USB"), None);
     assert_eq!(
         root("/run/media/user/USB/bios/psx"),
         Some(PathBuf::from("/run/media/user/USB/bios"))

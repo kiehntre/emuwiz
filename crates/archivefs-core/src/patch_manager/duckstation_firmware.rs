@@ -276,7 +276,6 @@ fn generic_bios_path(config: &DuckStationConfigInspection, directory: &Path) -> 
 /// required BIOS slot, before any file is opened or hashed. Selection
 /// policy only - see [`resolve_duckstation_bios`] for what happens next.
 enum ConfiguredBiosSelection {
-    Missing,
     /// No BIOS file is named for the required slot, so DuckStation searches
     /// its BIOS folder itself (upstream `BIOS::FindBIOSImageInDirectory`).
     AutoSearch {
@@ -397,10 +396,15 @@ fn trusted_bios_tree(directory: &Path) -> TrustedRoots {
     let Ok(canonical) = std::fs::canonicalize(directory) else {
         return TrustedRoots::none();
     };
-    let home = std::env::var_os("HOME")
+    // Without a resolvable home folder the home guard cannot be applied, so
+    // no tree is trusted and every BIOS link is refused (fail closed).
+    let Some(home) = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
-        .and_then(|home| std::fs::canonicalize(home).ok());
-    match trusted_bios_root(&canonical, home.as_deref()) {
+        .and_then(|home| std::fs::canonicalize(home).ok())
+    else {
+        return TrustedRoots::none();
+    };
+    match trusted_bios_root(&canonical, Some(&home)) {
         Some(root) => TrustedRoots::from_paths([root]),
         None => TrustedRoots::none(),
     }
@@ -423,14 +427,21 @@ fn trusted_bios_root<'a>(canonical: &'a Path, home: Option<&Path>) -> Option<&'a
     if depth(canonical) < 2 {
         return None;
     }
-    let broad = |parent: &Path| {
-        home.is_some_and(|home| home.starts_with(parent))
-            || ["/run/media", "/media", "/mnt"].iter().any(|media| {
-                parent.starts_with(media) && depth(parent) <= depth(Path::new(media)) + 1
-            })
+    // A folder is broad when it is the home folder or holds it, or when it is
+    // a mount root or above one: `/mnt/<drive>`, or `/media/<user>/<drive>`
+    // and `/run/media/<user>/<drive>` (one level deeper, per user).
+    let broad = |folder: &Path| {
+        home.is_some_and(|home| home.starts_with(folder))
+            || [("/run/media", 2), ("/media", 2), ("/mnt", 1)]
+                .iter()
+                .any(|(media, levels)| {
+                    folder.starts_with(media) && depth(folder) <= depth(Path::new(media)) + levels
+                })
     };
     match canonical.parent() {
         Some(parent) if depth(parent) >= MIN_TRUSTED_PARENT_DEPTH && !broad(parent) => Some(parent),
+        // The BIOS folder itself is never trusted when it is broad either.
+        _ if broad(canonical) => None,
         _ => Some(canonical),
     }
 }
@@ -542,7 +553,10 @@ fn auto_search_bios(
                     // Only a pre-filter so broken, oversized and special links
                     // never use the hash budget; the size and type that count
                     // are re-checked on the safely opened descriptor.
+                    // Absolute link targets are refused later anyway; never
+                    // stat them here, so a hung mount they name cannot block.
                     || (metadata.file_type().is_symlink()
+                        && std::fs::read_link(path).is_ok_and(|target| target.is_relative())
                         && std::fs::metadata(path).is_ok_and(|target| {
                             target.is_file() && target.len() == PS1_BIOS_SIZE
                         }))
@@ -649,7 +663,6 @@ pub fn resolve_duckstation_bios(
     evidence: &[FirmwareIdentityRecord],
 ) -> DuckStationBiosVerificationOutcome {
     match resolve_configured_bios_selection(profile, inspection) {
-        ConfiguredBiosSelection::Missing => DuckStationBiosVerificationOutcome::Missing,
         ConfiguredBiosSelection::Ambiguous(detail) => {
             DuckStationBiosVerificationOutcome::Ambiguous { detail }
         }
