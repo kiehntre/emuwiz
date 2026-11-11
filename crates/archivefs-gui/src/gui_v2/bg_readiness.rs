@@ -1239,15 +1239,15 @@ mod tests {
     }
 
     fn finished_state() -> EmulatorReadinessState {
-        let mut state = EmulatorReadinessState::default();
-        state.retroarch_profiles =
-            RetroArchProfilesState::Ready(crate::tests::cheat_discovery(vec![
+        EmulatorReadinessState {
+            retroarch_profiles: RetroArchProfilesState::Ready(crate::tests::cheat_discovery(vec![
                 crate::tests::cheat_profile("native-user", true),
-            ]));
-        state.dolphin_local_profiles = DolphinLocalProfilesState::Error("none".into());
-        state.pcsx2_launch_profiles = Pcsx2LaunchProfilesState::Error("none".into());
-        state.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Ready(Vec::new());
-        state
+            ])),
+            dolphin_local_profiles: DolphinLocalProfilesState::Error("none".into()),
+            pcsx2_launch_profiles: Pcsx2LaunchProfilesState::Error("none".into()),
+            pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState::Ready(Vec::new()),
+            ..Default::default()
+        }
     }
 
     #[test]
