@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
@@ -842,10 +842,12 @@ fn bios_sized(seed: u8) -> Vec<u8> {
 }
 
 fn search_fixture(label: &str) -> (Fixture, PathBuf) {
-    let fixture = build_fixture(label, "[BIOS]\nSearchDirectory=../bios-folder\n");
+    // The real layout: SearchDirectory names `bios/psx`, so the trusted BIOS
+    // tree is `bios` and everything else under the fixture root is outside it.
+    let fixture = build_fixture(label, "[BIOS]\nSearchDirectory=../bios/psx\n");
     // Exactly the path DuckStation forms: its data root joined with the
     // relative SearchDirectory.
-    let directory = fixture.profile.configuration_path.join("../bios-folder");
+    let directory = fixture.profile.configuration_path.join("../bios/psx");
     fs::create_dir_all(&directory).unwrap();
     (fixture, directory)
 }
@@ -922,17 +924,97 @@ fn search_directory_unverified_or_unknown_region_is_never_verified() {
 }
 
 #[test]
-fn search_directory_ignores_symlinks_and_wrong_sizes() {
-    let (fixture, directory) = search_fixture("auto-symlink");
+fn search_directory_ignores_wrong_sizes() {
+    let (fixture, directory) = search_fixture("auto-size");
     let usa = bios_sized(5);
-    let outside = write_bios(&fixture.root.join("outside"), "real.bin", &usa);
-    symlink(&outside, directory.join("scph1001.bin")).unwrap();
     write_bios(&directory, "short.bin", &usa[..1024]);
     let inspection = inspection_for(&fixture, "SLUS-00404");
     let outcome =
         resolve_duckstation_bios(&fixture.profile, &inspection, &[record_for("ps-22a", &usa)]);
     assert_eq!(outcome, DuckStationBiosVerificationOutcome::Missing);
     fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+// --- contained BIOS links (bios/psx/*.bin -> ../*.bin) ------------------------------------------
+
+#[test]
+fn a_relative_link_to_a_bios_in_the_folder_above_verifies() {
+    let (fixture, directory) = search_fixture("link-contained");
+    let usa = bios_sized(7);
+    write_bios(&directory.join(".."), "scph1001.bin", &usa);
+    symlink("../scph1001.bin", directory.join("scph1001.bin")).unwrap();
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome =
+        resolve_duckstation_bios(&fixture.profile, &inspection, &[record_for("ps-22a", &usa)]);
+    let DuckStationBiosVerificationOutcome::Verified(verified) = outcome else {
+        panic!("expected Verified, got {outcome:?}");
+    };
+    assert_eq!(verified.path, directory.join("scph1001.bin"));
+    assert_eq!(verified.record.name, "ps-22a");
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+fn assert_link_not_verified(label: &str, make: impl FnOnce(&Path, &Path, &[u8])) {
+    let (fixture, directory) = search_fixture(label);
+    let usa = bios_sized(8);
+    make(&fixture.root, &directory, &usa);
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome =
+        resolve_duckstation_bios(&fixture.profile, &inspection, &[record_for("ps-22a", &usa)]);
+    assert!(
+        !matches!(outcome, DuckStationBiosVerificationOutcome::Verified(_)),
+        "{label}: {outcome:?}"
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn a_relative_link_escaping_the_bios_tree_is_refused() {
+    assert_link_not_verified("link-escape", |root, directory, usa| {
+        write_bios(&root.join("outside"), "real.bin", usa);
+        symlink("../../outside/real.bin", directory.join("scph1001.bin")).unwrap();
+    });
+}
+
+#[test]
+fn an_absolute_link_is_refused_even_inside_the_tree() {
+    assert_link_not_verified("link-absolute", |_, directory, usa| {
+        let real = write_bios(&directory.join(".."), "real.bin", usa);
+        let real = fs::canonicalize(real).unwrap();
+        symlink(&real, directory.join("scph1001.bin")).unwrap();
+    });
+}
+
+#[test]
+fn broken_and_looping_links_are_refused() {
+    assert_link_not_verified("link-broken", |_, directory, _| {
+        symlink("../missing.bin", directory.join("scph1001.bin")).unwrap();
+        symlink("loop-b.bin", directory.join("loop-a.bin")).unwrap();
+        symlink("loop-a.bin", directory.join("loop-b.bin")).unwrap();
+    });
+}
+
+#[test]
+fn a_link_to_a_directory_or_fifo_inside_the_tree_is_refused() {
+    assert_link_not_verified("link-special", |_, directory, _| {
+        fs::create_dir_all(directory.join("../a-folder")).unwrap();
+        symlink("../a-folder", directory.join("scph1001.bin")).unwrap();
+        let fifo = directory.join("../a-fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        symlink("../a-fifo", directory.join("scph5501.bin")).unwrap();
+    });
+}
+
+#[test]
+fn a_link_through_a_symlinked_folder_out_of_the_tree_is_refused() {
+    // bios/escape -> ../outside, then psx/scph1001.bin -> ../escape/real.bin:
+    // the canonical target leaves the tree, so it is refused.
+    assert_link_not_verified("link-via-folder", |root, directory, usa| {
+        write_bios(&root.join("outside"), "real.bin", usa);
+        symlink("../outside", directory.join("../escape")).unwrap();
+        symlink("../escape/real.bin", directory.join("scph1001.bin")).unwrap();
+    });
 }
 
 #[test]

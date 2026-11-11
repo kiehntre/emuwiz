@@ -53,8 +53,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::dat::firmware_evidence::{
-    ComputedFirmwareDigests, FirmwareIdentityRecord, hash_firmware_file, matching_firmware_records,
+    ComputedFirmwareDigests, FirmwareIdentityRecord, hash_firmware_file, hash_open_firmware_file,
+    matching_firmware_records,
 };
+use crate::safe_read::TrustedRoots;
 
 use super::duckstation_local::{
     DuckStationBiosInventory, DuckStationBiosState, DuckStationConfigInspection,
@@ -386,6 +388,41 @@ fn resolve_configured_bios_selection(
     }
 }
 
+/// The trusted BIOS tree for DuckStation's configured BIOS folder: the folder
+/// itself and the one directly above it (a `bios/psx` folder of links to
+/// `bios/*.bin` is a common layout). Canonical, so it names real directories.
+/// Empty - every BIOS link refused - when the folder cannot be resolved.
+fn trusted_bios_tree(directory: &Path) -> TrustedRoots {
+    let Ok(canonical) = std::fs::canonicalize(directory) else {
+        return TrustedRoots::none();
+    };
+    TrustedRoots::from_paths([canonical.parent().unwrap_or(&canonical)])
+}
+
+/// Opens a BIOS symlink only when it is a relative link whose resolved target
+/// is a regular file inside `trusted`, via
+/// [`crate::safe_read::open_bounded_read`]: broken links and loops fail to
+/// resolve, special files and targets outside the tree are refused, and the
+/// target is opened by a no-follow descriptor walk so a component swapped for
+/// a link after the check is refused rather than followed. The caller hashes
+/// the returned descriptor, never the pathname again.
+fn open_contained_bios_link(path: &Path, trusted: &TrustedRoots) -> Result<std::fs::File, String> {
+    let target = std::fs::read_link(path).map_err(|error| error.to_string())?;
+    if target.is_absolute() {
+        return Err(
+            "BIOS link is absolute; only relative links inside the BIOS folder are followed"
+                .to_string(),
+        );
+    }
+    // The link's own directory must be named without `..` for the safe open.
+    let parent = path.parent().ok_or("BIOS link has no parent folder")?;
+    let name = path.file_name().ok_or("BIOS link has no file name")?;
+    let parent = std::fs::canonicalize(parent).map_err(|error| error.to_string())?;
+    crate::safe_read::open_bounded_read(&parent.join(name), trusted)
+        .map(crate::safe_read::SafeFile::into_file)
+        .map_err(|refusal| format!("BIOS link refused: {}", refusal.detail()))
+}
+
 /// DuckStation's BIOS image size; upstream also accepts PS2/PS3 BIOS sizes,
 /// which Redump PS1 evidence can never verify.
 const PS1_BIOS_SIZE: u64 = 512 * 1024;
@@ -457,17 +494,20 @@ fn auto_search_bios(
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
-            std::fs::symlink_metadata(path)
-                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == PS1_BIOS_SIZE)
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+                (metadata.is_file() && metadata.len() == PS1_BIOS_SIZE)
+                    || metadata.file_type().is_symlink()
+            })
         })
         .collect();
     if candidates.is_empty() {
         return DuckStationBiosVerificationOutcome::Missing;
     }
     candidates.sort();
+    let trusted = trusted_bios_tree(directory);
     if let Some(required) = required_region {
         for path in candidates.iter().take(MAX_AUTO_SEARCH_HASHED) {
-            let outcome = verify_one_bios_path(path, evidence, Some(required));
+            let outcome = verify_one_bios_path(path, evidence, Some(required), &trusted);
             if let DuckStationBiosVerificationOutcome::Verified(verified) = &outcome
                 && redump_ps1_bios_region(&verified.record) == Some(required)
             {
@@ -487,6 +527,7 @@ fn verify_one_bios_path(
     path: &Path,
     evidence: &[FirmwareIdentityRecord],
     required_region: Option<DuckStationRegion>,
+    trusted: &TrustedRoots,
 ) -> DuckStationBiosVerificationOutcome {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -499,23 +540,34 @@ fn verify_one_bios_path(
             };
         }
     };
-    if metadata.file_type().is_symlink() {
-        return DuckStationBiosVerificationOutcome::Unsafe {
-            path: path.to_path_buf(),
-            detail: "BIOS path is a symlink".to_string(),
-        };
-    }
-    if !metadata.is_file() {
+    let digests: ComputedFirmwareDigests = if metadata.file_type().is_symlink() {
+        match open_contained_bios_link(path, trusted) {
+            Ok(file) => {
+                match hash_open_firmware_file(file, MAX_BIOS_HASH_BYTES, HASH_CHUNK_BYTES) {
+                    Ok(digests) => digests,
+                    Err(detail) => {
+                        return DuckStationBiosVerificationOutcome::Unreadable { detail };
+                    }
+                }
+            }
+            Err(detail) => {
+                return DuckStationBiosVerificationOutcome::Unsafe {
+                    path: path.to_path_buf(),
+                    detail,
+                };
+            }
+        }
+    } else if !metadata.is_file() {
         return DuckStationBiosVerificationOutcome::Unsafe {
             path: path.to_path_buf(),
             detail: "BIOS path is not a regular file".to_string(),
         };
-    }
-    let digests: ComputedFirmwareDigests =
+    } else {
         match hash_firmware_file(path, MAX_BIOS_HASH_BYTES, HASH_CHUNK_BYTES) {
             Ok(digests) => digests,
             Err(detail) => return DuckStationBiosVerificationOutcome::Unreadable { detail },
-        };
+        }
+    };
     match matching_firmware_records(&digests, evidence).first() {
         Some(record) => DuckStationBiosVerificationOutcome::Verified(DuckStationVerifiedBios {
             path: path.to_path_buf(),
@@ -552,7 +604,12 @@ pub fn resolve_duckstation_bios(
         ConfiguredBiosSelection::One {
             path,
             required_region,
-        } => verify_one_bios_path(&path, evidence, required_region),
+        } => {
+            let trusted = path
+                .parent()
+                .map_or_else(TrustedRoots::none, trusted_bios_tree);
+            verify_one_bios_path(&path, evidence, required_region, &trusted)
+        }
         ConfiguredBiosSelection::AutoSearch {
             directory,
             required_region,
