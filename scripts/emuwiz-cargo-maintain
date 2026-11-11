@@ -148,6 +148,7 @@ EXPLANATIONS = {
     "BUILD_LOCK_HELD": "a build is running",
     "RECORDED_BUILD_ALIVE": "a recorded build is still alive",
     "LIVE_PROCESS_REFERENCE": "a process has its directory, executable or files open",
+    "LIVE_PROCESS_IN_SOURCE": "a process (editor, language server, shell) is using its source checkout",
     "INCOMPLETE_PROCESS_VISIBILITY": "needs the root-owned installed copy run as root with --as-user (see docs, privileged execution)",
     "DIRECTORY_IDENTITY_CHANGED": "the directory was replaced since it was recorded",
     "CONTAINS_MOUNT_POINT": "a mount point is inside the target",

@@ -323,6 +323,42 @@ class Holds(MaintBase):
             self.assertIn(reason, row["reasons"], (target, row))
             self.assertTrue(self.intact(target), target)
 
+    def test_busy_source_checkout_is_held_by_the_planner_and_does_not_block_others(self):
+        # 2026-11-05..07: a language server kept a released target's checkout mapped; the
+        # planner selected it as the oldest candidate every cycle, the executor held it
+        # (LIVE_PROCESS_IN_SOURCE) and nothing else was retired for 573 cycles.
+        busy_wt, busy = self.ready("busy-src")
+        self.age(busy, 20)
+        self.age_record(busy, 20)                                  # oldest: planned first
+        free_wt, free = self.ready("free-src")
+        proc = subprocess.Popen(["sleep", "600"], cwd=busy_wt)    # a process in the checkout only
+        try:
+            time.sleep(0.3)
+            self.approve(extra=("--max-targets", "1"))
+            row = self.state_of(self.status(), busy)
+            self.assertFalse(row["auto_eligible"], row)
+            self.assertIn("LIVE_PROCESS_IN_SOURCE", row["reasons"], row)
+            rc, out = self.call("plan", "--json")
+            self.assertEqual([e["name"] for e in json.loads(out)["selected"]], [os.path.basename(free)])
+            rc, out = self.call("run")
+            self.assertEqual(rc, 0, out)
+            cyc = self.last_cycle()
+            self.assertEqual(cyc["outcome"], "RETIRED", cyc)
+            self.assertEqual([t["name"] for t in cyc["targets"]], [os.path.basename(free)])
+            self.assertFalse(self.intact(free))
+            self.assertTrue(self.intact(busy))                     # the busy one is untouched
+            rc, out = self.call("run", "--only", os.path.basename(busy))
+            self.assertNotEqual(rc, 0, out)                        # and cannot be forced
+            self.assertTrue(self.intact(busy))
+        finally:
+            proc.kill()
+            proc.wait()
+        # once the checkout is no longer in use, the next cycle retires it normally
+        rc, out = self.call("run")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.last_cycle()["outcome"], "RETIRED", self.last_cycle())
+        self.assertFalse(self.intact(busy))
+
     def test_corrupt_records_hold_and_never_block(self):
         wt, t = self.ready("corrupt")
         rec = os.path.join(self.reg, "targets", self.key_of(t) + ".json")
