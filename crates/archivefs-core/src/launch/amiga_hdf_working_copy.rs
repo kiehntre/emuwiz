@@ -209,6 +209,18 @@ fn same_folder(recorded: &FolderIdentity, now: &FolderIdentity) -> bool {
     recorded.ino == now.ino && same_filesystem
 }
 
+/// Whether a folder's identity cannot tell its drive apart from another one
+/// plugged into the same port. FAT/exFAT (and some others) report a
+/// filesystem id that is only the device number, or none at all; with a
+/// fixed root inode, a different stick would then look identical.
+fn ambiguous_identity(identity: &FolderIdentity) -> bool {
+    let dev = identity.dev;
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    let kernel_encoded = (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12);
+    identity.fsid == 0 || identity.fsid == kernel_encoded
+}
+
 const RECONNECT_HELP: &str = "Reconnect or mount the drive and try again. If the folder really moved, choose it again in Settings > Amiga hard-disk game copies (or use \"Accept as it is now\" there); if it is gone for good, choose Forget there, and its saves will no longer be used.";
 
 /// Refuses unless `folder` (and its parent, when that was the folder the
@@ -452,28 +464,39 @@ pub fn working_copy_in(
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(e) => return Err(format!("cannot create the working copy: {e}")),
     };
-    // The copy must have landed in the folder checked above. If the folder
-    // was swapped meanwhile, remove only the copy this call just created
-    // (it holds no saves yet) and refuse.
-    let landed = {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::symlink_metadata(&target).map(|m| (m.dev(), m.ino()))
-    };
-    let still_same = identify_folder(root).is_ok_and(|now| same_folder(&root_identity, &now));
-    if !still_same || landed.as_ref().ok().map(|l| l.0) != Some(root_identity.dev) {
-        // Only the file this call wrote (same device and inode) is ever removed.
-        if created && landed.as_ref().ok() == Some(&written) {
-            let _ = std::fs::remove_file(&target);
-        }
-        return Err(format!(
-            "{} changed while the copy was being made; nothing was kept. {RECONNECT_HELP}",
-            root.display()
-        ));
-    }
+    check_landed_copy(root, &root_identity, &target, created, written)?;
     if let Ok(dir_handle) = File::open(&dir) {
         let _ = dir_handle.sync_all();
     }
     Ok(target)
+}
+
+/// After linking: the copy must have landed in the folder checked before.
+/// If the folder was swapped meanwhile, the copy this call just created (it
+/// holds no saves yet) is removed and the launch refused. Any other file at
+/// `target` (an existing copy, or one substituted by another launch or
+/// drive) may hold saves and is never removed: only a file whose device and
+/// inode are exactly those this call wrote.
+fn check_landed_copy(
+    root: &Path,
+    root_identity: &FolderIdentity,
+    target: &Path,
+    created: bool,
+    written: (u64, u64),
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let landed = std::fs::symlink_metadata(target).map(|m| (m.dev(), m.ino()));
+    let still_same = identify_folder(root).is_ok_and(|now| same_folder(root_identity, &now));
+    if still_same && landed.as_ref().ok().map(|l| l.0) == Some(root_identity.dev) {
+        return Ok(());
+    }
+    if created && landed.as_ref().ok() == Some(&written) {
+        let _ = std::fs::remove_file(target);
+    }
+    Err(format!(
+        "{} changed while the copy was being made; nothing was kept. {RECONNECT_HELP}",
+        root.display()
+    ))
 }
 
 /// Points the emulator argv at the working copy instead of the library file.
@@ -605,9 +628,25 @@ fn with_settings_lock<T>(
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(&lock_path)
         .map_err(|e| format!("cannot lock {}: {e}", lock_path.display()))?;
+    // O_NOFOLLOW refuses a symlink; anything else that is not the user's own
+    // regular file (a FIFO, device or someone else's file) is refused too.
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = lock
+            .metadata()
+            .map_err(|e| format!("cannot lock {}: {e}", lock_path.display()))?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if !meta.file_type().is_file() || meta.uid() != me {
+            return Err(format!(
+                "cannot lock {}: it is not a regular file owned by you; settings were not changed",
+                lock_path.display()
+            ));
+        }
+    }
     // SAFETY: flock on a valid, owned descriptor; released when `lock` closes.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(format!(
@@ -749,7 +788,11 @@ fn remember_used_root(root: &FolderIdentity) -> Result<(), String> {
 /// example a drive formatted or restored elsewhere) is the right one. Only
 /// the setting changes; nothing in the folder is touched.
 pub fn accept_storage_folder(folder: &Path) -> Result<(), String> {
-    let path = settings_path()?;
+    accept_storage_folder_in(&settings_path()?, folder)
+}
+
+fn accept_storage_folder_in(path: &Path, folder: &Path) -> Result<(), String> {
+    let path = path.to_path_buf();
     with_settings_lock(&path, || {
         let settings = load_settings_from(&path)?;
         if !settings.identities.iter().any(|i| i.path == folder) {
@@ -954,6 +997,12 @@ pub fn choose_storage(folder: Option<&Path>) -> Result<EffectiveStorage, String>
                 // it from an empty mount point when the drive is absent.
                 let picked = identify_folder(folder)
                     .map_err(|e| format!("cannot use {}: {e}", folder.display()))?;
+                if ambiguous_identity(&picked) {
+                    return Err(format!(
+                        "EmuWiz cannot reliably recognise the drive {} is on (FAT or exFAT drives look the same as any other drive in that port), so saves could end up on the wrong drive. Choose a folder on a Linux-formatted drive (ext4 or btrfs).",
+                        folder.display()
+                    ));
+                }
                 next = with_identity(&next, picked);
                 Some(folder.join(CHOSEN_SUBFOLDER))
             }
@@ -1660,6 +1709,199 @@ mod tests {
         working_copy_for(&path, &empty_mount_point.join(CHOSEN_SUBFOLDER)).unwrap();
         assert!(holds_copies(&empty_mount_point));
         assert!(holds_copies(&empty_mount_point.join(CHOSEN_SUBFOLDER)));
+    }
+
+    fn dev_ino(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(path).unwrap();
+        (m.dev(), m.ino())
+    }
+
+    #[test]
+    fn failed_copy_cleanup_never_removes_an_existing_or_substituted_save_file() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("copies");
+        std::fs::create_dir(&root).unwrap();
+        let recorded = identify_folder(&root).unwrap();
+        let game = root.join("game.hdf");
+        // A folder that was swapped after the check (its recorded identity no
+        // longer matches).
+        let swapped = FolderIdentity {
+            ino: recorded.ino + 1,
+            ..recorded.clone()
+        };
+
+        // 1. A save-bearing copy substituted at the target (by another
+        //    launch, or a different drive) is kept, though this call
+        //    "created" a file whose identity it remembers.
+        std::fs::write(&game, b"SAVES-substituted").unwrap();
+        let ours = (recorded.dev, u64::MAX);
+        assert!(check_landed_copy(&root, &swapped, &game, true, ours).is_err());
+        assert_eq!(std::fs::read(&game).unwrap(), b"SAVES-substituted");
+
+        // 2. An existing copy (link refused, so not created by this call) is
+        //    kept even when its device and inode are the ones given.
+        let existing = dev_ino(&game);
+        assert!(check_landed_copy(&root, &swapped, &game, false, existing).is_err());
+        assert_eq!(std::fs::read(&game).unwrap(), b"SAVES-substituted");
+
+        // 3. Same inode number on another device (another filesystem) is not
+        //    ours: kept.
+        let other_device = (existing.0 ^ 1, existing.1);
+        assert!(check_landed_copy(&root, &swapped, &game, true, other_device).is_err());
+        assert!(game.exists());
+
+        // 4. The folder did not change: nothing is removed, the copy stands.
+        assert!(check_landed_copy(&root, &recorded, &game, true, existing).is_ok());
+        assert!(game.exists());
+
+        // 5. Control: the exact file this call wrote, in a swapped folder, is
+        //    removed (it holds no saves yet) and the launch is refused.
+        assert!(check_landed_copy(&root, &swapped, &game, true, existing).is_err());
+        assert!(!game.exists());
+
+        // An existing save-bearing copy is reused, never overwritten, and a
+        // failed attempt to make another leaves it alone.
+        let src = tempfile::tempdir().unwrap();
+        let path = original(src.path(), b"RDSK-orig");
+        let copy = working_copy_for(&path, &root).unwrap();
+        std::fs::write(&copy, b"RDSK-with-saves").unwrap();
+        assert_eq!(working_copy_for(&path, &root).unwrap(), copy);
+        assert_eq!(std::fs::read(&copy).unwrap(), b"RDSK-with-saves");
+    }
+
+    #[test]
+    fn accept_refuses_an_empty_or_incorrect_folder_and_changes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let settings_file = base.path().join("cfg").join(SETTINGS_FILE);
+        let empty = base.path().join("usb");
+        std::fs::create_dir(&empty).unwrap();
+        let unrelated = base.path().join("photos");
+        std::fs::create_dir(&unrelated).unwrap();
+        std::fs::write(unrelated.join("holiday.jpg"), b"jpg").unwrap();
+        // A keep-note that is a symlink or a folder does not count.
+        let fake_note = base.path().join("fake");
+        std::fs::create_dir(&fake_note).unwrap();
+        std::os::unix::fs::symlink(base.path().join("x"), fake_note.join(KEEP_NOTE_NAME)).unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let src = tempfile::tempdir().unwrap();
+        working_copy_for(&original(src.path(), b"RDSK"), &real.join(CHOSEN_SUBFOLDER)).unwrap();
+        let link_to_real = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link_to_real).unwrap();
+        let not_remembered = base.path().join("elsewhere");
+        std::fs::create_dir(&not_remembered).unwrap();
+        working_copy_for(&original(src.path(), b"RDSK2"), &not_remembered).unwrap();
+
+        let stale = |path: &Path| FolderIdentity {
+            path: path.to_path_buf(),
+            dev: 1,
+            ino: 2,
+            fsid: 3,
+        };
+        let settings = StorageSettings {
+            identities: [&empty, &unrelated, &fake_note, &link_to_real, &real]
+                .iter()
+                .map(|p| stale(p))
+                .collect(),
+            ..StorageSettings::default()
+        };
+        save_settings_to(&settings_file, &settings).unwrap();
+        let before = std::fs::read(&settings_file).unwrap();
+
+        for refused in [
+            &empty,
+            &unrelated,
+            &fake_note,
+            &link_to_real,
+            &not_remembered,
+        ] {
+            assert!(
+                accept_storage_folder_in(&settings_file, refused).is_err(),
+                "{} must be refused",
+                refused.display()
+            );
+            assert_eq!(std::fs::read(&settings_file).unwrap(), before);
+        }
+        assert!(std::fs::read_dir(&empty).unwrap().next().is_none());
+
+        // The right folder, holding copies, is accepted with its live identity.
+        accept_storage_folder_in(&settings_file, &real).unwrap();
+        let after = load_settings_from(&settings_file).unwrap();
+        let now = after.identities.iter().find(|i| i.path == real).unwrap();
+        assert_eq!(now, &identify_folder(&real).unwrap());
+    }
+
+    #[test]
+    fn the_settings_lock_refuses_symlinks_and_non_regular_files() {
+        let base = tempfile::tempdir().unwrap();
+        let settings_file = base.path().join(SETTINGS_FILE);
+        let lock_path = settings_file.with_extension("json.lock");
+        let victim = base.path().join("victim.txt");
+        std::fs::write(&victim, b"keep me").unwrap();
+        let ran = std::cell::Cell::new(false);
+        let attempt = || {
+            with_settings_lock(&settings_file, || {
+                ran.set(true);
+                Ok(())
+            })
+        };
+
+        std::os::unix::fs::symlink(&victim, &lock_path).unwrap();
+        assert!(attempt().is_err());
+        std::fs::remove_file(&lock_path).unwrap();
+        // A dangling symlink is not followed to create a file either.
+        let created_through = base.path().join("created-through-link");
+        std::os::unix::fs::symlink(&created_through, &lock_path).unwrap();
+        assert!(attempt().is_err());
+        assert!(!created_through.exists());
+        std::fs::remove_file(&lock_path).unwrap();
+
+        let fifo = std::ffi::CString::new(lock_path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(attempt().is_err());
+        std::fs::remove_file(&lock_path).unwrap();
+
+        std::fs::create_dir(&lock_path).unwrap();
+        assert!(attempt().is_err());
+        std::fs::remove_dir(&lock_path).unwrap();
+
+        assert!(!ran.get(), "nothing runs without the lock");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        assert!(!settings_file.exists());
+
+        // Normal case: a regular lock file is created and used.
+        assert!(attempt().is_ok());
+        assert!(ran.get());
+        assert!(
+            std::fs::symlink_metadata(&lock_path)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn a_drive_whose_identity_is_only_its_device_number_is_ambiguous() {
+        let id = |dev: u64, fsid: u64| FolderIdentity {
+            path: PathBuf::from("/media/stick"),
+            dev,
+            ino: 1,
+            fsid,
+        };
+        // FAT/exFAT report the kernel's encoding of the device number.
+        assert!(ambiguous_identity(&id(0x0821, 0x0821))); // sdc1 (8:33)
+        let big = (259u64 << 8) | 5; // nvme partition 259:5
+        assert!(ambiguous_identity(&id(big, big)));
+        let wide_minor = (8u64 << 8) | 0x10 | ((0x300u64 & !0xff) << 12); // 8:0x310
+        assert!(ambiguous_identity(&id(
+            wide_minor,
+            0x10 | (8 << 8) | ((0x310u64 & !0xff) << 12)
+        )));
+        assert!(ambiguous_identity(&id(0x0821, 0)));
+        // ext4/btrfs ids come from the filesystem UUID: distinct.
+        assert!(!ambiguous_identity(&id(0x0821, 0xd76c_9b1f_2a40_33e1)));
     }
 
     #[test]
