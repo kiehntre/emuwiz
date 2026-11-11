@@ -1053,6 +1053,25 @@ fn a_shallow_bios_folder_never_trusts_a_broad_parent() {
         Some(PathBuf::from("/var/home/user/bios"))
     );
     assert_eq!(root("/run/media/user/USB"), None);
+    assert_eq!(root("/run/media/user"), None);
+    assert_eq!(root("/media/user"), None);
+    // Image-based systems: `/mnt` is a link to `var/mnt`, so canonical BIOS
+    // folders live below `/var/mnt` and its drives are mount roots too.
+    assert_eq!(root("/var/mnt/x"), None);
+    assert_eq!(root("/var/mnt"), None);
+    assert_eq!(
+        root("/var/mnt/x/bios"),
+        Some(PathBuf::from("/var/mnt/x/bios"))
+    );
+    assert_eq!(
+        root("/var/mnt/x/emu/bios/psx"),
+        Some(PathBuf::from("/var/mnt/x/emu/bios"))
+    );
+    // The BIOS folder is the home folder itself (standard layout).
+    assert_eq!(
+        trusted_bios_root(Path::new("/home/user"), Some(Path::new("/home/user"))),
+        None
+    );
     assert_eq!(
         root("/run/media/user/USB/bios/psx"),
         Some(PathBuf::from("/run/media/user/USB/bios"))
@@ -1157,4 +1176,25 @@ fn redump_machine_names_map_to_regions() {
         )),
         None
     );
+}
+
+#[test]
+fn an_unset_or_unresolvable_home_trusts_no_bios_tree() {
+    // Final re-review: without a home folder the home guard cannot be
+    // applied, so every BIOS link must be refused rather than trusted.
+    let (_fixture, directory) = search_fixture("home-unset");
+    for home in [
+        None,
+        Some(std::ffi::OsString::new()),
+        Some(std::ffi::OsString::from("/nonexistent/emuwiz-home-for-test")),
+    ] {
+        assert!(
+            trusted_bios_tree_for_home(&directory, home.clone()).is_empty(),
+            "HOME {home:?} must trust no tree"
+        );
+    }
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    if home.as_deref().is_some_and(|home| std::fs::canonicalize(home).is_ok()) {
+        assert!(!trusted_bios_tree_for_home(&directory, home).is_empty());
+    }
 }

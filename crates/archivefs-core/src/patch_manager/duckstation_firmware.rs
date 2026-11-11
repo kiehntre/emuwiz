@@ -393,12 +393,18 @@ fn resolve_configured_bios_selection(
 /// directories. Empty - every BIOS link refused - when the folder cannot be
 /// resolved.
 fn trusted_bios_tree(directory: &Path) -> TrustedRoots {
+    trusted_bios_tree_for_home(directory, std::env::var_os("HOME"))
+}
+
+/// [`trusted_bios_tree`] with the `HOME` value passed in, so the fail-closed
+/// branch is testable without changing the process environment.
+fn trusted_bios_tree_for_home(directory: &Path, home: Option<std::ffi::OsString>) -> TrustedRoots {
     let Ok(canonical) = std::fs::canonicalize(directory) else {
         return TrustedRoots::none();
     };
     // Without a resolvable home folder the home guard cannot be applied, so
     // no tree is trusted and every BIOS link is refused (fail closed).
-    let Some(home) = std::env::var_os("HOME")
+    let Some(home) = home
         .filter(|home| !home.is_empty())
         .and_then(|home| std::fs::canonicalize(home).ok())
     else {
@@ -428,11 +434,12 @@ fn trusted_bios_root<'a>(canonical: &'a Path, home: Option<&Path>) -> Option<&'a
         return None;
     }
     // A folder is broad when it is the home folder or holds it, or when it is
-    // a mount root or above one: `/mnt/<drive>`, or `/media/<user>/<drive>`
-    // and `/run/media/<user>/<drive>` (one level deeper, per user).
+    // a mount root or above one: `/mnt/<drive>` (`/var/mnt/<drive>` once
+    // canonical on image-based systems, where `/mnt` links there), or
+    // `/media/<user>/<drive>` and `/run/media/<user>/<drive>` (per user).
     let broad = |folder: &Path| {
         home.is_some_and(|home| home.starts_with(folder))
-            || [("/run/media", 2), ("/media", 2), ("/mnt", 1)]
+            || [("/run/media", 2), ("/media", 2), ("/mnt", 1), ("/var/mnt", 1)]
                 .iter()
                 .any(|(media, levels)| {
                     folder.starts_with(media) && depth(folder) <= depth(Path::new(media)) + levels
@@ -553,8 +560,9 @@ fn auto_search_bios(
                     // Only a pre-filter so broken, oversized and special links
                     // never use the hash budget; the size and type that count
                     // are re-checked on the safely opened descriptor.
-                    // Absolute link targets are refused later anyway; never
-                    // stat them here, so a hung mount they name cannot block.
+                    // Absolute link targets are refused later anyway, so they
+                    // are dropped here without a stat. A relative link (or a
+                    // chain) is still stat-ed before containment is checked.
                     || (metadata.file_type().is_symlink()
                         && std::fs::read_link(path).is_ok_and(|target| target.is_relative())
                         && std::fs::metadata(path).is_ok_and(|target| {
