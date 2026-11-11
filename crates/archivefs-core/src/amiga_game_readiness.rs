@@ -44,7 +44,11 @@ pub enum AmigaMediaKind {
     WhdloadPackage,
     /// CUE/BIN, ISO or CHD disc image.
     CdImage,
-    /// ZIP/7z/RAR container. EmuWiz never extracts it for Amiga play.
+    /// ZIP of one game's IPF floppy disks. Play stages those disks in a
+    /// private temporary folder (`zip_cartridge_stage`); the ZIP is never
+    /// changed.
+    ZipArchive,
+    /// 7z/RAR container. EmuWiz never extracts it for Amiga play.
     Container,
     Unsupported,
 }
@@ -65,7 +69,8 @@ impl AmigaMediaKind {
             "hdf" | "hdfx" | "rdb" => Self::HardDisk,
             "lha" | "lzh" => Self::WhdloadPackage,
             "cue" | "iso" | "chd" => Self::CdImage,
-            "zip" | "7z" | "rar" => Self::Container,
+            "zip" => Self::ZipArchive,
+            "7z" | "rar" => Self::Container,
             _ => Self::Unsupported,
         }
     }
@@ -81,6 +86,7 @@ impl AmigaMediaKind {
             Self::HardDisk => "Hard-disk image (HDF/RDB)",
             Self::WhdloadPackage => "WHDLoad package (LHA)",
             Self::CdImage => "CD image",
+            Self::ZipArchive => "ZIP of floppy disks",
             Self::Container => "Packed in an archive",
             Self::Unsupported => "Unrecognised file type",
         }
@@ -709,6 +715,7 @@ fn play_noun(machine: AmigaCdMachine, media: AmigaMediaKind) -> String {
         (_, AmigaMediaKind::Ipf) => "IPF images".into(),
         (_, AmigaMediaKind::Hfe) => "HFE images".into(),
         (_, AmigaMediaKind::CdImage) => "CD images".into(),
+        (_, AmigaMediaKind::ZipArchive) => "zipped floppy disks".into(),
         (_, AmigaMediaKind::Container) => "packed archives".into(),
         (_, AmigaMediaKind::WhdloadPackage | AmigaMediaKind::Unsupported) => {
             "files like this".into()
@@ -718,8 +725,8 @@ fn play_noun(machine: AmigaCdMachine, media: AmigaMediaKind) -> String {
 
 /// Honest explanations of HDF / IPF media, shared with the identity wording.
 pub const HARD_DISK_NOTE: &str = "It needs a hard-drive entry in the emulator's configuration; its contents are not proof of a complete game.";
-pub const IPF_NOTE: &str =
-    "Emulators need the CAPS/SPS library for IPF; EmuWiz cannot confirm it is installed.";
+pub const ZIP_DISKS_NOTE: &str = "Play copies this game's disks to a private temporary folder for RetroArch (PUAE) and removes them afterwards; the ZIP is never changed. The ZIP must hold only one game's IPF disks, and IPF needs the CAPS/SPS plugin. Games with up to four disks start with every disk in a drive. Games with more than four disks have not been tested.";
+pub const IPF_NOTE: &str = "IPF needs the CAPS/SPS plugin (capsimg.so) in RetroArch's system folder; Play checks for it before starting.";
 
 fn media_check(machine: AmigaCdMachine, media: AmigaMediaKind) -> (AmigaCheckState, String) {
     use AmigaCheckState::{Blocked, Ready, Warning};
@@ -763,9 +770,13 @@ fn media_check(machine: AmigaCdMachine, media: AmigaMediaKind) -> (AmigaCheckSta
             Ready,
             "WHDLoad package: an installed game run from a virtual hard drive, not a set of floppy images.".into(),
         ),
+        AmigaMediaKind::ZipArchive => (
+            Warning,
+            format!("ZIP of IPF floppy disks. {ZIP_DISKS_NOTE}"),
+        ),
         AmigaMediaKind::Container => (
             Blocked,
-            "Packed inside a ZIP, 7z or RAR archive. EmuWiz does not extract Amiga media for play.".into(),
+            "Packed inside a 7z or RAR archive. EmuWiz does not extract Amiga media from these for play.".into(),
         ),
         AmigaMediaKind::Unsupported => (
             Blocked,

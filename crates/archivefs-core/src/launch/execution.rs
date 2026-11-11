@@ -53,9 +53,33 @@ use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContainerKind, LaunchContentRef, LaunchTarget, build_launch_plan,
 };
 use crate::launch::process_spawn::{self, WatchedProcess};
+
 #[cfg(test)]
 use crate::launch::readiness::LaunchReadiness;
 use crate::launch::retroarch_command::{RetroArchCommand, build_retroarch_command_plan};
+
+/// Replaces the one argv entry naming `content` with `replacement`. Fails
+/// closed when the content argument cannot be found exactly once.
+fn swap_content_argument(
+    arguments: &mut [std::ffi::OsString],
+    content: &std::path::Path,
+    replacement: &std::path::Path,
+) -> Result<(), String> {
+    let wanted = content.as_os_str();
+    let positions: Vec<usize> = arguments
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| arg.as_os_str() == wanted)
+        .map(|(index, _)| index)
+        .collect();
+    match positions.as_slice() {
+        [index] => {
+            arguments[*index] = replacement.as_os_str().to_owned();
+            Ok(())
+        }
+        _ => Err("the emulator command does not name the game file exactly once".into()),
+    }
+}
 
 /// Caps how much of a launched process's stderr this module ever retains
 /// in memory - a diagnostic aid for a failed/crashed launch, never a full
@@ -589,6 +613,29 @@ pub fn preflight_retroarch_launch(
         ));
     }
 
+    // An Amiga IPF floppy only boots with the CAPS/SPS plugin (`capsimg.so`)
+    // in RetroArch's system folder; without it PUAE shows an empty drive.
+    if super::amiga_caps_plugin::needs_caps_plugin(&request.expected_platform_id, content_path) {
+        let system_directory = fresh_environment
+            .profiles
+            .iter()
+            .find(|profile| {
+                profile.profile_kind == request.profile.profile_kind
+                    && profile.scope == request.profile.scope
+            })
+            .and_then(|profile| {
+                profile.paths.iter().find(|p| {
+                    p.purpose == crate::emulator_environment::retroarch::PathPurpose::System
+                })
+            })
+            .and_then(|finding| finding.resolved_path.as_ref())
+            .filter(|path| !path.lossy)
+            .map(|path| PathBuf::from(&path.display));
+        super::amiga_caps_plugin::require_caps_plugin(system_directory.as_deref()).map_err(
+            |detail| preflight_error(LaunchPreflightErrorKind::CandidateNotReady, detail),
+        )?;
+    }
+
     // --- 9: rebuild the command plan ---
     let command_plan =
         build_retroarch_command_plan(&identity_status, candidate, &fresh_environment);
@@ -615,6 +662,11 @@ pub fn preflight_retroarch_launch(
             "command plan reported no blockers but also no command",
         )
     })?;
+    if super::amiga_caps_plugin::needs_caps_plugin(&request.expected_platform_id, content_path) {
+        super::amiga_caps_plugin::require_caps_core(&command.selection.core_stem).map_err(
+            |detail| preflight_error(LaunchPreflightErrorKind::CandidateNotReady, detail),
+        )?;
+    }
 
     if request.expected_platform_id == "Saturn" {
         let selected = request.saturn_core_selection.as_ref().ok_or_else(|| {
@@ -1626,12 +1678,26 @@ pub fn prepare_retroarch_launch_with_playlist(
                 })?;
                 staged_request.expected_game_key = member.game_key;
             }
-            let command = preflight_retroarch_launch_with_playlist(
+            let mut command = preflight_retroarch_launch_with_playlist(
                 &staged_request,
                 filesystem,
                 environment,
                 playlist,
             )?;
+            // A zipped Amiga game with several disks: every check above held
+            // the boot disk; RetroArch is given the staged M3U beside it so
+            // all of that game's disks (and only those) can be swapped in.
+            // The spawn re-check still re-derives the boot disk's key.
+            if let Some(disks) = staged.playlist() {
+                swap_content_argument(&mut command.arguments, staged.path(), disks).map_err(
+                    |detail| {
+                        preflight_error(
+                            LaunchPreflightErrorKind::ContentRequiresMount,
+                            format!("zipped game cannot be launched: {detail}"),
+                        )
+                    },
+                )?;
+            }
             return Ok(PreparedRetroArchLaunch {
                 command,
                 staged_cartridge: Some(staged),

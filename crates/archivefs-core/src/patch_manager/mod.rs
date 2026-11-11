@@ -665,16 +665,17 @@ pub use flycast_cheats::{
     apply_flycast_cheat_preview, build_flycast_cheat_preview, parse_flycast_cheat_file,
 };
 pub use flycast_local::{
-    FLYCAST_MAX_CHEAT_BYTES, FLYCAST_MAX_CONFIG_BYTES, FLYCAST_MAX_DIRECTORY_ENTRIES,
-    FLYCAST_MAX_PROFILES, FLYCAST_MAX_SAVE_CANDIDATES, FLYCAST_MAX_TEXTURE_DEPTH,
-    FLYCAST_MAX_TEXTURE_FILES, FlycastCheatInventory, FlycastConfigInspection, FlycastDiscContext,
-    FlycastDiscoveryError, FlycastExecutable, FlycastGameInspection, FlycastGameKeyMapping,
-    FlycastGameRequest, FlycastHealth, FlycastInstallationType, FlycastLaunchBlocker,
-    FlycastLaunchBlockerKind, FlycastNativeLaunchBinding, FlycastPlatform, FlycastProfile,
-    FlycastProfileDiscovery, FlycastProfileDiscoveryRoots, FlycastSaveStateInventory,
-    FlycastSettings, FlycastSystemFileState, FlycastSystemHealth, FlycastTextureInventory,
-    FlycastVmuInventory, FlycastWarning, FlycastWarningKind, discover_flycast_profiles,
-    flycast_profile_dreamcast_bios, inspect_flycast_game, parse_flycast_version,
+    FLYCAST_APPIMAGE_DIRECTORIES, FLYCAST_MAX_CHEAT_BYTES, FLYCAST_MAX_CONFIG_BYTES,
+    FLYCAST_MAX_DIRECTORY_ENTRIES, FLYCAST_MAX_PROFILES, FLYCAST_MAX_SAVE_CANDIDATES,
+    FLYCAST_MAX_TEXTURE_DEPTH, FLYCAST_MAX_TEXTURE_FILES, FLYCAST_NOT_SET_UP,
+    FlycastCheatInventory, FlycastConfigInspection, FlycastDiscContext, FlycastDiscoveryError,
+    FlycastExecutable, FlycastGameInspection, FlycastGameKeyMapping, FlycastGameRequest,
+    FlycastHealth, FlycastInstallationType, FlycastLaunchBlocker, FlycastLaunchBlockerKind,
+    FlycastNativeLaunchBinding, FlycastPlatform, FlycastProfile, FlycastProfileDiscovery,
+    FlycastProfileDiscoveryRoots, FlycastSaveStateInventory, FlycastSettings,
+    FlycastSystemFileState, FlycastSystemHealth, FlycastTextureInventory, FlycastVmuInventory,
+    FlycastWarning, FlycastWarningKind, discover_flycast_profiles, flycast_profile_dreamcast_bios,
+    inspect_flycast_game, is_appimage_executable, parse_flycast_version,
     resolve_flycast_native_launch_binding,
 };
 pub use fuse_local::{
