@@ -218,9 +218,41 @@ def maintenance_instance():
     return raw
 
 
+_EVIDENCE_STATE_DIR = None   # set only inside verify_retirement (evidence_state_dir)
+
+
 def state_dir():
+    if _EVIDENCE_STATE_DIR is not None:
+        return _EVIDENCE_STATE_DIR
     instance = maintenance_instance()
     return os.path.join(F.registry_dir(), "maintenance" if instance is None else f"maintenance-{instance}")
+
+
+def evidence_state_dir(record, target, trusted):
+    """(dir, why): the maintenance directory holding the evidence for a recorded retirement,
+    chosen from the evidence itself rather than from the caller's environment, so a target
+    retired by another instance (e.g. nvme2) verifies from a shell that only sets
+    EMUWIZ_TARGET_ROOT.  Accepted only if it is `maintenance` or `maintenance-NAME` directly
+    inside the registry and its own valid policy names the target's root."""
+    receipt = (record.get("last_retired") or {}).get("receipt")
+    if not isinstance(receipt, str) or os.path.normpath(receipt) != receipt:
+        return None, "evidence path is not directly inside the canonical evidence directory"
+    directory = os.path.dirname(os.path.dirname(receipt))
+    name = os.path.basename(directory)
+    if os.path.dirname(directory) != F.registry_dir() or not (
+            name == "maintenance" or (name.startswith("maintenance-")
+                                      and INSTANCE_NAME.fullmatch(name[len("maintenance-"):]))):
+        return None, "evidence is not in a maintenance directory of this registry"
+    text = read_trusted_text(os.path.join(directory, "policy.json"), trusted)
+    try:
+        policy = json.loads(text) if text is not None else None
+    except ValueError:
+        policy = None
+    if not isinstance(policy, dict) or not validate_policy(policy):
+        return None, "the evidence directory has no valid policy"
+    if policy["scope"]["target_root"] != os.path.realpath(os.path.dirname(target)):
+        return None, "the evidence directory's policy does not cover this target's root"
+    return directory, ""
 
 
 def policy_path():
@@ -638,6 +670,33 @@ def policy_for_display(policy):
     return out
 
 
+def policy_root_owner(root):
+    """The other maintenance directory (name) whose policy file names `root`, else None.
+    Any unreadable or unparsable other policy that might name it counts as a match
+    (fail closed: approval is refused rather than creating two policies over one root)."""
+    registry, mine = F.registry_dir(), os.path.basename(state_dir())
+    try:
+        names = sorted(os.listdir(registry))
+    except OSError:
+        return None
+    for name in names:
+        if name == mine or not (name == "maintenance" or (
+                name.startswith("maintenance-") and INSTANCE_NAME.fullmatch(name[len("maintenance-"):]))):
+            continue
+        path = os.path.join(registry, name, "policy.json")
+        if not os.path.lexists(path):
+            continue
+        try:
+            with open(path) as handle:
+                other = json.load(handle)
+            if ((other.get("scope") or {}).get("target_root")) != root:
+                continue
+        except (OSError, ValueError, AttributeError):
+            pass
+        return name
+    return None
+
+
 def cmd_policy(args):
     if args.action == "show":
         state, policy, why = load_policy()
@@ -654,6 +713,11 @@ def cmd_policy(args):
         if trigger is not None and (not math.isfinite(trigger) or trigger < 0 or trigger > args.reserve_free_gib):
             raise SystemExit("reserve-trigger-free-gib must be finite, nonnegative and not above reserve-free-gib")
         root = os.path.realpath(args.target_root or F.target_root())
+        if maintenance_instance() is not None and root != os.path.realpath(F.target_root()):
+            raise SystemExit(f"this instance measures {os.path.realpath(F.target_root())}; it cannot approve {root}")
+        other = policy_root_owner(root)
+        if other is not None:
+            raise SystemExit(f"{root} is already covered by the policy in {other}; one policy per root")
         policy = {
             "schema": POLICY_VERSION,
             "approved_by": F.owner_name(),
@@ -913,7 +977,8 @@ def free_space_need(limits, free):
     restore `reserve_free_bytes`; at or above the trigger the reserve asks for nothing."""
     reserve = limits.get("reserve_free_bytes", 0)
     trigger = limits.get("reserve_trigger_free_bytes", reserve)
-    free = free or 0
+    if free is None:   # free space unknown: never treat it as zero (the budget still applies)
+        return 0
     return max(0, reserve - free) if free < trigger else 0
 
 
@@ -1476,8 +1541,20 @@ def verify_retirement(record, target):
     target directory is still the one retired.  This is STRUCTURAL verification: the
     digests are unkeyed, so an attacker who controls the approving account could forge a
     consistent set.  It rejects accidents, stale or foreign files and casual edits."""
-    last = record.get("last_retired") or {}
+    global _EVIDENCE_STATE_DIR
     trusted = trusted_policy_uids()
+    directory, why = evidence_state_dir(record, target, trusted)
+    if directory is None:
+        return False, why
+    previous, _EVIDENCE_STATE_DIR = _EVIDENCE_STATE_DIR, directory
+    try:
+        return _verify_retirement_in(record, target, trusted)
+    finally:
+        _EVIDENCE_STATE_DIR = previous
+
+
+def _verify_retirement_in(record, target, trusted):
+    last = record.get("last_retired") or {}
     receipts, manifests = os.path.join(state_dir(), "receipts"), os.path.join(state_dir(), "manifests")
     for d in (state_dir(), receipts, manifests):
         ok, why = _trusted_file(d, trusted, want_dir=True)
@@ -2272,6 +2349,7 @@ USER_SAFE = re.compile(r"^[a-z_][a-z0-9_.-]*$")
 SERVICE = """[Unit]
 Description=EmuWiz Cargo cache maintenance cycle (policy-gated; deletes nothing unless the policy is enabled)
 ConditionPathExists={state}/policy.json
+RequiresMountsFor={targets}
 
 [Service]
 Type=oneshot
