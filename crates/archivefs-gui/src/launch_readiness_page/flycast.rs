@@ -21,7 +21,7 @@ pub(crate) struct Context {
 #[derive(Clone)]
 pub(crate) enum Request {
     Gdi {
-        preview: Preview,
+        preview: Box<Preview>,
         roots: FlycastProfileDiscoveryRoots,
     },
     Direct(DirectRequest),
@@ -244,7 +244,7 @@ pub(crate) fn prefer_standalone(plan: &mut LaunchPlan, reasons: &[(String, Strin
         .candidates
         .iter()
         .position(|c| flycast(c) && c.readiness == LaunchReadiness::Ready)
-        .or_else(|| plan.candidates.iter().position(|c| flycast(c)))
+        .or_else(|| plan.candidates.iter().position(&flycast))
     else {
         return;
     };
@@ -408,7 +408,7 @@ impl Context {
             return None;
         }
         Some(Request::Gdi {
-            preview: preview.clone(),
+            preview: Box::new(preview.clone()),
             roots: self.roots.clone(),
         })
     }
