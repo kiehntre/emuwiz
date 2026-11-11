@@ -1020,7 +1020,9 @@ fn a_link_through_a_symlinked_folder_out_of_the_tree_is_refused() {
 #[test]
 fn a_shallow_bios_folder_never_trusts_a_broad_parent() {
     // Review of e9309492: the parent of `/mnt/x` or `~/bios` is far too broad.
-    let root = |path: &str| trusted_bios_root(Path::new(path)).map(Path::to_path_buf);
+    let root = |path: &str| {
+        trusted_bios_root(Path::new(path), Some(Path::new("/var/home/user"))).map(Path::to_path_buf)
+    };
     assert_eq!(
         root("/mnt/usbdrive/[BIOS]/bios/psx"),
         Some(PathBuf::from("/mnt/usbdrive/[BIOS]/bios"))
@@ -1032,6 +1034,24 @@ fn a_shallow_bios_folder_never_trusts_a_broad_parent() {
     assert_eq!(root("/mnt/x"), Some(PathBuf::from("/mnt/x")));
     assert_eq!(root("/mnt"), None);
     assert_eq!(root("/"), None);
+    // Re-review: a deep parent can still be the whole home folder or every
+    // mounted drive; neither is ever trusted.
+    assert_eq!(
+        root("/var/home/user/bios"),
+        Some(PathBuf::from("/var/home/user/bios"))
+    );
+    assert_eq!(
+        root("/run/media/user/USB"),
+        Some(PathBuf::from("/run/media/user/USB"))
+    );
+    assert_eq!(
+        root("/run/media/user/USB/bios/psx"),
+        Some(PathBuf::from("/run/media/user/USB/bios"))
+    );
+    assert_eq!(
+        root("/var/home/user/emu/bios/psx"),
+        Some(PathBuf::from("/var/home/user/emu/bios"))
+    );
 }
 
 #[test]

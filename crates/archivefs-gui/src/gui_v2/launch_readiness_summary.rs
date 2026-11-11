@@ -623,14 +623,15 @@ fn project_plan(
     // A saved emulator choice that can no longer be used never falls back to
     // another emulator (launch_choice), so say which one is missing and
     // offer the choice again instead of a generic "choose one".
-    if selected.is_none()
-        && let Some(warning) = plan.candidates.iter().find_map(|candidate| {
-            candidate.warnings.iter().find(|warning| {
-                warning.kind
-                    == archivefs_core::launch::LaunchWarningKind::PreferredLaunchChoiceUnavailable
-            })
+    // `hold_for_new_choice` gives every remaining option this warning, so its
+    // presence alone means the choice is held: a sole remaining option must
+    // not fall through to the ready path (re-review of 17615e6c).
+    if let Some(warning) = plan.candidates.iter().find_map(|candidate| {
+        candidate.warnings.iter().find(|warning| {
+            warning.kind
+                == archivefs_core::launch::LaunchWarningKind::PreferredLaunchChoiceUnavailable
         })
-    {
+    }) {
         return with_details(
             base(
                 ReadinessPresentationState::NeedsEmulator,

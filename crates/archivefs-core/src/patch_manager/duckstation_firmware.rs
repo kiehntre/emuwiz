@@ -388,15 +388,19 @@ fn resolve_configured_bios_selection(
     }
 }
 
-/// The trusted BIOS tree for DuckStation's configured BIOS folder: the folder
-/// itself and the one directly above it (a `bios/psx` folder of links to
-/// `bios/*.bin` is a common layout). Canonical, so it names real directories.
-/// Empty - every BIOS link refused - when the folder cannot be resolved.
+/// The trusted BIOS tree for DuckStation's configured BIOS folder, chosen by
+/// [`trusted_bios_root`] (usually the folder above it: a `bios/psx` folder of
+/// links to `bios/*.bin` is a common layout). Canonical, so it names real
+/// directories. Empty - every BIOS link refused - when the folder cannot be
+/// resolved.
 fn trusted_bios_tree(directory: &Path) -> TrustedRoots {
     let Ok(canonical) = std::fs::canonicalize(directory) else {
         return TrustedRoots::none();
     };
-    match trusted_bios_root(&canonical) {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .and_then(|home| std::fs::canonicalize(home).ok());
+    match trusted_bios_root(&canonical, home.as_deref()) {
         Some(root) => TrustedRoots::from_paths([root]),
         None => TrustedRoots::none(),
     }
@@ -405,9 +409,12 @@ fn trusted_bios_tree(directory: &Path) -> TrustedRoots {
 /// The folder above is trusted only when it is itself at least
 /// [`MIN_TRUSTED_PARENT_DEPTH`] levels deep, so a BIOS folder such as `/mnt/x`
 /// or `~/bios` never trusts `/mnt` or `/home`; such a folder trusts only
-/// itself. A BIOS folder at the filesystem root, or one level below it,
-/// trusts nothing, so every link there is refused.
-fn trusted_bios_root(canonical: &Path) -> Option<&Path> {
+/// itself. A parent that is the user's home folder (or holds it, as
+/// `/var/home/user` does on image-based systems) or a removable-media folder
+/// such as `/run/media/user` is never trusted either. A BIOS folder at the
+/// filesystem root, or one level below it, trusts nothing, so every link
+/// there is refused.
+fn trusted_bios_root<'a>(canonical: &'a Path, home: Option<&Path>) -> Option<&'a Path> {
     let depth = |path: &Path| {
         path.components()
             .filter(|component| matches!(component, std::path::Component::Normal(_)))
@@ -416,8 +423,14 @@ fn trusted_bios_root(canonical: &Path) -> Option<&Path> {
     if depth(canonical) < 2 {
         return None;
     }
+    let broad = |parent: &Path| {
+        home.is_some_and(|home| home.starts_with(parent))
+            || ["/run/media", "/media", "/mnt"].iter().any(|media| {
+                parent.starts_with(media) && depth(parent) <= depth(Path::new(media)) + 1
+            })
+    };
     match canonical.parent() {
-        Some(parent) if depth(parent) >= MIN_TRUSTED_PARENT_DEPTH => Some(parent),
+        Some(parent) if depth(parent) >= MIN_TRUSTED_PARENT_DEPTH && !broad(parent) => Some(parent),
         _ => Some(canonical),
     }
 }
