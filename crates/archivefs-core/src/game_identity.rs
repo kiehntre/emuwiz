@@ -4792,7 +4792,7 @@ fn inspect_dreamcast_source(
         member_path,
         member_index,
         "Dreamcast IP.BIN product code",
-        "product code read from a recognised Sega Dreamcast IP.BIN boot structure",
+        "product code read from a recognised Sega Dreamcast IP.BIN boot structure; the rest of the disc image was not read, so this identifies the game without proving the image is undamaged",
     );
     report.bytes_read = report.bytes_read.max(source.bytes_read());
     report.complete = true;
