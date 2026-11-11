@@ -423,7 +423,7 @@ pub fn working_copy_in(
     temp_name.push(format!("{}-{nanos}-", std::process::id()));
     temp_name.push(&name);
     let temp = dir.join(temp_name);
-    let write = || -> std::io::Result<u64> {
+    let write = || -> std::io::Result<(u64, u64)> {
         use std::os::unix::fs::MetadataExt;
         let mut out = OpenOptions::new()
             .write(true)
@@ -433,10 +433,11 @@ pub fn working_copy_in(
             .open(&temp)?;
         out.write_all(&bytes)?;
         out.sync_all()?;
-        Ok(out.metadata()?.ino())
+        let meta = out.metadata()?;
+        Ok((meta.dev(), meta.ino()))
     };
-    let written_ino = match write() {
-        Ok(ino) => ino,
+    let written = match write() {
+        Ok(id) => id,
         Err(e) => {
             let _ = std::fs::remove_file(&temp);
             return Err(format!("cannot create the working copy: {e}"));
@@ -460,8 +461,8 @@ pub fn working_copy_in(
     };
     let still_same = identify_folder(root).is_ok_and(|now| same_folder(&root_identity, &now));
     if !still_same || landed.as_ref().ok().map(|l| l.0) != Some(root_identity.dev) {
-        // Only the file this call wrote (same inode) is ever removed.
-        if created && landed.as_ref().ok().map(|l| l.1) == Some(written_ino) {
+        // Only the file this call wrote (same device and inode) is ever removed.
+        if created && landed.as_ref().ok() == Some(&written) {
             let _ = std::fs::remove_file(&target);
         }
         return Err(format!(
@@ -585,15 +586,75 @@ pub fn load_settings_from(path: &Path) -> Result<StorageSettings, String> {
     }
 }
 
-fn save_settings_to(path: &Path, settings: &StorageSettings) -> Result<(), String> {
+/// Runs a read-modify-write of the settings file under an exclusive lock, so
+/// Settings and a launch recording a used folder never lose each other's
+/// update (a lost folder record would weaken the must-exist check).
+fn with_settings_lock<T>(
+    path: &Path,
+    update: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    use std::os::fd::AsRawFd;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
+    let lock_path = path.with_extension("json.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)
+        .map_err(|e| format!("cannot lock {}: {e}", lock_path.display()))?;
+    // SAFETY: flock on a valid, owned descriptor; released when `lock` closes.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "cannot lock {}: {}",
+            lock_path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let result = update();
+    drop(lock);
+    result
+}
+
+/// Crash-safe replace: a uniquely named temp file is written and flushed,
+/// renamed over the settings file, and the folder entry is flushed. A crash
+/// leaves either the old or the new settings, never a mix.
+fn save_settings_to(path: &Path, settings: &StorageSettings) -> Result<(), String> {
+    let fail = |e: std::io::Error| format!("cannot save {}: {e}", path.display());
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("cannot save {}: no folder", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(fail)?;
     let bytes = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
-    let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, bytes).map_err(|e| format!("cannot save {}: {e}", path.display()))?;
-    std::fs::rename(&temp, path).map_err(|e| format!("cannot save {}: {e}", path.display()))
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp = parent.join(format!(
+        ".{SETTINGS_FILE}.{}-{nanos}.tmp",
+        std::process::id()
+    ));
+    let written = (|| -> std::io::Result<()> {
+        let mut out = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temp)?;
+        out.write_all(&bytes)?;
+        out.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        File::open(parent)?.sync_all()
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written.map_err(fail)
 }
 
 fn resolve(
@@ -675,11 +736,13 @@ fn add_used_root(settings: &StorageSettings, root: &FolderIdentity) -> Option<St
 /// cannot be saved.
 fn remember_used_root(root: &FolderIdentity) -> Result<(), String> {
     let path = settings_path()?;
-    let settings = load_settings_from(&path)?;
-    match add_used_root(&settings, root) {
-        Some(next) => save_settings_to(&path, &next),
-        None => Ok(()),
-    }
+    with_settings_lock(&path, || {
+        let settings = load_settings_from(&path)?;
+        match add_used_root(&settings, root) {
+            Some(next) => save_settings_to(&path, &next),
+            None => Ok(()),
+        }
+    })
 }
 
 /// The user confirms that a remembered folder whose identity changed (for
@@ -687,19 +750,21 @@ fn remember_used_root(root: &FolderIdentity) -> Result<(), String> {
 /// the setting changes; nothing in the folder is touched.
 pub fn accept_storage_folder(folder: &Path) -> Result<(), String> {
     let path = settings_path()?;
-    let settings = load_settings_from(&path)?;
-    if !settings.identities.iter().any(|i| i.path == folder) {
-        return Err(format!("{} is not a remembered folder", folder.display()));
-    }
-    if !holds_copies(folder) {
-        return Err(format!(
-            "{} does not contain EmuWiz Amiga copies (no {KEEP_NOTE_NAME}). An unplugged drive leaves an empty folder like this: mount the drive instead of accepting it.",
-            folder.display()
-        ));
-    }
-    let now = identify_folder(folder)
-        .map_err(|e| format!("{} is not available: {e}", folder.display()))?;
-    save_settings_to(&path, &with_identity(&settings, now))
+    with_settings_lock(&path, || {
+        let settings = load_settings_from(&path)?;
+        if !settings.identities.iter().any(|i| i.path == folder) {
+            return Err(format!("{} is not a remembered folder", folder.display()));
+        }
+        if !holds_copies(folder) {
+            return Err(format!(
+                "{} does not contain EmuWiz Amiga copies (no {KEEP_NOTE_NAME}). An unplugged drive leaves an empty folder like this: mount the drive instead of accepting it.",
+                folder.display()
+            ));
+        }
+        let now = identify_folder(folder)
+            .map_err(|e| format!("{} is not available: {e}", folder.display()))?;
+        save_settings_to(&path, &with_identity(&settings, now))
+    })
 }
 
 /// Whether `folder` visibly holds EmuWiz copies: the keep-note written into
@@ -734,11 +799,13 @@ fn without_root(settings: &StorageSettings, folder: &Path) -> StorageSettings {
 /// folder in use for new copies cannot be forgotten.
 pub fn forget_storage_folder(folder: &Path) -> Result<(), String> {
     let path = settings_path()?;
-    let settings = load_settings_from(&path)?;
-    if settings.root.as_deref() == Some(folder) {
-        return Err("this folder is in use for new copies; choose another folder first".into());
-    }
-    save_settings_to(&path, &without_root(&settings, folder))
+    with_settings_lock(&path, || {
+        let settings = load_settings_from(&path)?;
+        if settings.root.as_deref() == Some(folder) {
+            return Err("this folder is in use for new copies; choose another folder first".into());
+        }
+        save_settings_to(&path, &without_root(&settings, folder))
+    })
 }
 
 fn env_paths() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
@@ -872,26 +939,29 @@ pub const CHOSEN_SUBFOLDER: &str = "EmuWiz Amiga HDF copies";
 /// remembered so its copies keep being found.
 pub fn choose_storage(folder: Option<&Path>) -> Result<EffectiveStorage, String> {
     let path = settings_path()?;
-    let settings = load_settings_from(&path)?;
-    let (_, home, target_root) = env_paths();
-    let current_root = match &settings.root {
-        Some(root) => root.clone(),
-        None => default_root()?,
-    };
-    let mut next = settings.clone();
-    let chosen = match folder {
-        Some(folder) => {
-            validate_chosen(folder, home.as_deref(), target_root.as_deref())?;
-            // Remember which filesystem object was picked, so Play can tell
-            // it from an empty mount point when the drive is absent.
-            let picked = identify_folder(folder)
-                .map_err(|e| format!("cannot use {}: {e}", folder.display()))?;
-            next = with_identity(&next, picked);
-            Some(folder.join(CHOSEN_SUBFOLDER))
-        }
-        None => None,
-    };
-    save_settings_to(&path, &record_choice(&next, chosen, &current_root))?;
+    with_settings_lock(&path, || {
+        let settings = load_settings_from(&path)?;
+        let (_, home, target_root) = env_paths();
+        let current_root = match &settings.root {
+            Some(root) => root.clone(),
+            None => default_root()?,
+        };
+        let mut next = settings.clone();
+        let chosen = match folder {
+            Some(folder) => {
+                validate_chosen(folder, home.as_deref(), target_root.as_deref())?;
+                // Remember which filesystem object was picked, so Play can tell
+                // it from an empty mount point when the drive is absent.
+                let picked = identify_folder(folder)
+                    .map_err(|e| format!("cannot use {}: {e}", folder.display()))?;
+                next = with_identity(&next, picked);
+                Some(folder.join(CHOSEN_SUBFOLDER))
+            }
+            None => None,
+        };
+        save_settings_to(&path, &record_choice(&next, chosen, &current_root))?;
+        Ok(())
+    })?;
     effective_storage()
 }
 
@@ -1256,6 +1326,53 @@ mod tests {
         assert_eq!(load_settings_from(&file).unwrap(), back);
         std::fs::write(&file, b"{not json").unwrap();
         assert!(load_settings_from(&file).is_err());
+    }
+
+    #[test]
+    fn settings_saves_are_atomic_and_concurrent_updates_are_never_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(SETTINGS_FILE);
+        // Many launches recording used folders at once, as Settings and a
+        // launch can: every record must survive.
+        let threads: Vec<_> = (0..16)
+            .map(|n| {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    let root = FolderIdentity {
+                        path: PathBuf::from(format!("/mnt/drive{n}/C")),
+                        dev: n,
+                        ino: n,
+                        fsid: n,
+                    };
+                    with_settings_lock(&file, || {
+                        let settings = load_settings_from(&file)?;
+                        let next = add_used_root(&settings, &root).unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        save_settings_to(&file, &next)
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let saved = load_settings_from(&file).unwrap();
+        assert_eq!(saved.used_roots.len(), 16);
+        assert_eq!(saved.identities.len(), 16);
+        // Only the settings file and its lock remain: no temp files.
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "amiga-hdf-storage.json".to_string(),
+                "amiga-hdf-storage.json.lock".to_string()
+            ]
+        );
     }
 
     #[test]
