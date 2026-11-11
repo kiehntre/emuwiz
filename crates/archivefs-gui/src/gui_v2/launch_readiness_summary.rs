@@ -620,6 +620,34 @@ fn project_plan(
     }
 
     let selected = selected_candidate(plan);
+    // A saved emulator choice that can no longer be used never falls back to
+    // another emulator (launch_choice), so say which one is missing and
+    // offer the choice again instead of a generic "choose one".
+    if selected.is_none()
+        && let Some(warning) = plan.candidates.iter().find_map(|candidate| {
+            candidate.warnings.iter().find(|warning| {
+                warning.kind
+                    == archivefs_core::launch::LaunchWarningKind::PreferredLaunchChoiceUnavailable
+            })
+        })
+    {
+        return with_details(
+            base(
+                ReadinessPresentationState::NeedsEmulator,
+                "Your saved emulator choice cannot be used",
+                &format!(
+                    "{} Use Choose emulator to pick another one for this launch, or save a new default.",
+                    warning.detail
+                ),
+                IdentitySummary::StrongLocal,
+                SourceSummary::Available,
+                FirmwareSummary::Unknown,
+                None,
+                Some(ReadinessAction::ChooseEmulator),
+            ),
+            details,
+        );
+    }
     let eligible = plan
         .candidates
         .iter()
@@ -2427,6 +2455,50 @@ mod tests {
 
         let alone = project(&plan(vec![sole]), ReadinessFreshness::Current);
         assert!(!alone.other_emulator_choosable);
+    }
+
+    /// Owner 2026-11-11: a missing saved PSX default showed only "More than
+    /// one safe emulator choice is available". The card now names the
+    /// missing selection, routes to Choose emulator and never offers Play,
+    /// even when just one other emulator remains.
+    #[test]
+    fn a_missing_saved_choice_is_named_and_offers_choose_emulator_not_play() {
+        let held = |preference| {
+            candidate(
+                LaunchReadiness::ReadyWithWarnings,
+                FirmwareReadiness::NotRequired,
+                vec![],
+                vec![LaunchWarning::new(
+                    archivefs_core::launch::LaunchWarningKind::PreferredLaunchChoiceUnavailable,
+                    "The emulator in your saved emulator default for this system (duckstation at /apps/DuckStationRemoved) is no longer available. No other emulator is used instead; choose one to continue.",
+                )],
+                preference,
+                Some("/game.chd"),
+            )
+        };
+        for candidates in [
+            vec![held(CandidatePreference::Undetermined)],
+            vec![
+                held(CandidatePreference::Undetermined),
+                held(CandidatePreference::Undetermined),
+            ],
+        ] {
+            let summary = project(&plan(candidates), ReadinessFreshness::Current);
+            assert_eq!(summary.status, ReadinessPresentationState::NeedsEmulator);
+            assert_eq!(
+                summary.primary_action,
+                Some(ReadinessAction::ChooseEmulator)
+            );
+            assert!(summary.headline.contains("saved emulator choice"));
+            assert!(
+                summary
+                    .explanation
+                    .contains("duckstation at /apps/DuckStationRemoved")
+            );
+            assert!(summary.explanation.contains("Choose emulator"));
+            let (_, action) = click_card_button(&summary, "Play");
+            assert_eq!(action, None, "Play stays inert");
+        }
     }
 
     #[test]

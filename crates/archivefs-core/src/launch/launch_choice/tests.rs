@@ -220,6 +220,7 @@ fn a_stale_preference_never_falls_back_even_to_a_sole_valid_option() {
     assert!(only.warnings.iter().any(|w| {
         w.kind == LaunchWarningKind::PreferredLaunchChoiceUnavailable
             && w.detail.contains("is no longer available")
+            && w.detail.contains("dolphin at /old/removed/User")
     }));
 
     // Choosing again explicitly recovers.
@@ -976,4 +977,23 @@ mod core_tie_review {
                 .any(|b| b.kind == LaunchBlockerKind::AmbiguousCore)
         );
     }
+}
+
+#[test]
+fn a_saved_option_id_is_described_by_the_emulator_it_names() {
+    assert_eq!(
+        describe_option_id(
+            "standalone/duckstation/duckstation:/home/user/Applications/DuckStation"
+        ),
+        "duckstation at /home/user/Applications/DuckStation"
+    );
+    assert_eq!(
+        describe_option_id("standalone/mesen/default"),
+        "mesen (default)"
+    );
+    assert_eq!(
+        describe_option_id("retroarch/native/user/swanstation"),
+        "RetroArch core swanstation (native, user)"
+    );
+    assert_eq!(describe_option_id("something-else"), "something-else");
 }
