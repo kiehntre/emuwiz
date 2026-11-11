@@ -689,6 +689,18 @@ fn inspect_system(profile: &FlycastProfile) -> FlycastSystemHealth {
         arcade_system_roms: arcade,
     }
 }
+
+/// Only the Dreamcast BIOS answer of [`inspect_flycast_game`]
+/// (`health.system.dreamcast_bios`), which never depends on the game: the
+/// same check of the profile's `dc_boot.bin`, without the configuration,
+/// cheats, textures, VMU and save-state reads the full inspection also does.
+/// The launch planner asks this on every readiness refresh.
+pub fn flycast_profile_dreamcast_bios(profile: &FlycastProfile) -> FlycastSystemFileState {
+    state(
+        &profile.system_path.join("dc_boot.bin"),
+        TRUSTED_DC_BOOT_BIN,
+    )
+}
 /// The trusted content identities used by Flycast's own public system-file
 /// documentation/catalogue. These are metadata only; EmuWiz never bundles or
 /// downloads firmware bytes. The two sources agree on these complete

@@ -381,7 +381,7 @@ fn loose_mega_drive_record(path: &str) -> ArchiveRecord {
     )
 }
 
-fn cheat_profile(profile_id: &str, eligible: bool) -> RetroArchCheatSetupProfile {
+pub(crate) fn cheat_profile(profile_id: &str, eligible: bool) -> RetroArchCheatSetupProfile {
     RetroArchCheatSetupProfile {
         profile_id: profile_id.to_string(),
         installation_type: ProfileKind::Native,
@@ -408,7 +408,9 @@ fn cheat_profile(profile_id: &str, eligible: bool) -> RetroArchCheatSetupProfile
     }
 }
 
-fn cheat_discovery(profiles: Vec<RetroArchCheatSetupProfile>) -> RetroArchCheatSetupDiscovery {
+pub(crate) fn cheat_discovery(
+    profiles: Vec<RetroArchCheatSetupProfile>,
+) -> RetroArchCheatSetupDiscovery {
     RetroArchCheatSetupDiscovery {
         schema_version: RETROARCH_CHEAT_SETUP_SCHEMA_VERSION,
         profiles,
@@ -657,7 +659,7 @@ pub(crate) fn app_with_cheats_mods_context() -> ArchiveFsApp {
     app
 }
 
-fn pcsx2_profile_fixture() -> Pcsx2Profile {
+pub(crate) fn pcsx2_profile_fixture() -> Pcsx2Profile {
     Pcsx2Profile {
         profile_id: "pcsx2-native-test".to_string(),
         installation_type: Pcsx2InstallationType::Native,
