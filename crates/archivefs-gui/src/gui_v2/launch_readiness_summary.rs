@@ -2880,7 +2880,7 @@ mod identity_reason_wording_tests {
         assert!(
             R::AmigaHardDisk
                 .blocker_text()
-                .contains("hard-drive entry in the emulator")
+                .contains("private working copy")
         );
         assert!(R::AmigaIpf.blocker_text().contains("CAPS/SPS"));
     }

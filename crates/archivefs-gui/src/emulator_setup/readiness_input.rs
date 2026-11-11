@@ -1848,10 +1848,13 @@ pub(crate) fn identity_unknown_reason(
         .unwrap_or_default();
     let archive = focused.is_some_and(is_archive_container);
     if platform == IdentityPlatform::Amiga {
-        match extension.as_str() {
-            "hdf" => return Reason::AmigaHardDisk,
-            "ipf" => return Reason::AmigaIpf,
-            _ => {}
+        // A hard-disk image (`.hdf`, typically a WHDLoad pack) takes the
+        // ordinary unverified route: RetroArch's PUAE core boots it, started
+        // from EmuWiz's private working copy so the library file is never
+        // written (launch::amiga_hdf_working_copy). IPF still needs the
+        // CAPS/SPS plugin, which EmuWiz does not check for.
+        if extension == "ipf" {
+            return Reason::AmigaIpf;
         }
     }
     // A known system with no IdentityPlatform (so no shared identity check and
@@ -2309,9 +2312,11 @@ mod identity_reason_tests {
     #[test]
     fn amiga_hdf_and_ipf_route_to_the_honest_amiga_reasons() {
         let amiga = IdentityPlatform::Amiga;
-        assert_eq!(reason("/g/a.hdf", amiga, None), R::AmigaHardDisk);
+        // A hard-disk image is no longer refused up front: it starts from a
+        // private working copy (owner directive 2026-11-11).
+        assert_eq!(reason("/g/a.hdf", amiga, None), R::NotConfirmed);
         assert_eq!(reason("/g/a.IPF", amiga, None), R::AmigaIpf);
-        assert_eq!(
+        assert_ne!(
             reason("/g/a.hdf", IdentityPlatform::Other, Some("Amiga")),
             R::AmigaHardDisk
         );

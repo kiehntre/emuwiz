@@ -717,7 +717,7 @@ fn play_noun(machine: AmigaCdMachine, media: AmigaMediaKind) -> String {
 }
 
 /// Honest explanations of HDF / IPF media, shared with the identity wording.
-pub const HARD_DISK_NOTE: &str = "It needs a hard-drive entry in the emulator's configuration; its contents are not proof of a complete game.";
+pub const HARD_DISK_NOTE: &str = "RetroArch (PUAE) starts it from a private working copy, so the game can save without changing your library file; its contents are not proof of a complete game.";
 pub const IPF_NOTE: &str =
     "Emulators need the CAPS/SPS library for IPF; EmuWiz cannot confirm it is installed.";
 

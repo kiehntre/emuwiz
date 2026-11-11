@@ -798,15 +798,25 @@ mod tests {
     }
 
     /// Owner rule 7 (2026-11-09): formats EmuWiz explicitly does not start
-    /// from here stay unsupported even with a saved system choice.
+    /// from here stay unsupported even with a saved system choice. IPF is
+    /// still one; a hard-disk image no longer is (2026-11-11: it starts from
+    /// a private working copy), so it must not be refused as one.
     #[test]
-    fn amiga_hard_disk_and_ipf_images_stay_explicitly_unsupported() {
+    fn amiga_ipf_stays_explicitly_unsupported_and_hard_disk_images_do_not() {
         use crate::launch_readiness_page::{IdentityUnknownReason as R, LaunchReadinessInput as I};
         let dir = tempfile::tempdir().unwrap();
-        for (name, expected) in [
-            ("20000 Leagues.hdf", R::AmigaHardDisk),
-            ("Game.ipf", R::AmigaIpf),
+        for source in [
+            Some("folder_alias"),
+            Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
         ] {
+            let job = on_disk_from(&dir, "20000 Leagues.hdf", "Amiga", source, &[0u8; 4096]);
+            if let Ok((I::IdentityUnknown(reason), _)) =
+                build_input(&env(), &job, &AtomicBool::new(false))
+            {
+                assert_ne!(reason, R::AmigaHardDisk, "{source:?}");
+            }
+        }
+        for (name, expected) in [("Game.ipf", R::AmigaIpf)] {
             for source in [
                 Some("folder_alias"),
                 Some(archivefs_core::MANUAL_PLATFORM_SOURCE),

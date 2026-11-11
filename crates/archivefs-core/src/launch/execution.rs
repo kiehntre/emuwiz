@@ -1142,9 +1142,22 @@ pub(crate) fn spawn_retroarch_guarded(
         None
     };
     let facts = command_facts(&command);
-    let prepared = command.command_spec();
+    let mut prepared = command.command_spec();
     let observation = crate::sram_provenance::prepare(&command).map_err(LaunchSpawnError::Spawn)?;
     final_sources().map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
+    // An Amiga hard-disk image is mounted read-write by the emulator, so it is
+    // started from EmuWiz's private working copy, never the library file. Made
+    // here, after every check, so a preview or refused launch writes nothing.
+    super::amiga_hdf_working_copy::redirect_for_launch(
+        &command.selection.platform_id,
+        &command.selection.content_path,
+        &mut prepared.arguments,
+    )
+    .map_err(|detail| {
+        LaunchSpawnError::Spawn(std::io::Error::other(format!(
+            "The Amiga hard-disk game could not be prepared: {detail}"
+        )))
+    })?;
     if let Some(selected) = &command.saturn_core_selection {
         selected
             .revalidate_files()
