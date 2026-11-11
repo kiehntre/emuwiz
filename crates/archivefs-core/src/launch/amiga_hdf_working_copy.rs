@@ -197,8 +197,16 @@ pub fn identify_folder(path: &Path) -> std::io::Result<FolderIdentity> {
     })
 }
 
+/// Same inode on the same filesystem. The filesystem id is preferred (it
+/// survives re-plugging on most Linux filesystems, where the device number
+/// can change); the device number is used only when an id is unavailable.
 fn same_folder(recorded: &FolderIdentity, now: &FolderIdentity) -> bool {
-    recorded.ino == now.ino && (recorded.fsid == now.fsid || recorded.dev == now.dev)
+    let same_filesystem = if recorded.fsid != 0 && now.fsid != 0 {
+        recorded.fsid == now.fsid
+    } else {
+        recorded.dev == now.dev
+    };
+    recorded.ino == now.ino && same_filesystem
 }
 
 const RECONNECT_HELP: &str = "Reconnect or mount the drive and try again. If the folder really moved, choose it again in Settings > Amiga hard-disk game copies (or use \"Accept as it is now\" there); if it is gone for good, choose Forget there, and its saves will no longer be used.";
@@ -354,8 +362,8 @@ pub fn working_copy_in(
     let root_identity =
         identify_folder(root).map_err(|e| format!("cannot open {}: {e}", root.display()))?;
     if let Some(parent) = root.parent()
-        && let Some(picked) = identities.iter().find(|i| i.path == parent)
-        && root_identity.dev != picked.dev
+        && identities.iter().any(|i| i.path == parent)
+        && identify_folder(parent).map(|now| now.dev).ok() != Some(root_identity.dev)
     {
         return Err(format!(
             "{} is not on the same drive as the folder you chose; nothing was copied",
@@ -415,7 +423,8 @@ pub fn working_copy_in(
     temp_name.push(format!("{}-{nanos}-", std::process::id()));
     temp_name.push(&name);
     let temp = dir.join(temp_name);
-    let write = || -> std::io::Result<()> {
+    let write = || -> std::io::Result<u64> {
+        use std::os::unix::fs::MetadataExt;
         let mut out = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -424,12 +433,15 @@ pub fn working_copy_in(
             .open(&temp)?;
         out.write_all(&bytes)?;
         out.sync_all()?;
-        Ok(())
+        Ok(out.metadata()?.ino())
     };
-    if let Err(e) = write() {
-        let _ = std::fs::remove_file(&temp);
-        return Err(format!("cannot create the working copy: {e}"));
-    }
+    let written_ino = match write() {
+        Ok(ino) => ino,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("cannot create the working copy: {e}"));
+        }
+    };
     // `link` never replaces an existing file: a copy another launch finished
     // first wins and keeps its saves.
     let linked = std::fs::hard_link(&temp, &target);
@@ -444,11 +456,12 @@ pub fn working_copy_in(
     // (it holds no saves yet) and refuse.
     let landed = {
         use std::os::unix::fs::MetadataExt;
-        std::fs::symlink_metadata(&target).map(|m| m.dev())
+        std::fs::symlink_metadata(&target).map(|m| (m.dev(), m.ino()))
     };
     let still_same = identify_folder(root).is_ok_and(|now| same_folder(&root_identity, &now));
-    if !still_same || landed.ok() != Some(root_identity.dev) {
-        if created {
+    if !still_same || landed.as_ref().ok().map(|l| l.0) != Some(root_identity.dev) {
+        // Only the file this call wrote (same inode) is ever removed.
+        if created && landed.as_ref().ok().map(|l| l.1) == Some(written_ino) {
             let _ = std::fs::remove_file(&target);
         }
         return Err(format!(
@@ -590,6 +603,15 @@ fn resolve(
     home: Option<&Path>,
     target_root: Option<&Path>,
 ) -> Result<EffectiveStorage, String> {
+    if let Some(chosen) = &settings.root
+        && let Some(picked) = chosen.parent()
+        && !settings.identities.iter().any(|i| i.path == picked)
+    {
+        return Err(format!(
+            "EmuWiz has no record of which drive {} is on. Choose that folder again in Settings > Amiga hard-disk game copies so EmuWiz can recognise it (nothing is moved or deleted).",
+            picked.display()
+        ));
+    }
     let (root, source) = match (env_value, &settings.root) {
         (Some(value), _) => (
             check_override(value, home, target_root)?,
@@ -615,7 +637,19 @@ fn resolve(
         root,
         source,
         earlier_roots,
-        used_roots: settings.used_roots.clone(),
+        used_roots: {
+            let mut used = settings.used_roots.clone();
+            for earlier in &settings.earlier_roots {
+                let known = settings
+                    .identities
+                    .iter()
+                    .any(|i| &i.path == earlier || Some(i.path.as_path()) == earlier.parent());
+                if earlier != &default && !known && !used.contains(earlier) {
+                    used.push(earlier.clone());
+                }
+            }
+            used
+        },
         identities: settings.identities.clone(),
     })
 }
@@ -657,9 +691,27 @@ pub fn accept_storage_folder(folder: &Path) -> Result<(), String> {
     if !settings.identities.iter().any(|i| i.path == folder) {
         return Err(format!("{} is not a remembered folder", folder.display()));
     }
+    if !holds_copies(folder) {
+        return Err(format!(
+            "{} does not contain EmuWiz Amiga copies (no {KEEP_NOTE_NAME}). An unplugged drive leaves an empty folder like this: mount the drive instead of accepting it.",
+            folder.display()
+        ));
+    }
     let now = identify_folder(folder)
         .map_err(|e| format!("{} is not available: {e}", folder.display()))?;
     save_settings_to(&path, &with_identity(&settings, now))
+}
+
+/// Whether `folder` visibly holds EmuWiz copies: the keep-note written into
+/// every storage folder, directly or in the chosen-folder subfolder. An
+/// empty mount point never does.
+fn holds_copies(folder: &Path) -> bool {
+    [
+        folder.join(KEEP_NOTE_NAME),
+        folder.join(CHOSEN_SUBFOLDER).join(KEEP_NOTE_NAME),
+    ]
+    .iter()
+    .any(|note| std::fs::symlink_metadata(note).is_ok_and(|m| m.file_type().is_file()))
 }
 
 /// Whether a remembered folder still matches its recorded identity:
@@ -759,6 +811,18 @@ fn validate_chosen(
     target_root: Option<&Path>,
 ) -> Result<(), String> {
     check_override(folder, home, target_root)?;
+    // Never nest storage inside an existing copies folder (or one of its
+    // per-game folders): a folder picker's autocompletion makes that easy.
+    if let Some(inside) = folder
+        .ancestors()
+        .find(|a| std::fs::symlink_metadata(a.join(KEEP_NOTE_NAME)).is_ok())
+    {
+        return Err(format!(
+            "{} is inside an existing EmuWiz copies folder ({}); choose the folder that contains \"{CHOSEN_SUBFOLDER}\" instead",
+            folder.display(),
+            inside.display()
+        ));
+    }
     let meta = std::fs::symlink_metadata(folder)
         .map_err(|e| format!("cannot use {}: {e}", folder.display()))?;
     if !meta.file_type().is_dir() {
@@ -1080,7 +1144,12 @@ mod tests {
             root: Some(PathBuf::from("/mnt/bulk/EmuWiz Amiga HDF copies")),
             earlier_roots: vec![PathBuf::from("/mnt/old"), default.clone()],
             used_roots: vec![PathBuf::from("/mnt/used")],
-            identities: Vec::new(),
+            identities: vec![FolderIdentity {
+                path: PathBuf::from("/mnt/bulk"),
+                dev: 1,
+                ino: 2,
+                fsid: 3,
+            }],
         };
         let none = StorageSettings::default();
         let home = Some(Path::new("/home/u"));
@@ -1417,5 +1486,75 @@ mod tests {
             copy.exists(),
             "the existing copy and its saves are untouched"
         );
+    }
+
+    #[test]
+    fn mount_identity_replugged_drive_with_a_new_device_number_still_plays() {
+        let src = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let (folder, id) = picked(base.path());
+        let path = original(src.path(), b"RDSK-rp2");
+        let root = folder.join(CHOSEN_SUBFOLDER);
+        // Same inode and filesystem id, different device number.
+        let replugged = FolderIdentity {
+            dev: id.dev.wrapping_add(7),
+            ..id.clone()
+        };
+        if id.fsid != 0 {
+            assert!(launch(&path, &root, &[replugged]).is_ok());
+        }
+    }
+
+    #[test]
+    fn settings_without_a_drive_record_fail_closed_until_the_folder_is_chosen_again() {
+        let legacy = StorageSettings {
+            root: Some(PathBuf::from("/mnt/usb/EmuWiz Amiga HDF copies")),
+            earlier_roots: vec![PathBuf::from("/mnt/old/EmuWiz Amiga HDF copies")],
+            ..Default::default()
+        };
+        let error = resolve(None, &legacy, PathBuf::from("/d"), None, None).unwrap_err();
+        assert!(error.contains("Choose that folder again"), "{error}");
+        // An earlier folder with no drive record is treated as required.
+        let chosen_again = with_identity(
+            &legacy,
+            FolderIdentity {
+                path: PathBuf::from("/mnt/usb"),
+                dev: 1,
+                ino: 2,
+                fsid: 3,
+            },
+        );
+        let storage = resolve(None, &chosen_again, PathBuf::from("/d"), None, None).unwrap();
+        assert!(
+            storage
+                .used_roots
+                .contains(&PathBuf::from("/mnt/old/EmuWiz Amiga HDF copies"))
+        );
+    }
+
+    #[test]
+    fn accept_is_only_possible_for_a_folder_that_holds_copies() {
+        let base = tempfile::tempdir().unwrap();
+        let empty_mount_point = base.path().join("usb");
+        std::fs::create_dir(&empty_mount_point).unwrap();
+        assert!(!holds_copies(&empty_mount_point));
+        let src = tempfile::tempdir().unwrap();
+        let path = original(src.path(), b"RDSK-acc");
+        working_copy_for(&path, &empty_mount_point.join(CHOSEN_SUBFOLDER)).unwrap();
+        assert!(holds_copies(&empty_mount_point));
+        assert!(holds_copies(&empty_mount_point.join(CHOSEN_SUBFOLDER)));
+    }
+
+    #[test]
+    fn a_folder_inside_an_existing_copies_folder_cannot_be_chosen() {
+        let base = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let path = original(src.path(), b"RDSK-nest");
+        let root = base.path().join(CHOSEN_SUBFOLDER);
+        let copy = working_copy_for(&path, &root).unwrap();
+        let home = Some(Path::new("/nonexistent-home"));
+        assert!(validate_chosen(&root, home, None).is_err());
+        assert!(validate_chosen(copy.parent().unwrap(), home, None).is_err());
+        assert!(validate_chosen(base.path(), home, None).is_ok());
     }
 }

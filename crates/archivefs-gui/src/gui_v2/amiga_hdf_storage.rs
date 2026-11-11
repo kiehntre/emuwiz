@@ -85,7 +85,16 @@ impl AmigaHdfStorageState {
                     ui.visuals().warn_fg_color,
                     format!("Storage folder unavailable: {error}"),
                 );
-                refresh = ui.button("Check again").clicked();
+                ui.horizontal_wrapped(|ui| {
+                    refresh = ui.button("Check again").clicked();
+                    if ui.button("Choose folder…").clicked()
+                        && let Some(folder) = rfd::FileDialog::new()
+                            .set_title("Folder for Amiga hard-disk game copies and saves")
+                            .pick_folder()
+                    {
+                        choose = Some(Some(folder));
+                    }
+                });
             }
             Some(Ok(view)) => {
                 let source = match view.storage.source {
@@ -143,7 +152,7 @@ impl AmigaHdfStorageState {
                         if *here
                             && ui
                                 .button("Accept as it is now")
-                                .on_hover_text("Only if you moved or restored this folder yourself and it holds your copies.")
+                                .on_hover_text("Only if you moved or restored this folder yourself and it holds your copies. Never for a drive that is just not plugged in: mount it instead.")
                                 .clicked()
                         {
                             accept = Some(root.clone());
