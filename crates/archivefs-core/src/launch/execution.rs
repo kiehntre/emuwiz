@@ -589,6 +589,29 @@ pub fn preflight_retroarch_launch(
         ));
     }
 
+    // An Amiga IPF floppy only boots with the CAPS/SPS plugin (`capsimg.so`)
+    // in RetroArch's system folder; without it PUAE shows an empty drive.
+    if super::amiga_caps_plugin::needs_caps_plugin(&request.expected_platform_id, content_path) {
+        let system_directory = fresh_environment
+            .profiles
+            .iter()
+            .find(|profile| {
+                profile.profile_kind == request.profile.profile_kind
+                    && profile.scope == request.profile.scope
+            })
+            .and_then(|profile| {
+                profile.paths.iter().find(|p| {
+                    p.purpose == crate::emulator_environment::retroarch::PathPurpose::System
+                })
+            })
+            .and_then(|finding| finding.resolved_path.as_ref())
+            .filter(|path| !path.lossy)
+            .map(|path| PathBuf::from(&path.display));
+        super::amiga_caps_plugin::require_caps_plugin(system_directory.as_deref()).map_err(
+            |detail| preflight_error(LaunchPreflightErrorKind::CandidateNotReady, detail),
+        )?;
+    }
+
     // --- 9: rebuild the command plan ---
     let command_plan =
         build_retroarch_command_plan(&identity_status, candidate, &fresh_environment);
