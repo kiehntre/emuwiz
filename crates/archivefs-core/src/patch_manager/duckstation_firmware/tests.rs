@@ -831,3 +831,150 @@ fn an_absolute_search_directory_is_used_as_is() {
     assert_eq!(verified.path, elsewhere.join("my-bios.bin"));
     fs::remove_dir_all(&fixture.root).unwrap();
 }
+
+// --- automatic BIOS search (no Path<Region>, no BIOSFilename) -----------------------------------
+
+/// A synthetic 512 KiB image (the PS1 BIOS size DuckStation's search accepts).
+fn bios_sized(seed: u8) -> Vec<u8> {
+    (0..PS1_BIOS_SIZE as usize)
+        .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
+}
+
+fn search_fixture(label: &str) -> (Fixture, PathBuf) {
+    let fixture = build_fixture(label, "[BIOS]\nSearchDirectory=../bios-folder\n");
+    // Exactly the path DuckStation forms: its data root joined with the
+    // relative SearchDirectory.
+    let directory = fixture.profile.configuration_path.join("../bios-folder");
+    fs::create_dir_all(&directory).unwrap();
+    (fixture, directory)
+}
+
+#[test]
+fn search_directory_only_verifies_a_redump_bios_for_the_required_region() {
+    // Real settings.ini shape: only [BIOS] SearchDirectory, relative to the
+    // data root. Before the fix this was reported Missing.
+    let (fixture, directory) = search_fixture("auto-usa");
+    let usa = bios_sized(1);
+    let japan = bios_sized(2);
+    write_bios(&directory, "scph1001.bin", &usa);
+    write_bios(&directory, "scph5500.bin", &japan);
+    write_bios(&directory, "readme.txt", b"not a bios");
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let evidence = vec![record_for("ps-22j", &japan), record_for("ps-22a", &usa)];
+    let outcome = resolve_duckstation_bios(&fixture.profile, &inspection, &evidence);
+    let DuckStationBiosVerificationOutcome::Verified(verified) = outcome else {
+        panic!("expected Verified, got {outcome:?}");
+    };
+    assert_eq!(verified.path, directory.join("scph1001.bin"));
+    assert_eq!(verified.record.name, "ps-22a");
+    assert_eq!(verified.required_region, Some("NTSC-U"));
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn search_directory_with_only_another_regions_bios_is_not_verified() {
+    let (fixture, directory) = search_fixture("auto-wrong-region");
+    let japan = bios_sized(3);
+    write_bios(&directory, "scph5500.bin", &japan);
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome = resolve_duckstation_bios(
+        &fixture.profile,
+        &inspection,
+        &[record_for("ps-22j", &japan)],
+    );
+    assert_eq!(
+        outcome,
+        DuckStationBiosVerificationOutcome::Unknown {
+            path: directory.clone()
+        }
+    );
+    assert_eq!(
+        outcome.as_legacy_state(),
+        DuckStationBiosState::PresentUnverified
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn search_directory_unverified_or_unknown_region_is_never_verified() {
+    let (fixture, directory) = search_fixture("auto-unverified");
+    let usa = bios_sized(4);
+    write_bios(&directory, "scph1001.bin", &usa);
+    // A matching hash whose record name carries no region is not enough.
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome = resolve_duckstation_bios(
+        &fixture.profile,
+        &inspection,
+        &[record_for("fixture", &usa)],
+    );
+    assert!(
+        matches!(outcome, DuckStationBiosVerificationOutcome::Unknown { .. }),
+        "{outcome:?}"
+    );
+    // No evidence at all: present, unverified.
+    let outcome = resolve_duckstation_bios(&fixture.profile, &inspection, &[]);
+    assert!(
+        matches!(outcome, DuckStationBiosVerificationOutcome::Unknown { .. }),
+        "{outcome:?}"
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn search_directory_ignores_symlinks_and_wrong_sizes() {
+    let (fixture, directory) = search_fixture("auto-symlink");
+    let usa = bios_sized(5);
+    let outside = write_bios(&fixture.root.join("outside"), "real.bin", &usa);
+    symlink(&outside, directory.join("scph1001.bin")).unwrap();
+    write_bios(&directory, "short.bin", &usa[..1024]);
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome =
+        resolve_duckstation_bios(&fixture.profile, &inspection, &[record_for("ps-22a", &usa)]);
+    assert_eq!(outcome, DuckStationBiosVerificationOutcome::Missing);
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn an_empty_path_for_the_required_region_falls_back_to_the_search() {
+    // Only a PAL path is set; an NTSC-U game makes DuckStation search.
+    let fixture = build_fixture(
+        "auto-other-region-path",
+        "[BIOS]\nSearchDirectory=../bios-folder\nPathPAL=pal.bin\n",
+    );
+    let directory = fixture.root.join("bios-folder");
+    let usa = bios_sized(6);
+    write_bios(&directory, "scph1001.bin", &usa);
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome = resolve_duckstation_bios(
+        &fixture.profile,
+        &inspection,
+        &[record_for("ps-41a(w)", &usa)],
+    );
+    assert!(
+        matches!(outcome, DuckStationBiosVerificationOutcome::Verified(_)),
+        "{outcome:?}"
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn redump_machine_names_map_to_regions() {
+    let bytes = b"x";
+    let region = |name: &str| redump_ps1_bios_region(&record_for(name, bytes));
+    assert_eq!(region("ps-41a"), Some(DuckStationRegion::NtscU));
+    assert_eq!(region("ps-41a(w)"), Some(DuckStationRegion::NtscU));
+    assert_eq!(region("ps-30e"), Some(DuckStationRegion::Pal));
+    assert_eq!(region("psone-43j"), Some(DuckStationRegion::NtscJ));
+    assert_eq!(region("ps-22j(v)"), Some(DuckStationRegion::NtscJ));
+    assert_eq!(region("ps-22d"), None);
+    assert_eq!(region("fixture"), None);
+    assert_eq!(
+        redump_ps1_bios_region(&record_for_system(
+            "ps-41a",
+            bytes,
+            FirmwareSystem::PlayStation2
+        )),
+        None
+    );
+}

@@ -275,6 +275,12 @@ fn generic_bios_path(config: &DuckStationConfigInspection, directory: &Path) -> 
 /// policy only - see [`resolve_duckstation_bios`] for what happens next.
 enum ConfiguredBiosSelection {
     Missing,
+    /// No BIOS file is named for the required slot, so DuckStation searches
+    /// its BIOS folder itself (upstream `BIOS::FindBIOSImageInDirectory`).
+    AutoSearch {
+        directory: PathBuf,
+        required_region: Option<DuckStationRegion>,
+    },
     One {
         path: PathBuf,
         required_region: Option<DuckStationRegion>,
@@ -350,7 +356,12 @@ fn resolve_configured_bios_selection(
                         required_region: Some(required),
                     }
                 } else {
-                    ConfiguredBiosSelection::Missing
+                    // An empty Path<Region> makes DuckStation search its
+                    // BIOS folder for this region.
+                    ConfiguredBiosSelection::AutoSearch {
+                        directory,
+                        required_region: Some(required),
+                    }
                 }
             }
             None => ConfiguredBiosSelection::Ambiguous(format!(
@@ -366,7 +377,106 @@ fn resolve_configured_bios_selection(
             path,
             required_region: region,
         },
-        None => ConfiguredBiosSelection::Missing,
+        // Nothing names a file: DuckStation's default is to pick one from
+        // its BIOS folder, which is not the same as "no BIOS".
+        None => ConfiguredBiosSelection::AutoSearch {
+            directory,
+            required_region: region,
+        },
+    }
+}
+
+/// DuckStation's BIOS image size; upstream also accepts PS2/PS3 BIOS sizes,
+/// which Redump PS1 evidence can never verify.
+const PS1_BIOS_SIZE: u64 = 512 * 1024;
+/// Bounds on the folder search: entries listed, and candidate files hashed.
+const MAX_AUTO_SEARCH_ENTRIES: usize = 4096;
+const MAX_AUTO_SEARCH_HASHED: usize = 128;
+
+/// The console region a Redump PS1 BIOS record is for, from its machine name
+/// (`ps-41a` USA, `ps-41e` Europe, `ps-22j` / `psone-43j` Japan; a trailing
+/// `(w)`/`(v)` variant tag is ignored). Any other suffix gives `None`.
+fn redump_ps1_bios_region(record: &FirmwareIdentityRecord) -> Option<DuckStationRegion> {
+    if record.system != crate::dat::firmware_evidence::FirmwareSystem::PlayStation {
+        return None;
+    }
+    let name = record.name.trim();
+    let base = name.split('(').next().unwrap_or(name).trim();
+    if !(base.starts_with("ps-") || base.starts_with("psone-")) {
+        return None;
+    }
+    match base.chars().last()?.to_ascii_lowercase() {
+        'a' => Some(DuckStationRegion::NtscU),
+        'e' => Some(DuckStationRegion::Pal),
+        'j' => Some(DuckStationRegion::NtscJ),
+        _ => None,
+    }
+}
+
+/// Models DuckStation's automatic BIOS pick for a folder without guessing a
+/// file: `Verified` only when the folder holds a regular (non-symlinked)
+/// 512 KiB file whose bytes exactly match a Redump PS1 BIOS record for the
+/// game's required region. DuckStation prefers a known BIOS of the matching
+/// region over any unknown or other-region image, so with such a file present
+/// it loads a known BIOS for this region (the reported path is the verified
+/// file EmuWiz found). Image-sized files that do not verify give `Unknown`
+/// (DuckStation may still boot, possibly with the wrong BIOS); none at all
+/// gives `Missing`, which is what DuckStation itself reports.
+fn auto_search_bios(
+    directory: &Path,
+    evidence: &[FirmwareIdentityRecord],
+    required_region: Option<DuckStationRegion>,
+) -> DuckStationBiosVerificationOutcome {
+    match std::fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return DuckStationBiosVerificationOutcome::Unsafe {
+                path: directory.to_path_buf(),
+                detail: "DuckStation's BIOS search folder is not a real folder".to_string(),
+            };
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return DuckStationBiosVerificationOutcome::Missing;
+        }
+        Err(error) => {
+            return DuckStationBiosVerificationOutcome::Unreadable {
+                detail: error.to_string(),
+            };
+        }
+    }
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return DuckStationBiosVerificationOutcome::Unreadable {
+                detail: error.to_string(),
+            };
+        }
+    };
+    let mut candidates: Vec<PathBuf> = entries
+        .take(MAX_AUTO_SEARCH_ENTRIES)
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == PS1_BIOS_SIZE)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return DuckStationBiosVerificationOutcome::Missing;
+    }
+    candidates.sort();
+    if let Some(required) = required_region {
+        for path in candidates.iter().take(MAX_AUTO_SEARCH_HASHED) {
+            let outcome = verify_one_bios_path(path, evidence, Some(required));
+            if let DuckStationBiosVerificationOutcome::Verified(verified) = &outcome
+                && redump_ps1_bios_region(&verified.record) == Some(required)
+            {
+                return outcome;
+            }
+        }
+    }
+    DuckStationBiosVerificationOutcome::Unknown {
+        path: directory.to_path_buf(),
     }
 }
 
@@ -443,6 +553,10 @@ pub fn resolve_duckstation_bios(
             path,
             required_region,
         } => verify_one_bios_path(&path, evidence, required_region),
+        ConfiguredBiosSelection::AutoSearch {
+            directory,
+            required_region,
+        } => auto_search_bios(&directory, evidence, required_region),
     }
 }
 
