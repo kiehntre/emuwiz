@@ -82,6 +82,7 @@ mod pad_mouse;
 mod pad_shell;
 mod suggest;
 pub(crate) use pad_shell::mark_secret;
+mod amiga_hdf_storage;
 mod pages;
 mod patch_composition;
 mod patch_package_preview;
@@ -107,7 +108,6 @@ mod saves_states;
 #[cfg(test)]
 mod scummvm_journey_tests;
 mod setup_portability;
-mod amiga_hdf_storage;
 #[cfg(test)]
 #[path = "tests/shared_scroll.rs"]
 mod shared_scroll_tests;

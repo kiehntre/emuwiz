@@ -55,7 +55,10 @@ impl AmigaHdfStorageState {
         let mut choose: Option<Option<PathBuf>> = None;
         match self.loaded.as_ref() {
             Some(Err(error)) => {
-                ui.colored_label(ui.visuals().warn_fg_color, format!("Storage folder unavailable: {error}"));
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("Storage folder unavailable: {error}"),
+                );
             }
             Some(Ok(view)) => {
                 let source = match view.storage.source {
@@ -63,7 +66,10 @@ impl AmigaHdfStorageState {
                     StorageSource::Chosen => "chosen in Settings",
                     StorageSource::Override => "set by EMUWIZ_AMIGA_HDF_WORKING_DIR",
                 };
-                ui.label(format!("New copies go to: {} ({source})", view.storage.root.display()));
+                ui.label(format!(
+                    "New copies go to: {} ({source})",
+                    view.storage.root.display()
+                ));
                 match &view.facts {
                     Ok(facts) => {
                         ui.label(format!(
@@ -78,7 +84,10 @@ impl AmigaHdfStorageState {
                         }
                     }
                     Err(error) => {
-                        ui.colored_label(ui.visuals().warn_fg_color, format!("Free space unknown: {error}"));
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            format!("Free space unknown: {error}"),
+                        );
                     }
                 }
                 for (root, copies) in &view.earlier {
@@ -113,7 +122,10 @@ impl AmigaHdfStorageState {
         }
         if let Some(choice) = choose {
             self.message = Some(match storage::choose_storage(choice.as_deref()) {
-                Ok(next) => format!("New Amiga hard-disk copies will go to {}.", next.root.display()),
+                Ok(next) => format!(
+                    "New Amiga hard-disk copies will go to {}.",
+                    next.root.display()
+                ),
                 Err(error) => format!("Folder not changed: {error}"),
             });
             self.loaded = None;
