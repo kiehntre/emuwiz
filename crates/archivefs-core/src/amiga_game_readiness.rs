@@ -724,7 +724,7 @@ fn play_noun(machine: AmigaCdMachine, media: AmigaMediaKind) -> String {
 }
 
 /// Honest explanations of HDF / IPF media, shared with the identity wording.
-pub const HARD_DISK_NOTE: &str = "It needs a hard-drive entry in the emulator's configuration; its contents are not proof of a complete game.";
+pub const HARD_DISK_NOTE: &str = "RetroArch (PUAE) starts it from a private working copy, so the game can save without changing your library file; its contents are not proof of a complete game.";
 pub const ZIP_DISKS_NOTE: &str = "Play copies this game's disks to a private temporary folder for RetroArch (PUAE) and removes them afterwards; the ZIP is never changed. The ZIP must hold only one game's IPF disks, and IPF needs the CAPS/SPS plugin. Games with up to four disks start with every disk in a drive. Games with more than four disks have not been tested.";
 pub const IPF_NOTE: &str = "IPF needs the CAPS/SPS plugin (capsimg.so) in RetroArch's system folder; Play checks for it before starting.";
 

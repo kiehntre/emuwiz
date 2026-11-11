@@ -1450,8 +1450,10 @@ mod tests {
         let ipf = write(&dir, "5th Gear (Europe).ipf", &[0u8; 4096]);
         let offered = trial_systems(&ipf, None, &|_| true);
         assert!(offered.contains(&"Amiga"), "{offered:?}");
+        // A hard-disk image is startable since 2026-11-11 (it runs from a
+        // private working copy), so it may be offered as Amiga.
         let hdf = write(&dir, "Game.hdf", &[0u8; 4096]);
-        assert!(!trial_systems(&hdf, None, &|_| true).contains(&"Amiga"));
+        assert!(trial_systems(&hdf, None, &|_| true).contains(&"Amiga"));
     }
 
     /// The 2026-11-10 smoke test: a `SEGA PICO`-headed ZIP in the sega-pico

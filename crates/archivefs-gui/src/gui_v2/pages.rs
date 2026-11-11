@@ -4286,6 +4286,7 @@ impl App {
             }
         });
         self.setup_portability.render(ui);
+        self.amiga_hdf_storage.render(ui);
         ui.label("Readable text and a permanent sidebar are on by default. The library view and current location are remembered separately from the legacy interface.");
         ui.separator();
         ui.label(theme::card_title("Beginner guidance"));
