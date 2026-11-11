@@ -244,13 +244,26 @@ fn refuse_ambiguous_storage(storage: &EffectiveStorage, default: &Path) -> Resul
         if folder == default {
             continue;
         }
+        // Only a folder that does not exist is left to the availability
+        // checks; anything else that cannot be opened as a plain folder (a
+        // symlink, no permission) is refused, never skipped.
+        let missing = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+        let cannot_check =
+            |path: &Path, e: std::io::Error| format!("cannot check {}: {e}", path.display());
         let checked = match identify_folder(folder) {
             Ok(identity) => identity,
-            Err(_) if folder == storage.root => match folder.parent().map(identify_folder) {
-                Some(Ok(identity)) => identity,
-                _ => continue,
-            },
-            Err(_) => continue,
+            Err(e) if missing(&e) && folder == storage.root => {
+                let Some(parent) = folder.parent() else {
+                    continue;
+                };
+                match identify_folder(parent) {
+                    Ok(identity) => identity,
+                    Err(e) if missing(&e) => continue,
+                    Err(e) => return Err(cannot_check(parent, e)),
+                }
+            }
+            Err(e) if missing(&e) => continue,
+            Err(e) => return Err(cannot_check(folder, e)),
         };
         refuse_ambiguous(&checked)?;
     }
@@ -1955,6 +1968,12 @@ mod tests {
         std::fs::create_dir_all(&default).unwrap();
         let own = storage(default.clone(), vec![base.path().join("gone")]);
         assert!(refuse_ambiguous_storage(&own, &default).is_ok());
+        // A symlinked storage folder is refused, not skipped: what it points
+        // at is never judged, so it must not be used unchecked.
+        let link = base.path().join("link-to-stick");
+        std::os::unix::fs::symlink(&picked, &link).unwrap();
+        let linked = storage(default.clone(), vec![link]);
+        assert!(refuse_ambiguous_storage(&linked, &default).is_err());
     }
 
     #[test]
