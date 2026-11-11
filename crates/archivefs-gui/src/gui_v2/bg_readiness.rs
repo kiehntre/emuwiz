@@ -798,25 +798,47 @@ mod tests {
     }
 
     /// Owner rule 7 (2026-11-09): formats EmuWiz explicitly does not start
-    /// from here stay unsupported even with a saved system choice.
+    /// from here stay unsupported even with a saved system choice. An Amiga
+    /// hard-disk image is still one of them.
     #[test]
-    fn amiga_hard_disk_and_ipf_images_stay_explicitly_unsupported() {
+    fn amiga_hard_disk_images_stay_explicitly_unsupported() {
         use crate::launch_readiness_page::{IdentityUnknownReason as R, LaunchReadinessInput as I};
         let dir = tempfile::tempdir().unwrap();
-        for (name, expected) in [
-            ("20000 Leagues.hdf", R::AmigaHardDisk),
-            ("Game.ipf", R::AmigaIpf),
+        let name = "20000 Leagues.hdf";
+        for source in [
+            Some("folder_alias"),
+            Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
         ] {
-            for source in [
-                Some("folder_alias"),
-                Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
-            ] {
-                let job = on_disk_from(&dir, name, "Amiga", source, &[0u8; 4096]);
-                match build_input(&env(), &job, &AtomicBool::new(false)) {
-                    Ok((I::IdentityUnknown(reason), _)) => assert_eq!(reason, expected, "{name}"),
-                    Ok((I::Plan { .. }, _)) => panic!("{name} {source:?} planned"),
-                    _ => panic!("{name} {source:?}: unexpected input"),
+            let job = on_disk_from(&dir, name, "Amiga", source, &[0u8; 4096]);
+            match build_input(&env(), &job, &AtomicBool::new(false)) {
+                Ok((I::IdentityUnknown(reason), _)) => {
+                    assert_eq!(reason, R::AmigaHardDisk, "{name}")
                 }
+                Ok((I::Plan { .. }, _)) => panic!("{name} {source:?} planned"),
+                _ => panic!("{name} {source:?}: unexpected input"),
+            }
+        }
+    }
+
+    /// Since 2026-11-11 an IPF floppy starts when the CAPS/SPS plugin is
+    /// present (checked at launch), so it is not refused up front any more.
+    #[test]
+    fn amiga_ipf_images_are_not_refused_up_front() {
+        use crate::launch_readiness_page::{IdentityUnknownReason as R, LaunchReadinessInput as I};
+        let dir = tempfile::tempdir().unwrap();
+        let name = "Game.ipf";
+        for source in [
+            Some("folder_alias"),
+            Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
+        ] {
+            let job = on_disk_from(&dir, name, "Amiga", source, &[0u8; 4096]);
+            if let Ok((I::IdentityUnknown(reason), _)) =
+                build_input(&env(), &job, &AtomicBool::new(false))
+            {
+                assert!(
+                    !matches!(reason, R::AmigaIpf),
+                    "{name} {source:?}: {reason:?}"
+                );
             }
         }
     }

@@ -3806,7 +3806,11 @@ fn zipped_cartridge_play_is_ready_plain_and_blocked_with_cheats_or_playlist() {
     upper.expected_platform_id = "SNES".into();
     assert!(is_zipped_cartridge_request(&upper));
     // Arcade/other platforms' ZIPs are native content: nothing changes.
-    for platform in ["Arcade", "MAME", "PlayStation", "Amiga"] {
+    // An Amiga ZIP is a zipped floppy game: staged like a cartridge.
+    let mut amiga = request_for("/roms/game.zip");
+    amiga.expected_platform_id = "Amiga".into();
+    assert!(is_zipped_cartridge_request(&amiga));
+    for platform in ["Arcade", "MAME", "PlayStation"] {
         let mut native = request_for("/roms/game.zip");
         native.expected_platform_id = platform.into();
         assert!(!is_zipped_cartridge_request(&native), "{platform}");

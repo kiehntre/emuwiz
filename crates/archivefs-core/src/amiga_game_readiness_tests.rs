@@ -400,10 +400,23 @@ fn incomplete_or_unverified_disk_sets_are_reported_honestly() {
 #[test]
 fn unsupported_damaged_and_packed_media_are_blocked() {
     let facts = env(vec![profile(AmigaEmulatorKind::FsUae, Some("A500"))]);
-    for name in ["a.hfe", "a.zip", "a.xyz"] {
+    for name in ["a.hfe", "a.7z", "a.rar", "a.xyz"] {
         let readiness = assess_amiga_game(AMIGA, Path::new(name), false, None, Some(&facts));
         assert_eq!(state(&readiness, K::Media), Blocked, "{name}");
     }
+    // A ZIP of IPF disks is staged privately at Play (never changed), so its
+    // format row warns instead of refusing.
+    let zipped = assess_amiga_game(AMIGA, Path::new("a.zip"), false, None, Some(&facts));
+    assert_eq!(state(&zipped, K::Media), Warning);
+    let media = zipped.check(K::Media).unwrap();
+    assert!(media.detail.contains("never changed"), "{}", media.detail);
+    assert!(
+        media
+            .detail
+            .contains("more than four disks have not been tested"),
+        "{}",
+        media.detail
+    );
     let damaged = assess_amiga_game(AMIGA, Path::new("a.adf"), true, None, Some(&facts));
     assert_eq!(state(&damaged, K::Media), Blocked);
 
