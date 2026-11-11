@@ -1443,9 +1443,11 @@ mod tests {
     #[test]
     fn a_format_the_system_does_not_start_is_never_offered_for_a_try() {
         let dir = tempfile::tempdir().unwrap();
+        // IPF is startable since 2026-11-11 (the launch checks for the
+        // CAPS/SPS plugin), so it may be offered as Amiga too.
         let ipf = write(&dir, "5th Gear (Europe).ipf", &[0u8; 4096]);
         let offered = trial_systems(&ipf, None, &|_| true);
-        assert!(!offered.contains(&"Amiga"), "{offered:?}");
+        assert!(offered.contains(&"Amiga"), "{offered:?}");
         // A hard-disk image is startable since 2026-11-11 (it runs from a
         // private working copy), so it may be offered as Amiga.
         let hdf = write(&dir, "Game.hdf", &[0u8; 4096]);

@@ -718,8 +718,7 @@ fn play_noun(machine: AmigaCdMachine, media: AmigaMediaKind) -> String {
 
 /// Honest explanations of HDF / IPF media, shared with the identity wording.
 pub const HARD_DISK_NOTE: &str = "RetroArch (PUAE) starts it from a private working copy, so the game can save without changing your library file; its contents are not proof of a complete game.";
-pub const IPF_NOTE: &str =
-    "Emulators need the CAPS/SPS library for IPF; EmuWiz cannot confirm it is installed.";
+pub const IPF_NOTE: &str = "IPF needs the CAPS/SPS plugin (capsimg.so) in RetroArch's system folder; Play checks for it before starting.";
 
 fn media_check(machine: AmigaCdMachine, media: AmigaMediaKind) -> (AmigaCheckState, String) {
     use AmigaCheckState::{Blocked, Ready, Warning};
