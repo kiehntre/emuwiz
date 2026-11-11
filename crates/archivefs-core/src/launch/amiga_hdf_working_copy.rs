@@ -171,6 +171,45 @@ pub struct FolderIdentity {
     /// statvfs filesystem id: stable across re-plugging for most Linux
     /// filesystems, where the device number may change.
     pub fsid: u64,
+    /// The filesystem's own UUID, when the kernel reports one
+    /// (FS_IOC_GETFSUUID, newer kernels; ext4, XFS, btrfs and others).
+    /// Identities recorded without it fall back to `fsid`/`dev`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fs_uuid: Option<String>,
+}
+
+/// The filesystem UUID from the kernel's FS_IOC_GETFSUUID, or `None` when
+/// the kernel or the filesystem does not provide one (FAT and exFAT never
+/// do; kernels before the ioctl existed answer ENOTTY).
+fn filesystem_uuid(dir: &File) -> Option<String> {
+    #[repr(C)]
+    struct FsUuid2 {
+        len: u8,
+        uuid: [u8; 16],
+    }
+    // _IOR(0x15, 0, struct fsuuid2): read, size 17.
+    const FS_IOC_GETFSUUID: u32 = 0x8011_1500;
+    let mut out = FsUuid2 {
+        len: 0,
+        uuid: [0; 16],
+    };
+    // SAFETY: `dir` is an open descriptor and `out` is a writable struct of
+    // exactly the size encoded in the request.
+    let rc = unsafe {
+        libc::ioctl(
+            std::os::fd::AsRawFd::as_raw_fd(dir),
+            FS_IOC_GETFSUUID as _,
+            &mut out as *mut FsUuid2,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let bytes = &out.uuid[..usize::from(out.len).min(out.uuid.len())];
+    if bytes.iter().all(|b| *b == 0) {
+        return None;
+    }
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Opens `path` as a directory without following a symlink at its last
@@ -194,6 +233,7 @@ pub fn identify_folder(path: &Path) -> std::io::Result<FolderIdentity> {
         dev: meta.dev(),
         ino: meta.ino(),
         fsid,
+        fs_uuid: filesystem_uuid(&dir),
     })
 }
 
@@ -201,6 +241,11 @@ pub fn identify_folder(path: &Path) -> std::io::Result<FolderIdentity> {
 /// survives re-plugging on most Linux filesystems, where the device number
 /// can change); the device number is used only when an id is unavailable.
 fn same_folder(recorded: &FolderIdentity, now: &FolderIdentity) -> bool {
+    // A recorded filesystem UUID is the strongest identity: it must still be
+    // there and equal (a missing one now fails closed).
+    if let Some(uuid) = &recorded.fs_uuid {
+        return recorded.ino == now.ino && now.fs_uuid.as_ref() == Some(uuid);
+    }
     let same_filesystem = if recorded.fsid != 0 && now.fsid != 0 {
         recorded.fsid == now.fsid
     } else {
@@ -210,10 +255,14 @@ fn same_folder(recorded: &FolderIdentity, now: &FolderIdentity) -> bool {
 }
 
 /// Whether a folder's identity cannot tell its drive apart from another one
-/// plugged into the same port. FAT/exFAT (and some others) report a
-/// filesystem id that is only the device number, or none at all; with a
-/// fixed root inode, a different stick would then look identical.
+/// plugged into the same port. A filesystem UUID from the kernel settles it.
+/// Without one, FAT/exFAT (and XFS on kernels without FS_IOC_GETFSUUID)
+/// report a filesystem id that is only the device number, or none at all;
+/// with fixed root inodes, a different drive would then look identical.
 fn ambiguous_identity(identity: &FolderIdentity) -> bool {
+    if identity.fs_uuid.is_some() {
+        return false;
+    }
     let dev = identity.dev;
     let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
     let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
@@ -221,7 +270,7 @@ fn ambiguous_identity(identity: &FolderIdentity) -> bool {
     identity.fsid == 0 || identity.fsid == kernel_encoded
 }
 
-const AMBIGUOUS_DRIVE: &str = "EmuWiz cannot reliably recognise the drive this folder is on: drives in this format (for example FAT or exFAT) look the same as any other drive plugged in at the same place, so saves could end up on the wrong drive. Choose a folder on a Linux-formatted drive (ext4 or btrfs) in Settings > Amiga hard-disk game copies.";
+const AMBIGUOUS_DRIVE: &str = "EmuWiz cannot verify which drive this folder is on. The drive reports no unique ID of its own (FAT and exFAT drives never do; XFS does only on newer Linux kernels), so it is recognised just by where it is plugged in, and a different drive plugged in there would look identical. Amiga hard-disk copies and their saves are not kept on such a drive, so they cannot end up split between two drives. Choose a folder on a drive that reports its own ID, such as an ext4 or btrfs drive.";
 
 /// Refuses a storage folder whose drive cannot be told apart from another.
 fn refuse_ambiguous(identity: &FolderIdentity) -> Result<(), String> {
@@ -1314,6 +1363,7 @@ mod tests {
                 dev: 1,
                 ino: 2,
                 fsid: 3,
+                fs_uuid: None,
             }],
         };
         let none = StorageSettings::default();
@@ -1438,6 +1488,7 @@ mod tests {
                         dev: n,
                         ino: n,
                         fsid: n,
+                        fs_uuid: None,
                     };
                     with_settings_lock(&file, || {
                         let settings = load_settings_from(&file)?;
@@ -1497,8 +1548,8 @@ mod tests {
         let result = working_copy_in(
             &path,
             new.path(),
-            &[gone.clone()],
-            &[gone.clone()],
+            std::slice::from_ref(&gone),
+            std::slice::from_ref(&gone),
             &[],
             &mut |_| Ok(()),
         );
@@ -1562,10 +1613,17 @@ mod tests {
         assert_eq!(seen, vec![root.clone()]);
         // Already remembered: not recorded again; the copy is reused.
         let mut again = 0;
-        let reused = working_copy_in(&path, &root, &[], &[root.clone()], &[], &mut |_| {
-            again += 1;
-            Ok(())
-        })
+        let reused = working_copy_in(
+            &path,
+            &root,
+            &[],
+            std::slice::from_ref(&root),
+            &[],
+            &mut |_| {
+                again += 1;
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!((reused, again), (copy, 0));
         // An override folder recorded this way is still searched after the
@@ -1575,6 +1633,7 @@ mod tests {
             dev: 1,
             ino: 2,
             fsid: 3,
+            fs_uuid: None,
         };
         let settings = add_used_root(&StorageSettings::default(), &x).unwrap();
         assert!(add_used_root(&settings, &x).is_none());
@@ -1681,6 +1740,7 @@ mod tests {
         let moved = FolderIdentity {
             dev: id.dev.wrapping_add(1),
             fsid: id.fsid.wrapping_add(1),
+            fs_uuid: id.fs_uuid.as_ref().map(|_| "another-drive".to_string()),
             ..id.clone()
         };
         assert!(launch(&path, &root, &[moved]).is_err());
@@ -1734,6 +1794,7 @@ mod tests {
                 dev: 1,
                 ino: 2,
                 fsid: 3,
+                fs_uuid: None,
             },
         );
         let storage = resolve(None, &chosen_again, PathBuf::from("/d"), None, None).unwrap();
@@ -1844,6 +1905,7 @@ mod tests {
             dev: 1,
             ino: 2,
             fsid: 3,
+            fs_uuid: None,
         };
         let settings = StorageSettings {
             identities: [&empty, &unrelated, &fake_note, &link_to_real, &real]
@@ -1942,6 +2004,7 @@ mod tests {
             dev: 0x0821,
             ino: 1,
             fsid: 0x0821,
+            fs_uuid: None,
         };
         assert!(refuse_ambiguous(&stick).is_err());
 
@@ -1983,6 +2046,7 @@ mod tests {
             dev,
             ino: 1,
             fsid,
+            fs_uuid: None,
         };
         // FAT/exFAT report the kernel's encoding of the device number.
         assert!(ambiguous_identity(&id(0x0821, 0x0821))); // sdc1 (8:33)
@@ -1994,6 +2058,38 @@ mod tests {
             0x10 | (8 << 8) | ((0x310u64 & !0xff) << 12)
         )));
         assert!(ambiguous_identity(&id(0x0821, 0)));
+        // A kernel-reported filesystem UUID (e.g. XFS on newer kernels) is a
+        // distinct identity even when the statvfs id is the device number.
+        let xfs = FolderIdentity {
+            fs_uuid: Some("4f2c9a10b6e34d7f8a1c0e5d9b2a7c31".into()),
+            ..id(0x0821, 0x0821)
+        };
+        assert!(!ambiguous_identity(&xfs));
+        // Same UUID and inode: the same folder, even on a new device number.
+        let replugged = FolderIdentity {
+            dev: 0x0831,
+            fsid: 0x0831,
+            ..xfs.clone()
+        };
+        assert!(same_folder(&xfs, &replugged));
+        // Another drive (different UUID) or a UUID that is now missing: not
+        // the same folder.
+        let other = FolderIdentity {
+            fs_uuid: Some("00112233445566778899aabbccddeeff".into()),
+            ..xfs.clone()
+        };
+        assert!(!same_folder(&xfs, &other));
+        let unknown_now = FolderIdentity {
+            fs_uuid: None,
+            ..xfs.clone()
+        };
+        assert!(!same_folder(&xfs, &unknown_now));
+        // A live folder's UUID, when the kernel gives one, is stable.
+        let dir = tempfile::tempdir().unwrap();
+        let a = identify_folder(dir.path()).unwrap();
+        let b = identify_folder(dir.path()).unwrap();
+        assert_eq!(a.fs_uuid, b.fs_uuid);
+        assert!(same_folder(&a, &b));
         // ext4/btrfs ids come from the filesystem UUID: distinct.
         assert!(!ambiguous_identity(&id(0x0821, 0xd76c_9b1f_2a40_33e1)));
     }
