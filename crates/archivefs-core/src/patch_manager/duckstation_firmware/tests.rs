@@ -1040,10 +1040,7 @@ fn a_shallow_bios_folder_never_trusts_a_broad_parent() {
         root("/media/user/disk/bios"),
         Some(PathBuf::from("/media/user/disk/bios"))
     );
-    assert_eq!(
-        root("/mnt/x/bios"),
-        Some(PathBuf::from("/mnt/x/bios"))
-    );
+    assert_eq!(root("/mnt/x/bios"), Some(PathBuf::from("/mnt/x/bios")));
     assert_eq!(root("/mnt"), None);
     assert_eq!(root("/"), None);
     // Re-review: a deep parent can still be the whole home folder or every
@@ -1186,7 +1183,9 @@ fn an_unset_or_unresolvable_home_trusts_no_bios_tree() {
     for home in [
         None,
         Some(std::ffi::OsString::new()),
-        Some(std::ffi::OsString::from("/nonexistent/emuwiz-home-for-test")),
+        Some(std::ffi::OsString::from(
+            "/nonexistent/emuwiz-home-for-test",
+        )),
     ] {
         assert!(
             trusted_bios_tree_for_home(&directory, home.clone()).is_empty(),
@@ -1194,7 +1193,10 @@ fn an_unset_or_unresolvable_home_trusts_no_bios_tree() {
         );
     }
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
-    if home.as_deref().is_some_and(|home| std::fs::canonicalize(home).is_ok()) {
+    if home
+        .as_deref()
+        .is_some_and(|home| std::fs::canonicalize(home).is_ok())
+    {
         assert!(!trusted_bios_tree_for_home(&directory, home).is_empty());
     }
 }

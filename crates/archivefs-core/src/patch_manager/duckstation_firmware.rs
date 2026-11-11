@@ -439,11 +439,16 @@ fn trusted_bios_root<'a>(canonical: &'a Path, home: Option<&Path>) -> Option<&'a
     // `/media/<user>/<drive>` and `/run/media/<user>/<drive>` (per user).
     let broad = |folder: &Path| {
         home.is_some_and(|home| home.starts_with(folder))
-            || [("/run/media", 2), ("/media", 2), ("/mnt", 1), ("/var/mnt", 1)]
-                .iter()
-                .any(|(media, levels)| {
-                    folder.starts_with(media) && depth(folder) <= depth(Path::new(media)) + levels
-                })
+            || [
+                ("/run/media", 2),
+                ("/media", 2),
+                ("/mnt", 1),
+                ("/var/mnt", 1),
+            ]
+            .iter()
+            .any(|(media, levels)| {
+                folder.starts_with(media) && depth(folder) <= depth(Path::new(media)) + levels
+            })
     };
     match canonical.parent() {
         Some(parent) if depth(parent) >= MIN_TRUSTED_PARENT_DEPTH && !broad(parent) => Some(parent),
