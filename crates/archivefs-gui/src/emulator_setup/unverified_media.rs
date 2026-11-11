@@ -1413,12 +1413,14 @@ mod tests {
         ] {
             let path = write(&dir, name, &bytes);
             let offered = trial_systems(&path, None, &|_| true);
-            // IPF keeps Atari ST only: Amiga IPF is unsupported (rule 7).
-            assert!(
-                offered.len() > 1 || name.ends_with(".ipf"),
+            // IPF is offered as both Atari ST and Amiga: Amiga IPF plays
+            // through PUAE once its CAPS/SPS plugin check passes.
+            assert!(offered.len() > 1, "{name}: {offered:?}");
+            assert_eq!(
+                offered.contains(&"Amiga"),
+                name.ends_with(".ipf"),
                 "{name}: {offered:?}"
             );
-            assert!(!offered.contains(&"Amiga"), "{name}: {offered:?}");
             assert!(offered.contains(&expect), "{name}: {offered:?}");
             assert!(matches!(
                 resolve(&path, "", None, None, Some(expect), None),

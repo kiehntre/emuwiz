@@ -638,6 +638,11 @@ pub fn preflight_retroarch_launch(
             "command plan reported no blockers but also no command",
         )
     })?;
+    if super::amiga_caps_plugin::needs_caps_plugin(&request.expected_platform_id, content_path) {
+        super::amiga_caps_plugin::require_caps_core(&command.selection.core_stem).map_err(
+            |detail| preflight_error(LaunchPreflightErrorKind::CandidateNotReady, detail),
+        )?;
+    }
 
     if request.expected_platform_id == "Saturn" {
         let selected = request.saturn_core_selection.as_ref().ok_or_else(|| {
@@ -1662,12 +1667,29 @@ pub fn prepare_retroarch_launch_with_playlist(
                 })?;
                 staged_request.expected_game_key = member.game_key;
             }
-            let command = preflight_retroarch_launch_with_playlist(
+            let mut command = preflight_retroarch_launch_with_playlist(
                 &staged_request,
                 filesystem,
                 environment,
                 playlist,
             )?;
+            // A zipped Amiga game with several disks: every check above held
+            // the boot disk; RetroArch is given the staged M3U beside it so
+            // all of that game's disks (and only those) can be swapped in.
+            // The spawn re-check still re-derives the boot disk's key.
+            if let Some(disks) = staged.playlist() {
+                super::amiga_hdf_working_copy::redirect_arguments(
+                    &mut command.arguments,
+                    staged.path(),
+                    disks,
+                )
+                .map_err(|detail| {
+                    preflight_error(
+                        LaunchPreflightErrorKind::ContentRequiresMount,
+                        format!("zipped game cannot be launched: {detail}"),
+                    )
+                })?;
+            }
             return Ok(PreparedRetroArchLaunch {
                 command,
                 staged_cartridge: Some(staged),

@@ -1571,7 +1571,9 @@ fn only_cartridge_platform_zips_count_as_zipped_cartridges() {
     use std::path::Path;
     assert!(zipped(Path::new("/r/g.zip"), "SNES"));
     assert!(zipped(Path::new("/r/g.ZIP"), "MegaDrive"));
-    for platform in ["Arcade", "MAME", "PlayStation", "GameCube", "Amiga"] {
+    // A zipped Amiga floppy game stages its IPF disks the same way.
+    assert!(zipped(Path::new("/r/g.zip"), "Amiga"));
+    for platform in ["Arcade", "MAME", "PlayStation", "GameCube"] {
         assert!(!zipped(Path::new("/r/g.zip"), platform), "{platform}");
     }
     assert!(!zipped(Path::new("/r/g.sfc"), "SNES"));

@@ -241,7 +241,7 @@ pub fn redirect_arguments(
             arguments[*index] = working_copy.as_os_str().to_owned();
             Ok(())
         }
-        _ => Err("the emulator command does not name the hard-disk image exactly once".into()),
+        _ => Err("the emulator command does not name the game file exactly once".into()),
     }
 }
 
