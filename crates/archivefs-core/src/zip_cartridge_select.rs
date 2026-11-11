@@ -68,26 +68,22 @@ pub fn is_loose_cartridge_platform(platform: IdentityPlatform) -> bool {
     )
 }
 
-/// The selected member, by central-directory index and exact stored name.
+/// One non-directory ZIP entry that passed every archive-wide check.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ZipCartridgeMember {
+pub(crate) struct ValidatedEntry {
     pub index: usize,
     pub name: Vec<u8>,
-    /// The member's declared uncompressed size.
     pub declared: u64,
-    /// The loose-ROM format the member's name was accepted as.
-    pub format: &'static str,
+    pub compressed: u64,
 }
 
-/// Validates the whole ZIP directory and selects its single supported ROM
-/// member. Shared by identity inspection, launch-time staging and Hasheous so
-/// all apply exactly the same refusals (encryption, names, duplicates,
-/// symlinks, ambiguity, size and ratio bounds).
-pub fn select_zip_cartridge_member(
+/// The archive-wide checks every launch consumer applies before choosing
+/// members (see the module docs for the list), returning the file entries.
+/// Refuses the whole archive on the first problem.
+pub(crate) fn validated_file_entries(
     archive: &mut ZipArchive<File>,
-    platform: IdentityPlatform,
     members_seen: &mut usize,
-) -> Result<ZipCartridgeMember, (IdentityStatus, String)> {
+) -> Result<Vec<ValidatedEntry>, (IdentityStatus, String)> {
     if archive.len() > MAX_ARCHIVE_MEMBERS {
         *members_seen = MAX_ARCHIVE_MEMBERS;
         return Err((
@@ -105,9 +101,8 @@ pub fn select_zip_cartridge_member(
             format!("ZIP entries are duplicated, overlapping or inconsistent: {error}"),
         ));
     }
-    let mut mismatch: Option<&'static str> = None;
     let mut seen_names = std::collections::HashSet::new();
-    let mut candidates: Vec<(usize, Vec<u8>, u64, u64, &'static str)> = Vec::new();
+    let mut entries = Vec::new();
     for index in 0..archive.len() {
         *members_seen += 1;
         let raw = match archive.by_index_raw(index) {
@@ -156,6 +151,45 @@ pub fn select_zip_cartridge_member(
         if raw.is_dir() {
             continue;
         }
+        entries.push(ValidatedEntry {
+            index,
+            name: name_raw,
+            declared: raw.size(),
+            compressed: raw.compressed_size(),
+        });
+    }
+    Ok(entries)
+}
+
+/// The selected member, by central-directory index and exact stored name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZipCartridgeMember {
+    pub index: usize,
+    pub name: Vec<u8>,
+    /// The member's declared uncompressed size.
+    pub declared: u64,
+    /// The loose-ROM format the member's name was accepted as.
+    pub format: &'static str,
+}
+
+/// Validates the whole ZIP directory and selects its single supported ROM
+/// member. Shared by identity inspection, launch-time staging and Hasheous so
+/// all apply exactly the same refusals (encryption, names, duplicates,
+/// symlinks, ambiguity, size and ratio bounds).
+pub fn select_zip_cartridge_member(
+    archive: &mut ZipArchive<File>,
+    platform: IdentityPlatform,
+    members_seen: &mut usize,
+) -> Result<ZipCartridgeMember, (IdentityStatus, String)> {
+    let mut mismatch: Option<&'static str> = None;
+    let mut candidates: Vec<(usize, Vec<u8>, u64, u64, &'static str)> = Vec::new();
+    for entry in validated_file_entries(archive, members_seen)? {
+        let ValidatedEntry {
+            index,
+            name: name_raw,
+            declared,
+            compressed,
+        } = entry;
         let member_path = Path::new(std::str::from_utf8(&name_raw).unwrap_or_default());
         // A bare `.bin` is a candidate only inside an Atari 2600 ZIP.
         if platform == IdentityPlatform::Atari2600
@@ -163,11 +197,11 @@ pub fn select_zip_cartridge_member(
                 crate::game_identity::supported_zip_member_rom_format(member_path, platform)
             && format == "bin"
         {
-            candidates.push((index, name_raw, raw.size(), raw.compressed_size(), format));
+            candidates.push((index, name_raw, declared, compressed, format));
             continue;
         }
         if let Some(format) = supported_loose_rom_format(member_path, platform) {
-            candidates.push((index, name_raw, raw.size(), raw.compressed_size(), format));
+            candidates.push((index, name_raw, declared, compressed, format));
         } else if mismatch.is_none() {
             mismatch = cross_platform_extension_mismatch(member_path, platform);
         }

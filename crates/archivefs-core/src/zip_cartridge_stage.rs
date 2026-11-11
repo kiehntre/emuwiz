@@ -27,14 +27,16 @@ fn staging_platform(platform_id: &str) -> IdentityPlatform {
 }
 
 /// Whether a launch request is for a zipped cartridge, i.e. staging applies:
-/// a `.zip` on a loose-cartridge platform. Arcade, disc and other platforms'
-/// ZIPs are native content and never match.
+/// a `.zip` on a loose-cartridge platform, or an Amiga `.zip` (a floppy game
+/// whose IPF disks are staged as one set, `zip_floppy_set`). Arcade, disc
+/// and other platforms' ZIPs are native content and never match.
 pub fn is_zipped_cartridge_request(content: &Path, platform_id: &str) -> bool {
+    let platform = staging_platform(platform_id);
     content
         .extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case("zip"))
-        && is_loose_cartridge_platform(staging_platform(platform_id))
+        && (is_loose_cartridge_platform(platform) || platform == IdentityPlatform::Amiga)
 }
 
 /// Whether `zip` holds exactly one ROM member that `platform_id`'s zipped
@@ -53,21 +55,39 @@ pub fn zip_cartridge_member_fits(zip: &Path, platform_id: &str) -> Option<bool> 
     let Ok(mut archive) = ZipArchive::new(file) else {
         return Some(false);
     };
+    if platform == IdentityPlatform::Amiga {
+        return Some(
+            crate::zip_floppy_set::select_amiga_ipf_disk_set(&mut archive, &mut 0).is_ok(),
+        );
+    }
     Some(select_zip_cartridge_member(&mut archive, platform, &mut 0).is_ok())
 }
 
-/// A zipped cartridge ROM extracted for one launch into a private, owner-only
-/// temporary directory outside the library. Dropping it removes the directory,
-/// so failure paths and process exit clean up. The ZIP is never modified.
+/// A zipped cartridge ROM (or a zipped Amiga game's disk set) extracted for
+/// one launch into a private, owner-only temporary directory outside the
+/// library. Dropping it removes the directory, so failure paths and process
+/// exit clean up. The ZIP is never modified.
 #[derive(Debug)]
 pub struct StagedCartridge {
     _dir: tempfile::TempDir,
     path: PathBuf,
+    /// For a disk set of more than one disk: the M3U playlist (beside the
+    /// disks, naming them in boot order) the emulator is given instead of
+    /// [`Self::path`], so every disk can be swapped in.
+    playlist: Option<PathBuf>,
 }
 
 impl StagedCartridge {
+    /// The extracted ROM, or a disk set's first (boot) disk: the file the
+    /// launch's identity and preflight checks are held to.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The disk-set playlist the emulator should load in place of
+    /// [`Self::path`], when there is more than one disk.
+    pub fn playlist(&self) -> Option<&Path> {
+        self.playlist.as_deref()
     }
 
     /// Leaves the directory in place (used when the emulator may still be
@@ -133,7 +153,6 @@ pub fn stage_zip_cartridge_for_launch_checked(
     accept: impl FnOnce(&mut std::fs::File) -> bool,
 ) -> Result<StagedCartridge, StageZipError> {
     use std::io::{Seek, SeekFrom};
-    use std::os::unix::fs::OpenOptionsExt;
 
     let platform = staging_platform(platform_hint);
     if !is_zipped_cartridge_request(zip, platform_hint) {
@@ -150,10 +169,15 @@ pub fn stage_zip_cartridge_for_launch_checked(
     let mut archive =
         ZipArchive::new(file).map_err(|error| refuse(format!("invalid ZIP: {error}")))?;
     let mut seen = 0;
-    let member = select_zip_cartridge_member(&mut archive, platform, &mut seen)
-        .map_err(|(_, message)| refuse(message))?;
-    let name = staged_file_name(&member.name)
-        .ok_or_else(|| refuse("ROM member file name is not safe to extract".into()))?;
+    let members = if platform == IdentityPlatform::Amiga {
+        crate::zip_floppy_set::select_amiga_ipf_disk_set(&mut archive, &mut seen)
+            .map_err(|(_, message)| refuse(message))?
+    } else {
+        vec![
+            select_zip_cartridge_member(&mut archive, platform, &mut seen)
+                .map_err(|(_, message)| refuse(message))?,
+        ]
+    };
     let dir = tempfile::Builder::new()
         .prefix("emuwiz-zip-rom-")
         .tempdir()
@@ -163,6 +187,40 @@ pub fn stage_zip_cartridge_for_launch_checked(
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .map_err(|error| refuse(format!("could not secure the private directory: {error}")))?;
     }
+    let mut staged = Vec::with_capacity(members.len());
+    for member in &members {
+        staged.push(extract_member(&mut archive, member, dir.path()).map_err(refuse)?);
+    }
+    let playlist = if staged.len() > 1 {
+        Some(write_disk_playlist(dir.path(), &staged).map_err(refuse)?)
+    } else {
+        None
+    };
+    if !still_same_file(zip, &TrustedRoots::none(), &before) {
+        return Err(refuse(
+            "ZIP changed while the ROM was being extracted".into(),
+        ));
+    }
+    let path = staged.swap_remove(0);
+    Ok(StagedCartridge {
+        _dir: dir,
+        path,
+        playlist,
+    })
+}
+
+/// Writes one selected member into `dir` under its validated plain name with
+/// `O_EXCL|O_NOFOLLOW`, counting the bytes actually written against the
+/// declared size (aborting past it).
+#[cfg(unix)]
+fn extract_member(
+    archive: &mut ZipArchive<std::fs::File>,
+    member: &crate::zip_cartridge_select::ZipCartridgeMember,
+    dir: &Path,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let name = staged_file_name(&member.name)
+        .ok_or_else(|| "ROM member file name is not safe to extract".to_string())?;
     // Cores only accept headerless No-Intro NES dumps under `.nes`; the
     // bytes are not changed (no header is added).
     let name = if member.format == "unh" {
@@ -174,40 +232,69 @@ pub fn stage_zip_cartridge_for_launch_checked(
     } else {
         name
     };
-    let path = dir.path().join(&name);
+    let path = dir.join(&name);
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
-        .map_err(|error| refuse(format!("could not create the staged ROM: {error}")))?;
+        .map_err(|error| format!("could not create the staged ROM: {error}"))?;
     {
         let entry = archive
             .by_index(member.index)
-            .map_err(|error| refuse(error.to_string()))?;
+            .map_err(|error| error.to_string())?;
         // The entry read must be the one the selector validated.
         if entry.name_raw() != member.name.as_slice() {
-            return Err(refuse("ZIP entry changed since it was selected".into()));
+            return Err("ZIP entry changed since it was selected".into());
         }
         let mut limited = entry.take(member.declared.saturating_add(1));
         let copied = io::copy(&mut limited, &mut out)
-            .map_err(|error| refuse(format!("ROM member is corrupt or truncated: {error}")))?;
+            .map_err(|error| format!("ROM member is corrupt or truncated: {error}"))?;
         if copied != member.declared {
-            return Err(refuse(format!(
+            return Err(format!(
                 "ROM member inflated to {copied} bytes but its header declares {}",
                 member.declared
-            )));
+            ));
         }
     }
     out.sync_all().ok();
-    drop(out);
-    if !still_same_file(zip, &TrustedRoots::none(), &before) {
-        return Err(refuse(
-            "ZIP changed while the ROM was being extracted".into(),
-        ));
+    Ok(path)
+}
+
+/// An M3U naming the staged disks (plain names, same directory) in order.
+/// It is named after the boot disk (`<disk 1 stem>.m3u`) because RetroArch
+/// names saves and states after the content it loads: one shared name would
+/// mix different games' states.
+#[cfg(unix)]
+fn write_disk_playlist(dir: &Path, disks: &[PathBuf]) -> Result<PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut text = String::new();
+    for disk in disks {
+        let name = disk
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| "staged disk name is not valid text".to_string())?;
+        text.push_str(name);
+        text.push('\n');
     }
-    Ok(StagedCartridge { _dir: dir, path })
+    let stem = disks
+        .first()
+        .and_then(|d| d.file_stem())
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "staged disk name is not valid text".to_string())?;
+    let path = dir.join(format!("{stem}.m3u"));
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|error| format!("could not create the disk playlist: {error}"))?;
+    out.write_all(text.as_bytes())
+        .map_err(|error| format!("could not write the disk playlist: {error}"))?;
+    Ok(path)
 }
 
 #[cfg(not(unix))]
