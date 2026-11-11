@@ -37,6 +37,63 @@ pub fn applies(platform_id: &str, content: &Path) -> bool {
             .is_some_and(|e| e.eq_ignore_ascii_case("hdf"))
 }
 
+const PARTIAL_PREFIX: &str = ".partial-";
+
+/// Kept free beyond the copy itself, so a launch never fills the disk.
+pub const SPACE_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+
+fn enough_space(available: u64, size: u64) -> bool {
+    available >= size.saturating_add(SPACE_HEADROOM_BYTES)
+}
+
+fn available_bytes(directory: &Path) -> Result<u64, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(directory.as_os_str().as_bytes())
+        .map_err(|_| "working-copy path contains NUL".to_string())?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `name` is a valid NUL-terminated path and `stats` is a
+    // writable, correctly sized struct.
+    if unsafe { libc::statvfs(name.as_ptr(), &mut stats) } != 0 {
+        return Err(format!(
+            "cannot check free space: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    fn widen<T: Into<u64>>(value: T) -> u64 {
+        value.into()
+    }
+    Ok(widen(stats.f_bavail).saturating_mul(widen(stats.f_frsize)))
+}
+
+fn writer_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks for existence/permission.
+    pid > 0
+        && (unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+/// Removes `.partial-<pid>-...` files in this private copy folder whose
+/// writing process no longer exists. Only regular files with that exact
+/// prefix are touched; anything else (the copy, other names) is left alone.
+fn remove_abandoned_partials(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(PARTIAL_PREFIX)) else {
+            continue;
+        };
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<i32>().ok()) else {
+            continue;
+        };
+        let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+        if is_file && !writer_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn open_original(original: &Path) -> Result<(File, u64), String> {
     let file = OpenOptions::new()
         .read(true)
@@ -112,9 +169,27 @@ pub fn working_copy_for(original: &Path, root: &Path) -> Result<PathBuf, String>
         Err(e) => return Err(format!("cannot inspect {}: {e}", target.display())),
     }
 
-    let mut temp_name = OsString::from(".partial-");
-    temp_name.push(std::process::id().to_string());
-    temp_name.push("-");
+    // A launch that crashed or lost power mid-copy leaves only a `.partial-`
+    // file (the copy itself appears atomically, via `link`, once complete).
+    // Clear those whose writer is gone, then check there is room.
+    remove_abandoned_partials(&dir);
+    let available = available_bytes(&dir)?;
+    if !enough_space(available, size) {
+        return Err(format!(
+            "not enough free space for the working copy: it needs {} MiB plus {} MiB headroom, {} MiB is available in {}",
+            size.div_ceil(1024 * 1024),
+            SPACE_HEADROOM_BYTES / (1024 * 1024),
+            available / (1024 * 1024),
+            dir.display()
+        ));
+    }
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let mut temp_name = OsString::from(PARTIAL_PREFIX);
+    temp_name.push(format!("{}-{nanos}-", std::process::id()));
     temp_name.push(&name);
     let temp = dir.join(temp_name);
     let write = || -> std::io::Result<()> {
@@ -289,5 +364,51 @@ mod tests {
         assert!(redirect_arguments(&mut none, content, copy).is_err());
         let mut twice: Vec<OsString> = vec![content.into(), content.into()];
         assert!(redirect_arguments(&mut twice, content, copy).is_err());
+    }
+    #[test]
+    fn an_abandoned_partial_copy_is_cleared_and_the_copy_completes() {
+        let src = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let path = original(src.path(), b"full-image");
+        // First run creates the folder; simulate a crash mid-copy by a dead
+        // writer (pid far beyond pid_max) and a live one (us).
+        let copy = working_copy_for(&path, data.path()).unwrap();
+        let dir = copy.parent().unwrap().to_path_buf();
+        std::fs::remove_file(&copy).unwrap();
+        let dead = dir.join(".partial-2147483000-1-Game_v1.0.hdf");
+        std::fs::write(&dead, b"full-im").unwrap();
+        let live = dir.join(format!(".partial-{}-1-Game_v1.0.hdf", std::process::id()));
+        std::fs::write(&live, b"full").unwrap();
+
+        let again = working_copy_for(&path, data.path()).unwrap();
+        assert_eq!(std::fs::read(&again).unwrap(), b"full-image");
+        assert!(!dead.exists(), "abandoned partial removed");
+        assert!(live.exists(), "a live writer's partial is never touched");
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_copy_and_no_partial() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let path = original(src.path(), b"image");
+        let copy = working_copy_for(&path, data.path()).unwrap();
+        let dir = copy.parent().unwrap().to_path_buf();
+        std::fs::remove_file(&copy).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = working_copy_for(&path, data.path());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if result.is_ok() {
+            // Running as root ignores directory permissions; nothing to check.
+            return;
+        }
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn space_check_requires_the_copy_plus_headroom() {
+        assert!(enough_space(10 + SPACE_HEADROOM_BYTES, 10));
+        assert!(!enough_space(9 + SPACE_HEADROOM_BYTES, 10));
+        assert!(!enough_space(u64::MAX - 1, u64::MAX));
     }
 }
