@@ -107,6 +107,7 @@ mod saves_states;
 #[cfg(test)]
 mod scummvm_journey_tests;
 mod setup_portability;
+mod amiga_hdf_storage;
 #[cfg(test)]
 #[path = "tests/shared_scroll.rs"]
 mod shared_scroll_tests;
@@ -496,6 +497,7 @@ pub(super) struct App {
     document_cache: Option<(i64, std::path::PathBuf, Vec<documents::GameDocument>)>,
     document_refresh: game_documents::DocumentRefresh,
     setup_portability: setup_portability::SetupPortabilityState,
+    amiga_hdf_storage: amiga_hdf_storage::AmigaHdfStorageState,
     update_check: update_check::UpdateCheckState,
     missing: missing_review::MissingReviewState,
     equiv: equivalent_duplicates::EquivalentState,
@@ -630,6 +632,7 @@ impl App {
             document_cache: None,
             document_refresh: Default::default(),
             setup_portability: setup_portability::SetupPortabilityState::default(),
+            amiga_hdf_storage: amiga_hdf_storage::AmigaHdfStorageState::default(),
             update_check: update_check::UpdateCheckState::default(),
             missing: Default::default(),
             equiv: Default::default(),

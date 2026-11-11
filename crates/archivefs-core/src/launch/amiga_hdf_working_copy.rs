@@ -14,9 +14,13 @@
 //! copy, holding the old saves, is left untouched.
 //!
 //! These copies are persistent game data (they hold saves), not a cache:
-//! nothing in EmuWiz prunes them. The folder can be moved off a full system
-//! drive with `EMUWIZ_AMIGA_HDF_WORKING_DIR` (an absolute path). It must not
-//! be inside a cache or Cargo build folder, which cleanup tools may delete.
+//! nothing in EmuWiz prunes them. Blue's Settings page can store them in a
+//! folder the user chooses (saved in `amiga-hdf-storage.json`);
+//! `EMUWIZ_AMIGA_HDF_WORKING_DIR` remains an advanced override. A storage
+//! folder must not be inside a cache or Cargo build folder, which cleanup
+//! tools may delete. Changing the folder never moves or deletes copies:
+//! earlier folders are remembered and a game's existing copy is still used
+//! from wherever it is.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -158,6 +162,17 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
 /// original's bytes when it does not exist yet. The original is only ever
 /// opened read-only.
 pub fn working_copy_for(original: &Path, root: &Path) -> Result<PathBuf, String> {
+    working_copy_in(original, root, &[])
+}
+
+/// Like [`working_copy_for`], but a copy that already exists under one of
+/// `earlier_roots` (folders used before the storage folder was changed) is
+/// reused where it is, so its saves are never left behind.
+pub fn working_copy_in(
+    original: &Path,
+    root: &Path,
+    earlier_roots: &[PathBuf],
+) -> Result<PathBuf, String> {
     let name = original
         .file_name()
         .ok_or_else(|| "the hard-disk image has no file name".to_string())?
@@ -173,6 +188,13 @@ pub fn working_copy_for(original: &Path, root: &Path) -> Result<PathBuf, String>
     }
     let digest = Sha256::digest(&bytes);
     let prefix: String = digest.iter().take(12).map(|b| format!("{b:02x}")).collect();
+
+    for earlier in earlier_roots.iter().filter(|r| r.as_path() != root) {
+        let candidate = earlier.join(&prefix).join(&name);
+        if std::fs::symlink_metadata(&candidate).is_ok_and(|m| m.file_type().is_file()) {
+            return Ok(candidate);
+        }
+    }
 
     ensure_private_dir(root)?;
     let note = root.join(KEEP_NOTE_NAME);
@@ -287,25 +309,247 @@ pub fn redirect_for_launch(
     if !applies(platform_id, content) {
         return Ok(None);
     }
-    let root = working_root()?;
-    let copy = working_copy_for(content, &root)?;
+    let storage = effective_storage()?;
+    let copy = working_copy_in(content, &storage.root, &storage.earlier_roots)?;
     redirect_arguments(arguments, content, &copy)?;
     Ok(Some(copy))
 }
 
-/// Where the persistent working copies live: the override when set, else
-/// `<data>/amiga-hdf-working`.
-pub fn working_root() -> Result<PathBuf, String> {
+/// Saved storage choice, in the EmuWiz config folder.
+pub const SETTINGS_FILE: &str = "amiga-hdf-storage.json";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageSettings {
+    /// Folder chosen in Blue; `None` means the default data folder.
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+    /// Folders used before, still searched for existing copies.
+    #[serde(default)]
+    pub earlier_roots: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageSource {
+    /// `EMUWIZ_AMIGA_HDF_WORKING_DIR` is set.
+    Override,
+    /// Chosen in Blue's Settings.
+    Chosen,
+    Default,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectiveStorage {
+    pub root: PathBuf,
+    pub source: StorageSource,
+    /// Other folders that may hold existing copies (default and earlier).
+    pub earlier_roots: Vec<PathBuf>,
+}
+
+fn default_root() -> Result<PathBuf, String> {
+    Ok(crate::app_dirs::data_dir()
+        .map_err(|e| format!("EmuWiz data folder unavailable: {e}"))?
+        .join(WORKING_COPY_DIR))
+}
+
+fn settings_path() -> Result<PathBuf, String> {
+    crate::app_dirs::config_path(SETTINGS_FILE)
+        .map_err(|e| format!("EmuWiz settings folder unavailable: {e}"))
+}
+
+/// Reads the saved choice. A missing file is the default; an unreadable or
+/// damaged one is an error, so a launch never silently falls back to a
+/// different folder and misses the user's saves.
+pub fn load_settings_from(path: &Path) -> Result<StorageSettings, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| format!("{} is damaged: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StorageSettings::default()),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    }
+}
+
+fn save_settings_to(path: &Path, settings: &StorageSettings) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    let bytes = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, bytes).map_err(|e| format!("cannot save {}: {e}", path.display()))?;
+    std::fs::rename(&temp, path).map_err(|e| format!("cannot save {}: {e}", path.display()))
+}
+
+fn resolve(
+    env_value: Option<&Path>,
+    settings: &StorageSettings,
+    default: PathBuf,
+    home: Option<&Path>,
+    target_root: Option<&Path>,
+) -> Result<EffectiveStorage, String> {
+    let (root, source) = match (env_value, &settings.root) {
+        (Some(value), _) => (
+            check_override(value, home, target_root)?,
+            StorageSource::Override,
+        ),
+        (None, Some(chosen)) => (
+            check_override(chosen, home, target_root)?,
+            StorageSource::Chosen,
+        ),
+        (None, None) => (default.clone(), StorageSource::Default),
+    };
+    let mut earlier_roots = Vec::new();
+    for candidate in std::iter::once(&default)
+        .chain(settings.root.iter())
+        .chain(settings.earlier_roots.iter())
+    {
+        if candidate != &root && !earlier_roots.contains(candidate) {
+            earlier_roots.push(candidate.clone());
+        }
+    }
+    Ok(EffectiveStorage {
+        root,
+        source,
+        earlier_roots,
+    })
+}
+
+fn env_paths() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
+    let value = std::env::var_os(ROOT_OVERRIDE_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let target_root = std::env::var_os("EMUWIZ_TARGET_ROOT").map(PathBuf::from);
-    match std::env::var_os(ROOT_OVERRIDE_ENV) {
-        Some(value) if !value.is_empty() => {
-            check_override(Path::new(&value), home.as_deref(), target_root.as_deref())
-        }
-        _ => Ok(crate::app_dirs::data_dir()
-            .map_err(|e| format!("EmuWiz data folder unavailable: {e}"))?
-            .join(WORKING_COPY_DIR)),
+    (value, home, target_root)
+}
+
+/// Where new working copies go, and where older ones may still be.
+pub fn effective_storage() -> Result<EffectiveStorage, String> {
+    let settings = load_settings_from(&settings_path()?)?;
+    let (value, home, target_root) = env_paths();
+    resolve(
+        value.as_deref(),
+        &settings,
+        default_root()?,
+        home.as_deref(),
+        target_root.as_deref(),
+    )
+}
+
+/// Where new working copies go.
+pub fn working_root() -> Result<PathBuf, String> {
+    effective_storage().map(|storage| storage.root)
+}
+
+/// Facts shown in Settings for one storage folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageFacts {
+    pub available: u64,
+    pub total: u64,
+    pub reserve: u64,
+    /// Game copies already in this folder.
+    pub copies: usize,
+}
+
+/// Free space is read from the nearest existing folder at or above `root`,
+/// which is the filesystem the copies will be written to.
+pub fn storage_facts(root: &Path) -> Result<StorageFacts, String> {
+    let existing = root
+        .ancestors()
+        .find(|p| p.is_dir())
+        .ok_or_else(|| format!("no existing folder above {}", root.display()))?;
+    let (available, total) = space(existing)?;
+    let copies = std::fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .count()
+        })
+        .unwrap_or(0);
+    Ok(StorageFacts {
+        available,
+        total,
+        reserve: reserve_bytes(total),
+        copies,
+    })
+}
+
+/// Checks a folder picked in Settings: absolute, an existing real folder
+/// (not a symlink), writable, outside cache/Cargo folders, and with at least
+/// the safety reserve free. Writes and removes one probe file.
+fn validate_chosen(
+    folder: &Path,
+    home: Option<&Path>,
+    target_root: Option<&Path>,
+) -> Result<(), String> {
+    check_override(folder, home, target_root)?;
+    let meta = std::fs::symlink_metadata(folder)
+        .map_err(|e| format!("cannot use {}: {e}", folder.display()))?;
+    if !meta.file_type().is_dir() {
+        return Err(format!("{} is not a folder", folder.display()));
     }
+    let probe = folder.join(format!(".emuwiz-write-check-{}", std::process::id()));
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&probe)
+        .map_err(|e| format!("EmuWiz cannot write to {}: {e}", folder.display()))?;
+    let _ = std::fs::remove_file(&probe);
+    let (available, total) = space(folder)?;
+    if available < reserve_bytes(total) {
+        return Err(format!(
+            "{} has only {} MiB free; at least {} MiB must stay free on that drive",
+            folder.display(),
+            available / (1024 * 1024),
+            reserve_bytes(total) / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
+fn record_choice(
+    settings: &StorageSettings,
+    chosen: Option<PathBuf>,
+    previous_root: &Path,
+) -> StorageSettings {
+    let mut next = settings.clone();
+    if !next.earlier_roots.iter().any(|r| r == previous_root) {
+        next.earlier_roots.push(previous_root.to_path_buf());
+    }
+    next.earlier_roots.retain(|r| Some(r) != chosen.as_ref());
+    next.root = chosen;
+    next
+}
+
+/// Copies go in this subfolder of a folder picked in Settings, so they never
+/// mix with the user's other files.
+pub const CHOSEN_SUBFOLDER: &str = "EmuWiz Amiga HDF copies";
+
+/// Saves `folder` (or the default, for `None`) as the storage folder for new
+/// copies. Nothing is moved or deleted: the folder in use until now is
+/// remembered so its copies keep being found.
+pub fn choose_storage(folder: Option<&Path>) -> Result<EffectiveStorage, String> {
+    let path = settings_path()?;
+    let settings = load_settings_from(&path)?;
+    let (_, home, target_root) = env_paths();
+    let current = resolve(
+        None,
+        &settings,
+        default_root()?,
+        home.as_deref(),
+        target_root.as_deref(),
+    )?;
+    let chosen = match folder {
+        Some(folder) => {
+            validate_chosen(folder, home.as_deref(), target_root.as_deref())?;
+            Some(folder.join(CHOSEN_SUBFOLDER))
+        }
+        None => None,
+    };
+    save_settings_to(&path, &record_choice(&settings, chosen, &current.root))?;
+    effective_storage()
 }
 
 /// An override must be absolute and outside folders that cleanup tools treat
@@ -530,5 +774,115 @@ mod tests {
             .filter(|e| e.as_ref().unwrap().file_type().unwrap().is_dir())
             .count();
         assert_eq!(folders, 1);
+    }
+
+    #[test]
+    fn storage_resolution_prefers_override_then_choice_then_default() {
+        let default = PathBuf::from("/data/amiga-hdf-working");
+        let chosen = StorageSettings {
+            root: Some(PathBuf::from("/mnt/bulk/EmuWiz Amiga HDF copies")),
+            earlier_roots: vec![PathBuf::from("/mnt/old"), default.clone()],
+        };
+        let none = StorageSettings::default();
+        let home = Some(Path::new("/home/u"));
+
+        let d = resolve(None, &none, default.clone(), home, None).unwrap();
+        assert_eq!(
+            (d.root.clone(), d.source),
+            (default.clone(), StorageSource::Default)
+        );
+        assert!(d.earlier_roots.is_empty());
+
+        let c = resolve(None, &chosen, default.clone(), home, None).unwrap();
+        assert_eq!(c.source, StorageSource::Chosen);
+        assert_eq!(c.root, Path::new("/mnt/bulk/EmuWiz Amiga HDF copies"));
+        // The default and every earlier folder are still searched, once each.
+        assert_eq!(
+            c.earlier_roots,
+            vec![default.clone(), PathBuf::from("/mnt/old")]
+        );
+
+        let o = resolve(
+            Some(Path::new("/mnt/x")),
+            &chosen,
+            default.clone(),
+            home,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (o.root.clone(), o.source),
+            (PathBuf::from("/mnt/x"), StorageSource::Override)
+        );
+        assert!(
+            o.earlier_roots
+                .contains(&PathBuf::from("/mnt/bulk/EmuWiz Amiga HDF copies"))
+        );
+
+        let cache = StorageSettings {
+            root: Some(PathBuf::from("/home/u/.cache/x")),
+            ..none
+        };
+        assert!(resolve(None, &cache, default, home, None).is_err());
+    }
+
+    #[test]
+    fn a_copy_in_an_earlier_folder_is_reused_not_duplicated() {
+        let src = tempfile::tempdir().unwrap();
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        let path = original(src.path(), b"RDSK-image");
+        let old_copy = working_copy_for(&path, old.path()).unwrap();
+        std::fs::write(&old_copy, b"RDSK-image+save").unwrap();
+
+        let found = working_copy_in(&path, new.path(), &[old.path().to_path_buf()]).unwrap();
+        assert_eq!(found, old_copy);
+        assert_eq!(std::fs::read(&found).unwrap(), b"RDSK-image+save");
+        assert!(std::fs::read_dir(new.path()).unwrap().next().is_none());
+
+        // A game with no earlier copy goes to the new folder.
+        let other = src.path().join("Other.hdf");
+        std::fs::write(&other, b"RDSK-other").unwrap();
+        let fresh = working_copy_in(&other, new.path(), &[old.path().to_path_buf()]).unwrap();
+        assert!(fresh.starts_with(new.path()));
+    }
+
+    #[test]
+    fn changing_the_folder_remembers_the_old_one_and_damaged_settings_fail_closed() {
+        let start = StorageSettings::default();
+        let default = PathBuf::from("/data/amiga-hdf-working");
+        let first = record_choice(&start, Some(PathBuf::from("/mnt/a/C")), &default);
+        assert_eq!(first.root, Some(PathBuf::from("/mnt/a/C")));
+        assert_eq!(first.earlier_roots, vec![default.clone()]);
+        let back = record_choice(&first, None, Path::new("/mnt/a/C"));
+        assert_eq!(back.root, None);
+        assert_eq!(back.earlier_roots, vec![default, PathBuf::from("/mnt/a/C")]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(SETTINGS_FILE);
+        assert_eq!(
+            load_settings_from(&file).unwrap(),
+            StorageSettings::default()
+        );
+        save_settings_to(&file, &back).unwrap();
+        assert_eq!(load_settings_from(&file).unwrap(), back);
+        std::fs::write(&file, b"{not json").unwrap();
+        assert!(load_settings_from(&file).is_err());
+    }
+
+    #[test]
+    fn a_chosen_folder_must_be_a_real_writable_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Some(Path::new("/nonexistent-home"));
+        assert!(validate_chosen(dir.path(), home, None).is_ok());
+        // The write check leaves nothing behind.
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+        assert!(validate_chosen(&dir.path().join("missing"), home, None).is_err());
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        assert!(validate_chosen(&link, home, None).is_err());
+        let facts = storage_facts(&dir.path().join("not-yet")).unwrap();
+        assert_eq!(facts.copies, 0);
+        assert!(facts.reserve >= MIN_RESERVE_BYTES);
     }
 }
