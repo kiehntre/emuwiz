@@ -158,20 +158,144 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Which filesystem object a storage folder is: recorded when a folder is
+/// chosen and when it receives its first copy, and checked at every Play.
+/// An unmounted drive leaves an empty mount-point folder on another
+/// filesystem (different inode and filesystem); a replaced folder has a new
+/// inode. Either way the identity no longer matches and Play is refused.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FolderIdentity {
+    pub path: PathBuf,
+    pub dev: u64,
+    pub ino: u64,
+    /// statvfs filesystem id: stable across re-plugging for most Linux
+    /// filesystems, where the device number may change.
+    pub fsid: u64,
+}
+
+/// Opens `path` as a directory without following a symlink at its last
+/// component, and reads its identity from the open handle.
+pub fn identify_folder(path: &Path) -> std::io::Result<FolderIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    let meta = dir.metadata()?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` is an open descriptor and `stats` is a writable struct.
+    if unsafe { libc::fstatvfs(std::os::fd::AsRawFd::as_raw_fd(&dir), &mut stats) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    #[allow(clippy::useless_conversion)]
+    let fsid = u64::from(stats.f_fsid);
+    Ok(FolderIdentity {
+        path: path.to_path_buf(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+        fsid,
+    })
+}
+
+fn same_folder(recorded: &FolderIdentity, now: &FolderIdentity) -> bool {
+    recorded.ino == now.ino && (recorded.fsid == now.fsid || recorded.dev == now.dev)
+}
+
+const RECONNECT_HELP: &str = "Reconnect or mount the drive and try again. If the folder really moved, choose it again in Settings > Amiga hard-disk game copies (or use \"Accept as it is now\" there); if it is gone for good, choose Forget there, and its saves will no longer be used.";
+
+/// Refuses unless `folder` (and its parent, when that was the folder the
+/// user picked) is the same filesystem object that was recorded.
+fn verify_recorded(folder: &Path, identities: &[FolderIdentity]) -> Result<(), String> {
+    for candidate in [Some(folder), folder.parent()].into_iter().flatten() {
+        let Some(recorded) = identities.iter().find(|i| i.path == candidate) else {
+            continue;
+        };
+        match identify_folder(candidate) {
+            Ok(now) if same_folder(recorded, &now) => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{} is not the folder that holds your Amiga hard-disk game copies: it is on a different drive or was replaced (is the drive mounted?). Nothing was created. {RECONNECT_HELP}",
+                    candidate.display()
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "{} is not available ({e}). Nothing was created. {RECONNECT_HELP}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Creates the storage folder itself if needed, but never the folder above
+/// it: a picked folder (or drive) that has gone missing must not be silently
+/// recreated on another disk.
+fn ensure_storage_root(root: &Path) -> Result<(), String> {
+    if let Some(parent) = root.parent()
+        && !std::fs::symlink_metadata(parent).is_ok_and(|m| m.file_type().is_dir())
+    {
+        return Err(format!(
+            "{} is not available; reconnect it or choose another folder in Settings > Amiga hard-disk game copies",
+            parent.display()
+        ));
+    }
+    ensure_private_dir(root)
+}
+
 /// Returns the working copy for `original` under `root`, creating it from the
 /// original's bytes when it does not exist yet. The original is only ever
 /// opened read-only.
 pub fn working_copy_for(original: &Path, root: &Path) -> Result<PathBuf, String> {
-    working_copy_in(original, root, &[])
+    working_copy_in(original, root, &[], &[], &[], &mut |_| Ok(()))
 }
 
-/// Like [`working_copy_for`], but a copy that already exists under one of
-/// `earlier_roots` (folders used before the storage folder was changed) is
-/// reused where it is, so its saves are never left behind.
+/// What one storage folder says about a game's copy.
+enum Probe {
+    Found(PathBuf),
+    Absent,
+    Unavailable(String),
+}
+
+fn probe(root: &Path, prefix: &str, name: &std::ffi::OsStr, must_exist: bool) -> Probe {
+    let candidate = root.join(prefix).join(name);
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(meta) if meta.file_type().is_file() => Probe::Found(candidate),
+        Ok(_) => Probe::Unavailable(format!(
+            "{} exists and is not a regular file",
+            candidate.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(root) {
+                Ok(meta) if meta.file_type().is_dir() => Probe::Absent,
+                Ok(_) => Probe::Unavailable(format!("{} is not a folder", root.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !must_exist => Probe::Absent,
+                Err(e) => Probe::Unavailable(format!("{}: {e}", root.display())),
+            }
+        }
+        Err(e) => Probe::Unavailable(format!("{}: {e}", candidate.display())),
+    }
+}
+
+/// Like [`working_copy_for`], but the game's copy is looked for in `root`
+/// and every folder in `earlier_roots` (folders used before the storage
+/// folder was changed), and reused where it is so its saves are never left
+/// behind. Folders in `must_exist` are known to have held copies: if one is
+/// missing or unreadable (an unplugged drive, say) the launch is refused
+/// rather than starting a second copy that would split the saves. A copy
+/// found in two places is refused too. Every folder with a recorded
+/// identity in `identities` (and the picked folder above `root`) must still
+/// be that same filesystem object, checked before searching and again just
+/// before anything is created. `before_first_copy` runs before the first
+/// copy is written into `root`, with its identity, so it can be remembered.
 pub fn working_copy_in(
     original: &Path,
     root: &Path,
     earlier_roots: &[PathBuf],
+    must_exist: &[PathBuf],
+    identities: &[FolderIdentity],
+    before_first_copy: &mut dyn FnMut(&FolderIdentity) -> Result<(), String>,
 ) -> Result<PathBuf, String> {
     let name = original
         .file_name()
@@ -189,14 +313,59 @@ pub fn working_copy_in(
     let digest = Sha256::digest(&bytes);
     let prefix: String = digest.iter().take(12).map(|b| format!("{b:02x}")).collect();
 
-    for earlier in earlier_roots.iter().filter(|r| r.as_path() != root) {
-        let candidate = earlier.join(&prefix).join(&name);
-        if std::fs::symlink_metadata(&candidate).is_ok_and(|m| m.file_type().is_file()) {
-            return Ok(candidate);
+    let mut searched: Vec<&Path> = vec![root];
+    for earlier in earlier_roots {
+        if !searched.contains(&earlier.as_path()) {
+            searched.push(earlier);
+        }
+    }
+    for folder in &searched {
+        verify_recorded(folder, identities)?;
+    }
+    let mut found = Vec::new();
+    for folder in &searched {
+        let required = must_exist.iter().any(|r| r.as_path() == *folder);
+        match probe(folder, &prefix, &name, required) {
+            Probe::Found(path) => found.push(path),
+            Probe::Absent => {}
+            Probe::Unavailable(why) => {
+                return Err(format!(
+                    "a folder that holds Amiga hard-disk game copies and saves is not available ({why}). Reconnect it and try again. If it is gone for good, choose Forget for it in Settings > Amiga hard-disk game copies; its saves will then no longer be used."
+                ));
+            }
+        }
+    }
+    match found.as_slice() {
+        [one] => return Ok(one.clone()),
+        [] => {}
+        many => {
+            let places: Vec<String> = many.iter().map(|p| p.display().to_string()).collect();
+            return Err(format!(
+                "this game has private copies in more than one place ({}); each may hold different saves. Keep one: move or rename the other yourself, then try again.",
+                places.join(", ")
+            ));
         }
     }
 
-    ensure_private_dir(root)?;
+    // Re-check right before creating anything: the drive may have gone
+    // between the search and now.
+    verify_recorded(root, identities)?;
+    ensure_storage_root(root)?;
+    let root_identity =
+        identify_folder(root).map_err(|e| format!("cannot open {}: {e}", root.display()))?;
+    if let Some(parent) = root.parent()
+        && let Some(picked) = identities.iter().find(|i| i.path == parent)
+        && root_identity.dev != picked.dev
+    {
+        return Err(format!(
+            "{} is not on the same drive as the folder you chose; nothing was copied",
+            root.display()
+        ));
+    }
+    verify_recorded(root, identities)?;
+    if !must_exist.iter().any(|r| r.as_path() == root) {
+        before_first_copy(&root_identity)?;
+    }
     let note = root.join(KEEP_NOTE_NAME);
     if std::fs::symlink_metadata(&note).is_err() {
         let _ = OpenOptions::new()
@@ -265,10 +434,27 @@ pub fn working_copy_in(
     // first wins and keeps its saves.
     let linked = std::fs::hard_link(&temp, &target);
     let _ = std::fs::remove_file(&temp);
-    match linked {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+    let created = match linked {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(e) => return Err(format!("cannot create the working copy: {e}")),
+    };
+    // The copy must have landed in the folder checked above. If the folder
+    // was swapped meanwhile, remove only the copy this call just created
+    // (it holds no saves yet) and refuse.
+    let landed = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(&target).map(|m| m.dev())
+    };
+    let still_same = identify_folder(root).is_ok_and(|now| same_folder(&root_identity, &now));
+    if !still_same || landed.ok() != Some(root_identity.dev) {
+        if created {
+            let _ = std::fs::remove_file(&target);
+        }
+        return Err(format!(
+            "{} changed while the copy was being made; nothing was kept. {RECONNECT_HELP}",
+            root.display()
+        ));
     }
     if let Ok(dir_handle) = File::open(&dir) {
         let _ = dir_handle.sync_all();
@@ -310,7 +496,14 @@ pub fn redirect_for_launch(
         return Ok(None);
     }
     let storage = effective_storage()?;
-    let copy = working_copy_in(content, &storage.root, &storage.earlier_roots)?;
+    let copy = working_copy_in(
+        content,
+        &storage.root,
+        &storage.earlier_roots,
+        &storage.used_roots,
+        &storage.identities,
+        &mut |root| remember_used_root(root),
+    )?;
     redirect_arguments(arguments, content, &copy)?;
     Ok(Some(copy))
 }
@@ -326,6 +519,14 @@ pub struct StorageSettings {
     /// Folders used before, still searched for existing copies.
     #[serde(default)]
     pub earlier_roots: Vec<PathBuf>,
+    /// Folders that have held a copy (recorded before the first copy is
+    /// written there, including an `EMUWIZ_AMIGA_HDF_WORKING_DIR` folder).
+    /// They are always searched, and must be reachable for a launch.
+    #[serde(default)]
+    pub used_roots: Vec<PathBuf>,
+    /// Filesystem identity of the picked folder and of every used folder.
+    #[serde(default)]
+    pub identities: Vec<FolderIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -343,6 +544,9 @@ pub struct EffectiveStorage {
     pub source: StorageSource,
     /// Other folders that may hold existing copies (default and earlier).
     pub earlier_roots: Vec<PathBuf>,
+    /// Folders known to have held copies; they must be reachable.
+    pub used_roots: Vec<PathBuf>,
+    pub identities: Vec<FolderIdentity>,
 }
 
 fn default_root() -> Result<PathBuf, String> {
@@ -401,6 +605,7 @@ fn resolve(
     for candidate in std::iter::once(&default)
         .chain(settings.root.iter())
         .chain(settings.earlier_roots.iter())
+        .chain(settings.used_roots.iter())
     {
         if candidate != &root && !earlier_roots.contains(candidate) {
             earlier_roots.push(candidate.clone());
@@ -410,7 +615,78 @@ fn resolve(
         root,
         source,
         earlier_roots,
+        used_roots: settings.used_roots.clone(),
+        identities: settings.identities.clone(),
     })
+}
+
+fn with_identity(settings: &StorageSettings, identity: FolderIdentity) -> StorageSettings {
+    let mut next = settings.clone();
+    next.identities.retain(|i| i.path != identity.path);
+    next.identities.push(identity);
+    next
+}
+
+fn add_used_root(settings: &StorageSettings, root: &FolderIdentity) -> Option<StorageSettings> {
+    if settings.used_roots.iter().any(|r| r == &root.path) {
+        return None;
+    }
+    let mut next = with_identity(settings, root.clone());
+    next.used_roots.push(root.path.clone());
+    Some(next)
+}
+
+/// Remembers `root` (with its filesystem identity) as holding copies before
+/// the first copy is written there. Fails closed: no copy is made if this
+/// cannot be saved.
+fn remember_used_root(root: &FolderIdentity) -> Result<(), String> {
+    let path = settings_path()?;
+    let settings = load_settings_from(&path)?;
+    match add_used_root(&settings, root) {
+        Some(next) => save_settings_to(&path, &next),
+        None => Ok(()),
+    }
+}
+
+/// The user confirms that a remembered folder whose identity changed (for
+/// example a drive formatted or restored elsewhere) is the right one. Only
+/// the setting changes; nothing in the folder is touched.
+pub fn accept_storage_folder(folder: &Path) -> Result<(), String> {
+    let path = settings_path()?;
+    let settings = load_settings_from(&path)?;
+    if !settings.identities.iter().any(|i| i.path == folder) {
+        return Err(format!("{} is not a remembered folder", folder.display()));
+    }
+    let now = identify_folder(folder)
+        .map_err(|e| format!("{} is not available: {e}", folder.display()))?;
+    save_settings_to(&path, &with_identity(&settings, now))
+}
+
+/// Whether a remembered folder still matches its recorded identity:
+/// `None` when nothing was recorded for it.
+pub fn folder_matches_record(folder: &Path, identities: &[FolderIdentity]) -> Option<bool> {
+    let recorded = identities.iter().find(|i| i.path == folder)?;
+    Some(identify_folder(folder).is_ok_and(|now| same_folder(recorded, &now)))
+}
+
+fn without_root(settings: &StorageSettings, folder: &Path) -> StorageSettings {
+    let mut next = settings.clone();
+    next.earlier_roots.retain(|r| r != folder);
+    next.used_roots.retain(|r| r != folder);
+    next.identities.retain(|i| i.path != folder);
+    next
+}
+
+/// Stops searching a remembered folder that is gone for good. The folder and
+/// anything still in it are not touched; only the setting changes. The
+/// folder in use for new copies cannot be forgotten.
+pub fn forget_storage_folder(folder: &Path) -> Result<(), String> {
+    let path = settings_path()?;
+    let settings = load_settings_from(&path)?;
+    if settings.root.as_deref() == Some(folder) {
+        return Err("this folder is in use for new copies; choose another folder first".into());
+    }
+    save_settings_to(&path, &without_root(&settings, folder))
 }
 
 fn env_paths() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
@@ -534,21 +810,24 @@ pub fn choose_storage(folder: Option<&Path>) -> Result<EffectiveStorage, String>
     let path = settings_path()?;
     let settings = load_settings_from(&path)?;
     let (_, home, target_root) = env_paths();
-    let current = resolve(
-        None,
-        &settings,
-        default_root()?,
-        home.as_deref(),
-        target_root.as_deref(),
-    )?;
+    let current_root = match &settings.root {
+        Some(root) => root.clone(),
+        None => default_root()?,
+    };
+    let mut next = settings.clone();
     let chosen = match folder {
         Some(folder) => {
             validate_chosen(folder, home.as_deref(), target_root.as_deref())?;
+            // Remember which filesystem object was picked, so Play can tell
+            // it from an empty mount point when the drive is absent.
+            let picked = identify_folder(folder)
+                .map_err(|e| format!("cannot use {}: {e}", folder.display()))?;
+            next = with_identity(&next, picked);
             Some(folder.join(CHOSEN_SUBFOLDER))
         }
         None => None,
     };
-    save_settings_to(&path, &record_choice(&settings, chosen, &current.root))?;
+    save_settings_to(&path, &record_choice(&next, chosen, &current_root))?;
     effective_storage()
 }
 
@@ -570,14 +849,32 @@ fn check_override(
     if let Some(target) = target_root {
         disposable.push(target.to_path_buf());
     }
+    let refuse = |inside: &Path| {
+        Err(format!(
+            "{} is inside {}, which cleanup tools may delete; choose a folder for saved games instead",
+            path.display(),
+            inside.display()
+        ))
+    };
     for root in disposable {
         let root_resolved = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
         if path.starts_with(&root) || resolved.starts_with(&root_resolved) {
-            return Err(format!(
-                "{ROOT_OVERRIDE_ENV} ({}) is inside {}, which cleanup tools may delete; choose a folder for saved games instead",
-                path.display(),
-                root.display()
-            ));
+            return refuse(&root);
+        }
+    }
+    // Recognised without any environment variable (a desktop-launched Blue
+    // does not see the Cargo settings): a folder named like the EmuWiz Cargo
+    // target root, or any folder carrying the standard cache marker that
+    // Cargo writes into every build folder.
+    for candidate in [path, resolved.as_path()] {
+        for ancestor in candidate.ancestors() {
+            let named_cargo = ancestor
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("emuwiz-cargo-target"));
+            if named_cargo || ancestor.join("CACHEDIR.TAG").exists() {
+                return refuse(ancestor);
+            }
         }
     }
     Ok(path.to_path_buf())
@@ -782,6 +1079,8 @@ mod tests {
         let chosen = StorageSettings {
             root: Some(PathBuf::from("/mnt/bulk/EmuWiz Amiga HDF copies")),
             earlier_roots: vec![PathBuf::from("/mnt/old"), default.clone()],
+            used_roots: vec![PathBuf::from("/mnt/used")],
+            identities: Vec::new(),
         };
         let none = StorageSettings::default();
         let home = Some(Path::new("/home/u"));
@@ -799,7 +1098,11 @@ mod tests {
         // The default and every earlier folder are still searched, once each.
         assert_eq!(
             c.earlier_roots,
-            vec![default.clone(), PathBuf::from("/mnt/old")]
+            vec![
+                default.clone(),
+                PathBuf::from("/mnt/old"),
+                PathBuf::from("/mnt/used")
+            ]
         );
 
         let o = resolve(
@@ -835,7 +1138,15 @@ mod tests {
         let old_copy = working_copy_for(&path, old.path()).unwrap();
         std::fs::write(&old_copy, b"RDSK-image+save").unwrap();
 
-        let found = working_copy_in(&path, new.path(), &[old.path().to_path_buf()]).unwrap();
+        let found = working_copy_in(
+            &path,
+            new.path(),
+            &[old.path().to_path_buf()],
+            &[],
+            &[],
+            &mut |_| Ok(()),
+        )
+        .unwrap();
         assert_eq!(found, old_copy);
         assert_eq!(std::fs::read(&found).unwrap(), b"RDSK-image+save");
         assert!(std::fs::read_dir(new.path()).unwrap().next().is_none());
@@ -843,7 +1154,15 @@ mod tests {
         // A game with no earlier copy goes to the new folder.
         let other = src.path().join("Other.hdf");
         std::fs::write(&other, b"RDSK-other").unwrap();
-        let fresh = working_copy_in(&other, new.path(), &[old.path().to_path_buf()]).unwrap();
+        let fresh = working_copy_in(
+            &other,
+            new.path(),
+            &[old.path().to_path_buf()],
+            &[],
+            &[],
+            &mut |_| Ok(()),
+        )
+        .unwrap();
         assert!(fresh.starts_with(new.path()));
     }
 
@@ -884,5 +1203,219 @@ mod tests {
         let facts = storage_facts(&dir.path().join("not-yet")).unwrap();
         assert_eq!(facts.copies, 0);
         assert!(facts.reserve >= MIN_RESERVE_BYTES);
+    }
+
+    #[test]
+    fn an_unavailable_folder_with_copies_blocks_play_instead_of_splitting_saves() {
+        let src = tempfile::tempdir().unwrap();
+        let drive = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        let path = original(src.path(), b"RDSK-x");
+        // Folder A held copies, then its drive went away.
+        let gone = drive.path().join("unplugged/EmuWiz Amiga HDF copies");
+        let result = working_copy_in(
+            &path,
+            new.path(),
+            &[gone.clone()],
+            &[gone.clone()],
+            &[],
+            &mut |_| Ok(()),
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("not available"), "{error}");
+        assert!(
+            std::fs::read_dir(new.path()).unwrap().next().is_none(),
+            "no second copy"
+        );
+        // Forgetting it (explicit user choice) lets play continue.
+        let settings = StorageSettings {
+            earlier_roots: vec![gone.clone()],
+            used_roots: vec![gone.clone()],
+            ..Default::default()
+        };
+        let forgotten = without_root(&settings, &gone);
+        assert!(forgotten.earlier_roots.is_empty() && forgotten.used_roots.is_empty());
+        // The same folder never used for copies is simply skipped.
+        assert!(working_copy_in(&path, new.path(), &[gone], &[], &[], &mut |_| Ok(())).is_ok());
+    }
+
+    #[test]
+    fn copies_in_two_places_are_refused() {
+        let src = tempfile::tempdir().unwrap();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let path = original(src.path(), b"RDSK-two");
+        working_copy_for(&path, a.path()).unwrap();
+        working_copy_for(&path, b.path()).unwrap();
+        let error = working_copy_in(
+            &path,
+            b.path(),
+            &[a.path().to_path_buf()],
+            &[],
+            &[],
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("more than one place"), "{error}");
+    }
+
+    #[test]
+    fn a_folder_is_remembered_before_its_first_copy_and_failure_writes_nothing() {
+        let src = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("copies");
+        let path = original(src.path(), b"RDSK-r");
+        let refused = working_copy_in(&path, &root, &[], &[], &[], &mut |_| {
+            Err("cannot save".into())
+        });
+        assert!(refused.is_err());
+        assert!(
+            !root.join(KEEP_NOTE_NAME).exists() || std::fs::read_dir(&root).unwrap().count() == 1
+        );
+        let mut seen = Vec::new();
+        let copy = working_copy_in(&path, &root, &[], &[], &[], &mut |r| {
+            seen.push(r.path.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![root.clone()]);
+        // Already remembered: not recorded again; the copy is reused.
+        let mut again = 0;
+        let reused = working_copy_in(&path, &root, &[], &[root.clone()], &[], &mut |_| {
+            again += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((reused, again), (copy, 0));
+        // An override folder recorded this way is still searched after the
+        // variable is unset.
+        let x = FolderIdentity {
+            path: PathBuf::from("/x"),
+            dev: 1,
+            ino: 2,
+            fsid: 3,
+        };
+        let settings = add_used_root(&StorageSettings::default(), &x).unwrap();
+        assert!(add_used_root(&settings, &x).is_none());
+        assert_eq!(settings.identities, vec![x]);
+        let after = resolve(None, &settings, PathBuf::from("/d"), None, None).unwrap();
+        assert!(after.earlier_roots.contains(&PathBuf::from("/x")));
+        assert_eq!(after.used_roots, vec![PathBuf::from("/x")]);
+    }
+
+    #[test]
+    fn a_missing_picked_folder_is_never_recreated() {
+        let src = tempfile::tempdir().unwrap();
+        let drive = tempfile::tempdir().unwrap();
+        let path = original(src.path(), b"RDSK-m");
+        let root = drive.path().join("picked-but-gone").join(CHOSEN_SUBFOLDER);
+        assert!(working_copy_for(&path, &root).is_err());
+        assert!(!drive.path().join("picked-but-gone").exists());
+    }
+
+    #[test]
+    fn cargo_and_cache_folders_are_recognised_without_environment_variables() {
+        let base = tempfile::tempdir().unwrap();
+        let cargo_root = base.path().join("emuwiz-cargo-targets");
+        std::fs::create_dir_all(cargo_root.join("x")).unwrap();
+        assert!(check_override(&cargo_root.join("x"), None, None).is_err());
+        let build = base.path().join("some-target");
+        std::fs::create_dir_all(build.join("debug")).unwrap();
+        std::fs::write(
+            build.join("CACHEDIR.TAG"),
+            b"Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        assert!(check_override(&build.join("debug"), None, None).is_err());
+        assert!(check_override(&base.path().join("saves"), None, None).is_ok());
+    }
+
+    fn picked(dir: &Path) -> (PathBuf, FolderIdentity) {
+        let folder = dir.join("drive-folder");
+        std::fs::create_dir(&folder).unwrap();
+        let identity = identify_folder(&folder).unwrap();
+        (folder, identity)
+    }
+
+    fn launch(path: &Path, root: &Path, ids: &[FolderIdentity]) -> Result<PathBuf, String> {
+        working_copy_in(path, root, &[], &[], ids, &mut |_| Ok(()))
+    }
+
+    #[test]
+    fn mount_identity_normal_mounted_folder_gets_the_copy() {
+        let src = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let (folder, id) = picked(base.path());
+        let path = original(src.path(), b"RDSK-ok");
+        let root = folder.join(CHOSEN_SUBFOLDER);
+        let copy = launch(&path, &root, std::slice::from_ref(&id)).unwrap();
+        assert!(copy.starts_with(&root));
+        // And again, reused, with the same identity.
+        assert_eq!(launch(&path, &root, &[id]).unwrap(), copy);
+    }
+
+    #[test]
+    fn mount_identity_unmounted_drive_leaves_an_empty_mount_point_and_play_is_refused() {
+        let src = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let (folder, id) = picked(base.path());
+        let path = original(src.path(), b"RDSK-um");
+        // "Unmount": the real folder goes away and an empty directory (the
+        // bare mount point on the system drive) is left at the same path.
+        std::fs::rename(&folder, base.path().join("elsewhere")).unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let error = launch(&path, &folder.join(CHOSEN_SUBFOLDER), &[id]).unwrap_err();
+        assert!(error.contains("different drive or was replaced"), "{error}");
+        assert!(
+            std::fs::read_dir(&folder).unwrap().next().is_none(),
+            "nothing created"
+        );
+    }
+
+    #[test]
+    fn mount_identity_missing_or_symlinked_folder_is_refused_without_creating_it() {
+        let src = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let (folder, id) = picked(base.path());
+        let path = original(src.path(), b"RDSK-rp");
+        std::fs::remove_dir(&folder).unwrap();
+        let root = folder.join(CHOSEN_SUBFOLDER);
+        assert!(launch(&path, &root, std::slice::from_ref(&id)).is_err());
+        assert!(!folder.exists());
+        // Replaced by a symlink to another folder: refused, nothing written there.
+        let other = base.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&other, &folder).unwrap();
+        assert!(launch(&path, &root, &[id]).is_err());
+        assert!(std::fs::read_dir(&other).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn mount_identity_changed_filesystem_is_refused_and_a_used_folder_is_checked_too() {
+        let src = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let (folder, id) = picked(base.path());
+        let path = original(src.path(), b"RDSK-fs");
+        let root = folder.join(CHOSEN_SUBFOLDER);
+        let moved = FolderIdentity {
+            dev: id.dev.wrapping_add(1),
+            fsid: id.fsid.wrapping_add(1),
+            ..id.clone()
+        };
+        assert!(launch(&path, &root, &[moved]).is_err());
+        assert!(!root.exists());
+        // The storage folder itself, once used, is checked as well.
+        let copy = launch(&path, &root, std::slice::from_ref(&id)).unwrap();
+        let used = identify_folder(&root).unwrap();
+        let replaced = FolderIdentity {
+            ino: used.ino.wrapping_add(1),
+            ..used
+        };
+        let error = launch(&path, &root, &[id, replaced]).unwrap_err();
+        assert!(error.contains("replaced"), "{error}");
+        assert!(
+            copy.exists(),
+            "the existing copy and its saves are untouched"
+        );
     }
 }

@@ -18,6 +18,10 @@ struct View {
     storage: EffectiveStorage,
     facts: Result<StorageFacts, String>,
     earlier: Vec<(PathBuf, usize)>,
+    /// Remembered folders that cannot be used now: (folder, still exists).
+    /// A folder that exists here has changed identity (unmounted drive's
+    /// empty mount point, or a replaced folder).
+    unavailable: Vec<(PathBuf, bool)>,
 }
 
 fn mib(bytes: u64) -> String {
@@ -28,19 +32,38 @@ fn mib(bytes: u64) -> String {
 fn load() -> Result<View, String> {
     let storage = storage::effective_storage()?;
     let facts = storage::storage_facts(&storage.root);
-    let earlier = storage
-        .earlier_roots
-        .iter()
-        .map(|root| {
-            let copies = storage::storage_facts(root).map(|f| f.copies).unwrap_or(0);
-            (root.clone(), copies)
-        })
-        .filter(|(root, copies)| *copies > 0 && root.is_dir())
-        .collect();
+    let exists =
+        |p: &std::path::Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir());
+    let mut earlier = Vec::new();
+    let mut unavailable: Vec<(PathBuf, bool)> = Vec::new();
+    let mut checked: Vec<PathBuf> = storage.earlier_roots.clone();
+    checked.push(storage.root.clone());
+    if let Some(parent) = storage.root.parent() {
+        checked.push(parent.to_path_buf());
+    }
+    for folder in &checked {
+        let here = exists(folder);
+        let changed = storage::folder_matches_record(folder, &storage.identities) == Some(false);
+        if changed || (!here && storage.used_roots.contains(folder)) {
+            if !unavailable.iter().any(|(f, _)| f == folder) {
+                unavailable.push((folder.clone(), here));
+            }
+            continue;
+        }
+        if here && storage.earlier_roots.contains(folder) {
+            let copies = storage::storage_facts(folder)
+                .map(|f| f.copies)
+                .unwrap_or(0);
+            if copies > 0 {
+                earlier.push((folder.clone(), copies));
+            }
+        }
+    }
     Ok(View {
         storage,
         facts,
         earlier,
+        unavailable,
     })
 }
 
@@ -53,12 +76,16 @@ impl AmigaHdfStorageState {
             self.loaded = Some(load());
         }
         let mut choose: Option<Option<PathBuf>> = None;
+        let mut forget: Option<PathBuf> = None;
+        let mut accept: Option<PathBuf> = None;
+        let mut refresh = false;
         match self.loaded.as_ref() {
             Some(Err(error)) => {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
                     format!("Storage folder unavailable: {error}"),
                 );
+                refresh = ui.button("Check again").clicked();
             }
             Some(Ok(view)) => {
                 let source = match view.storage.source {
@@ -96,6 +123,44 @@ impl AmigaHdfStorageState {
                         root.display()
                     ));
                 }
+                let in_use = |f: &PathBuf| {
+                    f == &view.storage.root || Some(f.as_path()) == view.storage.root.parent()
+                };
+                for (root, here) in &view.unavailable {
+                    let text = if *here {
+                        format!(
+                            "Changed: {} is not the same folder as before. It is on a different drive or was replaced; this is what an unmounted drive looks like. Amiga hard-disk games will not start until the drive is mounted again. Nothing is created there.",
+                            root.display()
+                        )
+                    } else {
+                        format!(
+                            "Not available: {}. It holds game copies and saves, so Amiga hard-disk games will not start until it is back (reconnect the drive).",
+                            root.display()
+                        )
+                    };
+                    ui.colored_label(ui.visuals().warn_fg_color, text);
+                    ui.horizontal_wrapped(|ui| {
+                        if *here
+                            && ui
+                                .button("Accept as it is now")
+                                .on_hover_text("Only if you moved or restored this folder yourself and it holds your copies.")
+                                .clicked()
+                        {
+                            accept = Some(root.clone());
+                        }
+                        if !in_use(root)
+                            && ui
+                                .button("Forget")
+                                .on_hover_text("EmuWiz stops looking here; the saves in it are no longer used. Nothing is deleted.")
+                                .clicked()
+                        {
+                            forget = Some(root.clone());
+                        }
+                    });
+                }
+                if !view.unavailable.is_empty() {
+                    refresh |= ui.button("Check again").clicked();
+                }
                 if view.storage.source == StorageSource::Override {
                     ui.label("The environment variable takes priority; unset it to use the folder chosen here.");
                 }
@@ -119,6 +184,26 @@ impl AmigaHdfStorageState {
                 ));
             }
             None => {}
+        }
+        if let Some(folder) = forget {
+            self.message = Some(match storage::forget_storage_folder(&folder) {
+                Ok(()) => format!(
+                    "EmuWiz no longer looks in {}. Nothing there was changed.",
+                    folder.display()
+                ),
+                Err(error) => format!("Not changed: {error}"),
+            });
+            self.loaded = None;
+        }
+        if let Some(folder) = accept {
+            self.message = Some(match storage::accept_storage_folder(&folder) {
+                Ok(()) => format!("{} accepted as it is now.", folder.display()),
+                Err(error) => format!("Not changed: {error}"),
+            });
+            self.loaded = None;
+        }
+        if refresh {
+            self.loaded = None;
         }
         if let Some(choice) = choose {
             self.message = Some(match storage::choose_storage(choice.as_deref()) {
