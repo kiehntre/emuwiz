@@ -6346,6 +6346,18 @@ fn inspect_disc_chd(
     aggregate_budget: Option<u64>,
 ) {
     report.format = IdentityImageFormat::Chd;
+    // A Dreamcast GD-ROM is recognised from the CHD header and metadata
+    // alone, read straight from the file, so its high-density area can be
+    // inspected sector by sector without first loading a 300-900 MB image.
+    if report.platform == IdentityPlatform::Dreamcast
+        && let Ok(observation) =
+            crate::chd_identity::observe_chd_identity_file(&report.archive_path)
+        && let crate::chd_identity::ChdMetadataOutcome::Observed(metadata) = &observation.metadata
+        && crate::chd_identity::needs_specialist_optical_backend(metadata)
+    {
+        inspect_dreamcast_gdrom_chd(report);
+        return;
+    }
     let bytes = match aggregate_budget.map_or_else(
         || read_bounded_chd_bytes(&report.archive_path),
         |budget| {
@@ -6731,13 +6743,31 @@ fn inspect_dreamcast_gdrom_chd(report: &mut GameIdentityReport) {
 /// filename - the honest answer is that this build cannot read this disc.
 #[cfg(not(feature = "chd-optical-specialist"))]
 fn inspect_dreamcast_gdrom_chd(report: &mut GameIdentityReport) {
-    add_unavailable(
-        report,
-        IdentityStatus::Unsupported,
-        "this CHD is a multi-track Dreamcast GD-ROM; reading its high-density data area \
-         requires the optional chd-optical-specialist build feature, which is not enabled in \
-         this build",
-    );
+    // Pure-Rust high-density reader: places each GD-ROM track exactly as
+    // chdman stores it and fails closed on any layout it cannot prove (see
+    // `crate::chd_logical_media::open_chd_gdrom_high_density_file`). The
+    // product code still comes only from the disc's own IP.BIN through the
+    // shared `inspect_dreamcast_source`.
+    let media =
+        match crate::chd_logical_media::open_chd_gdrom_high_density_file(&report.archive_path) {
+            Ok(media) => media,
+            Err(error) => {
+                push_with_source(
+                    report,
+                    IdentityKind::DreamcastProductCode,
+                    IdentityStatus::Invalid,
+                    None,
+                    IdentityConfidence::Unavailable,
+                    None,
+                    None,
+                    "Dreamcast GD-ROM high-density CHD reader",
+                    &error.to_string(),
+                );
+                return;
+            }
+        };
+    let mut source = MediaSource::new(media);
+    inspect_dreamcast_source(report, &mut source, None, None);
 }
 
 /// Authoritative Dreamcast identity for a DiscJuggler `.cdi` image. Never
@@ -10355,12 +10385,39 @@ mod tests {
                 .iter()
                 .find(|item| item.kind == IdentityKind::DreamcastProductCode)
                 .expect("a DreamcastProductCode evidence item must exist");
+            // The pure-Rust high-density reader now handles this shape; a
+            // metadata-only fixture has no hunk map, so it refuses as
+            // invalid media rather than "feature not built".
+            assert_eq!(evidence.status, IdentityStatus::Invalid);
             assert!(
-                evidence.diagnostic.contains("chd-optical-specialist"),
-                "expected the specialist-backend-unavailable message, got: {}",
+                !evidence.diagnostic.contains("chd-optical-specialist"),
+                "the default build must not claim the specialist backend is required: {}",
                 evidence.diagnostic
             );
         }
+    }
+
+    #[cfg(not(feature = "chd-optical-specialist"))]
+    #[test]
+    fn dreamcast_gdrom_chd_verifies_ip_bin_product_code_from_track_three() {
+        let iso = dreamcast_iso(b"T-8109N");
+        let blocks: Vec<[u8; 2048]> = iso
+            .chunks(ISO_SECTOR_SIZE as usize)
+            .map(|chunk| chunk.try_into().unwrap())
+            .collect();
+        let directory = FixtureDir::new("dreamcast-gdrom-chd-ip-bin");
+        let path = write_fixture(
+            &directory,
+            "renamed.chd",
+            &crate::chd_logical_media::synthetic_gdrom_chd(&blocks),
+        );
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(report.format, IdentityImageFormat::Chd);
+        assert_eq!(report.verified_dreamcast_product_code(), Some("T-8109N"));
+        assert!(report.complete);
+        // A Saturn hint over the same bytes never takes the Dreamcast reader.
+        let saturn = inspect_game_identity(&path, Some("Saturn"));
+        assert_eq!(saturn.verified_dreamcast_product_code(), None);
     }
 
     #[cfg(feature = "chd-optical-specialist")]

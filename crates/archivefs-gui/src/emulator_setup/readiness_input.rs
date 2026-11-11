@@ -1706,6 +1706,30 @@ impl ReadinessSources<'_> {
         if let Some(snapshot) = &shadps4_context {
             snapshot.apply(&mut plan, &content);
         }
+        // Dreamcast: an installed standalone Flycast is the automatic route;
+        // a RetroArch Flycast core needs an explicit emulator choice.
+        let flycast_reasons: Vec<(String, String)> = match &self.readiness.flycast_profiles {
+            FlycastProfilesState::Ready(ready) => ready
+                .discovery
+                .profiles
+                .iter()
+                .filter_map(|profile| {
+                    let reason = match &profile.blocker {
+                        Some(blocker) => blocker.clone(),
+                        None => {
+                            archivefs_core::patch_manager::resolve_flycast_native_launch_binding(
+                                profile,
+                            )
+                            .err()?
+                            .detail
+                        }
+                    };
+                    Some((profile.profile_id.clone(), reason))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        launch_readiness_page::flycast::prefer_standalone(&mut plan, &flycast_reasons);
         // Last: an explicit emulator choice only resolves what every check
         // above left usable, and never unblocks anything.
         archivefs_core::launch::launch_choice::apply(

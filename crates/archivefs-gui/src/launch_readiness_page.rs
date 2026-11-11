@@ -1004,6 +1004,13 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                     StandaloneLaunchRequest::Flycast(request),
                 ));
             }
+            // Direct Dreamcast CHD/CDI: click-time re-verification in
+            // `flycast::DirectRequest::execute`.
+            if let Some(Ok(request)) = flycast::direct_offer_for(plan, candidate) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Flycast(request),
+                ));
+            }
             if let Some(request) = vice.as_ref().and_then(|c| c.request(plan, candidate)) {
                 return Some(TypedLaunchRequest::Standalone(
                     StandaloneLaunchRequest::Vice(request),
@@ -1107,6 +1114,11 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         .collect();
     // mGBA's offer waits on a one-time Bubblewrap capability check; say so
     // (and keep repainting) rather than showing a generic blocker.
+    if requests.is_empty()
+        && let Some(blocker) = flycast_blocker(plan, plan.candidates.iter().filter(preferred))
+    {
+        return GamerPlayAction::BlockedTyped(blocker);
+    }
     if requests.is_empty() {
         for candidate in plan.candidates.iter().filter(preferred) {
             match mgba::offer_for(plan, candidate) {
@@ -5242,6 +5254,43 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
         },
         LaunchTarget::RetroArchCore { .. } => Some("RetroArch"),
     }
+}
+
+/// Standalone Flycast is the chosen Dreamcast route but cannot start: say
+/// exactly why, naming Flycast, instead of a generic blocker. Nothing else
+/// is started in its place.
+fn flycast_blocker<'a>(
+    plan: &LaunchPlan,
+    preferred: impl Iterator<Item = &'a LaunchCandidate>,
+) -> Option<GamerBlocker> {
+    for candidate in preferred {
+        if !matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "flycast",
+                ..
+            }
+        ) {
+            continue;
+        }
+        let reason = if let Some(blocker) = candidate.blockers.first() {
+            blocker.detail.clone()
+        } else if let Some(warning) = candidate.warnings.first() {
+            format!(
+                "EmuWiz only starts Flycast from a clean check: {}",
+                warning.detail
+            )
+        } else if let Some(Err(reason)) = flycast::direct_offer_for(plan, candidate) {
+            reason
+        } else {
+            continue;
+        };
+        return Some(GamerBlocker::new(
+            GamerBlockerKind::NoSafeEmulator,
+            format!("Flycast cannot start this game: {reason} Nothing else was started instead."),
+        ));
+    }
+    None
 }
 
 /// The generic reason when nothing more specific explains a missing route.
