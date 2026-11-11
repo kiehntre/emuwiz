@@ -396,11 +396,40 @@ fn trusted_bios_tree(directory: &Path) -> TrustedRoots {
     let Ok(canonical) = std::fs::canonicalize(directory) else {
         return TrustedRoots::none();
     };
-    TrustedRoots::from_paths([canonical.parent().unwrap_or(&canonical)])
+    match trusted_bios_root(&canonical) {
+        Some(root) => TrustedRoots::from_paths([root]),
+        None => TrustedRoots::none(),
+    }
 }
 
+/// The folder above is trusted only when it is itself at least
+/// [`MIN_TRUSTED_PARENT_DEPTH`] levels deep, so a BIOS folder such as `/mnt/x`
+/// or `~/bios` never trusts `/mnt` or `/home`; such a folder trusts only
+/// itself. A BIOS folder at the filesystem root, or one level below it,
+/// trusts nothing, so every link there is refused.
+fn trusted_bios_root(canonical: &Path) -> Option<&Path> {
+    let depth = |path: &Path| {
+        path.components()
+            .filter(|component| matches!(component, std::path::Component::Normal(_)))
+            .count()
+    };
+    if depth(canonical) < 2 {
+        return None;
+    }
+    match canonical.parent() {
+        Some(parent) if depth(parent) >= MIN_TRUSTED_PARENT_DEPTH => Some(parent),
+        _ => Some(canonical),
+    }
+}
+
+/// See [`trusted_bios_root`]: `/mnt/usbdrive/[BIOS]/bios` qualifies (four),
+/// `/home/user` does not (two).
+const MIN_TRUSTED_PARENT_DEPTH: usize = 3;
+
 /// Opens a BIOS symlink only when it is a relative link whose resolved target
-/// is a regular file inside `trusted`, via
+/// is a regular file inside `trusted`. Only the link itself must be relative:
+/// a further link in a chain may be absolute, but the fully resolved target
+/// is still checked against `trusted`, so no chain leaves the tree. Via
 /// [`crate::safe_read::open_bounded_read`]: broken links and loops fail to
 /// resolve, special files and targets outside the tree are refused, and the
 /// target is opened by a no-follow descriptor walk so a component swapped for
@@ -451,8 +480,9 @@ fn redump_ps1_bios_region(record: &FirmwareIdentityRecord) -> Option<DuckStation
 }
 
 /// Models DuckStation's automatic BIOS pick for a folder without guessing a
-/// file: `Verified` only when the folder holds a regular (non-symlinked)
-/// 512 KiB file whose bytes exactly match a Redump PS1 BIOS record for the
+/// file: `Verified` only when the folder holds a regular 512 KiB file (or a
+/// relative link to one inside the trusted BIOS tree; see
+/// [`open_contained_bios_link`]) whose bytes exactly match a Redump PS1 BIOS record for the
 /// game's required region. DuckStation prefers a known BIOS of the matching
 /// region over any unknown or other-region image, so with such a file present
 /// it loads a known BIOS for this region (the reported path is the verified
@@ -496,7 +526,13 @@ fn auto_search_bios(
         .filter(|path| {
             std::fs::symlink_metadata(path).is_ok_and(|metadata| {
                 (metadata.is_file() && metadata.len() == PS1_BIOS_SIZE)
-                    || metadata.file_type().is_symlink()
+                    // Only a pre-filter so broken, oversized and special links
+                    // never use the hash budget; the size and type that count
+                    // are re-checked on the safely opened descriptor.
+                    || (metadata.file_type().is_symlink()
+                        && std::fs::metadata(path).is_ok_and(|target| {
+                            target.is_file() && target.len() == PS1_BIOS_SIZE
+                        }))
             })
         })
         .collect();
@@ -520,9 +556,10 @@ fn auto_search_bios(
     }
 }
 
-/// Verifies exactly one selected local BIOS path against `evidence`. Never
-/// follows a symlink, never reads a non-regular file, never reports
-/// `Verified` on a partial match.
+/// Verifies exactly one selected local BIOS path against `evidence`. Follows
+/// only a contained relative link ([`open_contained_bios_link`]) whose target
+/// is exactly a PS1 BIOS image in size, never reads a non-regular file, never
+/// reports `Verified` on a partial match.
 fn verify_one_bios_path(
     path: &Path,
     evidence: &[FirmwareIdentityRecord],
@@ -542,14 +579,19 @@ fn verify_one_bios_path(
     };
     let digests: ComputedFirmwareDigests = if metadata.file_type().is_symlink() {
         match open_contained_bios_link(path, trusted) {
-            Ok(file) => {
-                match hash_open_firmware_file(file, MAX_BIOS_HASH_BYTES, HASH_CHUNK_BYTES) {
-                    Ok(digests) => digests,
-                    Err(detail) => {
-                        return DuckStationBiosVerificationOutcome::Unreadable { detail };
-                    }
-                }
+            Ok(file)
+                if file.metadata().map(|metadata| metadata.len()).ok() != Some(PS1_BIOS_SIZE) =>
+            {
+                return DuckStationBiosVerificationOutcome::Unknown {
+                    path: path.to_path_buf(),
+                };
             }
+            Ok(file) => match hash_open_firmware_file(file, PS1_BIOS_SIZE, HASH_CHUNK_BYTES) {
+                Ok(digests) => digests,
+                Err(detail) => {
+                    return DuckStationBiosVerificationOutcome::Unreadable { detail };
+                }
+            },
             Err(detail) => {
                 return DuckStationBiosVerificationOutcome::Unsafe {
                     path: path.to_path_buf(),

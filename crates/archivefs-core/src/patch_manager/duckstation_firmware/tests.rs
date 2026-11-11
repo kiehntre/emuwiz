@@ -1018,6 +1018,75 @@ fn a_link_through_a_symlinked_folder_out_of_the_tree_is_refused() {
 }
 
 #[test]
+fn a_shallow_bios_folder_never_trusts_a_broad_parent() {
+    // Review of e9309492: the parent of `/mnt/x` or `~/bios` is far too broad.
+    let root = |path: &str| trusted_bios_root(Path::new(path)).map(Path::to_path_buf);
+    assert_eq!(
+        root("/mnt/usbdrive/[BIOS]/bios/psx"),
+        Some(PathBuf::from("/mnt/usbdrive/[BIOS]/bios"))
+    );
+    assert_eq!(
+        root("/home/user/bios"),
+        Some(PathBuf::from("/home/user/bios"))
+    );
+    assert_eq!(root("/mnt/x"), Some(PathBuf::from("/mnt/x")));
+    assert_eq!(root("/mnt"), None);
+    assert_eq!(root("/"), None);
+}
+
+#[test]
+fn a_link_to_a_file_that_is_not_bios_sized_is_never_hashed_or_verified() {
+    let (fixture, directory) = search_fixture("link-oversized");
+    // A record for the oversized bytes proves the size gate, not the hash,
+    // is what refuses it.
+    let mut big = bios_sized(9);
+    big.extend(std::iter::repeat_n(0u8, 4096));
+    write_bios(&directory.join(".."), "big.bin", &big);
+    symlink("../big.bin", directory.join("scph1001.bin")).unwrap();
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome =
+        resolve_duckstation_bios(&fixture.profile, &inspection, &[record_for("ps-22a", &big)]);
+    assert!(
+        !matches!(outcome, DuckStationBiosVerificationOutcome::Verified(_)),
+        "{outcome:?}"
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn a_folder_of_only_broken_links_has_no_bios() {
+    let (fixture, directory) = search_fixture("link-only-broken");
+    symlink("../missing.bin", directory.join("scph1001.bin")).unwrap();
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome = resolve_duckstation_bios(&fixture.profile, &inspection, &[]);
+    assert!(
+        matches!(outcome, DuckStationBiosVerificationOutcome::Missing),
+        "{outcome:?}"
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn junk_links_sorted_first_do_not_hide_a_real_bios() {
+    let (fixture, directory) = search_fixture("link-junk-first");
+    let usa = bios_sized(10);
+    write_bios(&directory.join(".."), "real.bin", &usa);
+    write_bios(&directory.join(".."), "junk.bin", b"not a bios");
+    for index in 0..(MAX_AUTO_SEARCH_HASHED + 5) {
+        symlink("../junk.bin", directory.join(format!("a{index:04}.bin"))).unwrap();
+    }
+    symlink("../real.bin", directory.join("z-scph1001.bin")).unwrap();
+    let inspection = inspection_for(&fixture, "SLUS-00404");
+    let outcome =
+        resolve_duckstation_bios(&fixture.profile, &inspection, &[record_for("ps-22a", &usa)]);
+    assert!(
+        matches!(outcome, DuckStationBiosVerificationOutcome::Verified(_)),
+        "{outcome:?}"
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
 fn an_empty_path_for_the_required_region_falls_back_to_the_search() {
     // Only a PAL path is set; an NTSC-U game makes DuckStation search.
     let fixture = build_fixture(
