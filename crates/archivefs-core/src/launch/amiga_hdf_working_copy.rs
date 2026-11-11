@@ -12,6 +12,11 @@
 //! then reused so the game's own saves survive between sessions. A changed
 //! original has a different digest and therefore gets a fresh copy; the old
 //! copy, holding the old saves, is left untouched.
+//!
+//! These copies are persistent game data (they hold saves), not a cache:
+//! nothing in EmuWiz prunes them. The folder can be moved off a full system
+//! drive with `EMUWIZ_AMIGA_HDF_WORKING_DIR` (an absolute path). It must not
+//! be inside a cache or Cargo build folder, which cleanup tools may delete.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -39,14 +44,27 @@ pub fn applies(platform_id: &str, content: &Path) -> bool {
 
 const PARTIAL_PREFIX: &str = ".partial-";
 
-/// Kept free beyond the copy itself, so a launch never fills the disk.
-pub const SPACE_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+/// Absolute path that replaces `<data>/amiga-hdf-working` as the home of the
+/// persistent working copies.
+pub const ROOT_OVERRIDE_ENV: &str = "EMUWIZ_AMIGA_HDF_WORKING_DIR";
 
-fn enough_space(available: u64, size: u64) -> bool {
-    available >= size.saturating_add(SPACE_HEADROOM_BYTES)
+/// Minimum space left free after a copy. The reserve is the larger of this
+/// and 5% of the drive, so a nearly full system drive is never filled.
+pub const MIN_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+const KEEP_NOTE_NAME: &str = "README-KEEP.txt";
+const KEEP_NOTE: &str = "EmuWiz Amiga HDF working copies.\n\nEach folder holds a private, writable copy of an Amiga hard-disk game and the\nsaves the game wrote into it. This is not a cache: deleting it deletes those saves.\nThe original game files are never changed.\n";
+
+fn reserve_bytes(total: u64) -> u64 {
+    MIN_RESERVE_BYTES.max(total / 20)
 }
 
-fn available_bytes(directory: &Path) -> Result<u64, String> {
+fn enough_space(available: u64, total: u64, size: u64) -> bool {
+    available >= size.saturating_add(reserve_bytes(total))
+}
+
+/// (available, total) bytes on the filesystem holding `directory`.
+fn space(directory: &Path) -> Result<(u64, u64), String> {
     use std::os::unix::ffi::OsStrExt;
     let name = std::ffi::CString::new(directory.as_os_str().as_bytes())
         .map_err(|_| "working-copy path contains NUL".to_string())?;
@@ -62,7 +80,11 @@ fn available_bytes(directory: &Path) -> Result<u64, String> {
     fn widen<T: Into<u64>>(value: T) -> u64 {
         value.into()
     }
-    Ok(widen(stats.f_bavail).saturating_mul(widen(stats.f_frsize)))
+    let unit = widen(stats.f_frsize);
+    Ok((
+        widen(stats.f_bavail).saturating_mul(unit),
+        widen(stats.f_blocks).saturating_mul(unit),
+    ))
 }
 
 fn writer_alive(pid: i32) -> bool {
@@ -153,6 +175,16 @@ pub fn working_copy_for(original: &Path, root: &Path) -> Result<PathBuf, String>
     let prefix: String = digest.iter().take(12).map(|b| format!("{b:02x}")).collect();
 
     ensure_private_dir(root)?;
+    let note = root.join(KEEP_NOTE_NAME);
+    if std::fs::symlink_metadata(&note).is_err() {
+        let _ = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&note)
+            .and_then(|mut f| f.write_all(KEEP_NOTE.as_bytes()));
+    }
     let dir = root.join(prefix);
     ensure_private_dir(&dir)?;
     let target = dir.join(&name);
@@ -173,12 +205,12 @@ pub fn working_copy_for(original: &Path, root: &Path) -> Result<PathBuf, String>
     // file (the copy itself appears atomically, via `link`, once complete).
     // Clear those whose writer is gone, then check there is room.
     remove_abandoned_partials(&dir);
-    let available = available_bytes(&dir)?;
-    if !enough_space(available, size) {
+    let (available, total) = space(&dir)?;
+    if !enough_space(available, total, size) {
         return Err(format!(
-            "not enough free space for the working copy: it needs {} MiB plus {} MiB headroom, {} MiB is available in {}",
+            "not enough free space for this game's private working copy: it needs {} MiB and {} MiB must stay free, but only {} MiB is free in {}. Free some space or set {ROOT_OVERRIDE_ENV} to a folder on a bigger drive.",
             size.div_ceil(1024 * 1024),
-            SPACE_HEADROOM_BYTES / (1024 * 1024),
+            reserve_bytes(total) / (1024 * 1024),
             available / (1024 * 1024),
             dir.display()
         ));
@@ -255,12 +287,56 @@ pub fn redirect_for_launch(
     if !applies(platform_id, content) {
         return Ok(None);
     }
-    let root = crate::app_dirs::data_dir()
-        .map_err(|e| format!("EmuWiz data folder unavailable: {e}"))?
-        .join(WORKING_COPY_DIR);
+    let root = working_root()?;
     let copy = working_copy_for(content, &root)?;
     redirect_arguments(arguments, content, &copy)?;
     Ok(Some(copy))
+}
+
+/// Where the persistent working copies live: the override when set, else
+/// `<data>/amiga-hdf-working`.
+pub fn working_root() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let target_root = std::env::var_os("EMUWIZ_TARGET_ROOT").map(PathBuf::from);
+    match std::env::var_os(ROOT_OVERRIDE_ENV) {
+        Some(value) if !value.is_empty() => {
+            check_override(Path::new(&value), home.as_deref(), target_root.as_deref())
+        }
+        _ => Ok(crate::app_dirs::data_dir()
+            .map_err(|e| format!("EmuWiz data folder unavailable: {e}"))?
+            .join(WORKING_COPY_DIR)),
+    }
+}
+
+/// An override must be absolute and outside folders that cleanup tools treat
+/// as disposable (`~/.cache`, the Cargo build-target root).
+fn check_override(
+    path: &Path,
+    home: Option<&Path>,
+    target_root: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!("{ROOT_OVERRIDE_ENV} must be an absolute path"));
+    }
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut disposable: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home {
+        disposable.push(home.join(".cache"));
+    }
+    if let Some(target) = target_root {
+        disposable.push(target.to_path_buf());
+    }
+    for root in disposable {
+        let root_resolved = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        if path.starts_with(&root) || resolved.starts_with(&root_resolved) {
+            return Err(format!(
+                "{ROOT_OVERRIDE_ENV} ({}) is inside {}, which cleanup tools may delete; choose a folder for saved games instead",
+                path.display(),
+                root.display()
+            ));
+        }
+    }
+    Ok(path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -406,9 +482,53 @@ mod tests {
     }
 
     #[test]
-    fn space_check_requires_the_copy_plus_headroom() {
-        assert!(enough_space(10 + SPACE_HEADROOM_BYTES, 10));
-        assert!(!enough_space(9 + SPACE_HEADROOM_BYTES, 10));
-        assert!(!enough_space(u64::MAX - 1, u64::MAX));
+    fn space_check_keeps_a_reserve_of_2_gib_or_5_percent() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // Small drive: the 2 GiB floor applies.
+        assert!(enough_space(10 + 2 * GIB, 20 * GIB, 10));
+        assert!(!enough_space(9 + 2 * GIB, 20 * GIB, 10));
+        // 1.5 TiB drive (like the owner's system drive): 5% (~77 GiB) applies.
+        let total = 1536 * GIB;
+        assert!(!enough_space(70 * GIB, total, GIB));
+        assert!(enough_space(total / 20 + GIB, total, GIB));
+        assert!(!enough_space(u64::MAX - 1, u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn root_override_must_be_absolute_and_outside_disposable_folders() {
+        let home = Path::new("/home/u");
+        let target = Path::new("/mnt/nvme2/emuwiz-cargo-targets");
+        assert!(check_override(Path::new("rel/dir"), Some(home), None).is_err());
+        assert!(check_override(Path::new("/home/u/.cache/hdf"), Some(home), None).is_err());
+        assert!(
+            check_override(
+                Path::new("/mnt/nvme2/emuwiz-cargo-targets/hdf"),
+                Some(home),
+                Some(target)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            check_override(Path::new("/mnt/bulk/amiga-saves"), Some(home), Some(target)).unwrap(),
+            Path::new("/mnt/bulk/amiga-saves")
+        );
+    }
+
+    #[test]
+    fn the_working_root_carries_a_keep_note_and_copies_are_only_made_on_request() {
+        let src = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join(WORKING_COPY_DIR);
+        // Nothing exists until a launch asks for this one game.
+        assert!(!root.exists());
+        let path = original(src.path(), b"RDSK");
+        working_copy_for(&path, &root).unwrap();
+        let note = std::fs::read_to_string(root.join(KEEP_NOTE_NAME)).unwrap();
+        assert!(note.contains("not a cache"), "{note}");
+        let folders = std::fs::read_dir(&root)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_type().unwrap().is_dir())
+            .count();
+        assert_eq!(folders, 1);
     }
 }
