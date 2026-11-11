@@ -2249,3 +2249,29 @@ fn real_environment_pico_zip_preflight_diagnostic() {
     }
     assert!(findings.is_empty());
 }
+
+#[test]
+fn staged_playlist_replaces_the_boot_disk_argument_exactly_once() {
+    use std::ffi::OsString;
+    use std::path::Path;
+    let disk = Path::new("/tmp/emuwiz-zip-rom-x/Game (Disk 1).ipf");
+    let m3u = Path::new("/tmp/emuwiz-zip-rom-x/Game (Disk 1).m3u");
+    let mut argv: Vec<OsString> = ["-L", "/cores/puae_libretro.so"]
+        .iter()
+        .map(OsString::from)
+        .chain(std::iter::once(disk.as_os_str().to_owned()))
+        .collect();
+    super::swap_content_argument(&mut argv, disk, m3u).unwrap();
+    assert_eq!(argv.last().unwrap(), m3u.as_os_str());
+    assert!(!argv.iter().any(|a| a == disk.as_os_str()));
+
+    // Missing or duplicated content fails closed and leaves argv unchanged.
+    let mut missing: Vec<OsString> = vec!["-L".into(), "/cores/puae_libretro.so".into()];
+    let before = missing.clone();
+    assert!(super::swap_content_argument(&mut missing, disk, m3u).is_err());
+    assert_eq!(missing, before);
+    let mut twice: Vec<OsString> = vec![disk.as_os_str().to_owned(), disk.as_os_str().to_owned()];
+    let before = twice.clone();
+    assert!(super::swap_content_argument(&mut twice, disk, m3u).is_err());
+    assert_eq!(twice, before);
+}
