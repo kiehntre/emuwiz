@@ -798,11 +798,11 @@ mod tests {
     }
 
     /// Owner rule 7 (2026-11-09): formats EmuWiz explicitly does not start
-    /// from here stay unsupported even with a saved system choice. IPF is
-    /// still one; a hard-disk image no longer is (2026-11-11: it starts from
-    /// a private working copy), so it must not be refused as one.
+    /// from here stay unsupported even with a saved system choice. A
+    /// hard-disk image no longer is one (2026-11-11: it starts from a private
+    /// working copy), so it must not be refused as one.
     #[test]
-    fn amiga_ipf_stays_explicitly_unsupported_and_hard_disk_images_do_not() {
+    fn amiga_hard_disk_images_are_not_refused_up_front() {
         use crate::launch_readiness_page::{IdentityUnknownReason as R, LaunchReadinessInput as I};
         let dir = tempfile::tempdir().unwrap();
         for source in [
@@ -816,17 +816,27 @@ mod tests {
                 assert_ne!(reason, R::AmigaHardDisk, "{source:?}");
             }
         }
-        for (name, expected) in [("Game.ipf", R::AmigaIpf)] {
-            for source in [
-                Some("folder_alias"),
-                Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
-            ] {
-                let job = on_disk_from(&dir, name, "Amiga", source, &[0u8; 4096]);
-                match build_input(&env(), &job, &AtomicBool::new(false)) {
-                    Ok((I::IdentityUnknown(reason), _)) => assert_eq!(reason, expected, "{name}"),
-                    Ok((I::Plan { .. }, _)) => panic!("{name} {source:?} planned"),
-                    _ => panic!("{name} {source:?}: unexpected input"),
-                }
+    }
+
+    /// Since 2026-11-11 an IPF floppy starts when the CAPS/SPS plugin is
+    /// present (checked at launch), so it is not refused up front any more.
+    #[test]
+    fn amiga_ipf_images_are_not_refused_up_front() {
+        use crate::launch_readiness_page::{IdentityUnknownReason as R, LaunchReadinessInput as I};
+        let dir = tempfile::tempdir().unwrap();
+        let name = "Game.ipf";
+        for source in [
+            Some("folder_alias"),
+            Some(archivefs_core::MANUAL_PLATFORM_SOURCE),
+        ] {
+            let job = on_disk_from(&dir, name, "Amiga", source, &[0u8; 4096]);
+            if let Ok((I::IdentityUnknown(reason), _)) =
+                build_input(&env(), &job, &AtomicBool::new(false))
+            {
+                assert!(
+                    !matches!(reason, R::AmigaIpf),
+                    "{name} {source:?}: {reason:?}"
+                );
             }
         }
     }

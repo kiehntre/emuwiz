@@ -1413,12 +1413,14 @@ mod tests {
         ] {
             let path = write(&dir, name, &bytes);
             let offered = trial_systems(&path, None, &|_| true);
-            // IPF keeps Atari ST only: Amiga IPF is unsupported (rule 7).
-            assert!(
-                offered.len() > 1 || name.ends_with(".ipf"),
+            // IPF is offered as both Atari ST and Amiga: Amiga IPF plays
+            // through PUAE once its CAPS/SPS plugin check passes.
+            assert!(offered.len() > 1, "{name}: {offered:?}");
+            assert_eq!(
+                offered.contains(&"Amiga"),
+                name.ends_with(".ipf"),
                 "{name}: {offered:?}"
             );
-            assert!(!offered.contains(&"Amiga"), "{name}: {offered:?}");
             assert!(offered.contains(&expect), "{name}: {offered:?}");
             assert!(matches!(
                 resolve(&path, "", None, None, Some(expect), None),
@@ -1443,9 +1445,11 @@ mod tests {
     #[test]
     fn a_format_the_system_does_not_start_is_never_offered_for_a_try() {
         let dir = tempfile::tempdir().unwrap();
+        // IPF is startable since 2026-11-11 (the launch checks for the
+        // CAPS/SPS plugin), so it may be offered as Amiga too.
         let ipf = write(&dir, "5th Gear (Europe).ipf", &[0u8; 4096]);
         let offered = trial_systems(&ipf, None, &|_| true);
-        assert!(!offered.contains(&"Amiga"), "{offered:?}");
+        assert!(offered.contains(&"Amiga"), "{offered:?}");
         // A hard-disk image is startable since 2026-11-11 (it runs from a
         // private working copy), so it may be offered as Amiga.
         let hdf = write(&dir, "Game.hdf", &[0u8; 4096]);

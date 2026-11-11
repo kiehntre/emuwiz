@@ -1706,6 +1706,30 @@ impl ReadinessSources<'_> {
         if let Some(snapshot) = &shadps4_context {
             snapshot.apply(&mut plan, &content);
         }
+        // Dreamcast: an installed standalone Flycast is the automatic route;
+        // a RetroArch Flycast core needs an explicit emulator choice.
+        let flycast_reasons: Vec<(String, String)> = match &self.readiness.flycast_profiles {
+            FlycastProfilesState::Ready(ready) => ready
+                .discovery
+                .profiles
+                .iter()
+                .filter_map(|profile| {
+                    let reason = match &profile.blocker {
+                        Some(blocker) => blocker.clone(),
+                        None => {
+                            archivefs_core::patch_manager::resolve_flycast_native_launch_binding(
+                                profile,
+                            )
+                            .err()?
+                            .detail
+                        }
+                    };
+                    Some((profile.profile_id.clone(), reason))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        launch_readiness_page::flycast::prefer_standalone(&mut plan, &flycast_reasons);
         // Last: an explicit emulator choice only resolves what every check
         // above left usable, and never unblocks anything.
         archivefs_core::launch::launch_choice::apply(
@@ -1847,16 +1871,10 @@ pub(crate) fn identity_unknown_reason(
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     let archive = focused.is_some_and(is_archive_container);
-    if platform == IdentityPlatform::Amiga {
-        // A hard-disk image (`.hdf`, typically a WHDLoad pack) takes the
-        // ordinary unverified route: RetroArch's PUAE core boots it, started
-        // from EmuWiz's private working copy so the library file is never
-        // written (launch::amiga_hdf_working_copy). IPF still needs the
-        // CAPS/SPS plugin, which EmuWiz does not check for.
-        if extension == "ipf" {
-            return Reason::AmigaIpf;
-        }
-    }
+    // Amiga hard-disk images (`.hdf`, started from EmuWiz's private working
+    // copy: launch::amiga_hdf_working_copy) and IPF floppies (started when
+    // the CAPS/SPS plugin is present: launch::amiga_caps_plugin) both take
+    // the ordinary unverified route through RetroArch's PUAE core.
     // A known system with no IdentityPlatform (so no shared identity check and
     // no launch platform id) and no other identity route.
     if platform == IdentityPlatform::Other
@@ -2312,10 +2330,11 @@ mod identity_reason_tests {
     #[test]
     fn amiga_hdf_and_ipf_route_to_the_honest_amiga_reasons() {
         let amiga = IdentityPlatform::Amiga;
-        // A hard-disk image is no longer refused up front: it starts from a
-        // private working copy (owner directive 2026-11-11).
+        // Since 2026-11-11 neither is refused up front: a hard-disk image
+        // starts from a private working copy, an IPF when the CAPS/SPS plugin
+        // is present (checked at launch).
         assert_eq!(reason("/g/a.hdf", amiga, None), R::NotConfirmed);
-        assert_eq!(reason("/g/a.IPF", amiga, None), R::AmigaIpf);
+        assert_eq!(reason("/g/a.IPF", amiga, None), R::NotConfirmed);
         assert_ne!(
             reason("/g/a.hdf", IdentityPlatform::Other, Some("Amiga")),
             R::AmigaHardDisk
