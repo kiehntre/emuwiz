@@ -923,7 +923,6 @@ pub fn run_dat_audit_with_targets(
     // `known_hashes` and the reason stays visible in `archives` (completion and
     // member statuses); nothing claims the contents were member-verified.
     // `forcepacking="fileonly"` never opens members, so it has no pass to ask.
-    let mut report = report;
     let unaccounted = unaccounted_lha_paths(&archives);
     if !unaccounted.is_empty() {
         for entry in &mut report.entries {
