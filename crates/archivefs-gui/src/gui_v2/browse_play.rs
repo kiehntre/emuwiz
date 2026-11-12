@@ -931,7 +931,23 @@ impl App {
             self.browse_play_surprise_button(ui);
         });
         if let Some(platform) = chosen {
-            self.filter.select_platform(platform);
+            self.choose_system(platform);
+        }
+    }
+
+    /// Applies a system chip. A selected game the new system hides is
+    /// deselected, so the panel never shows (for example) an Acorn Electron
+    /// game while the list is filtered to Acorn Archimedes.
+    pub(super) fn choose_system(&mut self, platform: String) {
+        self.filter.select_platform(platform);
+        if let Route::BrowsePlayGame(id) = self.router.current
+            && !self.filter.platform.is_empty()
+            && self
+                .library
+                .game(id)
+                .is_none_or(|game| game.platform != self.filter.platform)
+        {
+            self.go(Route::BrowsePlay);
         }
     }
 

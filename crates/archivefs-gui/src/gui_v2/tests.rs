@@ -198,6 +198,26 @@ fn gui_v2_converter_is_a_native_workflow() {
 }
 
 #[test]
+fn browse_play_system_chip_deselects_a_game_the_new_system_hides() {
+    // Real session 2026-11-12: an Acorn Electron game stayed in the panel
+    // after the Acorn Archimedes chip was chosen.
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "Yie Ar Kung Fu 2", Some("Acorn Electron")),
+        archive(2, "Alerion", Some("Acorn Archimedes")),
+    ]));
+    app.router.current = Route::BrowsePlayGame(1);
+    app.choose_system("Acorn Electron".into());
+    assert_eq!(app.router.current, Route::BrowsePlayGame(1));
+    app.choose_system("Acorn Archimedes".into());
+    assert_eq!(app.router.current, Route::BrowsePlay);
+    app.router.current = Route::BrowsePlayGame(2);
+    app.choose_system(String::new());
+    assert_eq!(app.router.current, Route::BrowsePlayGame(2));
+}
+
+#[test]
 fn gui_v2_browse_play_reuses_filter_selection_and_canonical_destinations() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
