@@ -690,14 +690,20 @@ fn discover_executables(roots: &DuckStationProfileDiscoveryRoots) -> Vec<DuckSta
             // data root, like a native install.
             let portable =
                 is_appimage && portable_marker_beside(&KNOWN_DUCKSTATION, &path).is_some();
+            // A portable AppImage stays Portable even when the user chose it
+            // explicitly (Emulator Setup's "Use this installation" writes the
+            // executable override): its data root is still the folder beside
+            // it, and typing it Explicit made the portable launch binding
+            // refuse the very installation the user picked.
             DuckStationExecutable {
-                installation_type: if roots.explicit_executables.contains(&path) {
+                installation_type: if portable {
+                    DuckStationInstallationType::Portable
+                } else if roots.explicit_executables.contains(&path) {
                     DuckStationInstallationType::Explicit
-                } else if portable
-                    || roots
-                        .appimage_directory
-                        .as_ref()
-                        .is_some_and(|root| path.starts_with(root))
+                } else if roots
+                    .appimage_directory
+                    .as_ref()
+                    .is_some_and(|root| path.starts_with(root))
                 {
                     DuckStationInstallationType::Portable
                 } else {
@@ -2700,6 +2706,44 @@ mod tests {
         assert_eq!(
             blocker.kind,
             DuckStationLaunchBlockerKind::ExecutableMissing
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_user_chosen_portable_appimage_stays_portable_and_binds() {
+        // Emulator Setup's "Use this installation" records the executable as
+        // an explicit choice. A portable AppImage must still bind to its own
+        // folder; typing it Explicit made Launch refuse the user's choice.
+        let root = binding_fixture_root("chosen-portable");
+        let directory = root.join("home/Applications/DuckStation");
+        let executable = directory.join("DuckStation.AppImage");
+        make_native_executable(&executable);
+        fs::write(directory.join("portable.txt"), b"").unwrap();
+        fs::write(
+            directory.join("settings.ini"),
+            b"[Main]\nSetupWizardIncomplete = false\n",
+        )
+        .unwrap();
+        let mut roots = binding_roots(&root);
+        roots.portable_configuration_roots = vec![directory.clone()];
+        roots.explicit_executables = vec![executable.clone()];
+        let discovery = discover_duckstation_profiles(&roots);
+        let profile = discovery
+            .profiles
+            .iter()
+            .find(|profile| profile.configuration_path == directory)
+            .expect("portable profile is discovered");
+        assert!(profile.executable_candidates.iter().any(|candidate| {
+            candidate.path == executable
+                && candidate.installation_type == DuckStationInstallationType::Portable
+        }));
+        let binding = resolve_duckstation_native_launch_binding(profile, &roots)
+            .expect("the chosen portable AppImage binds");
+        assert_eq!(binding.executable, executable);
+        assert_eq!(
+            binding.user_directory_mode,
+            DuckStationUserDirectoryMode::PortableBesideExecutable
         );
         fs::remove_dir_all(root).unwrap();
     }

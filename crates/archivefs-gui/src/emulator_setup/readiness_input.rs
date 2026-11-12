@@ -1875,13 +1875,10 @@ pub(crate) fn identity_unknown_reason(
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     let archive = focused.is_some_and(is_archive_container);
-    // An Amiga hard-disk image (`.hdf`) is not started from here. An IPF
-    // floppy takes the ordinary unverified route through RetroArch's PUAE
-    // core; it starts only when the CAPS/SPS plugin is present, which the
-    // launch preflight checks (launch::amiga_caps_plugin).
-    if platform == IdentityPlatform::Amiga && extension == "hdf" {
-        return Reason::AmigaHardDisk;
-    }
+    // Amiga hard-disk images (`.hdf`, started from EmuWiz's private working
+    // copy: launch::amiga_hdf_working_copy) and IPF floppies (started when
+    // the CAPS/SPS plugin is present: launch::amiga_caps_plugin) both take
+    // the ordinary unverified route through RetroArch's PUAE core.
     // A known system with no IdentityPlatform (so no shared identity check and
     // no launch platform id) and no other identity route.
     if platform == IdentityPlatform::Other
@@ -2337,10 +2334,12 @@ mod identity_reason_tests {
     #[test]
     fn amiga_hdf_and_ipf_route_to_the_honest_amiga_reasons() {
         let amiga = IdentityPlatform::Amiga;
-        assert_eq!(reason("/g/a.hdf", amiga, None), R::AmigaHardDisk);
-        // IPF is startable since 2026-11-11 (the launch checks for CAPS/SPS).
+        // Since 2026-11-11 neither is refused up front: a hard-disk image
+        // starts from a private working copy, an IPF when the CAPS/SPS plugin
+        // is present (checked at launch).
+        assert_eq!(reason("/g/a.hdf", amiga, None), R::NotConfirmed);
         assert_eq!(reason("/g/a.IPF", amiga, None), R::NotConfirmed);
-        assert_eq!(
+        assert_ne!(
             reason("/g/a.hdf", IdentityPlatform::Other, Some("Amiga")),
             R::AmigaHardDisk
         );

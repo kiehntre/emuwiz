@@ -82,6 +82,7 @@ mod pad_mouse;
 mod pad_shell;
 mod suggest;
 pub(crate) use pad_shell::mark_secret;
+mod amiga_hdf_storage;
 mod pages;
 mod patch_composition;
 mod patch_package_preview;
@@ -496,6 +497,7 @@ pub(super) struct App {
     document_cache: Option<(i64, std::path::PathBuf, Vec<documents::GameDocument>)>,
     document_refresh: game_documents::DocumentRefresh,
     setup_portability: setup_portability::SetupPortabilityState,
+    amiga_hdf_storage: amiga_hdf_storage::AmigaHdfStorageState,
     update_check: update_check::UpdateCheckState,
     missing: missing_review::MissingReviewState,
     equiv: equivalent_duplicates::EquivalentState,
@@ -630,6 +632,7 @@ impl App {
             document_cache: None,
             document_refresh: Default::default(),
             setup_portability: setup_portability::SetupPortabilityState::default(),
+            amiga_hdf_storage: amiga_hdf_storage::AmigaHdfStorageState::default(),
             update_check: update_check::UpdateCheckState::default(),
             missing: Default::default(),
             equiv: Default::default(),

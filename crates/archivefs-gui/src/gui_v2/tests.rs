@@ -167,6 +167,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         document_index: None,
         document_issue: None,
         setup_portability: super::setup_portability::SetupPortabilityState::default(),
+        amiga_hdf_storage: super::amiga_hdf_storage::AmigaHdfStorageState::default(),
         update_check: super::update_check::UpdateCheckState::default(),
         missing: Default::default(),
         equiv: Default::default(),
@@ -6937,6 +6938,21 @@ fn gui_v2_setup_portability_is_visible_in_settings() {
         "Export setup",
         "Preview setup file",
         "Applying imports is not available yet",
+    ] {
+        scroll_to_text(&context, &mut app, [1280.0, 900.0], expected);
+    }
+}
+
+#[test]
+fn gui_v2_amiga_hdf_storage_is_visible_in_settings() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Settings);
+    // Rendering only reads the saved choice and free space; it writes nothing.
+    for expected in [
+        "Amiga hard-disk game copies",
+        "they are not a cache",
+        "Choose folder",
     ] {
         scroll_to_text(&context, &mut app, [1280.0, 900.0], expected);
     }

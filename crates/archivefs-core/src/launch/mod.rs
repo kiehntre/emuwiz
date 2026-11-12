@@ -69,6 +69,7 @@ pub mod amiberry_cd_profile;
 pub mod amiberry_command;
 pub mod amiberry_execution;
 pub mod amiga_caps_plugin;
+pub mod amiga_hdf_working_copy;
 pub mod amiga_whdload_command;
 pub mod amiga_whdload_execution;
 pub mod amiga_whdload_trainer_launch;
