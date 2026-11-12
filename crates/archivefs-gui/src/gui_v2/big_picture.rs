@@ -30,7 +30,10 @@ use gamepad::PadStatus;
 pub(super) use gamepad::Reader;
 #[cfg(test)]
 pub(super) use gamepad::{codes, decode_raw};
-use nav::{Command, Direction, Grid, Navigator, PadEvent, SEARCH_COLUMNS, SearchKey, search_keys};
+use nav::{
+    Button, Command, Control, Direction, Grid, Navigator, PadEvent, SEARCH_COLUMNS, SearchKey,
+    search_keys,
+};
 use std::sync::Arc;
 
 const MARGIN: f32 = 24.0;
@@ -53,6 +56,16 @@ const PAGE_TEXT_SCALE: f32 = 1.3;
 const RESUME_GRACE_SECS: f64 = 0.75;
 /// How long the first Back at the top level waits for a second.
 const LEAVE_CONFIRM_SECS: f64 = 4.0;
+/// Two controller X presses this close together on the same game are Play.
+const DOUBLE_X_SECS: f64 = 0.35;
+
+/// The first X of a possible double tap: where it was pressed, and when.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct XTap {
+    step: Step,
+    game: i64,
+    at: f64,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Step {
@@ -123,6 +136,8 @@ pub(super) struct BigPicture {
     play_refusal: Option<String>,
     notice: Option<Notice>,
     leave_armed_until: Option<f64>,
+    /// The last controller X, while a second one would still be a double tap.
+    x_tap: Option<XTap>,
     fullscreen: bool,
     /// The game Launch was opened for while an emulator is running.
     running: Option<Option<i64>>,
@@ -159,6 +174,7 @@ impl BigPicture {
             play_refusal: None,
             notice: None,
             leave_armed_until: None,
+            x_tap: None,
             fullscreen,
             running: None,
             resume_at: 0.0,
@@ -181,15 +197,63 @@ impl BigPicture {
         events
     }
 
-    /// `open`: whether controller input may act now.
-    fn pad_commands(&mut self, now: f64, open: bool) -> Vec<Command> {
-        let mut commands: Vec<Command> = self
-            .pad_events()
-            .into_iter()
-            .filter_map(|event| self.nav.feed(event, now, open))
-            .collect();
-        commands.extend(self.nav.tick(now, open));
+    /// `open`: whether controller input may act now. The flag marks a fresh
+    /// controller X press (the navigator already drops held repeats).
+    fn pad_commands(&mut self, now: f64, open: bool) -> Vec<(Command, bool)> {
+        let mut commands = Vec::new();
+        for event in self.pad_events() {
+            let x = matches!(
+                event,
+                PadEvent::Pressed {
+                    control: Control::Button(Button::West),
+                    ..
+                }
+            );
+            if let Some(command) = self.nav.feed(event, now, open) {
+                commands.push((command, x && command == Command::Search));
+            }
+        }
+        commands.extend(self.nav.tick(now, open).map(|command| (command, false)));
         commands
+    }
+
+    /// The game an X press is on: a focused tile, or the open game, with no
+    /// overlay over it. Anywhere else X is never the start of a double tap.
+    fn x_target(&self) -> Option<(Step, i64)> {
+        if self.overlay.is_some() {
+            return None;
+        }
+        match self.step {
+            Step::Browse => self.focused_position().and(self.focused),
+            Step::Game(id) => Some(id),
+            Step::Launch(_) => None,
+        }
+        .map(|game| (self.step, game))
+    }
+
+    /// #437: X on a game arms a double tap and does nothing else; a second X
+    /// on the same game in time is Start, so it reaches the same Play checks.
+    /// Any other command in between has already cleared the first tap. Off a
+    /// game (Search open, the Launch page) X keeps its old meaning.
+    fn x_press(&mut self, tap: Option<XTap>, command: Command, now: f64) -> Option<Command> {
+        let Some((step, game)) = self.x_target() else {
+            return Some(command);
+        };
+        if tap.is_some_and(|tap| {
+            tap.step == step && tap.game == game && now - tap.at <= DOUBLE_X_SECS
+        }) {
+            return Some(Command::Launch);
+        }
+        self.x_tap = Some(XTap {
+            step,
+            game,
+            at: now,
+        });
+        // Like any other input, it disarms a pending "Back again to leave".
+        if self.leave_armed_until.take().is_some() {
+            self.notice = None;
+        }
+        None
     }
 
     fn focused_position(&self) -> Option<usize> {
@@ -511,7 +575,10 @@ impl App {
             state.fullscreen = !state.fullscreen;
             context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(state.fullscreen));
         }
-        let mut commands = std::mem::take(&mut state.clicked);
+        let mut commands: Vec<(Command, bool)> = std::mem::take(&mut state.clicked)
+            .into_iter()
+            .map(|command| (command, false))
+            .collect();
         commands.extend(state.pad_commands(now, open));
         if focused {
             // Taken even when closed, so a key held while a game runs or in
@@ -520,7 +587,7 @@ impl App {
             // "launch in progress" guard refuses a second start.
             let keys = keyboard_commands(context, state.step, state.overlay.as_ref());
             if open {
-                commands.extend(keys);
+                commands.extend(keys.into_iter().map(|command| (command, false)));
             }
         }
         if state.nav.repeating() {
@@ -539,7 +606,18 @@ impl App {
         state.sync_list(&library, &indices);
         let route = self.router.current.clone();
         let mut next = Next::Stay;
-        for command in commands {
+        for (command, pad_x) in commands {
+            // Every command ends a pending double tap; only X can complete one.
+            let tap = state.x_tap.take();
+            let command = match command {
+                _ if pad_x => match state.x_press(tap, command, now) {
+                    Some(command) => command,
+                    None => continue,
+                },
+                // R3 is Search here, so X is free for the double tap.
+                Command::Pointer => Command::Search,
+                other => other,
+            };
             if self.big_picture_command(&mut state, context, command, now) == Next::Leave {
                 next = Next::Leave;
             }
@@ -1348,7 +1426,7 @@ fn big_picture_footer(ui: &mut egui::Ui, state: &mut BigPicture) {
             ("A / Enter  Select", Some(Command::Select)),
             ("Start / L  Launch", Some(Command::Launch)),
             ("B / Esc  Back", Some(Command::Back)),
-            ("X / S  Search", Some(Command::Search)),
+            ("R3 / S  Search", Some(Command::Search)),
             ("Y / F  System", Some(Command::Platforms)),
             ("LB RB / PgUp PgDn  Page", None),
             ("F11  Full screen", None),
@@ -1364,9 +1442,18 @@ fn big_picture_footer(ui: &mut egui::Ui, state: &mut BigPicture) {
             ("B / Esc  Back", Some(Command::Back)),
         ],
     };
+    // Only with a controller: the double tap is a controller shortcut.
+    let x_twice = state.pad_status.connected()
+        && state.x_target().is_some()
+        && (state.step == Step::Browse || state.actions.contains(&GameAction::Play));
+    let x_twice: &[(&str, Option<Command>)] = if x_twice {
+        &[("X twice  Play", None)]
+    } else {
+        &[]
+    };
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 28.0;
-        for (text, command) in legend {
+        for (text, command) in legend.iter().chain(x_twice) {
             let text = RichText::new(*text).size(19.0).color(blue::BODY_TEXT);
             let mut label = egui::Label::new(text).selectable(false);
             if command.is_some() {
@@ -1394,6 +1481,9 @@ impl BigPicture {
     }
     pub(super) fn focused_game(&self) -> Option<i64> {
         self.focused
+    }
+    pub(super) fn set_focus(&mut self, focus: usize) {
+        self.grid.focus = focus;
     }
     pub(super) fn columns(&self) -> usize {
         self.columns
