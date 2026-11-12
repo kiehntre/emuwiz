@@ -376,6 +376,32 @@ class SignedGate(R.Base):
         self.assertEqual(open(os.path.join(install, "emuwiz-cargo-maintain")).read(), "old\n")
         self.assertEqual(sorted(os.listdir(self.tmp)), before)
 
+    def test_installer_needs_exactly_one_signing_mode(self):
+        install = os.path.join(self.tmp, "installed")
+        os.makedirs(install)
+        tool = os.path.join(HERE, "emuwiz-cargo-stage-install")
+        for extra in ([], ["--selftest", "x", "--without-owner-signing"]):
+            r = subprocess.run([tool, "--source", HERE, "--install-dir", install, *extra], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, (extra, r.stderr))
+        self.assertEqual(os.listdir(install), [])
+
+    @unittest.skipIf(os.geteuid() == 0, "covers the unprivileged refusal")
+    def test_installer_without_owner_signing_still_refuses_non_root_and_changes_nothing(self):
+        install = os.path.join(self.tmp, "installed")
+        os.makedirs(install)
+        with open(os.path.join(install, "emuwiz-cargo-maintain"), "w") as handle:
+            handle.write("old\n")
+        before = sorted(os.listdir(self.tmp))
+        r = subprocess.run([os.path.join(HERE, "emuwiz-cargo-stage-install"), "--source", HERE,
+                            "--without-owner-signing", "--install-dir", install], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        if os.path.exists("/etc/emuwiz/cargo-retire-allowed-signers"):
+            self.assertIn("verify it with --selftest instead", r.stderr)
+        else:
+            self.assertIn("must run as root", r.stderr)
+        self.assertEqual(open(os.path.join(install, "emuwiz-cargo-maintain")).read(), "old\n")
+        self.assertEqual(sorted(os.listdir(self.tmp)), before)
+
     # ---- routine mode: no signature, only what every gate accepts
     def routine(self, path, digest, *extra, authority=lambda group: None):
         # emuwiz-cargo-maintain installs this in-process for its routine cycle; here a stub

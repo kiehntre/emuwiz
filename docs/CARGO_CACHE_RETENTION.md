@@ -156,9 +156,15 @@ If restoring fails, the cycle exits 70.
 It checks the anchor and the key lines, and verifies `FILE.sig`, which must be made with `-n emuwiz-cargo-retire-selftest@1` over a file starting `EMUWIZ OWNER SIGNING SELF-TEST`.
 A self-test signature can never authorise a retirement, because it uses a different namespace.
 
-**Installation.** `scripts/emuwiz-cargo-stage-install --source <repo>/scripts --selftest FILE` is run by the owner, as root, in an approved deployment.
-It refuses, leaving the installed version unchanged, when:
-- the signing check fails;
+**Installation.** `scripts/emuwiz-cargo-stage-install --source <repo>/scripts (--selftest FILE | --without-owner-signing) [--owner USER]` is run by the owner, as root, in an approved deployment.
+`--owner` defaults to `$SUDO_USER`.
+
+Routine maintenance and the worktree checks and removal need no signature. Before a signers file exists, install with `--without-owner-signing`.
+Owner-signed exceptional retirement then stays unavailable: the executor refuses it with `OWNER_SIGNERS_UNAVAILABLE`.
+Once the signers file is installed, re-install with `--selftest`; `--without-owner-signing` is refused from then on.
+
+The installer refuses, leaving the installed version unchanged, when:
+- with `--selftest`, the signing check fails (it checks the source copy as the owner);
 - a maintenance timer is enabled or active, or a maintenance service is running;
 - the staged copy fails `verify-install`.
 

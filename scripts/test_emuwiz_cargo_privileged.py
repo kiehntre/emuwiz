@@ -289,6 +289,46 @@ class SymlinksF1(Priv):
         self.assertEqual(sudo("cat", os.path.join(INSTALL, "protected", "secret")).stdout.strip(), "{}")
         sudo("rm", "-f", os.path.join(INSTALL, "protected", "secret"))
 
+    @unittest.skipIf(os.path.exists("/etc/emuwiz/cargo-retire-allowed-signers"),
+                     "a production signers file is installed: unsigned installation is refused by design")
+    def test_installer_without_owner_signing_installs_and_keeps_signed_retirement_unavailable(self):
+        """Routine maintenance and worktree removal need no signature: the tools install without
+        a signers file, and the installed executor still refuses an exceptional retirement."""
+        target_dir = os.path.join(INSTALL, "libexec-unsigned")
+        install_copy(target_dir)
+        r = sudo(os.path.join(HERE, "emuwiz-cargo-stage-install"), "--source", HERE, "--without-owner-signing",
+                 "--install-dir", target_dir, "--owner", ME, check=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("exceptional retirement: UNAVAILABLE", r.stdout)
+        listing = sudo("ls", INSTALL).stdout.split()
+        self.assertTrue(any(n.startswith("libexec-unsigned.rollback-") for n in listing), listing)
+        wt, t = self.managed_cache("unsigned-install")
+        path, digest = self.manifest([self.group(wt, t)])
+        r = self.root(os.path.join(target_dir, "emuwiz-cargo-retire"), "--manifest", path, "--approved-sha256", digest,
+                      "--execute", "--receipt-dir", self.receipts, "--json", *self.signed(path, digest),
+                      extra_env=("EMUWIZ_OWNER_SIGNERS=",))
+        out = json.loads(r.stdout)
+        self.assertEqual(out["refused"]["code"], "OWNER_SIGNERS_UNAVAILABLE", out)
+        self.assertTrue(self.artifacts_present(t))
+
+    @unittest.skipIf(os.path.exists("/etc/emuwiz/cargo-retire-allowed-signers"),
+                     "a production signers file is installed; this covers the not-installed state")
+    def test_installer_signed_preflight_runs_the_signing_check_as_root(self):
+        """As root the source copy (owner-owned) is checked as the owner: the refusal is the real
+        signing verdict, not the root untrusted-location refusal."""
+        target_dir = os.path.join(INSTALL, "libexec-signed")
+        install_copy(target_dir)
+        probe = os.path.join(self.tmp, "selftest.txt")
+        with open(probe, "wb") as handle:
+            handle.write(b"EMUWIZ OWNER SIGNING SELF-TEST\n")
+        os.chmod(self.tmp, 0o755)
+        r = sudo(os.path.join(HERE, "emuwiz-cargo-stage-install"), "--source", HERE, "--selftest", probe,
+                 "--install-dir", target_dir, "--owner", ME, check=False)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("owner-signature verification is missing, invalid or unusable", r.stderr)
+        self.assertNotIn("untrusted location", r.stderr)
+        self.assertFalse([n for n in sudo("ls", INSTALL).stdout.split() if n.startswith("libexec-signed.")])
+
     def test_manual_executor_lock_symlink(self):
         wt, t = self.managed_cache("man-lock")
         lock = self.lock_path(t)
