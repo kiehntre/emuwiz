@@ -7598,19 +7598,17 @@ fn detect_platform_from_folder_alias_with_match(
     let mut components: Vec<_> = relative.components().collect();
     components.pop(); // the archive's own filename never counts as a folder.
 
-    components
+    // One folder-choice rule for scans and the detection report.
+    let mut folders: Vec<String> = components
         .iter()
         .rev()
-        .find_map(|component| {
-            let matched_folder = component.as_os_str().to_string_lossy();
-            folder_platform_alias(&matched_folder)
-                .map(|platform| (platform, matched_folder.into_owned()))
-        })
-        .or_else(|| {
-            let matched_folder = source_root.file_name()?.to_string_lossy();
-            folder_platform_alias(&matched_folder)
-                .map(|platform| (platform, matched_folder.into_owned()))
-        })
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if let Some(root) = source_root.file_name() {
+        folders.push(root.to_string_lossy().into_owned());
+    }
+    platform::detect::nearest_platform_folder(&folders)
+        .map(|(platform, folder)| (platform.id, folder))
 }
 
 /// Normalizes one path segment for alias matching. Delegates to the registry
@@ -13701,6 +13699,43 @@ mod tests {
                 "{expected:?} must appear exactly once in canonical_platform_names"
             );
         }
+    }
+
+    /// Real library 2026-11-12: `pc-8800-series/Enterprise (MIA)/Enterprise
+    /// [CT].7z` was filed as the Enterprise 64/128 computer.
+    #[test]
+    fn a_title_folder_never_outranks_the_enclosing_platform_folder() {
+        let root = "/library/games";
+        assert_eq!(
+            detect_platform(
+                format!("{root}/pc-8800-series/Enterprise (MIA)/Enterprise [CT].7z"),
+                root
+            ),
+            Some("NEC PC-8801".to_string())
+        );
+        let report = crate::platform::detect::detect_platform_report(
+            &crate::platform::detect::DetectionRequest::new(
+                Path::new(&format!(
+                    "{root}/pc-8800-series/Enterprise (MIA)/Enterprise [CT].7z"
+                )),
+                Path::new(root),
+            ),
+        );
+        assert_eq!(report.platform, Some("NEC PC-8801"));
+        // Unchanged: an exact platform folder still wins when nearest, and a
+        // suffixed platform folder with nothing above it still counts.
+        assert_eq!(
+            detect_platform(format!("{root}/pc-8800-series/enterprise/Game.7z"), root),
+            Some("Enterprise".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Enterprise (2024)/Game.7z"), root),
+            Some("Enterprise".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/NEC PC-8801 (TOSEC)/Game.d88"), root),
+            Some("NEC PC-8801".to_string())
+        );
     }
 
     #[test]
