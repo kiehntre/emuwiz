@@ -807,8 +807,13 @@ impl App {
         // unreadable folders is "Needs attention",
         // never a plain success (Night Watch S06-06).
         let loaded = format!(
-            "{} games available to browse. Original game files were not changed.",
-            library.games.len()
+            "{} games available to browse. Original game files were not changed.{}",
+            library.games.len(),
+            library
+                .scan_note
+                .as_deref()
+                .map(|note| format!(" {note}"))
+                .unwrap_or_default()
         );
         match &library.scan_warning {
             Some(warning) => {

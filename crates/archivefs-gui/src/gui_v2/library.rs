@@ -297,6 +297,8 @@ pub(super) struct Library {
     pub sources: usize,
     pub load_ms: u128,
     pub scan_warning: Option<String>,
+    /// Informational scan detail (archive mounts read), not a warning.
+    pub scan_note: Option<String>,
     /// Superseded rows, preserved for provenance and Advanced details.
     pub historical: Vec<Game>,
     pub historical_links: HashMap<i64, HistoricalLink>,

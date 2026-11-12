@@ -71,6 +71,8 @@ pub use discovery_import::{
     DiscoveryImportUndoPreview, DiscoveryImportUndoResult,
 };
 mod catalogue_health;
+mod nested_scan;
+pub use nested_scan::{NestedMountOutcome, NestedMountState};
 mod cue_revalidation;
 pub(crate) mod organisation_paths;
 pub use cue_revalidation::{CueDiscCatalogue, CueDiscRevalidation};
@@ -3381,7 +3383,7 @@ pub struct ScummVmScanReport {
 }
 
 /// The outcome of one [`scan_and_persist`] call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanPersistSummary {
     pub scummvm: ScummVmScanReport,
     pub scan_run_id: i64,
@@ -3435,6 +3437,10 @@ pub struct ScanPersistSummary {
     pub ingestion_recognised_sample: Vec<crate::ingestion::GameDiscovery>,
     /// Role-aware arcade aggregation and support-material diagnostics.
     pub arcade_ingestion: crate::ingestion::ArcadeIngestionDiagnostics,
+    /// One entry per nested mount met (or remembered) inside a scanned
+    /// source: whether its games were indexed and whether missing games
+    /// were reconciled there this run, with the reason when not.
+    pub nested_mounts: Vec<NestedMountOutcome>,
 }
 
 impl ScanPersistSummary {
@@ -6647,8 +6653,13 @@ impl Database {
                 "source changed while opening missing authority".into(),
             ));
         }
+        // A remembered nested mount the coverage proof did not exclude must
+        // still be proven; one it excluded keeps its rows untouched.
         let unproven = self.unproven_nested_boundaries(source_folder_id, &source_guard)?;
-        if let Some((path, reason)) = unproven.first() {
+        if let Some((path, reason)) = unproven
+            .iter()
+            .find(|(path, _)| !coverage.excluded_roots.iter().any(|r| path.starts_with(r)))
+        {
             return Err(ArchiveFsError::Database(format!(
                 "nested filesystem boundary {} is not proven continuous ({reason}); missing reconciliation withheld",
                 path.display()
@@ -6664,7 +6675,20 @@ impl Database {
             })
             .map(|s| s.root.clone())
             .collect();
-        let mut recorded = coverage.excluded_roots.clone();
+        let areas = catalogue_health::missing_areas(
+            &self.connection,
+            source_folder_id,
+            &source_guard,
+            &coverage.excluded_roots,
+        )?;
+        // Nested mounts may be excluded too; every other exclusion must be
+        // exactly the configured child sources.
+        let mut recorded: Vec<_> = coverage
+            .excluded_roots
+            .iter()
+            .filter(|root| !areas.boundaries.contains(root))
+            .cloned()
+            .collect();
         delegated.sort();
         recorded.sort();
         if delegated != recorded {
@@ -6725,8 +6749,12 @@ impl Database {
                 {
                     return None;
                 }
-                let probe = source_guard
-                    .probe(&path, crate::archive_kind_is_directory_item(&kind))
+                let probe = areas
+                    .probe(
+                        &source_guard,
+                        &path,
+                        crate::archive_kind_is_directory_item(&kind),
+                    )
                     .probe;
                 if matches!(
                     probe,
@@ -6753,7 +6781,7 @@ impl Database {
                 "owned candidate could not be probed; missing reconciliation withheld".into(),
             ));
         }
-        if !source_guard.current() {
+        if !source_guard.current() || !areas.current(&source_guard) {
             return Err(ArchiveFsError::Database(
                 "source changed while probing missing candidates".into(),
             ));
@@ -6777,7 +6805,8 @@ impl Database {
                 source_folder_id,
                 &source_guard,
             )?
-            .first()
+            .iter()
+            .find(|(path, _)| !coverage.excluded_roots.iter().any(|r| path.starts_with(r)))
             {
                 return Err(ArchiveFsError::Database(format!(
                     "nested filesystem boundary {} is not proven continuous ({reason}); no missing evidence written",
@@ -6787,6 +6816,13 @@ impl Database {
             Ok(())
         };
         ensure_boundaries_hold(&tx)?;
+        // Nested mounts re-proven under the writer reservation.
+        let areas = catalogue_health::missing_areas(
+            &tx,
+            source_folder_id,
+            &source_guard,
+            &coverage.excluded_roots,
+        )?;
         // Re-checked inside the write transaction, not just before it.
         catalogue_health::assert_missing_authority(
             &tx,
@@ -6798,8 +6834,12 @@ impl Database {
         for archive_id in &missing {
             let (bytes,kind):(Vec<u8>,String)=tx.query_row("SELECT absolute_path_cached,archive_kind FROM archives WHERE id=?1 AND source_folder_id=?2",params![archive_id,source_folder_id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|db_error("revalidate missing row",e))?;
             let path = PathBuf::from(OsString::from_vec(bytes));
-            if source_guard
-                .probe(&path, crate::archive_kind_is_directory_item(&kind))
+            if areas
+                .probe(
+                    &source_guard,
+                    &path,
+                    crate::archive_kind_is_directory_item(&kind),
+                )
                 .probe
                 != crate::emulator_environment::FsProbe::Missing
             {
@@ -6827,8 +6867,12 @@ impl Database {
         }
         for (archive_id, path, kind) in &unseen_headers {
             if !matches!(
-                source_guard
-                    .probe(path, crate::archive_kind_is_directory_item(kind))
+                areas
+                    .probe(
+                        &source_guard,
+                        path,
+                        crate::archive_kind_is_directory_item(kind)
+                    )
                     .probe,
                 crate::emulator_environment::FsProbe::PresentFile
                     | crate::emulator_environment::FsProbe::PresentDirectory
@@ -6846,7 +6890,7 @@ impl Database {
             )
             .map_err(|error| db_error("failed to retire unseen header platform", error))?;
         }
-        if !source_guard.current() {
+        if !source_guard.current() || !areas.current(&source_guard) {
             return Err(ArchiveFsError::Database(
                 "source changed before missing commit".into(),
             ));
@@ -9588,6 +9632,7 @@ fn scan_and_persist_folders_transaction(
     let mut folder_errors = Vec::new();
     let mut platform_assignment_warnings = Vec::new();
     let mut preservation_fingerprint_warnings = Vec::new();
+    let mut nested_mounts = Vec::new();
     let mut scummvm_report = ScummVmScanReport::default();
     let mut skipped_files: Vec<crate::SkippedFile> = Vec::new();
     let mut ingestion_stats = crate::ingestion::DiscoveryStats::default();
@@ -9696,8 +9741,17 @@ fn scan_and_persist_folders_transaction(
             // the other systems sharing a mixed source root.
             excluded_roots.extend(sets.sets.iter().map(|set| set.path.clone()));
         }
+        // Remembered nested mounts: which are the same trusted mount as last
+        // time (only those may reuse cached observations).
+        let area_plans = match crate::catalogue_health::BoundRoot::open(&folder.path)
+            .filter(|root| Some(root.identity) == covered.root_identity)
+        {
+            Some(root) => nested_scan::plan_areas(database, folder.id, &root)?,
+            None => Vec::new(),
+        };
         let discovery_started = std::time::Instant::now();
         let discovery = match ArchiveScanner::new(&folder_config)
+            .with_trusted_nested_areas(nested_scan::trusted_paths(&area_plans))
             .scan_archives_with_cache_excluding(&fingerprint_refs, &excluded_roots)
         {
             Ok(discovery) => discovery,
@@ -9722,47 +9776,48 @@ fn scan_and_persist_folders_transaction(
                 continue;
             }
         };
-        // A nested filesystem seen on an earlier scan that has vanished or been
-        // replaced makes everything beneath it unprovable, not deleted.
-        let mut boundary_diagnostic = None;
+        #[cfg(test)]
+        nested_scan::test_hook::run();
+        // Every nested mount is its own ownership boundary, settled against
+        // the live filesystem: indexed through its own pinned root when it is
+        // still the mount discovery read, reconciled only when it is also the
+        // same trusted mount as last time. Anything else is excluded from
+        // Missing, so its existing entries are kept exactly as they were.
+        let mut settled_areas = nested_scan::SettledAreas::default();
         if let Some(root) = crate::catalogue_health::BoundRoot::open(&folder.path)
             && Some(root.identity) == covered.root_identity
         {
-            let mut unproven = database.unproven_nested_boundaries(folder.id, &root)?;
-            unproven.extend(database.record_nested_boundaries(
+            database.record_nested_boundaries(folder.id, &root, &discovery.nested_boundaries)?;
+            settled_areas = nested_scan::settle_areas(
+                database,
                 folder.id,
                 &root,
-                &discovery.nested_boundaries,
-            )?);
-            unproven.sort();
-            unproven.dedup_by(|a, b| a.0 == b.0);
-            if !unproven.is_empty() {
-                boundary_diagnostic = Some(
-                    unproven
-                        .iter()
-                        .map(|(path, reason)| {
-                            format!("nested filesystem boundary {} ({reason})", path.display())
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; "),
+                &area_plans,
+                &discovery.nested_areas,
+            )?;
+        } else {
+            for area in &discovery.nested_areas {
+                settled_areas.dropped.push(area.path.clone());
+                settled_areas.excluded.push(area.path.clone());
+            }
+        }
+        for outcome in &settled_areas.outcomes {
+            if !outcome.state.reconciled() {
+                log::warn!(
+                    "nested mount {} {:?}: {}; its existing entries are not reconciled this scan",
+                    outcome.path.display(),
+                    outcome.state,
+                    outcome.detail.as_deref().unwrap_or("")
                 );
             }
         }
-        if let Some(detail) = &boundary_diagnostic {
-            log::warn!(
-                "{detail}; catalogue evidence preserved and missing reconciliation withheld"
-            );
-            counts.errors_count += 1;
-            folder_errors.push((
-                folder.path.clone(),
-                format!(
-                    "{detail} is not proven continuous; catalogue evidence preserved and missing reconciliation withheld"
-                ),
-            ));
-            covered.diagnostic = Some(detail.clone());
-        }
-        let discovery_complete =
-            discovery.is_complete() && arcade_complete && boundary_diagnostic.is_none();
+        nested_mounts.extend(settled_areas.outcomes.iter().cloned());
+        covered
+            .excluded_roots
+            .extend(settled_areas.excluded.iter().cloned());
+        covered.excluded_roots.sort();
+        covered.excluded_roots.dedup();
+        let discovery_complete = discovery.is_complete() && arcade_complete;
         covered.state = if discovery_complete {
             ScanCoverageState::Complete
         } else {
@@ -9931,6 +9986,8 @@ fn scan_and_persist_folders_transaction(
             }
         }
         let mut archives = discovery.archives;
+        archives.retain(|archive| !settled_areas.is_dropped(&archive.path));
+        ingestion_evidence.retain(|evidence| !settled_areas.is_dropped(&evidence.path));
         if let Some(Ok(arcade_sets)) = arcade_sets {
             arcade_ingestion.merge(&arcade_sets.diagnostics);
             for set in arcade_sets.sets {
@@ -10060,7 +10117,10 @@ fn scan_and_persist_folders_transaction(
         }
         archives.sort_by(|left, right| left.path.cmp(&right.path));
         archives.dedup_by(|left, right| left.path == right.path);
-        let non_archive_fingerprints = discovery.non_archive_fingerprints;
+        let mut non_archive_fingerprints = discovery.non_archive_fingerprints;
+        non_archive_fingerprints.retain(|fingerprint| {
+            !settled_areas.is_dropped(&folder.path.join(&fingerprint.relative_path))
+        });
         // An inspection the detector reports as incomplete keeps whatever
         // the row already says, is shown as needing a retry, and keeps no
         // fingerprint, so the next scan looks at the file again.
@@ -10104,24 +10164,49 @@ fn scan_and_persist_folders_transaction(
         }
         database.record_scan_coverage(scan_run_id, covered)?;
         database.begin_folder_refresh()?;
+        let identities_recorded = match crate::catalogue_health::BoundRoot::open(&folder.path)
+            .filter(|root| Some(root.identity) == covered.root_identity)
+        {
+            Some(root) => {
+                nested_scan::record_identities(database, folder.id, &root, &settled_areas)
+            }
+            None => Err(ArchiveFsError::Database(
+                "source changed before nested mount identities were saved".into(),
+            )),
+        };
         let db_write_started = std::time::Instant::now();
         let persist_complete = discovery_complete && !scummvm_incomplete;
         let fully_reused = !arcade_specialist
             && persist_complete
             && discovery.timings.re_inspected == 0
             && non_archive_fingerprints.is_empty();
-        let persisted = if fully_reused {
-            database
+        let persisted = match identities_recorded {
+            Err(error) => Err(error),
+            Ok(()) if fully_reused => database
                 .reconcile_fully_reused_source(scan_run_id, folder, &archives)?
                 .map(Ok)
                 .unwrap_or_else(|| {
-                    persist_one_folder(database, scan_run_id, folder, &archives, persist_complete)
-                })
-        } else {
-            persist_one_folder(database, scan_run_id, folder, &archives, persist_complete)
+                    persist_one_folder(
+                        database,
+                        scan_run_id,
+                        folder,
+                        &archives,
+                        persist_complete,
+                        &settled_areas,
+                    )
+                }),
+            Ok(()) => persist_one_folder(
+                database,
+                scan_run_id,
+                folder,
+                &archives,
+                persist_complete,
+                &settled_areas,
+            ),
         };
         let persisted = persisted.and_then(|result| {
             if crate::catalogue_health::source_root_identity(&folder.path) != covered.root_identity
+                || !settled_areas.owners_current()
                 || !database.source_binding_current(folder.id, &folder.path)?
             {
                 Err(ArchiveFsError::Database(
@@ -10289,6 +10374,7 @@ fn scan_and_persist_folders_transaction(
         ingestion_skipped,
         ingestion_recognised_sample,
         arcade_ingestion,
+        nested_mounts,
     })
 }
 
@@ -10367,19 +10453,28 @@ fn persist_one_folder(
     folder: &RegisteredSourceFolder,
     archives: &[Archive],
     complete: bool,
+    areas: &nested_scan::SettledAreas,
 ) -> Result<ScanRunCounts> {
     let mut counts = ScanRunCounts::default();
     let mut seen_archive_ids = Vec::with_capacity(archives.len());
 
     let identity = crate::catalogue_health::source_root_identity(&folder.path);
     for archive in archives {
+        // Inside a nested mount, ownership is proven from that mount's own
+        // pinned root (still no crossing of any further mount); elsewhere
+        // from the source root. A game in an unsaved mount never gets here.
+        let (owner_root, owner_identity) = match areas.owner_of(&archive.path) {
+            Some((root, identity)) => (root.as_path(), Some(*identity)),
+            None => (folder.path.as_path(), identity),
+        };
         if folder
             .excluded_source_roots
             .iter()
             .any(|root| archive.path.starts_with(root))
+            || areas.is_dropped(&archive.path)
             || !crate::catalogue_health::observe_owned(
-                &folder.path,
-                identity,
+                owner_root,
+                owner_identity,
                 &archive.path,
                 matches!(
                     archive.kind,
@@ -10392,7 +10487,12 @@ fn persist_one_folder(
                 "positive observation outside safe source ownership".into(),
             ));
         }
-        revalidate_archive_for_catalogue(archive)?;
+        crate::revalidate_archive_within(
+            archive,
+            areas
+                .owner_of(&archive.path)
+                .map(|(root, identity)| (root.as_path(), *identity)),
+        )?;
         let outcome = database.upsert_archive(folder.id, &folder.path, archive)?;
         let incomplete = !archive.identity.inspection_problems.is_empty();
         database.set_inspection_retry_mark(outcome.archive_id, incomplete)?;
@@ -12986,76 +13086,6 @@ mod tests {
             summary.platform_assignment_warnings[0]
                 .1
                 .contains("remains visible")
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// Regression (2026-11-12): five ratarmount FUSE mounts inside the one
-    /// configured source made discovery list their files, persistence refuse
-    /// them (EXDEV), and the whole source fail with "positive observation
-    /// outside safe source ownership", so no scan had saved since October.
-    #[test]
-    fn nested_mount_is_skipped_and_the_rest_of_the_source_still_refreshes() {
-        let root = temp_dir("nested-mount-partial-scan");
-        let source = root.join("games");
-        let mount = root.join("mount");
-        write_archive_file(&source, "top.zip", b"top");
-        let gone = write_archive_file(&source, "gone.zip", b"gone");
-        write_archive_file(&source, "gba/ratarmount/inner.zip", b"inner");
-        let config = config_for(&source, &mount);
-        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
-        let first = scan_and_persist(&mut database, &config, "before-mount").unwrap();
-        assert!(first.folder_errors.is_empty(), "{:?}", first.folder_errors);
-        assert_eq!(database.load_archives().unwrap().len(), 3);
-
-        // The subtree becomes its own filesystem; one file leaves the
-        // source and one arrives.
-        let nested = source.join("gba/ratarmount");
-        crate::catalogue_health::test_mounts::simulate(&nested);
-        fs::remove_file(&gone).unwrap();
-        write_archive_file(&source, "new.zip", b"new");
-
-        let summary = scan_and_persist(&mut database, &config, "with-mount").unwrap();
-        assert_eq!(summary.counts.source_folders_scanned, 1);
-        assert_eq!(summary.counts.archives_added, 1, "new.zip was catalogued");
-        assert!(
-            summary
-                .folder_errors
-                .iter()
-                .any(|(_, message)| message.contains("separate filesystem")
-                    && message.contains("ratarmount")),
-            "skipped subtree reported: {:?}",
-            summary.folder_errors
-        );
-        assert!(
-            !summary
-                .folder_errors
-                .iter()
-                .any(|(_, message)| message.contains("outside safe source ownership")),
-            "{:?}",
-            summary.folder_errors
-        );
-        let archives = database.load_archives().unwrap();
-        let row = |name: &str| {
-            archives
-                .iter()
-                .find(|archive| archive.relative_path.ends_with(name))
-                .unwrap_or_else(|| panic!("{name} row kept"))
-        };
-        assert!(row("new.zip").last_verified_missing_at.is_none());
-        assert!(row("top.zip").last_verified_missing_at.is_none());
-        // Partial coverage: nothing is called missing, neither beneath the
-        // unscanned mount nor elsewhere in the source.
-        assert!(row("inner.zip").last_verified_missing_at.is_none());
-        assert!(row("gone.zip").last_verified_missing_at.is_none());
-        let status = database.list_source_folders().unwrap()[0].clone();
-        assert!(
-            status
-                .last_scan_error
-                .as_deref()
-                .is_some_and(|error| error.contains("separate filesystem")),
-            "{:?}",
-            status.last_scan_error
         );
         let _ = fs::remove_dir_all(&root);
     }

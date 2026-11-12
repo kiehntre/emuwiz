@@ -197,6 +197,13 @@ fn mount_of(file: &File) -> io::Result<MountObservation> {
     )
 }
 
+/// `fstatfs` filesystem type of a directory reached by pathname without
+/// following any symlink. Discovery uses it only to decide whether to walk a
+/// nested mount; persistence re-verifies through a pinned root.
+pub(crate) fn directory_filesystem_type(path: &Path) -> io::Result<i64> {
+    binding(&open(libc::AT_FDCWD, path, false, false)?).map(|binding| binding.filesystem_type)
+}
+
 /// Mount identity of a directory by pathname (no final symlink follow).
 pub(crate) fn directory_mount(path: &Path) -> io::Result<MountObservation> {
     let name =
@@ -353,6 +360,23 @@ impl BoundRoot {
     }
     pub(crate) fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
         self.target(path, false)?.metadata()
+    }
+    /// Names in one directory beneath this root. The directory itself is
+    /// resolved with the owned rules (beneath, no symlinks, no mount
+    /// crossing) and listed through that descriptor, never by pathname.
+    pub(crate) fn list_dir(&self, path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+        let directory = self.target(path, true)?;
+        if !directory.metadata()?.is_dir() {
+            return Err(io::ErrorKind::NotADirectory.into());
+        }
+        let mut names = std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()?;
+        if !self.current() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        names.sort();
+        Ok(names)
     }
     pub(crate) fn read_file(&self, path: &Path, expected: &PathObservation) -> Option<File> {
         let file = self.target(path, true).ok()?;

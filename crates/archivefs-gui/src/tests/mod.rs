@@ -1570,6 +1570,7 @@ fn skipped_files_summary(
         ingestion_skip_reasons: Default::default(),
         ingestion_platform_counts: Default::default(),
         arcade_ingestion: Default::default(),
+        nested_mounts: Vec::new(),
         ingestion_skipped: Vec::new(),
         ingestion_recognised_sample: Vec::new(),
     }
