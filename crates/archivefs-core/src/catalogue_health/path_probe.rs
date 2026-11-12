@@ -197,6 +197,27 @@ fn mount_of(file: &File) -> io::Result<MountObservation> {
     )
 }
 
+/// Whether this kernel reports mount IDs that are never reused
+/// (`STATX_MNT_ID_UNIQUE`, Linux 6.8+). Older IDs can be reused after an
+/// unmount, so they cannot tell one mount instance from the next.
+pub(crate) fn mount_ids_are_unique() -> bool {
+    static UNIQUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNIQUE.get_or_init(|| {
+        let mut out = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        // SAFETY: static NUL-terminated path and writable statx storage.
+        let rc = unsafe {
+            libc::statx(
+                libc::AT_FDCWD,
+                c"/".as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+                STATX_MNT_ID_UNIQUE,
+                out.as_mut_ptr(),
+            )
+        };
+        rc == 0 && unsafe { out.assume_init() }.stx_mask & STATX_MNT_ID_UNIQUE != 0
+    })
+}
+
 /// `fstatfs` filesystem type of a directory reached by pathname without
 /// following any symlink. Discovery uses it only to decide whether to walk a
 /// nested mount; persistence re-verifies through a pinned root.
@@ -357,6 +378,10 @@ impl BoundRoot {
     }
     pub(crate) fn root_path(&self) -> &Path {
         &self.path
+    }
+    /// Kernel mount ID of the pinned root descriptor itself.
+    pub(crate) fn mount_id(&self) -> io::Result<u64> {
+        mount_of(&self.file).map(|mount| mount.mount_id)
     }
     pub(crate) fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
         self.target(path, false)?.metadata()

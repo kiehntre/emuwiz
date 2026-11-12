@@ -17,7 +17,9 @@ pub(crate) use nested_area::is_supported_area_filesystem;
 pub(crate) use nested_area::{LiveArea, NestedBoundaryRecord, open_area, stable_identity};
 #[cfg(test)]
 pub(crate) use path_probe::test_mounts;
-pub(crate) use path_probe::{BoundRoot, NestedState, directory_filesystem_type, directory_mount};
+pub(crate) use path_probe::{
+    BoundRoot, NestedState, directory_filesystem_type, directory_mount, mount_ids_are_unique,
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

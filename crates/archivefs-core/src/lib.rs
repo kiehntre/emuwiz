@@ -7107,16 +7107,20 @@ pub fn scan_archives(config: &Config) -> Result<Vec<Archive>> {
     ArchiveScanner::new(config).scan_archives()
 }
 
+/// Source-root-only revalidation; production resolves through
+/// [`revalidate_archive_within`] so nested mounts use their own root.
+#[cfg(test)]
 pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> {
     revalidate_archive_within(archive, None)
 }
 
-/// As [`revalidate_archive_for_catalogue`], resolving the archive from the
-/// pinned root of the nested mount that owns it (`area`: its path and
-/// device/inode) when it lies inside one. The source root is still checked.
+/// Revalidates an archive before it is saved, resolving the archive from the
+/// pinned root of the nested mount that owns it (`area`: its path,
+/// device/inode and unique mount ID) when it lies inside one. The source
+/// root is still checked.
 pub(crate) fn revalidate_archive_within(
     archive: &Archive,
-    area: Option<(&Path, (u64, u64))>,
+    area: Option<(&Path, (u64, u64), u64)>,
 ) -> Result<()> {
     let source_identity = validate_source_root(&archive.identity.source_root)?;
     if archive.identity.source_filesystem_device != Some(source_identity.device)
@@ -7135,15 +7139,20 @@ pub(crate) fn revalidate_archive_within(
     }
     // One descriptor-relative resolution (no symlinks, beneath, no xdev): a
     // component swapped after the scan cannot redirect to outside content.
-    let (owner, owner_identity) = match area {
-        Some((path, identity)) if archive.path.starts_with(path) => (path, identity),
+    let (owner, owner_identity, owner_mount) = match area {
+        Some((path, identity, mount_id)) if archive.path.starts_with(path) => {
+            (path, identity, Some(mount_id))
+        }
         _ => (
             archive.identity.source_root.as_path(),
             (source_identity.device, source_identity.inode),
+            None,
         ),
     };
     let root = catalogue_health::BoundRoot::open(owner)
         .filter(|root| root.identity == owner_identity)
+        // Inside a nested mount: the very instance settlement proved.
+        .filter(|root| owner_mount.is_none_or(|expected| root.mount_id().ok() == Some(expected)))
         .ok_or_else(|| {
             ArchiveFsError::Scanner(format!(
                 "source root changed after scan: {}",

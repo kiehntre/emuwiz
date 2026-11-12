@@ -92,27 +92,44 @@ pub(super) struct SettledAreas {
     /// Areas whose discovered games must not be saved (not this mount).
     pub(super) dropped: Vec<PathBuf>,
     /// Pinned roots every saved game beneath an area must be resolved from.
-    pub(super) owners: Vec<(PathBuf, (u64, u64))>,
+    pub(super) owners: Vec<AreaOwner>,
     records: Vec<(PathBuf, NestedBoundaryRecord)>,
 }
 
 impl SettledAreas {
     /// The pinned area owning `path`, if any (innermost wins).
-    pub(super) fn owner_of(&self, path: &Path) -> Option<&(PathBuf, (u64, u64))> {
+    pub(super) fn owner_of(&self, path: &Path) -> Option<&AreaOwner> {
         self.owners
             .iter()
-            .filter(|(root, _)| path.starts_with(root))
-            .max_by_key(|(root, _)| root.as_os_str().len())
+            .filter(|owner| path.starts_with(&owner.root))
+            .max_by_key(|owner| owner.root.as_os_str().len())
     }
 
     pub(super) fn is_dropped(&self, path: &Path) -> bool {
         self.dropped.iter().any(|root| path.starts_with(root))
     }
 
-    /// Every owning area is still the exact mount it was when settled.
+    /// Every owning area is still the exact mount instance it was when
+    /// settled.
     pub(super) fn owners_current(&self) -> bool {
-        self.owners.iter().all(|(root, identity)| {
-            crate::catalogue_health::source_root_identity(root) == Some(*identity)
+        self.owners.iter().all(AreaOwner::is_current)
+    }
+}
+
+/// One settled area's root. Device and inode alone cannot tell two FUSE
+/// mount instances apart (device numbers are reused; the root inode is
+/// always the same), so the instance is pinned by its unique mount ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AreaOwner {
+    pub(super) root: PathBuf,
+    pub(super) identity: (u64, u64),
+    pub(super) mount_id: u64,
+}
+
+impl AreaOwner {
+    pub(super) fn is_current(&self) -> bool {
+        BoundRoot::open(&self.root).is_some_and(|root| {
+            root.identity == self.identity && root.mount_id().ok() == Some(self.mount_id)
         })
     }
 }
@@ -250,10 +267,11 @@ pub(super) fn settle_areas(
         };
         outcome_of[index] = Some(state);
         if let Some(live) = &live {
-            settled.owners.push((
-                area.path.clone(),
-                (live.binding().device, live.binding().inode),
-            ));
+            settled.owners.push(AreaOwner {
+                root: area.path.clone(),
+                identity: (live.binding().device, live.binding().inode),
+                mount_id: live.mount_id,
+            });
         }
         if !state.indexed() {
             settled.dropped.push(area.path.clone());
@@ -424,17 +442,33 @@ pub(super) fn record_identities(
 
 /// Lets a test act on the filesystem between discovery and settlement, the
 /// window in which a mount can be replaced or removed mid-scan.
+/// Lets a test act on the filesystem in the windows where a mount can be
+/// replaced or removed mid-scan: after discovery, and after identities are
+/// recorded but before games are saved.
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::cell::RefCell;
-    thread_local!(static AFTER_DISCOVERY: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None));
+    type Action = RefCell<Option<Box<dyn FnOnce()>>>;
+    thread_local! {
+        static AFTER_DISCOVERY: Action = RefCell::new(None);
+        static BEFORE_PERSIST: Action = RefCell::new(None);
+    }
     pub(crate) fn after_discovery(action: impl FnOnce() + 'static) {
         AFTER_DISCOVERY.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
     }
-    pub(crate) fn run() {
-        if let Some(action) = AFTER_DISCOVERY.with(|slot| slot.borrow_mut().take()) {
+    pub(crate) fn before_persist(action: impl FnOnce() + 'static) {
+        BEFORE_PERSIST.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
+    }
+    fn take(slot: &'static std::thread::LocalKey<Action>) {
+        if let Some(action) = slot.with(|slot| slot.borrow_mut().take()) {
             action();
         }
+    }
+    pub(crate) fn run() {
+        take(&AFTER_DISCOVERY);
+    }
+    pub(crate) fn run_before_persist() {
+        take(&BEFORE_PERSIST);
     }
 }
 

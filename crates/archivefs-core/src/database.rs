@@ -48,11 +48,13 @@ use crate::media_set::{
 };
 use crate::platform::identity::{PlatformIdentityResolution, PlatformIdentitySource};
 
+#[cfg(test)]
+use crate::revalidate_archive_for_catalogue;
 use crate::{
     ARCHIVE_PARSER_VERSION, Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config,
     IngestionFingerprint, PlatformProvenance, Result, SCAN_CACHE_VERSION, SCANNER_VERSION,
     ScanFingerprint, canonical_platform_names, detect_platform_with_details, nested_source_roots,
-    normalize_path_segment, revalidate_archive_for_catalogue, validate_configured_source_roots,
+    normalize_path_segment, validate_configured_source_roots,
 };
 
 mod attention;
@@ -6686,7 +6688,7 @@ impl Database {
         let mut recorded: Vec<_> = coverage
             .excluded_roots
             .iter()
-            .filter(|root| !areas.boundaries.contains(root))
+            .filter(|root| delegated.contains(root) || !areas.boundaries.contains(root))
             .cloned()
             .collect();
         delegated.sort();
@@ -9991,6 +9993,9 @@ fn scan_and_persist_folders_transaction(
         if let Some(Ok(arcade_sets)) = arcade_sets {
             arcade_ingestion.merge(&arcade_sets.diagnostics);
             for set in arcade_sets.sets {
+                if settled_areas.is_dropped(&set.path) {
+                    continue;
+                }
                 if let Some(archive) = Archive::from_arcade_set_directory(&set.path, &folder.path) {
                     archives.retain(|candidate| !candidate.path.starts_with(&set.path));
                     archives.push(archive);
@@ -10174,6 +10179,8 @@ fn scan_and_persist_folders_transaction(
                 "source changed before nested mount identities were saved".into(),
             )),
         };
+        #[cfg(test)]
+        nested_scan::test_hook::run_before_persist();
         let db_write_started = std::time::Instant::now();
         let persist_complete = discovery_complete && !scummvm_incomplete;
         let fully_reused = !arcade_specialist
@@ -10463,8 +10470,9 @@ fn persist_one_folder(
         // Inside a nested mount, ownership is proven from that mount's own
         // pinned root (still no crossing of any further mount); elsewhere
         // from the source root. A game in an unsaved mount never gets here.
-        let (owner_root, owner_identity) = match areas.owner_of(&archive.path) {
-            Some((root, identity)) => (root.as_path(), Some(*identity)),
+        let owner = areas.owner_of(&archive.path);
+        let (owner_root, owner_identity) = match owner {
+            Some(owner) => (owner.root.as_path(), Some(owner.identity)),
             None => (folder.path.as_path(), identity),
         };
         if folder
@@ -10489,9 +10497,7 @@ fn persist_one_folder(
         }
         crate::revalidate_archive_within(
             archive,
-            areas
-                .owner_of(&archive.path)
-                .map(|(root, identity)| (root.as_path(), *identity)),
+            owner.map(|owner| (owner.root.as_path(), owner.identity, owner.mount_id)),
         )?;
         let outcome = database.upsert_archive(folder.id, &folder.path, archive)?;
         let incomplete = !archive.identity.inspection_problems.is_empty();

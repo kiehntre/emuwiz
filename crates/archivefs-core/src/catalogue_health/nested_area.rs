@@ -85,6 +85,10 @@ impl LiveArea {
 /// Opens `area` (a directory beneath `source`) as a pinned root, only when it
 /// is currently a mount root of a supported filesystem type.
 pub(crate) fn open_area(source: &BoundRoot, area: &Path) -> Result<LiveArea, &'static str> {
+    // Every "same instance" check rests on mount IDs never being reused.
+    if !super::mount_ids_are_unique() {
+        return Err("this kernel cannot tell one mount instance from the next");
+    }
     let before: NestedState = source
         .nested_state(area)
         .map_err(|_| "mount point is missing or cannot be inspected")?;

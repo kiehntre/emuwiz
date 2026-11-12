@@ -363,6 +363,104 @@ fn real_mount_replaced_or_removed_during_a_scan_saves_nothing_from_it() {
     let _ = fs::remove_dir_all(&fx.root);
 }
 
+/// The same archive remounted after its identity was recorded but before
+/// games are saved: identical metadata, likely the same device number, a
+/// new instance. Nothing from that scan is saved for the source.
+#[test]
+fn real_identical_remount_before_saving_rolls_the_source_back() {
+    if !fuse_available() {
+        return;
+    }
+    let mut fx = Fixture::new("before-persist");
+    let tar = fx.tar("collection", GAMES);
+    let mounted = Ratar::mount(&tar, &fx.mount_point);
+    fx.scan();
+    fx.scan();
+    let slot = std::rc::Rc::new(std::cell::RefCell::new(Some(mounted)));
+    let replacement = std::rc::Rc::new(std::cell::RefCell::new(None));
+    {
+        let (slot, replacement) = (slot.clone(), replacement.clone());
+        let (tar, mount_point) = (tar.clone(), fx.mount_point.clone());
+        super::test_hook::before_persist(move || {
+            slot.borrow_mut().take().unwrap().unmount();
+            *replacement.borrow_mut() = Some(Ratar::mount(&tar, &mount_point));
+        });
+    }
+    fs::remove_file(fx.source.join("gone.zip")).unwrap();
+    write(&fx.source.join("new.zip"), b"new");
+    let summary = scan_and_persist(&mut fx.database, &fx.config, "nested-test").unwrap();
+    assert_eq!(
+        summary.folder_errors.len(),
+        1,
+        "{:?}",
+        summary.folder_errors
+    );
+    assert!(
+        fx.row("new.zip").is_none(),
+        "the source refresh was rolled back"
+    );
+    assert!(!fx.missing("gone.zip"));
+    assert!(!fx.missing("gba/ratarmount/Alpha.gba"));
+
+    // The next scan sees a normal restart and completes.
+    let next = fx.scan();
+    assert_eq!(mount_state(&next), NestedMountState::Restarted);
+    assert!(fx.row("new.zip").is_some());
+    assert!(fx.missing("gone.zip"));
+    replacement.borrow_mut().take().unwrap().unmount();
+    let _ = fs::remove_dir_all(&fx.root);
+}
+
+/// Device and inode cannot tell FUSE instances apart (device numbers are
+/// reused, the root inode is constant), so an owner is the exact mount
+/// instance: the same device/inode with any other mount ID is refused, both
+/// by the settled owner check and by per-game revalidation.
+#[test]
+fn real_area_owner_is_pinned_to_its_mount_instance() {
+    if !fuse_available() {
+        return;
+    }
+    let fx = Fixture::new("owner-instance");
+    let tar = fx.tar("collection", GAMES);
+    let mut mounted = Ratar::mount(&tar, &fx.mount_point);
+    let source = crate::catalogue_health::BoundRoot::open(&fx.source).unwrap();
+    let live = crate::catalogue_health::open_area(&source, &fx.mount_point).unwrap();
+    let owner = super::AreaOwner {
+        root: fx.mount_point.clone(),
+        identity: (live.binding().device, live.binding().inode),
+        mount_id: live.mount_id,
+    };
+    assert!(owner.is_current());
+    let other_instance = super::AreaOwner {
+        mount_id: live.mount_id + 1,
+        ..owner.clone()
+    };
+    assert!(!other_instance.is_current());
+
+    let config = config_for(&fx.source, &fx.root.join("virtual"));
+    let discovery = ArchiveScanner::new(&config)
+        .scan_archives_with_cache_excluding(&[], &[])
+        .unwrap();
+    let game = discovery
+        .archives
+        .iter()
+        .find(|archive| archive.path.starts_with(&fx.mount_point))
+        .unwrap();
+    let within = |mount_id| {
+        crate::revalidate_archive_within(
+            game,
+            Some((fx.mount_point.as_path(), owner.identity, mount_id)),
+        )
+    };
+    within(owner.mount_id).unwrap();
+    assert!(within(owner.mount_id + 1).is_err());
+    // Open handles inside the mount would make the unmount busy.
+    drop(live);
+    drop(source);
+    mounted.unmount();
+    let _ = fs::remove_dir_all(&fx.root);
+}
+
 /// Runs everywhere: a nested filesystem of a type that is not scanned is
 /// left alone, its existing entries are kept, and the rest of the source
 /// still reconciles (the mount ID is simulated; the type is the real one).
