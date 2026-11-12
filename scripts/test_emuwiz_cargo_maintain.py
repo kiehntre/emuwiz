@@ -803,6 +803,7 @@ class SecondRootInstance(MaintBase):
         self.assertIn("Environment=EMUWIZ_MAINTENANCE_INSTANCE=nvme2\n", service)
         self.assertIn(f"ConditionPathExists={self.reg}/maintenance-nvme2/policy.json\n", service)
         self.assertIn(f"ReadWritePaths={self.reg} {self.nv_root}\n", service)
+        self.assertIn(f"RequiresMountsFor={self.nv_root}\n", service)   # never runs against an unmounted root
         self.assertEqual(self.m.unit_basename(), "emuwiz-cargo-maintain-nvme2")
         os.environ.pop("EMUWIZ_TARGET_ROOT")
         with self.assertRaises(SystemExit):
@@ -814,6 +815,43 @@ class SecondRootInstance(MaintBase):
         self.assertIn(f"ConditionPathExists={self.reg}/maintenance/policy.json\n", service)
         self.assertNotIn("EMUWIZ_MAINTENANCE_INSTANCE", service)
         self.assertEqual(self.m.unit_basename(), "emuwiz-cargo-maintain")
+
+    def test_nvme2_retirement_verifies_from_a_shell_without_the_instance(self):
+        # The owner's shell (cargo-env.sh) sets EMUWIZ_TARGET_ROOT only; worktree-check and
+        # finish-task must still find the nvme2 instance's evidence instead of holding forever.
+        self.nvme()
+        n_wt, n = self.ready("nv-evidence")
+        self.approve(soft_gb="0.00001", hard_gb="0.0001")
+        rc, out = self.call("run")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(self.intact(n))
+        rc, out = self.call("worktree-check", n_wt, "--json")
+        with_instance = json.loads(out)["code"]
+        self.use(self.nv_root, None)
+        rc, out = self.call("worktree-check", n_wt, "--json")
+        without = json.loads(out)
+        self.assertEqual(without["code"], with_instance, without)
+        self.assertNotIn(without["code"], ("RECEIPT_UNVERIFIED", "ARTIFACTS_MISSING_UNVERIFIED"), without)
+        # evidence is only accepted from a maintenance directory whose policy covers the root
+        rec = {"last_retired": {"receipt": os.path.join(self.tmp, "elsewhere", "receipts", "r.json")}}
+        d, why = self.m.evidence_state_dir(rec, n, self.m.trusted_policy_uids())
+        self.assertIsNone(d, why)
+
+    def test_one_policy_per_root(self):
+        self.nvme()
+        self.approve_nvme(enable=False)
+        self.use(self.nv_root, None)        # default instance, shell pointing at nvme2
+        rc, out = self.call("policy", "approve", "--owners", "tester", "--soft-gb", "1", "--hard-gb", "2")
+        self.assertNotEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(self.m.policy_path()), "no second policy over the nvme2 root")
+        self.home_()                        # the default instance may still cover its own root
+        self.approve(enable=False)
+
+    def test_unknown_free_space_requests_nothing(self):
+        limits = {"reserve_free_bytes": 260 * self.GIB, "reserve_trigger_free_bytes": 240 * self.GIB}
+        self.assertEqual(self.m.free_space_need(limits, None), 0)
+        self.assertEqual(self.m.free_space_need(limits, 250 * self.GIB), 0)
+        self.assertEqual(self.m.free_space_need(limits, 230 * self.GIB), 30 * self.GIB)
 
 
 class WorktreeOrdering(MaintBase):

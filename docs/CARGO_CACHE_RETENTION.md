@@ -363,9 +363,21 @@ authority: each only plans targets directly under its own root (`OUTSIDE_POLICY_
 and an instance whose policy names a root other than `EMUWIZ_TARGET_ROOT` is invalid (fail closed).
 The default instance (no variable) is `<registry>/maintenance/`, unchanged. `units` run with both
 variables writes `emuwiz-cargo-maintain-NAME.service`/`.timer` carrying them and
-`ReadWritePaths=<registry> <root>`. Commands for an instance (`policy`, `plan`, `status`, `run`,
-`history`, and `worktree-check` for a target that instance retired) need the same two variables;
-without them the retirement evidence is not found and the gate stays HOLD.
+`ReadWritePaths=<registry> <root>` and `RequiresMountsFor=<root>` (a cycle never runs against an
+unmounted root). Commands that act for an instance (`policy`, `plan`, `status`, `run`, `history`,
+`admit`, and `emuwiz-cargo-retire --resolve-journal`/`--inspect-journal` for its journals) need the
+same two variables. Retirement evidence is found from the target itself: `worktree-check`,
+`task-complete` and `cargo-iso --finish-task` verify a target another instance retired using that
+instance's `maintenance-NAME/` evidence, accepted only when that directory's own valid policy
+covers the target's root, so a shell that sets only `EMUWIZ_TARGET_ROOT` works.
+
+Constraints: one policy per root (`policy approve` refuses a root another instance's policy already
+names, so the default policy cannot silently move to `/mnt/nvme2` from a shell that exports
+`EMUWIZ_TARGET_ROOT`); each instance must name `EMUWIZ_TARGET_ROOT` as its root; and the roots must
+be on **different filesystems**, because budgets count every registered target on the root's device
+(two roots on one device would count each other's bytes). `--only NAME` resolves the basename across
+both roots; if the same worktree built into both, the home item is chosen and an instance's `--only`
+refuses (fail closed). Unknown free space never requests cleanup (the budget still applies).
 
 Owner-approved /mnt/nvme2 numbers (180 GiB cache budget; clean below 240 GiB free, restore 260 GiB;
 3 targets / 20 GB per cycle). `--soft-gb` is decimal GB, so 180 GiB is 193.274 GB; the hard budget
