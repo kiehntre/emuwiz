@@ -6486,6 +6486,22 @@ impl<'a> ArchiveScanner<'a> {
                         inode: directory_mount.inode,
                         mount_id: directory_mount.mount_id,
                     });
+                // Never enter a nested filesystem. Persistence only accepts
+                // paths it can open beneath the source root without crossing a
+                // mount, so anything listed from in here would be refused and
+                // abort the whole source. Leaving it as a recoverable scan error
+                // makes this source Partial: everything else is refreshed,
+                // missing reconciliation is withheld, and entries beneath the
+                // boundary keep their evidence. Add the mount as its own
+                // source to catalogue it.
+                discovery.record_scan_error(
+                    directory.clone(),
+                    format!(
+                        "a separate filesystem is mounted at {} and was not scanned; entries beneath it were kept, and it can be added as its own source",
+                        directory.display()
+                    ),
+                );
+                continue;
             }
             let directory_device = directory_mount.mount_id;
             let read_dir = match fs::read_dir(&directory) {

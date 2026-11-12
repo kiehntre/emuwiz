@@ -201,7 +201,34 @@ fn mount_of(file: &File) -> io::Result<MountObservation> {
 pub(crate) fn directory_mount(path: &Path) -> io::Result<MountObservation> {
     let name =
         CString::new(path.as_os_str().as_bytes()).map_err(|_| io::ErrorKind::InvalidInput)?;
-    statx_mount(libc::AT_FDCWD, &name, libc::AT_SYMLINK_NOFOLLOW)
+    let observed = statx_mount(libc::AT_FDCWD, &name, libc::AT_SYMLINK_NOFOLLOW);
+    #[cfg(test)]
+    let observed = observed.map(|mut mount| {
+        if test_mounts::is_simulated(path) {
+            mount.mount_id = mount.mount_id.wrapping_add(test_mounts::OFFSET);
+        }
+        mount
+    });
+    observed
+}
+
+/// Unprivileged tests cannot mount a filesystem, so a test can mark
+/// directories (and everything beneath them) as a separate mount for
+/// `directory_mount` on the current thread only.
+#[cfg(test)]
+pub(crate) mod test_mounts {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    pub(super) const OFFSET: u64 = 1 << 40;
+    thread_local!(static SIMULATED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) });
+
+    pub(crate) fn simulate(path: &Path) {
+        SIMULATED.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
+    }
+    pub(super) fn is_simulated(path: &Path) -> bool {
+        SIMULATED.with(|paths| paths.borrow().iter().any(|root| path.starts_with(root)))
+    }
 }
 
 pub(crate) struct BoundRoot {

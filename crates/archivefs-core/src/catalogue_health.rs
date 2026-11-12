@@ -11,6 +11,8 @@ pub use crate::database::forget_missing::{
     ForgetMissingReceiptSummary, ForgetMissingResult, MissingClassification, RelatedRows,
     list_undoable_forget_missing_receipts,
 };
+#[cfg(test)]
+pub(crate) use path_probe::test_mounts;
 pub(crate) use path_probe::{BoundRoot, NestedState, directory_mount};
 
 use serde::{Deserialize, Serialize};

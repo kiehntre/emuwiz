@@ -644,7 +644,7 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             let scan_warning = if scan {
                 let summary = archivefs_core::scan_all_enabled_sources_default()
                     .map_err(|error| error.to_string())?;
-                (!summary.folder_errors.is_empty()).then(|| format!("{} game folders could not be read. Their previous entries were kept. Reconnect the drive or review Sources, then scan again.", summary.folder_errors.len()))
+                scan_warning_text(&summary.folder_errors)
             } else {
                 None
             };
@@ -1098,6 +1098,29 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             ),
         }),
     }
+}
+
+/// The Activity/notice text for a scan that saved but left folders partly
+/// or wholly unscanned. Names the first real reason: "reconnect the drive"
+/// is wrong when the drive is present and a mounted subfolder was skipped.
+pub(super) fn scan_warning_text(folder_errors: &[(PathBuf, String)]) -> Option<String> {
+    let (path, reason) = folder_errors.first()?;
+    let more = match folder_errors.len() {
+        1 => String::new(),
+        n => format!(" ({} more in the scan details)", n - 1),
+    };
+    Some(format!(
+        "{} game folder{} not fully scanned. Everything else was saved; entries EmuWiz could not check were kept, not marked missing. {}: {}{}",
+        folder_errors.len(),
+        if folder_errors.len() == 1 {
+            " was"
+        } else {
+            "s were"
+        },
+        path.display(),
+        reason,
+        more
+    ))
 }
 
 pub(super) fn trusted_root_for(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {

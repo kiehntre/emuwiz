@@ -12990,6 +12990,76 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Regression (2026-11-12): five ratarmount FUSE mounts inside the one
+    /// configured source made discovery list their files, persistence refuse
+    /// them (EXDEV), and the whole source fail with "positive observation
+    /// outside safe source ownership", so no scan had saved since October.
+    #[test]
+    fn nested_mount_is_skipped_and_the_rest_of_the_source_still_refreshes() {
+        let root = temp_dir("nested-mount-partial-scan");
+        let source = root.join("games");
+        let mount = root.join("mount");
+        write_archive_file(&source, "top.zip", b"top");
+        let gone = write_archive_file(&source, "gone.zip", b"gone");
+        write_archive_file(&source, "gba/ratarmount/inner.zip", b"inner");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let first = scan_and_persist(&mut database, &config, "before-mount").unwrap();
+        assert!(first.folder_errors.is_empty(), "{:?}", first.folder_errors);
+        assert_eq!(database.load_archives().unwrap().len(), 3);
+
+        // The subtree becomes its own filesystem; one file leaves the
+        // source and one arrives.
+        let nested = source.join("gba/ratarmount");
+        crate::catalogue_health::test_mounts::simulate(&nested);
+        fs::remove_file(&gone).unwrap();
+        write_archive_file(&source, "new.zip", b"new");
+
+        let summary = scan_and_persist(&mut database, &config, "with-mount").unwrap();
+        assert_eq!(summary.counts.source_folders_scanned, 1);
+        assert_eq!(summary.counts.archives_added, 1, "new.zip was catalogued");
+        assert!(
+            summary
+                .folder_errors
+                .iter()
+                .any(|(_, message)| message.contains("separate filesystem")
+                    && message.contains("ratarmount")),
+            "skipped subtree reported: {:?}",
+            summary.folder_errors
+        );
+        assert!(
+            !summary
+                .folder_errors
+                .iter()
+                .any(|(_, message)| message.contains("outside safe source ownership")),
+            "{:?}",
+            summary.folder_errors
+        );
+        let archives = database.load_archives().unwrap();
+        let row = |name: &str| {
+            archives
+                .iter()
+                .find(|archive| archive.relative_path.ends_with(name))
+                .unwrap_or_else(|| panic!("{name} row kept"))
+        };
+        assert!(row("new.zip").last_verified_missing_at.is_none());
+        assert!(row("top.zip").last_verified_missing_at.is_none());
+        // Partial coverage: nothing is called missing, neither beneath the
+        // unscanned mount nor elsewhere in the source.
+        assert!(row("inner.zip").last_verified_missing_at.is_none());
+        assert!(row("gone.zip").last_verified_missing_at.is_none());
+        let status = database.list_source_folders().unwrap()[0].clone();
+        assert!(
+            status
+                .last_scan_error
+                .as_deref()
+                .is_some_and(|error| error.contains("separate filesystem")),
+            "{:?}",
+            status.last_scan_error
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn repeat_scan_is_idempotent() {
         let root = temp_dir("repeat-scan-idempotent");

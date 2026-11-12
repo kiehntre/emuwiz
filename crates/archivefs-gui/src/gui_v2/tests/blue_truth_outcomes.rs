@@ -247,3 +247,20 @@ fn history_undo_of_an_unloaded_receipt_says_so() {
     let notice = app.history_view.notice.clone().unwrap();
     assert!(notice.contains("no longer loaded"), "{notice}");
 }
+
+#[test]
+fn partial_scan_warning_names_the_real_reason_not_a_disconnected_drive() {
+    let errors = vec![(
+        std::path::PathBuf::from("/games"),
+        "scan completed with 1 recoverable error(s): /games/gba/ratarmount: a separate filesystem is mounted at /games/gba/ratarmount and was not scanned".to_string(),
+    )];
+    let text = crate::gui_v2::backend::scan_warning_text(&errors).unwrap();
+    assert!(
+        text.starts_with("1 game folder was not fully scanned."),
+        "{text}"
+    );
+    assert!(text.contains("separate filesystem is mounted"), "{text}");
+    assert!(text.contains("not marked missing"), "{text}");
+    assert!(!text.contains("Reconnect"), "{text}");
+    assert!(crate::gui_v2::backend::scan_warning_text(&[]).is_none());
+}
