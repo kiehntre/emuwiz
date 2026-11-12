@@ -826,7 +826,21 @@ pub fn run_dat_audit_with_targets(
             .cloned()
             .collect::<Vec<_>>()
     };
-    let report = audit_files(&report_known, &index);
+    let mut report = audit_files(&report_known, &index);
+    // S03-05 for the one-catalogue audit, which is what library verification
+    // saves and the name review plans from. Same verified-header rules as the
+    // combined audit; only a file that matched nothing is looked at again.
+    let header_matches = match_one_catalogue_after_header_removal(
+        &mut report.entries,
+        &fingerprints,
+        &index,
+        request.platform.as_deref(),
+        trusted,
+        cancel,
+    );
+    if cancelled(cancel) {
+        return Err(DatAuditError::Cancelled);
+    }
     // `forcepacking="fileonly"` (see `DatPackingPolicy::FileOnly`): the
     // archive file itself is the hashed DAT item, already matched above
     // through `known`/`report` (loose-file evidence already includes each
@@ -851,6 +865,18 @@ pub fn run_dat_audit_with_targets(
                 &request.source_id,
             )?
         };
+
+    let mut archives = archives;
+    match_zip_members_after_header_removal(
+        &mut archives,
+        &index,
+        request.platform.as_deref(),
+        trusted,
+        cancel,
+    );
+    if cancelled(cancel) {
+        return Err(DatAuditError::Cancelled);
+    }
 
     // Disk-only sets (a game declaring `<disk>`s and zero `<rom>`s) are never
     // reached through the per-archive ROM-evidence path above, so classify
@@ -980,10 +1006,191 @@ pub fn run_dat_audit_with_targets(
             let _ = cache.save();
             cache.metrics.clone()
         },
-        known_hashes: known_hashes_by_path(&known, &fingerprints),
+        known_hashes: {
+            let mut known_hashes = known_hashes_by_path(&known, &fingerprints);
+            for (path, header_match) in header_matches {
+                if let Some(hashes) = known_hashes.get_mut(&path) {
+                    hashes.header_removal = Some(header_match);
+                }
+            }
+            known_hashes
+        },
         loose_discs,
     };
     Ok(outcome)
+}
+
+/// S03-05 for ZIP members, under the same rules as loose files: only a
+/// hash-complete, non-nested member of a completely examined ZIP whose verdict
+/// is `NotInDat` and whose extension belongs to the header platform is
+/// re-read (privately, in memory, selected by its audited name, size, SHA-1
+/// and CRC32) and compared by the bytes after its verified header. The
+/// member's whole headered hashes stay its evidence; the verdict's algorithm
+/// says the header was ignored. Several candidates become `Ambiguous`.
+fn match_zip_members_after_header_removal(
+    archives: &mut [DatArchiveAudit],
+    index: &DatIndex,
+    platform: Option<&str>,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+) {
+    use crate::dat::header_match::{
+        HeaderHashOutcome, extension_fits_kind, hash_zip_member_after_header,
+        header_kind_for_platform, headerless_algorithm_label,
+    };
+    let Some(kind) = platform.and_then(header_kind_for_platform) else {
+        return;
+    };
+    for archive in archives.iter_mut() {
+        if archive.format != "zip" || !matches!(archive.completion, ArchivePassCompletion::Complete)
+        {
+            continue;
+        }
+        for member in archive.members.iter_mut() {
+            if cancelled(cancel) {
+                return;
+            }
+            if !matches!(member.verdict, Some(AuditVerdict::NotInDat))
+                || member.evidence.is_nested_archive
+                || !member.evidence.is_hash_complete()
+                || !extension_fits_kind(Path::new(&member.evidence.member_name_display), kind)
+            {
+                continue;
+            }
+            let (Some(hashes), Ok(name)) = (
+                member.evidence.hashes.as_ref(),
+                std::str::from_utf8(&member.evidence.member_name_raw),
+            ) else {
+                continue;
+            };
+            let HeaderHashOutcome::Hashed(header_match) = hash_zip_member_after_header(
+                &archive.archive_path,
+                name,
+                hashes,
+                member.evidence.logical_size,
+                trusted,
+                cancel,
+                kind,
+            ) else {
+                continue;
+            };
+            let headerless =
+                KnownFileEvidence::new(archive.archive_path.to_string_lossy().into_owned(), name)
+                    .with_size(header_match.headerless_size)
+                    .with_crc32(header_match.headerless_crc32.clone())
+                    .with_md5(header_match.headerless_md5.clone())
+                    .with_sha1(header_match.headerless_sha1.clone());
+            member.verdict = match audit_one(&headerless, index) {
+                AuditVerdict::Exact {
+                    game_name,
+                    rom_name,
+                    algorithm,
+                } => Some(AuditVerdict::Exact {
+                    game_name,
+                    rom_name,
+                    algorithm: headerless_algorithm_label(algorithm),
+                }),
+                AuditVerdict::Ambiguous { detail } => Some(AuditVerdict::Ambiguous {
+                    detail: format!("after header removal: {detail}"),
+                }),
+                AuditVerdict::ExactMultipleCandidates {
+                    count, game_names, ..
+                } => Some(AuditVerdict::Ambiguous {
+                    detail: format!(
+                        "after header removal: {count} catalogue entries match ({})",
+                        game_names.join(", ")
+                    ),
+                }),
+                _ => continue,
+            };
+            // Positional refs describe the whole-member lookup; the
+            // headerless verdict carries its own names.
+            member.matched_refs.clear();
+        }
+    }
+}
+
+/// S03-05 for one catalogue. `platform` is the request's platform: the
+/// catalogue's assigned system, or the system library verification proved
+/// from the catalogue's own header. Without one, or for a platform with no
+/// header transform, nothing is looked at. A single exact headerless match
+/// becomes `Exact` with a "... after header removal" algorithm; several
+/// candidates become `Ambiguous`; anything else leaves the verdict alone.
+fn match_one_catalogue_after_header_removal(
+    entries: &mut [AuditEntry],
+    fingerprints: &std::collections::BTreeMap<
+        String,
+        crate::identity_source::hashing::FileFingerprint,
+    >,
+    index: &DatIndex,
+    platform: Option<&str>,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+) -> std::collections::BTreeMap<String, crate::dat::header_match::HeaderRemovalMatch> {
+    use crate::dat::header_match::{
+        HeaderHashOutcome, extension_fits_kind, hash_after_header, header_kind_for_platform,
+        headerless_algorithm_label,
+    };
+    let mut matches = std::collections::BTreeMap::new();
+    let Some(kind) = platform.and_then(header_kind_for_platform) else {
+        return matches;
+    };
+    for entry in entries.iter_mut() {
+        if cancelled(cancel) {
+            break;
+        }
+        if !matches!(entry.verdict, AuditVerdict::NotInDat) {
+            continue;
+        }
+        let path = Path::new(&entry.local_path);
+        if !extension_fits_kind(path, kind) {
+            continue;
+        }
+        let Some(fingerprint) = fingerprints.get(&entry.local_path) else {
+            continue;
+        };
+        let HeaderHashOutcome::Hashed(header_match) =
+            hash_after_header(path, trusted, cancel, kind, fingerprint)
+        else {
+            continue;
+        };
+        let headerless = KnownFileEvidence::new(entry.local_path.clone(), &entry.local_filename)
+            .with_size(header_match.headerless_size)
+            .with_crc32(header_match.headerless_crc32.clone())
+            .with_md5(header_match.headerless_md5.clone())
+            .with_sha1(header_match.headerless_sha1.clone());
+        match audit_one(&headerless, index) {
+            AuditVerdict::Exact {
+                game_name,
+                rom_name,
+                algorithm,
+            } => {
+                entry.verdict = AuditVerdict::Exact {
+                    game_name,
+                    rom_name,
+                    algorithm: headerless_algorithm_label(algorithm),
+                };
+                matches.insert(entry.local_path.clone(), header_match);
+            }
+            AuditVerdict::Ambiguous { detail } => {
+                entry.verdict = AuditVerdict::Ambiguous {
+                    detail: format!("after header removal: {detail}"),
+                };
+            }
+            AuditVerdict::ExactMultipleCandidates {
+                count, game_names, ..
+            } => {
+                entry.verdict = AuditVerdict::Ambiguous {
+                    detail: format!(
+                        "after header removal: {count} catalogue entries match ({})",
+                        game_names.join(", ")
+                    ),
+                };
+            }
+            _ => {}
+        }
+    }
+    matches
 }
 
 /// The one shared local scan/hash pass used by both one-catalogue and

@@ -315,6 +315,118 @@ pub fn hash_after_header(
     })
 }
 
+/// The one member of a ZIP archive whose already-verified decoded hashes are
+/// `member`, hashed again after `kind`'s header. Streams through the shared
+/// safe ZIP reader into memory only: nothing is extracted or written, and the
+/// archive is checked to be the same object afterwards. The member is selected
+/// by its exact name, size, SHA-1 and CRC32 from the completed member pass, so
+/// a member that differs from the one audited is refused, never substituted.
+pub fn hash_zip_member_after_header(
+    archive: &Path,
+    member_name: &str,
+    member: &crate::dat::archive::ArchiveMemberHashes,
+    member_size: u64,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+    kind: HeaderNormalizationKind,
+) -> HeaderHashOutcome {
+    use crate::dat::archive::limits::ArchiveLimits;
+    use crate::dat::archive::zip::{ZipMemberRequest, stream_zip_member_into};
+    let header_len = kind.header_len() as u64;
+    if member_size < header_len {
+        return HeaderHashOutcome::Rejected(HeaderRejection::TooShort);
+    }
+    if member_size > MAX_AUTOMATIC_HASH_BYTES {
+        return HeaderHashOutcome::Refused;
+    }
+    let request = ZipMemberRequest {
+        member_name: Some(member_name.to_string()),
+        require_exact_name: true,
+        size_bytes: Some(member_size),
+        sha1: Some(member.sha1.clone()),
+        crc32: Some(member.crc32.clone()),
+    };
+    let mut stream = HeaderlessStream::new(kind.header_len());
+    if stream_zip_member_into(
+        archive,
+        trusted,
+        &ArchiveLimits::default(),
+        cancel,
+        &request,
+        &mut stream,
+    )
+    .is_err()
+    {
+        return HeaderHashOutcome::Refused;
+    }
+    stream.finish(kind, member_size)
+}
+
+/// An in-memory `Write` sink that keeps the first `header_len` bytes and
+/// hashes everything after them.
+struct HeaderlessStream {
+    header_len: usize,
+    header: Vec<u8>,
+    crc: Crc32,
+    md5: md5::Md5,
+    sha1: sha1::Sha1,
+    payload: u64,
+}
+
+impl HeaderlessStream {
+    fn new(header_len: usize) -> Self {
+        use sha1::digest::Digest;
+        Self {
+            header_len,
+            header: Vec::with_capacity(header_len),
+            crc: Crc32::new(),
+            md5: md5::Md5::new(),
+            sha1: sha1::Sha1::new(),
+            payload: 0,
+        }
+    }
+
+    fn finish(self, kind: HeaderNormalizationKind, total: u64) -> HeaderHashOutcome {
+        use sha1::digest::Digest;
+        let payload_len = total - self.header_len as u64;
+        if self.header.len() != self.header_len || self.payload != payload_len {
+            return HeaderHashOutcome::Refused;
+        }
+        if let Err(rejection) = validate_header(&self.header, payload_len, kind) {
+            return HeaderHashOutcome::Rejected(rejection);
+        }
+        HeaderHashOutcome::Hashed(HeaderRemovalMatch {
+            platform: platform_id_for_kind(kind).to_string(),
+            transform_id: kind.transform_id().to_string(),
+            header_label: kind.label().to_string(),
+            header_len: self.header_len as u64,
+            headerless_size: payload_len,
+            headerless_crc32: self.crc.finish_hex(),
+            headerless_md5: hex(&self.md5.finalize()),
+            headerless_sha1: hex(&self.sha1.finalize()),
+        })
+    }
+}
+
+impl std::io::Write for HeaderlessStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use sha1::digest::Digest;
+        let take = (self.header_len - self.header.len()).min(buf.len());
+        self.header.extend_from_slice(&buf[..take]);
+        let rest = &buf[take..];
+        if !rest.is_empty() {
+            self.crc.update(rest);
+            self.md5.update(rest);
+            self.sha1.update(rest);
+            self.payload += rest.len() as u64;
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes

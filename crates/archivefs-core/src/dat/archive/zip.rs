@@ -540,6 +540,47 @@ fn copy_zip_member_with(
     request: &ZipMemberRequest,
     create_output: impl FnOnce() -> Result<File, ZipMemberError>,
 ) -> Result<ZipMemberCopy, ZipMemberError> {
+    stream_zip_member_with(path, trusted, limits, cancel, request, || {
+        create_output().map(DurableOutput)
+    })
+}
+
+/// A file output that is synced before the source is re-checked.
+struct DurableOutput(File);
+impl Write for DurableOutput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.sync_all()
+    }
+}
+
+/// Streams one checksum-selected member into a caller-owned in-memory
+/// consumer (for example a hasher). Nothing is written to disk. The same
+/// member-name safety, regular-entry, codec, size and ratio limits, exact
+/// checksum selection and before/after outer-identity check apply as for
+/// [`copy_zip_member_to`]; the consumer only ever sees the bytes of the one
+/// member whose decoded SHA-1/CRC32 matched `request`.
+pub(crate) fn stream_zip_member_into<W: Write>(
+    path: &Path,
+    trusted: &TrustedRoots,
+    limits: &ArchiveLimits,
+    cancel: &AtomicBool,
+    request: &ZipMemberRequest,
+    output: &mut W,
+) -> Result<ZipMemberCopy, ZipMemberError> {
+    stream_zip_member_with(path, trusted, limits, cancel, request, || Ok(output))
+}
+
+fn stream_zip_member_with<W: Write>(
+    path: &Path,
+    trusted: &TrustedRoots,
+    limits: &ArchiveLimits,
+    cancel: &AtomicBool,
+    request: &ZipMemberRequest,
+    create_output: impl FnOnce() -> Result<W, ZipMemberError>,
+) -> Result<ZipMemberCopy, ZipMemberError> {
     if request.sha1.is_none() && request.crc32.is_none() {
         return Err(ZipMemberError::BadChecksum);
     }
@@ -661,7 +702,7 @@ fn copy_zip_member_with(
         return Err(ZipMemberError::BadChecksum);
     }
     output
-        .sync_all()
+        .flush()
         .map_err(|error| ZipMemberError::Open(error.to_string()))?;
     if !source.outer_identity_unchanged() {
         return Err(ZipMemberError::SourceChanged);
@@ -737,7 +778,7 @@ fn decode_entry_to(
     entry: &super::zip_preflight::ZipPreflightEntry,
     limits: &ArchiveLimits,
     cancel: &AtomicBool,
-    output: &mut File,
+    output: &mut impl Write,
 ) -> Result<(String, String), ZipMemberError> {
     use sha1::Digest;
 
