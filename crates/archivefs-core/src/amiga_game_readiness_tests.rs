@@ -470,6 +470,34 @@ fn cd32_and_cdtv_media_are_never_floppies() {
 }
 
 #[test]
+fn cd32_zip_is_blocked_without_calling_it_floppy_disks() {
+    // Real session 2026-11-12: a CD32 ZIP holding CUE+ISO was described as
+    // "a zip of floppy disks". The ZIP is still refused, only truthfully.
+    let facts = env(vec![profile(AmigaEmulatorKind::Amiberry, Some("CD32"))]);
+    let readiness = assess_amiga_game(
+        AmigaCdMachine::Cd32,
+        Path::new("Alien Breed Special Edition.zip"),
+        false,
+        None,
+        Some(&facts),
+    );
+    let media = readiness.check(K::Media).expect("media row");
+    assert_eq!(media.state, Blocked);
+    assert!(
+        !media.detail.to_ascii_lowercase().contains("floppy"),
+        "{}",
+        media.detail
+    );
+    assert!(
+        media.detail.contains("Extract the disc image"),
+        "{}",
+        media.detail
+    );
+    assert!(!readiness.launch_route_exists);
+    assert!(!AmigaMediaKind::ZipArchive.label().contains("floppy"));
+}
+
+#[test]
 fn rows_needing_the_environment_wait_for_it() {
     let readiness = assess_amiga_game(AMIGA, Path::new("a.lha"), false, None, None);
     assert!(readiness.check(K::Emulator).is_none());

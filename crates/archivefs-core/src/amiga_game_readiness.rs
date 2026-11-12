@@ -86,7 +86,8 @@ impl AmigaMediaKind {
             Self::HardDisk => "Hard-disk image (HDF/RDB)",
             Self::WhdloadPackage => "WHDLoad package (LHA)",
             Self::CdImage => "CD image",
-            Self::ZipArchive => "ZIP of floppy disks",
+            // The extension alone says nothing about what the ZIP holds.
+            Self::ZipArchive => "ZIP archive",
             Self::Container => "Packed in an archive",
             Self::Unsupported => "Unrecognised file type",
         }
@@ -739,6 +740,15 @@ fn media_check(machine: AmigaCdMachine, media: AmigaMediaKind) -> (AmigaCheckSta
         AmigaMediaKind::CdImage => (
             Blocked,
             "A CD image stored as an ordinary Amiga game. CD32 and CDTV discs are not floppies; check the platform.".into(),
+        ),
+        // A ZIP's contents are not read here, so never call them floppies:
+        // real CD32 ZIPs usually hold a CUE/ISO disc image.
+        AmigaMediaKind::ZipArchive if cd_machine => (
+            Blocked,
+            format!(
+                "{} discs are not started from inside a ZIP. Extract the disc image (CUE/BIN, ISO or CHD) from the ZIP, then recheck readiness. The ZIP was not changed.",
+                machine_label(machine)
+            ),
         ),
         _ if cd_machine => (
             Blocked,
