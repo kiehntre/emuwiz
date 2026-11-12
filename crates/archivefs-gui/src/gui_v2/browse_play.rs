@@ -132,6 +132,9 @@ pub(super) struct BrowsePlayState {
     /// signature it was taken at; a different signature invalidates both.
     env: Option<(u64, super::bg_readiness::EnvSnapshot)>,
     env_signature: Option<u64>,
+    /// The scan-result part of that signature, reused briefly (see
+    /// `EnvSnapshot::cached_signature`).
+    env_heavy: super::bg_readiness::HeavySignatureCache,
     /// The library snapshot generation the settled decisions were made at.
     database_generation: Option<u64>,
     /// Ids drawn this frame / last frame, nearest the top first.
@@ -628,7 +631,10 @@ impl App {
             .native_workflows
             .as_ref()
             .map(|w| w.emulator_readiness());
-        let signature = readiness.and_then(super::bg_readiness::EnvSnapshot::signature);
+        let now = std::time::Instant::now();
+        let signature = readiness.and_then(|readiness| {
+            super::bg_readiness::EnvSnapshot::cached_signature(readiness, &mut state.env_heavy, now)
+        });
         if state.env_signature != signature {
             state.env_signature = signature;
             state.background.invalidate();

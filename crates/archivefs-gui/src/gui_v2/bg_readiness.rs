@@ -71,6 +71,31 @@ pub(super) fn selection_bound_identity(
     )
 }
 
+/// How long the scan-result part of the environment signature is reused.
+pub(super) const HEAVY_SIGNATURE_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The last scan-result hash and when it was taken; see
+/// [`EnvSnapshot::cached_signature`].
+#[derive(Default)]
+pub(super) struct HeavySignatureCache {
+    heavy: Option<(std::time::Instant, u64)>,
+}
+
+/// Feeds a value's Debug text straight into a hasher, without building the
+/// whole string first, and ends it with a separator so fields cannot run
+/// into each other.
+fn hash_debug(hasher: &mut impl std::hash::Hasher, value: &impl std::fmt::Debug) {
+    struct Feed<'a, H: std::hash::Hasher>(&'a mut H);
+    impl<H: std::hash::Hasher> std::fmt::Write for Feed<'_, H> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0.write(text.as_bytes());
+            Ok(())
+        }
+    }
+    let _ = std::fmt::write(&mut Feed(hasher), format_args!("{value:?}"));
+    hasher.write_u8(0xff);
+}
+
 /// Immutable copy of the emulator readiness the builder reads. Only finished
 /// scans are copied; anything still scanning is `None`, and the worker waits.
 #[derive(Clone)]
@@ -95,43 +120,110 @@ pub(super) struct EnvSnapshot {
 }
 
 impl EnvSnapshot {
-    /// A cheap fingerprint of everything [`Self::capture`] reads, or `None`
-    /// while a needed scan is unfinished. A different value means earlier
-    /// background answers no longer describe the machine.
+    /// A fingerprint of everything [`Self::capture`] reads, or `None` while a
+    /// needed scan is unfinished. A different value means earlier background
+    /// answers no longer describe the machine. Walks every scan result in
+    /// full; per-frame callers use [`Self::cached_signature`].
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn signature(state: &EmulatorReadinessState) -> Option<u64> {
-        use std::hash::{Hash, Hasher};
+        use std::hash::Hasher;
+        let heavy = Self::heavy_signature(state)?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write_u64(heavy);
+        hasher.write_u64(Self::light_signature(state));
+        Some(hasher.finish())
+    }
+
+    /// [`Self::signature`] for every frame. The small settings (overrides,
+    /// remembered emulators, launch choices, installation fingerprint) are
+    /// hashed every call. The scan results (the RetroArch report with every
+    /// playlist entry, Xenia, Dolphin and PCSX2 discovery) can be tens of
+    /// thousands of entries, so their hash is reused for at most
+    /// [`HEAVY_SIGNATURE_RECHECK`]. A rescan passes through a scanning state,
+    /// which returns `None` at once and drops the cached hash, so the reuse
+    /// window only matters for a result replaced without a rescan.
+    pub(super) fn cached_signature(
+        state: &EmulatorReadinessState,
+        cache: &mut HeavySignatureCache,
+        now: std::time::Instant,
+    ) -> Option<u64> {
+        use std::hash::Hasher;
+        if !Self::scans_finished(state) {
+            cache.heavy = None;
+            return None;
+        }
+        let heavy = match cache.heavy {
+            Some((at, heavy)) if now.saturating_duration_since(at) < HEAVY_SIGNATURE_RECHECK => {
+                heavy
+            }
+            _ => {
+                let heavy = Self::heavy_signature(state)?;
+                cache.heavy = Some((now, heavy));
+                heavy
+            }
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write_u64(heavy);
+        hasher.write_u64(Self::light_signature(state));
+        Some(hasher.finish())
+    }
+
+    /// Whether every scan the signature covers has an answer (Ready or Error).
+    fn scans_finished(state: &EmulatorReadinessState) -> bool {
+        matches!(state.retroarch_profiles, RetroArchProfilesState::Ready(_))
+            && matches!(
+                state.dolphin_local_profiles,
+                DolphinLocalProfilesState::Ready(_) | DolphinLocalProfilesState::Error(_)
+            )
+            && matches!(
+                state.pcsx2_launch_profiles,
+                Pcsx2LaunchProfilesState::Ready(_) | Pcsx2LaunchProfilesState::Error(_)
+            )
+            && matches!(
+                state.pcsx2_firmware_evidence,
+                Pcsx2FirmwareEvidenceState::Ready(_) | Pcsx2FirmwareEvidenceState::Error(_)
+            )
+    }
+
+    /// The large scan results. `None` while any of them is unfinished.
+    fn heavy_signature(state: &EmulatorReadinessState) -> Option<u64> {
+        use std::hash::Hasher;
+        if !Self::scans_finished(state) {
+            return None;
+        }
         let RetroArchProfilesState::Ready(retroarch) = &state.retroarch_profiles else {
             return None;
         };
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        format!("{:?}", retroarch.environment).hash(&mut hasher);
-        format!("{:?}", state.retroarch_installation_fingerprint).hash(&mut hasher);
-        format!("{:?}", state.retroarch_core_directory_override).hash(&mut hasher);
-        format!("{:?}", state.emulator_setup_overrides).hash(&mut hasher);
-        format!("{:?}", state.xenia_profiles).hash(&mut hasher);
-        format!("{:?}", state.remembered_emulator_profiles).hash(&mut hasher);
-        // Only what changes a plan; the launch-observation flag does not.
-        format!(
-            "{:?}{:?}",
-            state.launch_choices.preferences, state.launch_choices.once
-        )
-        .hash(&mut hasher);
+        hash_debug(&mut hasher, &retroarch.environment);
+        hash_debug(&mut hasher, &state.xenia_profiles);
         match &state.dolphin_local_profiles {
-            DolphinLocalProfilesState::Ready(r) => format!("{:?}", r.discovery).hash(&mut hasher),
-            DolphinLocalProfilesState::Error(_) => 1u8.hash(&mut hasher),
-            _ => return None,
+            DolphinLocalProfilesState::Ready(r) => hash_debug(&mut hasher, &r.discovery),
+            _ => hasher.write_u8(1),
         }
         match &state.pcsx2_launch_profiles {
-            Pcsx2LaunchProfilesState::Ready(r) => format!("{:?}", r.discovery).hash(&mut hasher),
-            Pcsx2LaunchProfilesState::Error(_) => 1u8.hash(&mut hasher),
-            _ => return None,
+            Pcsx2LaunchProfilesState::Ready(r) => hash_debug(&mut hasher, &r.discovery),
+            _ => hasher.write_u8(1),
         }
         match &state.pcsx2_firmware_evidence {
-            Pcsx2FirmwareEvidenceState::Ready(records) => records.len().hash(&mut hasher),
-            Pcsx2FirmwareEvidenceState::Error(_) => 1u8.hash(&mut hasher),
-            _ => return None,
+            Pcsx2FirmwareEvidenceState::Ready(records) => hasher.write_usize(records.len()),
+            _ => hasher.write_u8(1),
         }
         Some(hasher.finish())
+    }
+
+    /// The small settings that change a plan, cheap enough for every frame.
+    fn light_signature(state: &EmulatorReadinessState) -> u64 {
+        use std::hash::Hasher;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hash_debug(&mut hasher, &state.retroarch_installation_fingerprint);
+        hash_debug(&mut hasher, &state.retroarch_core_directory_override);
+        hash_debug(&mut hasher, &state.emulator_setup_overrides);
+        hash_debug(&mut hasher, &state.remembered_emulator_profiles);
+        // Only what changes a plan; the launch-observation flag does not.
+        hash_debug(&mut hasher, &state.launch_choices.preferences);
+        hash_debug(&mut hasher, &state.launch_choices.once);
+        hasher.finish()
     }
 
     /// `None` until the scans every launch decision needs have finished.
@@ -1142,5 +1234,79 @@ mod tests {
             "a cancelled check must not report Ready"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn finished_state() -> EmulatorReadinessState {
+        EmulatorReadinessState {
+            retroarch_profiles: RetroArchProfilesState::Ready(crate::tests::cheat_discovery(vec![
+                crate::tests::cheat_profile("native-user", true),
+            ])),
+            dolphin_local_profiles: DolphinLocalProfilesState::Error("none".into()),
+            pcsx2_launch_profiles: Pcsx2LaunchProfilesState::Error("none".into()),
+            pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState::Ready(Vec::new()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cached_signature_matches_the_full_signature() {
+        let state = finished_state();
+        let mut cache = HeavySignatureCache::default();
+        let now = std::time::Instant::now();
+        let full = EnvSnapshot::signature(&state);
+        assert!(full.is_some());
+        assert_eq!(EnvSnapshot::cached_signature(&state, &mut cache, now), full);
+        assert_eq!(EnvSnapshot::cached_signature(&state, &mut cache, now), full);
+    }
+
+    #[test]
+    fn a_settings_change_moves_the_cached_signature_at_once() {
+        let mut state = finished_state();
+        let mut cache = HeavySignatureCache::default();
+        let now = std::time::Instant::now();
+        let before = EnvSnapshot::cached_signature(&state, &mut cache, now);
+        state.launch_choices.preferences = Err("changed".into());
+        let after = EnvSnapshot::cached_signature(&state, &mut cache, now);
+        assert_ne!(before, after, "launch choices are hashed on every call");
+        assert_eq!(after, EnvSnapshot::signature(&state));
+    }
+
+    #[test]
+    fn a_rescan_drops_the_cached_scan_hash_at_once() {
+        let mut state = finished_state();
+        let mut cache = HeavySignatureCache::default();
+        let now = std::time::Instant::now();
+        let before = EnvSnapshot::cached_signature(&state, &mut cache, now);
+        // A rescan passes through an unfinished state: no signature, no reuse.
+        state.dolphin_local_profiles = DolphinLocalProfilesState::NotScanned;
+        assert_eq!(EnvSnapshot::cached_signature(&state, &mut cache, now), None);
+        // The new result is hashed in full at once, even inside the window.
+        state.dolphin_local_profiles = DolphinLocalProfilesState::Error("none".into());
+        if let RetroArchProfilesState::Ready(discovery) = &mut state.retroarch_profiles {
+            discovery.environment.format_version += 1;
+        }
+        let after = EnvSnapshot::cached_signature(&state, &mut cache, now);
+        assert_ne!(before, after);
+        assert_eq!(after, EnvSnapshot::signature(&state));
+    }
+
+    #[test]
+    fn a_scan_result_replaced_in_place_is_seen_after_the_recheck_window() {
+        let mut state = finished_state();
+        let mut cache = HeavySignatureCache::default();
+        let now = std::time::Instant::now();
+        let before = EnvSnapshot::cached_signature(&state, &mut cache, now);
+        if let RetroArchProfilesState::Ready(discovery) = &mut state.retroarch_profiles {
+            discovery.environment.format_version += 1;
+        }
+        // Inside the window the scan hash is reused (bounded staleness).
+        assert_eq!(
+            EnvSnapshot::cached_signature(&state, &mut cache, now),
+            before
+        );
+        let later = now + HEAVY_SIGNATURE_RECHECK;
+        let after = EnvSnapshot::cached_signature(&state, &mut cache, later);
+        assert_ne!(before, after);
+        assert_eq!(after, EnvSnapshot::signature(&state));
     }
 }
