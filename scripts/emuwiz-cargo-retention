@@ -213,6 +213,347 @@ def home():
     return os.environ.get("HOME") or os.path.expanduser("~")
 
 
+HOLD_LIST_NAME = "hold-list.txt"            # simple owner list (optional): one absolute path per line
+HOLD_REGISTRY_NAME = "hold-registry.json"    # required: the durable HOLD registry (schema below)
+HOLD_REGISTRY_KIND = "EMUWIZ_HOLD_REGISTRY"
+HOLD_COORDINATION_GLOB = "emuwiz-audit-ledger/*/COORDINATION.md"
+HOLD_MEMORY_GLOB = ".claude/projects/*/memory/*.md"   # owner/agent memory notes: HOLD lines are live sources
+# Every code that protects a target because of a HOLD source (or uncertainty about one).
+HOLD_CODES = ("HOLD_LISTED", "HOLD_UNRESOLVED_MATCH", "HOLD_COORDINATION", "HOLD_MEMORY_NOTE",
+              "HOLD_INDICATION_UNRECONCILED",
+              "HOLD_REGISTRY_MISSING", "HOLD_REGISTRY_INVALID", "HOLD_REGISTRY_STALE", "HOLD_SOURCE_UNREADABLE")
+_HOLD_WORD = re.compile(r"\b(HOLD|HELD)\b", re.I)
+_HOLD_WORD_MEMORY = re.compile(r"\b(HOLD|HELD)\b")      # memory: the owner's capitalised HOLD
+
+
+def _names_in(name, lines):
+    """True when `name` (a checkout or cache basename) appears in a line as a whole name:
+    preceded by start, whitespace, / ( ` ' " and followed by end, whitespace, / ) , ; : ` ' "
+    or a full stop that ends a sentence (so emuwiz-foo never matches emuwiz-foo-bar or
+    emuwiz-foo.v1)."""
+    pattern = re.compile(r"(?:^|[\s/(`'\"~\[*|])" + re.escape(name) + r"(?=$|[\s)/,;:`'\"\]*|+]|\.(?:\s|$))")
+    return any(pattern.search(line) for line in lines)
+_SHA = re.compile(r"[0-9a-f]{40}")
+_HOLD_CACHE = {}
+_GIT_FACTS = {}
+
+
+def hold_list_path():
+    return os.path.join(registry_dir(), HOLD_LIST_NAME)
+
+
+def hold_registry_path():
+    return os.path.join(registry_dir(), HOLD_REGISTRY_NAME)
+
+
+def _read_regular(path, limit=1 << 22):
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(f"{path} is not a regular file")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read(limit)
+
+
+HOLD_RELEASE_KIND = "EMUWIZ_HOLD_RELEASE"
+HOLD_RELEASE_NAMESPACE = "emuwiz-hold-release@1"
+HOLD_RELEASES_DIR = "hold-releases"
+# Set by the program that loads this module (maintain/retire): verifies the owner's
+# signature over a release record, returning facts or None.  Unset: no release is honoured.
+HOLD_RELEASE_VERIFIER = None
+_RELEASE_VERIFIED = {}
+_LIFT = re.compile(r"\b(hold|held)\b\s+(?:was\s+|is\s+|has\s+been\s+)?(lifted|released|removed|cleared|ended|over)\b|"
+                   r"\b(lift(?:ed)?|release[ds]?|remove[ds]?|clear(?:ed)?|end(?:ed)?)\s+(?:the\s+|its\s+|that\s+)?"
+                   r"(hold|held)\b|\bno\s+longer\s+(?:on\s+)?(hold|held)\b|\bun-?hold\b", re.I)
+_STATES = ("HELD", "RELEASED", "UNKNOWN")
+
+
+def indication_hash(text):
+    return hashlib.sha256(" ".join(text.split()).encode()).hexdigest()
+
+
+def _valid_registry(doc):
+    """(entries, problem).  Schema 2: every entry has state HELD | RELEASED | UNKNOWN and an
+    ordered `transitions` history; schema 1 (MAPPED/UNRESOLVED) is read as HELD/UNKNOWN.
+    Every entry must be matchable (path, branch or head); an empty registry is invalid."""
+    if not isinstance(doc, dict) or doc.get("kind") != HOLD_REGISTRY_KIND or doc.get("schema") not in (1, 2):
+        return None, "HOLD_REGISTRY_INVALID"
+    entries, ids = doc.get("entries"), set()
+    if not isinstance(entries, list) or not entries:
+        return None, "HOLD_REGISTRY_INVALID"
+    out = []
+    for e in entries:
+        if not isinstance(e, dict) or not isinstance(e.get("id"), str) or e["id"] in ids:
+            return None, "HOLD_REGISTRY_INVALID"
+        ids.add(e["id"])
+        state = e.get("state") or {"MAPPED": "HELD", "UNRESOLVED": "UNKNOWN"}.get(e.get("status"))
+        if state not in _STATES:
+            return None, "HOLD_REGISTRY_INVALID"
+        paths, branches, heads = e.get("paths", []), e.get("branches", []), e.get("heads", [])
+        transitions = e.get("transitions", [])
+        if not all(isinstance(x, list) for x in (paths, branches, heads, transitions)) \
+                or not all(isinstance(p, str) and os.path.isabs(p) for p in paths) \
+                or not all(isinstance(x, str) and x for x in branches) \
+                or not all(isinstance(h, str) and _SHA.fullmatch(h) for h in heads) \
+                or not all(isinstance(t, dict) and t.get("state") in ("HELD", "RELEASED")
+                           and isinstance(t.get("at"), (int, float)) for t in transitions):
+            return None, "HOLD_REGISTRY_INVALID"
+        if not (paths or branches or heads):
+            return None, "HOLD_REGISTRY_INVALID"
+        out.append(dict(e, state=state))
+    try:
+        generated, max_age = float(doc["generated_at"]), float(doc.get("max_age_days", 30))
+    except (KeyError, TypeError, ValueError):
+        return None, "HOLD_REGISTRY_INVALID"
+    if generated > now() + 300 or now() - generated > max_age * 86400:
+        return None, "HOLD_REGISTRY_STALE"
+    for src in doc.get("sources", []):
+        if not isinstance(src, dict) or not isinstance(src.get("path"), str):
+            return None, "HOLD_REGISTRY_INVALID"
+        if src.get("required") and not os.path.exists(src["path"]):
+            return None, "HOLD_SOURCE_UNREADABLE"
+    return out, None
+
+
+def checkout_identity(path):
+    """{path, dev, ino, head, branch} of a checkout, or None: what a release is bound to."""
+    try:
+        real = os.path.realpath(path)
+        st = os.stat(real)
+    except OSError:
+        return None
+    head, branch = _git_facts(real)
+    if not head:
+        return None
+    return {"path": real, "dev": st.st_dev, "ino": st.st_ino, "head": head, "branch": branch}
+
+
+def _release_valid(entry, transition):
+    """The signed release record behind a RELEASED transition, if it verifies and is bound
+    to this entry and to the CURRENT identity of a checkout it names; else None."""
+    name = transition.get("release_record")
+    if not isinstance(name, str) or HOLD_RELEASE_VERIFIER is None:
+        return None
+    path = os.path.join(registry_dir(), HOLD_RELEASES_DIR, os.path.basename(name))
+    try:
+        raw = _read_regular(path, 1 << 20)
+        record = json.loads(raw)
+        sig = _read_regular(path + ".sig", 1 << 14)
+        key = (path, hashlib.sha256(raw).hexdigest(), hashlib.sha256(sig).hexdigest())
+        if key not in _RELEASE_VERIFIED:       # signature checked once per (record, signature) bytes
+            _RELEASE_VERIFIED[key] = HOLD_RELEASE_VERIFIER(path, raw) is not None
+        if not _RELEASE_VERIFIED[key]:
+            return None
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, dict) or record.get("kind") != HOLD_RELEASE_KIND or record.get("entry") != entry["id"] \
+            or record.get("at") != transition.get("at") or not isinstance(record.get("checkout"), dict) \
+            or not isinstance(record.get("acknowledged"), list):
+        return None
+    current = checkout_identity(record["checkout"].get("path", ""))
+    want = record["checkout"]
+    if current is None or any(current.get(k) != want.get(k) for k in ("path", "dev", "ino", "head")):
+        return None                    # the checkout changed since the owner released it
+    return record
+
+
+def effective_state(entry):
+    """(state, release record or None).  The LAST transition decides: a later HELD always
+    overrides an earlier release; a RELEASED transition counts only with a valid signed
+    release bound to the current checkout identity, otherwise the entry is UNKNOWN."""
+    transitions = sorted(entry.get("transitions", []), key=lambda t: t["at"])
+    if transitions:
+        last = transitions[-1]
+        if last["state"] == "HELD":
+            return "HELD", None
+        record = _release_valid(entry, last)
+        return ("RELEASED", record) if record else ("UNKNOWN", None)
+    if entry["state"] == "RELEASED":          # a RELEASED state without its signed transition
+        return "UNKNOWN", None
+    return entry["state"], None
+
+
+def hold_sources():
+    """The HOLD registry (the authority) plus the HOLD *indications* used to reconcile it:
+    hold-list.txt entries, COORDINATION.md lines saying HOLD/HELD and memory-note lines
+    saying HOLD/HELD (lines saying a hold was lifted are not indications).  An indication
+    for a checkout blocks it until a valid release acknowledged that exact line (by hash);
+    a line added after the release blocks again.  `problem` (missing, malformed, stale or
+    incomplete registry; unreadable source) holds every target."""
+    import glob
+    coordination = sorted(glob.glob(os.path.join(home(), HOLD_COORDINATION_GLOB)))
+    memory = sorted(glob.glob(os.path.join(home(), HOLD_MEMORY_GLOB)))
+    releases = sorted(glob.glob(os.path.join(registry_dir(), HOLD_RELEASES_DIR, "*")))
+    key = []
+    for path in (hold_registry_path(), hold_list_path(), *coordination, *memory, *releases):
+        try:
+            st = os.lstat(path)
+            key.append((path, st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size))
+        except OSError:
+            key.append((path, None))
+    key = tuple(key)                   # any change to any source re-reads them all
+    cached = _HOLD_CACHE.get(key)
+    if cached:
+        return cached
+    out = {"entries": [], "indications": [], "list_paths": [], "problem": None}
+    try:
+        raw = _read_regular(hold_registry_path(), (1 << 22) + 1)
+        if len(raw) > 1 << 22:
+            raise ValueError("HOLD registry larger than 4 MiB")
+        entries, problem = _valid_registry(json.loads(raw))
+    except FileNotFoundError:
+        entries, problem = None, "HOLD_REGISTRY_MISSING"
+    except (OSError, ValueError, UnicodeDecodeError):
+        entries, problem = None, "HOLD_REGISTRY_INVALID"
+    out["problem"] = problem
+    for e in entries or ():
+        paths = {os.path.normpath(p) for p in e.get("paths", [])}
+        out["entries"].append(dict(e, _paths=paths | {os.path.realpath(p) for p in paths}))
+    try:
+        raw = _read_regular(hold_list_path(), (1 << 20) + 1)
+        if len(raw) > 1 << 20:
+            raise OSError("hold list larger than 1 MiB")
+        for line in raw.decode("utf-8").splitlines():
+            entry = line.split("#", 1)[0].strip()
+            if entry and not os.path.isabs(entry):
+                out["problem"] = out["problem"] or "HOLD_SOURCE_UNREADABLE"
+            elif entry:
+                p = os.path.normpath(entry)
+                out["list_paths"].append(({p, os.path.realpath(p)}, indication_hash(line)))
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeDecodeError):
+        out["problem"] = out["problem"] or "HOLD_SOURCE_UNREADABLE"
+    for kind, files, word in (("HOLD_COORDINATION", coordination, _HOLD_WORD),
+                              ("HOLD_MEMORY_NOTE", memory, _HOLD_WORD_MEMORY)):
+        for path in files:
+            try:
+                raw = _read_regular(path, (1 << 22) + 1)
+                if len(raw) > 1 << 22:
+                    raise OSError("source larger than 4 MiB")
+                lines = raw.decode("utf-8").splitlines()
+            except (OSError, UnicodeDecodeError):
+                out["problem"] = out["problem"] or "HOLD_SOURCE_UNREADABLE"
+                continue
+            for line in lines:
+                if word.search(_LIFT.sub(" ", line)):
+                    out["indications"].append((kind, line, indication_hash(line)))
+    _HOLD_CACHE.clear()
+    _HOLD_CACHE[key] = out
+    return out
+
+
+def hold_indications(*paths):
+    """[(code, text, hash)] of the HOLD indications naming these checkout/cache paths."""
+    src = hold_sources()
+    found = []
+    for path in paths:
+        if not path:
+            continue
+        forms = {os.path.normpath(os.path.abspath(path)), os.path.realpath(path)}
+        for listed, digest in src["list_paths"]:
+            if any(f == h or f.startswith(h.rstrip(os.sep) + os.sep) for f in forms for h in listed):
+                found.append(("HOLD_LISTED", "hold-list.txt", digest))
+        for form in forms:
+            base = os.path.basename(form)
+            if base:
+                found.extend(i for i in src["indications"] if _names_in(base, [i[1]]))
+    return list(dict.fromkeys(found))
+
+
+def _git_head_file(path):
+    """The checkout's own HEAD file (worktree admin dir or .git/HEAD), or None."""
+    dotgit = os.path.join(path, ".git")
+    try:
+        if os.path.isdir(dotgit) and not os.path.islink(dotgit):
+            return os.path.join(dotgit, "HEAD")
+        with open(dotgit) as handle:
+            line = handle.read(4096).strip()
+        if line.startswith("gitdir: "):
+            gitdir = line[len("gitdir: "):]
+            return os.path.join(gitdir if os.path.isabs(gitdir) else os.path.join(path, gitdir), "HEAD")
+    except OSError:
+        pass
+    return None
+
+
+def _git_facts(path):
+    """(HEAD, branch) of a checkout; (None, None) when it is not a checkout; (False, None)
+    when it has a .git but its state cannot be read (callers hold).  Cached per HEAD-file
+    identity, so a branch switch or commit during a long cycle is seen at the next check;
+    no inherited GIT_* environment can redirect it to another repository."""
+    if not (os.path.isdir(path) and os.path.lexists(os.path.join(path, ".git"))):
+        return (None, None)
+    head_file = _git_head_file(path)
+    try:                               # HEAD (branch switch) and its reflog (commit, reset, merge)
+        st = os.stat(head_file) if head_file else None
+        log = os.stat(os.path.join(os.path.dirname(head_file), "logs", "HEAD")) if head_file else None
+    except OSError:
+        st = log = None                # no reflog: never cached
+    if log is None:
+        st = None
+    key = (path, head_file, st and (st.st_ino, st.st_mtime_ns, st.st_size),
+           log and (log.st_ino, log.st_mtime_ns, log.st_size))
+    if st is not None and key in _GIT_FACTS:
+        return _GIT_FACTS[key]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_OPTIONAL_LOCKS="0", GIT_NO_REPLACE_OBJECTS="1", LC_ALL="C")
+    facts = (False, None)
+    try:
+        out = run_as_owner(["git", "-C", path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD"],
+                           capture_output=True, text=True, timeout=10, env=env)
+        lines = out.stdout.split() if out.returncode == 0 else []
+        if len(lines) == 2 and re.fullmatch(r"[0-9a-f]{40}", lines[0]):
+            facts = (lines[0], None if lines[1] == "HEAD" else lines[1])
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if st is not None and facts[0] is not False:
+        _GIT_FACTS[key] = facts
+    return facts
+
+
+def hold_listed(*paths, heads=()):
+    """None, or why these checkout/cache paths are HOLD.  The registry decides: an entry that
+    matches (path equal to or above, branch of a current checkout, or a recorded/current
+    HEAD) and is HELD or UNKNOWN holds.  A HOLD indication (hold list, coordination or
+    memory line) holds unless a matching RELEASED entry's signed release acknowledged that
+    exact line.  RELEASED only removes HOLD; pins and every other gate still apply."""
+    src = hold_sources()
+    if src["problem"]:
+        return src["problem"]
+    forms, all_heads, branches = set(), {h for h in heads if h}, set()
+    for path in paths:
+        if not path:
+            continue
+        forms |= {os.path.normpath(os.path.abspath(path)), os.path.realpath(path)}
+        head, branch = _git_facts(os.path.realpath(path))
+        if head is False:                      # a checkout whose Git state cannot be read
+            return "HOLD_SOURCE_UNREADABLE"
+        if head:
+            all_heads.add(head)
+        if branch:
+            branches.add(branch)
+    acknowledged, released, unknown = set(), False, False
+    for e in src["entries"]:              # every matching entry counts: HELD > UNKNOWN > RELEASED
+        hit = any(f == h or f.startswith(h.rstrip(os.sep) + os.sep) for f in forms for h in e["_paths"]) \
+            or branches & set(e.get("branches", [])) or all_heads & set(e.get("heads", []))
+        if not hit:
+            continue
+        state, record = effective_state(e)
+        if state == "HELD":
+            return "HOLD_LISTED"
+        if state == "UNKNOWN":
+            unknown = True
+            continue
+        released = True
+        acknowledged.update(a for a in record["acknowledged"] if isinstance(a, str))
+    if unknown:
+        return "HOLD_UNRESOLVED_MATCH"
+    for code, _text, digest in hold_indications(*paths):
+        if digest not in acknowledged:
+            return "HOLD_INDICATION_UNRECONCILED" if released else code
+    return None
+
 def registry_dir():
     return os.environ.get("EMUWIZ_RETENTION_DIR") or os.path.join(
         home(), ".cache", "emuwiz-cargo-retention"
@@ -1163,7 +1504,7 @@ def lifecycle_state(item, record):
     holds = item["holds"]
     if any(h in holds for h in ("BUILD_LOCK_HELD", "RECORDED_BUILD_ALIVE", "LIVE_PROCESS_REFERENCE")):
         return "ACTIVE"
-    if "PINNED" in holds or "PIN_STATE_UNKNOWN" in holds:
+    if any(h in holds for h in ("PINNED", "PIN_STATE_UNKNOWN") + HOLD_CODES):
         return "PROTECTED"
     if not record:
         return "UNTRACKED"
@@ -1187,6 +1528,10 @@ def evaluate(items, registry, args, census, measured):
             holds.append("PIN_STATE_UNKNOWN")
         if pins:
             holds.append("PINNED")
+        listed = hold_listed(path, (record or {}).get("worktree"),
+                             heads=((record or {}).get("head"), ((record or {}).get("released") or {}).get("head")))
+        if listed:
+            holds.append(listed)
         if item.get("symlink") or not os.path.isdir(path) or os.path.islink(path):
             holds.append("SYMLINK_OR_MISSING_TARGET")
         if item["kind"] == "per-worktree" and not NAME_RE.match(item["name"]):
@@ -1260,7 +1605,7 @@ def evaluate(items, registry, args, census, measured):
         if m.get("cross_device"):
             holds.append("CONTAINS_MOUNT_POINT")
         item["protected_reasons"] = [h for h in holds if h in (
-            "PINNED", "PIN_STATE_UNKNOWN", "BUILD_LOCK_HELD", "RECORDED_BUILD_ALIVE", "LIVE_PROCESS_REFERENCE",
+            "PINNED", "PIN_STATE_UNKNOWN", *HOLD_CODES, "BUILD_LOCK_HELD", "RECORDED_BUILD_ALIVE", "LIVE_PROCESS_REFERENCE",
             "LIVE_PROCESS_IN_SOURCE", "RECENT_ACTIVITY", "DIRECTORY_IDENTITY_CHANGED", "CONTAINS_MOUNT_POINT", "WRITTEN_AFTER_RELEASE",
         )]
         item["eligible"] = not holds
@@ -1627,8 +1972,13 @@ def cmd_adopt(args):
 # ----------------------------------------------------------------------- plan
 
 
-def select_artifacts(target, root_dev):
-    """Exact compiler-artifact paths under one target, and everything preserved."""
+RA_SUBTARGET = "rust-analyzer"   # cargo-iso --rust-analyzer builds into <target>/rust-analyzer
+
+
+def select_artifacts(target, root_dev, _nested=False):
+    """Exact compiler-artifact paths under one target, and everything preserved.  The
+    rust-analyzer sub-target (<target>/rust-analyzer, one level only) is classified with
+    exactly the same rules as the target itself."""
     selected, preserved = [], []
 
     def keep(path, why):
@@ -1659,6 +2009,11 @@ def select_artifacts(target, root_dev):
             continue
         if not stat.S_ISDIR(s.st_mode):
             keep(full, "unrecognised file")
+            continue
+        if name == RA_SUBTARGET and not _nested:
+            sub_selected, sub_preserved = select_artifacts(full, root_dev, _nested=True)
+            selected.extend(sub_selected)
+            preserved.extend(sub_preserved)
             continue
         for profile in profile_dirs(full, s, keep):
             select_profile(profile, selected, keep)

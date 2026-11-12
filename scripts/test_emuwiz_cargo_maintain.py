@@ -29,11 +29,27 @@ ISO = os.path.join(HERE, "cargo-iso")
 DAY = 86400
 
 
+# The fixture repository of the running test.  Production inventory enumerates the worktrees of
+# the repository the script lives in (make_args: repo=None), which for this checkout means every
+# real worktree on the machine; tests must see only their own fixture repository.
+FIXTURE_REPO = None
+
+
 def load_maintain():
     loader = importlib.machinery.SourceFileLoader("emuwiz_cargo_maintain_under_test", MAINTAIN)
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
+    production_make_args = module.make_args
+
+    def fixture_make_args(policy, extra=None):
+        ns = production_make_args(policy, extra)
+        if ns.repo is None:
+            if FIXTURE_REPO is None:
+                raise AssertionError("inventory outside a test fixture would enumerate real worktrees")
+            ns.repo = FIXTURE_REPO
+        return ns
+    module.make_args = fixture_make_args
     return module
 
 
@@ -52,7 +68,12 @@ class MaintBase(R.Base):
 
     def setUp(self):
         super().setUp()
+        global FIXTURE_REPO
+        FIXTURE_REPO = self.repo
+        self.addCleanup(globals().__setitem__, "FIXTURE_REPO", None)
         self.m = load_maintain()
+        import test_emuwiz_cargo_signing as S
+        S.install_test_anchor(self.m.executor())
 
     def full_census(self, m=None):
         m = m or self.m
@@ -60,8 +81,11 @@ class MaintBase(R.Base):
         ex = m.executor()
         ex.F.Census = with_full_census(ex.F.Census)
 
-    def call(self, *argv, m=None):
+    def call(self, *argv, m=None, raw=False, signed=False):
         m = m or self.m
+        argv = list(argv)
+        if signed and argv and argv[0] == "run" and "--dry-run" not in argv and "--scoped-run" not in argv:
+            argv = self.signed_run_argv(argv, m)
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             try:
@@ -69,6 +93,29 @@ class MaintBase(R.Base):
             except SystemExit as exit_:
                 rc = exit_.code if isinstance(exit_.code, int) else 1
         return rc, out.getvalue()
+
+    def signed_run_argv(self, argv, m):
+        """The owner-signed form of a `run`: the targets the plan selects (or the given
+        --only names), a scoped-run record from request-retirement, signed with the test
+        owner key.  Unplannable requests are passed through unchanged (and refused)."""
+        import test_emuwiz_cargo_signing as S
+        only = [argv[i + 1] for i, a in enumerate(argv) if a == "--only" and i + 1 < len(argv)]
+        if not only:
+            st, policy, _ = m.load_policy()
+            if st != "ok" or not policy["enabled"]:
+                return argv
+            _, items, census, _, summ = m.snapshot(policy)
+            only = [e["item"]["name"] for e in m.plan_cycle(policy, items, summ, census, None)["selected"]]
+            if not only:
+                return argv
+        req = ["request-retirement"] + [x for n in only for x in ("--only", n)]
+        rc, out = self.call(*req, m=m, raw=True)
+        if rc != 0:
+            return argv if "--only" in argv else argv + [x for n in only for x in ("--only", n)]
+        record = out.splitlines()[0].strip()
+        S.sign(record)
+        rest = [a for i, a in enumerate(argv[1:], 1) if a != "--only" and (i == 0 or argv[i - 1] != "--only")]
+        return ["run"] + [x for n in only for x in ("--only", n)] + rest + ["--scoped-run", record]
 
     def status(self, m=None):
         rc, out = self.call("status", "--json", m=m)
@@ -283,6 +330,21 @@ class Policy(MaintBase):
         self.call("run")
         self.assertEqual(self.last_cycle()["outcome"], "NOTHING_TO_DO")
         self.assertTrue(os.path.exists(os.path.join(t, "debug", "deps", "libx.rlib")))
+
+
+class FixtureIsolation(MaintBase):
+    def test_inventory_sees_only_the_fixture(self):
+        wt, t = self.cache("iso")
+        self.finish(wt)
+        self.full_census()
+        rc, out = self.call("status", "--json")
+        targets = json.loads(out)["targets"]
+        self.assertTrue(targets)
+        tmp = os.path.realpath(self.tmp) + os.sep
+        outside = [t for t in targets
+                   if not (os.path.realpath(t.get("worktree") or tmp) + os.sep).startswith(tmp)]
+        self.assertEqual(outside, [], "the test inventory must not include real worktrees or their targets")
+        self.assertLess(json.loads(out)["total_allocated"], 1 << 30)
 
 
 class Holds(MaintBase):
