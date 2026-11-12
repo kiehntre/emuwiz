@@ -208,6 +208,27 @@ pub fn retroarch_option_id(
     format!("retroarch/{kind}/{scope}/{core_stem}")
 }
 
+/// A readable name for a saved [`launch_option_id`], so a choice that can no
+/// longer be used says which emulator it named. Built only from the stored
+/// id (the option itself may be gone); an unrecognised id is shown as stored.
+pub fn describe_option_id(option_id: &str) -> String {
+    if let Some(rest) = option_id.strip_prefix("standalone/")
+        && let Some((adapter, profile)) = rest.split_once('/')
+    {
+        return match profile.find('/') {
+            Some(at) => format!("{adapter} at {}", &profile[at..]),
+            None => format!("{adapter} ({profile})"),
+        };
+    }
+    if let Some(rest) = option_id.strip_prefix("retroarch/") {
+        let parts: Vec<&str> = rest.splitn(3, '/').collect();
+        if let [kind, scope, core] = parts.as_slice() {
+            return format!("RetroArch core {core} ({kind}, {scope})");
+        }
+    }
+    option_id.to_owned()
+}
+
 pub fn is_adopted(plan: &LaunchPlan) -> bool {
     plan.platform_id.is_some()
 }
@@ -308,8 +329,9 @@ pub fn apply(plan: &mut LaunchPlan, inputs: LaunchChoiceInputs<'_>) -> LaunchCho
                     hold_for_new_choice(
                         plan,
                         &format!(
-                            "The emulator in your {} {state}. No other emulator is used instead; choose one to continue.",
-                            source.describe()
+                            "The emulator in your {} ({}) {state}. No other emulator is used instead; choose one to continue.",
+                            source.describe(),
+                            describe_option_id(&option_id)
                         ),
                     );
                     LaunchChoiceOutcome::PreferredUnavailable { source, option_id }

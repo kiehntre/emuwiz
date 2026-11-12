@@ -4831,6 +4831,19 @@ mod tests {
     }
 
     #[test]
+    fn only_launchable_or_unassessed_installations_can_be_chosen() {
+        use archivefs_core::launch::installation_support::LaunchSupport;
+        assert!(!super::lifecycle_choice_is_launchable(
+            &LaunchSupport::NotLaunchableYet {
+                reason: "no binding".into()
+            }
+        ));
+        assert!(super::lifecycle_choice_is_launchable(
+            &LaunchSupport::NotAssessed
+        ));
+    }
+
+    #[test]
     fn lifecycle_status_never_calls_detected_installations_not_installed() {
         use archivefs_core::emulator_lifecycle::LifecycleState;
 
@@ -4938,10 +4951,17 @@ fn lifecycle_setup_panel(
                             .map(update_status_label)
                             .unwrap_or("Latest version unknown")
                     ));
+                    ui.label(installation.launch_support.label());
+                    let launchable = lifecycle_choice_is_launchable(&installation.launch_support);
                     if !installation.selected
                         && let Some(path) = lifecycle_executable_path(&installation.exact_binding)
                         && let Some(emulator) = overridable_emulator(&projection.emulator_id)
-                        && ui.button("Use this installation").clicked()
+                        && ui
+                            .add_enabled(launchable, egui::Button::new("Use this installation"))
+                            .on_disabled_hover_text(
+                                "EmuWiz cannot launch this installation, so it cannot be chosen.",
+                            )
+                            .clicked()
                     {
                         app.emulator_readiness
                             .emulator_setup_overrides
@@ -5012,6 +5032,18 @@ fn lifecycle_primary_state_label(
         archivefs_core::emulator_lifecycle::LifecycleState::Missing => "Detected",
         _ => lifecycle_state_label(state),
     }
+}
+
+/// "Use this installation" is offered only for an installation Launch can
+/// start. Emulators whose launch adapter does not assess installations keep
+/// the existing behaviour.
+fn lifecycle_choice_is_launchable(
+    support: &archivefs_core::launch::installation_support::LaunchSupport,
+) -> bool {
+    !matches!(
+        support,
+        archivefs_core::launch::installation_support::LaunchSupport::NotLaunchableYet { .. }
+    )
 }
 
 fn lifecycle_selection_notice(
