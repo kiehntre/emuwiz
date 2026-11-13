@@ -339,6 +339,12 @@ rules; efficiency never overrides those guarantees.
 3. Never repeatedly poll builds, process lists, logs or Cargo locks using AI
    model turns. Use bounded shell waiters that write completion status and
    results to disk; inspect the result after completion or the bounded timeout.
+   Run long builds in the background and wait for the completion notification
+   instead of foreground `sleep`/`until` loops. For GUI automation never use a
+   fixed `sleep 90`-`sleep 120` before a screenshot or click: wait on a condition
+   with `scripts/qa/gui_wait.py` (`--window NAME --stable 2`, `--window-gone`,
+   `--log FILE --pattern RE --new-only`, `--pid-exit PID`, bounded `--timeout`),
+   or `xdotool search --sync`.
 4. Run focused tests during implementation. Freeze the candidate before running
    the full relevant final gate.
 5. Reuse successful test and review evidence. Repeat it only when subsequent
@@ -371,7 +377,9 @@ rules; efficiency never overrides those guarantees.
     open/update the PR, verify CI targets the exact reviewed head, and check once
     for immediate failures. If checks remain running, report the PR, full head SHA,
     run links and PENDING, then end the development session. Never use
-    `gh run watch`, repeated status/log polling or artifact downloads to wait for CI.
+    `gh run watch`, `gh pr checks --watch`, `sleep`+`gh` loops, background polling
+    watchers, repeated status/log polling or artifact downloads to wait for CI; this
+    applies equally to subagents.
     GitHub's completion notifier handles the final notification; see
     `docs/ci-notifications.md`. After completion, perform a separate short
     merge-readiness check using completed results for that exact head. Collect
