@@ -12,6 +12,7 @@
 //! This module owns no shared state with `crate::patch_manager` and is not
 //! imported by it.
 
+pub mod content_history;
 pub mod installation_selection;
 
 use std::collections::BTreeMap;

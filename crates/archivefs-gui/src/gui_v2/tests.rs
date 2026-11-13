@@ -137,6 +137,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         discovery_import_history: Default::default(),
         database_recovery: Default::default(),
         duckstation_history: Default::default(),
+        recently_played: Default::default(),
         canonical_organisation_generation: 0,
         canonical_organisation_history: Vec::new(),
         mods: super::mods::ModsPageState::default(),
