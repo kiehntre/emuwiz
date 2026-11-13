@@ -587,8 +587,8 @@ class PolicyState(Base):
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                  for op in ("enable", "disable", "enable", "disable", "enable", "disable")]
         for p in procs:
-            p.communicate()
-            self.assertEqual(p.returncode, 0)
+            _out, err = p.communicate()
+            self.assertEqual(p.returncode, 0, err.decode(errors="replace"))
         gens = [e["generation"] for e in self.events()]
         self.assertEqual(len(gens), len(set(gens)))
         self.assertEqual(gens, sorted(gens))
