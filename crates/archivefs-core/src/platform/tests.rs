@@ -3297,3 +3297,48 @@ mod inspection_completeness {
         assert_ne!(report.confidence, DetectionConfidence::Confirmed);
     }
 }
+
+/// The scan consequence of the Sega Pico entry (owner approval 2026-11-10 is
+/// for development only; the live library is not rescanned by this change):
+/// a `sega-pico` folder now names Sega Pico, while a Mega Drive folder and a
+/// Mega Drive header keep reading as Mega Drive. The Pico header is
+/// deliberately not a registry magic rule.
+#[test]
+fn a_sega_pico_folder_is_sega_pico_and_mega_drive_folders_are_unchanged() {
+    for folder in [
+        "sega-pico",
+        "Sega Pico",
+        "pico",
+        "kids-pico",
+        "segatoys-pico",
+    ] {
+        assert_eq!(platform_for_folder(folder), Some("Sega Pico"), "{folder}");
+        let zip = detect(&format!("{ROOT}/{folder}/Anpanman (Japan).zip"));
+        assert_eq!(zip.platform, Some("Sega Pico"), "{folder}");
+    }
+    for folder in ["megadrive", "genesis", "md"] {
+        assert_eq!(platform_for_folder(folder), Some("MegaDrive"), "{folder}");
+    }
+    // Extension-only files outside any system folder:
+    // `.md` was already ambiguous (Sega 32X lists it too); the Pico is one
+    // more named candidate, never a new decision.
+    let md = detect(&format!("{ROOT}/misc/Game.md"));
+    assert_eq!(md.platform, None, "{md:?}");
+    let named: Vec<_> = md.candidates.iter().map(|c| c.platform).collect();
+    assert_eq!(named, ["MegaDrive", "Sega 32X", "Sega Pico"]);
+    assert_eq!(
+        detect(&format!("{ROOT}/misc/Game.smd")).platform,
+        Some("MegaDrive")
+    );
+    let tree = TempTree::new("pico-header-registry");
+    let mut rom = vec![0u8; 0x400];
+    rom[0x100..0x109].copy_from_slice(b"SEGA PICO");
+    let path = tree.file("megadrive/Pico Game.md", &rom);
+    let report =
+        detect_platform_report(&DetectionRequest::new(&path, tree.path()).inspecting_content());
+    assert_eq!(report.platform, Some("MegaDrive"), "{report:?}");
+    let pico = platform_by_id("Sega Pico").expect("registered");
+    assert!(pico.magic.is_empty());
+    assert!(pico.conflicts_with.contains(&"MegaDrive"));
+    assert!(pico.accepts_extension("zip") && !pico.accepts_extension("pco"));
+}

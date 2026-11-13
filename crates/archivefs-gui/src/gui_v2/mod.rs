@@ -76,11 +76,13 @@ mod nkit;
 mod onboarding;
 mod optical_compare;
 mod organisation;
+mod organise;
 mod osk;
 mod pad_mouse;
 mod pad_shell;
 mod suggest;
 pub(crate) use pad_shell::mark_secret;
+mod amiga_hdf_storage;
 mod pages;
 mod patch_composition;
 mod patch_package_preview;
@@ -346,6 +348,8 @@ enum CanonicalOrganisationJobKind {
     Preview,
     Apply,
     Rollback,
+    /// Re-read and re-walk the configured source folders (read-only).
+    Rescan,
 }
 
 #[derive(Clone, Debug)]
@@ -383,6 +387,9 @@ pub(super) struct App {
     artwork: Artwork,
     imagery: imagery::Imagery,
     load_job: Option<u64>,
+    /// The `load_job` when it is a folder scan (a catalogue writer), so the
+    /// native Sources page refuses its own writers meanwhile (Night Watch S06-04).
+    scan_job: Option<u64>,
     artwork_job: Option<u64>,
     /// Picture totals for this session, shown on one grouped Activity entry.
     artwork_totals: activity::ArtworkTotals,
@@ -490,6 +497,7 @@ pub(super) struct App {
     document_cache: Option<(i64, std::path::PathBuf, Vec<documents::GameDocument>)>,
     document_refresh: game_documents::DocumentRefresh,
     setup_portability: setup_portability::SetupPortabilityState,
+    amiga_hdf_storage: amiga_hdf_storage::AmigaHdfStorageState,
     update_check: update_check::UpdateCheckState,
     missing: missing_review::MissingReviewState,
     equiv: equivalent_duplicates::EquivalentState,
@@ -526,6 +534,7 @@ impl App {
             artwork: Artwork::start(context),
             imagery: imagery::Imagery::default(),
             load_job: None,
+            scan_job: None,
             artwork_job: None,
             artwork_totals: activity::ArtworkTotals::default(),
             index_job: None,
@@ -584,7 +593,10 @@ impl App {
             classic_trainers: classic_trainers::State::default(),
             recording_integrity: recording_integrity::State::default(),
             game_detail_facts: game_detail_facts::State::default(),
-            canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::load(),
+            // The candidate walk runs on the worker at the first Preview, never
+            // on the GUI thread at start-up (Night Watch S06-02).
+            canonical_organisation:
+                crate::rom_organisation_page::RomOrganisationPageState::load_deferred(),
             canonical_organisation_job: None,
             history_view: Default::default(),
             discovery_import_history: Default::default(),
@@ -620,6 +632,7 @@ impl App {
             document_cache: None,
             document_refresh: Default::default(),
             setup_portability: setup_portability::SetupPortabilityState::default(),
+            amiga_hdf_storage: amiga_hdf_storage::AmigaHdfStorageState::default(),
             update_check: update_check::UpdateCheckState::default(),
             missing: Default::default(),
             equiv: Default::default(),
@@ -794,8 +807,13 @@ impl App {
         // unreadable folders is "Needs attention",
         // never a plain success (Night Watch S06-06).
         let loaded = format!(
-            "{} games available to browse. Original game files were not changed.",
-            library.games.len()
+            "{} games available to browse. Original game files were not changed.{}",
+            library.games.len(),
+            library
+                .scan_note
+                .as_deref()
+                .map(|note| format!(" {note}"))
+                .unwrap_or_default()
         );
         match &library.scan_warning {
             Some(warning) => {
@@ -855,6 +873,14 @@ impl App {
             });
             return;
         }
+        // So does a Sources-page action on the embedded native app (Night Watch S06-04).
+        if scan && self.native_catalogue_writer_busy() {
+            self.notice = Some(Notice {
+                message: "A Sources action is still running. Scan again when it has finished; nothing was started.".into(),
+                technical: "Refused: the native Sources page holds the catalogue writer.".into(),
+            });
+            return;
+        }
         let id = self.activity.queue(
             if scan {
                 "Scanning your game folders"
@@ -865,7 +891,29 @@ impl App {
             false,
         );
         self.load_job = Some(id);
-        self.send(id, Command::Load { scan });
+        self.scan_job = scan.then_some(id);
+        if scan && let Some(workflows) = &mut self.native_workflows {
+            // Close the one-frame window before the next per-frame sync.
+            workflows.app.external_catalogue_writer_busy = true;
+        }
+        if !self.send(id, Command::Load { scan }) {
+            // load_job keeps its existing contract (the refused job stays
+            // recorded, as the disconnected-backend tests rely on). Only the
+            // scan state added for the writer gate is released, so a refused
+            // scan cannot hold the native Sources writers forever.
+            self.scan_job = None;
+            if let Some(workflows) = &mut self.native_workflows {
+                workflows.app.external_catalogue_writer_busy = false;
+            }
+        }
+    }
+    /// Whether the embedded native app is writing the catalogue (a Sources
+    /// action, an alias or platform change, a missing-entry removal, or a
+    /// database load). Blue's own scan must not start meanwhile.
+    fn native_catalogue_writer_busy(&self) -> bool {
+        self.native_workflows
+            .as_ref()
+            .is_some_and(|workflows| !workflows.app.native_writers_idle())
     }
     fn refresh_environment(&mut self, context: &egui::Context) {
         if self.environment_job.is_some() {
@@ -1347,6 +1395,7 @@ impl App {
                 CanonicalOrganisationJobKind::Preview => "Planning verified-game organisation",
                 CanonicalOrganisationJobKind::Apply => "Organising verified games",
                 CanonicalOrganisationJobKind::Rollback => "Undoing game organisation",
+                CanonicalOrganisationJobKind::Rescan => "Finding your game files",
             },
             Route::Section(Section::Build),
             match kind {
@@ -1356,6 +1405,8 @@ impl App {
                 CanonicalOrganisationJobKind::Apply => activity::CancelPolicy::AfterCurrentStep,
                 // Undo must run to the end so the library is left consistent.
                 CanonicalOrganisationJobKind::Rollback => activity::CancelPolicy::NotCancellable,
+                // A bounded read-only walk; it finishes on its own.
+                CanonicalOrganisationJobKind::Rescan => activity::CancelPolicy::NotCancellable,
             },
         );
         let cancel = self.job_cancel_flag(id);
@@ -1483,6 +1534,9 @@ impl App {
                     CanonicalOrganisationJobKind::Preview => {
                         "The organisation preview could not be completed. Nothing was changed."
                     }
+                    CanonicalOrganisationJobKind::Rescan => {
+                        "The source folders could not be re-scanned. Nothing was changed."
+                    }
                     CanonicalOrganisationJobKind::Apply if new_transaction.is_some() => {
                         "The organisation stopped before finishing. Some changes may have been made; Undo is available on this page and History records it for review."
                     }
@@ -1510,6 +1564,21 @@ impl App {
                 "Organisation preview ready. Review every move, rename, link and blocker before confirming.".into(),
                 None,
             );
+        } else if kind == CanonicalOrganisationJobKind::Rescan {
+            let incomplete = self.canonical_organisation.source_scan_incomplete().len();
+            if incomplete == 0 {
+                self.activity.finish(
+                    job.id,
+                    "Source folders re-scanned. Nothing was changed.".into(),
+                    None,
+                );
+            } else {
+                self.activity.finish(
+                    job.id,
+                    format!("Source folders re-scanned, but the scan stopped early ({incomplete} reason(s)). Apply stays off until a complete scan. Nothing was changed."),
+                    Some(self.canonical_organisation.source_scan_incomplete().join("; ")),
+                );
+            }
         } else if complete {
             self.activity.finish(
                 job.id,
@@ -1924,6 +1993,7 @@ impl App {
                     let was_load_job = self.load_job == Some(id);
                     if was_load_job {
                         self.load_job = None;
+                        self.scan_job = None;
                     }
                     if self.problem_summary_job == Some(id) {
                         self.problem_summary_job = None;
@@ -2533,6 +2603,19 @@ impl eframe::App for App {
         // no longer showing; reload so Game Details reads it.
         self.game_dat_check.poll();
         self.folder_check.poll();
+        self.folder_check.organise.poll();
+        if self.load_job.is_none() && self.folder_check.organise.take_library_changed() {
+            // Moved games have new paths: reload, and check again from fresh.
+            reload_library = true;
+            self.folder_check.ran = false;
+            self.folder_check.findings.clear();
+            self.folder_check.unknown.clear();
+            self.folder_check.candidates.clear();
+            self.folder_check.next = 0;
+            // Picked folders and sets were part of that run.
+            self.folder_check.picked_files.clear();
+            self.folder_check.picked_folders.clear();
+        }
         self.hasheous_check.poll();
         if self.load_job.is_none() && self.game_dat_check.take_saved() {
             reload_library = true;

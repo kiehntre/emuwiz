@@ -48,6 +48,9 @@ pub mod arcade_compatibility;
 pub mod arcade_fbneo_compatibility;
 /// Read-only per-set compatibility against pinned installed MAME evidence.
 pub mod arcade_mame_compatibility;
+/// Per-set routing of extracted Arcade set directories to the installed MAME
+/// from MAME's own `-listxml` / `-verifyroms` data (no category gates).
+pub mod arcade_mame_routing;
 /// Deterministic emulator recommendation from existing arcade evidence.
 pub mod arcade_recommendation;
 /// Bounded Atari 8-bit standard cassette WAV evidence.
@@ -188,7 +191,7 @@ pub use database::{
 pub use database::{
     DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
     DiscoveryImportUndoPreview, DiscoveryImportUndoResult, MissingCleanupTarget,
-    PreservationFreshness,
+    NestedMountOutcome, NestedMountState, PreservationFreshness,
 };
 pub use database::{
     FileIdentity, InterruptedRestoreAssessment, InterruptedRestoreOutcome,
@@ -225,6 +228,7 @@ pub use archive_member_resolver::{
 pub mod game_identity;
 pub mod scummvm_detection;
 pub mod zip_cartridge_stage;
+pub mod zip_floppy_set;
 
 mod library_view_history;
 pub use library_view_history::{
@@ -699,6 +703,10 @@ pub mod mod_history;
 pub mod classic_poke_family;
 /// Per-game, read-only view of classic POKE trainers (never applies anything).
 pub mod classic_trainer_evidence;
+/// Game package boundaries (single file, CUE/GDI/M3U set, game folder).
+pub mod game_package;
+/// Manual system choices kept outside the database (survive rebuilds).
+pub mod manual_platform_choices;
 /// Provider-neutral, metadata-only catalogue records for future mod sources.
 pub mod mod_catalogue;
 /// Provider-neutral, metadata-only discovery and user-acquisition handoff.
@@ -709,6 +717,8 @@ pub mod mod_provider;
 pub mod moddb;
 /// Legal/open cheat-provider metadata and conservative local projections.
 pub mod open_retro_cheat_providers;
+/// Re-points RetroArch JSON playlists at games EmuWiz moved.
+pub mod retroarch_playlist_relink;
 /// Bounded import of user-supplied local ROM-hack metadata.
 pub mod rom_hack_catalogue;
 
@@ -6094,6 +6104,9 @@ pub struct ArchiveStatus {
 
 pub struct ArchiveScanner<'a> {
     config: &'a Config,
+    /// Nested mounts whose cached observations may be reused (see
+    /// [`ArchiveScanner::with_trusted_nested_areas`]).
+    trusted_nested_areas: Vec<PathBuf>,
 }
 
 // v2 records that stable direct-media classifications are reusable under the
@@ -6235,6 +6248,32 @@ pub struct ArchiveScanDiscovery {
     /// parent directory's, so same-device bind mounts count). Remembered so a later scan that finds one gone or
     /// replaced cannot treat the files formerly beneath it as deleted.
     pub nested_boundaries: Vec<catalogue_health::NestedBoundaryObservation>,
+    /// Every nested mount met, in walk order. Errors inside a walked area
+    /// are counted there, not against the source, so one unreadable mount
+    /// cannot make the rest of the source partial.
+    pub nested_areas: Vec<DiscoveredNestedArea>,
+}
+
+/// One nested filesystem found inside a source during discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredNestedArea {
+    pub path: PathBuf,
+    /// The area this one is nested in, if any.
+    pub parent_area: Option<usize>,
+    pub mount_id: u64,
+    pub device: u64,
+    pub inode: u64,
+    /// A FUSE archive mount that was walked. Anything else was not entered.
+    pub supported: bool,
+    pub archives: usize,
+    pub scan_errors: Vec<ScanError>,
+    pub scan_errors_total: usize,
+}
+
+impl DiscoveredNestedArea {
+    pub fn is_complete(&self) -> bool {
+        self.supported && self.scan_errors_total == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6261,6 +6300,23 @@ impl ArchiveScanDiscovery {
         self.scan_errors_total == 0
     }
 
+    /// Records an error against the nested area it happened in, or against
+    /// the source itself outside every area.
+    fn record_error_in(&mut self, area: Option<usize>, path: PathBuf, message: impl Into<String>) {
+        let Some(index) = area else {
+            self.record_scan_error(path, message);
+            return;
+        };
+        let area = &mut self.nested_areas[index];
+        area.scan_errors_total = area.scan_errors_total.saturating_add(1);
+        if area.scan_errors.len() < MAX_RETAINED_SCAN_ERRORS {
+            area.scan_errors.push(ScanError {
+                path,
+                message: message.into(),
+            });
+        }
+    }
+
     pub fn scan_errors_truncated(&self) -> bool {
         self.scan_errors_total > self.scan_errors.len()
     }
@@ -6283,7 +6339,18 @@ impl ArchiveScanDiscovery {
 
 impl<'a> ArchiveScanner<'a> {
     pub fn new(config: &'a Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            trusted_nested_areas: Vec::new(),
+        }
+    }
+
+    /// Nested mounts the caller has proven to be the same trusted mount as
+    /// at the last scan. Cached file observations are reused only inside
+    /// these; every other nested mount is inspected afresh.
+    pub fn with_trusted_nested_areas(mut self, areas: Vec<PathBuf>) -> Self {
+        self.trusted_nested_areas = areas;
+        self
     }
 
     pub fn scan_archives(&self) -> Result<Vec<Archive>> {
@@ -6429,14 +6496,16 @@ impl<'a> ArchiveScanner<'a> {
         let root_mount = catalogue_health::directory_mount(source)
             .map(|mount| mount.mount_id)
             .map_err(|error| ArchiveFsError::io(source.to_path_buf(), error))?;
-        let mut directories = vec![(source.to_path_buf(), 0_usize, root_mount)];
-        while let Some((directory, depth, parent_mount)) = directories.pop() {
+        let mut directories = vec![(source.to_path_buf(), 0_usize, root_mount, None::<usize>)];
+        let untrusted_fingerprints = HashMap::new();
+        while let Some((directory, depth, parent_mount, mut area)) = directories.pop() {
             discovery.timings.directories_visited += 1;
             let traversal_started = Instant::now();
             let before = match fs::symlink_metadata(&directory) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    discovery.record_scan_error(
+                    discovery.record_error_in(
+                        area,
                         directory.clone(),
                         ArchiveFsError::io(directory.clone(), error).to_string(),
                     );
@@ -6444,7 +6513,8 @@ impl<'a> ArchiveScanner<'a> {
                 }
             };
             if before.file_type().is_symlink() || !before.is_dir() {
-                discovery.record_scan_error(
+                discovery.record_error_in(
+                    area,
                     directory.clone(),
                     format!(
                         "source directory changed or became unsafe during scan: {}",
@@ -6457,7 +6527,8 @@ impl<'a> ArchiveScanner<'a> {
                 Ok(mount) => mount,
                 Err(error) => {
                     // Without a mount identity a boundary cannot be excluded.
-                    discovery.record_scan_error(
+                    discovery.record_error_in(
+                        area,
                         directory.clone(),
                         format!(
                             "mount identity unavailable for {}: {error}",
@@ -6476,12 +6547,47 @@ impl<'a> ArchiveScanner<'a> {
                         inode: directory_mount.inode,
                         mount_id: directory_mount.mount_id,
                     });
+                // A nested filesystem is its own ownership boundary. FUSE
+                // archive mounts are walked as a separate area (persistence
+                // opens each one as its own root); any other filesystem is
+                // left unwalked and reported, never resolved across.
+                let supported = catalogue_health::directory_filesystem_type(&directory)
+                    .is_ok_and(catalogue_health::is_supported_area_filesystem);
+                discovery.nested_areas.push(DiscoveredNestedArea {
+                    path: directory.clone(),
+                    parent_area: area,
+                    mount_id: directory_mount.mount_id,
+                    device: directory_mount.device,
+                    inode: directory_mount.inode,
+                    supported,
+                    archives: 0,
+                    scan_errors: Vec::new(),
+                    scan_errors_total: 0,
+                });
+                if !supported {
+                    continue;
+                }
+                area = Some(discovery.nested_areas.len() - 1);
             }
+            // Cached observations are reused inside a nested mount only when
+            // the caller proved it is the same trusted mount; otherwise every
+            // file there is inspected afresh.
+            let fingerprints = match area {
+                Some(index)
+                    if !self
+                        .trusted_nested_areas
+                        .contains(&discovery.nested_areas[index].path) =>
+                {
+                    &untrusted_fingerprints
+                }
+                _ => fingerprints,
+            };
             let directory_device = directory_mount.mount_id;
             let read_dir = match fs::read_dir(&directory) {
                 Ok(read_dir) => read_dir,
                 Err(error) => {
-                    discovery.record_scan_error(
+                    discovery.record_error_in(
+                        area,
                         directory.clone(),
                         ArchiveFsError::io(directory.clone(), error).to_string(),
                     );
@@ -6495,7 +6601,8 @@ impl<'a> ArchiveScanner<'a> {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
-                        discovery.record_scan_error(
+                        discovery.record_error_in(
+                            area,
                             directory.clone(),
                             ArchiveFsError::io(directory.clone(), error).to_string(),
                         );
@@ -6507,7 +6614,8 @@ impl<'a> ArchiveScanner<'a> {
                 let file_type = match entry.file_type() {
                     Ok(file_type) => file_type,
                     Err(error) => {
-                        discovery.record_scan_error(
+                        discovery.record_error_in(
+                            area,
                             path.clone(),
                             ArchiveFsError::io(path.clone(), error).to_string(),
                         );
@@ -6531,7 +6639,7 @@ impl<'a> ArchiveScanner<'a> {
                     None
                 };
                 if let Some(error) = metadata_error {
-                    discovery.record_scan_error(path.clone(), error);
+                    discovery.record_error_in(area, path.clone(), error);
                     continue;
                 }
                 if file_type.is_dir() {
@@ -6554,13 +6662,14 @@ impl<'a> ArchiveScanner<'a> {
                         continue;
                     }
                     if depth >= MAX_SCAN_DEPTH {
-                        discovery.record_scan_error(path.clone(), format!("source scan exceeded the {MAX_SCAN_DEPTH} directory depth limit at {}", path.display()));
+                        discovery.record_error_in(area, path.clone(), format!("source scan exceeded the {MAX_SCAN_DEPTH} directory depth limit at {}", path.display()));
                         continue;
                     }
-                    child_directories.push((path, depth + 1, directory_device));
+                    child_directories.push((path, depth + 1, directory_device, area));
                 } else if let Some(archive) = candidate {
                     if archive.identity.size_bytes.is_none() {
-                        discovery.record_scan_error(
+                        discovery.record_error_in(
+                            area,
                             path.clone(),
                             format!(
                                 "archive changed or became unreadable during scan: {}",
@@ -6570,6 +6679,9 @@ impl<'a> ArchiveScanner<'a> {
                         continue;
                     }
                     debug!("discovered archive {}", archive.path.display());
+                    if let Some(index) = area {
+                        discovery.nested_areas[index].archives += 1;
+                    }
                     discovery.archives.push(archive);
                     discovery.timings.candidate_discovery_ns +=
                         candidate_started.elapsed().as_nanos();
@@ -6655,7 +6767,8 @@ impl<'a> ArchiveScanner<'a> {
                     let non_archive_metadata = match fs::metadata(&path) {
                         Ok(metadata) => metadata,
                         Err(error) => {
-                            discovery.record_scan_error(
+                            discovery.record_error_in(
+                                area,
                                 path.clone(),
                                 ArchiveFsError::io(path.clone(), error).to_string(),
                             );
@@ -6709,7 +6822,8 @@ impl<'a> ArchiveScanner<'a> {
             let after = match fs::symlink_metadata(&directory) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    discovery.record_scan_error(
+                    discovery.record_error_in(
+                        area,
                         directory.clone(),
                         ArchiveFsError::io(directory.clone(), error).to_string(),
                     );
@@ -6720,7 +6834,8 @@ impl<'a> ArchiveScanner<'a> {
                 || !after.is_dir()
                 || filesystem_identity(&before) != filesystem_identity(&after)
             {
-                discovery.record_scan_error(
+                discovery.record_error_in(
+                    area,
                     directory.clone(),
                     format!(
                         "source directory changed during scan: {}",
@@ -6992,7 +7107,21 @@ pub fn scan_archives(config: &Config) -> Result<Vec<Archive>> {
     ArchiveScanner::new(config).scan_archives()
 }
 
+/// Source-root-only revalidation; production resolves through
+/// [`revalidate_archive_within`] so nested mounts use their own root.
+#[cfg(test)]
 pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> {
+    revalidate_archive_within(archive, None)
+}
+
+/// Revalidates an archive before it is saved, resolving the archive from the
+/// pinned root of the nested mount that owns it (`area`: its path,
+/// device/inode and unique mount ID) when it lies inside one. The source
+/// root is still checked.
+pub(crate) fn revalidate_archive_within(
+    archive: &Archive,
+    area: Option<(&Path, (u64, u64), u64)>,
+) -> Result<()> {
     let source_identity = validate_source_root(&archive.identity.source_root)?;
     if archive.identity.source_filesystem_device != Some(source_identity.device)
         || archive.identity.source_filesystem_inode != Some(source_identity.inode)
@@ -7010,8 +7139,20 @@ pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> 
     }
     // One descriptor-relative resolution (no symlinks, beneath, no xdev): a
     // component swapped after the scan cannot redirect to outside content.
-    let root = catalogue_health::BoundRoot::open(&archive.identity.source_root)
-        .filter(|root| root.identity == (source_identity.device, source_identity.inode))
+    let (owner, owner_identity, owner_mount) = match area {
+        Some((path, identity, mount_id)) if archive.path.starts_with(path) => {
+            (path, identity, Some(mount_id))
+        }
+        _ => (
+            archive.identity.source_root.as_path(),
+            (source_identity.device, source_identity.inode),
+            None,
+        ),
+    };
+    let root = catalogue_health::BoundRoot::open(owner)
+        .filter(|root| root.identity == owner_identity)
+        // Inside a nested mount: the very instance settlement proved.
+        .filter(|root| owner_mount.is_none_or(|expected| root.mount_id().ok() == Some(expected)))
         .ok_or_else(|| {
             ArchiveFsError::Scanner(format!(
                 "source root changed after scan: {}",
@@ -7588,19 +7729,17 @@ fn detect_platform_from_folder_alias_with_match(
     let mut components: Vec<_> = relative.components().collect();
     components.pop(); // the archive's own filename never counts as a folder.
 
-    components
+    // One folder-choice rule for scans and the detection report.
+    let mut folders: Vec<String> = components
         .iter()
         .rev()
-        .find_map(|component| {
-            let matched_folder = component.as_os_str().to_string_lossy();
-            folder_platform_alias(&matched_folder)
-                .map(|platform| (platform, matched_folder.into_owned()))
-        })
-        .or_else(|| {
-            let matched_folder = source_root.file_name()?.to_string_lossy();
-            folder_platform_alias(&matched_folder)
-                .map(|platform| (platform, matched_folder.into_owned()))
-        })
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if let Some(root) = source_root.file_name() {
+        folders.push(root.to_string_lossy().into_owned());
+    }
+    platform::detect::nearest_platform_folder(&folders)
+        .map(|(platform, folder)| (platform.id, folder))
 }
 
 /// Normalizes one path segment for alias matching. Delegates to the registry
@@ -13691,6 +13830,43 @@ mod tests {
                 "{expected:?} must appear exactly once in canonical_platform_names"
             );
         }
+    }
+
+    /// Real library 2026-11-12: `pc-8800-series/Enterprise (MIA)/Enterprise
+    /// [CT].7z` was filed as the Enterprise 64/128 computer.
+    #[test]
+    fn a_title_folder_never_outranks_the_enclosing_platform_folder() {
+        let root = "/library/games";
+        assert_eq!(
+            detect_platform(
+                format!("{root}/pc-8800-series/Enterprise (MIA)/Enterprise [CT].7z"),
+                root
+            ),
+            Some("NEC PC-8801".to_string())
+        );
+        let report = crate::platform::detect::detect_platform_report(
+            &crate::platform::detect::DetectionRequest::new(
+                Path::new(&format!(
+                    "{root}/pc-8800-series/Enterprise (MIA)/Enterprise [CT].7z"
+                )),
+                Path::new(root),
+            ),
+        );
+        assert_eq!(report.platform, Some("NEC PC-8801"));
+        // Unchanged: an exact platform folder still wins when nearest, and a
+        // suffixed platform folder with nothing above it still counts.
+        assert_eq!(
+            detect_platform(format!("{root}/pc-8800-series/enterprise/Game.7z"), root),
+            Some("Enterprise".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Enterprise (2024)/Game.7z"), root),
+            Some("Enterprise".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/NEC PC-8801 (TOSEC)/Game.d88"), root),
+            Some("NEC PC-8801".to_string())
+        );
     }
 
     #[test]

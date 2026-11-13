@@ -400,10 +400,23 @@ fn incomplete_or_unverified_disk_sets_are_reported_honestly() {
 #[test]
 fn unsupported_damaged_and_packed_media_are_blocked() {
     let facts = env(vec![profile(AmigaEmulatorKind::FsUae, Some("A500"))]);
-    for name in ["a.hfe", "a.zip", "a.xyz"] {
+    for name in ["a.hfe", "a.7z", "a.rar", "a.xyz"] {
         let readiness = assess_amiga_game(AMIGA, Path::new(name), false, None, Some(&facts));
         assert_eq!(state(&readiness, K::Media), Blocked, "{name}");
     }
+    // A ZIP of IPF disks is staged privately at Play (never changed), so its
+    // format row warns instead of refusing.
+    let zipped = assess_amiga_game(AMIGA, Path::new("a.zip"), false, None, Some(&facts));
+    assert_eq!(state(&zipped, K::Media), Warning);
+    let media = zipped.check(K::Media).unwrap();
+    assert!(media.detail.contains("never changed"), "{}", media.detail);
+    assert!(
+        media
+            .detail
+            .contains("more than four disks have not been tested"),
+        "{}",
+        media.detail
+    );
     let damaged = assess_amiga_game(AMIGA, Path::new("a.adf"), true, None, Some(&facts));
     assert_eq!(state(&damaged, K::Media), Blocked);
 
@@ -454,6 +467,34 @@ fn cd32_and_cdtv_media_are_never_floppies() {
         Some(&facts),
     );
     assert_eq!(state(&readiness, K::Machine), Blocked);
+}
+
+#[test]
+fn cd32_zip_is_blocked_without_calling_it_floppy_disks() {
+    // Real session 2026-11-12: a CD32 ZIP holding CUE+ISO was described as
+    // "a zip of floppy disks". The ZIP is still refused, only truthfully.
+    let facts = env(vec![profile(AmigaEmulatorKind::Amiberry, Some("CD32"))]);
+    let readiness = assess_amiga_game(
+        AmigaCdMachine::Cd32,
+        Path::new("Alien Breed Special Edition.zip"),
+        false,
+        None,
+        Some(&facts),
+    );
+    let media = readiness.check(K::Media).expect("media row");
+    assert_eq!(media.state, Blocked);
+    assert!(
+        !media.detail.to_ascii_lowercase().contains("floppy"),
+        "{}",
+        media.detail
+    );
+    assert!(
+        media.detail.contains("Extract the disc image"),
+        "{}",
+        media.detail
+    );
+    assert!(!readiness.launch_route_exists);
+    assert!(!AmigaMediaKind::ZipArchive.label().contains("floppy"));
 }
 
 #[test]

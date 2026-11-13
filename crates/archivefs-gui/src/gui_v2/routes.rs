@@ -836,7 +836,7 @@ impl ToolPage {
             Self::ArcadeShelf => "Virtual Arcade Shelf",
             Self::Vita3kTitles => "PlayStation Vita (Vita3K) titles",
             Self::OpenRct2 => "RollerCoaster Tycoon 2 via OpenRCT2 (alternative)",
-            Self::FolderCheck => "Smart ROM Folder Check",
+            Self::FolderCheck => "Organise my games",
         }
     }
 
@@ -891,7 +891,7 @@ impl ToolPage {
                 "Play RollerCoaster Tycoon 2 with an OpenRCT2 you installed, using your own game folder; nothing is installed or copied."
             }
             Self::FolderCheck => {
-                "Look for games whose content belongs to a different system than their folder. Read only: nothing is changed or moved."
+                "Identify every game by its content, then move games in the wrong system folder (or with no known system) after one preview and approval. Undo puts them back."
             }
         }
     }

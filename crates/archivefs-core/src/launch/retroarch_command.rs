@@ -33,6 +33,12 @@ pub struct RetroArchCommand {
     pub saturn_core_selection: Option<super::saturn_core_selection::SaturnCoreSelection>,
     /// Minted by source-aware preflight, checked again at the spawn boundary.
     pub snapshot_evidence: Option<crate::classic_trainer_evidence::snapshot::SnapshotEvidence>,
+    /// Set only by the preflight for an owner-approved unverified launch: the
+    /// content-bound `unverified:` key the file had when it was checked. The
+    /// spawn step re-derives the key from the file and refuses unless it is
+    /// still this one, instead of checking a DAT snapshot. `None` for every
+    /// other command.
+    pub unverified_game_key: Option<String>,
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
@@ -345,6 +351,7 @@ pub fn build_retroarch_command_plan(
     RetroArchCommandPlan {
         command: Some(RetroArchCommand {
             saturn_core_selection: None,
+            unverified_game_key: None,
             snapshot_evidence: None,
             executable,
             arguments,

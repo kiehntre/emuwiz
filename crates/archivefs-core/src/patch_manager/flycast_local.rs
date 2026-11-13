@@ -355,6 +355,13 @@ pub fn discover_flycast_profiles(roots: &FlycastProfileDiscoveryRoots) -> Flycas
                     candidate.kind,
                     FlycastInstallationType::Explicit | FlycastInstallationType::Portable
                 )
+                // An installed native Flycast that has never been opened has
+                // no settings folder yet. Keep its profile (ineligible, with
+                // that reason) so Blue can say so instead of hiding Flycast.
+                || (candidate.kind == FlycastInstallationType::Native
+                    && executables
+                        .iter()
+                        .any(|e| e.installation_type == FlycastInstallationType::Native))
         })
         .take(FLYCAST_MAX_PROFILES)
         .map(|candidate| profile(candidate, &executables))
@@ -445,6 +452,8 @@ fn profile(candidate: Candidate, executables: &[FlycastExecutable]) -> FlycastPr
     let config_path = candidate.config.join("emu.cfg");
     let blocker = if !candidate.config.is_absolute() {
         Some("configuration path is not absolute".to_string())
+    } else if !candidate.config.exists() && fs::symlink_metadata(&candidate.config).is_err() {
+        Some(FLYCAST_NOT_SET_UP.to_string())
     } else if !is_real_directory(&candidate.config) {
         Some("configuration directory is absent, unsafe, or not a real directory".to_string())
     } else if !is_regular_file(&config_path) {
@@ -490,6 +499,7 @@ fn discover_executables(roots: &FlycastProfileDiscoveryRoots) -> Vec<FlycastExec
             paths.push(directory.join("flycast"));
         }
     }
+    paths.extend(discover_user_appimages(&roots.home));
     paths.sort();
     paths.dedup();
     paths
@@ -514,6 +524,53 @@ fn discover_executables(roots: &FlycastProfileDiscoveryRoots) -> Vec<FlycastExec
             path,
         })
         .collect()
+}
+
+/// Profile blocker for an installed Flycast that has never been opened.
+pub const FLYCAST_NOT_SET_UP: &str = "Flycast is installed but has not been set up yet: open Flycast once so it creates its settings, then recheck";
+
+/// Fixed per-user folders where a downloaded Flycast AppImage normally
+/// lives. Only these exact directories are listed (never recursively).
+pub const FLYCAST_APPIMAGE_DIRECTORIES: [&str; 6] = [
+    "Applications",
+    "Applications/Flycast",
+    "Applications/emulators",
+    "AppImages",
+    ".local/bin",
+    "bin",
+];
+const FLYCAST_APPIMAGE_MAX_ENTRIES: usize = 512;
+
+/// The official upstream release is a type-2 AppImage named like
+/// `flycast-x86_64-2.7.AppImage`. It reads and writes the same native XDG
+/// roots as a distro build (it is not sandboxed), so it binds to the Native
+/// profile. Only regular, non-symlink files whose name starts with `flycast`
+/// and ends with `.AppImage` (any case) are considered.
+fn discover_user_appimages(home: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for relative in FLYCAST_APPIMAGE_DIRECTORIES {
+        let Ok(entries) = fs::read_dir(home.join(relative)) else {
+            continue;
+        };
+        for entry in entries.take(FLYCAST_APPIMAGE_MAX_ENTRIES).flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let lower = name.to_ascii_lowercase();
+            if lower.starts_with("flycast") && lower.ends_with(".appimage") {
+                found.push(entry.path());
+            }
+        }
+    }
+    found
+}
+
+/// Whether `path` is a type-2 AppImage (ELF with `AI\x02` at offset 8).
+pub fn is_appimage_executable(path: &Path) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 11];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok_and(|()| &header[..4] == b"\x7fELF" && &header[8..11] == b"AI\x02")
 }
 
 fn normalize_key(value: &str) -> Option<String> {
@@ -688,6 +745,18 @@ fn inspect_system(profile: &FlycastProfile) -> FlycastSystemHealth {
         dreamcast_flash: flash,
         arcade_system_roms: arcade,
     }
+}
+
+/// Only the Dreamcast BIOS answer of [`inspect_flycast_game`]
+/// (`health.system.dreamcast_bios`), which never depends on the game: the
+/// same check of the profile's `dc_boot.bin`, without the configuration,
+/// cheats, textures, VMU and save-state reads the full inspection also does.
+/// The launch planner asks this on every readiness refresh.
+pub fn flycast_profile_dreamcast_bios(profile: &FlycastProfile) -> FlycastSystemFileState {
+    state(
+        &profile.system_path.join("dc_boot.bin"),
+        TRUSTED_DC_BOOT_BIN,
+    )
 }
 /// The trusted content identities used by Flycast's own public system-file
 /// documentation/catalogue. These are metadata only; EmuWiz never bundles or
@@ -1179,6 +1248,60 @@ mod tests {
             known_version_outputs: BTreeMap::new(),
             appimage_directory: None,
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn user_appimage_binds_the_native_profile_and_unopened_flycast_explains_itself() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TempDir::new().unwrap();
+        let r = roots(&t);
+        let dir = r.home.join("Applications/Flycast");
+        fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("flycast-x86_64-2.7.AppImage");
+        let mut bytes = b"\x7fELF\x02\x01\x01\x00AI\x02".to_vec();
+        bytes.resize(64, 0);
+        fs::write(&image, &bytes).unwrap();
+        fs::set_permissions(&image, fs::Permissions::from_mode(0o755)).unwrap();
+        // Neither a symlink nor an unrelated AppImage is a Flycast candidate.
+        std::os::unix::fs::symlink(&image, dir.join("flycast-link.AppImage")).unwrap();
+        fs::write(dir.join("Other.AppImage"), &bytes).unwrap();
+        assert!(is_appimage_executable(&image));
+
+        // Installed but never opened: the native profile is listed with the
+        // specific reason instead of disappearing.
+        let discovery = discover_flycast_profiles(&r);
+        let native: Vec<_> = discovery
+            .profiles
+            .iter()
+            .filter(|p| p.installation_type == FlycastInstallationType::Native)
+            .collect();
+        assert_eq!(native.len(), 1);
+        assert!(!native[0].eligible);
+        assert_eq!(native[0].blocker.as_deref(), Some(FLYCAST_NOT_SET_UP));
+        assert_eq!(
+            native[0]
+                .executable_candidates
+                .iter()
+                .map(|e| e.path.clone())
+                .collect::<Vec<_>>(),
+            vec![image.clone()]
+        );
+
+        // After Flycast creates its settings the AppImage is the binding.
+        write(&r.xdg_config_home.join("flycast"), "[config]\n");
+        let discovery = discover_flycast_profiles(&r);
+        let native = discovery
+            .profiles
+            .iter()
+            .find(|p| p.installation_type == FlycastInstallationType::Native)
+            .unwrap();
+        assert!(native.eligible);
+        assert_eq!(
+            resolve_flycast_native_launch_binding(native)
+                .unwrap()
+                .executable,
+            image
+        );
     }
     fn write(root: &Path, text: &str) {
         fs::create_dir_all(root).unwrap();

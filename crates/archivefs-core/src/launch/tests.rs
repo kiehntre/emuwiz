@@ -528,14 +528,15 @@ fn two_matching_cores_without_a_reviewed_hint_remain_ambiguous() {
         &resolved("NES"),
         &resolved_content(),
         &[],
+        // Neither core is named by the platform's reviewed hint list.
         &retroarch_environment_with_cores(vec![
             core_finding(
-                "fceumm",
+                "fixnes",
                 Some("Nintendo - Nintendo Entertainment System"),
                 None,
             ),
             core_finding(
-                "mesen",
+                "quicknes",
                 Some("Nintendo - Nintendo Entertainment System"),
                 None,
             ),
@@ -1309,4 +1310,129 @@ fn cartridge_family_platform_map_rows_resolve_installed_core_info() {
             );
         }
     }
+}
+
+fn with_extensions(mut core: CoreFinding, extensions: &[&str]) -> CoreFinding {
+    if let CoreInfoFinding::Found {
+        supported_extensions,
+        ..
+    } = &mut core.info
+    {
+        *supported_extensions = extensions.iter().map(|e| e.to_string()).collect();
+    }
+    core
+}
+
+fn nes_cores() -> Vec<CoreFinding> {
+    let system = Some("Nintendo Entertainment System");
+    vec![
+        with_extensions(core_finding("fixnes", system, None), &["nes"]),
+        with_extensions(core_finding("quicknes", system, None), &["nes"]),
+        with_extensions(
+            core_finding("mesen", system, None),
+            &["nes", "fds", "unf", "unif"],
+        ),
+    ]
+}
+
+fn nes_content(name: &str) -> LaunchContentRef {
+    LaunchContentRef {
+        kind: Some(LaunchContentKind::Cartridge),
+        container: Some(LaunchContainerKind::PlainFile),
+        resolved_path: Some(PathBuf::from(name)),
+        requires_mount: false,
+        provenance: "plain file".into(),
+    }
+}
+
+#[test]
+fn a_disk_image_only_considers_cores_that_can_open_it() {
+    // Distros alias nestopia/fceumm to mesen (not counted as separate cores), so
+    // only fixnes, quicknes and mesen exist; only mesen lists .fds.
+    let plan = build_launch_plan(
+        &resolved("NES"),
+        &nes_content("/g/Disk (Japan).fds"),
+        &[],
+        &retroarch_environment_with_cores(nes_cores()),
+        &[],
+    );
+    assert_eq!(plan.candidates.len(), 1, "{:?}", plan.candidates);
+    let candidate = &plan.candidates[0];
+    assert!(matches!(
+        candidate.target,
+        LaunchTarget::RetroArchCore { ref core_stem, .. } if core_stem == "mesen"
+    ));
+    assert!(candidate.blockers.is_empty(), "{:?}", candidate.blockers);
+    assert_eq!(candidate.preference, CandidatePreference::SoleEligible);
+}
+
+#[test]
+fn nes_cartridges_prefer_a_reviewed_core_that_is_actually_installed() {
+    let plan = build_launch_plan(
+        &resolved("NES"),
+        &nes_content("/g/Game (USA).nes"),
+        &[],
+        &retroarch_environment_with_cores(nes_cores()),
+        &[],
+    );
+    assert_eq!(plan.candidates.len(), 3);
+    assert!(
+        plan.candidates.iter().all(|c| c
+            .blockers
+            .iter()
+            .all(|b| b.kind != LaunchBlockerKind::AmbiguousCore)),
+        "{:?}",
+        plan.candidates
+    );
+    let preferred: Vec<_> = plan
+        .candidates
+        .iter()
+        .filter(|c| c.preference == CandidatePreference::SoleEligible)
+        .collect();
+    assert_eq!(preferred.len(), 1);
+    assert!(matches!(
+        preferred[0].target,
+        LaunchTarget::RetroArchCore { ref core_stem, .. } if core_stem == "mesen"
+    ));
+}
+
+#[test]
+fn an_extension_nothing_lists_does_not_narrow_the_cores() {
+    let plan = build_launch_plan(
+        &resolved("NES"),
+        &nes_content("/g/archive.zip"),
+        &[],
+        &retroarch_environment_with_cores(nes_cores()),
+        &[],
+    );
+    assert_eq!(plan.candidates.len(), 3);
+}
+
+#[test]
+fn a_ranked_core_hint_list_picks_the_first_installed_name() {
+    // With both Nestopia and FCEUmm (and Mesen) installed, Nestopia wins; the
+    // lower-ranked names are not "ties".
+    let system = Some("Nintendo Entertainment System");
+    let cores = vec![
+        with_extensions(core_finding("mesen", system, None), &["nes", "fds"]),
+        with_extensions(core_finding("fceumm", system, None), &["nes", "fds"]),
+        with_extensions(core_finding("nestopia", system, None), &["nes", "fds"]),
+    ];
+    let plan = build_launch_plan(
+        &resolved("NES"),
+        &nes_content("/g/Game.nes"),
+        &[],
+        &retroarch_environment_with_cores(cores),
+        &[],
+    );
+    let preferred: Vec<_> = plan
+        .candidates
+        .iter()
+        .filter(|c| c.preference == CandidatePreference::SoleEligible)
+        .collect();
+    assert_eq!(preferred.len(), 1);
+    assert!(matches!(
+        preferred[0].target,
+        LaunchTarget::RetroArchCore { ref core_stem, .. } if core_stem == "nestopia"
+    ));
 }

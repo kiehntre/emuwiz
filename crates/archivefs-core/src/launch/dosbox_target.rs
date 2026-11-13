@@ -90,6 +90,9 @@ impl UserApprovedDosBoxTarget {
 }
 
 /// Keeps existing canonical launch callers distinct from explicit local trust.
+// Built once per launch; the approved target's file identities (now with
+// ctime) make it the larger variant, which costs nothing here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DosBoxLaunchIdentity {
     Canonical(CanonicalIdentityStatus),

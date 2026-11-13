@@ -69,6 +69,18 @@ pub(crate) struct EmulatorReadinessState {
     pub(crate) pcsx2_save_vault: pcsx2_page::Pcsx2SaveVaultState,
     pub(crate) pcsx2_status_generation: u64,
     pub(crate) pcsx2_status_archive_path: Option<PathBuf>,
+    /// Each PCSX2 / Flycast profile's BIOS answer for the launch planner,
+    /// reused briefly; see `readiness_input::FirmwareAnswerCache`.
+    pub(crate) pcsx2_bios_cache: std::sync::Mutex<
+        crate::emulator_setup::readiness_input::FirmwareAnswerCache<
+            archivefs_core::patch_manager::Pcsx2BiosVerification,
+        >,
+    >,
+    pub(crate) flycast_bios_cache: std::sync::Mutex<
+        crate::emulator_setup::readiness_input::FirmwareAnswerCache<
+            archivefs_core::patch_manager::FlycastSystemFileState,
+        >,
+    >,
 }
 
 impl Default for EmulatorReadinessState {
@@ -88,6 +100,8 @@ impl Default for EmulatorReadinessState {
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             retroarch_installation_fingerprint: None,
             retroarch_revalidated_at: None,
+            pcsx2_bios_cache: Default::default(),
+            flycast_bios_cache: Default::default(),
             retroarch_core_directory_override: None,
             retroarch_core_folder_rejected_pick: None,
             retroarch_core_folder_preview: None,

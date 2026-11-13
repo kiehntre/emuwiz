@@ -541,6 +541,19 @@ pub(crate) fn attribute_archive_members(
                 Some(AuditVerdict::Exact { .. })
                     | Some(AuditVerdict::ExactMultipleCandidates { .. })
             );
+            // S03-03: a member whose hash agrees only with `nodump`/`baddump`
+            // records is refused as verified identity (`Ambiguous`), yet the
+            // bytes demonstrably are those records' bytes. Attributing the
+            // slot lets the state machine below say `BadMetadata` for the
+            // set, exactly as it did when such a match was still reported
+            // `Exact`; `has_nodump`/`has_baddump` take precedence over
+            // `Complete`, so this can never verify a set.
+            let known_bad_attribution =
+                matches!(member.verdict, Some(AuditVerdict::Ambiguous { .. }))
+                    && refs.iter().all(|candidate| {
+                        !crate::dat::audit::DumpStatus::of(candidate.status.as_deref())
+                            .is_verifiable()
+                    });
             let valid_positions = refs
                 .iter()
                 .all(|candidate| ref_matches_catalogue(candidate, games));
@@ -554,7 +567,9 @@ pub(crate) fn attribute_archive_members(
             let safely_shared_slot_evidence =
                 one_game && valid_positions && refs_share_cryptographic_identity(refs);
 
-            if strong_verdict && valid_positions && (refs.len() == 1 || safely_shared_slot_evidence)
+            if (strong_verdict || known_bad_attribution)
+                && valid_positions
+                && (refs.len() == 1 || safely_shared_slot_evidence)
             {
                 let game_name = refs[0].game_name.clone();
                 let set = touched.entry(game_name).or_default();
@@ -2028,8 +2043,8 @@ mod tests {
             ],
             status: rom.status.clone(),
             merge: rom.merge.clone(),
-            content_classification: game.content_classification.clone(),
-            original_metadata: game.original_metadata.clone(),
+            content_classification: std::sync::Arc::new(game.content_classification.clone()),
+            original_metadata: std::sync::Arc::new(game.original_metadata.clone()),
             clone_of: None,
         }
     }
@@ -2051,8 +2066,8 @@ mod tests {
             ],
             status: rom.status.clone(),
             merge: rom.merge.clone(),
-            content_classification: game.content_classification.clone(),
-            original_metadata: game.original_metadata.clone(),
+            content_classification: std::sync::Arc::new(game.content_classification.clone()),
+            original_metadata: std::sync::Arc::new(game.original_metadata.clone()),
             clone_of: None,
         }
     }
@@ -2176,6 +2191,44 @@ mod tests {
             resolutions[0].state,
             SetState::BadMetadata(BadMetadataReason::BadDump)
         );
+    }
+
+    /// S03-03: a member whose hash agrees only with the `baddump` record is
+    /// refused as verified (`Ambiguous`) yet still attributed to its slot,
+    /// so the set reports `BadMetadata` - and never `Complete`, even when
+    /// every other member is verified or when the bad member stands alone.
+    #[test]
+    fn known_bad_attribution_reports_bad_metadata_and_never_complete() {
+        let mut bad = rom("bad.bin", Some("baddump"));
+        bad.sha1 = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        let games = vec![game("Game (World)", vec![rom("game.bin", None), bad])];
+        // The catalogue check compares every declared checksum, so the
+        // reference carries the record's full list (CRC32 and SHA-1).
+        let mut bad_ref = top_ref(0, &games[0], 1);
+        bad_ref.checksums = games[0].roms[1].checksums();
+        let bad_member = DatArchiveMemberAudit {
+            evidence: evidence(1, "bad.bin"),
+            verdict: Some(AuditVerdict::Ambiguous {
+                detail: "only unverifiable record Game (World) / bad.bin (baddump)".to_string(),
+            }),
+            matched_refs: vec![bad_ref],
+            evidence_sources: Vec::new(),
+        };
+        for members in [
+            vec![
+                exact_member(0, "game.bin", "Game (World)", "game.bin"),
+                bad_member.clone(),
+            ],
+            vec![bad_member.clone()],
+        ] {
+            let audit = archive(members, complete_pass());
+            let resolutions = classify_archive_sets(&audit, &[], true, &games, "collection");
+            assert_eq!(resolutions.len(), 1);
+            assert_eq!(
+                resolutions[0].state,
+                SetState::BadMetadata(BadMetadataReason::BadDump)
+            );
+        }
     }
 
     #[test]
@@ -3370,8 +3423,8 @@ mod tests {
                 checksums: rom.checksums(),
                 status: rom.status.clone(),
                 merge: rom.merge.clone(),
-                content_classification: game.content_classification.clone(),
-                original_metadata: game.original_metadata.clone(),
+                content_classification: std::sync::Arc::new(game.content_classification.clone()),
+                original_metadata: std::sync::Arc::new(game.original_metadata.clone()),
                 clone_of: None,
             }
         }
@@ -3422,8 +3475,8 @@ mod tests {
             checksums: nested.checksums.clone(),
             status: None,
             merge: None,
-            content_classification: games[1].content_classification.clone(),
-            original_metadata: games[1].original_metadata.clone(),
+            content_classification: std::sync::Arc::new(games[1].content_classification.clone()),
+            original_metadata: std::sync::Arc::new(games[1].original_metadata.clone()),
             clone_of: None,
         };
 

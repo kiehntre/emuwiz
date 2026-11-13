@@ -1177,6 +1177,19 @@ pub(crate) enum SelectedEvidenceAction {
 /// Shared with `plan_preview_page` (GUI Batch C), so the resolver-result
 /// tone shown there is the exact same mapping this panel already uses -
 /// never a second, possibly-diverging one.
+/// Shown beside a verified Dreamcast product code: that fact comes from the
+/// disc's boot header (IP.BIN) alone, so it names the game without proving
+/// the rest of the disc image can be read.
+pub(crate) const DREAMCAST_HEADER_ONLY_NOTE: &str = "The Dreamcast product code was read from the disc's boot header. It identifies the game, but EmuWiz did not read the rest of the disc image, so a damaged image can still show read errors or a black screen in Flycast.";
+
+pub(crate) fn header_only_identity_note(
+    mut kinds: impl Iterator<Item = archivefs_core::game_identity::IdentityKind>,
+) -> Option<&'static str> {
+    kinds
+        .any(|kind| kind == archivefs_core::game_identity::IdentityKind::DreamcastProductCode)
+        .then_some(DREAMCAST_HEADER_ONLY_NOTE)
+}
+
 pub(crate) fn status_tone_for(status: IdentityStatus) -> widgets::StatusTone {
     match status {
         IdentityStatus::Conflict => widgets::StatusTone::Blocked,
@@ -1404,12 +1417,17 @@ pub(crate) fn show_identity_evidence(ui: &mut egui::Ui, report: &SelectedEvidenc
         .collect::<Vec<_>>();
     if !verified_identity_facts.is_empty() {
         widgets::section_header(ui, "Verified identity evidence", None);
-        for evidence in verified_identity_facts {
+        for evidence in &verified_identity_facts {
             ui.horizontal(|ui| {
                 ui.label(evidence.kind.to_string());
                 widgets::status_badge(ui, "Verified", widgets::StatusTone::Success);
                 ui.label(evidence.value.as_deref().unwrap_or_default());
             });
+        }
+        if let Some(note) =
+            header_only_identity_note(verified_identity_facts.iter().map(|evidence| evidence.kind))
+        {
+            widgets::banner(ui, "Disc header only", note, widgets::StatusTone::Info);
         }
     }
 
@@ -1859,6 +1877,21 @@ mod tests {
     };
     use std::io::Write;
     use std::time::Duration;
+
+    #[test]
+    fn dreamcast_header_identity_says_it_does_not_prove_a_working_disc() {
+        use archivefs_core::game_identity::IdentityKind;
+        let note = header_only_identity_note([IdentityKind::DreamcastProductCode].into_iter())
+            .expect("a Dreamcast product code is header-only evidence");
+        assert!(note.contains("did not read the rest of the disc image"));
+        assert!(note.contains("damaged image"));
+        assert_eq!(
+            header_only_identity_note([IdentityKind::Ps2Serial].into_iter()),
+            None,
+            "other identity kinds keep their existing wording"
+        );
+        assert_eq!(header_only_identity_note(std::iter::empty()), None);
+    }
 
     fn amiga_floppy_bytes(dos: u8, readable_root: bool) -> Vec<u8> {
         let mut bytes = vec![0_u8; 880 * 1024];

@@ -1605,7 +1605,7 @@ fn parse_firmware_requirements(
 /// EmuWiz declines to resolve it (colon alias, or a plain relative
 /// value with no config-relative anchor RetroArch itself would use -
 /// confirmed via `fill_pathname_expand_special` in the primary source).
-fn resolve_configured_value(raw: &str, tilde_home: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_configured_value(raw: &str, tilde_home: &Path) -> Option<PathBuf> {
     if raw.starts_with('/') {
         Some(PathBuf::from(raw))
     } else if raw == "~" {

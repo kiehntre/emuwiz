@@ -285,6 +285,7 @@ pub(super) fn show(
                     ActionStyle::Secondary,
                     !loading,
                 )
+                .on_hover_text("Reloads the results already saved in the library database. It does not look at your game folders; use Scan library for that.")
                 .clicked()
                 {
                     state.refresh(&context);
@@ -305,6 +306,7 @@ pub(super) fn show(
             _ => {
                 let scanning = loading || app_scan_running;
                 if widgets::action_button(ui, "Scan library", ActionStyle::Secondary, !scanning)
+                    .on_hover_text("Reads every enabled game folder and saves what changed.")
                     .on_disabled_hover_text("A scan is already running.")
                     .clicked()
                 {
@@ -316,6 +318,7 @@ pub(super) fn show(
                     ActionStyle::Secondary,
                     !loading,
                 )
+                .on_hover_text("Reloads the results already saved in the library database. It does not look at your game folders; use Scan library for that.")
                 .clicked()
                 {
                     state.refresh(&context);
