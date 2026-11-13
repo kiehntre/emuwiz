@@ -524,6 +524,20 @@ mod tests {
         connection
     }
 
+    /// /proc/locks is a seq_file: a read can miss an entry while other tests in
+    /// this process add and drop their own locks, so a single read may
+    /// transiently say "not held". Re-reads `check` for a bounded time; a
+    /// condition that is truly false still fails the caller's assertion.
+    fn eventually(mut check: impl FnMut() -> bool) -> bool {
+        for _ in 0..50 {
+            if check() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
     #[test]
     fn write_lock_probe_sees_a_reserved_lock_held_in_this_process() {
         let root = tempfile::tempdir().unwrap();
@@ -594,16 +608,26 @@ mod tests {
             spilled,
             "the writer's transaction never spilled to its journal"
         );
-        assert!(sqlite_write_lock_held(&path).unwrap());
-        assert_eq!(
-            classify_live_journal(&path).unwrap(),
-            Some(LiveJournalVerdict::WriterActive)
-        );
-        let error = require_inert_rollback_journal(&path)
-            .unwrap_err()
-            .to_string();
+        // The writer took its lock synchronously (BEGIN IMMEDIATE above), so
+        // it is held; only the /proc/locks read can be transiently wrong.
         assert!(
-            error.contains("writing the library database right now"),
+            eventually(|| sqlite_write_lock_held(&path).unwrap()),
+            "the running writer's lock is not visible in /proc/locks"
+        );
+        assert!(
+            eventually(
+                || classify_live_journal(&path).unwrap() == Some(LiveJournalVerdict::WriterActive)
+            ),
+            "a live journal with a running writer was not classified WriterActive"
+        );
+        let mut error = String::new();
+        assert!(
+            eventually(|| {
+                error = require_inert_rollback_journal(&path)
+                    .unwrap_err()
+                    .to_string();
+                error.contains("writing the library database right now")
+            }),
             "{error}"
         );
         assert!(!error.contains("cannot be determined"), "{error}");
