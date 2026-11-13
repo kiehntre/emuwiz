@@ -1543,46 +1543,14 @@ fn gate_rows_left_by_a_forgotten_game_are_never_deleted_by_undo() {
     assert_eq!(gate_new_table_rows(&f, freed), (1, 1));
 }
 
-/// EXPECTED TO FAIL on 8abe9b90 (finding F1 in REVIEW.md).
-///
-/// The new game is given the forgotten game's id (archive ids are reused
-/// unless a Discovery record reserves them), inherits its kept rows by id,
-/// and its Undo is then refused for good although nothing about the imported
-/// game was ever modified: its record is still `touched = 0`.
-#[test]
-fn f1_an_untouched_import_that_reuses_a_forgotten_games_id_can_still_be_undone() {
-    let f = Fixture::new();
-    let freed = gate_forgotten_game_leaves_rows_behind(&f);
-    f.write("new.z80", 2);
-    let r = f.import();
-    let id = r.inserted[0].1;
-    assert_eq!(
-        id, freed,
-        "precondition: the import was given the forgotten game's id"
-    );
-    assert_eq!(
-        gate_count(
-            &f,
-            &format!("SELECT touched FROM discovery_import_records WHERE archive_id={id}")
-        ),
-        0,
-        "nothing has modified the imported game"
-    );
-    let p = f.preview(r.operation_id.as_deref().unwrap());
-    assert!(
-        p.can_undo(),
-        "an untouched import is refused because of another game's rows: {:?}",
-        p.blockers
-    );
-    Database::undo_discovery_import(&p).unwrap();
-    assert_eq!(f.db().load_archives().unwrap().len(), 1);
-    assert_eq!(gate_new_table_rows(&f, freed), (1, 1));
-}
+// The reviewer's `f1_…` test stood here. It asserted that a later import is
+// given a forgotten game's id; that can no longer happen, and the reviewer's
+// re-review of 9e87d192 asked for it to be removed in favour of the `fix_f1_…`
+// tests below.
 
 // ---- Author's regression tests for review finding F1 (not the reviewer's) ----
 //
-// The reviewer's `f1_…` test above can no longer reach its precondition: a
-// later game is never given the id of a deleted game that left kept records.
+// A later game is never given the id of a deleted game that left kept records.
 
 /// A game that was deleted after leaving kept DAT evidence, a re-check note,
 /// or both. Returns its (now free) id.
