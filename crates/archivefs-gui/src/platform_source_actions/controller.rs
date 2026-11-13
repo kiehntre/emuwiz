@@ -644,6 +644,18 @@ impl ArchiveFsApp {
                     warning: None,
                     more_information: gamer_add_failed.then_some(message),
                 });
+                // A scan can commit part of its work before it fails (its run
+                // is then saved as partial). Reload saved status read-only so
+                // the page shows what was committed, and the next scan review
+                // is compared with current saved state rather than a stale one.
+                if matches!(
+                    action,
+                    SourceAction::ScanOne(_)
+                        | SourceAction::ScanAll
+                        | SourceAction::SetEnabled { enabled: true, .. }
+                ) {
+                    self.start_database_action(context.clone(), false);
+                }
             }
         }
     }
