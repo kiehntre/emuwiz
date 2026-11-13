@@ -109,11 +109,11 @@ pub use missing_cleanup::MissingCleanupTarget;
 #[cfg(test)]
 #[path = "database/dat_evidence_history_tests.rs"]
 mod dat_evidence_history_tests;
-mod journal_state;
 mod journal_recovery;
 #[cfg(test)]
 #[path = "database/journal_recovery_tests.rs"]
 mod journal_recovery_tests;
+mod journal_state;
 pub use journal_recovery::{
     JournalRecoveryReceipt, JournalRecoveryState, PreservedFile, apply_journal_recovery,
     prepare_journal_recovery, read_journal_recovery_receipt,
@@ -4907,7 +4907,8 @@ impl Database {
                 // (which would, among other things, refuse its import's Undo
                 // for good). Legacy schemas without these tables keep their
                 // former allocation.
-                let mut sources = vec!["SELECT coalesce(max(id),0) AS value FROM archives".to_string()];
+                let mut sources =
+                    vec!["SELECT coalesce(max(id),0) AS value FROM archives".to_string()];
                 for table in [
                     "discovery_import_records",
                     "library_dat_identity_history",
