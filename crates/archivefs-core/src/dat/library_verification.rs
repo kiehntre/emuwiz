@@ -122,6 +122,8 @@ pub struct VerificationPreview {
     /// One selected game: its save touches only that game's evidence, so the
     /// library-wide disc-order rebuild is not run.
     single_game: bool,
+    /// A bounded set of rows chosen by a re-check (see `execute`).
+    rows_population: bool,
 }
 
 /// Which library rows a verification may hash and save.
@@ -449,6 +451,7 @@ fn preview_verification(
         targets: CatalogueAuditTargets::default(),
         _snapshot: snapshot,
         single_game: single.is_some() || chosen_rows.is_some(),
+        rows_population: chosen_rows.is_some(),
     };
     preview.request.dat_path = frozen;
     preview.request.platform = Some(platform);
@@ -610,6 +613,9 @@ pub struct VerificationTotals {
     pub protected_prior: usize,
     /// The definitive result reached for each library row in this run.
     pub findings: Vec<VerificationFinding>,
+    /// Set only for a bounded row set: the save committed, but some results
+    /// in it were withheld (their rows are simply still not current).
+    pub save_withheld: Option<String>,
     /// The disc-order refresh that follows a successful save. An error here
     /// never undoes the saved evidence.
     pub disc_order: Option<Result<crate::DatDiscOrderOutcome, String>>,
@@ -863,7 +869,19 @@ impl VerificationPreview {
             || saved.ambiguous != 0
             || saved.negative_platform_unproven_skipped != 0
         {
-            return Err(format!("Verification save was incomplete: {saved:?}"));
+            // The transaction has committed. A whole-system or one-game
+            // check reports that as an error, as it always has. A bounded
+            // row set must not: its caller would take "error" to mean
+            // nothing was saved, read the set again and stop at it forever.
+            if !self.rows_population {
+                return Err(format!("Verification save was incomplete: {saved:?}"));
+            }
+            totals.save_withheld = Some(format!(
+                "Some results in this set were not saved ({} refused, {} not tied to one library row, {} negative results that do not apply to the game's system)",
+                usize::from(saved.refused.is_some()),
+                saved.unassociated + saved.ambiguous,
+                saved.negative_platform_unproven_skipped
+            ));
         }
         totals.saved = saved.inserted + saved.updated;
         totals.protected_prior = saved.skipped_protected_prior_result;

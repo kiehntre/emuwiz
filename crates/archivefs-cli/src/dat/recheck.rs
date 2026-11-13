@@ -3,8 +3,9 @@
 //!
 //! Without `--confirm` nothing is hashed and nothing is written. With it,
 //! game files are read (never changed) and the library database is updated
-//! one bounded set at a time; Ctrl-C stops after the current set and the
-//! finished sets stay saved. Running it again continues with the rest.
+//! one bounded set at a time. Ctrl-C stops the run: the set being read is
+//! given up, every finished set stays saved, and running the command again
+//! continues with the rest.
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +79,7 @@ struct ReportJson {
     no_longer_matching: Vec<NoteJson>,
     not_reached: usize,
     stopped: Option<String>,
+    warnings: Vec<String>,
     seconds: f64,
 }
 
@@ -175,6 +177,7 @@ fn report_json(report: &ReauditReport, seconds: f64) -> ReportJson {
             ReauditStop::Cancelled => "stopped on request".to_string(),
             ReauditStop::Interrupted(reason) => reason.clone(),
         }),
+        warnings: report.warnings.clone(),
         seconds,
     }
 }
@@ -222,7 +225,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let database = match database {
-        Some(path) => path,
+        Some(path) => std::path::absolute(path)?,
         None => archivefs_core::default_database_path()?,
     };
     let catalogues = ReauditCatalogues::load_default()?;
@@ -321,6 +324,9 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 output.not_checked.len() - 20
             );
         }
+    }
+    for warning in &output.warnings {
+        println!("Note: {warning}");
     }
     if let Some(stopped) = &output.stopped {
         println!(

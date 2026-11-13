@@ -225,16 +225,121 @@ fn local_filesystem(path: &Path) -> Result<bool> {
             std::io::Error::last_os_error()
         )));
     }
-    const LOCAL: [i64; 7] = [
+    // Not overlayfs: the inode `/proc/locks` reports for a file there need
+    // not be the one `stat` reports, so a live writer could go unseen.
+    const LOCAL: [i64; 6] = [
         0xEF53,      // ext2/3/4
         0x5846_5342, // xfs
         0x9123_683E, // btrfs
         0x0102_1994, // tmpfs
         0x2FC1_2FC1, // zfs
         0xF2F5_2010, // f2fs
-        0x794C_7630, // overlayfs
     ];
     Ok(LOCAL.contains(&(stats.f_type as i64)))
+}
+
+/// Processes that have `database` or its journal open right now, by file
+/// identity, from `/proc/<pid>/fd`. A writer whose locks were lost (closing
+/// any descriptor on a file drops a process's POSIX locks on it) still has
+/// the file open, and so does an idle connection in this very process; both
+/// are invisible to the lock table. Only processes this user may inspect are
+/// seen; that covers every EmuWiz process of this user.
+fn processes_holding(paths: &[&Path]) -> Result<Vec<u32>> {
+    let targets: Vec<(u64, u64)> = paths
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok())
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+        .collect();
+    let mut holders = Vec::new();
+    let processes = fs::read_dir("/proc").map_err(|error| {
+        refuse(format!(
+            "could not read /proc to see who has the library database open: {error}. Nothing \
+             was changed."
+        ))
+    })?;
+    for process in processes.flatten() {
+        let Some(pid) = process
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(descriptors) = fs::read_dir(process.path().join("fd")) else {
+            continue;
+        };
+        for descriptor in descriptors.flatten() {
+            if let Ok(metadata) = fs::metadata(descriptor.path())
+                && targets.contains(&(metadata.dev(), metadata.ino()))
+            {
+                holders.push(pid);
+                break;
+            }
+        }
+    }
+    Ok(holders)
+}
+
+/// Whether every page of `live` is the same page of `first` or of `second`.
+/// That is what a database part-way through SQLite's rollback of the checked
+/// journal looks like: each page is either still the interrupted one or
+/// already the restored one. Anything else is not the checked database.
+fn every_page_from_either(live: &Path, first: &Path, second: &Path) -> Result<bool> {
+    let open = |path: &Path| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|error| refuse(format!("could not read {}: {error}", path.display())))
+    };
+    let (mut live_file, mut first_file, mut second_file) =
+        (open(live)?, open(first)?, open(second)?);
+    let mut header = [0_u8; 18];
+    first_file
+        .read_exact(&mut header)
+        .and_then(|_| first_file.seek(SeekFrom::Start(0)))
+        .map_err(|error| refuse(format!("could not read {}: {error}", first.display())))?;
+    let page = match u16::from_be_bytes([header[16], header[17]]) {
+        1 => 65_536_usize,
+        size if size >= 512 && size.is_power_of_two() => usize::from(size),
+        _ => return Ok(false),
+    };
+    let length = |file: &File, path: &Path| {
+        file.metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|error| refuse(format!("could not read {}: {error}", path.display())))
+    };
+    let (live_len, first_len, second_len) = (
+        length(&live_file, live)?,
+        length(&first_file, first)?,
+        length(&second_file, second)?,
+    );
+    if live_len % page as u64 != 0 || live_len > first_len.max(second_len) {
+        return Ok(false);
+    }
+    let mut buffers = (vec![0_u8; page], vec![0_u8; page], vec![0_u8; page]);
+    let mut offset = 0_u64;
+    while offset < live_len {
+        let read = |file: &mut File, buffer: &mut [u8], path: &Path| {
+            file.read_exact(buffer)
+                .map_err(|error| refuse(format!("could not read {}: {error}", path.display())))
+        };
+        read(&mut live_file, &mut buffers.0, live)?;
+        let mut matches = false;
+        if offset + page as u64 <= first_len {
+            read(&mut first_file, &mut buffers.1, first)?;
+            matches |= buffers.0 == buffers.1;
+        }
+        if offset + page as u64 <= second_len {
+            read(&mut second_file, &mut buffers.2, second)?;
+            matches |= buffers.0 == buffers.2;
+        }
+        if !matches {
+            return Ok(false);
+        }
+        offset += page as u64;
+    }
+    Ok(true)
 }
 
 /// A rollback journal that names a super-journal belongs to a transaction
@@ -299,6 +404,23 @@ fn require_recoverable_state(database_path: &Path) -> Result<u64> {
             "this process still has the library database open with a lock. Close the library \
              and try again. Nothing was changed.",
         ));
+    }
+    let holders = processes_holding(&[database_path, &sidecar(database_path, "-journal")])?;
+    if !holders.is_empty() {
+        return Err(refuse(format!(
+            "the library database or its journal is still open in {} (process {}). Close every \
+             EmuWiz window and process and try again. Nothing was changed.",
+            if holders.len() == 1 {
+                "another program"
+            } else {
+                "other programs"
+            },
+            holders
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
     }
     if names_super_journal(&sidecar(database_path, "-journal"))? {
         return Err(refuse(
@@ -377,9 +499,14 @@ fn sqlite_rollback_and_check(database: &Path) -> Result<(i64, BTreeMap<String, u
     };
     let connection = rusqlite::Connection::open_with_flags(
         database,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|e| error("open", e))?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| error("open", e))?;
     // The first read is what makes SQLite replay a hot journal. It checks
     // for a live writer itself first, and reports "busy" if there is one.
     let _: i64 = connection
@@ -441,6 +568,12 @@ fn sqlite_rollback_and_check(database: &Path) -> Result<(i64, BTreeMap<String, u
 /// read. Creates one recovery folder beside the database.
 pub fn prepare_journal_recovery(database_path: &Path) -> Result<JournalRecoveryReceipt> {
     let _lock = UpgradeLock::acquire_waiting(database_path, LOCK_WAIT)?;
+    if !database_path.is_absolute() || database_path.to_str().is_none() {
+        return Err(refuse(
+            "the library database path must be absolute and valid UTF-8 for a recovery receipt \
+             to name it. Nothing was changed.",
+        ));
+    }
     let journal_path = sidecar(database_path, "-journal");
     let journal_bytes = require_recoverable_state(database_path)?;
     let before = (stamp(database_path)?, stamp(&journal_path)?);
@@ -601,6 +734,10 @@ pub fn prepare_journal_recovery(database_path: &Path) -> Result<JournalRecoveryR
 ///
 /// Safe to call again after an interruption: the journal is not changed by
 /// a rollback until it has finished, and replaying it is idempotent.
+///
+/// Call it from a process that has no connection to this library open (the
+/// command-line tool). It refuses when any process, this one included,
+/// still has the database or its journal open.
 pub fn apply_journal_recovery(
     database_path: &Path,
     recovery_dir: &Path,
@@ -619,6 +756,27 @@ pub fn apply_journal_recovery(
         ));
     }
     let journal_path = sidecar(database_path, "-journal");
+    // An apply that was cut off after SQLite had finished: the journal is
+    // gone, so there is nothing left to roll back, only to confirm.
+    if receipt.state == JournalRecoveryState::Applying
+        && !matches!(
+            journal_state::rollback_journal_state(database_path)?,
+            RollbackJournalState::LiveHeader { .. }
+        )
+    {
+        if hash_file(database_path)? != receipt.recovered {
+            return Err(refuse(format!(
+                "an earlier apply of this recovery was interrupted, the journal is gone, and \
+                 the library database is not the copy that was checked. Nothing was changed \
+                 now. The preserved originals are in {}.",
+                recovery_dir.join("original").display()
+            )));
+        }
+        receipt.state = JournalRecoveryState::Applied;
+        receipt.applied_at = Some(now_utc_string());
+        write_receipt(&receipt)?;
+        return Ok(receipt);
+    }
     require_recoverable_state(database_path)?;
     let file_name = database_path
         .file_name()
@@ -642,13 +800,27 @@ pub fn apply_journal_recovery(
     }
     // Before a first apply the database must be exactly the preserved one.
     // After an interrupted apply it may be part-way through the same
-    // rollback; the unchanged journal still restores the same pages.
-    if receipt.state == JournalRecoveryState::Prepared
-        && hash_file(database_path)? != receipt.database
-    {
+    // rollback: then every page is either still the preserved page or
+    // already the checked, restored page. Any other database (one put
+    // there since, say) is not what this recovery checked.
+    let is_checked_database = match receipt.state {
+        JournalRecoveryState::Prepared => hash_file(database_path)? == receipt.database,
+        _ => every_page_from_either(
+            database_path,
+            &original_dir.join(file_name),
+            &recovery_dir.join("recovered").join(file_name),
+        )?,
+    };
+    if !is_checked_database {
         return Err(refuse(
             "the library database is not the one this recovery checked. Prepare a new \
              recovery. Nothing was changed.",
+        ));
+    }
+    if hash_file(&recovery_dir.join("recovered").join(file_name))? != receipt.recovered {
+        return Err(refuse(
+            "the checked copy in the recovery folder no longer matches its receipt. Prepare a \
+             new recovery. Nothing was changed.",
         ));
     }
     receipt.state = JournalRecoveryState::Applying;

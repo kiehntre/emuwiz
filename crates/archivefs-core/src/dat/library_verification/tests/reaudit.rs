@@ -693,3 +693,396 @@ fn a_recheck_marks_only_the_discovery_imports_of_the_games_it_rewrote() {
     assert_eq!(touched[&1], 1, "a rewritten game's import stays protected");
     assert_eq!(touched[&900], 0, "an unrelated import must not be marked");
 }
+
+// ---- Independent review tests (engine/recovery review of 8abe9b90), unmodified ----
+
+/// A1. The group-level failure branch (reaudit.rs 605-626) pushes a note for
+/// "the rest of the group". Every planned row must be counted exactly once,
+/// and rows from the set that was already saved must not be among the notes.
+#[test]
+fn review_a_catalogue_that_fails_mid_group_accounts_for_every_row_once() {
+    let f = Fixture::legacy_library(5);
+    let plan = f.plan();
+    let calls = Cell::new(0usize);
+    let report = run_reaudit(
+        &f.db,
+        &plan,
+        &|_| {
+            let n = calls.replace(calls.get() + 1);
+            if n == 0 {
+                Ok(f.resolved())
+            } else {
+                Err("the catalogue went away".to_string())
+            }
+        },
+        &TrustedRoots::none(),
+        &AtomicBool::new(false),
+        ReauditLimits {
+            max_games_per_set: 2,
+            max_bytes_per_set: u64::MAX,
+        },
+        &|_| {},
+    )
+    .unwrap();
+    assert_eq!(report.planned, 5);
+    assert_eq!(
+        (report.verified, report.saved, report.sets_saved),
+        (2, 2, 1),
+        "{report:?}"
+    );
+    let mut noted: Vec<i64> = report.not_checked.iter().map(|n| n.archive_id).collect();
+    noted.sort();
+    assert_eq!(noted, vec![3, 4, 5], "{report:?}");
+    assert_eq!(report.not_reached, 0, "{report:?}");
+    assert_eq!(
+        report.planned,
+        report.verified
+            + report.no_match
+            + report.ambiguous
+            + report.not_checked.len()
+            + report.not_reached
+    );
+    let statuses = f.statuses();
+    for id in [1, 2] {
+        assert_eq!(statuses[&id], Status::Current, "row {id}");
+    }
+    for id in [3, 4, 5] {
+        assert_eq!(statuses[&id], Status::MissingProof, "row {id}");
+    }
+    assert_eq!(f.evidence().exact.len(), 2);
+}
+
+/// A2. The same situation: the reason those three rows were not checked
+/// should survive a restart like every other "not checked" reason does.
+#[test]
+fn review_rows_skipped_with_their_catalogue_keep_a_saved_reason() {
+    let f = Fixture::legacy_library(5);
+    let plan = f.plan();
+    let calls = Cell::new(0usize);
+    let report = run_reaudit(
+        &f.db,
+        &plan,
+        &|_| {
+            let n = calls.replace(calls.get() + 1);
+            if n == 0 {
+                Ok(f.resolved())
+            } else {
+                Err("the catalogue went away".to_string())
+            }
+        },
+        &TrustedRoots::none(),
+        &AtomicBool::new(false),
+        ReauditLimits {
+            max_games_per_set: 2,
+            max_bytes_per_set: u64::MAX,
+        },
+        &|_| {},
+    )
+    .unwrap();
+    assert_eq!(report.not_checked.len(), 3, "{report:?}");
+    let mut saved_reasons: Vec<i64> = f.notes().iter().map(|n| n.archive_id).collect();
+    saved_reasons.sort();
+    assert_eq!(
+        saved_reasons,
+        vec![3, 4, 5],
+        "the report lists these rows as not checked but no reason was saved for them"
+    );
+}
+
+/// A3. One more file is replaced on every attempt of the same set. The retry
+/// loop must end, every row must be reported once, and nothing may be saved
+/// or promoted.
+#[test]
+fn review_a_different_file_changing_on_every_attempt_terminates() {
+    let f = Fixture::legacy_library(4);
+    let before = f.dat_rows();
+    let armed = Cell::new(false);
+    let next = Cell::new(0usize);
+    let refusals = Cell::new(0usize);
+    let report = f
+        .reaudit_with(&f.plan(), 10, &AtomicBool::new(false), &|p| match p {
+            ReauditProgress::SetStarted { .. } => armed.set(true),
+            ReauditProgress::SetNotSaved { retrying, .. } => {
+                refusals.set(refusals.get() + 1);
+                armed.set(retrying);
+            }
+            ReauditProgress::Audit(DatAuditProgress::Hashing { .. }) => {
+                if armed.replace(false) {
+                    let n = next.replace(next.get() + 1);
+                    if n < 4 {
+                        let target = f.root.join(format!("g{n:04}.tap"));
+                        let replacement = target.with_extension("new");
+                        std::fs::write(&replacement, body(n)).unwrap();
+                        std::fs::rename(&replacement, &target).unwrap();
+                    }
+                }
+            }
+            _ => {}
+        })
+        .unwrap();
+    assert!(refusals.get() <= 5, "{} refusals", refusals.get());
+    assert!(report.stopped.is_none(), "{report:?}");
+    assert_eq!(
+        (report.verified, report.saved, report.sets_saved),
+        (0, 0, 0),
+        "{report:?}"
+    );
+    let mut noted: Vec<i64> = report.not_checked.iter().map(|n| n.archive_id).collect();
+    noted.sort();
+    assert_eq!(noted, vec![1, 2, 3, 4], "{report:?}");
+    assert_eq!(report.not_reached, 0, "{report:?}");
+    assert_eq!(f.dat_rows(), before, "a refused set changed saved rows");
+    assert!(f.history().is_empty());
+    assert!(f.statuses().values().all(|s| *s == Status::MissingProof));
+    assert!(f.evidence().states.is_empty());
+    assert_eq!(f.notes().len(), 4);
+}
+
+/// A4. At 756d9740 `current_library_dat_evidence` skipped a row whose
+/// catalogue is not configured *before* parsing its saved facts. It now
+/// parses first (dat_current.rs 227-230), so one unreadable row belonging to
+/// a removed catalogue fails the whole read that patches, trainers and the
+/// library view depend on.
+#[test]
+fn review_an_unreadable_row_of_an_unconfigured_catalogue_is_still_skipped() {
+    let f = Fixture::legacy_library(2);
+    f.reaudit(10);
+    assert_eq!(f.evidence().exact.len(), 2);
+    rusqlite::Connection::open(&f.db)
+        .unwrap()
+        .execute(
+            "INSERT INTO library_dat_identities \
+             (archive_id, dat_source_id, dat_ecosystem, source_revision, verification_state, \
+              completeness, audited_at, revision_marked_stale, facts_json, created_at, updated_at) \
+             VALUES (1, 'a-catalogue-that-was-removed', NULL, NULL, 'verified_single_match', \
+                     'exhaustive', '2026-01-01T00:00:00Z', 0, x'7b7d', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+    f.sized();
+    let evidence = Database::open_read_only(&f.db)
+        .unwrap()
+        .current_library_dat_evidence(&f.configured());
+    let outcome = evidence
+        .as_ref()
+        .map(|e| e.exact.len())
+        .map_err(|e| e.to_string());
+    assert_eq!(
+        outcome,
+        Ok(2),
+        "a row of a catalogue that is not configured used to be skipped unread"
+    );
+}
+
+// ---- Independent review tests (Discovery gate review of 8abe9b90), unmodified ----
+
+fn gate_touched(f: &Fixture) -> BTreeMap<i64, i64> {
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let mut statement = conn
+        .prepare("SELECT archive_id, touched FROM discovery_import_records")
+        .unwrap();
+    let rows = statement
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect::<BTreeMap<i64, i64>>();
+    rows
+}
+
+/// An untouched import record for a real library row, bound to its real path
+/// and source folder so the path-keyed triggers are exercised as well.
+fn gate_import_record(f: &Fixture, archive_id: i64, name: &str) {
+    let path = f.root.join(name);
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    conn.execute(
+        "INSERT INTO discovery_import_operations SELECT 'gate','committed','then',NULL,x'7b7d' WHERE NOT EXISTS(SELECT 1 FROM discovery_import_operations WHERE operation_id='gate')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO discovery_import_records VALUES('gate',?1,1,?2,?3,x'7b7d',0)",
+        rusqlite::params![
+            archive_id,
+            name.as_bytes(),
+            std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str())
+        ],
+    )
+    .unwrap();
+}
+
+fn gate_dependents(f: &Fixture, archive_id: i64) -> i64 {
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    [
+        "archive_scan_observations",
+        "library_dat_identities",
+        "library_dat_identity_history",
+        "dat_recheck_attempts",
+        "verified_identity_facts",
+        "screenscraper_enrichments",
+        "dat_set_audit_results",
+    ]
+    .iter()
+    .map(|table| {
+        conn.query_row(
+            &format!("SELECT count(*) FROM {table} WHERE archive_id=?1"),
+            [archive_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    })
+    .sum()
+}
+
+#[test]
+fn gate_a_bulk_recheck_and_its_disc_order_refresh_leave_an_unrelated_real_import_alone() {
+    let f = Fixture::legacy_library(3);
+    // A real library game on the same system and source folder that has
+    // never been checked, so it is in no plan.
+    f.add(
+        50,
+        "other.tap",
+        Some(b"an unrelated game nobody checked"),
+        Some("ZX Spectrum"),
+    );
+    f.sized();
+    gate_import_record(&f, 50, "other.tap");
+    let plan = f.plan();
+    assert_eq!(plan.games(), 3);
+    assert_eq!(gate_touched(&f)[&50], 0, "planning must be read-only");
+    let report = f.reaudit(2);
+    assert_eq!((report.verified, report.saved), (3, 3));
+    assert!(
+        matches!(report.disc_order, Some(Ok(_))),
+        "{:?}",
+        report.disc_order
+    );
+    assert_eq!(gate_touched(&f)[&50], 0, "an unrelated import was marked");
+    assert_eq!(gate_dependents(&f, 50), 0);
+    // A second run has nothing to do and still marks nothing.
+    let again = f.reaudit(2);
+    assert_eq!((again.saved, again.sets_saved), (0, 0));
+    assert_eq!(gate_touched(&f)[&50], 0);
+    assert_eq!(gate_dependents(&f, 50), 0);
+}
+
+/// The whole-platform path. An import is marked exactly when the check saved
+/// a row for that game (existing design: a first DAT row is a protected
+/// dependent). A game on another system is never read, written or marked.
+#[test]
+fn gate_a_whole_platform_check_marks_an_import_only_when_it_saves_a_row_for_that_game() {
+    let f = Fixture::legacy_library(2);
+    f.add(
+        50,
+        "other.tap",
+        Some(b"an unrelated game nobody checked"),
+        Some("ZX Spectrum"),
+    );
+    f.add(
+        51,
+        "elsewhere.gb",
+        Some(b"another system"),
+        Some("Game Boy"),
+    );
+    f.sized();
+    gate_import_record(&f, 50, "other.tap");
+    gate_import_record(&f, 51, "elsewhere.gb");
+    let _totals = f.run();
+    let touched = gate_touched(&f);
+    eprintln!(
+        "GATE-INFO whole-platform check: same-system import touched={} dependents={}",
+        touched[&50],
+        gate_dependents(&f, 50)
+    );
+    assert_eq!(
+        touched[&50] == 1,
+        gate_dependents(&f, 50) > 0,
+        "marked without a saved row, or a saved row without the mark"
+    );
+    assert_eq!(touched[&51], 0, "a game on another system was marked");
+    assert_eq!(gate_dependents(&f, 51), 0);
+}
+
+#[test]
+fn gate_a_recheck_stopped_while_hashing_marks_no_import_at_all() {
+    let f = Fixture::legacy_library(3);
+    f.add(
+        50,
+        "other.tap",
+        Some(b"an unrelated game nobody checked"),
+        Some("ZX Spectrum"),
+    );
+    f.sized();
+    gate_import_record(&f, 50, "other.tap");
+    let cancel = AtomicBool::new(false);
+    let report = f
+        .reaudit_with(&f.plan(), 10, &cancel, &|p| {
+            if matches!(p, ReauditProgress::Audit(_)) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        })
+        .unwrap();
+    assert_eq!(report.saved, 0);
+    assert_eq!(gate_touched(&f)[&50], 0);
+    assert_eq!(gate_dependents(&f, 50), 0);
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    for table in ["library_dat_identity_history", "dat_recheck_attempts"] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+}
+
+/// EXPECTED TO FAIL on 8abe9b90 (finding F2 in REVIEW.md).
+///
+/// A plan names game 2. Before the run reaches it, game 2 is forgotten and a
+/// different game is given the free id 2 (as a Discovery import would be).
+/// The run then writes a "not checked" note under id 2, which marks the new
+/// game's import as modified and leaves it a dependent row, although the run
+/// never read or wrote anything about the new game.
+#[test]
+fn f2_a_stale_plan_never_marks_or_annotates_a_newer_game_that_was_given_the_same_id() {
+    let f = Fixture::legacy_library(2);
+    let plan = f.plan();
+    assert_eq!(plan.games(), 2);
+    // Forget game 2 the way forget_missing / missing_cleanup do.
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    conn.execute_batch(
+        "DELETE FROM screenscraper_enrichments WHERE archive_id=2;
+         DELETE FROM library_dat_identities WHERE archive_id=2;
+         DELETE FROM verified_identity_facts WHERE archive_id=2;
+         DELETE FROM platform_assignments WHERE archive_id=2;
+         DELETE FROM archive_scan_observations WHERE archive_id=2;
+         DELETE FROM archives WHERE id=2;",
+    )
+    .unwrap();
+    drop(conn);
+    std::fs::remove_file(f.root.join("g0001.tap")).unwrap();
+    // A different game arrives and is given id 2.
+    f.add(
+        2,
+        "fresh.tap",
+        Some(b"a brand new game, never checked"),
+        Some("ZX Spectrum"),
+    );
+    f.sized();
+    gate_import_record(&f, 2, "fresh.tap");
+    assert_eq!(gate_touched(&f)[&2], 0);
+    let report = f
+        .reaudit_with(&plan, 10, &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    eprintln!(
+        "GATE-INFO stale plan run: verified={} saved={} not_checked={:?} stopped={:?}",
+        report.verified, report.saved, report.not_checked, report.stopped
+    );
+    assert_eq!(
+        gate_dependents(&f, 2),
+        0,
+        "the run left a row under the new game's id"
+    );
+    assert_eq!(
+        gate_touched(&f)[&2],
+        0,
+        "the run marked an import it never read or wrote"
+    );
+}

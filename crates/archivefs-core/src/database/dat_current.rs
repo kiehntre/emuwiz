@@ -224,6 +224,12 @@ impl Database {
         for row in rows {
             let (archive_id, source_id, bytes, size_bytes, platform, ecosystem, path_bytes) =
                 row.map_err(|error| db_error("failed to read current DAT evidence", error))?;
+            // A row of a catalogue that is not configured can never count,
+            // so it is skipped unread: one unreadable row of a removed
+            // catalogue must not take the whole library's evidence with it.
+            if !catalogues.contains_key(&source_id) {
+                continue;
+            }
             let saved: crate::dat::library_identity_summary::PersistedLibraryDatIdentity =
                 serde_json::from_slice(&bytes).map_err(|error| {
                     ArchiveFsError::Database(format!("stored DAT evidence is unreadable: {error}"))
@@ -317,7 +323,8 @@ pub struct DatRecheckAttempt {
 
 impl Database {
     /// Records, in one transaction, why a re-check saved nothing for each
-    /// row. A row that has current evidence by then is left without a note.
+    /// row. Nothing is written for a row that is no longer in the library at
+    /// that path, or for which this very check saved a proof-bearing result.
     pub fn record_dat_recheck_attempts(
         &mut self,
         dat_source_id: &str,
@@ -333,10 +340,29 @@ impl Database {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| db_error("failed to start DAT re-check note transaction", error))?;
         for (archive_id, path, reason) in notes {
+            // A check that did save a proof-bearing row against these very
+            // catalogue bytes (a probable match, say) saved something: the
+            // row itself is the record, and a note would contradict it.
+            let saved_by_this_check =
+                library_dat_identity_for_item_conn(&tx, *archive_id, dat_source_id)?.is_some_and(
+                    |row| {
+                        (row.audit_file.is_some() || !row.disc_members.is_empty())
+                            && catalogue_sha256.is_some()
+                            && row.source.catalogue_sha256.as_deref() == catalogue_sha256
+                    },
+                );
+            if saved_by_this_check {
+                continue;
+            }
+            // Only for the library row the check was about: the same id at
+            // the same path. A plan made before the row moved or was
+            // forgotten writes nothing.
             tx.execute(
                 "INSERT INTO dat_recheck_attempts \
                  (archive_id, dat_source_id, archive_path, attempted_at, reason, catalogue_sha256) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6 \
+                 WHERE EXISTS (SELECT 1 FROM archives a \
+                               WHERE a.id = ?1 AND a.absolute_path_cached = ?3) \
                  ON CONFLICT(archive_id, dat_source_id) DO UPDATE SET \
                   archive_path = excluded.archive_path, attempted_at = excluded.attempted_at, \
                   reason = excluded.reason, catalogue_sha256 = excluded.catalogue_sha256",

@@ -429,3 +429,109 @@ fn killing_prepare_or_apply_never_harms_the_library_and_recovery_still_finishes(
         "recovery kill test: {unfinished_prepares} unfinished prepares, {interrupted_applies} applies interrupted, {finished_by_child} applies finished before the kill"
     );
 }
+
+// ---- Independent review tests (engine/recovery review of 8abe9b90), unmodified ----
+
+/// J1. `apply_journal_recovery` skips the "live database is the preserved
+/// one" check whenever the receipt says `applying` (journal_recovery.rs
+/// 643-653). An apply can be left in that state by a kill, or by SQLite
+/// returning "busy" after the receipt was written. If the database file is
+/// then replaced by anything else while the journal is left behind (a backup
+/// copied over it, for example), a second apply must still refuse, because
+/// the journal no longer belongs to that database.
+#[test]
+fn review_an_interrupted_apply_still_refuses_a_database_it_never_checked() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = interrupted_library(temp.path(), true);
+    let receipt = prepare_journal_recovery(&database).unwrap();
+
+    // The state an apply leaves when it stops right after its first receipt
+    // write and before SQLite touched anything.
+    let receipt_path = receipt.recovery_dir.join("receipt.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    value["state"] = serde_json::Value::String("applying".into());
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    assert_eq!(
+        read_journal_recovery_receipt(&receipt.recovery_dir)
+            .unwrap()
+            .state,
+        JournalRecoveryState::Applying
+    );
+
+    // Another, healthy library is put where the interrupted one was. The old
+    // journal is still beside it.
+    let other_dir = temp.path().join("other");
+    fs::create_dir(&other_dir).unwrap();
+    let other = other_dir.join("library.sqlite3");
+    drop(Database::open_or_create(&other).unwrap());
+    fs::copy(&other, &database).unwrap();
+    let foreign = fs::read(&database).unwrap();
+    assert_ne!(
+        foreign,
+        fs::read(receipt.recovery_dir.join("original/library.sqlite3")).unwrap()
+    );
+    assert_ne!(
+        foreign,
+        fs::read(receipt.recovery_dir.join("recovered/library.sqlite3")).unwrap()
+    );
+
+    let result = apply_journal_recovery(&database, &receipt.recovery_dir);
+    let outcome = result
+        .as_ref()
+        .map(|r| format!("{:?}", r.state))
+        .map_err(|e| e.to_string());
+    assert_eq!(
+        fs::read(&database).unwrap(),
+        foreign,
+        "apply let SQLite roll a journal back onto a database it never checked ({outcome:?})"
+    );
+    assert!(result.is_err(), "{outcome:?}");
+}
+
+/// J2. A kill between SQLite deleting the journal and the final receipt
+/// write leaves: journal gone, database equal to the checked copy, receipt
+/// `applying`. Running apply again (which the documentation tells the person
+/// to do) should recognise the finished rollback and close the receipt, and
+/// must not change the database.
+#[test]
+fn review_an_apply_killed_after_sqlite_finished_can_be_finalised() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = interrupted_library(temp.path(), true);
+    let receipt = prepare_journal_recovery(&database).unwrap();
+    apply_journal_recovery(&database, &receipt.recovery_dir).unwrap();
+    let recovered = fs::read(&database).unwrap();
+    assert_eq!(
+        recovered,
+        fs::read(receipt.recovery_dir.join("recovered/library.sqlite3")).unwrap()
+    );
+    assert!(!journal_of(&database).exists());
+
+    // Put the receipt back to what it was just before the last write.
+    let receipt_path = receipt.recovery_dir.join("receipt.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    value["state"] = serde_json::Value::String("applying".into());
+    value["applied_at"] = serde_json::Value::Null;
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+    let again = apply_journal_recovery(&database, &receipt.recovery_dir);
+    let outcome = again
+        .as_ref()
+        .map(|r| format!("{:?}", r.state))
+        .map_err(|e| e.to_string());
+    assert_eq!(
+        fs::read(&database).unwrap(),
+        recovered,
+        "a repeated apply changed a recovered library"
+    );
+    assert_eq!(committed_rows(&database), ROWS as i64);
+    let state = read_journal_recovery_receipt(&receipt.recovery_dir)
+        .unwrap()
+        .state;
+    assert!(
+        again.is_ok() && state == JournalRecoveryState::Applied,
+        "the receipt is left saying the library may be part-way through a rollback: \
+         apply returned {outcome:?}, receipt state {state:?}"
+    );
+}

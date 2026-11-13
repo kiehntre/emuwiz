@@ -85,9 +85,10 @@ pub fn run(args: Vec<String>) -> Result<String, Box<dyn std::error::Error>> {
         }
     }
     let database = match database {
-        Some(path) => path,
+        Some(path) => std::path::absolute(path)?,
         None => default_database_path()?,
     };
+    let apply = apply.map(std::path::absolute).transpose()?;
     let Some(recovery_dir) = apply else {
         let receipt = prepare_journal_recovery(&database)?;
         let mut out = describe(&receipt);

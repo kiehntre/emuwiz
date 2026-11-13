@@ -4900,12 +4900,39 @@ impl Database {
             None => {
                 // Discovery ownership rows retain deleted IDs permanently. This
                 // keeps delayed verification/metadata workers from targeting a
-                // different record after selective Undo. Legacy schemas have
-                // no import tombstones and retain their former allocation.
-                let has_import_history: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='discovery_import_records')", [], |r|r.get(0)).map_err(|e|db_error("check retained import identities",e))?;
-                let max_id: i64 = if has_import_history {
-                    tx.query_row("SELECT max(value) FROM (SELECT coalesce(max(id),0) AS value FROM archives UNION ALL SELECT coalesce(max(archive_id),0) AS value FROM discovery_import_records)",[],|r|r.get(0))
-                } else { tx.query_row("SELECT coalesce(max(id),0) FROM archives",[],|r|r.get(0)) }.map_err(|e|db_error("reserve new archive identity",e))?;
+                // different record after selective Undo. Kept DAT evidence and
+                // re-check notes (schema 27) also outlive their game and are
+                // keyed by its id, so those ids are never handed out again
+                // either: a new game must not inherit another game's records
+                // (which would, among other things, refuse its import's Undo
+                // for good). Legacy schemas without these tables keep their
+                // former allocation.
+                let mut sources = vec!["SELECT coalesce(max(id),0) AS value FROM archives".to_string()];
+                for table in [
+                    "discovery_import_records",
+                    "library_dat_identity_history",
+                    "dat_recheck_attempts",
+                ] {
+                    let exists: bool = tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                            [table],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| db_error("check retained archive identities", e))?;
+                    if exists {
+                        sources.push(format!(
+                            "SELECT coalesce(max(archive_id),0) AS value FROM {table}"
+                        ));
+                    }
+                }
+                let max_id: i64 = tx
+                    .query_row(
+                        &format!("SELECT max(value) FROM ({})", sources.join(" UNION ALL ")),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| db_error("reserve new archive identity", e))?;
                 let new_id = max_id.checked_add(1).ok_or_else(|| {
                     ArchiveFsError::Database(
                         "Archive identity space exhausted; insertion refused".into(),
@@ -7541,7 +7568,17 @@ impl Database {
         persisted: &crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
     ) -> Result<LibraryDatIdentityPersistOutcome> {
         let now = now_utc_string();
-        persist_library_dat_identity_row(&self.connection, archive_id, persisted, &now)
+        // Keeping the replaced row, clearing its note and writing the new
+        // row are one change.
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
+        let outcome = persist_library_dat_identity_row(&tx, archive_id, persisted, &now)?;
+        tx.commit().map_err(|error| {
+            db_error("failed to commit library DAT identity transaction", error)
+        })?;
+        Ok(outcome)
     }
 
     /// The stored DAT identity for one library item and one DAT source, if
@@ -7710,12 +7747,15 @@ impl Database {
         outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
         scope: Option<&crate::dat::library_verification::VerificationScope>,
     ) -> Result<LibraryDatIdentityAuditPersistOutcome> {
-        // Reads and writes share one SQLite snapshot. Concurrent membership
-        // changes either precede validation or prevent upgrading this transaction.
-        let tx = self
-            .connection
-            .unchecked_transaction()
-            .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
+        // Reads and writes share one SQLite snapshot. The write lock is taken
+        // at the start (waiting out another writer for the busy timeout), so
+        // a membership change either precedes validation or waits for this
+        // save; a save is never refused only because it had read first.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
         if let Some(scope) = scope {
             scope
                 .validate(&self.load_archives()?, outcome)

@@ -287,8 +287,8 @@ pub enum ReauditStop {
     /// Stopped on request. Sets saved before the stop stay saved.
     Cancelled,
     /// A set could not be saved twice running for a reason that is not one
-    /// game's fault (the library or catalogue is changing, or the database
-    /// is busy). Nothing from that set was saved.
+    /// game's or one catalogue's fault (the library is changing, cannot be
+    /// read, or the database is busy). Nothing from that set was saved.
     Interrupted(String),
 }
 
@@ -308,6 +308,9 @@ pub struct ReauditReport {
     pub stopped: Option<ReauditStop>,
     /// The one disc-order refresh after the last saved set.
     pub disc_order: Option<Result<crate::DatDiscOrderOutcome, String>>,
+    /// Things that went wrong beside the checks themselves (a reason that
+    /// could not be recorded, results a save withheld). Never a result.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -391,6 +394,9 @@ struct SetOutcome {
     dropped: Vec<(i64, PathBuf, String)>,
     catalogue_sha256: Option<String>,
     failure: Option<String>,
+    /// The failure is about this catalogue or system only (it cannot be
+    /// resolved, or does not fit these rows); other groups can still run.
+    group_only: bool,
 }
 
 /// Runs one set to a single transaction. A file that changes while it is
@@ -415,6 +421,7 @@ fn run_set(
         dropped: Vec::new(),
         catalogue_sha256: None,
         failure: None,
+        group_only: false,
     };
     let mut plain_retry_used = false;
     loop {
@@ -436,6 +443,11 @@ fn run_set(
         let preview = match attempt {
             Ok(preview) => preview,
             Err(reason) => {
+                // A preview that fails while the library itself can still be
+                // read is about this catalogue or system. One that fails
+                // because the library cannot be read is everyone's problem.
+                outcome.group_only = outcome.catalogue_sha256.is_none()
+                    && Database::open_read_only(database_path).is_ok();
                 outcome.failure = Some(reason);
                 return outcome;
             }
@@ -455,22 +467,28 @@ fn run_set(
                 let changed = watch.changed();
                 let mut dropped_now = 0;
                 rows.retain(|id, path| {
+                    let own = changed.iter().any(|c| c == path);
                     // A changed companion (a disc track, say) belongs to the
                     // row in the same folder that names it; without a cheap
                     // way to tell which, every row beside it is dropped.
-                    let hit = changed.iter().any(|c| c == path)
-                        || changed.iter().any(|c| {
+                    let beside = !own
+                        && changed.iter().any(|c| {
                             !set.iter().any(|i| &i.path == c) && c.parent() == path.parent()
                         });
-                    if hit {
+                    if own || beside {
                         dropped_now += 1;
                         outcome.dropped.push((
                             *id,
                             path.clone(),
-                            "The file changed while it was being checked".into(),
+                            if own {
+                                "The file changed while it was being checked"
+                            } else {
+                                "Another file in this game's folder changed while it was being checked"
+                            }
+                            .into(),
                         ));
                     }
-                    !hit
+                    !(own || beside)
                 });
                 let retrying = dropped_now > 0 || !plain_retry_used;
                 if dropped_now == 0 {
@@ -579,16 +597,45 @@ pub fn run_reaudit(
             if stop.is_none() {
                 done += set.len();
             }
-            // The notes explain, after a restart, why a row is still not
-            // current. Failing to write one never undoes a saved set.
-            if !notes.is_empty()
-                && let Ok(mut db) = Database::open_or_create(database_path)
-            {
-                let _ = db.record_dat_recheck_attempts(
-                    &group.source_id,
-                    outcome.catalogue_sha256.as_deref(),
-                    &notes,
+            let group_failure = match (&stop, outcome.group_only) {
+                (Some(ReauditStop::Interrupted(reason)), true) => Some(reason.clone()),
+                _ => None,
+            };
+            if let Some(reason) = &group_failure {
+                // This catalogue or system cannot be used: none of the
+                // group's remaining rows will be read in this run.
+                notes.extend(
+                    group
+                        .items
+                        .iter()
+                        .skip_while(|item| item.archive_id != set[0].archive_id)
+                        .map(|item| (item.archive_id, item.path.clone(), reason.clone())),
                 );
+            }
+            if let Some(withheld) = outcome
+                .totals
+                .as_ref()
+                .and_then(|t| t.save_withheld.clone())
+            {
+                report.warnings.push(withheld);
+            }
+            // The notes explain, after a restart, why a row is still not
+            // current. Failing to write one never undoes a saved set, but
+            // it is reported.
+            if !notes.is_empty() {
+                let recorded = Database::open_existing(database_path).and_then(|mut db| {
+                    db.record_dat_recheck_attempts(
+                        &group.source_id,
+                        outcome.catalogue_sha256.as_deref(),
+                        &notes,
+                    )
+                });
+                if let Err(error) = recorded {
+                    report.warnings.push(format!(
+                        "The reasons {} games were not checked could not be recorded: {error}",
+                        notes.len()
+                    ));
+                }
             }
             report
                 .not_checked
@@ -602,28 +649,10 @@ pub fn run_reaudit(
                             reason,
                         }),
                 );
+            if group_failure.is_some() {
+                continue 'groups;
+            }
             if let Some(stop) = stop {
-                // A catalogue that cannot be used stops only its own rows.
-                if matches!(&stop, ReauditStop::Interrupted(_))
-                    && outcome.catalogue_sha256.is_none()
-                {
-                    let ReauditStop::Interrupted(reason) = stop else {
-                        unreachable!()
-                    };
-                    report.not_checked.extend(
-                        group
-                            .items
-                            .iter()
-                            .skip_while(|item| item.archive_id != set[0].archive_id)
-                            .map(|item| ReauditNote {
-                                archive_id: item.archive_id,
-                                source_id: group.source_id.clone(),
-                                path: item.path.clone(),
-                                reason: reason.clone(),
-                            }),
-                    );
-                    continue 'groups;
-                }
                 report.stopped = Some(stop);
                 break 'groups;
             }
@@ -634,7 +663,7 @@ pub fn run_reaudit(
         .saturating_sub(report.not_checked.len());
     if report.sets_saved > 0 {
         report.disc_order = Some(
-            Database::open_or_create(database_path)
+            Database::open_existing(database_path)
                 .and_then(|mut db| db.refresh_dat_disc_order(0))
                 .map_err(|e| e.to_string()),
         );
