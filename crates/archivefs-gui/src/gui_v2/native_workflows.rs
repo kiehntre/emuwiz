@@ -1853,9 +1853,9 @@ impl NativeWorkflows {
                 self.saved_source_history = SavedSourceHistory::Loading(receiver);
             }
             SavedSourceHistory::Loading(receiver) => match receiver.try_recv() {
-                Ok(Some(views)) => {
+                Ok(Some(saved)) => {
                     self.saved_source_history =
-                        SavedSourceHistory::Loaded(views, std::time::Instant::now());
+                        SavedSourceHistory::Loaded(saved, std::time::Instant::now());
                 }
                 Ok(None) | Err(TryRecvError::Disconnected) => {
                     self.saved_source_history = SavedSourceHistory::Unavailable;
@@ -1900,6 +1900,7 @@ impl NativeWorkflows {
             &source_state.sources,
             snapshot
                 .map(|snapshot| snapshot.source_health.as_slice())
+                .or_else(|| self.saved_source_history.health())
                 .unwrap_or(&[]),
         );
         let mut health_action = None;
@@ -4294,6 +4295,9 @@ mod source_presentation_tests {
 #[cfg(test)]
 #[path = "native_workflows/launch_recovery_tests.rs"]
 mod launch_recovery_tests;
+#[cfg(test)]
+#[path = "native_workflows/saved_sources_tests.rs"]
+mod saved_sources_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5367,32 +5371,59 @@ mod lifecycle_selection_tests {
 enum SavedSourceHistory {
     #[default]
     NotStarted,
-    Loading(Receiver<Option<Vec<SourceFolderView>>>),
-    Loaded(Vec<SourceFolderView>, std::time::Instant),
+    Loading(Receiver<Option<SavedSources>>),
+    Loaded(SavedSources, std::time::Instant),
     Unavailable,
+}
+
+/// The saved per-source state the Sources page needs while the full library
+/// snapshot is absent: scan history and the backend's catalogue health.
+#[derive(Debug, Default)]
+struct SavedSources {
+    views: Vec<SourceFolderView>,
+    health: Vec<archivefs_core::catalogue_health::SourceHealth>,
 }
 
 impl SavedSourceHistory {
     fn views(&self) -> Option<&[SourceFolderView]> {
         match self {
-            Self::Loaded(views, _) => Some(views.as_slice()),
+            Self::Loaded(saved, _) => Some(saved.views.as_slice()),
+            _ => None,
+        }
+    }
+
+    fn health(&self) -> Option<&[archivefs_core::catalogue_health::SourceHealth]> {
+        match self {
+            Self::Loaded(saved, _) => Some(saved.health.as_slice()),
             _ => None,
         }
     }
 }
 
-/// Reads configured sources joined with their saved scan history. Read-only;
-/// `None` when the config or database cannot be read.
-fn load_saved_source_views() -> Option<Vec<SourceFolderView>> {
+/// Reads configured sources joined with their saved scan history, plus the
+/// backend's catalogue health for them. Read-only; `None` when the config or
+/// database cannot be read. Without the health, Blue's Sources page would
+/// show "Checking" forever whenever the full snapshot was never loaded.
+fn load_saved_source_views() -> Option<SavedSources> {
     let config = archivefs_core::default_config_path().ok()?;
     let sources = archivefs_core::load_source_folder_configs_from(config).ok()?;
     let database =
         archivefs_core::Database::open_read_only(archivefs_core::default_database_path().ok()?)
             .ok()?;
+    saved_sources_from(&database, &sources)
+}
+
+fn saved_sources_from(
+    database: &archivefs_core::Database,
+    sources: &[archivefs_core::SourceFolderConfig],
+) -> Option<SavedSources> {
     let records = database.list_source_folders().ok()?;
-    Some(archivefs_core::build_source_folder_views(
-        &sources, &records,
-    ))
+    let roots: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    Some(SavedSources {
+        views: archivefs_core::build_source_folder_views(sources, &records),
+        // Same call and same fallback as the full snapshot load.
+        health: database.source_health(&roots).unwrap_or_default(),
+    })
 }
 
 /// Only checks still running keep a pending Play waiting. Anything that needs
