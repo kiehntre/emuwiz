@@ -50,6 +50,7 @@ const SOUTH: Control = Control::Button(Button::South);
 const EAST: Control = Control::Button(Button::East);
 const START: Control = Control::Button(Button::Start);
 const WEST: Control = Control::Button(Button::West);
+const R3: Control = Control::Button(Button::RightStick);
 const NORTH: Control = Control::Button(Button::North);
 const RIGHT: Control = Control::Direction(Direction::Right);
 const DOWN: Control = Control::Direction(Direction::Down);
@@ -110,7 +111,7 @@ fn no_controller_means_a_window_with_keyboard_hints_and_a_plain_statement() {
         "A / Enter  Select",
         "B / Esc  Back",
         "Start / L  Launch",
-        "X / S  Search",
+        "R3 / S  Search",
     ] {
         assert!(strings.iter().any(|s| s == hint), "{hint}");
     }
@@ -409,7 +410,7 @@ fn loading_and_empty_states_are_said_plainly() {
 fn on_screen_keyboard_searches_and_keeps_keyboard_typing() {
     let context = egui::Context::default();
     let mut app = opened(&context, 30);
-    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, R3);
     assert!(state(&app).search_open());
     // A, then Right x9, Down... : press the first key.
     tap(&context, &mut app, SOUTH);
@@ -421,7 +422,7 @@ fn on_screen_keyboard_searches_and_keeps_keyboard_typing() {
     assert!(!state(&app).search_open());
     assert_eq!(app.filter.search, "AB", "Back keeps what was typed");
     app.filter.search.clear();
-    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, R3);
     let _ = frame_with_events(
         &context,
         &mut app,
@@ -731,9 +732,11 @@ fn a_sunshine_xbox_one_pad_selects_with_a_and_goes_back_with_b_everywhere() {
     );
     xbox(&context, &mut app, BTN_A);
     xbox(&context, &mut app, BTN_B);
-    // Search keyboard: X, the left button, opens it as the hint says.
+    // Search keyboard: R3 opens it as the hint says; X is the double tap.
     xbox(&context, &mut app, BTN_X);
-    assert!(state(&app).search_open(), "X opens search");
+    assert!(!state(&app).search_open(), "one X does nothing");
+    tap(&context, &mut app, R3);
+    assert!(state(&app).search_open(), "R3 opens search");
     xbox(&context, &mut app, BTN_A);
     assert_eq!(app.filter.search, "A", "A presses the focused key");
     xbox(&context, &mut app, BTN_B);
@@ -758,4 +761,150 @@ fn a_sunshine_xbox_one_pad_selects_with_a_and_goes_back_with_b_everywhere() {
     xbox(&context, &mut app, BTN_A);
     assert_eq!(app.filter.platform, "SNES", "A chooses the focused system");
     assert!(!state(&app).platforms_open());
+    // X, the left button, twice: Play.
+    xbox(&context, &mut app, BTN_X);
+    xbox(&context, &mut app, BTN_X);
+    assert!(
+        matches!(state(&app).step(), Step::Launch(_)),
+        "X twice plays"
+    );
+}
+
+/// Press and release at a known clock, so a double-tap window can be crossed.
+fn tap_at(context: &egui::Context, app: &mut App, control: Control, time: f64) {
+    let state = app.big_picture.as_mut().expect("Big Picture is open");
+    state.inject(PadEvent::Pressed { device: 1, control });
+    state.inject(PadEvent::Released { device: 1, control });
+    for offset in [0.0, 0.01] {
+        let _ = context.run(
+            egui::RawInput {
+                time: Some(time + offset),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SIZE.into())),
+                ..Default::default()
+            },
+            |context| app.show(context),
+        );
+    }
+}
+
+#[test]
+fn x_twice_plays_an_unready_game_only_as_far_as_its_launch_page() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    app.big_picture.as_mut().unwrap().set_connected();
+    let strings = text(&tap(&context, &mut app, RIGHT));
+    assert!(strings.iter().any(|s| s == "X twice  Play"), "{strings:?}");
+    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Launch(2));
+    assert!(
+        !app.native_workflows
+            .as_ref()
+            .unwrap()
+            .launch_was_requested(2),
+        "this fixture has no ready plan: Play waits on the Launch page, it never launches blind"
+    );
+    // The open game's page works the same way.
+    tap(&context, &mut app, EAST);
+    assert_eq!(state(&app).step(), Step::Game(2));
+    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Launch(2));
+}
+
+#[test]
+fn one_x_or_two_slow_ones_do_nothing_and_start_still_plays() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    tap_at(&context, &mut app, WEST, 10.0);
+    assert_eq!(state(&app).step(), Step::Browse);
+    assert!(!state(&app).search_open(), "Search moved to R3");
+    tap_at(&context, &mut app, WEST, 10.5);
+    assert_eq!(
+        state(&app).step(),
+        Step::Browse,
+        "too slow for a double tap"
+    );
+    tap_at(&context, &mut app, WEST, 10.7);
+    assert_eq!(
+        state(&app).step(),
+        Step::Launch(1),
+        "the slow one armed a new tap"
+    );
+    tap(&context, &mut app, EAST);
+    tap(&context, &mut app, EAST);
+    tap(&context, &mut app, START);
+    assert_eq!(state(&app).step(), Step::Launch(1), "Start is unchanged");
+}
+
+#[test]
+fn a_held_x_is_one_press_not_a_double_tap() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    let state_mut = app.big_picture.as_mut().unwrap();
+    for _ in 0..3 {
+        state_mut.inject(PadEvent::Pressed {
+            device: 1,
+            control: WEST,
+        });
+    }
+    settle(&context, &mut app);
+    settle(&context, &mut app);
+    assert_eq!(state(&app).step(), Step::Browse);
+}
+
+#[test]
+fn any_other_input_or_focus_change_between_the_xs_resets_the_double_tap() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, RIGHT);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Browse, "a move in between");
+    tap(&context, &mut app, EAST);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Browse, "Back in between");
+    assert_eq!(state(&app).notice_text(), None, "X disarms leaving");
+    // That X armed a tap; then focus changes with no command between (a
+    // mouse click on a tile).
+    app.big_picture.as_mut().unwrap().set_focus(3);
+    settle(&context, &mut app);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Browse, "another game focused");
+    // Search open: X is not a double tap there.
+    tap(&context, &mut app, R3);
+    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Browse, "not from an overlay");
+}
+
+#[test]
+fn x_twice_on_a_game_that_cannot_play_is_refused_with_the_start_reason() {
+    let context = egui::Context::default();
+    let mut recording = archive(2, "Recording", Some("ZX Spectrum"));
+    recording.archive_kind = "preservation_recording".into();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "Game", Some("SNES")),
+        recording,
+    ]));
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.loaded = true;
+    app.enter_big_picture(&context);
+    settle(&context, &mut app);
+    tap(&context, &mut app, RIGHT);
+    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Browse);
+    assert!(
+        state(&app)
+            .notice_text()
+            .unwrap()
+            .contains("Play is not offered")
+    );
+    tap(&context, &mut app, SOUTH);
+    assert_eq!(state(&app).step(), Step::Game(2));
+    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Game(2), "never past the refusal");
 }
