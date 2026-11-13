@@ -630,7 +630,8 @@ pub use duckstation_native::{
     DuckStationNativeWarning, EnableCheatsChange, apply_duckstation_native_plan,
     duckstation_disc_topology_from_media_sets, duckstation_native_batch_from_catalogue,
     duckstation_native_section_digest, plan_duckstation_native, preview_duckstation_native_undo,
-    read_duckstation_native_receipt, resolve_duckstation_folders, undo_duckstation_native,
+    read_duckstation_native_receipt, resolve_duckstation_folders,
+    resolve_duckstation_memory_cards_folder, undo_duckstation_native,
 };
 pub use duckstation_native_history::{
     DUCKSTATION_NATIVE_SOURCE_MODE, GroupedHistoryRow, NativeGroupState, NativeHistoryGroup,
