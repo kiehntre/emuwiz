@@ -13,7 +13,7 @@ use eframe::egui;
 mod diagnosis;
 pub(crate) mod route_truth;
 mod vita3k_package;
-pub(crate) use diagnosis::{Attempt, AttemptTracker, Finding};
+pub(crate) use diagnosis::{Attempt, AttemptTracker, Cause, Finding};
 pub(crate) use vita3k_package::note_vita3k_package;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

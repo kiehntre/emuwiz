@@ -3495,6 +3495,8 @@ impl App {
                     super::saturn_manifest::show(ui, game);
                 });
         }
+        // Closed by default and last, so it never moves anything above it.
+        self.show_game_doctor(ui, game);
     }
 
     /// Advanced details: identity, source, media kind, old locations,
