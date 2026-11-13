@@ -114,9 +114,7 @@ mod negative_dat_platform_tests;
 pub(crate) mod reconciliation;
 mod restore;
 mod scan_history;
-pub use scan_history::{
-    MAX_SCAN_HISTORY_RUNS, RecordedScanCounts, ScanRunCoverage, ScanRunRecord,
-};
+pub use scan_history::{MAX_SCAN_HISTORY_RUNS, RecordedScanCounts, ScanRunCoverage, ScanRunRecord};
 #[cfg(test)]
 #[path = "database/topology_evidence_tests.rs"]
 mod topology_evidence_tests;

@@ -189,9 +189,6 @@ pub use database::{
     rollback_database_restore, scan_and_persist, upgrade_library_database,
 };
 pub use database::{
-    MAX_SCAN_HISTORY_RUNS, RecordedScanCounts, ScanRunCoverage, ScanRunRecord,
-};
-pub use database::{
     DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
     DiscoveryImportUndoPreview, DiscoveryImportUndoResult, MissingCleanupTarget,
     NestedMountOutcome, NestedMountState, PreservationFreshness,
@@ -202,6 +199,7 @@ pub use database::{
     interrupted_restore_receipts, preview_interrupted_restore, read_database_restore_receipt,
     review_database_rollback,
 };
+pub use database::{MAX_SCAN_HISTORY_RUNS, RecordedScanCounts, ScanRunCoverage, ScanRunRecord};
 
 mod inspector;
 pub use inspector::{
