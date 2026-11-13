@@ -61,6 +61,15 @@ def setUpModule():
     sudo("install", "-o", "root", "-g", "root", "-m", "0755", os.path.realpath(sys.executable), PYTHON)
     install_copy(os.path.join(base, "libexec"))
     sudo("install", "-d", "-o", "root", "-g", "root", "-m", "0700", os.path.join(base, "protected"))
+    # the owner-signature anchor for these tests: a root-owned copy of the TEST allowed-signers
+    # file (throwaway keys); the production file is never read or written
+    import test_emuwiz_cargo_signing as S
+    sudo("install", "-d", "-o", "root", "-g", "root", "-m", "0755", os.path.join(base, "anchor"))
+    sudo("install", "-o", "root", "-g", "root", "-m", "0644", S.keys()["signers"], SIGNERS())
+
+
+def SIGNERS():
+    return os.path.join(INSTALL, "anchor", "allowed_signers")
 
 
 def tearDownModule():
@@ -86,13 +95,36 @@ class Priv(M.MaintBase):
 
     def root(self, script, *argv, flags=("-I", "-S"), as_user=ME, extra_env=(), python=None):
         env = [f"HOME={self.home}", f"EMUWIZ_TARGET_ROOT={self.targets}", f"EMUWIZ_RETENTION_DIR={self.reg}",
-               "EMUWIZ_OWNER=tester", "PATH=/usr/bin:/bin", *extra_env]
+               "EMUWIZ_OWNER=tester", "PATH=/usr/bin:/bin", f"EMUWIZ_OWNER_SIGNERS={SIGNERS()}", *extra_env]
         head = ["--as-user", as_user] if as_user else []
         if script.endswith("emuwiz-cargo-maintain"):
             argv = head + list(argv)
         else:
             argv = list(argv) + head
         return sudo("env", "-i", *env, python or PYTHON, *flags, script, *argv, check=False)
+
+    def signed(self, path, digest):
+        """['--scoped-run', RECORD]: an owner-signed (test key) scoped-run record for this manifest,
+        written as the registry owner exactly where the root executor looks for it."""
+        import importlib.machinery
+        import importlib.util
+        import test_emuwiz_cargo_signing as S
+        saved = {k: os.environ.get(k) for k in ("EMUWIZ_RETENTION_DIR", "EMUWIZ_TARGET_ROOT", "HOME")}
+        os.environ.update(EMUWIZ_RETENTION_DIR=self.reg, EMUWIZ_TARGET_ROOT=self.targets, HOME=self.home)
+        try:
+            loader = importlib.machinery.SourceFileLoader("retire_for_records", os.path.join(HERE, "emuwiz-cargo-retire"))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            X = importlib.util.module_from_spec(spec)
+            loader.exec_module(X)
+            with open(path) as handle:
+                groups = json.load(handle)["cargo_artifact_groups"]
+            return ["--scoped-run", S.write_record(X, path, digest, groups)]
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
     def released(self, name):
         wt, t = self.cache(name)
@@ -257,6 +289,46 @@ class SymlinksF1(Priv):
         self.assertEqual(sudo("cat", os.path.join(INSTALL, "protected", "secret")).stdout.strip(), "{}")
         sudo("rm", "-f", os.path.join(INSTALL, "protected", "secret"))
 
+    @unittest.skipIf(os.path.exists("/etc/emuwiz/cargo-retire-allowed-signers"),
+                     "a production signers file is installed: unsigned installation is refused by design")
+    def test_installer_without_owner_signing_installs_and_keeps_signed_retirement_unavailable(self):
+        """Routine maintenance and worktree removal need no signature: the tools install without
+        a signers file, and the installed executor still refuses an exceptional retirement."""
+        target_dir = os.path.join(INSTALL, "libexec-unsigned")
+        install_copy(target_dir)
+        r = sudo(os.path.join(HERE, "emuwiz-cargo-stage-install"), "--source", HERE, "--without-owner-signing",
+                 "--install-dir", target_dir, "--owner", ME, check=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("exceptional retirement: UNAVAILABLE", r.stdout)
+        listing = sudo("ls", INSTALL).stdout.split()
+        self.assertTrue(any(n.startswith("libexec-unsigned.rollback-") for n in listing), listing)
+        wt, t = self.managed_cache("unsigned-install")
+        path, digest = self.manifest([self.group(wt, t)])
+        r = self.root(os.path.join(target_dir, "emuwiz-cargo-retire"), "--manifest", path, "--approved-sha256", digest,
+                      "--execute", "--receipt-dir", self.receipts, "--json", *self.signed(path, digest),
+                      extra_env=("EMUWIZ_OWNER_SIGNERS=",))
+        out = json.loads(r.stdout)
+        self.assertEqual(out["refused"]["code"], "OWNER_SIGNERS_UNAVAILABLE", out)
+        self.assertTrue(self.artifacts_present(t))
+
+    @unittest.skipIf(os.path.exists("/etc/emuwiz/cargo-retire-allowed-signers"),
+                     "a production signers file is installed; this covers the not-installed state")
+    def test_installer_signed_preflight_runs_the_signing_check_as_root(self):
+        """As root the source copy (owner-owned) is checked as the owner: the refusal is the real
+        signing verdict, not the root untrusted-location refusal."""
+        target_dir = os.path.join(INSTALL, "libexec-signed")
+        install_copy(target_dir)
+        probe = os.path.join(self.tmp, "selftest.txt")
+        with open(probe, "wb") as handle:
+            handle.write(b"EMUWIZ OWNER SIGNING SELF-TEST\n")
+        os.chmod(self.tmp, 0o755)
+        r = sudo(os.path.join(HERE, "emuwiz-cargo-stage-install"), "--source", HERE, "--selftest", probe,
+                 "--install-dir", target_dir, "--owner", ME, check=False)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("owner-signature verification is missing, invalid or unusable", r.stderr)
+        self.assertNotIn("untrusted location", r.stderr)
+        self.assertFalse([n for n in sudo("ls", INSTALL).stdout.split() if n.startswith("libexec-signed.")])
+
     def test_manual_executor_lock_symlink(self):
         wt, t = self.managed_cache("man-lock")
         lock = self.lock_path(t)
@@ -265,7 +337,7 @@ class SymlinksF1(Priv):
         os.symlink(victim, lock)
         path, digest = self.manifest([self.group(wt, t)])
         r = self.root(self.lib("emuwiz-cargo-retire"), "--manifest", path, "--approved-sha256", digest,
-                      "--execute", "--receipt-dir", self.receipts, "--json")
+                      "--execute", "--receipt-dir", self.receipts, "--json", *self.signed(path, digest))
         self.assertEqual(protected_listing(), [], r.stderr)
         out = json.loads(r.stdout)
         self.assertEqual(out["groups"][0]["outcome"], "HELD", out["groups"][0])
@@ -461,7 +533,7 @@ class ManualProcedure(Priv):
         self.assertEqual(dry["groups"][0]["outcome"], "WOULD_RETIRE", dry["groups"][0]["holds"])
         self.assertTrue(self.artifacts_present(t))
         r = self.root(x, "--manifest", path, "--approved-sha256", digest, "--execute",
-                      "--receipt-dir", self.receipts, "--json")
+                      "--receipt-dir", self.receipts, "--json", *self.signed(path, digest))
         done = json.loads(r.stdout)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(done["groups"][0]["outcome"], "RETIRED")
@@ -515,7 +587,7 @@ class OrphanRouteRoot(Priv):
         argv = ["--manifest", path, "--approved-sha256", digest, "--receipt-dir", self.receipts, "--json",
                 "--maintenance-window-attested"]
         if execute:
-            argv.append("--execute")
+            argv += ["--execute", *self.signed(path, digest)]
         r = self.root(self.lib("emuwiz-cargo-retire"), *argv)
         try:
             out = json.loads(r.stdout)
@@ -599,8 +671,13 @@ class OrphanRouteRoot(Priv):
             self.assert_held(dict(g, source_head=bad), "h.json", {"OWNER_UNVERIFIED", "SOURCE_MISSING"})
         wt2, t2, g2 = self.orphan("root-ident")
         g2["inode"] = g2["inode"] + 1
-        r, out, codes = self.retire_as_root(g2, "i.json")
-        self.assertNotEqual(out["groups"][0]["outcome"], "RETIRED", out)
+        path, digest = self.manifest([g2], "i.json")
+        r = self.root(self.lib("emuwiz-cargo-retire"), "--manifest", path, "--approved-sha256", digest,
+                      "--receipt-dir", self.receipts, "--json", "--maintenance-window-attested", "--execute",
+                      *self.signed(path, digest))
+        out = json.loads(r.stdout)
+        # the signed record pins the recorded identity: the whole run refuses, or the group holds
+        self.assertTrue(out.get("refused") or out["groups"][0]["outcome"] != "RETIRED", out)
         self.assertTrue(self.artifacts_present(t2))
 
     def test_root_unreadable_filesystem_state_holds_instead_of_counting_as_absent(self):

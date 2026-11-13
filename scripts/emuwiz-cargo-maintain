@@ -117,6 +117,9 @@ import importlib.machinery
 import importlib.util
 import json
 import re
+import secrets
+import signal
+import socket
 import subprocess
 import time
 import types
@@ -136,12 +139,39 @@ EXIT_REFUSED = 5               # reserved for a future enforce mode; admit never
 ADMISSION_MODES = ("advisory", "off")   # "enforce" is deliberately unavailable (see cmd_admit)
 
 EXPLANATIONS = {
+    "SOURCE_NOT_MERGED": "routine retirement needs the worktree's HEAD merged into main (origin/main when present); "
+                         "anything else needs an owner-signed scoped run",
+    "SOURCE_GIT_UNVERIFIED": "origin/main could not be refreshed (bounded fetch) or merged pull requests could not be "
+                             "read, so merged status is unproven; the cache is kept and nothing in Git is changed",
+    "CHECKOUT_RECENTLY_USED": "not released automatically: the checkout or cache changed within the 24 h quiet period",
+    "OWNERSHIP_UNRESOLVED": "not released automatically: no readable coordination-table row lists this checkout",
+    "OWNERSHIP_TASK_NOT_FINISHED": "not released automatically: its coordination-table row is not plainly finished "
+                                   "(active, paused, waiting, hold or mixed wording)",
+    "CHECKOUT_NAMED_BY_A_RECENT_SESSION": "not released automatically: a recent agent session transcript names this checkout",
+    "SOURCE_HISTORY_UNPRESERVED": "routine retirement needs a clean checkout whose history is preserved "
+                                  "(no dirty, unpushed or reflog-only work)",
     "NO_LIFECYCLE_RECORD": "legacy or untracked target: never auto-retired; needs a human `adopt` and a maintenance window",
     "NONPARTICIPATING": "never built through cargo-iso: plain cargo writers cannot be excluded; held for manual cleanup",
     "NOT_RELEASED": "task not finished: run `scripts/cargo-iso --finish-task` in the worktree when done",
     "OWNER_UNVERIFIED": "completion release does not match a known owner; review ownership by hand",
     "COMPLETION_UNVERIFIED": "completion timestamp is invalid or in the future; review by hand",
     "PINNED": "explicit pin; release the pin to allow retirement",
+    "HOLD_LISTED": "on the owner's HOLD registry/list: never released, retired or removed, whatever its pins "
+                   "or Git state; only the owner removes the entry",
+    "HOLD_UNRESOLVED_MATCH": "its branch or a recorded/current HEAD matches an UNRESOLVED HOLD entry (folder not "
+                             "verified): protected until the owner resolves the entry",
+    "HOLD_COORDINATION": "a coordination-table line marks this checkout or cache HOLD (protected even if the "
+                         "HOLD registry omits it)",
+    "HOLD_MEMORY_NOTE": "a memory note line marks this checkout or cache HOLD (protected even if the HOLD "
+                        "registry omits it)",
+    "HOLD_INDICATION_UNRECONCILED": "released, but a HOLD line naming it appeared after the owner's release; "
+                                    "protected until the owner reconciles it (hold-set, or a new signed release)",
+    "HOLD_REGISTRY_MISSING": "the HOLD registry (registry hold-registry.json) is missing: every target is held",
+    "HOLD_REGISTRY_INVALID": "the HOLD registry is malformed or incomplete: every target is held",
+    "HOLD_REGISTRY_STALE": "the HOLD registry is older than its max_age_days: every target is held until it is regenerated",
+    "HOLD_SOURCE_UNREADABLE": "a HOLD source (hold list, coordination table or a required registry source) is "
+                              "unreadable or missing: every target is held",
+    "GIT_STATE_UNVERIFIED": "the checkout's Git state (HEAD, branch, reflog or status) cannot be read: it is held",
     "PIN_STATE_UNKNOWN": "pin record unreadable or malformed; repair it by hand",
     "RECENT_ACTIVITY": "used or written within the minimum idle period",
     "WRITTEN_AFTER_RELEASE": "output was written after the release was recorded (reopened); release it again with `scripts/cargo-iso --finish-task` when done",
@@ -178,6 +208,14 @@ def load(path, name):
 F = load(os.path.join(HERE, "emuwiz-cargo-retention"), "emuwiz_cargo_retention")
 RETIRE = os.path.join(HERE, "emuwiz-cargo-retire")
 _executor = None
+
+
+def _verify_hold_release(path, raw):
+    """HOLD releases are verified by the deletion engine's owner-signature check."""
+    return executor().verify_hold_release(path, raw)
+
+
+F.HOLD_RELEASE_VERIFIER = _verify_hold_release
 
 
 def executor():
@@ -593,11 +631,11 @@ def load_policy(trusted_uids=None):
         return "invalid", None, "policy is not a stable, safe authority file"
     try:
         policy = json.loads(text)
-    except ValueError as error:
-        return "invalid", None, f"policy unreadable: {error}"
+    except ValueError:
+        return "invalid", None, "policy unreadable: not valid JSON"
     old_schema = policy.get("schema") if isinstance(policy, dict) else None
     if isinstance(old_schema, int) and not isinstance(old_schema, bool) and 0 < old_schema < POLICY_VERSION:
-        return "invalid", None, (f"policy schema {old_schema} was approved before the retirement scope was "
+        return "invalid", None, (f"policy schema (older than {POLICY_VERSION}) was approved before the retirement scope was "
                                  f"widened (schema {POLICY_VERSION}: post-retirement binary residue); it no longer "
                                  "authorises anything. Review the scope and run `policy approve` again")
     if not isinstance(policy, dict) or not validate_policy(policy):
@@ -605,8 +643,8 @@ def load_policy(trusted_uids=None):
     if maintenance_instance() is not None and policy["scope"]["target_root"] != os.path.realpath(F.target_root()):
         # budgets and free space are measured on F.target_root(); an instance policy that
         # names another root would be measured against the wrong device
-        return "invalid", None, (f"instance policy covers {policy['scope']['target_root']} but EMUWIZ_TARGET_ROOT "
-                                 f"selects {os.path.realpath(F.target_root())}")
+        return "invalid", None, ("instance policy covers another target root than the one EMUWIZ_TARGET_ROOT "
+                                 f"selects ({os.path.realpath(F.target_root())})")
     claimed = policy["enabled"]
     # BOTH are required: the policy file itself says enabled AND a fresh approval exists for
     # the exact code now running.  Either one alone leaves retirement disabled.
@@ -764,34 +802,46 @@ def cmd_policy(args):
         if policy["enabled"] == want and (want or not (stored and stored["state"] == "ENABLED")):
             print(f"policy already {'enabled' if want else 'disabled'}")
             return 0
-        gen = next_generation()
-        if want:
-            fingerprint = code_fingerprint()
-            if fingerprint is None:
-                raise SystemExit("policy enable: the maintenance scripts cannot be read; nothing enabled")
-            # state record first, history second: an interruption between them is NOT enabled
-            write_state({"schema": 2, "generation": gen, "state": "ENABLED", "policy_digest": policy["digest"],
-                         "code_sha256": fingerprint, "by": F.owner_name(), "at": now(), "uid": os.geteuid()})
-            append_history({"event": "policy_enabled", "digest": policy["digest"], "generation": gen,
-                            "code_sha256": fingerprint})
-            write_policy(dict(policy, enabled=True))     # last: until here the file is still disabled
-        else:
-            write_policy(dict(policy, enabled=False))    # first: the file is disabled before anything else
-            # history first, state second: an interruption leaves a newer DISABLED transition
-            record_transition("policy_disabled", gen, policy["digest"], "DISABLED")
+        set_enabled_locked(policy, want)
     print(f"automatic retirement {'ENABLED' if want else 'DISABLED'}")
     return 0
 
 
+def set_enabled_locked(policy, want, **extra):
+    """The enable/disable transition.  Caller holds transition_lock()."""
+    gen = next_generation()
+    if want:
+        fingerprint = code_fingerprint()
+        if fingerprint is None:
+            raise SystemExit("policy enable: the maintenance scripts cannot be read; nothing enabled")
+        # state record first, history second: an interruption between them is NOT enabled
+        write_state({"schema": 2, "generation": gen, "state": "ENABLED", "policy_digest": policy["digest"],
+                     "code_sha256": fingerprint, "by": F.owner_name(), "at": now(), "uid": os.geteuid()})
+        append_history(dict(extra, event="policy_enabled", digest=policy["digest"], generation=gen,
+                            code_sha256=fingerprint))
+        write_policy(dict(policy, enabled=True))     # last: until here the file is still disabled
+    else:
+        write_policy(dict(policy, enabled=False))    # first: the file is disabled before anything else
+        # history first, state second: an interruption leaves a newer DISABLED transition
+        record_transition("policy_disabled", gen, policy["digest"], "DISABLED", **extra)
+
+
+class ConcurrentMaintenance(Exception):
+    pass
+
+
 @contextlib.contextmanager
-def transition_lock():
-    """Serialises policy transitions (approve/enable/disable) across processes."""
+def transition_lock(wait=True):
+    """Serialises policy transitions (approve/enable/disable) across processes.  With
+    wait=False a busy lock raises ConcurrentMaintenance instead of waiting."""
     ensure_state()
     fd = os.open(os.path.join(state_dir(), ".policy-transition.lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            if not wait:
+                raise ConcurrentMaintenance("another maintenance cycle or policy transition is in progress")
             print("emuwiz-cargo-maintain: waiting for an in-flight maintenance cycle or policy transition "
                   "to finish (a running executor transaction is never interrupted)", file=sys.stderr, flush=True)
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -877,6 +927,399 @@ def policy_reasons(item, policy):
     return sorted(set(out))
 
 
+_MAIN_REFS = {}       # git common dir -> (base ref, problem): one bounded fetch per repository per run
+_MERGED_PRS = {}      # git common dir -> {head oid: merge commit oid} or None (unavailable)
+FETCH_TIMEOUT = 90
+
+
+def _git(wt, *args, timeout=30, group_timeout=False):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE="/nonexistent", GIT_CONFIG_NOSYSTEM="1",
+               GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C",
+               GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=15")
+    cmd = ["git", "-c", "core.hooksPath=/dev/null", "-C", wt, *args]
+    if group_timeout:          # coreutils timeout signals the whole process group (remote helpers, ssh)
+        cmd = ["timeout", "-k", "10", str(timeout), *cmd]
+        timeout += 30
+    return F.run_as_owner(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+
+
+def _git_env():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE="/nonexistent", GIT_CONFIG_NOSYSTEM="1",
+               GIT_CONFIG_GLOBAL="/dev/null", GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C",
+               GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=15")
+    return env
+
+
+ALLOW_LOCAL_EVIDENCE_REMOTE = False     # tests only (in-process): a local bare repository as origin
+STORE_CONFIG = ("[core]\n\trepositoryformatversion = 0\n\tbare = true\n\thooksPath = /dev/null\n"
+                "\tcommitGraph = false\n\tmultiPackIndex = false\n[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n"
+                "[fetch]\n\twriteCommitGraph = false\n")
+
+
+def _git_in(gitdir, *args, timeout=30, group_timeout=False):
+    """git against a bare repository (the merge-evidence store), hooks disabled."""
+    cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.commitGraph=false", "--git-dir", gitdir, *args]
+    if group_timeout:
+        cmd = ["timeout", "-k", "10", str(timeout), *cmd]
+        timeout += 30
+    return F.run_as_owner(cmd, capture_output=True, text=True, timeout=timeout, env=_git_env())
+
+
+def _github_repo(url):
+    """owner/repo for a GitHub remote URL (SSH or HTTPS), else None."""
+    m = re.fullmatch(r"(?:(?:ssh://)?git@github\.com[:/]|https://github\.com/)([\w.-]+/[\w.-]+?)(?:\.git)?/?",
+                     url or "")
+    return m.group(1) if m else None
+
+
+def _fetch_url(url):
+    """The only URLs merge evidence comes from: a GitHub repository, fetched anonymously
+    over HTTPS (no keys, agent or credential helper inside the service; a private
+    repository fails closed).  Anything else is None (SOURCE_GIT_UNVERIFIED), except a
+    local bare repository when the in-process test switch is set."""
+    repo = _github_repo(url)
+    if repo:
+        return f"https://github.com/{repo}.git"
+    if ALLOW_LOCAL_EVIDENCE_REMOTE and url and os.path.isabs(url):
+        return url
+    return None
+
+
+def evidence_store(common):
+    """The merge-evidence store for a repository: a bare repository inside this instance's
+    maintenance state directory (already writable by the sandboxed service), borrowing the
+    source repository's objects READ-ONLY through objects/info/alternates.  The service
+    never writes to a source .git or worktree; only this store's refs/objects change."""
+    path = os.path.join(state_dir(), "git-evidence", hashlib.sha256(common.encode()).hexdigest()[:16] + ".git")
+    for part in (os.path.dirname(path), path, os.path.join(path, "objects"), os.path.join(path, "refs")):
+        if os.path.islink(part):
+            raise OSError(f"{part} is a symlink; the merge-evidence store must be a plain directory")
+    if not os.path.isdir(os.path.join(path, "objects")):
+        ensure_state()                         # the state directory itself: private (0700)
+        try:
+            os.mkdir(os.path.dirname(path), 0o700)
+        except FileExistsError:
+            pass
+        done = F.run_as_owner(["git", "init", "-q", "--bare", path], capture_output=True, text=True,
+                              timeout=30, env=_git_env())
+        if done.returncode != 0:
+            raise OSError("cannot create the merge-evidence store: " + done.stderr.strip()[:200])
+        for key, value in (("gc.auto", "0"), ("maintenance.auto", "false"), ("core.hooksPath", "/dev/null"),
+                           ("fetch.writeCommitGraph", "false")):
+            _git_in(path, "config", key, value)
+    _write_text(os.path.join(path, "config"), STORE_CONFIG)    # rewritten every run: no inherited settings
+    for name in ("commit-graph", os.path.join("info", "commit-graphs")):
+        if os.path.lexists(os.path.join(path, "objects", name)):
+            raise OSError("the merge-evidence store contains a commit-graph; refusing to trust it")
+    alternates = os.path.join(path, "objects", "info", "alternates")
+    wanted = os.path.join(common, "objects") + "\n"
+    try:
+        with open(alternates) as handle:
+            current = handle.read()
+    except OSError:
+        current = None
+    if current != wanted:
+        os.makedirs(os.path.dirname(alternates), exist_ok=True)
+        _write_text(alternates, wanted)
+    return path
+
+
+def _write_text(path, text):
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def main_ref(wt):
+    """(gitdir, ref, problem): where to ask what is merged.  With an `origin` remote:
+    refs/remotes/origin/main in the merge-evidence store, refreshed first by ONE bounded
+    fetch of exactly main per repository per run (no gc, no hooks, no FETCH_HEAD; a stalled
+    transfer is killed with its whole process group).  Nothing in the source repository,
+    its branches, HEAD, index or worktrees is written.  A failed fetch is a problem (the
+    cache is kept), never a fallback to an older ref.  Without a remote: the repository's
+    own local main/master, read-only."""
+    try:
+        common = os.path.realpath(os.path.join(wt, _git(wt, "rev-parse", "--git-common-dir").stdout.strip()))
+    except (OSError, subprocess.SubprocessError) as error:
+        return None, None, f"git unavailable ({error})"
+    if common in _MAIN_REFS:
+        return _MAIN_REFS[common]
+    try:
+        url = _git(wt, "config", "--get", "remote.origin.url")    # raw: no insteadOf rewriting
+        if url.returncode != 0:
+            ref = next((r for r in ("refs/heads/main", "refs/heads/master")
+                        if _git(wt, "rev-parse", "-q", "--verify", r + "^{commit}").returncode == 0), None)
+            result = (None, ref, None if ref else "no main branch")
+        else:
+            source = _fetch_url(url.stdout.strip())
+            if not source:
+                result = (None, None, f"origin {url.stdout.strip()[:120]!r} is not a GitHub repository; "
+                                      "merge evidence comes only from GitHub")
+                _MAIN_REFS[common] = result
+                return result
+            store = evidence_store(common)
+            done = _git_in(store, "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=30",
+                           "fetch", "--no-tags", "--no-recurse-submodules", "--no-auto-maintenance",
+                           "--no-write-fetch-head", "--quiet", source,
+                           "+refs/heads/main:refs/remotes/origin/main", timeout=FETCH_TIMEOUT, group_timeout=True)
+            result = (store, "refs/remotes/origin/main", None) if done.returncode == 0 else \
+                (None, None, "fetch of origin/main failed: " + (done.stderr.strip().splitlines() or ["?"])[-1][:200])
+    except (OSError, subprocess.SubprocessError) as error:
+        result = (None, None, f"fetch of origin/main failed ({type(error).__name__}: {str(error)[:120]})")
+    _MAIN_REFS[common] = result
+    return result
+
+
+def merged_pr_heads(wt):
+    """{head oid: merge commit oid} of merged pull requests (squash merges leave the branch
+    HEAD outside main), from one bounded `gh pr list` per repository; None if unavailable."""
+    try:
+        common = os.path.realpath(os.path.join(wt, _git(wt, "rev-parse", "--git-common-dir").stdout.strip()))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if common not in _MERGED_PRS:
+        try:
+            repo = _github_repo(_git(wt, "config", "--get", "remote.origin.url").stdout.strip())
+            if not repo:                       # the same repository the evidence was fetched from, only
+                _MERGED_PRS[common] = None
+                return None
+            env = {k: v for k, v in os.environ.items() if not k.startswith(("GH_", "GITHUB_", "GIT_"))}
+            env.update(GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", NO_COLOR="1")
+            done = F.run_as_owner(["timeout", "-k", "10", str(FETCH_TIMEOUT), "gh", "pr", "list", "-R", repo,
+                                   "--state", "merged", "--limit", "1000", "--json", "headRefOid,mergeCommit"],
+                                  capture_output=True, text=True, timeout=FETCH_TIMEOUT + 30, env=env)
+            prs = json.loads(done.stdout) if done.returncode == 0 else None
+            _MERGED_PRS[common] = None if prs is None else {
+                p["headRefOid"]: (p.get("mergeCommit") or {}).get("oid") for p in prs if p.get("headRefOid")}
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+            _MERGED_PRS[common] = None
+    return _MERGED_PRS[common]
+
+
+def routine_source_problems(wt):
+    """[] when the cache's source is finished work: its HEAD is merged into main (an
+    ancestor of the freshly fetched origin/main, or the exact head of a merged pull request
+    whose merge commit is in origin/main: squash merges) and the checkout's history is
+    preserved (history_preservation_problem: clean, no unpushed or reflog-only commits, no
+    unfinished Git operation).  Fail closed: anything not established is a problem."""
+    store, base, problem = main_ref(wt)
+    if problem or not base:
+        return ["SOURCE_GIT_UNVERIFIED"]
+
+    def is_ancestor(commit):
+        if store:
+            return _git_in(store, "merge-base", "--is-ancestor", commit, base).returncode == 0
+        return _git(wt, "merge-base", "--is-ancestor", commit, base).returncode == 0
+    try:
+        head = _git(wt, "rev-parse", "HEAD").stdout.strip()
+        merged = bool(head) and is_ancestor(head)
+        if not merged and store:
+            heads = merged_pr_heads(wt)
+            if heads is None:
+                return ["SOURCE_GIT_UNVERIFIED"]
+            merge = heads.get(head)
+            merged = bool(merge) and is_ancestor(merge)
+    except (OSError, subprocess.SubprocessError):
+        return ["SOURCE_GIT_UNVERIFIED"]
+    if not merged:
+        return ["SOURCE_NOT_MERGED"]
+    try:
+        problem = history_preservation_problem(wt)
+    except (OSError, subprocess.SubprocessError):
+        problem = ("GIT_STATE_UNVERIFIED", "")
+    return ["SOURCE_HISTORY_UNPRESERVED"] if problem else []
+
+
+# ------------------------------------------- forgotten --finish-task (routine release)
+
+AUTO_RELEASE_QUIET_HOURS = 24.0
+AUTO_RELEASE_TASK = "routine-verified-finished"
+SESSION_GLOBS = (".claude/projects/**/*.jsonl", ".codex/sessions/**/*.jsonl")   # incl. subagents/
+COORDINATION_GLOB = "emuwiz-audit-ledger/*/COORDINATION.md"
+_FINISHED_WORDS = re.compile(r"\b(merged|closed|done|completed?|finished|superseded|abandoned|retired)\b", re.I)
+_UNFINISHED_WORDS = re.compile(r"\b(active|paused?|wait(ing)?|hold|held|in[-\s]progress|started|queued|blocked|"
+                               r"pending|reassess\w*|handed|resum\w*|draft|open|owner decision|not\s+(yet\s+)?"
+                               r"(merged|done|finished|complete\w*)|wip|running|await\w*|review\w*|ongoing|"
+                               r"reopen\w*|follow-?ups?|todo|next|unfinished|incomplete|stopped|interrupted)\b", re.I)
+
+
+def coordination_problem(wt):
+    """None only when the coordination/ownership table(s) list this checkout and every
+    row naming it in its Worktree column says the task is over (merged/closed/done...)
+    without any word of continuing work (active, paused, waiting, hold, ...), and no note
+    or other row naming it carries such a word either.  No table, an unreadable table, no
+    row, or mixed wording: ownership is unresolved or unfinished, so skip."""
+    import glob
+    paths = sorted(glob.glob(os.path.join(F.home(), COORDINATION_GLOB)))
+    if not paths:
+        return "OWNERSHIP_UNRESOLVED"
+    names = {os.path.basename(os.path.normpath(wt)), os.path.realpath(wt)}
+    pattern = re.compile("|".join(r"(?:^|[\s/(`'\"])" + re.escape(n) + r"(?=$|[\s)/,;:`'\"]|\.(?:\s|$))"
+                                  for n in names))
+    rows, notes = [], []
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except (OSError, UnicodeDecodeError):
+            return "OWNERSHIP_UNRESOLVED"
+        header = None                      # kept across notes interleaved with the rows
+        for n, line in enumerate(lines):
+            following = lines[n + 1] if n + 1 < len(lines) else ""
+            if line.startswith("|"):
+                cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                if set("".join(cells)) <= set("-: "):
+                    continue
+                if following.startswith("|") and set(following.replace("|", "")) <= set("-: ") and following.strip("| "):
+                    header = [c.lower() for c in cells]
+                    continue
+                col = next((i for i, h in enumerate(header or []) if h.startswith("worktree")), None)
+                scol = next((i for i, h in enumerate(header or []) if h.startswith("status")), None)
+                if col is not None and col < len(cells) and pattern.search(cells[col]):
+                    status = cells[scol] if scol is not None and scol < len(cells) else " ".join(cells)
+                    rows.append((" ".join(cells), status))
+                elif pattern.search(line):
+                    notes.append(line)     # named elsewhere in a row: e.g. a hand-over
+            elif pattern.search(line):
+                notes.append(line)
+    if any(_UNFINISHED_WORDS.search(n) for n in notes):
+        return "OWNERSHIP_TASK_NOT_FINISHED"
+    if not rows:
+        return "OWNERSHIP_UNRESOLVED"
+    if any(_UNFINISHED_WORDS.search(row) or not _FINISHED_WORDS.search(status) for row, status in rows):
+        return "OWNERSHIP_TASK_NOT_FINISHED"
+    return None
+
+
+def _newest_mtime(path, skip=(".git", "target")):
+    try:
+        newest = os.lstat(path).st_mtime
+    except OSError:
+        return float("inf")                   # cannot tell: treat as in use
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for name in files + dirs:
+            try:
+                newest = max(newest, os.lstat(os.path.join(root, name)).st_mtime)
+            except OSError:
+                pass
+    return newest
+
+
+def _git_admin_mtime(wt):
+    """Newest of the checkout's own Git admin files (index, HEAD, reflog): status, commits
+    and resets touch them although nothing else in the checkout changes."""
+    try:
+        gitdir = os.path.join(wt, _git(wt, "rev-parse", "--git-dir").stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        return float("inf")
+    newest = 0.0
+    for name in ("index", "HEAD", "ORIG_HEAD", os.path.join("logs", "HEAD")):
+        try:
+            newest = max(newest, os.lstat(os.path.join(gitdir, name)).st_mtime)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return float("inf")
+    return newest
+
+
+def _recent_sessions(cutoff):
+    import glob
+    paths = []
+    for pattern in SESSION_GLOBS:
+        for path in glob.glob(os.path.join(F.home(), pattern), recursive=True):
+            try:
+                if os.path.getmtime(path) >= cutoff:
+                    paths.append(path)
+            except OSError:
+                paths.append(path)            # cannot tell: searched (and unreadable = named)
+    return sorted(set(paths))
+
+
+def _session_names(paths, needles):
+    """True when any recent transcript contains any needle (or cannot be read).  Streamed
+    with mmap, so large transcripts are never loaded whole."""
+    import mmap
+    for path in paths:
+        try:
+            with open(path, "rb") as handle:
+                if os.fstat(handle.fileno()).st_size == 0:
+                    continue
+                with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                    if any(data.find(n) >= 0 for n in needles):
+                        return True
+        except (OSError, ValueError):
+            return True
+    return False
+
+
+def finished_task_candidates(items, policy):
+    """Targets whose task was evidently finished but never released: IDLE with no hold but
+    NOT_RELEASED (so no build lock, no recorded or live process in the cache OR its source
+    checkout, idle long enough, not pinned), inside the policy scope, with a merged, clean,
+    history-preserved source (routine_source_problems), and a checkout that neither changed
+    nor was named in any agent session transcript for AUTO_RELEASE_QUIET_HOURS.  A merged PR
+    alone is never enough.  Returns (candidates, [(item, reasons)] for the rest considered)."""
+    quiet = max(AUTO_RELEASE_QUIET_HOURS, float(((policy or {}).get("limits") or {}).get("min_idle_hours") or 0))
+    cutoff = now() - quiet * 3600
+    sessions = None
+    found, skipped = [], []
+    for item in items:
+        record = item["record"] or {}
+        if item["state"] != "IDLE" or set(item["holds"]) != {"NOT_RELEASED"} or not record.get("last_start"):
+            continue
+        reasons = policy_reasons(item, policy)
+        wt = record.get("worktree")
+        if not reasons and (not wt or not os.path.isdir(wt)):
+            reasons = ["SOURCE_MISSING"]
+        if not reasons:
+            problem = coordination_problem(wt)
+            reasons = [problem] if problem else []
+        if not reasons:
+            reasons = routine_source_problems(wt)
+        if not reasons and max(_newest_mtime(wt), _newest_mtime(item["target"], skip=()),
+                               _git_admin_mtime(wt)) >= cutoff:
+            reasons = ["CHECKOUT_RECENTLY_USED"]
+        if not reasons:
+            if sessions is None:
+                sessions = _recent_sessions(cutoff)
+            names = {os.path.realpath(wt), os.path.normpath(wt), "~/" + os.path.basename(os.path.normpath(wt)),
+                     os.path.basename(os.path.normpath(wt))}
+            if _session_names(sessions, [n.encode() for n in names]):
+                reasons = ["CHECKOUT_NAMED_BY_A_RECENT_SESSION"]
+        (skipped.append((item, reasons)) if reasons else found.append(item))
+    return found, skipped
+
+
+def release_finished_tasks(policy, cycle_id):
+    """Record the releases (`finish`, record only; nothing is deleted here).  Returns names."""
+    _, items, _, _, _ = snapshot(policy)
+    candidates, _ = finished_task_candidates(items, policy)
+    done = []
+    for item in candidates:
+        owner = item["record"].get("owner")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            try:
+                rc = F.main(["finish", item["target"], *(["--owner", owner] if owner else []),
+                             "--task", AUTO_RELEASE_TASK, "--note",
+                             f"routine cycle {cycle_id}: source merged into main, clean, history preserved, "
+                             f"no process, coordination row finished, quiet >= {AUTO_RELEASE_QUIET_HOURS:g} h"])
+            except SystemExit as exit_:
+                rc = exit_.code if isinstance(exit_.code, int) else 1
+        if rc == 0:
+            done.append(item["name"])
+    if done:
+        append_history({"event": "routine_release", "id": cycle_id, "released": done})
+    return done
+
+
 def classify(items, policy):
     """Attach `auto` = (eligible_for_auto, [reasons]) to every item."""
     for item in items:
@@ -896,6 +1339,8 @@ def classify(items, policy):
             wt = record.get("worktree")
             if not wt or not os.path.isdir(wt):
                 reasons.append("SOURCE_MISSING")
+            elif not reasons:
+                reasons += routine_source_problems(wt)
         item["auto_reasons"] = sorted(set(reasons))
         item["auto_eligible"] = st == "RETIRABLE" and not item["auto_reasons"]
     return items
@@ -1224,17 +1669,48 @@ def cmd_plan(args):
     return refused
 
 
-def run_executor(manifest_path, digest, receipts):
-    argv = ["--manifest", manifest_path, "--approved-sha256", digest,
-            "--receipt-dir", receipts, "--execute", "--json"]
+def routine_recheck(policy):
+    """The executor's in-process routine authority (see ROUTINE_AUTHORITY): called under the
+    target's lifecycle lock immediately before deletion.  None, or why it is not routine."""
+    def check(group):
+        target = group.get("directory")
+        st, current, why = load_policy()
+        if st != "ok" or not current["enabled"] or current["digest"] != policy["digest"]:
+            return f"the policy is no longer the enabled one this cycle started under ({why or 'changed'})"
+        if os.path.dirname(target) != current["scope"]["target_root"]:
+            return "outside the policy root"
+        _, record = F.Registry(create=False).read_checked("targets", F.key_for(target), F.valid_target_record)
+        record = record or {}
+        if record.get("owner") not in current["scope"]["owners"]:
+            return "owner not covered by the policy"
+        wt = record.get("worktree")
+        if not wt or not os.path.isdir(wt):
+            return "source checkout missing"
+        if F.head_of(wt) != group.get("source_head"):
+            return "the source HEAD changed since the plan"
+        problems = routine_source_problems(wt)
+        return ", ".join(problems) if problems else None
+    return check
+
+
+def run_executor(manifest_path, digest, receipts, scoped_run=None, policy=None):
+    argv = ["--manifest", manifest_path, "--approved-sha256", digest, "--receipt-dir", receipts, "--execute", "--json"]
+    argv += ["--scoped-run", scoped_run] if scoped_run else ["--routine"]
+    X = executor()
+    X.ROUTINE_AUTHORITY = None if scoped_run else routine_recheck(policy)
     # No --maintenance-window-attested: only participating (cargo-iso) targets can pass.
     out, err = io.StringIO(), io.StringIO()
+    saved = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         try:
             rc = executor().main(argv)
         except SystemExit as exit_:
             rc = exit_.code if isinstance(exit_.code, int) else 1
             err.write(str(exit_.code))
+        finally:
+            X.ROUTINE_AUTHORITY = None
+            for sig, handler in saved.items():   # the executor installs its own handlers in-process
+                signal.signal(sig, handler)
     try:
         return rc, json.loads(out.getvalue()), err.getvalue()
     except ValueError:
@@ -1334,33 +1810,181 @@ def cmd_run(args):
                             "outcome": "REFUSED", "why": str(error)})
         print(f"REFUSED: {error}")
         return 1
+    cycle_id = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now())) + f"-{os.getpid()}"
+    temporary = getattr(args, "enable_for_cycle", False)
+    if temporary and args.dry_run:
+        print("REFUSED: --enable-for-cycle cannot be combined with --dry-run")
+        return EXIT_REFUSED
+    if getattr(args, "scoped_run", None) and args.only_names is None:
+        print("REFUSED: --scoped-run needs --only with exactly the record's target names; nothing was retired")
+        return EXIT_REFUSED
+    if temporary and not getattr(args, "scoped_run", None):
+        # DISABLED is the owner's off switch: only an owner-signed exact batch may lift it for one
+        # cycle.  Routine retirement runs only while the policy is enabled through `policy enable`.
+        print("REFUSED: --enable-for-cycle needs --only and an owner-signed --scoped-run; nothing was retired")
+        return EXIT_REFUSED
     if not args.dry_run and revoke_stale_enablement():
         print("revoked a stored enablement that belonged to different code; `policy enable` is required again")
     st, policy, why = load_policy()
-    cycle_id = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now())) + f"-{os.getpid()}"
     if st == "invalid":
         append_history({"event": "cycle", "id": cycle_id, "outcome": "REFUSED", "why": why})
         print(f"REFUSED: automatic retirement policy is invalid ({why})")
         return 1
+    if temporary:
+        return temporary_cycle(args, cycle_id)
     if args.dry_run or not (policy and policy["enabled"]):
-        return plan_only_cycle(args, policy, cycle_id)
-    with transition_lock():
-        return locked_cycle(args, cycle_id)
+        return plan_only_cycle(args, policy, cycle_id)      # deletes nothing (exit 75 when not a dry run)
+    # ROUTINE (no --scoped-run): only targets every safety gate accepts, with merged and
+    # preserved sources; EXCEPTIONAL (--scoped-run): the owner-signed exact batch
+    try:
+        with transition_lock(wait=False):
+            return locked_cycle(args, cycle_id)
+    except ConcurrentMaintenance as error:
+        print(f"REFUSED: {error}; nothing was retired")
+        return EXIT_REFUSED
+
+
+EXIT_REFUSED = 1
+EXIT_DISABLED = 75          # EX_TEMPFAIL: nothing was deleted because the policy is disabled
+EXIT_RESTORE_FAILED = 70    # EX_SOFTWARE: the temporary enablement could not be restored to DISABLED
+TEMP_ENABLE_MARKER = "temporary-enable.json"
+
+
+class TerminatedDuringCycle(BaseException):
+    pass
+
+
+def _raise_terminated(signum, frame):
+    raise TerminatedDuringCycle(signum)
+
+
+def temporary_enable_lock():
+    """fd holding the exclusive temporary-enablement lock, or None when another process holds it."""
+    ensure_state()
+    fd = os.open(os.path.join(state_dir(), ".temporary-enable.lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def recover_stale_temporary_enable():
+    """Crash recovery.  A temporary cycle writes the marker BEFORE enabling and removes it
+    only after restoring DISABLED, holding the temporary-enable lock throughout.  A marker
+    whose lock is free therefore belongs to a cycle that died (SIGKILL, power loss): disable
+    the policy before anything else.  Returns "NONE", "LIVE" (a cycle is running) or
+    "RECOVERED"; raises if recovery itself fails (callers must not proceed)."""
+    marker = os.path.join(state_dir(), TEMP_ENABLE_MARKER)
+    if not os.path.lexists(marker):
+        return "NONE"
+    try:
+        with open(marker) as handle:
+            if json.load(handle).get("state") == "RESTORED":
+                return "NONE"
+    except (OSError, ValueError):
+        pass                                   # unreadable marker: treat as ACTIVE (fail safe: disable)
+    fd = temporary_enable_lock()
+    if fd is None:
+        return "LIVE"
+    try:
+        with transition_lock():
+            st, policy, why = load_policy()
+            if st == "ok" and (policy["enabled"] or (read_state_record(trusted_policy_uids()) or {}).get("state") == "ENABLED"):
+                set_enabled_locked(policy, False, reason="stale temporary enablement recovered")
+            elif st not in ("ok", "absent"):
+                raise SystemExit(f"stale temporary enablement found but the policy is unreadable ({why}); "
+                                 "disable it by hand before any maintenance command")
+            durable_write(marker, {"state": "RESTORED", "at": now(), "recovered": True})
+        print("emuwiz-cargo-maintain: recovered a temporary enablement left by an interrupted cycle; "
+              "the policy is DISABLED", file=sys.stderr)
+        return "RECOVERED"
+    finally:
+        os.close(fd)
+
+
+def temporary_cycle(args, cycle_id):
+    """Enable the (DISABLED) policy for exactly one approved, exact-name cycle and restore
+    DISABLED afterwards: on success, refusal, exception and SIGTERM/SIGHUP/SIGINT (in a
+    finally), and after SIGKILL or power loss by recover_stale_temporary_enable on the next
+    run.  Those signals are blocked from before the marker is written until the restoring
+    try/finally is in force, so no interruption window can leave the policy ENABLED.
+    Exit EXIT_RESTORE_FAILED if the restoration itself fails."""
+    lock = temporary_enable_lock()
+    if lock is None:
+        print("REFUSED: another temporary maintenance cycle is running; nothing was retired")
+        return EXIT_REFUSED
+    signals = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    old = {sig: signal.signal(sig, _raise_terminated) for sig in signals}
+    marker = os.path.join(state_dir(), TEMP_ENABLE_MARKER)
+    try:
+        try:
+            with transition_lock(wait=False):
+                st, policy, why = load_policy()
+                if st != "ok":
+                    print(f"REFUSED: policy unavailable ({why})")
+                    return EXIT_REFUSED
+                if policy["enabled"]:
+                    print("REFUSED: --enable-for-cycle needs a DISABLED policy; nothing was retired")
+                    return EXIT_REFUSED
+                rc = EXIT_REFUSED
+                signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+                try:
+                    durable_write(marker, {"state": "ACTIVE", "pid": os.getpid(), "cycle": cycle_id, "at": now(),
+                                           "digest": policy["digest"]})
+                    set_enabled_locked(policy, True, temporary=cycle_id)
+                    signal.pthread_sigmask(signal.SIG_UNBLOCK, signals)   # a pending signal lands here, inside try
+                    rc = locked_cycle(args, cycle_id)
+                except TerminatedDuringCycle:
+                    rc = 143
+                    print("interrupted by a signal; restoring DISABLED", file=sys.stderr)
+                finally:
+                    signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+                    try:
+                        st2, policy2, _ = load_policy()
+                        set_enabled_locked(policy2 if st2 == "ok" else policy, False, temporary=cycle_id, restored=True)
+                        durable_write(marker, {"state": "RESTORED", "at": now(), "cycle": cycle_id})
+                    except BaseException as error:  # noqa: BLE001 - must be loud, never silent
+                        print(f"RESTORE FAILED: the policy may still be ENABLED ({error}); the next maintenance "
+                              "command will disable it before doing anything else", file=sys.stderr)
+                        rc = EXIT_RESTORE_FAILED
+                    finally:
+                        signal.pthread_sigmask(signal.SIG_UNBLOCK, signals)
+                return rc
+        except ConcurrentMaintenance as error:
+            print(f"REFUSED: {error}; nothing was retired")
+            return EXIT_REFUSED
+        except TerminatedDuringCycle:
+            return 143                     # before anything was enabled, or after it was restored
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+        os.close(lock)
 
 
 def plan_only_cycle(args, policy, cycle_id):
     ns, items, census, measured, s = snapshot(policy)
+    would_release, release_skipped = [], {}
+    if policy and getattr(args, "only_names", None) is None and not census.unreadable_foreign:
+        candidates, skipped = finished_task_candidates(items, policy)
+        for item, reasons in skipped:
+            release_skipped.setdefault(reasons[0], []).append(item["name"])
+        for item in candidates:              # what a real routine cycle would release first
+            item["auto_eligible"], item["would_release"] = True, True
+            would_release.append(item["name"])
     plan = plan_cycle(policy, items, s, census, getattr(args, "only_names", None))
     selected = plan["selected"]
     write_usage(s, items)
     mode = "dry-run" if args.dry_run else "disabled"
     append_history({"event": "cycle", "id": cycle_id, "outcome": "DRY_RUN" if args.dry_run else "DISABLED",
-                    "would_select": [e["item"]["name"] for e in selected],
+                    "would_select": [e["item"]["name"] for e in selected], "would_release": would_release, "release_skipped": release_skipped,
                     "would_reclaim_bytes": plan.get("estimated_total", 0), "blocked": plan["blocked"]})
     print(f"{mode}: automatic retirement did not delete anything "
           f"(would select {len(selected)} target(s), ~{gb(plan.get('estimated_total', 0))}"
-          f"{'; ' + plan['blocked'] if plan['blocked'] else ''})")
-    return 0
+          f"{'; ' + plan['blocked'] if plan['blocked'] else ''}"
+          f"{f'; would first release {len(would_release)} verified finished task(s)' if would_release else ''})")
+    return 0 if args.dry_run else EXIT_DISABLED
 
 
 def batch_identity(manifest):
@@ -1386,6 +2010,10 @@ def locked_cycle(args, cycle_id):
         return plan_only_cycle(args, policy, cycle_id)   # disabled before the cycle began
     authority = authority_snapshot(policy)
     only = getattr(args, "only_names", None)
+    if not getattr(args, "scoped_run", None) and only is None:
+        released = release_finished_tasks(policy, cycle_id)
+        if released:
+            print(f"released {len(released)} verified finished task(s): {', '.join(released)}")
     ns, items, census, measured, s = snapshot(policy)
     plan = plan_cycle(policy, items, s, census, only)
     selected = plan["selected"]
@@ -1403,8 +2031,19 @@ def locked_cycle(args, cycle_id):
     ensure_state()
     manifest = build_manifest(policy, plan, measured)
     verify_manifest_against_policy(manifest, policy, plan)
-    mpath = os.path.join(state_dir(), "manifests", f"cycle-{cycle_id}.json")
-    F.atomic_write(mpath, manifest)
+    scoped_run = getattr(args, "scoped_run", None)
+    if scoped_run:
+        try:
+            mpath, digest, signed = signed_manifest_for(scoped_run, manifest)
+        except executor().Refusal as refusal:
+            append_history({"event": "cycle", "id": cycle_id, "outcome": "REFUSED", "only": list(only),
+                            "why": f"{refusal.code}: {refusal.detail}"})
+            print(f"REFUSED: {refusal.code}: {refusal.detail}; nothing was retired")
+            return EXIT_REFUSED
+        manifest = signed
+    else:
+        mpath = os.path.join(state_dir(), "manifests", f"cycle-{cycle_id}.json")
+        F.atomic_write(mpath, manifest)
     with open(mpath, "rb") as handle:
         digest = hashlib.sha256(handle.read()).hexdigest()
     append_history({"event": "cycle_start", "id": cycle_id, "manifest": mpath, "manifest_sha256": digest,
@@ -1434,7 +2073,7 @@ def locked_cycle(args, cycle_id):
         print("REFUSED: policy changed, replaced or lost approval before the executor was entered")
         return 1
     receipts = os.path.join(state_dir(), "receipts")
-    rc, receipt, err = run_executor(mpath, digest, receipts)
+    rc, receipt, err = run_executor(mpath, digest, receipts, scoped_run, policy2)
     registry = F.Registry(create=True)
     outcome = "FAILED"
     reclaimed = 0
@@ -1448,7 +2087,9 @@ def locked_cycle(args, cycle_id):
                                "freed": g.get("accounted_freed_bytes", 0),
                                "holds": [h["code"] for h in g.get("holds", [])],
                                "hold_details": g.get("holds", [])})
-            if g.get("outcome") in ("RETIRED", "PARTIAL") and g.get("accounted_freed_bytes", 0):
+            # owner-signed executions are recorded by the executor (route OWNER_SIGNED); a
+            # routine cycle records its fully RETIRED targets here (the automatic-cycle route)
+            if not scoped_run and g.get("outcome") == "RETIRED" and g.get("accounted_freed_bytes", 0):
                 mark_retired(registry, e["item"], g["accounted_freed_bytes"], receipt)
         outs = {t["outcome"] for t in per_target}
         outcome = ("RETIRED" if outs == {"RETIRED"} else "PARTIAL" if outs & {"RETIRED", "PARTIAL"} else
@@ -1555,6 +2196,8 @@ def verify_retirement(record, target):
 
 def _verify_retirement_in(record, target, trusted):
     last = record.get("last_retired") or {}
+    if last.get("route") == "OWNER_SIGNED":
+        return _verify_signed_in(record, target, trusted)
     receipts, manifests = os.path.join(state_dir(), "receipts"), os.path.join(state_dir(), "manifests")
     for d in (state_dir(), receipts, manifests):
         ok, why = _trusted_file(d, trusted, want_dir=True)
@@ -1626,6 +2269,509 @@ def _verify_retirement_in(record, target, trusted):
     return True, ""
 
 
+def _journal_events(path):
+    events = []
+    with open(path) as handle:
+        for line in handle:
+            if line.strip():
+                events.append(json.loads(line))
+    return events
+
+
+def _complete_journal(events, msha):
+    kinds = [e.get("event") for e in events]
+    return bool(events) and kinds[0] == "begin" and events[0].get("manifest_sha256") == msha and \
+        "interrupted" not in kinds and "receipt_publication_failed" not in kinds and kinds[-1] == "end"
+
+
+def _verify_signed_in(record, target, trusted):
+    """An OWNER_SIGNED execution: receipt and journal canonical and unchanged; the scoped-run
+    record canonical, unchanged and consumed by THIS execution; the receipt says the owner
+    signature verified; the record and the journal name this directory with the identity it
+    still has; the manifest is the one signed; the outcome is a complete RETIRED."""
+    X = executor()
+    last = record["last_retired"]
+    receipts = os.path.join(state_dir(), "receipts")
+    scoped_dir = os.path.join(state_dir(), "scoped-runs")
+    for d in (state_dir(), receipts, scoped_dir):
+        ok, why = _trusted_file(d, trusted, want_dir=True)
+        if not ok:
+            return False, why
+    try:
+        for key, directory in (("receipt", receipts), ("journal", receipts), ("scoped_run", scoped_dir)):
+            path = last.get(key)
+            if not isinstance(path, str) or os.path.normpath(path) != path or os.path.dirname(path) != directory:
+                return False, f"{key} is not directly inside the canonical evidence directory"
+            ok, why = _trusted_file(path, trusted)
+            if not ok:
+                return False, why
+            if file_sha256(path) != last.get(key + "_sha256"):
+                return False, f"{key} was modified after it was recorded"
+        receipt = _read_json_file(last["receipt"])
+        if receipt.get("mode") != "EXECUTE" or receipt.get("refused") or receipt.get("interrupted"):
+            return False, "receipt does not describe a completed execution"
+        msha = receipt.get("manifest_sha256")
+        if not msha or msha != receipt.get("approved_sha256") or msha != last.get("manifest_sha256"):
+            return False, "manifest identity disagrees between receipt and record"
+        rs = receipt.get("scoped_run") or {}
+        if rs.get("path") != last["scoped_run"] or rs.get("sha256") != last.get("scoped_run_sha256") \
+                or rs.get("owner_signature") != "VERIFIED":
+            return False, "receipt names a different or unsigned scoped-run record"
+        if receipt.get("journal_file") != last["journal"]:
+            return False, "receipt names a different journal"
+        groups = [g for g in receipt.get("groups", []) if g.get("directory") == target]
+        if len(groups) != 1 or groups[0].get("outcome") != "RETIRED":
+            return False, "receipt has no complete RETIRED outcome for this target"
+        scoped = _read_json_file(last["scoped_run"])
+        if scoped.get("kind") != X.SCOPED_KIND or scoped.get("target_root") != os.path.dirname(target) \
+                or scoped.get("manifest_sha256") != msha or scoped.get("nonce") != rs.get("nonce"):
+            return False, "scoped-run record does not match this target's root, manifest or receipt"
+        events = _journal_events(last["journal"])
+        if not _complete_journal(events, msha) or (events[0].get("scoped_run") or {}).get("sha256") != rs.get("sha256"):
+            return False, "journal is not a complete, matching signed execution"
+        consumed = X.consumed_path(last["scoped_run"])
+        ok, why = _trusted_file(consumed, trusted)
+        if not ok or json.loads(open(consumed).read()).get("exec_id") != events[0].get("exec_id"):
+            return False, "the scoped-run record was not consumed by this execution"
+        # the stored "VERIFIED" is not evidence: verify the owner's signature again, now,
+        # against the trust anchor, and require the same signer the receipt recorded
+        try:
+            with open(last["scoped_run"], "rb") as handle:
+                record_bytes = handle.read()
+            facts = X.verify_owner_signature(last["scoped_run"], record_bytes)
+        except X.Refusal as refusal:
+            return False, f"the owner signature does not verify now ({refusal.code})"
+        if facts["signer_fingerprint"] != rs.get("signer_fingerprint") \
+                or hashlib.sha256(record_bytes).hexdigest() != last.get("scoped_run_sha256"):
+            return False, "the owner signature or signer differs from the one the receipt recorded"
+        st = os.lstat(target)
+        plans = [e for e in events if e.get("event") == "group_plan" and e.get("directory") == target]
+        if len(plans) != 1 or (plans[0].get("device"), plans[0].get("inode")) != (st.st_dev, st.st_ino):
+            return False, "journal does not match this directory's identity"
+        if [target, st.st_dev, st.st_ino] not in [[t.get("directory"), t.get("device"), t.get("inode")]
+                                                 for t in scoped.get("targets", [])]:
+            return False, "scoped-run record does not name this directory identity"
+        ident = last.get("identity")
+        if not ident or (ident.get("dev"), ident.get("ino")) != (st.st_dev, st.st_ino):
+            return False, "directory was replaced after retirement"
+        manifest_path = receipt.get("manifest")
+        if not isinstance(manifest_path, str) or file_sha256(manifest_path) != msha:
+            return False, "the executed manifest no longer matches its digest"
+        manifest = _read_json_file(manifest_path)
+        if not any(g.get("directory") == target and (g.get("device"), g.get("inode")) == (st.st_dev, st.st_ino)
+                   for g in manifest.get("cargo_artifact_groups", [])):
+            return False, "manifest does not name this target"
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        return False, f"evidence unreadable or inconsistent ({type(error).__name__})"
+    return True, ""
+
+
+# ------------------------------------------------- historical owner attestation
+#
+# Evidence ONLY.  For a retirement that already happened under an owner approval given
+# outside this tool (before signed scoped runs existed), the owner may record that the
+# exact manifest digest was approved, with the approval text pinned by hash.  It is
+# accepted only if the original receipt, journal and manifest still verify and are
+# unchanged; the original files are never modified.  It never authorises deletion (the
+# executor reads approvals only), and it satisfies only the "was the retirement verified"
+# question of the worktree gate: every other condition is still checked.
+
+ATTEST_KIND = "HISTORICAL_RETIREMENT_ATTESTATION"
+ATTEST_NAME = re.compile(r"attest-[0-9a-f]{16}\.json")
+
+
+def attestations_dir():
+    return os.path.join(state_dir(), "attestations")
+
+
+def historical_evidence_problem(att, target, record, trusted):
+    """Why `att` does not verify a complete retirement of `target`, or None."""
+    try:
+        if att.get("kind") != ATTEST_KIND or att.get("grants") != "RETIREMENT_EVIDENCE_ONLY":
+            return "not a historical retirement attestation"
+        if att.get("target_root") != os.path.dirname(target) or att.get("state_dir") != state_dir():
+            return "attestation is for another root"
+        files = att.get("files") or {}
+        for key in ("receipt", "journal", "manifest", "evidence"):
+            f = files.get(key) or {}
+            if not isinstance(f.get("path"), str) or file_sha256(f["path"]) != f.get("sha256"):
+                return f"the original {key} is missing or was modified"
+        msha = att.get("manifest_sha256")
+        if not isinstance(msha, str) or files["manifest"]["sha256"] != msha:
+            return "attested digest is not the manifest's digest"
+        evidence = open(files["evidence"]["path"], encoding="utf-8", errors="replace").read()
+        if msha not in evidence:
+            return "the preserved owner approval does not name this manifest digest"
+        receipt = _read_json_file(files["receipt"]["path"])
+        if receipt.get("mode") != "EXECUTE" or receipt.get("refused") or receipt.get("interrupted"):
+            return "receipt does not describe a completed execution"
+        if receipt.get("manifest_sha256") != msha or receipt.get("approved_sha256") != msha:
+            return "receipt was not executed against the attested digest"
+        if os.path.realpath(receipt.get("manifest") or "") != os.path.realpath(files["manifest"]["path"]) or \
+                os.path.realpath(receipt.get("journal_file") or "") != os.path.realpath(files["journal"]["path"]):
+            return "receipt names other manifest or journal files"
+        hist = att.get("historical") or {}
+        if (hist.get("started"), hist.get("finished")) != (receipt.get("started"), receipt.get("finished")):
+            return "historical execution time disagrees with the receipt"
+        if not isinstance(att.get("attested_at"), (int, float)) or att["attested_at"] < receipt["finished"]:
+            return "attestation predates the execution it attests"
+        groups = [g for g in receipt.get("groups", []) if g.get("directory") == target]
+        if len(groups) != 1 or groups[0].get("outcome") != "RETIRED":
+            return "receipt has no complete RETIRED outcome for this target"
+        events = _journal_events(files["journal"]["path"])
+        if not _complete_journal(events, msha):
+            return "journal is not a complete, matching execution"
+        st = os.lstat(target)
+        plans = [e for e in events if e.get("event") == "group_plan" and e.get("directory") == target]
+        if len(plans) != 1 or (plans[0].get("device"), plans[0].get("inode")) != (st.st_dev, st.st_ino):
+            return "journal does not match this directory's identity"
+        manifest = _read_json_file(files["manifest"]["path"])
+        if not any(g.get("directory") == target and (g.get("device"), g.get("inode")) == (st.st_dev, st.st_ino)
+                   for g in manifest.get("cargo_artifact_groups", [])):
+            return "manifest does not name this directory identity"
+        if [target, st.st_dev, st.st_ino] not in [[t.get("directory"), t.get("device"), t.get("inode")]
+                                                 for t in att.get("targets", [])]:
+            return "attestation does not name this directory identity"
+        if not record or (record.get("identity") or {}) != {"dev": st.st_dev, "ino": st.st_ino}:
+            return "lifecycle record does not match this directory"
+        if any((record.get(k) or 0) > receipt["finished"] for k in ("last_start", "last_end", "last_use")):
+            return "the cache was used again after the attested retirement"
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        return f"evidence unreadable or inconsistent ({type(error).__name__})"
+    return None
+
+
+def attested_retirement(record, target):
+    """(ok, why) from a historical attestation in a maintenance directory whose policy
+    covers this target's root."""
+    global _EVIDENCE_STATE_DIR
+    trusted = trusted_policy_uids()
+    why = "no historical attestation"
+    try:
+        names = sorted(n for n in os.listdir(F.registry_dir()) if n == "maintenance" or (
+            n.startswith("maintenance-") and INSTANCE_NAME.fullmatch(n[len("maintenance-"):])))
+    except OSError:
+        return False, why
+    for name in names:
+        directory = os.path.join(F.registry_dir(), name)
+        previous, _EVIDENCE_STATE_DIR = _EVIDENCE_STATE_DIR, directory
+        try:
+            text = read_trusted_text(policy_path(), trusted)
+            policy = json.loads(text) if text else None
+            if not (isinstance(policy, dict) and validate_policy(policy)
+                    and policy["scope"]["target_root"] == os.path.dirname(target)):
+                continue
+            ok, _ = _trusted_file(attestations_dir(), trusted, want_dir=True)
+            if not ok:
+                continue
+            for entry in sorted(os.listdir(attestations_dir())):
+                if not ATTEST_NAME.fullmatch(entry):
+                    continue
+                text = read_trusted_text(os.path.join(attestations_dir(), entry), trusted)
+                try:
+                    att = json.loads(text) if text else None
+                except ValueError:
+                    continue
+                if not isinstance(att, dict) or target not in [t.get("directory") for t in att.get("targets", [])
+                                                               if isinstance(t, dict)]:
+                    continue
+                problem = historical_evidence_problem(att, target, record, trusted)
+                if problem is None:
+                    return True, ""
+                why = problem
+        except (OSError, ValueError):
+            continue
+        finally:
+            _EVIDENCE_STATE_DIR = previous
+    return False, why
+
+
+def cmd_attest_retirement(args):
+    """Record (once per receipt) the owner's historical approval of an executed manifest."""
+    trusted = trusted_policy_uids()
+    st_, policy, why = load_policy()
+    root = os.path.realpath(F.target_root())
+    if st_ != "ok" or policy["scope"]["target_root"] != root:
+        raise SystemExit(f"attest-retirement: this instance has no valid policy for {root} ({why})")
+    digest = args.manifest_sha256.lower()
+    receipt_path, evidence_path = os.path.realpath(args.receipt), os.path.realpath(args.evidence)
+    receipt = _read_json_file(receipt_path)
+    if receipt.get("manifest_sha256") != digest:
+        raise SystemExit("attest-retirement: the receipt was not executed against that digest; nothing recorded")
+    files = {"receipt": receipt_path, "journal": os.path.realpath(receipt.get("journal_file") or "/nonexistent"),
+             "manifest": os.path.realpath(receipt.get("manifest") or "/nonexistent"), "evidence": evidence_path}
+    pinned = {k: {"path": v, "sha256": file_sha256(v)} for k, v in files.items()}
+    targets, refused = [], []
+    for g in receipt.get("groups", []):
+        target = g.get("directory")
+        if not isinstance(target, str) or os.path.dirname(target) != root:
+            refused.append((target, "not in this instance's root"))
+            continue
+        try:
+            st = os.lstat(target)
+        except OSError:
+            refused.append((target, "missing"))
+            continue
+        targets.append({"directory": target, "device": st.st_dev, "inode": st.st_ino})
+    att = {"schema": 1, "kind": ATTEST_KIND, "grants": "RETIREMENT_EVIDENCE_ONLY", "target_root": root,
+           "state_dir": state_dir(), "manifest_sha256": digest, "files": pinned,
+           "historical": {"started": receipt.get("started"), "finished": receipt.get("finished")},
+           "attested_at": now(), "attested_by": F.owner_name(), "note": args.note or "", "targets": targets}
+    registry = F.Registry(create=False)
+    good = []
+    for t in targets:
+        _, record = registry.read_checked("targets", F.key_for(t["directory"]), F.valid_target_record)
+        problem = historical_evidence_problem(att, t["directory"], record, trusted)
+        (refused.append((t["directory"], problem)) if problem else good.append(t))
+    if refused and not args.allow_partial:
+        for target, problem in refused:
+            print(f"  NOT ATTESTABLE {target}: {problem}")
+        raise SystemExit("attest-retirement: some targets do not verify; nothing recorded "
+                         "(each must verify, or pass --allow-partial to attest only the verified ones)")
+    if not good:
+        raise SystemExit("attest-retirement: no target verifies; nothing recorded")
+    att["targets"] = good
+    os.makedirs(attestations_dir(), mode=0o700, exist_ok=True)
+    name = f"attest-{pinned['receipt']['sha256'][:16]}.json"
+    path = os.path.join(attestations_dir(), name)
+    data = (json.dumps(att, indent=1, sort_keys=True) + "\n").encode()
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except FileExistsError:
+        raise SystemExit(f"attest-retirement: this receipt is already attested ({path})") from None
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    fsync_directory(attestations_dir())
+    append_history({"event": "historical_attestation", "path": path, "manifest_sha256": digest,
+                    "targets": [t["directory"] for t in good], "receipt_sha256": pinned["receipt"]["sha256"]})
+    print(f"attested {len(good)} target(s) as retirement EVIDENCE ONLY (never an approval): {path}")
+    for target, problem in refused:
+        print(f"  not attested {target}: {problem}")
+    return 0
+
+
+# ------------------------------------------------- scoped-run record (request)
+#
+# `request-retirement` writes the scoped-run record that the executor needs: the exact
+# targets with their identities, this root, the manifest digest, a <=24 h expiry and a
+# one-time nonce.  It is ACCIDENT PROTECTION ONLY: any process of this account can write
+# one.  Nothing is deleted until the owner signs the record's exact bytes off this
+# machine with `ssh-keygen -Y sign` and the executor verifies that signature.
+
+def write_new_file(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    fsync_directory(os.path.dirname(path))
+
+
+# ------------------------------------------------------------ HOLD registry lifecycle
+
+def _hold_registry_update(change):
+    """Apply `change(doc)` to hold-registry.json under an exclusive lock, atomically."""
+    path = F.hold_registry_path()
+    fd = os.open(os.path.join(F.registry_dir(), ".hold-registry.lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with open(path) as handle:
+            doc = json.load(handle)
+        entries, problem = F._valid_registry(doc)
+        if problem:
+            raise SystemExit(f"the HOLD registry is not usable ({problem}); fix it first")
+        change(doc)
+        F.atomic_write(path, doc)
+    finally:
+        os.close(fd)
+
+
+def _hold_entry(doc, entry_id):
+    entry = next((e for e in doc["entries"] if e.get("id") == entry_id), None)
+    if entry is None:
+        raise SystemExit(f"no HOLD registry entry {entry_id!r}")
+    return entry
+
+
+def _checkout_caches(wt):
+    real = os.path.realpath(wt)
+    return [r["target"] for r in F.Registry(create=False).all_records().values()
+            if r.get("worktree") and os.path.realpath(r["worktree"]) == real and r.get("target")]
+
+
+def cmd_hold_release_request(args):
+    """Write an UNSIGNED release record for one entry and one exact checkout.  It records the
+    checkout identity (path, dev/ino, HEAD, branch) and acknowledges, by hash, every HOLD
+    indication that names the checkout or its caches today.  Nothing changes until the
+    owner signs it off this machine and `hold-release-apply` verifies it."""
+    with open(F.hold_registry_path()) as handle:
+        doc = json.load(handle)
+    entries, problem = F._valid_registry(doc)
+    if problem:
+        raise SystemExit(f"the HOLD registry is not usable ({problem})")
+    entry = _hold_entry(doc, args.entry)
+    ident = F.checkout_identity(args.worktree)
+    if ident is None:
+        raise SystemExit(f"{args.worktree}: not a readable checkout; a release binds to a verified checkout")
+    real = {os.path.realpath(p) for p in entry.get("paths", [])}
+    if not (ident["path"] in real or ident["branch"] in entry.get("branches", []) or ident["head"] in entry.get("heads", [])):
+        raise SystemExit(f"{ident['path']} is not the checkout entry {args.entry} protects")
+    found = F.hold_indications(ident["path"], *_checkout_caches(ident["path"]))
+    record = {"kind": F.HOLD_RELEASE_KIND, "schema": 1, "entry": entry["id"], "at": now(), "checkout": ident,
+              "acknowledged": sorted({d for _c, _t, d in found}),
+              "acknowledged_text": [{"source": c, "text": t[:500]} for c, t, _d in found],
+              "requested_by": F.owner_name(), "nonce": secrets.token_hex(16), "note": args.note or ""}
+    raw = (json.dumps(record, indent=1, sort_keys=True) + "\n").encode()
+    directory = os.path.join(F.registry_dir(), F.HOLD_RELEASES_DIR)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    path = os.path.join(directory, f"release-{hashlib.sha256(raw).hexdigest()[:16]}.json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(raw)
+    print(path)
+    print(f"acknowledges {len(found)} HOLD indication(s); owner signs off this machine with:\n"
+          f"  ssh-keygen -Y sign -n {F.HOLD_RELEASE_NAMESPACE} -f <owner key> {os.path.basename(path)}\n"
+          f"then: hold-release-apply --record {path}")
+    return 0
+
+
+def cmd_hold_release_apply(args):
+    """Record RELEASED for an entry, only from an owner-signed release record bound to the
+    checkout's current identity.  Auditable: the transition names the record; history logs it."""
+    path = os.path.join(F.registry_dir(), F.HOLD_RELEASES_DIR, os.path.basename(args.record))
+    raw = F._read_regular(path, 1 << 20)
+    X = executor()
+    try:
+        facts = X.verify_owner_signature(path, raw, F.HOLD_RELEASE_NAMESPACE)
+    except X.Refusal as refusal:
+        raise SystemExit(f"hold-release-apply refused: {refusal}") from None
+    record = json.loads(raw)
+    if record.get("kind") != F.HOLD_RELEASE_KIND:
+        raise SystemExit("not a HOLD release record")
+    current = F.checkout_identity(record["checkout"]["path"])
+    if current is None or any(current.get(k) != record["checkout"].get(k) for k in ("path", "dev", "ino", "head")):
+        raise SystemExit("the checkout changed since the release was requested; request and sign a new one")
+
+    def change(doc):
+        entry = _hold_entry(doc, record["entry"])
+        entry.setdefault("transitions", []).append({
+            "state": "RELEASED", "at": record["at"], "release_record": os.path.basename(path),
+            "signer_fingerprint": facts.get("signer_fingerprint"), "applied_at": now(), "applied_by": F.owner_name()})
+        entry["state"] = "RELEASED"
+    _hold_registry_update(change)
+    append_history({"event": "hold_release", "entry": record["entry"], "record": os.path.basename(path),
+                    "checkout": record["checkout"], "signer_fingerprint": facts.get("signer_fingerprint")})
+    print(f"released HOLD entry {record['entry']} for {record['checkout']['path']} at {record['checkout']['head'][:12]}; "
+          "pins and every other safety gate still apply")
+    return 0
+
+
+def cmd_hold_set(args):
+    """Record HELD (adding protection needs no signature); a later HELD overrides any release."""
+    def change(doc):
+        entry = next((e for e in doc["entries"] if e.get("id") == args.entry), None)
+        if entry is None:
+            if not args.path:
+                raise SystemExit(f"no entry {args.entry!r}; give --path to create it")
+            entry = {"id": args.entry, "state": "HELD", "paths": [os.path.realpath(args.path)], "branches": [],
+                     "heads": [], "provenance": [f"hold-set by {F.owner_name()}"]}
+            doc["entries"].append(entry)
+        entry.setdefault("transitions", []).append({"state": "HELD", "at": now(), "by": F.owner_name(),
+                                                    "reason": args.reason or ""})
+        entry["state"] = "HELD"
+    _hold_registry_update(change)
+    append_history({"event": "hold_set", "entry": args.entry, "reason": args.reason or ""})
+    print(f"HOLD entry {args.entry}: HELD")
+    return 0
+
+
+def cmd_request_retirement(args):
+    X = executor()
+    root = os.path.realpath(F.target_root())
+    if bool(args.only) == bool(args.manifest):
+        raise SystemExit("request-retirement: give either --only NAME (repeatable) or --manifest FILE")
+    if not (0 < args.hours <= X.SCOPED_MAX_SECONDS / 3600):
+        raise SystemExit("request-retirement: --hours must be above 0 and at most 24")
+    ensure_state()
+    os.makedirs(os.path.join(state_dir(), "manifests"), mode=0o700, exist_ok=True)
+    if args.manifest:
+        manifest_path = os.path.realpath(args.manifest)
+        manifest = _read_json_file(manifest_path)
+    else:
+        st_, policy, why = load_policy()
+        if st_ != "ok":
+            raise SystemExit(f"request-retirement: no valid policy for this instance ({why})")
+        only = parse_only(args.only)
+        _, items, census, measured, summ = snapshot(policy)
+        plan = plan_cycle(policy, items, summ, census, only)
+        if plan["blocked"] or {e["item"]["name"] for e in plan["selected"]} != set(only):
+            raise SystemExit("request-retirement: the requested targets are not exactly plannable "
+                             f"({plan['blocked'] or 'not every name is eligible'}); nothing recorded")
+        manifest = build_manifest(policy, plan, measured)
+        verify_manifest_against_policy(manifest, policy, plan)
+        manifest_path = os.path.join(state_dir(), "manifests",
+                                     f"request-{time.strftime('%Y%m%dT%H%M%S', time.gmtime(now()))}-{os.getpid()}.json")
+        F.atomic_write(manifest_path, manifest)
+    manifest_sha = file_sha256(manifest_path)
+    targets = []
+    for g in manifest.get("cargo_artifact_groups", []):
+        directory = g.get("directory")
+        if not isinstance(directory, str) or os.path.dirname(directory) != root or os.path.realpath(directory) != directory:
+            raise SystemExit(f"request-retirement: {directory} is not a canonical cache directory in {root}")
+        st = os.lstat(directory)
+        if not stat.S_ISDIR(st.st_mode) or (g.get("device"), g.get("inode")) != (st.st_dev, st.st_ino):
+            raise SystemExit(f"request-retirement: {directory} is not the directory the manifest names")
+        targets.append({"directory": directory, "device": st.st_dev, "inode": st.st_ino})
+    if not targets or len({t["directory"] for t in targets}) != len(targets):
+        raise SystemExit("request-retirement: no targets, or a target named twice")
+    at = now()
+    record = {"schema": X.SCOPED_SCHEMA, "kind": X.SCOPED_KIND, "operation": X.SCOPED_OPERATION,
+              "host": socket.gethostname(), "target_root": root, "state_dir": state_dir(),
+              "manifest_path": manifest_path, "manifest_sha256": manifest_sha,
+              "targets": sorted(targets, key=lambda t: t["directory"]),
+              "created_at": at, "expires_at": at + args.hours * 3600, "nonce": secrets.token_hex(16),
+              "recorded_by": F.owner_name(), "note": args.note or "",
+              "notice": "accident protection only; not proof of owner consent until signed by the owner's key"}
+    data = (json.dumps(record, indent=1, sort_keys=True) + "\n").encode()
+    directory = os.path.join(state_dir(), "scoped-runs")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    path = os.path.join(directory, f"scoped-{hashlib.sha256(data).hexdigest()[:16]}.json")
+    write_new_file(path, data)
+    append_history({"event": "scoped_run_requested", "path": path, "targets": [t["directory"] for t in targets],
+                    "manifest_sha256": manifest_sha, "expires_at": record["expires_at"]})
+    print(path)
+    print(f"  {len(targets)} target(s) in {root}; manifest sha256 {manifest_sha}; expires in {args.hours:g} h")
+    print("  NOT AUTHORISED until the owner signs these exact bytes OFF this machine:")
+    print(f"    ssh-keygen -Y sign -n {X.SIGNATURE_NAMESPACE} -f <owner key> {os.path.basename(path)}")
+    print(f"  and the resulting {os.path.basename(path)}.sig is placed next to the record.")
+    return 0
+
+
+def signed_manifest_for(record_path, fresh):
+    """(path, digest, manifest) of the manifest a signed scoped-run record names, after
+    checking (signature included) that the record is usable and that a freshly planned
+    manifest deletes exactly the same paths with the same identities."""
+    X = executor()
+    if not record_path:
+        raise X.Refusal("SCOPED_RUN_REQUIRED", "no scoped-run record")
+    raw = _read_json_file(os.path.normpath(os.path.abspath(record_path)))
+    mpath = raw.get("manifest_path") if isinstance(raw, dict) else None
+    if not isinstance(mpath, str) or os.path.dirname(mpath) != os.path.join(state_dir(), "manifests"):
+        raise X.Refusal("SCOPED_RUN_MISMATCH", "the record's manifest is not in this instance's manifests directory")
+    digest = file_sha256(mpath)
+    signed = _read_json_file(mpath)
+    X.check_scoped_run(record_path, [{"group": g} for g in signed.get("cargo_artifact_groups", [])],
+                       digest, mpath, now(), receipt_dir=os.path.join(state_dir(), "receipts"))
+    if batch_identity(signed) != batch_identity(fresh):
+        raise X.Refusal("SCOPED_RUN_MISMATCH", "the signed batch differs from a fresh plan (paths or identities "
+                        "changed since it was signed); request and sign a new record")
+    return mpath, digest, signed
+
+
 # Per-worktree state naming work that `git worktree remove` would delete unchecked.
 # FETCH_HEAD is left out on purpose: every fetching checkout has one, and what it
 # names came from a remote, not from this checkout.
@@ -1637,6 +2783,120 @@ UNFINISHED_GIT_STATE = ("index.lock", "HEAD.lock", "MERGE_HEAD", "CHERRY_PICK_HE
 KNOWN_ADMIN_ENTRIES = frozenset(("HEAD", "ORIG_HEAD", "REBASE_HEAD", "FETCH_HEAD", "AUTO_MERGE", "COMMIT_EDITMSG",
                                  "MERGE_MSG", "SQUASH_MSG", "index", "logs", "gitdir", "commondir",
                                  "config.worktree", "refs", "info"))
+
+
+CACHEDIR_TAG_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
+IN_TREE_SCAN_LIMIT = 500_000
+
+
+def in_tree_build_output_problem(wt, rel):
+    """Why the ignored directory `rel` (exactly `target/` at the checkout root, or a
+    `__pycache__/` directory) is not proven to be reproducible build output, or None.
+
+    `git worktree remove` deletes ignored files, so ignored content is evidence until
+    proven otherwise. Proof for `target/`: every file is covered by the retirement
+    tool's own artifact selection (the same classification the executor deletes by),
+    except Cargo's empty lock files, an exact CACHEDIR.TAG and EMPTY preserved
+    directories; no symlink, special file or other filesystem anywhere; and no process
+    references it under a complete census. `__pycache__/`: only regular `*.pyc` files.
+    Anything unreadable, oversized or unexpected is a problem (fail closed)."""
+    path = os.path.join(wt, rel.rstrip("/"))
+    try:
+        st = os.lstat(path)
+        wt_dev = os.lstat(wt).st_dev
+    except OSError as error:
+        return f"{rel}: cannot inspect ({error.strerror})"
+    if not stat.S_ISDIR(st.st_mode) or st.st_dev != wt_dev:
+        return f"{rel}: not a plain directory on the checkout's filesystem"
+    if rel != "target/":
+        try:
+            names = os.listdir(path)
+        except OSError as error:
+            return f"{rel}: cannot list ({error.strerror})"
+        for name in names:
+            try:
+                s = os.lstat(os.path.join(path, name))
+            except OSError:
+                return f"{rel}{name}: cannot inspect"
+            if not (stat.S_ISREG(s.st_mode) and name.endswith(".pyc") and s.st_dev == wt_dev):
+                return f"{rel}{name}: not a compiled Python file"
+        return None
+    selected, preserved = F.select_artifacts(path, None)
+    covered = {os.path.normpath(e["path"]) for e in selected}
+    allowed_files, empty_dirs = set(), set()
+    for p in preserved:
+        full = os.path.normpath(p["path"])
+        try:
+            s = os.lstat(full)
+        except OSError:
+            return f"{os.path.relpath(full, wt)}: cannot inspect"
+        name = os.path.basename(full)
+        if stat.S_ISREG(s.st_mode) and name in F.CARGO_LOCK_NAMES and s.st_size == 0:
+            allowed_files.add(full)
+        elif stat.S_ISREG(s.st_mode) and name == "CACHEDIR.TAG" and os.path.dirname(full) == path:
+            try:
+                with open(full, "rb") as handle:
+                    head = handle.read(4096)
+            except OSError:
+                return "target/CACHEDIR.TAG: cannot read"
+            if not head.startswith(CACHEDIR_TAG_SIGNATURE):
+                return "target/CACHEDIR.TAG: not Cargo's cache directory tag"
+            allowed_files.add(full)
+        elif stat.S_ISDIR(s.st_mode) and name in F.ALWAYS_PRESERVE:
+            empty_dirs.add(full)
+        else:
+            return f"{os.path.relpath(full, wt)}: kept by the retirement tool ({p.get('why')})"
+
+    def is_covered(p):
+        while len(p) > len(path):
+            if p in covered:
+                return True
+            p = os.path.dirname(p)
+        return False
+
+    def fail(error):
+        raise error
+
+    seen = 0
+    for root, dirs, files in os.walk(path, onerror=fail):
+        for name in dirs + files:
+            seen += 1
+            if seen > IN_TREE_SCAN_LIMIT:
+                return "target/: too large to verify"
+            full = os.path.join(root, name)
+            s = os.lstat(full)
+            if s.st_dev != wt_dev or not (stat.S_ISDIR(s.st_mode) or stat.S_ISREG(s.st_mode)):
+                return f"{os.path.relpath(full, wt)}: symlink, special file or other filesystem"
+            if stat.S_ISREG(s.st_mode) and not (full in allowed_files or is_covered(full)):
+                if any(full.startswith(d + os.sep) for d in empty_dirs):
+                    return f"{os.path.relpath(full, wt)}: preserved directory is not empty"
+                return f"{os.path.relpath(full, wt)}: not recognised compiler output"
+    census = F.Census([path])
+    if census.unreadable_foreign:
+        return "target/: process visibility is incomplete (run the check as root)"
+    if census.refs.get(path):
+        return "target/: a process is using it"
+    return None
+
+
+def reproducible_ignored_problem(wt, entries):
+    """The CHECKOUT_NOT_CLEAN / IN_TREE_BUILD_OUTPUT_UNVERIFIED result for `git status
+    -z --ignored=matching` entries, or None when every entry is an ignored `target/`
+    or `__pycache__/` directory proven reproducible by in_tree_build_output_problem."""
+    for entry in entries:
+        rel = entry[3:]
+        if not entry.startswith("!! ") or not rel.endswith("/") or not (
+                rel == "target/" or rel == "__pycache__/" or rel.endswith("/__pycache__/")):
+            return ("CHECKOUT_NOT_CLEAN", "tracked, untracked or ignored files require preservation")
+    for entry in entries:
+        try:
+            why = in_tree_build_output_problem(wt, entry[3:])
+        except OSError as error:
+            why = f"{entry[3:]}: cannot inspect ({error})"
+        if why:
+            return ("IN_TREE_BUILD_OUTPUT_UNVERIFIED",
+                    "ignored build output is not proven reproducible and would be deleted with the checkout: " + why)
+    return None
 
 
 def history_preservation_problem(wt):
@@ -1740,12 +3000,15 @@ def history_preservation_problem(wt):
         # Before status, which does not see these files.
         if any(line and (line[0].islower() or line[0] == "S") for line in git("ls-files", "-v", "-z").split("\0")):
             return ("CHECKOUT_INDEX_UNVERIFIED", "assume-unchanged or skip-worktree entries can hide unfinished code")
-        status = run("status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
+        status = run("status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching",
                      "--ignore-submodules=none")
         if status.returncode != 0 or "could not open directory" in status.stderr:
             return ("GIT_STATE_UNVERIFIED", status.stderr.strip())
-        if status.stdout.strip():
-            return ("CHECKOUT_NOT_CLEAN", "tracked, untracked or ignored files require preservation")
+        entries = [e for e in status.stdout.split("\0") if e]
+        if entries:
+            problem = reproducible_ignored_problem(wt, entries)
+            if problem:
+                return problem
         # Files inside a gitlink's directory are invisible to status, with or without
         # submodule state, and are deleted with the checkout.
         if any(line.startswith("160000 ") for line in git("ls-files", "-s", "-z").split("\0")):
@@ -1780,11 +3043,64 @@ def history_preservation_problem(wt):
     return None
 
 
+def configured_roots():
+    """Every Cargo cache root a worktree can have output in: the default home root, the
+    root this shell selects (EMUWIZ_TARGET_ROOT) and the target_root of every valid
+    maintenance policy in the registry.  Canonical paths, sorted, without duplicates."""
+    roots = {os.path.realpath(os.path.join(F.home(), ".cache", "emuwiz-cargo-targets")),
+             os.path.realpath(F.target_root())}
+    trusted = trusted_policy_uids()
+    try:
+        names = os.listdir(F.registry_dir())
+    except OSError:
+        names = []
+    for name in names:
+        if not (name == "maintenance" or (name.startswith("maintenance-")
+                                          and INSTANCE_NAME.fullmatch(name[len("maintenance-"):]))):
+            continue
+        text = read_trusted_text(os.path.join(F.registry_dir(), name, "policy.json"), trusted)
+        try:
+            policy = json.loads(text) if text else None
+        except ValueError:
+            policy = None
+        if isinstance(policy, dict) and validate_policy(policy):
+            roots.add(os.path.realpath(policy["scope"]["target_root"]))
+    return sorted(roots)
+
+
+def lifecycle_gate_all_roots(path):
+    """lifecycle_gate on every configured root (F3).  CLEAR only when every root is CLEAR;
+    otherwise the first HOLD, with each root's verdict listed under "roots"."""
+    verdicts = []
+    saved = os.environ.get("EMUWIZ_TARGET_ROOT")
+    try:
+        for root in configured_roots():
+            os.environ["EMUWIZ_TARGET_ROOT"] = root
+            verdicts.append((root, lifecycle_gate(path)))
+    finally:
+        if saved is None:
+            os.environ.pop("EMUWIZ_TARGET_ROOT", None)
+        else:
+            os.environ["EMUWIZ_TARGET_ROOT"] = saved
+    holds = [v for _, v in verdicts if v["status"] != "CLEAR"]
+    current = os.path.realpath(F.target_root())
+    res = dict(holds[0] if holds else next((v for r, v in verdicts if r == current), verdicts[0][1]))
+    res["roots"] = [{"root": r, "target": v["target"], "status": v["status"], "code": v["code"]} for r, v in verdicts]
+    if holds and len(verdicts) > 1:
+        res["explanation"] = f"[{os.path.dirname(res['target'])}] " + res["explanation"]
+    return res
+
+
 def worktree_gate(path):
-    """The lifecycle gate, which can only be CLEAR when the checkout's history is
-    also preserved. A HOLD still reports any history problem, so a Cargo reason
-    can never hide it."""
-    res = lifecycle_gate(path)
+    """The lifecycle gate on every configured root, which can only be CLEAR when the
+    checkout's history is also preserved. A HOLD still reports any history problem, so a
+    Cargo reason can never hide it."""
+    res = lifecycle_gate_all_roots(path)
+    listed = F.hold_listed(res.get("worktree") or path, res.get("target"),
+                           *[r.get("target") for r in res.get("roots") or []])
+    if listed:                                 # unconditional: no Cargo or Git state can clear it
+        res.update(status="HOLD", code=listed, explanation=EXPLANATIONS[listed])
+        return res
     problem = history_preservation_problem(res["worktree"])
     if problem and res["status"] == "CLEAR":
         res.update(status="HOLD", code=problem[0], explanation=problem[1])
@@ -1916,20 +3232,32 @@ def lifecycle_gate(path):
                     "refuses them. Review by hand and keep the worktree until resolved"
                     % (len(remnants), os.path.relpath(remnants[0]["path"], target), remnants[0]["why"]))
     if not selected:
+        evidence, why = None, ""
         if record and record.get("last_retired"):
             ok, why = verify_retirement(record, target)
-            if not ok:
-                return hold("RECEIPT_UNVERIFIED", "artifacts are gone but the retirement evidence could not be verified: "
-                            + why + ". Keep the worktree and review the receipt and journal by hand")
+            if ok:
+                evidence = "retirement receipt verified"
+        if evidence is None and record and record.get("last_start"):
+            # historical owner attestation: retirement EVIDENCE only, never an authorisation;
+            # every other check below still applies
+            ok2, why2 = attested_retirement(record, target)
+            if ok2:
+                evidence = "historical owner attestation verified, evidence only"
+            elif not why and why2 != "no historical attestation":
+                why = why2
+        if evidence is None and record and record.get("last_retired"):
+            return hold("RECEIPT_UNVERIFIED", "artifacts are gone but the retirement evidence could not be verified: "
+                        + why + ". Keep the worktree and review the receipt and journal by hand")
+        if evidence is not None:
             count, size, examples = unrecognised_residue(target)
             if count:
                 return hold("UNRECOGNISED_RESIDUE",
-                            "the retirement receipt is verified but %d item(s), %.2f GB, remain that the retirement tool "
+                            "the retirement is verified but %d item(s), %.2f GB, remain that the retirement tool "
                             "does not recognise (for example %s), so it can never retire them and they would be orphaned "
                             "once the worktree is gone. Keep the worktree and review them by hand"
                             % (count, size / 1e9, ", ".join(examples)),
                             residue={"items": count, "bytes": size, "examples": examples})
-            return clear("no compiler artifacts remain (retirement receipt verified); "
+            return clear(f"no compiler artifacts remain ({evidence}); "
                          "preserved evidence stays in the cache directory")
         try:
             empty = not os.listdir(target)
@@ -1939,8 +3267,8 @@ def lifecycle_gate(path):
             return clear("the cache directory is empty and nothing was ever built through cargo-iso here")
         return hold("ARTIFACTS_MISSING_UNVERIFIED",
                     "no compiler artifacts are present but there is no verified retirement receipt and no proof that "
-                    "none were ever created; they may have been removed outside the maintenance workflow. "
-                    "Keep the worktree and review by hand")
+                    "none were ever created; they may have been removed outside the maintenance workflow"
+                    + (f" ({why})" if why else "") + ". Keep the worktree and review by hand")
     # artifacts remain: the source worktree is what proves ownership at retirement time
     if not record:
         return hold("NO_LIFECYCLE_RECORD", "legacy cache with no lifecycle record: it cannot be retired automatically; "
@@ -2019,6 +3347,8 @@ def reconcile_legacy_worktree(path, preserved_ref=None, remove=False):
             raise LegacyCheckoutHold(*problem)
 
     def absent():
+        listed = F.hold_listed(wt, target)       # HOLD overrides removal: checked at every re-check
+        require(not listed, listed or "", EXPLANATIONS.get(listed or "", ""))
         # exists/isdir would misclassify dangling symlinks and permission failures.
         try:
             os.lstat(target)
@@ -2360,7 +3690,11 @@ TimeoutStartSec=30min
 User=root
 Group=root
 {environment}UMask=0077
+# Routine cycle: only caches every safety gate accepts (released, idle, census-clear, merged
+# and preserved source); stops at the first uncertain target.  Exits 75 while the policy is
+# disabled.  Exceptional retirements need an owner-signed scoped run and never run here.
 ExecStart={python} -I -S {script} --as-user {user} run
+SuccessExitStatus=75
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths={registry} {targets}
@@ -2509,7 +3843,40 @@ def build_parser():
     r.add_argument("--dry-run", action="store_true")
     r.add_argument("--only", action="append", metavar="TARGET",
                    help="retire exactly these target names (repeatable); all-or-nothing, never substitutes another target")
+    r.add_argument("--scoped-run", metavar="FILE",
+                   help="owner-signed scoped-run record (FILE and FILE.sig) for exactly --only; "
+                        "without it the cycle is routine (verified-reproducible caches only)")
+    r.add_argument("--enable-for-cycle", action="store_true",
+                   help="enable the DISABLED policy for this one cycle and restore DISABLED afterwards (also on error or signal)")
     r.set_defaults(func=cmd_run)
+    hr = sub.add_parser("hold-release-request", help="write an unsigned HOLD release record for one checkout")
+    hr.add_argument("--entry", required=True)
+    hr.add_argument("--worktree", required=True)
+    hr.add_argument("--note")
+    hr.set_defaults(func=cmd_hold_release_request)
+    ha = sub.add_parser("hold-release-apply", help="record RELEASED from an owner-signed release record")
+    ha.add_argument("--record", required=True)
+    ha.set_defaults(func=cmd_hold_release_apply)
+    hs = sub.add_parser("hold-set", help="record HELD for an entry (overrides any earlier release)")
+    hs.add_argument("--entry", required=True)
+    hs.add_argument("--path")
+    hs.add_argument("--reason")
+    hs.set_defaults(func=cmd_hold_set)
+    rq = sub.add_parser("request-retirement",
+                        help="write a scoped-run record (accident protection only; the owner must sign it before anything is deleted)")
+    rq.add_argument("--only", action="append", metavar="TARGET")
+    rq.add_argument("--manifest", help="an existing manifest instead of --only")
+    rq.add_argument("--hours", type=float, default=4.0, help="validity, at most 24 (default 4)")
+    rq.add_argument("--note")
+    rq.set_defaults(func=cmd_request_retirement)
+    at = sub.add_parser("attest-retirement",
+                        help="record historical retirement EVIDENCE for an executed receipt (never authorises deletion)")
+    at.add_argument("--receipt", required=True)
+    at.add_argument("--manifest-sha256", required=True)
+    at.add_argument("--evidence", required=True, help="file preserving the owner's approval text; must quote the digest")
+    at.add_argument("--note")
+    at.add_argument("--allow-partial", action="store_true")
+    at.set_defaults(func=cmd_attest_retirement)
     pol = sub.add_parser("policy")
     pol.add_argument("action", choices=("show", "approve", "enable", "disable"))
     pol.add_argument("--owners", help="comma-separated owner labels covered by the policy")
@@ -2562,6 +3929,9 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     enter_privileged(args)
+    if args.command not in ("units", "verify-install"):
+        if recover_stale_temporary_enable() == "LIVE" and args.command == "policy" and args.action == "enable":
+            raise SystemExit("policy enable: a temporary maintenance cycle is running")
     return args.func(args)
 
 

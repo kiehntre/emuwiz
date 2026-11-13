@@ -43,6 +43,11 @@
 #   --designate-dev  mark THIS worktree as an active developer worktree: its builds
 #                    are incremental by default from now on. Runs no cargo
 #   --undesignate-dev  remove that mark (the target is kept as it is). Runs no cargo
+#   --rust-analyzer  build for rust-analyzer: same guards, lock and registry as a normal
+#                    build, but into <target>/rust-analyzer (so its output never lands
+#                    in the worktree and never fights the main build for the same files);
+#                    no debug info, the target's debug-mode record is neither read nor
+#                    changed. Used by scripts/emuwiz-ra-cargo
 #   --sccache        route rustc through sccache with a dedicated, size-capped cache
 #                    shared by all worktrees (see below); also EMUWIZ_CARGO_SCCACHE=1
 #   --help           this text
@@ -126,6 +131,7 @@ case "$incremental_choice" in
   *) echo "cargo-iso: note: ignoring EMUWIZ_CARGO_INCREMENTAL='$incremental_choice' (only 0 or 1 are meaningful)" >&2; incremental_choice="" ;;
 esac
 designate=""
+ra_mode=0
 use_sccache="${EMUWIZ_CARGO_SCCACHE:-0}"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -137,12 +143,17 @@ while [ $# -gt 0 ]; do
     --designate-dev) designate=on; shift ;;
     --undesignate-dev) designate=off; shift ;;
     --sccache) use_sccache=1; shift ;;
+    --rust-analyzer) ra_mode=1; shift ;;
     --finish-task) finish_task=1; shift ;;
     --task) task_name="${2:-}"; shift; [ $# -gt 0 ] && shift ;;
     --help|-h) usage; exit 0 ;;
     *) break ;;
   esac
 done
+if [ "$ra_mode" -eq 1 ] && { [ "$finish_task" -eq 1 ] || [ -n "$designate" ] || [ "$use_sccache" = "1" ] || [ -n "$debug_choice" ]; }; then
+  echo "cargo-iso: --rust-analyzer cannot be combined with --finish-task, --designate-dev, --sccache or a debug-mode choice" >&2
+  exit 2
+fi
 if [ "$print_only" -eq 0 ] && [ "$finish_task" -eq 0 ] && [ -z "$designate" ] && [ $# -eq 0 ]; then
   echo "cargo-iso: no cargo command given (try --help)" >&2
   exit 2
@@ -297,6 +308,9 @@ for arg in "$@"; do
   prev="$arg"
 done
 
+if [ "$ra_mode" -eq 1 ]; then
+  debug_mode=rust-analyzer; debug_why="rust-analyzer sub-target (no debug info, record untouched)"
+fi
 if [ "$debug_mode" = unknown ]; then
   echo "cargo-iso: cannot establish this target's debug mode: $debug_why." >&2
   echo "           Nothing was built. Pass --low-debug or --full-debug to choose (and record) one." >&2
@@ -330,6 +344,10 @@ fi
 
 mkdir -p "$target"
 export CARGO_TARGET_DIR="$target"
+if [ "$ra_mode" -eq 1 ]; then
+  mkdir -p "$target/rust-analyzer"
+  export CARGO_TARGET_DIR="$target/rust-analyzer" CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+fi
 unset CARGO_BUILD_TARGET_DIR
 if [ "$debug_mode" = low ] || [ "$debug_mode" = full ]; then
   if [ -n "$recorded" ] && [ "$recorded" != "$debug_mode" ]; then

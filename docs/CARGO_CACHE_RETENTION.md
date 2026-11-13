@@ -87,6 +87,98 @@ device holding the target root; other devices are reported separately. `status` 
 protected targets that stop further reduction. Active or protected caches are never
 evicted.
 
+## Who may authorise a deletion (2026-11-12)
+
+There are two modes.
+
+**Routine retirement (hands-off; `emuwiz-cargo-maintain run`, executor `--routine`).** No signature is needed.
+It is limited to what every existing safety gate accepts:
+- cargo-iso-participating caches, released by `--finish-task`, idle, not pinned or held;
+- a live privileged process census with no users, writers, open files or maps;
+- fresh lifecycle-lock and identity checks immediately before each deletion;
+- the worktree's HEAD merged into main (origin/main when present), with the checkout clean and its history preserved (`SOURCE_NOT_MERGED`, `SOURCE_HISTORY_UNPRESERVED`).
+
+A finished task alone is never enough.
+- Selection starts when usage exceeds the policy soft budget (recommended 160 GiB), or when free space drops below the trigger.
+- Cycles are bounded by the policy caps (recommended 10 targets / 60 GB; the executor hard-caps routine cycles at 10 targets).
+- A routine cycle stops at the first target that is not fully RETIRED at execution time, and reports it.
+- It refuses every exceptional option: maintenance window, adoption, journal resume, orphan or source-less caches.
+- It never removes worktrees or branches.
+
+The unit runs this routine cycle. It exits 75 while the policy is DISABLED, and timers stay disabled until the owner approves activation.
+
+**Exceptional retirement (owner-signed).** Every other `--execute` needs two separate things:
+
+1. **A scoped-run record.** This is accident protection only. `emuwiz-cargo-maintain request-retirement --only NAME... | --manifest FILE` writes
+   `<registry>/maintenance[-inst]/scoped-runs/scoped-<content-hash>.json`. It names:
+   - the operation, host and cache root;
+   - each canonical cache directory with its (device, inode);
+   - the manifest path and digest;
+   - an expiry of at most 24 h and a one-time nonce.
+
+   The executor refuses unless the manifest matches the record exactly: no extra, missing or substituted target, and the same identities now.
+   It consumes the record once (an O_EXCL marker, plus a nonce check against every journal) before anything is changed.
+   **Any process of this account can write a record, so a record proves nothing about consent.**
+2. **An owner signature over the record's exact bytes.** It is made off this machine:
+   `ssh-keygen -Y sign -n emuwiz-cargo-retire@1 -f <owner key> scoped-<id>.json`, which writes `scoped-<id>.json.sig` next to the record.
+   It is verified against `/etc/emuwiz/cargo-retire-allowed-signers` for principal `emuwiz-owner`.
+   That file must be root-owned all the way up, and the key line must carry `namespaces="emuwiz-cargo-retire@1,..."`.
+   Each receipt records the signer fingerprint and the digest of the signers file.
+
+   There is no command-line or environment override for an unprivileged run.
+   Without the signers file every execution is refused with `OWNER_SIGNERS_UNAVAILABLE`.
+   That is the state until the owner installs a public key.
+
+Refusal codes:
+- `SCOPED_RUN_REQUIRED`, `SCOPED_RUN_INVALID`, `SCOPED_RUN_WRONG_ROOT`, `SCOPED_RUN_MISMATCH`;
+- `SCOPED_RUN_IDENTITY_CHANGED`, `SCOPED_RUN_EXPIRED`, `SCOPED_RUN_REPLAYED`;
+- `OWNER_SIGNERS_UNAVAILABLE`, `OWNER_SIGNATURE_REQUIRED`, `OWNER_SIGNATURE_INVALID`.
+
+**Limitation.** While the agent account has `sudo NOPASSWD: ALL` (or is in the root-equivalent `docker`/`lxd` groups), an agent can become root.
+It can then replace the signers file or this code. Signature verification then makes a forged authorisation **detectable** but not **impossible**.
+To detect one, compare the receipt's `signer_fingerprint` and `signers_sha256` with your own key.
+Genuine enforcement needs the agent to run as an account that cannot become root and cannot write the signers file, the installed tools or the protected cache roots.
+See the privilege-migration plan in the audit ledger (2026-11-12-lifecycle-overhaul/PRIVILEGE-MIGRATION.md).
+
+Signed records expire after at most 6 hours. A signed execution must write its receipt in the instance's receipts directory.
+The gate re-verifies the owner signature whenever it relies on a signed receipt, so a stored "VERIFIED" is never trusted on its own.
+
+**Routine mode and the same-account limitation, honestly.** Routine retirement needs no consent, because it deletes only caches that are reproducible by construction: compiler output of finished, merged, preserved work, with no live user.
+An agent that runs a routine cycle itself can do nothing the timer could not do.
+The owner signature protects only the exceptional operations. While agents can become root, that protection is tamper-evident rather than enforced (see below).
+
+**Temporary enablement.** `--enable-for-cycle` (with `--only`) enables a DISABLED policy for that one cycle, routine or signed.
+It restores DISABLED in a `finally` block and on SIGTERM/SIGHUP/SIGINT; those signals are blocked across the enable step.
+If the process dies with SIGKILL or the machine loses power, the next maintenance command restores DISABLED, using the `temporary-enable.json` marker and its lock.
+If restoring fails, the cycle exits 70.
+
+**Self-test (harmless).** `emuwiz-cargo-retire --check-owner-signing [--selftest FILE]` is read-only.
+It checks the anchor and the key lines, and verifies `FILE.sig`, which must be made with `-n emuwiz-cargo-retire-selftest@1` over a file starting `EMUWIZ OWNER SIGNING SELF-TEST`.
+A self-test signature can never authorise a retirement, because it uses a different namespace.
+
+**Installation.** `scripts/emuwiz-cargo-stage-install --source <repo>/scripts (--selftest FILE | --without-owner-signing) [--owner USER]` is run by the owner, as root, in an approved deployment.
+`--owner` defaults to `$SUDO_USER`.
+
+Routine maintenance and the worktree checks and removal need no signature. Before a signers file exists, install with `--without-owner-signing`.
+Owner-signed exceptional retirement then stays unavailable: the executor refuses it with `OWNER_SIGNERS_UNAVAILABLE`.
+Once the signers file is installed, re-install with `--selftest`; `--without-owner-signing` is refused from then on.
+
+The installer refuses, leaving the installed version unchanged, when:
+- with `--selftest`, the signing check fails (it checks the source copy as the owner);
+- a maintenance timer is enabled or active, or a maintenance service is running;
+- the staged copy fails `verify-install`.
+
+It keeps `<install-dir>.rollback-<stamp>` and restores it automatically if the post-install check fails.
+
+**Historical attestation** (`attest-retirement`) records retirement *evidence* only for a receipt executed before this gate existed.
+It does this once per receipt, and only if the original receipt, journal and manifest still verify.
+It never authorises a deletion; the executor never reads it.
+The worktree gate uses it only to answer "was this retirement verified?", and every other condition is still checked.
+
+**rust-analyzer.** `scripts/emuwiz-rust-analyzer` sets `CARGO=scripts/emuwiz-ra-cargo`, which runs `cargo-iso --rust-analyzer` inside EmuWiz checkouts.
+That uses the same guard, lock and registry, with output in `<target>/rust-analyzer`, which retirement classifies like the target itself.
+It never builds into the worktree's own `target/`. The editor/plugin configuration is not changed by these scripts.
+
 ## Manifest-authorised retirement (`scripts/emuwiz-cargo-retire`)
 
 Dry run by default; deletes only with `--execute --approved-sha256 <digest> --receipt-dir DIR`.
