@@ -3,6 +3,7 @@
 use super::*;
 use crate::gui_v2::routes::{Route, Section};
 use crate::gui_v2::tests::{archive, fixture};
+use eframe::egui;
 use std::sync::Arc;
 
 const SIZE: [f32; 2] = [1280.0, 820.0];
@@ -136,11 +137,33 @@ fn keys_are_read_exactly() {
     }
 }
 
-/// A focused button and one Enter event, with or without the shared filter.
-fn button_clicked_by(enter: egui::Event, filtered: bool) -> bool {
+fn release(key: egui::Key) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed: false,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+/// The key goes down before the button has focus and is never released;
+/// once the button holds focus, one more press arrives: an auto-repeat
+/// (egui marks it so), or, with `released`, a fresh press after a release.
+fn button_clicked_by_held(key_held: egui::Key, released: bool, filtered: bool) -> bool {
     let context = egui::Context::default();
     let mut clicked = false;
-    for events in [Vec::new(), vec![enter]] {
+    let mut focused = false;
+    let press = key(key_held, egui::Modifiers::NONE, false);
+    let last = if released {
+        vec![release(key_held), press.clone()]
+    } else {
+        vec![press.clone()]
+    };
+    for (frame, events) in [vec![press], Vec::new(), Vec::new(), last]
+        .into_iter()
+        .enumerate()
+    {
         let _ = context.run(
             egui::RawInput {
                 events,
@@ -152,24 +175,29 @@ fn button_clicked_by(enter: egui::Event, filtered: bool) -> bool {
                 }
                 egui::CentralPanel::default().show(context, |ui| {
                     let response = ui.add(egui::Button::new("Play"));
-                    context.memory_mut(|memory| memory.request_focus(response.id));
+                    if frame == 0 {
+                        response.request_focus();
+                    }
+                    focused = response.has_focus();
                     clicked |= response.clicked();
                 });
             },
         );
     }
+    assert!(focused, "the button should hold keyboard focus");
     clicked
 }
 
 #[test]
 fn a_held_enter_never_activates_the_focused_control() {
-    let none = egui::Modifiers::NONE;
-    // egui alone would click on an auto-repeat.
-    assert!(button_clicked_by(key(egui::Key::Enter, none, true), false));
-    assert!(!button_clicked_by(key(egui::Key::Enter, none, true), true));
-    assert!(!button_clicked_by(key(egui::Key::Space, none, true), true));
+    use egui::Key::{Enter, Space};
+    // egui alone clicks on an auto-repeat.
+    assert!(button_clicked_by_held(Enter, false, false));
+    assert!(!button_clicked_by_held(Enter, false, true));
+    assert!(!button_clicked_by_held(Space, false, true));
     // A deliberate press still activates the focused control.
-    assert!(button_clicked_by(key(egui::Key::Enter, none, false), true));
+    assert!(button_clicked_by_held(Enter, true, true));
+    assert!(button_clicked_by_held(Space, true, true));
 }
 
 fn run(

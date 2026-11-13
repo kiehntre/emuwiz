@@ -30,6 +30,7 @@
 //!   [`claimed_escape_pressed`]; Back then waits for the next Escape.
 
 use super::App;
+use eframe::egui;
 
 /// The keys of one frame this module resolves. Enter is deliberately absent:
 /// it is never a shortcut.
@@ -264,7 +265,11 @@ impl App {
 
     fn apply_shortcuts(&mut self, context: &egui::Context) {
         // Registrations are per frame: what the last frame drew.
-        let search = context.data_mut(|data| data.remove_temp::<egui::Id>(search_slot()));
+        let search = context.data_mut(|data| {
+            let search = data.get_temp::<egui::Id>(search_slot());
+            data.remove::<egui::Id>(search_slot());
+            search
+        });
         let escape_claimed = context
             .data_mut(|data| data.remove_temp::<bool>(escape_claim_slot()))
             .unwrap_or(false);
