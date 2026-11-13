@@ -420,6 +420,7 @@ pub(crate) fn cheat_discovery(
             profiles: Vec::new(),
             diagnostics: Vec::new(),
         },
+        zipped_save_findings: Vec::new(),
     }
 }
 

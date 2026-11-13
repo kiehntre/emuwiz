@@ -1363,13 +1363,13 @@ fn staged_launch_findings(
 
 /// Readiness projection of the launch-time zipped-cartridge refusal: every
 /// RetroArch candidate for zipped content is blocked with exactly the
-/// findings [`staged_launch_is_safe`] would refuse the launch with, so the
-/// readiness screen and the Play button can never disagree. Other content
-/// is untouched. Read-only.
+/// findings [`staged_launch_is_safe`] would refuse the launch with (computed
+/// by [`zipped_cartridge_save_findings`] for the same RetroArch scan the
+/// plan was built from), so readiness and Play agree. Pure: no file access,
+/// safe to call every frame. Other content is untouched.
 pub fn apply_zipped_cartridge_save_safety(
     plan: &mut super::planning::LaunchPlan,
-    filesystem: &dyn ReadOnlyHostFilesystem,
-    environment: &DiscoveryEnvironment,
+    findings_by_profile: &[(ProfileRef, Vec<String>)],
 ) {
     for candidate in &mut plan.candidates {
         if candidate.content.provenance != super::ZIPPED_CARTRIDGE_PROVENANCE {
@@ -1378,18 +1378,23 @@ pub fn apply_zipped_cartridge_save_safety(
         let LaunchTarget::RetroArchCore { profile, .. } = &candidate.target else {
             continue;
         };
-        let findings = staged_launch_findings_for(profile, filesystem, environment);
+        // Not checked (no completed RetroArch scan for this profile): leave
+        // readiness as planned; the launch itself still runs the full check.
+        let Some((_, findings)) = findings_by_profile.iter().find(|(p, _)| p == profile) else {
+            continue;
+        };
         if findings.is_empty() {
             continue;
         }
         candidate.blockers.push(super::readiness::LaunchBlocker::new(
             super::readiness::LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe,
             format!(
-                "This game is inside a ZIP, so EmuWiz plays a temporary copy that is deleted when you quit, and RetroArch's save setup would lose your saves: {}. Fix this in RetroArch, then check again.",
-                findings.join("; ")
+                "This game is inside a ZIP, so EmuWiz plays a temporary copy that is deleted when you quit, and RetroArch's save setup would lose your saves: {}. {}",
+                findings.join("; "),
+                super::planning::RETROARCH_RECHECK_HINT
             ),
         ));
-        candidate.readiness = LaunchReadiness::Blocked;
+        candidate.readiness = super::readiness::LaunchReadiness::Blocked;
     }
     plan.summary = super::planning::summarize(&plan.candidates);
 }
@@ -1397,6 +1402,27 @@ pub fn apply_zipped_cartridge_save_safety(
 fn staged_launch_findings_for(
     request_profile: &ProfileRef,
     filesystem: &dyn ReadOnlyHostFilesystem,
+    environment: &DiscoveryEnvironment,
+) -> Vec<String> {
+    if request_profile.profile_kind != ProfileKind::Native {
+        return zipped_cartridge_save_findings(None, request_profile, environment);
+    }
+    match discover_retroarch_environment(filesystem, environment) {
+        Ok(report) => zipped_cartridge_save_findings(Some(&report), request_profile, environment),
+        Err(error) => vec![format!("RetroArch could not be inspected: {error}")],
+    }
+}
+
+/// The zipped-cartridge save-safety findings for one RetroArch profile of an
+/// already-discovered `report` (empty means safe). The launch-time refusal
+/// ([`staged_launch_is_safe`]) discovers fresh and calls this; Blue calls it
+/// once per profile on its RetroArch scan thread and reuses the result for
+/// readiness, never per frame. `report` may be `None` only for a non-native
+/// profile, which is refused without inspection. Reads the settings file and
+/// override folders; never writes.
+pub fn zipped_cartridge_save_findings(
+    report: Option<&RetroArchEnvironmentReport>,
+    request_profile: &ProfileRef,
     environment: &DiscoveryEnvironment,
 ) -> Vec<String> {
     use crate::emulator_environment::retroarch::{PathPurpose, ResolutionState};
@@ -1410,9 +1436,8 @@ fn staged_launch_findings_for(
                 .into(),
         ];
     }
-    let report = match discover_retroarch_environment(filesystem, environment) {
-        Ok(report) => report,
-        Err(error) => return vec![format!("RetroArch could not be inspected: {error}")],
+    let Some(report) = report else {
+        return vec!["RetroArch could not be inspected".into()];
     };
     let Some(profile) = report.profiles.iter().find(|profile| {
         profile.profile_kind == request_profile.profile_kind

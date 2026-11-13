@@ -2287,11 +2287,20 @@ fn zipped_save_refusal_is_shown_at_readiness_and_matches_launch() {
     let report = inspect_catalogued_game_identity(&zip, Some("MegaDrive"));
     let content = crate::launch::launch_content_ref_for_zipped_cartridge(&report).unwrap();
     let (identity, _) = crate::launch::canonical_identity_from_game_report(&report);
+    // As Blue does it: findings computed once per scan, then a pure lookup.
     let plan_for = |content: &LaunchContentRef| {
         let environment =
             discover_retroarch_environment(&HostReadOnlyFilesystem, &ready.environment).unwrap();
+        let findings = vec![(
+            ready.request.profile,
+            zipped_cartridge_save_findings(
+                Some(&environment),
+                &ready.request.profile,
+                &ready.environment,
+            ),
+        )];
         let mut plan = build_launch_plan(&identity, content, &[], &environment, &[]);
-        apply_zipped_cartridge_save_safety(&mut plan, &HostReadOnlyFilesystem, &ready.environment);
+        apply_zipped_cartridge_save_safety(&mut plan, &findings);
         plan
     };
     let retroarch = |plan: &crate::launch::planning::LaunchPlan| {
@@ -2365,4 +2374,68 @@ fn zipped_save_refusal_is_shown_at_readiness_and_matches_launch() {
             .starts_with("In-game progress may fail to save.")
     );
     assert!(warning.detail.contains(&missing.display().to_string()));
+}
+
+/// Readiness for a zipped game is rebuilt every frame in Blue; the ZIP save
+/// check there must be a pure lookup over the scan's findings. After the
+/// scan, RetroArch's settings file is removed: repeated readiness passes give
+/// the same answer (so nothing re-reads it), while the launch itself still
+/// re-checks freshly and refuses with the now-current reason.
+#[test]
+fn zipped_save_readiness_is_pure_across_repeated_frames_and_launch_rechecks() {
+    use crate::launch::readiness::LaunchBlockerKind;
+    let rom = b"synthetic mega drive rom bytes";
+    let (ready, zip, _) = zipped_ready("zip-frames", &[("a.md", rom)]);
+    let config = ready.fixture.path("config/retroarch/retroarch.cfg");
+    // Broken setup at scan time: save folder missing.
+    let missing = ready.fixture.path("no-saves");
+    fs::write(
+        &config,
+        format!(
+            "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\nsavefile_directory = \"{}\"\nsavestate_directory = \"/var/tmp/emuwiz-zip-test-states\"\n",
+            ready.fixture.path("cores").display(),
+            ready.fixture.path("info").display(),
+            missing.display(),
+        ),
+    )
+    .unwrap();
+    let report = inspect_catalogued_game_identity(&zip, Some("MegaDrive"));
+    let content = crate::launch::launch_content_ref_for_zipped_cartridge(&report).unwrap();
+    let (identity, _) = crate::launch::canonical_identity_from_game_report(&report);
+    let environment =
+        discover_retroarch_environment(&HostReadOnlyFilesystem, &ready.environment).unwrap();
+    let findings = vec![(
+        ready.request.profile,
+        zipped_cartridge_save_findings(
+            Some(&environment),
+            &ready.request.profile,
+            &ready.environment,
+        ),
+    )];
+    assert!(!findings[0].1.is_empty());
+
+    fs::remove_file(&config).unwrap();
+    let frame = || {
+        let mut plan = build_launch_plan(&identity, &content, &[], &environment, &[]);
+        apply_zipped_cartridge_save_safety(&mut plan, &findings);
+        plan.candidates
+            .into_iter()
+            .find(|c| matches!(c.target, LaunchTarget::RetroArchCore { .. }))
+            .unwrap()
+    };
+    let first = frame();
+    for _ in 0..50 {
+        assert_eq!(
+            frame(),
+            first,
+            "readiness must not depend on re-reading files"
+        );
+    }
+    assert!(first.blockers.iter().any(|b| b.kind
+        == LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe
+        && b.detail.contains(&missing.display().to_string())));
+    // The launch never trusts the cached answer: it re-checks now.
+    let launch = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment)
+        .expect_err("launch re-checks and refuses");
+    assert!(!launch.contains(&missing.display().to_string()), "{launch}");
 }

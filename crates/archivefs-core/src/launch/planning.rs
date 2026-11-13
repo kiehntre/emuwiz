@@ -589,6 +589,11 @@ fn narrow_cores_by_extension(matches: &mut Vec<RetroArchCoreMatch>, content: &La
     }
 }
 
+/// Readiness reflects the last RetroArch scan, so every save-folder finding
+/// says how to re-check after a fix (owner decision 2026-11-13).
+pub const RETROARCH_RECHECK_HINT: &str =
+    "After fixing this folder or changing RetroArch settings, refresh RetroArch to check again.";
+
 /// Visible warnings for the save-file/save-state folders a launch of
 /// `found` would use: the core's per-core override value when it sets one,
 /// otherwise `retroarch.cfg`'s. Folders that are usable, or that RetroArch
@@ -657,7 +662,7 @@ fn retroarch_save_directory_warnings(
         };
         warnings.push(LaunchWarning::new(
             LaunchWarningKind::RetroArchSaveDirectoryUnusable,
-            format!("{at_risk} may fail to save. {detail}"),
+            format!("{at_risk} may fail to save. {detail} {RETROARCH_RECHECK_HINT}"),
         ));
     }
     warnings

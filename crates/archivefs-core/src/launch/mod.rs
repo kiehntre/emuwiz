@@ -355,7 +355,7 @@ pub use execution::{
     apply_zipped_cartridge_save_safety, preflight_and_launch_retroarch,
     preflight_and_launch_retroarch_with_playlist, preflight_retroarch_launch,
     preflight_retroarch_launch_with_playlist, prepare_retroarch_launch_with_playlist,
-    spawn_retroarch,
+    spawn_retroarch, zipped_cartridge_save_findings,
 };
 pub use fbneo_command::{
     FBNEO_SUPPORTED_PLATFORM_ID, FbneoCommand, FbneoCommandPlan, FbneoIdentityEvidence,
@@ -474,8 +474,8 @@ pub use pcsx2_execution::{
 pub use planning::{
     CandidatePreference, CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind,
     LaunchContentKind, LaunchContentRef, LaunchPlan, LaunchPlanSummary, LaunchTarget,
-    RememberedPreference, ResolvedIdentity, StandaloneProfileInput, VerifiedWHDLoadContent,
-    build_launch_plan,
+    RETROARCH_RECHECK_HINT, RememberedPreference, ResolvedIdentity, StandaloneProfileInput,
+    VerifiedWHDLoadContent, build_launch_plan,
 };
 pub use platform_map::{
     LAUNCH_COMPATIBILITY, LaunchCompatibility, MappingConfidence, extension_narrows_candidate,
