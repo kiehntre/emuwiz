@@ -122,14 +122,13 @@ pub(super) fn show(ui: &mut egui::Ui, page: &mut HealthPage) {
     }
     ui.separator();
     ui.horizontal_wrapped(|ui| {
-        if ui
-            .add(
-                egui::TextEdit::singleline(&mut page.query)
-                    .hint_text("Find set or description")
-                    .desired_width(ui.available_width().min(280.0)),
-            )
-            .changed()
-        {
+        let search = ui.add(
+            egui::TextEdit::singleline(&mut page.query)
+                .hint_text("Find set or description")
+                .desired_width(ui.available_width().min(280.0)),
+        );
+        crate::gui_v2::shortcuts::register_search(&search);
+        if search.changed() {
             page.offset = 0;
         }
         for (filter, label) in [
