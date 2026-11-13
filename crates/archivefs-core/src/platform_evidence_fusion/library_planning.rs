@@ -558,6 +558,7 @@ pub fn plan_library(
         content_policy: Default::default(),
         candidates: &candidates,
         generation: context.generation,
+        unknown_folder: None,
     });
 
     // organisation_plan.entries is sorted (status, source_path,

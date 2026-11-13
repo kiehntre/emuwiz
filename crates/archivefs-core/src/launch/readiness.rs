@@ -616,6 +616,17 @@ pub enum LaunchWarningKind {
     /// CHD support). Launch is not blocked; a route with known CHD support
     /// is preferred when one is ready.
     RetroArchChdSupportUnconfirmed,
+    /// The file's system, format and structure were confirmed (so it can be
+    /// launched safely), but EmuWiz could not establish WHICH game it is:
+    /// no header identity exists for this system and optional DAT matching
+    /// has not been done. Owner-approved 2026-11-07 for ZX Spectrum `.tap` /
+    /// `.tzx` and shown to the user as a visible warning; never a verified
+    /// identity.
+    IdentityUnverified,
+    /// MAME's own driver data flags this machine (imperfect or unemulated
+    /// feature, special controls, gambling/fruit machine). Informational:
+    /// never a launch gate.
+    MameMachineFlagged,
 }
 
 impl LaunchWarningKind {
@@ -624,9 +635,12 @@ impl LaunchWarningKind {
     /// RetroArch with a visible warning. This is the ALLOW-LIST of warning
     /// kinds that do not withdraw RetroArch Play; every other kind (present
     /// or future) still does. Add a kind here only with explicit owner
-    /// approval.
+    /// approval (`IdentityUnverified`: ZX/X68000 decision, 2026-11-07).
     pub fn permits_retroarch_play(self) -> bool {
-        matches!(self, Self::FirmwarePresentUnverified)
+        matches!(
+            self,
+            Self::FirmwarePresentUnverified | Self::IdentityUnverified
+        )
     }
 }
 
@@ -1137,6 +1151,7 @@ mod tests {
     #[test]
     fn only_unverified_firmware_warning_permits_retroarch_play() {
         assert!(LaunchWarningKind::FirmwarePresentUnverified.permits_retroarch_play());
+        assert!(LaunchWarningKind::IdentityUnverified.permits_retroarch_play());
         for kind in [
             LaunchWarningKind::OptionalFirmwareMissing,
             LaunchWarningKind::MultipleEligibleProfiles,

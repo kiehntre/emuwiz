@@ -187,10 +187,12 @@ pub fn build_hatari_command_plan(
             "selected Hatari media path must be absolute",
         ));
     }
-    if !matches!(disk_drive, 'A' | 'a' | 'B' | 'b') {
+    // The isolated session only ever loads the selected disk in drive A and
+    // switches drive B off, so no other drive can be requested.
+    if !matches!(disk_drive, 'A' | 'a') {
         blockers.push(blocker(
             LaunchBlockerKind::HatariDiskDriveInvalid,
-            "disk selection must explicitly name drive A or B",
+            "Atari ST media always loads in drive A; drive B is switched off",
         ));
     }
     if !blockers.is_empty() {
@@ -199,20 +201,27 @@ pub fn build_hatari_command_plan(
             blockers,
         };
     }
-    let flag = if disk_drive.eq_ignore_ascii_case(&'A') {
-        "--disk-a"
-    } else {
-        "--disk-b"
+    // The preview shows the selected media; at spawn time Hatari is given a
+    // read-only copy inside a private session (see `hatari_session`), with no
+    // inherited configuration, no drive B and no hard disks.
+    let arguments = match crate::launch::hatari_session::isolated_arguments(
+        expected_machine,
+        &tos_path,
+        selected_content,
+    ) {
+        Ok(arguments) => arguments,
+        Err(detail) => {
+            blockers.push(blocker(LaunchBlockerKind::HatariMachineMismatch, detail));
+            return HatariCommandPlan {
+                command: None,
+                blockers,
+            };
+        }
     };
     HatariCommandPlan {
         command: Some(HatariCommand {
             executable: executable.path.clone(),
-            arguments: vec![
-                "--configfile".into(),
-                profile.config_path.clone().into_os_string(),
-                flag.into(),
-                selected_content.as_os_str().to_os_string(),
-            ],
+            arguments,
             working_directory: None,
             selection: HatariCommandSelection {
                 profile_id: profile.profile_id.clone(),

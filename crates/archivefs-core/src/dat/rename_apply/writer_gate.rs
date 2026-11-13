@@ -348,8 +348,10 @@ fn candidate_executable(process: &Path) -> Result<Option<PathBuf>, String> {
     use std::os::unix::fs::MetadataExt;
     let inspection_error = |error| {
         format!(
-            "cannot inspect running process {}: {error}; journal work is disabled. Nothing was changed",
-            process.display()
+            "cannot inspect running process {} ({}): {error}; journal work is disabled. Nothing \
+             was changed",
+            process.display(),
+            describe_process(process)
         )
     };
     let metadata = match std::fs::metadata(process) {
@@ -360,10 +362,19 @@ fn candidate_executable(process: &Path) -> Result<Option<PathBuf>, String> {
     if metadata.uid() != unsafe { libc::geteuid() } {
         return Ok(None);
     }
-    match std::fs::read_link(process.join("exe")) {
+    match read_executable_link(process) {
         Ok(executable) => Ok(Some(executable)),
         Err(error) => {
             if std::fs::metadata(process).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+                return Ok(None);
+            }
+            // The kernel hides `exe` from its own user only for a
+            // non-dumpable process. EmuWiz never is one, so only the listed
+            // system programs, matched on kernel evidence as well as their
+            // names, are passed over. Every other hidden process refuses.
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                && known_hidden_program(process).is_some()
+            {
                 return Ok(None);
             }
             let zombie = std::fs::read_to_string(process.join("stat"))
@@ -380,6 +391,243 @@ fn candidate_executable(process: &Path) -> Result<Option<PathBuf>, String> {
             }
         }
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static HIDDEN_EXECUTABLES: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test support: make `exe` of a fake process report PermissionDenied, as the
+/// kernel does for a non-dumpable process, whoever runs the test.
+#[cfg(any(test, feature = "test-support"))]
+pub fn hide_executable_for_this_thread(process: Option<PathBuf>) {
+    HIDDEN_EXECUTABLES.with(|cell| match process {
+        Some(process) => cell.borrow_mut().push(process),
+        None => cell.borrow_mut().clear(),
+    });
+}
+
+/// The running executable of a process (`/proc/<pid>/exe`).
+fn read_executable_link(process: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(any(test, feature = "test-support"))]
+    if HIDDEN_EXECUTABLES.with(|cell| cell.borrow().iter().any(|hidden| hidden == process)) {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    std::fs::read_link(process.join("exe"))
+}
+
+/// The kernel's short name of a process (`comm`).
+fn command_name(process: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(process.join("comm")).ok()?;
+    let name = text.strip_suffix('\n').unwrap_or(&text);
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// The arguments of a process. `cmdline` is NUL-separated, never split on
+/// spaces: a program path may contain them.
+fn arguments(process: &Path) -> Option<Vec<String>> {
+    let bytes = std::fs::read(process.join("cmdline")).ok()?;
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(&bytes);
+    let arguments = bytes
+        .split(|b| *b == 0)
+        .map(|argument| String::from_utf8(argument.to_vec()).ok())
+        .collect::<Option<Vec<_>>>()?;
+    arguments
+        .first()
+        .is_some_and(|first| !first.is_empty())
+        .then_some(arguments)
+}
+
+/// The parent pid of a process (field 4 of `stat`).
+fn parent_pid(process: &Path) -> Option<u32> {
+    let stat = std::fs::read_to_string(process.join("stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// One `Uid:`/`Gid:`/`CapPrm:` line of `status`, as its fields.
+fn status_fields(process: &Path, key: &str) -> Option<Vec<String>> {
+    let status = std::fs::read_to_string(process.join("status")).ok()?;
+    let line = status.lines().find_map(|line| line.strip_prefix(key))?;
+    Some(line.split_whitespace().map(str::to_owned).collect())
+}
+
+/// Who a process is, for a refusal the user can act on.
+fn describe_process(process: &Path) -> String {
+    let name = command_name(process).unwrap_or_else(|| "name unreadable".to_owned());
+    match arguments(process) {
+        Some(arguments) => format!("{name:?}, started as {:?}", arguments[0]),
+        None => format!("{name:?}, command line unreadable"),
+    }
+}
+
+fn mentions_emuwiz(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("emuwiz") || text.contains("archivefs")
+}
+
+/// How argv[0] of a listed program must look.
+enum StartedAs {
+    /// A program path or bare name with exactly this file name.
+    Program(&'static str),
+    /// A title the program gives itself, starting with this text.
+    Title(&'static str),
+}
+
+/// Kernel evidence, beyond names, of why a listed program is hidden.
+enum Evidence {
+    /// Started by PID 1 with this as its only argument.
+    ChildOfInit(&'static str),
+    /// Its parent is the user manager (an entry with `ChildOfInit`).
+    ChildOfUserManager,
+    /// Started by the user manager with this as its only argument, as a
+    /// systemd user service.
+    ServiceOfUserManager(&'static str),
+    /// Its parent is a root-owned process of this name.
+    ChildOfRoot(&'static str),
+    /// Its parent is a process of this name.
+    ChildOf(&'static str),
+    /// Its saved group differs from its real group: it was started from a
+    /// set-group-id file.
+    SetGroupId,
+    /// It holds permitted capabilities: it was started from a file with
+    /// capabilities.
+    FileCapabilities,
+}
+
+/// A program known to hide its executable from its own user. EmuWiz is never
+/// set-uid, set-gid or capability-bearing and never makes itself non-dumpable,
+/// so it cannot be hidden; this list exists only so ordinary system programs
+/// do not disable journal work. Names alone are never enough: each entry also
+/// needs kernel evidence for why it is hidden.
+struct HiddenProgram {
+    comm: &'static str,
+    started_as: StartedAs,
+    evidence: Evidence,
+    /// Why the kernel hides it.
+    #[allow(dead_code)]
+    reason: &'static str,
+}
+
+const HIDDEN_PROGRAMS: &[HiddenProgram] = &[
+    HiddenProgram {
+        comm: "systemd",
+        started_as: StartedAs::Program("systemd"),
+        evidence: Evidence::ChildOfInit("--user"),
+        reason: "the user manager is started by PID 1 as root and switches to this user \
+                 without starting a new program",
+    },
+    HiddenProgram {
+        comm: "(sd-pam)",
+        started_as: StartedAs::Title("(sd-pam)"),
+        evidence: Evidence::ChildOfUserManager,
+        reason: "the user manager's PAM helper is forked before the switch to this user and \
+                 never starts a new program",
+    },
+    HiddenProgram {
+        comm: "sshd",
+        started_as: StartedAs::Title("sshd: "),
+        evidence: Evidence::ChildOfRoot("sshd"),
+        reason: "an OpenSSH session is forked by the root daemon and switches to this user \
+                 without starting a new program",
+    },
+    HiddenProgram {
+        comm: "sftp-server",
+        started_as: StartedAs::Program("sftp-server"),
+        evidence: Evidence::ChildOf("sshd"),
+        reason: "OpenSSH's SFTP server turns off tracing of itself when it starts",
+    },
+    HiddenProgram {
+        comm: "ssh-agent",
+        started_as: StartedAs::Program("ssh-agent"),
+        evidence: Evidence::SetGroupId,
+        reason: "ssh-agent is installed set-group-id and also turns off tracing of itself",
+    },
+    HiddenProgram {
+        comm: "gpg-agent",
+        started_as: StartedAs::Program("gpg-agent"),
+        evidence: Evidence::ServiceOfUserManager("--supervised"),
+        reason: "GnuPG's agent calls prctl(PR_SET_DUMPABLE, 0) at start-up to protect keys \
+                 (seen in the installed 2.4.4 binary); this is how its systemd user service \
+                 starts it",
+    },
+    HiddenProgram {
+        comm: "sunshine",
+        started_as: StartedAs::Program("sunshine"),
+        evidence: Evidence::FileCapabilities,
+        reason: "Sunshine is installed with file capabilities for screen capture",
+    },
+];
+
+impl HiddenProgram {
+    fn matches(&self, root: &Path, process: &Path, comm: &str, arguments: &[String]) -> bool {
+        let first = &arguments[0];
+        let started_as = match self.started_as {
+            StartedAs::Program(name) => {
+                Path::new(first).file_name().and_then(|n| n.to_str()) == Some(name)
+            }
+            StartedAs::Title(prefix) => first.starts_with(prefix),
+        };
+        if comm != self.comm || !started_as {
+            return false;
+        }
+        let parent = || parent_pid(process).map(|pid| (pid, root.join(pid.to_string())));
+        let child_of_user_manager = || {
+            parent().is_some_and(|(pid, parent)| {
+                pid != 1
+                    && known_hidden_program_in(root, &parent)
+                        .is_some_and(|program| matches!(program.evidence, Evidence::ChildOfInit(_)))
+            })
+        };
+        match self.evidence {
+            Evidence::ChildOfInit(argument) => {
+                parent_pid(process) == Some(1) && arguments[1..] == [argument.to_owned()]
+            }
+            Evidence::ChildOfUserManager => child_of_user_manager(),
+            Evidence::ServiceOfUserManager(argument) => {
+                child_of_user_manager() && arguments[1..] == [argument.to_owned()]
+            }
+            Evidence::ChildOfRoot(name) => parent().is_some_and(|(_, parent)| {
+                use std::os::unix::fs::MetadataExt;
+                command_name(&parent).as_deref() == Some(name)
+                    && std::fs::metadata(&parent).is_ok_and(|m| m.uid() == 0)
+            }),
+            Evidence::ChildOf(name) => {
+                parent().is_some_and(|(_, parent)| command_name(&parent).as_deref() == Some(name))
+            }
+            Evidence::SetGroupId => {
+                status_fields(process, "Gid:").is_some_and(|gid| gid.len() >= 3 && gid[0] != gid[2])
+            }
+            Evidence::FileCapabilities => status_fields(process, "CapPrm:").is_some_and(|caps| {
+                caps.first()
+                    .and_then(|caps| u64::from_str_radix(caps, 16).ok())
+                    .is_some_and(|caps| caps != 0)
+            }),
+        }
+    }
+}
+
+/// The listed program a hidden process is, if its name, start and kernel
+/// evidence all match one entry and nothing about it mentions EmuWiz.
+fn known_hidden_program(process: &Path) -> Option<&'static HiddenProgram> {
+    known_hidden_program_in(process.parent()?, process)
+}
+
+fn known_hidden_program_in(root: &Path, process: &Path) -> Option<&'static HiddenProgram> {
+    let comm = command_name(process)?;
+    let arguments = arguments(process)?;
+    if mentions_emuwiz(&comm) || mentions_emuwiz(&arguments[0]) {
+        return None;
+    }
+    HIDDEN_PROGRAMS
+        .iter()
+        .find(|program| program.matches(root, process, &comm, &arguments))
 }
 
 /// Running EmuWiz processes of this user (other than this one) that cannot
@@ -775,6 +1023,329 @@ pub(crate) mod tests {
         assert!(candidate_executable(&process).unwrap().is_none());
     }
 
+    /// Adds a process whose `exe` the kernel hides (PermissionDenied).
+    /// `cmdline: None` leaves it unreadable (absent).
+    fn add_hidden(
+        root: &Path,
+        pid: u32,
+        ppid: u32,
+        comm: &str,
+        cmdline: Option<&[u8]>,
+        status: &str,
+    ) -> PathBuf {
+        let process = root.join(pid.to_string());
+        std::fs::create_dir_all(&process).unwrap();
+        std::fs::write(process.join("comm"), format!("{comm}\n")).unwrap();
+        if let Some(cmdline) = cmdline {
+            std::fs::write(process.join("cmdline"), cmdline).unwrap();
+        }
+        std::fs::write(
+            process.join("stat"),
+            format!("{pid} ({comm}) S {ppid} 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 90 0 0"),
+        )
+        .unwrap();
+        std::fs::write(process.join("status"), status).unwrap();
+        hide_executable_for_this_thread(Some(process.clone()));
+        process
+    }
+
+    const PLAIN: &str =
+        "Uid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nCapPrm:\t0000000000000000\n";
+
+    /// The gate's verdict on a table, through the real `check()`.
+    fn gate(root: &Path) -> Result<(), String> {
+        set_process_root_for_this_thread(Some(root.to_path_buf()));
+        check()
+    }
+
+    #[test]
+    fn hidden_system_programs_with_kernel_evidence_are_skipped_and_the_gate_opens() {
+        let _reset = Reset;
+        let table = tempfile::tempdir().unwrap();
+        let root = table.path();
+        let manager = add_hidden(
+            root,
+            4_900_001,
+            1,
+            "systemd",
+            Some(b"/usr/lib/systemd/systemd\0--user\0"),
+            PLAIN,
+        );
+        add_hidden(
+            root,
+            4_900_002,
+            4_900_001,
+            "(sd-pam)",
+            Some(b"(sd-pam)\0"),
+            PLAIN,
+        );
+        add_hidden(
+            root,
+            4_900_008,
+            4_900_001,
+            "gpg-agent",
+            Some(b"/usr/bin/gpg-agent\0--supervised\0"),
+            PLAIN,
+        );
+        add_hidden(
+            root,
+            4_900_003,
+            4_900_001,
+            "sunshine",
+            Some(b"/usr/bin/sunshine\0"),
+            "Gid:\t1000\t1000\t1000\t1000\nCapPrm:\t0000000000800000\n",
+        );
+        add_hidden(
+            root,
+            4_900_004,
+            1,
+            "ssh-agent",
+            Some(b"ssh-agent\0-s\0"),
+            "Gid:\t1000\t1000\t111\t1000\nCapPrm:\t0000000000000000\n",
+        );
+        // A root-owned sshd parent cannot be faked as another user; this
+        // test runner's table entry is owned by whoever runs it.
+        let root_owned = unsafe { libc::geteuid() } == 0;
+        add_process(root, "sshd", 4_900_005, "1");
+        std::fs::write(root.join("4900005/comm"), "sshd\n").unwrap();
+        add_hidden(
+            root,
+            4_900_006,
+            4_900_005,
+            "sshd",
+            Some(b"sshd: me@pts/0\0\0\0"),
+            PLAIN,
+        );
+        add_hidden(
+            root,
+            4_900_007,
+            4_900_006,
+            "sftp-server",
+            Some(b"/usr/lib/openssh/sftp-server\0"),
+            PLAIN,
+        );
+
+        assert!(candidate_executable(&manager).unwrap().is_none());
+        for pid in [4_900_002, 4_900_003, 4_900_004, 4_900_007, 4_900_008] {
+            assert!(
+                candidate_executable(&root.join(pid.to_string()))
+                    .unwrap()
+                    .is_none(),
+                "{pid}"
+            );
+        }
+        // The sshd session is skipped only when its parent really is root's.
+        let session = candidate_executable(&root.join("4900006"));
+        assert_eq!(session.is_ok(), root_owned, "{session:?}");
+        if !root_owned {
+            assert!(gate(root).is_err());
+            // Without its session the SFTP server is unproven too.
+            std::fs::remove_dir_all(root.join("4900006")).unwrap();
+            assert!(candidate_executable(&root.join("4900007")).is_err());
+            std::fs::remove_dir_all(root.join("4900007")).unwrap();
+        }
+        gate(root).unwrap();
+    }
+
+    #[test]
+    fn gpg_agent_is_skipped_only_as_the_user_manager_starts_it() {
+        let _reset = Reset;
+        let cases: &[(u32, &str, &[u8])] = &[
+            (4_900_041, "gpg-agent", b"gpg-agent\0--daemon\0"),
+            (4_900_041, "gpg-agent", b"/usr/bin/gpg-agent\0"),
+            (
+                4_900_041,
+                "gpg-agent",
+                b"/usr/bin/gpg-agent\0--supervised\0--homedir\0/x\0",
+            ),
+            (
+                4_900_041,
+                "gpg-agent",
+                b"/opt/emuwiz/gpg-agent\0--supervised\0",
+            ),
+            (
+                4_900_041,
+                "emuwiz-v2",
+                b"/usr/bin/gpg-agent\0--supervised\0",
+            ),
+            (
+                4_900_041,
+                "gpg-agent",
+                b"/home/me/My Apps/emuwiz-v2\0--supervised\0",
+            ),
+            // A parent that only looks like the user manager.
+            (
+                4_900_042,
+                "gpg-agent",
+                b"/usr/bin/gpg-agent\0--supervised\0",
+            ),
+            (
+                4_900_043,
+                "gpg-agent",
+                b"/usr/bin/gpg-agent\0--supervised\0",
+            ),
+        ];
+        for (ppid, comm, cmdline) in cases {
+            let table = tempfile::tempdir().unwrap();
+            let root = table.path();
+            add_hidden(
+                root,
+                4_900_041,
+                1,
+                "systemd",
+                Some(b"/usr/lib/systemd/systemd\0--user\0"),
+                PLAIN,
+            );
+            add_hidden(
+                root,
+                4_900_042,
+                4_242,
+                "systemd",
+                Some(b"/usr/lib/systemd/systemd\0--user\0"),
+                PLAIN,
+            );
+            add_hidden(
+                root,
+                4_900_043,
+                1,
+                "systemd",
+                Some(b"/usr/lib/systemd/systemd\0--system\0"),
+                PLAIN,
+            );
+            let agent = add_hidden(root, 4_900_049, *ppid, comm, Some(cmdline), PLAIN);
+            let refusal = candidate_executable(&agent).unwrap_err();
+            assert!(refusal.contains(&format!("{comm:?}")), "{refusal}");
+            assert!(gate(root).is_err(), "{ppid} {comm} {cmdline:?}");
+            hide_executable_for_this_thread(None);
+        }
+        let table = tempfile::tempdir().unwrap();
+        let root = table.path();
+        add_hidden(
+            root,
+            4_900_041,
+            1,
+            "systemd",
+            Some(b"/usr/lib/systemd/systemd\0--user\0"),
+            PLAIN,
+        );
+        let agent = add_hidden(
+            root,
+            4_900_049,
+            4_900_041,
+            "gpg-agent",
+            Some(b"/usr/bin/gpg-agent\0--supervised\0"),
+            PLAIN,
+        );
+        assert!(candidate_executable(&agent).unwrap().is_none());
+        gate(root).unwrap();
+    }
+
+    #[test]
+    fn a_hidden_process_with_no_usable_command_line_refuses() {
+        let _reset = Reset;
+        for cmdline in [
+            None,
+            Some(&b""[..]),
+            Some(&b"\0"[..]),
+            Some(&b"\xff\xfe\0"[..]),
+        ] {
+            let table = tempfile::tempdir().unwrap();
+            let process = add_hidden(table.path(), 4_900_011, 1, "systemd", cmdline, PLAIN);
+            let refusal = candidate_executable(&process).unwrap_err();
+            assert!(
+                refusal.contains("cannot inspect running process"),
+                "{refusal}"
+            );
+            assert!(refusal.contains("\"systemd\""), "{refusal}");
+            assert!(gate(table.path()).is_err(), "{cmdline:?}");
+            hide_executable_for_this_thread(None);
+        }
+    }
+
+    #[test]
+    fn a_hidden_emuwiz_refuses_however_it_was_started() {
+        let _reset = Reset;
+        let cases: &[(&str, &[u8])] = &[
+            ("emuwiz-v2", b"/opt/x/emuwiz-v2\0"),
+            ("emuwiz-v2", b"/home/me/My Apps/emuwiz-v2\0--library\0x\0"),
+            ("AppRun", b"/tmp/.mount_EmuWiz/AppRun\0"),
+            ("archivefs-cli", b"archivefs-cli\0scan\0"),
+            // A familiar name cannot hide a program that mentions EmuWiz.
+            ("systemd", b"/opt/emuwiz/systemd\0--user\0"),
+            ("emuwiz", b"/usr/lib/systemd/systemd\0--user\0"),
+            ("systemd", b"/home/me/My Apps/EmuWiz/systemd\0--user\0"),
+        ];
+        for (comm, cmdline) in cases {
+            let table = tempfile::tempdir().unwrap();
+            let process = add_hidden(table.path(), 4_900_021, 1, comm, Some(cmdline), PLAIN);
+            let refusal = candidate_executable(&process).unwrap_err();
+            assert!(refusal.contains(&format!("{comm:?}")), "{refusal}");
+            assert!(gate(table.path()).is_err(), "{comm} {cmdline:?}");
+            hide_executable_for_this_thread(None);
+        }
+        // The full path with spaces is what the refusal names.
+        let table = tempfile::tempdir().unwrap();
+        let process = add_hidden(
+            table.path(),
+            4_900_022,
+            1,
+            "emuwiz-v2",
+            Some(b"/home/me/My Apps/emuwiz-v2\0"),
+            PLAIN,
+        );
+        let refusal = candidate_executable(&process).unwrap_err();
+        assert!(
+            refusal.contains("started as \"/home/me/My Apps/emuwiz-v2\""),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_hidden_program_that_is_not_listed_or_lacks_its_evidence_refuses() {
+        let _reset = Reset;
+        let cases: &[(u32, &str, &[u8], &str)] = &[
+            // Not listed.
+            (1, "some-daemon", b"/usr/bin/some-daemon\0", PLAIN),
+            // gpg-agent only as its user service starts it.
+            (1, "gpg-agent", b"/usr/bin/gpg-agent\0--supervised\0", PLAIN),
+            (
+                4_242,
+                "gpg-agent",
+                b"/usr/bin/gpg-agent\0--supervised\0",
+                PLAIN,
+            ),
+            // Listed names without the kernel evidence for being hidden.
+            (
+                4_242,
+                "systemd",
+                b"/usr/lib/systemd/systemd\0--user\0",
+                PLAIN,
+            ),
+            (1, "systemd", b"/usr/lib/systemd/systemd\0", PLAIN),
+            (
+                1,
+                "systemd",
+                b"/usr/lib/systemd/systemd\0--user\0--x\0",
+                PLAIN,
+            ),
+            (1, "(sd-pam)", b"(sd-pam)\0", PLAIN),
+            (1, "sunshine", b"/usr/bin/sunshine\0", PLAIN),
+            (1, "ssh-agent", b"/usr/bin/ssh-agent\0", PLAIN),
+            (1, "sshd", b"sshd: me@pts/0\0", PLAIN),
+            (1, "sftp-server", b"/usr/lib/openssh/sftp-server\0", PLAIN),
+            // Name and start must agree.
+            (1, "systemd", b"/usr/bin/other\0--user\0", PLAIN),
+        ];
+        for (ppid, comm, cmdline, status) in cases {
+            let table = tempfile::tempdir().unwrap();
+            let process = add_hidden(table.path(), 4_900_031, *ppid, comm, Some(cmdline), status);
+            let refusal = candidate_executable(&process).unwrap_err();
+            assert!(refusal.contains(&format!("{comm:?}")), "{refusal}");
+            assert!(gate(table.path()).is_err(), "{comm} {cmdline:?}");
+            hide_executable_for_this_thread(None);
+        }
+    }
+
     /// Writes the registration a sealing-capable instance would write.
     fn register(root: &Path, pid: u32) {
         let text = registration_text(
@@ -790,6 +1361,7 @@ pub(crate) mod tests {
     impl Drop for Reset {
         fn drop(&mut self) {
             set_process_root_for_this_thread(None);
+            hide_executable_for_this_thread(None);
         }
     }
 

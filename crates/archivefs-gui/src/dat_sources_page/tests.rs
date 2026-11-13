@@ -4529,6 +4529,10 @@ fn plan_proposal(
         sanitisation_notes: Vec::new(),
         actionable: state == ProposalState::Suggested,
         audited_identity: None,
+        // Bound like a planner-built proposal: observed when the file exists.
+        audited_fingerprint: archivefs_core::identity_source::hashing::FileFingerprint::observe(
+            std::path::Path::new(source),
+        ),
         is_outer_archive: false,
     }
 }

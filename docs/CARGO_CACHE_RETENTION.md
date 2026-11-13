@@ -347,6 +347,50 @@ non-participating targets stay held with an explanation. Incomplete journals are
 auto-acknowledged. `status`, `plan`, `run --dry-run` and `history` report decisions, held reasons
 (actionable), reclaimed space and the last cleanup.
 
+**Free-space trigger (optional).** `--reserve-trigger-free-gib T` (T must not exceed
+`--reserve-free-gib R`) adds `limits.reserve_trigger_free_bytes`: the free-space reserve asks for
+nothing while free space is at or above T, and once it falls below T a cycle aims to restore R
+(`need = R - free`), still within the per-cycle caps, so it can take several cycles. Without it the
+trigger is R itself (the original behaviour); existing policies, and their digests, are unchanged.
+The soft budget remains a separate trigger: a cycle runs when either one asks for space.
+
+**A second target root (policy instance).** One policy covers one target root. For another root
+(e.g. `/mnt/nvme2/emuwiz-cargo-targets`, where `cargo-env.sh` sends builds) set
+`EMUWIZ_MAINTENANCE_INSTANCE=NAME` together with `EMUWIZ_TARGET_ROOT=<root>`. The instance keeps its
+own policy, enablement, history, manifests and receipts in `<registry>/maintenance-NAME/` over the
+same shared lifecycle registry (target records, pins and locks), so the two policies never share
+authority: each only plans targets directly under its own root (`OUTSIDE_POLICY_ROOT` otherwise),
+and an instance whose policy names a root other than `EMUWIZ_TARGET_ROOT` is invalid (fail closed).
+The default instance (no variable) is `<registry>/maintenance/`, unchanged. `units` run with both
+variables writes `emuwiz-cargo-maintain-NAME.service`/`.timer` carrying them and
+`ReadWritePaths=<registry> <root>` and `RequiresMountsFor=<root>` (a cycle never runs against an
+unmounted root). Commands that act for an instance (`policy`, `plan`, `status`, `run`, `history`,
+`admit`, and `emuwiz-cargo-retire --resolve-journal`/`--inspect-journal` for its journals) need the
+same two variables. Retirement evidence is found from the target itself: `worktree-check`,
+`task-complete` and `cargo-iso --finish-task` verify a target another instance retired using that
+instance's `maintenance-NAME/` evidence, accepted only when that directory's own valid policy
+covers the target's root, so a shell that sets only `EMUWIZ_TARGET_ROOT` works.
+
+Constraints: one policy per root (`policy approve` refuses a root another instance's policy already
+names, so the default policy cannot silently move to `/mnt/nvme2` from a shell that exports
+`EMUWIZ_TARGET_ROOT`); each instance must name `EMUWIZ_TARGET_ROOT` as its root; and the roots must
+be on **different filesystems**, because budgets count every registered target on the root's device
+(two roots on one device would count each other's bytes). `--only NAME` resolves the basename across
+both roots; if the same worktree built into both, the home item is chosen and an instance's `--only`
+refuses (fail closed). Unknown free space never requests cleanup (the budget still applies).
+
+Owner-approved /mnt/nvme2 numbers (180 GiB cache budget; clean below 240 GiB free, restore 260 GiB;
+3 targets / 20 GB per cycle). `--soft-gb` is decimal GB, so 180 GiB is 193.274 GB; the hard budget
+only drives the advisory admission note and must exceed the soft one:
+
+```
+EMUWIZ_MAINTENANCE_INSTANCE=nvme2 EMUWIZ_TARGET_ROOT=/mnt/nvme2/emuwiz-cargo-targets \
+  emuwiz-cargo-maintain policy approve --owners davedap --soft-gb 193.274 --hard-gb 214.748 \
+  --reserve-free-gib 260 --reserve-trigger-free-gib 240 --max-targets 3 --max-gb 20
+```
+
+The build guards (`cargo-iso`/`emuwiz-cargo-guard`, `EMUWIZ_MIN_FREE_GB`) are separate and unchanged.
+
 ### Admission and the minimum-free guard (ADVISORY ONLY)
 `cargo-iso` calls `emuwiz-cargo-maintain admit` for a new or re-created (artifact-free) target.
 The check is **advisory**: if allocated storage plus an allowance (3 GB default;

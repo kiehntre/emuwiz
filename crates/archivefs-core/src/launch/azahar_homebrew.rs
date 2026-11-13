@@ -546,7 +546,12 @@ mod tests {
             Err(AzaharHomebrewLaunchError::Executable(_))
         ));
         // Same path, replaced file (new inode): the existing drift check refuses.
-        fs::remove_file(&exe).unwrap();
+        // The old file is kept (renamed aside), so the filesystem cannot hand
+        // the replacement the freed inode: a same-size file with a reused
+        // inode and an equal mtime is indistinguishable by (dev, inode, size,
+        // mtime), which made this test fail under heavy load.
+        let aside = dir.path().join("azahar.old");
+        fs::rename(&exe, &aside).unwrap();
         fake_azahar(dir.path(), 1);
         assert!(matches!(
             preflight_and_launch_azahar_homebrew(&req, &roots(&exe, dir.path())),
@@ -557,6 +562,32 @@ mod tests {
         assert!(matches!(
             preflight_and_launch_azahar_homebrew(&req, &roots(&exe, dir.path())),
             Err(AzaharHomebrewLaunchError::Executable(_))
+        ));
+    }
+
+    /// The `executable_swap_or_move_refuses` flake, made deterministic: the
+    /// emulator file that is there now matches the checked one on device,
+    /// inode, size and mtime (a same-size rewrite with a reset mtime, or a
+    /// replacement given the freed inode), and differs only in ctime. The
+    /// old four-field check would accept it; the launch must refuse it.
+    #[test]
+    fn an_executable_matching_on_inode_size_and_mtime_but_not_ctime_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "game.3dsx", &sample_3dsx());
+        let exe = fake_azahar(dir.path(), 0);
+        let evidence = verify_three_dsx(&path).unwrap();
+        let mut req = request(evidence, &exe);
+        let now = req.executable_identity;
+        req.executable_identity.changed = now
+            .changed
+            .map(|ctime| ctime - std::time::Duration::from_nanos(1));
+        assert!(now.changed.is_some(), "ctime must be captured on Unix");
+        let old_check = |i: &CapturedFileIdentity| (i.device, i.inode, i.size, i.modified);
+        assert_eq!(old_check(&req.executable_identity), old_check(&now));
+        assert!(matches!(
+            preflight_and_launch_azahar_homebrew(&req, &roots(&exe, dir.path())),
+            Err(AzaharHomebrewLaunchError::Preflight(error))
+                if error.kind == crate::launch::azahar_execution::AzaharPreflightErrorKind::ExecutableDrift
         ));
     }
 

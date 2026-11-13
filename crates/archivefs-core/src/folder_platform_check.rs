@@ -27,6 +27,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub mod organise;
 #[cfg(test)]
 mod tests;
 
@@ -41,15 +42,26 @@ pub const DERIVED_PROVENANCE: &str = "derived from DAT header name";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Tier {
+    /// A catalogue hash for another system identifies the game.
     Confirmed,
+    /// A calibrated content validator establishes the system; the exact game
+    /// is not identified. No DAT match never means "unknown platform".
+    PlatformConfirmed,
     Probable,
     Ambiguous,
 }
 
 impl Tier {
+    /// Strong enough to move the game to the detected system's folder after
+    /// the person approves.
+    pub fn is_movable(self) -> bool {
+        matches!(self, Self::Confirmed | Self::PlatformConfirmed)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Confirmed => "Confirmed",
+            Self::PlatformConfirmed => "Platform confirmed (game identity unverified)",
             Self::Probable => "Probable (heuristic)",
             Self::Ambiguous => "Ambiguous",
         }
@@ -187,6 +199,8 @@ pub fn load_cartridge_catalogues(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadRefusal {
+    /// Nothing exists at the recorded path any more.
+    Missing,
     Unreadable(String),
     TooLarge(u64),
     NotSingleMember(&'static str),
@@ -197,6 +211,7 @@ pub enum ReadRefusal {
 impl ReadRefusal {
     pub fn describe(&self) -> String {
         match self {
+            Self::Missing => "is no longer at this location".to_string(),
             Self::Unreadable(e) => format!("could not be read: {e}"),
             Self::TooLarge(n) => format!("{n} bytes is larger than this check reads"),
             Self::NotSingleMember(w) | Self::Unsafe(w) => (*w).to_string(),
@@ -217,8 +232,17 @@ pub fn read_check_file(
     path: &Path,
     trusted: &TrustedRoots,
 ) -> Result<(Option<String>, Vec<u8>), ReadRefusal> {
-    let safe = open_bounded_read(path, trusted)
-        .map_err(|refusal| ReadRefusal::Unreadable(refusal.detail()))?;
+    let safe = open_bounded_read(path, trusted).map_err(|refusal| {
+        // Only a confirmed absence is reported as missing; any other failure
+        // (permission, I/O, an unsafe link) stays "could not be read".
+        if std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            ReadRefusal::Missing
+        } else {
+            ReadRefusal::Unreadable(refusal.detail())
+        }
+    })?;
     let is_zip = path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
@@ -511,6 +535,44 @@ pub fn nes_structure(bytes: &[u8]) -> Option<Signal> {
     ))
 }
 
+/// Registers only an NES program writes: PPUCTRL, PPUMASK, PPUADDR, PPUDATA,
+/// OAMDMA and JOY1 strobe.
+const NES_WRITE_REGISTERS: [u16; 6] = [0x2000, 0x2001, 0x2006, 0x2007, 0x4014, 0x4016];
+
+/// Calibrated content validator for NES program code, headered or not.
+///
+/// The image must contain absolute stores (STA/STX/STY: 8D/8E/8C) to every one
+/// of [`NES_WRITE_REGISTERS`], and carry no validated header of another
+/// system. Calibrated on the owner's library (2026-11-08): 2,628 of 2,640
+/// No-Intro-verified NES images pass; 0 of ~1,700 images of other 6502-family
+/// systems (PC Engine, Atari 2600/5200/7800, Lynx, C64, ColecoVision, Master
+/// System) pass. Unlike [`nes_structure`] this establishes the platform, but
+/// never the game. File names, extensions, folders and sizes are not used.
+pub fn nes_register_signature(bytes: &[u8]) -> Option<Signal> {
+    let mut seen = [false; NES_WRITE_REGISTERS.len()];
+    for window in bytes.windows(3) {
+        if matches!(window[0], 0x8C..=0x8E) {
+            let address = u16::from_le_bytes([window[1], window[2]]);
+            if let Some(slot) = NES_WRITE_REGISTERS.iter().position(|r| *r == address) {
+                seen[slot] = true;
+            }
+        }
+    }
+    if !seen.iter().all(|s| *s) {
+        return None;
+    }
+    if header_signals(bytes)
+        .iter()
+        .any(|s| !same_platform(&s.platform, "NES"))
+    {
+        return None;
+    }
+    Some(signal(
+        "NES",
+        "program code writes every NES-only register (PPUCTRL $2000, PPUMASK $2001, PPUADDR $2006, PPUDATA $2007, OAM DMA $4014, JOY1 $4016) and there is no other system's header",
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Classification (pure)
 // ---------------------------------------------------------------------------
@@ -533,6 +595,8 @@ pub struct Evidence {
     pub hash_hits: Vec<HashHit>,
     pub signatures: Vec<Signal>,
     pub structure: Vec<Signal>,
+    /// Calibrated validators: establish the platform, never the game.
+    pub validators: Vec<Signal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -628,10 +692,43 @@ pub fn classify(e: &Evidence) -> Option<Classification> {
     if assigned_has_header {
         return None; // content agrees with the folder
     }
+    if e.validators
+        .iter()
+        .any(|s| consistent(&e.assigned, &s.platform))
+    {
+        return None; // a validator agrees with the folder
+    }
+    let mut validated: Vec<&str> = e.validators.iter().map(|s| s.platform.as_str()).collect();
+    validated.sort_unstable();
+    validated.dedup();
+    if let [detected] = validated.as_slice() {
+        let contradicting = e
+            .signatures
+            .iter()
+            .chain(e.structure.iter())
+            .any(|s| !consistent(detected, &s.platform));
+        if !contradicting {
+            return Some(Classification {
+                tier: Tier::PlatformConfirmed,
+                detected: (*detected).to_string(),
+                lines: e
+                    .validators
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{} (no catalogue hash matched; game identity unverified).",
+                            s.reason
+                        )
+                    })
+                    .collect(),
+            });
+        }
+    }
     let mut candidates: Vec<&Signal> = e
         .signatures
         .iter()
         .chain(e.structure.iter())
+        .chain(e.validators.iter())
         .filter(|s| !consistent(&e.assigned, &s.platform))
         .collect();
     candidates.sort_by(|a, b| a.platform.cmp(&b.platform));
@@ -663,6 +760,63 @@ pub fn classify(e: &Evidence) -> Option<Classification> {
     }
 }
 
+/// A game whose content confirms the system it is already assigned, but which
+/// does not sit in a folder the scanner reads as that system (a mixed or
+/// unsorted folder). Movable like a mismatch; the system does not change.
+pub fn outside_own_folder(e: &Evidence, path: &Path) -> Option<Classification> {
+    let folder_platform = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .and_then(|name| crate::platform::detect::platform_for_folder_name(&name))
+        .map(|platform| platform.id);
+    if folder_platform.is_some_and(|platform| consistent(&e.assigned, platform)) {
+        return None;
+    }
+    let own_hash: Vec<&HashHit> = e
+        .hash_hits
+        .iter()
+        .filter(|h| consistent(&e.assigned, &h.platform))
+        .collect();
+    let others = e
+        .hash_hits
+        .iter()
+        .any(|h| !consistent(&e.assigned, &h.platform))
+        || e.signatures
+            .iter()
+            .chain(e.structure.iter())
+            .chain(e.validators.iter())
+            .any(|s| !consistent(&e.assigned, &s.platform));
+    if others {
+        return None; // anything contradictory is handled (and shown) by classify
+    }
+    let where_now = "It is not in a folder for that system.";
+    if let Some(hit) = own_hash.first() {
+        return Some(Classification {
+            tier: Tier::Confirmed,
+            detected: e.assigned.clone(),
+            lines: vec![format!(
+                "Catalogue {}: entry \"{}\", SHA-1 {}. {where_now}",
+                hit.dat_name, hit.entry_name, hit.sha1
+            )],
+        });
+    }
+    let own: Vec<&Signal> = e
+        .signatures
+        .iter()
+        .chain(e.validators.iter())
+        .filter(|s| consistent(&e.assigned, &s.platform))
+        .collect();
+    (!own.is_empty()).then(|| Classification {
+        tier: Tier::PlatformConfirmed,
+        detected: e.assigned.clone(),
+        lines: own
+            .iter()
+            .map(|s| format!("{} (game identity unverified). {where_now}", s.reason))
+            .collect(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Detector
 // ---------------------------------------------------------------------------
@@ -682,6 +836,8 @@ pub struct Candidate {
 pub struct Finding {
     pub archive_id: i64,
     pub title: String,
+    /// The game file as it was checked.
+    pub path: PathBuf,
     pub folder: PathBuf,
     pub assigned: String,
     pub assigned_source: Option<String>,
@@ -700,11 +856,24 @@ pub struct RunOutput {
     /// Games per folder that were read, to show the disagreeing fraction.
     pub checked_per_folder: std::collections::BTreeMap<PathBuf, usize>,
     pub unreadable: usize,
+    /// No file at the recorded path any more (counted apart from unreadable).
+    pub missing: usize,
     /// Larger than [`MAX_CHECK_BYTES`].
     pub too_large: usize,
     /// Multi-member, unsafe or inconsistent ZIPs, or changed files.
     pub skipped: usize,
     pub cancelled: bool,
+    /// Games with no recorded system (`Candidate::assigned` empty) for which
+    /// this check found no platform evidence either, with the reason.
+    pub unknown: Vec<UnknownResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownResult {
+    pub archive_id: i64,
+    pub title: String,
+    pub path: PathBuf,
+    pub reason: String,
 }
 
 pub fn folder_of(path: &Path) -> PathBuf {
@@ -731,18 +900,28 @@ pub fn check_candidates(
         out.checked += 1;
         progress(out.checked);
         let folder = folder_of(&candidate.path);
+        let unassigned = candidate.assigned.is_empty();
+        let unknown = |reason: String| UnknownResult {
+            archive_id: candidate.archive_id,
+            title: candidate.title.clone(),
+            path: candidate.path.clone(),
+            reason,
+        };
         let (member, bytes) = match read_check_file(&candidate.path, trusted) {
             Ok(read) => read,
-            Err(ReadRefusal::Unreadable(_)) => {
-                out.unreadable += 1;
-                continue;
-            }
-            Err(ReadRefusal::TooLarge(_)) => {
-                out.too_large += 1;
-                continue;
-            }
-            Err(_) => {
-                out.skipped += 1;
+            Err(refusal) => {
+                match &refusal {
+                    ReadRefusal::Missing => out.missing += 1,
+                    ReadRefusal::Unreadable(_) => out.unreadable += 1,
+                    ReadRefusal::TooLarge(_) => out.too_large += 1,
+                    _ => out.skipped += 1,
+                }
+                if unassigned {
+                    out.unknown.push(unknown(format!(
+                        "The scan found no system and this check could not read the content: {}.",
+                        refusal.describe().trim_end_matches('.')
+                    )));
+                }
                 continue;
             }
         };
@@ -774,11 +953,23 @@ pub fn check_candidates(
             hash_hits,
             signatures: header_signals(&bytes),
             structure: nes_structure(&bytes).into_iter().collect(),
+            validators: nes_register_signature(&bytes).into_iter().collect(),
         };
-        if let Some(found) = classify(&evidence) {
+        let mut found = classify(&evidence);
+        if found.is_none() && !unassigned {
+            found = outside_own_folder(&evidence, &candidate.path);
+        }
+        if found.is_none() && unassigned {
+            out.unknown.push(unknown(
+                "No catalogue hash, validated header or calibrated content check matched any system."
+                    .into(),
+            ));
+        }
+        if let Some(found) = found {
             out.findings.push(Finding {
                 archive_id: candidate.archive_id,
                 title: candidate.title.clone(),
+                path: candidate.path.clone(),
                 folder,
                 assigned: candidate.assigned.clone(),
                 assigned_source: candidate.assigned_source.clone(),

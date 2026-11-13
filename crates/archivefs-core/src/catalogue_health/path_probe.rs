@@ -197,11 +197,66 @@ fn mount_of(file: &File) -> io::Result<MountObservation> {
     )
 }
 
+/// Whether this kernel reports mount IDs that are never reused
+/// (`STATX_MNT_ID_UNIQUE`, Linux 6.8+). Older IDs can be reused after an
+/// unmount, so they cannot tell one mount instance from the next.
+pub(crate) fn mount_ids_are_unique() -> bool {
+    static UNIQUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNIQUE.get_or_init(|| {
+        let mut out = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        // SAFETY: static NUL-terminated path and writable statx storage.
+        let rc = unsafe {
+            libc::statx(
+                libc::AT_FDCWD,
+                c"/".as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+                STATX_MNT_ID_UNIQUE,
+                out.as_mut_ptr(),
+            )
+        };
+        rc == 0 && unsafe { out.assume_init() }.stx_mask & STATX_MNT_ID_UNIQUE != 0
+    })
+}
+
+/// `fstatfs` filesystem type of a directory reached by pathname without
+/// following any symlink. Discovery uses it only to decide whether to walk a
+/// nested mount; persistence re-verifies through a pinned root.
+pub(crate) fn directory_filesystem_type(path: &Path) -> io::Result<i64> {
+    binding(&open(libc::AT_FDCWD, path, false, false)?).map(|binding| binding.filesystem_type)
+}
+
 /// Mount identity of a directory by pathname (no final symlink follow).
 pub(crate) fn directory_mount(path: &Path) -> io::Result<MountObservation> {
     let name =
         CString::new(path.as_os_str().as_bytes()).map_err(|_| io::ErrorKind::InvalidInput)?;
-    statx_mount(libc::AT_FDCWD, &name, libc::AT_SYMLINK_NOFOLLOW)
+    let observed = statx_mount(libc::AT_FDCWD, &name, libc::AT_SYMLINK_NOFOLLOW);
+    #[cfg(test)]
+    let observed = observed.map(|mut mount| {
+        if test_mounts::is_simulated(path) {
+            mount.mount_id = mount.mount_id.wrapping_add(test_mounts::OFFSET);
+        }
+        mount
+    });
+    observed
+}
+
+/// Unprivileged tests cannot mount a filesystem, so a test can mark
+/// directories (and everything beneath them) as a separate mount for
+/// `directory_mount` on the current thread only.
+#[cfg(test)]
+pub(crate) mod test_mounts {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    pub(super) const OFFSET: u64 = 1 << 40;
+    thread_local!(static SIMULATED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) });
+
+    pub(crate) fn simulate(path: &Path) {
+        SIMULATED.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
+    }
+    pub(super) fn is_simulated(path: &Path) -> bool {
+        SIMULATED.with(|paths| paths.borrow().iter().any(|root| path.starts_with(root)))
+    }
 }
 
 pub(crate) struct BoundRoot {
@@ -324,8 +379,29 @@ impl BoundRoot {
     pub(crate) fn root_path(&self) -> &Path {
         &self.path
     }
+    /// Kernel mount ID of the pinned root descriptor itself.
+    pub(crate) fn mount_id(&self) -> io::Result<u64> {
+        mount_of(&self.file).map(|mount| mount.mount_id)
+    }
     pub(crate) fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
         self.target(path, false)?.metadata()
+    }
+    /// Names in one directory beneath this root. The directory itself is
+    /// resolved with the owned rules (beneath, no symlinks, no mount
+    /// crossing) and listed through that descriptor, never by pathname.
+    pub(crate) fn list_dir(&self, path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+        let directory = self.target(path, true)?;
+        if !directory.metadata()?.is_dir() {
+            return Err(io::ErrorKind::NotADirectory.into());
+        }
+        let mut names = std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()?;
+        if !self.current() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        names.sort();
+        Ok(names)
     }
     pub(crate) fn read_file(&self, path: &Path, expected: &PathObservation) -> Option<File> {
         let file = self.target(path, true).ok()?;

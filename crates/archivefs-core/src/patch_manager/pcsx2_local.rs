@@ -2087,7 +2087,7 @@ pub struct Pcsx2Config {
 /// `inis/PCSX2.ini` and falling back to the older `PCSX2.ini` directly at
 /// the profile root (the same two locations `inspect_pcsx2_marker`,
 /// above, already treats as equally valid PCSX2 evidence).
-fn pcsx2_global_config_path(configuration_path: &Path) -> PathBuf {
+pub(super) fn pcsx2_global_config_path(configuration_path: &Path) -> PathBuf {
     let modern = configuration_path.join("inis/PCSX2.ini");
     if is_regular_file_no_follow(&modern) {
         modern
@@ -2096,7 +2096,7 @@ fn pcsx2_global_config_path(configuration_path: &Path) -> PathBuf {
     }
 }
 
-fn inspect_pcsx2_config(path: &Path) -> Pcsx2Config {
+pub(super) fn inspect_pcsx2_config(path: &Path) -> Pcsx2Config {
     let exists = path.exists();
     let mut warnings = Vec::new();
     let text = match read_bounded_text(path, PCSX2_MAX_CONFIG_BYTES) {

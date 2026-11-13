@@ -200,6 +200,7 @@ mod tests {
             sanitisation_notes: Vec::new(),
             actionable: true,
             audited_identity: None,
+            audited_fingerprint: None,
             is_outer_archive: false,
         }
     }

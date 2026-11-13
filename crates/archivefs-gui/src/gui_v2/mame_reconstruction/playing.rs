@@ -317,6 +317,7 @@ pub(super) fn request(
         selected_content: content,
         expected_content_identity,
         rom_search_path: report.inputs.root.clone(),
+        extra_rompaths: Vec::new(),
     };
     preflight_mame_launch(&request).map_err(|e| {
         e.blockers

@@ -380,12 +380,15 @@ impl Database {
                     "source changed at scan commit; catalogue evidence preserved".into(),
                 ));
             }
-            // Authority that was proven earlier must still hold at commit.
+            // Authority that was proven earlier must still hold at commit. A
+            // nested mount this run excluded from Missing may be unproven;
+            // any other must still be the mount the run proved.
             if covered.state == ScanCoverageState::Complete
                 && let Some(root) = BoundRoot::open(&covered.root)
-                && !self
+                && self
                     .unproven_nested_boundaries(covered.source_id, &root)?
-                    .is_empty()
+                    .iter()
+                    .any(|(path, _)| !covered.excluded_roots.iter().any(|r| path.starts_with(r)))
             {
                 return Err(ArchiveFsError::Database(
                     "nested filesystem boundary changed at scan commit; catalogue evidence preserved"
@@ -1047,4 +1050,89 @@ pub(super) fn unproven_nested_boundaries_on(
         }
     }
     Ok(unproven)
+}
+
+/// Remembered nested mounts beneath one source, as the Missing write boundary
+/// sees them. Rows beneath an excluded mount are never candidates; every
+/// other remembered mount must be open now as the exact mount its record
+/// names, and rows beneath it are probed through that mount's own pinned
+/// root (owned rules, so never across a further mount).
+pub(super) struct MissingAreas {
+    /// Every remembered nested mount path (excluded or not).
+    pub(super) boundaries: Vec<PathBuf>,
+    live: Vec<crate::catalogue_health::LiveArea>,
+}
+
+impl MissingAreas {
+    /// Probes `path` through the innermost live area containing it, or
+    /// through the source root outside every area.
+    pub(super) fn probe(
+        &self,
+        source: &BoundRoot,
+        path: &Path,
+        directory: bool,
+    ) -> crate::catalogue_health::PathObservation {
+        match self
+            .live
+            .iter()
+            .filter(|area| path.starts_with(area.path()))
+            .max_by_key(|area| area.path().as_os_str().len())
+        {
+            Some(area) if area.current(source) => area.root.probe(path, directory),
+            Some(_) => crate::catalogue_health::PathObservation::unsafe_observation(),
+            None => source.probe(path, directory),
+        }
+    }
+
+    pub(super) fn current(&self, source: &BoundRoot) -> bool {
+        self.live.iter().all(|area| area.current(source))
+    }
+}
+
+pub(super) fn missing_areas(
+    connection: &Connection,
+    source: i64,
+    root: &BoundRoot,
+    excluded: &[PathBuf],
+) -> Result<MissingAreas> {
+    let mut stmt = connection
+        .prepare("SELECT relative_path,binding_json FROM source_nested_boundaries WHERE source_folder_id=?1 ORDER BY relative_path")
+        .map_err(|e| db_error("prepare nested mounts for missing", e))?;
+    let rows: Vec<(Vec<u8>, Option<String>)> = stmt
+        .query_map([source], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| db_error("read nested mounts for missing", e))?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|e| db_error("decode nested mounts for missing", e))?;
+    let mut areas = MissingAreas {
+        boundaries: Vec::new(),
+        live: Vec::new(),
+    };
+    for (relative, json) in rows {
+        let path = root
+            .root_path()
+            .join(PathBuf::from(OsString::from_vec(relative)));
+        areas.boundaries.push(path.clone());
+        if excluded.iter().any(|r| path.starts_with(r)) {
+            continue;
+        }
+        let refuse = |reason: &str| {
+            ArchiveFsError::Database(format!(
+                "nested mount {} {reason}; no missing evidence written",
+                path.display()
+            ))
+        };
+        let record = json
+            .as_deref()
+            .and_then(crate::catalogue_health::NestedBoundaryRecord::decode)
+            .filter(|record| record.stable.is_some())
+            .ok_or_else(|| refuse("has no proven identity"))?;
+        let live = crate::catalogue_health::open_area(root, &path).map_err(refuse)?;
+        // The exact instance this scan proved: binding alone cannot tell a
+        // remount that reused the device number.
+        if live.binding() != &record.binding || Some(live.mount_id) != record.mount_id {
+            return Err(refuse("changed since its coverage was proven"));
+        }
+        areas.live.push(live);
+    }
+    Ok(areas)
 }

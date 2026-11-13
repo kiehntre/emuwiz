@@ -1209,8 +1209,13 @@ fn write_zip_test_config(ready: &ReadyFixture, extra: &str) {
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    let saves = PathBuf::from("/var/tmp").join(format!("{unique}-saves"));
-    let states = PathBuf::from("/var/tmp").join(format!("{unique}-states"));
+    let _ = unique;
+    // Shared, fixed folders (RetroArch ignores a missing one, so the staged
+    // route requires them to exist); never removed, so tests cannot race.
+    let saves = PathBuf::from("/var/tmp/emuwiz-zip-test-saves");
+    let states = PathBuf::from("/var/tmp/emuwiz-zip-test-states");
+    fs::create_dir_all(&saves).unwrap();
+    fs::create_dir_all(&states).unwrap();
     ready.fixture.write(
         "config/retroarch/retroarch.cfg",
         format!(
@@ -1566,8 +1571,707 @@ fn only_cartridge_platform_zips_count_as_zipped_cartridges() {
     use std::path::Path;
     assert!(zipped(Path::new("/r/g.zip"), "SNES"));
     assert!(zipped(Path::new("/r/g.ZIP"), "MegaDrive"));
-    for platform in ["Arcade", "MAME", "PlayStation", "GameCube", "Amiga"] {
+    // A zipped Amiga floppy game stages its IPF disks the same way.
+    assert!(zipped(Path::new("/r/g.zip"), "Amiga"));
+    for platform in ["Arcade", "MAME", "PlayStation", "GameCube"] {
         assert!(!zipped(Path::new("/r/g.zip"), platform), "{platform}");
     }
     assert!(!zipped(Path::new("/r/g.sfc"), "SNES"));
+}
+
+// ---- NW2-C-01: sort saves/states by content folder ----
+
+/// NW2-C-01: with RetroArch's "sort saves/states by content directory" on,
+/// saves go to <savefile_directory>/<content folder name>/. A staged zipped
+/// cartridge runs from a fresh random `emuwiz-zip-rom-*` folder each launch,
+/// so the save would land somewhere new every time. The staged route must
+/// refuse, as it already does for the *_in_content_dir keys.
+#[test]
+fn nw2_c01_zipped_cartridge_is_refused_when_retroarch_sorts_saves_by_content_folder() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let rom = b"synthetic mega drive rom bytes";
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+    ] {
+        let (ready, _, _) = zipped_ready(&format!("nw2-c01-{key}"), &[("a.md", rom)]);
+        write_zip_test_config(&ready, &format!("{key} = \"true\"\n"));
+        let result = preflight_and_launch_retroarch_with_playlist(
+            &ready.request,
+            &HostReadOnlyFilesystem,
+            &ready.environment,
+            None,
+        );
+        let Err(error) = result else {
+            panic!(
+                "{key} = true: the staged launch went ahead, so saves land in a new per-launch folder"
+            );
+        };
+        assert!(format!("{error:?}").contains(key), "{error:?}");
+    }
+}
+
+/// Runs only the staged-launch safety check against a config with `extra`.
+fn staged_safety_with(label: &str, extra: &str) -> Result<(), String> {
+    let (ready, _, _) = zipped_ready(label, &[("a.md", b"synthetic mega drive rom bytes")]);
+    write_zip_test_config(&ready, extra);
+    staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment)
+}
+
+#[test]
+fn nw2_c01_sort_by_content_keys_accept_only_absent_or_explicit_false() {
+    assert_eq!(staged_safety_with("nw2-c01-absent", ""), Ok(()));
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+    ] {
+        for ok in ["\"false\"", "false", "FALSE", "\"0\"", "0"] {
+            assert_eq!(
+                staged_safety_with("nw2-c01-ok", &format!("{key} = {ok}\n")),
+                Ok(()),
+                "{key} = {ok}"
+            );
+        }
+        for bad in [
+            "\"true\"", "true", "\"1\"", "1", "\"yes\"", "\"\"", "true # x",
+        ] {
+            let error = staged_safety_with("nw2-c01-bad", &format!("{key} = {bad}\n"))
+                .expect_err(&format!("{key} = {bad} must be refused"));
+            assert!(error.contains(key), "{error}");
+            assert!(error.contains("emuwiz-zip-rom-"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn nw2_c01_conflicting_duplicate_sort_by_content_keys_are_refused() {
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+    ] {
+        let error = staged_safety_with(
+            "nw2-c01-dup",
+            &format!("{key} = \"false\"\n{key} = \"true\"\n"),
+        )
+        .expect_err("conflicting duplicates must be refused");
+        assert!(
+            error.contains("more than once") && error.contains(key),
+            "{error}"
+        );
+        // Identical duplicates are not a conflict.
+        assert_eq!(
+            staged_safety_with(
+                "nw2-c01-dup-same",
+                &format!("{key} = \"false\"\n{key} = \"false\"\n")
+            ),
+            Ok(())
+        );
+    }
+}
+
+/// A UTF-8 byte-order mark on line 1 must not hide a key from the check.
+#[test]
+fn nw2_c01_leading_bom_does_not_hide_sort_by_content_keys() {
+    let bom_config = |label: &str, first: &str| -> Result<(), String> {
+        let (ready, _, _) = zipped_ready(label, &[("a.md", b"synthetic mega drive rom bytes")]);
+        write_zip_test_config(&ready, "");
+        let path = ready.fixture.path("config/retroarch/retroarch.cfg");
+        let body = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("\u{feff}{first}{body}")).unwrap();
+        staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment)
+    };
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+        "savefiles_in_content_dir",
+    ] {
+        let error = bom_config("nw2-c01-bom-true", &format!("{key} = \"true\"\n"))
+            .expect_err("BOM + true must be refused");
+        assert!(error.contains(key), "{error}");
+        assert_eq!(
+            bom_config("nw2-c01-bom-false", &format!("{key} = \"false\"\n")),
+            Ok(())
+        );
+    }
+    assert_eq!(bom_config("nw2-c01-bom-absent", ""), Ok(()));
+}
+
+// ---------------------------------------------------------------------------
+// Unverified (one-time try / remembered / saved system) launches: the
+// content-bound `unverified:` key is held from readiness to the spawn
+// ---------------------------------------------------------------------------
+
+fn unverified_key(path: &std::path::Path) -> String {
+    let identity =
+        crate::launch::unverified_media::platform_media_identity_fresh(path, "MegaDrive")
+            .expect("the format is one Mega Drive lists");
+    assert!(crate::launch::unverified_media::is_unverified_key(
+        &identity.game_key
+    ));
+    identity.game_key
+}
+
+/// Replaces the fake RetroArch with one that records the content it was
+/// handed (its last argument): the path and that file's bytes.
+fn record_handoff(ready: &ReadyFixture) -> (PathBuf, PathBuf) {
+    let path_out = ready.fixture.path("handoff-path.txt");
+    let bytes_out = ready.fixture.path("handoff-bytes.bin");
+    ready.fixture.write_executable(
+        "bin/retroarch",
+        format!(
+            "#!/bin/sh\nfor a; do last=\"$a\"; done\nprintf '%s' \"$last\" > '{}'\ncat \"$last\" > '{}'\nexit 0\n",
+            path_out.display(),
+            bytes_out.display()
+        )
+        .as_bytes(),
+    );
+    (path_out, bytes_out)
+}
+
+fn wait_for_exit(process: &mut LaunchedRetroArchProcess) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while process.poll().is_none() {
+        assert!(std::time::Instant::now() < deadline, "fake script exits");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn an_unverified_zipped_cartridge_reaches_the_emulator_and_changed_zips_are_refused() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let before = staged_dirs();
+    let rom = b"synthetic mega drive rom bytes";
+
+    // Unchanged ZIP, one valid member, unverified key bound to the ZIP: the
+    // member itself is what RetroArch receives, from a private copy.
+    let (mut ready, zip, _) = zipped_ready("zip-unverified-ok", &[("Game (USA).md", rom)]);
+    ready.request.expected_game_key = unverified_key(&zip);
+    let (path_out, bytes_out) = record_handoff(&ready);
+    let zip_before = fs::read(&zip).unwrap();
+    let mut process = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .expect("an unchanged zipped cartridge tried as Mega Drive launches");
+    let staged = process
+        .staged_cartridge
+        .as_ref()
+        .expect("staged copy travels with the process")
+        .path()
+        .to_path_buf();
+    wait_for_exit(&mut process);
+    assert_eq!(
+        fs::read(&bytes_out).unwrap(),
+        rom,
+        "the member reached RetroArch"
+    );
+    assert_eq!(
+        PathBuf::from(fs::read_to_string(&path_out).unwrap()),
+        staged
+    );
+    assert_ne!(staged, zip, "never the ZIP itself");
+    assert_eq!(fs::read(&zip).unwrap(), zip_before, "ZIP never modified");
+
+    // The ZIP was replaced after readiness (a different member): refused.
+    let (mut ready, zip, _) = zipped_ready("zip-unverified-member", &[("a.md", rom)]);
+    ready.request.expected_game_key = unverified_key(&zip);
+    let (_, bytes_out) = record_handoff(&ready);
+    write_rom_zip(&zip, &[("a.md", b"a different rom entirely")]);
+    let error = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .err()
+    .expect("a ZIP whose member changed must not launch");
+    assert!(
+        format!("{error:?}").contains("IdentityUnresolved"),
+        "{error:?}"
+    );
+    assert!(!bytes_out.exists(), "nothing was started");
+
+    // Same member, different archive bytes (a member added): refused.
+    let (mut ready, zip, _) = zipped_ready("zip-unverified-archive", &[("a.md", rom)]);
+    ready.request.expected_game_key = unverified_key(&zip);
+    write_rom_zip(&zip, &[("a.md", rom), ("readme.txt", b"hello")]);
+    let error = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .err()
+    .expect("a changed ZIP must not launch");
+    assert!(
+        format!("{error:?}").contains("IdentityUnresolved"),
+        "{error:?}"
+    );
+
+    // The member's key is never accepted in place of the ZIP's.
+    let (mut ready, _, _) = zipped_ready("zip-unverified-wrong-key", &[("a.md", rom)]);
+    let loose = ready.fixture.write("content/member.md", rom);
+    ready.request.expected_game_key = unverified_key(&loose);
+    let error = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .err()
+    .expect("a key for other bytes never authorises the ZIP");
+    assert!(
+        format!("{error:?}").contains("IdentityUnresolved"),
+        "{error:?}"
+    );
+    assert_eq!(staged_dirs(), before, "no staging directory left behind");
+}
+
+#[test]
+fn an_unverified_file_changed_between_preflight_and_spawn_is_refused() {
+    let mut ready = build_ready_fixture("unverified-spawn-swap");
+    let content = ready.request.selected_content_path.clone();
+    ready.request.expected_game_key = unverified_key(&content);
+    let command = preflight(&ready).expect("unchanged unverified file passes preflight");
+    assert_eq!(
+        command.unverified_game_key.as_deref(),
+        Some(ready.request.expected_game_key.as_str())
+    );
+    // Different bytes of the same listed format, same path.
+    fs::write(&content, b"other mega drive rom bytes!!!!").unwrap();
+    assert!(
+        spawn_retroarch(command).is_err(),
+        "spawn re-derives the key and refuses a different file"
+    );
+}
+
+#[test]
+fn an_unverified_file_whose_header_names_another_system_is_refused_at_preflight() {
+    let mut rom = vec![0u8; 0x400];
+    rom[0x100..0x109].copy_from_slice(b"SEGA PICO");
+    let mut ready = build_ready_fixture("unverified-pico");
+    let content = ready.request.selected_content_path.clone();
+    fs::write(&content, &rom).unwrap();
+    ready.request.expected_game_key = unverified_key(&content);
+    let error = preflight(&ready).unwrap_err();
+    assert_eq!(error.kind, LaunchPreflightErrorKind::IdentityUnresolved);
+    assert!(error.detail.contains("Sega Pico"), "{}", error.detail);
+}
+
+/// A ZIP renamed over the approved one after the key was checked can never
+/// be extracted in its place: the key is read through staging's own handle,
+/// and a path that no longer names that handle's file is refused.
+#[test]
+fn a_zip_swapped_in_after_its_key_was_checked_is_never_extracted() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let before = staged_dirs();
+    let (ready, zip, _) = zipped_ready("zip-swap-race", &[("a.md", b"approved rom bytes")]);
+    let approved = unverified_key(&zip);
+    let other = ready.fixture.path("content/other.zip");
+    write_rom_zip(&other, &[("a.md", b"a different rom entirely")]);
+    let result = crate::zip_cartridge_stage::stage_zip_cartridge_for_launch_checked(
+        &zip,
+        "MegaDrive",
+        |file| {
+            let keyed = crate::launch::unverified_media::platform_media_key_of_open_file(
+                file,
+                &zip,
+                "MegaDrive",
+            );
+            // The swap lands after the handle was opened.
+            fs::rename(&other, &zip).unwrap();
+            keyed.as_deref() == Some(approved.as_str())
+        },
+    );
+    match result {
+        Ok(staged) => panic!(
+            "extracted {:?} from a swapped ZIP",
+            fs::read(staged.path()).unwrap()
+        ),
+        Err(error) => assert!(
+            matches!(error, crate::zip_cartridge_stage::StageZipError::Refused(_)),
+            "{error:?}"
+        ),
+    }
+    // A key that does not match is refused before anything is extracted.
+    let (_ready, zip, _) = zipped_ready("zip-swap-key", &[("a.md", b"approved rom bytes")]);
+    assert_eq!(
+        crate::zip_cartridge_stage::stage_zip_cartridge_for_launch_checked(
+            &zip,
+            "MegaDrive",
+            |_| false
+        )
+        .err(),
+        Some(crate::zip_cartridge_stage::StageZipError::NotAccepted)
+    );
+    assert_eq!(staged_dirs(), before, "no staging directory left behind");
+}
+
+/// A Sega Pico ZIP (owner approval 2026-11-10) goes to PicoDrive: its one
+/// `.md` member is staged under the Mega Drive member rules, the launch stays
+/// Sega Pico, and the same key and header checks hold.
+#[test]
+fn a_sega_pico_zip_reaches_picodrive_and_never_runs_as_mega_drive() {
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rom = vec![0u8; 0x400];
+    rom[0x100..0x110].copy_from_slice(b"SEGA PICO       ");
+    let (mut ready, zip, _) = zipped_ready("pico-zip", &[("Anpanman (Japan).md", &rom)]);
+    ready
+        .fixture
+        .write("cores/picodrive_libretro.so", b"stub core");
+    ready.fixture.write(
+        "info/picodrive.info",
+        b"systemname = \"Sega 8/16-bit + 32X (Various)\"\ndatabase = \"Sega - Mega Drive - Genesis|Sega - PICO|Sega - 32X\"\n",
+    );
+    let key = crate::launch::unverified_media::platform_media_identity_fresh(&zip, "Sega Pico")
+        .expect("Sega Pico lists zip")
+        .game_key;
+    ready.request.expected_platform_id = "Sega Pico".into();
+    ready.request.core_stem = "picodrive".into();
+    ready.request.expected_game_key = key.clone();
+    let (path_out, bytes_out) = record_handoff(&ready);
+    let mut process = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .expect("a Pico ZIP launches through PicoDrive");
+    wait_for_exit(&mut process);
+    assert_eq!(
+        fs::read(&bytes_out).unwrap(),
+        rom,
+        "the Pico ROM reached PicoDrive"
+    );
+    assert!(
+        fs::read_to_string(&path_out)
+            .unwrap()
+            .ends_with("Anpanman (Japan).md")
+    );
+    // The same file as Mega Drive is refused by its own header.
+    ready.request.expected_platform_id = "MegaDrive".into();
+    ready.request.core_stem = "genesis_plus_gx".into();
+    ready.request.expected_game_key = unverified_key(&zip);
+    let error = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .err()
+    .expect("a Pico ROM never runs as Mega Drive");
+    assert!(format!("{error:?}").contains("Sega Pico"), "{error:?}");
+}
+
+/// Writes a `retroarch.cfg` whose save/state keys are given verbatim and points
+/// the discovery home at a folder outside the system temp folder (the staged
+/// route refuses saves under it). Returns the fixture and that home.
+fn tilde_config_ready(label: &str, save_keys: &str) -> (ReadyFixture, PathBuf) {
+    let (mut ready, _, _) = zipped_ready(label, &[("a.md", b"synthetic mega drive rom bytes")]);
+    let unique = ready
+        .fixture
+        .root
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let home = PathBuf::from("/var/tmp").join(format!("{unique}-home"));
+    fs::create_dir_all(home.join(".config/retroarch/saves")).unwrap();
+    fs::create_dir_all(home.join(".config/retroarch/states")).unwrap();
+    ready.environment.home = Some(home.clone().into_os_string());
+    ready.fixture.write(
+        "config/retroarch/retroarch.cfg",
+        format!(
+            "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n{save_keys}",
+            ready.fixture.path("cores").display(),
+            ready.fixture.path("info").display(),
+        )
+        .as_bytes(),
+    );
+    (ready, home)
+}
+
+/// The exact save/state lines from the 2026-11-10 production smoke test
+/// (`~/.config/retroarch/retroarch.cfg`), which refused every zipped cartridge.
+const SMOKE_TEST_TILDE_SAVE_KEYS: &str = "savefile_directory = \"~/.config/retroarch/saves\"\n\
+savefiles_in_content_dir = \"false\"\n\
+savestate_directory = \"~/.config/retroarch/states\"\n\
+savestates_in_content_dir = \"false\"\n\
+sort_savefiles_by_content_enable = \"false\"\n\
+sort_savefiles_enable = \"false\"\n\
+sort_savestates_by_content_enable = \"false\"\n\
+sort_savestates_enable = \"false\"\n";
+
+#[test]
+fn zipped_cartridge_accepts_retroarch_tilde_save_dirs_from_the_smoke_test_config() {
+    let (ready, home) = tilde_config_ready("zip-tilde-smoke", SMOKE_TEST_TILDE_SAVE_KEYS);
+    assert_eq!(
+        staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment),
+        Ok(()),
+        "`~/` save and state folders are expanded against the user's home, as RetroArch does"
+    );
+    let _serial = STAGING_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut process = preflight_and_launch_retroarch_with_playlist(
+        &ready.request,
+        &HostReadOnlyFilesystem,
+        &ready.environment,
+        None,
+    )
+    .expect("a zipped cartridge launches with RetroArch-style `~/` save folders");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while process.poll().is_none() {
+        assert!(std::time::Instant::now() < deadline, "fake script exits");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn zipped_cartridge_still_refuses_unexpandable_or_unsafe_save_dirs() {
+    let refused = |label: &str, saves: &str, states: &str| -> String {
+        let (ready, home) = tilde_config_ready(
+            label,
+            &format!("savefile_directory = \"{saves}\"\nsavestate_directory = \"{states}\"\n"),
+        );
+        let result =
+            staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment);
+        let _ = fs::remove_dir_all(home);
+        result.expect_err(&format!("{saves} / {states} must be refused"))
+    };
+    // Forms RetroArch's own `~` expansion does not cover stay refused.
+    for (saves, states) in [
+        ("~other/saves", "~/states"),
+        ("~/saves", "~other/states"),
+        (":/saves", "~/states"),
+        ("saves", "~/states"),
+        ("", "~/states"),
+    ] {
+        refused("zip-tilde-bad", saves, states);
+    }
+    // Expansion happens before the existing checks, which still apply.
+    let same = refused("zip-tilde-same", "~/retroarch/saves", "~/retroarch/saves");
+    assert!(same.contains("separate"), "{same}");
+}
+
+#[test]
+fn zipped_cartridge_tilde_save_dirs_inside_a_temporary_home_are_refused() {
+    // Home itself under the system temp folder: the expanded folders are
+    // temporary, so the existing temporary-folder refusal must still fire.
+    let (mut ready, _, _) = zipped_ready(
+        "zip-tilde-temp-home",
+        &[("a.md", b"synthetic mega drive rom bytes")],
+    );
+    ready.fixture.write(
+        "config/retroarch/retroarch.cfg",
+        format!(
+            "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\n{SMOKE_TEST_TILDE_SAVE_KEYS}",
+            ready.fixture.path("cores").display(),
+            ready.fixture.path("info").display(),
+        )
+        .as_bytes(),
+    );
+    ready.environment.home = Some(ready.fixture.root.clone().into_os_string());
+    let error = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment)
+        .expect_err("saves under the temporary folder are refused");
+    assert!(error.contains("temporary"), "{error}");
+}
+
+// ---- 2026-11-10: real-configuration ZIP preflight (false /etc refusal) ----
+
+/// The owner's real `~/.config/retroarch/retroarch.cfg` lines that bear on the
+/// staged route (RetroArch 1.22.2, Ubuntu package): `~/` save folders, the
+/// override folder named through `rgui_config_directory`, auto overrides on.
+const REAL_WORLD_USER_KEYS: &str = "config_save_on_exit = \"true\"\n\
+auto_overrides_enable = \"true\"\n\
+rgui_config_directory = \"~/.config/retroarch/config/\"\n";
+
+#[test]
+fn zip_preflight_accepts_the_real_world_user_config_even_with_a_packaged_etc_skeleton() {
+    // Ubuntu's retroarch package installs /etc/retroarch.cfg, a template that
+    // RetroArch only copies when it must create a user settings file; with
+    // the user's own file present it is never opened (checked with strace on
+    // 1.22.2). This test runs unchanged on machines with that file.
+    let (ready, home) = tilde_config_ready(
+        "zip-real-world",
+        &format!("{SMOKE_TEST_TILDE_SAVE_KEYS}{REAL_WORLD_USER_KEYS}"),
+    );
+    // Per-core folders RetroArch created, with no override files in them.
+    fs::create_dir_all(home.join(".config/retroarch/config/PicoDrive")).unwrap();
+    fs::create_dir_all(home.join(".config/retroarch/config/Genesis Plus GX")).unwrap();
+    let result = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment);
+    let _ = fs::remove_dir_all(&home);
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn zip_preflight_still_refuses_a_legacy_home_retroarch_cfg() {
+    let (ready, home) = tilde_config_ready("zip-legacy-home", SMOKE_TEST_TILDE_SAVE_KEYS);
+    fs::write(home.join(".retroarch.cfg"), b"").unwrap();
+    let result = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment);
+    let _ = fs::remove_dir_all(&home);
+    assert!(result.expect_err("legacy file refused").contains("legacy"));
+}
+
+#[test]
+fn zip_preflight_refuses_save_folders_that_do_not_exist() {
+    let (ready, home) = tilde_config_ready("zip-missing-dir", SMOKE_TEST_TILDE_SAVE_KEYS);
+    fs::remove_dir(home.join(".config/retroarch/states")).unwrap();
+    let result = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment);
+    let _ = fs::remove_dir_all(&home);
+    let error = result.expect_err("a missing states folder is refused");
+    assert!(
+        error.contains("savestate_directory") && error.contains("does not exist"),
+        "{error}"
+    );
+    assert!(!error.contains("savefile_directory"), "{error}");
+}
+
+#[test]
+fn zip_preflight_refuses_overrides_in_the_configured_rgui_config_directory() {
+    let (ready, home) = tilde_config_ready(
+        "zip-rgui-overrides",
+        &format!(
+            "{SMOKE_TEST_TILDE_SAVE_KEYS}rgui_config_directory = \"~/elsewhere/overrides/\"\n"
+        ),
+    );
+    let core = home.join("elsewhere/overrides/PicoDrive");
+    fs::create_dir_all(&core).unwrap();
+    fs::write(core.join("PicoDrive.cfg"), b"savefile_directory = \"/x\"\n").unwrap();
+    let result = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment);
+    let _ = fs::remove_dir_all(&home);
+    assert!(result.expect_err("override refused").contains("override"));
+}
+
+#[test]
+fn zip_preflight_reports_every_problem_together() {
+    let (ready, home) = tilde_config_ready(
+        "zip-all-findings",
+        "savefile_directory = \"~/.config/retroarch/saves\"\n\
+         savestate_directory = \"~/.config/retroarch/nostates\"\n\
+         savefiles_in_content_dir = \"true\"\n\
+         sort_savestates_by_content_enable = \"true\"\n",
+    );
+    // `config/` beside the settings file the discovery read.
+    ready
+        .fixture
+        .write("config/retroarch/config/PicoDrive/PicoDrive.cfg", b"");
+    fs::write(home.join(".retroarch.cfg"), b"").unwrap();
+    let result = staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment);
+    let _ = fs::remove_dir_all(&home);
+    let error = result.expect_err("refused");
+    for expected in [
+        "beside the game",
+        "sort_savestates_by_content_enable",
+        "does not exist",
+        "override",
+        "legacy",
+    ] {
+        assert!(error.contains(expected), "missing {expected:?} in: {error}");
+    }
+}
+
+/// Read-only diagnostic of the complete ZIP launch preflight against this
+/// machine's real RetroArch, settings, PicoDrive core and a real Pico ZIP.
+/// Nothing is launched and nothing is written outside a private temporary
+/// extraction that is removed on return. Run with
+/// `EMUWIZ_TEST_REAL_ENVIRONMENT=1 ... -- --ignored --nocapture`.
+#[test]
+#[ignore = "reads the real RetroArch installation and library; opt-in only"]
+fn real_environment_pico_zip_preflight_diagnostic() {
+    use crate::emulator_environment::retroarch::DiscoveryEnvironment as Env;
+    if std::env::var_os("EMUWIZ_TEST_REAL_ENVIRONMENT").is_none() {
+        eprintln!("EMUWIZ_TEST_REAL_ENVIRONMENT not set; skipped");
+        return;
+    }
+    let zip = PathBuf::from(std::env::var("EMUWIZ_TEST_REAL_ZIP").unwrap_or_else(|_| {
+        "/mnt/usbdrive/games/sega-pico/3-choume no Tama - Momo-chan wa Doko! (Japan) (Rev 1).zip"
+            .into()
+    }));
+    let environment = Env::from_process_environment();
+    let report = discover_retroarch_environment(&HostReadOnlyFilesystem, &environment)
+        .expect("RetroArch discovery");
+    let profile = report
+        .profiles
+        .iter()
+        .find(|p| p.profile_kind == ProfileKind::Native)
+        .expect("a native RetroArch profile");
+    eprintln!("config file: {}", profile.config_file.path.display);
+    let platform = "Sega Pico";
+    let mut file = fs::File::open(&zip).expect("real ZIP opens");
+    let key =
+        super::super::unverified_media::platform_media_key_of_open_file(&mut file, &zip, platform)
+            .expect("real ZIP has an unverified media key");
+    let executable = match profile.evidence.executables.as_slice() {
+        [one] => {
+            Some(RetroArchExecutableBinding::capture(PathBuf::from(&one.display)).expect("binding"))
+        }
+        _ => None,
+    };
+    eprintln!("program: {:?}", executable.as_ref().map(|b| &b.path));
+    let request = RetroArchLaunchRequest {
+        saturn_core_selection: None,
+        launch_choice: None,
+        expected_snapshot_evidence: None,
+        selected_content_path: zip.clone(),
+        expected_platform_id: platform.into(),
+        expected_game_key: key,
+        profile: ProfileRef {
+            profile_kind: profile.profile_kind,
+            scope: profile.scope,
+        },
+        core_stem: "picodrive".into(),
+        expected_appimage_executable: None,
+        expected_executable_binding: executable,
+        expected_configuration_file: Some(PathBuf::from(&profile.config_file.path.display)),
+    };
+    let findings = staged_launch_findings(&request, &HostReadOnlyFilesystem, &environment);
+    eprintln!("save-safety findings ({}):", findings.len());
+    for finding in &findings {
+        eprintln!("  - {finding}");
+    }
+    match prepare_retroarch_launch_with_playlist(
+        &request,
+        &HostReadOnlyFilesystem,
+        &environment,
+        None,
+    ) {
+        Ok(prepared) => {
+            eprintln!("COMPLETE PREFLIGHT: PASS");
+            eprintln!("arguments: {:?}", prepared.command.arguments);
+            eprintln!("staged: {:?}", prepared.staged_content_path());
+        }
+        Err(error) => {
+            eprintln!("COMPLETE PREFLIGHT: REFUSED: {error:?}");
+            panic!("complete preflight refused");
+        }
+    }
+    assert!(findings.is_empty());
+}
+
+#[test]
+fn staged_playlist_replaces_the_boot_disk_argument_exactly_once() {
+    use std::ffi::OsString;
+    use std::path::Path;
+    let disk = Path::new("/tmp/emuwiz-zip-rom-x/Game (Disk 1).ipf");
+    let m3u = Path::new("/tmp/emuwiz-zip-rom-x/Game (Disk 1).m3u");
+    let mut argv: Vec<OsString> = ["-L", "/cores/puae_libretro.so"]
+        .iter()
+        .map(OsString::from)
+        .chain(std::iter::once(disk.as_os_str().to_owned()))
+        .collect();
+    super::swap_content_argument(&mut argv, disk, m3u).unwrap();
+    assert_eq!(argv.last().unwrap(), m3u.as_os_str());
+    assert!(!argv.iter().any(|a| a == disk.as_os_str()));
+
+    // Missing or duplicated content fails closed and leaves argv unchanged.
+    let mut missing: Vec<OsString> = vec!["-L".into(), "/cores/puae_libretro.so".into()];
+    let before = missing.clone();
+    assert!(super::swap_content_argument(&mut missing, disk, m3u).is_err());
+    assert_eq!(missing, before);
+    let mut twice: Vec<OsString> = vec![disk.as_os_str().to_owned(), disk.as_os_str().to_owned()];
+    let before = twice.clone();
+    assert!(super::swap_content_argument(&mut twice, disk, m3u).is_err());
+    assert_eq!(twice, before);
 }

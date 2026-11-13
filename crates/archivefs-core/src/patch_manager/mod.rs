@@ -101,7 +101,7 @@ mod gamehacking_provider;
 mod gamehacking_shared;
 mod gamehacking_wii_provider;
 mod gecko_document;
-mod hatari_local;
+pub(crate) mod hatari_local;
 mod import_safety;
 mod local_cheat_install;
 mod local_cheat_install_dolphin;
@@ -665,16 +665,18 @@ pub use flycast_cheats::{
     apply_flycast_cheat_preview, build_flycast_cheat_preview, parse_flycast_cheat_file,
 };
 pub use flycast_local::{
-    FLYCAST_MAX_CHEAT_BYTES, FLYCAST_MAX_CONFIG_BYTES, FLYCAST_MAX_DIRECTORY_ENTRIES,
-    FLYCAST_MAX_PROFILES, FLYCAST_MAX_SAVE_CANDIDATES, FLYCAST_MAX_TEXTURE_DEPTH,
-    FLYCAST_MAX_TEXTURE_FILES, FlycastCheatInventory, FlycastConfigInspection, FlycastDiscContext,
-    FlycastDiscoveryError, FlycastExecutable, FlycastGameInspection, FlycastGameKeyMapping,
-    FlycastGameRequest, FlycastHealth, FlycastInstallationType, FlycastLaunchBlocker,
-    FlycastLaunchBlockerKind, FlycastNativeLaunchBinding, FlycastPlatform, FlycastProfile,
-    FlycastProfileDiscovery, FlycastProfileDiscoveryRoots, FlycastSaveStateInventory,
-    FlycastSettings, FlycastSystemFileState, FlycastSystemHealth, FlycastTextureInventory,
-    FlycastVmuInventory, FlycastWarning, FlycastWarningKind, discover_flycast_profiles,
-    inspect_flycast_game, parse_flycast_version, resolve_flycast_native_launch_binding,
+    FLYCAST_APPIMAGE_DIRECTORIES, FLYCAST_MAX_CHEAT_BYTES, FLYCAST_MAX_CONFIG_BYTES,
+    FLYCAST_MAX_DIRECTORY_ENTRIES, FLYCAST_MAX_PROFILES, FLYCAST_MAX_SAVE_CANDIDATES,
+    FLYCAST_MAX_TEXTURE_DEPTH, FLYCAST_MAX_TEXTURE_FILES, FLYCAST_NOT_SET_UP,
+    FlycastCheatInventory, FlycastConfigInspection, FlycastDiscContext, FlycastDiscoveryError,
+    FlycastExecutable, FlycastGameInspection, FlycastGameKeyMapping, FlycastGameRequest,
+    FlycastHealth, FlycastInstallationType, FlycastLaunchBlocker, FlycastLaunchBlockerKind,
+    FlycastNativeLaunchBinding, FlycastPlatform, FlycastProfile, FlycastProfileDiscovery,
+    FlycastProfileDiscoveryRoots, FlycastSaveStateInventory, FlycastSettings,
+    FlycastSystemFileState, FlycastSystemHealth, FlycastTextureInventory, FlycastVmuInventory,
+    FlycastWarning, FlycastWarningKind, discover_flycast_profiles, flycast_profile_dreamcast_bios,
+    inspect_flycast_game, is_appimage_executable, parse_flycast_version,
+    resolve_flycast_native_launch_binding,
 };
 pub use fuse_local::{
     FUSE_MAX_PROFILES, FUSE_NATIVE_BINARY_NAMES, FuseExecutable, FuseInstallationType,
@@ -867,7 +869,7 @@ pub use pcsx2::{
 };
 pub use pcsx2_firmware::{
     Pcsx2BiosVerificationOutcome, Pcsx2GameInspectionWithFirmware, Pcsx2VerifiedBios,
-    inspect_pcsx2_game_with_firmware_evidence, resolve_pcsx2_bios,
+    inspect_pcsx2_game_with_firmware_evidence, pcsx2_profile_bios_verification, resolve_pcsx2_bios,
 };
 pub use pcsx2_identity::{
     Pcsx2GameIdentity, Pcsx2IdentityState, Pcsx2ProfileChoiceError, confirmed_pcsx2_profile,
