@@ -100,8 +100,10 @@ Keeping builds warm (a target is only reused by the same worktree path):
   designation, then off. A designated worktree overrides an inherited `CARGO_INCREMENTAL=0`.
   Measured on `archivefs-gui --lib` tests: edit-to-rebuild 106 s -> ~41 s (2026-11-13), at a
   one-off ~5 min priming build and ~2x the target size, so designate only the worktrees you
-  build in all day. **At most two worktrees may be designated** (records reading `on` in
-  `$EMUWIZ_TARGET_ROOT.incremental-mode/`; `EMUWIZ_CARGO_MAX_DEV_WORKTREES`, default 2):
+  build in all day. **At most two worktrees may be designated in total across target roots**
+  (`~/.cache` and `/mnt/nvme2` together, not two per drive: records reading `on` in every
+  known `<root>.incremental-mode/`, counted under one shared lock;
+  `EMUWIZ_CARGO_MAX_DEV_WORKTREES`, default 2):
   `--designate-dev` is refused (exit 3) at the limit. Prefer reusing an already designated,
   idle, coordinated worktree over designating a new one. Release and other non-dev profiles
   (`--release`, `--profile X`) are never incremental unless asked explicitly. Opt-in

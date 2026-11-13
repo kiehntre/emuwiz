@@ -99,10 +99,15 @@
 #      worktrees, and for every existing worktree nobody designated).
 # A designation record that is unreadable or says anything but "on" is ignored (OFF).
 # At most EMUWIZ_CARGO_MAX_DEV_WORKTREES (default 2; owner limit for disk) worktrees are
-# designated in total, counting records that read "on". --designate-dev is refused (exit 3)
+# designated in total across ALL target roots (~/.cache and e.g. /mnt/nvme2 together),
+# counting records that read "on" in every root listed in the roots file
+# (EMUWIZ_DESIGNATION_ROOTS_FILE, default ~/.cache/emuwiz-cargo-designation-roots), the
+# default home root, the current root and EMUWIZ_DESIGNATION_ROOTS (colon-separated;
+# default /mnt/nvme2/emuwiz-cargo-targets). --designate-dev is refused (exit 3)
 # with a clear message when that many are already on; free one with --undesignate-dev in
-# an idle worktree you own. Count and write happen under one lock, so two at once cannot
-# both take the last place.
+# an idle worktree you own. Count and write happen under one lock shared by every root
+# (EMUWIZ_DESIGNATION_LOCK, default ~/.cache/emuwiz-cargo-designation.lock), so two at
+# once cannot both take the last place.
 # Opt-in automatic designation (EMUWIZ_CARGO_AUTO_DESIGNATE=1; default 0 = off, owner
 # decision 2026-11-13): the first build of a worktree whose
 # target does not exist yet, that is on a branch (not a detached HEAD, which is how
@@ -296,21 +301,45 @@ max_dev="${EMUWIZ_CARGO_MAX_DEV_WORKTREES:-2}"
 case "$max_dev" in
   ''|*[!0-9]*) echo "cargo-iso: EMUWIZ_CARGO_MAX_DEV_WORKTREES must be a whole number, got '$max_dev'" >&2; exit 2 ;;
 esac
-# Designated worktrees in total: regular records reading "on" (as the decision reads them).
+# The limit is for ALL target roots together (owner rule: two in total, not two per drive).
+# Every root this user builds in is listed in one roots file under the home cache; the
+# default home root, the current root and EMUWIZ_DESIGNATION_ROOTS (colon-separated,
+# default /mnt/nvme2/emuwiz-cargo-targets) are always included. Each real build and designation adds its root to the file.
+roots_file="${EMUWIZ_DESIGNATION_ROOTS_FILE:-$home/.cache/emuwiz-cargo-designation-roots}"
+designation_lock="${EMUWIZ_DESIGNATION_LOCK:-$home/.cache/emuwiz-cargo-designation.lock}"
+# Known roots on this host, counted even before any new build registers them (set it to
+# an empty value to count none extra).
+extra_roots="${EMUWIZ_DESIGNATION_ROOTS-/mnt/nvme2/emuwiz-cargo-targets}"
+designation_roots() {
+  {
+    printf '%s\n' "$root" "$home/.cache/emuwiz-cargo-targets"
+    printf '%s\n' "$extra_roots" | tr ':' '\n'
+    if [ -f "$roots_file" ]; then cat -- "$roots_file" 2>/dev/null; fi
+  } | while IFS= read -r r; do [ -n "$r" ] && realpath -m -- "$r"; done | awk '!seen[$0]++'
+}
+register_root() {
+  local canonical
+  canonical=$(realpath -m -- "$root")
+  mkdir -p -- "$(dirname "$roots_file")" 2>/dev/null || return 0
+  grep -qxF -- "$canonical" "$roots_file" 2>/dev/null || printf '%s\n' "$canonical" >>"$roots_file" 2>/dev/null || true
+}
+# Designated worktrees in total: regular records reading "on" in every known root.
 count_designated() {
-  local record n=0
-  for record in "$root.incremental-mode"/*; do
-    if [ -f "$record" ] && [ ! -L "$record" ] && [ "$(cat -- "$record" 2>/dev/null)" = on ]; then
-      n=$((n + 1))
-    fi
-  done
+  local r record n=0
+  while IFS= read -r r; do
+    for record in "$r.incremental-mode"/*; do
+      if [ -f "$record" ] && [ ! -L "$record" ] && [ "$(cat -- "$record" 2>/dev/null)" = on ]; then
+        n=$((n + 1))
+      fi
+    done
+  done < <(designation_roots)
   echo "$n"
 }
 # Write this worktree's record ($1 = on|off) under the designation lock. Turning one on
 # re-counts under the lock and refuses (status 9) when the limit is reached.
 write_designation() {
-  local lock="$root.incremental-mode.lock" current=""
-  mkdir -p -- "$(dirname "$inc_file")" 2>/dev/null || return 1
+  local lock="$designation_lock" current=""
+  mkdir -p -- "$(dirname "$inc_file")" "$(dirname "$lock")" 2>/dev/null || return 1
   { exec 8>>"$lock"; } 2>/dev/null || return 1
   flock -w 30 8 || { exec 8>&-; return 1; }
   if [ "$1" = on ]; then
@@ -321,6 +350,7 @@ write_designation() {
     fi
   fi
   { printf '%s\n' "$1" >"$inc_file.tmp.$$" && mv -f -- "$inc_file.tmp.$$" "$inc_file"; } 2>/dev/null || { exec 8>&-; return 1; }
+  register_root
   exec 8>&-
 }
 designated_total=$(count_designated)
@@ -366,9 +396,9 @@ if [ -n "$designate" ]; then
   write_rc=0
   write_designation "$designate" || write_rc=$?
   if [ "$write_rc" -eq 9 ]; then
-    echo "cargo-iso: refusing --designate-dev: $max_dev developer worktrees are already designated (the limit)." >&2
+    echo "cargo-iso: refusing --designate-dev: $max_dev developer worktrees are already designated in total across target roots (the limit)." >&2
     echo "           Free one first with scripts/cargo-iso --undesignate-dev in an idle worktree you own" >&2
-    echo "           (records: $root.incremental-mode/; a record whose worktree no longer exists can be" >&2
+    echo "           (records, all roots: $(designation_roots | sed 's|$|.incremental-mode/|' | tr '\n' ' '); a record whose worktree no longer exists can be" >&2
     echo "           set to off by writing 'off' into it). Nothing was changed." >&2
     exit 3
   elif [ "$write_rc" -ne 0 ]; then
@@ -452,8 +482,9 @@ if [ -f "$maintain" ] && command -v python3 >/dev/null 2>&1; then
   fi
 fi
 
+register_root
 if [ "$dev_cap_reached" -eq 1 ]; then
-  echo "cargo-iso: note: not designating $top: $designated_total of $max_dev developer worktrees are already designated; building non-incremental (free one with --undesignate-dev in an idle worktree)" >&2
+  echo "cargo-iso: note: not designating $top: $designated_total of $max_dev developer worktrees are already designated in total across target roots; building non-incremental (free one with --undesignate-dev in an idle worktree)" >&2
 fi
 if [ "$auto_designate" -eq 1 ]; then
   write_rc=0

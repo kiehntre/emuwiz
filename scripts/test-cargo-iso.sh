@@ -54,7 +54,8 @@ export FAKE_CARGO_LOG="$tmp/log"
 legacy="$HOME/.cache/emuwiz-cargo-target"
 # The sections before "auto-designation" test the explicit policy on its own.
 export EMUWIZ_CARGO_AUTO_DESIGNATE=0
-unset EMUWIZ_CARGO_MAX_BUILDS EMUWIZ_CARGO_SLOT EMUWIZ_CARGO_SLOT_DIR EMUWIZ_CARGO_MAX_DEV_WORKTREES
+unset EMUWIZ_CARGO_MAX_BUILDS EMUWIZ_CARGO_SLOT EMUWIZ_CARGO_SLOT_DIR EMUWIZ_CARGO_MAX_DEV_WORKTREES EMUWIZ_DESIGNATION_ROOTS_FILE EMUWIZ_DESIGNATION_LOCK
+export EMUWIZ_DESIGNATION_ROOTS=""  # never count this host's real roots
 # An inherited machine guard (e.g. EMUWIZ_MIN_FREE_GB=110) must not change the defaults tested here.
 unset EMUWIZ_MIN_FREE_GB
 unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG EMUWIZ_CARGO_LOW_DEBUG EMUWIZ_CARGO_FULL_DEBUG EMUWIZ_CARGO_INCREMENTAL EMUWIZ_CARGO_SCCACHE EMUWIZ_SCCACHE_DIR EMUWIZ_SCCACHE_SIZE EMUWIZ_SCCACHE_PORT RUSTC_WRAPPER SCCACHE_DIR
@@ -373,6 +374,38 @@ check "re-designating an already designated worktree at the limit is fine" test 
 check "the limit can be raised explicitly" test "$rc" = 0
 (cd "$tmp/wt-one" && EMUWIZ_CARGO_MAX_DEV_WORKTREES=x "$iso" check >/dev/null 2>&1); rc=$?
 check "a malformed EMUWIZ_CARGO_MAX_DEV_WORKTREES is refused (2)" test "$rc" = 2
+
+# ---- the limit is TWO IN TOTAL across target roots (home cache and e.g. /mnt/nvme2), not per root
+home_root="$HOME/.cache/emuwiz-cargo-targets"
+in_home() { env -u EMUWIZ_TARGET_ROOT "$@"; }
+home_rec() { cat "$home_root.incremental-mode/$(basename "$(cd "$1" && in_home "$iso" --print-target | sed -n 's/^target: *//p')")" 2>/dev/null; }
+(cd "$tmp/wt-third" && "$iso" --undesignate-dev >/dev/null 2>&1)
+check "one designation left in the main root" test "$(grep -lx on "$EMUWIZ_TARGET_ROOT.incremental-mode"/* | wc -l)" = 1
+git -C "$repo" worktree add -q "$tmp/wt-homeroot" -b homeroot
+git -C "$repo" worktree add -q "$tmp/wt-cross" -b cross
+(cd "$tmp/wt-homeroot" && in_home "$iso" --designate-dev >/dev/null 2>&1); rc=$?
+check "one designation in the home root is allowed (one per root, two in total)" test "$rc/$(home_rec "$tmp/wt-homeroot")" = "0/on"
+(cd "$tmp/wt-cross" && "$iso" --designate-dev >/dev/null 2>"$tmp/err"); rc=$?
+check "a third designation in the main root is refused (3)" test "$rc" = 3
+(cd "$tmp/wt-homeroot" && in_home "$iso" --designate-dev >/dev/null 2>&1); rc=$?
+check "re-designating an already designated worktree at the limit still passes" test "$rc/$(home_rec "$tmp/wt-homeroot")" = "0/on"
+main_root="$EMUWIZ_TARGET_ROOT"
+(cd "$tmp/wt-cross" && EMUWIZ_TARGET_ROOT="$tmp/listed-root" EMUWIZ_DESIGNATION_ROOTS_FILE="$tmp/no-roots" EMUWIZ_DESIGNATION_ROOTS="$main_root" "$iso" --designate-dev >/dev/null 2>&1); rc=$?
+check "roots named in EMUWIZ_DESIGNATION_ROOTS are counted without the roots file" test "$rc" = 3
+check "the refusal lists the records of every root" grep -q "$home_root.incremental-mode" "$tmp/err"
+(cd "$tmp/wt-cross" && in_home "$iso" --designate-dev >/dev/null 2>&1); rc=$?
+check "a third designation in the home root is refused (3)" test "$rc/$(home_rec "$tmp/wt-cross")" = "3/"
+(cd "$tmp/wt-cross" && EMUWIZ_TARGET_ROOT="$tmp/third-root" "$iso" --designate-dev >/dev/null 2>&1); rc=$?
+check "a third designation in a root never used before is refused too (roots file)" test "$rc" = 3
+check "the roots file lists the roots that built or designated" bash -c "grep -qxF '$EMUWIZ_TARGET_ROOT' '$HOME/.cache/emuwiz-cargo-designation-roots' && grep -qxF '$home_root' '$HOME/.cache/emuwiz-cargo-designation-roots'"
+check "one designation lock is shared by every root" test -e "$HOME/.cache/emuwiz-cargo-designation.lock"
+(cd "$tmp/wt-cross" && in_home env EMUWIZ_CARGO_AUTO_DESIGNATE=1 CARGO_INCREMENTAL=0 "$iso" check >/dev/null 2>&1)
+check "automatic designation in the other root also respects the total" test "$(logged incremental)/$(home_rec "$tmp/wt-cross")" = "0/"
+(cd "$tmp/wt-homeroot" && in_home "$iso" --undesignate-dev >/dev/null 2>&1)
+(cd "$tmp/wt-cross" && "$iso" --designate-dev >/dev/null 2>&1); rc=$?
+check "freeing the home-root designation frees a place in the main root" test "$rc" = 0
+(cd "$tmp/wt-cross" && "$iso" --undesignate-dev >/dev/null 2>&1)
+(cd "$tmp/wt-new" && "$iso" --undesignate-dev >/dev/null 2>&1)
 export EMUWIZ_CARGO_AUTO_DESIGNATE=0
 
 # ---- concurrent builds: at most EMUWIZ_CARGO_MAX_BUILDS (default 2), waiting on the lock
