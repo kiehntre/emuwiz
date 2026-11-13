@@ -340,7 +340,9 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         confidence: MappingConfidence::StronglyKnown,
     },
     // Native Atari800 (disposable ATR sessions, see `atari800_setup`) and the
-    // libretro core of the same name stay separate candidates.
+    // libretro core of the same name stay separate candidates. The core hint
+    // keeps RetroArch a cheat route here; it is NOT a launch preference (see
+    // `CHEAT_ROUTE_ONLY_CORE_HINTS`).
     LaunchCompatibility {
         platform_id: "Atari 8-bit",
         standalone_adapters: &["atari800"],
@@ -407,6 +409,24 @@ pub fn launch_compatibility_for_platform(
     LAUNCH_COMPATIBILITY
         .iter()
         .find(|entry| entry.platform_id == platform_id)
+}
+
+/// Platforms whose `retroarch_core_hints` exist only so RetroArch stays a
+/// cheat route beside a standalone adapter (see
+/// `crate::patch_manager::cheat_route`). The hint was never reviewed as a
+/// launch preference, so it must not pick a winner between installed cores:
+/// a tie between different cores stays a choice for the person.
+const CHEAT_ROUTE_ONLY_CORE_HINTS: &[&str] = &["Atari 8-bit"];
+
+/// The reviewed RetroArch core preference used when planning a LAUNCH for
+/// `platform_id`: the row's hints, except where they are cheat-route only.
+pub fn retroarch_launch_core_hints(platform_id: &str) -> &'static [&'static str] {
+    if CHEAT_ROUTE_ONLY_CORE_HINTS.contains(&platform_id) {
+        return &[];
+    }
+    launch_compatibility_for_platform(platform_id)
+        .map(|entry| entry.retroarch_core_hints)
+        .unwrap_or(&[])
 }
 
 /// Every reviewed row whose `standalone_adapters` names `adapter_id` - the
@@ -629,6 +649,11 @@ mod tests {
         let entry = launch_compatibility_for_platform("Atari 8-bit").unwrap();
         assert_eq!(entry.standalone_adapters, &["atari800"]);
         assert_eq!(entry.retroarch_core_hints, &["atari800"]);
+        // Kept for cheat routing only: launch planning sees no core preference,
+        // exactly as before this platform had a row.
+        assert!(retroarch_launch_core_hints("Atari 8-bit").is_empty());
+        assert_eq!(retroarch_launch_core_hints("Atari2600"), &["stella"]);
+        assert!(retroarch_launch_core_hints("No Such Platform").is_empty());
         assert_eq!(
             platforms_for_standalone_adapter("atari800"),
             vec!["Atari 8-bit"]

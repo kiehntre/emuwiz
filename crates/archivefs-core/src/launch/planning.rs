@@ -816,7 +816,7 @@ fn apply_preference(candidates: &mut [LaunchCandidate], remembered: &[Remembered
     // Opt-in native routes never compete for the automatic choice. A game
     // that already has another ready route keeps it for Play; the native
     // route stays an explicit choice ("Use once" / a saved default), and it
-    // becomes the automatic route only when no other route is ready.
+    // becomes the automatic route only when there is no other route.
     let opt_in = |candidate: &LaunchCandidate| {
         matches!(
             &candidate.target,
@@ -824,10 +824,21 @@ fn apply_preference(candidates: &mut [LaunchCandidate], remembered: &[Remembered
                 if OPT_IN_STANDALONE_ADAPTERS.contains(adapter_id)
         )
     };
-    let eligible_indices: Vec<usize> = if eligible_indices
-        .iter()
-        .any(|&index| !opt_in(&candidates[index]))
-    {
+    // "Another route" is one that is ready, or one that only waits for the
+    // person to pick between tied RetroArch cores. That tie is a question for
+    // the person: a ready native route must not answer it by default.
+    let waits_for_core_choice = |candidate: &LaunchCandidate| {
+        !candidate.blockers.is_empty()
+            && candidate
+                .blockers
+                .iter()
+                .all(|blocker| blocker.kind == LaunchBlockerKind::AmbiguousCore)
+    };
+    let another_route = candidates.iter().any(|candidate| {
+        !opt_in(candidate)
+            && (candidate.readiness != LaunchReadiness::Blocked || waits_for_core_choice(candidate))
+    });
+    let eligible_indices: Vec<usize> = if another_route {
         eligible_indices
             .into_iter()
             .filter(|&index| {
@@ -990,7 +1001,6 @@ pub fn build_launch_plan(
         };
     };
 
-    let compat = launch_compatibility_for_platform(&resolved.platform_id);
     let mut candidates =
         build_standalone_candidates(&resolved.platform_id, content, standalone_profiles);
 
@@ -999,9 +1009,7 @@ pub fn build_launch_plan(
             platform.id,
             content,
             retroarch,
-            compat
-                .map(|entry| entry.retroarch_core_hints)
-                .unwrap_or(&[]),
+            crate::launch::platform_map::retroarch_launch_core_hints(&resolved.platform_id),
         ));
     }
 

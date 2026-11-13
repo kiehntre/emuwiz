@@ -3005,6 +3005,168 @@ mod tests {
         assert!(crate::launch::launch_choice::is_choosable(&after, native));
     }
 
+    /// Two different installed cores that both play Atari 8-bit.
+    fn retroarch_with_two_atari_cores() -> RetroArchEnvironmentReport {
+        let mut report = retroarch_with_atari800_core(false);
+        let mut other = report.profiles[0].cores[0].clone();
+        other.core_stem = "altirra".to_string();
+        report.profiles[0].cores.push(other);
+        report
+    }
+
+    fn automatic(plan: &LaunchPlan) -> usize {
+        plan.candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.preference,
+                    CandidatePreference::SoleEligible | CandidatePreference::Remembered
+                )
+            })
+            .count()
+    }
+
+    /// What the planner decided for the RetroArch candidates only.
+    fn retroarch_decisions(
+        plan: &LaunchPlan,
+    ) -> Vec<(
+        String,
+        CandidatePreference,
+        LaunchReadiness,
+        Vec<LaunchBlockerKind>,
+    )> {
+        plan.candidates
+            .iter()
+            .filter_map(|candidate| match &candidate.target {
+                LaunchTarget::RetroArchCore { core_stem, .. } => Some((
+                    core_stem.clone(),
+                    candidate.preference,
+                    candidate.readiness,
+                    candidate.blockers.iter().map(|b| b.kind).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The platform row's core hint exists for cheat routing. It must not
+    /// pick between two different installed cores, and a ready native
+    /// Atari800 must not answer that question either: the chooser stays.
+    #[test]
+    fn two_different_ready_cores_without_a_saved_choice_still_ask() {
+        let two = retroarch_with_two_atari_cores();
+        let without_native = atari_plan(None, &two);
+        let decisions = retroarch_decisions(&without_native);
+        assert_eq!(decisions.len(), 2);
+        for (stem, preference, readiness, blockers) in &decisions {
+            assert_eq!(*preference, CandidatePreference::Undetermined, "{stem}");
+            assert_eq!(*readiness, LaunchReadiness::Blocked, "{stem}");
+            assert_eq!(blockers, &[LaunchBlockerKind::AmbiguousCore], "{stem}");
+        }
+        assert_eq!(automatic(&without_native), 0, "nothing is picked");
+
+        let with_native = atari_plan(Some(FirmwareReadiness::PresentUnverified), &two);
+        assert_eq!(
+            retroarch_decisions(&with_native),
+            decisions,
+            "native Atari800 changes nothing about the RetroArch routes"
+        );
+        assert_eq!(automatic(&with_native), 0, "the tie is not answered");
+        // Every route, native included, is there to be chosen.
+        assert_eq!(with_native.candidates.len(), 3);
+        for candidate in &with_native.candidates {
+            assert!(crate::launch::launch_choice::is_choosable(
+                &with_native,
+                candidate
+            ));
+        }
+    }
+
+    #[test]
+    fn a_saved_core_choice_is_honoured_with_or_without_native_atari800() {
+        use crate::launch::launch_choice::{
+            LaunchChoiceInputs, LaunchChoiceOutcome, LaunchPreference, apply, launch_option_id,
+        };
+        let two = retroarch_with_two_atari_cores();
+        for native in [None, Some(FirmwareReadiness::PresentUnverified)] {
+            let mut plan = atari_plan(native, &two);
+            let wanted = plan
+                .candidates
+                .iter()
+                .find(|candidate| {
+                    matches!(&candidate.target,
+                        LaunchTarget::RetroArchCore { core_stem, .. } if core_stem == "altirra")
+                })
+                .map(|candidate| launch_option_id(&candidate.target))
+                .unwrap();
+            let saved = [LaunchPreference::game("Atari 8-bit", "atrsha", &wanted)];
+            let outcome = apply(
+                &mut plan,
+                LaunchChoiceInputs {
+                    once: None,
+                    preferences: Ok(&saved),
+                },
+            );
+            assert!(matches!(outcome, LaunchChoiceOutcome::Applied { .. }));
+            for candidate in &plan.candidates {
+                let chosen = launch_option_id(&candidate.target) == wanted;
+                assert_eq!(
+                    candidate.preference == CandidatePreference::Remembered,
+                    chosen,
+                    "{:?}",
+                    candidate.target
+                );
+                assert_ne!(candidate.preference, CandidatePreference::SoleEligible);
+                if chosen {
+                    assert_ne!(candidate.readiness, LaunchReadiness::Blocked);
+                }
+            }
+        }
+    }
+
+    /// The saved core was uninstalled. Neither the remaining core nor a ready
+    /// native Atari800 is used in its place.
+    #[test]
+    fn a_saved_choice_whose_core_is_gone_substitutes_nothing() {
+        use crate::launch::launch_choice::{
+            LaunchChoiceInputs, LaunchChoiceOutcome, LaunchPreference, apply, launch_option_id,
+        };
+        let two = atari_plan(None, &retroarch_with_two_atari_cores());
+        let gone = two
+            .candidates
+            .iter()
+            .find(|candidate| {
+                matches!(&candidate.target,
+                    LaunchTarget::RetroArchCore { core_stem, .. } if core_stem == "altirra")
+            })
+            .map(|candidate| launch_option_id(&candidate.target))
+            .unwrap();
+        let saved = [LaunchPreference::game("Atari 8-bit", "atrsha", &gone)];
+        // Only the other core is installed now, beside a ready native route.
+        let mut plan = atari_plan(
+            Some(FirmwareReadiness::PresentUnverified),
+            &retroarch_with_atari800_core(false),
+        );
+        let outcome = apply(
+            &mut plan,
+            LaunchChoiceInputs {
+                once: None,
+                preferences: Ok(&saved),
+            },
+        );
+        assert!(matches!(
+            outcome,
+            LaunchChoiceOutcome::PreferredUnavailable { .. }
+        ));
+        assert_eq!(automatic(&plan), 0);
+        assert!(plan.candidates.iter().all(|candidate| {
+            candidate
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == LaunchWarningKind::PreferredLaunchChoiceUnavailable)
+        }));
+    }
+
     #[test]
     fn native_atari800_is_not_a_candidate_for_other_atari_8bit_formats() {
         let input = atari800_input(true, FirmwareReadiness::PresentUnverified);
