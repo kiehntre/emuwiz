@@ -132,6 +132,9 @@ pub(super) struct BrowsePlayState {
     /// signature it was taken at; a different signature invalidates both.
     env: Option<(u64, super::bg_readiness::EnvSnapshot)>,
     env_signature: Option<u64>,
+    /// The scan-result part of that signature, reused briefly (see
+    /// `EnvSnapshot::cached_signature`).
+    env_heavy: super::bg_readiness::HeavySignatureCache,
     /// The library snapshot generation the settled decisions were made at.
     database_generation: Option<u64>,
     /// Ids drawn this frame / last frame, nearest the top first.
@@ -297,7 +300,7 @@ fn status_text(game: &Game, blue: bool) -> (&'static str, Color32) {
 
 /// Shown under Play in Blue (board `D10-GP-SelectVsPlay`).
 pub(super) const SELECT_VS_PLAY: &str =
-    "Clicking a cover only selects it. Play opens the launch-readiness check first.";
+    "Clicking a cover only selects it. Press Play to start the game when it is ready.";
 /// Preservation-only media has no launch route, so it gets this instead of
 /// a readiness check.
 pub(super) const PRESERVATION_ONLY_SENTENCE: &str = "A recording of a play session, kept for \
@@ -310,9 +313,9 @@ fn readiness_sentence(game: &Game) -> &'static str {
     } else if game.identity_summary() == "Mismatch" {
         "Game identity evidence conflicts. Review it before play."
     } else if game.identified {
-        "Play checks that everything is ready first. Nothing starts until you confirm."
+        "Play starts this game when it is ready."
     } else if game.platform != super::library::UNKNOWN_PLATFORM {
-        "Play checks whether this game can start. Catalogue (DAT) verification is optional."
+        "Play checks that this game can start, then starts it. Catalogue (DAT) verification is optional."
     } else {
         "More platform evidence is needed. Assign the platform or review the source folder."
     }
@@ -628,7 +631,10 @@ impl App {
             .native_workflows
             .as_ref()
             .map(|w| w.emulator_readiness());
-        let signature = readiness.and_then(super::bg_readiness::EnvSnapshot::signature);
+        let now = std::time::Instant::now();
+        let signature = readiness.and_then(|readiness| {
+            super::bg_readiness::EnvSnapshot::cached_signature(readiness, &mut state.env_heavy, now)
+        });
         if state.env_signature != signature {
             state.env_signature = signature;
             state.background.invalidate();
@@ -904,7 +910,9 @@ impl App {
                     .selected_text(format!("More systems ({})", rest.len()))
                     // A known width lets the wrapping row place it instead of overflowing.
                     .width(190.0)
-                    .height(360.0)
+                    // Tall enough for the whole list but never taller than the
+                    // window, so the menu is not cut off on short screens.
+                    .height((ui.ctx().screen_rect().height() * 0.75).clamp(160.0, 720.0))
                     .show_ui(ui, |ui| {
                         for (name, count) in rest {
                             if ui
@@ -923,7 +931,23 @@ impl App {
             self.browse_play_surprise_button(ui);
         });
         if let Some(platform) = chosen {
-            self.filter.select_platform(platform);
+            self.choose_system(platform);
+        }
+    }
+
+    /// Applies a system chip. A selected game the new system hides is
+    /// deselected, so the panel never shows (for example) an Acorn Electron
+    /// game while the list is filtered to Acorn Archimedes.
+    pub(super) fn choose_system(&mut self, platform: String) {
+        self.filter.select_platform(platform);
+        if let Route::BrowsePlayGame(id) = self.router.current
+            && !self.filter.platform.is_empty()
+            && self
+                .library
+                .game(id)
+                .is_none_or(|game| game.platform != self.filter.platform)
+        {
+            self.go(Route::BrowsePlay);
         }
     }
 
@@ -1233,6 +1257,14 @@ impl App {
                     .clicked()
             {
                 self.filter.select_platform(String::new());
+            }
+            if let Some((note, detail)) = retired_note(&self.library) {
+                ui.label(
+                    RichText::new(note)
+                        .size(theme::METADATA_SIZE)
+                        .color(theme::SECONDARY_TEXT),
+                )
+                .on_hover_text(detail);
             }
             if let Some(note) = self.browse_play.cover_note.as_deref() {
                 ui.label(
@@ -1769,6 +1801,33 @@ fn readiness_filter_hint(filter: ReadinessFilter) -> &'static str {
     }
 }
 
+/// How many records of removed library locations are not listed, and why.
+/// The records are kept; this only says they exist.
+pub(super) fn retired_note(library: &super::library::Library) -> Option<(String, String)> {
+    use archivefs_core::catalogue_supersession::Retirement;
+    if library.retired.is_empty() {
+        return None;
+    }
+    let count = |reason| {
+        library
+            .retired_reasons
+            .values()
+            .filter(|r| **r == reason)
+            .count()
+    };
+    Some((
+        format!(
+            "{} older records not listed: their library location was removed and the files are no longer there.",
+            thousands(library.retired.len())
+        ),
+        format!(
+            "Kept in the database, not deleted. {} have a file with the same name in your library that could not be confirmed as the same game; {} were not found in your library.",
+            thousands(count(Retirement::UnresolvedCopies)),
+            thousands(count(Retirement::NotFoundAnywhere))
+        ),
+    ))
+}
+
 /// Said under every readiness view that could be mistaken for a verdict on
 /// the whole library. Launch checks run for the game you select, so nothing
 /// here has assessed every game.
@@ -1875,5 +1934,27 @@ mod classic_identity_status_tests {
         exact.mark_dat_exact(Some("DAT"));
         assert_eq!(exact.identity_summary(), "Mismatch");
         assert_eq!(exact.status(), "Identity conflict · review evidence");
+    }
+}
+
+#[cfg(test)]
+mod play_wording_tests {
+    use super::SELECT_VS_PLAY;
+    use crate::gui_v2::launch_readiness_summary::PLAY_RUNS_THE_CHECK;
+
+    /// Play launches directly now; no hint may still promise a detour through
+    /// a readiness page or a confirmation step.
+    #[test]
+    fn play_hints_do_not_describe_the_old_detour() {
+        for text in [
+            SELECT_VS_PLAY,
+            PLAY_RUNS_THE_CHECK,
+            crate::gui_v2::surprise_me::PLAY_NOTE,
+        ] {
+            let lower = text.to_lowercase();
+            assert!(!lower.contains("opens the"), "{text}");
+            assert!(!lower.contains("until you confirm"), "{text}");
+            assert!(!lower.contains("readiness check first"), "{text}");
+        }
     }
 }

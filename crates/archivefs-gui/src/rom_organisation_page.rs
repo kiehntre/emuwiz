@@ -52,6 +52,15 @@ pub(crate) struct RomOrganisationPageState {
     /// Candidate source files collected from the configured source folders.
     sources: Vec<PathBuf>,
     unavailable_source_roots: Vec<PathBuf>,
+    /// The configured source folders the candidate walk reads.
+    source_roots: Vec<PathBuf>,
+    /// Why the last candidate walk did not see everything (file limit, depth
+    /// limit, unreadable folders). Non-empty means `sources` is a subset and
+    /// Apply is refused until a complete walk (Night Watch S11-06).
+    source_scan_incomplete: Vec<String>,
+    /// False until the candidate walk has run. Blue defers the walk from
+    /// start-up to the first Preview on the worker (Night Watch S06-02).
+    sources_scanned: bool,
     /// The read-only plan, when generated. `generation` is bumped on every
     /// regeneration so a stale review decision can never apply.
     plan: Option<OrganisationPlan>,
@@ -218,6 +227,9 @@ impl RomOrganisationPageState {
             mode: OrganisationMode::MoveRealFile,
             sources: Vec::new(),
             unavailable_source_roots: Vec::new(),
+            source_roots: Vec::new(),
+            source_scan_incomplete: Vec::new(),
+            sources_scanned: true,
             plan: None,
             plan_generation: 0,
             advanced_r2_selected: false,
@@ -264,7 +276,7 @@ impl RomOrganisationPageState {
     }
     pub(crate) fn input_fingerprint(&self) -> String {
         format!(
-            "{:?}|{}|{}|{}|{}|{}",
+            "{:?}|{}|{}|{}|{}|{}|{}|{}",
             self.mode,
             self.master_root_draft,
             self.library_root_draft,
@@ -273,7 +285,9 @@ impl RomOrganisationPageState {
             self.sources
                 .iter()
                 .map(|path| path.to_string_lossy().len())
-                .sum::<usize>()
+                .sum::<usize>(),
+            self.sources_scanned,
+            self.source_scan_incomplete.len()
         )
     }
 
@@ -389,7 +403,20 @@ impl RomOrganisationPageState {
     /// unreadable file is treated as "no persisted approval", never as
     /// "approve everything").
     pub(crate) fn load() -> Self {
-        let mut state = Self::default();
+        let mut state = Self::load_deferred();
+        state.scan_sources();
+        state
+    }
+
+    /// `load` without the candidate walk: configuration and the persisted
+    /// approvals only, so a GUI thread can construct the page instantly. The
+    /// walk runs on the first Preview (`generate_plan_reporting`) or on
+    /// `rescan_sources`, both of which Blue runs on its worker.
+    pub(crate) fn load_deferred() -> Self {
+        let mut state = Self {
+            sources_scanned: false,
+            ..Self::default()
+        };
         if let Ok(config) = Config::load_default() {
             state.saved_master_root = config.master_rom_root.clone();
             state.master_root_draft = config
@@ -397,13 +424,8 @@ impl RomOrganisationPageState {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default();
-            state.sources = collect_source_files(&config.source_folders);
-            state.unavailable_source_roots = config
-                .source_folders
-                .iter()
-                .filter(|path| !path.is_dir())
-                .cloned()
-                .collect();
+            state.source_roots = config.source_folders.clone();
+            state.unavailable_source_roots = unavailable_roots(&config.source_folders);
         }
         match load_persisted_approved_set(None) {
             Ok(Some(set)) => state.approved = set,
@@ -494,17 +516,61 @@ impl RomOrganisationPageState {
         }
     }
 
-    /// Re-scans the configured source folders for candidate files.
+    /// Walks `source_roots` for candidate files with the page's conservative
+    /// bounds, recording every reason the walk was incomplete. Read-only.
+    pub(crate) fn scan_sources(&mut self) {
+        self.scan_sources_bounded(2_000, 4);
+    }
+
+    fn scan_sources_bounded(&mut self, max_files: usize, max_depth: usize) {
+        let scan = collect_source_files_reported(&self.source_roots, max_files, max_depth);
+        self.sources = scan.files;
+        self.source_scan_incomplete = scan.incomplete;
+        self.unavailable_source_roots = unavailable_roots(&self.source_roots);
+        self.sources_scanned = true;
+    }
+
+    /// Test builder: the folders the next candidate walk reads.
+    #[cfg(test)]
+    pub(crate) fn with_deferred_source_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.source_roots = roots;
+        self.sources_scanned = false;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sources_scanned(&self) -> bool {
+        self.sources_scanned
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Whether the candidate walk has run and saw everything.
+    pub(crate) fn sources_complete(&self) -> bool {
+        self.sources_scanned && self.source_scan_incomplete.is_empty()
+    }
+
+    pub(crate) fn source_scan_incomplete(&self) -> &[String] {
+        &self.source_scan_incomplete
+    }
+
+    /// Re-reads the configured source folders and re-scans them for
+    /// candidate files.
     pub(crate) fn rescan_sources(&mut self) {
-        if let Ok(config) = Config::load_default() {
-            self.sources = collect_source_files(&config.source_folders);
-            self.unavailable_source_roots = config
-                .source_folders
-                .iter()
-                .filter(|path| !path.is_dir())
-                .cloned()
-                .collect();
+        self.rescan_sources_with(Config::load_default().ok().as_ref());
+    }
+
+    /// [`Self::rescan_sources`] from an already-read configuration (`None`:
+    /// none could be read, so the current folders are kept). Tests pass their
+    /// own: the default configuration is shared by every test in the process.
+    pub(crate) fn rescan_sources_with(&mut self, config: Option<&Config>) {
+        if let Some(config) = config {
+            self.source_roots = config.source_folders.clone();
         }
+        self.scan_sources();
         self.plan = None;
         self.approved.clear();
         // Any previously persisted approvals may now reference paths that no
@@ -535,6 +601,14 @@ impl RomOrganisationPageState {
             return false;
         }
         self.plan_generation += 1;
+        if !self.sources_scanned {
+            progress.phase("Finding your game files", "folders", None);
+            progress.flush();
+            self.scan_sources();
+            if stop() {
+                return false;
+            }
+        }
         if self.sources.is_empty() && !self.unavailable_source_roots.is_empty() {
             self.error =
                 Some("source drive may not be mounted; nothing was scanned or changed".to_string());
@@ -572,6 +646,7 @@ impl RomOrganisationPageState {
                     archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
                 candidates: &candidates,
                 generation: self.plan_generation,
+                unknown_folder: None,
             },
             cancel,
             progress,
@@ -628,6 +703,16 @@ impl RomOrganisationPageState {
         self.begin_outcome();
         if let Some(refusal) = &self.applied_journal_unavailable {
             self.error = Some(refusal.clone());
+            return;
+        }
+        if !self.sources_scanned {
+            self.error = Some("The source folders have not been scanned yet, so this plan may not cover every game. Nothing was changed. Rescan, then preview again.".into());
+            return;
+        }
+        if let Some(reason) = self.source_scan_incomplete.first() {
+            self.error = Some(format!(
+                "The source scan was incomplete ({reason}), so this plan may not cover every game. Nothing was changed. Narrow the source folders or rescan, then preview again."
+            ));
             return;
         }
         if self.advanced_r2_selected {
@@ -1236,18 +1321,12 @@ impl RomOrganisationPageState {
 /// paths: regular files and symlink *objects*. Symlinked directories are
 /// collected as link objects but never traversed, so a symlink loop cannot
 /// recurse. Read-only.
-pub(crate) fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
-    collect_source_files_bounded(roots, 2_000, 4)
-}
-
-/// Same conservative collector with explicit bounds for background workflows
-/// that can safely review larger nested collections.
-pub(crate) fn collect_source_files_bounded(
-    roots: &[PathBuf],
-    max_files: usize,
-    max_depth: usize,
-) -> Vec<PathBuf> {
-    collect_source_files_reported(roots, max_files, max_depth).files
+fn unavailable_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .filter(|path| !path.is_dir())
+        .cloned()
+        .collect()
 }
 
 pub(crate) struct SourceFileScan {
@@ -1519,6 +1598,8 @@ pub(crate) enum RomOrganisationPageAction {
     Preview,
     Apply,
     Rollback,
+    /// Re-read the configured source folders and re-scan them for candidates.
+    Rescan,
     OpenAdvanced,
     OpenDat,
     OpenCheck,
@@ -1536,6 +1617,7 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             }
             RomOrganisationPageAction::Apply => state.apply(),
             RomOrganisationPageAction::Rollback => state.rollback(),
+            RomOrganisationPageAction::Rescan => state.rescan_sources(),
             RomOrganisationPageAction::OpenAdvanced => {}
             RomOrganisationPageAction::OpenDat => {}
             RomOrganisationPageAction::OpenCheck => {}
@@ -1893,10 +1975,15 @@ fn show_rom_organisation_page_with_options(
     widgets::card(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Games ready to organise").strong());
-            if widgets::action_button(ui, "Rescan sources", widgets::ActionStyle::Secondary, true)
-                .clicked()
+            if widgets::action_button(
+                ui,
+                "Rescan sources",
+                widgets::ActionStyle::Secondary,
+                !async_busy,
+            )
+            .clicked()
             {
-                state.rescan_sources();
+                page_action = Some(RomOrganisationPageAction::Rescan);
             }
             if widgets::action_button(
                 ui,
@@ -1921,13 +2008,36 @@ fn show_rom_organisation_page_with_options(
                 );
             });
         }
-        ui.label(
-            egui::RichText::new(format!(
-                "{} game(s) ready to organise.",
-                state.sources.len()
-            ))
-            .color(theme::muted(ui)),
-        );
+        if state.sources_scanned {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} game(s) ready to organise.",
+                    state.sources.len()
+                ))
+                .color(theme::muted(ui)),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "Your game folders have not been scanned yet. Preview scans them first.",
+                )
+                .color(theme::muted(ui)),
+            );
+        }
+        if !state.source_scan_incomplete.is_empty() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Not every game was found: the scan stopped early ({}). Apply stays off until a complete scan. Narrow the source folders or rescan.",
+                    state.source_scan_incomplete.len()
+                ))
+                .color(theme::warning(ui)),
+            );
+            widgets::technical_details(ui, "incomplete_organisation_scan", |ui| {
+                for reason in &state.source_scan_incomplete {
+                    ui.label(reason);
+                }
+            });
+        }
         if !state.unavailable_source_roots.is_empty() {
             ui.label(
                 egui::RichText::new(
@@ -2505,7 +2615,7 @@ fn show_plan(
             });
         });
     }
-    let applyable = suggested > 0 && approved > 0;
+    let applyable = suggested > 0 && approved > 0 && state.sources_complete();
     if widgets::action_button(
         ui,
         format!("Apply approved organisation ({approved})"),
@@ -2549,7 +2659,7 @@ fn show_plan(
                     ui,
                     "Confirm apply",
                     widgets::ActionStyle::Primary,
-                    phrase_ok && older_writer_notice().is_none(),
+                    phrase_ok && older_writer_notice().is_none() && state.sources_complete(),
                 )
                 .clicked()
                 {
@@ -2931,7 +3041,8 @@ mod tests {
     }
 
     fn collected(roots: &[PathBuf]) -> Vec<String> {
-        collect_source_files(roots)
+        collect_source_files_reported(roots, 2_000, 4)
+            .files
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect()
@@ -3809,5 +3920,99 @@ mod tests {
         assert!(refused(&state), "{:?}", state.error);
         assert!(!state.error_after_changes);
         assert_eq!(cwd_journal.exists(), cwd_journal_existed);
+    }
+
+    fn page_text(state: &mut RomOrganisationPageState) -> String {
+        let ctx = egui::Context::default();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, state);
+            });
+        });
+        crate::transaction_outcome::test_support::rendered_text(&output)
+    }
+
+    fn folder_with_files(count: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..count {
+            std::fs::write(dir.path().join(format!("game{i}.sfc")), b"x").unwrap();
+        }
+        dir
+    }
+
+    /// Night Watch S06-02: Blue constructs the page without walking the
+    /// source folders; the first Preview walks them (on Blue's worker).
+    #[test]
+    fn a_deferred_load_walks_the_sources_at_the_first_preview() {
+        let dir = folder_with_files(3);
+        let mut state = RomOrganisationPageState::default()
+            .with_deferred_source_roots(vec![dir.path().to_path_buf()]);
+        assert!(!state.sources_scanned());
+        assert_eq!(state.source_count(), 0);
+        let before = page_text(&mut state);
+        assert!(before.contains("have not been scanned yet"), "{before}");
+        assert!(!before.contains("0 game(s) ready"), "{before}");
+
+        state.generate_plan();
+
+        assert!(state.sources_scanned());
+        assert_eq!(state.source_count(), 3);
+        assert!(state.sources_complete());
+        let after = page_text(&mut state);
+        assert!(after.contains("3 game(s) ready to organise"), "{after}");
+    }
+
+    /// Night Watch S11-06: a walk that hit its limit is said out loud and
+    /// Apply is refused; nothing is organised from a partial list.
+    #[test]
+    fn an_incomplete_source_walk_is_shown_and_blocks_apply() {
+        let dir = folder_with_files(5);
+        let mut state = RomOrganisationPageState::default()
+            .with_deferred_source_roots(vec![dir.path().to_path_buf()]);
+        state.scan_sources_bounded(3, 4);
+        assert_eq!(state.source_count(), 3);
+        assert!(!state.sources_complete());
+        assert!(
+            state
+                .source_scan_incomplete()
+                .iter()
+                .any(|reason| reason.contains("3-file limit")),
+            "{:?}",
+            state.source_scan_incomplete()
+        );
+        let text = page_text(&mut state);
+        assert!(text.contains("Not every game was found"), "{text}");
+
+        state.apply();
+
+        let error = state.error().unwrap_or_default();
+        assert!(error.contains("source scan was incomplete"), "{error}");
+        assert!(error.contains("Nothing was changed"), "{error}");
+        assert!(state.applied().is_none());
+    }
+
+    #[test]
+    fn a_complete_rescan_clears_an_earlier_incomplete_notice() {
+        let dir = folder_with_files(2);
+        let mut state = RomOrganisationPageState::default()
+            .with_deferred_source_roots(vec![dir.path().to_path_buf()]);
+        state.scan_sources_bounded(1, 4);
+        assert!(!state.sources_complete());
+        // Not `rescan_sources()`: it reads the process-wide test config, which
+        // other tests seed with `source_folders = []` (the cause of this
+        // test's order-dependent failures in the full suite).
+        state.rescan_sources_with(None);
+        assert!(state.sources_complete());
+        assert_eq!(state.source_count(), 2);
+    }
+
+    #[test]
+    fn the_fingerprint_changes_when_the_walk_completes() {
+        let dir = folder_with_files(1);
+        let mut state = RomOrganisationPageState::default()
+            .with_deferred_source_roots(vec![dir.path().to_path_buf()]);
+        let before = state.input_fingerprint();
+        state.scan_sources();
+        assert_ne!(before, state.input_fingerprint());
     }
 }

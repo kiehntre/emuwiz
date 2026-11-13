@@ -119,7 +119,33 @@ pub(crate) fn format_scan_activity(summary: &ScanPersistSummary) -> String {
         )
     } else {
         String::new()
+    } + &format_nested_mounts(summary)
+}
+
+/// One sentence about archive mounts inside sources, when there are any.
+fn format_nested_mounts(summary: &ScanPersistSummary) -> String {
+    if summary.nested_mounts.is_empty() {
+        return String::new();
     }
+    let read: Vec<_> = summary
+        .nested_mounts
+        .iter()
+        .filter(|mount| mount.state.indexed())
+        .collect();
+    let games: usize = read.iter().map(|mount| mount.archives).sum();
+    let held = summary
+        .nested_mounts
+        .iter()
+        .filter(|mount| !mount.state.reconciled())
+        .count();
+    format!(
+        " Mounted archive folders: {} read ({games} games){}.",
+        read.len(),
+        match held {
+            0 => String::new(),
+            n => format!(", {n} not checked for missing games this scan (see the scan details)"),
+        }
+    )
 }
 
 pub(crate) fn format_database_upgrade_success(

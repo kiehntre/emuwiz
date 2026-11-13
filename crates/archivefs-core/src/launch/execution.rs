@@ -53,9 +53,33 @@ use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContainerKind, LaunchContentRef, LaunchTarget, build_launch_plan,
 };
 use crate::launch::process_spawn::{self, WatchedProcess};
+
 #[cfg(test)]
 use crate::launch::readiness::LaunchReadiness;
 use crate::launch::retroarch_command::{RetroArchCommand, build_retroarch_command_plan};
+
+/// Replaces the one argv entry naming `content` with `replacement`. Fails
+/// closed when the content argument cannot be found exactly once.
+fn swap_content_argument(
+    arguments: &mut [std::ffi::OsString],
+    content: &std::path::Path,
+    replacement: &std::path::Path,
+) -> Result<(), String> {
+    let wanted = content.as_os_str();
+    let positions: Vec<usize> = arguments
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| arg.as_os_str() == wanted)
+        .map(|(index, _)| index)
+        .collect();
+    match positions.as_slice() {
+        [index] => {
+            arguments[*index] = replacement.as_os_str().to_owned();
+            Ok(())
+        }
+        _ => Err("the emulator command does not name the game file exactly once".into()),
+    }
+}
 
 /// Caps how much of a launched process's stderr this module ever retains
 /// in memory - a diagnostic aid for a failed/crashed launch, never a full
@@ -379,7 +403,19 @@ pub fn preflight_retroarch_launch(
     }
 
     // --- 5: fresh identity re-inspection ---
-    let snapshot_evidence = if request.expected_platform_id == "ZX Spectrum" {
+    // An owner-approved unverified launch (a ZX tape, or since 2026-11-09 any
+    // single-file game whose system is established) carries no DAT snapshot;
+    // its identity is re-derived from the file below instead.
+    let unverified_media = super::unverified_media::is_unverified_key(&request.expected_game_key);
+    let snapshot_evidence = if unverified_media {
+        if request.expected_snapshot_evidence.is_some() {
+            return Err(preflight_error(
+                LaunchPreflightErrorKind::IdentityMismatch,
+                "An unverified tape launch must not carry snapshot evidence.",
+            ));
+        }
+        None
+    } else if request.expected_platform_id == "ZX Spectrum" {
         let evidence = request
             .expected_snapshot_evidence
             .as_ref()
@@ -413,9 +449,38 @@ pub fn preflight_retroarch_launch(
             ));
         }
         identity
+    } else if unverified_media {
+        match super::unverified_media::platform_media_identity_fresh(
+            content_path,
+            &request.expected_platform_id,
+        ) {
+            Some(identity) if identity.game_key == request.expected_game_key => {
+                CanonicalIdentityStatus::Resolved(identity)
+            }
+            _ => {
+                return Err(preflight_error(
+                    LaunchPreflightErrorKind::IdentityUnresolved,
+                    "The game file changed or is no longer a format this system accepts; recheck this game.",
+                ));
+            }
+        }
     } else {
         fresh_identity_status(content_path, request)?
     };
+    // Whatever route identified it, a file whose own header names another
+    // system is never started as this one (owner policy 2026-11-09).
+    if let super::unverified_media::MediaSystemEvidence::Contradicts(other) =
+        super::unverified_media::media_system_evidence(content_path, &request.expected_platform_id)
+    {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::IdentityUnresolved,
+            format!(
+                "The game file's own header says it is for {}, not {}; EmuWiz will not start it with this system.",
+                crate::platform::display_name_for(other),
+                crate::platform::display_name_for(&request.expected_platform_id),
+            ),
+        ));
+    }
     super::nkit_readiness::check_raw_nkit_launch(&request.expected_platform_id, content_path)
         .map_err(|detail| {
             preflight_error(
@@ -548,6 +613,29 @@ pub fn preflight_retroarch_launch(
         ));
     }
 
+    // An Amiga IPF floppy only boots with the CAPS/SPS plugin (`capsimg.so`)
+    // in RetroArch's system folder; without it PUAE shows an empty drive.
+    if super::amiga_caps_plugin::needs_caps_plugin(&request.expected_platform_id, content_path) {
+        let system_directory = fresh_environment
+            .profiles
+            .iter()
+            .find(|profile| {
+                profile.profile_kind == request.profile.profile_kind
+                    && profile.scope == request.profile.scope
+            })
+            .and_then(|profile| {
+                profile.paths.iter().find(|p| {
+                    p.purpose == crate::emulator_environment::retroarch::PathPurpose::System
+                })
+            })
+            .and_then(|finding| finding.resolved_path.as_ref())
+            .filter(|path| !path.lossy)
+            .map(|path| PathBuf::from(&path.display));
+        super::amiga_caps_plugin::require_caps_plugin(system_directory.as_deref()).map_err(
+            |detail| preflight_error(LaunchPreflightErrorKind::CandidateNotReady, detail),
+        )?;
+    }
+
     // --- 9: rebuild the command plan ---
     let command_plan =
         build_retroarch_command_plan(&identity_status, candidate, &fresh_environment);
@@ -574,6 +662,11 @@ pub fn preflight_retroarch_launch(
             "command plan reported no blockers but also no command",
         )
     })?;
+    if super::amiga_caps_plugin::needs_caps_plugin(&request.expected_platform_id, content_path) {
+        super::amiga_caps_plugin::require_caps_core(&command.selection.core_stem).map_err(
+            |detail| preflight_error(LaunchPreflightErrorKind::CandidateNotReady, detail),
+        )?;
+    }
 
     if request.expected_platform_id == "Saturn" {
         let selected = request.saturn_core_selection.as_ref().ok_or_else(|| {
@@ -633,6 +726,7 @@ pub fn preflight_retroarch_launch(
     }
 
     command.snapshot_evidence = snapshot_evidence;
+    command.unverified_game_key = unverified_media.then(|| request.expected_game_key.clone());
     Ok(command)
 }
 
@@ -1048,7 +1142,32 @@ pub(crate) fn spawn_retroarch_guarded(
             .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
     }
     let mut backend_stamps = None;
-    let current_snapshot = if command.selection.platform_id == "ZX Spectrum" {
+    let current_snapshot = if let Some(expected_key) = &command.unverified_game_key {
+        // An unverified launch must still be the same accepted file now (the
+        // content-bound key it was checked with), and never carries snapshot
+        // evidence.
+        if command.snapshot_evidence.is_some()
+            || super::unverified_media::platform_media_identity_fresh(
+                &command.selection.content_path,
+                &command.selection.platform_id,
+            )
+            .is_none_or(|identity| &identity.game_key != expected_key)
+            || matches!(
+                super::unverified_media::media_system_evidence(
+                    &command.selection.content_path,
+                    &command.selection.platform_id,
+                ),
+                super::unverified_media::MediaSystemEvidence::Contradicts(_)
+            )
+        {
+            return Err(LaunchSpawnError::Spawn(std::io::Error::other(
+                "The game file changed since it was checked; recheck this game.",
+            )));
+        }
+        // Owner-approved unverified tape launch: no DAT snapshot exists, and
+        // the tape was just re-validated from the file itself.
+        None
+    } else if command.selection.platform_id == "ZX Spectrum" {
         let evidence = command
             .snapshot_evidence
             .as_ref()
@@ -1075,9 +1194,22 @@ pub(crate) fn spawn_retroarch_guarded(
         None
     };
     let facts = command_facts(&command);
-    let prepared = command.command_spec();
+    let mut prepared = command.command_spec();
     let observation = crate::sram_provenance::prepare(&command).map_err(LaunchSpawnError::Spawn)?;
     final_sources().map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
+    // An Amiga hard-disk image is mounted read-write by the emulator, so it is
+    // started from EmuWiz's private working copy, never the library file. Made
+    // here, after every check, so a preview or refused launch writes nothing.
+    super::amiga_hdf_working_copy::redirect_for_launch(
+        &command.selection.platform_id,
+        &command.selection.content_path,
+        &mut prepared.arguments,
+    )
+    .map_err(|detail| {
+        LaunchSpawnError::Spawn(std::io::Error::other(format!(
+            "The Amiga hard-disk game could not be prepared: {detail}"
+        )))
+    })?;
     if let Some(selected) = &command.saturn_core_selection {
         selected
             .revalidate_files()
@@ -1201,35 +1333,60 @@ fn cfg_files_exist(dir: &Path, depth: usize) -> Result<bool, String> {
 }
 
 /// Refuses the staged-zip route unless the chosen RetroArch is a native
-/// install and its own configuration names absolute, separate save and state
-/// directories and does not store them beside the content. Reads the user's
-/// `retroarch.cfg`; never edits it.
+/// install and its own configuration names absolute, existing, separate save
+/// and state directories and does not store them beside the content. Reads
+/// the user's `retroarch.cfg`; never edits it. Every problem found is
+/// reported together (joined with "; "), not just the first.
 fn staged_launch_is_safe(
     request: &RetroArchLaunchRequest,
     filesystem: &dyn ReadOnlyHostFilesystem,
     environment: &DiscoveryEnvironment,
 ) -> Result<(), String> {
+    let findings = staged_launch_findings(request, filesystem, environment);
+    if findings.is_empty() {
+        Ok(())
+    } else {
+        Err(findings.join("; "))
+    }
+}
+
+/// Every reason the staged-zip route is unsafe for this request; empty means
+/// safe. Problems that leave nothing else to inspect (not native, settings
+/// not found or unreadable) are reported alone.
+fn staged_launch_findings(
+    request: &RetroArchLaunchRequest,
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    environment: &DiscoveryEnvironment,
+) -> Vec<String> {
     use crate::emulator_environment::retroarch::{PathPurpose, ResolutionState};
     use std::io::Read as _;
 
     if request.profile.profile_kind != ProfileKind::Native {
-        return Err(
+        return vec![
             "a zipped cartridge can only be launched with a native RetroArch \
-                    installation, because an AppImage or Flatpak launcher may exit while \
-                    the game is still running"
+             installation, because an AppImage or Flatpak launcher may exit while \
+             the game is still running"
                 .into(),
-        );
+        ];
     }
-    let report = discover_retroarch_environment(filesystem, environment)
-        .map_err(|error| format!("RetroArch could not be inspected: {error}"))?;
-    let profile = report
-        .profiles
-        .iter()
-        .find(|profile| {
-            profile.profile_kind == request.profile.profile_kind
-                && profile.scope == request.profile.scope
-        })
-        .ok_or("the selected RetroArch settings could not be found")?;
+    let report = match discover_retroarch_environment(filesystem, environment) {
+        Ok(report) => report,
+        Err(error) => return vec![format!("RetroArch could not be inspected: {error}")],
+    };
+    let Some(profile) = report.profiles.iter().find(|profile| {
+        profile.profile_kind == request.profile.profile_kind
+            && profile.scope == request.profile.scope
+    }) else {
+        return vec!["the selected RetroArch settings could not be found".into()];
+    };
+    let config = Path::new(&profile.config_file.path.display);
+    let mut text = String::new();
+    if let Err(error) =
+        fs::File::open(config).and_then(|file| file.take(1024 * 1024).read_to_string(&mut text))
+    {
+        return vec![format!("RetroArch settings could not be read: {error}")];
+    }
+    let mut findings = Vec::new();
     for (purpose, key) in [
         (PathPurpose::Saves, "savefile_directory"),
         (PathPurpose::SaveStates, "savestate_directory"),
@@ -1243,27 +1400,23 @@ fn staged_launch_is_safe(
                     .is_some_and(|path| Path::new(&path.display).is_absolute())
         });
         if !established {
-            return Err(format!(
+            findings.push(format!(
                 "RetroArch has no explicit absolute `{key}` set, so saves for a zipped \
                  cartridge would be written to a temporary folder and lost; set it in \
                  RetroArch first"
             ));
         }
     }
-    let config = Path::new(&profile.config_file.path.display);
-    let mut text = String::new();
-    fs::File::open(config)
-        .and_then(|file| file.take(1024 * 1024).read_to_string(&mut text))
-        .map_err(|error| format!("RetroArch settings could not be read: {error}"))?;
     let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut repeated: Vec<String> = Vec::new();
+    let mut includes = false;
+    // A leading UTF-8 byte-order mark must not hide the first line's key.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("#include") || trimmed.starts_with("#reference") {
-            return Err(
-                "RetroArch settings include other files that are not read, so \
-                        where saves go cannot be proven"
-                    .into(),
-            );
+            includes = true;
+            continue;
         }
         let Some((key, value)) = trimmed.split_once('=') else {
             continue;
@@ -1278,65 +1431,177 @@ fn staged_launch_is_safe(
                     | "savestate_directory"
                     | "savefiles_in_content_dir"
                     | "savestates_in_content_dir"
+                    | "sort_savefiles_by_content_enable"
+                    | "sort_savestates_by_content_enable"
+                    | "rgui_config_directory"
             )
+            && !repeated.contains(&key)
         {
-            return Err(format!("RetroArch settings set `{key}` more than once"));
+            repeated.push(key);
         }
+    }
+    if includes {
+        findings.push(
+            "RetroArch settings include other files that are not read, so \
+             where saves go cannot be proven"
+                .into(),
+        );
+    }
+    for key in &repeated {
+        findings.push(format!("RetroArch settings set `{key}` more than once"));
     }
     for key in ["savefiles_in_content_dir", "savestates_in_content_dir"] {
         if let Some(value) = seen.get(key)
             && !matches!(value.to_ascii_lowercase().as_str(), "false" | "0")
         {
-            return Err(format!(
+            findings.push(format!(
                 "RetroArch may keep saves beside the game (`{key}` is not explicitly false), \
                  which would lose them for a zipped cartridge"
             ));
         }
     }
-    let dir_of = |key: &str| -> Option<PathBuf> {
-        seen.get(key).map(PathBuf::from).filter(|p| p.is_absolute())
-    };
-    let (Some(saves), Some(states)) = (dir_of("savefile_directory"), dir_of("savestate_directory"))
-    else {
-        return Err(
-            "RetroArch save and state directories could not be read from its settings".into(),
-        );
-    };
-    if saves == states {
-        return Err("RetroArch save and state directories must be separate folders".into());
+    // With "sort by content directory" on, RetroArch writes saves into a
+    // folder named after the content's directory, which for a staged zip is a
+    // fresh `emuwiz-zip-rom-*` folder every launch. Fail closed; never rewrite.
+    for key in [
+        "sort_savefiles_by_content_enable",
+        "sort_savestates_by_content_enable",
+    ] {
+        if let Some(value) = seen.get(key)
+            && !matches!(value.to_ascii_lowercase().as_str(), "false" | "0")
+        {
+            findings.push(format!(
+                "RetroArch sorts saves into a folder named after the game's folder (`{key}` \
+                 is not explicitly false), so saves for a zipped cartridge would land in a \
+                 per-launch emuwiz-zip-rom-* folder and never be found again; turn it off in \
+                 RetroArch first"
+            ));
+        }
     }
-    let temp = std::env::temp_dir();
-    if saves.starts_with(&temp) || states.starts_with(&temp) {
-        return Err("RetroArch save or state directory is inside the temporary folder".into());
+    // RetroArch expands a leading `~` (`~` or `~/...`) to the user's home
+    // directory, so the same values are read here with the same resolver and
+    // home the environment discovery used for this native profile. Anything
+    // else that is not absolute (`~user`, `:/` aliases, relative values) is
+    // still refused, as is a missing home directory.
+    let tilde_home = environment
+        .home
+        .as_ref()
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute());
+    let dir_of = |key: &str| -> Option<PathBuf> {
+        let raw = seen.get(key)?;
+        let resolved = match &tilde_home {
+            Some(home) => {
+                crate::emulator_environment::retroarch::resolve_configured_value(raw, home)?
+            }
+            None => PathBuf::from(raw),
+        };
+        Some(resolved).filter(|path| path.is_absolute())
+    };
+    match (dir_of("savefile_directory"), dir_of("savestate_directory")) {
+        (Some(saves), Some(states)) => {
+            if saves == states {
+                findings
+                    .push("RetroArch save and state directories must be separate folders".into());
+            }
+            let temp = std::env::temp_dir();
+            if saves.starts_with(&temp) || states.starts_with(&temp) {
+                findings.push(
+                    "RetroArch save or state directory is inside the temporary folder".into(),
+                );
+            }
+            // RetroArch ignores a configured directory that does not exist
+            // ("is not a directory, ignoring") and then writes beside the
+            // content - the staged copy, deleted at exit.
+            for (key, dir) in [
+                ("savefile_directory", &saves),
+                ("savestate_directory", &states),
+            ] {
+                if !fs::metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+                    findings.push(format!(
+                        "RetroArch's `{key}` folder {} does not exist, so RetroArch would \
+                         ignore it and saves for a zipped cartridge would be lost; create \
+                         the folder first",
+                        dir.display()
+                    ));
+                }
+            }
+        }
+        _ => findings.push(
+            "RetroArch save and state directories could not be read from its settings".into(),
+        ),
     }
     // Per-core, per-content and per-directory override files can change any of
     // the above and are never parsed: any of them (or an unreadable folder)
-    // refuses the route. Legacy config locations are refused if present, too.
-    let overrides = config.parent().map(|parent| parent.join("config"));
-    if let Some(dir) = overrides
-        && cfg_files_exist(&dir, 0)?
-    {
-        return Err(
+    // refuses the route. RetroArch reads them from `rgui_config_directory`
+    // when set, else from `config/` beside the settings file; both are checked.
+    let mut override_dirs: Vec<PathBuf> = config
+        .parent()
+        .map(|parent| parent.join("config"))
+        .into_iter()
+        .collect();
+    if seen.contains_key("rgui_config_directory") {
+        match dir_of("rgui_config_directory") {
+            Some(dir) => override_dirs.push(dir),
+            None => findings.push(
+                "RetroArch's `rgui_config_directory` could not be read, so per-game \
+                 override settings cannot be checked"
+                    .into(),
+            ),
+        }
+    }
+    let mut overrides_found = false;
+    let mut checked: Vec<PathBuf> = Vec::new();
+    for dir in override_dirs {
+        let dir = PathBuf::from(dir.to_string_lossy().trim_end_matches('/'));
+        if checked.contains(&dir) {
+            continue;
+        }
+        match cfg_files_exist(&dir, 0) {
+            Ok(true) => overrides_found = true,
+            Ok(false) => {}
+            Err(detail) => findings.push(detail),
+        }
+        checked.push(dir);
+    }
+    if overrides_found {
+        findings.push(
             "RetroArch has per-core or per-game override settings, which are not \
-                    read; saves for a zipped cartridge cannot be proven safe"
+             read; saves for a zipped cartridge cannot be proven safe"
                 .into(),
         );
     }
-    // The system-wide file is skipped under test so results do not depend on
-    // the machine running them.
-    let mut legacy = Vec::new();
-    #[cfg(not(test))]
-    legacy.push(PathBuf::from("/etc/retroarch.cfg"));
+    // A legacy `~/.retroarch.cfg` beside the settings above is ambiguous and
+    // refused. The packaged system-wide `/etc/retroarch.cfg` is not: RetroArch
+    // only uses it as the template when it has to create a new settings file,
+    // never once the user's own settings file (read above) exists.
     if let Some(home) = &environment.home {
-        legacy.push(PathBuf::from(home).join(".retroarch.cfg"));
+        let legacy = PathBuf::from(home).join(".retroarch.cfg");
+        if legacy != config && fs::symlink_metadata(&legacy).is_ok() {
+            findings
+                .push("a legacy RetroArch settings file exists and might take precedence".into());
+        }
     }
-    if legacy.iter().any(|path| fs::symlink_metadata(path).is_ok()) {
-        return Err("a legacy RetroArch settings file exists and might take precedence".into());
-    }
-    Ok(())
+    findings
 }
 
-/// [`preflight_retroarch_launch_with_playlist`] then [`spawn_retroarch`].
+/// A launch fully checked and ready to start: the command, and, for a zipped
+/// cartridge, the private extracted copy it runs (kept until the process
+/// exits). Produced by [`prepare_retroarch_launch_with_playlist`].
+pub struct PreparedRetroArchLaunch {
+    pub command: RetroArchCommand,
+    staged_cartridge: Option<crate::zip_cartridge_stage::StagedCartridge>,
+}
+
+impl PreparedRetroArchLaunch {
+    /// The extracted copy RetroArch would be given, for a zipped cartridge.
+    pub fn staged_content_path(&self) -> Option<&Path> {
+        self.staged_cartridge.as_ref().map(|staged| staged.path())
+    }
+}
+
+/// [`prepare_retroarch_launch_with_playlist`] then [`spawn_retroarch`].
 pub fn preflight_and_launch_retroarch_with_playlist(
     request: &RetroArchLaunchRequest,
     filesystem: &dyn ReadOnlyHostFilesystem,
@@ -1346,6 +1611,25 @@ pub fn preflight_and_launch_retroarch_with_playlist(
         &crate::launch::multidisc_launch::MultiDiscPlaylist,
     )>,
 ) -> Result<LaunchedRetroArchProcess, LaunchExecutionError> {
+    let prepared =
+        prepare_retroarch_launch_with_playlist(request, filesystem, environment, playlist)?;
+    let mut process = spawn_retroarch(prepared.command)?;
+    process.staged_cartridge = prepared.staged_cartridge;
+    Ok(process)
+}
+
+/// Every launch check, including a zipped cartridge's staging and save-safety
+/// checks, without starting anything. Nothing is written except the private
+/// extracted copy of a zipped cartridge, removed when the result is dropped.
+pub fn prepare_retroarch_launch_with_playlist(
+    request: &RetroArchLaunchRequest,
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    environment: &DiscoveryEnvironment,
+    playlist: Option<(
+        &[crate::media_set::MediaSet],
+        &crate::launch::multidisc_launch::MultiDiscPlaylist,
+    )>,
+) -> Result<PreparedRetroArchLaunch, LaunchPreflightError> {
     if playlist.is_some()
         && crate::zip_cartridge_stage::is_zipped_cartridge_request(
             &request.selected_content_path,
@@ -1355,15 +1639,27 @@ pub fn preflight_and_launch_retroarch_with_playlist(
         return Err(preflight_error(
             LaunchPreflightErrorKind::ContentRequiresMount,
             "multi-disc play is not supported for a zipped cartridge",
-        )
-        .into());
+        ));
     }
     // A zipped cartridge is extracted to a private temporary file for this
     // launch only; the normal preflight then re-verifies that file's identity
     // against `expected_game_key`. Anything else takes the unchanged route.
-    match crate::zip_cartridge_stage::stage_zip_cartridge_for_launch(
+    // An unverified key is bound to the ZIP's bytes, not the member's: it is
+    // re-derived through the handle staging extracts from, so the member
+    // launched comes from the very archive that was checked.
+    let unverified_zip = super::unverified_media::is_unverified_key(&request.expected_game_key);
+    match crate::zip_cartridge_stage::stage_zip_cartridge_for_launch_checked(
         &request.selected_content_path,
         &request.expected_platform_id,
+        |file| {
+            !unverified_zip
+                || super::unverified_media::platform_media_key_of_open_file(
+                    file,
+                    &request.selected_content_path,
+                    &request.expected_platform_id,
+                )
+                .is_some_and(|key| key == request.expected_game_key)
+        },
     ) {
         Ok(staged) => {
             // The staged copy is deleted at exit, so anything RetroArch would
@@ -1379,28 +1675,67 @@ pub fn preflight_and_launch_retroarch_with_playlist(
             })?;
             let mut staged_request = request.clone();
             staged_request.selected_content_path = staged.path().to_path_buf();
-            let command = preflight_retroarch_launch_with_playlist(
+            // The ZIP's key was checked on staging's own handle (and staging
+            // refused a ZIP that changed while extracting); the extracted
+            // member is now held to its own key from here to spawn.
+            if unverified_zip {
+                let member = super::unverified_media::platform_media_identity_fresh(
+                    staged.path(),
+                    &request.expected_platform_id,
+                )
+                .ok_or_else(|| {
+                    preflight_error(
+                        LaunchPreflightErrorKind::IdentityUnresolved,
+                        "The game file changed or is no longer a format this system accepts; recheck this game.",
+                    )
+                })?;
+                staged_request.expected_game_key = member.game_key;
+            }
+            let mut command = preflight_retroarch_launch_with_playlist(
                 &staged_request,
                 filesystem,
                 environment,
                 playlist,
             )?;
-            let mut process = spawn_retroarch(command)?;
-            process.staged_cartridge = Some(staged);
-            return Ok(process);
+            // A zipped Amiga game with several disks: every check above held
+            // the boot disk; RetroArch is given the staged M3U beside it so
+            // all of that game's disks (and only those) can be swapped in.
+            // The spawn re-check still re-derives the boot disk's key.
+            if let Some(disks) = staged.playlist() {
+                swap_content_argument(&mut command.arguments, staged.path(), disks).map_err(
+                    |detail| {
+                        preflight_error(
+                            LaunchPreflightErrorKind::ContentRequiresMount,
+                            format!("zipped game cannot be launched: {detail}"),
+                        )
+                    },
+                )?;
+            }
+            return Ok(PreparedRetroArchLaunch {
+                command,
+                staged_cartridge: Some(staged),
+            });
         }
         Err(crate::zip_cartridge_stage::StageZipError::NotApplicable) => {}
+        Err(crate::zip_cartridge_stage::StageZipError::NotAccepted) => {
+            return Err(preflight_error(
+                LaunchPreflightErrorKind::IdentityUnresolved,
+                "The game file changed or is no longer a format this system accepts; recheck this game.",
+            ));
+        }
         Err(crate::zip_cartridge_stage::StageZipError::Refused(detail)) => {
             return Err(preflight_error(
                 LaunchPreflightErrorKind::ContentRequiresMount,
                 format!("zipped cartridge cannot be launched: {detail}"),
-            )
-            .into());
+            ));
         }
     }
     let command =
         preflight_retroarch_launch_with_playlist(request, filesystem, environment, playlist)?;
-    Ok(spawn_retroarch(command)?)
+    Ok(PreparedRetroArchLaunch {
+        command,
+        staged_cartridge: None,
+    })
 }
 
 #[cfg(test)]

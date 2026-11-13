@@ -166,6 +166,7 @@ mod app_pages;
 mod app_polling;
 mod app_reactions;
 mod app_shell;
+mod arcade_mame_probe;
 mod archive_context;
 use archive_context::ArchiveContext;
 mod archive_inspector_controller;

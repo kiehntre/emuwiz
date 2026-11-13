@@ -74,7 +74,11 @@ use crate::emulator_environment::{
     BoundedReadResult, HostReadOnlyFilesystem, ReadOnlyHostFilesystem,
 };
 
-use super::cheat_catalogue::{CheatAvailabilityEntry, MAX_CATALOGUE_FILE_BYTES};
+use super::anchored_fs::{DirectoryHandle, DirectoryIdentity};
+use super::cheat_catalogue::{
+    CheatAvailabilityEntry, CheatCatalogueFormat, MAX_CATALOGUE_FILE_BYTES,
+    NO_INSTALLABLE_CHEATS_REASON, cheat_destination_file_name, render_installable_cheat_document,
+};
 use super::cheat_install_result::{
     CHEAT_INSTALL_RUN_SCHEMA_VERSION, CheatInstallEntryResult, CheatInstallOutcome,
     CheatInstallPath, CheatInstallRun, CheatInstallRunStatus, CheatInstallSummary,
@@ -103,12 +107,44 @@ enum FaultPoint {
     TempDestinationWrite,
     Rename,
     FinalVerification,
+    /// The pending journal cannot be created before the first mutation.
     JournalWrite,
+    /// The per-entry journal rewrite after entry `n` (0-based) fails.
+    JournalUpdate(usize),
+    /// The final journal rewrite (status + completion time) fails.
+    JournalFinalize,
+    /// The process dies after entry `n` was applied but before its journal
+    /// update - modelled as a panic the test catches with `catch_unwind`.
+    CrashBeforeJournalUpdate(usize),
+    /// The process dies right after entry `n`'s journal update.
+    CrashAfterJournalUpdate(usize),
 }
+
+#[cfg(test)]
+type AnchorHook = Box<dyn Fn(&Path)>;
 
 #[cfg(test)]
 thread_local! {
     static INJECTED_FAULT: std::cell::Cell<Option<FaultPoint>> = const { std::cell::Cell::new(None) };
+    /// Runs with the destination root right before the installer opens its
+    /// directory handle for a write - the window in which a parent
+    /// directory could be swapped for a symlink (Night Watch D7-03).
+    static BEFORE_ANCHOR_HOOK: std::cell::RefCell<Option<AnchorHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_anchor_hook_for_test(hook: Option<AnchorHook>) {
+    BEFORE_ANCHOR_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
+fn run_before_anchor_hook(_root: &Path) {
+    #[cfg(test)]
+    BEFORE_ANCHOR_HOOK.with(|cell| {
+        if let Some(hook) = cell.borrow().as_ref() {
+            hook(_root);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -153,18 +189,23 @@ pub struct CheatInstallOptions {
 pub struct CheatInstallRunOutcome {
     pub run: CheatInstallRun,
     /// Where the journal was written, for a real (non-dry-run) run whose
-    /// journal write succeeded. Always `None` for a dry run.
+    /// journal exists on disk - including a run whose final write failed
+    /// (the journal then still reads `in_progress`; see `journal_error`).
+    /// `None` for a dry run and for a run that failed closed.
     pub journal_path: Option<PathBuf>,
-    /// Set when a real run's journal write itself failed - the run's own
-    /// entries and summary are still fully valid and already reflect
-    /// exactly what was (or was not) written to the filesystem; only the
-    /// durable record of that run failed to be persisted.
+    /// Set when a real run's journal could not be created or kept up to
+    /// date. The run's own entries and summary are still fully valid and
+    /// reflect exactly what was (or was not) written to the filesystem:
+    /// when the *pending* journal could not be created, nothing was written
+    /// at all (every eligible entry carries reason code
+    /// `journal_unavailable`); when a mid-run update failed, no further
+    /// entry was attempted (reason code `journal_update_failed`).
     pub journal_error: Option<String>,
 }
 
 /// Executes one full installation run: plans every entry (reusing
 /// [`plan_cheat_install_entry`]), revalidates and, if eligible and
-/// permitted, applies each independently, then writes one journal file for
+/// permitted, applies each independently, and keeps one journal file for
 /// a real (non-dry-run, confirmed) run.
 ///
 /// `options.confirmed` is the `--yes` gate: whenever it is `false`, this
@@ -173,9 +214,35 @@ pub struct CheatInstallRunOutcome {
 /// of `options.dry_run` - the two are combined, not layered, so a caller
 /// can never accidentally write by only checking one of them.
 ///
-/// One entry failing never stops another from being processed: every
-/// entry in `entries` is always attempted independently, in the given
-/// (already-deterministic) order.
+/// ## Crash-proof Undo (journal before the first mutation)
+///
+/// A real run never touches the destination before an Undo record exists:
+///
+/// 1. A *pending* journal (`status: in_progress`, every entry in its
+///    planned state, `settled_entries: 0`) is written at the final journal
+///    path before the first filesystem mutation. If that write fails the
+///    run **fails closed**: nothing is written anywhere, every eligible
+///    entry is reported `failed_write` with reason `journal_unavailable`,
+///    and the run's status is `failed`.
+/// 2. After each entry settles the journal is atomically rewritten
+///    (temp file, fsync, rename over the pending file) with
+///    `settled_entries` advanced. If that rewrite fails, no further entry
+///    is attempted (each is reported with reason `journal_update_failed`)
+///    so the on-disk journal never claims less than one entry behind the
+///    truth, and never more than was done.
+/// 3. The journal is finalised once with the derived status and
+///    completion time.
+///
+/// A journal still reading `in_progress` therefore means the process died
+/// (or the final write failed): `entries[..settled_entries]` are final,
+/// `entries[settled_entries]` may or may not have been applied (only the
+/// destination's current hash can tell), and later entries were never
+/// attempted. `cheat_rollback` and `cheat_history` read it exactly that
+/// way.
+///
+/// One entry failing never stops another from being processed (except for
+/// the journal-update failure above): every entry in `entries` is
+/// attempted independently, in the given (already-deterministic) order.
 pub fn execute_cheat_install_run(
     entries: &[CheatAvailabilityEntry],
     options: &CheatInstallOptions,
@@ -183,32 +250,12 @@ pub fn execute_cheat_install_run(
     let effective_dry_run = options.dry_run || !options.confirmed;
     let mut claimed_destinations: BTreeSet<PathBuf> = BTreeSet::new();
 
-    let results: Vec<CheatInstallEntryResult> = entries
-        .iter()
-        .map(|entry| {
-            install_one_entry(entry, options, effective_dry_run, &mut claimed_destinations)
-        })
-        .collect();
-
-    let summary = CheatInstallSummary::from_entries(&results, effective_dry_run);
-    let status = CheatInstallRunStatus::derive(&summary, effective_dry_run);
-    let completed_at_unix_seconds = current_unix_seconds().max(options.started_at_unix_seconds);
-
-    let run = CheatInstallRun {
-        schema_version: CHEAT_INSTALL_RUN_SCHEMA_VERSION,
-        run_id: options.run_id.clone(),
-        started_at_unix_seconds: options.started_at_unix_seconds,
-        completed_at_unix_seconds: Some(completed_at_unix_seconds),
-        dry_run: effective_dry_run,
-        allow_replace_different: options.allow_replace_different,
-        destination_root: Some(CheatInstallPath::from_path(&options.destination_root)),
-        catalogue_source: options.catalogue_source.clone(),
-        entries: results,
-        summary,
-        status,
-    };
-
     if effective_dry_run {
+        let results: Vec<CheatInstallEntryResult> = entries
+            .iter()
+            .map(|entry| install_one_entry(entry, options, true, &mut claimed_destinations))
+            .collect();
+        let run = finished_run(options, results, true);
         return CheatInstallRunOutcome {
             run,
             journal_path: None,
@@ -216,16 +263,195 @@ pub fn execute_cheat_install_run(
         };
     }
 
-    match write_cheat_install_journal(&run, &options.journal_directory) {
-        Ok(path) => CheatInstallRunOutcome {
+    // --- 1. Plan every entry and write the pending journal first. ---
+    let planned: Vec<CheatInstallEntryResult> = entries
+        .iter()
+        .map(|entry| {
+            let mut result = plan_cheat_install_entry(entry, options.allow_replace_different);
+            if result.outcome == CheatInstallOutcome::ReplacedWithBackup
+                && let (Some(destination), Some(previous_hash)) = (
+                    result.destination_path.as_ref(),
+                    result.previous_destination_hash.as_deref(),
+                )
+            {
+                result.planned_backup_path =
+                    Some(CheatInstallPath::from_path(&planned_backup_path(
+                        Path::new(&destination.display),
+                        previous_hash,
+                        &options.backup_directory,
+                        &options.run_id,
+                    )));
+            }
+            result
+        })
+        .collect();
+    let summary = CheatInstallSummary::from_entries(&planned, false);
+    let mut run = CheatInstallRun {
+        schema_version: CHEAT_INSTALL_RUN_SCHEMA_VERSION,
+        run_id: options.run_id.clone(),
+        started_at_unix_seconds: options.started_at_unix_seconds,
+        completed_at_unix_seconds: None,
+        dry_run: false,
+        allow_replace_different: options.allow_replace_different,
+        destination_root: Some(CheatInstallPath::from_path(&options.destination_root)),
+        catalogue_source: options.catalogue_source.clone(),
+        entries: planned,
+        summary,
+        status: CheatInstallRunStatus::InProgress,
+        settled_entries: 0,
+        temp_file_prefix: Some(own_temp_file_prefix()),
+    };
+
+    // The installer lock is taken before the journal becomes visible and
+    // held for the whole run, so a rollback can tell a live run from a
+    // crashed one (the kernel releases the lock when the process dies).
+    let lock_and_journal = InstallerLock::acquire(
+        &options.journal_directory,
+        &options
+            .journal_directory
+            .join(journal_file_name(&run.run_id)),
+    )
+    .and_then(|lock| {
+        create_pending_journal(&run, &options.journal_directory).map(|path| (lock, path))
+    });
+    let (_installer_lock, journal_path) = match lock_and_journal {
+        Ok(pair) => pair,
+        Err(error) => {
+            // Fail closed: no Undo record, no mutation.
+            for entry in &mut run.entries {
+                if is_actionable_plan(entry.outcome) {
+                    entry.outcome = CheatInstallOutcome::FailedWrite;
+                    entry.reason_code = JOURNAL_UNAVAILABLE_REASON.to_string();
+                    entry.detail.push(
+                        "not attempted: the install record (journal) could not be created \
+                         before the first change, so nothing was written"
+                            .to_string(),
+                    );
+                }
+            }
+            let run = finished_run(options, run.entries, false);
+            return CheatInstallRunOutcome {
+                run,
+                journal_path: None,
+                journal_error: Some(format!(
+                    "nothing was written: the install record could not be created: {error}"
+                )),
+            };
+        }
+    };
+
+    // --- 2. Apply entries in order, recording each as it settles. ---
+    let mut journal_error: Option<String> = None;
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(error) = &journal_error {
+            let planned = &mut run.entries[index];
+            if is_actionable_plan(planned.outcome) {
+                planned.outcome = CheatInstallOutcome::FailedWrite;
+                planned.reason_code = JOURNAL_UPDATE_FAILED_REASON.to_string();
+                planned.detail.push(format!(
+                    "not attempted: an earlier install-record update failed ({error})"
+                ));
+            }
+            continue;
+        }
+        let planned_backup_path = run.entries[index].planned_backup_path.take();
+        let mut result = install_one_entry(entry, options, false, &mut claimed_destinations);
+        result.planned_backup_path = planned_backup_path;
+        run.entries[index] = result;
+        if should_inject(FaultPoint::CrashBeforeJournalUpdate(index)) {
+            panic!("injected crash after entry {index} was applied, before its journal update");
+        }
+        run.settled_entries = index + 1;
+        run.summary = CheatInstallSummary::from_entries(&run.entries, false);
+        if should_inject(FaultPoint::JournalUpdate(index)) {
+            journal_error = Some(format!(
+                "injected journal update failure after entry {index}"
+            ));
+        } else if let Err(error) = rewrite_journal(&run, &journal_path, &options.journal_directory)
+        {
+            journal_error = Some(format!(
+                "install record could not be updated after entry {index}: {error}"
+            ));
+        }
+        if should_inject(FaultPoint::CrashAfterJournalUpdate(index)) {
+            panic!("injected crash right after entry {index}'s journal update");
+        }
+    }
+
+    // --- 3. Finalise once. ---
+    let run = finished_run(options, run.entries, false);
+    let finalize = if should_inject(FaultPoint::JournalFinalize) {
+        Err("injected journal finalize failure".to_string())
+    } else {
+        rewrite_journal(&run, &journal_path, &options.journal_directory)
+    };
+    match finalize {
+        Ok(()) => CheatInstallRunOutcome {
             run,
-            journal_path: Some(path),
-            journal_error: None,
+            journal_path: Some(journal_path),
+            journal_error,
         },
+        // The last per-entry (`in_progress`) journal is still on disk and
+        // lists every applied entry, so its path is still reported: Undo
+        // stays possible from it.
         Err(error) => CheatInstallRunOutcome {
             run,
-            journal_path: None,
-            journal_error: Some(error),
+            journal_path: Some(journal_path),
+            journal_error: Some(match journal_error {
+                Some(earlier) => {
+                    format!("{earlier}; final install-record write also failed: {error}")
+                }
+                None => format!(
+                    "the changes were applied but the install record could not be finalised \
+                     (it still reads in_progress): {error}"
+                ),
+            }),
+        },
+    }
+}
+
+/// Reason code on every eligible entry of a run that failed closed because
+/// its pending journal could not be created - nothing was written.
+pub const JOURNAL_UNAVAILABLE_REASON: &str = "journal_unavailable";
+/// Reason code on every entry that was not attempted because an earlier
+/// per-entry journal update failed.
+pub const JOURNAL_UPDATE_FAILED_REASON: &str = "journal_update_failed";
+
+fn is_actionable_plan(outcome: CheatInstallOutcome) -> bool {
+    matches!(
+        outcome,
+        CheatInstallOutcome::InstalledNew
+            | CheatInstallOutcome::AlreadyInstalled
+            | CheatInstallOutcome::ReplacedWithBackup
+    )
+}
+
+fn finished_run(
+    options: &CheatInstallOptions,
+    entries: Vec<CheatInstallEntryResult>,
+    dry_run: bool,
+) -> CheatInstallRun {
+    let summary = CheatInstallSummary::from_entries(&entries, dry_run);
+    let status = CheatInstallRunStatus::derive(&summary, dry_run);
+    let completed_at_unix_seconds = current_unix_seconds().max(options.started_at_unix_seconds);
+    let settled_entries = entries.len();
+    CheatInstallRun {
+        schema_version: CHEAT_INSTALL_RUN_SCHEMA_VERSION,
+        run_id: options.run_id.clone(),
+        started_at_unix_seconds: options.started_at_unix_seconds,
+        completed_at_unix_seconds: Some(completed_at_unix_seconds),
+        dry_run,
+        allow_replace_different: options.allow_replace_different,
+        destination_root: Some(CheatInstallPath::from_path(&options.destination_root)),
+        catalogue_source: options.catalogue_source.clone(),
+        entries,
+        summary,
+        status,
+        settled_entries,
+        temp_file_prefix: if dry_run {
+            None
+        } else {
+            Some(own_temp_file_prefix())
         },
     }
 }
@@ -292,16 +518,64 @@ fn install_one_entry(
             );
         }
     };
-    let observed_source_hash = hex_sha256(&source_bytes);
-    result.observed_source_hash = Some(observed_source_hash.clone());
-    if Some(observed_source_hash.as_str()) != result.expected_source_hash.as_deref() {
-        return reject(
-            result,
-            CheatInstallOutcome::SkippedSourceChanged,
-            "source_hash_changed_since_preview",
-            "source content changed since the catalogue was previewed",
-        );
-    }
+    let observed_file_hash = hex_sha256(&source_bytes);
+    // --- 1b. What will actually be written (Night Watch D7-01). ---
+    // A `.cht` source is installed byte for byte, so the file's own hash
+    // must equal the preview's. A JSON manifest describes many games in one
+    // file: the manifest must be unchanged since the preview (its own hash
+    // against the record), and the per-game `.cht` document rendered from
+    // it must hash to exactly what the preview promised. The manifest's
+    // bytes themselves are never written anywhere.
+    let (install_bytes, install_hash) = match record.format {
+        CheatCatalogueFormat::RetroarchChtDirectory => {
+            if Some(observed_file_hash.as_str()) != result.expected_source_hash.as_deref() {
+                result.observed_source_hash = Some(observed_file_hash);
+                return reject(
+                    result,
+                    CheatInstallOutcome::SkippedSourceChanged,
+                    "source_hash_changed_since_preview",
+                    "source content changed since the catalogue was previewed",
+                );
+            }
+            (source_bytes, observed_file_hash)
+        }
+        CheatCatalogueFormat::JsonManifest => {
+            if Some(observed_file_hash.as_str()) != record.source_file_hash.as_deref() {
+                result.observed_source_hash = Some(observed_file_hash);
+                return reject(
+                    result,
+                    CheatInstallOutcome::SkippedSourceChanged,
+                    "source_hash_changed_since_preview",
+                    "the catalogue manifest changed since it was previewed",
+                );
+            }
+            let Some(rendered) = render_installable_cheat_document(record) else {
+                return reject(
+                    result,
+                    CheatInstallOutcome::SkippedNotEligible,
+                    NO_INSTALLABLE_CHEATS_REASON,
+                    "this manifest game lists no cheat with a code, so there is nothing RetroArch could load; nothing was written",
+                );
+            };
+            let rendered_hash = hex_sha256(&rendered);
+            if Some(rendered_hash.as_str()) != result.expected_source_hash.as_deref() {
+                result.observed_source_hash = Some(rendered_hash);
+                return reject(
+                    result,
+                    CheatInstallOutcome::SkippedSourceChanged,
+                    "rendered_document_differs_from_preview",
+                    "the per-game cheat file rendered from the manifest differs from the one the preview showed",
+                );
+            }
+            result.detail.push(format!(
+                "rendered a per-game RetroArch .cht from the catalogue manifest (manifest sha256 {observed_file_hash}); the manifest itself is never installed"
+            ));
+            (rendered, rendered_hash)
+        }
+    };
+    result.observed_source_hash = Some(install_hash.clone());
+    let source_bytes = install_bytes;
+    let observed_source_hash = install_hash;
 
     // --- 2. Reconstruct and revalidate the destination fresh, via destination_safety. ---
     let Some(platform_hint) = record.source_platform.as_deref() else {
@@ -324,7 +598,17 @@ fn install_one_entry(
             "platform hint does not resolve to a known canonical platform",
         );
     };
-    let file_name = format!("{}.cht", record.source_game_name);
+    // Night Watch D7-02: the written name is derived by the same helper
+    // the preview used, so the two can never disagree; a name the helper
+    // refuses (control characters, separators) is never written.
+    let Some(file_name) = cheat_destination_file_name(record) else {
+        return reject(
+            result,
+            CheatInstallOutcome::FailedUnsafePath,
+            "destination_name_unsafe",
+            "the game name is not a safe file name",
+        );
+    };
 
     let assessment = match assess_destination(
         &options.destination_root,
@@ -344,12 +628,39 @@ fn install_one_entry(
 
     let resolved_destination_path = assessment.proposed_destination.path().to_path_buf();
     let resolved_destination = CheatInstallPath::from_path(&resolved_destination_path);
-    if result.destination_path.as_ref() != Some(&resolved_destination) {
-        result.detail.push(
-            "destination path re-resolved at apply time differs from the preview".to_string(),
+    // The assessment works on absolute paths; a preview taken with a
+    // relative `--cheat-destination-root` shows the relative form of the
+    // same path. Compare like with like so only a genuinely different
+    // destination is refused.
+    let same_as_preview = result.destination_path.as_ref().is_some_and(|previewed| {
+        previewed == &resolved_destination
+            || (!previewed.lossy
+                && !resolved_destination.lossy
+                && std::path::absolute(Path::new(&previewed.display))
+                    .ok()
+                    .as_deref()
+                    == Some(resolved_destination_path.as_path()))
+    });
+    if !same_as_preview {
+        // The approved plan is the previewed path; nothing else is ever
+        // written (Night Watch D7-02).
+        result.detail.push(format!(
+            "destination re-resolved at apply time ({}) differs from the previewed path",
+            resolved_destination.display
+        ));
+        return reject(
+            result,
+            CheatInstallOutcome::SkippedDestinationChanged,
+            "destination_differs_from_preview",
+            "the destination path no longer matches the approved preview; nothing was written",
         );
     }
     result.destination_path = Some(resolved_destination);
+    let anchor = WriteAnchor {
+        root: options.destination_root.clone(),
+        platform: canonical_platform.to_string(),
+        file_name: file_name.clone(),
+    };
 
     // --- 3. Batch-level duplicate-destination defense in depth. ---
     if !claimed_destinations.insert(resolved_destination_path.clone()) {
@@ -432,16 +743,12 @@ fn install_one_entry(
 
     match result.outcome {
         CheatInstallOutcome::InstalledNew => {
-            install_new_file(
-                &mut result,
-                assessment.proposed_destination.path(),
-                &source_bytes,
-                &observed_source_hash,
-            );
+            install_new_file(&mut result, &anchor, &source_bytes, &observed_source_hash);
         }
         CheatInstallOutcome::ReplacedWithBackup => {
             replace_with_backup(
                 &mut result,
+                &anchor,
                 &resolved_destination_path,
                 &source_bytes,
                 &observed_source_hash,
@@ -452,6 +759,176 @@ fn install_one_entry(
         _ => unreachable!("already_installed already returned above"),
     }
     result
+}
+
+/// Where a write lands, as the three names the write is anchored to: the
+/// assessed destination root, the canonical platform directory beneath it,
+/// and the file name. Every write opens the root once (no-follow) and does
+/// everything else relative to open directory descriptors, so a directory
+/// swapped for a symlink after the assessment redirects nothing (Night
+/// Watch D7-03).
+struct WriteAnchor {
+    root: PathBuf,
+    platform: String,
+    file_name: String,
+}
+
+/// Opens the platform directory for writing, creating it when `create` is
+/// allowed. The root must already be the plain directory the assessment
+/// saw (compared by device and inode after a no-follow open); the platform
+/// directory is opened relative to that root and must be a plain directory
+/// too.
+fn open_platform_directory(
+    anchor: &WriteAnchor,
+    create: bool,
+) -> Result<DirectoryHandle, (CheatInstallOutcome, String, String)> {
+    run_before_anchor_hook(&anchor.root);
+    let root_metadata = fs::symlink_metadata(&anchor.root).map_err(|error| {
+        (
+            CheatInstallOutcome::FailedUnsafePath,
+            "destination_root_missing".to_string(),
+            format!("{}: {error}", anchor.root.display()),
+        )
+    })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err((
+            CheatInstallOutcome::FailedUnsafePath,
+            "destination_root_not_a_plain_directory".to_string(),
+            format!("{} is not a plain directory", anchor.root.display()),
+        ));
+    }
+    let root = DirectoryHandle::open_verified(
+        &anchor.root,
+        DirectoryIdentity::of_metadata(&root_metadata),
+    )
+    .map_err(|error| {
+        (
+            CheatInstallOutcome::FailedUnsafePath,
+            "destination_root_replaced_before_write".to_string(),
+            format!("{}: {error}", anchor.root.display()),
+        )
+    })?;
+    let platform = OsStr::new(&anchor.platform);
+    let opened = if create {
+        root.open_or_create_child_dir(platform).map(|(dir, _)| dir)
+    } else {
+        root.open_child_dir(platform)
+    };
+    opened.map_err(|error| {
+        let kind = error.kind();
+        if kind == io::ErrorKind::NotFound || kind == io::ErrorKind::AlreadyExists {
+            (
+                CheatInstallOutcome::FailedWrite,
+                "directory_creation_failed".to_string(),
+                format!("{}/{}: {error}", anchor.root.display(), anchor.platform),
+            )
+        } else {
+            (
+                CheatInstallOutcome::FailedUnsafePath,
+                "parent_symlink_rejected".to_string(),
+                format!(
+                    "{}/{} is not a plain directory (replaced since the check?): {error}",
+                    anchor.root.display(),
+                    anchor.platform
+                ),
+            )
+        }
+    })
+}
+
+/// Writes `bytes` to a brand-new temporary file inside `dir`, flushed and
+/// hash-verified through the directory handle, with the same permission
+/// bits as before. Returns the temporary name; on any failure the
+/// temporary file is removed and nothing is left behind.
+fn stage_in_directory(
+    dir: &DirectoryHandle,
+    bytes: &[u8],
+    expected_hash: &str,
+) -> Result<String, (CheatInstallOutcome, String, String)> {
+    let temp_name = unique_temp_component("cheat-install");
+    let temp = OsStr::new(&temp_name);
+    if should_inject(FaultPoint::TempDestinationWrite) {
+        return Err((
+            CheatInstallOutcome::FailedWrite,
+            "injected_temp_write_failure".to_string(),
+            String::new(),
+        ));
+    }
+    let written = (|| -> io::Result<()> {
+        let mut file = dir.create_new_file(temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o644))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = written {
+        let _ = dir.unlink(temp);
+        return Err((
+            CheatInstallOutcome::FailedWrite,
+            "temp_file_write_failed".to_string(),
+            error.to_string(),
+        ));
+    }
+    if let Err(error) = verify_temp_file_hash_in(dir, temp, expected_hash) {
+        let _ = dir.unlink(temp);
+        return Err((
+            CheatInstallOutcome::FailedVerification,
+            "temp_file_hash_mismatch".to_string(),
+            error,
+        ));
+    }
+    Ok(temp_name)
+}
+
+/// Hashes `name` inside `dir` through the directory handle (never by path).
+fn hash_in_directory(dir: &DirectoryHandle, name: &OsStr) -> Result<String, String> {
+    use std::io::Read;
+    let mut file = dir
+        .open_file(name)
+        .map_err(|error| format!("could not open for verification: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    let mut total = 0_usize;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("could not read for verification: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        total += read;
+        if total > MAX_CATALOGUE_FILE_BYTES {
+            return Err("file grew past the catalogue size limit during verification".into());
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn verify_temp_file_hash_in(
+    dir: &DirectoryHandle,
+    name: &OsStr,
+    expected_hash: &str,
+) -> Result<(), String> {
+    if should_inject(FaultPoint::FinalVerification) {
+        return Err("injected verification failure".to_string());
+    }
+    let actual = hash_in_directory(dir, name)?;
+    if actual == expected_hash {
+        Ok(())
+    } else {
+        Err(format!(
+            "verification hash mismatch: expected {expected_hash}, got {actual}"
+        ))
+    }
 }
 
 fn reject(
@@ -478,80 +955,77 @@ fn destination_safety_reason_code(reason: DestinationSafetyFailureReason) -> Str
 
 fn install_new_file(
     result: &mut CheatInstallEntryResult,
-    destination: &Path,
+    anchor: &WriteAnchor,
     source_bytes: &[u8],
     source_hash: &str,
 ) {
-    let Some(parent) = destination.parent() else {
-        result.outcome = CheatInstallOutcome::FailedUnsafePath;
-        result.reason_code = "destination_has_no_parent".to_string();
-        return;
-    };
-
-    if let Err((outcome, reason, detail)) = create_directory_chain(parent) {
+    // The destination root itself may be absent for a first-ever install
+    // (the assessment approved creating it); every level beneath it is
+    // created relative to the opened root, never by path.
+    if fs::symlink_metadata(&anchor.root).is_err()
+        && let Err((outcome, reason, detail)) = create_directory_chain(&anchor.root)
+    {
         result.outcome = outcome;
         result.reason_code = reason;
         result.detail.push(detail);
         return;
     }
+    let dir = match open_platform_directory(anchor, true) {
+        Ok(dir) => dir,
+        Err((outcome, reason, detail)) => {
+            result.outcome = outcome;
+            result.reason_code = reason;
+            result.detail.push(detail);
+            return;
+        }
+    };
+    let temp_name = match stage_in_directory(&dir, source_bytes, source_hash) {
+        Ok(name) => name,
+        Err((outcome, reason, detail)) => {
+            result.outcome = outcome;
+            result.reason_code = reason;
+            if !detail.is_empty() {
+                result.detail.push(detail);
+            }
+            return;
+        }
+    };
+    let temp = OsStr::new(&temp_name);
+    let final_name = OsStr::new(&anchor.file_name);
 
-    let temp_path = parent.join(unique_temp_component("cheat-install"));
-
-    if should_inject(FaultPoint::TempDestinationWrite) {
-        result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "injected_temp_write_failure".to_string();
-        return;
-    }
-    if let Err(error) = write_new_temp_file(&temp_path, source_bytes) {
-        result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "temp_file_write_failed".to_string();
-        result.detail.push(error.to_string());
-        return;
-    }
-
-    if let Err(error) = verify_temp_file_hash(&temp_path, source_hash) {
-        let _ = fs::remove_file(&temp_path);
-        result.outcome = CheatInstallOutcome::FailedVerification;
-        result.reason_code = "temp_file_hash_mismatch".to_string();
-        result.detail.push(error);
-        return;
-    }
-
-    if let Err(error) = set_sensible_file_permissions(&temp_path) {
-        let _ = fs::remove_file(&temp_path);
-        result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "permission_set_failed".to_string();
-        result.detail.push(error.to_string());
-        return;
-    }
-
-    // Revalidate the exact final path immediately before rename: it must
-    // still be genuinely absent.
-    if fs::symlink_metadata(destination).is_ok() {
-        let _ = fs::remove_file(&temp_path);
-        result.outcome = CheatInstallOutcome::SkippedDestinationChanged;
-        result.reason_code = "destination_appeared_before_rename".to_string();
-        result
-            .detail
-            .push("something occupied the destination immediately before rename".to_string());
-        return;
+    // Revalidate the exact final name immediately before rename, through
+    // the same handle: it must still be genuinely absent.
+    match dir.lstat(final_name) {
+        Ok(None) => {}
+        _ => {
+            let _ = dir.unlink(temp);
+            result.outcome = CheatInstallOutcome::SkippedDestinationChanged;
+            result.reason_code = "destination_appeared_before_rename".to_string();
+            result
+                .detail
+                .push("something occupied the destination immediately before rename".to_string());
+            return;
+        }
     }
 
     if should_inject(FaultPoint::Rename) {
-        let _ = fs::remove_file(&temp_path);
+        let _ = dir.unlink(temp);
         result.outcome = CheatInstallOutcome::FailedWrite;
         result.reason_code = "injected_rename_failure".to_string();
         return;
     }
-    if let Err(error) = rename_no_replace(&temp_path, destination) {
-        let _ = fs::remove_file(&temp_path);
+    if let Err(error) = dir.rename_no_replace(temp, final_name) {
+        let _ = dir.unlink(temp);
         result.outcome = CheatInstallOutcome::FailedWrite;
         result.reason_code = "rename_failed".to_string();
         result.detail.push(error.to_string());
         return;
     }
-
-    fsync_directory_best_effort(parent, &mut result.detail);
+    if let Err(error) = dir.sync() {
+        result
+            .detail
+            .push(format!("directory fsync failed (non-fatal): {error}"));
+    }
 
     result.resulting_destination_hash = Some(source_hash.to_string());
     result.previous_destination_state = PreviousDestinationState::Absent;
@@ -562,8 +1036,10 @@ fn install_new_file(
 // Real writes: replace_different (backup, then replace)
 // ---------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn replace_with_backup(
     result: &mut CheatInstallEntryResult,
+    anchor: &WriteAnchor,
     destination: &Path,
     source_bytes: &[u8],
     source_hash: &str,
@@ -572,12 +1048,6 @@ fn replace_with_backup(
 ) {
     let filesystem = HostReadOnlyFilesystem;
     let previous_hash = result.previous_destination_hash.clone().unwrap_or_default();
-    let file_name = destination
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "cheat".to_string());
-    let hash_prefix: String = previous_hash.chars().take(12).collect();
-    let safe_run_id = sanitize_for_filename(run_id);
 
     if let Err(error) = fs::create_dir_all(backup_directory) {
         result.outcome = CheatInstallOutcome::FailedBackup;
@@ -608,7 +1078,7 @@ fn replace_with_backup(
     }
 
     let backup_final_path =
-        backup_directory.join(format!("{file_name}.{safe_run_id}.{hash_prefix}.bak"));
+        planned_backup_path(destination, &previous_hash, backup_directory, run_id);
     let backup_temp_path = backup_directory.join(unique_temp_component("cheat-backup"));
 
     if let Err(error) = write_new_temp_file(&backup_temp_path, &current_destination_bytes) {
@@ -645,63 +1115,46 @@ fn replace_with_backup(
     // sequence as a new install - the original destination content is
     // never opened for writing at any point; it is only ever read (above,
     // to create the backup) or atomically replaced (below).
-    let Some(parent) = destination.parent() else {
-        result.outcome = CheatInstallOutcome::FailedUnsafePath;
-        result.reason_code = "destination_has_no_parent".to_string();
-        result.detail.push(format!(
-            "backup preserved at {}",
-            backup_final_path.display()
-        ));
-        return;
+    // A verified backup now durably exists. Only now install the
+    // replacement, through the same anchored sequence as a new install.
+    // Publication is an atomic exchange: the displaced file is re-hashed
+    // under the temporary name (where nothing writing by path can reach
+    // it) and the exchange is reversed if it is not the exact file that
+    // was backed up - the original content is never opened for writing
+    // and never overwritten unverified.
+    let backup_note = format!(
+        "original preserved; backup at {}",
+        backup_final_path.display()
+    );
+    let dir = match open_platform_directory(anchor, false) {
+        Ok(dir) => dir,
+        Err((outcome, reason, detail)) => {
+            result.outcome = outcome;
+            result.reason_code = reason;
+            result.detail.push(detail);
+            result.detail.push(backup_note);
+            return;
+        }
     };
-    let temp_path = parent.join(unique_temp_component("cheat-install"));
+    let temp_name = match stage_in_directory(&dir, source_bytes, source_hash) {
+        Ok(name) => name,
+        Err((outcome, reason, detail)) => {
+            result.outcome = outcome;
+            result.reason_code = reason;
+            if !detail.is_empty() {
+                result.detail.push(detail);
+            }
+            result.detail.push(backup_note);
+            return;
+        }
+    };
+    let temp = OsStr::new(&temp_name);
+    let final_name = OsStr::new(&anchor.file_name);
 
-    if should_inject(FaultPoint::TempDestinationWrite) {
-        result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "injected_temp_write_failure".to_string();
-        result.detail.push(format!(
-            "original preserved; backup at {}",
-            backup_final_path.display()
-        ));
-        return;
-    }
-    if let Err(error) = write_new_temp_file(&temp_path, source_bytes) {
-        result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "temp_file_write_failed".to_string();
-        result.detail.push(error.to_string());
-        result.detail.push(format!(
-            "original preserved; backup at {}",
-            backup_final_path.display()
-        ));
-        return;
-    }
-    if let Err(error) = verify_temp_file_hash(&temp_path, source_hash) {
-        let _ = fs::remove_file(&temp_path);
-        result.outcome = CheatInstallOutcome::FailedVerification;
-        result.reason_code = "temp_file_hash_mismatch".to_string();
-        result.detail.push(error);
-        result.detail.push(format!(
-            "original preserved; backup at {}",
-            backup_final_path.display()
-        ));
-        return;
-    }
-    if let Err(error) = set_sensible_file_permissions(&temp_path) {
-        let _ = fs::remove_file(&temp_path);
-        result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "permission_set_failed".to_string();
-        result.detail.push(error.to_string());
-        result.detail.push(format!(
-            "original preserved; backup at {}",
-            backup_final_path.display()
-        ));
-        return;
-    }
-
-    match filesystem.read_bounded(destination, MAX_CATALOGUE_FILE_BYTES) {
-        BoundedReadResult::Ok(bytes) if hex_sha256(&bytes) == previous_hash => {}
+    match hash_in_directory(&dir, final_name) {
+        Ok(hash) if hash == previous_hash => {}
         _ => {
-            let _ = fs::remove_file(&temp_path);
+            let _ = dir.unlink(temp);
             result.outcome = CheatInstallOutcome::SkippedDestinationChanged;
             result.reason_code = "destination_changed_before_replace".to_string();
             result.detail.push(format!(
@@ -713,41 +1166,223 @@ fn replace_with_backup(
     }
 
     if should_inject(FaultPoint::Rename) {
-        let _ = fs::remove_file(&temp_path);
+        let _ = dir.unlink(temp);
         result.outcome = CheatInstallOutcome::FailedWrite;
         result.reason_code = "injected_rename_failure".to_string();
-        result.detail.push(format!(
-            "original preserved; backup at {}",
-            backup_final_path.display()
-        ));
+        result.detail.push(backup_note);
         return;
     }
-    // A replacing rename is the one place a clobbering `fs::rename` is
-    // correct - replacement is the whole point, and the content being
-    // replaced was just verified above and is durably backed up either
-    // way.
-    if let Err(error) = fs::rename(&temp_path, destination) {
-        let _ = fs::remove_file(&temp_path);
+    if let Err(error) = dir.exchange(temp, final_name) {
+        let _ = dir.unlink(temp);
         result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "rename_failed".to_string();
-        result.detail.push(error.to_string());
-        result.detail.push(format!(
-            "original preserved; backup at {}",
-            backup_final_path.display()
-        ));
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+        ) {
+            // Only an atomic exchange may replace a user's file: without
+            // one EmuWiz refuses rather than check-then-rename, which
+            // could overwrite a change made in between.
+            result.reason_code = "atomic_replace_unsupported".to_string();
+            result.detail.push(
+                "this folder's filesystem cannot replace files atomically, so the existing file was left exactly as it is; to apply the new cheat file, close RetroArch and copy it over the existing one by hand"
+                    .to_string(),
+            );
+        } else {
+            result.reason_code = "rename_failed".to_string();
+            result.detail.push(error.to_string());
+        }
+        result.detail.push(backup_note);
         return;
     }
-
-    fsync_directory_best_effort(parent, &mut result.detail);
+    // `temp` now names the displaced file. Only the exact backed-up bytes
+    // may be discarded.
+    match hash_in_directory(&dir, temp) {
+        Ok(hash) if hash == previous_hash => {
+            let _ = dir.unlink(temp);
+        }
+        _ => match dir.exchange(temp, final_name) {
+            Ok(()) => {
+                let _ = dir.unlink(temp);
+                result.outcome = CheatInstallOutcome::SkippedDestinationChanged;
+                result.reason_code = "destination_changed_before_replace".to_string();
+                result.detail.push(
+                    "the file changed between the check and the replacement; it was put back untouched"
+                        .to_string(),
+                );
+                result.detail.push(backup_note);
+                return;
+            }
+            Err(error) => {
+                // Our file is live and the user's changed file is still
+                // under the temporary name. Give it a name no cleanup
+                // sweep recognises, and say exactly where it is.
+                let kept_name = format!(
+                    "{}.changed-by-you.{}",
+                    anchor.file_name,
+                    temp_name.trim_start_matches('.')
+                );
+                let kept_at = match dir.rename_no_replace(temp, OsStr::new(&kept_name)) {
+                    Ok(()) => destination.with_file_name(&kept_name),
+                    Err(_) => destination.with_file_name(&temp_name),
+                };
+                result.outcome = CheatInstallOutcome::FailedWrite;
+                result.reason_code = "displaced_file_kept".to_string();
+                result.resulting_destination_hash = Some(source_hash.to_string());
+                result.detail.push(format!(
+                    "the file changed between the check and the replacement and could not be swapped back ({error}); the new cheat file IS in place, and the changed file is kept at {} - nothing was deleted",
+                    kept_at.display()
+                ));
+                result.detail.push(backup_note);
+                return;
+            }
+        },
+    }
+    if let Err(error) = dir.sync() {
+        result
+            .detail
+            .push(format!("directory fsync failed (non-fatal): {error}"));
+    }
     result.resulting_destination_hash = Some(source_hash.to_string());
     result.applied = true;
 }
 
-// ---------------------------------------------------------------------
-// Journal
-// ---------------------------------------------------------------------
+/// The deterministic backup path a `replaced_with_backup` entry uses:
+/// `{file_name}.{safe_run_id}.{hash_prefix}.bak` beneath `backup_directory`.
+/// Recorded in the pending journal (as `planned_backup_path`) before any
+/// mutation and used verbatim by [`replace_with_backup`], so a crash-time
+/// reader and the writer can never disagree about where a backup went.
+fn planned_backup_path(
+    destination: &Path,
+    previous_hash: &str,
+    backup_directory: &Path,
+    run_id: &str,
+) -> PathBuf {
+    let file_name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cheat".to_string());
+    let hash_prefix: String = previous_hash.chars().take(12).collect();
+    let safe_run_id = sanitize_for_filename(run_id);
+    backup_directory.join(format!("{file_name}.{safe_run_id}.{hash_prefix}.bak"))
+}
 
-fn write_cheat_install_journal(
+/// The prefix shared by every destination-side temporary file this process
+/// creates (see [`unique_temp_component`]); recorded in the journal so a
+/// rollback of an interrupted run can sweep exactly this run's leftovers.
+fn own_temp_file_prefix() -> String {
+    format!(".archivefs-cheat-install-{}-", std::process::id())
+}
+
+/// The advisory lock file an installer holds for its whole run, beside
+/// its journal: `<journal dir>/.<journal file name>.lock`.
+pub(crate) fn installer_lock_path(journal_path: &Path) -> PathBuf {
+    let name = journal_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    journal_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!(".{name}.lock"))
+}
+
+/// Result of probing an install journal's lock from another run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallerLockState {
+    /// A live installer holds the lock: its run is still in progress.
+    HeldByLiveInstaller,
+    /// No lock file (finished run, or a journal older than the lock) or the
+    /// lock was free (the installer died - the kernel released it).
+    NotHeld,
+}
+
+/// Exclusive `flock` held by an installer for the whole run. Dropping it
+/// unlinks the lock file, then releases the lock.
+pub(crate) struct InstallerLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl InstallerLock {
+    fn acquire(journal_directory: &Path, journal_path: &Path) -> Result<Self, String> {
+        fs::create_dir_all(journal_directory)
+            .map_err(|error| format!("could not create journal directory: {error}"))?;
+        let path = installer_lock_path(journal_path);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| format!("could not create the installer lock: {error}"))?;
+        match try_lock_exclusive(&file) {
+            Ok(true) => Ok(Self { path, _file: file }),
+            Ok(false) => Err(format!(
+                "another run already holds the installer lock {}",
+                path.display()
+            )),
+            Err(error) => Err(format!("could not take the installer lock: {error}")),
+        }
+    }
+
+    /// Probes (non-blocking) whether a live installer holds the lock for
+    /// `journal_path`. On `NotHeld` with an existing lock file, the
+    /// returned guard keeps the lock for the caller's lifetime.
+    pub(crate) fn probe(journal_path: &Path) -> io::Result<(InstallerLockState, Option<File>)> {
+        let path = installer_lock_path(journal_path);
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok((InstallerLockState::NotHeld, None));
+            }
+            Err(error) => return Err(error),
+        };
+        if try_lock_exclusive(&file)? {
+            Ok((InstallerLockState::NotHeld, Some(file)))
+        } else {
+            Ok((InstallerLockState::HeldByLiveInstaller, None))
+        }
+    }
+}
+
+impl Drop for InstallerLock {
+    fn drop(&mut self) {
+        // Unlink while still holding the lock: anyone who opens the path
+        // afterwards finds nothing, anyone who opened it before gets the
+        // lock only once this run is done.
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// `flock(LOCK_EX | LOCK_NB)`: `Ok(false)` when another open file holds it.
+#[cfg(unix)]
+pub(crate) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `file` owns a valid descriptor for the duration of the call.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn try_lock_exclusive(_file: &File) -> io::Result<bool> {
+    Ok(true)
+}
+
+fn journal_file_name(run_id: &str) -> String {
+    format!("{}.json", sanitize_for_filename(run_id))
+}
+
+/// Creates the pending journal at its final path, refusing to clobber an
+/// existing journal with the same run id. Durable before it returns.
+fn create_pending_journal(
     run: &CheatInstallRun,
     journal_directory: &Path,
 ) -> Result<PathBuf, String> {
@@ -756,30 +1391,50 @@ fn write_cheat_install_journal(
     }
     fs::create_dir_all(journal_directory)
         .map_err(|error| format!("could not create journal directory: {error}"))?;
-
-    let file_name = format!("{}.json", sanitize_for_filename(&run.run_id));
-    let final_path = journal_directory.join(&file_name);
-    if final_path.exists() {
+    let final_path = journal_directory.join(journal_file_name(&run.run_id));
+    if fs::symlink_metadata(&final_path).is_ok() {
         return Err(format!(
             "a journal already exists at {}",
             final_path.display()
         ));
     }
+    let temp_path = write_journal_temp(run, journal_directory)?;
+    if let Err(error) = rename_no_replace(&temp_path, &final_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("could not finalize journal: {error}"));
+    }
+    let mut detail = Vec::new();
+    fsync_directory_best_effort(journal_directory, &mut detail);
+    Ok(final_path)
+}
 
+/// Atomically replaces this run's own journal with a newer state: temp
+/// file, fsync, rename over the existing file. A clobbering rename is
+/// correct here - the file being replaced is the one this run created
+/// moments ago - and `rewrite` never produces a journal that claims more
+/// than the run has actually done.
+fn rewrite_journal(
+    run: &CheatInstallRun,
+    journal_path: &Path,
+    journal_directory: &Path,
+) -> Result<(), String> {
+    let temp_path = write_journal_temp(run, journal_directory)?;
+    if let Err(error) = fs::rename(&temp_path, journal_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("could not replace journal: {error}"));
+    }
+    let mut detail = Vec::new();
+    fsync_directory_best_effort(journal_directory, &mut detail);
+    Ok(())
+}
+
+fn write_journal_temp(run: &CheatInstallRun, journal_directory: &Path) -> Result<PathBuf, String> {
     let json = serde_json::to_string_pretty(run)
         .map_err(|error| format!("could not serialize journal: {error}"))?;
     let temp_path = journal_directory.join(unique_temp_component("cheat-journal"));
     write_new_temp_file(&temp_path, json.as_bytes())
         .map_err(|error| format!("could not write journal temp file: {error}"))?;
-
-    if let Err(error) = rename_no_replace(&temp_path, &final_path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(format!("could not finalize journal: {error}"));
-    }
-
-    let mut detail = Vec::new();
-    fsync_directory_best_effort(journal_directory, &mut detail);
-    Ok(final_path)
+    Ok(temp_path)
 }
 
 // ---------------------------------------------------------------------
@@ -837,16 +1492,6 @@ fn write_new_temp_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Verifies the replacement/new content temp file - this is the "final
-/// verification" fault point (it is the last check before the file
-/// becomes visible at its real destination name).
-fn verify_temp_file_hash(path: &Path, expected_hash: &str) -> Result<(), String> {
-    if should_inject(FaultPoint::FinalVerification) {
-        return Err("injected verification failure".to_string());
-    }
-    verify_file_hash_unconditionally(path, expected_hash)
-}
-
 /// Verifies a backup temp file - deliberately not gated by the "final
 /// verification" fault point (that name refers to the replacement
 /// content's own verification, not the backup's); a backup-specific
@@ -866,19 +1511,6 @@ fn verify_file_hash_unconditionally(path: &Path, expected_hash: &str) -> Result<
         Err(format!(
             "verification hash mismatch: expected {expected_hash}, got {actual}"
         ))
-    }
-}
-
-fn set_sensible_file_permissions(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o644))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
     }
 }
 
@@ -957,7 +1589,7 @@ fn create_one_directory_level(path: &Path) -> Result<(), (CheatInstallOutcome, S
 /// existence check immediately before a plain `rename` (a small, accepted
 /// TOCTOU gap - see the module doc comment).
 #[cfg(target_os = "linux")]
-fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let from_c = std::ffi::CString::new(from.as_os_str().as_bytes())
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -976,14 +1608,21 @@ fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
         )
     };
     if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+        return Ok(());
+    }
+    // As in `rename_exchange`: a filesystem without RENAME_NOREPLACE is
+    // reported as `Unsupported` so callers can choose a safe fallback.
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP) => {
+            Err(io::Error::new(io::ErrorKind::Unsupported, error))
+        }
+        _ => Err(error),
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     if to.exists() {
         return Err(io::Error::from(io::ErrorKind::AlreadyExists));
     }

@@ -161,6 +161,14 @@ pub struct CheatInstallEntryResult {
     /// `None` from [`plan_cheat_install_entries`] - backup creation is not
     /// implemented anywhere in this codebase yet.
     pub backup_path: Option<CheatInstallPath>,
+    /// Where the executor *will* write the pre-replacement backup for a
+    /// `replaced_with_backup` entry - recorded in the pending journal
+    /// before the first filesystem mutation so a crash-time reader can tell
+    /// what was about to happen. Unlike [`Self::backup_path`] it never
+    /// claims the backup exists. Absent from journals written before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_backup_path: Option<CheatInstallPath>,
     /// The destination's content hash after a real write. Always `None`
     /// from [`plan_cheat_install_entries`] - nothing is ever written by
     /// this module.
@@ -212,6 +220,60 @@ pub struct CheatInstallRun {
     pub entries: Vec<CheatInstallEntryResult>,
     pub summary: CheatInstallSummary,
     pub status: CheatInstallRunStatus,
+    /// How many leading `entries` the executor has fully settled and
+    /// recorded. Only meaningful while [`Self::status`] is
+    /// [`CheatInstallRunStatus::InProgress`]: entries are processed strictly
+    /// in order, so `entries[settled_entries]` (if any) is the one that was
+    /// in flight when the run stopped and may or may not have been applied,
+    /// and every later entry was never attempted. A finished journal always
+    /// has every entry settled regardless of this value (journals written
+    /// before this field existed deserialize it as `0`).
+    #[serde(default)]
+    pub settled_entries: usize,
+    /// The filename prefix of every temporary file this run creates next to
+    /// a destination or a backup (`.archivefs-cheat-install-<pid>-` /
+    /// `.archivefs-cheat-backup-<pid>-`), recorded so a later rollback of
+    /// an interrupted run can remove exactly this run's leftovers and
+    /// nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_file_prefix: Option<String>,
+}
+
+/// Where one entry stands in an interrupted run - see
+/// [`CheatInstallRun::entry_settlement`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheatInstallEntrySettlement {
+    /// The journal's record of this entry is final.
+    Settled,
+    /// The run stopped while this entry was being applied: the journal
+    /// still shows its planned state, and only the destination's current
+    /// content can tell whether the write happened.
+    InFlight,
+    /// The run stopped before this entry was attempted; nothing was
+    /// touched for it.
+    NotStarted,
+}
+
+impl CheatInstallRun {
+    /// Classifies `entries[index]` for a reader that must not trust a
+    /// pending journal's planned outcomes as facts. Every entry of a
+    /// finished (non-`in_progress`) journal is `Settled`.
+    pub fn entry_settlement(&self, index: usize) -> CheatInstallEntrySettlement {
+        if self.status != CheatInstallRunStatus::InProgress || index < self.settled_entries {
+            CheatInstallEntrySettlement::Settled
+        } else if index == self.settled_entries {
+            CheatInstallEntrySettlement::InFlight
+        } else {
+            CheatInstallEntrySettlement::NotStarted
+        }
+    }
+
+    /// `true` for a journal whose run never reached its final write - a
+    /// crash, kill, or failed journal update left it pending.
+    pub fn is_interrupted(&self) -> bool {
+        self.status == CheatInstallRunStatus::InProgress
+    }
 }
 
 /// Counts derived entirely from `entries` by [`CheatInstallSummary::from_entries`] -
@@ -311,6 +373,12 @@ pub enum CheatInstallRunStatus {
     PartialFailure,
     Failed,
     DryRun,
+    /// A real run's pending journal: written before the first filesystem
+    /// mutation and rewritten after every settled entry, so a journal still
+    /// carrying this status was interrupted (process killed, or the final
+    /// journal write failed). Never produced by [`Self::derive`]; readers
+    /// must treat it as "needs attention", never as success.
+    InProgress,
 }
 
 impl CheatInstallRunStatus {
@@ -460,6 +528,7 @@ pub fn plan_cheat_install_entry(
         previous_destination_state,
         previous_destination_hash: plan.existing_destination_hash.clone(),
         backup_path: None,
+        planned_backup_path: None,
         resulting_destination_hash: None,
         outcome,
         reason_code,
@@ -514,6 +583,8 @@ pub fn plan_cheat_install_run(
         entries: planned_entries,
         summary,
         status,
+        settled_entries: 0,
+        temp_file_prefix: None,
     }
 }
 

@@ -323,6 +323,42 @@ class Holds(MaintBase):
             self.assertIn(reason, row["reasons"], (target, row))
             self.assertTrue(self.intact(target), target)
 
+    def test_busy_source_checkout_is_held_by_the_planner_and_does_not_block_others(self):
+        # 2026-11-05..07: a language server kept a released target's checkout mapped; the
+        # planner selected it as the oldest candidate every cycle, the executor held it
+        # (LIVE_PROCESS_IN_SOURCE) and nothing else was retired for 573 cycles.
+        busy_wt, busy = self.ready("busy-src")
+        self.age(busy, 20)
+        self.age_record(busy, 20)                                  # oldest: planned first
+        free_wt, free = self.ready("free-src")
+        proc = subprocess.Popen(["sleep", "600"], cwd=busy_wt)    # a process in the checkout only
+        try:
+            time.sleep(0.3)
+            self.approve(extra=("--max-targets", "1"))
+            row = self.state_of(self.status(), busy)
+            self.assertFalse(row["auto_eligible"], row)
+            self.assertIn("LIVE_PROCESS_IN_SOURCE", row["reasons"], row)
+            rc, out = self.call("plan", "--json")
+            self.assertEqual([e["name"] for e in json.loads(out)["selected"]], [os.path.basename(free)])
+            rc, out = self.call("run")
+            self.assertEqual(rc, 0, out)
+            cyc = self.last_cycle()
+            self.assertEqual(cyc["outcome"], "RETIRED", cyc)
+            self.assertEqual([t["name"] for t in cyc["targets"]], [os.path.basename(free)])
+            self.assertFalse(self.intact(free))
+            self.assertTrue(self.intact(busy))                     # the busy one is untouched
+            rc, out = self.call("run", "--only", os.path.basename(busy))
+            self.assertNotEqual(rc, 0, out)                        # and cannot be forced
+            self.assertTrue(self.intact(busy))
+        finally:
+            proc.kill()
+            proc.wait()
+        # once the checkout is no longer in use, the next cycle retires it normally
+        rc, out = self.call("run")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.last_cycle()["outcome"], "RETIRED", self.last_cycle())
+        self.assertFalse(self.intact(busy))
+
     def test_corrupt_records_hold_and_never_block(self):
         wt, t = self.ready("corrupt")
         rec = os.path.join(self.reg, "targets", self.key_of(t) + ".json")
@@ -548,6 +584,274 @@ class Workflow(MaintBase):
         src = open(MAINTAIN).read()
         for banned in ("rmtree", "os.remove", "os.unlink(", "os.rmdir", "shutil.rm", "unlinkat"):
             self.assertNotIn(banned, src)
+
+
+class SecondRootInstance(MaintBase):
+    """A second, independent policy instance (EMUWIZ_MAINTENANCE_INSTANCE) for another
+    target root over the same shared lifecycle registry, with the free-space trigger
+    (`--reserve-trigger-free-gib`) the /mnt/nvme2 policy uses.  Both roots are synthetic
+    temp directories; free space is simulated by patching the summary only."""
+    GIB = 1024 ** 3
+
+    def setUp(self):
+        super().setUp()
+        self.home_root = self.targets
+        self.nv_root = os.path.join(self.tmp, "nvme2-targets")
+        os.makedirs(self.nv_root)
+        self.addCleanup(self.restore, "EMUWIZ_MAINTENANCE_INSTANCE", os.environ.get("EMUWIZ_MAINTENANCE_INSTANCE"))
+        self.use(self.home_root, None)
+        self.full_census()
+        self.fake_free = None
+        real = self.m.F.summary
+
+        def summary(*a, **kw):
+            out = real(*a, **kw)
+            if self.fake_free is not None:
+                out["free_bytes"] = self.fake_free
+            return out
+        self.m.F.summary = summary
+
+    def use(self, root, instance):
+        os.environ["EMUWIZ_TARGET_ROOT"] = self.env["EMUWIZ_TARGET_ROOT"] = root
+        if instance is None:
+            os.environ.pop("EMUWIZ_MAINTENANCE_INSTANCE", None)
+            self.env.pop("EMUWIZ_MAINTENANCE_INSTANCE", None)
+        else:
+            os.environ["EMUWIZ_MAINTENANCE_INSTANCE"] = self.env["EMUWIZ_MAINTENANCE_INSTANCE"] = instance
+
+    def nvme(self):
+        self.use(self.nv_root, "nvme2")
+
+    def home_(self):
+        self.use(self.home_root, None)
+
+    def ready(self, name, days=10):
+        wt, t = self.cache(name)
+        self.finish(wt)
+        self.age(t, days)
+        self.age_record(t, days)
+        return wt, t
+
+    def intact(self, t):
+        return os.path.exists(os.path.join(t, "debug", "deps", "libx.rlib"))
+
+    def approve_nvme(self, soft_gb="100000", hard_gb="200000", max_targets="3", max_gb="20", enable=True):
+        """The owner's /mnt/nvme2 free-space numbers.  The soft budget is set far out of reach
+        (the inventory also counts this checkout's in-tree targets on the temp device), so
+        only the free-space trigger decides."""
+        rc, out = self.call("policy", "approve", "--owners", "tester", "--soft-gb", soft_gb, "--hard-gb", hard_gb,
+                            "--reserve-free-gib", "260", "--reserve-trigger-free-gib", "240",
+                            "--max-targets", max_targets, "--max-gb", max_gb)
+        self.assertEqual(rc, 0, out)
+        if enable:
+            rc, out = self.call("policy", "enable")
+            self.assertEqual(rc, 0, out)
+
+    def plan(self):
+        rc, out = self.call("plan", "--json")
+        self.assertEqual(rc, 0, out)
+        return json.loads(out)
+
+    def test_each_instance_only_ever_touches_its_own_root(self):
+        self.home_()
+        h_wt, h = self.ready("home-a")
+        self.nvme()
+        n_wt, n = self.ready("nv-a")
+        self.assertEqual(os.path.dirname(h), os.path.realpath(self.home_root))
+        self.assertEqual(os.path.dirname(n), os.path.realpath(self.nv_root))
+        self.home_()
+        self.approve()                                   # tiny soft budget: wants everything
+        with open(self.m.policy_path(), "rb") as handle:
+            home_policy = handle.read()
+        home_state = self.m.state_dir()
+        self.nvme()
+        self.approve(soft_gb="0.00001", hard_gb="0.0001")
+        self.assertNotEqual(self.m.state_dir(), home_state)
+        self.assertEqual(os.path.basename(self.m.state_dir()), "maintenance-nvme2")
+        with open(os.path.join(home_state, "policy.json"), "rb") as handle:
+            self.assertEqual(handle.read(), home_policy)  # the default policy is untouched
+        # each plan sees the other root as out of scope
+        self.assertEqual([e["name"] for e in self.plan()["selected"]], [os.path.basename(n)])
+        self.assertIn("OUTSIDE_POLICY_ROOT", self.state_of(self.status(), h)["reasons"])
+        self.home_()
+        self.assertEqual([e["name"] for e in self.plan()["selected"]], [os.path.basename(h)])
+        self.assertIn("OUTSIDE_POLICY_ROOT", self.state_of(self.status(), n)["reasons"])
+        # the nvme2 cycle retires only its root ...
+        self.nvme()
+        rc, out = self.call("run")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([t["name"] for t in self.last_cycle()["targets"]], [os.path.basename(n)])
+        self.assertFalse(self.intact(n))
+        self.assertTrue(self.intact(h))
+        # ... and the default cycle only its own, with separate histories
+        self.home_()
+        self.assertFalse(any(c.get("event") == "cycle" for c in self.history()))
+        rc, out = self.call("run")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([t["name"] for t in self.last_cycle()["targets"]], [os.path.basename(h)])
+        self.assertFalse(self.intact(h))
+
+    def test_instance_policy_for_another_root_fails_closed(self):
+        self.nvme()
+        n_wt, n = self.ready("nv-wrong")
+        self.approve(soft_gb="0.00001", hard_gb="0.0001")
+        # same instance, but EMUWIZ_TARGET_ROOT now selects the home root
+        self.use(self.home_root, "nvme2")
+        st, _, why = self.m.load_policy()
+        self.assertEqual(st, "invalid", why)
+        rc, out = self.call("run")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.last_cycle()["outcome"], "REFUSED")
+        self.assertTrue(self.intact(n))
+        os.environ["EMUWIZ_MAINTENANCE_INSTANCE"] = "../maintenance"
+        with self.assertRaises(SystemExit):
+            self.m.state_dir()
+
+    def test_nothing_is_retired_at_or_above_the_free_space_trigger(self):
+        self.nvme()
+        ts = [self.ready(f"nv-free{i}")[1] for i in range(2)]
+        self.approve_nvme()
+        for free in (240 * self.GIB, 250 * self.GIB, 400 * self.GIB):
+            self.fake_free = free
+            plan = self.plan()
+            self.assertEqual((plan["need_bytes"], plan["selected"]), (0, []), free)
+            rc, out = self.call("run")
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(self.last_cycle()["outcome"], "NOTHING_TO_DO", free)
+            self.assertTrue(all(self.intact(t) for t in ts))
+
+    def test_below_the_trigger_selection_stops_at_the_caps_or_the_restore_target(self):
+        self.nvme()
+        ts = [self.ready(f"nv-low{i}", days=10 + i)[1] for i in range(4)]   # nv-low3 oldest
+        self.approve_nvme()
+        self.fake_free = 240 * self.GIB - 1
+        plan = self.plan()
+        self.assertEqual(plan["free_space_need_bytes"], 20 * self.GIB + 1)
+        names = [e["name"] for e in plan["selected"]]
+        self.assertEqual(names, [os.path.basename(t) for t in ts[3:0:-1]])  # 3-target cap, oldest first
+        # the restore target ends selection: exactly enough for the oldest one
+        st, policy, _ = self.m.load_policy()
+        ns, items, census, measured, summ = self.m.snapshot(policy)
+        first = plan["selected"][0]["estimated_recoverable"]
+        limits = dict(policy["limits"], reserve_free_bytes=300 * self.GIB, reserve_trigger_free_bytes=300 * self.GIB)
+        summ["free_bytes"] = 300 * self.GIB - first
+        got = self.m.plan_cycle(dict(policy, limits=limits), items, summ, census)
+        self.assertEqual([e["item"]["name"] for e in got["selected"]], names[:1])
+        # the per-cycle byte cap also bounds it
+        limits = dict(policy["limits"], max_bytes_per_cycle=first)
+        summ["free_bytes"] = 100 * self.GIB
+        got = self.m.plan_cycle(dict(policy, limits=limits), items, summ, census)
+        self.assertEqual([e["item"]["name"] for e in got["selected"]], names[:1])
+        # the real cycle retires exactly the planned three and leaves the fourth
+        rc, out = self.call("run")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(sorted(t["name"] for t in self.last_cycle()["targets"]), sorted(names))
+        self.assertTrue(self.intact(ts[0]))
+        self.assertFalse(any(self.intact(t) for t in ts[1:]))
+
+    def test_trigger_above_the_reserve_is_refused(self):
+        self.nvme()
+        rc, _ = self.call("policy", "approve", "--owners", "tester", "--soft-gb", "100", "--hard-gb", "200",
+                          "--reserve-free-gib", "240", "--reserve-trigger-free-gib", "260")
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(os.path.exists(self.m.policy_path()))
+
+    def test_protected_active_and_changed_targets_stay_held_below_the_trigger(self):
+        self.nvme()
+        pin_wt, pinned = self.ready("nv-pinned", days=40)
+        self.assertEqual(self.ret("pin", pin_wt, "--reason", "release-build").returncode, 0)
+        idle_wt, idle = self.cache("nv-idle", age_days=40)                # never released
+        chg_wt, changed = self.ready("nv-changed", days=40)
+        keyfile = os.path.join(self.reg, "targets", self.key_of(changed) + ".json")
+        rec = T.jload(keyfile)
+        rec["identity"]["ino"] += 12345
+        T.jdump(rec, keyfile)
+        src_wt, busy_src = self.ready("nv-busy-src", days=40)
+        act_wt, active = self.ready("nv-active", days=40)
+        free_wt, free = self.ready("nv-free", days=10)
+        self.approve_nvme()
+        self.fake_free = 200 * self.GIB
+        sleeper = subprocess.Popen(["sleep", "600"], cwd=src_wt)
+        build = subprocess.Popen([ISO, "check"], cwd=act_wt, env=dict(self.env, FAKE_SLEEP="25"))
+        try:
+            time.sleep(1.5)
+            st = self.status()
+            for target, reason in ((pinned, "PINNED"), (idle, "NOT_RELEASED"),
+                                   (changed, "DIRECTORY_IDENTITY_CHANGED"), (busy_src, "LIVE_PROCESS_IN_SOURCE")):
+                row = self.state_of(st, target)
+                self.assertFalse(row["auto_eligible"], row)
+                self.assertIn(reason, row["reasons"], (target, row))
+            self.assertEqual(self.state_of(st, active)["state"], "ACTIVE")
+            self.assertFalse(self.state_of(st, active)["auto_eligible"])
+            self.assertEqual([e["name"] for e in self.plan()["selected"]], [os.path.basename(free)])
+            rc, out = self.call("run")
+            self.assertEqual(rc, 0, out)
+            self.assertEqual([t["name"] for t in self.last_cycle()["targets"]], [os.path.basename(free)])
+        finally:
+            for proc in (sleeper, build):
+                proc.kill()
+                proc.wait()
+        self.assertFalse(self.intact(free))
+        for target in (pinned, idle, changed, busy_src, active):
+            self.assertTrue(self.intact(target), target)
+
+    def test_instance_units_select_the_root_and_its_own_state(self):
+        import pwd
+        self.nvme()
+        service, timer = self.m.unit_texts(pwd.getpwuid(os.getuid()).pw_name, self.m.DEFAULT_INSTALL_DIR)
+        self.assertIn(f"Environment=EMUWIZ_TARGET_ROOT={self.nv_root}\n", service)
+        self.assertIn("Environment=EMUWIZ_MAINTENANCE_INSTANCE=nvme2\n", service)
+        self.assertIn(f"ConditionPathExists={self.reg}/maintenance-nvme2/policy.json\n", service)
+        self.assertIn(f"ReadWritePaths={self.reg} {self.nv_root}\n", service)
+        self.assertIn(f"RequiresMountsFor={self.nv_root}\n", service)   # never runs against an unmounted root
+        self.assertEqual(self.m.unit_basename(), "emuwiz-cargo-maintain-nvme2")
+        os.environ.pop("EMUWIZ_TARGET_ROOT")
+        with self.assertRaises(SystemExit):
+            self.m.unit_texts(pwd.getpwuid(os.getuid()).pw_name, self.m.DEFAULT_INSTALL_DIR)
+        # the default instance's unit is unchanged
+        self.home_()
+        os.environ.pop("EMUWIZ_TARGET_ROOT")
+        service, _ = self.m.unit_texts(pwd.getpwuid(os.getuid()).pw_name, self.m.DEFAULT_INSTALL_DIR)
+        self.assertIn(f"ConditionPathExists={self.reg}/maintenance/policy.json\n", service)
+        self.assertNotIn("EMUWIZ_MAINTENANCE_INSTANCE", service)
+        self.assertEqual(self.m.unit_basename(), "emuwiz-cargo-maintain")
+
+    def test_nvme2_retirement_verifies_from_a_shell_without_the_instance(self):
+        # The owner's shell (cargo-env.sh) sets EMUWIZ_TARGET_ROOT only; worktree-check and
+        # finish-task must still find the nvme2 instance's evidence instead of holding forever.
+        self.nvme()
+        n_wt, n = self.ready("nv-evidence")
+        self.approve(soft_gb="0.00001", hard_gb="0.0001")
+        rc, out = self.call("run")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(self.intact(n))
+        rc, out = self.call("worktree-check", n_wt, "--json")
+        with_instance = json.loads(out)["code"]
+        self.use(self.nv_root, None)
+        rc, out = self.call("worktree-check", n_wt, "--json")
+        without = json.loads(out)
+        self.assertEqual(without["code"], with_instance, without)
+        self.assertNotIn(without["code"], ("RECEIPT_UNVERIFIED", "ARTIFACTS_MISSING_UNVERIFIED"), without)
+        # evidence is only accepted from a maintenance directory whose policy covers the root
+        rec = {"last_retired": {"receipt": os.path.join(self.tmp, "elsewhere", "receipts", "r.json")}}
+        d, why = self.m.evidence_state_dir(rec, n, self.m.trusted_policy_uids())
+        self.assertIsNone(d, why)
+
+    def test_one_policy_per_root(self):
+        self.nvme()
+        self.approve_nvme(enable=False)
+        self.use(self.nv_root, None)        # default instance, shell pointing at nvme2
+        rc, out = self.call("policy", "approve", "--owners", "tester", "--soft-gb", "1", "--hard-gb", "2")
+        self.assertNotEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(self.m.policy_path()), "no second policy over the nvme2 root")
+        self.home_()                        # the default instance may still cover its own root
+        self.approve(enable=False)
+
+    def test_unknown_free_space_requests_nothing(self):
+        limits = {"reserve_free_bytes": 260 * self.GIB, "reserve_trigger_free_bytes": 240 * self.GIB}
+        self.assertEqual(self.m.free_space_need(limits, None), 0)
+        self.assertEqual(self.m.free_space_need(limits, 250 * self.GIB), 0)
+        self.assertEqual(self.m.free_space_need(limits, 230 * self.GIB), 30 * self.GIB)
 
 
 class WorktreeOrdering(MaintBase):

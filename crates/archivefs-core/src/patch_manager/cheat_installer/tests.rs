@@ -1243,7 +1243,7 @@ fn dry_run_writes_no_journal() {
 }
 
 #[test]
-fn journal_write_failure_is_surfaced_without_hiding_real_success() {
+fn journal_finalize_failure_leaves_a_truthful_pending_journal() {
     let catalogue_root = temp_root("journal-fail-catalogue");
     let destination_root = temp_root("journal-fail-dest");
     let journal_dir = temp_root("journal-fail-journal");
@@ -1265,11 +1265,12 @@ fn journal_write_failure_is_surfaced_without_hiding_real_success() {
         "run-26",
     );
 
-    let _guard = FaultGuard::new(FaultPoint::JournalWrite);
+    let _guard = FaultGuard::new(FaultPoint::JournalFinalize);
     let outcome = execute_cheat_install_run(&[entry], &opts);
     drop(_guard);
 
-    assert!(outcome.journal_path.is_none());
+    // The pending journal is still on disk, so its path is reported (L5).
+    assert_eq!(outcome.journal_path, Some(journal_dir.join("run-26.json")));
     assert!(outcome.journal_error.is_some());
     // The file itself was genuinely installed - the journal failure must
     // not be papered over as if nothing happened, but it also must not
@@ -1286,6 +1287,16 @@ fn journal_write_failure_is_surfaced_without_hiding_real_success() {
             .join("Frogger.cht")
             .exists()
     );
+    // The on-disk record is the last per-entry update: pending, but it
+    // already lists the applied entry, so Undo stays possible.
+    let on_disk =
+        parse_cheat_install_run(&fs::read_to_string(journal_dir.join("run-26.json")).unwrap())
+            .unwrap();
+    assert_eq!(on_disk.status, CheatInstallRunStatus::InProgress);
+    assert_eq!(on_disk.completed_at_unix_seconds, None);
+    assert_eq!(on_disk.settled_entries, 1);
+    assert!(on_disk.entries[0].applied);
+    assert!(on_disk.is_interrupted());
 }
 
 #[test]
@@ -1462,5 +1473,1398 @@ fn module_source_never_touches_live_home_or_database() {
             "cheat_installer.rs must never reference `{forbidden}` - every path/root/journal \
              location must be supplied explicitly via `CheatInstallOptions`"
         );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Crash-proof Undo: the journal must exist before the first mutation
+// (Night Watch S04-01 / D2-01).
+// ---------------------------------------------------------------------
+
+#[test]
+fn d2_01_no_destination_is_mutated_without_a_prior_durable_journal() {
+    let catalogue_root = temp_root("d2-01-catalogue");
+    let destination_root = temp_root("d2-01-dest");
+    let backup_dir = temp_root("d2-01-backup");
+    let parent = temp_root("d2-01-journal-parent");
+    let journal_dir = parent.join("journal");
+    fs::write(&journal_dir, b"not a directory").unwrap(); // journal can never be created
+
+    // One replace (user-edited existing file) + one new install, like the CLI repro.
+    let replace = replace_different_entry(
+        &catalogue_root,
+        &destination_root,
+        b"catalogue content\n",
+        b"USER EDITED\n",
+    );
+    let new = install_new_entry(
+        &catalogue_root,
+        &destination_root,
+        "Pitfall",
+        b"cheats = 0\n",
+    );
+    let opts = options(
+        &destination_root,
+        &journal_dir,
+        &backup_dir,
+        false,
+        true,
+        true,
+        "d2-01",
+    );
+
+    let outcome = execute_cheat_install_run(&[replace, new], &opts);
+
+    let platform_dir = destination_root.join("Atari2600");
+    assert_eq!(
+        fs::read(platform_dir.join("Frogger.cht")).unwrap(),
+        b"USER EDITED\n",
+        "the user's file must not be replaced when no Undo record can exist"
+    );
+    assert!(
+        !platform_dir.join("Pitfall.cht").exists(),
+        "no new file without a journal"
+    );
+    assert!(
+        dir_entries(&platform_dir)
+            .iter()
+            .all(|n| !n.starts_with(".archivefs-cheat-install-")),
+        "no temporary install file may be left in the emulator's cheat folder"
+    );
+    assert!(
+        backup_dir_is_empty(&backup_dir),
+        "no backup may be created when no Undo record can exist"
+    );
+    assert_ne!(outcome.run.status, CheatInstallRunStatus::Success);
+    assert!(outcome.journal_error.is_some());
+}
+
+#[test]
+fn journal_fault_before_first_mutation_fails_closed_with_nothing_written() {
+    let catalogue_root = temp_root("journal-first-catalogue");
+    let destination_root = temp_root("journal-first-dest");
+    let journal_dir = temp_root("journal-first-journal");
+    let backup_dir = temp_root("journal-first-backup");
+
+    let replace = replace_different_entry(
+        &catalogue_root,
+        &destination_root,
+        b"catalogue content\n",
+        b"USER EDITED\n",
+    );
+    let new = install_new_entry(
+        &catalogue_root,
+        &destination_root,
+        "Pitfall",
+        b"cheats = 0\n",
+    );
+    let opts = options(
+        &destination_root,
+        &journal_dir,
+        &backup_dir,
+        false,
+        true,
+        true,
+        "journal-first",
+    );
+
+    let _guard = FaultGuard::new(FaultPoint::JournalWrite);
+    let outcome = execute_cheat_install_run(&[replace, new], &opts);
+    drop(_guard);
+
+    let platform_dir = destination_root.join("Atari2600");
+    assert_eq!(dir_entries(&platform_dir), vec!["Frogger.cht".to_string()]);
+    assert_eq!(
+        fs::read(platform_dir.join("Frogger.cht")).unwrap(),
+        b"USER EDITED\n"
+    );
+    assert!(backup_dir_is_empty(&backup_dir));
+    assert!(
+        dir_entries(&journal_dir).is_empty(),
+        "no partial journal may be left behind: {:?}",
+        dir_entries(&journal_dir)
+    );
+    assert_eq!(outcome.run.status, CheatInstallRunStatus::Failed);
+    assert!(outcome.journal_path.is_none());
+    assert!(outcome.journal_error.is_some());
+    for entry in &outcome.run.entries {
+        assert!(!entry.applied);
+        assert_eq!(entry.reason_code, "journal_unavailable");
+    }
+}
+
+// ---------------------------------------------------------------------
+// Crash recovery: pending journal, per-entry updates, rollback of an
+// interrupted run (Night Watch S04-01).
+// ---------------------------------------------------------------------
+
+use crate::patch_manager::{
+    CheatHistoryOptions, CheatInstallEntrySettlement, CheatRollbackAvailability,
+    CheatRollbackOptions, CheatRollbackOutcome, CheatRollbackRunOutcome, CheatRollbackRunStatus,
+    execute_cheat_rollback_run, inspect_cheat_install_journal,
+};
+
+struct CrashFixture {
+    catalogue_root: PathBuf,
+    destination_root: PathBuf,
+    journal_dir: PathBuf,
+    backup_dir: PathBuf,
+    rollback_dir: PathBuf,
+    entries: Vec<CheatAvailabilityEntry>,
+    opts: CheatInstallOptions,
+}
+
+/// Three entries in install order: a replacement of the user's edited
+/// `Frogger.cht` (backup required), then two new installs.
+fn crash_fixture(label: &str, run_id: &str) -> CrashFixture {
+    let catalogue_root = temp_root(&format!("{label}-catalogue"));
+    let destination_root = temp_root(&format!("{label}-dest"));
+    let journal_dir = temp_root(&format!("{label}-journal"));
+    let backup_dir = temp_root(&format!("{label}-backup"));
+    let rollback_dir = temp_root(&format!("{label}-rollback"));
+    let replace = replace_different_entry(
+        &catalogue_root,
+        &destination_root,
+        b"catalogue content\n",
+        b"USER EDITED\n",
+    );
+    let pitfall = install_new_entry(
+        &catalogue_root,
+        &destination_root,
+        "Pitfall",
+        b"cheats = 0\n",
+    );
+    let zaxxon = install_new_entry(
+        &catalogue_root,
+        &destination_root,
+        "Zaxxon",
+        b"cheats = 2\n",
+    );
+    let opts = options(
+        &destination_root,
+        &journal_dir,
+        &backup_dir,
+        false,
+        true,
+        true,
+        run_id,
+    );
+    CrashFixture {
+        catalogue_root,
+        destination_root,
+        journal_dir,
+        backup_dir,
+        rollback_dir,
+        entries: vec![replace, pitfall, zaxxon],
+        opts,
+    }
+}
+
+impl CrashFixture {
+    fn platform_dir(&self) -> PathBuf {
+        self.destination_root.join("Atari2600")
+    }
+
+    fn journal_path(&self) -> PathBuf {
+        self.journal_dir.join(format!("{}.json", self.opts.run_id))
+    }
+
+    fn on_disk_journal(&self) -> CheatInstallRun {
+        parse_cheat_install_run(&fs::read_to_string(self.journal_path()).unwrap()).unwrap()
+    }
+
+    /// Runs the installer under `fault` and asserts it died by the
+    /// injected crash (a panic the test catches).
+    fn run_until_crash(&self, fault: FaultPoint) {
+        let guard = FaultGuard::new(fault);
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_cheat_install_run(&self.entries, &self.opts)
+        }));
+        drop(guard);
+        assert!(crashed.is_err(), "the injected crash must abort the run");
+    }
+
+    fn rollback(&self, confirmed: bool) -> CheatRollbackRunOutcome {
+        execute_cheat_rollback_run(
+            &self.journal_path(),
+            &CheatRollbackOptions {
+                journal_path: self.journal_path(),
+                destination_root: self.destination_root.clone(),
+                backup_directory: self.backup_dir.clone(),
+                rollback_journal_directory: self.rollback_dir.clone(),
+                dry_run: false,
+                confirmed,
+                run_id: format!("{}-rollback", self.opts.run_id),
+                started_at_unix_seconds: 1_700_000_100,
+            },
+        )
+    }
+
+    fn history_options(&self) -> CheatHistoryOptions {
+        CheatHistoryOptions {
+            journal_root: self.journal_dir.clone(),
+            backup_root: self.backup_dir.clone(),
+            rollback_journal_root: self.rollback_dir.clone(),
+        }
+    }
+
+    fn assert_destination_is_pre_run_state(&self) {
+        assert_eq!(
+            dir_entries(&self.platform_dir()),
+            vec!["Frogger.cht".to_string()],
+            "only the user's original file may remain"
+        );
+        assert_eq!(
+            fs::read(self.platform_dir().join("Frogger.cht")).unwrap(),
+            b"USER EDITED\n"
+        );
+    }
+}
+
+#[test]
+fn pending_journal_is_written_before_the_first_mutation_in_planned_state() {
+    let fixture = crash_fixture("pending-journal", "run-pending");
+    // Crash right after entry 0 was applied, before its journal update: the
+    // on-disk journal is exactly the pending journal written up front.
+    fixture.run_until_crash(FaultPoint::CrashBeforeJournalUpdate(0));
+
+    let journal = fixture.on_disk_journal();
+    assert_eq!(journal.status, CheatInstallRunStatus::InProgress);
+    assert!(journal.is_interrupted());
+    assert_eq!(journal.completed_at_unix_seconds, None);
+    assert_eq!(journal.settled_entries, 0);
+    assert_eq!(journal.run_id, "run-pending");
+    assert_eq!(journal.catalogue_source, "Fixture Catalogue");
+    assert!(journal.allow_replace_different);
+    assert_eq!(
+        journal.destination_root,
+        Some(CheatInstallPath::from_path(&fixture.destination_root))
+    );
+    assert_eq!(
+        journal.temp_file_prefix.as_deref(),
+        Some(format!(".archivefs-cheat-install-{}-", std::process::id()).as_str())
+    );
+    assert_eq!(journal.entries.len(), 3);
+    for entry in &journal.entries {
+        assert!(!entry.applied, "a pending journal never claims an apply");
+        assert!(entry.resulting_destination_hash.is_none());
+        assert!(entry.expected_source_hash.is_some());
+        assert!(entry.destination_path.is_some());
+    }
+    let replace = &journal.entries[0];
+    assert_eq!(replace.outcome, CheatInstallOutcome::ReplacedWithBackup);
+    assert_eq!(
+        replace.previous_destination_hash.as_deref(),
+        Some(hex_sha256(b"USER EDITED\n").as_str())
+    );
+    let expected_backup = fixture.backup_dir.join(format!(
+        "Frogger.cht.run-pending.{}.bak",
+        &hex_sha256(b"USER EDITED\n")[..12]
+    ));
+    assert_eq!(
+        replace.planned_backup_path,
+        Some(CheatInstallPath::from_path(&expected_backup))
+    );
+    assert!(replace.backup_path.is_none());
+    assert_eq!(
+        journal.entries[1].outcome,
+        CheatInstallOutcome::InstalledNew
+    );
+    assert_eq!(
+        journal.entries[2].outcome,
+        CheatInstallOutcome::InstalledNew
+    );
+    assert_eq!(
+        journal.entry_settlement(0),
+        CheatInstallEntrySettlement::InFlight
+    );
+    assert_eq!(
+        journal.entry_settlement(1),
+        CheatInstallEntrySettlement::NotStarted
+    );
+
+    // The crash happened after the replacement was published: the
+    // destination holds catalogue content and the backup is exactly where
+    // the pending journal said it would be.
+    assert_eq!(
+        fs::read(fixture.platform_dir().join("Frogger.cht")).unwrap(),
+        b"catalogue content\n"
+    );
+    assert_eq!(fs::read(&expected_backup).unwrap(), b"USER EDITED\n");
+
+    // History sees an interrupted run with an in-flight replacement that is
+    // rollback-available via the planned backup; never "success".
+    let inspection =
+        inspect_cheat_install_journal(&fixture.journal_path(), &fixture.history_options()).unwrap();
+    assert!(inspection.interrupted);
+    assert_eq!(inspection.settled_entries, 0);
+    assert_eq!(inspection.install_status, CheatInstallRunStatus::InProgress);
+    assert!(
+        inspection
+            .warnings
+            .iter()
+            .any(|w| w.contains("interrupted"))
+    );
+    assert_eq!(
+        inspection.entries[0].settlement,
+        CheatInstallEntrySettlement::InFlight
+    );
+    assert_eq!(
+        inspection.entries[0].rollback_availability,
+        CheatRollbackAvailability::Available
+    );
+    assert_eq!(
+        inspection.entries[1].settlement,
+        CheatInstallEntrySettlement::NotStarted
+    );
+    assert_eq!(
+        inspection.entries[1].rollback_availability,
+        CheatRollbackAvailability::Unnecessary
+    );
+
+    // Rollback restores the user's file from the planned backup.
+    let outcome = fixture.rollback(true);
+    assert_eq!(outcome.run.status, CheatRollbackRunStatus::Success);
+    assert_eq!(
+        outcome.run.entries[0].outcome,
+        CheatRollbackOutcome::RestoredBackup
+    );
+    assert_eq!(
+        outcome.run.entries[1].outcome,
+        CheatRollbackOutcome::NoChangeRequired
+    );
+    fixture.assert_destination_is_pre_run_state();
+    let _ = &fixture.catalogue_root;
+}
+
+#[test]
+fn crash_after_entry_k_journal_update_rolls_back_exactly_the_applied_entries() {
+    let fixture = crash_fixture("crash-after-k", "run-crash-k");
+    fixture.run_until_crash(FaultPoint::CrashAfterJournalUpdate(1));
+
+    let journal = fixture.on_disk_journal();
+    assert_eq!(journal.status, CheatInstallRunStatus::InProgress);
+    assert_eq!(journal.settled_entries, 2);
+    assert!(journal.entries[0].applied);
+    assert_eq!(
+        journal.entries[0].outcome,
+        CheatInstallOutcome::ReplacedWithBackup
+    );
+    assert!(journal.entries[0].backup_path.is_some());
+    assert!(journal.entries[1].applied);
+    assert_eq!(
+        journal.entries[1].outcome,
+        CheatInstallOutcome::InstalledNew
+    );
+    assert!(!journal.entries[2].applied, "entry 3 is still planned");
+    assert!(journal.entries[2].resulting_destination_hash.is_none());
+    assert_eq!(
+        journal.entry_settlement(2),
+        CheatInstallEntrySettlement::InFlight
+    );
+    // Entry 3 was never started on disk.
+    assert!(!fixture.platform_dir().join("Zaxxon.cht").exists());
+    assert_eq!(journal.summary.writes_succeeded, 2);
+
+    let inspection =
+        inspect_cheat_install_journal(&fixture.journal_path(), &fixture.history_options()).unwrap();
+    assert!(inspection.interrupted);
+    assert_eq!(inspection.settled_entries, 2);
+    assert_eq!(
+        inspection.entries[0].settlement,
+        CheatInstallEntrySettlement::Settled
+    );
+    assert_eq!(
+        inspection.entries[0].rollback_availability,
+        CheatRollbackAvailability::Available
+    );
+    assert_eq!(
+        inspection.entries[1].rollback_availability,
+        CheatRollbackAvailability::Available
+    );
+    assert_eq!(
+        inspection.entries[2].settlement,
+        CheatInstallEntrySettlement::InFlight
+    );
+    assert_eq!(
+        inspection.entries[2].rollback_availability,
+        CheatRollbackAvailability::Unnecessary,
+        "an in-flight new install whose destination is absent was never published"
+    );
+
+    // Dry-run rollback previews, writes nothing.
+    let preview = fixture.rollback(false);
+    assert_eq!(preview.run.status, CheatRollbackRunStatus::DryRun);
+    assert!(fixture.platform_dir().join("Pitfall.cht").exists());
+
+    let outcome = fixture.rollback(true);
+    assert_eq!(outcome.run.status, CheatRollbackRunStatus::Success);
+    assert_eq!(
+        outcome.run.entries[0].outcome,
+        CheatRollbackOutcome::RestoredBackup
+    );
+    assert_eq!(
+        outcome.run.entries[1].outcome,
+        CheatRollbackOutcome::RemovedInstalledFile
+    );
+    assert_eq!(
+        outcome.run.entries[2].outcome,
+        CheatRollbackOutcome::NoChangeRequired
+    );
+    fixture.assert_destination_is_pre_run_state();
+    // The backup recorded in the journal was the one used.
+    let backup = PathBuf::from(&journal.entries[0].backup_path.as_ref().unwrap().display);
+    assert_eq!(fs::read(&backup).unwrap(), b"USER EDITED\n");
+
+    // History now binds the rollback journal and reports completion.
+    let after =
+        inspect_cheat_install_journal(&fixture.journal_path(), &fixture.history_options()).unwrap();
+    assert!(after.rollback.exists);
+    assert_eq!(after.rollback.completed_successfully, Some(true));
+    assert!(after.entries.iter().all(|entry| entry.rollback_availability
+        == CheatRollbackAvailability::AlreadyCompleted));
+}
+
+#[test]
+fn entry_published_but_unrecorded_is_resolved_by_destination_hash_at_rollback() {
+    let fixture = crash_fixture("crash-before-update", "run-in-flight");
+    // Entry 0 settled and recorded; entry 1 published but the process died
+    // before the journal update - the classic kill-between-rename-and-record.
+    fixture.run_until_crash(FaultPoint::CrashBeforeJournalUpdate(1));
+
+    let journal = fixture.on_disk_journal();
+    assert_eq!(journal.settled_entries, 1);
+    assert!(journal.entries[0].applied);
+    assert!(
+        !journal.entries[1].applied,
+        "journal still shows the planned state"
+    );
+    assert_eq!(
+        journal.entry_settlement(1),
+        CheatInstallEntrySettlement::InFlight
+    );
+    assert!(
+        fixture.platform_dir().join("Pitfall.cht").exists(),
+        "the file was published before the crash"
+    );
+
+    // Leftovers this run could have left (same pid prefix) are swept by the
+    // rollback; another process's temp file is not ours to touch.
+    let own_temp = fixture.platform_dir().join(format!(
+        ".archivefs-cheat-install-{}-deadbeef-7",
+        std::process::id()
+    ));
+    fs::write(&own_temp, b"partial").unwrap();
+    let foreign_temp = fixture
+        .platform_dir()
+        .join(".archivefs-cheat-install-999999999-cafe-1");
+    fs::write(&foreign_temp, b"someone else's").unwrap();
+
+    let inspection =
+        inspect_cheat_install_journal(&fixture.journal_path(), &fixture.history_options()).unwrap();
+    assert_eq!(
+        inspection.entries[1].settlement,
+        CheatInstallEntrySettlement::InFlight
+    );
+    assert_eq!(
+        inspection.entries[1].rollback_availability,
+        CheatRollbackAvailability::Available,
+        "destination hash equals the source hash, so it was applied"
+    );
+
+    let outcome = fixture.rollback(true);
+    assert_eq!(outcome.run.status, CheatRollbackRunStatus::Success);
+    assert_eq!(
+        outcome.run.entries[1].outcome,
+        CheatRollbackOutcome::RemovedInstalledFile
+    );
+    assert!(outcome.run.entries[1].message.contains("interrupted"));
+    assert!(!own_temp.exists(), "this run's leftover temp file is swept");
+    assert!(
+        foreign_temp.exists(),
+        "another process's temp file is untouched"
+    );
+    fs::remove_file(&foreign_temp).unwrap();
+    fixture.assert_destination_is_pre_run_state();
+
+    // An in-flight entry whose destination holds neither the catalogue nor
+    // the pre-install content is never touched.
+    let fixture = crash_fixture("crash-before-update-edited", "run-in-flight-edited");
+    fixture.run_until_crash(FaultPoint::CrashBeforeJournalUpdate(1));
+    fs::write(
+        fixture.platform_dir().join("Pitfall.cht"),
+        b"edited in RetroArch after the crash\n",
+    )
+    .unwrap();
+    let outcome = fixture.rollback(true);
+    assert_eq!(
+        outcome.run.entries[1].outcome,
+        CheatRollbackOutcome::FailedDestinationChanged
+    );
+    assert_eq!(
+        fs::read(fixture.platform_dir().join("Pitfall.cht")).unwrap(),
+        b"edited in RetroArch after the crash\n"
+    );
+    assert_ne!(outcome.run.status, CheatRollbackRunStatus::Success);
+}
+
+#[test]
+fn mid_run_journal_update_failure_stops_further_entries_truthfully() {
+    let fixture = crash_fixture("update-fault", "run-update-fault");
+    let guard = FaultGuard::new(FaultPoint::JournalUpdate(0));
+    let outcome = execute_cheat_install_run(&fixture.entries, &fixture.opts);
+    drop(guard);
+
+    assert!(outcome.run.entries[0].applied);
+    for entry in &outcome.run.entries[1..] {
+        assert!(!entry.applied);
+        assert_eq!(entry.outcome, CheatInstallOutcome::FailedWrite);
+        assert_eq!(entry.reason_code, JOURNAL_UPDATE_FAILED_REASON);
+    }
+    assert!(!fixture.platform_dir().join("Pitfall.cht").exists());
+    assert_eq!(outcome.run.status, CheatInstallRunStatus::PartialFailure);
+    assert!(
+        outcome.journal_error.is_some(),
+        "the update failure is reported"
+    );
+    // The final write succeeded, so the on-disk record is complete and
+    // claims exactly what was done.
+    assert!(outcome.journal_path.is_some());
+    let journal = fixture.on_disk_journal();
+    assert_eq!(journal.status, CheatInstallRunStatus::PartialFailure);
+    assert_eq!(journal.settled_entries, 3);
+    assert!(journal.entries[0].applied);
+    assert!(!journal.entries[1].applied);
+}
+
+#[test]
+fn finished_journal_marks_every_entry_settled_and_old_journals_still_parse() {
+    let fixture = crash_fixture("finished", "run-finished");
+    let outcome = execute_cheat_install_run(&fixture.entries, &fixture.opts);
+    assert_eq!(outcome.run.status, CheatInstallRunStatus::Success);
+    let journal = fixture.on_disk_journal();
+    assert_eq!(journal.settled_entries, 3);
+    assert!(journal.completed_at_unix_seconds.is_some());
+    assert!((0..3).all(|i| journal.entry_settlement(i) == CheatInstallEntrySettlement::Settled));
+
+    // A journal written before `settled_entries`/`in_progress` existed has
+    // neither field and is read as fully settled.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fixture.journal_path()).unwrap()).unwrap();
+    value.as_object_mut().unwrap().remove("settled_entries");
+    value.as_object_mut().unwrap().remove("temp_file_prefix");
+    for entry in value["entries"].as_array_mut().unwrap() {
+        entry.as_object_mut().unwrap().remove("planned_backup_path");
+    }
+    let legacy = parse_cheat_install_run(&value.to_string()).unwrap();
+    assert!(!legacy.is_interrupted());
+    assert_eq!(legacy.settled_entries, 0);
+    assert!((0..3).all(|i| legacy.entry_settlement(i) == CheatInstallEntrySettlement::Settled));
+}
+
+// ---------------------------------------------------------------------
+// Rollback: no clobbering after a stale hash check, and a pending rollback
+// record before the first mutation (Night Watch S04-02 / D2-02).
+// ---------------------------------------------------------------------
+
+use crate::patch_manager::cheat_rollback::{
+    FaultPoint as RollbackFaultPoint, inject_rollback_fault_for_test,
+    set_before_destination_mutation_hook_for_test,
+};
+
+fn walk(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(root) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn d2_02_rollback_never_destroys_a_cheat_rewritten_after_its_hash_check() {
+    let fixture = crash_fixture("d2-02", "d2-02");
+    let installed = execute_cheat_install_run(&fixture.entries, &fixture.opts);
+    assert_eq!(installed.run.status, CheatInstallRunStatus::Success);
+
+    let racing = b"cheats = 1\ncheat0_desc = \"EDITED IN RETROARCH\"\n".to_vec();
+    let racing_for_hook = racing.clone();
+    set_before_destination_mutation_hook_for_test(Some(Box::new(move |path: &Path| {
+        fs::write(path, &racing_for_hook).unwrap()
+    })));
+    let outcome = fixture.rollback(true);
+    set_before_destination_mutation_hook_for_test(None);
+
+    let survivors = |root: &Path| -> usize {
+        walk(root)
+            .into_iter()
+            .filter(|p| fs::read(p).ok().as_deref() == Some(&racing[..]))
+            .count()
+    };
+    // All three racing edits (Frogger restore target, Pitfall and Zaxxon
+    // removal targets) must survive, in place or at a reported path.
+    assert_eq!(
+        survivors(&fixture.destination_root)
+            + survivors(&fixture.rollback_dir)
+            + survivors(&fixture.backup_dir),
+        3
+    );
+    assert_eq!(
+        fs::read(fixture.platform_dir().join("Frogger.cht")).unwrap(),
+        racing
+    );
+    assert_eq!(
+        fs::read(fixture.platform_dir().join("Pitfall.cht")).unwrap(),
+        racing
+    );
+    assert_ne!(outcome.run.status, CheatRollbackRunStatus::Success);
+    for entry in &outcome.run.entries {
+        assert_eq!(
+            entry.outcome,
+            CheatRollbackOutcome::FailedDestinationChanged,
+            "{}",
+            entry.message
+        );
+        assert!(!entry.wrote);
+    }
+    // No temp or parked file is left next to the user's cheats.
+    assert_eq!(
+        dir_entries(&fixture.platform_dir()),
+        vec!["Frogger.cht", "Pitfall.cht", "Zaxxon.cht"]
+    );
+    // The truthful rollback record exists and binds to the install.
+    let inspection =
+        inspect_cheat_install_journal(&fixture.journal_path(), &fixture.history_options()).unwrap();
+    assert!(inspection.rollback.exists);
+    assert_eq!(inspection.rollback.completed_successfully, Some(false));
+}
+
+#[test]
+fn rollback_fails_closed_when_its_record_cannot_be_created() {
+    let fixture = crash_fixture("rb-journal-first", "rb-journal-first");
+    execute_cheat_install_run(&fixture.entries, &fixture.opts);
+    let before = dir_entries(&fixture.platform_dir());
+
+    inject_rollback_fault_for_test(Some(RollbackFaultPoint::JournalWrite));
+    let outcome = fixture.rollback(true);
+    inject_rollback_fault_for_test(None);
+
+    assert_eq!(dir_entries(&fixture.platform_dir()), before);
+    assert_eq!(
+        fs::read(fixture.platform_dir().join("Frogger.cht")).unwrap(),
+        b"catalogue content\n",
+        "nothing may be restored without a rollback record"
+    );
+    assert_eq!(outcome.run.status, CheatRollbackRunStatus::Failed);
+    assert!(outcome.journal_path.is_none());
+    assert!(outcome.journal_error.is_some());
+    assert!(outcome.run.entries.iter().all(|entry| {
+        !entry.wrote && entry.error_code.as_deref() == Some("journal_unavailable")
+    }));
+    assert!(dir_entries(&fixture.rollback_dir).is_empty());
+}
+
+#[test]
+fn rollback_killed_mid_way_leaves_a_pending_record_and_can_be_resumed() {
+    let fixture = crash_fixture("rb-crash", "rb-crash");
+    execute_cheat_install_run(&fixture.entries, &fixture.opts);
+
+    inject_rollback_fault_for_test(Some(RollbackFaultPoint::CrashAfterEntry(0)));
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fixture.rollback(true)));
+    inject_rollback_fault_for_test(None);
+    assert!(crashed.is_err());
+
+    // Entry 0 was restored; the record says exactly that and no more.
+    assert_eq!(
+        fs::read(fixture.platform_dir().join("Frogger.cht")).unwrap(),
+        b"USER EDITED\n"
+    );
+    assert!(fixture.platform_dir().join("Pitfall.cht").exists());
+    let journals = dir_entries(&fixture.rollback_dir);
+    assert_eq!(journals, vec!["rb-crash-rollback.json".to_string()]);
+    let pending: crate::patch_manager::CheatRollbackRun =
+        crate::patch_manager::parse_cheat_rollback_run(
+            &fs::read_to_string(fixture.rollback_dir.join(&journals[0])).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(pending.status, CheatRollbackRunStatus::InProgress);
+    assert_eq!(pending.completed_at_unix_seconds, None);
+    assert_eq!(
+        pending.entries[0].outcome,
+        CheatRollbackOutcome::RestoredBackup
+    );
+    assert!(pending.entries[0].wrote);
+    assert_eq!(pending.entries[1].outcome, CheatRollbackOutcome::Pending);
+    assert_eq!(pending.entries[2].outcome, CheatRollbackOutcome::Pending);
+
+    // History binds the pending record and refuses to call it completed.
+    let inspection =
+        inspect_cheat_install_journal(&fixture.journal_path(), &fixture.history_options()).unwrap();
+    assert!(inspection.rollback.exists);
+    assert_eq!(inspection.rollback.completed_successfully, Some(false));
+
+    // A second rollback run finishes the job.
+    let resumed = execute_cheat_rollback_run(
+        &fixture.journal_path(),
+        &CheatRollbackOptions {
+            journal_path: fixture.journal_path(),
+            destination_root: fixture.destination_root.clone(),
+            backup_directory: fixture.backup_dir.clone(),
+            rollback_journal_directory: fixture.rollback_dir.clone(),
+            dry_run: false,
+            confirmed: true,
+            run_id: "rb-crash-rollback-2".into(),
+            started_at_unix_seconds: 1_700_000_200,
+        },
+    );
+    assert_eq!(resumed.run.status, CheatRollbackRunStatus::Success);
+    assert_eq!(
+        resumed.run.entries[0].outcome,
+        CheatRollbackOutcome::AlreadyRestored
+    );
+    assert_eq!(
+        resumed.run.entries[1].outcome,
+        CheatRollbackOutcome::RemovedInstalledFile
+    );
+    fixture.assert_destination_is_pre_run_state();
+
+    // History prefers the completed resumed run over the interrupted one it
+    // superseded: not ambiguous, rollback complete (M2).
+    let after =
+        inspect_cheat_install_journal(&fixture.journal_path(), &fixture.history_options()).unwrap();
+    assert!(after.rollback.exists);
+    assert!(!after.rollback.ambiguous);
+    assert_eq!(after.rollback.completed_successfully, Some(true));
+    assert_eq!(
+        after.rollback.run_id.as_deref(),
+        Some("rb-crash-rollback-2")
+    );
+    assert!(after.entries.iter().all(|entry| entry.rollback_availability
+        == CheatRollbackAvailability::AlreadyCompleted));
+}
+
+// ---------------------------------------------------------------------
+// Installer lock: rollback refuses a still-live install (review M1).
+// ---------------------------------------------------------------------
+
+fn hold_installer_lock(journal_path: &Path) -> fs::File {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(installer_lock_path(journal_path))
+        .unwrap();
+    assert!(try_lock_exclusive(&file).unwrap(), "test must get the lock");
+    file
+}
+
+#[test]
+fn rollback_refuses_an_in_progress_journal_whose_installer_is_still_running() {
+    let fixture = crash_fixture("live-install", "live-install");
+    fixture.run_until_crash(FaultPoint::CrashAfterJournalUpdate(0));
+    assert!(fixture.on_disk_journal().is_interrupted());
+    let journal_before = fs::read(fixture.journal_path()).unwrap();
+    let dest_before = dir_entries(&fixture.platform_dir());
+    let frogger_before = fs::read(fixture.platform_dir().join("Frogger.cht")).unwrap();
+
+    // A live installer holds the journal's lock.
+    let held = hold_installer_lock(&fixture.journal_path());
+    for confirmed in [true, false] {
+        let refused = fixture.rollback(confirmed);
+        assert_ne!(refused.run.status, CheatRollbackRunStatus::Success);
+        assert!(refused.journal_path.is_none());
+        assert!(refused.run.entries.iter().all(|entry| {
+            !entry.wrote
+                && entry.error_code.as_deref() == Some("install_still_running")
+                && entry.message.contains("install still running")
+        }));
+    }
+    assert_eq!(dir_entries(&fixture.platform_dir()), dest_before);
+    assert_eq!(
+        fs::read(fixture.platform_dir().join("Frogger.cht")).unwrap(),
+        frogger_before
+    );
+    assert_eq!(fs::read(fixture.journal_path()).unwrap(), journal_before);
+    assert!(dir_entries(&fixture.rollback_dir).is_empty());
+
+    // The installer ends (a crash releases the lock the same way).
+    drop(held);
+    let outcome = fixture.rollback(true);
+    assert_eq!(outcome.run.status, CheatRollbackRunStatus::Success);
+    fixture.assert_destination_is_pre_run_state();
+}
+
+#[test]
+fn installer_holds_its_lock_for_the_whole_run_and_removes_it_when_done() {
+    let fixture = crash_fixture("installer-lock", "installer-lock");
+    // Someone else holding this run's lock makes the installer fail closed.
+    let held = hold_installer_lock(&fixture.journal_path());
+    let blocked = execute_cheat_install_run(&fixture.entries, &fixture.opts);
+    assert_eq!(blocked.run.status, CheatInstallRunStatus::Failed);
+    assert!(blocked.journal_path.is_none());
+    assert!(!fixture.journal_path().exists());
+    assert!(!fixture.platform_dir().join("Pitfall.cht").exists());
+    drop(held);
+    fs::remove_file(installer_lock_path(&fixture.journal_path())).unwrap();
+
+    let done = execute_cheat_install_run(&fixture.entries, &fixture.opts);
+    assert_eq!(done.run.status, CheatInstallRunStatus::Success);
+    assert_eq!(
+        dir_entries(&fixture.journal_dir),
+        vec!["installer-lock.json".to_string()],
+        "the lock file is removed when the run ends"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Filesystems without RENAME_NOREPLACE (review L1).
+// ---------------------------------------------------------------------
+
+#[test]
+fn rollback_removes_installed_files_where_noreplace_is_unsupported() {
+    let fixture = crash_fixture("noreplace-unsupported", "noreplace-unsupported");
+    let installed = execute_cheat_install_run(&fixture.entries, &fixture.opts);
+    assert_eq!(installed.run.status, CheatInstallRunStatus::Success);
+
+    inject_rollback_fault_for_test(Some(RollbackFaultPoint::NoReplaceUnsupported));
+    let outcome = fixture.rollback(true);
+    inject_rollback_fault_for_test(None);
+
+    assert_eq!(outcome.run.status, CheatRollbackRunStatus::Success);
+    for entry in &outcome.run.entries[1..] {
+        assert_eq!(
+            entry.outcome,
+            CheatRollbackOutcome::RemovedInstalledFile,
+            "{}",
+            entry.message
+        );
+        assert!(entry.wrote);
+    }
+    fixture.assert_destination_is_pre_run_state();
+}
+
+#[test]
+fn noreplace_fallback_never_removes_a_cheat_rewritten_after_its_hash_check() {
+    let fixture = crash_fixture("noreplace-race", "noreplace-race");
+    execute_cheat_install_run(&fixture.entries, &fixture.opts);
+
+    let racing = b"cheats = 1\ncheat0_desc = \"EDITED\"\n".to_vec();
+    let racing_for_hook = racing.clone();
+    set_before_destination_mutation_hook_for_test(Some(Box::new(move |path: &Path| {
+        fs::write(path, &racing_for_hook).unwrap()
+    })));
+    inject_rollback_fault_for_test(Some(RollbackFaultPoint::NoReplaceUnsupported));
+    let outcome = fixture.rollback(true);
+    inject_rollback_fault_for_test(None);
+    set_before_destination_mutation_hook_for_test(None);
+
+    for (entry, name) in outcome.run.entries[1..]
+        .iter()
+        .zip(["Pitfall.cht", "Zaxxon.cht"])
+    {
+        assert_eq!(
+            entry.outcome,
+            CheatRollbackOutcome::FailedDestinationChanged,
+            "{}",
+            entry.message
+        );
+        assert!(!entry.wrote);
+        assert_eq!(fs::read(fixture.platform_dir().join(name)).unwrap(), racing);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Night Watch D7-01 / D7-02 / D7-03: what the installer writes, under
+// which name, and where - through the real catalogue preview.
+// ---------------------------------------------------------------------
+
+mod d7_wiring {
+    use super::*;
+    use crate::emulator_environment::HostReadOnlyFilesystem;
+    use crate::patch_manager::cheat_catalogue::{
+        NO_INSTALLABLE_CHEATS_REASON, build_cheat_availability_report,
+        load_cheat_catalogue_snapshot, render_installable_cheat_document,
+    };
+    use crate::patch_manager::{
+        CatalogueGameEvidence, CheatRollbackOptions, execute_cheat_rollback_run,
+    };
+    use std::os::unix::fs::symlink;
+
+    fn evidence(archive_id: i64, name: &str) -> CatalogueGameEvidence {
+        CatalogueGameEvidence {
+            archive_id,
+            is_present: true,
+            display_name: name.to_string(),
+            normalized_name: name.to_ascii_lowercase(),
+            platform: Some("Atari2600".to_string()),
+            region: None,
+            serial: None,
+            executable_crc: None,
+        }
+    }
+
+    type CheatSpec<'a> = (&'a str, Option<&'a str>);
+    type GameSpec<'a> = (&'a str, &'a [CheatSpec<'a>]);
+
+    fn manifest(root: &Path, games: &[GameSpec<'_>]) -> PathBuf {
+        let games_json: Vec<String> = games
+            .iter()
+            .map(|(name, cheats)| {
+                let cheats_json: Vec<String> = cheats
+                    .iter()
+                    .map(|(description, code)| match code {
+                        Some(code) => format!(
+                            r#"{{"description": "{description}", "code": "{code}", "enabled_by_default": true}}"#
+                        ),
+                        None => format!(r#"{{"description": "{description}"}}"#),
+                    })
+                    .collect();
+                format!(
+                    r#"{{"game_name": "{name}", "platform": "Atari2600", "cheats": [{}]}}"#,
+                    cheats_json.join(",")
+                )
+            })
+            .collect();
+        let path = root.join("manifest.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"source_name": "Fixture", "games": [{}]}}"#,
+                games_json.join(",")
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn previewed(
+        manifest_path: &Path,
+        games: &[CatalogueGameEvidence],
+        destination_root: &Path,
+    ) -> Vec<CheatAvailabilityEntry> {
+        let snapshot =
+            load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", manifest_path);
+        build_cheat_availability_report(
+            &HostReadOnlyFilesystem,
+            &snapshot,
+            games,
+            None,
+            Some(destination_root),
+        )
+        .entries
+    }
+
+    #[test]
+    fn d7_01_manifest_install_writes_the_rendered_per_game_cht_not_the_manifest() {
+        let catalogue_root = temp_root("d7-01-manifest");
+        let destination_root = temp_root("d7-01-manifest-dest");
+        let journal_dir = temp_root("d7-01-manifest-journal");
+        let backup_dir = temp_root("d7-01-manifest-backup");
+        let manifest_path = manifest(
+            &catalogue_root,
+            &[
+                (
+                    " Alpha Quest ",
+                    &[("only for Alpha", Some("F000:01")), ("codeless", None)],
+                ),
+                ("Delta", &[("only for Delta", Some("F001:02"))]),
+            ],
+        );
+        let manifest_bytes = fs::read(&manifest_path).unwrap();
+        let entries = previewed(
+            &manifest_path,
+            &[evidence(1, "Alpha Quest"), evidence(2, "Delta")],
+            &destination_root,
+        );
+        assert_eq!(entries.len(), 2);
+        let opts = options(
+            &destination_root,
+            &journal_dir,
+            &backup_dir,
+            false,
+            true,
+            false,
+            "d7-01",
+        );
+        let outcome = execute_cheat_install_run(&entries, &opts);
+        assert_eq!(outcome.run.status, CheatInstallRunStatus::Success);
+        assert!(outcome.journal_error.is_none());
+        let platform_dir = destination_root.join("Atari2600");
+        for (entry, result) in entries.iter().zip(&outcome.run.entries) {
+            assert_eq!(
+                result.outcome,
+                CheatInstallOutcome::InstalledNew,
+                "{result:?}"
+            );
+            assert!(result.applied);
+            // The written path is exactly the previewed path (D7-02):
+            // " Alpha Quest " was previewed and is written as Alpha Quest.cht.
+            let previewed_path = entry
+                .staging_plan
+                .proposed_destination_path
+                .as_ref()
+                .unwrap()
+                .display
+                .clone();
+            assert_eq!(
+                result.destination_path.as_ref().unwrap().display,
+                previewed_path
+            );
+            let written = fs::read(&previewed_path).unwrap();
+            let rendered = render_installable_cheat_document(&entry.game).unwrap();
+            assert_eq!(written, rendered, "exactly the rendered per-game document");
+            assert_ne!(written, manifest_bytes, "never the manifest bytes");
+            let text = String::from_utf8(written).unwrap();
+            assert!(text.contains("cheats = 1\n"), "{text}");
+            assert!(!text.contains("codeless"), "{text}");
+            assert_eq!(
+                result.resulting_destination_hash.as_deref(),
+                Some(hex_sha256(&rendered).as_str())
+            );
+            assert!(
+                result
+                    .detail
+                    .iter()
+                    .any(|line| line.contains("rendered a per-game")),
+                "{:?}",
+                result.detail
+            );
+        }
+        let alpha = fs::read_to_string(platform_dir.join("Alpha Quest.cht")).unwrap();
+        assert!(
+            !alpha.contains("Delta"),
+            "another game's cheats leaked: {alpha}"
+        );
+        assert!(!platform_dir.join(" Alpha Quest .cht").exists());
+        assert!(
+            dir_entries(&platform_dir)
+                .iter()
+                .all(|name| !name.starts_with('.')),
+            "no temporary residue: {:?}",
+            dir_entries(&platform_dir)
+        );
+
+        // A second run sees the rendered file as already installed; a
+        // manifest edited afterwards is refused for the right reason.
+        let again = previewed(
+            &manifest_path,
+            &[evidence(1, "Alpha Quest"), evidence(2, "Delta")],
+            &destination_root,
+        );
+        assert!(
+            again
+                .iter()
+                .all(|entry| entry.staging_plan.planned_action
+                    == CheatStagingAction::AlreadyInstalled)
+        );
+        fs::write(
+            &manifest_path,
+            b"{\"source_name\": \"Fixture\", \"games\": []}",
+        )
+        .unwrap();
+        let opts = options(
+            &destination_root,
+            &journal_dir,
+            &backup_dir,
+            false,
+            true,
+            false,
+            "d7-01-again",
+        );
+        let outcome = execute_cheat_install_run(&again, &opts);
+        assert_eq!(
+            outcome.run.entries[0].outcome,
+            CheatInstallOutcome::SkippedSourceChanged
+        );
+        assert_eq!(
+            outcome.run.entries[0].reason_code,
+            "source_hash_changed_since_preview"
+        );
+    }
+
+    #[test]
+    fn d7_01_codeless_manifest_game_is_reported_skipped_and_never_installed() {
+        let catalogue_root = temp_root("d7-01-codeless");
+        let destination_root = temp_root("d7-01-codeless-dest");
+        let journal_dir = temp_root("d7-01-codeless-journal");
+        let backup_dir = temp_root("d7-01-codeless-backup");
+        let manifest_path = manifest(
+            &catalogue_root,
+            &[("Frogger", &[("Infinite Lives", None), ("Moon Jump", None)])],
+        );
+        let entries = previewed(&manifest_path, &[evidence(1, "Frogger")], &destination_root);
+        assert_eq!(entries[0].staging_plan.reason, NO_INSTALLABLE_CHEATS_REASON);
+        let opts = options(
+            &destination_root,
+            &journal_dir,
+            &backup_dir,
+            false,
+            true,
+            false,
+            "d7-01-codeless",
+        );
+        let outcome = execute_cheat_install_run(&entries, &opts);
+        assert_eq!(
+            outcome.run.entries[0].outcome,
+            CheatInstallOutcome::SkippedNotEligible
+        );
+        assert_eq!(
+            outcome.run.entries[0].reason_code,
+            NO_INSTALLABLE_CHEATS_REASON
+        );
+        assert!(!outcome.run.entries[0].applied);
+        assert_eq!(outcome.run.summary.writes_succeeded, 0);
+        assert!(!destination_root.join("Atari2600").exists());
+    }
+
+    #[test]
+    fn d7_02_a_destination_that_differs_from_the_preview_is_refused_not_noted() {
+        let catalogue_root = temp_root("d7-02-mismatch");
+        let destination_root = temp_root("d7-02-mismatch-dest");
+        let journal_dir = temp_root("d7-02-mismatch-journal");
+        let backup_dir = temp_root("d7-02-mismatch-backup");
+        // A preview that (hypothetically) promised the untrimmed name: the
+        // installer's own derivation differs, so nothing may be written.
+        let entry = install_new_entry(
+            &catalogue_root,
+            &destination_root,
+            " Frogger ",
+            b"cheats = 0\n",
+        );
+        let opts = options(
+            &destination_root,
+            &journal_dir,
+            &backup_dir,
+            false,
+            true,
+            false,
+            "d7-02",
+        );
+        let outcome = execute_cheat_install_run(&[entry], &opts);
+        assert_eq!(
+            outcome.run.entries[0].outcome,
+            CheatInstallOutcome::SkippedDestinationChanged
+        );
+        assert_eq!(
+            outcome.run.entries[0].reason_code,
+            "destination_differs_from_preview"
+        );
+        assert!(!outcome.run.entries[0].applied);
+        assert!(!destination_root.join("Atari2600").exists());
+
+        // A name no helper accepts is refused outright.
+        let entry = install_new_entry(
+            &catalogue_root,
+            &destination_root,
+            "Frog\u{1}ger",
+            b"cheats = 0\n",
+        );
+        let outcome = execute_cheat_install_run(
+            &[entry],
+            &options(
+                &destination_root,
+                &journal_dir,
+                &backup_dir,
+                false,
+                true,
+                false,
+                "d7-02-ctrl",
+            ),
+        );
+        assert_eq!(
+            outcome.run.entries[0].outcome,
+            CheatInstallOutcome::FailedUnsafePath
+        );
+        assert_eq!(
+            outcome.run.entries[0].reason_code,
+            "destination_name_unsafe"
+        );
+        assert!(!destination_root.join("Atari2600").exists());
+    }
+
+    /// D7-03: the platform directory is swapped for a symlink to an outside
+    /// folder after the read-only assessment and before the write.
+    #[test]
+    fn d7_03_platform_directory_swapped_for_a_symlink_after_assessment_writes_nothing() {
+        let catalogue_root = temp_root("d7-03-swap");
+        let destination_root = temp_root("d7-03-swap-dest");
+        let journal_dir = temp_root("d7-03-swap-journal");
+        let backup_dir = temp_root("d7-03-swap-backup");
+        let outside = temp_root("d7-03-swap-outside");
+        let platform_dir = destination_root.join("Atari2600");
+        fs::create_dir_all(&platform_dir).unwrap();
+        let entry = install_new_entry(
+            &catalogue_root,
+            &destination_root,
+            "Frogger",
+            b"cheats = 0\n",
+        );
+        let moved = destination_root.join("Atari2600.moved");
+        let (moved_for_hook, platform_for_hook, outside_for_hook) =
+            (moved.clone(), platform_dir.clone(), outside.clone());
+        set_before_anchor_hook_for_test(Some(Box::new(move |_root: &Path| {
+            if platform_for_hook.exists() && !moved_for_hook.exists() {
+                fs::rename(&platform_for_hook, &moved_for_hook).unwrap();
+                symlink(&outside_for_hook, &platform_for_hook).unwrap();
+            }
+        })));
+        let outcome = execute_cheat_install_run(
+            &[entry],
+            &options(
+                &destination_root,
+                &journal_dir,
+                &backup_dir,
+                false,
+                true,
+                false,
+                "d7-03",
+            ),
+        );
+        set_before_anchor_hook_for_test(None);
+        let result = &outcome.run.entries[0];
+        assert_eq!(
+            result.outcome,
+            CheatInstallOutcome::FailedUnsafePath,
+            "{result:?}"
+        );
+        assert_eq!(result.reason_code, "parent_symlink_rejected");
+        assert!(!result.applied);
+        assert_ne!(outcome.run.status, CheatInstallRunStatus::Success);
+        assert!(
+            fs::read_dir(&outside).unwrap().next().is_none(),
+            "nothing may land where the symlink points"
+        );
+        assert!(
+            dir_entries(&moved).is_empty(),
+            "nothing in the moved directory either"
+        );
+
+        // The same swap of the destination root itself is refused as well.
+        let destination_root2 = temp_root("d7-03-swap-root");
+        let entry = install_new_entry(
+            &catalogue_root,
+            &destination_root2,
+            "Pitfall",
+            b"cheats = 0\n",
+        );
+        let moved_root = temp_root("d7-03-swap-root-moved");
+        let _ = fs::remove_dir(&moved_root);
+        let (root_for_hook, moved_root_for_hook, outside_for_hook) = (
+            destination_root2.clone(),
+            moved_root.clone(),
+            outside.clone(),
+        );
+        set_before_anchor_hook_for_test(Some(Box::new(move |_root: &Path| {
+            if !moved_root_for_hook.exists() {
+                fs::rename(&root_for_hook, &moved_root_for_hook).unwrap();
+                symlink(&outside_for_hook, &root_for_hook).unwrap();
+            }
+        })));
+        let outcome = execute_cheat_install_run(
+            &[entry],
+            &options(
+                &destination_root2,
+                &journal_dir,
+                &backup_dir,
+                false,
+                true,
+                false,
+                "d7-03-root",
+            ),
+        );
+        set_before_anchor_hook_for_test(None);
+        let result = &outcome.run.entries[0];
+        assert_eq!(
+            result.outcome,
+            CheatInstallOutcome::FailedUnsafePath,
+            "{result:?}"
+        );
+        assert!(!result.applied);
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    /// D7-03 for Undo: a platform directory swapped for a symlink right
+    /// before the mutation redirects nothing, because the rollback already
+    /// holds the real directory open; the installed file is removed from
+    /// where it really is and the symlink target stays empty.
+    #[test]
+    fn d7_03_rollback_mutation_stays_in_the_opened_directory_after_a_swap() {
+        let catalogue_root = temp_root("d7-03-rb");
+        let destination_root = temp_root("d7-03-rb-dest");
+        let journal_dir = temp_root("d7-03-rb-journal");
+        let backup_dir = temp_root("d7-03-rb-backup");
+        let rollback_dir = temp_root("d7-03-rb-rollback");
+        let outside = temp_root("d7-03-rb-outside");
+        let entry = install_new_entry(
+            &catalogue_root,
+            &destination_root,
+            "Frogger",
+            b"cheats = 0\n",
+        );
+        let installed = execute_cheat_install_run(
+            &[entry],
+            &options(
+                &destination_root,
+                &journal_dir,
+                &backup_dir,
+                false,
+                true,
+                false,
+                "d7-03-rb",
+            ),
+        );
+        let journal = installed.journal_path.expect("install journal");
+        let platform_dir = destination_root.join("Atari2600");
+        assert_eq!(
+            fs::read(platform_dir.join("Frogger.cht")).unwrap(),
+            b"cheats = 0\n"
+        );
+        let moved = destination_root.join("Atari2600.moved");
+        let (moved_for_hook, platform_for_hook, outside_for_hook) =
+            (moved.clone(), platform_dir.clone(), outside.clone());
+        crate::patch_manager::cheat_rollback::set_before_destination_mutation_hook_for_test(Some(
+            Box::new(move |_path: &Path| {
+                if !moved_for_hook.exists() {
+                    fs::rename(&platform_for_hook, &moved_for_hook).unwrap();
+                    symlink(&outside_for_hook, &platform_for_hook).unwrap();
+                }
+            }),
+        ));
+        let outcome = execute_cheat_rollback_run(
+            &journal,
+            &CheatRollbackOptions {
+                journal_path: journal.clone(),
+                destination_root: destination_root.clone(),
+                backup_directory: backup_dir.clone(),
+                rollback_journal_directory: rollback_dir.clone(),
+                dry_run: false,
+                confirmed: true,
+                run_id: "d7-03-rb-undo".into(),
+                started_at_unix_seconds: 1_700_000_100,
+            },
+        );
+        crate::patch_manager::cheat_rollback::set_before_destination_mutation_hook_for_test(None);
+        assert_eq!(
+            outcome.run.entries[0].outcome,
+            crate::patch_manager::CheatRollbackOutcome::RemovedInstalledFile,
+            "{:?}",
+            outcome.run.entries[0]
+        );
+        assert!(
+            !moved.join("Frogger.cht").exists(),
+            "removed from the real directory"
+        );
+        assert!(
+            fs::read_dir(&outside).unwrap().next().is_none(),
+            "symlink target untouched"
+        );
+        assert!(dir_entries(&moved).is_empty(), "no parked residue");
     }
 }

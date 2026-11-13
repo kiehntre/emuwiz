@@ -24,6 +24,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -577,6 +578,19 @@ pub fn create_snapshot_checked(
                 });
             }
             fs::rename(&staging, &final_path).map_err(|error| io_error(&staging, error))?;
+            // The file data is already durable (write_file). Make the
+            // directory entries durable too, innermost first, so a power loss
+            // after a restore cannot lose the backup the receipt names.
+            for dir in [
+                final_path.join("files"),
+                final_path.clone(),
+                game_dir.clone(),
+            ] {
+                sync_parent(&dir).map_err(|detail| SaveSnapshotError::InvalidPath {
+                    path: dir.clone(),
+                    detail: format!("could not make the snapshot folder durable: {detail}"),
+                })?;
+            }
             Ok(SaveSnapshot {
                 manifest,
                 storage_path: final_path,
@@ -842,9 +856,9 @@ pub fn apply_single_file_restore_gated(
         .parent()
         .ok_or_else(|| SaveRestoreError::Refused(SaveRestoreRefusal::TargetPathUnsafe))?;
     ensure_directory(parent)?;
-    ensure_directory(&options.backup_root)
+    ensure_directory_durable(&options.backup_root)
         .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
-    ensure_directory(&options.receipt_root)
+    ensure_directory_durable(&options.receipt_root)
         .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::ReceiptWriteFailed))?;
     verify_snapshot(snapshot)?;
 
@@ -873,6 +887,10 @@ pub fn apply_single_file_restore_gated(
         let backup = create_snapshot(&backup_request)
             .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
         verify_snapshot(&backup)
+            .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
+        // The backup's own folders are durable (create_snapshot); its entry in
+        // backup_root must be too before the receipt that names it is.
+        sync_parent(&options.backup_root)
             .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
         Some(backup)
     } else {
@@ -1069,6 +1087,18 @@ pub fn undo_single_file_restore(
     receipt: &SaveRestoreReceipt,
     quiescence: SaveQuiescenceRequirement,
 ) -> Result<(), SaveRestoreError> {
+    undo_single_file_restore_gated(receipt, quiescence, &|| true)
+}
+
+/// As [`undo_single_file_restore`]; `still_safe` is asked once more after the
+/// previous save has been staged, immediately before it is published over the
+/// restored file. If it says no, the stage is discarded and `SaveInUse` is
+/// returned with the restored file untouched.
+pub fn undo_single_file_restore_gated(
+    receipt: &SaveRestoreReceipt,
+    quiescence: SaveQuiescenceRequirement,
+    still_safe: &dyn Fn() -> bool,
+) -> Result<(), SaveRestoreError> {
     match quiescence {
         SaveQuiescenceRequirement::ConfirmedClosed => {}
         SaveQuiescenceRequirement::Running => {
@@ -1156,19 +1186,23 @@ pub fn undo_single_file_restore(
     let parent = target
         .parent()
         .ok_or_else(|| SaveRestoreError::Refused(SaveRestoreRefusal::TargetPathUnsafe))?;
-    let stage = parent.join(format!(
-        ".{}.emuwiz-undo-stage-{}",
-        target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("save"),
-        short_path_token(&receipt.receipt_path)
-    ));
+    // An earlier Undo of this receipt that died mid-copy (kill, ENOSPC, EIO)
+    // leaves its stage behind; it is ours, so it is cleared before copying.
+    let prefix = stage_prefix(target, "undo", &short_path_token(&receipt.receipt_path));
+    remove_owned_stale_stages(parent, &prefix);
+    let stage = parent.join(unique_stage_name(&prefix));
     copy_and_verify(&backup, &stage, &backup_hash)?;
-    fs::rename(&stage, target).map_err(|error| SaveRestoreError::Io {
-        path: target.clone(),
-        detail: format!("atomic undo publication failed: {error}"),
-    })?;
+    if !still_safe() {
+        let _ = fs::remove_file(&stage);
+        return Err(SaveRestoreError::Refused(SaveRestoreRefusal::SaveInUse));
+    }
+    if let Err(error) = fs::rename(&stage, target) {
+        let _ = fs::remove_file(&stage);
+        return Err(SaveRestoreError::Io {
+            path: target.clone(),
+            detail: format!("atomic undo publication failed: {error}"),
+        });
+    }
     sync_parent(parent).map_err(|error| SaveRestoreError::Io {
         path: parent.to_path_buf(),
         detail: error,
@@ -1241,6 +1275,31 @@ fn live_target_matches(preflight: &SaveRestorePreflight) -> bool {
     }
 }
 
+/// As [`ensure_directory`], and makes every folder it had to create durable
+/// (each new folder and the existing parent that now lists the first one).
+fn ensure_directory_durable(path: &Path) -> Result<(), SaveRestoreError> {
+    let mut created = Vec::new();
+    let mut cursor = path;
+    while fs::symlink_metadata(cursor).is_err() {
+        created.push(cursor.to_path_buf());
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => break,
+        }
+    }
+    ensure_directory(path)?;
+    if created.is_empty() {
+        return Ok(());
+    }
+    for dir in created.iter().chain(std::iter::once(&cursor.to_path_buf())) {
+        sync_parent(dir).map_err(|detail| SaveRestoreError::Io {
+            path: dir.clone(),
+            detail,
+        })?;
+    }
+    Ok(())
+}
+
 fn ensure_directory(path: &Path) -> Result<(), SaveRestoreError> {
     fs::create_dir_all(path).map_err(|error| SaveRestoreError::Io {
         path: path.to_path_buf(),
@@ -1258,6 +1317,10 @@ fn ensure_directory(path: &Path) -> Result<(), SaveRestoreError> {
     Ok(())
 }
 
+/// Copies `source` to a new file at `destination` and checks its hash. The
+/// destination is created with `create_new`; on any failure after that (read,
+/// write, sync or hash mismatch) the partial file is removed, so a failed
+/// attempt never blocks the next one.
 fn copy_and_verify(
     source: &Path,
     destination: &Path,
@@ -1275,6 +1338,27 @@ fn copy_and_verify(
             path: destination.to_path_buf(),
             detail: error.to_string(),
         })?;
+    let result = copy_into(
+        &mut input,
+        &mut output,
+        source,
+        destination,
+        expected_sha256,
+    );
+    if result.is_err() {
+        drop(output);
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+fn copy_into(
+    input: &mut File,
+    output: &mut File,
+    source: &Path,
+    destination: &Path,
+    expected_sha256: &str,
+) -> Result<(), SaveRestoreError> {
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -1301,12 +1385,56 @@ fn copy_and_verify(
     })?;
     let actual = hex_digest(digest);
     if actual != expected_sha256 {
-        let _ = fs::remove_file(destination);
         return Err(SaveRestoreError::Refused(
             SaveRestoreRefusal::StagedHashMismatch,
         ));
     }
     Ok(())
+}
+
+/// `.<save>.emuwiz-<kind>-stage-<token>`: the fixed part of a stage name,
+/// so a leftover is attributable to its save and its receipt or target.
+fn stage_prefix(target: &Path, kind: &str, token: &str) -> String {
+    format!(
+        ".{}.emuwiz-{kind}-stage-{token}",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("save")
+    )
+}
+
+/// A stage name unique to this attempt (process id and a per-process
+/// counter), so a leftover from an earlier attempt can never collide with it.
+fn unique_stage_name(prefix: &str) -> String {
+    static ATTEMPT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        ATTEMPT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Removes leftover stage files of our own in `parent`: regular files only
+/// (lstat, never following a symlink) whose name starts with `prefix`. A
+/// name that merely resembles a stage but is a symlink, directory or special
+/// file is left alone.
+fn remove_owned_stale_stages(parent: &Path, prefix: &str) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(prefix) {
+            continue;
+        }
+        let path = entry.path();
+        if fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 fn rollback_after_failed_restore(
@@ -1348,23 +1476,21 @@ fn rollback_after_failed_restore(
     let parent = target
         .parent()
         .ok_or_else(|| SaveRestoreError::Refused(SaveRestoreRefusal::TargetPathUnsafe))?;
-    let stage = parent.join(format!(
-        ".{}.emuwiz-rollback-stage-{}",
-        target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("save"),
-        short_path_token(target)
-    ));
+    let prefix = stage_prefix(target, "rollback", &short_path_token(target));
+    remove_owned_stale_stages(parent, &prefix);
+    let stage = parent.join(unique_stage_name(&prefix));
     copy_and_verify(
         &source,
         &stage,
         preflight.target_fingerprint.as_deref().unwrap_or_default(),
     )?;
-    fs::rename(stage, target).map_err(|error| SaveRestoreError::Io {
-        path: target.to_path_buf(),
-        detail: error.to_string(),
-    })?;
+    if let Err(error) = fs::rename(&stage, target) {
+        let _ = fs::remove_file(&stage);
+        return Err(SaveRestoreError::Io {
+            path: target.to_path_buf(),
+            detail: error.to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -1388,10 +1514,30 @@ fn persist_receipt(receipt: &SaveRestoreReceipt) -> Result<(), SaveRestoreError>
     Ok(())
 }
 
+/// fsync of a directory: makes its entries (renames, new files) durable.
 fn sync_parent(path: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    sync_log::record(path);
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| error.to_string())
+}
+
+/// Test-only record of directory fsyncs, in order, for this thread.
+#[cfg(test)]
+pub(crate) mod sync_log {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    thread_local! {
+        static SYNCED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+    pub(super) fn record(path: &Path) {
+        SYNCED.with(|synced| synced.borrow_mut().push(path.to_path_buf()));
+    }
+    /// Directory fsyncs since the last call, oldest first.
+    pub(crate) fn take() -> Vec<PathBuf> {
+        SYNCED.with(|synced| std::mem::take(&mut *synced.borrow_mut()))
+    }
 }
 
 fn validate_source(path: &Path) -> Result<PathBuf, SaveSnapshotError> {

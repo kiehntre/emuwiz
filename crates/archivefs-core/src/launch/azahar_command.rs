@@ -123,12 +123,14 @@ mod tests {
             keys_state: AzaharEvidenceState::Absent,
             system_data_state: AzaharEvidenceState::Unknown,
             captured_identity: CapturedFileIdentity {
+                changed: None,
                 device: 1,
                 inode: 2,
                 size: 3,
                 modified: None,
             },
             executable_identity: CapturedFileIdentity {
+                changed: None,
                 device: 1,
                 inode: 2,
                 size: 3,

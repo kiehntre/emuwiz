@@ -68,6 +68,8 @@ pub mod amiberry_cd_execution;
 pub mod amiberry_cd_profile;
 pub mod amiberry_command;
 pub mod amiberry_execution;
+pub mod amiga_caps_plugin;
+pub mod amiga_hdf_working_copy;
 pub mod amiga_whdload_command;
 pub mod amiga_whdload_execution;
 pub mod amiga_whdload_trainer_launch;
@@ -93,6 +95,7 @@ pub mod dosbox_command;
 pub mod dosbox_execution;
 pub mod dosbox_sandbox;
 pub mod dosbox_target;
+pub mod unverified_media;
 pub use dosbox_target::{DosBoxLaunchIdentity, UserApprovedDosBoxTarget};
 pub mod duckstation_command;
 pub mod duckstation_execution;
@@ -115,6 +118,7 @@ pub mod fsuae_execution;
 pub mod fuse_command;
 pub mod hatari_command;
 pub mod hatari_execution;
+pub mod hatari_session;
 pub mod input_projection;
 pub mod integration;
 pub mod mame_command;
@@ -347,9 +351,10 @@ pub use evidence_freshness::{
 pub use execution::{
     LAUNCH_STDERR_CAPTURE_LIMIT, LaunchCommandFacts, LaunchContentIdentity, LaunchExecutionError,
     LaunchExitReport, LaunchPreflightError, LaunchPreflightErrorKind, LaunchSpawnError,
-    LaunchedRetroArchProcess, RetroArchLaunchRequest, preflight_and_launch_retroarch,
-    preflight_and_launch_retroarch_with_playlist, preflight_retroarch_launch,
-    preflight_retroarch_launch_with_playlist, spawn_retroarch,
+    LaunchedRetroArchProcess, PreparedRetroArchLaunch, RetroArchLaunchRequest,
+    preflight_and_launch_retroarch, preflight_and_launch_retroarch_with_playlist,
+    preflight_retroarch_launch, preflight_retroarch_launch_with_playlist,
+    prepare_retroarch_launch_with_playlist, spawn_retroarch,
 };
 pub use fbneo_command::{
     FBNEO_SUPPORTED_PLATFORM_ID, FbneoCommand, FbneoCommandPlan, FbneoIdentityEvidence,
@@ -414,6 +419,7 @@ pub use integration::{
 };
 pub use mame_command::{
     MAME_SUPPORTED_PLATFORM_IDS, MameCommand, MameCommandPlan, build_mame_command_plan,
+    build_mame_command_plan_with_extra,
 };
 pub use mame_execution::{
     MameLaunchExecutionError, MameLaunchPreflightError, MameLaunchRequest,
@@ -649,6 +655,7 @@ pub mod nkit_readiness;
 
 /// Explicit user choice between tied launch candidates.
 pub mod launch_choice;
+pub mod remembered_launch_system;
 
 /// Dolphin profiles are launch options only with a provable binding.
 pub mod dolphin_binding_readiness;

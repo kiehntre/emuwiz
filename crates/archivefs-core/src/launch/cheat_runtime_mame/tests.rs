@@ -65,6 +65,7 @@ impl Fx {
                 &std::fs::symlink_metadata(&content).unwrap(),
             )),
             rom_search_path: dir.path().to_path_buf(),
+            extra_rompaths: Vec::new(),
             selected_content: content,
         };
         (Self { dir, exe }, request)

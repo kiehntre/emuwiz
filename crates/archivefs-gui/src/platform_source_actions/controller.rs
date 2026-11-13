@@ -371,6 +371,12 @@ impl ArchiveFsApp {
     /// already running (and vice versa via the other `*_available`
     /// checks, once updated).
     pub(crate) fn source_action_available(&self) -> bool {
+        !self.external_catalogue_writer_busy && self.native_writers_idle()
+    }
+
+    /// The native app's own writers only, ignoring any writer the embedding
+    /// shell reports through `external_catalogue_writer_busy`.
+    pub(crate) fn native_writers_idle(&self) -> bool {
         self.sources_ui.source_action.is_none()
             && self.library_ui.alias_action.is_none()
             && self.library_ui.platform_action.is_none()
@@ -829,10 +835,28 @@ pub(crate) fn apply_platform_action_at(
                 archive_path.display()
             ))
         })?;
-    match action {
-        PlatformAction::Set(platform) => database.set_manual_platform(archive_id, platform),
-        PlatformAction::Clear => database.clear_manual_platform(archive_id),
+    let change = match action {
+        PlatformAction::Set(platform) => database.set_manual_platform(archive_id, platform)?,
+        PlatformAction::Clear => database.clear_manual_platform(archive_id)?,
+    };
+    // Mirror the choice outside the database so a rebuilt library keeps it.
+    // The database choice above already stands if this cannot be written.
+    let store = archivefs_core::manual_platform_choices::store_path(database_path);
+    let mirrored = match action {
+        PlatformAction::Set(platform) => {
+            archivefs_core::manual_platform_choices::remember(&store, archive_path, platform)
+        }
+        PlatformAction::Clear => {
+            archivefs_core::manual_platform_choices::forget(&store, archive_path)
+        }
+    };
+    if let Err(error) = mirrored {
+        eprintln!(
+            "emuwiz: manual system choice not mirrored to {}: {error}",
+            store.display()
+        );
     }
+    Ok(change)
 }
 
 /// Opens the default library database and applies one
@@ -870,10 +894,14 @@ pub(crate) fn apply_bulk_platform_action_at(
 ) -> archivefs_core::Result<BulkPlatformActionOutcome> {
     let mut database = Database::open_or_create(database_path)?;
     let mut ids = Vec::with_capacity(archive_paths.len());
+    let mut resolved = Vec::with_capacity(archive_paths.len());
     let mut unresolved_paths = 0usize;
     for path in archive_paths {
         match database.find_archive_id_by_absolute_path(path)? {
-            Some(id) => ids.push(id),
+            Some(id) => {
+                ids.push(id);
+                resolved.push(path.clone());
+            }
             None => unresolved_paths += 1,
         }
     }
@@ -883,6 +911,23 @@ pub(crate) fn apply_bulk_platform_action_at(
         }
         BulkPlatformActionKind::Clear => database.clear_manual_platform_for_archives(&ids)?,
     };
+    // Mirror outside the database so a rebuilt library keeps these choices.
+    let store = archivefs_core::manual_platform_choices::store_path(database_path);
+    let mirrored = match kind {
+        BulkPlatformActionKind::Set(platform) => {
+            archivefs_core::manual_platform_choices::remember_all(&store, &resolved, platform)
+                .map(|_| ())
+        }
+        BulkPlatformActionKind::Clear => {
+            archivefs_core::manual_platform_choices::forget_all(&store, &resolved)
+        }
+    };
+    if let Err(error) = mirrored {
+        eprintln!(
+            "emuwiz: manual system choices not mirrored to {}: {error}",
+            store.display()
+        );
+    }
     Ok(BulkPlatformActionOutcome {
         result,
         unresolved_paths,

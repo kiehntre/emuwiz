@@ -27,6 +27,24 @@ impl ArchiveFsApp {
         archivefs_core::launch::launch_content_ref_for_unmounted(*kind, path)
     }
 
+    /// Whether `path` is a catalogued `arcade_set_directory`. The page's own
+    /// catalogue row (handed over by Blue) is checked first: the saved-library
+    /// snapshot is not loaded on the v2 Library/Game Details routes, so it
+    /// cannot be the only source or the MAME probe would never be asked.
+    pub(crate) fn is_catalogued_arcade_set_directory(&self, path: &Path) -> bool {
+        self.catalogued_loose_content
+            .as_ref()
+            .is_some_and(|(row_path, kind)| {
+                row_path == path && *kind == archivefs_core::ArchiveKind::ArcadeSetDirectory
+            })
+            || self.database_state.snapshot().is_some_and(|snapshot| {
+                snapshot
+                    .archives
+                    .iter()
+                    .any(|a| a.archive_kind == "arcade_set_directory" && a.absolute_path == path)
+            })
+    }
+
     pub(crate) fn persisted_scummvm_folder(
         &self,
         path: &Path,
@@ -937,6 +955,34 @@ impl ArchiveFsApp {
         let member_path = |record: &ArchiveRecord| self.resolved_archive_member_path(record);
         let is_scummvm_folder = |path: &Path| self.persisted_scummvm_folder(path).is_some();
         let loose_ref = |path: &Path| self.catalogued_loose_content_ref(path);
+        let is_arcade_set_directory = |path: &Path| self.is_catalogued_arcade_set_directory(path);
+        let platform_hint = |path: &Path| {
+            self.catalogued_platform_hint
+                .as_ref()
+                .filter(|(hinted, _)| hinted == path)
+                .map(|(_, platform)| platform.clone())
+        };
+        let platform_source = |path: &Path| {
+            self.catalogued_platform_source
+                .as_ref()
+                .filter(|(hinted, _)| hinted == path)
+                .map(|(_, source)| source.clone())
+        };
+        let system_unknown = |path: &Path| {
+            self.catalogued_row_health
+                .as_ref()
+                .is_some_and(|(row, _)| row == path)
+                && self
+                    .catalogued_platform_hint
+                    .as_ref()
+                    .is_none_or(|(hinted, _)| hinted != path)
+        };
+        let system_trial = |path: &Path| {
+            self.launch_system_trial
+                .as_ref()
+                .filter(|(tried, _)| tried == path)
+                .map(|(_, system)| *system)
+        };
         super::readiness_input::ReadinessSources {
             readiness: &self.emulator_readiness,
             evidence: &self.selected_evidence_ui.selected_evidence,
@@ -948,6 +994,13 @@ impl ArchiveFsApp {
             member_path: &member_path,
             is_scummvm_folder: &is_scummvm_folder,
             loose_ref: &loose_ref,
+            is_arcade_set_directory: &is_arcade_set_directory,
+            platform_hint: &platform_hint,
+            platform_source: &platform_source,
+            system_trial: &system_trial,
+            remembered_system:
+                &archivefs_core::launch::remembered_launch_system::remembered_launch_system,
+            system_unknown: &system_unknown,
         }
         .build(live)
     }
@@ -2021,7 +2074,55 @@ pub(crate) fn load_pcsx2_firmware_evidence_from_registry()
         .map_err(|error| error.to_string())?;
     let (registry, _warnings) =
         archivefs_core::dat::sources::DatSourceRegistry::from_config(&config);
-    Ok(pcsx2_firmware_evidence_from_registry(&registry))
+    let mut evidence = pcsx2_firmware_evidence_from_registry(&registry);
+    evidence.extend(managed_redump_bios_evidence_default());
+    Ok(evidence)
+}
+
+/// Firmware records from the installed EmuWiz-managed Redump BIOS DATs
+/// (DAT Sources > Redump BIOS). Without these, a user who installed the
+/// managed PS1 BIOS DAT but registered no separate BIOS DAT file could never
+/// get a verified PS1/PS2 BIOS, so standalone DuckStation was never offered.
+/// Only the current installed snapshot is read; nothing is downloaded or
+/// written, and an absent or unreadable managed configuration adds nothing.
+fn managed_redump_bios_evidence_default()
+-> Vec<archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord> {
+    use archivefs_core::dat::managed_sources::{
+        load_managed_dat_sources_default, resolve_redump_bios_sources_default,
+    };
+    let Ok(sources) = load_managed_dat_sources_default() else {
+        return Vec::new();
+    };
+    let Ok(resolved) = resolve_redump_bios_sources_default(&sources) else {
+        return Vec::new();
+    };
+    managed_redump_bios_evidence(&resolved)
+}
+
+pub(crate) fn managed_redump_bios_evidence(
+    resolved: &[archivefs_core::dat::managed_sources::ResolvedRedumpBiosSource],
+) -> Vec<archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord> {
+    use archivefs_core::dat::firmware_evidence::redump_bios_evidence_from_dat;
+    use archivefs_core::dat::limits::DatLimits;
+    use archivefs_core::dat::parsers::parse_dat_file;
+
+    let mut evidence = Vec::new();
+    for source in resolved {
+        let Some(current) = &source.current else {
+            continue;
+        };
+        let Ok(outcome) = parse_dat_file(current.path(), DatLimits::default()) else {
+            continue;
+        };
+        // The dataset header must name this source's own system; the parser
+        // refuses anything else, so a mislabelled file contributes nothing.
+        if let Ok(records) =
+            redump_bios_evidence_from_dat(&outcome.dat, source.config.system.firmware_system())
+        {
+            evidence.extend(records);
+        }
+    }
+    evidence
 }
 
 /// The caller-confirmed local executable paths to add to a standalone
@@ -2211,4 +2312,70 @@ pub(super) fn disc_files_diagnostic(
         None => diagnostic.to_string(),
     };
     Some(format!("This disc cannot be launched: {text}"))
+}
+
+#[cfg(test)]
+#[path = "controller_arcade_gate_tests.rs"]
+mod arcade_gate_tests;
+
+#[cfg(test)]
+mod managed_redump_bios_evidence_tests {
+    use archivefs_core::dat::firmware_evidence::FirmwareSystem;
+    use archivefs_core::dat::managed_sources::{ManagedDatSources, resolve_redump_bios_sources};
+    use archivefs_core::dat::updates::{
+        ManagedDatSnapshot, ManagedDatSourceDescriptor, ManagedDatState, ManagedDatUpdatePolicy,
+        RedumpBiosSystem, save_managed_dat_state,
+    };
+
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn an_installed_managed_ps1_bios_dat_becomes_launch_firmware_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("managed-dats");
+        let descriptor = ManagedDatSourceDescriptor::redump_bios(RedumpBiosSystem::PlayStation)
+            .unwrap()
+            .with_update_policy(ManagedDatUpdatePolicy::Manual);
+        let state =
+            ManagedDatState::new(&descriptor, ManagedDatSnapshot::new(SHA).unwrap()).unwrap();
+        let object = root
+            .join(state.source_id.storage_relative_path())
+            .join("objects")
+            .join(SHA);
+        std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+        std::fs::write(
+            &object,
+            r#"<?xml version="1.0"?><datafile><header><name>Sony - PlayStation - BIOS Images</name><description>Sony - PlayStation - BIOS Images</description><author>redump</author></header><machine name="ps-41a"><description>SCPH-7001</description><rom name="ps-41a.bin" size="524288" crc="0badc0de" md5="00112233445566778899aabbccddeeff" sha1="0011223344556677889900112233445566778899"/></machine></datafile>"#,
+        )
+        .unwrap();
+        save_managed_dat_state(&root, &state).unwrap();
+        let mut sources = ManagedDatSources::new();
+        sources
+            .add_redump_bios(
+                RedumpBiosSystem::PlayStation,
+                ManagedDatUpdatePolicy::Manual,
+            )
+            .unwrap();
+        let resolved = resolve_redump_bios_sources(&sources, &root).unwrap();
+
+        let evidence = super::managed_redump_bios_evidence(&resolved);
+
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].system, FirmwareSystem::PlayStation);
+        assert_eq!(evidence[0].name, "ps-41a");
+    }
+
+    #[test]
+    fn a_configured_but_not_installed_managed_bios_dat_adds_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut sources = ManagedDatSources::new();
+        sources
+            .add_redump_bios(
+                RedumpBiosSystem::PlayStation,
+                ManagedDatUpdatePolicy::Manual,
+            )
+            .unwrap();
+        let resolved = resolve_redump_bios_sources(&sources, temp.path()).unwrap();
+        assert!(super::managed_redump_bios_evidence(&resolved).is_empty());
+    }
 }

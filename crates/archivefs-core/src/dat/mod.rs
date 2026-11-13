@@ -51,6 +51,7 @@ pub mod duel;
 pub mod expected_inventory;
 pub mod firmware_evidence;
 pub mod hash;
+pub mod header_match;
 pub mod identity;
 pub mod index;
 pub mod library_identity_projection;

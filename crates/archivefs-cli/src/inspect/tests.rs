@@ -73,11 +73,35 @@ fn scummvm_directories_never_reach_the_external_detector() {
         size_bytes: Some(1),
     };
     for hint in ["scummvm", "ScummVM", " SCUMM VM "] {
-        assert!(needs_external_detector(Some(hint), &dir), "{hint}");
+        assert!(
+            needs_external_detector(Some(hint), &dir).is_some(),
+            "{hint}"
+        );
         // Only a directory triggers the detector subprocess in the core.
-        assert!(!needs_external_detector(Some(hint), &file), "{hint}");
+        assert!(
+            needs_external_detector(Some(hint), &file).is_none(),
+            "{hint}"
+        );
     }
     for hint in [None, Some("ps2"), Some("gamecube"), Some("NES")] {
-        assert!(!needs_external_detector(hint, &dir), "{hint:?}");
+        assert!(needs_external_detector(hint, &dir).is_none(), "{hint:?}");
     }
+    // Night Watch D8-01: an Amiga LHA/LZH *file* needs an external 7-Zip to
+    // list it, whatever the hint says; other files do not.
+    for name in ["/library/Amiga/Game.lha", "/library/Amiga/Game.LZH"] {
+        let lha = Target {
+            path: name.to_string(),
+            path_is_utf8: true,
+            kind: "file",
+            size_bytes: Some(1),
+        };
+        for hint in [None, Some("amiga"), Some("ps2")] {
+            let reason = needs_external_detector(hint, &lha);
+            assert!(
+                reason.is_some_and(|reason| reason.contains("7-Zip")),
+                "{name} {hint:?}: {reason:?}"
+            );
+        }
+    }
+    assert!(needs_external_detector(Some("amiga"), &file).is_none());
 }

@@ -293,3 +293,63 @@ fn mame_disk_declaration_review_blocks_command_before_handoff() {
         );
     }
 }
+
+#[test]
+fn extra_rompaths_follow_the_set_folder_in_one_rompath_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    let bios = std::fs::canonicalize(dir.path()).unwrap();
+    let plan = build_mame_command_plan_with_extra(
+        &identity("pacman"),
+        &[resolution("pacman", SetState::Complete)],
+        Some(std::path::Path::new("/usr/bin/mame")),
+        Some(std::path::Path::new("/library")),
+        std::slice::from_ref(&bios),
+    );
+    let command = plan.command.expect("valid extra path plans");
+    let expected = format!("/library;{}", bios.display());
+    assert_eq!(
+        command.arguments,
+        vec![
+            OsString::from("-rompath"),
+            OsString::from(expected),
+            OsString::from("pacman")
+        ]
+    );
+}
+
+#[test]
+fn unvalidated_extra_rompaths_block_the_plan() {
+    for bad in ["relative", "/definitely/not/here", "/tmp/a;b"] {
+        let plan = build_mame_command_plan_with_extra(
+            &identity("pacman"),
+            &[resolution("pacman", SetState::Complete)],
+            Some(std::path::Path::new("/usr/bin/mame")),
+            Some(std::path::Path::new("/library")),
+            &[bad.into()],
+        );
+        assert!(plan.command.is_none(), "{bad}");
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|b| b.detail.contains("extra MAME ROM search path"))
+        );
+    }
+}
+
+#[test]
+fn a_semicolon_in_the_collection_folder_path_is_refused() {
+    let mut res = resolution("pacman", SetState::Complete);
+    res.archive_path = "/lib;x/pacman".into();
+    let plan = build_mame_command_plan(
+        &identity("pacman"),
+        &[res],
+        Some(std::path::Path::new("/usr/bin/mame")),
+        Some(std::path::Path::new("/lib;x")),
+    );
+    assert!(plan.command.is_none());
+    assert!(
+        plan.blockers
+            .iter()
+            .any(|b| b.detail.contains("contains ';'"))
+    );
+}

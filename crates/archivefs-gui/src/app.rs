@@ -169,6 +169,16 @@ pub(crate) struct ArchiveFsApp {
     /// the same reason: the identity inspector needs the system, and without
     /// the snapshot a loose ROM would be inspected as an unknown platform.
     pub(crate) catalogued_platform_hint: Option<(PathBuf, String)>,
+    /// How that catalogued platform was set (`platform_assignments.source`).
+    pub(crate) catalogued_platform_source: Option<(PathBuf, String)>,
+    /// A one-launch "Try anyway" system for one file. In memory only: never
+    /// saved, never a manual choice, consumed by the next launch attempt.
+    pub(crate) launch_system_trial: Option<(PathBuf, &'static str)>,
+    /// The Launch page's "Remember this launch choice" tick box, for one
+    /// file. Unticked by default; only a tick plus a system press saves.
+    pub(crate) launch_remember_choice: Option<PathBuf>,
+    /// Why saving or forgetting a remembered launch choice failed, per file.
+    pub(crate) launch_remember_error: Option<(PathBuf, String)>,
     /// The page's own catalogue row's stored health, handed over with the row
     /// (Blue does not load the library snapshot on the Launch route). The
     /// freshest word on whether that file's last inspection completed.
@@ -291,6 +301,10 @@ pub(crate) struct ArchiveFsApp {
     /// any - mirrors `source_action` exactly, including the "one writer at
     /// a time" convention.
     pub(crate) library_view_action: Option<RunningLibraryViewAction>,
+    /// Set by the Blue shell while it writes the catalogue itself (its folder
+    /// scan, a database upgrade). Part of `source_action_available`, so every
+    /// Sources-page writer (including the reviewed rebind dialog) honours it.
+    pub(crate) external_catalogue_writer_busy: bool,
     /// The most recently computed Preview for a view, if any - both what
     /// the Library Views page shows in its plan table and what "Apply"/
     /// "Repair" act on for that view, and what the Library page's "Show in
@@ -394,6 +408,27 @@ impl ArchiveFsApp {
             || self.setup_action.is_some()
     }
 
+    /// No worker of this window can be writing the library database: the
+    /// catalogue is not loading or scanning, no source, alias, platform,
+    /// missing-removal or library-view action is running, and no mount or
+    /// setup operation is in flight. Database restore, rollback and
+    /// reconciliation require this; writers in other processes are refused
+    /// by the restore's own locks.
+    pub(crate) fn database_writers_idle(&self) -> bool {
+        !self.database_state.is_loading() && !self.is_busy() && self.source_action_available()
+    }
+
+    /// After the live database file was replaced (restore, rollback or a
+    /// reconciled interrupted restore) every cached snapshot is stale.
+    pub(crate) fn reload_catalogue_after_database_replacement(&mut self, context: egui::Context) {
+        self.database_generation = self.database_generation.next();
+        let generation = self.database_generation;
+        let previous = self.database_state.snapshot().cloned().map(Box::new);
+        self.database_state =
+            crate::database_load::start_database_load(context, generation, previous, false);
+        self.shared_history = SharedHistoryState::NotLoaded;
+    }
+
     pub(crate) fn new(context: egui::Context) -> Self {
         Self::new_with_initial_load(context, true)
     }
@@ -483,6 +518,10 @@ impl ArchiveFsApp {
             snapshot_stale: false,
             catalogued_scummvm_folder: None,
             catalogued_platform_hint: None,
+            catalogued_platform_source: None,
+            launch_system_trial: None,
+            launch_remember_choice: None,
+            launch_remember_error: None,
             catalogued_row_health: None,
             catalogued_loose_content: None,
             refresh_generation: generation,
@@ -510,6 +549,7 @@ impl ArchiveFsApp {
             gamer_view_scan_pending_review: false,
             library_views: load_library_view_configs_default().unwrap_or_default(),
             library_view_action: None,
+            external_catalogue_writer_busy: false,
             library_view_last_plan: None,
             library_view_form_dialog: None,
             library_view_remove_dialog: None,
@@ -904,6 +944,7 @@ impl Drop for ArchiveFsApp {
 
 impl ArchiveFsApp {
     pub(crate) fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::arcade_mame_probe::register_repaint(context);
         app_polling::poll_and_reconcile(self, context);
         self.launch_standalone
             .focus_dosbox_game(self.archive_context.focused.as_deref());
