@@ -788,8 +788,10 @@ def cmd_policy(args):
             write_policy(policy)
         print("policy recorded and left DISABLED; enable it explicitly with `policy enable`")
         return 0
-    state, policy, why = load_policy()
-    if state != "ok":
+    # unlocked fast path only for "no policy at all"; an unlocked read can see a concurrent
+    # transition's atomic replace and report "invalid", so validity is decided under the lock
+    state, _policy, why = load_policy()
+    if state == "absent":
         raise SystemExit(f"policy {args.action}: {why}")
     want = args.action == "enable"
     ensure_state()
