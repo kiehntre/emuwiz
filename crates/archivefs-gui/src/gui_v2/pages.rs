@@ -1550,6 +1550,15 @@ impl App {
                         .map(|summary| (id, summary))
                 })
         };
+        if let Some((id, summary)) = &summary
+            && let Some(game) = library.game(*id)
+            && let Some(view) = self
+                .native_workflows
+                .as_ref()
+                .map(|w| w.compact_of(summary))
+        {
+            self.note_checked_readiness(game, &view);
+        }
         let diagnosis = match (&picked, &summary) {
             (Some(_), None) => super::doctor_launch_check::checking(),
             _ => super::doctor_launch_check::diagnose(summary.as_ref().map(|(_, summary)| summary)),
@@ -3278,6 +3287,13 @@ impl App {
                 &mut self.activity,
             )
         };
+        let shown = self.native_workflows.as_ref().and_then(|workflows| {
+            let summary = workflows.shown_readiness(id, &game.archive.absolute_path)?;
+            Some(workflows.compact_of(summary))
+        });
+        if let Some(view) = shown {
+            self.note_checked_readiness(game, &view);
+        }
         if let Some(route) = readiness_route {
             self.go(route);
         }

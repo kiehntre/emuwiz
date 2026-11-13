@@ -608,25 +608,17 @@ impl App {
         view
     }
 
-    /// Keep the background readiness checks in step with what is on screen.
-    /// Blue only. Never selects a game, loads evidence for the details panel,
-    /// or starts any scan; it waits until the foreground has finished them.
-    fn browse_play_background(&mut self, context: &egui::Context, blue: bool) {
-        if !blue {
-            return;
-        }
+    /// Drop every readiness answer whose inputs moved: the library snapshot
+    /// (disc sets, catalogue rows) or what the checks read (emulator scans,
+    /// BIOS evidence, emulator choice, settings). Until a game has been
+    /// selected once, no scan has run and there is nothing to check against.
+    fn sync_readiness_freshness(&mut self) {
         let state = &mut self.browse_play;
-        // The library snapshot (and so every disc-set decision) changed: games
-        // held back for want of it are looked at again.
         let generation = self
             .native_workflows
             .as_ref()
             .map(|w| w.database_generation());
         state.note_database_generation(generation);
-        // What the checks read changed (emulator scans, settings): drop
-        // everything decided under the old state.
-        // Until a game has been selected once, no scan has run and there is
-        // nothing to check against.
         let readiness = self
             .native_workflows
             .as_ref()
@@ -642,6 +634,36 @@ impl App {
             state.env =
                 signature.zip(readiness.and_then(super::bg_readiness::EnvSnapshot::capture));
         }
+    }
+
+    /// Record a launch check another screen (Game Details, Setup & Doctor,
+    /// Big Picture) just showed for `game` in the Library's one readiness
+    /// cache, so the Ready view agrees with it. Freshness is checked first,
+    /// so the answer is stored against the inputs it was taken under; a
+    /// checking, stale or partial answer forgets the game (Not checked).
+    /// Preservation-only media gets no launch check here, as in the Library.
+    pub(super) fn note_checked_readiness(
+        &mut self,
+        game: &Game,
+        view: &super::launch_readiness_summary::CompactReadiness,
+    ) {
+        if game.is_preservation_only() {
+            return;
+        }
+        self.sync_readiness_freshness();
+        let result = CheckedReadiness::from_compact(view);
+        self.browse_play.readiness.record(game, result);
+    }
+
+    /// Keep the background readiness checks in step with what is on screen.
+    /// Blue only. Never selects a game, loads evidence for the details panel,
+    /// or starts any scan; it waits until the foreground has finished them.
+    fn browse_play_background(&mut self, context: &egui::Context, blue: bool) {
+        if !blue {
+            return;
+        }
+        self.sync_readiness_freshness();
+        let state = &mut self.browse_play;
         for (id, outcome) in state.background.drain() {
             if let Some(game) = self.library.game(id) {
                 super::bg_readiness::record_outcome(&mut state.readiness, game, outcome);

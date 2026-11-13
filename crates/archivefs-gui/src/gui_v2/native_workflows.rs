@@ -1343,6 +1343,15 @@ impl NativeWorkflows {
             .map(|(_, _, summary)| summary)
     }
 
+    /// `summary` as the Library's compact card would show it for the game on
+    /// screen (an identity answer still waiting on its checksum is partial).
+    pub(super) fn compact_of(
+        &self,
+        summary: &launch_readiness_summary::GameReadinessSummary,
+    ) -> launch_readiness_summary::CompactReadiness {
+        launch_readiness_summary::compact(summary, self.selected_checksum_pending())
+    }
+
     /// The current readiness answer for the game on screen, for reading only.
     pub(super) fn readiness_summary(
         &self,
