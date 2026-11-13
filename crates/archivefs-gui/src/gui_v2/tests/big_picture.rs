@@ -788,7 +788,7 @@ fn tap_at(context: &egui::Context, app: &mut App, control: Control, time: f64) {
 }
 
 #[test]
-fn x_twice_on_a_focused_game_opens_its_launch_page_like_start() {
+fn x_twice_plays_an_unready_game_only_as_far_as_its_launch_page() {
     let context = egui::Context::default();
     let mut app = opened(&context, 10);
     app.big_picture.as_mut().unwrap().set_connected();
@@ -798,8 +798,11 @@ fn x_twice_on_a_focused_game_opens_its_launch_page_like_start() {
     tap(&context, &mut app, WEST);
     assert_eq!(state(&app).step(), Step::Launch(2));
     assert!(
-        !app.native_workflows.as_ref().unwrap().launch_in_progress(),
-        "the Launch page's own Play still decides"
+        !app.native_workflows
+            .as_ref()
+            .unwrap()
+            .launch_was_requested(2),
+        "this fixture has no ready plan: Play waits on the Launch page, it never launches blind"
     );
     // The open game's page works the same way.
     tap(&context, &mut app, EAST);

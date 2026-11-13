@@ -59,6 +59,17 @@ const LEAVE_CONFIRM_SECS: f64 = 4.0;
 /// Two controller X presses this close together on the same game are Play.
 const DOUBLE_X_SECS: f64 = 0.35;
 
+/// What a controller X press does.
+#[derive(Debug, PartialEq)]
+enum XPress {
+    /// Not on a game: X keeps its old meaning.
+    Pass(Command),
+    /// The first tap: nothing happens yet.
+    Armed,
+    /// The second tap in time on the same game: Play it.
+    Play,
+}
+
 /// The first X of a possible double tap: where it was pressed, and when.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct XTap {
@@ -232,28 +243,28 @@ impl BigPicture {
     }
 
     /// #437: X on a game arms a double tap and does nothing else; a second X
-    /// on the same game in time is Start, so it reaches the same Play checks.
-    /// Any other command in between has already cleared the first tap. Off a
-    /// game (Search open, the Launch page) X keeps its old meaning.
-    fn x_press(&mut self, tap: Option<XTap>, command: Command, now: f64) -> Option<Command> {
+    /// on the same game in time is Play. Any other command in between has
+    /// already cleared the first tap. Off a game (Search open, the Launch
+    /// page) X keeps its old meaning.
+    fn x_press(&mut self, tap: Option<XTap>, command: Command, now: f64) -> XPress {
         let Some((step, game)) = self.x_target() else {
-            return Some(command);
+            return XPress::Pass(command);
         };
+        // Like any other input, X disarms a pending "Back again to leave".
+        if self.leave_armed_until.take().is_some() {
+            self.notice = None;
+        }
         if tap.is_some_and(|tap| {
             tap.step == step && tap.game == game && now - tap.at <= DOUBLE_X_SECS
         }) {
-            return Some(Command::Launch);
+            return XPress::Play;
         }
         self.x_tap = Some(XTap {
             step,
             game,
             at: now,
         });
-        // Like any other input, it disarms a pending "Back again to leave".
-        if self.leave_armed_until.take().is_some() {
-            self.notice = None;
-        }
-        None
+        XPress::Armed
     }
 
     fn focused_position(&self) -> Option<usize> {
@@ -611,8 +622,13 @@ impl App {
             let tap = state.x_tap.take();
             let command = match command {
                 _ if pad_x => match state.x_press(tap, command, now) {
-                    Some(command) => command,
-                    None => continue,
+                    XPress::Pass(command) => command,
+                    XPress::Armed => continue,
+                    XPress::Play => {
+                        self.big_picture_play(&mut state, context);
+                        state.sync_list(&library, &indices);
+                        continue;
+                    }
                 },
                 // R3 is Search here, so X is free for the double tap.
                 Command::Pointer => Command::Search,
@@ -813,6 +829,40 @@ impl App {
             _ => {}
         }
         Next::Stay
+    }
+
+    /// X twice: the game card's own Play (`ReadinessAction::Play`), which
+    /// starts the planner's single safe request when there is one and
+    /// otherwise waits on, or refuses on, the Launch page. The Launch page is
+    /// shown either way, so a running game, a refusal or a needed choice is
+    /// always on screen. A game Play is not offered for is refused here, with
+    /// the reason Start gives.
+    fn big_picture_play(&mut self, state: &mut BigPicture, context: &egui::Context) {
+        let Some((step, id)) = state.x_target() else {
+            return;
+        };
+        match step {
+            Step::Browse => match self.library.game(id) {
+                Some(game) if game.is_preservation_only() => {
+                    state.notice = Some(Notice::new(Tone::Warning, PRESERVATION_ONLY_SENTENCE));
+                    return;
+                }
+                Some(_) => {}
+                None => return,
+            },
+            _ if !state.actions.contains(&GameAction::Play) => {
+                if let Some(reason) = state.play_refusal.clone() {
+                    state.notice = Some(Notice::new(Tone::Warning, reason));
+                }
+                return;
+            }
+            _ => {}
+        }
+        state.notice = None;
+        if let Some(workflows) = self.native_workflows.as_mut() {
+            let _ = workflows.readiness_action_route(context, ReadinessAction::Play, id);
+        }
+        state.enter_step(Step::Launch(id));
     }
 
     fn game_action(
