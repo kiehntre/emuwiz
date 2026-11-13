@@ -7,6 +7,7 @@ mod arcade_compat_panel;
 mod arcade_input_details;
 mod archive_inspector;
 mod artwork;
+mod artwork_fallback;
 mod backend;
 mod bezel;
 mod bezel_history;
