@@ -63,6 +63,9 @@ pub enum ReauditBlock {
     FileUnavailable,
     /// The saved result does not apply to this game.
     DoesNotApply,
+    /// The person limited this run to fewer games; this one waits for the
+    /// next run.
+    LeftOutOfThisRun,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,7 +88,79 @@ pub struct ReauditPlan {
     pub saved_rows: usize,
 }
 
+/// One count per saved DAT result. Every saved result is in exactly one of
+/// `current`, `not_applicable`, `skipped` and `eligible`; every eligible one
+/// is in exactly one of `verified`, `no_match`, `need_choice`, `failed` and
+/// `not_reached`. `completed` is the sum of the first three of those.
+///
+/// Built from a plan (and, after a run, its report), never from stored
+/// totals: the counts are what was found when the plan was made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReauditTally {
+    /// Every saved DAT result in the library.
+    pub saved_results: usize,
+    /// Already backed by current proof. Not read again.
+    pub current: usize,
+    /// Historical results that say nothing about the game they are saved
+    /// for (a "not in this catalogue" result from a catalogue for another
+    /// system, typically). Kept exactly as they are; there is nothing to
+    /// check again.
+    pub not_applicable: usize,
+    /// Could be checked, but not now: the catalogue is unavailable, the
+    /// game's system is not known, or the file cannot be reached.
+    pub skipped: usize,
+    /// What a check will read: saved results that lost their proof, for a
+    /// game whose system the catalogue covers.
+    pub eligible: usize,
+    /// Eligible games for which a definitive result was reached and saved.
+    pub completed: usize,
+    pub verified: usize,
+    pub no_match: usize,
+    /// More than one catalogue entry fits; the person has to choose.
+    pub need_choice: usize,
+    /// Eligible games the check looked at and could save no result for
+    /// (each has a reason). They stay as they were.
+    pub failed: usize,
+    /// Eligible games the run stopped before.
+    pub not_reached: usize,
+}
+
+impl ReauditTally {
+    /// Whether every saved result is counted exactly once.
+    pub fn is_consistent(&self) -> bool {
+        self.saved_results == self.current + self.not_applicable + self.skipped + self.eligible
+            && self.completed == self.verified + self.no_match + self.need_choice
+            && self.eligible == self.completed + self.failed + self.not_reached
+    }
+}
+
 impl ReauditPlan {
+    /// Saved results that do not apply to the game they are saved for.
+    pub fn not_applicable(&self) -> usize {
+        self.blocked
+            .iter()
+            .filter(|blocked| blocked.block == ReauditBlock::DoesNotApply)
+            .count()
+    }
+
+    /// Saved results that cannot be checked now, for a reason that can change.
+    pub fn skipped(&self) -> usize {
+        self.blocked.len() - self.not_applicable()
+    }
+
+    /// The counts before anything has been checked.
+    pub fn tally(&self) -> ReauditTally {
+        ReauditTally {
+            saved_results: self.saved_rows,
+            current: self.current,
+            not_applicable: self.not_applicable(),
+            skipped: self.skipped(),
+            eligible: self.games(),
+            not_reached: self.games(),
+            ..Default::default()
+        }
+    }
+
     pub fn games(&self) -> usize {
         self.groups.iter().map(|group| group.items.len()).sum()
     }
@@ -108,11 +183,21 @@ impl ReauditPlan {
         counts
     }
 
-    /// Keeps at most `limit` games, in plan order.
+    /// Keeps at most `limit` games, in plan order. The games left out stay
+    /// counted, as skipped: they are simply not part of this run.
     pub fn truncated(mut self, limit: usize) -> Self {
         let mut left = limit;
         for group in &mut self.groups {
-            group.items.truncate(left);
+            for item in group.items.drain(left.min(group.items.len())..) {
+                self.blocked.push(ReauditBlocked {
+                    archive_id: item.archive_id,
+                    source_id: group.source_id.clone(),
+                    path: item.path,
+                    saved_verdict: item.saved_verdict,
+                    status: item.status,
+                    block: ReauditBlock::LeftOutOfThisRun,
+                });
+            }
             left -= group.items.len();
         }
         self.groups.retain(|group| !group.items.is_empty());
@@ -311,6 +396,21 @@ pub struct ReauditReport {
     /// Things that went wrong beside the checks themselves (a reason that
     /// could not be recorded, results a save withheld). Never a result.
     pub warnings: Vec<String>,
+}
+
+impl ReauditReport {
+    /// The counts after this run of `plan` (the plan that was run).
+    pub fn tally(&self, plan: &ReauditPlan) -> ReauditTally {
+        ReauditTally {
+            completed: self.verified + self.no_match + self.ambiguous,
+            verified: self.verified,
+            no_match: self.no_match,
+            need_choice: self.ambiguous,
+            failed: self.not_checked.len(),
+            not_reached: self.not_reached,
+            ..plan.tally()
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

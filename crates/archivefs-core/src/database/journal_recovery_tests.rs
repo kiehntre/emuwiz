@@ -535,3 +535,76 @@ fn review_an_apply_killed_after_sqlite_finished_can_be_finalised() {
          apply returned {outcome:?}, receipt state {state:?}"
     );
 }
+
+// ---- Independent re-review tests (engine/recovery re-review of 9e87d192), as written ----
+fn review_mark_applying(recovery_dir: &Path) {
+    let receipt_path = recovery_dir.join("receipt.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    value["state"] = serde_json::Value::String("applying".into());
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+}
+
+fn review_untouched_or_recovered(database: &Path, recovery_dir: &Path, cut: Vec<u8>) {
+    let journal_before = fs::read(journal_of(database)).unwrap();
+    let recovered = fs::read(recovery_dir.join("recovered/library.sqlite3")).unwrap();
+    let result = apply_journal_recovery(database, recovery_dir);
+    let outcome = result
+        .as_ref()
+        .map(|r| format!("{:?}", r.state))
+        .map_err(|e| e.to_string());
+    let now = fs::read(database).unwrap();
+    if result.is_ok() {
+        assert_eq!(
+            now, recovered,
+            "apply succeeded on something else: {outcome:?}"
+        );
+        assert!(!journal_of(database).exists());
+    } else {
+        assert!(
+            now == cut,
+            "apply refused but changed the database ({} -> {} bytes): {outcome:?}",
+            cut.len(),
+            now.len()
+        );
+        assert!(
+            journal_of(database).exists()
+                && fs::read(journal_of(database)).unwrap() == journal_before,
+            "apply refused but the journal is gone or changed: {outcome:?}"
+        );
+    }
+}
+
+/// J3. A zero-length file has no page that differs from either copy, so
+/// `every_page_from_either` accepts it. SQLite deletes a hot journal that
+/// sits beside an empty database instead of replaying it.
+#[test]
+fn review_an_emptied_database_is_not_taken_for_a_part_finished_rollback() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = interrupted_library(temp.path(), true);
+    let receipt = prepare_journal_recovery(&database).unwrap();
+    review_mark_applying(&receipt.recovery_dir);
+    fs::write(&database, b"").unwrap();
+    review_untouched_or_recovered(&database, &receipt.recovery_dir, Vec::new());
+}
+
+/// J4. The first half of the preserved database, cut at a page boundary (an
+/// interrupted copy, say). Every page in it is a preserved page, but a
+/// rollback never leaves a file of that length.
+#[test]
+fn review_a_cut_short_database_ends_untouched_or_exactly_recovered() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = interrupted_library(temp.path(), true);
+    let receipt = prepare_journal_recovery(&database).unwrap();
+    review_mark_applying(&receipt.recovery_dir);
+    let whole = fs::read(&database).unwrap();
+    let page = match u16::from_be_bytes([whole[16], whole[17]]) {
+        1 => 65_536_usize,
+        size => usize::from(size),
+    };
+    let pages = whole.len() / page;
+    assert!(pages >= 4, "{pages} pages");
+    let cut = whole[..(pages / 2) * page].to_vec();
+    fs::write(&database, &cut).unwrap();
+    review_untouched_or_recovered(&database, &receipt.recovery_dir, cut);
+}

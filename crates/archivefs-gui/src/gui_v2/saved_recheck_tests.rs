@@ -56,6 +56,21 @@ fn plan(games: usize, blocked: usize, current: usize) -> ReauditPlan {
     }
 }
 
+/// `plan` plus `n` historical results that do not apply to their game.
+fn plan_with_not_applicable(games: usize, blocked: usize, current: usize, n: usize) -> ReauditPlan {
+    let mut plan = plan(games, blocked, current);
+    plan.blocked.extend((0..n).map(|i| ReauditBlocked {
+        archive_id: 5000 + i as i64,
+        source_id: "158".into(),
+        path: PathBuf::from(format!("/games/pc88/disk-{i}.d88")),
+        saved_verdict: "no_match".into(),
+        status: SavedDatEvidenceStatus::DoesNotApply,
+        block: ReauditBlock::DoesNotApply,
+    }));
+    plan.saved_rows += n;
+    plan
+}
+
 fn settle(state: &mut State) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while state.busy() && Instant::now() < deadline {
@@ -110,11 +125,11 @@ fn the_list_says_how_many_why_and_that_they_count_as_not_verified() {
     let text = rendered(&mut state);
     assert!(text.contains(TITLE), "{text}");
     assert!(
-        text.contains("3 saved results are no longer backed by a current check"),
+        text.contains("• 3 can be checked again (they lost their proof; the game has to be read)"),
         "{text}"
     );
     assert!(
-        text.contains("treats those games as not verified until checked again"),
+        text.contains("Until checked again, EmuWiz treats those games as not verified."),
         "{text}"
     );
     assert!(
@@ -129,18 +144,13 @@ fn the_list_says_how_many_why_and_that_they_count_as_not_verified() {
         text.contains("3 Game Boy Advance against No-Intro: Nintendo - Game Boy Advance"),
         "{text}"
     );
-    assert!(
-        text.contains("2 saved results cannot be checked now:"),
-        "{text}"
-    );
+    assert!(text.contains("• 2 cannot be checked now"), "{text}");
     assert!(
         text.contains("switched off, removed or a folder of several files"),
         "{text}"
     );
     assert!(
-        text.contains(
-            "10 saved results are already backed by a current check and will not be read again."
-        ),
+        text.contains("• 10 already backed by a current check (not read again)"),
         "{text}"
     );
     assert!(text.contains("Check 3 games again"), "{text}");
@@ -152,10 +162,7 @@ fn the_list_says_how_many_why_and_that_they_count_as_not_verified() {
 fn only_blocked_results_offer_no_check() {
     let mut state = listed(0, 4, 0);
     let text = rendered(&mut state);
-    assert!(
-        text.contains("4 saved results cannot be checked now:"),
-        "{text}"
-    );
+    assert!(text.contains("• 4 cannot be checked now"), "{text}");
     assert!(
         !text.contains("again\n") || !text.contains("Check "),
         "{text}"
@@ -311,7 +318,7 @@ fn a_finished_check_tells_matches_no_matches_choices_and_failures_apart() {
     let text = rendered(&mut state);
     assert!(text.contains("Checked again"), "{text}");
     assert!(
-        text.contains("2 verified · 1 no match · 1 need your choice"),
+        text.contains("Of 6 that could be checked: 4 completed (2 verified · 1 no match · 1 need your choice) · 2 not checked · 0 not reached"),
         "{text}"
     );
     assert!(
@@ -398,4 +405,75 @@ fn nothing_can_be_started_twice() {
     go.send(()).unwrap();
     settle(&mut state);
     assert!(!started.load(Ordering::Relaxed));
+}
+
+#[test]
+fn old_results_that_do_not_apply_are_counted_apart_and_never_offered_for_checking() {
+    // The owner's real shape: results worth checking, plus thousands of old
+    // "no match" results from another system's catalogue.
+    let mut state = State::default();
+    state.list_with(|| Ok(plan_with_not_applicable(3, 1, 10, 5101)));
+    settle(&mut state);
+    let text = rendered(&mut state);
+    assert!(
+        text.contains("5,115 saved catalogue results in this library:"),
+        "{text}"
+    );
+    assert!(text.contains("• 3 can be checked again"), "{text}");
+    assert!(
+        text.contains("• 10 already backed by a current check"),
+        "{text}"
+    );
+    assert!(text.contains("• 1 cannot be checked now"), "{text}");
+    assert!(
+        text.contains("• 5,101 do not apply to their game (old results from another system's catalogue; kept as they are, nothing to check)"),
+        "{text}"
+    );
+    assert!(text.contains("Check 3 games again"), "{text}");
+    let Stage::Listed(plan) = &state.stage else {
+        panic!()
+    };
+    assert!(plan.tally().is_consistent());
+
+    // After the check the same groups are still told apart.
+    let plan = plan.clone();
+    state.run_with(plan, |_, _, _| {
+        Ok(ReauditReport {
+            planned: 3,
+            verified: 2,
+            saved: 2,
+            sets_saved: 1,
+            not_checked: vec![ReauditNote {
+                archive_id: 3,
+                source_id: "158".into(),
+                path: PathBuf::from("/games/gba/game-3.gba"),
+                reason: "Unavailable file".into(),
+            }],
+            ..Default::default()
+        })
+    });
+    settle(&mut state);
+    let text = rendered(&mut state);
+    assert!(
+        text.contains("Of 3 that could be checked: 2 completed (2 verified · 0 no match · 0 need your choice) · 1 not checked · 0 not reached"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Not part of this check: 10 already current · 1 cannot be checked now · 5,101 do not apply to their game (kept as they are)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn when_only_inapplicable_old_results_remain_there_is_one_line_and_no_task() {
+    let mut state = State::default();
+    state.list_with(|| Ok(plan_with_not_applicable(0, 0, 6502, 5101)));
+    settle(&mut state);
+    let text = rendered(&mut state);
+    assert!(!text.contains(TITLE), "{text}");
+    assert!(
+        text.contains("Every saved catalogue result that can be checked is backed by a current check. 5,101 older results do not apply to their game"),
+        "{text}"
+    );
+    assert!(!text.contains("Check "), "{text}");
 }

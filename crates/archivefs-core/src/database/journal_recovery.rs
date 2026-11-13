@@ -314,7 +314,11 @@ fn every_page_from_either(live: &Path, first: &Path, second: &Path) -> Result<bo
         length(&first_file, first)?,
         length(&second_file, second)?,
     );
-    if live_len % page as u64 != 0 || live_len > first_len.max(second_len) {
+    // A rollback changes the file's length only once, from the interrupted
+    // length to the restored one, so the live file is as long as one of the
+    // two. A shorter or emptied file is not a state of this rollback (and
+    // SQLite would drop the journal of an empty file instead of replaying it).
+    if live_len % page as u64 != 0 || (live_len != first_len && live_len != second_len) {
         return Ok(false);
     }
     let mut buffers = (vec![0_u8; page], vec![0_u8; page], vec![0_u8; page]);
@@ -764,6 +768,17 @@ pub fn apply_journal_recovery(
             RollbackJournalState::LiveHeader { .. }
         )
     {
+        // Nothing may have the database open while it is read with plain
+        // I/O: closing such a descriptor would drop that holder's locks.
+        if journal_state::sqlite_write_lock_held(database_path)?
+            || journal_state::own_process_holds_lock(database_path)?
+            || !processes_holding(&[database_path])?.is_empty()
+        {
+            return Err(refuse(
+                "the library database is open in a running program. Close every EmuWiz \
+                 window and process and try again. Nothing was changed.",
+            ));
+        }
         if hash_file(database_path)? != receipt.recovered {
             return Err(refuse(format!(
                 "an earlier apply of this recovery was interrupted, the journal is gone, and \

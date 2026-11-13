@@ -45,11 +45,91 @@ fn block_text(block: ReauditBlock) -> &'static str {
         ReauditBlock::SystemUnknown => "the game has no known system",
         ReauditBlock::FileUnavailable => "file missing or storage not connected",
         ReauditBlock::DoesNotApply => "saved result does not apply to this game",
+        ReauditBlock::LeftOutOfThisRun => "left out of this run by --limit",
+    }
+}
+
+#[derive(Serialize)]
+struct TallyJson {
+    saved_results: usize,
+    current: usize,
+    not_applicable: usize,
+    skipped: usize,
+    eligible: usize,
+    completed: usize,
+    verified: usize,
+    no_match: usize,
+    need_choice: usize,
+    failed: usize,
+    not_reached: usize,
+}
+
+fn tally_json(tally: archivefs_core::dat::reaudit::ReauditTally) -> TallyJson {
+    TallyJson {
+        saved_results: tally.saved_results,
+        current: tally.current,
+        not_applicable: tally.not_applicable,
+        skipped: tally.skipped,
+        eligible: tally.eligible,
+        completed: tally.completed,
+        verified: tally.verified,
+        no_match: tally.no_match,
+        need_choice: tally.need_choice,
+        failed: tally.failed,
+        not_reached: tally.not_reached,
+    }
+}
+
+fn print_tally(tally: &TallyJson, after_run: bool) {
+    println!("Saved DAT results: {}", tally.saved_results);
+    println!(
+        "  {:>7}  current         already backed by a current check; not read again",
+        tally.current
+    );
+    println!(
+        "  {:>7}  not applicable  historical results that say nothing about their game (for example a no-match from another system's catalogue); kept as they are",
+        tally.not_applicable
+    );
+    println!(
+        "  {:>7}  skipped         cannot be checked now (catalogue unavailable, system not known, file not reachable, or left out by --limit)",
+        tally.skipped
+    );
+    println!(
+        "  {:>7}  eligible        lost their proof and can be checked again by reading the game",
+        tally.eligible
+    );
+    if after_run {
+        println!("  of the eligible:");
+        println!(
+            "  {:>7}  completed       a definitive result was reached and saved",
+            tally.completed
+        );
+        println!(
+            "  {:>7}    verified      the file matches one catalogue entry exactly",
+            tally.verified
+        );
+        println!(
+            "  {:>7}    no match      the file is not in the catalogue",
+            tally.no_match
+        );
+        println!(
+            "  {:>7}    need a choice more than one catalogue entry fits",
+            tally.need_choice
+        );
+        println!(
+            "  {:>7}  failed          looked at, no result could be saved (reasons below); unchanged",
+            tally.failed
+        );
+        println!(
+            "  {:>7}  not reached     the run stopped before them",
+            tally.not_reached
+        );
     }
 }
 
 #[derive(Serialize)]
 struct PlanJson {
+    tally: TallyJson,
     saved_rows: usize,
     current: usize,
     to_check: usize,
@@ -69,6 +149,7 @@ struct GroupJson {
 
 #[derive(Serialize)]
 struct ReportJson {
+    tally: TallyJson,
     planned: usize,
     verified: usize,
     no_match: usize,
@@ -97,6 +178,7 @@ fn plan_json(plan: &ReauditPlan) -> PlanJson {
         *cannot_check.entry(block_text(blocked.block)).or_insert(0) += 1;
     }
     PlanJson {
+        tally: tally_json(plan.tally()),
         saved_rows: plan.saved_rows,
         current: plan.current,
         to_check: plan.games(),
@@ -121,10 +203,9 @@ fn plan_json(plan: &ReauditPlan) -> PlanJson {
 }
 
 fn print_plan(plan: &PlanJson) {
-    println!("Saved DAT results: {}", plan.saved_rows);
-    println!("  backed by current evidence: {}", plan.current);
+    print_tally(&plan.tally, false);
     println!(
-        "  to check again: {} ({:.1} GiB by recorded size)",
+        "Eligible: {} ({:.1} GiB by recorded size)",
         plan.to_check,
         plan.bytes as f64 / (1u64 << 30) as f64
     );
@@ -138,14 +219,15 @@ fn print_plan(plan: &PlanJson) {
         );
     }
     let cannot: usize = plan.cannot_check.values().sum();
-    println!("  cannot be checked now: {cannot}");
+    println!("Not eligible ({cannot}), by reason:");
     for (reason, count) in &plan.cannot_check {
         println!("    {count:>7}  {reason}");
     }
 }
 
-fn report_json(report: &ReauditReport, seconds: f64) -> ReportJson {
+fn report_json(report: &ReauditReport, plan: &ReauditPlan, seconds: f64) -> ReportJson {
     ReportJson {
+        tally: tally_json(report.tally(plan)),
         planned: report.planned,
         verified: report.verified,
         no_match: report.no_match,
@@ -295,15 +377,16 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     let seconds = started.elapsed().as_secs_f64();
-    let output = report_json(&report, seconds);
+    let output = report_json(&report, &plan, seconds);
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
     println!(
-        "Checked again in {seconds:.1} s: {} verified, {} no match, {} need review; {} rows saved in {} sets.",
-        output.verified, output.no_match, output.ambiguous, output.saved, output.sets_saved
+        "Checked again in {seconds:.1} s; {} rows saved in {} sets.",
+        output.saved, output.sets_saved
     );
+    print_tally(&output.tally, true);
     if !output.no_longer_matching.is_empty() {
         println!(
             "{} saved matches no longer match their file (the earlier results are kept for the record):",

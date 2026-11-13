@@ -220,6 +220,29 @@ fn a_library_taken_to_27_by_another_build_line_is_refused_and_untouched() {
     }
 }
 
+/// From schema 27 on a migration's description is part of its identity: the
+/// lineage guard compares it with what each library recorded. Changing one
+/// here would make every library already at that schema refuse to open.
+#[test]
+fn shipped_migration_descriptions_from_27_on_are_pinned() {
+    let shipped = [(
+        27,
+        "keep replaced DAT evidence and unfinished re-check reasons",
+    )];
+    for (version, description) in shipped {
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == version)
+            .expect("a shipped migration was removed");
+        assert_eq!(migration.description, description, "schema {version}");
+    }
+    assert_eq!(
+        MIGRATIONS.iter().filter(|m| m.version >= 27).count(),
+        shipped.len(),
+        "a new migration must be added to this list when it ships"
+    );
+}
+
 // ---- Process kill during the upgrade --------------------------------------
 
 const KILL_PATH: &str = "EMUWIZ_TEST_UPGRADE27_KILL_PATH";

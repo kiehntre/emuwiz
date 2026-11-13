@@ -441,6 +441,209 @@ fn a_library_that_keeps_changing_stops_the_run_without_saving_that_set() {
     assert!(f.statuses().values().all(|s| *s == Status::MissingProof));
 }
 
+// ---- Eligible, not applicable, skipped: every saved result counted once ----
+
+impl Fixture {
+    /// A game on another system with an old "not in this catalogue" result
+    /// from this (Spectrum) catalogue: what a whole-library check against
+    /// the wrong system's catalogue used to leave behind.
+    fn add_wrong_system_no_match(&self, id: i64, name: &str, platform: Option<&str>) {
+        self.add(id, name, Some(b"some other system's game"), platform);
+        let mut facts = self.facts(1);
+        facts["verification_state"] = serde_json::json!({"state": "no_match"});
+        for key in [
+            "matched_entries",
+            "ambiguous_candidates",
+            "candidate_provenance",
+        ] {
+            facts[key] = serde_json::json!([]);
+        }
+        facts["canonical"] = serde_json::json!({"canonical_dat_name": null, "canonical_rom_name": null, "region": null, "revision": null});
+        facts["hash_evidence"]["matched_algorithm"] = serde_json::Value::Null;
+        facts["hash_evidence"]["matched_value"] = serde_json::Value::Null;
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        conn.execute(
+            "INSERT INTO library_dat_identities(archive_id,dat_source_id,dat_ecosystem,source_revision,verification_state,completeness,audited_at,facts_json,created_at,updated_at) \
+             SELECT ?1, dat_source_id, dat_ecosystem, source_revision, 'no_match', completeness, audited_at, ?2, created_at, updated_at \
+             FROM library_dat_identities WHERE archive_id = 1",
+            rusqlite::params![id, serde_json::to_vec(&facts).unwrap()],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn old_no_match_results_from_another_systems_catalogue_are_not_applicable_and_left_alone() {
+    let f = Fixture::legacy_library(3);
+    // The owner's real case: other systems' files once compared with this
+    // catalogue. One has no known system at all.
+    f.add_wrong_system_no_match(10, "disk.d88", Some("NEC PC-8801"));
+    f.add_wrong_system_no_match(11, "storyware.md", Some("Sega Pico"));
+    f.add_wrong_system_no_match(12, "mystery.bin", None);
+    let before = f.dat_rows();
+    let plan = f.plan();
+    let tally = plan.tally();
+    assert!(tally.is_consistent(), "{tally:?}");
+    assert_eq!(
+        (
+            tally.saved_results,
+            tally.eligible,
+            tally.not_applicable,
+            tally.skipped,
+            tally.current
+        ),
+        (6, 3, 3, 0, 0)
+    );
+    assert!(
+        plan.blocked
+            .iter()
+            .all(|b| b.block == ReauditBlock::DoesNotApply && b.status == Status::DoesNotApply)
+    );
+    let report = f
+        .reaudit_with(&plan, 10, &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    let tally = report.tally(&plan);
+    assert!(tally.is_consistent(), "{tally:?}");
+    assert_eq!(
+        (
+            tally.completed,
+            tally.verified,
+            tally.failed,
+            tally.not_reached,
+            tally.not_applicable
+        ),
+        (3, 3, 0, 0, 3)
+    );
+    // The historical results are kept byte for byte: not rewritten, not
+    // deleted, not copied to the replaced-evidence table, no note.
+    let after = f.dat_rows();
+    for id in 10..=12 {
+        assert_eq!(
+            before.iter().find(|r| r.0 == id),
+            after.iter().find(|r| r.0 == id),
+            "row {id}"
+        );
+    }
+    assert!(f.history().iter().all(|h| h.0 < 10));
+    assert!(f.notes().is_empty());
+    // And they never become evidence of anything.
+    let e = f.evidence();
+    assert!((10..=12).all(|id| !e.states.contains_key(&id)));
+    // Afterwards nothing is eligible; they are still counted, apart.
+    let tally = f.plan().tally();
+    assert_eq!(
+        (tally.eligible, tally.current, tally.not_applicable),
+        (0, 3, 3)
+    );
+}
+
+#[test]
+fn a_saved_match_for_a_game_now_on_another_system_is_checked_refused_and_counted_as_failed() {
+    let f = Fixture::legacy_library(3);
+    // Game 2 was verified against this catalogue; it is now assigned to a
+    // system the catalogue is not for. The saved positive is not silently
+    // dropped as "not applicable": it is eligible, and the check refuses it.
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    conn.execute(
+        "UPDATE platform_assignments SET platform = 'Amstrad CPC' WHERE archive_id = 2",
+        [],
+    )
+    .unwrap();
+    let before = f.dat_rows();
+    let plan = f.plan();
+    assert_eq!(
+        (plan.games(), plan.not_applicable(), plan.groups.len()),
+        (3, 0, 2)
+    );
+    let report = f
+        .reaudit_with(&plan, 10, &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    let tally = report.tally(&plan);
+    assert!(tally.is_consistent(), "{tally:?}");
+    assert_eq!((tally.verified, tally.failed, tally.not_reached), (2, 1, 0));
+    assert!(report.stopped.is_none(), "{report:?}");
+    assert_eq!(report.not_checked[0].archive_id, 2);
+    assert!(
+        report.not_checked[0].reason.contains("incompatible"),
+        "{:?}",
+        report.not_checked
+    );
+    // Its old row is untouched, it is not current, and the reason is kept.
+    assert_eq!(
+        before.iter().find(|r| r.0 == 2),
+        f.dat_rows().iter().find(|r| r.0 == 2)
+    );
+    assert_eq!(f.statuses()[&2], Status::MissingProof);
+    assert_eq!(
+        f.notes().iter().map(|n| n.archive_id).collect::<Vec<_>>(),
+        vec![2]
+    );
+}
+
+#[test]
+fn a_catalogue_that_names_several_systems_verifies_nothing_until_a_system_is_chosen() {
+    let f = Fixture::legacy_library(2);
+    // The same catalogue file is replaced by one whose header names more
+    // than one system. Nobody chose which: nothing may be verified from it.
+    let entries = std::fs::read_to_string(&f.dat).unwrap();
+    std::fs::write(
+        &f.dat,
+        entries.replace(
+            "Sinclair ZX Spectrum - Games - [TAP]",
+            "IBM - PC and Compatibles",
+        ),
+    )
+    .unwrap();
+    let before = f.dat_rows();
+    let plan = f.plan();
+    assert_eq!(plan.games(), 2);
+    let report = f
+        .reaudit_with(&plan, 10, &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    let tally = report.tally(&plan);
+    assert!(tally.is_consistent(), "{tally:?}");
+    assert_eq!(
+        (tally.completed, tally.failed, tally.not_reached),
+        (0, 2, 0)
+    );
+    assert_eq!(f.dat_rows(), before);
+    assert!(f.evidence().states.is_empty());
+}
+
+#[test]
+fn a_limited_or_stopped_run_still_counts_every_saved_result_once() {
+    let f = Fixture::legacy_library(5);
+    f.add_wrong_system_no_match(10, "disk.d88", Some("NEC PC-8801"));
+    let plan = f.plan().truncated(4);
+    let tally = plan.tally();
+    assert!(tally.is_consistent(), "{tally:?}");
+    assert_eq!(
+        (tally.eligible, tally.skipped, tally.not_applicable),
+        (4, 1, 1)
+    );
+    let cancel = AtomicBool::new(false);
+    let report = f
+        .reaudit_with(&plan, 2, &cancel, &|p| {
+            if matches!(p, ReauditProgress::SetSaved { .. }) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        })
+        .unwrap();
+    let tally = report.tally(&plan);
+    assert!(tally.is_consistent(), "{tally:?}");
+    assert_eq!(
+        (
+            tally.saved_results,
+            tally.eligible,
+            tally.completed,
+            tally.not_reached,
+            tally.skipped,
+            tally.not_applicable
+        ),
+        (6, 4, 2, 2, 1, 1)
+    );
+}
+
 // ---- Process kill and restart -------------------------------------------
 //
 // A child process runs the re-check and is killed (SIGKILL) at arbitrary

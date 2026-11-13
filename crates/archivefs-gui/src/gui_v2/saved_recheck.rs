@@ -35,7 +35,7 @@ pub(super) const NOT_A_PROMISE: &str = "Verified means the file matches its cata
 pub(super) enum Message {
     Plan(Result<ReauditPlan, String>),
     Progress(ReauditProgress),
-    Done(Result<ReauditReport, String>),
+    Done(Result<ReauditReport, String>, Arc<ReauditPlan>),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -60,7 +60,8 @@ pub(super) enum Stage {
     /// The person asked to start; this is the confirmation.
     Confirm(Arc<ReauditPlan>),
     Running(Running),
-    Finished(Box<ReauditReport>),
+    /// The report, with the plan that was run (for the totals).
+    Finished(Box<ReauditReport>, Arc<ReauditPlan>),
     CouldNotComplete(String),
 }
 
@@ -99,6 +100,7 @@ pub(super) fn block_text(block: ReauditBlock) -> &'static str {
         ReauditBlock::DoesNotApply => {
             "the saved result came from a catalogue for another system, so there is nothing to check"
         }
+        ReauditBlock::LeftOutOfThisRun => "left out of this run",
     }
 }
 
@@ -208,7 +210,7 @@ impl State {
             let result = run(&plan, &cancel, &move |p| {
                 let _ = progress.send(Message::Progress(p));
             });
-            let _ = sender.send(Message::Done(result));
+            let _ = sender.send(Message::Done(result, plan));
         });
     }
 
@@ -313,13 +315,13 @@ impl State {
                         }
                     }
                 }
-                Message::Done(result) => {
+                Message::Done(result, plan) => {
                     self.receiver = None;
                     self.cancel = None;
                     self.stage = match result {
                         Ok(report) => {
                             self.saved = report.saved > 0;
-                            Stage::Finished(Box::new(report))
+                            Stage::Finished(Box::new(report), plan)
                         }
                         Err(error) => Stage::CouldNotComplete(error),
                     };
@@ -339,11 +341,19 @@ impl State {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(200));
         }
-        // A library where every saved result is current shows no card.
+        // Nothing to check and nothing waiting: no card. Old results that do
+        // not apply to their game are mentioned in one line, not as a task.
         if let Stage::Listed(plan) = &self.stage
             && plan.games() == 0
-            && plan.blocked.is_empty()
+            && plan.skipped() == 0
         {
+            if plan.not_applicable() > 0 {
+                ui.label(format!(
+                    "Every saved catalogue result that can be checked is backed by a current check. {} older result{} not apply to their game (they came from another system's catalogue) and are kept as they are.",
+                    count(plan.not_applicable()),
+                    if plan.not_applicable() == 1 { " does" } else { "s do" }
+                ));
+            }
             return;
         }
         if matches!(self.stage, Stage::NotLoaded | Stage::Listing) {
@@ -412,8 +422,8 @@ impl State {
                         stop = true;
                     }
                 }
-                Stage::Finished(report) => {
-                    show_report(ui, report);
+                Stage::Finished(report, plan) => {
+                    show_report(ui, report, plan);
                     let unfinished = report.stopped.is_some() || report.not_reached > 0;
                     if unfinished {
                         if super::pages::primary(ui, "Continue") {
@@ -446,13 +456,39 @@ impl State {
     }
 }
 
+/// The four groups every saved result falls into, each exactly one of them.
+fn show_groups(ui: &mut egui::Ui, plan: &ReauditPlan) {
+    let tally = plan.tally();
+    ui.label(format!(
+        "{} saved catalogue result{} in this library:",
+        count(tally.saved_results),
+        if tally.saved_results == 1 { "" } else { "s" }
+    ));
+    ui.label(format!(
+        "• {} can be checked again (they lost their proof; the game has to be read)",
+        count(tally.eligible)
+    ));
+    ui.label(format!(
+        "• {} already backed by a current check (not read again)",
+        count(tally.current)
+    ));
+    ui.label(format!("• {} cannot be checked now", count(tally.skipped)));
+    ui.label(format!(
+        "• {} do not apply to their game (old results from another system's catalogue; kept as they are, nothing to check)",
+        count(tally.not_applicable)
+    ));
+}
+
 fn show_plan(ui: &mut egui::Ui, plan: &ReauditPlan) {
+    show_groups(ui, plan);
     if plan.games() > 0 {
         ui.label(format!(
-            "{} saved result{} no longer backed by a current check, so EmuWiz treats {} as not verified until checked again.",
-            count(plan.games()),
-            if plan.games() == 1 { " is" } else { "s are" },
-            if plan.games() == 1 { "that game" } else { "those games" },
+            "Until checked again, EmuWiz treats {} as not verified. Why they lost their proof:",
+            if plan.games() == 1 {
+                "that game"
+            } else {
+                "those games"
+            },
         ));
         for (status, n) in plan.by_status() {
             ui.label(format!("• {}: {}", count(n), reason_text(status)));
@@ -466,30 +502,23 @@ fn show_plan(ui: &mut egui::Ui, plan: &ReauditPlan) {
             ));
         }
     }
-    if !plan.blocked.is_empty() {
-        ui.label(format!(
-            "{} saved result{} cannot be checked now:",
-            count(plan.blocked.len()),
-            if plan.blocked.len() == 1 { "" } else { "s" }
-        ));
-        let mut blocks: BTreeMap<ReauditBlock, usize> = BTreeMap::new();
-        for blocked in &plan.blocked {
-            *blocks.entry(blocked.block).or_insert(0) += 1;
-        }
+    let mut blocks: BTreeMap<ReauditBlock, usize> = BTreeMap::new();
+    for blocked in plan
+        .blocked
+        .iter()
+        .filter(|blocked| blocked.block != ReauditBlock::DoesNotApply)
+    {
+        *blocks.entry(blocked.block).or_insert(0) += 1;
+    }
+    if !blocks.is_empty() {
+        ui.label("Cannot be checked now:");
         for (block, n) in blocks {
             ui.label(format!("• {}: {}", count(n), block_text(block)));
         }
     }
-    if plan.current > 0 {
-        ui.label(format!(
-            "{} saved result{} already backed by a current check and will not be read again.",
-            count(plan.current),
-            if plan.current == 1 { " is" } else { "s are" }
-        ));
-    }
 }
 
-fn show_report(ui: &mut egui::Ui, report: &ReauditReport) {
+fn show_report(ui: &mut egui::Ui, report: &ReauditReport, plan: &ReauditPlan) {
     let stopped = match &report.stopped {
         None => None,
         Some(ReauditStop::Cancelled) => Some("You stopped the check.".to_string()),
@@ -500,11 +529,22 @@ fn show_report(ui: &mut egui::Ui, report: &ReauditReport) {
     } else {
         "Checked again"
     });
+    let tally = report.tally(plan);
     ui.label(format!(
-        "{} verified · {} no match · {} need your choice",
-        count(report.verified),
-        count(report.no_match),
-        count(report.ambiguous)
+        "Of {} that could be checked: {} completed ({} verified · {} no match · {} need your choice) · {} not checked · {} not reached",
+        count(tally.eligible),
+        count(tally.completed),
+        count(tally.verified),
+        count(tally.no_match),
+        count(tally.need_choice),
+        count(tally.failed),
+        count(tally.not_reached)
+    ));
+    ui.label(format!(
+        "Not part of this check: {} already current · {} cannot be checked now · {} do not apply to their game (kept as they are)",
+        count(tally.current),
+        count(tally.skipped),
+        count(tally.not_applicable)
     ));
     if let Some(stopped) = stopped {
         ui.label(format!(
