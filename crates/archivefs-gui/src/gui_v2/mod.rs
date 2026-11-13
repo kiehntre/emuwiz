@@ -57,6 +57,7 @@ mod legacy;
 pub(crate) mod library;
 mod library_failure;
 mod library_reconciliation;
+mod library_selection;
 mod library_views_page;
 mod local_artwork_folders;
 mod mame_collection_health;
@@ -398,6 +399,8 @@ pub(super) struct App {
     index_job: Option<u64>,
     /// How many shelf cards Browse & Play draws, and the scope it was chosen for.
     browse_play: browse_play::BrowsePlayState,
+    /// Ctrl/Shift multi-select over the Library list (read-only bulk actions).
+    library_selection: library_selection::LibrarySelection,
     batch_selection: multi_selection::MultiSelection,
     batch_state: crate::screenscraper_batch_enrichment_page::ScreenScraperBatchState,
     batch_open: bool,
@@ -543,6 +546,7 @@ impl App {
             artwork_totals: activity::ArtworkTotals::default(),
             index_job: None,
             browse_play: Default::default(),
+            library_selection: Default::default(),
             batch_selection: multi_selection::MultiSelection::with_limit(
                 archivefs_core::screenscraper_enrichment::MAX_EXPLICIT_BATCH_SIZE,
             ),
