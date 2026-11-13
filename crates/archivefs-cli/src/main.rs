@@ -100,6 +100,7 @@ mod repair;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
+mod journal_recovery;
 mod rom_organise;
 mod romm_identity;
 mod saves;
@@ -176,6 +177,7 @@ fn is_read_only_invocation(cli: &CliArgs) -> bool {
             | "data-dir"
             | "library-status"
             | "database-check"
+            | "database-recover-journal"
     )
 }
 
@@ -1301,6 +1303,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 print_library_scan(&report);
             }
+        }
+        "database-recover-journal" => {
+            print!("{}", journal_recovery::run(args.collect())?);
         }
         "library-upgrade" => {
             let input_args: Vec<String> = args.collect();
