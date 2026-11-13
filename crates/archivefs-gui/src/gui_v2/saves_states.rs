@@ -1397,7 +1397,11 @@ mod tests {
         // A multi-disc game matches a save made with any of its discs.
         let multi = ps1_game(3, &["SLUS-00892", "SLUS-00908"]);
         assert_eq!(
-            game_association(&ps1_card_save("SLUS-00908"), &multi, &[multi.clone()]),
+            game_association(
+                &ps1_card_save("SLUS-00908"),
+                &multi,
+                std::slice::from_ref(&multi)
+            ),
             Some(GameAssociation::MatchedBySaveSerial)
         );
     }
@@ -1444,7 +1448,7 @@ mod tests {
             report.evidence[0].status = IdentityStatus::Candidate;
         }
         assert_eq!(
-            game_association(&record, &unverified, &[unverified.clone()]),
+            game_association(&record, &unverified, std::slice::from_ref(&unverified)),
             None
         );
     }
