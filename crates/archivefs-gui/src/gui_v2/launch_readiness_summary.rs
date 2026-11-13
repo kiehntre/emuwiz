@@ -1055,7 +1055,9 @@ pub(crate) fn status_label(status: ReadinessPresentationState) -> &'static str {
         ReadinessPresentationState::ReadyWithWarnings => "Ready with warning",
         ReadinessPresentationState::NeedsEmulator => "Emulator needed",
         ReadinessPresentationState::NeedsFirmware => "Firmware needed",
-        ReadinessPresentationState::NeedsIdentityReview => "Identity needs review",
+        // Launch needs the file's own evidence; identity confidence is
+        // stated separately, so this never reads as an identity verdict.
+        ReadinessPresentationState::NeedsIdentityReview => "File check needed",
         ReadinessPresentationState::NeedsSystem => "System needed",
         ReadinessPresentationState::SourceUnavailable => "Game file unavailable",
         ReadinessPresentationState::MediaUnreadable => "Game file unreadable",
@@ -1083,7 +1085,15 @@ pub(crate) fn action_label(action: ReadinessAction) -> &'static str {
     }
 }
 
-pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<ReadinessAction> {
+/// `identity` is the page's identity wording. The launch projection's own
+/// identity value follows which launch branch ran (a missing BIOS, an
+/// emulator, a check still running), so it is only a fallback.
+pub(crate) fn show(
+    ui: &mut egui::Ui,
+    summary: &GameReadinessSummary,
+    identity: Option<&str>,
+) -> Option<ReadinessAction> {
+    let identity = identity.unwrap_or(identity_label(summary.identity));
     let mut action = None;
     crate::ui::components::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -1193,7 +1203,7 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
             if let Some(emulator) = &summary.emulator {
                 ui.label(format!("Using: {}", emulator.name));
             }
-            ui.label(format!("Identity: {}", identity_label(summary.identity)));
+            ui.label(format!("Identity: {identity}"));
             if ui
                 .small_button(action_label(ReadinessAction::LookUpOnline))
                 .on_hover_text(super::hasheous_check::SHORTCUT_HINT)
@@ -1224,10 +1234,7 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
                     ui.monospace(line);
                 }
             }
-            ui.label(format!(
-                "Identity evidence: {}",
-                identity_label(summary.identity)
-            ));
+            ui.label(format!("Identity evidence: {identity}"));
             ui.label(format!("Source state: {}", source_label(summary.source)));
             ui.label(format!(
                 "Firmware state: {}",
@@ -2318,6 +2325,82 @@ mod tests {
         assert_eq!(summary.primary_action, Some(ReadinessAction::SetUpEmulator));
     }
 
+    /// The card's identity line is the page's identity wording. The launch
+    /// projection's own value follows the launch branch (missing firmware,
+    /// an emulator needed, a check still running) and used to read as an
+    /// identity verdict beside the page's Identity line.
+    #[test]
+    fn the_card_states_the_pages_identity_never_a_launch_branch_value() {
+        use ReadinessPresentationState as State;
+        let page = "Name hint only · not verified";
+        let cases = [
+            base(
+                State::NeedsFirmware,
+                "This system needs firmware",
+                "fixture",
+                IdentitySummary::StrongLocal,
+                SourceSummary::Available,
+                FirmwareSummary::Missing,
+                None,
+                Some(ReadinessAction::CheckFirmware),
+            ),
+            base(
+                State::NeedsEmulator,
+                "An emulator is needed",
+                "fixture",
+                IdentitySummary::StrongLocal,
+                SourceSummary::Available,
+                FirmwareSummary::Unknown,
+                None,
+                Some(ReadinessAction::SetUpEmulator),
+            ),
+            base(
+                State::ReadyWithWarnings,
+                "Ready, with a warning",
+                "fixture",
+                IdentitySummary::LaunchableWithWarning,
+                SourceSummary::Available,
+                FirmwareSummary::Ready,
+                None,
+                Some(ReadinessAction::Play),
+            ),
+            checking_summary(),
+            identity_summary(true),
+        ];
+        for summary in cases {
+            let context = egui::Context::default();
+            let output = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    show(ui, &summary, Some(page));
+                });
+            });
+            let strings = super::super::tests::text(&output);
+            let status = summary.status;
+            assert!(
+                strings
+                    .iter()
+                    .any(|line| *line == format!("Identity: {page}")),
+                "{status:?}: {strings:?}"
+            );
+            for launch_value in [
+                "Strong local identity",
+                "Launchable with warning",
+                "Needs review",
+                "Mismatch / blocked",
+                "Identity needs review",
+            ] {
+                assert!(
+                    !strings.iter().any(|line| line.contains(launch_value)),
+                    "{status:?} shows {launch_value}: {strings:?}"
+                );
+            }
+        }
+        assert_eq!(
+            status_label(State::NeedsIdentityReview),
+            "File check needed"
+        );
+    }
+
     #[test]
     fn verified_identity_while_checking_changes_only_the_identity_line() {
         let mut checking = project(
@@ -2405,7 +2488,7 @@ mod tests {
         summary: &GameReadinessSummary,
         label: &str,
     ) -> (Vec<String>, Option<ReadinessAction>) {
-        click_rendered_button(summary, label, show)
+        click_rendered_button(summary, label, |ui, summary| show(ui, summary, None))
     }
 
     /// The same, for the Library's compact card at a 1024x600-sized column.
@@ -3105,7 +3188,8 @@ mod identity_reason_wording_tests {
             ReadinessFreshness::Current,
         );
         assert_eq!(s.primary_action, Some(ReadinessAction::ReviewIdentity));
-        assert_eq!(status_label(s.status), "Identity needs review");
+        // The badge names the launch step; the identity verdict is the page's.
+        assert_eq!(status_label(s.status), "File check needed");
     }
 
     #[test]

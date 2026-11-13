@@ -100,7 +100,7 @@ fn render(
         },
         |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, summary);
+                show(ui, summary, None);
             });
         },
     );

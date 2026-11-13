@@ -102,7 +102,7 @@ fn assert_agree_after_panel(f: &VerifiedGame, game: &Game) -> bool {
     let current = note.starts_with("From the verified match");
     assert_eq!(verified, current, "panel {guidance:?} vs region {note:?}");
     if !current {
-        assert!(note.ends_with("Needs a recheck."), "{note}");
+        assert!(note.ends_with("Not confirmed as current."), "{note}");
     }
     verified
 }

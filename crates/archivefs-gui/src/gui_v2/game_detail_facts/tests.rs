@@ -216,7 +216,7 @@ fn a_saved_match_that_is_not_current_never_reads_as_verified() {
     );
     assert_eq!(row.value, "USA, Europe");
     let note = row.note.unwrap();
-    assert!(note.contains("Needs a recheck"), "{note}");
+    assert!(note.contains("Not confirmed as current"), "{note}");
     assert!(!note.contains("verified"), "{note}");
 }
 

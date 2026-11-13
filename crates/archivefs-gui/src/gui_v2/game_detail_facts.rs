@@ -224,7 +224,9 @@ fn region(game: &Game, sources: Sources<'_>) -> Fact {
         let note = if sources.dat_current {
             format!("From the verified match in {catalogue}")
         } else {
-            format!("From a saved match in {catalogue}. Needs a recheck.")
+            // Not "needs a recheck": while it is still being re-read the
+            // Identity line says "Checking verification".
+            format!("From a saved match in {catalogue}. Not confirmed as current.")
         };
         return plain("Region", value.to_string(), Some(note));
     }
