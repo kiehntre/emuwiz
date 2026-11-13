@@ -93,7 +93,10 @@ for unit in $units; do
   case "$unit" in
     *.timer) if systemctl is-enabled --quiet "$unit" 2>/dev/null || systemctl is-active --quiet "$unit" 2>/dev/null; then
                refuse "$unit is enabled or active"; fi ;;
-    *.service) systemctl is-active --quiet "$unit" 2>/dev/null && refuse "$unit is running" ;;
+    *.service) # a running oneshot is "activating", which is-active does not count: only
+               # inactive or failed is idle, and an unreadable state refuses
+               state=$(systemctl show -p ActiveState --value -- "$unit" 2>/dev/null) || state=""
+               case "$state" in inactive|failed) ;; *) refuse "$unit is running or its state is unknown (${state:-unreadable})" ;; esac ;;
   esac
 done
 
