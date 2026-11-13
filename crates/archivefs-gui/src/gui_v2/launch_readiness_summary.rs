@@ -212,6 +212,21 @@ pub(crate) fn project(
     summary
 }
 
+/// A readiness check that stopped with an error is shown as that error, not
+/// as the generic "changed since this result": rechecking a game whose file
+/// is missing otherwise repeats that sentence forever without saying why.
+/// The answer stays stale, so Play stays unavailable.
+pub(super) fn describe_check_error(summary: &mut GameReadinessSummary, error: &str) {
+    if summary.freshness != ReadinessFreshness::Stale {
+        return;
+    }
+    summary.headline = "EmuWiz couldn't check this game".into();
+    summary.explanation = format!(
+        "The check stopped with this error: {}. Nothing was changed. Fix the cause (for example reconnect the game's drive), then recheck.",
+        error.trim().trim_end_matches('.')
+    );
+}
+
 /// The shared DuckStation resolver's fallback or refusal, shown with the
 /// Launch readiness so it is never a silent substitution.
 fn attach_duckstation_resolver_notices(
@@ -2146,6 +2161,42 @@ mod tests {
             summary.primary_action,
             Some(ReadinessAction::RecheckReadiness)
         );
+    }
+
+    #[test]
+    fn a_failed_check_names_its_error_instead_of_a_change() {
+        let ready = || {
+            plan(vec![candidate(
+                LaunchReadiness::Ready,
+                FirmwareReadiness::NotRequired,
+                vec![],
+                vec![],
+                CandidatePreference::SoleEligible,
+                Some("/game.iso"),
+            )])
+        };
+        let mut summary = project(&ready(), ReadinessFreshness::Stale);
+        describe_check_error(
+            &mut summary,
+            "game.chd: No such file or directory (os error 2).",
+        );
+        assert_eq!(summary.status, ReadinessPresentationState::Stale);
+        assert_eq!(summary.headline, "EmuWiz couldn't check this game");
+        assert!(
+            summary
+                .explanation
+                .contains("No such file or directory (os error 2). Nothing")
+        );
+        assert!(!summary.explanation.contains("changed since this result"));
+        assert_eq!(
+            summary.primary_action,
+            Some(ReadinessAction::RecheckReadiness)
+        );
+        // A current answer is never rewritten.
+        let mut current = project(&ready(), ReadinessFreshness::Current);
+        let before = current.headline.clone();
+        describe_check_error(&mut current, "boom");
+        assert_eq!(current.headline, before);
     }
 
     #[test]

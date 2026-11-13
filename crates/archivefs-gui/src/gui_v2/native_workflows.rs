@@ -1217,13 +1217,17 @@ impl NativeWorkflows {
         self.select(path);
         self.start_launch_readiness_with(context, checksum);
         let input = self.launch_input();
-        let freshness = if self.readiness_error().is_some() {
+        let error = self.readiness_error();
+        let freshness = if error.is_some() {
             ReadinessFreshness::Stale
         } else {
             ReadinessFreshness::Current
         };
         self.observe_readiness_activity(activity);
         let mut summary = launch_readiness_summary::project(&input, freshness);
+        if let Some(error) = &error {
+            launch_readiness_summary::describe_check_error(&mut summary, error);
+        }
         if let launch_readiness_page::LaunchReadinessInput::Plan {
             plan, retroarch, ..
         } = &input
@@ -1348,13 +1352,17 @@ impl NativeWorkflows {
         if self.selected_game != Some(game_id) || self.selected.as_deref() != Some(path) {
             return None;
         }
-        let freshness = if self.readiness_error().is_some() {
+        let error = self.readiness_error();
+        let freshness = if error.is_some() {
             ReadinessFreshness::Stale
         } else {
             ReadinessFreshness::Current
         };
         let input = self.launch_input();
         let mut summary = launch_readiness_summary::project(&input, freshness);
+        if let Some(error) = &error {
+            launch_readiness_summary::describe_check_error(&mut summary, error);
+        }
         self.note_launch_route(&mut summary, game_id, path, &input, None);
         Some(summary)
     }
