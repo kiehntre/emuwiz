@@ -1568,6 +1568,9 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::Nes, "nes") => Some("nes"),
         (IdentityPlatform::Nes, "fds") => Some("fds"),
         (IdentityPlatform::Nes, "unf") => Some("unf"),
+        // No-Intro headerless dump: cores supply the mapper from their own
+        // game database, so it is staged as `.nes` (bytes unchanged).
+        (IdentityPlatform::Nes, "unh") => Some("unh"),
         (IdentityPlatform::GameBoy, "gb") => Some("gb"),
         (IdentityPlatform::GameBoyColor, "gb") => Some("gb"),
         (IdentityPlatform::GameBoyColor, "gbc") => Some("gbc"),
@@ -2608,6 +2611,9 @@ fn hash_bounded_file(file: &mut File, maximum: u64) -> io::Result<(String, u64)>
 pub(crate) struct StableFileMetadata {
     len: u64,
     modified: Option<std::time::SystemTime>,
+    /// Unix ctime (see `CapturedFileIdentity::changed`): catches a same-size
+    /// rewrite with a reset mtime and a replacement given the freed inode.
+    changed: Option<std::time::SystemTime>,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -2639,6 +2645,7 @@ impl StableFileMetadata {
         Ok(Self {
             len: metadata.len(),
             modified: metadata.modified().ok(),
+            changed: crate::launch::process_spawn::status_change_time(&metadata),
             #[cfg(unix)]
             device: metadata.dev(),
             #[cfg(unix)]
@@ -4785,7 +4792,7 @@ fn inspect_dreamcast_source(
         member_path,
         member_index,
         "Dreamcast IP.BIN product code",
-        "product code read from a recognised Sega Dreamcast IP.BIN boot structure",
+        "product code read from a recognised Sega Dreamcast IP.BIN boot structure; the rest of the disc image was not read, so this identifies the game without proving the image is undamaged",
     );
     report.bytes_read = report.bytes_read.max(source.bytes_read());
     report.complete = true;
@@ -6339,6 +6346,18 @@ fn inspect_disc_chd(
     aggregate_budget: Option<u64>,
 ) {
     report.format = IdentityImageFormat::Chd;
+    // A Dreamcast GD-ROM is recognised from the CHD header and metadata
+    // alone, read straight from the file, so its high-density area can be
+    // inspected sector by sector without first loading a 300-900 MB image.
+    if report.platform == IdentityPlatform::Dreamcast
+        && let Ok(observation) =
+            crate::chd_identity::observe_chd_identity_file(&report.archive_path)
+        && let crate::chd_identity::ChdMetadataOutcome::Observed(metadata) = &observation.metadata
+        && crate::chd_identity::needs_specialist_optical_backend(metadata)
+    {
+        inspect_dreamcast_gdrom_chd(report);
+        return;
+    }
     let bytes = match aggregate_budget.map_or_else(
         || read_bounded_chd_bytes(&report.archive_path),
         |budget| {
@@ -6724,13 +6743,31 @@ fn inspect_dreamcast_gdrom_chd(report: &mut GameIdentityReport) {
 /// filename - the honest answer is that this build cannot read this disc.
 #[cfg(not(feature = "chd-optical-specialist"))]
 fn inspect_dreamcast_gdrom_chd(report: &mut GameIdentityReport) {
-    add_unavailable(
-        report,
-        IdentityStatus::Unsupported,
-        "this CHD is a multi-track Dreamcast GD-ROM; reading its high-density data area \
-         requires the optional chd-optical-specialist build feature, which is not enabled in \
-         this build",
-    );
+    // Pure-Rust high-density reader: places each GD-ROM track exactly as
+    // chdman stores it and fails closed on any layout it cannot prove (see
+    // `crate::chd_logical_media::open_chd_gdrom_high_density_file`). The
+    // product code still comes only from the disc's own IP.BIN through the
+    // shared `inspect_dreamcast_source`.
+    let media =
+        match crate::chd_logical_media::open_chd_gdrom_high_density_file(&report.archive_path) {
+            Ok(media) => media,
+            Err(error) => {
+                push_with_source(
+                    report,
+                    IdentityKind::DreamcastProductCode,
+                    IdentityStatus::Invalid,
+                    None,
+                    IdentityConfidence::Unavailable,
+                    None,
+                    None,
+                    "Dreamcast GD-ROM high-density CHD reader",
+                    &error.to_string(),
+                );
+                return;
+            }
+        };
+    let mut source = MediaSource::new(media);
+    inspect_dreamcast_source(report, &mut source, None, None);
 }
 
 /// Authoritative Dreamcast identity for a DiscJuggler `.cdi` image. Never
@@ -10348,12 +10385,39 @@ mod tests {
                 .iter()
                 .find(|item| item.kind == IdentityKind::DreamcastProductCode)
                 .expect("a DreamcastProductCode evidence item must exist");
+            // The pure-Rust high-density reader now handles this shape; a
+            // metadata-only fixture has no hunk map, so it refuses as
+            // invalid media rather than "feature not built".
+            assert_eq!(evidence.status, IdentityStatus::Invalid);
             assert!(
-                evidence.diagnostic.contains("chd-optical-specialist"),
-                "expected the specialist-backend-unavailable message, got: {}",
+                !evidence.diagnostic.contains("chd-optical-specialist"),
+                "the default build must not claim the specialist backend is required: {}",
                 evidence.diagnostic
             );
         }
+    }
+
+    #[cfg(not(feature = "chd-optical-specialist"))]
+    #[test]
+    fn dreamcast_gdrom_chd_verifies_ip_bin_product_code_from_track_three() {
+        let iso = dreamcast_iso(b"T-8109N");
+        let blocks: Vec<[u8; 2048]> = iso
+            .chunks(ISO_SECTOR_SIZE as usize)
+            .map(|chunk| chunk.try_into().unwrap())
+            .collect();
+        let directory = FixtureDir::new("dreamcast-gdrom-chd-ip-bin");
+        let path = write_fixture(
+            &directory,
+            "renamed.chd",
+            &crate::chd_logical_media::synthetic_gdrom_chd(&blocks),
+        );
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(report.format, IdentityImageFormat::Chd);
+        assert_eq!(report.verified_dreamcast_product_code(), Some("T-8109N"));
+        assert!(report.complete);
+        // A Saturn hint over the same bytes never takes the Dreamcast reader.
+        let saturn = inspect_game_identity(&path, Some("Saturn"));
+        assert_eq!(saturn.verified_dreamcast_product_code(), None);
     }
 
     #[cfg(feature = "chd-optical-specialist")]
@@ -12425,6 +12489,28 @@ mod tests {
             item.kind == IdentityKind::LooseRomSha256
                 && item.status == IdentityStatus::ResourceLimitReached
         }));
+    }
+
+    /// ZIP staging and loose-ROM reads re-check the file with
+    /// `still_same_file`. A file equal on device, inode, size and mtime but
+    /// with a different ctime (same-size rewrite with a reset mtime, or a
+    /// replacement given the freed inode) passed the old check; it must not.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_matching_on_inode_size_and_mtime_but_not_ctime_is_not_the_same_file() {
+        let directory = FixtureDir::new("ctime-reuse");
+        let path = write_fixture(&directory, "Replaced.zip", b"replacement bytes");
+        let now = StableFileMetadata::from_file(&File::open(&path).unwrap()).unwrap();
+        assert!(now.changed.is_some(), "ctime must be captured on Unix");
+        let mut before = now.clone();
+        before.changed = now
+            .changed
+            .map(|ctime| ctime - std::time::Duration::from_nanos(1));
+        let old_check = |m: &StableFileMetadata| (m.device, m.inode, m.len, m.modified);
+        assert_eq!(old_check(&before), old_check(&now));
+        assert!(!still_same_file(&path, &TrustedRoots::none(), &before));
+        assert!(!loose_rom_read_was_stable(&before, &now, now.len));
+        assert!(still_same_file(&path, &TrustedRoots::none(), &now));
     }
 
     #[test]

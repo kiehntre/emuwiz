@@ -13,16 +13,22 @@
 //!
 //! # Safety rules
 //!
-//! - A choice only clears the tie warning from the one candidate it names.
-//!   Every other blocker and warning survives, a blocked candidate is never
-//!   made usable, and launch preflight still revalidates from scratch.
+//! - A choice only clears the tie from the one candidate it names: the tie
+//!   warning, or the RetroArch core tie ([`LaunchBlockerKind::AmbiguousCore`],
+//!   2026-11-10; never for Saturn, which has its own validated selection).
+//!   Every other blocker and warning survives, a candidate blocked for any
+//!   other reason is never made usable, and launch preflight still
+//!   revalidates from scratch.
 //! - A choice that names a missing, changed or blocked option never falls
 //!   back to another one: every remaining candidate receives
 //!   [`LaunchWarningKind::PreferredLaunchChoiceUnavailable`] (so strict
 //!   launch gates refuse) until the user chooses again. Unreadable saved
 //!   choices are treated the same way.
-//! - Only platforms in [`ADOPTED_PLATFORMS`] use this facility so far. Every
-//!   other platform's plan is returned unchanged.
+//! - Every platform uses this facility (2026-11-09; first adopted for
+//!   GameCube and Wii). Before that, any other system with more than one
+//!   usable emulator showed "Choice needed" with no way to choose, so Play
+//!   was never offered (owner screenshot: PS2 with native, Flatpak and
+//!   portable PCSX2). A plan without a platform is returned unchanged.
 //!
 //! # Identity
 //!
@@ -42,12 +48,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::planning::{CandidatePreference, LaunchCandidate, LaunchPlan, LaunchTarget};
-use super::readiness::{LaunchReadiness, LaunchWarning, LaunchWarningKind};
+use super::readiness::{LaunchBlockerKind, LaunchReadiness, LaunchWarning, LaunchWarningKind};
 use crate::emulator_environment::retroarch::{ProfileKind, ProfileScope};
 
 /// File name inside the EmuWiz configuration directory.
 pub const LAUNCH_PREFERENCES_FILE: &str = "launch_preferences.json";
-/// Platforms whose launch pages use this facility. Others are untouched.
+/// The platforms that first used this facility; kept for reference only.
+/// Every platform now uses it (see [`is_adopted`]).
 pub const ADOPTED_PLATFORMS: &[&str] = &["GameCube", "Wii"];
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 const FORMAT_VERSION: u32 = 1;
@@ -201,16 +208,53 @@ pub fn retroarch_option_id(
     format!("retroarch/{kind}/{scope}/{core_stem}")
 }
 
+/// A readable name for a saved [`launch_option_id`], so a choice that can no
+/// longer be used says which emulator it named. Built only from the stored
+/// id (the option itself may be gone); an unrecognised id is shown as stored.
+pub fn describe_option_id(option_id: &str) -> String {
+    if let Some(rest) = option_id.strip_prefix("standalone/")
+        && let Some((adapter, profile)) = rest.split_once('/')
+    {
+        return match profile.find('/') {
+            Some(at) => format!("{adapter} at {}", &profile[at..]),
+            None => format!("{adapter} ({profile})"),
+        };
+    }
+    if let Some(rest) = option_id.strip_prefix("retroarch/") {
+        let parts: Vec<&str> = rest.splitn(3, '/').collect();
+        if let [kind, scope, core] = parts.as_slice() {
+            return format!("RetroArch core {core} ({kind}, {scope})");
+        }
+    }
+    option_id.to_owned()
+}
+
 pub fn is_adopted(plan: &LaunchPlan) -> bool {
-    plan.platform_id
-        .as_deref()
-        .is_some_and(|platform| ADOPTED_PLATFORMS.contains(&platform))
+    plan.platform_id.is_some()
 }
 
 /// Whether the user may choose `candidate` for `plan`: an adopted platform
-/// with a verified game identity, and a candidate that is not blocked.
+/// with a game key, and a candidate that is not blocked - or is blocked only
+/// because several installed RetroArch cores fit and none is
+/// reviewed-preferred ([`LaunchBlockerKind::AmbiguousCore`]).
 pub fn is_choosable(plan: &LaunchPlan, candidate: &LaunchCandidate) -> bool {
-    is_adopted(plan) && plan.game_key.is_some() && candidate.readiness != LaunchReadiness::Blocked
+    is_adopted(plan) && plan.game_key.is_some() && usable_if_chosen(plan, candidate)
+}
+
+/// A candidate a choice may name: not blocked, or blocked by nothing but the
+/// core tie. That tie means "do not pick a core automatically"; the person's
+/// explicit choice is exactly the answer it waits for (as the reviewed native
+/// Saturn core selection already does). Saturn keeps its own validated core
+/// authority, and every other blocker - firmware, content, executable,
+/// a core installed twice under one name - still refuses.
+fn usable_if_chosen(plan: &LaunchPlan, candidate: &LaunchCandidate) -> bool {
+    candidate.readiness != LaunchReadiness::Blocked
+        || (plan.platform_id.as_deref() != Some("Saturn")
+            && !candidate.blockers.is_empty()
+            && candidate
+                .blockers
+                .iter()
+                .all(|blocker| blocker.kind == LaunchBlockerKind::AmbiguousCore))
 }
 
 /// The choice that applies to `(platform_id, game_key)` by precedence, or
@@ -264,7 +308,7 @@ pub fn apply(plan: &mut LaunchPlan, inputs: LaunchChoiceInputs<'_>) -> LaunchCho
         Ok(Some((source, option_id))) => {
             let option_id = option_id.to_owned();
             let usable = plan.candidates.iter().position(|candidate| {
-                candidate.readiness != LaunchReadiness::Blocked
+                usable_if_chosen(plan, candidate)
                     && launch_option_id(&candidate.target) == option_id
             });
             match usable {
@@ -285,8 +329,9 @@ pub fn apply(plan: &mut LaunchPlan, inputs: LaunchChoiceInputs<'_>) -> LaunchCho
                     hold_for_new_choice(
                         plan,
                         &format!(
-                            "The emulator in your {} {state}. No other emulator is used instead; choose one to continue.",
-                            source.describe()
+                            "The emulator in your {} ({}) {state}. No other emulator is used instead; choose one to continue.",
+                            source.describe(),
+                            describe_option_id(&option_id)
                         ),
                     );
                     LaunchChoiceOutcome::PreferredUnavailable { source, option_id }
@@ -319,6 +364,10 @@ pub fn chosen_source(
 fn choose(plan: &mut LaunchPlan, index: usize) {
     for (position, candidate) in plan.candidates.iter_mut().enumerate() {
         if position == index {
+            // Only the tie the person just answered; see `usable_if_chosen`.
+            candidate
+                .blockers
+                .retain(|blocker| blocker.kind != LaunchBlockerKind::AmbiguousCore);
             candidate.warnings.retain(|warning| {
                 !matches!(
                     warning.kind,

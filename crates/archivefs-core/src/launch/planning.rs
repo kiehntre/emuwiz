@@ -198,8 +198,23 @@ impl LaunchCandidate {
         match self.readiness {
             LaunchReadiness::Ready => self.warnings.is_empty(),
             LaunchReadiness::ReadyWithWarnings => {
+                // The firmware warning needs unverified-but-present firmware
+                // behind it. Without it (the identity warning on its own) the
+                // firmware must already be fine: never missing or unknown.
+                let firmware_warned = self
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.kind == LaunchWarningKind::FirmwarePresentUnverified);
+                let firmware_ok = if firmware_warned {
+                    self.firmware == FirmwareReadiness::PresentUnverified
+                } else {
+                    matches!(
+                        self.firmware,
+                        FirmwareReadiness::NotRequired | FirmwareReadiness::Verified
+                    )
+                };
                 !self.warnings.is_empty()
-                    && self.firmware == FirmwareReadiness::PresentUnverified
+                    && firmware_ok
                     && self
                         .warnings
                         .iter()
@@ -463,6 +478,17 @@ struct RetroArchCoreMatch {
     info: CoreInfoFinding,
 }
 
+/// Whether any installed RetroArch core in `environment` resolves to
+/// `platform_id` - the route an unidentified game's one-time try or
+/// remembered launch choice can use. Says nothing about firmware, content or
+/// any other check, which the plan still performs.
+pub fn retroarch_core_installed_for(
+    platform_id: &str,
+    environment: &RetroArchEnvironmentReport,
+) -> bool {
+    !matching_retroarch_cores(platform_id, environment).is_empty()
+}
+
 fn matching_retroarch_cores(
     platform_id: &str,
     environment: &RetroArchEnvironmentReport,
@@ -515,13 +541,51 @@ fn psx_chd_content(content: &LaunchContentRef) -> bool {
         })
 }
 
+/// Drops cores whose own `.info` does not list the content's file extension,
+/// but only when at least one matching core does. A core that cannot open the
+/// file is never a valid "second choice" (and made unrelated cores look like
+/// an ambiguity: `.fds` on an install whose only FDS-capable core is Mesen),
+/// while unusual containers nothing lists (for example ZIP) are untouched.
+fn narrow_cores_by_extension(matches: &mut Vec<RetroArchCoreMatch>, content: &LaunchContentRef) {
+    let Some(extension) = content
+        .resolved_path
+        .as_deref()
+        .and_then(|path| path.extension())
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return;
+    };
+    // RetroArch extracts archives for cores that never list them, so an
+    // archive extension says nothing about which core can play the game.
+    if matches!(extension.as_str(), "zip" | "7z") {
+        return;
+    }
+    let supports = |info: &CoreInfoFinding| match info {
+        CoreInfoFinding::Found {
+            supported_extensions,
+            ..
+        } => {
+            supported_extensions.is_empty()
+                || supported_extensions
+                    .iter()
+                    .any(|listed| listed.eq_ignore_ascii_case(&extension))
+        }
+        _ => true,
+    };
+    if matches.iter().any(|m| supports(&m.info)) {
+        matches.retain(|m| supports(&m.info));
+    }
+}
+
 fn build_retroarch_candidates(
     platform_id: &'static str,
     content: &LaunchContentRef,
     environment: &RetroArchEnvironmentReport,
     core_hints: &[&'static str],
 ) -> Vec<LaunchCandidate> {
-    let matches = matching_retroarch_cores(platform_id, environment);
+    let mut matches = matching_retroarch_cores(platform_id, environment);
+    narrow_cores_by_extension(&mut matches, content);
     if matches.is_empty() {
         return Vec::new();
     }
@@ -532,11 +596,14 @@ fn build_retroarch_candidates(
     // (ranking only - it never decided the platform, only which
     // already-valid core to prefer); otherwise automatic selection would
     // be unsafe and every tied candidate is blocked as ambiguous.
-    let hinted: Vec<String> = distinct_stems
+    // `core_hints` is an ordered, reviewed preference: the first named core
+    // that is actually installed wins. (Every platform but NES names exactly
+    // one core, so this is the same rule as before for them.)
+    let hinted: Vec<String> = core_hints
         .iter()
-        .filter(|stem| core_hints.contains(&stem.as_str()))
-        .cloned()
-        .collect();
+        .find(|hint| distinct_stems.contains(**hint))
+        .map(|hint| vec![(*hint).to_string()])
+        .unwrap_or_default();
     let ambiguous = distinct_stems.len() > 1 && hinted.len() != 1;
 
     matches
@@ -923,5 +990,91 @@ mod missing_firmware_detail_tests {
             missing_firmware_detail(&info),
             "required firmware/BIOS is missing: scph5500.bin, scph5501.bin, scph5502.bin"
         );
+    }
+}
+
+#[cfg(test)]
+mod identity_unverified_eligibility_tests {
+    use super::*;
+    use crate::launch::readiness::{LaunchWarning, LaunchWarningKind};
+
+    fn candidate(
+        firmware: FirmwareReadiness,
+        readiness: LaunchReadiness,
+        warnings: Vec<LaunchWarning>,
+    ) -> LaunchCandidate {
+        LaunchCandidate {
+            target: LaunchTarget::Standalone {
+                adapter_id: "fixture",
+                profile_id: "fixture".into(),
+                profile_path: None,
+            },
+            content: LaunchContentRef {
+                kind: None,
+                container: Some(LaunchContainerKind::PlainFile),
+                resolved_path: Some("/g/game.tap".into()),
+                requires_mount: false,
+                provenance: "fixture".into(),
+            },
+            firmware,
+            blockers: vec![],
+            warnings,
+            readiness,
+            preference: CandidatePreference::SoleEligible,
+        }
+    }
+
+    fn warn(kind: LaunchWarningKind) -> LaunchWarning {
+        LaunchWarning::new(kind, "fixture")
+    }
+
+    #[test]
+    fn the_identity_warning_alone_permits_retroarch_play_without_firmware() {
+        let identity = candidate(
+            FirmwareReadiness::NotRequired,
+            LaunchReadiness::ReadyWithWarnings,
+            vec![warn(LaunchWarningKind::IdentityUnverified)],
+        );
+        assert!(identity.retroarch_play_eligible());
+        // A blocker always wins.
+        let mut blocked = identity.clone();
+        blocked.blockers.push(LaunchBlocker::new(
+            LaunchBlockerKind::ContentNotResolved,
+            "fixture",
+        ));
+        assert!(!blocked.retroarch_play_eligible());
+        // The identity warning never waives missing or unknown firmware.
+        for firmware in [FirmwareReadiness::Missing, FirmwareReadiness::Unknown] {
+            let c = candidate(
+                firmware,
+                LaunchReadiness::ReadyWithWarnings,
+                vec![warn(LaunchWarningKind::IdentityUnverified)],
+            );
+            assert!(!c.retroarch_play_eligible(), "{firmware:?}");
+        }
+    }
+
+    #[test]
+    fn firmware_and_other_warnings_keep_their_existing_rules() {
+        // Firmware warning still needs present-but-unverified firmware.
+        let firmware = |fw| {
+            candidate(
+                fw,
+                LaunchReadiness::ReadyWithWarnings,
+                vec![warn(LaunchWarningKind::FirmwarePresentUnverified)],
+            )
+        };
+        assert!(firmware(FirmwareReadiness::PresentUnverified).retroarch_play_eligible());
+        assert!(!firmware(FirmwareReadiness::NotRequired).retroarch_play_eligible());
+        // Identity warning combined with any non-allow-listed warning withdraws Play.
+        let mixed = candidate(
+            FirmwareReadiness::NotRequired,
+            LaunchReadiness::ReadyWithWarnings,
+            vec![
+                warn(LaunchWarningKind::IdentityUnverified),
+                warn(LaunchWarningKind::MultipleEligibleProfiles),
+            ],
+        );
+        assert!(!mixed.retroarch_play_eligible());
     }
 }

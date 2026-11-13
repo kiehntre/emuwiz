@@ -44,15 +44,17 @@ use archivefs_core::patch_manager::{
     DOLPHIN_TEXTURE_MOD_SOURCE_MODE, DOLPHIN_TEXTURE_PACK_MAX_MANIFEST_BYTES, DolphinProfile,
     DolphinTextureModIdentity, DolphinTextureModPlan, DolphinTextureModPreviewRequest,
     DolphinTexturePackApplyResult, DolphinTexturePackBuildPreview, DolphinTexturePackBuildRequest,
-    DolphinTexturePackManifest, DolphinTexturePackPlan, SharedApplyConfirmation,
-    SharedApplyOptions, SharedApplyOutcome, SharedApplyResult, SharedApplyStatus,
-    SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview, SharedRollbackResult,
-    SharedTransactionPlan, build_dolphin_texture_mod_preview, build_dolphin_texture_pack_manifest,
-    build_dolphin_texture_pack_preview, build_dolphin_texture_pack_transaction_plan,
-    build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
+    DolphinTexturePackManifest, DolphinTexturePackPlan, DolphinTexturePackStaging,
+    SharedApplyConfirmation, SharedApplyOptions, SharedApplyOutcome, SharedApplyResult,
+    SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview,
+    SharedRollbackResult, SharedTransactionPlan, build_dolphin_texture_mod_preview,
+    build_dolphin_texture_pack_manifest, build_dolphin_texture_pack_preview,
+    build_dolphin_texture_pack_transaction_plan, build_shared_transaction_plan,
+    default_shared_backup_root, default_shared_history_root, describe_missing_texture_pack_source,
     dolphin_texture_mod_destination_root, execute_dolphin_texture_pack_apply, execute_shared_apply,
     execute_shared_rollback, generate_shared_operation_id, inspect_dolphin_texture_pack_zip,
-    preview_shared_rollback, validate_dolphin_texture_source, verified_dolphin_texture_identity,
+    preview_shared_rollback, relocate_dolphin_texture_pack_manifest,
+    validate_dolphin_texture_source, verified_dolphin_texture_identity,
 };
 use eframe::egui;
 
@@ -96,11 +98,15 @@ enum DolphinTextureModStage {
         identity: DolphinTextureModIdentity,
         destination_root: PathBuf,
     },
+    /// `staging` owns the temporary extracted copy when the source came from
+    /// a ZIP preview (`None` for a user-chosen directory). Leaving these
+    /// stages without saving drops it, which removes the copy.
     PackBuilderForm {
         source_root: PathBuf,
         archive_path: PathBuf,
         identity: DolphinTextureModIdentity,
         destination_root: PathBuf,
+        staging: Option<DolphinTexturePackStaging>,
     },
     PackBuilderPreview {
         preview: DolphinTexturePackBuildPreview,
@@ -108,6 +114,7 @@ enum DolphinTextureModStage {
         archive_path: PathBuf,
         identity: DolphinTextureModIdentity,
         destination_root: PathBuf,
+        staging: Option<DolphinTexturePackStaging>,
     },
     PackArchivePreview {
         preview: DolphinTexturePackBuildPreview,
@@ -115,9 +122,12 @@ enum DolphinTextureModStage {
         archive_path: PathBuf,
         identity: DolphinTextureModIdentity,
         destination_root: PathBuf,
+        staging: Option<DolphinTexturePackStaging>,
     },
     PackManifestSaved {
         path: PathBuf,
+        /// Where a ZIP preview's extracted files were kept for the manifest.
+        retained_root: Option<PathBuf>,
     },
     PreviewReady {
         plan: DolphinTextureModPlan,
@@ -319,6 +329,7 @@ impl DolphinTextureModPageState {
                         archive_path,
                         identity,
                         destination_root,
+                        staging: None,
                     });
                     true
                 }
@@ -624,6 +635,7 @@ pub(crate) fn show_dolphin_texture_mod_panel(
             archive_path,
             identity,
             destination_root,
+            staging,
         }) => show_pack_builder_form(
             ui,
             state,
@@ -631,6 +643,7 @@ pub(crate) fn show_dolphin_texture_mod_panel(
             archive_path,
             identity,
             destination_root,
+            staging,
         ),
         Some(DolphinTextureModStage::PackBuilderPreview {
             preview,
@@ -638,6 +651,7 @@ pub(crate) fn show_dolphin_texture_mod_panel(
             archive_path,
             identity,
             destination_root,
+            staging,
         }) => show_pack_builder_preview(
             ui,
             state,
@@ -646,6 +660,7 @@ pub(crate) fn show_dolphin_texture_mod_panel(
             archive_path,
             identity,
             destination_root,
+            staging,
         ),
         Some(DolphinTextureModStage::PackArchivePreview {
             preview,
@@ -653,6 +668,7 @@ pub(crate) fn show_dolphin_texture_mod_panel(
             archive_path,
             identity,
             destination_root,
+            staging,
         }) => show_pack_builder_preview(
             ui,
             state,
@@ -661,12 +677,22 @@ pub(crate) fn show_dolphin_texture_mod_panel(
             archive_path,
             identity,
             destination_root,
+            staging,
         ),
-        Some(DolphinTextureModStage::PackManifestSaved { path }) => {
+        Some(DolphinTextureModStage::PackManifestSaved {
+            path,
+            retained_root,
+        }) => {
             let mut done = false;
             widgets::card(ui, |ui| {
                 widgets::status_badge(ui, "Manifest saved", widgets::StatusTone::Success);
                 widgets::path_value(ui, "Manifest", &path);
+                if let Some(retained_root) = &retained_root {
+                    widgets::path_value(ui, "Extracted texture files kept at", retained_root);
+                    ui.label(
+                        "The manifest points at this EmuWiz-owned copy of the ZIP contents. Delete the folder yourself if you no longer want the pack.",
+                    );
+                }
                 ui.label(
                     "Use Choose texture-pack manifest when you are ready to preview installation.",
                 );
@@ -675,7 +701,10 @@ pub(crate) fn show_dolphin_texture_mod_panel(
                 }
             });
             if !done {
-                state.stage = Some(DolphinTextureModStage::PackManifestSaved { path });
+                state.stage = Some(DolphinTextureModStage::PackManifestSaved {
+                    path,
+                    retained_root,
+                });
             }
         }
         Some(DolphinTextureModStage::PreviewReady {
@@ -848,6 +877,7 @@ fn show_pack_builder_form(
     archive_path: PathBuf,
     identity: DolphinTextureModIdentity,
     destination_root: PathBuf,
+    staging: Option<DolphinTexturePackStaging>,
 ) {
     let mut scan = false;
     let mut cancel = false;
@@ -881,7 +911,9 @@ fn show_pack_builder_form(
         }
     });
     if cancel {
+        // Dropping `staging` here removes a ZIP preview's extracted copy.
         state.stage = None;
+        return;
     }
     if scan {
         let request = DolphinTexturePackBuildRequest {
@@ -899,6 +931,7 @@ fn show_pack_builder_form(
                     archive_path,
                     identity,
                     destination_root,
+                    staging,
                 })
             }
             Err(error) => {
@@ -907,9 +940,22 @@ fn show_pack_builder_form(
                 })
             }
         }
+        return;
     }
+    // Nothing happened this frame: keep the stage (and the staging) alive.
+    state.stage = Some(DolphinTextureModStage::PackBuilderForm {
+        source_root,
+        archive_path,
+        identity,
+        destination_root,
+        staging,
+    });
 }
 
+// The stage's fields travel by value through this renderer and come back
+// out as the next stage; bundling them would only add a struct that exists
+// for this one call.
+#[allow(clippy::too_many_arguments)]
 fn show_pack_builder_preview(
     ui: &mut egui::Ui,
     state: &mut DolphinTextureModPageState,
@@ -918,6 +964,7 @@ fn show_pack_builder_preview(
     archive_path: PathBuf,
     identity: DolphinTextureModIdentity,
     destination_root: PathBuf,
+    staging: Option<DolphinTexturePackStaging>,
 ) {
     let mut save = false;
     let mut back = false;
@@ -975,22 +1022,171 @@ fn show_pack_builder_preview(
             archive_path,
             identity,
             destination_root,
+            staging,
         });
+        return;
     }
     if save
         && let Some(path) = rfd::FileDialog::new()
             .add_filter("Dolphin texture-pack manifest", &["json"])
             .save_file()
     {
-        match save_pack_manifest(&path, &preview.manifest) {
-            Ok(()) => state.stage = Some(DolphinTextureModStage::PackManifestSaved { path }),
+        state.stage = Some(save_manifest_stage(
+            &path,
+            preview.manifest,
+            &identity,
+            staging,
+        ));
+        return;
+    }
+    // Nothing happened this frame: the dispatcher took the stage out of
+    // `state`, so put it back unchanged (which keeps a ZIP staging alive).
+    // Before this, both builder stages vanished after the frame they were
+    // first shown in unless a button was clicked that same frame.
+    state.stage = Some(if staging.is_some() {
+        DolphinTextureModStage::PackArchivePreview {
+            preview,
+            source_root,
+            archive_path,
+            identity,
+            destination_root,
+            staging,
+        }
+    } else {
+        DolphinTextureModStage::PackBuilderPreview {
+            preview,
+            source_root,
+            archive_path,
+            identity,
+            destination_root,
+            staging,
+        }
+    });
+}
+
+/// Saves `manifest` to `path`, keeping a ZIP preview's files under the
+/// EmuWiz data directory. See [`save_manifest_stage_in`].
+fn save_manifest_stage(
+    path: &Path,
+    manifest: DolphinTexturePackManifest,
+    identity: &DolphinTextureModIdentity,
+    staging: Option<DolphinTexturePackStaging>,
+) -> DolphinTextureModStage {
+    let retained_parent = match archivefs_core::app_dirs::data_dir() {
+        Ok(dir) => dir.join("dolphin-texture-packs"),
+        Err(error) => {
+            return DolphinTextureModStage::Failed {
+                detail: format!(
+                    "could not find the EmuWiz data directory to keep the texture files: {error}"
+                ),
+            };
+        }
+    };
+    save_manifest_stage_in(path, manifest, identity, staging, &retained_parent)
+}
+
+/// Saves `manifest` to `path`. When the files came from a ZIP preview
+/// (`staging` is `Some`), they are first moved from the temporary staging
+/// directory into a new directory under `retained_parent` and the manifest
+/// is relocated there - `source_root` and every file path - and re-validated,
+/// so the saved manifest never points into `$TMPDIR` and loads after a
+/// restart (Night Watch NW2-A-01, reviewer finding F1). Any failure drops
+/// the staging (removing the temporary copy), removes a retained copy that
+/// ended up without a manifest, and never writes a broken manifest.
+fn save_manifest_stage_in(
+    path: &Path,
+    manifest: DolphinTexturePackManifest,
+    identity: &DolphinTextureModIdentity,
+    staging: Option<DolphinTexturePackStaging>,
+    retained_parent: &Path,
+) -> DolphinTextureModStage {
+    // Refuse an existing manifest path *before* moving anything.
+    if path.exists() {
+        return DolphinTextureModStage::Failed {
+            detail: "could not save manifest: refusing to overwrite an existing manifest".into(),
+        };
+    }
+    let mut manifest = manifest;
+    let mut retained_pack_dir = None;
+    if let Some(staging) = staging {
+        let target = retained_parent.join(retained_pack_directory_name(&manifest.name));
+        let staging_root = staging.root().to_path_buf();
+        let suffix = manifest
+            .source_root
+            .strip_prefix(&staging_root)
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let retained_root = match staging.retain_into(&target) {
+            Ok(root) => root,
             Err(error) => {
-                state.stage = Some(DolphinTextureModStage::Failed {
-                    detail: format!("could not save manifest: {error}"),
-                })
+                return DolphinTextureModStage::Failed {
+                    detail: format!(
+                        "could not keep the extracted texture files: {}",
+                        error.detail
+                    ),
+                };
+            }
+        };
+        retained_pack_dir = Some(retained_root.clone());
+        let new_root = retained_root.join(suffix);
+        manifest = match relocate_dolphin_texture_pack_manifest(&manifest, identity, &new_root) {
+            Ok(relocated) => relocated,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&retained_root);
+                return DolphinTextureModStage::Failed {
+                    detail: format!(
+                        "the kept texture files did not validate, so nothing was saved: {}",
+                        error.detail
+                    ),
+                };
+            }
+        };
+    }
+    match save_pack_manifest(path, &manifest) {
+        Ok(()) => DolphinTextureModStage::PackManifestSaved {
+            path: path.to_path_buf(),
+            retained_root: retained_pack_dir.map(|_| manifest.source_root.clone()),
+        },
+        Err(error) => {
+            if let Some(dir) = retained_pack_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            DolphinTextureModStage::Failed {
+                detail: format!("could not save manifest: {error}"),
             }
         }
     }
+}
+
+/// `<slug>-<unix seconds>-<counter>`: unique within a process even for two
+/// saves in the same second, and readable in a file manager.
+fn retained_pack_directory_name(pack_name: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let slug: String = pack_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(48)
+        .collect();
+    let slug = if slug.is_empty() {
+        "texture-pack".to_string()
+    } else {
+        slug
+    };
+    format!(
+        "{slug}-{}-{}",
+        now_unix_seconds(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn save_pack_manifest(path: &Path, manifest: &DolphinTexturePackManifest) -> Result<(), String> {
@@ -1046,6 +1242,14 @@ fn build_pack_preview_stage(
         }
     };
     let source_root = manifest.source_root.clone();
+    // A manifest whose source folder is gone (in particular one saved from a
+    // ZIP preview before EmuWiz kept the extracted files) is explained, not
+    // reported as a corrupt manifest - and nothing is installed from it.
+    if let Some(explanation) = describe_missing_texture_pack_source(&source_root) {
+        return DolphinTextureModStage::Failed {
+            detail: explanation,
+        };
+    }
     let request = archivefs_core::patch_manager::DolphinTexturePackPreviewRequest {
         selected_archive: archive_path.to_path_buf(),
         identity: identity.clone(),
@@ -1085,6 +1289,7 @@ fn build_pack_archive_preview_stage(
                 archive_path: game_archive.to_path_buf(),
                 identity: identity.clone(),
                 destination_root: destination_root.to_path_buf(),
+                staging: Some(preview.staging),
             }
         }
         Err(error) => DolphinTextureModStage::Failed {

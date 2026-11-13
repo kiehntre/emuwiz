@@ -77,8 +77,8 @@ pub(crate) fn platform_asset_category(platform: &str) -> PlatformAssetCategory {
     match platform.id {
         "3DO" | "ColecoVision" | "Dreamcast" | "GameCube" | "Intellivision" | "MasterSystem"
         | "MegaDrive" | "N64" | "NeoGeo" | "NeoGeo64" | "NES" | "PSX" | "PS2" | "PS3" | "PS4"
-        | "Saturn" | "Sega 32X" | "SNES" | "Switch" | "Vectrex" | "Wii" | "WiiU" | "Xbox"
-        | "Xbox360" => PlatformAssetCategory::Console,
+        | "Saturn" | "Sega 32X" | "Sega Pico" | "SNES" | "Switch" | "Vectrex" | "Wii" | "WiiU"
+        | "Xbox" | "Xbox360" => PlatformAssetCategory::Console,
         "Atari Lynx"
         | "Game Boy"
         | "Game Boy Advance"

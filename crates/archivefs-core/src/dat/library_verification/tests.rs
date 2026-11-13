@@ -1436,3 +1436,257 @@ fn one_game_cue_check_reads_its_tracks_but_saves_only_the_sheet_row() {
     );
     assert_eq!(other_tables(&f.db), tables);
 }
+
+// ---- S03-05 in library verification: headered Lynx / 7800 files against the
+// headerless main catalogues (No-Intro "Atari Lynx (LYX)", "Atari 7800 (BIN)").
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    use sha1::digest::Digest;
+    sha1::Sha1::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+fn body(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
+}
+fn lynx(pages: u16, seed: u8) -> (Vec<u8>, Vec<u8>) {
+    let mut header = vec![0_u8; 64];
+    header[..4].copy_from_slice(b"LYNX");
+    header[4..6].copy_from_slice(&pages.to_le_bytes());
+    let payload = body(usize::from(pages) * 256, seed);
+    ([header, payload.clone()].concat(), payload)
+}
+fn a7800(len: u32) -> (Vec<u8>, Vec<u8>) {
+    let mut header = vec![0_u8; 128];
+    header[1..10].copy_from_slice(b"ATARI7800");
+    header[49..53].copy_from_slice(&len.to_be_bytes());
+    let payload = body(len as usize, 5);
+    ([header, payload.clone()].concat(), payload)
+}
+impl Fixture {
+    fn write_headerless_dat(&self, header: &str, rom: &str, payload: &[u8]) {
+        std::fs::write(&self.dat, format!(
+            "<datafile><header><name>{header}</name><description>{header}</description><version>synthetic-1</version><homepage>No-Intro</homepage><url>https://www.no-intro.org</url></header><game name=\"Cart (USA)\"><rom name=\"{rom}\" size=\"{}\" sha1=\"{}\"/></game></datafile>",
+            payload.len(), sha1_hex(payload))).unwrap();
+    }
+    fn run_for(&self, platform: &str) -> VerificationTotals {
+        preview_library_verification(self.resolved(), self.db.clone(), platform.into(), None)
+            .unwrap()
+            .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+            .unwrap()
+    }
+    fn saved_state(&self, id: i64) -> Option<(String, String)> {
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        conn.query_row(
+            "SELECT verification_state, CAST(facts_json AS TEXT) FROM library_dat_identities WHERE archive_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
+    }
+}
+
+#[test]
+fn headered_lynx_file_is_verified_against_the_headerless_catalogue() {
+    let f = Fixture::new();
+    let (full, payload) = lynx(2, 3);
+    f.write_headerless_dat("Atari - Atari Lynx (LYX)", "Cart (USA).lyx", &payload);
+    f.add(1, "cart.lnx", Some(&full), Some("Atari Lynx"));
+    let preview =
+        preview_library_verification(f.resolved(), f.db.clone(), "Atari Lynx".into(), None)
+            .unwrap();
+    assert_eq!(preview.eligible_games, 1, "{:?}", preview.exclusions);
+    let t = f.run_for("Atari Lynx");
+    assert_eq!(
+        (t.verified, t.no_match, t.saved),
+        (1, 0, 1),
+        "{:?}",
+        t.unchecked
+    );
+    let (state, facts) = f.saved_state(1).unwrap();
+    assert_eq!(state, "verified_single_match");
+    assert!(facts.contains("after header removal"), "{facts}");
+    // Read-only: the ROM is untouched.
+    assert_eq!(std::fs::read(f.root.join("cart.lnx")).unwrap(), full);
+}
+
+#[test]
+fn headered_7800_file_is_verified_against_the_headerless_catalogue() {
+    let f = Fixture::new();
+    let (full, payload) = a7800(16 * 1024);
+    f.write_headerless_dat("Atari - Atari 7800 (BIN)", "Cart (USA).bin", &payload);
+    f.add(1, "cart.a78", Some(&full), Some("Atari7800"));
+    let t = f.run_for("Atari7800");
+    assert_eq!(
+        (t.verified, t.no_match, t.saved),
+        (1, 0, 1),
+        "{:?}",
+        t.unchecked
+    );
+}
+
+#[test]
+fn unmatched_or_malformed_headered_file_is_not_a_definitive_negative() {
+    let f = Fixture::new();
+    let (_, payload) = lynx(2, 3);
+    f.write_headerless_dat("Atari - Atari Lynx (LYX)", "Cart (USA).lyx", &payload);
+    // A valid header over different content.
+    let (other, _) = lynx(2, 9);
+    f.add(1, "other.lnx", Some(&other), Some("Atari Lynx"));
+    // A header declaring the wrong size over the catalogued content.
+    let (mut lying, _) = lynx(2, 3);
+    lying[4] = 3;
+    f.add(2, "lying.lnx", Some(&lying), Some("Atari Lynx"));
+    let t = f.run_for("Atari Lynx");
+    assert_eq!((t.verified, t.no_match, t.saved), (0, 0, 0));
+    assert_eq!(t.unchecked.len(), 2, "{:?}", t.unchecked);
+    assert!(f.saved_state(1).is_none() && f.saved_state(2).is_none());
+}
+
+#[test]
+fn headered_file_is_not_admitted_for_a_platform_without_a_header_transform() {
+    let f = Fixture::new();
+    let (full, _) = lynx(2, 3);
+    f.add(1, "cart.lnx", Some(&full), Some("ZX Spectrum"));
+    let preview = f.preview();
+    assert_eq!(preview.eligible_games, 0);
+}
+
+impl Fixture {
+    fn zip_members(&self, name: &str, members: &[(&str, &[u8])]) {
+        let file = std::fs::File::create(self.root.join(name)).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (member, body) in members {
+            zip.start_file(*member, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    fn write_headerless_dat_games(&self, header: &str, games: &[(&str, &str, &[u8])]) {
+        let body: String = games
+            .iter()
+            .map(|(game, rom, payload)| {
+                format!(
+                    "<game name=\"{game}\"><rom name=\"{rom}\" size=\"{}\" sha1=\"{}\"/></game>",
+                    payload.len(),
+                    sha1_hex(payload)
+                )
+            })
+            .collect();
+        std::fs::write(&self.dat, format!(
+            "<datafile><header><name>{header}</name><description>{header}</description><version>synthetic-1</version><homepage>No-Intro</homepage><url>https://www.no-intro.org</url></header>{body}</datafile>")).unwrap();
+    }
+}
+
+#[test]
+fn headered_lynx_zip_member_is_verified_without_changing_the_archive() {
+    let f = Fixture::new();
+    let (full, payload) = lynx(2, 3);
+    f.write_headerless_dat("Atari - Atari Lynx (LYX)", "Cart (USA).lyx", &payload);
+    f.add(1, "cart.zip", Some(b"placeholder"), Some("Atari Lynx"));
+    f.zip("cart.zip", "Cart (USA).lnx", &full);
+    let before = std::fs::read(f.root.join("cart.zip")).unwrap();
+    let t = f.run_for("Atari Lynx");
+    assert_eq!(
+        (t.verified, t.no_match, t.saved),
+        (1, 0, 1),
+        "{:?}",
+        t.unchecked
+    );
+    let (state, facts) = f.saved_state(1).unwrap();
+    assert_eq!(state, "verified_single_match");
+    assert!(facts.contains("after header removal"), "{facts}");
+    // The headered member is named as the evidence; the archive itself and
+    // its whole-file identity are what was saved.
+    assert!(
+        facts.contains("\"member_name\":\"Cart (USA).lnx\""),
+        "{facts}"
+    );
+    assert_eq!(std::fs::read(f.root.join("cart.zip")).unwrap(), before);
+}
+
+#[test]
+fn headered_7800_zip_member_is_verified() {
+    let f = Fixture::new();
+    let (full, payload) = a7800(16 * 1024);
+    f.write_headerless_dat("Atari - Atari 7800 (BIN)", "Cart (USA).bin", &payload);
+    f.add(1, "cart.zip", Some(b"placeholder"), Some("Atari7800"));
+    f.zip("cart.zip", "Cart (USA).a78", &full);
+    let t = f.run_for("Atari7800");
+    assert_eq!(
+        (t.verified, t.no_match, t.saved),
+        (1, 0, 1),
+        "{:?}",
+        t.unchecked
+    );
+}
+
+#[test]
+fn ambiguous_multi_member_and_malformed_zips_stay_unverified() {
+    let f = Fixture::new();
+    let (full, payload) = lynx(2, 3);
+    let (other, _) = lynx(2, 9);
+    // Two catalogue games share the headerless content: ambiguous.
+    f.write_headerless_dat_games(
+        "Atari - Atari Lynx (LYX)",
+        &[
+            ("Cart (USA)", "Cart (USA).lyx", &payload),
+            ("Cart (Europe)", "Cart (Europe).lyx", &payload),
+        ],
+    );
+    f.add(1, "ambiguous.zip", Some(b"x"), Some("Atari Lynx"));
+    f.zip("ambiguous.zip", "Cart.lnx", &full);
+    // Two members: one would match, one does not; never a single identity.
+    f.add(2, "two.zip", Some(b"x"), Some("Atari Lynx"));
+    f.zip_members("two.zip", &[("a.lnx", &full), ("b.lnx", &other)]);
+    // Not a ZIP at all.
+    f.add(
+        3,
+        "broken.zip",
+        Some(b"PK\x03\x04 not really a zip"),
+        Some("Atari Lynx"),
+    );
+    // A member whose header declares the wrong size.
+    let mut lying = full.clone();
+    lying[4] = 3;
+    f.add(4, "lying.zip", Some(b"x"), Some("Atari Lynx"));
+    f.zip("lying.zip", "Cart.lnx", &lying);
+    let t = f.run_for("Atari Lynx");
+    assert_eq!((t.verified, t.no_match), (0, 0), "{:?}", t.unchecked);
+    for id in [2, 3, 4] {
+        assert!(
+            f.saved_state(id)
+                .is_none_or(|(state, _)| state != "verified_single_match"),
+            "{id}: {:?}",
+            f.saved_state(id)
+        );
+    }
+    assert!(
+        f.saved_state(1)
+            .is_none_or(|(state, _)| state != "verified_single_match")
+    );
+}
+
+#[test]
+fn headered_zip_member_of_an_incomplete_multi_rom_set_is_not_verified() {
+    let f = Fixture::new();
+    let (full, payload) = lynx(2, 3);
+    let extra = body(256, 7);
+    std::fs::write(&f.dat, format!(
+        "<datafile><header><name>Atari - Atari Lynx (LYX)</name><description>Atari - Atari Lynx (LYX)</description><version>synthetic-1</version><homepage>No-Intro</homepage><url>https://www.no-intro.org</url></header><game name=\"Cart (USA)\"><rom name=\"Cart (USA).lyx\" size=\"{}\" sha1=\"{}\"/><rom name=\"Extra.bin\" size=\"{}\" sha1=\"{}\"/></game></datafile>",
+        payload.len(), sha1_hex(&payload), extra.len(), sha1_hex(&extra))).unwrap();
+    f.add(1, "partial.zip", Some(b"x"), Some("Atari Lynx"));
+    f.zip("partial.zip", "Cart (USA).lnx", &full);
+    let t = f.run_for("Atari Lynx");
+    assert_eq!(t.verified, 0, "{:?}", t.unchecked);
+    assert!(
+        f.saved_state(1)
+            .is_none_or(|(state, _)| state != "verified_single_match"),
+        "{:?}",
+        f.saved_state(1)
+    );
+}

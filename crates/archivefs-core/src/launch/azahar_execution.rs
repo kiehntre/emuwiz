@@ -184,12 +184,14 @@ mod tests {
             keys_state: crate::patch_manager::AzaharEvidenceState::Absent,
             system_data_state: crate::patch_manager::AzaharEvidenceState::Unknown,
             captured_identity: CapturedFileIdentity {
+                changed: None,
                 device: 0,
                 inode: 0,
                 size: 0,
                 modified: None,
             },
             executable_identity: CapturedFileIdentity {
+                changed: None,
                 device: 0,
                 inode: 0,
                 size: 0,

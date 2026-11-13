@@ -76,6 +76,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         artwork: Artwork::with_indexer(context.clone(), None, Arc::new(|_| MediaIndex::default())),
         imagery: super::imagery::Imagery::default(),
         load_job: None,
+        scan_job: None,
         artwork_job: None,
         artwork_totals: super::activity::ArtworkTotals::default(),
         index_job: None,
@@ -166,6 +167,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         document_index: None,
         document_issue: None,
         setup_portability: super::setup_portability::SetupPortabilityState::default(),
+        amiga_hdf_storage: super::amiga_hdf_storage::AmigaHdfStorageState::default(),
         update_check: super::update_check::UpdateCheckState::default(),
         missing: Default::default(),
         equiv: Default::default(),
@@ -193,6 +195,26 @@ fn gui_v2_converter_is_a_native_workflow() {
             "missing native converter content: {expected}"
         );
     }
+}
+
+#[test]
+fn browse_play_system_chip_deselects_a_game_the_new_system_hides() {
+    // Real session 2026-11-12: an Acorn Electron game stayed in the panel
+    // after the Acorn Archimedes chip was chosen.
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "Yie Ar Kung Fu 2", Some("Acorn Electron")),
+        archive(2, "Alerion", Some("Acorn Archimedes")),
+    ]));
+    app.router.current = Route::BrowsePlayGame(1);
+    app.choose_system("Acorn Electron".into());
+    assert_eq!(app.router.current, Route::BrowsePlayGame(1));
+    app.choose_system("Acorn Archimedes".into());
+    assert_eq!(app.router.current, Route::BrowsePlay);
+    app.router.current = Route::BrowsePlayGame(2);
+    app.choose_system(String::new());
+    assert_eq!(app.router.current, Route::BrowsePlayGame(2));
 }
 
 #[test]
@@ -6120,18 +6142,31 @@ fn hackhash_normal_view_is_plain_english_and_keeps_internals_under_advanced() {
     }
     assert!(!strings.iter().any(|v| v.starts_with("Parser schema")));
     for plain in [
-        "Check for a newer list",
-        "Download list",
-        "Load list from a file…",
+        "Add HackHash list…",
         "Review downloaded list",
         "Use this list",
     ] {
         assert!(strings.iter().any(|v| v == plain), "missing {plain}");
     }
+    // The web-address features only appear once an address is set under
+    // Advanced details, so the normal path never asks for a URL.
+    for hidden in ["Check for a newer list", "Download list"] {
+        assert!(
+            !strings.iter().any(|v| v == hidden),
+            "{hidden} shown without a configured address"
+        );
+    }
     assert!(
-        strings
-            .iter()
-            .any(|v| v.starts_with("Download address: not set"))
+        !strings.iter().any(|v| v.starts_with("Download address")),
+        "the normal view must not ask for a download address"
+    );
+    assert!(
+        strings.iter().any(|v| v.starts_with("Optional. HackHash")),
+        "the page must say HackHash is optional"
+    );
+    assert!(
+        strings.iter().any(|v| v.starts_with("To add it:")),
+        "the page must say how to add the list in one plain step"
     );
     assert!(strings.iter().any(|v| v == "Advanced details"));
 }
@@ -6819,6 +6854,56 @@ fn gui_v2_browse_play_many_platforms_do_not_push_the_selected_game_off_screen() 
     );
 }
 
+/// Owner screenshots 03/04/15 (7 Nov build): after picking a system from
+/// "More systems", the dropdown went off-screen and its list covered the
+/// selected-game panel. With a non-top system selected, the dropdown and the
+/// selected game's Play must both stay on screen at the owner's widths.
+#[test]
+fn gui_v2_browse_play_a_system_picked_from_more_systems_keeps_the_dropdown_on_screen() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(
+        (1..=200)
+            .map(|id| {
+                archive(
+                    id,
+                    &format!("Game {id}"),
+                    Some(&format!("Platform {}", id % 70)),
+                )
+            })
+            .collect(),
+    ));
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.filter.select_platform("Platform 69".to_string());
+    app.indices = (0..app.library.games.len())
+        .filter(|&i| app.library.games[i].platform == "Platform 69")
+        .collect();
+    let game = app.library.games[app.indices[0]].archive.id;
+    for width in [2048.0, 1880.0, 1400.0] {
+        app.router.current = Route::BrowsePlayGame(game);
+        let output = frame(&context, &mut app, [width, 1100.0]);
+        let more = text(&output)
+            .into_iter()
+            .find(|t| t.starts_with("More systems"))
+            .unwrap_or_else(|| "More systems".to_string());
+        for needle in [more.as_str(), "Play"] {
+            let bounds = text_bounds(&output, needle);
+            assert!(
+                !bounds.is_empty(),
+                "{needle} must be drawn at {width}px; drawn: {:?}",
+                text(&output)
+                    .iter()
+                    .filter(|t| t.contains("Platform") || t.contains("systems"))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                bounds.iter().all(|rect| rect.max.x <= width),
+                "{needle} must be on screen at {width}px: {bounds:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn gui_v2_browse_play_says_loading_while_the_library_loads() {
     let context = egui::Context::default();
@@ -6873,6 +6958,21 @@ fn gui_v2_setup_portability_is_visible_in_settings() {
         "Export setup",
         "Preview setup file",
         "Applying imports is not available yet",
+    ] {
+        scroll_to_text(&context, &mut app, [1280.0, 900.0], expected);
+    }
+}
+
+#[test]
+fn gui_v2_amiga_hdf_storage_is_visible_in_settings() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Settings);
+    // Rendering only reads the saved choice and free space; it writes nothing.
+    for expected in [
+        "Amiga hard-disk game copies",
+        "they are not a cache",
+        "Choose folder",
     ] {
         scroll_to_text(&context, &mut app, [1280.0, 900.0], expected);
     }
@@ -7884,6 +7984,116 @@ fn real_catalogue_supersession_counts() {
         .filter(|game| game.archive.last_verified_missing_at.is_some())
         .count();
     println!("missing rows still visible (unresolved)={still_missing}");
+    let mut retired = std::collections::BTreeMap::new();
+    for reason in after.retired_reasons.values() {
+        *retired.entry(format!("{reason:?}")).or_insert(0usize) += 1;
+    }
+    println!(
+        "retired old-location rows={} (kept, not listed) by reason: {retired:?}",
+        after.retired.len()
+    );
+    // Optional: a TSV whose first column is an archive id, to show where each
+    // listed row now sits (superseded, retired, or still listed).
+    if let Ok(list) = std::env::var("STALE_ROWS") {
+        let ids: Vec<i64> = std::fs::read_to_string(list)
+            .expect("STALE_ROWS")
+            .lines()
+            .filter_map(|line| line.split('\t').next()?.parse().ok())
+            .collect();
+        let mut outcome = std::collections::BTreeMap::new();
+        for id in &ids {
+            let key = if after.historical_links.contains_key(id) {
+                "superseded by a current row".to_string()
+            } else if let Some(reason) = after.retired_reasons.get(id) {
+                format!("retired: {reason:?}")
+            } else if after.by_id.contains_key(id) {
+                "still listed".to_string()
+            } else {
+                "not in catalogue".to_string()
+            };
+            *outcome.entry(key).or_insert(0usize) += 1;
+        }
+        println!("stale rows={} outcome: {outcome:?}", ids.len());
+    }
+}
+
+#[test]
+fn absent_rows_of_a_removed_source_are_retired_not_listed_and_not_organised() {
+    use archivefs_core::catalogue_supersession::Retirement;
+    let removed = |id, rel: &str, platform: &str| {
+        let mut row = moved_row(id, rel, 10 + id as u64, false);
+        row.source_folder_id = 9;
+        row.platform = Some(platform.into());
+        row.platform_source = Some("folder".into());
+        row
+    };
+    let current = |id, rel: &str, size, platform: &str| {
+        let mut row = moved_row(id, rel, size, false);
+        row.platform = Some(platform.into());
+        row.platform_source = Some("folder".into());
+        row
+    };
+    let rows = vec![
+        // Labelled SNES at the old location, NES at the new one.
+        removed(1, "roms/snes/Mario.nes", "SNES"),
+        current(2, "nes/Mario.nes", 11, "NES"),
+        removed(3, "roms/snes/Gone.sfc", "SNES"),
+        // Still on disk at the old path: stays listed.
+        removed(4, "roms/snes/Here.sfc", "SNES"),
+        current(5, "snes/Real.sfc", 50, "SNES"),
+    ];
+    let configured = std::collections::HashSet::from([1]);
+    let library = Library::with_history_retiring(rows, &[], Some(&configured), |path| {
+        !path.ends_with("Here.sfc")
+    });
+    let mut listed: Vec<i64> = library.games.iter().map(|g| g.archive.id).collect();
+    listed.sort_unstable();
+    assert_eq!(listed, vec![2, 4, 5]);
+    assert_eq!(
+        library.retired_reasons,
+        std::collections::HashMap::from([
+            (1, Retirement::UnresolvedCopies),
+            (3, Retirement::NotFoundAnywhere)
+        ])
+    );
+    assert_eq!(library.retired.len(), 2, "kept, not deleted");
+    let (note, detail) = super::browse_play::retired_note(&library).expect("a note");
+    assert!(note.starts_with("2 older records not listed"), "{note}");
+    assert!(
+        detail.contains("not deleted")
+            && detail.contains("1 have a file with the same name")
+            && detail.contains("1 were not found"),
+        "{detail}"
+    );
+    assert!(super::browse_play::retired_note(&Library::default()).is_none());
+    let snes = &library
+        .games
+        .iter()
+        .find(|g| g.archive.id == 5)
+        .unwrap()
+        .platform;
+    assert_eq!(
+        library.platforms.get(snes),
+        Some(&2),
+        "{:?}",
+        library.platforms
+    );
+    assert!(library.historical.is_empty() && library.resolve(1) == 1);
+    let organised: Vec<i64> = super::folder_check::candidates_of(&library.games)
+        .iter()
+        .map(|c| c.archive_id)
+        .collect();
+    assert!(
+        !organised.contains(&1) && !organised.contains(&3),
+        "{organised:?}"
+    );
+    // Without an absence check nothing is retired (the previous behaviour).
+    let plain = Library::with_history(
+        library.retired.iter().map(|g| g.archive.clone()).collect(),
+        &[],
+        Some(&configured),
+    );
+    assert_eq!(plain.games.len(), 2);
 }
 
 #[test]
@@ -11931,6 +12141,9 @@ mod blue_worker_lane;
 #[path = "tests/repair.rs"]
 mod repair;
 
+#[path = "tests/blue_catalogue_writers.rs"]
+mod blue_catalogue_writers;
+
 #[path = "tests/blue_truth_outcomes.rs"]
 mod blue_truth_outcomes;
 
@@ -11942,6 +12155,8 @@ mod nkit_gui;
 
 #[path = "tests/big_picture.rs"]
 mod big_picture_journey;
+#[path = "tests/launch_census.rs"]
+mod launch_census;
 #[path = "tests/launch_focus.rs"]
 mod launch_focus;
 #[path = "tests/pad_shell.rs"]

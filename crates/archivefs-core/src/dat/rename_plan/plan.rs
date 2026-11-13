@@ -155,6 +155,26 @@ pub fn build_rename_plan(
                 if let Some(evidence) = evidence_by_path.get(entry.local_path.as_str()) {
                     apply_combined_provenance(&mut proposal, evidence);
                 }
+                // Bind the proposal to the file the audit actually hashed. The
+                // fingerprint was taken around the hashing read; a proposal
+                // for a file that later changes is refused at apply, not
+                // re-bound to whatever is at the path then.
+                proposal.audited_fingerprint = outcome
+                    .known_hashes
+                    .get(entry.local_path.as_str())
+                    .and_then(|hashes| hashes.fingerprint.clone());
+                // S03-05: say plainly when the match needed a header ignored.
+                if let Some(header_match) = outcome
+                    .known_hashes
+                    .get(entry.local_path.as_str())
+                    .and_then(|hashes| hashes.header_removal.as_ref())
+                {
+                    proposal.verdict_label = format!(
+                        "Exact ({})",
+                        crate::dat::header_match::MATCHED_AFTER_HEADER_REMOVAL.to_ascii_lowercase()
+                    );
+                    proposal.explanations.push(header_match.explanation());
+                }
                 proposals.push(proposal);
             }
             None => proposals.push(blocked_missing_source(
@@ -435,6 +455,7 @@ fn derive_proposal(
         sanitisation_notes,
         actionable: state == ProposalState::Suggested,
         audited_identity: None,
+        audited_fingerprint: None,
         is_outer_archive: false,
     }
 }
@@ -655,6 +676,7 @@ fn derive_outer_archive_proposals(
             sanitisation_notes,
             actionable: state == ProposalState::Suggested,
             audited_identity: Some(audited_identity.clone()),
+            audited_fingerprint: None,
             is_outer_archive: true,
         });
     }
@@ -790,6 +812,7 @@ fn derive_combined_archive_proposals(
             sanitisation_notes,
             actionable: state == ProposalState::Suggested,
             audited_identity: Some(audited_identity.clone()),
+            audited_fingerprint: None,
             is_outer_archive: true,
         });
     }
@@ -872,6 +895,7 @@ fn unresolved_verified_archive_proposal(
         sanitisation_notes: Vec::new(),
         actionable: false,
         audited_identity: archive.outer_identity.clone(),
+        audited_fingerprint: None,
         is_outer_archive: true,
     })
 }
@@ -1262,6 +1286,53 @@ mod tests {
         assert_eq!(p.extension_status, Some(ExtensionStatus::Preserved));
         assert!(p.actionable);
         assert!(p.match_confident);
+    }
+
+    /// Identity Lock: a loose-file proposal carries the fingerprint the audit
+    /// recorded while hashing, so apply can refuse a file that changed since.
+    #[test]
+    fn loose_proposals_carry_the_audit_fingerprint() {
+        let dir = temp();
+        let file = write(dir.path(), "goldenaxe.hdf");
+        let fingerprint = crate::identity_source::hashing::FileFingerprint::observe(&file).unwrap();
+        let entries = vec![entry_for(
+            &file,
+            "goldenaxe.hdf",
+            exact("Golden Axe (Europe).hdf"),
+        )];
+        let mut audited = outcome(dir.path(), entries, Vec::new(), None, false);
+        audited.known_hashes.insert(
+            file.to_string_lossy().into_owned(),
+            crate::dat::sources::audit_run::AuditedFileHashes {
+                fingerprint: Some(fingerprint.clone()),
+                ..Default::default()
+            },
+        );
+        let plan = build_rename_plan(&audited, &RenamePlanContext { generation: 1 }, &no_cancel())
+            .unwrap();
+        assert_eq!(
+            plan.proposals[0].audited_fingerprint.as_ref(),
+            Some(&fingerprint)
+        );
+
+        // Without hash evidence for the path nothing is invented.
+        let unbound = build_rename_plan(
+            &outcome(
+                dir.path(),
+                vec![entry_for(
+                    &file,
+                    "goldenaxe.hdf",
+                    exact("Golden Axe (Europe).hdf"),
+                )],
+                Vec::new(),
+                None,
+                false,
+            ),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
+        assert!(unbound.proposals[0].audited_fingerprint.is_none());
     }
 
     #[test]

@@ -295,11 +295,13 @@ fn same_size_in_place_edit_with_restored_mtime_makes_the_checked_version_stale()
     file.set_modified(before.modified().unwrap()).unwrap();
     drop(file);
     let after = fs::metadata(&bin).unwrap();
-    assert_eq!(
-        CapturedFileIdentity::capture(&before),
-        CapturedFileIdentity::capture(&after),
-        "metadata identity alone cannot see this edit"
-    );
+    // Device, inode, size and mtime cannot see this edit (ctime may, when
+    // the kernel's timestamp tick has moved); the hash always does.
+    let old_check = |m: &fs::Metadata| {
+        let i = CapturedFileIdentity::capture(m);
+        (i.device, i.inode, i.size, i.modified)
+    };
+    assert_eq!(old_check(&before), old_check(&after));
     assert!(matches!(
         preflight_openrct2_launch(&req, &dirs),
         Err(OpenRct2LaunchError::Changed(m)) if m.contains("changed since it was checked")
@@ -404,6 +406,38 @@ fn real_probe_runs_the_pinned_descriptor_and_limits_output() {
     // The path now names a different file, but the probe still runs the pin.
     assert!(probe_openrct2_version(&pinned).is_some());
     assert!(pinned.confirm_unchanged().is_ok());
+}
+
+/// Renaming over the path moves only the pinned inode's ctime (its last
+/// name is gone); the bytes still hash the same through the descriptor, so
+/// the pin stays valid. A forged ctime with changed bytes is refused.
+#[test]
+fn a_ctime_only_change_is_revalidated_by_hash_and_changed_bytes_are_refused() {
+    use std::io::{Seek, SeekFrom, Write};
+    let t = tempfile::tempdir().unwrap();
+    let bin = elf(&t.path().join("bin"), "true");
+    let mut pinned = PinnedOpenRct2::open(&fs::canonicalize(&bin).unwrap()).unwrap();
+    let checked = pinned.identity;
+    pinned.identity.changed = checked
+        .changed
+        .map(|ctime| ctime - std::time::Duration::from_nanos(1));
+    assert!(
+        pinned.confirm_unchanged().is_ok(),
+        "same bytes: revalidated"
+    );
+    let mut file = fs::OpenOptions::new().write(true).open(&bin).unwrap();
+    file.seek(SeekFrom::End(-1)).unwrap();
+    file.write_all(&[0xA5]).unwrap();
+    file.set_modified(checked.modified.unwrap()).unwrap();
+    drop(file);
+    pinned.identity.changed = fs::metadata(&bin)
+        .map(|m| CapturedFileIdentity::capture(&m).changed)
+        .unwrap()
+        .map(|ctime| ctime - std::time::Duration::from_nanos(1));
+    assert!(
+        pinned.confirm_unchanged().is_err(),
+        "changed bytes: refused"
+    );
 }
 
 #[test]

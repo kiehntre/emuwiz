@@ -114,6 +114,10 @@ fn fixture(root: &Path, kind: &str) -> VerifiedGameFixture {
 }
 
 fn run(kind: &str) {
+    run_scenarios(kind, None);
+}
+
+fn run_scenarios(kind: &str, only: Option<&[&str]>) {
     let owned = tempfile::tempdir().unwrap();
     let exported = std::env::var_os("EMUWIZ_THREE_LAUNCH_EXPORT").map(PathBuf::from);
     let base = exported
@@ -134,6 +138,7 @@ fn run(kind: &str) {
     } else {
         &["plain", "failure", "changed", "missing-core"]
     };
+    let scenarios = only.unwrap_or(scenarios);
     let scenarios = if std::env::var_os("EMUWIZ_THREE_LAUNCH_BASELINE").is_some() {
         &["plain"][..]
     } else {
@@ -211,6 +216,22 @@ fn run(kind: &str) {
 #[test]
 fn game_boy_blue_play_journey() {
     run("gb");
+}
+/// #437: X twice in Big Picture starts a ready game through the real Play
+/// path (the recording fake RetroArch), a game whose core went missing is
+/// refused by that same path, a Play pressed before the checks finish waits
+/// for them, and one cancelled with Back never fires on a later visit.
+#[test]
+fn game_boy_big_picture_double_x_journey() {
+    run_scenarios(
+        "gb",
+        Some(&[
+            "big-picture",
+            "big-picture-missing-core",
+            "big-picture-unchecked",
+            "big-picture-unchecked-cancel",
+        ]),
+    );
 }
 #[test]
 fn virtual_boy_blue_play_journey() {
@@ -395,6 +416,14 @@ fn child_entry() {
     if kind != "cue" {
         blue.guard_executables(&root);
     }
+    if let Some(rest) = scenario.strip_prefix("big-picture-unchecked") {
+        big_picture_unchecked(&mut blue, &root, &f.rom_path, &kind, !rest.is_empty());
+        return;
+    }
+    if let Some(rest) = scenario.strip_prefix("big-picture") {
+        big_picture_double_x(&mut blue, &root, &f.rom_path, &kind, !rest.is_empty());
+        return;
+    }
     let mut restore = None;
     match scenario.as_str() {
         "changed" => {
@@ -567,6 +596,142 @@ fn child_entry() {
         "BLUE_LAUNCH {kind}/{scenario}: ok; displayed={:?}",
         blue.seen
     );
+}
+
+fn double_x(blue: &mut Blue) {
+    use crate::gui_v2::big_picture::nav::{Button, Control, PadEvent};
+    let control = Control::Button(Button::West);
+    for _ in 0..2 {
+        let state = blue.app.big_picture.as_mut().expect("Big Picture is open");
+        state.inject(PadEvent::Pressed { device: 1, control });
+        state.inject(PadEvent::Released { device: 1, control });
+        blue.paint();
+    }
+}
+
+fn press(blue: &mut Blue, button: crate::gui_v2::big_picture::nav::Button) {
+    use crate::gui_v2::big_picture::nav::{Control, PadEvent};
+    let control = Control::Button(button);
+    let state = blue.app.big_picture.as_mut().expect("Big Picture is open");
+    state.inject(PadEvent::Pressed { device: 1, control });
+    state.inject(PadEvent::Released { device: 1, control });
+    blue.paint();
+}
+
+/// X twice straight from the shelf, before the game has ever been checked.
+fn big_picture_unchecked(blue: &mut Blue, root: &Path, rom: &Path, kind: &str, cancel: bool) {
+    use crate::gui_v2::big_picture::{Step, nav::Button};
+    let record = root.join("launch-record");
+    let game = blue.game;
+    let step = |b: &Blue| b.app.big_picture.as_ref().map(|state| state.step());
+    // A fresh start: no Launch page has been drawn, so nothing is selected or
+    // checked, exactly as when Big Picture opens on a cold library. (Only the
+    // disposable profile's probe is set, as `Blue::open_game` does.)
+    let mut fresh = crate::gui_v2::native_workflows::NativeWorkflows::new(blue.context.clone());
+    fresh.app.launch_retroarch.use_probe(Arc::new(TestProbe));
+    blue.app.native_workflows = Some(fresh);
+    blue.app.router.current = Route::BrowsePlay;
+    blue.app.enter_big_picture(&blue.context);
+    blue.paint();
+    double_x(blue);
+    assert_eq!(step(blue), Some(Step::Launch(game)), "{:?}", blue.last);
+    let pending = |b: &Blue| b.app.native_workflows.as_ref().unwrap().play_pending();
+    assert_eq!(
+        pending(blue),
+        Some(game),
+        "the checks were still running, so Play waits for them: {:?}",
+        blue.last
+    );
+    if cancel {
+        // Back leaves the Launch page while the checks are still running.
+        press(blue, Button::East);
+        assert_eq!(step(blue), Some(Step::Game(game)));
+        // Let the checks finish off the page, then come back with Start.
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(100));
+            blue.paint();
+        }
+        press(blue, Button::Start);
+        blue.wait_until(|b| b.shown(PLAY), 25);
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            blue.paint();
+        }
+        assert_eq!(pending(blue), None);
+        assert!(
+            !record.join("pid").exists(),
+            "a cancelled Play never starts the game on a later visit"
+        );
+        blue.guard_executables(root);
+        return;
+    }
+    blue.wait_until(|_| record.join("pid").exists(), 45);
+    blue.guard_executables(root);
+    blue.wait_until(
+        |b| record.join("args.txt").exists() && step(b) == Some(Step::Browse),
+        45,
+    );
+    let args = fs::read_to_string(record.join("args.txt")).unwrap();
+    let args: Vec<String> = args.lines().map(str::to_string).collect();
+    assert_eq!(Path::new(args.last().unwrap()), rom);
+    assert_core(
+        &args,
+        &root.join(format!("retroarch/cores/{}_libretro.so", core_stem(kind))),
+    );
+}
+
+fn big_picture_double_x(blue: &mut Blue, root: &Path, rom: &Path, kind: &str, refused: bool) {
+    use crate::gui_v2::big_picture::Step;
+    let record = root.join("launch-record");
+    if refused {
+        let core = format!("retroarch/cores/{}_libretro.so", core_stem(kind));
+        fs::remove_file(root.join(core)).unwrap();
+    }
+    blue.app.enter_big_picture(&blue.context);
+    blue.paint();
+    blue.paint();
+    double_x(blue);
+    let game = blue.game;
+    let step = |b: &Blue| b.app.big_picture.as_ref().map(|state| state.step());
+    assert_eq!(step(blue), Some(Step::Launch(game)), "{:?}", blue.last);
+    if refused {
+        blue.wait_until(
+            |b| {
+                b.shown("not started")
+                    || b.shown("could not")
+                    || b.shown("failed")
+                    || record.join("args.txt").exists()
+            },
+            20,
+        );
+        assert!(
+            !record.join("args.txt").exists(),
+            "a refused game never reaches the emulator"
+        );
+    } else {
+        blue.wait_until(|_| record.join("pid").exists(), 20);
+        // The session ends back on the shelf, which says the game closed (the
+        // recording emulator exits at once, so it reads as a quick close).
+        blue.wait_until(
+            |b| record.join("args.txt").exists() && step(b) == Some(Step::Browse),
+            45,
+        );
+        assert!(
+            blue.shown("Synthetic Pocket (USA) closed"),
+            "{:?}",
+            blue.last
+        );
+        let args: Vec<String> = fs::read_to_string(record.join("args.txt"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(Path::new(args.last().unwrap()), rom);
+        assert_core(
+            &args,
+            &root.join(format!("retroarch/cores/{}_libretro.so", core_stem(kind))),
+        );
+    }
 }
 
 fn ps1_iso_bytes() -> Vec<u8> {

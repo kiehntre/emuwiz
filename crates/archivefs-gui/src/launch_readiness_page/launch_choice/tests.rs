@@ -302,13 +302,16 @@ fn a_chosen_retroarch_candidate_carries_its_choice_into_the_launch_request() {
         "an unambiguous candidate needs no choice authority"
     );
 
+    // Every platform now carries the choice that made its candidate usable
+    // (2026-11-09), so preflight re-applies it to the rebuilt plan.
     plan.platform_id = Some("MegaDrive".into());
+    plan.candidates = vec![candidate.clone()];
     assert_eq!(
         super::super::retroarch_launch_request(&plan, &candidate, None)
             .unwrap()
-            .launch_choice,
-        None,
-        "platforms not yet adopted never carry a choice"
+            .launch_choice
+            .as_deref(),
+        Some("retroarch/native/user/dolphin"),
     );
 }
 

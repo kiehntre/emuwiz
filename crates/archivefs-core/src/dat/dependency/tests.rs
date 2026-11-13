@@ -127,8 +127,8 @@ fn top_ref(game_index: usize, games: &[DatGameEntry], rom_index: usize) -> DatRo
         ],
         status: member.status.clone(),
         merge: member.merge.clone(),
-        content_classification: entry.content_classification.clone(),
-        original_metadata: entry.original_metadata.clone(),
+        content_classification: std::sync::Arc::new(entry.content_classification.clone()),
+        original_metadata: std::sync::Arc::new(entry.original_metadata.clone()),
         clone_of: None,
     }
 }
