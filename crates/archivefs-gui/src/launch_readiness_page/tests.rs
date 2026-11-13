@@ -3859,7 +3859,10 @@ fn gba_retroarch_moves_first_and_is_recommended_when_launchable() {
         gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
     ]);
     assert_eq!(super::recommended_gba_candidate(&plan, |_| true), Some(2));
-    assert_eq!(super::gba_display_order(&plan, |_| true), vec![2, 0, 1]);
+    assert_eq!(
+        super::candidate_display_order(&plan, |_| true),
+        vec![2, 0, 1]
+    );
 }
 
 #[test]
@@ -3870,20 +3873,23 @@ fn gba_order_is_unchanged_without_a_launchable_retroarch() {
         gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
     ]);
     // RetroArch present but not launchable (not scanned/refused).
-    assert_eq!(super::gba_display_order(&plan, |_| false), vec![0, 1]);
+    assert_eq!(super::candidate_display_order(&plan, |_| false), vec![0, 1]);
     // RetroArch blocked.
     let blocked = gba_plan(vec![
         gba_candidate(standalone("mgba"), LaunchReadiness::Ready, Undetermined),
         gba_candidate(retroarch_target(), LaunchReadiness::Blocked, Undetermined),
     ]);
-    assert_eq!(super::gba_display_order(&blocked, |_| true), vec![0, 1]);
+    assert_eq!(
+        super::candidate_display_order(&blocked, |_| true),
+        vec![0, 1]
+    );
     // No RetroArch candidate at all.
     let none = gba_plan(vec![gba_candidate(
         standalone("mgba"),
         LaunchReadiness::Ready,
         Undetermined,
     )]);
-    assert_eq!(super::gba_display_order(&none, |_| true), vec![0]);
+    assert_eq!(super::candidate_display_order(&none, |_| true), vec![0]);
 }
 
 #[test]
@@ -3894,7 +3900,7 @@ fn explicit_or_remembered_choice_is_never_reordered_or_overridden() {
         gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
     ]);
     assert_eq!(super::recommended_gba_candidate(&plan, |_| true), None);
-    assert_eq!(super::gba_display_order(&plan, |_| true), vec![0, 1]);
+    assert_eq!(super::candidate_display_order(&plan, |_| true), vec![0, 1]);
 }
 
 #[test]
@@ -3908,7 +3914,39 @@ fn other_platforms_keep_core_plan_order() {
         ),
         gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
     ]);
-    assert_eq!(super::gba_display_order(&plan, |_| true), vec![0, 1]);
+    assert_eq!(super::candidate_display_order(&plan, |_| true), vec![0, 1]);
+}
+
+#[test]
+fn blocked_standalone_cards_follow_the_card_play_uses() {
+    use CandidatePreference::{SoleEligible, Undetermined};
+    // NES ZIP: a blocked native Mesen first in the plan, then RetroArch cores.
+    let mut plan = plan_with(vec![
+        gba_candidate(standalone("mesen"), LaunchReadiness::Blocked, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, SoleEligible),
+    ]);
+    plan.platform_id = Some("NES".into());
+    assert_eq!(
+        super::candidate_display_order(&plan, |_| true),
+        vec![2, 1, 0]
+    );
+}
+
+#[test]
+fn a_remembered_choice_stays_first_even_when_blocked() {
+    use CandidatePreference::{Remembered, Undetermined};
+    let plan = plan_with(vec![
+        gba_candidate(standalone("other"), LaunchReadiness::Blocked, Undetermined),
+        gba_candidate(standalone("mesen"), LaunchReadiness::Blocked, Remembered),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+    ]);
+    // Nothing usable stands out, so plan order, with the blocked
+    // Remembered card kept ahead of the other blocked one.
+    assert_eq!(
+        super::candidate_display_order(&plan, |_| true),
+        vec![1, 2, 0]
+    );
 }
 
 #[test]
@@ -3919,7 +3957,7 @@ fn gba_recommendation_follows_the_sole_eligible_core_play_uses() {
         gba_candidate(retroarch_target(), LaunchReadiness::Ready, SoleEligible),
     ]);
     assert_eq!(super::recommended_gba_candidate(&plan, |_| true), Some(1));
-    assert_eq!(super::gba_display_order(&plan, |_| true), vec![1, 0]);
+    assert_eq!(super::candidate_display_order(&plan, |_| true), vec![1, 0]);
 }
 
 #[test]
@@ -3935,7 +3973,7 @@ fn gba_sole_eligible_not_launchable_recommends_nothing() {
         None
     );
     assert_eq!(
-        super::gba_display_order(&plan, sole_not_launchable),
+        super::candidate_display_order(&plan, sole_not_launchable),
         vec![0, 1]
     );
 }
@@ -4056,7 +4094,7 @@ fn core_at(plan: &LaunchPlan, index: usize) -> &str {
 #[test]
 fn sega_pico_picodrive_card_is_listed_first_and_alternatives_stay() {
     let plan = smoke_test_pico_plan();
-    let order = super::gba_display_order(&plan, |_| true);
+    let order = super::candidate_display_order(&plan, |_| true);
     assert_eq!(order, vec![2, 0, 1]);
     assert_eq!(core_at(&plan, order[0]), "picodrive");
     // Genesis Plus GX cores remain listed as choices; nothing is removed or
@@ -4072,10 +4110,15 @@ fn sega_pico_picodrive_card_is_listed_first_and_alternatives_stay() {
 fn sega_pico_order_leaves_a_blocked_picodrive_and_other_platforms_alone() {
     let mut plan = smoke_test_pico_plan();
     plan.candidates[2].readiness = LaunchReadiness::Blocked;
-    assert_eq!(super::gba_display_order(&plan, |_| true), vec![0, 1, 2]);
+    assert_eq!(
+        super::candidate_display_order(&plan, |_| true),
+        vec![0, 1, 2]
+    );
+    // Other systems do not get the Pico rule; they get the general one, which
+    // puts the card Play uses (here the Sole eligible core) first.
     let mut md = smoke_test_pico_plan();
     md.platform_id = Some("MegaDrive".into());
-    assert_eq!(super::gba_display_order(&md, |_| true), vec![0, 1, 2]);
+    assert_eq!(super::candidate_display_order(&md, |_| true), vec![2, 0, 1]);
 }
 
 /// Saves "Default for Sega Pico" on `core` through the real choice state and
@@ -4136,7 +4179,7 @@ fn sega_pico_existing_user_default_stays_first_and_keeps_its_controls_note() {
     // A user who chose Genesis Plus GX keeps it: it is listed first, PicoDrive
     // stays available, and the controls note no longer claims PicoDrive's pen.
     let (plan, _) = plan_with_saved_pico_default("gpgx-kept", "genesis_plus_gx");
-    let order = super::gba_display_order(&plan, |_| true);
+    let order = super::candidate_display_order(&plan, |_| true);
     assert_eq!(core_at(&plan, order[0]), "genesis_plus_gx");
     assert!(order.iter().any(|&i| core_at(&plan, i) == "picodrive"));
     let note = crate::emulator_setup::unverified_media::sega_pico_controls_note(&plan).unwrap();
