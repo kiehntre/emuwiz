@@ -6,15 +6,17 @@
 //! | `/`, Ctrl+F                  | Focus this page's search field                |
 //! | Escape                       | Close the open dialog (as Cancel), else leave |
 //! |                              | the focused field, else Back                  |
-//! | Alt+Left                     | Back                                          |
+//! | Alt+Left                     | Back, only while no text field has focus      |
 //! | Backspace                    | Back, only while no text field has focus      |
 //! | Enter, Space                 | Activate the focused control (never held)     |
 //! | Tab, Shift+Tab               | Move focus                                    |
 //!
-//! Escape and Alt+Left are still read by `App::show` (pages.rs) with the same
-//! precedence; the keys here run first and never act while a text field has
-//! focus, a Blue confirmation is open, a menu or another window is open, or a
-//! full-screen viewer, Big Picture or the controller keyboard owns the keys.
+//! Escape and Alt+Left are applied by [`App::apply_back_keys`], which
+//! `App::show` calls once the viewers, Big Picture and the controller keyboard
+//! have had their keys. The other keys run before the page and never act while
+//! a text field has focus, a Blue confirmation is open, a menu or another
+//! window is open, or a full-screen viewer, Big Picture or the controller
+//! keyboard owns the keys.
 //!
 //! No key here launches a game or answers a confirmation. Enter and Space only
 //! do what egui gives every focused control (a click), and their auto-repeat is
@@ -31,6 +33,69 @@
 
 use super::App;
 use eframe::egui;
+
+/// The list Settings shows, in the order of the table above.
+pub(super) const HELP: [(&str, &str); 6] = [
+    ("/ or Ctrl+F", "Search this page"),
+    (
+        "Escape",
+        "Close the open dialog (like Cancel), leave a text field, or go back",
+    ),
+    ("Alt+Left", "Go back"),
+    ("Backspace", "Go back, when you are not typing"),
+    (
+        "Enter or Space",
+        "Use the focused button or open the focused game's details",
+    ),
+    ("Tab, Shift+Tab", "Move between controls"),
+];
+
+/// The "Keyboard shortcuts" list on Settings.
+pub(super) fn show_help(ui: &mut egui::Ui) {
+    ui.label(crate::ui::theme::card_title("Keyboard shortcuts"));
+    egui::Grid::new("v2_keyboard_shortcuts")
+        .num_columns(2)
+        .spacing([16.0, 4.0])
+        .show(ui, |ui| {
+            for (keys, meaning) in HELP {
+                ui.label(egui::RichText::new(keys).strong());
+                ui.label(meaning);
+                ui.end_row();
+            }
+        });
+    ui.label("Shortcuts never start a game or answer a confirmation for you.");
+}
+
+/// What one Escape press means, most specific first: an open confirmation,
+/// then an open menu, then another window, then a focused text field, and
+/// only then Back.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum EscapeAction {
+    CloseModal,
+    PopupHandles,
+    KeepDialogOpen,
+    LeaveFocus,
+    Back,
+}
+
+pub(super) fn escape_action(
+    modal_open: bool,
+    popup_open: bool,
+    other_window_open: bool,
+    typing: bool,
+) -> EscapeAction {
+    if modal_open {
+        EscapeAction::CloseModal
+    } else if popup_open {
+        EscapeAction::PopupHandles
+    } else if other_window_open {
+        EscapeAction::KeepDialogOpen
+    } else if typing {
+        EscapeAction::LeaveFocus
+    } else {
+        EscapeAction::Back
+    }
+}
 
 /// The keys of one frame this module resolves. Enter is deliberately absent:
 /// it is never a shortcut.
@@ -254,6 +319,68 @@ impl App {
             || self.history_view.confirm_undo.is_some()
             || self.missing.confirm
             || self.equiv.confirm
+    }
+
+    /// Close every Blue confirmation, as its Cancel button does. Every v2
+    /// confirmation is a preview-only step, so closing is always safe.
+    fn cancel_blue_confirmations(&mut self, context: &egui::Context) {
+        self.confirm_scan = false;
+        if let Some(confirm) = self.setup_actions.confirm.take() {
+            let opened = egui::Id::new(("v2_setup_confirm_opened", confirm.path()));
+            context.data_mut(|data| data.remove::<bool>(opened));
+        }
+        self.repair_confirm = false;
+        self.undo_confirm = None;
+        if let Some(id) = self.history_view.confirm_undo.take() {
+            let opened = egui::Id::new(("v2_history_undo_opened", id));
+            context.data_mut(|data| data.remove::<bool>(opened));
+        }
+        self.missing.confirm = false;
+        self.equiv.confirm = false;
+    }
+
+    /// Escape and Alt+Left. `App::show` calls this after the viewers, Big
+    /// Picture and the controller keyboard, so those keep their own keys.
+    pub(super) fn apply_back_keys(&mut self, context: &egui::Context) {
+        let (escape, alt_left) = context.input(|input| {
+            (
+                input.key_pressed(egui::Key::Escape),
+                input.modifiers.alt && input.key_pressed(egui::Key::ArrowLeft),
+            )
+        });
+        if !escape && !alt_left {
+            return;
+        }
+        let gate = Gate {
+            typing: self.text_was_focused || context.text_edit_focused(),
+            confirmation: self.blue_confirmation_open(),
+            ..live_gate(context)
+        };
+        if escape {
+            // egui releases a focused field on this same Escape, so "typing"
+            // is what the last frame ended with.
+            match escape_action(
+                gate.confirmation,
+                gate.popup,
+                gate.window,
+                self.text_was_focused,
+            ) {
+                EscapeAction::CloseModal => self.cancel_blue_confirmations(context),
+                // egui has already released the field's focus on this key press.
+                EscapeAction::LeaveFocus => {}
+                // egui closes an open popup on this same key press.
+                EscapeAction::PopupHandles => {}
+                // Any other open window (the classic Sources dialogs are
+                // hosted here too) is not ours to cancel, but Back must not
+                // run underneath it.
+                EscapeAction::KeepDialogOpen => {}
+                EscapeAction::Back => self.back(),
+            }
+        } else if gate.free() {
+            // Not while typing (Alt+Left moves by word there), nor under a
+            // dialog, menu or window.
+            self.back();
+        }
     }
 
     fn shortcut_overlay(&self) -> bool {
