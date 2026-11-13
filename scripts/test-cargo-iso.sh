@@ -385,12 +385,15 @@ flock "$slots/slot-0.lock" cat "$tmp/release-0" >/dev/null &
 h0=$!
 flock "$slots/slot-1.lock" cat "$tmp/release-1" >/dev/null &
 h1=$!
-until ! flock -n "$slots/slot-0.lock" true && ! flock -n "$slots/slot-1.lock" true; do :; done
+# Bounded waits: a regression fails the check instead of hanging the suite.
+wait_for() { local n=0; until "$@"; do n=$((n + 1)); [ "$n" -ge 200 ] && return 1; sleep 0.05; done; }
+slots_held() { ! flock -n "$slots/slot-0.lock" true && ! flock -n "$slots/slot-1.lock" true; }
+check "both slots are held by the test holders" wait_for slots_held
 rm -f "$FAKE_CARGO_LOG"
 (cd "$tmp/wt-one" && "$iso" check >/dev/null 2>"$tmp/wait-err") &
 waiter=$!
-until grep -q 'already running' "$tmp/wait-err" 2>/dev/null; do :; done
-check "with both slots taken the build waits and says so" test ! -e "$FAKE_CARGO_LOG"
+check "with both slots taken the build says it waits" wait_for grep -q 'already running' "$tmp/wait-err"
+check "with both slots taken the build waits" test ! -e "$FAKE_CARGO_LOG"
 (cd "$tmp/wt-one" && EMUWIZ_CARGO_MAX_BUILDS=0 "$iso" check >/dev/null 2>&1); rc=$?
 check "EMUWIZ_CARGO_MAX_BUILDS=0 removes the limit" test "$rc/$(logged slot)" = "0/<unset>"
 (cd "$tmp/wt-one" && EMUWIZ_CARGO_SLOT=1 "$iso" check >/dev/null 2>&1); rc=$?
@@ -400,7 +403,8 @@ check "--rust-analyzer takes no slot" test "$rc/$(logged slot)" = "0/<unset>"
 rm -f "$FAKE_CARGO_LOG"
 echo >"$tmp/release-1"
 wait "$h1"
-wait "$waiter"; rc=$?
+rc=124
+if wait_for bash -c "! kill -0 $waiter 2>/dev/null"; then wait "$waiter"; rc=$?; else kill "$waiter" 2>/dev/null; fi
 check "the waiting build starts once a slot frees" test "$rc/$(logged slot)" = "0/1"
 check "it says when it starts" grep -q 'slot free' "$tmp/wait-err"
 echo >"$tmp/release-0"
@@ -409,6 +413,13 @@ wait "$h0"
 check "a malformed EMUWIZ_CARGO_MAX_BUILDS is refused (2)" test "$rc" = 2
 (cd "$tmp/wt-one" && EMUWIZ_CARGO_MAX_BUILDS=1 "$iso" check >/dev/null 2>&1)
 check "a limit of 1 uses slot 0 only" test "$(logged slot)" = 0
+mv "$slots/slot-0.lock" "$tmp/slot-0.saved" && mkdir "$slots/slot-0.lock"
+rm -f "$FAKE_CARGO_LOG"
+(cd "$tmp/wt-one" && "$iso" check >/dev/null 2>"$tmp/err"); rc=$?
+check "an unopenable slot file never blocks the build" test "$rc" = 0
+check "it builds without a slot" test "$(logged slot)" = "<unset>"
+check "it says the limit is unavailable" grep -q 'build-slot limit unavailable' "$tmp/err"
+rmdir "$slots/slot-0.lock" && mv "$tmp/slot-0.saved" "$slots/slot-0.lock"
 
 # ---- never deletes
 mkdir -p "$t1/debug" && : >"$t1/debug/precious-artifact"

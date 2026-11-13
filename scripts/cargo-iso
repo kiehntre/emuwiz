@@ -129,7 +129,10 @@
 # soon as a slot frees. This limits how many builds run, not how many jobs each build
 # uses. --rust-analyzer runs, --print-target and the designation commands take no slot,
 # and a cargo-iso started inside a build that already holds one (EMUWIZ_CARGO_SLOT set)
-# never waits for a second. Under the lifecycle tracker (the default) cargo never
+# never waits for a second. A slot is held for the whole cargo run, so a long `cargo-iso test`
+# (for example an --ignored proof run) keeps its slot until the tests finish, not just
+# while compiling. A slot file that cannot be opened skips the limit with a note and never
+# blocks the build. Under the lifecycle tracker (the default) cargo never
 # inherits the slot; with EMUWIZ_RETENTION=0 cargo is exec'd with it, so a daemon cargo
 # leaves running (an sccache server, for example) would keep that slot until it exits.
 #
@@ -308,7 +311,7 @@ count_designated() {
 write_designation() {
   local lock="$root.incremental-mode.lock" current=""
   mkdir -p -- "$(dirname "$inc_file")" 2>/dev/null || return 1
-  exec 8>>"$lock" || return 1
+  { exec 8>>"$lock"; } 2>/dev/null || return 1
   flock -w 30 8 || { exec 8>&-; return 1; }
   if [ "$1" = on ]; then
     [ -f "$inc_file" ] && [ ! -L "$inc_file" ] && current=$(cat -- "$inc_file" 2>/dev/null)
@@ -365,7 +368,8 @@ if [ -n "$designate" ]; then
   if [ "$write_rc" -eq 9 ]; then
     echo "cargo-iso: refusing --designate-dev: $max_dev developer worktrees are already designated (the limit)." >&2
     echo "           Free one first with scripts/cargo-iso --undesignate-dev in an idle worktree you own" >&2
-    echo "           (records: $root.incremental-mode/). Nothing was changed." >&2
+    echo "           (records: $root.incremental-mode/; a record whose worktree no longer exists can be" >&2
+    echo "           set to off by writing 'off' into it). Nothing was changed." >&2
     exit 3
   elif [ "$write_rc" -ne 0 ]; then
     echo "cargo-iso: could not record the designation in $inc_file" >&2; exit 3
@@ -527,9 +531,12 @@ if [ "$ra_mode" -eq 0 ] && [ "$max_builds" -gt 0 ] && [ -z "${EMUWIZ_CARGO_SLOT:
     slot=""
     announced=0
     next=0
+    slot_broken=""
+    # A slot file that cannot be opened (a directory, another owner's file) must never stop
+    # the build: the limit is then skipped with a note, exactly like an unusable slot dir.
     while [ -z "$slot" ]; do
       for ((i = 0; i < max_builds; i++)); do
-        exec 9>>"$slot_dir/slot-$i.lock"
+        if ! { exec 9>>"$slot_dir/slot-$i.lock"; } 2>/dev/null; then slot_broken="$slot_dir/slot-$i.lock"; break 2; fi
         if flock -n 9; then slot=$i; break; fi
       done
       [ -n "$slot" ] && break
@@ -539,12 +546,17 @@ if [ "$ra_mode" -eq 0 ] && [ "$max_builds" -gt 0 ] && [ -z "${EMUWIZ_CARGO_SLOT:
       fi
       # Block on one slot's lock (returns the moment it frees); the timeout only
       # lets the next pass try the other slots too.
-      exec 9>>"$slot_dir/slot-$next.lock"
-      if flock -w 15 9; then slot=$next; fi
+      if ! { exec 9>>"$slot_dir/slot-$next.lock"; } 2>/dev/null; then slot_broken="$slot_dir/slot-$next.lock"; break; fi
+      if flock -w 2 9; then slot=$next; fi
       next=$(( (next + 1) % max_builds ))
     done
-    [ "$announced" -eq 1 ] && echo "cargo-iso: build slot free; starting" >&2
-    export EMUWIZ_CARGO_SLOT="$slot"
+    if [ -n "$slot_broken" ]; then
+      { exec 9>&-; } 2>/dev/null || true
+      echo "cargo-iso: note: build-slot limit unavailable ($slot_broken cannot be opened); building without it" >&2
+    else
+      [ "$announced" -eq 1 ] && echo "cargo-iso: build slot free; starting" >&2
+      export EMUWIZ_CARGO_SLOT="$slot"
+    fi
   else
     echo "cargo-iso: note: build-slot limit unavailable ($slot_dir); building without it" >&2
   fi
