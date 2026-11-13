@@ -602,7 +602,19 @@ fn refusals_are_counted_separately_and_unh_is_a_real_extension_fact() {
         &AtomicBool::new(false),
         &mut |_| {},
     );
-    assert_eq!((out.unreadable, out.too_large, out.skipped), (1, 1, 1));
+    // The absent file is reported as missing, not as unreadable.
+    assert_eq!(
+        (out.missing, out.unreadable, out.too_large, out.skipped),
+        (1, 0, 1, 1)
+    );
+    assert_eq!(
+        read_check_bytes(&candidates[0].path, &TrustedRoots::none()),
+        Err(ReadRefusal::Missing)
+    );
+    assert_eq!(
+        ReadRefusal::Missing.describe(),
+        "is no longer at this location"
+    );
     assert_eq!(out.findings.len(), 2);
     assert!(
         out.findings
@@ -618,4 +630,94 @@ fn refusals_are_counted_separately_and_unh_is_a_real_extension_fact() {
             .unwrap()
             .has_unh
     );
+}
+
+/// An image whose code writes every NES-only register, among padding.
+fn nes_program(len: usize, registers: &[u16]) -> Vec<u8> {
+    let mut b = vec![0xEA_u8; len];
+    for (i, r) in registers.iter().enumerate() {
+        let at = 0x100 + i * 16;
+        b[at] = 0x8D; // STA absolute
+        b[at + 1..at + 3].copy_from_slice(&r.to_le_bytes());
+    }
+    b
+}
+
+#[test]
+fn nes_register_validator_needs_every_nes_only_register() {
+    let all = [0x2000, 0x2001, 0x2006, 0x2007, 0x4014, 0x4016];
+    assert!(nes_register_signature(&nes_program(32 * 1024, &all)).is_some());
+    for missing in 0..all.len() {
+        let some: Vec<u16> = all
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != missing)
+            .map(|(_, r)| *r)
+            .collect();
+        assert!(
+            nes_register_signature(&nes_program(32 * 1024, &some)).is_none(),
+            "{missing}"
+        );
+    }
+    // Reads (LDA abs, AD) are not writes.
+    let mut reads = nes_program(32 * 1024, &all);
+    reads[0x100 + 5 * 16] = 0xAD;
+    assert!(nes_register_signature(&reads).is_none());
+}
+
+#[test]
+fn validator_without_dat_match_is_platform_confirmed_not_unknown() {
+    let mut e = ev(&id("snes"));
+    e.validators = vec![sig(&id("nes"))];
+    let c = classify(&e).unwrap();
+    assert_eq!(c.tier, Tier::PlatformConfirmed);
+    assert!(c.tier.is_movable());
+    assert_eq!(c.detected, id("nes"));
+    assert!(c.lines[0].contains("game identity unverified"));
+}
+
+#[test]
+fn validator_contradicted_by_other_content_is_ambiguous_and_never_movable() {
+    let mut e = ev(&id("snes"));
+    e.validators = vec![sig(&id("nes"))];
+    e.signatures = vec![sig(&id("megadrive"))];
+    let c = classify(&e).unwrap();
+    assert_eq!(c.tier, Tier::Ambiguous);
+    assert!(!c.tier.is_movable());
+}
+
+#[test]
+fn validator_agreeing_with_folder_is_no_mismatch() {
+    let mut e = ev(&id("nes"));
+    e.validators = vec![sig(&id("nes"))];
+    assert!(classify(&e).is_none());
+}
+
+#[test]
+fn probable_structure_alone_is_never_movable() {
+    assert!(!Tier::Probable.is_movable());
+    assert!(!Tier::Ambiguous.is_movable());
+}
+
+#[test]
+fn a_verified_game_outside_its_system_folder_is_movable_without_changing_system() {
+    let mut e = ev(&id("nes"));
+    e.hash_hits = vec![hit(&id("nes"))];
+    let c = outside_own_folder(&e, Path::new("/games/mixed/Game.zip")).unwrap();
+    assert_eq!(c.tier, Tier::Confirmed);
+    assert_eq!(c.detected, id("nes"));
+    assert!(outside_own_folder(&e, Path::new("/games/nes/Game.zip")).is_none());
+    assert!(outside_own_folder(&e, Path::new("/games/famicom/Game.zip")).is_none());
+}
+
+#[test]
+fn a_header_alone_outside_the_folder_is_platform_confirmed_and_contradictions_stay_put() {
+    let mut e = ev(&id("gba"));
+    e.signatures = vec![sig(&id("gba"))];
+    let c = outside_own_folder(&e, Path::new("/games/mixed/Game.zip")).unwrap();
+    assert_eq!(c.tier, Tier::PlatformConfirmed);
+    e.structure = vec![sig(&id("nes"))];
+    assert!(outside_own_folder(&e, Path::new("/games/mixed/Game.zip")).is_none());
+    // Folder name and nothing else is never evidence.
+    assert!(outside_own_folder(&ev(&id("gba")), Path::new("/games/mixed/Game.zip")).is_none());
 }

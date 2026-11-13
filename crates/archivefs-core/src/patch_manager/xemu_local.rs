@@ -366,6 +366,9 @@ pub fn discover_xemu_profiles(roots: &XemuProfileDiscoveryRoots) -> XemuProfileD
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XemuNativeLaunchBinding {
     pub executable: PathBuf,
+    /// Arguments that must precede xemu's own (empty for a native binary;
+    /// `run app.xemu.xemu` for the reviewed Flatpak contract).
+    pub launcher_arguments: Vec<std::ffi::OsString>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -435,6 +438,7 @@ pub fn resolve_xemu_native_launch_binding(
         XemuInstallationType::Native => {
             &[XemuInstallationType::Native, XemuInstallationType::Explicit]
         }
+        XemuInstallationType::FlatpakUser => return resolve_flatpak_xemu_binding(profile),
         other => {
             return Err(launch_blocker(
                 XemuLaunchBlockerKind::UnsupportedInstallationType,
@@ -468,6 +472,7 @@ pub fn resolve_xemu_native_launch_binding(
         0 => Err(last_error.expect("at least one candidate was inspected")),
         1 => Ok(XemuNativeLaunchBinding {
             executable: valid.into_iter().next().expect("length checked above"),
+            launcher_arguments: Vec::new(),
         }),
         count => Err(launch_blocker(
             XemuLaunchBlockerKind::AmbiguousExecutable,
@@ -477,6 +482,77 @@ pub fn resolve_xemu_native_launch_binding(
             ),
         )),
     }
+}
+
+/// Reviewed Flatpak contract: the profile must be exactly the app's own
+/// `~/.var/app/app.xemu.xemu/data/xemu/xemu` directory, the Flatpak app must
+/// be deployed (user or system), and xemu is started as
+/// `flatpak run app.xemu.xemu -dvd_path <iso>`. Nothing is executed here; the
+/// configuration (BIOS, EEPROM, HDD) is the profile's own `xemu.toml`.
+const FLATPAK_XEMU_LAUNCHER: &str = "/usr/bin/flatpak";
+
+fn resolve_flatpak_xemu_binding(
+    profile: &XemuProfile,
+) -> Result<XemuNativeLaunchBinding, XemuLaunchBlocker> {
+    resolve_flatpak_xemu_binding_with(profile, Path::new(FLATPAK_XEMU_LAUNCHER))
+}
+
+fn resolve_flatpak_xemu_binding_with(
+    profile: &XemuProfile,
+    launcher: &Path,
+) -> Result<XemuNativeLaunchBinding, XemuLaunchBlocker> {
+    let expected_tail = Path::new(".var/app")
+        .join(FLATPAK_APP_ID)
+        .join("data/xemu/xemu");
+    if !profile.configuration_path.ends_with(&expected_tail) {
+        return Err(launch_blocker(
+            XemuLaunchBlockerKind::UnsupportedInstallationType,
+            "this is not the Xemu Flatpak's own data directory",
+        ));
+    }
+    let home = profile
+        .configuration_path
+        .ancestors()
+        .nth(expected_tail.components().count())
+        .ok_or_else(|| {
+            launch_blocker(
+                XemuLaunchBlockerKind::UnsupportedInstallationType,
+                "the Flatpak profile has no home directory",
+            )
+        })?;
+    let deployed = [
+        home.join(".local/share/flatpak/app").join(FLATPAK_APP_ID),
+        PathBuf::from("/var/lib/flatpak/app").join(FLATPAK_APP_ID),
+    ]
+    .iter()
+    .any(|path| fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()));
+    if !deployed {
+        return Err(launch_blocker(
+            XemuLaunchBlockerKind::ExecutableMissing,
+            "the xemu Flatpak (app.xemu.xemu) is not installed",
+        ));
+    }
+    validate_native_xemu_executable(launcher)?;
+    Ok(XemuNativeLaunchBinding {
+        executable: launcher.to_path_buf(),
+        launcher_arguments: vec!["run".into(), FLATPAK_APP_ID.into()],
+    })
+}
+
+/// A shell script that only runs the Flatpak is not a native xemu: counting
+/// it as one made EmuWiz read the wrong configuration and report two
+/// "native" candidates. It is recognised by content and never executed.
+fn is_flatpak_wrapper_script(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut head = vec![0u8; 4096];
+    let Ok(read) = file.read(&mut head) else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&head[..read]);
+    text.starts_with("#!") && text.contains("flatpak run") && text.contains(FLATPAK_APP_ID)
 }
 
 fn validate_native_xemu_executable(path: &Path) -> Result<(), XemuLaunchBlocker> {
@@ -662,6 +738,7 @@ fn discover_executables(roots: &XemuProfileDiscoveryRoots) -> Vec<XemuExecutable
     paths
         .into_iter()
         .filter(|path| is_regular_file(path))
+        .filter(|path| !is_flatpak_wrapper_script(path))
         .map(|path| XemuExecutable {
             installation_type: if roots.explicit_executables.contains(&path) {
                 XemuInstallationType::Explicit
@@ -1402,5 +1479,83 @@ mod tests {
         }];
         let blocker = resolve_xemu_native_launch_binding(&candidate).unwrap_err();
         assert_eq!(blocker.kind, XemuLaunchBlockerKind::ExecutableNotExecutable);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod flatpak_contract_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn profile_at(home: &Path) -> XemuProfile {
+        XemuProfile {
+            profile_id: "xemu-flatpak-user-test".into(),
+            installation_type: XemuInstallationType::FlatpakUser,
+            scope: XemuProfileScope::User,
+            configuration_path: home.join(".var/app/app.xemu.xemu/data/xemu/xemu"),
+            config_path: home.join(".var/app/app.xemu.xemu/data/xemu/xemu/xemu.toml"),
+            provenance: "test",
+            eligible: true,
+            blockers: Vec::new(),
+            executable_candidates: Vec::new(),
+        }
+    }
+
+    fn executable(path: &Path) {
+        std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn the_flatpak_binding_needs_the_deployed_app_and_a_real_launcher() {
+        let home = tempfile::tempdir().unwrap();
+        let launcher = home.path().join("flatpak");
+        executable(&launcher);
+        let profile = profile_at(home.path());
+        // App not deployed yet.
+        assert_eq!(
+            resolve_flatpak_xemu_binding_with(&profile, &launcher)
+                .unwrap_err()
+                .kind,
+            XemuLaunchBlockerKind::ExecutableMissing
+        );
+        std::fs::create_dir_all(home.path().join(".local/share/flatpak/app/app.xemu.xemu"))
+            .unwrap();
+        let binding = resolve_flatpak_xemu_binding_with(&profile, &launcher).unwrap();
+        assert_eq!(binding.executable, launcher);
+        assert_eq!(
+            binding.launcher_arguments,
+            vec![std::ffi::OsString::from("run"), "app.xemu.xemu".into()]
+        );
+        // A missing launcher is refused.
+        assert!(resolve_flatpak_xemu_binding_with(&profile, &home.path().join("nope")).is_err());
+        // Any other directory is not "the Flatpak's own data directory".
+        let mut elsewhere = profile.clone();
+        elsewhere.configuration_path = home.path().join("custom/xemu");
+        assert_eq!(
+            resolve_flatpak_xemu_binding_with(&elsewhere, &launcher)
+                .unwrap_err()
+                .kind,
+            XemuLaunchBlockerKind::UnsupportedInstallationType
+        );
+    }
+
+    #[test]
+    fn a_flatpak_wrapper_script_is_not_a_native_xemu() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("xemu");
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\nexec flatpak run \"app.xemu.xemu\" \"$@\"\n",
+        )
+        .unwrap();
+        assert!(is_flatpak_wrapper_script(&wrapper));
+        let real = dir.path().join("xemu-kvm");
+        executable(&real);
+        assert!(!is_flatpak_wrapper_script(&real));
+        // A script that merely mentions xemu without the Flatpak is not excluded.
+        let other = dir.path().join("other");
+        std::fs::write(&other, "#!/bin/sh\necho xemu\n").unwrap();
+        assert!(!is_flatpak_wrapper_script(&other));
     }
 }

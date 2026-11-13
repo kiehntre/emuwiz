@@ -56,8 +56,6 @@
 //! file or any key material, and never extracts package contents - the
 //! Content ID is evidence, not proof of a playable disc title.
 
-use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind};
@@ -133,6 +131,14 @@ pub fn looks_like_ps3_disc_sfb(header: &[u8]) -> bool {
 /// observer in this crate ("absence of evidence" is a legitimate result).
 pub fn observe_ps3_directory(root: &Path) -> Ps3DirectoryObservation {
     let mut observation = Ps3DirectoryObservation::default();
+    // Every file read below goes through the crate's one bounded, FIFO-safe,
+    // symlink-refusing open ([`crate::safe_read`]), which needs an absolute
+    // path. A root that cannot be made absolute yields the all-`false`
+    // observation like any other unreadable root (Night Watch G6-04).
+    let Some(root) = absolute_lexical(root) else {
+        return observation;
+    };
+    let root = root.as_path();
     let Some(game_dir) = locate_ps3_game_dir(root) else {
         return observation;
     };
@@ -142,36 +148,64 @@ pub fn observe_ps3_directory(root: &Path) -> Ps3DirectoryObservation {
     observation.layout.usrdir_present = usrdir.is_dir();
 
     let sfo_path = game_dir.join("PARAM.SFO");
-    if let Ok(metadata) = fs::metadata(&sfo_path)
-        && metadata.is_file()
-        && metadata.len() <= MAX_SFO_BYTES as u64
-        && let Ok(bytes) = fs::read(&sfo_path)
-    {
+    if let Some(bytes) = read_regular_prefix(&sfo_path, MAX_SFO_BYTES, true) {
         observation.layout.param_sfo = parse_param_sfo(&bytes);
     }
 
     let eboot_path = usrdir.join("EBOOT.BIN");
-    if eboot_path.is_file() {
+    if let Some(header) = read_regular_prefix(&eboot_path, MAX_EBOOT_HEADER_READ_BYTES, false) {
         observation.layout.eboot_bin_present = true;
-        if let Ok(mut file) = fs::File::open(&eboot_path) {
-            let mut header = vec![0u8; MAX_EBOOT_HEADER_READ_BYTES];
-            if let Ok(read) = file.read(&mut header) {
-                header.truncate(read);
-                check_eboot_self_magic(&mut observation.layout, &header);
-            }
-        }
+        check_eboot_self_magic(&mut observation.layout, &header);
     }
 
     if let Some(disc_root) = disc_root_for(root, &game_dir) {
         let sfb_path = disc_root.join("PS3_DISC.SFB");
-        if let Ok(mut file) = fs::File::open(&sfb_path) {
-            let mut header = [0u8; 4];
-            observation.disc_sfb_present =
-                file.read_exact(&mut header).is_ok() && looks_like_ps3_disc_sfb(&header);
+        if let Some(header) = read_regular_prefix(&sfb_path, PS3_DISC_SFB_MAGIC.len(), false) {
+            observation.disc_sfb_present = looks_like_ps3_disc_sfb(&header);
         }
     }
 
     observation
+}
+
+/// `root` made absolute against the working directory with `.` and `..`
+/// resolved lexically (no symlink is followed to do so). The result is only
+/// ever used to *open* files under the read policy, which refuses anything
+/// the lexical answer gets wrong, so a mismatch fails closed.
+fn absolute_lexical(root: &Path) -> Option<PathBuf> {
+    let absolute = std::path::absolute(root).ok()?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized.is_absolute().then_some(normalized)
+}
+
+/// Reads at most `max_bytes` from the start of the regular file at
+/// `path`, through [`crate::safe_read::open_bounded_read`] with no trusted
+/// roots: a symlink anywhere in the path, a FIFO, a device or a directory is
+/// refused (and never blocks), rather than followed or waited on. With
+/// `whole_file_only`, a file longer than `max_bytes` yields `None` instead
+/// of a truncated prefix (PARAM.SFO is parsed whole or not at all). An empty
+/// file yields an empty buffer.
+fn read_regular_prefix(path: &Path, max_bytes: usize, whole_file_only: bool) -> Option<Vec<u8>> {
+    let mut file =
+        crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none()).ok()?;
+    let available = usize::try_from(file.len()).unwrap_or(usize::MAX);
+    if whole_file_only && available > max_bytes {
+        return None;
+    }
+    let length = available.min(max_bytes);
+    if length == 0 {
+        return Some(Vec::new());
+    }
+    file.read_exact_at(0, length, max_bytes)
 }
 
 /// Neutral evidence for a [`Ps3DirectoryObservation`]: every fact
@@ -423,6 +457,7 @@ pub fn pkg_header_evidence(fact: &PkgHeaderFact) -> Vec<ContentEvidence> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -837,5 +872,113 @@ mod tests {
     fn ps3_disc_sfb_magic_is_detected() {
         assert!(looks_like_ps3_disc_sfb(b".SFB\x00\x00"));
         assert!(!looks_like_ps3_disc_sfb(b"not sfb"));
+    }
+
+    /// Runs the observer on another thread and fails rather than hangs if
+    /// it does not return within five seconds; releases a blocked FIFO open
+    /// so the test binary can still exit.
+    #[cfg(unix)]
+    fn observe_with_deadline(root: PathBuf, unblock: PathBuf) -> Option<Ps3DirectoryObservation> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(observe_ps3_directory(&root));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).ok();
+        if got.is_none() {
+            // O_RDWR on a Linux FIFO never blocks.
+            let _ = fs::OpenOptions::new().read(true).write(true).open(&unblock);
+        }
+        got
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// Night Watch G6-04: a FIFO in `PS3_DISC.SFB`'s place must not hang
+    /// identity inspection.
+    #[cfg(unix)]
+    #[test]
+    fn observe_ps3_directory_does_not_block_on_a_fifo_disc_sfb() {
+        let root = temp_dir("observe-sfb-fifo");
+        fs::create_dir_all(root.join("PS3_GAME").join("USRDIR")).unwrap();
+        write_file(&root.join("PS3_GAME/USRDIR/EBOOT.BIN"), b"SCE\0header");
+        let sfb = root.join("PS3_DISC.SFB");
+        mkfifo(&sfb);
+        let observation = observe_with_deadline(root.clone(), sfb)
+            .expect("observe_ps3_directory blocked on a FIFO PS3_DISC.SFB");
+        assert!(!observation.disc_sfb_present);
+        assert!(observation.layout.eboot_bin_present);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Night Watch G6-04: FIFOs in the place of `PARAM.SFO` or `EBOOT.BIN`
+    /// are refused the same way, and the observation stays honest.
+    #[cfg(unix)]
+    #[test]
+    fn observe_ps3_directory_does_not_block_on_fifo_param_sfo_or_eboot() {
+        let root = temp_dir("observe-fifo-sfo-eboot");
+        fs::create_dir_all(root.join("PS3_GAME").join("USRDIR")).unwrap();
+        let sfo = root.join("PS3_GAME/PARAM.SFO");
+        let eboot = root.join("PS3_GAME/USRDIR/EBOOT.BIN");
+        mkfifo(&sfo);
+        mkfifo(&eboot);
+        let observation = observe_with_deadline(root.clone(), sfo.clone())
+            .expect("observe_ps3_directory blocked on a FIFO PARAM.SFO");
+        assert!(observation.layout.param_sfo.is_none());
+        assert!(!observation.layout.eboot_bin_present);
+        let _ = fs::OpenOptions::new().read(true).write(true).open(&eboot);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Night Watch G6-04: a symlinked `PS3_DISC.SFB` is never followed - not
+    /// to a FIFO outside the folder (which would block) and not to a real
+    /// `.SFB` outside the folder (which would become evidence).
+    #[cfg(unix)]
+    #[test]
+    fn observe_ps3_directory_does_not_follow_a_symlinked_disc_sfb() {
+        let root = temp_dir("observe-sfb-symlink");
+        let outside = temp_dir("observe-sfb-symlink-outside");
+        fs::create_dir_all(root.join("PS3_GAME").join("USRDIR")).unwrap();
+        let target = outside.join("fifo");
+        mkfifo(&target);
+        std::os::unix::fs::symlink(&target, root.join("PS3_DISC.SFB")).unwrap();
+        let observation = observe_with_deadline(root.clone(), target)
+            .expect("observe_ps3_directory followed PS3_DISC.SFB to a FIFO outside the folder");
+        assert!(!observation.disc_sfb_present);
+        fs::remove_file(root.join("PS3_DISC.SFB")).unwrap();
+        write_file(&outside.join("real.SFB"), b".SFB\x00\x01\x00\x00padding");
+        std::os::unix::fs::symlink(outside.join("real.SFB"), root.join("PS3_DISC.SFB")).unwrap();
+        assert!(!observe_ps3_directory(&root).disc_sfb_present);
+        // The same file in place, not linked, is evidence.
+        fs::remove_file(root.join("PS3_DISC.SFB")).unwrap();
+        write_file(&root.join("PS3_DISC.SFB"), b".SFB\x00\x01\x00\x00padding");
+        assert!(observe_ps3_directory(&root).disc_sfb_present);
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn observe_ps3_directory_accepts_a_relative_root() {
+        let root = temp_dir("observe-relative-root");
+        fs::create_dir_all(root.join("PS3_GAME").join("USRDIR")).unwrap();
+        write_file(&root.join("PS3_GAME/USRDIR/EBOOT.BIN"), b"SCE\0header");
+        write_file(&root.join("PS3_DISC.SFB"), b".SFB\x00\x01\x00\x00padding");
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        let relative = relative.join(root.strip_prefix("/").unwrap());
+        let observation = observe_ps3_directory(&relative);
+        assert!(observation.layout.ps3_game_dir_present);
+        assert!(observation.layout.eboot_bin_present);
+        assert!(observation.disc_sfb_present);
+        fs::remove_dir_all(&root).ok();
     }
 }

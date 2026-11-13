@@ -4,6 +4,7 @@ fn finding(id: i64, tier: Tier, detected: &str, folder: &str) -> Finding {
     Finding {
         archive_id: id,
         title: format!("Game {id}"),
+        path: PathBuf::from(folder).join(format!("Game {id}.zip")),
         folder: PathBuf::from(folder),
         assigned: "SNES".into(),
         assigned_source: Some("folder_alias".into()),
@@ -83,20 +84,9 @@ fn review_list_groups_by_detected_system_then_tier() {
 }
 
 #[test]
-fn mixed_folder_reports_fraction_not_a_verdict() {
-    let text = disagreement_text(3, 10);
-    assert!(text.starts_with("3 of 10 checked games"));
-    assert!(text.contains("each game is judged on its own"));
-    assert_eq!(
-        disagreement_text(0, 0),
-        "No games were read in this folder."
-    );
-}
-
-#[test]
 fn playable_note_explains_unh_for_nes_only() {
     assert!(playable_note("NES", true).contains(".unh"));
-    assert!(playable_note("NES", true).contains("not accepted"));
+    assert!(playable_note("NES", true).contains("staged for the emulator"));
     assert!(!playable_note("NES", false).contains(".unh"));
     assert!(!playable_note("Game Boy", true).contains(".unh"));
     assert!(playable_note("Game Boy", true).contains("does not necessarily make the ROM playable"));
@@ -121,8 +111,8 @@ fn choose_system_preview_shows_current_source_suggestion_evidence_and_effect() {
         display_name_for("NES")
     )));
     assert!(lines.contains("Evidence: Catalogue X"));
-    assert!(lines.contains("not accepted by Blue's NES identity or launch yet"));
-    assert!(lines.contains("renamed or moved file"));
+    assert!(lines.contains("staged for the emulator"));
+    assert!(lines.contains("remembered by the game's content"));
     assert!(lines.contains("No game file is changed"));
 }
 
@@ -140,10 +130,11 @@ fn preview_without_finding_and_with_differing_choice() {
 fn constants_carry_required_wording() {
     assert_eq!(
         READ_ONLY_NOTE,
-        "This only looks for mismatches. Nothing is changed or moved."
+        "Checking only reads. Nothing moves until you review the preview and approve it."
     );
-    assert!(KNOWN_LIMITS.contains("renamed or moved"));
-    assert!(KNOWN_LIMITS.contains("removing a source folder deletes"));
+    assert!(KNOWN_LIMITS.contains("renamed or moved file"));
+    assert!(KNOWN_LIMITS.contains("remembered by the game's content"));
+    assert!(KNOWN_LIMITS.contains("Undo"));
     assert!(KNOWN_LIMITS.contains("Probable"));
 }
 
@@ -173,12 +164,14 @@ fn unh_note_in_preview_needs_nes_and_a_real_unh_file() {
 
 #[test]
 fn progress_text_separates_each_kind_and_shows_stopped_early() {
-    let t = progress_text(40, 100, true, 1, 2, 3);
+    let t = progress_text(40, 100, true, 4, 1, 2, 3);
     assert!(t.starts_with("Stopped early - 40 of 100 checked."));
+    assert!(t.contains("4 no longer at their recorded location"));
     assert!(t.contains("1 could not be read."));
     assert!(t.contains("2 too large to check."));
     assert!(t.contains("3 skipped"));
-    let ok = progress_text(100, 100, false, 0, 0, 0);
+    let ok = progress_text(100, 100, false, 0, 0, 0, 0);
+    assert!(!ok.contains("location"));
     assert!(ok.starts_with("Checked 100 of 100"));
     assert!(!ok.contains("too large") && !ok.contains("skipped") && !ok.contains("read"));
 }
@@ -227,4 +220,9 @@ fn partial_catalogue_list_is_not_cached_and_stop_is_surfaced() {
         .unwrap();
     state.poll();
     assert!(state.catalogues.is_none());
+}
+
+#[test]
+fn limits_say_probable_results_never_move_on_their_own() {
+    assert!(KNOWN_LIMITS.contains("never moves on its own"));
 }

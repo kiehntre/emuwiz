@@ -680,7 +680,12 @@ mod tests {
             .unwrap()
             .set_modified(modified)
             .unwrap();
-        assert_eq!(capture(path), request.content_identity);
+        // Device, inode, size and mtime are unchanged by construction (ctime
+        // moves whenever the kernel's timestamp tick did); either check refuses.
+        let four = |i: crate::launch::process_spawn::CapturedFileIdentity| {
+            (i.device, i.inode, i.size, i.modified)
+        };
+        assert_eq!(four(capture(path)), four(request.content_identity));
         assert_eq!(
             preflight_mgba_launch(&request, &roots, &identity)
                 .unwrap_err()
@@ -698,7 +703,13 @@ mod tests {
             .unwrap()
             .set_modified(modified)
             .unwrap();
-        assert_eq!(capture(config), request.config_identity.unwrap());
+        let four = |i: crate::launch::process_spawn::CapturedFileIdentity| {
+            (i.device, i.inode, i.size, i.modified)
+        };
+        assert_eq!(
+            four(capture(config)),
+            four(request.config_identity.unwrap())
+        );
         assert_eq!(
             preflight_mgba_launch(&request, &roots, &identity)
                 .unwrap_err()

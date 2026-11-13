@@ -64,6 +64,11 @@ pub enum ApplyError {
     Journal(String),
     /// The batch was cancelled before any mutation.
     Cancelled,
+    /// Approved sources no longer match the audit evidence their proposals
+    /// were built from (rewritten, replaced, moved or gone). The whole batch
+    /// is refused before any journal write or rename; a fresh audit is the
+    /// only way forward.
+    SourceChangedSinceAudit(Vec<ChangedSource>),
     /// The transaction has already reached (or begun entering) a rollback
     /// or otherwise-settled terminal state and must never be resumed by a
     /// fresh apply call - a caller must build a new transaction instead.
@@ -100,6 +105,34 @@ impl std::fmt::Display for ApplyError {
             Self::InvalidTransactionId(id) => write!(f, "transaction id '{id}' is not usable"),
             Self::Journal(detail) => write!(f, "could not write the transaction journal: {detail}"),
             Self::Cancelled => write!(f, "the apply was cancelled"),
+            Self::SourceChangedSinceAudit(changed) => {
+                let shown = changed
+                    .iter()
+                    .take(3)
+                    .map(|change| {
+                        let name = change
+                            .path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| change.path.to_string_lossy().into_owned());
+                        format!("{name}: {}", change.reason.describe())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let more = changed.len().saturating_sub(3);
+                write!(
+                    f,
+                    "{} approved file(s) changed since the audit that verified them ({shown}{}); \
+                     nothing was renamed. Re-run the audit: unchanged files keep their cached \
+                     hashes and only the changed ones are hashed again",
+                    changed.len(),
+                    if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    }
+                )
+            }
             Self::AlreadySettled {
                 transaction_id,
                 state,
@@ -139,7 +172,16 @@ pub fn build_transaction(
             current: current_generation,
         });
     }
-    let entries = build_transaction_entries(plan, approved_paths);
+    let BuiltEntries {
+        entries,
+        changed_since_audit,
+    } = build_transaction_entries(plan, approved_paths);
+    if !changed_since_audit.is_empty() {
+        // Refuse the whole batch: the reviewed plan no longer describes the
+        // files on disk, and a partial batch would silently drop the very
+        // proposals the user approved. Nothing has been written.
+        return Err(ApplyError::SourceChangedSinceAudit(changed_since_audit));
+    }
     if entries.is_empty() {
         return Err(ApplyError::NothingApproved);
     }
@@ -165,13 +207,121 @@ pub fn build_transaction(
     Ok(transaction)
 }
 
+/// Why an approved source no longer matches its audit evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceChangeReason {
+    /// Nothing is at the source path any more (moved, deleted, or unreadable).
+    Missing,
+    /// The file at the path is a different filesystem object (device or inode
+    /// differ): it was replaced, not edited.
+    Replaced,
+    /// The same object has a different size.
+    SizeChanged,
+    /// The same object, same size, but its modification time moved.
+    ModifiedTimeChanged,
+    /// Same object, same size, same modification time, but the change time
+    /// differs: the content was rewritten in place and the mtime put back.
+    RewrittenInPlace,
+    /// The proposal carries no audit evidence at all (neither a fingerprint
+    /// nor an archive identity), so nothing ties it to the verified bytes.
+    NoAuditEvidence,
+    /// The audit recorded a fingerprint without an object stamp, or the
+    /// current observation lacks one, so the two cannot be compared.
+    FingerprintIncomparable,
+    /// An archive proposal's recorded identity (size, mtime, inode, SHA-256)
+    /// no longer matches the archive on disk.
+    IdentityChanged,
+}
+
+impl SourceChangeReason {
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Missing => "no longer at this path",
+            Self::Replaced => "replaced by a different file",
+            Self::SizeChanged => "size changed",
+            Self::ModifiedTimeChanged => "modification time changed",
+            Self::RewrittenInPlace => {
+                "rewritten in place (change time differs; size and mtime unchanged)"
+            }
+            Self::NoAuditEvidence => "no audit evidence is attached to this proposal",
+            Self::FingerprintIncomparable => "audit fingerprint cannot be compared",
+            Self::IdentityChanged => "archive identity changed since the audit",
+        }
+    }
+
+    /// Whether two fingerprints describe the same, unmodified file: size,
+    /// whole-second mtime and the full object stamp (device, inode, change
+    /// time, mtime nanoseconds). The path is deliberately not compared.
+    fn fingerprints_match(
+        audited: &crate::identity_source::hashing::FileFingerprint,
+        current: &crate::identity_source::hashing::FileFingerprint,
+    ) -> bool {
+        audited.size_bytes == current.size_bytes
+            && audited.modified_unix_seconds == current.modified_unix_seconds
+            && audited.object.is_some()
+            && audited.object == current.object
+    }
+
+    fn from_fingerprints(
+        audited: &crate::identity_source::hashing::FileFingerprint,
+        current: &crate::identity_source::hashing::FileFingerprint,
+    ) -> Self {
+        match (&audited.object, &current.object) {
+            (Some(before), Some(after)) => {
+                if before.device != after.device || before.inode != after.inode {
+                    return Self::Replaced;
+                }
+            }
+            _ => return Self::FingerprintIncomparable,
+        }
+        if audited.size_bytes != current.size_bytes {
+            Self::SizeChanged
+        } else if audited.modified_unix_seconds != current.modified_unix_seconds
+            || audited.object.as_ref().map(|o| o.modified_nanoseconds)
+                != current.object.as_ref().map(|o| o.modified_nanoseconds)
+        {
+            Self::ModifiedTimeChanged
+        } else {
+            Self::RewrittenInPlace
+        }
+    }
+}
+
+/// One approved source that failed freshness validation, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedSource {
+    pub path: PathBuf,
+    pub reason: SourceChangeReason,
+}
+
+/// The entries a plan's approved proposals produced, and the approved sources
+/// that no longer match the evidence their proposal was built from.
+#[derive(Debug, Default)]
+pub struct BuiltEntries {
+    pub entries: Vec<TransactionEntry>,
+    /// Approved, applicable proposals whose source is gone, or whose current
+    /// fingerprint/identity differs from the one the audit recorded, each with
+    /// the reason. These are never silently dropped from a batch;
+    /// [`build_transaction`] refuses the batch when this is non-empty. The
+    /// audit evidence of the *unchanged* files is untouched by the refusal:
+    /// a fresh audit reuses their cached hashes and hashes only these.
+    pub changed_since_audit: Vec<ChangedSource>,
+}
+
 /// Builds the transaction entries for the approved, actionable proposals of a
 /// plan, capturing each source's current identity. Read-only.
+///
+/// A proposal that carries audit-time evidence (`audited_fingerprint` for a
+/// loose file, `audited_identity` for an archive) is bound to it: the entry is
+/// built only if the file at the source path still observes to that evidence,
+/// so the identity verdict the user reviewed and the bytes about to be renamed
+/// are the same bytes. Anything else is reported in `changed_since_audit`.
 pub fn build_transaction_entries(
     plan: &RenamePlan,
     approved_paths: &BTreeSet<String>,
-) -> Vec<TransactionEntry> {
-    let mut entries = Vec::new();
+) -> BuiltEntries {
+    let mut built = BuiltEntries::default();
+    let entries = &mut built.entries;
     for proposal in &plan.proposals {
         if !is_applicable_proposal(proposal) {
             continue;
@@ -185,13 +335,69 @@ pub fn build_transaction_entries(
         let Some(parent) = proposal.source_path.parent() else {
             continue;
         };
+        if let Some(audited) = proposal.audited_fingerprint.as_ref() {
+            let current =
+                crate::identity_source::hashing::FileFingerprint::observe(&proposal.source_path);
+            match current {
+                None => {
+                    built.changed_since_audit.push(ChangedSource {
+                        path: proposal.source_path.clone(),
+                        reason: SourceChangeReason::Missing,
+                    });
+                    continue;
+                }
+                Some(current) if !SourceChangeReason::fingerprints_match(audited, &current) => {
+                    built.changed_since_audit.push(ChangedSource {
+                        path: proposal.source_path.clone(),
+                        reason: SourceChangeReason::from_fingerprints(audited, &current),
+                    });
+                    continue;
+                }
+                Some(_) => {}
+            }
+        }
+        if proposal.audited_fingerprint.is_none() && proposal.audited_identity.is_none() {
+            // Nothing ties this proposal to the bytes the audit verified, so
+            // capturing "current" identity would bless whatever is on disk.
+            built.changed_since_audit.push(ChangedSource {
+                path: proposal.source_path.clone(),
+                reason: SourceChangeReason::NoAuditEvidence,
+            });
+            continue;
+        }
         let Ok(current_identity) = capture_identity(&proposal.source_path) else {
             // The source is gone between plan and build; the entry cannot be
-            // built with a recorded identity, so it is not included.
+            // built with a recorded identity.
+            built.changed_since_audit.push(ChangedSource {
+                path: proposal.source_path.clone(),
+                reason: SourceChangeReason::Missing,
+            });
             continue;
         };
+        if let Some(audited) = proposal.audited_fingerprint.as_ref() {
+            // The identity was captured after the first observation; observe
+            // again so the bytes are bracketed by two matching fingerprints.
+            let after =
+                crate::identity_source::hashing::FileFingerprint::observe(&proposal.source_path);
+            if !after
+                .as_ref()
+                .is_some_and(|after| SourceChangeReason::fingerprints_match(audited, after))
+            {
+                built.changed_since_audit.push(ChangedSource {
+                    path: proposal.source_path.clone(),
+                    reason: after.map_or(SourceChangeReason::Missing, |after| {
+                        SourceChangeReason::from_fingerprints(audited, &after)
+                    }),
+                });
+                continue;
+            }
+        }
         let identity = if let Some(audited) = proposal.audited_identity.as_ref() {
             if !super::identity::identity_matches(audited, &current_identity) {
+                built.changed_since_audit.push(ChangedSource {
+                    path: proposal.source_path.clone(),
+                    reason: SourceChangeReason::IdentityChanged,
+                });
                 continue;
             }
             audited.clone()
@@ -214,7 +420,7 @@ pub fn build_transaction_entries(
             unknown: Default::default(),
         });
     }
-    entries
+    built
 }
 
 /// Whether a proposal may ever be applied: it must be a Suggested, actionable

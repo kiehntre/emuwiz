@@ -127,6 +127,7 @@ fn no_cheats_selected_changes_nothing() {
 fn no_cheats_leaves_the_command_unchanged_even_for_unsupported_targets() {
     let command = RetroArchCommand {
         saturn_core_selection: None,
+        unverified_game_key: None,
         snapshot_evidence: None,
         executable: PathBuf::from("/usr/bin/retroarch"),
         arguments: vec![

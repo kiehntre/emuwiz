@@ -522,3 +522,96 @@ fn managed_redump_ps2_evidence_satisfies_the_existing_pcsx2_bios_matcher() {
     let outcome = resolve_pcsx2_bios(&root, &empty_global_config(), &evidence);
     assert!(matches!(outcome, Pcsx2BiosVerificationOutcome::Verified(_)));
 }
+
+fn profile_at(root: &std::path::Path) -> Pcsx2Profile {
+    use super::super::pcsx2_local::{Pcsx2InstallationType, Pcsx2ProfileScope};
+    Pcsx2Profile {
+        profile_id: "pcsx2-bios-only-test".to_string(),
+        installation_type: Pcsx2InstallationType::Native,
+        scope: Pcsx2ProfileScope::User,
+        configuration_path: root.to_path_buf(),
+        provenance: "test fixture",
+        eligible: true,
+        blockers: Vec::new(),
+        patch_directories: Vec::new(),
+        configuration_identity: None,
+        executable_candidates: Vec::new(),
+    }
+}
+
+/// The BIOS-only answer the launch planner uses is the same answer the full
+/// game inspection gives, for every BIOS state.
+#[test]
+fn bios_only_verification_matches_the_full_inspection() {
+    let request = Pcsx2GameRequest {
+        verified_ps2_serial: None,
+        verified_executable_crc: None,
+        emulator_serial: None,
+    };
+    let full = |profile: &Pcsx2Profile, evidence: &[FirmwareIdentityRecord]| {
+        inspect_pcsx2_game_with_firmware_evidence(profile, &request, evidence)
+            .inspection
+            .bios
+            .verification
+    };
+
+    // No bios directory at all.
+    let missing = fixture_root("bios-only-missing");
+    let profile = profile_at(&missing);
+    assert_eq!(
+        pcsx2_profile_bios_verification(&profile, &[]),
+        full(&profile, &[])
+    );
+    assert_eq!(
+        pcsx2_profile_bios_verification(&profile, &[]),
+        Pcsx2BiosVerification::Missing
+    );
+
+    // A BIOS that matches the evidence.
+    let verified = fixture_root("bios-only-verified");
+    write_bios(&verified.join("bios"), "scph-test.bin", BIOS_BYTES);
+    let evidence = vec![record_for("scph-test.bin", BIOS_BYTES)];
+    let profile = profile_at(&verified);
+    assert_eq!(
+        pcsx2_profile_bios_verification(&profile, &evidence),
+        full(&profile, &evidence)
+    );
+    assert_eq!(
+        pcsx2_profile_bios_verification(&profile, &evidence),
+        Pcsx2BiosVerification::Verified
+    );
+    // The same file without evidence is not verified, in both paths.
+    assert_eq!(
+        pcsx2_profile_bios_verification(&profile, &[]),
+        full(&profile, &[])
+    );
+    assert_ne!(
+        pcsx2_profile_bios_verification(&profile, &[]),
+        Pcsx2BiosVerification::Verified
+    );
+
+    // A configured BIOS name in the global settings is honoured by both.
+    let configured = fixture_root("bios-only-configured");
+    write_bios(&configured.join("bios"), "a.bin", BIOS_BYTES);
+    write_bios(
+        &configured.join("bios"),
+        "b.bin",
+        b"other synthetic bytes, not a BIOS",
+    );
+    fs::create_dir_all(configured.join("inis")).unwrap();
+    fs::write(
+        configured.join("inis/PCSX2.ini"),
+        "[Filenames]\nBIOS = a.bin\n",
+    )
+    .unwrap();
+    let evidence = vec![record_for("a.bin", BIOS_BYTES)];
+    let profile = profile_at(&configured);
+    assert_eq!(
+        pcsx2_profile_bios_verification(&profile, &evidence),
+        full(&profile, &evidence)
+    );
+
+    for root in [missing, verified, configured] {
+        let _ = fs::remove_dir_all(root);
+    }
+}

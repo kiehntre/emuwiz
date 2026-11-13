@@ -641,10 +641,12 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             })
         }
         Command::Load { scan } => {
+            let mut scan_note = None;
             let scan_warning = if scan {
                 let summary = archivefs_core::scan_all_enabled_sources_default()
                     .map_err(|error| error.to_string())?;
-                (!summary.folder_errors.is_empty()).then(|| format!("{} game folders could not be read. Their previous entries were kept. Reconnect the drive or review Sources, then scan again.", summary.folder_errors.len()))
+                scan_note = scan_mount_note(&summary);
+                scan_warning_text(&summary)
             } else {
                 None
             };
@@ -655,6 +657,7 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             let mut library = load_library(&path)?;
             library.sources = sources;
             library.scan_warning = scan_warning;
+            library.scan_note = scan_note;
             Ok(Payload::Library(Arc::new(library)))
         }
         Command::Filter {
@@ -1050,6 +1053,11 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                     reporter.flush();
                     state.rollback();
                 }
+                super::CanonicalOrganisationJobKind::Rescan => {
+                    reporter.phase("Finding your game files", "folders", None);
+                    reporter.flush();
+                    state.rescan_sources();
+                }
             }
             Ok(Payload::CanonicalOrganisation {
                 state,
@@ -1092,6 +1100,82 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 &archivefs_core::save_snapshots::history::default_closure_observer(),
             ),
         }),
+    }
+}
+
+/// The Activity/notice text for a scan that saved but left folders, or
+/// archive mounts inside them, partly or wholly unread. Names the first real
+/// reason: "reconnect the drive" is wrong when the drive is present.
+pub(super) fn scan_warning_text(summary: &archivefs_core::ScanPersistSummary) -> Option<String> {
+    let mut parts = Vec::new();
+    let folder_errors = &summary.folder_errors;
+    if let Some((path, reason)) = folder_errors.first() {
+        parts.push(format!(
+            "{} game folder{} not fully scanned. Everything else was saved; entries EmuWiz could not check were kept, not marked missing. {}: {}{}",
+            folder_errors.len(),
+            if folder_errors.len() == 1 { " was" } else { "s were" },
+            path.display(),
+            reason,
+            more_text(folder_errors.len()),
+        ));
+    }
+    let attention: Vec<_> = summary
+        .nested_mounts
+        .iter()
+        .filter(|mount| {
+            use archivefs_core::NestedMountState::*;
+            matches!(mount.state, Incomplete | Unavailable | Unsupported | Failed)
+        })
+        .collect();
+    if let Some(first) = attention.first() {
+        parts.push(format!(
+            "{} mounted folder{} inside your game folders {} not fully read; {} games were kept, not marked missing. {}: {}{}",
+            attention.len(),
+            if attention.len() == 1 { "" } else { "s" },
+            if attention.len() == 1 { "was" } else { "were" },
+            if attention.len() == 1 { "its" } else { "their" },
+            first.path.display(),
+            first.detail.as_deref().unwrap_or("not read"),
+            more_text(attention.len()),
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Informational line for archive mounts that were read: how many games
+/// they hold, and whether missing games there wait for the next scan.
+pub(super) fn scan_mount_note(summary: &archivefs_core::ScanPersistSummary) -> Option<String> {
+    let indexed: Vec<_> = summary
+        .nested_mounts
+        .iter()
+        .filter(|mount| mount.state.indexed())
+        .collect();
+    if indexed.is_empty() {
+        return None;
+    }
+    let games: usize = indexed.iter().map(|mount| mount.archives).sum();
+    let waiting = indexed
+        .iter()
+        .filter(|mount| !mount.state.reconciled())
+        .count();
+    Some(format!(
+        "Read {} mounted archive folder{} ({games} games).{}",
+        indexed.len(),
+        if indexed.len() == 1 { "" } else { "s" },
+        match waiting {
+            0 => String::new(),
+            n => format!(
+                " {n} {} new or changed, so missing games there are checked from the next scan.",
+                if n == 1 { "is" } else { "are" }
+            ),
+        }
+    ))
+}
+
+fn more_text(count: usize) -> String {
+    match count {
+        0 | 1 => String::new(),
+        n => format!(" ({} more in the scan details)", n - 1),
     }
 }
 
@@ -1153,7 +1237,13 @@ pub(super) fn load_library_with_catalogues(
     .filter(|result| !result.stale)
     .filter_map(|result| result.archive_id)
     .collect();
-    let mut library = Library::with_history(archives, &renames, Some(&configured));
+    // An old-location row is retired only when its path is confirmed absent;
+    // any other error (permission, I/O) keeps it listed.
+    let mut library =
+        Library::with_history_retiring(archives, &renames, Some(&configured), |path| {
+            std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        });
     library.identity_context = super::library::IdentityContext {
         inventory: crate::dat_catalogue_picker::reference_inventory(),
         matched,

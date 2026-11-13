@@ -381,7 +381,7 @@ fn loose_mega_drive_record(path: &str) -> ArchiveRecord {
     )
 }
 
-fn cheat_profile(profile_id: &str, eligible: bool) -> RetroArchCheatSetupProfile {
+pub(crate) fn cheat_profile(profile_id: &str, eligible: bool) -> RetroArchCheatSetupProfile {
     RetroArchCheatSetupProfile {
         profile_id: profile_id.to_string(),
         installation_type: ProfileKind::Native,
@@ -408,7 +408,9 @@ fn cheat_profile(profile_id: &str, eligible: bool) -> RetroArchCheatSetupProfile
     }
 }
 
-fn cheat_discovery(profiles: Vec<RetroArchCheatSetupProfile>) -> RetroArchCheatSetupDiscovery {
+pub(crate) fn cheat_discovery(
+    profiles: Vec<RetroArchCheatSetupProfile>,
+) -> RetroArchCheatSetupDiscovery {
     RetroArchCheatSetupDiscovery {
         schema_version: RETROARCH_CHEAT_SETUP_SCHEMA_VERSION,
         profiles,
@@ -657,7 +659,7 @@ pub(crate) fn app_with_cheats_mods_context() -> ArchiveFsApp {
     app
 }
 
-fn pcsx2_profile_fixture() -> Pcsx2Profile {
+pub(crate) fn pcsx2_profile_fixture() -> Pcsx2Profile {
     Pcsx2Profile {
         profile_id: "pcsx2-native-test".to_string(),
         installation_type: Pcsx2InstallationType::Native,
@@ -1144,6 +1146,10 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         snapshot_stale: false,
         catalogued_scummvm_folder: None,
         catalogued_platform_hint: None,
+        catalogued_platform_source: None,
+        launch_system_trial: None,
+        launch_remember_choice: None,
+        launch_remember_error: None,
         catalogued_row_health: None,
         catalogued_loose_content: None,
         refresh_generation: RefreshGeneration::INITIAL,
@@ -1200,6 +1206,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         // `~/.config/archivefs/library_views.json` happens to contain.
         library_views: Vec::new(),
         library_view_action: None,
+        external_catalogue_writer_busy: false,
         library_view_last_plan: None,
         library_view_form_dialog: None,
         library_view_remove_dialog: None,
@@ -1563,6 +1570,7 @@ fn skipped_files_summary(
         ingestion_skip_reasons: Default::default(),
         ingestion_platform_counts: Default::default(),
         arcade_ingestion: Default::default(),
+        nested_mounts: Vec::new(),
         ingestion_skipped: Vec::new(),
         ingestion_recognised_sample: Vec::new(),
     }

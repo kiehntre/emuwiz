@@ -74,7 +74,11 @@ use crate::emulator_environment::{
     BoundedReadResult, HostReadOnlyFilesystem, ReadOnlyHostFilesystem,
 };
 
-use super::cheat_catalogue::{CheatAvailabilityEntry, MAX_CATALOGUE_FILE_BYTES};
+use super::anchored_fs::{DirectoryHandle, DirectoryIdentity};
+use super::cheat_catalogue::{
+    CheatAvailabilityEntry, CheatCatalogueFormat, MAX_CATALOGUE_FILE_BYTES,
+    NO_INSTALLABLE_CHEATS_REASON, cheat_destination_file_name, render_installable_cheat_document,
+};
 use super::cheat_install_result::{
     CHEAT_INSTALL_RUN_SCHEMA_VERSION, CheatInstallEntryResult, CheatInstallOutcome,
     CheatInstallPath, CheatInstallRun, CheatInstallRunStatus, CheatInstallSummary,
@@ -117,8 +121,30 @@ enum FaultPoint {
 }
 
 #[cfg(test)]
+type AnchorHook = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
 thread_local! {
     static INJECTED_FAULT: std::cell::Cell<Option<FaultPoint>> = const { std::cell::Cell::new(None) };
+    /// Runs with the destination root right before the installer opens its
+    /// directory handle for a write - the window in which a parent
+    /// directory could be swapped for a symlink (Night Watch D7-03).
+    static BEFORE_ANCHOR_HOOK: std::cell::RefCell<Option<AnchorHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_anchor_hook_for_test(hook: Option<AnchorHook>) {
+    BEFORE_ANCHOR_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
+fn run_before_anchor_hook(_root: &Path) {
+    #[cfg(test)]
+    BEFORE_ANCHOR_HOOK.with(|cell| {
+        if let Some(hook) = cell.borrow().as_ref() {
+            hook(_root);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -492,16 +518,64 @@ fn install_one_entry(
             );
         }
     };
-    let observed_source_hash = hex_sha256(&source_bytes);
-    result.observed_source_hash = Some(observed_source_hash.clone());
-    if Some(observed_source_hash.as_str()) != result.expected_source_hash.as_deref() {
-        return reject(
-            result,
-            CheatInstallOutcome::SkippedSourceChanged,
-            "source_hash_changed_since_preview",
-            "source content changed since the catalogue was previewed",
-        );
-    }
+    let observed_file_hash = hex_sha256(&source_bytes);
+    // --- 1b. What will actually be written (Night Watch D7-01). ---
+    // A `.cht` source is installed byte for byte, so the file's own hash
+    // must equal the preview's. A JSON manifest describes many games in one
+    // file: the manifest must be unchanged since the preview (its own hash
+    // against the record), and the per-game `.cht` document rendered from
+    // it must hash to exactly what the preview promised. The manifest's
+    // bytes themselves are never written anywhere.
+    let (install_bytes, install_hash) = match record.format {
+        CheatCatalogueFormat::RetroarchChtDirectory => {
+            if Some(observed_file_hash.as_str()) != result.expected_source_hash.as_deref() {
+                result.observed_source_hash = Some(observed_file_hash);
+                return reject(
+                    result,
+                    CheatInstallOutcome::SkippedSourceChanged,
+                    "source_hash_changed_since_preview",
+                    "source content changed since the catalogue was previewed",
+                );
+            }
+            (source_bytes, observed_file_hash)
+        }
+        CheatCatalogueFormat::JsonManifest => {
+            if Some(observed_file_hash.as_str()) != record.source_file_hash.as_deref() {
+                result.observed_source_hash = Some(observed_file_hash);
+                return reject(
+                    result,
+                    CheatInstallOutcome::SkippedSourceChanged,
+                    "source_hash_changed_since_preview",
+                    "the catalogue manifest changed since it was previewed",
+                );
+            }
+            let Some(rendered) = render_installable_cheat_document(record) else {
+                return reject(
+                    result,
+                    CheatInstallOutcome::SkippedNotEligible,
+                    NO_INSTALLABLE_CHEATS_REASON,
+                    "this manifest game lists no cheat with a code, so there is nothing RetroArch could load; nothing was written",
+                );
+            };
+            let rendered_hash = hex_sha256(&rendered);
+            if Some(rendered_hash.as_str()) != result.expected_source_hash.as_deref() {
+                result.observed_source_hash = Some(rendered_hash);
+                return reject(
+                    result,
+                    CheatInstallOutcome::SkippedSourceChanged,
+                    "rendered_document_differs_from_preview",
+                    "the per-game cheat file rendered from the manifest differs from the one the preview showed",
+                );
+            }
+            result.detail.push(format!(
+                "rendered a per-game RetroArch .cht from the catalogue manifest (manifest sha256 {observed_file_hash}); the manifest itself is never installed"
+            ));
+            (rendered, rendered_hash)
+        }
+    };
+    result.observed_source_hash = Some(install_hash.clone());
+    let source_bytes = install_bytes;
+    let observed_source_hash = install_hash;
 
     // --- 2. Reconstruct and revalidate the destination fresh, via destination_safety. ---
     let Some(platform_hint) = record.source_platform.as_deref() else {
@@ -524,7 +598,17 @@ fn install_one_entry(
             "platform hint does not resolve to a known canonical platform",
         );
     };
-    let file_name = format!("{}.cht", record.source_game_name);
+    // Night Watch D7-02: the written name is derived by the same helper
+    // the preview used, so the two can never disagree; a name the helper
+    // refuses (control characters, separators) is never written.
+    let Some(file_name) = cheat_destination_file_name(record) else {
+        return reject(
+            result,
+            CheatInstallOutcome::FailedUnsafePath,
+            "destination_name_unsafe",
+            "the game name is not a safe file name",
+        );
+    };
 
     let assessment = match assess_destination(
         &options.destination_root,
@@ -544,12 +628,39 @@ fn install_one_entry(
 
     let resolved_destination_path = assessment.proposed_destination.path().to_path_buf();
     let resolved_destination = CheatInstallPath::from_path(&resolved_destination_path);
-    if result.destination_path.as_ref() != Some(&resolved_destination) {
-        result.detail.push(
-            "destination path re-resolved at apply time differs from the preview".to_string(),
+    // The assessment works on absolute paths; a preview taken with a
+    // relative `--cheat-destination-root` shows the relative form of the
+    // same path. Compare like with like so only a genuinely different
+    // destination is refused.
+    let same_as_preview = result.destination_path.as_ref().is_some_and(|previewed| {
+        previewed == &resolved_destination
+            || (!previewed.lossy
+                && !resolved_destination.lossy
+                && std::path::absolute(Path::new(&previewed.display))
+                    .ok()
+                    .as_deref()
+                    == Some(resolved_destination_path.as_path()))
+    });
+    if !same_as_preview {
+        // The approved plan is the previewed path; nothing else is ever
+        // written (Night Watch D7-02).
+        result.detail.push(format!(
+            "destination re-resolved at apply time ({}) differs from the previewed path",
+            resolved_destination.display
+        ));
+        return reject(
+            result,
+            CheatInstallOutcome::SkippedDestinationChanged,
+            "destination_differs_from_preview",
+            "the destination path no longer matches the approved preview; nothing was written",
         );
     }
     result.destination_path = Some(resolved_destination);
+    let anchor = WriteAnchor {
+        root: options.destination_root.clone(),
+        platform: canonical_platform.to_string(),
+        file_name: file_name.clone(),
+    };
 
     // --- 3. Batch-level duplicate-destination defense in depth. ---
     if !claimed_destinations.insert(resolved_destination_path.clone()) {
@@ -632,16 +743,12 @@ fn install_one_entry(
 
     match result.outcome {
         CheatInstallOutcome::InstalledNew => {
-            install_new_file(
-                &mut result,
-                assessment.proposed_destination.path(),
-                &source_bytes,
-                &observed_source_hash,
-            );
+            install_new_file(&mut result, &anchor, &source_bytes, &observed_source_hash);
         }
         CheatInstallOutcome::ReplacedWithBackup => {
             replace_with_backup(
                 &mut result,
+                &anchor,
                 &resolved_destination_path,
                 &source_bytes,
                 &observed_source_hash,
@@ -652,6 +759,176 @@ fn install_one_entry(
         _ => unreachable!("already_installed already returned above"),
     }
     result
+}
+
+/// Where a write lands, as the three names the write is anchored to: the
+/// assessed destination root, the canonical platform directory beneath it,
+/// and the file name. Every write opens the root once (no-follow) and does
+/// everything else relative to open directory descriptors, so a directory
+/// swapped for a symlink after the assessment redirects nothing (Night
+/// Watch D7-03).
+struct WriteAnchor {
+    root: PathBuf,
+    platform: String,
+    file_name: String,
+}
+
+/// Opens the platform directory for writing, creating it when `create` is
+/// allowed. The root must already be the plain directory the assessment
+/// saw (compared by device and inode after a no-follow open); the platform
+/// directory is opened relative to that root and must be a plain directory
+/// too.
+fn open_platform_directory(
+    anchor: &WriteAnchor,
+    create: bool,
+) -> Result<DirectoryHandle, (CheatInstallOutcome, String, String)> {
+    run_before_anchor_hook(&anchor.root);
+    let root_metadata = fs::symlink_metadata(&anchor.root).map_err(|error| {
+        (
+            CheatInstallOutcome::FailedUnsafePath,
+            "destination_root_missing".to_string(),
+            format!("{}: {error}", anchor.root.display()),
+        )
+    })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err((
+            CheatInstallOutcome::FailedUnsafePath,
+            "destination_root_not_a_plain_directory".to_string(),
+            format!("{} is not a plain directory", anchor.root.display()),
+        ));
+    }
+    let root = DirectoryHandle::open_verified(
+        &anchor.root,
+        DirectoryIdentity::of_metadata(&root_metadata),
+    )
+    .map_err(|error| {
+        (
+            CheatInstallOutcome::FailedUnsafePath,
+            "destination_root_replaced_before_write".to_string(),
+            format!("{}: {error}", anchor.root.display()),
+        )
+    })?;
+    let platform = OsStr::new(&anchor.platform);
+    let opened = if create {
+        root.open_or_create_child_dir(platform).map(|(dir, _)| dir)
+    } else {
+        root.open_child_dir(platform)
+    };
+    opened.map_err(|error| {
+        let kind = error.kind();
+        if kind == io::ErrorKind::NotFound || kind == io::ErrorKind::AlreadyExists {
+            (
+                CheatInstallOutcome::FailedWrite,
+                "directory_creation_failed".to_string(),
+                format!("{}/{}: {error}", anchor.root.display(), anchor.platform),
+            )
+        } else {
+            (
+                CheatInstallOutcome::FailedUnsafePath,
+                "parent_symlink_rejected".to_string(),
+                format!(
+                    "{}/{} is not a plain directory (replaced since the check?): {error}",
+                    anchor.root.display(),
+                    anchor.platform
+                ),
+            )
+        }
+    })
+}
+
+/// Writes `bytes` to a brand-new temporary file inside `dir`, flushed and
+/// hash-verified through the directory handle, with the same permission
+/// bits as before. Returns the temporary name; on any failure the
+/// temporary file is removed and nothing is left behind.
+fn stage_in_directory(
+    dir: &DirectoryHandle,
+    bytes: &[u8],
+    expected_hash: &str,
+) -> Result<String, (CheatInstallOutcome, String, String)> {
+    let temp_name = unique_temp_component("cheat-install");
+    let temp = OsStr::new(&temp_name);
+    if should_inject(FaultPoint::TempDestinationWrite) {
+        return Err((
+            CheatInstallOutcome::FailedWrite,
+            "injected_temp_write_failure".to_string(),
+            String::new(),
+        ));
+    }
+    let written = (|| -> io::Result<()> {
+        let mut file = dir.create_new_file(temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o644))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = written {
+        let _ = dir.unlink(temp);
+        return Err((
+            CheatInstallOutcome::FailedWrite,
+            "temp_file_write_failed".to_string(),
+            error.to_string(),
+        ));
+    }
+    if let Err(error) = verify_temp_file_hash_in(dir, temp, expected_hash) {
+        let _ = dir.unlink(temp);
+        return Err((
+            CheatInstallOutcome::FailedVerification,
+            "temp_file_hash_mismatch".to_string(),
+            error,
+        ));
+    }
+    Ok(temp_name)
+}
+
+/// Hashes `name` inside `dir` through the directory handle (never by path).
+fn hash_in_directory(dir: &DirectoryHandle, name: &OsStr) -> Result<String, String> {
+    use std::io::Read;
+    let mut file = dir
+        .open_file(name)
+        .map_err(|error| format!("could not open for verification: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    let mut total = 0_usize;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("could not read for verification: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        total += read;
+        if total > MAX_CATALOGUE_FILE_BYTES {
+            return Err("file grew past the catalogue size limit during verification".into());
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn verify_temp_file_hash_in(
+    dir: &DirectoryHandle,
+    name: &OsStr,
+    expected_hash: &str,
+) -> Result<(), String> {
+    if should_inject(FaultPoint::FinalVerification) {
+        return Err("injected verification failure".to_string());
+    }
+    let actual = hash_in_directory(dir, name)?;
+    if actual == expected_hash {
+        Ok(())
+    } else {
+        Err(format!(
+            "verification hash mismatch: expected {expected_hash}, got {actual}"
+        ))
+    }
 }
 
 fn reject(
@@ -678,80 +955,77 @@ fn destination_safety_reason_code(reason: DestinationSafetyFailureReason) -> Str
 
 fn install_new_file(
     result: &mut CheatInstallEntryResult,
-    destination: &Path,
+    anchor: &WriteAnchor,
     source_bytes: &[u8],
     source_hash: &str,
 ) {
-    let Some(parent) = destination.parent() else {
-        result.outcome = CheatInstallOutcome::FailedUnsafePath;
-        result.reason_code = "destination_has_no_parent".to_string();
-        return;
-    };
-
-    if let Err((outcome, reason, detail)) = create_directory_chain(parent) {
+    // The destination root itself may be absent for a first-ever install
+    // (the assessment approved creating it); every level beneath it is
+    // created relative to the opened root, never by path.
+    if fs::symlink_metadata(&anchor.root).is_err()
+        && let Err((outcome, reason, detail)) = create_directory_chain(&anchor.root)
+    {
         result.outcome = outcome;
         result.reason_code = reason;
         result.detail.push(detail);
         return;
     }
+    let dir = match open_platform_directory(anchor, true) {
+        Ok(dir) => dir,
+        Err((outcome, reason, detail)) => {
+            result.outcome = outcome;
+            result.reason_code = reason;
+            result.detail.push(detail);
+            return;
+        }
+    };
+    let temp_name = match stage_in_directory(&dir, source_bytes, source_hash) {
+        Ok(name) => name,
+        Err((outcome, reason, detail)) => {
+            result.outcome = outcome;
+            result.reason_code = reason;
+            if !detail.is_empty() {
+                result.detail.push(detail);
+            }
+            return;
+        }
+    };
+    let temp = OsStr::new(&temp_name);
+    let final_name = OsStr::new(&anchor.file_name);
 
-    let temp_path = parent.join(unique_temp_component("cheat-install"));
-
-    if should_inject(FaultPoint::TempDestinationWrite) {
-        result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "injected_temp_write_failure".to_string();
-        return;
-    }
-    if let Err(error) = write_new_temp_file(&temp_path, source_bytes) {
-        result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "temp_file_write_failed".to_string();
-        result.detail.push(error.to_string());
-        return;
-    }
-
-    if let Err(error) = verify_temp_file_hash(&temp_path, source_hash) {
-        let _ = fs::remove_file(&temp_path);
-        result.outcome = CheatInstallOutcome::FailedVerification;
-        result.reason_code = "temp_file_hash_mismatch".to_string();
-        result.detail.push(error);
-        return;
-    }
-
-    if let Err(error) = set_sensible_file_permissions(&temp_path) {
-        let _ = fs::remove_file(&temp_path);
-        result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "permission_set_failed".to_string();
-        result.detail.push(error.to_string());
-        return;
-    }
-
-    // Revalidate the exact final path immediately before rename: it must
-    // still be genuinely absent.
-    if fs::symlink_metadata(destination).is_ok() {
-        let _ = fs::remove_file(&temp_path);
-        result.outcome = CheatInstallOutcome::SkippedDestinationChanged;
-        result.reason_code = "destination_appeared_before_rename".to_string();
-        result
-            .detail
-            .push("something occupied the destination immediately before rename".to_string());
-        return;
+    // Revalidate the exact final name immediately before rename, through
+    // the same handle: it must still be genuinely absent.
+    match dir.lstat(final_name) {
+        Ok(None) => {}
+        _ => {
+            let _ = dir.unlink(temp);
+            result.outcome = CheatInstallOutcome::SkippedDestinationChanged;
+            result.reason_code = "destination_appeared_before_rename".to_string();
+            result
+                .detail
+                .push("something occupied the destination immediately before rename".to_string());
+            return;
+        }
     }
 
     if should_inject(FaultPoint::Rename) {
-        let _ = fs::remove_file(&temp_path);
+        let _ = dir.unlink(temp);
         result.outcome = CheatInstallOutcome::FailedWrite;
         result.reason_code = "injected_rename_failure".to_string();
         return;
     }
-    if let Err(error) = rename_no_replace(&temp_path, destination) {
-        let _ = fs::remove_file(&temp_path);
+    if let Err(error) = dir.rename_no_replace(temp, final_name) {
+        let _ = dir.unlink(temp);
         result.outcome = CheatInstallOutcome::FailedWrite;
         result.reason_code = "rename_failed".to_string();
         result.detail.push(error.to_string());
         return;
     }
-
-    fsync_directory_best_effort(parent, &mut result.detail);
+    if let Err(error) = dir.sync() {
+        result
+            .detail
+            .push(format!("directory fsync failed (non-fatal): {error}"));
+    }
 
     result.resulting_destination_hash = Some(source_hash.to_string());
     result.previous_destination_state = PreviousDestinationState::Absent;
@@ -762,8 +1036,10 @@ fn install_new_file(
 // Real writes: replace_different (backup, then replace)
 // ---------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn replace_with_backup(
     result: &mut CheatInstallEntryResult,
+    anchor: &WriteAnchor,
     destination: &Path,
     source_bytes: &[u8],
     source_hash: &str,
@@ -839,63 +1115,46 @@ fn replace_with_backup(
     // sequence as a new install - the original destination content is
     // never opened for writing at any point; it is only ever read (above,
     // to create the backup) or atomically replaced (below).
-    let Some(parent) = destination.parent() else {
-        result.outcome = CheatInstallOutcome::FailedUnsafePath;
-        result.reason_code = "destination_has_no_parent".to_string();
-        result.detail.push(format!(
-            "backup preserved at {}",
-            backup_final_path.display()
-        ));
-        return;
+    // A verified backup now durably exists. Only now install the
+    // replacement, through the same anchored sequence as a new install.
+    // Publication is an atomic exchange: the displaced file is re-hashed
+    // under the temporary name (where nothing writing by path can reach
+    // it) and the exchange is reversed if it is not the exact file that
+    // was backed up - the original content is never opened for writing
+    // and never overwritten unverified.
+    let backup_note = format!(
+        "original preserved; backup at {}",
+        backup_final_path.display()
+    );
+    let dir = match open_platform_directory(anchor, false) {
+        Ok(dir) => dir,
+        Err((outcome, reason, detail)) => {
+            result.outcome = outcome;
+            result.reason_code = reason;
+            result.detail.push(detail);
+            result.detail.push(backup_note);
+            return;
+        }
     };
-    let temp_path = parent.join(unique_temp_component("cheat-install"));
+    let temp_name = match stage_in_directory(&dir, source_bytes, source_hash) {
+        Ok(name) => name,
+        Err((outcome, reason, detail)) => {
+            result.outcome = outcome;
+            result.reason_code = reason;
+            if !detail.is_empty() {
+                result.detail.push(detail);
+            }
+            result.detail.push(backup_note);
+            return;
+        }
+    };
+    let temp = OsStr::new(&temp_name);
+    let final_name = OsStr::new(&anchor.file_name);
 
-    if should_inject(FaultPoint::TempDestinationWrite) {
-        result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "injected_temp_write_failure".to_string();
-        result.detail.push(format!(
-            "original preserved; backup at {}",
-            backup_final_path.display()
-        ));
-        return;
-    }
-    if let Err(error) = write_new_temp_file(&temp_path, source_bytes) {
-        result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "temp_file_write_failed".to_string();
-        result.detail.push(error.to_string());
-        result.detail.push(format!(
-            "original preserved; backup at {}",
-            backup_final_path.display()
-        ));
-        return;
-    }
-    if let Err(error) = verify_temp_file_hash(&temp_path, source_hash) {
-        let _ = fs::remove_file(&temp_path);
-        result.outcome = CheatInstallOutcome::FailedVerification;
-        result.reason_code = "temp_file_hash_mismatch".to_string();
-        result.detail.push(error);
-        result.detail.push(format!(
-            "original preserved; backup at {}",
-            backup_final_path.display()
-        ));
-        return;
-    }
-    if let Err(error) = set_sensible_file_permissions(&temp_path) {
-        let _ = fs::remove_file(&temp_path);
-        result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "permission_set_failed".to_string();
-        result.detail.push(error.to_string());
-        result.detail.push(format!(
-            "original preserved; backup at {}",
-            backup_final_path.display()
-        ));
-        return;
-    }
-
-    match filesystem.read_bounded(destination, MAX_CATALOGUE_FILE_BYTES) {
-        BoundedReadResult::Ok(bytes) if hex_sha256(&bytes) == previous_hash => {}
+    match hash_in_directory(&dir, final_name) {
+        Ok(hash) if hash == previous_hash => {}
         _ => {
-            let _ = fs::remove_file(&temp_path);
+            let _ = dir.unlink(temp);
             result.outcome = CheatInstallOutcome::SkippedDestinationChanged;
             result.reason_code = "destination_changed_before_replace".to_string();
             result.detail.push(format!(
@@ -907,39 +1166,85 @@ fn replace_with_backup(
     }
 
     if should_inject(FaultPoint::Rename) {
-        let _ = fs::remove_file(&temp_path);
+        let _ = dir.unlink(temp);
         result.outcome = CheatInstallOutcome::FailedWrite;
         result.reason_code = "injected_rename_failure".to_string();
-        result.detail.push(format!(
-            "original preserved; backup at {}",
-            backup_final_path.display()
-        ));
+        result.detail.push(backup_note);
         return;
     }
-    // A replacing rename is the one place a clobbering `fs::rename` is
-    // correct - replacement is the whole point, and the content being
-    // replaced was just verified above and is durably backed up either
-    // way.
-    if let Err(error) = fs::rename(&temp_path, destination) {
-        let _ = fs::remove_file(&temp_path);
+    if let Err(error) = dir.exchange(temp, final_name) {
+        let _ = dir.unlink(temp);
         result.outcome = CheatInstallOutcome::FailedWrite;
-        result.reason_code = "rename_failed".to_string();
-        result.detail.push(error.to_string());
-        result.detail.push(format!(
-            "original preserved; backup at {}",
-            backup_final_path.display()
-        ));
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+        ) {
+            // Only an atomic exchange may replace a user's file: without
+            // one EmuWiz refuses rather than check-then-rename, which
+            // could overwrite a change made in between.
+            result.reason_code = "atomic_replace_unsupported".to_string();
+            result.detail.push(
+                "this folder's filesystem cannot replace files atomically, so the existing file was left exactly as it is; to apply the new cheat file, close RetroArch and copy it over the existing one by hand"
+                    .to_string(),
+            );
+        } else {
+            result.reason_code = "rename_failed".to_string();
+            result.detail.push(error.to_string());
+        }
+        result.detail.push(backup_note);
         return;
     }
-
-    fsync_directory_best_effort(parent, &mut result.detail);
+    // `temp` now names the displaced file. Only the exact backed-up bytes
+    // may be discarded.
+    match hash_in_directory(&dir, temp) {
+        Ok(hash) if hash == previous_hash => {
+            let _ = dir.unlink(temp);
+        }
+        _ => match dir.exchange(temp, final_name) {
+            Ok(()) => {
+                let _ = dir.unlink(temp);
+                result.outcome = CheatInstallOutcome::SkippedDestinationChanged;
+                result.reason_code = "destination_changed_before_replace".to_string();
+                result.detail.push(
+                    "the file changed between the check and the replacement; it was put back untouched"
+                        .to_string(),
+                );
+                result.detail.push(backup_note);
+                return;
+            }
+            Err(error) => {
+                // Our file is live and the user's changed file is still
+                // under the temporary name. Give it a name no cleanup
+                // sweep recognises, and say exactly where it is.
+                let kept_name = format!(
+                    "{}.changed-by-you.{}",
+                    anchor.file_name,
+                    temp_name.trim_start_matches('.')
+                );
+                let kept_at = match dir.rename_no_replace(temp, OsStr::new(&kept_name)) {
+                    Ok(()) => destination.with_file_name(&kept_name),
+                    Err(_) => destination.with_file_name(&temp_name),
+                };
+                result.outcome = CheatInstallOutcome::FailedWrite;
+                result.reason_code = "displaced_file_kept".to_string();
+                result.resulting_destination_hash = Some(source_hash.to_string());
+                result.detail.push(format!(
+                    "the file changed between the check and the replacement and could not be swapped back ({error}); the new cheat file IS in place, and the changed file is kept at {} - nothing was deleted",
+                    kept_at.display()
+                ));
+                result.detail.push(backup_note);
+                return;
+            }
+        },
+    }
+    if let Err(error) = dir.sync() {
+        result
+            .detail
+            .push(format!("directory fsync failed (non-fatal): {error}"));
+    }
     result.resulting_destination_hash = Some(source_hash.to_string());
     result.applied = true;
 }
-
-// ---------------------------------------------------------------------
-// Journal
-// ---------------------------------------------------------------------
 
 /// The deterministic backup path a `replaced_with_backup` entry uses:
 /// `{file_name}.{safe_run_id}.{hash_prefix}.bak` beneath `backup_directory`.
@@ -1187,16 +1492,6 @@ fn write_new_temp_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Verifies the replacement/new content temp file - this is the "final
-/// verification" fault point (it is the last check before the file
-/// becomes visible at its real destination name).
-fn verify_temp_file_hash(path: &Path, expected_hash: &str) -> Result<(), String> {
-    if should_inject(FaultPoint::FinalVerification) {
-        return Err("injected verification failure".to_string());
-    }
-    verify_file_hash_unconditionally(path, expected_hash)
-}
-
 /// Verifies a backup temp file - deliberately not gated by the "final
 /// verification" fault point (that name refers to the replacement
 /// content's own verification, not the backup's); a backup-specific
@@ -1216,19 +1511,6 @@ fn verify_file_hash_unconditionally(path: &Path, expected_hash: &str) -> Result<
         Err(format!(
             "verification hash mismatch: expected {expected_hash}, got {actual}"
         ))
-    }
-}
-
-fn set_sensible_file_permissions(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o644))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
     }
 }
 
@@ -1345,46 +1627,6 @@ pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
         return Err(io::Error::from(io::ErrorKind::AlreadyExists));
     }
     fs::rename(from, to)
-}
-
-/// Atomically swaps the two names (`renameat2(..., RENAME_EXCHANGE)`), so
-/// whatever occupied `b` is afterwards reachable at `a` and can still be
-/// inspected - the primitive `cheat_rollback` uses to replace a file only
-/// if it still holds the expected content, with no check-then-act window.
-/// `Unsupported` where the kernel or filesystem cannot exchange.
-#[cfg(target_os = "linux")]
-pub(crate) fn rename_exchange(a: &Path, b: &Path) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let a_c = std::ffi::CString::new(a.as_os_str().as_bytes())
-        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let b_c = std::ffi::CString::new(b.as_os_str().as_bytes())
-        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    // SAFETY: valid NUL-terminated C strings owned for the duration of the
-    // call; `AT_FDCWD` with absolute paths is documented `renameat2` usage.
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            a_c.as_ptr(),
-            libc::AT_FDCWD,
-            b_c.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP) => {
-            Err(io::Error::new(io::ErrorKind::Unsupported, error))
-        }
-        _ => Err(error),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn rename_exchange(_a: &Path, _b: &Path) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 #[cfg(test)]

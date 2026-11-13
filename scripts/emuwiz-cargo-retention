@@ -1148,6 +1148,14 @@ def completion_problem(record, newest_mtime=0):
     return None
 
 
+def source_of(record):
+    """The real path of a record's source checkout, or None (no record, no checkout)."""
+    wt = (record or {}).get("worktree")
+    if not isinstance(wt, str) or not os.path.isabs(wt) or not os.path.isdir(wt):
+        return None
+    return os.path.realpath(wt)
+
+
 def lifecycle_state(item, record):
     """ACTIVE: in use. PROTECTED: pinned (or pin state unknown). UNTRACKED: no valid
     lifecycle record (legacy). IDLE: tracked, not released. RELEASED: the owner
@@ -1215,6 +1223,15 @@ def evaluate(items, registry, args, census, measured):
         item["process_refs"] = refs
         if refs:
             holds.append("LIVE_PROCESS_REFERENCE")
+        # The executor holds a target whose source checkout is in use (an editor or
+        # language server mapping it, a shell in it).  Plan with the same rule, so a
+        # busy checkout is reported as held here instead of being selected every
+        # cycle, held by the executor, and blocking every other eligible target.
+        source = source_of(record)
+        source_refs = census.refs.get(source, []) if census and source else []
+        item["source_process_refs"] = source_refs
+        if source_refs:
+            holds.append("LIVE_PROCESS_IN_SOURCE")
         if not record:
             holds.append("NO_LIFECYCLE_RECORD")
         m = measured.get(path) or {}
@@ -1244,7 +1261,7 @@ def evaluate(items, registry, args, census, measured):
             holds.append("CONTAINS_MOUNT_POINT")
         item["protected_reasons"] = [h for h in holds if h in (
             "PINNED", "PIN_STATE_UNKNOWN", "BUILD_LOCK_HELD", "RECORDED_BUILD_ALIVE", "LIVE_PROCESS_REFERENCE",
-            "RECENT_ACTIVITY", "DIRECTORY_IDENTITY_CHANGED", "CONTAINS_MOUNT_POINT", "WRITTEN_AFTER_RELEASE",
+            "LIVE_PROCESS_IN_SOURCE", "RECENT_ACTIVITY", "DIRECTORY_IDENTITY_CHANGED", "CONTAINS_MOUNT_POINT", "WRITTEN_AFTER_RELEASE",
         )]
         item["eligible"] = not holds
         item["state"] = lifecycle_state(item, record)
@@ -1264,7 +1281,8 @@ def collect(args, with_measure=True):
             if item.get("symlink") or not os.path.isdir(item["target"]):
                 continue
             measured[item["target"]] = measure_tree(item["target"], seen)
-    census = Census([i["target"] for i in items if not i.get("symlink")])
+    sources = {source_of(i["record"]) for i in items} - {None}
+    census = Census([i["target"] for i in items if not i.get("symlink")] + sorted(sources))
     evaluate(items, registry, args, census, measured)
     for item in items:
         m = measured.get(item["target"]) or {}

@@ -65,6 +65,7 @@ mod retroarch_stop;
 #[cfg(test)]
 pub(crate) use retroarch_stop::retroarch_test_request;
 pub(crate) mod azahar;
+pub(crate) mod hatari;
 pub(crate) mod launch_choice;
 pub(crate) mod openrct2;
 mod rmg;
@@ -147,6 +148,27 @@ pub(crate) enum IdentityUnknownReason {
     AmigaHardDisk,
     /// An Amiga IPF preservation image: not an identity-checked game file.
     AmigaIpf,
+    /// Only the folder (or another automatic hint) says which system this is,
+    /// and the file's format is shared with other systems (payload: the
+    /// system's display name). The person must confirm the system first;
+    /// a folder guess never becomes trusted platform identity by itself.
+    FolderOnly(&'static str),
+    /// No system is recorded for this game at all, but its format is one that
+    /// at least one system with an installed launch route lists, and its own
+    /// bytes rule none of those out. The person may try it once as one of
+    /// them, or remember that choice; nothing is ever saved as the game's
+    /// system (owner decision 2026-11-10).
+    SystemUnknown,
+    /// The file's own header names a system EmuWiz has no launch route for
+    /// (payload: that system's name, e.g. Sega Pico). Every other system is
+    /// contradicted by that header, so nothing is offered to try.
+    NoLaunchRoute(&'static str),
+    /// The file's own header names a different system from the one recorded
+    /// for it (payloads: recorded system, the file's own system).
+    MediaConflict {
+        recorded: &'static str,
+        content: &'static str,
+    },
 }
 
 impl IdentityUnknownReason {
@@ -155,7 +177,14 @@ impl IdentityUnknownReason {
     /// The other reasons have no identity route, so no "Verify identity" or
     /// "Review identity" action is offered for them.
     pub(crate) fn has_identity_screen(self) -> bool {
-        matches!(self, Self::SystemNotChosen | Self::NotConfirmed)
+        matches!(
+            self,
+            Self::SystemNotChosen
+                | Self::NotConfirmed
+                | Self::FolderOnly(_)
+                | Self::SystemUnknown
+                | Self::MediaConflict { .. }
+        )
     }
 
     /// Plain sentence under the page for reasons that have no identity
@@ -165,7 +194,8 @@ impl IdentityUnknownReason {
             Self::NoIdentityCheck(_)
             | Self::UnsupportedFormat(_)
             | Self::AmigaHardDisk
-            | Self::AmigaIpf => Some(self.banner_body()),
+            | Self::AmigaIpf
+            | Self::NoLaunchRoute(_) => Some(self.banner_body()),
             _ => None,
         }
     }
@@ -189,6 +219,18 @@ impl IdentityUnknownReason {
             ),
             Self::AmigaHardDisk => format!("Amiga hard-disk image. {AMIGA_HDF_NOTE}"),
             Self::AmigaIpf => format!("Amiga IPF image. {AMIGA_IPF_NOTE}"),
+            Self::FolderOnly(system) => format!(
+                "Only the folder name says this is a {system} game, and this file format is used by other systems too. Confirm the system on the identity screen to try launching it."
+            ),
+            Self::SystemUnknown => {
+                "No system is recorded for this game. Try it once as a compatible system, or choose the system on the identity screen.".into()
+            }
+            Self::NoLaunchRoute(system) => format!(
+                "The file's own header says this is a {system} game. No emulator installed here starts {system} games, and EmuWiz will not start it as another system. Install one that does (for {system}, the PicoDrive core in RetroArch), then press Retry readiness check."
+            ),
+            Self::MediaConflict { recorded, content } => format!(
+                "This game is recorded as {recorded}, but the file's own header says {content}. EmuWiz will not start it as {recorded}. Change the system on the identity screen."
+            ),
         }
     }
 
@@ -201,6 +243,10 @@ impl IdentityUnknownReason {
             Self::UnsupportedFormat(_) => "File format not supported yet",
             Self::AmigaHardDisk => "Amiga hard-disk image",
             Self::AmigaIpf => "Amiga IPF image",
+            Self::FolderOnly(_) => "System taken from the folder name",
+            Self::SystemUnknown => "System not known",
+            Self::NoLaunchRoute(_) => "No emulator installed for this system",
+            Self::MediaConflict { .. } => "The file says it is for another system",
         }
     }
 
@@ -236,6 +282,32 @@ impl IdentityUnknownReason {
             Self::AmigaIpf => format!(
                 "{AMIGA_IPF_NOTE} EmuWiz does not check an IPF image's identity, so it \
                  cannot start it from here. This is not caused by missing DAT verification."
+            ),
+            Self::FolderOnly(system) => format!(
+                "EmuWiz only knows this is a {system} game from the folder it is in, and this \
+                 file format is shared with other systems, so it will not trust the folder on its \
+                 own. If it really is a {system} game, confirm the system and it can be started \
+                 with a \"game not identified\" warning. Your choice does not identify the game \
+                 or count as catalogue (DAT) verification."
+            ),
+            Self::SystemUnknown => {
+                "EmuWiz has no system recorded for this game and the file does not say which \
+                 system it is for. You can try it once as one of the compatible systems listed \
+                 below (only systems that use this file format and have an installed emulator), \
+                 with a warning, or tick \"Remember this launch choice\" to keep that choice for \
+                 this unchanged file. Neither sets the game's system or identifies the game; \
+                 choose the system permanently on the identity screen for that.".into()
+            }
+            Self::NoLaunchRoute(system) => format!(
+                "The file's own header says this is a {system} game. No installed emulator \
+                 starts {system} games, and the header rules out every other system, so nothing \
+                 is offered to try and nothing is remembered. Nothing is wrong with the file. \
+                 This is not caused by missing DAT verification."
+            ),
+            Self::MediaConflict { recorded, content } => format!(
+                "This game is recorded as {recorded}, but the file's own header says it is a \
+                 {content} game. EmuWiz will not start it with a {recorded} emulator. Change the \
+                 system to match the file, or check whether the file was put in the wrong folder."
             ),
         }
     }
@@ -531,6 +603,7 @@ impl TypedLaunchRequest {
             Self::Standalone(StandaloneLaunchRequest::Mgba(_)) => vec![mgba::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Rmg(_)) => vec![rmg::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Stella(_)) => vec![stella::LIMITATION],
+            Self::Standalone(StandaloneLaunchRequest::Hatari(_)) => vec![hatari::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Snes9x(_)) => vec![snes9x::LIMITATION],
             _ => Vec::new(),
         }
@@ -542,7 +615,9 @@ impl TypedLaunchRequest {
     pub(crate) fn unverified_status_label(&self) -> &'static str {
         match self {
             Self::Standalone(
-                StandaloneLaunchRequest::Desmume(_) | StandaloneLaunchRequest::SameBoy(_),
+                StandaloneLaunchRequest::Desmume(_)
+                | StandaloneLaunchRequest::SameBoy(_)
+                | StandaloneLaunchRequest::Hatari(_),
             ) => "Ready, identity not DAT-verified",
             Self::Standalone(
                 StandaloneLaunchRequest::Mgba(_)
@@ -817,6 +892,15 @@ pub(crate) fn gamer_resolver_notice(
 /// carries the exact typed request that the selected adapter preflights again
 /// before spawning anything.
 pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction {
+    // Atari ST: a single, fully preflighted Hatari profile launches through
+    // the isolated disposable session (see `hatari`).
+    if let LaunchReadinessInput::AtariSt(snapshot) = input
+        && let Some(request) = snapshot.launch_request()
+    {
+        return GamerPlayAction::Launch(Box::new(TypedLaunchRequest::Standalone(
+            StandaloneLaunchRequest::Hatari(request),
+        )));
+    }
     let LaunchReadinessInput::Plan {
         plan,
         retroarch,
@@ -916,6 +1000,13 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         .filter(preferred)
         .filter_map(|candidate| {
             if let Some(request) = flycast.as_ref().and_then(|c| c.request(plan, candidate)) {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Flycast(request),
+                ));
+            }
+            // Direct Dreamcast CHD/CDI: click-time re-verification in
+            // `flycast::DirectRequest::execute`.
+            if let Some(Ok(request)) = flycast::direct_offer_for(plan, candidate) {
                 return Some(TypedLaunchRequest::Standalone(
                     StandaloneLaunchRequest::Flycast(request),
                 ));
@@ -1023,6 +1114,11 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
         .collect();
     // mGBA's offer waits on a one-time Bubblewrap capability check; say so
     // (and keep repainting) rather than showing a generic blocker.
+    if requests.is_empty()
+        && let Some(blocker) = flycast_blocker(plan, plan.candidates.iter().filter(preferred))
+    {
+        return GamerPlayAction::BlockedTyped(blocker);
+    }
     if requests.is_empty() {
         for candidate in plan.candidates.iter().filter(preferred) {
             match mgba::offer_for(plan, candidate) {
@@ -1254,6 +1350,7 @@ pub(crate) enum StandaloneProcess {
     Mgba(archivefs_core::launch::process_spawn::WatchedProcess),
     Desmume(archivefs_core::launch::process_spawn::WatchedProcess),
     Stella(archivefs_core::launch::process_spawn::WatchedProcess),
+    Hatari(archivefs_core::launch::process_spawn::WatchedProcess),
     Snes9x(archivefs_core::launch::process_spawn::WatchedProcess),
     SameBoy(archivefs_core::launch::LaunchedSameBoyProcess),
     Rmg(archivefs_core::launch::process_spawn::WatchedProcess),
@@ -1533,6 +1630,7 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Mgba(p) => p.poll().is_some(),
                     StandaloneProcess::Desmume(p) => p.poll().is_some(),
                     StandaloneProcess::Stella(p) => p.poll().is_some(),
+                    StandaloneProcess::Hatari(p) => p.poll().is_some(),
                     StandaloneProcess::Snes9x(p) => p.poll().is_some(),
                     StandaloneProcess::SameBoy(p) => p.poll().is_some(),
                     StandaloneProcess::Rmg(p) => p.poll().is_some(),
@@ -1607,6 +1705,9 @@ impl StandaloneLaunchState {
             }
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Stella(process)))) => {
                 process.exit_report().and_then(stella::exit_failure)
+            }
+            Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Hatari(process)))) => {
+                process.exit_report().and_then(hatari::exit_failure)
             }
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Snes9x(process)))) => {
                 process.exit_report().and_then(snes9x::exit_failure)
@@ -1793,6 +1894,7 @@ pub(crate) enum StandaloneLaunchRequest {
     Mgba(mgba::Request),
     Desmume(desmume::Request),
     Stella(stella::Request),
+    Hatari(hatari::Request),
     Snes9x(snes9x::Request),
     SameBoy(sameboy::Request),
     Rmg(rmg::Request),
@@ -1848,6 +1950,7 @@ impl StandaloneLaunchRequest {
             Self::Mgba(_) => "mGBA",
             Self::Desmume(_) => "DeSmuME",
             Self::Stella(_) => "Stella",
+            Self::Hatari(_) => "Hatari",
             Self::Snes9x(_) => "Snes9x",
             Self::SameBoy(_) => "SameBoy",
             Self::Rmg(_) => "RMG",
@@ -1881,6 +1984,7 @@ impl StandaloneLaunchRequest {
             Self::Mgba(r) => r.key(),
             Self::Desmume(r) => r.key(),
             Self::Stella(r) => r.key(),
+            Self::Hatari(r) => r.key(),
             Self::Snes9x(r) => r.key(),
             Self::SameBoy(r) => r.key(),
             Self::Rmg(r) => r.key(),
@@ -1925,6 +2029,7 @@ impl StandaloneLaunchRequest {
             Self::Mgba(r) => r.execute().map(StandaloneProcess::Mgba),
             Self::Desmume(r) => r.execute().map(StandaloneProcess::Desmume),
             Self::Stella(r) => r.execute().map(StandaloneProcess::Stella),
+            Self::Hatari(r) => r.execute().map(StandaloneProcess::Hatari),
             Self::Snes9x(r) => r.execute().map(StandaloneProcess::Snes9x),
             Self::SameBoy(r) => r.execute().map(StandaloneProcess::SameBoy),
             Self::Rmg(r) => r.execute().map(StandaloneProcess::Rmg),
@@ -3448,7 +3553,9 @@ fn retroarch_launch_request_unexplained(
         } else {
             None
         },
-        expected_snapshot_evidence: if platform_id == "ZX Spectrum" {
+        expected_snapshot_evidence: if platform_id == "ZX Spectrum"
+            && !archivefs_core::launch::unverified_media::is_unverified_key(game_key)
+        {
             // An unproven snapshot is a game-level refusal, never an
             // installation one.
             let evidence =
@@ -3616,6 +3723,23 @@ fn launch_error_message(error: &LaunchExecutionError) -> (&'static str, String) 
     }
 }
 
+/// The panel's one-line introduction. The DOSBox folder-approval note is
+/// only for DOS games: shown everywhere it read as if a Wii or Acorn game
+/// needed DOSBox (owner screenshot 08, 2026-11-07).
+fn panel_intro(input: &LaunchReadinessInput) -> &'static str {
+    const BASE: &str = "Ways this game can be played. Check emulator readiness and content.";
+    const DOS: &str = "Ways this game can be played. Check emulator readiness and content. DOSBox also requires explicit approval of its local folder and start target; that approval does not verify a release.";
+    let dos = match input {
+        LaunchReadinessInput::DosBoxReview => true,
+        LaunchReadinessInput::Plan { plan, .. } => plan
+            .platform_id
+            .as_deref()
+            .is_some_and(|platform| matches!(platform, "DOS" | "PC")),
+        _ => false,
+    };
+    if dos { DOS } else { BASE }
+}
+
 // The panel's inputs are the read-only launch input, each emulator's own
 // launch tracker and the read-only emulator choices; nothing else.
 #[allow(clippy::too_many_arguments)]
@@ -3635,13 +3759,7 @@ pub(crate) fn show_launch_readiness_panel(
         standalone_launch_state.show_cemu_lifecycle(ui);
         retroarch_launch_state.show_stop_control(ui);
     }
-    widgets::section_header(
-        ui,
-        "Play / Launch readiness",
-        Some(
-            "Ways this game can be played. Check emulator readiness and content. DOSBox also requires explicit approval of its local folder and start target; that approval does not verify a release.",
-        ),
-    );
+    widgets::section_header(ui, "Play / Launch readiness", Some(panel_intro(input)));
 
     match input {
         LaunchReadinessInput::AtariSt(snapshot) => snapshot.show(ui),
@@ -4055,11 +4173,43 @@ fn gba_display_order(
     launchable: impl Fn(&LaunchCandidate) -> bool,
 ) -> Vec<usize> {
     let mut order: Vec<usize> = (0..plan.candidates.len()).collect();
-    if let Some(index) = recommended_gba_candidate(plan, launchable) {
+    if let Some(index) =
+        recommended_gba_candidate(plan, launchable).or_else(|| sega_pico_first_candidate(plan))
+    {
         order.retain(|&i| i != index);
         order.insert(0, index);
     }
     order
+}
+
+/// The Sega Pico card to show first. Cores are listed alphabetically, so a
+/// Genesis Plus GX build whose `.info` lists `Sega - PICO` came before
+/// PicoDrive, the reviewed Pico core whose pen and Storyware controls the page
+/// describes. An explicit saved or one-time choice (Remembered) always comes
+/// first; otherwise the reviewed-preferred PicoDrive card does. Blocked cards
+/// never move. Display only: it never changes the plan, a preference, or what
+/// Play launches, and every other core stays listed as a choice.
+fn sega_pico_first_candidate(plan: &LaunchPlan) -> Option<usize> {
+    if plan.platform_id.as_deref()
+        != Some(archivefs_core::launch::unverified_media::SEGA_PICO_PLATFORM)
+    {
+        return None;
+    }
+    let usable = |c: &LaunchCandidate| c.readiness != LaunchReadiness::Blocked;
+    plan.candidates
+        .iter()
+        .position(|c| usable(c) && c.preference == CandidatePreference::Remembered)
+        .or_else(|| {
+            plan.candidates.iter().position(|c| {
+                usable(c)
+                    && c.preference == CandidatePreference::SoleEligible
+                    && matches!(
+                        &c.target,
+                        LaunchTarget::RetroArchCore { core_stem, .. }
+                            if core_stem == crate::emulator_setup::unverified_media::SEGA_PICO_REVIEWED_CORE
+                    )
+            })
+        })
 }
 
 fn readiness_label_and_tone(readiness: LaunchReadiness) -> (&'static str, widgets::StatusTone) {
@@ -4477,6 +4627,34 @@ fn standalone_container_allowed(adapter_id: &str, container: Option<LaunchContai
     }
 }
 
+/// Whether the candidate's readiness/blockers/warnings permit building a
+/// standalone launch request. Only MAME's own driver flags are tolerated as
+/// warnings: they are informational by contract
+/// (`LaunchWarningKind::MameMachineFlagged`: "never a launch gate"), and real
+/// "not working" verdicts are blockers, not warnings. Any other warning, for
+/// any adapter, still withdraws Play.
+pub(crate) fn standalone_status_allows_request(candidate: &LaunchCandidate) -> bool {
+    if !candidate.blockers.is_empty() {
+        return false;
+    }
+    if candidate.warnings.is_empty() {
+        return candidate.readiness == LaunchReadiness::Ready;
+    }
+    matches!(
+        candidate.target,
+        LaunchTarget::Standalone {
+            adapter_id: "mame",
+            ..
+        }
+    ) && matches!(
+        candidate.readiness,
+        LaunchReadiness::Ready | LaunchReadiness::ReadyWithWarnings
+    ) && candidate
+        .warnings
+        .iter()
+        .all(|warning| warning.kind == LaunchWarningKind::MameMachineFlagged)
+}
+
 fn standalone_launch_request(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
@@ -4487,11 +4665,7 @@ fn standalone_launch_request(
     xenia: Option<&XeniaLaunchContext>,
     melonds: Option<&MelonDsLaunchContext>,
 ) -> Option<StandaloneLaunchRequest> {
-    if candidate.readiness != LaunchReadiness::Ready
-        || !candidate.blockers.is_empty()
-        || !candidate.warnings.is_empty()
-        || candidate.content.requires_mount
-    {
+    if !standalone_status_allows_request(candidate) || candidate.content.requires_mount {
         return None;
     }
     let path = candidate.content.resolved_path.clone()?;
@@ -4796,43 +4970,68 @@ fn mame_launch_request(
             "the MAME logical-set identity is unresolved",
         )
     })?;
-    let database_path = archivefs_core::default_database_path().map_err(|error| {
-        mame_blocker(
-            LaunchBlockerKind::MameSetVerdictUnavailable,
-            format!("the MAME audit database path is unavailable: {error}"),
-        )
-    })?;
-    let database = archivefs_core::Database::open_read_only(database_path).map_err(|error| {
-        mame_blocker(
-            LaunchBlockerKind::MameSetVerdictUnavailable,
-            format!("the MAME audit database cannot be read: {error}"),
-        )
-    })?;
-    let evidence = database
-        .mame_arcade_join_for_archive_path(
-            archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256,
-            &path,
-        )
-        .map_err(|error| {
+    // An extracted set folder is judged by the installed MAME's own per-set
+    // data (cached, probed in the background, never on this thread).
+    // `peek` never starts a probe: only the catalogue-gated readiness build
+    // (arcade_probe_target) does, so an uncatalogued folder is never probed.
+    let arcade_lookup = (platform_id == "Arcade")
+        .then(|| crate::arcade_mame_probe::peek(&executable, &path))
+        .flatten();
+    let (resolution, extra_rompaths) = if let Some(lookup) = arcade_lookup {
+        match lookup {
+            crate::arcade_mame_probe::Lookup::Checking => {
+                return Err(crate::arcade_mame_probe::checking_blocker());
+            }
+            crate::arcade_mame_probe::Lookup::Done(probe) => {
+                if probe.verdict.readiness
+                    == archivefs_core::arcade_mame_routing::ArcadeReadiness::Blocked
+                {
+                    return Err(crate::arcade_mame_probe::blocker_for(&probe));
+                }
+                (probe.resolution.clone(), probe.extra_rompaths.clone())
+            }
+        }
+    } else {
+        let database_path = archivefs_core::default_database_path().map_err(|error| {
             mame_blocker(
                 LaunchBlockerKind::MameSetVerdictUnavailable,
-                format!("the exact MAME audit evidence cannot be read: {error}"),
-            )
-        })?
-        .ok_or_else(|| {
-            mame_blocker(
-                LaunchBlockerKind::MameSetVerdictUnavailable,
-                "no current exact-path MAME audit evidence is available",
+                format!("the MAME audit database path is unavailable: {error}"),
             )
         })?;
-    let resolution =
-        archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(&evidence, &path)
+        let database =
+            archivefs_core::Database::open_read_only(database_path).map_err(|error| {
+                mame_blocker(
+                    LaunchBlockerKind::MameSetVerdictUnavailable,
+                    format!("the MAME audit database cannot be read: {error}"),
+                )
+            })?;
+        let evidence = database
+            .mame_arcade_join_for_archive_path(
+                archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256,
+                &path,
+            )
+            .map_err(|error| {
+                mame_blocker(
+                    LaunchBlockerKind::MameSetVerdictUnavailable,
+                    format!("the exact MAME audit evidence cannot be read: {error}"),
+                )
+            })?
             .ok_or_else(|| {
                 mame_blocker(
                     LaunchBlockerKind::MameSetVerdictUnavailable,
-                    "the persisted MAME audit does not authorize this logical set",
+                    "no current exact-path MAME audit evidence is available",
                 )
             })?;
+        let resolution =
+            archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(&evidence, &path)
+                .ok_or_else(|| {
+                    mame_blocker(
+                        LaunchBlockerKind::MameSetVerdictUnavailable,
+                        "the persisted MAME audit does not authorize this logical set",
+                    )
+                })?;
+        (resolution, Vec::new())
+    };
     let rom_search_path = path.parent().map(Path::to_path_buf).ok_or_else(|| {
         mame_blocker(
             LaunchBlockerKind::MameSearchPathUnconfigured,
@@ -4849,6 +5048,7 @@ fn mame_launch_request(
         selected_content: path,
         expected_content_identity: None,
         rom_search_path,
+        extra_rompaths,
     })
 }
 
@@ -5054,6 +5254,43 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
         },
         LaunchTarget::RetroArchCore { .. } => Some("RetroArch"),
     }
+}
+
+/// Standalone Flycast is the chosen Dreamcast route but cannot start: say
+/// exactly why, naming Flycast, instead of a generic blocker. Nothing else
+/// is started in its place.
+fn flycast_blocker<'a>(
+    plan: &LaunchPlan,
+    preferred: impl Iterator<Item = &'a LaunchCandidate>,
+) -> Option<GamerBlocker> {
+    for candidate in preferred {
+        if !matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "flycast",
+                ..
+            }
+        ) {
+            continue;
+        }
+        let reason = if let Some(blocker) = candidate.blockers.first() {
+            blocker.detail.clone()
+        } else if let Some(warning) = candidate.warnings.first() {
+            format!(
+                "EmuWiz only starts Flycast from a clean check: {}",
+                warning.detail
+            )
+        } else if let Some(Err(reason)) = flycast::direct_offer_for(plan, candidate) {
+            reason
+        } else {
+            continue;
+        };
+        return Some(GamerBlocker::new(
+            GamerBlockerKind::NoSafeEmulator,
+            format!("Flycast cannot start this game: {reason} Nothing else was started instead."),
+        ));
+    }
+    None
 }
 
 /// The generic reason when nothing more specific explains a missing route.
@@ -5673,6 +5910,13 @@ pub(crate) fn show_standalone_launch_action(
                     "Exited"
                 }
             }
+            Some(StandaloneLaunchStage::Exited(StandaloneProcess::Hatari(p))) => {
+                if p.exit_report().and_then(hatari::exit_failure).is_some() {
+                    "Failed"
+                } else {
+                    "Exited"
+                }
+            }
             Some(StandaloneLaunchStage::Exited(StandaloneProcess::Snes9x(p))) => {
                 if p.exit_report().and_then(snes9x::exit_failure).is_some() {
                     "Failed"
@@ -5755,6 +5999,9 @@ pub(crate) fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Stella(p)))) => {
                 stella::show_running(ui, p);
             }
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Hatari(p)))) => {
+                hatari::show_running(ui, p);
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Snes9x(p)))) => {
                 snes9x::show_running(ui, p);
             }
@@ -5808,6 +6055,9 @@ pub(crate) fn show_standalone_launch_action(
                 }
                 if let StandaloneProcess::Stella(p) = process {
                     stella::show_exited(ui, p);
+                }
+                if let StandaloneProcess::Hatari(p) = process {
+                    hatari::show_exited(ui, p);
                 }
                 if let StandaloneProcess::Snes9x(p) = process {
                     snes9x::show_exited(ui, p);
@@ -6600,3 +6850,20 @@ pub(crate) fn show_dolphin_profile_guidance(ui: &mut egui::Ui, input: &LaunchRea
 mod amiga_retry_tests;
 
 pub(crate) mod amiga_boot;
+
+#[cfg(test)]
+mod panel_intro_tests {
+    use super::*;
+
+    #[test]
+    fn the_dosbox_approval_note_is_only_for_dos_games() {
+        assert!(panel_intro(&LaunchReadinessInput::DosBoxReview).contains("DOSBox"));
+        for other in [
+            LaunchReadinessInput::IdentityUnknown(IdentityUnknownReason::NotConfirmed),
+            LaunchReadinessInput::IdentityConflicting,
+            LaunchReadinessInput::EvidenceNotLoaded,
+        ] {
+            assert!(!panel_intro(&other).contains("DOSBox"));
+        }
+    }
+}

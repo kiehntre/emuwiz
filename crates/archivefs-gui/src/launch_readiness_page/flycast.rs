@@ -1,5 +1,9 @@
-//! Blue GDI action over core's existing Flycast planner and stamped preview.
+//! Blue Flycast actions over core's existing Flycast planner: the stamped
+//! GDI preview, plus a direct CHD/CDI request that re-verifies identity,
+//! profile, BIOS and the exact file at click time (same pattern as the
+//! SameBoy/mGBA offers).
 use super::*;
+use archivefs_core::launch::process_spawn::CapturedFileIdentity;
 use archivefs_core::{
     launch::{FlycastLaunchRequest, LaunchContentRef, flycast_gdi_readiness::Preview},
     patch_manager::{
@@ -15,19 +19,241 @@ pub(crate) struct Context {
     pub previews: Vec<(String, Result<Preview, String>)>,
 }
 #[derive(Clone)]
-pub(crate) struct Request {
-    preview: Preview,
-    roots: FlycastProfileDiscoveryRoots,
+pub(crate) enum Request {
+    Gdi {
+        preview: Box<Preview>,
+        roots: FlycastProfileDiscoveryRoots,
+    },
+    Direct(DirectRequest),
 }
 impl Request {
     pub(crate) fn key(&self) -> (PathBuf, String) {
-        (
-            self.preview.request.selected_content_path.clone(),
-            "flycast".into(),
-        )
+        let path = match self {
+            Self::Gdi { preview, .. } => preview.request.selected_content_path.clone(),
+            Self::Direct(direct) => direct.path.clone(),
+        };
+        (path, "flycast".into())
     }
     pub(crate) fn execute(self) -> Result<archivefs_core::launch::LaunchedFlycastProcess, String> {
-        self.preview.launch(&self.roots)
+        match self {
+            Self::Gdi { preview, roots } => preview.launch(&roots),
+            Self::Direct(direct) => direct.execute(),
+        }
+    }
+}
+
+/// Extensions the direct (non-GDI) Flycast Play route accepts. GDI keeps its
+/// companion-freshness preview; ZIP and other archives are never launched.
+pub(crate) const DIRECT_EXTENSIONS: [&str; 2] = ["chd", "cdi"];
+
+fn direct_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| DIRECT_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+/// A Ready standalone Flycast candidate for one direct `.chd`/`.cdi` file.
+/// Building it reads only metadata; [`DirectRequest::execute`] repeats the
+/// full identity, profile, BIOS and file checks before anything starts.
+#[derive(Clone)]
+pub(crate) struct DirectRequest {
+    path: PathBuf,
+    profile_id: String,
+    platform_id: String,
+    game_key: String,
+    file: CapturedFileIdentity,
+}
+
+impl DirectRequest {
+    fn offer(plan: &LaunchPlan, candidate: &LaunchCandidate) -> Result<Self, String> {
+        let LaunchTarget::Standalone {
+            adapter_id: "flycast",
+            profile_id,
+            ..
+        } = &candidate.target
+        else {
+            return Err("The selected candidate is not standalone Flycast.".into());
+        };
+        if candidate.readiness != LaunchReadiness::Ready
+            || !candidate.blockers.is_empty()
+            || !candidate.warnings.is_empty()
+            || candidate.content.requires_mount
+            || candidate.content.container != Some(LaunchContainerKind::PlainFile)
+        {
+            return Err(
+                "Flycast only starts from a clean check of a direct Dreamcast disc file. Resolve the listed blockers first."
+                    .into(),
+            );
+        }
+        if plan.platform_id.as_deref() != Some("Dreamcast") {
+            return Err("Flycast requires a verified Dreamcast identity.".into());
+        }
+        let game_key = plan
+            .game_key
+            .clone()
+            .ok_or("Game identity is unresolved. Recheck this game.")?;
+        let path = candidate
+            .content
+            .resolved_path
+            .clone()
+            .ok_or("No direct disc path is available.")?;
+        if !path.is_absolute() || !direct_extension(&path) {
+            return Err(
+                "Flycast Play needs a direct .chd or .cdi disc file here; archives are not opened."
+                    .into(),
+            );
+        }
+        Ok(Self {
+            file: capture(&path)?,
+            path,
+            profile_id: profile_id.clone(),
+            platform_id: "Dreamcast".into(),
+            game_key,
+        })
+    }
+
+    fn execute(self) -> Result<archivefs_core::launch::LaunchedFlycastProcess, String> {
+        let roots = FlycastProfileDiscoveryRoots::from_environment()
+            .map_err(|e| format!("Flycast profile roots are unavailable: {e}"))?;
+        if capture(&self.path)? != self.file {
+            return Err("The disc file changed since Play was offered. Recheck this game.".into());
+        }
+        let profile = discover_flycast_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|p| p.profile_id == self.profile_id)
+            .ok_or("The selected Flycast profile was not rediscovered. Recheck emulator setup.")?;
+        let binding = resolve_flycast_native_launch_binding(&profile)
+            .map_err(|e| format!("Flycast cannot be used: {}", e.detail))?;
+        let report = archivefs_core::game_identity::inspect_catalogued_game_identity(
+            &self.path,
+            Some("Dreamcast"),
+        );
+        let (identity, facts) =
+            archivefs_core::launch::evidence_bridge::canonical_identity_from_game_report(&report);
+        match &identity {
+            CanonicalIdentityStatus::Resolved(id) if id.game_key == self.game_key => {}
+            _ => {
+                return Err(
+                    "Fresh disc identity no longer matches the selected game. Recheck this game."
+                        .into(),
+                );
+            }
+        }
+        let product = facts
+            .iter()
+            .find_map(|f| match f {
+                archivefs_core::launch::VerifiedIdentityFact::DreamcastProductCode(code) => {
+                    Some(code.clone())
+                }
+                _ => None,
+            })
+            .ok_or("No verified Dreamcast product code was read from the disc.")?;
+        let request = FlycastLaunchRequest {
+            selected_content_path: self.path.clone(),
+            expected_platform_id: self.platform_id.clone(),
+            expected_game_key: self.game_key.clone(),
+            expected_dreamcast_product_code: product,
+            profile_id: self.profile_id.clone(),
+            expected_executable: binding.executable,
+        };
+        let command = archivefs_core::launch::preflight_flycast_launch(&request, &roots)
+            .map_err(|e| format!("Flycast was not started: {}", e.detail))?;
+        if capture(&self.path)? != self.file {
+            return Err(
+                "The disc file changed during the launch check. Nothing was started.".into(),
+            );
+        }
+        archivefs_core::launch::spawn_flycast(command)
+            .map_err(|e| format!("Flycast could not start: {e:?}"))
+    }
+}
+
+fn capture(path: &Path) -> Result<CapturedFileIdentity, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("The Dreamcast disc is not a regular, non-symlink file.".into());
+    }
+    Ok(CapturedFileIdentity::capture(&metadata))
+}
+
+/// The direct CHD/CDI offer for one candidate, or `None` when this route
+/// does not apply (not Flycast, or a GDI handled by the stamped preview).
+pub(crate) fn direct_offer_for(
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+) -> Option<Result<Request, String>> {
+    if !matches!(
+        candidate.target,
+        LaunchTarget::Standalone {
+            adapter_id: "flycast",
+            ..
+        }
+    ) {
+        return None;
+    }
+    let path = candidate.content.resolved_path.as_deref()?;
+    direct_extension(path).then(|| DirectRequest::offer(plan, candidate).map(Request::Direct))
+}
+
+/// Dreamcast route preference. When a standalone Flycast profile exists and
+/// nothing is remembered, standalone Flycast is the automatic choice: a
+/// RetroArch Flycast core stays available only as an explicit emulator
+/// choice, so Play never silently switches emulators. If standalone Flycast
+/// is installed but blocked, Play reports Flycast's own reason.
+///
+/// `reasons` maps a Flycast profile id to the adapter's own reason it cannot
+/// be used (not set up, executable missing/ambiguous); it replaces the
+/// planner's generic "profile is not eligible" text.
+pub(crate) fn prefer_standalone(plan: &mut LaunchPlan, reasons: &[(String, String)]) {
+    for candidate in &mut plan.candidates {
+        let LaunchTarget::Standalone {
+            adapter_id: "flycast",
+            profile_id,
+            ..
+        } = &candidate.target
+        else {
+            continue;
+        };
+        if let Some((_, reason)) = reasons.iter().find(|(id, _)| id == profile_id) {
+            for blocker in &mut candidate.blockers {
+                if blocker.kind == archivefs_core::launch::LaunchBlockerKind::ProfileIneligible {
+                    blocker.detail = reason.clone();
+                }
+            }
+        }
+    }
+    if plan.platform_id.as_deref() != Some("Dreamcast")
+        || plan
+            .candidates
+            .iter()
+            .any(|c| c.preference == CandidatePreference::Remembered)
+    {
+        return;
+    }
+    let flycast = |c: &LaunchCandidate| {
+        matches!(
+            c.target,
+            LaunchTarget::Standalone {
+                adapter_id: "flycast",
+                ..
+            }
+        )
+    };
+    let Some(best) = plan
+        .candidates
+        .iter()
+        .position(|c| flycast(c) && c.readiness == LaunchReadiness::Ready)
+        .or_else(|| plan.candidates.iter().position(&flycast))
+    else {
+        return;
+    };
+    for (index, candidate) in plan.candidates.iter_mut().enumerate() {
+        if index == best {
+            candidate.preference = CandidatePreference::SoleEligible;
+        } else if candidate.preference == CandidatePreference::SoleEligible {
+            candidate.preference = CandidatePreference::Undetermined;
+        }
     }
 }
 impl Context {
@@ -181,8 +407,8 @@ impl Context {
         {
             return None;
         }
-        Some(Request {
-            preview: preview.clone(),
+        Some(Request::Gdi {
+            preview: Box::new(preview.clone()),
             roots: self.roots.clone(),
         })
     }
@@ -233,8 +459,8 @@ fn selection_matches(
 mod tests {
     use super::*;
     use archivefs_core::launch::{
-        FirmwareReadiness, LaunchContentKind, ResolvedIdentity, StandaloneProfileInput,
-        build_launch_plan,
+        CandidatePreference, FirmwareReadiness, LaunchContentKind, ResolvedIdentity,
+        StandaloneProfileInput, build_launch_plan,
     };
     fn fixture() -> (Context, LaunchPlan) {
         let selected = PathBuf::from("/synthetic/game.gdi");
@@ -279,6 +505,132 @@ mod tests {
             },
             plan,
         )
+    }
+    fn direct_plan(path: &Path) -> LaunchPlan {
+        let roots = FlycastProfileDiscoveryRoots::from_environment().unwrap();
+        let identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Dreamcast".into(),
+            game_key: "T-8109N".into(),
+        });
+        let content = LaunchContentRef {
+            kind: Some(LaunchContentKind::OpticalDisc),
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(path.to_path_buf()),
+            requires_mount: false,
+            provenance: "synthetic planner input; no payload verification".into(),
+        };
+        let profiles = [StandaloneProfileInput {
+            adapter_id: "flycast",
+            profile_id: "flycast:native".into(),
+            profile_path: Some(roots.xdg_config_home.join("flycast")),
+            eligible: true,
+            firmware: FirmwareReadiness::Verified,
+        }];
+        let env = archivefs_core::emulator_environment::retroarch::RetroArchEnvironmentReport {
+            format_version: 1,
+            profiles: vec![],
+            diagnostics: vec![],
+        };
+        build_launch_plan(&identity, &content, &profiles, &env, &[])
+    }
+    #[test]
+    fn direct_chd_and_cdi_get_a_click_time_offer_but_gdi_keeps_its_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["game.chd", "game.CDI"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"disc").unwrap();
+            let plan = direct_plan(&path);
+            let offer = direct_offer_for(&plan, &plan.candidates[0]).expect("Flycast applies");
+            assert!(matches!(offer, Ok(Request::Direct(_))), "{name}");
+        }
+        let gdi = dir.path().join("game.gdi");
+        std::fs::write(&gdi, b"3").unwrap();
+        let plan = direct_plan(&gdi);
+        assert!(direct_offer_for(&plan, &plan.candidates[0]).is_none());
+        let zip = dir.path().join("game.zip");
+        std::fs::write(&zip, b"PK").unwrap();
+        let plan = direct_plan(&zip);
+        assert!(direct_offer_for(&plan, &plan.candidates[0]).is_none());
+    }
+    #[test]
+    fn direct_offer_refuses_warnings_archives_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.chd");
+        std::fs::write(&path, b"disc").unwrap();
+        let plan = direct_plan(&path);
+        let mut warned = plan.candidates[0].clone();
+        warned.readiness = LaunchReadiness::ReadyWithWarnings;
+        assert!(matches!(direct_offer_for(&plan, &warned), Some(Err(_))));
+        let mut archived = plan.candidates[0].clone();
+        archived.content.container = Some(LaunchContainerKind::Archive);
+        assert!(matches!(direct_offer_for(&plan, &archived), Some(Err(_))));
+        let link = dir.path().join("link.chd");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let plan = direct_plan(&link);
+        assert!(matches!(
+            direct_offer_for(&plan, &plan.candidates[0]),
+            Some(Err(_))
+        ));
+    }
+    #[test]
+    fn standalone_flycast_outranks_a_hinted_route_and_explains_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.chd");
+        std::fs::write(&path, b"disc").unwrap();
+        let mut plan = direct_plan(&path);
+        let mut other = plan.candidates[0].clone();
+        other.target = LaunchTarget::Standalone {
+            adapter_id: "another_adapter",
+            profile_id: "other".into(),
+            profile_path: None,
+        };
+        other.preference = CandidatePreference::SoleEligible;
+        plan.candidates.push(other);
+        plan.candidates[0].preference = CandidatePreference::Undetermined;
+        prefer_standalone(&mut plan, &[]);
+        assert_eq!(
+            plan.candidates[0].preference,
+            CandidatePreference::SoleEligible
+        );
+        assert_eq!(
+            plan.candidates[1].preference,
+            CandidatePreference::Undetermined
+        );
+
+        // A remembered explicit choice is never overridden.
+        let mut remembered = direct_plan(&path);
+        remembered.candidates[0].preference = CandidatePreference::Remembered;
+        prefer_standalone(&mut remembered, &[]);
+        assert_eq!(
+            remembered.candidates[0].preference,
+            CandidatePreference::Remembered
+        );
+
+        // An installed but never-opened Flycast says so, by name.
+        let mut blocked = direct_plan(&path);
+        blocked.candidates[0]
+            .blockers
+            .push(archivefs_core::launch::LaunchBlocker::new(
+                archivefs_core::launch::LaunchBlockerKind::ProfileIneligible,
+                "the discovered profile is not eligible",
+            ));
+        blocked.candidates[0].readiness = LaunchReadiness::Blocked;
+        prefer_standalone(
+            &mut blocked,
+            &[(
+                "flycast:native".into(),
+                archivefs_core::patch_manager::FLYCAST_NOT_SET_UP.into(),
+            )],
+        );
+        assert_eq!(
+            blocked.candidates[0].preference,
+            CandidatePreference::SoleEligible
+        );
+        assert!(
+            blocked.candidates[0].blockers[0]
+                .detail
+                .contains("open Flycast once")
+        );
     }
     #[test]
     fn failed_companion_preflight_blocks_the_existing_blue_candidate() {

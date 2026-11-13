@@ -42,6 +42,10 @@ pub(crate) enum ReadinessAction {
     VerifyIdentity,
     /// No trusted system on record: open the existing Choose system flow.
     ChooseSystem,
+    /// The system came from the folder name only: open the Launch page,
+    /// which offers a one-launch "Try anyway" (nothing saved) beside the
+    /// permanent Change system.
+    TryAnyway,
     CheckGamesFolder,
     ReviewProblem,
     ChooseEmulator,
@@ -121,6 +125,12 @@ pub(crate) struct GameReadinessSummary {
     pub(crate) findings: Vec<Finding>,
     /// What happened the last time Play was pressed for this game.
     pub(crate) attempt: Option<Attempt>,
+    /// Play is ready and at least one other emulator could also be chosen
+    /// for this game (the shared launch-choice gate, so a blocked or
+    /// unavailable one never counts). The card then also offers "Choose
+    /// emulator", which opens the Launch page's per-emulator choice controls;
+    /// without it a planner's sole pick left no way to set a default.
+    pub(crate) other_emulator_choosable: bool,
 }
 
 pub(crate) fn project(
@@ -130,6 +140,14 @@ pub(crate) fn project(
     let mut summary = match input {
         LaunchReadinessInput::EvidenceNotLoaded | LaunchReadinessInput::RetroArchNotScanned => {
             checking_summary()
+        }
+        // One fully preflighted Hatari profile launches through the isolated
+        // disposable session, so it projects like any other ready plan (with
+        // its visible identity-unverified warning and a Play action).
+        LaunchReadinessInput::AtariSt(snapshot) if snapshot.launch_request().is_some() => {
+            let mut summary = project_plan(&snapshot.plan(), true, true);
+            summary.details.extend(snapshot.details());
+            summary
         }
         LaunchReadinessInput::AtariSt(snapshot) => {
             let mut summary = project_plan(&snapshot.plan(), true, true);
@@ -257,7 +275,19 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
                     Vec::new()
                 }
             } else {
+                // An option blocked only by a core tie can be chosen, so it
+                // speaks for the game before an option that cannot open the
+                // file at all (Stella refusing a zipped 2600 cartridge must
+                // not turn the action into "Check games folder").
                 selected_candidate(plan)
+                    .or_else(|| {
+                        plan.candidates.iter().find(|c| {
+                            !c.blockers.is_empty()
+                                && c.blockers
+                                    .iter()
+                                    .all(|b| b.kind == LaunchBlockerKind::AmbiguousCore)
+                        })
+                    })
                     .or_else(|| plan.candidates.iter().find(|c| !c.blockers.is_empty()))
                     .map(findings_for)
                     .unwrap_or_default()
@@ -325,11 +355,15 @@ fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSumma
         reason @ (IdentityUnknownReason::NoIdentityCheck(_)
         | IdentityUnknownReason::UnsupportedFormat(_)
         | IdentityUnknownReason::AmigaHardDisk
-        | IdentityUnknownReason::AmigaIpf) => base(
+        | IdentityUnknownReason::AmigaIpf
+        | IdentityUnknownReason::NoLaunchRoute(_)) => base(
             ReadinessPresentationState::Blocked,
             &match reason {
                 IdentityUnknownReason::NoIdentityCheck(system) => {
                     format!("EmuWiz has no identity check for {system} yet")
+                }
+                IdentityUnknownReason::NoLaunchRoute(system) => {
+                    format!("This is a {system} game; no installed emulator starts it")
                 }
                 IdentityUnknownReason::UnsupportedFormat(_) => {
                     "EmuWiz does not read this file format yet".to_string()
@@ -342,6 +376,40 @@ fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSumma
             FirmwareSummary::Unknown,
             None,
             Some(ReadinessAction::RecheckReadiness),
+        ),
+        IdentityUnknownReason::FolderOnly(system) => base(
+            ReadinessPresentationState::NeedsSystem,
+            &format!("The {system} system is only a guess from the folder"),
+            &format!(
+                "EmuWiz only knows the system from the folder this file is in, and the file format is shared with other systems, so Play is not offered on that guess alone. Try anyway starts it once as {system} (or another compatible system) with a warning and saves nothing. To make it lasting, change the system permanently on Review identity. Catalogue (DAT) verification is not required."
+            ),
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::TryAnyway),
+        ),
+        IdentityUnknownReason::SystemUnknown => base(
+            ReadinessPresentationState::NeedsSystem,
+            "The system for this game is not known",
+            "No system is recorded for this game and the file does not name one, so Play is not offered on a guess. Try anyway starts it once as a compatible system you pick (only systems that use this file format and have an installed emulator), with a warning, and saves nothing unless you tick Remember this launch choice. Neither sets the game's system; choose it permanently on Review identity. Catalogue (DAT) verification is not required.",
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::TryAnyway),
+        ),
+        IdentityUnknownReason::MediaConflict { recorded, content } => base(
+            ReadinessPresentationState::Blocked,
+            &format!("This file is a {content} game, not {recorded}"),
+            &format!(
+                "The file's own header says {content}, but the game is recorded as {recorded}. EmuWiz will not start it with a {recorded} emulator. Review identity lets you change the system."
+            ),
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::ReviewIdentity),
         ),
         IdentityUnknownReason::NotConfirmed => base(
             ReadinessPresentationState::NeedsIdentityReview,
@@ -485,23 +553,31 @@ fn project_plan(
         );
     }
 
-    if let Some(candidate) = plan.candidates.iter().find(|candidate| {
-        candidate.blockers.iter().any(|blocker| {
-            matches!(
-                blocker.kind,
-                LaunchBlockerKind::ContentNotResolved | LaunchBlockerKind::NoInstallationCandidate
-            )
-        })
-    }) && candidate
-        .blockers
+    // One option's own content refusal (a zipped cartridge on a standalone
+    // emulator that cannot open ZIPs) says nothing about the game when another
+    // option can start it, or is blocked for its own reason (a core tie): the
+    // card then follows those options, exactly as the Launch page does.
+    let no_usable_option = plan
+        .candidates
         .iter()
-        .any(|blocker| blocker.kind == LaunchBlockerKind::ContentNotResolved)
+        .all(|candidate| candidate.readiness == LaunchReadiness::Blocked);
+    let content_unresolved = |candidate: &LaunchCandidate| {
+        candidate
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == LaunchBlockerKind::ContentNotResolved)
+    };
+    if no_usable_option
+        && plan.candidates.iter().all(content_unresolved)
+        && let Some(candidate) = plan.candidates.first()
     {
+        // A file confirmed missing gets its own message (`note_file_missing`);
+        // here only "no route can open it as stored" is known.
         return with_details(
             base(
                 ReadinessPresentationState::SourceUnavailable,
-                "The game file is unavailable",
-                "The library remembers this game, but its current folder cannot be reached.",
+                "No emulator here can open this game file",
+                "None of the installed emulators can start this file as it is stored. A game kept in an archive (such as a ZIP of a disc image) may need extracting, and a moved or disconnected folder must be reconnected.",
                 IdentitySummary::StrongLocal,
                 SourceSummary::Unavailable,
                 firmware_for(candidate),
@@ -512,7 +588,7 @@ fn project_plan(
         );
     }
 
-    if let Some(candidate) = plan.candidates.iter().find(|candidate| {
+    let media_refused = |candidate: &LaunchCandidate| {
         candidate.blockers.iter().any(|blocker| {
             matches!(
                 blocker.kind,
@@ -521,7 +597,13 @@ fn project_plan(
                     | LaunchBlockerKind::ContentNotResolved
             )
         })
-    }) {
+    };
+    // Only when every option refuses the media itself; an option blocked for
+    // its own reason (a core tie) is reported by the branches below.
+    if no_usable_option
+        && plan.candidates.iter().all(media_refused)
+        && let Some(candidate) = plan.candidates.first()
+    {
         return with_details(
             base(
                 ReadinessPresentationState::MediaUnreadable,
@@ -538,6 +620,35 @@ fn project_plan(
     }
 
     let selected = selected_candidate(plan);
+    // A saved emulator choice that can no longer be used never falls back to
+    // another emulator (launch_choice), so say which one is missing and
+    // offer the choice again instead of a generic "choose one".
+    // `hold_for_new_choice` gives every remaining option this warning, so its
+    // presence alone means the choice is held: a sole remaining option must
+    // not fall through to the ready path (re-review of 17615e6c).
+    if let Some(warning) = plan.candidates.iter().find_map(|candidate| {
+        candidate.warnings.iter().find(|warning| {
+            warning.kind
+                == archivefs_core::launch::LaunchWarningKind::PreferredLaunchChoiceUnavailable
+        })
+    }) {
+        return with_details(
+            base(
+                ReadinessPresentationState::NeedsEmulator,
+                "Your saved emulator choice cannot be used",
+                &format!(
+                    "{} Use Choose emulator to pick another one for this launch, or save a new default.",
+                    warning.detail
+                ),
+                IdentitySummary::StrongLocal,
+                SourceSummary::Available,
+                FirmwareSummary::Unknown,
+                None,
+                Some(ReadinessAction::ChooseEmulator),
+            ),
+            details,
+        );
+    }
     let eligible = plan
         .candidates
         .iter()
@@ -704,6 +815,10 @@ fn project_plan(
     );
     summary.warnings = warnings;
     summary.details = details;
+    summary.other_emulator_choosable = plan.candidates.iter().any(|other| {
+        !std::ptr::eq(other, candidate)
+            && archivefs_core::launch::launch_choice::is_choosable(plan, other)
+    });
     if !has_warning && let Some(emulator) = &summary.emulator {
         summary.explanation = format!(
             "EmuWiz can now prepare this game for {}. Checking readiness does not change your game files.",
@@ -737,6 +852,7 @@ fn base(
         freshness: ReadinessFreshness::Current,
         findings: Vec::new(),
         attempt: None,
+        other_emulator_choosable: false,
     }
 }
 
@@ -899,6 +1015,7 @@ pub(crate) fn action_label(action: ReadinessAction) -> &'static str {
         ReadinessAction::ReviewIdentity => "Review identity",
         ReadinessAction::VerifyIdentity => "Verify identity",
         ReadinessAction::ChooseSystem => "Choose system",
+        ReadinessAction::TryAnyway => "Try anyway",
         ReadinessAction::CheckGamesFolder => "Check games folder",
         ReadinessAction::ReviewProblem => "Review problem",
         ReadinessAction::ChooseEmulator => "Choose emulator",
@@ -923,9 +1040,12 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
         });
         // The action sits directly under the state so it stays on screen in a
         // short window; the explanation and evidence chips follow it.
+        let offers_choice = summary.primary_action == Some(ReadinessAction::Play)
+            && summary.other_emulator_choosable;
         let action_count = 1 + usize::from(
-            summary.primary_action.is_some()
-                && summary.primary_action != Some(ReadinessAction::Play),
+            (summary.primary_action.is_some()
+                && summary.primary_action != Some(ReadinessAction::Play))
+                || offers_choice,
         );
         let available = ui.available_width();
         let gap = ui.spacing().item_spacing.x;
@@ -957,6 +1077,17 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
                 {
                     action = Some(primary);
                 }
+            }
+            if offers_choice
+                && ui
+                    .add_sized(
+                        [slot, 64.0],
+                        egui::Button::new(action_label(ReadinessAction::ChooseEmulator)).wrap(),
+                    )
+                    .on_hover_text("Other emulators can also start this game. Choose one for this launch, or save it as the default for this game or system.")
+                    .clicked()
+            {
+                action = Some(ReadinessAction::ChooseEmulator);
             }
             // Play is always on screen so the page never changes shape: when
             // it cannot run, it is disabled and the headline above says why.
@@ -1049,7 +1180,7 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
 
 /// Shown while the Library's check has not reached a current answer.
 pub(crate) const PLAY_RUNS_THE_CHECK: &str =
-    "Play runs the full launch check first. Nothing starts unless it passes.";
+    "Play checks that this game can start, then starts it. Nothing starts unless the check passes.";
 
 /// The Library's selected-game readiness, before it is drawn.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1637,6 +1768,75 @@ mod tests {
         assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
     }
 
+    /// Census 2026-11-10 (NES/Game Gear/... zips): the Launch page offered
+    /// Play through RetroArch while Game Details said "The game file is
+    /// unavailable", taken from the standalone option's own ZIP refusal.
+    #[test]
+    fn a_zipped_cartridge_refused_by_one_option_stays_playable_through_another() {
+        let mesen = candidate(
+            LaunchReadiness::Blocked,
+            FirmwareReadiness::NotRequired,
+            vec![LaunchBlocker::new(
+                LaunchBlockerKind::ContentNotResolved,
+                "a zipped cartridge launches through RetroArch only",
+            )],
+            vec![],
+            CandidatePreference::Undetermined,
+            Some("/mnt/nes/Game.zip"),
+        );
+        let retroarch = candidate(
+            LaunchReadiness::Ready,
+            FirmwareReadiness::NotRequired,
+            vec![],
+            vec![],
+            CandidatePreference::SoleEligible,
+            Some("/mnt/nes/Game.zip"),
+        );
+        let summary = project(
+            &plan(vec![mesen.clone(), retroarch]),
+            ReadinessFreshness::Current,
+        );
+        assert_ne!(
+            summary.status,
+            ReadinessPresentationState::SourceUnavailable
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+        // Atari 2600 zip: the other options are blocked by a core tie, not by
+        // the file, so the card must not say the file cannot be opened.
+        let tied = candidate(
+            LaunchReadiness::Blocked,
+            FirmwareReadiness::NotRequired,
+            vec![LaunchBlocker::new(
+                LaunchBlockerKind::AmbiguousCore,
+                "more than one installed RetroArch core resolves to Atari2600",
+            )],
+            vec![],
+            CandidatePreference::Undetermined,
+            Some("/mnt/a2600/Game.zip"),
+        );
+        let summary = project(
+            &plan(vec![mesen.clone(), tied]),
+            ReadinessFreshness::Current,
+        );
+        assert_ne!(
+            summary.status,
+            ReadinessPresentationState::SourceUnavailable
+        );
+        // Census 2026-11-10: the media branch said "could not be read" here.
+        assert_ne!(summary.status, ReadinessPresentationState::MediaUnreadable);
+        // Census 2026-11-10 (059ae25a): the action followed the option that
+        // cannot open ZIPs ("Check games folder"); the tie can be chosen.
+        assert_eq!(
+            summary.primary_action,
+            Some(ReadinessAction::ChooseEmulator)
+        );
+        // With nothing else, the refusal is still reported - without claiming
+        // the folder is unreachable (the file may simply be an archive).
+        let alone = project(&plan(vec![mesen]), ReadinessFreshness::Current);
+        assert_eq!(alone.status, ReadinessPresentationState::SourceUnavailable);
+        assert!(!alone.explanation.contains("cannot be reached"));
+    }
+
     #[test]
     fn ready_with_warning_does_not_become_blocked() {
         let warning = LaunchWarning {
@@ -2193,6 +2393,115 @@ mod tests {
         assert_eq!(action, Some(ReadinessAction::Play));
     }
 
+    /// Owner 2026-11-11: PS1 showed one Play for the planner's sole pick
+    /// (a reviewed SwanStation core) while standalone DuckStation was also
+    /// ready, so "Default for PSX" was unreachable. Another choosable
+    /// emulator now adds "Choose emulator" beside Play; a blocked or
+    /// unavailable one never does.
+    #[test]
+    fn a_ready_sole_pick_offers_choose_emulator_only_when_another_is_choosable() {
+        let sole = candidate(
+            LaunchReadiness::Ready,
+            FirmwareReadiness::NotRequired,
+            vec![],
+            vec![],
+            CandidatePreference::SoleEligible,
+            Some("/game.chd"),
+        );
+        let other_ready = candidate(
+            LaunchReadiness::Ready,
+            FirmwareReadiness::Verified,
+            vec![],
+            vec![],
+            CandidatePreference::Undetermined,
+            Some("/game.chd"),
+        );
+        let summary = project(
+            &plan(vec![sole.clone(), other_ready]),
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+        assert!(summary.other_emulator_choosable);
+        let (labels, action) = click_card_button(&summary, "Choose emulator");
+        assert_eq!(action, Some(ReadinessAction::ChooseEmulator), "{labels:?}");
+        let (labels, action) = click_card_button(&summary, "Play");
+        assert_eq!(labels.iter().filter(|label| *label == "Play").count(), 1);
+        assert_eq!(action, Some(ReadinessAction::Play));
+
+        for unavailable in [
+            LaunchBlocker::new(
+                LaunchBlockerKind::NoInstallationCandidate,
+                "the chosen DuckStation is no longer installed",
+            ),
+            LaunchBlocker::new(LaunchBlockerKind::RequiredFirmwareMissing, "no BIOS"),
+        ] {
+            let blocked = candidate(
+                LaunchReadiness::Blocked,
+                FirmwareReadiness::Missing,
+                vec![unavailable],
+                vec![],
+                CandidatePreference::Undetermined,
+                Some("/game.chd"),
+            );
+            let summary = project(
+                &plan(vec![sole.clone(), blocked]),
+                ReadinessFreshness::Current,
+            );
+            assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+            assert!(!summary.other_emulator_choosable);
+            let (labels, action) = click_card_button(&summary, "Choose emulator");
+            assert_eq!(action, None);
+            assert!(!labels.iter().any(|label| label == "Choose emulator"));
+        }
+
+        let alone = project(&plan(vec![sole]), ReadinessFreshness::Current);
+        assert!(!alone.other_emulator_choosable);
+    }
+
+    /// Owner 2026-11-11: a missing saved PSX default showed only "More than
+    /// one safe emulator choice is available". The card now names the
+    /// missing selection, routes to Choose emulator and never offers Play,
+    /// even when just one other emulator remains.
+    #[test]
+    fn a_missing_saved_choice_is_named_and_offers_choose_emulator_not_play() {
+        let held = |preference| {
+            candidate(
+                LaunchReadiness::ReadyWithWarnings,
+                FirmwareReadiness::NotRequired,
+                vec![],
+                vec![LaunchWarning::new(
+                    archivefs_core::launch::LaunchWarningKind::PreferredLaunchChoiceUnavailable,
+                    "The emulator in your saved emulator default for this system (duckstation at /apps/DuckStationRemoved) is no longer available. No other emulator is used instead; choose one to continue.",
+                )],
+                preference,
+                Some("/game.chd"),
+            )
+        };
+        for candidates in [
+            vec![held(CandidatePreference::Undetermined)],
+            vec![
+                held(CandidatePreference::Undetermined),
+                held(CandidatePreference::Undetermined),
+            ],
+        ] {
+            let summary = project(&plan(candidates), ReadinessFreshness::Current);
+            assert_eq!(summary.status, ReadinessPresentationState::NeedsEmulator);
+            assert_eq!(
+                summary.primary_action,
+                Some(ReadinessAction::ChooseEmulator)
+            );
+            assert!(summary.headline.contains("saved emulator choice"));
+            assert!(
+                summary
+                    .explanation
+                    .contains("duckstation at /apps/DuckStationRemoved")
+            );
+            assert!(summary.explanation.contains("Choose emulator"));
+            let (_, action) = click_card_button(&summary, "Play");
+            assert_eq!(action, None, "Play stays inert");
+        }
+    }
+
     #[test]
     fn blocked_card_keeps_play_visible_but_inert_and_routes_the_fix() {
         let summary = project(
@@ -2734,7 +3043,7 @@ mod identity_reason_wording_tests {
         assert!(
             R::AmigaHardDisk
                 .blocker_text()
-                .contains("hard-drive entry in the emulator")
+                .contains("private working copy")
         );
         assert!(R::AmigaIpf.blocker_text().contains("CAPS/SPS"));
     }

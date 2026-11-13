@@ -1930,19 +1930,37 @@ fn safe_regular_file_if_present(path: &Path) -> Result<bool, CheatBaseError> {
         Err(e) => Err(cache_error(e)),
     }
 }
+/// Opens a CheatBase source or cache file for reading: no symlink is
+/// followed and the open never blocks, so a FIFO put in the file's place is
+/// refused rather than waited on forever (Night Watch D7-04).
 fn open_regular_nofollow(path: &Path) -> Result<File, CheatBaseError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
     #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let file = options.open(path).map_err(source_error)?;
-    if !file.metadata().map_err(source_error)?.is_file() {
-        return Err(CheatBaseError::new(
-            CheatBaseErrorKind::UnsafePath,
-            "CheatBase source must be a regular file",
-        ));
+    {
+        crate::safe_read::open_regular_file_nonblocking(path, false).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidInput {
+                CheatBaseError::new(
+                    CheatBaseErrorKind::UnsafePath,
+                    "CheatBase source must be a regular file",
+                )
+            } else {
+                source_error(error)
+            }
+        })
     }
-    Ok(file)
+    #[cfg(not(unix))]
+    {
+        let file = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(source_error)?;
+        if !file.metadata().map_err(source_error)?.is_file() {
+            return Err(CheatBaseError::new(
+                CheatBaseErrorKind::UnsafePath,
+                "CheatBase source must be a regular file",
+            ));
+        }
+        Ok(file)
+    }
 }
 fn create_new_nofollow(path: &Path) -> Result<File, CheatBaseError> {
     let _ = fs::remove_file(path);

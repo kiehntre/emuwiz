@@ -25,6 +25,7 @@ jobs:
     # Pinned to the oldest supported baseline (Ubuntu 24.04, glibc 2.39);
     # ubuntu-latest is 26.04 and produces binaries needing GLIBC_2.43.
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
 
     steps:
       # Resolves the release tag before checkout, so checkout can pin to
