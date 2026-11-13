@@ -32,6 +32,7 @@ cat >"$fake" <<'E'
   echo "sccache_dir=${SCCACHE_DIR-<unset>}"
   echo "sccache_size=${SCCACHE_CACHE_SIZE-<unset>}"
   echo "sccache_port=${SCCACHE_SERVER_PORT-<unset>}"
+  echo "slot=${EMUWIZ_CARGO_SLOT-<unset>}"
   echo "argc=$#"
   i=0; for a in "$@"; do i=$((i + 1)); echo "arg$i=$a"; done
 } >"${FAKE_CARGO_LOG:?}"
@@ -51,6 +52,11 @@ export EMUWIZ_TARGET_ROOT="$tmp/targets"
 export EMUWIZ_CARGO="$fake"
 export FAKE_CARGO_LOG="$tmp/log"
 legacy="$HOME/.cache/emuwiz-cargo-target"
+# The sections before "auto-designation" test the explicit policy on its own.
+export EMUWIZ_CARGO_AUTO_DESIGNATE=0
+unset EMUWIZ_CARGO_MAX_BUILDS EMUWIZ_CARGO_SLOT EMUWIZ_CARGO_SLOT_DIR EMUWIZ_CARGO_MAX_DEV_WORKTREES
+# An inherited machine guard (e.g. EMUWIZ_MIN_FREE_GB=110) must not change the defaults tested here.
+unset EMUWIZ_MIN_FREE_GB
 unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG EMUWIZ_CARGO_LOW_DEBUG EMUWIZ_CARGO_FULL_DEBUG EMUWIZ_CARGO_INCREMENTAL EMUWIZ_CARGO_SCCACHE EMUWIZ_SCCACHE_DIR EMUWIZ_SCCACHE_SIZE EMUWIZ_SCCACHE_PORT RUSTC_WRAPPER SCCACHE_DIR
 
 target_of() { (cd "$1" && "$iso" --print-target | sed -n 's/^target: *//p'); }
@@ -290,6 +296,119 @@ check "EMUWIZ_CARGO_SCCACHE=0 is the default" test "$rc" = 0
 check "a malformed cache size is refused (2)" test "$rc" = 2
 (cd "$tmp/wt-one" && PATH="$fakebin:$PATH" EMUWIZ_SCCACHE_SIZE=512M EMUWIZ_SCCACHE_DIR="$tmp/sc" "$iso" --sccache check >/dev/null 2>&1)
 check "size and dir overrides are honoured" test "$(logged sccache_size)/$(logged sccache_dir)" = "512M/$tmp/sc"
+
+# ---- automatic designation is OFF by default (owner decision): opt in with EMUWIZ_CARGO_AUTO_DESIGNATE=1
+git -C "$repo" worktree add -q "$tmp/wt-default" -b default
+(cd "$tmp/wt-default" && env -u EMUWIZ_CARGO_AUTO_DESIGNATE CARGO_INCREMENTAL=0 "$iso" check >/dev/null 2>&1)
+check "by default a new branch worktree is not designated" test -z "$(cat "$EMUWIZ_TARGET_ROOT.incremental-mode/$(basename "$(target_of "$tmp/wt-default")")" 2>/dev/null)"
+check "by default a new branch worktree keeps the inherited 0" test "$(logged incremental)" = 0
+
+# ---- opt-in auto-designation: a NEW developer worktree (on a branch) becomes incremental
+export EMUWIZ_CARGO_AUTO_DESIGNATE=1
+git -C "$repo" worktree add -q "$tmp/wt-new" -b new
+git -C "$repo" worktree add -q --detach "$tmp/wt-detached"
+git -C "$repo" worktree add -q "$tmp/wt-rel" -b rel
+git -C "$repo" worktree add -q "$tmp/wt-explicit" -b explicit
+git -C "$repo" worktree add -q "$tmp/wt-old" -b old
+git -C "$repo" worktree add -q "$tmp/wt-off" -b off
+inc_of() { cat "$EMUWIZ_TARGET_ROOT.incremental-mode/$(basename "$(target_of "$1")")" 2>/dev/null; }
+check "--print-target says a new branch worktree will be incremental" bash -c "cd '$tmp/wt-new' && '$iso' --print-target | grep -q '^incremental: on (new developer worktree'"
+check "--print-target records nothing" test -z "$(inc_of "$tmp/wt-new")"
+(cd "$tmp/wt-new" && CARGO_INCREMENTAL=0 "$iso" check >/dev/null 2>"$tmp/err"); rc=$?
+check "the first build of a new branch worktree succeeds" test "$rc" = 0
+check "it is built incremental despite an inherited 0" test "$(logged incremental)" = 1
+check "it is recorded as designated" test "$(inc_of "$tmp/wt-new")" = on
+check "the designation is announced with its undo" grep -q 'undesignate-dev' "$tmp/err"
+(cd "$tmp/wt-new" && CARGO_INCREMENTAL=0 "$iso" check >/dev/null 2>&1)
+check "later builds stay incremental" test "$(logged incremental)" = 1
+(cd "$tmp/wt-detached" && CARGO_INCREMENTAL=0 "$iso" check >/dev/null 2>&1)
+check "a detached (review/verification) worktree is not designated" test -z "$(inc_of "$tmp/wt-detached")"
+check "a detached worktree keeps the inherited 0" test "$(logged incremental)" = 0
+(cd "$tmp/wt-rel" && CARGO_INCREMENTAL=0 "$iso" build --release >/dev/null 2>&1)
+check "a first release build designates nothing" test -z "$(inc_of "$tmp/wt-rel")"
+check "a first release build keeps the inherited 0" test "$(logged incremental)" = 0
+(cd "$tmp/wt-explicit" && CARGO_INCREMENTAL=0 "$iso" --no-incremental check >/dev/null 2>&1)
+check "an explicit choice on the first build designates nothing" test -z "$(inc_of "$tmp/wt-explicit")"
+mkdir -p "$(target_of "$tmp/wt-old")"
+(cd "$tmp/wt-old" && CARGO_INCREMENTAL=0 "$iso" check >/dev/null 2>&1)
+check "an existing target is never auto-designated" test -z "$(inc_of "$tmp/wt-old")"
+check "an existing undesignated target keeps the inherited 0" test "$(logged incremental)" = 0
+(cd "$tmp/wt-off" && "$iso" --undesignate-dev >/dev/null 2>&1 && CARGO_INCREMENTAL=0 "$iso" check >/dev/null 2>&1)
+check "an --undesignate-dev record is respected for a new target" test "$(inc_of "$tmp/wt-off")" = off
+check "undesignated new target keeps the inherited 0" test "$(logged incremental)" = 0
+(cd "$tmp/wt-new" && CARGO_INCREMENTAL=0 "$iso" build --release >/dev/null 2>&1)
+check "a designated worktree's release build is not incremental" test "$(logged incremental)" = 0
+(cd "$tmp/wt-new" && CARGO_INCREMENTAL=0 "$iso" build --profile release >/dev/null 2>&1)
+check "--profile release is a release build too" test "$(logged incremental)" = 0
+(cd "$tmp/wt-new" && CARGO_INCREMENTAL=0 "$iso" --incremental build --release >/dev/null 2>&1)
+check "an explicit --incremental still wins for a release build" test "$(logged incremental)" = 1
+(cd "$tmp/wt-new" && CARGO_INCREMENTAL=0 "$iso" bench --profile=bench >/dev/null 2>&1)
+check "another non-dev profile is not incremental" test "$(logged incremental)" = 0
+(cd "$tmp/wt-new" && CARGO_INCREMENTAL=0 "$iso" test --profile test >/dev/null 2>&1)
+check "--profile test stays incremental in a designated worktree" test "$(logged incremental)" = 1
+# owner limit: at most 2 designated worktrees in total (wt-new is one already)
+git -C "$repo" worktree add -q "$tmp/wt-second" -b second
+git -C "$repo" worktree add -q "$tmp/wt-third" -b third
+(cd "$tmp/wt-second" && CARGO_INCREMENTAL=0 "$iso" check >/dev/null 2>&1)
+check "a second new worktree is designated" test "$(inc_of "$tmp/wt-second")" = on
+check "--print-target names the full designation limit" bash -c "cd '$tmp/wt-third' && '$iso' --print-target | grep -q '^incremental: off (new developer worktree, but 2 of 2'"
+(cd "$tmp/wt-third" && CARGO_INCREMENTAL=0 "$iso" check >/dev/null 2>"$tmp/err"); rc=$?
+check "a third new worktree still builds" test "$rc" = 0
+check "a third new worktree is not designated" test -z "$(inc_of "$tmp/wt-third")"
+check "a third new worktree is built non-incremental" test "$(logged incremental)" = 0
+check "the limit is explained" grep -q '2 of 2 developer worktrees are already designated' "$tmp/err"
+(cd "$tmp/wt-second" && "$iso" --undesignate-dev >/dev/null 2>&1)
+rm -rf "$(target_of "$tmp/wt-third")"
+(cd "$tmp/wt-third" && CARGO_INCREMENTAL=0 "$iso" check >/dev/null 2>&1)
+check "freeing a designation lets the next new worktree be designated" test "$(inc_of "$tmp/wt-third")" = on
+check "the limit is counted from records reading on" test "$(grep -lx on "$EMUWIZ_TARGET_ROOT.incremental-mode"/* | wc -l)" = 2
+before=$(cat "$EMUWIZ_TARGET_ROOT.incremental-mode/$(basename "$t1")" 2>/dev/null)
+(cd "$tmp/wt-one" && "$iso" --designate-dev >/dev/null 2>"$tmp/err"); rc=$?
+check "an explicit --designate-dev at the limit is refused (3)" test "$rc" = 3
+check "the refusal says how to free one" grep -q 'undesignate-dev in an idle worktree' "$tmp/err"
+check "the refused record is unchanged" test "$(cat "$EMUWIZ_TARGET_ROOT.incremental-mode/$(basename "$t1")" 2>/dev/null)" = "$before"
+(cd "$tmp/wt-new" && "$iso" --designate-dev >/dev/null 2>&1); rc=$?
+check "re-designating an already designated worktree at the limit is fine" test "$rc" = 0
+(cd "$tmp/wt-one" && EMUWIZ_CARGO_MAX_DEV_WORKTREES=3 "$iso" --designate-dev >/dev/null 2>&1 && "$iso" --undesignate-dev >/dev/null 2>&1); rc=$?
+check "the limit can be raised explicitly" test "$rc" = 0
+(cd "$tmp/wt-one" && EMUWIZ_CARGO_MAX_DEV_WORKTREES=x "$iso" check >/dev/null 2>&1); rc=$?
+check "a malformed EMUWIZ_CARGO_MAX_DEV_WORKTREES is refused (2)" test "$rc" = 2
+export EMUWIZ_CARGO_AUTO_DESIGNATE=0
+
+# ---- concurrent builds: at most EMUWIZ_CARGO_MAX_BUILDS (default 2), waiting on the lock
+slots="$HOME/.cache/emuwiz-cargo-build-slots"
+(cd "$tmp/wt-one" && "$iso" check >/dev/null 2>&1)
+check "a build takes a slot and exports it" test "$(logged slot)" = 0
+check "the slot files live under the user's cache" test -e "$slots/slot-0.lock"
+mkfifo "$tmp/release-0" "$tmp/release-1"
+flock "$slots/slot-0.lock" cat "$tmp/release-0" >/dev/null &
+h0=$!
+flock "$slots/slot-1.lock" cat "$tmp/release-1" >/dev/null &
+h1=$!
+until ! flock -n "$slots/slot-0.lock" true && ! flock -n "$slots/slot-1.lock" true; do :; done
+rm -f "$FAKE_CARGO_LOG"
+(cd "$tmp/wt-one" && "$iso" check >/dev/null 2>"$tmp/wait-err") &
+waiter=$!
+until grep -q 'already running' "$tmp/wait-err" 2>/dev/null; do :; done
+check "with both slots taken the build waits and says so" test ! -e "$FAKE_CARGO_LOG"
+(cd "$tmp/wt-one" && EMUWIZ_CARGO_MAX_BUILDS=0 "$iso" check >/dev/null 2>&1); rc=$?
+check "EMUWIZ_CARGO_MAX_BUILDS=0 removes the limit" test "$rc/$(logged slot)" = "0/<unset>"
+(cd "$tmp/wt-one" && EMUWIZ_CARGO_SLOT=1 "$iso" check >/dev/null 2>&1); rc=$?
+check "a nested cargo-iso inside a held slot does not wait" test "$rc/$(logged slot)" = "0/1"
+(cd "$tmp/wt-one" && "$iso" --rust-analyzer check >/dev/null 2>&1); rc=$?
+check "--rust-analyzer takes no slot" test "$rc/$(logged slot)" = "0/<unset>"
+rm -f "$FAKE_CARGO_LOG"
+echo >"$tmp/release-1"
+wait "$h1"
+wait "$waiter"; rc=$?
+check "the waiting build starts once a slot frees" test "$rc/$(logged slot)" = "0/1"
+check "it says when it starts" grep -q 'slot free' "$tmp/wait-err"
+echo >"$tmp/release-0"
+wait "$h0"
+(cd "$tmp/wt-one" && EMUWIZ_CARGO_MAX_BUILDS=two "$iso" check >/dev/null 2>&1); rc=$?
+check "a malformed EMUWIZ_CARGO_MAX_BUILDS is refused (2)" test "$rc" = 2
+(cd "$tmp/wt-one" && EMUWIZ_CARGO_MAX_BUILDS=1 "$iso" check >/dev/null 2>&1)
+check "a limit of 1 uses slot 0 only" test "$(logged slot)" = 0
 
 # ---- never deletes
 mkdir -p "$t1/debug" && : >"$t1/debug/precious-artifact"

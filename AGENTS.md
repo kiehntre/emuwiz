@@ -98,11 +98,23 @@ Keeping builds warm (a target is only reused by the same worktree path):
   `scripts/cargo-iso --designate-dev` (undo: `--undesignate-dev`). Order of precedence:
   `--incremental`/`--no-incremental`, then `EMUWIZ_CARGO_INCREMENTAL=1|0`, then the
   designation, then off. A designated worktree overrides an inherited `CARGO_INCREMENTAL=0`.
-  Measured on `archivefs-gui --lib` tests: edit-to-rebuild 97.5 s -> ~28 s, at a one-off
-  ~5 min priming build and ~3x the target size, so designate only the worktrees you build
-  in all day. `--sccache` builds a designated worktree non-incremental; `--sccache` with an
-  explicit `--incremental` is refused. `--print-target` shows the decision. CI and
-  `scripts/build-release.sh` never go through `cargo-iso` and are unaffected.
+  Measured on `archivefs-gui --lib` tests: edit-to-rebuild 106 s -> ~41 s (2026-11-13), at a
+  one-off ~5 min priming build and ~2x the target size, so designate only the worktrees you
+  build in all day. **At most two worktrees may be designated** (records reading `on` in
+  `$EMUWIZ_TARGET_ROOT.incremental-mode/`; `EMUWIZ_CARGO_MAX_DEV_WORKTREES`, default 2):
+  `--designate-dev` is refused (exit 3) at the limit. Prefer reusing an already designated,
+  idle, coordinated worktree over designating a new one. Release and other non-dev profiles
+  (`--release`, `--profile X`) are never incremental unless asked explicitly. Opt-in
+  automatic designation of a new branch worktree on its first build:
+  `EMUWIZ_CARGO_AUTO_DESIGNATE=1` (off by default; detached, release, `--sccache` and
+  explicit choices are never designated; the limit applies). `--sccache` builds a designated
+  worktree non-incremental; `--sccache` with an explicit `--incremental` is refused.
+  `--print-target` shows the decision. CI and `scripts/build-release.sh` never go through
+  `cargo-iso` and are unaffected.
+- At most two `cargo-iso` builds run at once (`EMUWIZ_CARGO_MAX_BUILDS`, default 2; `0` = no
+  limit), across all worktrees and target roots: a third waits on a lock and starts the
+  moment a slot frees (no sleep loop; it says so once). This limits concurrent builds, not
+  jobs per build. `--rust-analyzer` takes no slot.
 - Debug mode is recorded per target and kept. A target with no compiler output to keep
   (new worktree, or retired with a verified receipt: `worktree-check --cargo-state-only`
   says CLEAR) builds
@@ -346,8 +358,9 @@ rules; efficiency never overrides those guarantees.
 11. Use appropriately priced models and reasoning levels for routine tasks when
     model selection is available and authorised. Reserve expensive reasoning for
     difficult or safety-sensitive work.
-12. Avoid overlapping full builds. Respect the existing shared Cargo heavy-build
-    lock as well as worktree-specific Cargo targets and retention rules.
+12. Avoid overlapping full builds. `cargo-iso` lets at most two builds run at once and
+    queues the rest; do not bypass it (`EMUWIZ_CARGO_MAX_BUILDS=0`) to jump the queue.
+    Respect worktree-specific Cargo targets and retention rules.
 13. Never sacrifice correctness, required independent safety review, final
     validation or preservation guarantees to save usage.
 14. Do not start a new development campaign while assigned work is unfinished
