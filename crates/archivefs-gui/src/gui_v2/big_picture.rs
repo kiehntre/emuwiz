@@ -859,9 +859,12 @@ impl App {
             _ => {}
         }
         state.notice = None;
-        if let Some(workflows) = self.native_workflows.as_mut() {
-            let _ = workflows.readiness_action_route(context, ReadinessAction::Play, id);
-        }
+        // The Launch page creates these on first draw; Play needs them now so
+        // a game never checked before still has its Play waiting for it.
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(context.clone()));
+        let _ = workflows.readiness_action_route(context, ReadinessAction::Play, id);
         state.enter_step(Step::Launch(id));
     }
 

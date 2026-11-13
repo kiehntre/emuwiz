@@ -67,7 +67,9 @@ pub(super) struct NativeWorkflows {
     launch_attempts: launch_readiness_summary::AttemptTracker,
     /// Set when Play was pressed before the launch plan could be built; the
     /// Launch page then starts the game itself the moment the plan is ready.
-    pending_play: Option<(i64, std::time::Instant)>,
+    /// The pass number is the last egui pass this game's Launch page was
+    /// drawn in: see [`pending_play_is_live`].
+    pending_play: Option<(i64, u64)>,
     /// Scan history read straight from the library database on a background
     /// thread, so Sources shows real history while the full library snapshot
     /// is still loading.
@@ -774,14 +776,18 @@ impl NativeWorkflows {
             self.readiness_job = Some(job);
         }
         self.observe_readiness_activity(activity);
-        // A Play pressed while the plan was still loading is honoured only
-        // briefly and only for this game; it can never fire on a later visit.
-        if pending_play_is_live(self.pending_play, game_id) {
+        // A Play pressed while the plan was still loading waits, however long
+        // the checks take, only while this game's Launch page stays on screen;
+        // it can never fire on a later visit or for another game.
+        let pass = ui.ctx().cumulative_pass_nr();
+        if pending_play_is_live(self.pending_play, game_id, pass) {
             match self.try_play(game_id) {
                 PlayOutcome::Started | PlayOutcome::Blocked => self.pending_play = None,
-                PlayOutcome::Waiting => ui
-                    .ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(100)),
+                PlayOutcome::Waiting => {
+                    self.pending_play = Some((game_id, pass));
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                }
             }
         } else {
             self.pending_play = None;
@@ -1245,7 +1251,7 @@ impl NativeWorkflows {
         if action == ReadinessAction::Play {
             // Play launches. The Launch page is only the fallback for a plan
             // that is still loading, needs an emulator choice, or is blocked.
-            self.pending_play = Some((game_id, std::time::Instant::now()));
+            self.pending_play = Some((game_id, context.cumulative_pass_nr()));
             if self.try_play(game_id) == PlayOutcome::Started {
                 self.pending_play = None;
                 return None;
@@ -1257,7 +1263,7 @@ impl NativeWorkflows {
     /// Starts the game through the planner's single safe request, exactly as
     /// Gamer View's Play does. Never picks between equally valid emulators.
     pub(super) fn try_play(&mut self, game_id: i64) -> PlayOutcome {
-        use launch_readiness_page::{GamerBlockerKind, GamerPlayAction};
+        use launch_readiness_page::GamerPlayAction;
         if self.selected_game != Some(game_id) {
             return PlayOutcome::Waiting;
         }
@@ -1278,12 +1284,10 @@ impl NativeWorkflows {
                 self.app.launch_system_trial = None;
                 PlayOutcome::Started
             }
-            GamerPlayAction::BlockedTyped(blocker) => match blocker.kind {
-                GamerBlockerKind::CheckingGame | GamerBlockerKind::EmulatorNotChecked => {
-                    PlayOutcome::Waiting
-                }
-                _ => PlayOutcome::Blocked,
-            },
+            GamerPlayAction::BlockedTyped(blocker) if still_checking(blocker.kind) => {
+                PlayOutcome::Waiting
+            }
+            GamerPlayAction::BlockedTyped(_) => PlayOutcome::Blocked,
         }
     }
 
@@ -1294,6 +1298,12 @@ impl NativeWorkflows {
 
     /// Reuse the same current plan and candidate policy as Launch. Never
     /// substitute an inventory installation or select a different candidate.
+    /// The game a Play is waiting on the Launch page for, if any.
+    #[cfg(test)]
+    pub(super) fn play_pending(&self) -> Option<i64> {
+        self.pending_play.map(|(game, _)| game)
+    }
+
     #[cfg(test)]
     pub(super) fn launch_was_requested(&self, game_id: i64) -> bool {
         self.launch_active() || self.launch_attempts.for_game(game_id).is_some()
@@ -4290,14 +4300,40 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_play_expires_and_never_applies_to_another_game() {
-        let now = std::time::Instant::now();
-        assert!(pending_play_is_live(Some((5, now)), 5));
-        assert!(!pending_play_is_live(Some((5, now)), 6));
-        assert!(!pending_play_is_live(None, 5));
-        if let Some(old) = now.checked_sub(PLAY_WAIT + std::time::Duration::from_secs(1)) {
-            assert!(!pending_play_is_live(Some((5, old)), 5));
+    fn a_pending_play_never_waits_past_a_needed_confirmation_or_a_refusal() {
+        use launch_readiness_page::GamerBlockerKind as K;
+        for kind in [
+            K::UnknownSystem,
+            K::ConflictingIdentity,
+            K::ContentNeedsPreparation,
+            K::EmulatorNotInstalled,
+            K::EmulatorSetupIncomplete,
+            K::NoSafeEmulator,
+            K::MultipleChoices,
+            K::LaunchPlanInvalid,
+            K::InspectionIncomplete,
+        ] {
+            assert!(!still_checking(kind), "{kind:?} must end the pending Play");
         }
+        assert!(still_checking(K::CheckingGame));
+        assert!(still_checking(K::EmulatorNotChecked));
+    }
+
+    #[test]
+    fn a_pending_play_waits_out_slow_checks_but_never_outlives_its_page_or_game() {
+        // Slow readiness: drawn every pass, it stays live with no clock.
+        let mut pending = Some((5, 10));
+        for pass in 11..10_000 {
+            assert!(pending_play_is_live(pending, 5, pass));
+            pending = Some((5, pass));
+        }
+        // Another game never inherits it.
+        assert!(!pending_play_is_live(pending, 6, 10_000));
+        assert!(!pending_play_is_live(None, 5, 1));
+        // Cancelled or left (Back, another page): the page was not drawn, so
+        // coming back later is not permission to launch.
+        assert!(!pending_play_is_live(Some((5, 10)), 5, 13));
+        assert!(!pending_play_is_live(Some((5, 10)), 5, 500));
     }
 
     #[test]
@@ -5329,12 +5365,23 @@ fn load_saved_source_views() -> Option<Vec<SourceFolderView>> {
     ))
 }
 
-/// How long a Play pressed before the plan was ready may wait to start.
-const PLAY_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Only checks still running keep a pending Play waiting. Anything that needs
+/// the player (a choice, "Try anyway", setup) or refuses is a definite answer:
+/// the pending Play ends and the Launch page shows what is needed.
+fn still_checking(kind: launch_readiness_page::GamerBlockerKind) -> bool {
+    use launch_readiness_page::GamerBlockerKind::{CheckingGame, EmulatorNotChecked};
+    matches!(kind, CheckingGame | EmulatorNotChecked)
+}
 
-/// A pending Play is live only for its own game and only for [`PLAY_WAIT`].
-fn pending_play_is_live(pending: Option<(i64, std::time::Instant)>, game: i64) -> bool {
-    pending.is_some_and(|(pending_game, since)| pending_game == game && since.elapsed() < PLAY_WAIT)
+/// A pending Play is live for its own game while its Launch page is drawn
+/// without a break: `seen` is the last pass it was drawn in (or Play was
+/// pressed in; the page follows within a pass). There is no clock, so slow
+/// readiness never expires it, and only a definite answer (started or
+/// blocked), another game, or leaving the page (Back, another page, the
+/// controller leaving Launch) ends it. A page left and opened again later
+/// therefore never starts a game by itself.
+fn pending_play_is_live(pending: Option<(i64, u64)>, game: i64, pass: u64) -> bool {
+    pending.is_some_and(|(pending_game, seen)| pending_game == game && pass <= seen + 2)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
