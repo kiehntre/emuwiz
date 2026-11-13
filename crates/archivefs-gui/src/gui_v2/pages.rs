@@ -1550,6 +1550,15 @@ impl App {
                         .map(|summary| (id, summary))
                 })
         };
+        if let Some((id, summary)) = &summary
+            && let Some(game) = library.game(*id)
+            && let Some(view) = self
+                .native_workflows
+                .as_ref()
+                .map(|w| w.compact_of(summary))
+        {
+            self.note_checked_readiness(game, &view);
+        }
         let diagnosis = match (&picked, &summary) {
             (Some(_), None) => super::doctor_launch_check::checking(),
             _ => super::doctor_launch_check::diagnose(summary.as_ref().map(|(_, summary)| summary)),
@@ -1942,60 +1951,18 @@ impl App {
                 response.on_hover_text("RomM's saved record is out of date because its game file changed or disappeared. This picture is retained as display evidence. Refresh the RomM index to recheck its association.");
             }
         } else {
-            // No cover (yet): the game's own platform hardware, dimmed, on the
-            // same plate, so an uncovered shelf still reads as distinct systems.
-            ui.painter().rect_filled(rect, 8.0, theme::deep_fill(ui));
-            // Blue: a dashed same-size placeholder, never a fake cover.
-            if theme::blue_profile(ui) {
-                crate::ui::components::paint_dashed_outline(
-                    ui.painter(),
-                    rect,
-                    theme::blue::BORDER_STRONG,
-                );
-            } else {
-                ui.painter()
-                    .rect_stroke(rect, 8.0, theme::border(ui), egui::StrokeKind::Inside);
-            }
+            // No cover (yet): a platform-coloured plate with the platform's
+            // name, its hardware picture and the title (`artwork_fallback`).
             let label = self.artwork.label(key);
-            let labelled = size.x > 90.0 && size.y > 90.0;
-            // Lay the words out first so the hardware image leaves them room.
-            let font = egui::FontId::proportional(theme::METADATA_SIZE);
-            let wrap = (size.x - 12.0).max(40.0);
-            let galleys: Vec<_> = if labelled {
-                std::iter::once(label.headline.to_string())
-                    .chain(label.detail.clone().filter(|_| detail_on_tile))
-                    .map(|text| {
-                        ui.painter()
-                            .layout(text, font.clone(), theme::SECONDARY_TEXT, wrap)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let text_height: f32 = galleys.iter().map(|galley| galley.size().y).sum();
-            let side = if labelled {
-                (size.x.min(size.y - text_height - 22.0)).max(24.0) * 0.72
-            } else {
-                size.x.min(size.y) * 0.82
-            };
-            let centre = if labelled {
-                rect.center() - egui::vec2(0.0, text_height / 2.0)
-            } else {
-                rect.center()
-            };
-            self.imagery.paint_platform(
+            super::artwork_fallback::paint(
                 ui,
-                egui::Rect::from_center_size(centre, egui::vec2(side, side)),
+                &mut self.imagery,
+                rect,
+                &game.title,
                 &game.platform,
-                Color32::from_white_alpha(150),
+                &label,
+                detail_on_tile,
             );
-            let mut bottom = rect.bottom() - 8.0;
-            for galley in galleys.into_iter().rev() {
-                bottom -= galley.size().y;
-                let x = rect.center().x - galley.size().x / 2.0;
-                ui.painter()
-                    .galley(egui::pos2(x, bottom), galley, theme::SECONDARY_TEXT);
-            }
             // Small tiles have no room for words; the tooltip carries them.
             let hover = match &label.detail {
                 Some(detail) => format!("{}\n{detail}", label.headline),
@@ -3278,6 +3245,13 @@ impl App {
                 &mut self.activity,
             )
         };
+        let shown = self.native_workflows.as_ref().and_then(|workflows| {
+            let summary = workflows.shown_readiness(id, &game.archive.absolute_path)?;
+            Some(workflows.compact_of(summary))
+        });
+        if let Some(view) = shown {
+            self.note_checked_readiness(game, &view);
+        }
         if let Some(route) = readiness_route {
             self.go(route);
         }

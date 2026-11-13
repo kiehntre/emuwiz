@@ -1316,7 +1316,6 @@ impl NativeWorkflows {
     /// Reuse the same current plan and candidate policy as Launch. Never
     /// substitute an inventory installation or select a different candidate.
     /// The game a Play is waiting on the Launch page for, if any.
-    #[cfg(test)]
     pub(super) fn play_pending(&self) -> Option<i64> {
         self.pending_play.map(|(game, _)| game)
     }
@@ -1341,6 +1340,15 @@ impl NativeWorkflows {
             .as_ref()
             .filter(|(id, shown, _)| *id == game_id && shown == path)
             .map(|(_, _, summary)| summary)
+    }
+
+    /// `summary` as the Library's compact card would show it for the game on
+    /// screen (an identity answer still waiting on its checksum is partial).
+    pub(super) fn compact_of(
+        &self,
+        summary: &launch_readiness_summary::GameReadinessSummary,
+    ) -> launch_readiness_summary::CompactReadiness {
+        launch_readiness_summary::compact(summary, self.selected_checksum_pending())
     }
 
     /// The current readiness answer for the game on screen, for reading only.

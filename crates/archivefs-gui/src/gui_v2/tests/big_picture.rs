@@ -908,3 +908,105 @@ fn x_twice_on_a_game_that_cannot_play_is_refused_with_the_start_reason() {
     tap(&context, &mut app, WEST);
     assert_eq!(state(&app).step(), Step::Game(2), "never past the refusal");
 }
+
+const UP: Control = Control::Direction(Direction::Up);
+
+fn focused(context: &egui::Context) -> Option<egui::Id> {
+    context.memory(|m| m.focused())
+}
+
+/// Job 5: A on a game, A on its Play, and the Launch page opens with its own
+/// Play focused, so a third A is Play: the game card's Play, which asks the
+/// planner and starts nothing it refuses. Directions leave Play for the
+/// page's controls and come back; B goes back to the game.
+#[test]
+fn a_a_lands_on_a_focused_play_that_only_asks_the_launch_planner() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    tap(&context, &mut app, SOUTH);
+    assert_eq!(state(&app).step(), Step::Game(1));
+    tap(&context, &mut app, SOUTH);
+    assert_eq!(state(&app).step(), Step::Launch(1));
+    let strings = after_launch_page_loads(&context, &mut app);
+    let play = state(&app)
+        .play_button()
+        .expect("the Launch step offers Play");
+    assert_eq!(focused(&context), Some(play), "{strings:?}");
+    assert!(
+        strings.iter().any(|s| s == "Play / Launch readiness"),
+        "the unchanged Launch page is still below: {strings:?}"
+    );
+    // This fixture's page may have no control of its own: then Down wraps
+    // back to Play. Either way focus is never lost, and Up returns to Play.
+    tap(&context, &mut app, DOWN);
+    assert!(focused(&context).is_some(), "Down never drops focus");
+    for _ in 0..20 {
+        if focused(&context) == Some(play) {
+            break;
+        }
+        tap(&context, &mut app, UP);
+    }
+    assert_eq!(focused(&context), Some(play), "Up comes back to Play");
+    tap(&context, &mut app, SOUTH);
+    settle(&context, &mut app);
+    let workflows = app.native_workflows.as_ref().unwrap();
+    assert!(
+        !workflows.launch_was_requested(1),
+        "this fixture has no ready plan: Play never launches blind"
+    );
+    assert!(
+        state(&app).notice_text().is_some(),
+        "Play says what happened instead of doing nothing"
+    );
+    tap(&context, &mut app, EAST);
+    assert_eq!(state(&app).step(), Step::Game(1));
+    assert_eq!(
+        focused(&context),
+        None,
+        "the Game step's buttons are Big Picture's own"
+    );
+}
+
+/// The keyboard reaches the same Play, and an Enter held down from the
+/// game's own Play (egui marks every later press of a held key as a repeat)
+/// never runs it.
+#[test]
+fn keyboard_reaches_launch_play_and_a_held_enter_never_runs_it() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Enter));
+    assert_eq!(state(&app).step(), Step::Game(1));
+    settle(&context, &mut app);
+    // Enter on the game's Play, then held: the first press opens Launch.
+    for _ in 0..4 {
+        let _ = frame_with_events(
+            &context,
+            &mut app,
+            SIZE,
+            vec![key_event(egui::Key::Enter, true, false)],
+        );
+    }
+    assert_eq!(state(&app).step(), Step::Launch(1));
+    let play = state(&app).play_button().expect("Play is drawn");
+    assert_eq!(focused(&context), Some(play));
+    let pending = |app: &App| app.native_workflows.as_ref().unwrap().play_pending();
+    assert_eq!(pending(&app), None, "a held Enter is not a press");
+    assert_eq!(state(&app).notice_text(), None);
+    let _ = frame_with_events(
+        &context,
+        &mut app,
+        SIZE,
+        vec![key_event(egui::Key::Enter, false, false)],
+    );
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Enter));
+    settle(&context, &mut app);
+    assert!(state(&app).notice_text().is_some(), "a fresh Enter is Play");
+    assert!(
+        !app.native_workflows
+            .as_ref()
+            .unwrap()
+            .launch_was_requested(1)
+    );
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Escape));
+    assert_eq!(state(&app).step(), Step::Game(1), "Esc goes back");
+}
