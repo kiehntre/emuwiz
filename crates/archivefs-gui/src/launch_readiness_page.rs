@@ -4080,7 +4080,7 @@ fn show_plan(
             }
         });
     }
-    let display_order = gba_display_order(plan, |candidate| {
+    let display_order = candidate_display_order(plan, |candidate| {
         retroarch_launch_request_checked(plan, candidate, retroarch).is_ok()
     });
     for candidate in display_order
@@ -4166,20 +4166,57 @@ fn recommended_gba_candidate(
 
 /// Render order for the candidate cards. The plan lists standalone emulators
 /// before RetroArch cores (core `build_launch_plan`), which buried a working
-/// RetroArch below several competing choices. For GBA the recommended
-/// RetroArch card moves to the top; all others keep their relative order.
-fn gba_display_order(
+/// RetroArch below several competing choices: an NES ZIP opened on a blocked
+/// native Mesen card, and Big Picture put focus on that card's buttons.
+///
+/// The first card is the GBA recommendation, the Sega Pico card, or on other
+/// systems the usable card Play uses (Remembered, then Sole eligible). Blocked cards then
+/// follow every usable one, except a Remembered choice, so a person's own
+/// pick is never moved away from its explanation. Otherwise the plan order is
+/// kept. Display only: it never changes the plan, a preference, or what Play
+/// launches.
+fn candidate_display_order(
     plan: &LaunchPlan,
     launchable: impl Fn(&LaunchCandidate) -> bool,
 ) -> Vec<usize> {
     let mut order: Vec<usize> = (0..plan.candidates.len()).collect();
-    if let Some(index) =
-        recommended_gba_candidate(plan, launchable).or_else(|| sega_pico_first_candidate(plan))
+    if let Some(index) = recommended_gba_candidate(plan, launchable)
+        .or_else(|| sega_pico_first_candidate(plan))
+        .or_else(|| play_candidate(plan))
     {
         order.retain(|&i| i != index);
         order.insert(0, index);
     }
+    // Stable: usable cards keep their order, then blocked ones keep theirs.
+    order.sort_by_key(|&i| {
+        let candidate = &plan.candidates[i];
+        candidate.readiness == LaunchReadiness::Blocked
+            && candidate.preference != CandidatePreference::Remembered
+    });
     order
+}
+
+/// The usable card Play would use, if one stands out: a Remembered choice,
+/// otherwise the Sole eligible candidate. GBA and Sega Pico keep their own
+/// reviewed rules above.
+fn play_candidate(plan: &LaunchPlan) -> Option<usize> {
+    if matches!(
+        plan.platform_id.as_deref(),
+        Some("Game Boy Advance" | archivefs_core::launch::unverified_media::SEGA_PICO_PLATFORM)
+    ) {
+        return None;
+    }
+    let usable = |c: &LaunchCandidate| c.readiness != LaunchReadiness::Blocked;
+    [
+        CandidatePreference::Remembered,
+        CandidatePreference::SoleEligible,
+    ]
+    .into_iter()
+    .find_map(|preference| {
+        plan.candidates
+            .iter()
+            .position(|c| usable(c) && c.preference == preference)
+    })
 }
 
 /// The Sega Pico card to show first. Cores are listed alphabetically, so a
