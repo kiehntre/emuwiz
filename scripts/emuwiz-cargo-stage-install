@@ -80,8 +80,15 @@ if [ -z "$owner" ] || [ "$owner" = root ] || ! id -u -- "$owner" >/dev/null 2>&1
 fi
 
 # 2. nothing may be running or scheduled
-units=$(systemctl list-unit-files --no-legend --plain 'emuwiz-cargo-maintain*' 2>/dev/null | awk '{print $1}') ||
+# list-unit-files exits 1 when no unit matches: that is "none installed" only when an
+# unfiltered listing works (so systemctl itself answers); anything else refuses
+if listing=$(systemctl list-unit-files --no-legend --plain 'emuwiz-cargo-maintain*' 2>/dev/null); then
+  units=$(printf '%s\n' "$listing" | awk 'NF {print $1}')
+elif [ -z "$listing" ] && systemctl list-unit-files --no-legend --plain >/dev/null 2>&1; then
+  units=""
+else
   refuse "cannot list the maintenance units"
+fi
 for unit in $units; do
   case "$unit" in
     *.timer) if systemctl is-enabled --quiet "$unit" 2>/dev/null || systemctl is-active --quiet "$unit" 2>/dev/null; then

@@ -390,7 +390,7 @@ class HoldSourcesMore(Helpers):
         with open(os.path.join(wt, ".git"), "w") as h:      # a .git that points nowhere
             h.write("gitdir: /nonexistent/worktrees/x\n")
         self.approve()
-        self.assertIn("HOLD_SOURCE_UNREADABLE", self.row(t)["reasons"])
+        self.assertIn("GIT_STATE_UNVERIFIED", self.row(t)["reasons"])
 
     def test_non_github_origin_is_never_merge_evidence(self):
         wt, t = self.ready_released("hm-local-origin")

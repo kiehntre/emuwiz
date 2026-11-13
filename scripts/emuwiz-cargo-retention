@@ -221,7 +221,8 @@ HOLD_MEMORY_GLOB = ".claude/projects/*/memory/*.md"   # owner/agent memory notes
 # Every code that protects a target because of a HOLD source (or uncertainty about one).
 HOLD_CODES = ("HOLD_LISTED", "HOLD_UNRESOLVED_MATCH", "HOLD_COORDINATION", "HOLD_MEMORY_NOTE",
               "HOLD_INDICATION_UNRECONCILED",
-              "HOLD_REGISTRY_MISSING", "HOLD_REGISTRY_INVALID", "HOLD_REGISTRY_STALE", "HOLD_SOURCE_UNREADABLE")
+              "HOLD_REGISTRY_MISSING", "HOLD_REGISTRY_INVALID", "HOLD_REGISTRY_STALE", "HOLD_SOURCE_UNREADABLE",
+              "GIT_STATE_UNVERIFIED")
 _HOLD_WORD = re.compile(r"\b(HOLD|HELD)\b", re.I)
 _HOLD_WORD_MEMORY = re.compile(r"\b(HOLD|HELD)\b")      # memory: the owner's capitalised HOLD
 
@@ -527,8 +528,8 @@ def hold_listed(*paths, heads=()):
             continue
         forms |= {os.path.normpath(os.path.abspath(path)), os.path.realpath(path)}
         head, branch = _git_facts(os.path.realpath(path))
-        if head is False:                      # a checkout whose Git state cannot be read
-            return "HOLD_SOURCE_UNREADABLE"
+        if head is False:                      # a checkout whose Git state cannot be read: held
+            return "GIT_STATE_UNVERIFIED"
         if head:
             all_heads.add(head)
         if branch:

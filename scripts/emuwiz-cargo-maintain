@@ -171,6 +171,7 @@ EXPLANATIONS = {
     "HOLD_REGISTRY_STALE": "the HOLD registry is older than its max_age_days: every target is held until it is regenerated",
     "HOLD_SOURCE_UNREADABLE": "a HOLD source (hold list, coordination table or a required registry source) is "
                               "unreadable or missing: every target is held",
+    "GIT_STATE_UNVERIFIED": "the checkout's Git state (HEAD, branch, reflog or status) cannot be read: it is held",
     "PIN_STATE_UNKNOWN": "pin record unreadable or malformed; repair it by hand",
     "RECENT_ACTIVITY": "used or written within the minimum idle period",
     "WRITTEN_AFTER_RELEASE": "output was written after the release was recorded (reopened); release it again with `scripts/cargo-iso --finish-task` when done",
