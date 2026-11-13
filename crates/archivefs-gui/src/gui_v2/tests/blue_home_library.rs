@@ -574,6 +574,40 @@ fn browse_play_readiness_control_fits_the_compact_window() {
 }
 
 #[test]
+fn browse_play_shows_a_sort_control_that_reorders_the_list() {
+    use crate::gui_v2::library::SortOrder;
+    let context = egui::Context::default();
+    let mut rows = games();
+    // Only game 3 has a known size larger than the rest; game 7 has none.
+    rows[2].size_bytes = Some(900);
+    rows[6].size_bytes = None;
+    let mut app = blue_app(&context, rows);
+    app.router.current = Route::BrowsePlay;
+    let strings = shown(&context, &mut app, COMPACT);
+    assert!(has(&strings, "Sort: Title A–Z"), "{strings:?}");
+    let ids = |app: &mut App| -> Vec<i64> {
+        let indices = app.browse_play_indices();
+        indices
+            .iter()
+            .map(|index| app.library.games[*index].archive.id)
+            .collect()
+    };
+    assert_eq!(ids(&mut app), (1..=12).collect::<Vec<_>>());
+    app.filter.sort = SortOrder::LargestFirst;
+    let strings = shown(&context, &mut app, COMPACT);
+    assert!(has(&strings, "Sort: Size, largest"));
+    assert!(has(
+        &strings,
+        "1 of 12 games has no size; it is listed after the rest, by title."
+    ));
+    let order = ids(&mut app);
+    assert_eq!(order.first(), Some(&3));
+    assert_eq!(order.last(), Some(&7));
+    // Equal sizes keep title order.
+    assert_eq!(order[1..11], [1, 2, 4, 5, 6, 8, 9, 10, 11, 12]);
+}
+
+#[test]
 fn the_classic_home_is_unchanged() {
     let context = egui::Context::default();
     let mut app = blue_app(&context, games());
