@@ -251,24 +251,113 @@ pub(super) fn checking() -> Diagnosis {
 
 pub(super) const PICKER_LIMIT: usize = 8;
 
+/// The picker's answer to a search: the best matches to show, best first, and
+/// how many games matched in total (so the overflow can be shown).
+pub(super) struct PickerMatches<'a> {
+    pub shown: Vec<&'a super::library::Game>,
+    pub total: usize,
+}
+
+impl PickerMatches<'_> {
+    /// Matches found but not shown because of [`PICKER_LIMIT`].
+    pub(super) fn hidden(&self) -> usize {
+        self.total - self.shown.len()
+    }
+}
+
+/// How well a matching game's title answers the query; lower is better.
+/// Title and query are compared as lowercase letter/digit words, so case,
+/// spacing and punctuation ("Zelda: A Link" vs "zelda a link") do not matter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Relevance {
+    /// The title is exactly the query.
+    Exact = 0,
+    /// The title starts with the query.
+    Prefix = 1,
+    /// Every query word starts a word of the title.
+    Words = 2,
+    /// Anything else that matched (inside a word, or only via the platform).
+    Other = 3,
+}
+
+fn tokens(text: &str) -> Vec<&str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn relevance(title_lower: &str, query_tokens: &[&str]) -> Relevance {
+    let title = tokens(title_lower);
+    let Some((last, leading)) = query_tokens.split_last() else {
+        return Relevance::Other;
+    };
+    if title.as_slice() == query_tokens {
+        return Relevance::Exact;
+    }
+    if title.len() >= query_tokens.len()
+        && title[..leading.len()] == *leading
+        && title[leading.len()].starts_with(last)
+    {
+        return Relevance::Prefix;
+    }
+    if query_tokens
+        .iter()
+        .all(|word| title.iter().any(|t| t.starts_with(word)))
+    {
+        return Relevance::Words;
+    }
+    Relevance::Other
+}
+
 /// Library games whose title or platform contains every word of the query,
-/// in library order, at most [`PICKER_LIMIT`]. An empty query lists none.
+/// best first: exact title, then title prefix, then whole-word matches, then
+/// any other match; equal relevance keeps library order. At most
+/// [`PICKER_LIMIT`] are returned, with the total count. An empty query lists
+/// none. One pass, no sort of the whole library.
 pub(super) fn matches<'a>(
     games: impl IntoIterator<Item = &'a super::library::Game>,
     query: &str,
-) -> Vec<&'a super::library::Game> {
+) -> PickerMatches<'a> {
     let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let none = PickerMatches {
+        shown: Vec::new(),
+        total: 0,
+    };
     if words.is_empty() {
-        return Vec::new();
+        return none;
     }
-    games
-        .into_iter()
-        .filter(|game| {
-            let hay = format!("{} {}", game.title, game.platform).to_lowercase();
-            words.iter().all(|word| hay.contains(word.as_str()))
-        })
-        .take(PICKER_LIMIT)
-        .collect()
+    let query_lower = words.join(" ");
+    let query_tokens = tokens(&query_lower);
+    // The first PICKER_LIMIT games of each relevance, in library order.
+    let mut buckets: [Vec<&'a super::library::Game>; 4] = Default::default();
+    let mut total = 0;
+    for game in games {
+        let mut hay = game.title.to_lowercase();
+        let title_len = hay.len();
+        hay.push(' ');
+        hay.push_str(&game.platform.to_lowercase());
+        if !words.iter().all(|word| hay.contains(word.as_str())) {
+            continue;
+        }
+        total += 1;
+        let bucket = &mut buckets[relevance(&hay[..title_len], &query_tokens) as usize];
+        if bucket.len() < PICKER_LIMIT {
+            bucket.push(game);
+        }
+    }
+    let shown = buckets.into_iter().flatten().take(PICKER_LIMIT).collect();
+    PickerMatches { shown, total }
+}
+
+/// The text under the list when more games matched than are shown.
+pub(super) fn overflow_note(hidden: usize) -> Option<String> {
+    match hidden {
+        0 => None,
+        1 => Some("1 more match not shown. Type more of the title to narrow the search.".into()),
+        n => Some(format!(
+            "{n} more matches not shown. Type more of the title to narrow the search."
+        )),
+    }
 }
 
 /// The games matching the search box, as buttons. Picking runs nothing by
@@ -280,16 +369,19 @@ pub(super) fn show_matches(
 ) -> Option<i64> {
     let mut choice = None;
     let found = matches(games, query);
-    if !query.trim().is_empty() && found.is_empty() {
+    if !query.trim().is_empty() && found.total == 0 {
         ui.label("No game in your library matches.");
     }
-    for game in found {
+    for game in &found.shown {
         if ui
             .button(format!("{} ({})", game.title, game.platform))
             .clicked()
         {
             choice = Some(game.archive.id);
         }
+    }
+    if let Some(note) = overflow_note(found.hidden()) {
+        ui.weak(note);
     }
     choice
 }
