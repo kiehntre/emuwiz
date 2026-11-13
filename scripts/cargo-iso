@@ -58,6 +58,13 @@
 #   EMUWIZ_CARGO_LOW_DEBUG   1 = same as --low-debug
 #   EMUWIZ_CARGO_FULL_DEBUG  1 = same as --full-debug
 #   EMUWIZ_CARGO_INCREMENTAL 1 = same as --incremental, 0 = same as --no-incremental
+#   EMUWIZ_CARGO_AUTO_DESIGNATE 1 = designate a new developer worktree on its first build
+#                            (default 0, off), within the limit below
+#   EMUWIZ_CARGO_MAX_DEV_WORKTREES most worktrees designated in total (default 2)
+#   EMUWIZ_CARGO_MAX_BUILDS  Cargo runs allowed at once through cargo-iso (default 2;
+#                            0 = no limit). See "Concurrent builds" below
+#   EMUWIZ_CARGO_SLOT_DIR    where the build-slot lock files live
+#                            (default ~/.cache/emuwiz-cargo-build-slots)
 #   EMUWIZ_CARGO_SCCACHE     1 = same as --sccache
 #   EMUWIZ_SCCACHE_DIR       sccache directory (default ~/.cache/emuwiz-sccache)
 #   EMUWIZ_SCCACHE_SIZE      cache size cap, e.g. 2G (default 2G)
@@ -82,11 +89,34 @@
 # first match wins:
 #   1. --incremental / --no-incremental on the command line;
 #   2. EMUWIZ_CARGO_INCREMENTAL=1 / 0 in the environment;
-#   3. this worktree's designation (--designate-dev), recorded outside every target in
+#   3. a release or other non-dev profile (--release, -r, --profile X other than dev/test)
+#      -> OFF, so release builds are never incremental, even in a designated worktree;
+#   4. this worktree's designation (--designate-dev), recorded outside every target in
 #      $EMUWIZ_TARGET_ROOT.incremental-mode/<target name> -> incremental ON;
-#   4. otherwise OFF (the default for review, verification, integration and short-lived
-#      worktrees, and for every worktree nobody designated).
+#   5. a NEW developer worktree, only when EMUWIZ_CARGO_AUTO_DESIGNATE=1 -> designated on
+#      its first build, then ON (see below);
+#   6. otherwise OFF (the default for review, verification, integration and short-lived
+#      worktrees, and for every existing worktree nobody designated).
 # A designation record that is unreadable or says anything but "on" is ignored (OFF).
+# At most EMUWIZ_CARGO_MAX_DEV_WORKTREES (default 2; owner limit for disk) worktrees are
+# designated in total across ALL target roots (~/.cache and e.g. /mnt/nvme2 together),
+# counting records that read "on" in every root listed in the roots file
+# (EMUWIZ_DESIGNATION_ROOTS_FILE, default ~/.cache/emuwiz-cargo-designation-roots), the
+# default home root, the current root and EMUWIZ_DESIGNATION_ROOTS (colon-separated;
+# default /mnt/nvme2/emuwiz-cargo-targets). --designate-dev is refused (exit 3)
+# with a clear message when that many are already on; free one with --undesignate-dev in
+# an idle worktree you own. Count and write happen under one lock shared by every root
+# (EMUWIZ_DESIGNATION_LOCK, default ~/.cache/emuwiz-cargo-designation.lock), so two at
+# once cannot both take the last place.
+# Opt-in automatic designation (EMUWIZ_CARGO_AUTO_DESIGNATE=1; default 0 = off, owner
+# decision 2026-11-13): the first build of a worktree whose
+# target does not exist yet, that is on a branch (not a detached HEAD, which is how
+# review, verification and deploy checkouts are made), that has no designation record
+# (an --undesignate-dev "off" is respected), and whose command is not a release build
+# and does not use --sccache, writes the same record --designate-dev writes and is
+# announced. An explicit choice on that first build (--incremental/--no-incremental or
+# EMUWIZ_CARGO_INCREMENTAL) designates nothing; at the limit the worktree is built
+# non-incremental with a note. scripts/cargo-iso --undesignate-dev undoes it.
 # Whatever is decided overrides an inherited CARGO_INCREMENTAL (older ~/.bashrc files
 # export CARGO_INCREMENTAL=0, which makes every edit recompile the whole crate). With a
 # decision of OFF that was not explicit the inherited value is left exactly as it was;
@@ -95,6 +125,21 @@
 # 97.5 s off vs 27.6-28.4 s on, after a one-off ~5 min priming build and roughly 3x the
 # target size (2.3 -> 6.9 GiB). Designate only the few worktrees you build in all day, and
 # keep one choice per worktree so its cache stays warm. Nothing is designated for you.
+#
+# Concurrent builds: at most EMUWIZ_CARGO_MAX_BUILDS (default 2) cargo-iso runs build at
+# the same time, across every worktree and target root of this user. Builds slow down
+# 1.7-3.6x when three or more run together (measured 2026-11-13). A run takes one of the
+# slot locks in EMUWIZ_CARGO_SLOT_DIR (flock) and holds it until cargo exits; when all
+# are taken it says so once and waits on the lock itself (no fixed sleep), starting as
+# soon as a slot frees. This limits how many builds run, not how many jobs each build
+# uses. --rust-analyzer runs, --print-target and the designation commands take no slot,
+# and a cargo-iso started inside a build that already holds one (EMUWIZ_CARGO_SLOT set)
+# never waits for a second. A slot is held for the whole cargo run, so a long `cargo-iso test`
+# (for example an --ignored proof run) keeps its slot until the tests finish, not just
+# while compiling. A slot file that cannot be opened skips the limit with a note and never
+# blocks the build. Under the lifecycle tracker (the default) cargo never
+# inherits the slot; with EMUWIZ_RETENTION=0 cargo is exec'd with it, so a daemon cargo
+# leaves running (an sccache server, for example) would keep that slot until it exits.
 #
 # sccache (--sccache): shares compiled dependency artefacts between worktrees
 # while every worktree keeps its own target directory. It sets RUSTC_WRAPPER for
@@ -241,10 +286,97 @@ designated=0
 if [ -f "$inc_file" ] && [ ! -L "$inc_file" ] && [ "$(cat -- "$inc_file" 2>/dev/null)" = on ]; then
   designated=1
 fi
+release_build=0
+prev=""
+for arg in "$@"; do
+  [ "$arg" = "--" ] && break
+  case "$arg" in
+    --release|-r) release_build=1 ;;
+    --profile=*) case "${arg#--profile=}" in dev|test) ;; *) release_build=1 ;; esac ;;
+    *) if [ "$prev" = "--profile" ]; then case "$arg" in dev|test) ;; *) release_build=1 ;; esac; fi ;;
+  esac
+  prev="$arg"
+done
+max_dev="${EMUWIZ_CARGO_MAX_DEV_WORKTREES:-2}"
+case "$max_dev" in
+  ''|*[!0-9]*) echo "cargo-iso: EMUWIZ_CARGO_MAX_DEV_WORKTREES must be a whole number, got '$max_dev'" >&2; exit 2 ;;
+esac
+# The limit is for ALL target roots together (owner rule: two in total, not two per drive).
+# Every root this user builds in is listed in one roots file under the home cache; the
+# default home root, the current root and EMUWIZ_DESIGNATION_ROOTS (colon-separated,
+# default /mnt/nvme2/emuwiz-cargo-targets) are always included. Each real build and designation adds its root to the file.
+roots_file="${EMUWIZ_DESIGNATION_ROOTS_FILE:-$home/.cache/emuwiz-cargo-designation-roots}"
+designation_lock="${EMUWIZ_DESIGNATION_LOCK:-$home/.cache/emuwiz-cargo-designation.lock}"
+# Known roots on this host, counted even before any new build registers them (set it to
+# an empty value to count none extra).
+extra_roots="${EMUWIZ_DESIGNATION_ROOTS-/mnt/nvme2/emuwiz-cargo-targets}"
+designation_roots() {
+  {
+    printf '%s\n' "$root" "$home/.cache/emuwiz-cargo-targets"
+    printf '%s\n' "$extra_roots" | tr ':' '\n'
+    if [ -f "$roots_file" ]; then cat -- "$roots_file" 2>/dev/null; fi
+  } | while IFS= read -r r; do [ -n "$r" ] && realpath -m -- "$r"; done | awk '!seen[$0]++'
+}
+register_root() {
+  local canonical
+  canonical=$(realpath -m -- "$root")
+  mkdir -p -- "$(dirname "$roots_file")" 2>/dev/null || return 0
+  grep -qxF -- "$canonical" "$roots_file" 2>/dev/null || printf '%s\n' "$canonical" >>"$roots_file" 2>/dev/null || true
+}
+# Designated worktrees in total: regular records reading "on" in every known root.
+count_designated() {
+  local r record n=0
+  while IFS= read -r r; do
+    for record in "$r.incremental-mode"/*; do
+      if [ -f "$record" ] && [ ! -L "$record" ] && [ "$(cat -- "$record" 2>/dev/null)" = on ]; then
+        n=$((n + 1))
+      fi
+    done
+  done < <(designation_roots)
+  echo "$n"
+}
+# Write this worktree's record ($1 = on|off) under the designation lock. Turning one on
+# re-counts under the lock and refuses (status 9) when the limit is reached.
+write_designation() {
+  local lock="$designation_lock" current=""
+  mkdir -p -- "$(dirname "$inc_file")" "$(dirname "$lock")" 2>/dev/null || return 1
+  { exec 8>>"$lock"; } 2>/dev/null || return 1
+  flock -w 30 8 || { exec 8>&-; return 1; }
+  if [ "$1" = on ]; then
+    [ -f "$inc_file" ] && [ ! -L "$inc_file" ] && current=$(cat -- "$inc_file" 2>/dev/null)
+    if [ "$current" != on ] && [ "$(count_designated)" -ge "$max_dev" ]; then
+      exec 8>&-
+      return 9
+    fi
+  fi
+  { printf '%s\n' "$1" >"$inc_file.tmp.$$" && mv -f -- "$inc_file.tmp.$$" "$inc_file"; } 2>/dev/null || { exec 8>&-; return 1; }
+  register_root
+  exec 8>&-
+}
+designated_total=$(count_designated)
+dev_cap_reached=0
+auto_designate=0
+if [ -z "$incremental_choice" ] && [ "$designated" -eq 0 ] && [ "$release_build" -eq 0 ] &&
+   [ "${EMUWIZ_CARGO_AUTO_DESIGNATE:-0}" = "1" ] && [ "$ra_mode" -eq 0 ] && [ "$use_sccache" != "1" ] &&
+   [ "$finish_task" -eq 0 ] && [ -z "$designate" ] &&
+   [ ! -e "$target" ] && [ ! -L "$target" ] && [ ! -e "$inc_file" ] && [ ! -L "$inc_file" ] &&
+   git -C "$top" symbolic-ref -q HEAD >/dev/null 2>&1; then
+  if [ "$designated_total" -lt "$max_dev" ]; then
+    auto_designate=1
+  else
+    dev_cap_reached=1
+  fi
+fi
 if [ -n "$incremental_choice" ]; then
   incremental=$incremental_choice; incremental_why="explicit"; inc_explicit=1
+elif [ "$release_build" -eq 1 ]; then
+  incremental=0; incremental_why="release or non-dev profile"; inc_explicit=0
 elif [ "$designated" -eq 1 ]; then
   incremental=1; incremental_why="designated developer worktree"; inc_explicit=0
+elif [ "$auto_designate" -eq 1 ]; then
+  incremental=1; incremental_why="new developer worktree, designated on its first build"; inc_explicit=0
+elif [ "$dev_cap_reached" -eq 1 ]; then
+  incremental=0; incremental_why="new developer worktree, but $designated_total of $max_dev designated worktrees are in use"; inc_explicit=0
 else
   incremental=0; incremental_why="default (not designated)"; inc_explicit=0
 fi
@@ -261,9 +393,17 @@ if [ -n "$designate" ]; then
   fi
   if [ -d "$inc_file" ]; then echo "cargo-iso: $inc_file is a directory; refusing" >&2; exit 3; fi
   # Record or remove the designation. Touches only the record, never a target, and runs no cargo.
-  { mkdir -p -- "$(dirname "$inc_file")" &&
-    printf '%s\n' "$designate" >"$inc_file.tmp.$$" && mv -f -- "$inc_file.tmp.$$" "$inc_file"; } 2>/dev/null || {
-    echo "cargo-iso: could not record the designation in $inc_file" >&2; exit 3; }
+  write_rc=0
+  write_designation "$designate" || write_rc=$?
+  if [ "$write_rc" -eq 9 ]; then
+    echo "cargo-iso: refusing --designate-dev: $max_dev developer worktrees are already designated in total across target roots (the limit)." >&2
+    echo "           Free one first with scripts/cargo-iso --undesignate-dev in an idle worktree you own" >&2
+    echo "           (records, all roots: $(designation_roots | sed 's|$|.incremental-mode/|' | tr '\n' ' '); a record whose worktree no longer exists can be" >&2
+    echo "           set to off by writing 'off' into it). Nothing was changed." >&2
+    exit 3
+  elif [ "$write_rc" -ne 0 ]; then
+    echo "cargo-iso: could not record the designation in $inc_file" >&2; exit 3
+  fi
   if [ "$designate" = on ]; then
     echo "cargo-iso: $top is a designated developer worktree: builds are incremental by default (opt out per run with --no-incremental)"
   else
@@ -342,6 +482,24 @@ if [ -f "$maintain" ] && command -v python3 >/dev/null 2>&1; then
   fi
 fi
 
+register_root
+if [ "$dev_cap_reached" -eq 1 ]; then
+  echo "cargo-iso: note: not designating $top: $designated_total of $max_dev developer worktrees are already designated in total across target roots; building non-incremental (free one with --undesignate-dev in an idle worktree)" >&2
+fi
+if [ "$auto_designate" -eq 1 ]; then
+  write_rc=0
+  write_designation on || write_rc=$?
+  if [ "$write_rc" -eq 0 ]; then
+    echo "cargo-iso: note: new developer worktree $top is now designated: builds are incremental (undo: scripts/cargo-iso --undesignate-dev)" >&2
+  elif [ "$write_rc" -eq 9 ]; then
+    incremental=0
+    echo "cargo-iso: note: not designating $top: $max_dev developer worktrees are already designated; building non-incremental" >&2
+  else
+    incremental=0
+    echo "cargo-iso: note: could not record the developer designation in $inc_file; building non-incremental" >&2
+  fi
+fi
+
 mkdir -p "$target"
 export CARGO_TARGET_DIR="$target"
 if [ "$ra_mode" -eq 1 ]; then
@@ -393,6 +551,48 @@ elif [ "$incremental" = "1" ]; then
 elif [ "$inc_explicit" -eq 1 ]; then
   export CARGO_INCREMENTAL=0
 fi
+# Concurrent builds (see the header): take one of the build slots, waiting on the lock.
+max_builds="${EMUWIZ_CARGO_MAX_BUILDS:-2}"
+case "$max_builds" in
+  ''|*[!0-9]*) echo "cargo-iso: EMUWIZ_CARGO_MAX_BUILDS must be a whole number, got '$max_builds'" >&2; exit 2 ;;
+esac
+slot_dir="${EMUWIZ_CARGO_SLOT_DIR:-$home/.cache/emuwiz-cargo-build-slots}"
+if [ "$ra_mode" -eq 0 ] && [ "$max_builds" -gt 0 ] && [ -z "${EMUWIZ_CARGO_SLOT:-}" ]; then
+  if command -v flock >/dev/null 2>&1 && mkdir -p -- "$slot_dir" 2>/dev/null && [ -w "$slot_dir" ]; then
+    slot=""
+    announced=0
+    next=0
+    slot_broken=""
+    # A slot file that cannot be opened (a directory, another owner's file) must never stop
+    # the build: the limit is then skipped with a note, exactly like an unusable slot dir.
+    while [ -z "$slot" ]; do
+      for ((i = 0; i < max_builds; i++)); do
+        if ! { exec 9>>"$slot_dir/slot-$i.lock"; } 2>/dev/null; then slot_broken="$slot_dir/slot-$i.lock"; break 2; fi
+        if flock -n 9; then slot=$i; break; fi
+      done
+      [ -n "$slot" ] && break
+      if [ "$announced" -eq 0 ]; then
+        echo "cargo-iso: $max_builds Cargo builds are already running; this one starts as soon as one finishes (EMUWIZ_CARGO_MAX_BUILDS=0 removes the limit)" >&2
+        announced=1
+      fi
+      # Block on one slot's lock (returns the moment it frees); the timeout only
+      # lets the next pass try the other slots too.
+      if ! { exec 9>>"$slot_dir/slot-$next.lock"; } 2>/dev/null; then slot_broken="$slot_dir/slot-$next.lock"; break; fi
+      if flock -w 2 9; then slot=$next; fi
+      next=$(( (next + 1) % max_builds ))
+    done
+    if [ -n "$slot_broken" ]; then
+      { exec 9>&-; } 2>/dev/null || true
+      echo "cargo-iso: note: build-slot limit unavailable ($slot_broken cannot be opened); building without it" >&2
+    else
+      [ "$announced" -eq 1 ] && echo "cargo-iso: build slot free; starting" >&2
+      export EMUWIZ_CARGO_SLOT="$slot"
+    fi
+  else
+    echo "cargo-iso: note: build-slot limit unavailable ($slot_dir); building without it" >&2
+  fi
+fi
+
 # Lifecycle tracking (scripts/emuwiz-cargo-retention): holds a shared lock for
 # the whole build so the cache cannot be retired under it, and records who built
 # what. It preserves cargo's arguments, exit status and signals, and never blocks

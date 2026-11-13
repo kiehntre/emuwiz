@@ -305,9 +305,16 @@ pub(super) fn show(
             }
             _ => {
                 let scanning = loading || app_scan_running;
+                // A plain status reload also disables Scan; only call it a scan
+                // when one is actually running.
+                let busy_text = if app_scan_running {
+                    "A scan is already running."
+                } else {
+                    "Loading database status…"
+                };
                 if widgets::action_button(ui, "Scan library", ActionStyle::Secondary, !scanning)
                     .on_hover_text("Reads every enabled game folder and saves what changed.")
-                    .on_disabled_hover_text("A scan is already running.")
+                    .on_disabled_hover_text(busy_text)
                     .clicked()
                 {
                     request = Some(Request::Scan);
@@ -325,7 +332,7 @@ pub(super) fn show(
                 }
                 if scanning {
                     ui.label(
-                        RichText::new("A scan is already running.")
+                        RichText::new(busy_text)
                             .size(13.0)
                             .color(palette::SECONDARY_TEXT),
                     );
@@ -616,6 +623,57 @@ mod tests {
         state.poll(&context);
         assert!(state.db.is_none());
         assert!(!state.refresh(&context));
+    }
+
+    #[test]
+    fn a_status_reload_is_not_described_as_a_scan() {
+        let context = egui::Context::default();
+        crate::gui_v2::readable_style(&context);
+        for (app_scan_running, wanted, unwanted) in [
+            (
+                false,
+                "Loading database status…",
+                "A scan is already running.",
+            ),
+            (
+                true,
+                "A scan is already running.",
+                "Loading database status…",
+            ),
+        ] {
+            let (_sender, receiver) = std::sync::mpsc::channel();
+            let mut state = DatabaseStatusState {
+                db: Some(DatabaseState::Loading {
+                    generation: DatabaseGeneration(1),
+                    receiver,
+                    worker: None,
+                    previous: None,
+                    scanning: false,
+                }),
+                ..Default::default()
+            };
+            let output = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    show(ui, &mut state, app_scan_running);
+                });
+            });
+            let mut texts = Vec::new();
+            fn gather(shape: &egui::Shape, out: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| gather(s, out)),
+                    _ => {}
+                }
+            }
+            for shape in &output.shapes {
+                gather(&shape.shape, &mut texts);
+            }
+            assert!(texts.iter().any(|t| t == wanted), "{wanted}: {texts:?}");
+            assert!(
+                !texts.iter().any(|t| t == unwanted),
+                "{unwanted}: {texts:?}"
+            );
+        }
     }
 
     #[test]
