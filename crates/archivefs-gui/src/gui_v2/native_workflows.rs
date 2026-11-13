@@ -4072,6 +4072,14 @@ impl NativeWorkflows {
         );
         // An explicit recheck also forgets any cached MAME answer for this game.
         crate::arcade_mame_probe::invalidate_path(&path);
+        // RetroArch facts (save folders, the zipped-game save check) come from
+        // its background scan, so an explicit recheck refreshes that too.
+        if !matches!(
+            self.app.emulator_readiness.retroarch_profiles,
+            crate::emulator_setup::RetroArchProfilesState::Scanning { .. }
+        ) {
+            self.app.start_retroarch_profile_scan(context.clone());
+        }
         if !running {
             self.app.launch_standalone.clear_cue_review();
             self.app.start_selected_evidence_load(context.clone(), path);

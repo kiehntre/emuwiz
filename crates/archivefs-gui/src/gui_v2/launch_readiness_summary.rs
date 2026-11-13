@@ -272,6 +272,14 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
     let named_disc_refusal = summary
         .explanation
         .starts_with(archivefs_core::launch::evidence_bridge::CUE_BIN_REFUSED_PREFIX);
+    // The zipped-save refusal already offers Recheck (which refreshes
+    // RetroArch, where the answer comes from); the generic safety-refusal
+    // finding must not turn that into "Review problem".
+    let zipped_save_refusal = matches!(input, LaunchReadinessInput::Plan { plan, .. }
+    if plan.candidates.iter().flat_map(|candidate| &candidate.blockers).any(|blocker| {
+        blocker.kind == LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe
+            && blocker.detail == summary.explanation
+    }));
     let mut findings = match input {
         LaunchReadinessInput::IdentityConflicting => diagnosis::single(Cause::IdentityNotConfirmed),
         // Each reason already carries its own wording and next action.
@@ -324,7 +332,10 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
     {
         return;
     }
-    if !named_disc_refusal && let Some(fix) = findings[0].fix {
+    if !named_disc_refusal
+        && !zipped_save_refusal
+        && let Some(fix) = findings[0].fix
+    {
         summary.primary_action = Some(fix);
     }
     summary.findings = findings;
@@ -724,6 +735,28 @@ fn project_plan(
     if let Some(blocker) = candidate
         .blockers
         .iter()
+        .find(|blocker| blocker.kind == LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe)
+    {
+        // Same reason the launch would refuse with; Recheck also refreshes
+        // RetroArch, which is where this answer comes from.
+        return with_details(
+            base(
+                ReadinessPresentationState::Blocked,
+                "RetroArch would lose this zipped game's saves",
+                &blocker.detail,
+                IdentitySummary::StrongLocal,
+                source_for(candidate),
+                firmware_for(candidate),
+                emulator_for(candidate),
+                Some(ReadinessAction::RecheckReadiness),
+            ),
+            details,
+        );
+    }
+
+    if let Some(blocker) = candidate
+        .blockers
+        .iter()
         .find(|blocker| blocker.kind == LaunchBlockerKind::RetroArchArcadeSetNeedsArchive)
     {
         return with_details(
@@ -841,6 +874,15 @@ fn project_plan(
         );
     }
     summary
+}
+
+/// A save-folder finding comes from the last RetroArch scan; offer the
+/// refresh that re-checks it (owner decision 2026-11-13).
+pub(crate) fn offers_retroarch_refresh(summary: &GameReadinessSummary) -> bool {
+    summary
+        .warnings
+        .iter()
+        .any(|warning| warning.ends_with(archivefs_core::launch::RETROARCH_RECHECK_HINT))
 }
 
 fn base(
@@ -1166,6 +1208,9 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
         });
         for warning in summary.warnings.iter().take(2) {
             ui.colored_label(crate::ui::theme::warning(ui), warning);
+        }
+        if offers_retroarch_refresh(summary) && ui.small_button("Refresh RetroArch").clicked() {
+            action = Some(ReadinessAction::RecheckReadiness);
         }
         ui.collapsing("Readiness details", |ui| {
             if let Some(emulator) = &summary.emulator {
@@ -2922,6 +2967,67 @@ mod tests {
             ReadinessFreshness::Current,
         );
         assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
+    }
+
+    #[test]
+    fn save_folder_warning_keeps_play_and_offers_retroarch_refresh() {
+        let detail = format!(
+            "In-game progress may fail to save. RetroArch's save-file folder /gone does not exist. {}",
+            archivefs_core::launch::RETROARCH_RECHECK_HINT
+        );
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::ReadyWithWarnings,
+                FirmwareReadiness::NotRequired,
+                vec![],
+                vec![LaunchWarning::new(
+                    archivefs_core::launch::LaunchWarningKind::RetroArchSaveDirectoryUnusable,
+                    detail.clone(),
+                )],
+                CandidatePreference::SoleEligible,
+                Some("/game.sfc"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(
+            summary.status,
+            ReadinessPresentationState::ReadyWithWarnings
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+        assert!(summary.warnings.contains(&detail));
+        assert!(offers_retroarch_refresh(&summary));
+        let (_, refresh) = click_card_button(&summary, "Refresh RetroArch");
+        assert_eq!(refresh, Some(ReadinessAction::RecheckReadiness));
+    }
+
+    #[test]
+    fn zipped_save_blocker_states_the_reason_and_offers_recheck_not_play() {
+        let reason = format!(
+            "This game is inside a ZIP ... /gone does not exist ... {}",
+            archivefs_core::launch::RETROARCH_RECHECK_HINT
+        );
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::Blocked,
+                FirmwareReadiness::NotRequired,
+                vec![LaunchBlocker::new(
+                    LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe,
+                    reason.clone(),
+                )],
+                vec![],
+                CandidatePreference::SoleEligible,
+                Some("/game.zip"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(summary.status, ReadinessPresentationState::Blocked);
+        assert_eq!(summary.explanation, reason);
+        assert_eq!(
+            summary.primary_action,
+            Some(ReadinessAction::RecheckReadiness)
+        );
+        let (_, play) = click_card_button(&summary, "Play");
+        assert_eq!(play, None, "a refused zipped game must not launch");
     }
 }
 

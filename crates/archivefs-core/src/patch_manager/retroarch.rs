@@ -1601,6 +1601,7 @@ mod tests {
                 complete: true,
             },
             app_images: Vec::new(),
+            save_directories: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
