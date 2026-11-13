@@ -19,7 +19,7 @@ use crate::dat::dependency::graph::{DependencyGraph, SetRef};
 use crate::dat::dependency::owner::{RomOwner, rom_owner};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatDiskEntry, DatGameEntry, DatRomEntry, ParsedDat};
-use crate::dat::parsers::mame_listxml::parse_mame_listxml;
+use crate::dat::parsers::mame_listxml::parse_mame_logiqx_datafile;
 use crate::dat::set::{
     MemberClass, NeedsReviewReason, SetIdentity, SetResolution, SetState, classify_disk_member,
 };
@@ -646,13 +646,15 @@ pub fn load_verified_mame_0174(path: &Path) -> Result<VerifiedMameDat, String> {
             "refusing DAT with SHA-256 {sha256}; expected {MAME_0174_SHA256}"
         ));
     }
-    let parsed = parse_mame_listxml(path, DatLimits::default())
+    // This DAT is Logiqx-shaped datafile XML with `<machine>` entries rather
+    // than current `-listxml`'s `<mame build=...>` root. The bounded MAME
+    // machine parser supplies the entries through its `<datafile>` entry point
+    // (the generic Logiqx parser drops `<driver status>`, which readiness
+    // needs); this exact header assertion proves the publisher's internal
+    // revision without filename inference.
+    let parsed = parse_mame_logiqx_datafile(path, DatLimits::default())
         .map_err(|e| format!("parse MAME XML: {e}"))?
         .dat;
-    // This DAT is Logiqx-shaped datafile XML with `<machine>` entries rather
-    // than current `-listxml`'s `<mame build=...>` root. The existing bounded
-    // MAME machine parser supplies the entries; this exact header assertion
-    // proves the publisher's internal revision without filename inference.
     let header_proof = String::from_utf8_lossy(&bytes);
     if !header_proof.contains("<description>MAME Arcade 0.174</description>") {
         return Err("refusing DAT without internal MAME 0.174 header description".into());
@@ -1593,6 +1595,17 @@ mod tests {
         .unwrap();
         let err = load_verified_mame_0174(&path);
         assert!(err.is_err());
+    }
+
+    /// Read-only check against the real pinned DAT, which is not in the
+    /// repository: set `EMUWIZ_MAME_0174_DAT` and run with `--ignored`.
+    #[test]
+    #[ignore = "needs the pinned MAME 0.174 Arcade XML DAT via EMUWIZ_MAME_0174_DAT"]
+    fn pinned_mame_0174_datafile_loads() {
+        let path = std::env::var_os("EMUWIZ_MAME_0174_DAT").expect("EMUWIZ_MAME_0174_DAT");
+        let dat = load_verified_mame_0174(Path::new(&path)).unwrap();
+        assert_eq!(dat.sha256, MAME_0174_SHA256);
+        assert_eq!(dat.parsed.games.len(), 32_071);
     }
 
     #[test]
