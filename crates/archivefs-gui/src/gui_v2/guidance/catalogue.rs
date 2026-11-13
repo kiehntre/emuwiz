@@ -1544,7 +1544,7 @@ pub(crate) static CATALOGUE: &[GuidanceScript] = &[
         category: C::Explain,
         pages: &[P::Settings],
         mascot: M::Helpful,
-        quick: "You can turn these hints off below; no control or page is ever hidden by them.",
+        quick: "You can turn these hints off under Beginner guidance; no control or page is ever hidden by them.",
         ..BASE
     },
     GuidanceScript {
