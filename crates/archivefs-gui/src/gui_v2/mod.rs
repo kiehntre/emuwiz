@@ -113,6 +113,7 @@ mod setup_portability;
 #[cfg(test)]
 #[path = "tests/shared_scroll.rs"]
 mod shared_scroll_tests;
+mod shortcuts;
 mod simple_shell;
 mod single_file_restore;
 mod source_impact;
@@ -2633,7 +2634,7 @@ impl eframe::App for App {
         }
         self.poll(ui.ctx());
         self.note_window_resize(ui.ctx());
-        self.show(ui.ctx());
+        self.show_with_shortcuts(ui.ctx());
         self.simple.paint_focus_ring(ui.ctx());
         self.finish_frame();
     }

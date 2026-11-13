@@ -219,7 +219,7 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut State) {
     platforms.dedup();
     ui.horizontal(|ui| {
         ui.label("Search");
-        ui.text_edit_singleline(&mut state.query);
+        crate::gui_v2::shortcuts::register_search(&ui.text_edit_singleline(&mut state.query));
         egui::ComboBox::from_label("Platform claim")
             .selected_text(state.platform.as_deref().unwrap_or("Any"))
             .show_ui(ui, |ui| {

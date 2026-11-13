@@ -194,11 +194,12 @@ pub(super) fn show(
 }
 
 fn search_box(ui: &mut egui::Ui, query: &mut String) {
-    ui.add(
+    let search = ui.add(
         egui::TextEdit::singleline(query)
             .hint_text("Find a game to check")
             .desired_width(220.0),
     );
+    crate::gui_v2::shortcuts::register_search(&search);
 }
 
 /// Where a Doctor action goes: always an existing screen, never a launch or
