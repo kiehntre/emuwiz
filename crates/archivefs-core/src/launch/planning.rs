@@ -450,6 +450,15 @@ fn build_standalone_candidates(
     profiles
         .iter()
         .filter(|profile| compat.standalone_adapters.contains(&profile.adapter_id))
+        // Native Atari800 is given `.atr` disks only; for any other Atari
+        // 8-bit format it is not a route at all, ready or blocked.
+        .filter(|profile| {
+            profile.adapter_id != "atari800"
+                || content.resolved_path.as_deref().is_some_and(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("atr"))
+                })
+        })
         .map(|profile| {
             let mut blockers = Vec::new();
             let mut warnings = Vec::new();
@@ -759,6 +768,11 @@ fn build_retroarch_candidates(
         .collect()
 }
 
+/// Standalone adapters added beside an already working route for the same
+/// platform. Becoming ready must never take over (or stall) the Play action
+/// of a game that another emulator already starts: see `apply_preference`.
+const OPT_IN_STANDALONE_ADAPTERS: &[&str] = &["atari800"];
+
 /// Applies remembered-profile preference to standalone candidates, and
 /// surfaces [`LaunchWarningKind::MultipleEligibleProfiles`] when more than
 /// one is eligible and nothing is remembered.
@@ -798,6 +812,36 @@ fn apply_preference(candidates: &mut [LaunchCandidate], remembered: &[Remembered
         candidates[index].preference = CandidatePreference::Remembered;
         return;
     }
+
+    // Opt-in native routes never compete for the automatic choice. A game
+    // that already has another ready route keeps it for Play; the native
+    // route stays an explicit choice ("Use once" / a saved default), and it
+    // becomes the automatic route only when no other route is ready.
+    let opt_in = |candidate: &LaunchCandidate| {
+        matches!(
+            &candidate.target,
+            LaunchTarget::Standalone { adapter_id, .. }
+                if OPT_IN_STANDALONE_ADAPTERS.contains(adapter_id)
+        )
+    };
+    let eligible_indices: Vec<usize> = if eligible_indices
+        .iter()
+        .any(|&index| !opt_in(&candidates[index]))
+    {
+        eligible_indices
+            .into_iter()
+            .filter(|&index| {
+                if opt_in(&candidates[index]) {
+                    candidates[index].preference = CandidatePreference::Undetermined;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect()
+    } else {
+        eligible_indices
+    };
 
     // PlayStation CHD content: prefer the route with the strongest CHD
     // evidence, but only when that route can really start. Tier 0 is a known

@@ -228,7 +228,54 @@ pub fn discover_remaining_emulator_readiness() -> Vec<RemainingEmulatorReadiness
             ),
         ));
     }
+    #[cfg(target_os = "linux")]
+    out.extend(atari800_readiness());
     out
+}
+
+/// Native Atari800, reported only once the user has it or has started its
+/// setup: its absence is not a finding for everyone else.
+#[cfg(target_os = "linux")]
+fn atari800_readiness() -> Option<RemainingEmulatorReadiness> {
+    use crate::launch::atari800_setup::{Atari800Paths, Atari800Setup, load_setup, resolve_setup};
+    let paths = Atari800Paths::from_environment().ok()?;
+    let setup = load_setup(&paths.setup_file);
+    let resolved = setup
+        .as_ref()
+        .ok()
+        .map(|setup| resolve_setup(setup, std::env::var_os("PATH").as_deref()));
+    if let (Ok(setup), Some(resolved)) = (&setup, &resolved)
+        && *setup == Atari800Setup::default()
+        && resolved.discovered.is_empty()
+    {
+        return None;
+    }
+    let blockers = match (&setup, &resolved) {
+        (Err(error), _) => vec![error.clone()],
+        (_, Some(resolved)) => resolved.blockers.iter().map(ToString::to_string).collect(),
+        _ => Vec::new(),
+    };
+    let executable = resolved
+        .as_ref()
+        .and_then(|resolved| resolved.executable.as_deref())
+        .map(EncodedPath::from_path);
+    Some(item(
+        "Atari800",
+        executable,
+        None,
+        Some(EncodedPath::from_path(&paths.setup_file)),
+        &[crate::launch::atari800::PLATFORM_ID],
+        blockers.is_empty(),
+        details(
+            blockers,
+            vec![
+                "Profile semantics: EmuWiz-owned setup; your own Atari800 configuration is never read or changed".into(),
+                "Firmware: user-selected OS/BASIC ROMs bound by role, size and SHA-256; contents are not verified".into(),
+                "Media: direct .atr only, in a temporary session whose disk changes are discarded".into(),
+            ],
+            "Open an Atari 8-bit game's Launch panel and complete the Atari800 setup, then run Doctor again.",
+        ),
+    ))
 }
 
 pub fn findings_from_remaining_profiles() -> Vec<Finding> {

@@ -223,6 +223,13 @@ impl EnvSnapshot {
         // Only what changes a plan; the launch-observation flag does not.
         hash_debug(&mut hasher, &state.launch_choices.preferences);
         hash_debug(&mut hasher, &state.launch_choices.once);
+        // The native Atari800 setup: a verdict made before its first check
+        // answered, or before the setup changed, is recomputed.
+        #[cfg(target_os = "linux")]
+        hash_debug(
+            &mut hasher,
+            &crate::launch_readiness_page::atari800::plan_signature(),
+        );
         hasher.finish()
     }
 

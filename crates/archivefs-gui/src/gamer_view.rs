@@ -299,6 +299,12 @@ pub(crate) fn show_gamer_launch_blocker(
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(100));
             }
+            // The Atari800 setup check also answers from a worker thread.
+            #[cfg(target_os = "linux")]
+            if blocker.detail == launch_readiness_page::atari800::CHECKING {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+            }
             "EmuWiz is still checking this game."
         }
         launch_readiness_page::GamerBlockerKind::UnknownSystem => {

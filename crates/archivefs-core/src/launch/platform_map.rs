@@ -339,6 +339,14 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         retroarch_core_hints: &[],
         confidence: MappingConfidence::StronglyKnown,
     },
+    // Native Atari800 (disposable ATR sessions, see `atari800_setup`) and the
+    // libretro core of the same name stay separate candidates.
+    LaunchCompatibility {
+        platform_id: "Atari 8-bit",
+        standalone_adapters: &["atari800"],
+        retroarch_core_hints: &["atari800"],
+        confidence: MappingConfidence::StronglyKnown,
+    },
     LaunchCompatibility {
         platform_id: "Atari5200",
         standalone_adapters: &[],
@@ -614,6 +622,24 @@ mod tests {
                 "{platform_id} is missing from LAUNCH_COMPATIBILITY"
             );
         }
+    }
+
+    #[test]
+    fn atari_8bit_maps_to_native_atari800_and_keeps_the_retroarch_core() {
+        let entry = launch_compatibility_for_platform("Atari 8-bit").unwrap();
+        assert_eq!(entry.standalone_adapters, &["atari800"]);
+        assert_eq!(entry.retroarch_core_hints, &["atari800"]);
+        assert_eq!(
+            platforms_for_standalone_adapter("atari800"),
+            vec!["Atari 8-bit"]
+        );
+        // The 5200 shares the chipset but is not launched by this adapter.
+        assert!(
+            launch_compatibility_for_platform("Atari5200")
+                .unwrap()
+                .standalone_adapters
+                .is_empty()
+        );
     }
 
     #[test]
