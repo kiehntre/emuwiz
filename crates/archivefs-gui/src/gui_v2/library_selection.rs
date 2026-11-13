@@ -22,7 +22,7 @@
 // Integration pending: Library sort (Batch 1 D) and Ready filter (Batch 2
 // Job 6) are still changing the list code, so the row click and bar are wired
 // in after they merge. Remove this once wired.
-#![cfg_attr(not(test), allow(dead_code))]
+#![allow(dead_code)]
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
