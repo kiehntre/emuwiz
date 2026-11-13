@@ -836,16 +836,37 @@ impl App {
     /// The sort control. It sits at the end of the systems row, so it adds
     /// no row of its own on small windows.
     fn browse_play_sort_control(&mut self, ui: &mut egui::Ui) {
-        egui::ComboBox::from_id_salt("library_sort")
-            .selected_text(sort_button_text(self.filter.sort))
-            .show_ui(ui, |ui| {
-                for choice in SortOrder::ALL {
-                    ui.selectable_value(&mut self.filter.sort, choice, choice.label())
-                        .on_hover_text(choice.hint());
-                }
-            })
-            .response
-            .on_hover_text(self.filter.sort.hint());
+        let text = sort_button_text(self.filter.sort);
+        // A combo box asks the row only for the space left on it, so the
+        // wrapping row never moves it down and its label runs off the edge.
+        // Claiming the label's full width first lets the row wrap it.
+        let spacing = ui.spacing();
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let label_width = ui
+            .painter()
+            .layout_no_wrap(text.clone(), font, Color32::PLACEHOLDER)
+            .size()
+            .x;
+        let width = (label_width
+            + spacing.icon_spacing
+            + spacing.icon_width
+            + 2.0 * spacing.button_padding.x)
+            .max(spacing.combo_width);
+        let height = spacing.interact_size.y;
+        ui.allocate_ui(egui::vec2(width, height), |ui| {
+            egui::ComboBox::from_id_salt("library_sort")
+                .selected_text(text)
+                .width(width)
+                .wrap_mode(egui::TextWrapMode::Extend)
+                .show_ui(ui, |ui| {
+                    for choice in SortOrder::ALL {
+                        ui.selectable_value(&mut self.filter.sort, choice, choice.label())
+                            .on_hover_text(choice.hint());
+                    }
+                })
+                .response
+                .on_hover_text(self.filter.sort.hint());
+        });
     }
 
     /// When the list is sorted by a value some shown games lack, says how
