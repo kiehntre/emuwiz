@@ -170,7 +170,7 @@ fn games_outside_registered_roots_are_left_alone_with_a_reason() {
         plans[0]
             .left_alone
             .iter()
-            .any(|(p, why)| p == &path && why.contains("registered source folder"))
+            .any(|(p, why)| p == &path && why == OUTSIDE_SOURCES_REASON)
     );
 }
 
