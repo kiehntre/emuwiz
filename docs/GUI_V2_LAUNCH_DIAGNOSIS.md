@@ -95,3 +95,39 @@ persistence or actions.
 Not covered yet: repair offers or links (Next Frontier M31 GD-3/GD-4, deferred
 in the Midnight Handoff), a persisted launch-outcome record (NF-38-01), the
 core `diagnostics::Finding` projection (NF-31-01) and a CLI `doctor --game`.
+
+## Setup & Doctor: selected-game launch check
+
+The first card on Setup & Doctor (`gui_v2/doctor_launch_check.rs`) restates
+the launch-readiness answer Blue already holds for the game selected in
+Browse & Play. It runs no check of its own and changes nothing.
+
+- **Ready**: a current answer whose launch checks passed with no findings.
+  Doctor never offers Play.
+- **Unsupported**: every finding is `FormatUnsupported` or
+  `PlatformUnsupported`. If anything else is also wrong, that fixable item
+  leads, as **Needs attention**.
+- **Needs attention**: the first (most actionable) finding's title, reason
+  and existing fix. A stale answer, or a blocked answer with no finding,
+  keeps the readiness card's own headline and action.
+- **Not checked**: no game selected, or its check is still running. This is
+  never reported as Ready.
+
+The one button opens an existing screen through `route_for_action`.
+Play and "Try anyway" open the Launch page, whose preflight and
+confirmations still decide. Recheck and "Look up online" open Game Details.
+
+### Gap: no controller configuration destination
+
+The follow-up asked for an optional "Configure controller" action. It is
+**omitted**, because Blue has no controller configuration screen. The only
+controller surfaces are read-only:
+
+- the Launch page's controller settings evidence, which is PCSX2 only
+  (`launch_readiness_page/controller_readiness.rs`, #101);
+- Hatari's report in Emulator Setup.
+
+Both only say whether settings exist. They bind nothing, and they say so.
+Launch readiness carries no controller fact. When a real controller
+configuration workflow exists, add the button as a secondary action in
+`doctor_launch_check::show`. It must not change the verdict.

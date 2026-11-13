@@ -1449,6 +1449,8 @@ impl App {
     }
 
     fn setup_doctor(&mut self, ui: &mut egui::Ui) {
+        // First, so its status and next step are visible without scrolling.
+        self.doctor_launch_check(ui);
         self.folder_check_cards(ui);
         // A summary that arrived since the last frame goes to the clipboard once.
         if let Some(summary) = self.setup_actions.summary.take() {
@@ -1493,6 +1495,37 @@ impl App {
                 Some(false) => self.setup_actions.confirm = None,
                 None => {}
             }
+        }
+    }
+
+    /// The selected game's launch check: read-only, from the readiness
+    /// answer Blue already holds. Its one button opens an existing screen.
+    fn doctor_launch_check(&mut self, ui: &mut egui::Ui) {
+        let selected = self
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.selected_game_on_screen())
+            .filter(|(id, path)| {
+                self.library
+                    .game(*id)
+                    .is_some_and(|game| game.archive.absolute_path == *path)
+            });
+        let summary = selected.as_ref().and_then(|(id, path)| {
+            self.native_workflows
+                .as_ref()
+                .and_then(|workflows| workflows.readiness_summary(*id, path))
+        });
+        let diagnosis = super::doctor_launch_check::diagnose(summary.as_ref());
+        let title = selected
+            .as_ref()
+            .and_then(|(id, _)| self.library.game(*id))
+            .map(|game| game.title.clone());
+        let pressed = super::doctor_launch_check::show(ui, title.as_deref(), &diagnosis);
+        ui.add_space(theme::SPACE_SM);
+        if let (Some(action), Some((id, _))) = (pressed, selected)
+            && let Some(route) = super::doctor_launch_check::route(action, id)
+        {
+            self.go(route);
         }
     }
 

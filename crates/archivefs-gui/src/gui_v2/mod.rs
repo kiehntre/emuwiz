@@ -21,6 +21,7 @@ mod dat_exact_tests;
 mod database_recovery;
 mod database_status_page;
 mod detail_identity;
+mod doctor_launch_check;
 mod documents;
 mod dreamcast_ipbin;
 mod duplicate_undo;

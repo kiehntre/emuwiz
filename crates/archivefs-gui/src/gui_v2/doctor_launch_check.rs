@@ -41,12 +41,6 @@ fn unsupported(cause: Cause) -> bool {
     matches!(cause, Cause::FormatUnsupported | Cause::PlatformUnsupported)
 }
 
-/// Doctor never launches: Play becomes "open the Launch page" (the same
-/// route), and in-place checks are left to Game Details where they live.
-fn doctor_action(action: Option<ReadinessAction>) -> Option<ReadinessAction> {
-    action
-}
-
 pub(super) fn diagnose(summary: Option<&GameReadinessSummary>) -> Diagnosis {
     let Some(summary) = summary else {
         return Diagnosis {
@@ -66,7 +60,10 @@ pub(super) fn diagnose(summary: Option<&GameReadinessSummary>) -> Diagnosis {
         };
     }
     let current = summary.freshness == ReadinessFreshness::Current;
-    if current && matches!(summary.status, S::Ready | S::ReadyWithWarnings) && summary.findings.is_empty() {
+    if current
+        && matches!(summary.status, S::Ready | S::ReadyWithWarnings)
+        && summary.findings.is_empty()
+    {
         let explanation = match summary.warnings.first() {
             Some(warning) => format!("Launch checks passed, with a warning: {warning}"),
             None => "Launch checks passed. This is not proof the game plays; EmuWiz keeps no record of gameplay.".into(),
@@ -88,7 +85,7 @@ pub(super) fn diagnose(summary: Option<&GameReadinessSummary>) -> Diagnosis {
             verdict: Verdict::Unsupported,
             reason: finding.title.into(),
             explanation: finding.why.into(),
-            action: doctor_action(finding.fix),
+            action: finding.fix,
         };
     }
     if current && let Some(finding) = summary.findings.iter().find(|f| !unsupported(f.cause)) {
@@ -96,7 +93,7 @@ pub(super) fn diagnose(summary: Option<&GameReadinessSummary>) -> Diagnosis {
             verdict: Verdict::NeedsAttention,
             reason: finding.title.into(),
             explanation: finding.why.into(),
-            action: doctor_action(finding.fix),
+            action: finding.fix,
         };
     }
     // A stale answer, or a blocked one that lists no finding: the card's own
@@ -105,7 +102,7 @@ pub(super) fn diagnose(summary: Option<&GameReadinessSummary>) -> Diagnosis {
         verdict: Verdict::NeedsAttention,
         reason: summary.headline.clone(),
         explanation: summary.explanation.clone(),
-        action: doctor_action(summary.primary_action),
+        action: summary.primary_action,
     }
 }
 
@@ -151,7 +148,11 @@ pub(super) fn show(
             ui.label(title);
         }
         ui.horizontal_wrapped(|ui| {
-            status_badge(ui, verdict_label(diagnosis.verdict), verdict_tone(diagnosis.verdict));
+            status_badge(
+                ui,
+                verdict_label(diagnosis.verdict),
+                verdict_tone(diagnosis.verdict),
+            );
             ui.strong(&diagnosis.reason);
         });
         ui.label(&diagnosis.explanation);
@@ -165,6 +166,18 @@ pub(super) fn show(
         }
     });
     pressed
+}
+
+/// Where a Doctor action goes: always an existing screen, never a launch or
+/// a repair. Play and "Try anyway" open the Launch page, whose own preflight
+/// and confirmations still decide; in-place checks open Game Details.
+pub(super) fn route(action: ReadinessAction, game_id: i64) -> Option<super::routes::Route> {
+    match action {
+        ReadinessAction::RecheckReadiness | ReadinessAction::LookUpOnline => {
+            Some(super::routes::Route::Game(game_id))
+        }
+        other => super::native_workflows::route_for_action(other, game_id),
+    }
 }
 
 #[cfg(test)]

@@ -1322,6 +1322,11 @@ impl NativeWorkflows {
         self.launch_active() || self.launch_attempts.for_game(game_id).is_some()
     }
 
+    /// The game the readiness checks currently belong to, if any.
+    pub(super) fn selected_game_on_screen(&self) -> Option<(i64, PathBuf)> {
+        Some((self.selected_game?, self.selected.clone()?))
+    }
+
     /// Exactly what the readiness card last displayed for this game and path.
     pub(super) fn shown_readiness(
         &self,
