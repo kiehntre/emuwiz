@@ -631,11 +631,11 @@ def load_policy(trusted_uids=None):
         return "invalid", None, "policy is not a stable, safe authority file"
     try:
         policy = json.loads(text)
-    except ValueError as error:
-        return "invalid", None, f"policy unreadable: {error}"
+    except ValueError:
+        return "invalid", None, "policy unreadable: not valid JSON"
     old_schema = policy.get("schema") if isinstance(policy, dict) else None
     if isinstance(old_schema, int) and not isinstance(old_schema, bool) and 0 < old_schema < POLICY_VERSION:
-        return "invalid", None, (f"policy schema {old_schema} was approved before the retirement scope was "
+        return "invalid", None, (f"policy schema (older than {POLICY_VERSION}) was approved before the retirement scope was "
                                  f"widened (schema {POLICY_VERSION}: post-retirement binary residue); it no longer "
                                  "authorises anything. Review the scope and run `policy approve` again")
     if not isinstance(policy, dict) or not validate_policy(policy):
@@ -643,8 +643,8 @@ def load_policy(trusted_uids=None):
     if maintenance_instance() is not None and policy["scope"]["target_root"] != os.path.realpath(F.target_root()):
         # budgets and free space are measured on F.target_root(); an instance policy that
         # names another root would be measured against the wrong device
-        return "invalid", None, (f"instance policy covers {policy['scope']['target_root']} but EMUWIZ_TARGET_ROOT "
-                                 f"selects {os.path.realpath(F.target_root())}")
+        return "invalid", None, ("instance policy covers another target root than the one EMUWIZ_TARGET_ROOT "
+                                 f"selects ({os.path.realpath(F.target_root())})")
     claimed = policy["enabled"]
     # BOTH are required: the policy file itself says enabled AND a fresh approval exists for
     # the exact code now running.  Either one alone leaves retirement disabled.
