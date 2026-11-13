@@ -3349,7 +3349,9 @@ fn gui_v2_large_library_projection_measurement() {
         load.as_millis(),
         start.elapsed().as_micros()
     );
-    assert_eq!(indices.len(), 500);
+    // Every word must match: "049" also appears later in some numbers
+    // (Game 004903, Game 010490, ...), so more than the 500 "Game 049xxx".
+    assert_eq!(indices.len(), 575);
     assert_eq!(library.games.len(), 50_000);
 }
 
