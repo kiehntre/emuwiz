@@ -416,7 +416,7 @@ impl App {
         ui.add_space(theme::SPACE_XS);
         self.browse_play_systems(ui, &library);
         let indices = self.browse_play_indices();
-        self.browse_play_sort_row(ui, &library, &indices);
+        self.browse_play_sort_note(ui, &library, &indices);
         let blue = theme::blue_profile(ui);
         self.browse_play_background(ui.ctx(), blue);
         ui.add_space(theme::SPACE_XS);
@@ -833,51 +833,53 @@ impl App {
         }
     }
 
-    /// The sort control, on its own row above the list so the toolbar keeps
-    /// its width, and a note on how many shown games lack the value the list
-    /// is sorted by, so a block of them at the end is explained. The count is
-    /// made once per list.
-    fn browse_play_sort_row(
+    /// The sort control. It sits at the end of the systems row, so it adds
+    /// no row of its own on small windows.
+    fn browse_play_sort_control(&mut self, ui: &mut egui::Ui) {
+        egui::ComboBox::from_id_salt("library_sort")
+            .selected_text(sort_button_text(self.filter.sort))
+            .show_ui(ui, |ui| {
+                for choice in SortOrder::ALL {
+                    ui.selectable_value(&mut self.filter.sort, choice, choice.label())
+                        .on_hover_text(choice.hint());
+                }
+            })
+            .response
+            .on_hover_text(self.filter.sort.hint());
+    }
+
+    /// When the list is sorted by a value some shown games lack, says how
+    /// many, so a block of them at the end is explained. Nothing is drawn
+    /// otherwise. The count is made once per list.
+    fn browse_play_sort_note(
         &mut self,
         ui: &mut egui::Ui,
         library: &super::library::Library,
         indices: &Arc<Vec<usize>>,
     ) {
         let sort = self.filter.sort;
-        let note = sort.missing_noun().and_then(|noun| {
-            let key = (Arc::as_ptr(indices) as usize, indices.len(), sort);
-            let missing = match self.browse_play.sort_note {
-                Some((k0, k1, k2, count)) if (k0, k1, k2) == key => count,
-                _ => {
-                    let count = library.missing_sort_value(indices, sort);
-                    self.browse_play.sort_note = Some((key.0, key.1, key.2, count));
-                    count
-                }
-            };
-            sort_missing_note(missing, indices.len(), noun)
-        });
-        ui.horizontal_wrapped(|ui| {
-            egui::ComboBox::from_id_salt("library_sort")
-                .selected_text(sort_button_text(self.filter.sort))
-                .show_ui(ui, |ui| {
-                    for choice in SortOrder::ALL {
-                        ui.selectable_value(&mut self.filter.sort, choice, choice.label())
-                            .on_hover_text(choice.hint());
-                    }
-                })
-                .response
-                .on_hover_text(self.filter.sort.hint());
-            if let Some(note) = note {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(note)
-                            .size(theme::METADATA_SIZE)
-                            .color(theme::SECONDARY_TEXT),
-                    )
-                    .wrap(),
-                );
+        let Some(noun) = sort.missing_noun() else {
+            return;
+        };
+        let key = (Arc::as_ptr(indices) as usize, indices.len(), sort);
+        let missing = match self.browse_play.sort_note {
+            Some((k0, k1, k2, count)) if (k0, k1, k2) == key => count,
+            _ => {
+                let count = library.missing_sort_value(indices, sort);
+                self.browse_play.sort_note = Some((key.0, key.1, key.2, count));
+                count
             }
-        });
+        };
+        if let Some(note) = sort_missing_note(missing, indices.len(), noun) {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(note)
+                        .size(theme::METADATA_SIZE)
+                        .color(theme::SECONDARY_TEXT),
+                )
+                .wrap(),
+            );
+        }
     }
 
     fn big_picture_button(&mut self, ui: &mut egui::Ui) {
@@ -1008,6 +1010,7 @@ impl App {
             }
             self.browse_play_verify_button(ui);
             self.browse_play_surprise_button(ui);
+            self.browse_play_sort_control(ui);
         });
         if let Some(platform) = chosen {
             self.choose_system(platform);

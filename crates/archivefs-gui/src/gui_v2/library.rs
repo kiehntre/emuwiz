@@ -567,7 +567,9 @@ pub(super) struct Filter {
     pub cache_aware: bool,
     pub unverified_only: bool,
     pub list: bool,
-    /// Browse order. Saved with the view, so the Library opens as it was left.
+    /// Browse order. Saved with the view, so the Library opens as it was
+    /// left. The default is not written, so a first-start save is unchanged.
+    #[serde(skip_serializing_if = "SortOrder::is_default")]
     pub sort: SortOrder,
 }
 
@@ -619,6 +621,10 @@ pub(super) enum SortOrder {
 }
 
 impl SortOrder {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
     pub const ALL: [Self; 7] = [
         Self::TitleAsc,
         Self::TitleDesc,
