@@ -341,61 +341,9 @@ impl App {
         }
         self.drive_pad_shell(context);
         crate::ui::picker::show(context);
-        let modal_open = self.confirm_scan
-            || self.setup_actions.confirm.is_some()
-            || self.repair_confirm
-            || self.undo_confirm.is_some()
-            || self.history_view.confirm_undo.is_some()
-            || self.missing.confirm
-            || self.equiv.confirm;
-        let (escape, alt_back) = context.input(|input| {
-            (
-                input.key_pressed(egui::Key::Escape),
-                input.modifiers.alt && input.key_pressed(egui::Key::ArrowLeft),
-            )
-        });
-        if escape {
-            // Any other open dialog (the classic Sources dialogs are hosted here too)
-            // is not ours to cancel, but Back must not run underneath it.
-            let other_window_open = context.memory(|memory| {
-                memory
-                    .areas()
-                    .visible_layer_ids()
-                    .iter()
-                    .any(|layer| layer.order == egui::Order::Middle)
-            });
-            match escape_action(
-                modal_open,
-                egui::Popup::is_any_open(context),
-                other_window_open,
-                self.text_was_focused,
-            ) {
-                EscapeAction::CloseModal => {
-                    // Every v2 confirmation is a preview-only step, so closing is always safe.
-                    self.confirm_scan = false;
-                    if let Some(confirm) = self.setup_actions.confirm.take() {
-                        let opened = egui::Id::new(("v2_setup_confirm_opened", confirm.path()));
-                        context.data_mut(|data| data.remove::<bool>(opened));
-                    }
-                    self.repair_confirm = false;
-                    self.undo_confirm = None;
-                    if let Some(id) = self.history_view.confirm_undo.take() {
-                        let opened = egui::Id::new(("v2_history_undo_opened", id));
-                        context.data_mut(|data| data.remove::<bool>(opened));
-                    }
-                    self.missing.confirm = false;
-                    self.equiv.confirm = false;
-                }
-                // egui has already released the field's focus on this key press.
-                EscapeAction::LeaveFocus => {}
-                // egui closes an open popup on this same key press.
-                EscapeAction::PopupHandles => {}
-                EscapeAction::KeepDialogOpen => {}
-                EscapeAction::Back => self.back(),
-            }
-        } else if alt_back && !modal_open {
-            self.back();
-        }
+        // Escape and Alt+Left, after the viewers, Big Picture and the
+        // controller keyboard above have had their keys.
+        self.apply_back_keys(context);
         if context.input(|input| input.modifiers.alt && input.key_pressed(egui::Key::Home)) {
             self.go(Route::Home);
         }
@@ -2583,11 +2531,12 @@ impl App {
                     self.problem_filter = ProblemFilter::All;
                 }
                 ui.label("Search");
-                ui.add_sized(
+                let search = ui.add_sized(
                     [220.0, 28.0],
                     egui::TextEdit::singleline(&mut self.problem_query)
                         .hint_text("title, game or path"),
                 );
+                super::shortcuts::register_search(&search);
                 if !self.problem_query.is_empty() && ui.button("Clear").clicked() {
                     self.problem_query.clear();
                 }
@@ -4342,6 +4291,7 @@ impl App {
     fn settings(&mut self, ui: &mut egui::Ui) {
         self.simple_shell_settings(ui);
         super::update_check::show(ui, &mut self.update_check);
+        super::shortcuts::show_help(ui);
         ui.horizontal_wrapped(|ui| {
             ui.label("Your library:");
             if crate::ui::components::action_button(
@@ -4701,36 +4651,6 @@ mod disambiguation_tests {
         assert_eq!(first.as_deref(), Some("Source: games/roms"));
         assert_eq!(second.as_deref(), Some("Source: usbdrive/games"));
         assert_ne!(first, second);
-    }
-}
-
-/// What one Escape press means, most specific first: an open confirmation,
-/// then an open menu, then a focused text field, and only then Back.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum EscapeAction {
-    CloseModal,
-    PopupHandles,
-    KeepDialogOpen,
-    LeaveFocus,
-    Back,
-}
-
-pub(super) fn escape_action(
-    modal_open: bool,
-    popup_open: bool,
-    other_window_open: bool,
-    typing: bool,
-) -> EscapeAction {
-    if modal_open {
-        EscapeAction::CloseModal
-    } else if popup_open {
-        EscapeAction::PopupHandles
-    } else if other_window_open {
-        EscapeAction::KeepDialogOpen
-    } else if typing {
-        EscapeAction::LeaveFocus
-    } else {
-        EscapeAction::Back
     }
 }
 

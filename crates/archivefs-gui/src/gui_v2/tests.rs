@@ -7087,7 +7087,7 @@ fn open_jump_to(context: &egui::Context, app: &mut App, size: [f32; 2]) {
 
 #[test]
 fn escape_policy_prefers_modal_then_popup_then_text_then_back() {
-    use super::pages::{EscapeAction::*, escape_action};
+    use super::shortcuts::{EscapeAction::*, escape_action};
     assert_eq!(escape_action(true, true, true, true), CloseModal);
     assert_eq!(escape_action(false, true, true, true), PopupHandles);
     assert_eq!(escape_action(false, false, true, true), KeepDialogOpen);

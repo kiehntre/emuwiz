@@ -404,3 +404,77 @@ fn enter_on_a_library_card_opens_game_details_and_a_held_enter_goes_no_further()
     }
     assert_eq!(app.router.current, Route::BrowsePlayGame(1));
 }
+
+fn alt_left() -> egui::Event {
+    key(egui::Key::ArrowLeft, egui::Modifiers::ALT, false)
+}
+
+#[test]
+fn alt_left_goes_back_but_never_while_typing_or_under_a_confirmation() {
+    let context = egui::Context::default();
+    let mut app = app_on_problems(&context);
+
+    app.confirm_scan = true;
+    idle(&context, &mut app);
+    press(&context, &mut app, alt_left());
+    assert_eq!(app.router.current, Route::Section(Section::Problems));
+    assert!(app.confirm_scan, "Alt+Left must not answer the dialog");
+    app.confirm_scan = false;
+    idle(&context, &mut app);
+
+    run(&context, &mut app, slash(), egui::Modifiers::NONE);
+    idle(&context, &mut app);
+    assert!(context.text_edit_focused());
+    press(&context, &mut app, alt_left());
+    assert_eq!(app.router.current, Route::Section(Section::Problems));
+
+    press(
+        &context,
+        &mut app,
+        key(egui::Key::Escape, egui::Modifiers::NONE, false),
+    );
+    idle(&context, &mut app);
+    assert!(!context.text_edit_focused());
+    press(&context, &mut app, alt_left());
+    assert_eq!(app.router.current, Route::Section(Section::Games));
+}
+
+#[test]
+fn escape_cancels_a_confirmation_without_going_back() {
+    let context = egui::Context::default();
+    let mut app = app_on_problems(&context);
+    app.confirm_scan = true;
+    idle(&context, &mut app);
+    press(
+        &context,
+        &mut app,
+        key(egui::Key::Escape, egui::Modifiers::NONE, false),
+    );
+    assert!(!app.confirm_scan, "Escape closes the dialog like Cancel");
+    assert_eq!(app.router.current, Route::Section(Section::Problems));
+}
+
+#[test]
+fn settings_lists_the_keyboard_shortcuts() {
+    let context = egui::Context::default();
+    let mut app = blue(&context);
+    app.go(Route::Section(Section::Settings));
+    idle(&context, &mut app);
+    let output = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(SIZE[0], 4000.0),
+            )),
+            ..Default::default()
+        },
+        |context| app.show_with_shortcuts(context),
+    );
+    let strings = crate::gui_v2::tests::text(&output);
+    for wanted in std::iter::once("Keyboard shortcuts").chain(HELP.iter().map(|(keys, _)| *keys)) {
+        assert!(
+            strings.iter().any(|value| value == wanted),
+            "Settings is missing {wanted:?}"
+        );
+    }
+}
