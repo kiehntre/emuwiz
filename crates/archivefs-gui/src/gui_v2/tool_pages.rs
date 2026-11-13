@@ -26,6 +26,7 @@ pub(super) struct ToolPagesState {
     pub view_history: super::view_history_page::ViewHistoryState,
     pub platform_aliases: super::platform_aliases_page::PlatformAliasesState,
     pub database: super::database_status_page::DatabaseStatusState,
+    pub scan_history: super::scan_history::ScanHistoryState,
     pub alternative_provider_preview: super::alternative_provider_preview::State,
     pub netplay: super::netplay_preview::State,
     pub cheat_extras: super::cheat_extras_page::CheatExtrasState,
@@ -44,6 +45,7 @@ impl ToolPagesState {
             view_history: Default::default(),
             platform_aliases: super::platform_aliases_page::PlatformAliasesState::live(),
             database: super::database_status_page::DatabaseStatusState::live(),
+            scan_history: super::scan_history::ScanHistoryState::live(),
             alternative_provider_preview: Default::default(),
             netplay: Default::default(),
             cheat_extras: Default::default(),
@@ -111,6 +113,11 @@ impl App {
                 }
                 state.saw_app_scan = app_scan;
                 let request = show(ui, state, app_scan);
+                // Read-only history of saved runs, with Blue's own scan as
+                // Activity tracks it. Starts, queues and cancels nothing new.
+                let upgrading = state.upgrading();
+                let scan_job = super::scan_history::session_scan_job(&self.activity, self.scan_job);
+                super::scan_history::show(ui, &mut self.tools.scan_history, scan_job, upgrading);
                 // Kept until no other load is in flight, so the reload is not lost.
                 if self.load_job.is_none()
                     && std::mem::take(&mut self.tools.database.library_changed)

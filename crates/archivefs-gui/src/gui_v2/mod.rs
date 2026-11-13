@@ -107,6 +107,7 @@ mod save_compatibility;
 mod save_snapshots;
 mod save_state_guidance;
 mod saves_states;
+mod scan_history;
 #[cfg(test)]
 mod scummvm_journey_tests;
 mod setup_portability;
@@ -888,7 +889,7 @@ impl App {
         }
         let id = self.activity.queue(
             if scan {
-                "Scanning your game folders"
+                scan_history::SCAN_JOB_TITLE
             } else {
                 "Loading your library"
             },
