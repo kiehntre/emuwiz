@@ -198,6 +198,17 @@ impl LaunchCandidate {
         match self.readiness {
             LaunchReadiness::Ready => self.warnings.is_empty(),
             LaunchReadiness::ReadyWithWarnings => {
+                // A save-folder warning alone never withdraws Play (owner
+                // decision 2026-11-13): judge the rest exactly as if it were
+                // absent, so it cannot hide or add any other condition.
+                let others: Vec<&LaunchWarning> = self
+                    .warnings
+                    .iter()
+                    .filter(|w| w.kind != LaunchWarningKind::RetroArchSaveDirectoryUnusable)
+                    .collect();
+                if others.is_empty() {
+                    return !self.warnings.is_empty();
+                }
                 // The firmware warning needs unverified-but-present firmware
                 // behind it. Without it (the identity warning on its own) the
                 // firmware must already be fine: never missing or unknown.
@@ -578,6 +589,80 @@ fn narrow_cores_by_extension(matches: &mut Vec<RetroArchCoreMatch>, content: &La
     }
 }
 
+/// Visible warnings for the save-file/save-state folders a launch of
+/// `found` would use: the core's per-core override value when it sets one,
+/// otherwise `retroarch.cfg`'s. Folders that are usable, or that RetroArch
+/// leaves at its own default, produce nothing.
+fn retroarch_save_directory_warnings(
+    environment: &RetroArchEnvironmentReport,
+    found: &RetroArchCoreMatch,
+) -> Vec<LaunchWarning> {
+    use crate::emulator_environment::retroarch::{PathPurpose, SaveDirectoryStatus};
+    let Some(profile) = environment.profiles.iter().find(|profile| {
+        profile.profile_kind == found.profile.profile_kind && profile.scope == found.profile.scope
+    }) else {
+        return Vec::new();
+    };
+    let core_name = match &found.info {
+        CoreInfoFinding::Found { core_name, .. } => core_name.as_deref(),
+        _ => None,
+    };
+    let mut warnings = Vec::new();
+    for purpose in [PathPurpose::Saves, PathPurpose::SaveStates] {
+        let of = |name: Option<&str>| {
+            profile
+                .save_directories
+                .iter()
+                .find(|f| f.purpose == purpose && f.core_name.as_deref() == name)
+        };
+        let Some(finding) = core_name
+            .and_then(|name| of(Some(name)))
+            .or_else(|| of(None))
+        else {
+            continue;
+        };
+        let (what, menu, at_risk) = if purpose == PathPurpose::Saves {
+            ("save-file folder", "Save Files", "In-game progress")
+        } else {
+            ("save-state folder", "Save States", "Save states")
+        };
+        let source = match &finding.core_name {
+            Some(core) => format!("the {core} core override {}", finding.settings_file.display),
+            None => format!("RetroArch's settings {}", finding.settings_file.display),
+        };
+        let key = finding.config_key;
+        let folder = finding
+            .directory
+            .as_ref()
+            .map_or_else(String::new, |dir| format!(" {}", dir.display));
+        let fix =
+            format!("choose an existing folder in RetroArch under Settings > Directory > {menu}");
+        let detail = match finding.status {
+            SaveDirectoryStatus::Usable => continue,
+            SaveDirectoryStatus::Missing => format!(
+                "RetroArch's {what}{folder} (`{key}` in {source}) does not exist. RetroArch ignores a missing folder and writes beside the game file instead, where saves may be lost or not found. Create the folder, or {fix}."
+            ),
+            SaveDirectoryStatus::NotADirectory => format!(
+                "RetroArch's {what}{folder} (`{key}` in {source}) is not a folder, so RetroArch ignores it and writes beside the game file instead. Remove or rename what is there and create the folder, or {fix}."
+            ),
+            SaveDirectoryStatus::Symlink => format!(
+                "RetroArch's {what}{folder} (`{key}` in {source}) is a symbolic link, which EmuWiz does not follow, so it cannot confirm saves will be kept. Point the setting at the real folder, or {fix}."
+            ),
+            SaveDirectoryStatus::NotWritable => format!(
+                "RetroArch's {what}{folder} (`{key}` in {source}) cannot be written by your user account, so RetroArch cannot store saves there. Give your account write permission on the folder, or {fix}."
+            ),
+            SaveDirectoryStatus::Uncheckable => format!(
+                "EmuWiz could not check RetroArch's {what}{folder} (`{key}` in {source}), so it cannot confirm saves will be kept. Make sure the setting names an existing folder you can write to, or {fix}."
+            ),
+        };
+        warnings.push(LaunchWarning::new(
+            LaunchWarningKind::RetroArchSaveDirectoryUnusable,
+            format!("{at_risk} may fail to save. {detail}"),
+        ));
+    }
+    warnings
+}
+
 fn build_retroarch_candidates(
     platform_id: &'static str,
     content: &LaunchContentRef,
@@ -636,6 +721,7 @@ fn build_retroarch_candidates(
                     ),
                 ));
             }
+            warnings.extend(retroarch_save_directory_warnings(environment, &found));
             if retroarch_chd_support_unconfirmed(platform_id, &found.core_stem, content) {
                 warnings.push(LaunchWarning::new(
                     LaunchWarningKind::RetroArchChdSupportUnconfirmed,

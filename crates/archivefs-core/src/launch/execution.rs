@@ -1358,10 +1358,51 @@ fn staged_launch_findings(
     filesystem: &dyn ReadOnlyHostFilesystem,
     environment: &DiscoveryEnvironment,
 ) -> Vec<String> {
+    staged_launch_findings_for(&request.profile, filesystem, environment)
+}
+
+/// Readiness projection of the launch-time zipped-cartridge refusal: every
+/// RetroArch candidate for zipped content is blocked with exactly the
+/// findings [`staged_launch_is_safe`] would refuse the launch with, so the
+/// readiness screen and the Play button can never disagree. Other content
+/// is untouched. Read-only.
+pub fn apply_zipped_cartridge_save_safety(
+    plan: &mut super::planning::LaunchPlan,
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    environment: &DiscoveryEnvironment,
+) {
+    for candidate in &mut plan.candidates {
+        if candidate.content.provenance != super::ZIPPED_CARTRIDGE_PROVENANCE {
+            continue;
+        }
+        let LaunchTarget::RetroArchCore { profile, .. } = &candidate.target else {
+            continue;
+        };
+        let findings = staged_launch_findings_for(profile, filesystem, environment);
+        if findings.is_empty() {
+            continue;
+        }
+        candidate.blockers.push(super::readiness::LaunchBlocker::new(
+            super::readiness::LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe,
+            format!(
+                "This game is inside a ZIP, so EmuWiz plays a temporary copy that is deleted when you quit, and RetroArch's save setup would lose your saves: {}. Fix this in RetroArch, then check again.",
+                findings.join("; ")
+            ),
+        ));
+        candidate.readiness = LaunchReadiness::Blocked;
+    }
+    plan.summary = super::planning::summarize(&plan.candidates);
+}
+
+fn staged_launch_findings_for(
+    request_profile: &ProfileRef,
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    environment: &DiscoveryEnvironment,
+) -> Vec<String> {
     use crate::emulator_environment::retroarch::{PathPurpose, ResolutionState};
     use std::io::Read as _;
 
-    if request.profile.profile_kind != ProfileKind::Native {
+    if request_profile.profile_kind != ProfileKind::Native {
         return vec![
             "a zipped cartridge can only be launched with a native RetroArch \
              installation, because an AppImage or Flatpak launcher may exit while \
@@ -1374,8 +1415,8 @@ fn staged_launch_findings(
         Err(error) => return vec![format!("RetroArch could not be inspected: {error}")],
     };
     let Some(profile) = report.profiles.iter().find(|profile| {
-        profile.profile_kind == request.profile.profile_kind
-            && profile.scope == request.profile.scope
+        profile.profile_kind == request_profile.profile_kind
+            && profile.scope == request_profile.scope
     }) else {
         return vec!["the selected RetroArch settings could not be found".into()];
     };

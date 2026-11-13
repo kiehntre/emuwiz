@@ -1673,6 +1673,16 @@ impl ReadinessSources<'_> {
             archivefs_core::launch::dolphin_binding_readiness::apply(&mut plan, profiles);
         }
         archivefs_core::launch::nkit_readiness::inspect_and_apply(&mut plan);
+        // A zipped cartridge's launch is refused when RetroArch's save setup
+        // would lose saves; show that same refusal here, before Play.
+        // Same filesystem and environment the production launch uses.
+        if content.provenance == archivefs_core::launch::ZIPPED_CARTRIDGE_PROVENANCE {
+            archivefs_core::launch::apply_zipped_cartridge_save_safety(
+                &mut plan,
+                &archivefs_core::emulator_environment::HostReadOnlyFilesystem,
+                &archivefs_core::emulator_environment::retroarch::DiscoveryEnvironment::from_process_environment(),
+            );
+        }
         archivefs_core::launch::cemu_readiness::apply_cemu_readiness(
             &mut plan,
             self.readiness.cemu.inspection_for(focused),

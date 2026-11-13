@@ -2275,3 +2275,94 @@ fn staged_playlist_replaces_the_boot_disk_argument_exactly_once() {
     assert!(super::swap_content_argument(&mut twice, disk, m3u).is_err());
     assert_eq!(twice, before);
 }
+
+/// Readiness shows the zipped-cartridge save refusal before Play, with the
+/// very findings the launch would refuse with; a normal game with the same
+/// broken folder keeps Play with a save-folder warning (owner 2026-11-13).
+#[test]
+fn zipped_save_refusal_is_shown_at_readiness_and_matches_launch() {
+    use crate::launch::readiness::{LaunchBlockerKind, LaunchWarningKind};
+    let rom = b"synthetic mega drive rom bytes";
+    let (ready, zip, _) = zipped_ready("zip-readiness", &[("a.md", rom)]);
+    let report = inspect_catalogued_game_identity(&zip, Some("MegaDrive"));
+    let content = crate::launch::launch_content_ref_for_zipped_cartridge(&report).unwrap();
+    let (identity, _) = crate::launch::canonical_identity_from_game_report(&report);
+    let plan_for = |content: &LaunchContentRef| {
+        let environment =
+            discover_retroarch_environment(&HostReadOnlyFilesystem, &ready.environment).unwrap();
+        let mut plan = build_launch_plan(&identity, content, &[], &environment, &[]);
+        apply_zipped_cartridge_save_safety(&mut plan, &HostReadOnlyFilesystem, &ready.environment);
+        plan
+    };
+    let retroarch = |plan: &crate::launch::planning::LaunchPlan| {
+        plan.candidates
+            .iter()
+            .find(|c| matches!(c.target, LaunchTarget::RetroArchCore { .. }))
+            .cloned()
+            .expect("RetroArch candidate")
+    };
+
+    // Safe setup: readiness and launch both accept.
+    let ok = retroarch(&plan_for(&content));
+    assert_eq!(ok.readiness, LaunchReadiness::Ready, "{ok:?}");
+    assert!(
+        staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment).is_ok()
+    );
+
+    // Missing save folder: the launch refuses, and readiness blocks with the
+    // same reason before Play is pressed.
+    let missing = ready.fixture.path("no-such-saves");
+    ready.fixture.write(
+        "config/retroarch/retroarch.cfg",
+        format!(
+            "libretro_directory = \"{}\"\nlibretro_info_path = \"{}\"\nsavefile_directory = \"{}\"\nsavestate_directory = \"/var/tmp/emuwiz-zip-test-states\"\n",
+            ready.fixture.path("cores").display(),
+            ready.fixture.path("info").display(),
+            missing.display(),
+        )
+        .as_bytes(),
+    );
+    let launch_reason =
+        staged_launch_is_safe(&ready.request, &HostReadOnlyFilesystem, &ready.environment)
+            .expect_err("launch refuses a missing save folder for a zipped game");
+    let zipped = retroarch(&plan_for(&content));
+    assert_eq!(zipped.readiness, LaunchReadiness::Blocked);
+    assert!(!zipped.retroarch_play_eligible());
+    let blocker = zipped
+        .blockers
+        .iter()
+        .find(|b| b.kind == LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe)
+        .expect("zipped save blocker");
+    assert!(
+        blocker.detail.contains(&launch_reason),
+        "{} / {launch_reason}",
+        blocker.detail
+    );
+    assert!(blocker.detail.contains(&missing.display().to_string()));
+    assert!(
+        blocker.detail.contains("create the folder first"),
+        "{}",
+        blocker.detail
+    );
+    assert!(!missing.exists(), "readiness never creates the folder");
+
+    // The same broken folder for a normal (not zipped) game: a warning naming
+    // the folder and the remedy, and Play stays available.
+    let mut normal = content.clone();
+    normal.provenance = "already-resolved library path".into();
+    let plain = retroarch(&plan_for(&normal));
+    assert!(plain.blockers.is_empty(), "{:?}", plain.blockers);
+    assert_eq!(plain.readiness, LaunchReadiness::ReadyWithWarnings);
+    assert!(plain.retroarch_play_eligible());
+    let warning = plain
+        .warnings
+        .iter()
+        .find(|w| w.kind == LaunchWarningKind::RetroArchSaveDirectoryUnusable)
+        .expect("save-folder warning");
+    assert!(
+        warning
+            .detail
+            .starts_with("In-game progress may fail to save.")
+    );
+    assert!(warning.detail.contains(&missing.display().to_string()));
+}

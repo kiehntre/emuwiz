@@ -13,6 +13,8 @@
 //! imported by it.
 
 pub mod installation_selection;
+mod save_directories;
+pub use save_directories::{SaveDirectoryFinding, SaveDirectoryStatus};
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -715,6 +717,9 @@ pub struct RetroArchProfile {
     /// evidence never merges with a Flatpak sandbox's own path roots.
     /// Sorted by encoded AppImage path bytes.
     pub app_images: Vec<AppImageCandidate>,
+    /// Health of the configured save-file/save-state folders, from
+    /// `retroarch.cfg` and each installed core's per-core override.
+    pub save_directories: Vec<SaveDirectoryFinding>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -1133,11 +1138,13 @@ fn discover_profile(
     let config_directory_found = config_directory_probe == FsProbe::PresentDirectory;
 
     let config_file_path = config_dir.join("retroarch.cfg");
+    let mut config_keys = path_purpose_keys().to_vec();
+    config_keys.push(save_directories::OVERRIDE_DIRECTORY_KEY);
     let (config_probe, config_outcome, parsed) = read_config_file(
         filesystem,
         &config_file_path,
         MAX_CONFIG_BYTES,
-        &path_purpose_keys(),
+        &config_keys,
     );
     record_config_diagnostics(
         &config_probe,
@@ -1185,6 +1192,22 @@ fn discover_profile(
     // finding appears twice in JSON for no benefit.
     let playlists = discover_playlists(filesystem, &path_results.resolved_dirs, profile_ref);
 
+    let save_directories = save_directories::discover_save_directories(
+        filesystem,
+        &config_file_path,
+        |key| {
+            parsed
+                .as_ref()
+                .and_then(|parsed| parsed.values.get(key))
+                .map(String::as_str)
+        },
+        tilde_home,
+        cores.iter().filter_map(|core| match &core.info {
+            CoreInfoFinding::Found { core_name, .. } => core_name.as_deref(),
+            _ => None,
+        }),
+    );
+
     let evidence = Evidence {
         executables: executables.clone(),
         flatpak_metadata_found: flatpak_metadata_found.unwrap_or(false),
@@ -1209,6 +1232,7 @@ fn discover_profile(
         cores,
         playlists,
         app_images: Vec::new(), // filled in by discover_retroarch_environment, native/AppImage profiles only
+        save_directories,
         diagnostics: Vec::new(), // filled in by the caller after global sort
     };
 
