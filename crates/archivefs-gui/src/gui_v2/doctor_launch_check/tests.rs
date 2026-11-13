@@ -312,14 +312,17 @@ fn picker_ranks_exact_then_prefix_then_words_then_other() {
         ],
         "mario",
     );
+    // Library order is by lowercase title (then id), so within one relevance
+    // "Mario Kart 64" comes before "Mariokart Clone" and "Dr. Mario" before
+    // "Super Mario World".
     assert_eq!(
         got,
         [
             "Mario",             // exact
-            "Mariokart Clone",   // prefix (library order among prefixes)
-            "Mario Kart 64",     // prefix
+            "Mario Kart 64",     // prefix (library order among prefixes)
+            "Mariokart Clone",   // prefix
+            "Dr. Mario",         // word (library order among words)
             "Super Mario World", // word
-            "Dr. Mario",         // word
             "Supermario Remix",  // inside a word
         ]
     );
@@ -358,19 +361,33 @@ fn picker_multi_word_prefix_and_platform_only_matches_rank_last() {
 
 #[test]
 fn picker_shows_the_best_matches_even_beyond_the_first_eight_in_library_order() {
+    use crate::gui_v2::tests::archive;
+    // "A Tetris Tale N" sorts before "Tetris" in library order (lowercase
+    // title), so the exact title is the 31st game the search meets.
     let mut titles: Vec<(String, &str)> = (1..=30)
-        .map(|n| (format!("Tetris Clone {n}"), "PC"))
+        .map(|n| (format!("A Tetris Tale {n}"), "PC"))
         .collect();
     titles.push(("Tetris".into(), "Game Boy"));
     let refs: Vec<(&str, &str)> = titles.iter().map(|(t, p)| (t.as_str(), *p)).collect();
+    let library = crate::gui_v2::library::Library::new(
+        refs.iter()
+            .zip(1..)
+            .map(|((title, platform), id)| archive(id, title, Some(platform)))
+            .collect(),
+    );
+    assert_eq!(
+        library.games.last().map(|game| game.title.as_str()),
+        Some("Tetris"),
+        "precondition: the exact title is last in library order"
+    );
     let got = ranked(&refs, "tetris");
     assert_eq!(
         got[0], "Tetris",
         "the exact title is listed first though it is last in the library"
     );
     assert_eq!(got.len(), PICKER_LIMIT);
-    // Equal relevance keeps library order (stable).
-    assert_eq!(&got[1..3], ["Tetris Clone 1", "Tetris Clone 2"]);
+    // Equal relevance keeps library order (stable): lowercase title order.
+    assert_eq!(&got[1..3], ["A Tetris Tale 1", "A Tetris Tale 10"]);
 }
 
 #[test]
