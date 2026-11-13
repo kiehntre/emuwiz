@@ -174,6 +174,52 @@ fn games_outside_registered_roots_are_left_alone_with_a_reason() {
     );
 }
 
+#[test]
+fn a_picked_game_outside_every_source_is_reported_even_with_no_plan() {
+    let lib = library(&["snes/Game.zip"]);
+    let outside = tempfile::tempdir().unwrap();
+    let path = outside.path().join("Picked.zip");
+    std::fs::write(&path, b"x").unwrap();
+    let chosen = [ChosenGame {
+        archive_id: 0,
+        path: path.clone(),
+        platform: "nes".into(),
+    }];
+    let (plans, excluded) =
+        plan_organisation_with_exclusions(&[], &chosen, &[], std::slice::from_ref(&lib.root), 1);
+    assert!(plans.is_empty(), "nothing inside a source was picked");
+    assert_eq!(
+        excluded,
+        vec![(path.clone(), OUTSIDE_SOURCES_REASON.to_string())]
+    );
+    assert!(OUTSIDE_SOURCES_REASON.contains("Sources & Providers"));
+    // The file is untouched: planning never moves anything.
+    assert_eq!(std::fs::read(&path).unwrap(), b"x");
+}
+
+#[test]
+fn an_unbounded_picked_file_outside_every_source_is_still_reported() {
+    let lib = library(&["snes/Game.zip"]);
+    let outside = tempfile::tempdir().unwrap();
+    // A CUE whose track is missing cannot be bounded as a set.
+    let cue = outside.path().join("Disc.cue");
+    std::fs::write(
+        &cue,
+        "FILE \"Disc (Track 1).bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n",
+    )
+    .unwrap();
+    let chosen = [ChosenGame {
+        archive_id: 0,
+        path: cue.clone(),
+        platform: "psx".into(),
+    }];
+    let (plans, excluded) =
+        plan_organisation_with_exclusions(&[], &chosen, &[], std::slice::from_ref(&lib.root), 1);
+    assert!(plans.is_empty());
+    assert_eq!(excluded.len(), 1);
+    assert_eq!(excluded[0].0, cue);
+}
+
 fn approve_all(plan: &RootPlan) -> BTreeSet<String> {
     plan.plan
         .suggested()
