@@ -710,8 +710,6 @@ impl App {
         } else {
             0.0
         };
-        let sort =
-            measure(&sort_button_text(SortOrder::YearNewest)) + ui.spacing().icon_width + gap;
         let available = ui.available_width();
         let search = (available - switch - clear - attention - gap).min(300.0);
         let stacked = search < SEARCH_MIN_WIDTH;

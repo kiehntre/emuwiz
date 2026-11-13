@@ -908,16 +908,18 @@ mod tests {
         );
     }
 
+    /// (id, title, platform, size, mtime, release year)
+    type SortRow<'a> = (
+        i64,
+        &'a str,
+        Option<&'a str>,
+        Option<u64>,
+        Option<i64>,
+        Option<u16>,
+    );
+
     fn sort_fixture() -> super::Library {
-        // (id, title, platform, size, mtime, release year)
-        let rows: [(
-            i64,
-            &str,
-            Option<&str>,
-            Option<u64>,
-            Option<i64>,
-            Option<u16>,
-        ); 5] = [
+        let rows: [SortRow<'_>; 5] = [
             (1, "Bravo", Some("snes"), Some(300), Some(30), Some(1994)),
             (2, "alpha", Some("nes"), None, Some(10), None),
             (3, "Charlie", None, Some(100), None, Some(1990)),
