@@ -147,6 +147,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         welcome_dismissed: false,
         beginner_hints_enabled: true,
         doctor_platform: None,
+        doctor_picker: Default::default(),
         guidance: super::guidance::GuidanceState::default(),
         saves_states: super::saves_states::SavesStatesState::default(),
         converter: crate::optical_conversion_page::OpticalConversionPageState::default(),

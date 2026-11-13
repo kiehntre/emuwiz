@@ -117,6 +117,20 @@ The one button opens an existing screen through `route_for_action`.
 Play and "Try anyway" open the Launch page, whose preflight and
 confirmations still decide. Recheck and "Look up online" open Game Details.
 
+### Choosing a game
+
+By default the card follows the game last opened in Browse & Play, and only
+reads it. A search box on the card finds any game in the library: every word
+must match its title or platform, and at most 8 matches are listed. Picking a
+game runs the same quick readiness check the Library's selected-game panel
+runs (`note_catalogue_row` + `readiness_projection`, without the whole-file
+checksum).
+
+- While the check runs, the card shows **Checking**.
+- Only an answer that belongs to the picked game (`selected_game_on_screen`)
+  is shown, so another game's result never appears under its title.
+- Opening a different game elsewhere returns the card to following that game.
+
 ### Gap: no controller configuration destination
 
 The follow-up asked for an optional "Configure controller" action. It is

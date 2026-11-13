@@ -21,7 +21,9 @@ pub(super) enum Verdict {
     NeedsAttention,
     /// Every finding says EmuWiz does not launch this format or system yet.
     Unsupported,
-    /// No selected game, or its check has not finished. Never a diagnosis.
+    /// The existing checks are still running for this game.
+    Checking,
+    /// No game selected, or no answer for it. Never a diagnosis.
     NotChecked,
 }
 
@@ -35,10 +37,10 @@ pub(super) struct Diagnosis {
 }
 
 pub(super) const NO_SELECTION: &str = "No game selected";
-pub(super) const NO_SELECTION_WHY: &str = "Open a game in Browse & Play and its launch check appears here. Setup & Doctor runs no game checks of its own.";
+pub(super) const NO_SELECTION_WHY: &str =
+    "Choose a game below, or open one in Browse & Play, to see its launch check here.";
 
-pub(super) const NO_SELECTION_LINE: &str =
-    "Selected game launch check: no game selected. Open one in Browse & Play to see it here.";
+pub(super) const NO_SELECTION_LINE: &str = "Game launch check: no game selected.";
 
 fn unsupported(cause: Cause) -> bool {
     matches!(cause, Cause::FormatUnsupported | Cause::PlatformUnsupported)
@@ -56,9 +58,9 @@ pub(super) fn diagnose(summary: Option<&GameReadinessSummary>) -> Diagnosis {
     use ReadinessPresentationState as S;
     if summary.status == S::Checking {
         return Diagnosis {
-            verdict: Verdict::NotChecked,
-            reason: "Still checking this game".into(),
-            explanation: "The launch check has not finished, so nothing is reported yet. Open Game Details to follow it.".into(),
+            verdict: Verdict::Checking,
+            reason: "Checking this game".into(),
+            explanation: "The launch check is running, so nothing is reported yet.".into(),
             action: None,
         };
     }
@@ -114,6 +116,7 @@ pub(super) fn verdict_label(verdict: Verdict) -> &'static str {
         Verdict::Ready => "Ready",
         Verdict::NeedsAttention => "Needs attention",
         Verdict::Unsupported => "Unsupported",
+        Verdict::Checking => "Checking",
         Verdict::NotChecked => "Not checked",
     }
 }
@@ -123,6 +126,7 @@ fn verdict_tone(verdict: Verdict) -> StatusTone {
         Verdict::Ready => StatusTone::Success,
         Verdict::NeedsAttention => StatusTone::Warning,
         Verdict::Unsupported => StatusTone::Blocked,
+        Verdict::Checking => StatusTone::Active,
         Verdict::NotChecked => StatusTone::Pending,
     }
 }
@@ -142,6 +146,7 @@ pub(super) fn show(
     ui: &mut egui::Ui,
     title: Option<&str>,
     diagnosis: &Diagnosis,
+    query: &mut String,
 ) -> Option<ReadinessAction> {
     if title.is_none() && diagnosis.reason == NO_SELECTION {
         // Nothing selected: one line, so setup problems below stay in view.
@@ -152,6 +157,7 @@ pub(super) fn show(
                 verdict_tone(diagnosis.verdict),
             );
             ui.label(NO_SELECTION_LINE);
+            search_box(ui, query);
         });
         return None;
     }
@@ -179,8 +185,20 @@ pub(super) fn show(
         {
             pressed = Some(action);
         }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Check another game:");
+            search_box(ui, query);
+        });
     });
     pressed
+}
+
+fn search_box(ui: &mut egui::Ui, query: &mut String) {
+    ui.add(
+        egui::TextEdit::singleline(query)
+            .hint_text("Find a game to check")
+            .desired_width(220.0),
+    );
 }
 
 /// Where a Doctor action goes: always an existing screen, never a launch or
@@ -193,6 +211,87 @@ pub(super) fn route(action: ReadinessAction, game_id: i64) -> Option<super::rout
         }
         other => super::native_workflows::route_for_action(other, game_id),
     }
+}
+
+/// The Doctor's own game choice. `None` keeps the default: the game last
+/// opened in Browse & Play.
+#[derive(Default)]
+pub(super) struct Picker {
+    pub(super) game: Option<i64>,
+    pub(super) query: String,
+    /// Picked this frame: its check has not been started yet.
+    pub(super) fresh: bool,
+}
+
+impl Picker {
+    pub(super) fn pick(&mut self, id: i64) {
+        self.game = Some(id);
+        self.fresh = true;
+        self.query.clear();
+    }
+
+    /// The game to check here, given the game Blue's readiness checks
+    /// currently belong to. Opening a different game elsewhere (Browse &
+    /// Play, Game Details) returns the card to following that game.
+    pub(super) fn current(&mut self, on_screen: Option<i64>) -> Option<i64> {
+        let picked = self.game?;
+        if std::mem::take(&mut self.fresh) || on_screen == Some(picked) {
+            Some(picked)
+        } else {
+            self.game = None;
+            None
+        }
+    }
+}
+
+/// A chosen game whose own answer is not available yet.
+pub(super) fn checking() -> Diagnosis {
+    diagnose(Some(&super::launch_readiness_summary::not_started_summary()))
+}
+
+pub(super) const PICKER_LIMIT: usize = 8;
+
+/// Library games whose title or platform contains every word of the query,
+/// in library order, at most [`PICKER_LIMIT`]. An empty query lists none.
+pub(super) fn matches<'a>(
+    games: impl IntoIterator<Item = &'a super::library::Game>,
+    query: &str,
+) -> Vec<&'a super::library::Game> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    games
+        .into_iter()
+        .filter(|game| {
+            let hay = format!("{} {}", game.title, game.platform).to_lowercase();
+            words.iter().all(|word| hay.contains(word.as_str()))
+        })
+        .take(PICKER_LIMIT)
+        .collect()
+}
+
+/// The games matching the search box, as buttons. Picking runs nothing by
+/// itself; the caller starts the existing readiness check for that game.
+pub(super) fn show_matches(
+    ui: &mut egui::Ui,
+    query: &str,
+    games: &[super::library::Game],
+) -> Option<i64> {
+    let mut choice = None;
+    let found = matches(games, query);
+    if !query.trim().is_empty() && found.is_empty() {
+        ui.label("No game in your library matches.");
+    }
+    for game in found {
+        if ui
+            .button(format!("{} ({})", game.title, game.platform))
+            .clicked()
+        {
+            choice = Some(game.archive.id);
+        }
+    }
+    choice
 }
 
 #[cfg(test)]

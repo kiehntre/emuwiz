@@ -478,6 +478,8 @@ pub(super) struct App {
     welcome_dismissed: bool,
     beginner_hints_enabled: bool,
     doctor_platform: Option<String>,
+    /// Setup & Doctor's chosen game for its launch check.
+    doctor_picker: doctor_launch_check::Picker,
     guidance: guidance::GuidanceState,
     saves_states: saves_states::SavesStatesState,
     archive_inspector: archive_inspector::ArchiveInspectorPageState,
@@ -614,6 +616,7 @@ impl App {
             welcome_dismissed: false,
             beginner_hints_enabled: true,
             doctor_platform: None,
+            doctor_picker: Default::default(),
             guidance: guidance::GuidanceState::default(),
             saves_states: saves_states::SavesStatesState::default(),
             archive_inspector: archive_inspector::ArchiveInspectorPageState::default(),
