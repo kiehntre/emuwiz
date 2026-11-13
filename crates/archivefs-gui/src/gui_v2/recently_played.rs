@@ -526,6 +526,7 @@ impl super::App {
                 ui.set_width(ui.available_width());
                 egui::ScrollArea::vertical()
                     .id_salt("v2_recently_played_unmatched")
+                    .min_scrolled_height(220.0)
                     .max_height(260.0)
                     .show(ui, |ui| {
                         for (index, row) in unmatched.iter().enumerate() {
