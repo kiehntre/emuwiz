@@ -175,6 +175,13 @@ pub enum BoundedListResult {
 /// command in this codebase already has.
 pub trait ReadOnlyHostFilesystem {
     fn probe(&self, path: &Path) -> FsProbe;
+    /// Whether this user may create files in an existing directory, by a
+    /// read-only permission check (`access(2)`); nothing is written.
+    /// `None` when it cannot be determined (the default for injected test
+    /// filesystems).
+    fn directory_writable(&self, _path: &Path) -> Option<bool> {
+        None
+    }
     /// Final-component no-follow size for an existing filesystem object.
     /// Returns `None` when metadata is unavailable. Callers must pair this
     /// with [`Self::probe`] before treating the object as a regular file.
@@ -293,6 +300,18 @@ impl ReadOnlyHostFilesystem for HostReadOnlyFilesystem {
     }
     fn probe(&self, path: &Path) -> FsProbe {
         Self::probe_metadata(fs::symlink_metadata(path))
+    }
+
+    fn directory_writable(&self, path: &Path) -> Option<bool> {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `path` is a valid NUL-terminated string for the call.
+        if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } == 0 {
+            return Some(true);
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EACCES | libc::EROFS | libc::EPERM) => Some(false),
+            _ => None,
+        }
     }
 
     /// Resolve-and-verify probe for firmware candidates.

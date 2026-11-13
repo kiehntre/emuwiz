@@ -382,12 +382,13 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut AllToolsState) -> Option<Route
         }
     });
     ui.add_space(6.0);
-    ui.add(
+    let search = ui.add(
         egui::TextEdit::singleline(&mut state.query)
             .id(egui::Id::new("v2_all_tools_search"))
             .hint_text("Find a tool, for example \u{201c}convert\u{201d}, \u{201c}duplicates\u{201d} or \u{201c}cheats\u{201d}")
             .desired_width(ui.available_width().min(620.0)),
     );
+    crate::gui_v2::shortcuts::register_search(&search);
     ui.add_space(12.0);
     let visible: Vec<(&'static str, Vec<Tool>)> = groups()
         .into_iter()

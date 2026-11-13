@@ -464,7 +464,7 @@ impl Library {
                 && (!filter.unverified_only || !game.identified)
                 && words.iter().all(|word| game.search.contains(word))
         };
-        if filter.platform.is_empty() {
+        let mut indices: Vec<usize> = if filter.platform.is_empty() {
             self.games
                 .iter()
                 .enumerate()
@@ -479,7 +479,79 @@ impl Library {
                 .copied()
                 .filter(|index| matches(&self.games[*index]))
                 .collect()
+        };
+        sort_indices(&self.games, &mut indices, filter.sort);
+        indices
+    }
+
+    /// How many of `indices` have no value for `sort`'s key, so the toolbar
+    /// can say why they are at the end. Zero for orders every game can use.
+    pub fn missing_sort_value(&self, indices: &[usize], sort: SortOrder) -> usize {
+        indices
+            .iter()
+            .filter(|index| {
+                self.games
+                    .get(**index)
+                    .is_some_and(|game| sort.value_missing(game))
+            })
+            .count()
+    }
+}
+
+/// A sort key that puts a missing value after every present one, then falls
+/// back to the catalogue (title) position.
+fn missing_last<T: Ord>(value: Option<T>, position: usize) -> (bool, Option<T>, usize) {
+    (value.is_none(), value, position)
+}
+
+fn release_year(game: &Game) -> Option<u16> {
+    game.screenscraper
+        .as_ref()
+        .and_then(|enrichment| enrichment.values.release_year)
+}
+
+/// Orders filtered `indices` for `sort`. `games` is already in title order
+/// (then id), and every comparison falls back to that position, so equal keys
+/// keep a stable, repeatable order. Games without the sorted value (no release
+/// year, size or file date; unknown system) always come last, in title order,
+/// whichever direction is chosen.
+fn sort_indices(games: &[Game], indices: &mut [usize], sort: SortOrder) {
+    use std::cmp::Reverse;
+    match sort {
+        // The catalogue order is already title A-Z.
+        SortOrder::TitleAsc => indices.sort_unstable(),
+        SortOrder::TitleDesc => indices.sort_by_cached_key(|index| {
+            let game = &games[*index];
+            (Reverse(game.title.to_lowercase()), game.archive.id)
+        }),
+        SortOrder::System => indices.sort_by_cached_key(|index| {
+            let game = &games[*index];
+            (
+                game.platform == UNKNOWN_PLATFORM,
+                game.platform.to_lowercase(),
+                *index,
+            )
+        }),
+        SortOrder::YearNewest => {
+            indices.sort_by_key(|index| {
+                missing_last(release_year(&games[*index]).map(Reverse), *index)
+            });
         }
+        SortOrder::YearOldest => {
+            indices.sort_by_key(|index| missing_last(release_year(&games[*index]), *index));
+        }
+        SortOrder::FileNewest => indices.sort_by_key(|index| {
+            missing_last(
+                games[*index]
+                    .archive
+                    .modified_time_unix_seconds
+                    .map(Reverse),
+                *index,
+            )
+        }),
+        SortOrder::LargestFirst => indices.sort_by_key(|index| {
+            missing_last(games[*index].archive.size_bytes.map(Reverse), *index)
+        }),
     }
 }
 
@@ -495,6 +567,10 @@ pub(super) struct Filter {
     pub cache_aware: bool,
     pub unverified_only: bool,
     pub list: bool,
+    /// Browse order. Saved with the view, so the Library opens as it was
+    /// left. The default is not written, so a first-start save is unchanged.
+    #[serde(skip_serializing_if = "SortOrder::is_default")]
+    pub sort: SortOrder,
 }
 
 /// What a saved `gui-v2.json` may hold, including files written before the
@@ -509,6 +585,7 @@ struct SavedFilter {
     attention_only: bool,
     unverified_only: bool,
     list: bool,
+    sort: SortOrder,
 }
 
 impl From<SavedFilter> for Filter {
@@ -525,6 +602,86 @@ impl From<SavedFilter> for Filter {
             cache_aware: false,
             unverified_only: saved.unverified_only,
             list: saved.list,
+            sort: saved.sort,
+        }
+    }
+}
+
+/// The Library's browse orders. Title A-Z is the catalogue's own order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(super) enum SortOrder {
+    #[default]
+    TitleAsc,
+    TitleDesc,
+    System,
+    YearNewest,
+    YearOldest,
+    FileNewest,
+    LargestFirst,
+}
+
+impl SortOrder {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub const ALL: [Self; 7] = [
+        Self::TitleAsc,
+        Self::TitleDesc,
+        Self::System,
+        Self::YearNewest,
+        Self::YearOldest,
+        Self::FileNewest,
+        Self::LargestFirst,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TitleAsc => "Title A–Z",
+            Self::TitleDesc => "Title Z–A",
+            Self::System => "System",
+            Self::YearNewest => "Release year, newest",
+            Self::YearOldest => "Release year, oldest",
+            Self::FileNewest => "File date, newest",
+            Self::LargestFirst => "Size, largest",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::TitleAsc | Self::TitleDesc => "Alphabetical by title.",
+            Self::System => "Grouped by system, then by title. Unknown system comes last.",
+            Self::YearNewest | Self::YearOldest => {
+                "Uses the release year from accepted game info. Games without one come last, by title."
+            }
+            Self::FileNewest => {
+                "Uses the file's last-changed date from the last scan. Games without one come last."
+            }
+            Self::LargestFirst => {
+                "Uses the file size from the last scan. Games without one come last."
+            }
+        }
+    }
+
+    /// What a game without this order's value is missing, for the toolbar
+    /// note; `None` when every game has a value.
+    pub fn missing_noun(self) -> Option<&'static str> {
+        match self {
+            Self::TitleAsc | Self::TitleDesc => None,
+            Self::System => Some("no known system"),
+            Self::YearNewest | Self::YearOldest => Some("no release year"),
+            Self::FileNewest => Some("no file date"),
+            Self::LargestFirst => Some("no size"),
+        }
+    }
+
+    fn value_missing(self, game: &Game) -> bool {
+        match self {
+            Self::TitleAsc | Self::TitleDesc => false,
+            Self::System => game.platform == UNKNOWN_PLATFORM,
+            Self::YearNewest | Self::YearOldest => release_year(game).is_none(),
+            Self::FileNewest => game.archive.modified_time_unix_seconds.is_none(),
+            Self::LargestFirst => game.archive.size_bytes.is_none(),
         }
     }
 }
@@ -755,6 +912,149 @@ mod tests {
             game.status(),
             "Platform recognised · Game not yet identified"
         );
+    }
+
+    /// (id, title, platform, size, mtime, release year)
+    type SortRow<'a> = (
+        i64,
+        &'a str,
+        Option<&'a str>,
+        Option<u64>,
+        Option<i64>,
+        Option<u16>,
+    );
+
+    fn sort_fixture() -> super::Library {
+        let rows: [SortRow<'_>; 5] = [
+            (1, "Bravo", Some("snes"), Some(300), Some(30), Some(1994)),
+            (2, "alpha", Some("nes"), None, Some(10), None),
+            (3, "Charlie", None, Some(100), None, Some(1990)),
+            (4, "Alpha", Some("snes"), Some(300), Some(30), Some(1994)),
+            (5, "delta", Some("nes"), Some(200), Some(20), None),
+        ];
+        let archives = rows
+            .iter()
+            .map(|(id, title, platform, size, mtime, _)| PersistedArchive {
+                id: *id,
+                source_folder_id: 1,
+                relative_path: format!("{id}.zip").into(),
+                absolute_path: format!("/fixture/{id}.zip").into(),
+                archive_kind: "zip".into(),
+                display_name: (*title).into(),
+                normalized_name: title.to_lowercase(),
+                size_bytes: *size,
+                modified_time_unix_seconds: *mtime,
+                platform: platform.map(Into::into),
+                platform_source: platform.map(|_| "fixture".into()),
+                last_known_health: "healthy".into(),
+                last_seen_at: "fixture".into(),
+                last_verified_missing_at: None,
+                identity_report: None,
+            })
+            .collect();
+        let mut library = super::Library::new(archives);
+        for (id, .., year) in rows {
+            let index = library.by_id[&id];
+            library.games[index].screenscraper = year.map(|year| {
+                archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment {
+                    archive_id: id,
+                    values:
+                        archivefs_core::screenscraper_enrichment::AcceptedScreenScraperMetadata {
+                            release_year: Some(year),
+                            ..Default::default()
+                        },
+                    receipt:
+                        archivefs_core::screenscraper_enrichment::ScreenScraperEnrichmentReceipt {
+                            provider: "ScreenScraper".into(),
+                            provider_record_id: "fixture".into(),
+                            retrieved_at_unix_seconds: 1,
+                            match_basis: "fixture".into(),
+                            before: Default::default(),
+                            accepted: Default::default(),
+                            media_reference_count: 0,
+                            field_sources: Default::default(),
+                        },
+                }
+            });
+        }
+        library
+    }
+
+    fn sorted_ids(library: &super::Library, sort: super::SortOrder, platform: &str) -> Vec<i64> {
+        library
+            .filter(&super::Filter {
+                sort,
+                platform: platform.into(),
+                ..Default::default()
+            })
+            .into_iter()
+            .map(|index| library.games[index].archive.id)
+            .collect()
+    }
+
+    #[test]
+    fn every_sort_order_is_stable_and_puts_missing_values_last() {
+        use super::SortOrder::*;
+        let library = sort_fixture();
+        // Title order ignores case; equal titles keep id order.
+        assert_eq!(sorted_ids(&library, TitleAsc, ""), [2, 4, 1, 3, 5]);
+        assert_eq!(sorted_ids(&library, TitleDesc, ""), [5, 3, 1, 2, 4]);
+        // Unknown system last; within a system, title order.
+        assert_eq!(sorted_ids(&library, System, ""), [2, 5, 4, 1, 3]);
+        // Equal years keep title order; no year comes last in either direction.
+        assert_eq!(sorted_ids(&library, YearNewest, ""), [4, 1, 3, 2, 5]);
+        assert_eq!(sorted_ids(&library, YearOldest, ""), [3, 4, 1, 2, 5]);
+        assert_eq!(sorted_ids(&library, FileNewest, ""), [4, 1, 5, 2, 3]);
+        assert_eq!(sorted_ids(&library, LargestFirst, ""), [4, 1, 5, 3, 2]);
+        // The same order applies inside one system, and repeats exactly.
+        let nes = library.game(5).unwrap().platform.clone();
+        assert_eq!(sorted_ids(&library, LargestFirst, &nes), [5, 2]);
+        for sort in super::SortOrder::ALL {
+            assert_eq!(
+                sorted_ids(&library, sort, ""),
+                sorted_ids(&library, sort, "")
+            );
+        }
+    }
+
+    #[test]
+    fn missing_sort_values_are_counted_for_the_shown_list() {
+        use super::SortOrder::*;
+        let library = sort_fixture();
+        let all = library.filter(&super::Filter::default());
+        assert_eq!(library.missing_sort_value(&all, TitleAsc), 0);
+        assert_eq!(library.missing_sort_value(&all, System), 1);
+        assert_eq!(library.missing_sort_value(&all, YearNewest), 2);
+        assert_eq!(library.missing_sort_value(&all, FileNewest), 1);
+        assert_eq!(library.missing_sort_value(&all, LargestFirst), 1);
+        assert!(TitleAsc.missing_noun().is_none());
+    }
+
+    #[test]
+    fn the_sort_note_explains_games_placed_last() {
+        use crate::gui_v2::browse_play::sort_missing_note;
+        assert_eq!(sort_missing_note(0, 5, "no release year"), None);
+        assert_eq!(
+            sort_missing_note(2, 5, "no release year").as_deref(),
+            Some("2 of 5 games have no release year; they are listed after the rest, by title.")
+        );
+        assert_eq!(
+            sort_missing_note(5, 5, "no release year").as_deref(),
+            Some("None of these 5 games has a release year yet, so they stay in title order.")
+        );
+    }
+
+    #[test]
+    fn the_sort_order_is_saved_and_older_views_open_in_title_order() {
+        let older: super::Filter = serde_json::from_str(r#"{"search":"x","list":true}"#).unwrap();
+        assert_eq!(older.sort, super::SortOrder::TitleAsc);
+        let saved = super::Filter {
+            sort: super::SortOrder::YearNewest,
+            ..Default::default()
+        };
+        let restored: super::Filter =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(restored.sort, super::SortOrder::YearNewest);
     }
 
     fn game(id: i64, health: &str) -> Game {

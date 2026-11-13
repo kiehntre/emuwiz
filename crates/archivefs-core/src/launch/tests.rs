@@ -106,6 +106,7 @@ fn retroarch_environment_with_cores(cores: Vec<CoreFinding>) -> RetroArchEnviron
                 complete: true,
             },
             app_images: Vec::new(),
+            save_directories: Vec::new(),
             diagnostics: Vec::new(),
         }],
         diagnostics: Vec::new(),
@@ -1435,4 +1436,198 @@ fn a_ranked_core_hint_list_picks_the_first_installed_name() {
         preferred[0].target,
         LaunchTarget::RetroArchCore { ref core_stem, .. } if core_stem == "nestopia"
     ));
+}
+
+// ---------------------------------------------------------------------
+// RetroArch save-folder readiness (owner decision 2026-11-13: warn, keep Play)
+// ---------------------------------------------------------------------
+
+fn save_dir_finding(
+    purpose: crate::emulator_environment::retroarch::PathPurpose,
+    core_name: Option<&str>,
+    directory: &str,
+    status: crate::emulator_environment::retroarch::SaveDirectoryStatus,
+) -> crate::emulator_environment::retroarch::SaveDirectoryFinding {
+    use crate::emulator_environment::retroarch::PathPurpose;
+    crate::emulator_environment::retroarch::SaveDirectoryFinding {
+        purpose,
+        config_key: if purpose == PathPurpose::Saves {
+            "savefile_directory"
+        } else {
+            "savestate_directory"
+        },
+        core_name: core_name.map(str::to_string),
+        settings_file: EncodedPath::from_path(&PathBuf::from(match core_name {
+            Some(core) => format!("/home/user/.config/retroarch/config/{core}/{core}.cfg"),
+            None => "/home/user/.config/retroarch/retroarch.cfg".into(),
+        })),
+        directory: Some(EncodedPath::from_path(&PathBuf::from(directory))),
+        status,
+    }
+}
+
+fn snes_plan_with_save_dirs(
+    findings: Vec<crate::emulator_environment::retroarch::SaveDirectoryFinding>,
+    firmware: Vec<crate::emulator_environment::retroarch::FirmwareRequirement>,
+) -> LaunchPlan {
+    let mut core = core_finding("snes9x", Some("Nintendo - SNES / SFC"), None);
+    if let CoreInfoFinding::Found { firmware: f, .. } = &mut core.info {
+        *f = firmware;
+    }
+    let mut environment = retroarch_environment_with_cores(vec![core]);
+    environment.profiles[0].save_directories = findings;
+    build_launch_plan(
+        &resolved("SNES"),
+        &resolved_content(),
+        &[],
+        &environment,
+        &[],
+    )
+}
+
+#[test]
+fn unusable_save_folders_warn_with_path_and_remedy_but_keep_play() {
+    use crate::emulator_environment::retroarch::{PathPurpose, SaveDirectoryStatus};
+    for (status, reason) in [
+        (SaveDirectoryStatus::Missing, "does not exist"),
+        (SaveDirectoryStatus::NotWritable, "cannot be written"),
+        (SaveDirectoryStatus::Symlink, "symbolic link"),
+        (SaveDirectoryStatus::Uncheckable, "could not check"),
+        (SaveDirectoryStatus::NotADirectory, "is not a folder"),
+    ] {
+        let plan = snes_plan_with_save_dirs(
+            vec![save_dir_finding(
+                PathPurpose::Saves,
+                None,
+                "/gone/saves",
+                status,
+            )],
+            Vec::new(),
+        );
+        let candidate = &plan.candidates[0];
+        assert_eq!(
+            candidate.readiness,
+            LaunchReadiness::ReadyWithWarnings,
+            "{status:?}"
+        );
+        assert!(candidate.blockers.is_empty(), "{status:?}");
+        assert!(
+            candidate.retroarch_play_eligible(),
+            "{status:?}: Play stays available"
+        );
+        let warning = candidate
+            .warnings
+            .iter()
+            .find(|w| w.kind == LaunchWarningKind::RetroArchSaveDirectoryUnusable)
+            .expect("save-folder warning");
+        let text = &warning.detail;
+        assert!(
+            text.starts_with("In-game progress may fail to save."),
+            "{text}"
+        );
+        assert!(
+            text.contains("/gone/saves") && text.contains("savefile_directory"),
+            "{text}"
+        );
+        assert!(text.contains(reason), "{text}");
+        assert!(text.contains("Settings > Directory > Save Files"), "{text}");
+    }
+}
+
+#[test]
+fn per_core_override_wins_over_retroarch_cfg_and_usable_folders_are_silent() {
+    use crate::emulator_environment::retroarch::{PathPurpose, SaveDirectoryStatus};
+    // retroarch.cfg's state folder is fine, but snes9x's override points at a
+    // missing one: the override is what the launch would use.
+    let plan = snes_plan_with_save_dirs(
+        vec![
+            save_dir_finding(
+                PathPurpose::Saves,
+                None,
+                "/ok/saves",
+                SaveDirectoryStatus::Usable,
+            ),
+            save_dir_finding(
+                PathPurpose::SaveStates,
+                None,
+                "/ok/states",
+                SaveDirectoryStatus::Usable,
+            ),
+            save_dir_finding(
+                PathPurpose::SaveStates,
+                Some("snes9x"),
+                "/gone/states",
+                SaveDirectoryStatus::Missing,
+            ),
+            // Another core's broken override never affects snes9x.
+            save_dir_finding(
+                PathPurpose::Saves,
+                Some("mgba"),
+                "/x",
+                SaveDirectoryStatus::Missing,
+            ),
+        ],
+        Vec::new(),
+    );
+    let warnings: Vec<_> = plan.candidates[0]
+        .warnings
+        .iter()
+        .filter(|w| w.kind == LaunchWarningKind::RetroArchSaveDirectoryUnusable)
+        .collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let text = &warnings[0].detail;
+    assert!(text.starts_with("Save states may fail to save."), "{text}");
+    assert!(
+        text.contains("/gone/states") && text.contains("snes9x core override"),
+        "{text}"
+    );
+
+    let fine = snes_plan_with_save_dirs(
+        vec![save_dir_finding(
+            PathPurpose::Saves,
+            None,
+            "/ok",
+            SaveDirectoryStatus::Usable,
+        )],
+        Vec::new(),
+    );
+    assert_eq!(fine.candidates[0].readiness, LaunchReadiness::Ready);
+}
+
+#[test]
+fn save_folder_warning_never_hides_a_real_blocker_or_firmware_rule() {
+    use crate::emulator_environment::retroarch::{
+        FirmwarePresence, FirmwareRequirement, PathPurpose, SaveDirectoryStatus,
+    };
+    let broken = || {
+        vec![save_dir_finding(
+            PathPurpose::Saves,
+            None,
+            "/gone",
+            SaveDirectoryStatus::Missing,
+        )]
+    };
+    let required = |presence| {
+        vec![FirmwareRequirement {
+            index: 0,
+            path: Some("bios.bin".into()),
+            description: None,
+            optional: false,
+            presence,
+        }]
+    };
+    // Missing firmware still blocks.
+    let plan = snes_plan_with_save_dirs(broken(), required(FirmwarePresence::Missing));
+    assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Blocked);
+    assert!(!plan.candidates[0].retroarch_play_eligible());
+    // Unverified firmware keeps its own rule alongside the save warning.
+    let plan = snes_plan_with_save_dirs(broken(), required(FirmwarePresence::PresentUnverified));
+    assert!(plan.candidates[0].retroarch_play_eligible());
+    // A non-allow-listed warning still withdraws Play even with a save warning.
+    let mut candidate = snes_plan_with_save_dirs(broken(), Vec::new()).candidates[0].clone();
+    candidate.warnings.push(LaunchWarning::new(
+        LaunchWarningKind::MultipleEligibleProfiles,
+        "fixture",
+    ));
+    assert!(!candidate.retroarch_play_eligible());
 }

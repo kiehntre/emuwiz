@@ -341,61 +341,9 @@ impl App {
         }
         self.drive_pad_shell(context);
         crate::ui::picker::show(context);
-        let modal_open = self.confirm_scan
-            || self.setup_actions.confirm.is_some()
-            || self.repair_confirm
-            || self.undo_confirm.is_some()
-            || self.history_view.confirm_undo.is_some()
-            || self.missing.confirm
-            || self.equiv.confirm;
-        let (escape, alt_back) = context.input(|input| {
-            (
-                input.key_pressed(egui::Key::Escape),
-                input.modifiers.alt && input.key_pressed(egui::Key::ArrowLeft),
-            )
-        });
-        if escape {
-            // Any other open dialog (the classic Sources dialogs are hosted here too)
-            // is not ours to cancel, but Back must not run underneath it.
-            let other_window_open = context.memory(|memory| {
-                memory
-                    .areas()
-                    .visible_layer_ids()
-                    .iter()
-                    .any(|layer| layer.order == egui::Order::Middle)
-            });
-            match escape_action(
-                modal_open,
-                egui::Popup::is_any_open(context),
-                other_window_open,
-                self.text_was_focused,
-            ) {
-                EscapeAction::CloseModal => {
-                    // Every v2 confirmation is a preview-only step, so closing is always safe.
-                    self.confirm_scan = false;
-                    if let Some(confirm) = self.setup_actions.confirm.take() {
-                        let opened = egui::Id::new(("v2_setup_confirm_opened", confirm.path()));
-                        context.data_mut(|data| data.remove::<bool>(opened));
-                    }
-                    self.repair_confirm = false;
-                    self.undo_confirm = None;
-                    if let Some(id) = self.history_view.confirm_undo.take() {
-                        let opened = egui::Id::new(("v2_history_undo_opened", id));
-                        context.data_mut(|data| data.remove::<bool>(opened));
-                    }
-                    self.missing.confirm = false;
-                    self.equiv.confirm = false;
-                }
-                // egui has already released the field's focus on this key press.
-                EscapeAction::LeaveFocus => {}
-                // egui closes an open popup on this same key press.
-                EscapeAction::PopupHandles => {}
-                EscapeAction::KeepDialogOpen => {}
-                EscapeAction::Back => self.back(),
-            }
-        } else if alt_back && !modal_open {
-            self.back();
-        }
+        // Escape and Alt+Left, after the viewers, Big Picture and the
+        // controller keyboard above have had their keys.
+        self.apply_back_keys(context);
         if context.input(|input| input.modifiers.alt && input.key_pressed(egui::Key::Home)) {
             self.go(Route::Home);
         }
@@ -2583,11 +2531,12 @@ impl App {
                     self.problem_filter = ProblemFilter::All;
                 }
                 ui.label("Search");
-                ui.add_sized(
+                let search = ui.add_sized(
                     [220.0, 28.0],
                     egui::TextEdit::singleline(&mut self.problem_query)
                         .hint_text("title, game or path"),
                 );
+                super::shortcuts::register_search(&search);
                 if !self.problem_query.is_empty() && ui.button("Clear").clicked() {
                     self.problem_query.clear();
                 }
@@ -2612,13 +2561,17 @@ impl App {
                     .game(game_id)
                     .map(|game| (game.title.clone(), game.platform.clone()))
             {
-                let identity = self.identity_review_for(game_id);
+                // The same identity wording as Game Details.
+                let identity = self
+                    .library
+                    .game(game_id)
+                    .and_then(|game| self.detail_identity_wording(game));
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.heading(&title);
                     ui.label(format!("Problems for this game · {platform}"));
-                    if let Some(review) = &identity {
-                        ui.label(format!("Identity: {}", review.list_label()));
-                        if !review.is_verified() && ui.button("Review identity").clicked() {
+                    if let Some(identity) = &identity {
+                        ui.label(format!("Identity: {}", identity.label));
+                        if !identity.is_verified() && ui.button("Review identity").clicked() {
                             self.go(Route::ReviewIdentity(game_id));
                         }
                     }
@@ -3227,6 +3180,8 @@ impl App {
         let identity = self.detail_identity(game);
         let identity_verified = identity.as_ref().is_some_and(|i| i.is_verified());
         let dat_identity = identity.as_ref().and_then(|i| i.card_identity());
+        // The card's identity line says what the Identity line says.
+        let identity_label = self.detail_identity_wording(game).map(|w| w.label);
         let readiness_route = {
             let workflows = self.native_workflows.get_or_insert_with(|| {
                 super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
@@ -3240,6 +3195,7 @@ impl App {
                 super::native_workflows::SavedFileFacts {
                     catalogue_verified: identity_verified,
                     dat_identity,
+                    identity_label,
                     file_missing,
                 },
                 &mut self.activity,
@@ -3350,9 +3306,10 @@ impl App {
         }
         // General file identification and launch readiness remain separate.
         // The identity result leads; the longer verification guidance follows.
-        if let Some(identity) = self.detail_identity(game) {
+        // Identification confidence only; requirements and Play stay on the card.
+        if let Some(identity) = self.detail_identity_wording(game) {
             ui.horizontal_wrapped(|ui| {
-                ui.strong(format!("Identity: {}", identity.label()));
+                ui.strong(format!("Identity: {}", identity.label));
                 let label = if identity.is_verified() {
                     "View evidence"
                 } else {
@@ -3362,6 +3319,13 @@ impl App {
                     self.go(Route::ReviewIdentity(id));
                 }
             });
+            // What a verified answer rests on. An unverified one is explained
+            // by the likely-match card and the Verification card below.
+            if identity.is_verified()
+                && let Some(note) = identity.note
+            {
+                ui.small(note);
+            }
             if !identity.is_verified() {
                 let review = self.identity_review_for(id);
                 let guess = super::detail_identity::likely_match(game, review.as_ref());
@@ -3571,11 +3535,13 @@ impl App {
     ) {
         let id = game.archive.id;
         let key = key.clone();
-        ui.label(match game.dat_exact_label() {
-            Some(label) => label,
-            None if game.identified => "Identified in the saved game list".to_string(),
-            None => "Identity is not confirmed".to_string(),
-        });
+        // The page's one identity answer; a saved record is labelled as saved.
+        if let Some(identity) = self.detail_identity_wording(game) {
+            ui.label(format!("Identity: {}", identity.label));
+        }
+        if let Some(record) = game.dat_exact_label() {
+            ui.label(format!("Saved catalogue record: {record}"));
+        }
         ui.monospace(format!("Source: {}", game.archive.relative_path.display()));
         ui.monospace(format!("Media kind: {}", game.archive.archive_kind));
         for old in library.historical_for(id) {
@@ -4325,6 +4291,7 @@ impl App {
     fn settings(&mut self, ui: &mut egui::Ui) {
         self.simple_shell_settings(ui);
         super::update_check::show(ui, &mut self.update_check);
+        super::shortcuts::show_help(ui);
         ui.horizontal_wrapped(|ui| {
             ui.label("Your library:");
             if crate::ui::components::action_button(
@@ -4684,36 +4651,6 @@ mod disambiguation_tests {
         assert_eq!(first.as_deref(), Some("Source: games/roms"));
         assert_eq!(second.as_deref(), Some("Source: usbdrive/games"));
         assert_ne!(first, second);
-    }
-}
-
-/// What one Escape press means, most specific first: an open confirmation,
-/// then an open menu, then a focused text field, and only then Back.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum EscapeAction {
-    CloseModal,
-    PopupHandles,
-    KeepDialogOpen,
-    LeaveFocus,
-    Back,
-}
-
-pub(super) fn escape_action(
-    modal_open: bool,
-    popup_open: bool,
-    other_window_open: bool,
-    typing: bool,
-) -> EscapeAction {
-    if modal_open {
-        EscapeAction::CloseModal
-    } else if popup_open {
-        EscapeAction::PopupHandles
-    } else if other_window_open {
-        EscapeAction::KeepDialogOpen
-    } else if typing {
-        EscapeAction::LeaveFocus
-    } else {
-        EscapeAction::Back
     }
 }
 

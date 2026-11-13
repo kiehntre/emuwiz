@@ -99,6 +99,7 @@ mod psp_iso_analyser;
 mod quarantine_confirm;
 mod quarantine_outcome;
 mod r2_rename;
+mod recently_played;
 mod recording_integrity;
 #[cfg(test)]
 mod retroarch_journey_tests;
@@ -109,12 +110,14 @@ mod save_compatibility;
 mod save_snapshots;
 mod save_state_guidance;
 mod saves_states;
+mod scan_history;
 #[cfg(test)]
 mod scummvm_journey_tests;
 mod setup_portability;
 #[cfg(test)]
 #[path = "tests/shared_scroll.rs"]
 mod shared_scroll_tests;
+mod shortcuts;
 mod simple_shell;
 mod single_file_restore;
 mod source_impact;
@@ -470,6 +473,8 @@ pub(super) struct App {
     discovery_import_history: history_discovery_import::State,
     database_recovery: database_recovery::State,
     duckstation_history: history_duckstation::State,
+    /// Home's "Continue playing" row, from RetroArch's own history.
+    recently_played: recently_played::State,
     canonical_organisation_generation: u64,
     canonical_organisation_history:
         Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
@@ -611,6 +616,7 @@ impl App {
             discovery_import_history: Default::default(),
             database_recovery: Default::default(),
             duckstation_history: Default::default(),
+            recently_played: Default::default(),
             canonical_organisation_generation: 0,
             canonical_organisation_history: Vec::new(),
             mods: ModsPageState::default(),
@@ -893,7 +899,7 @@ impl App {
         }
         let id = self.activity.queue(
             if scan {
-                "Scanning your game folders"
+                scan_history::SCAN_JOB_TITLE
             } else {
                 "Loading your library"
             },
@@ -2638,7 +2644,7 @@ impl eframe::App for App {
         }
         self.poll(ui.ctx());
         self.note_window_resize(ui.ctx());
-        self.show(ui.ctx());
+        self.show_with_shortcuts(ui.ctx());
         self.simple.paint_focus_ring(ui.ctx());
         self.finish_frame();
     }

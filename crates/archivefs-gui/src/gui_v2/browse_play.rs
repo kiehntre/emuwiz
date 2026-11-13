@@ -14,7 +14,7 @@ use std::sync::Arc;
 use super::{
     App,
     artwork::Picture,
-    library::{CheckedReadiness, Filter, Game, ReadinessCache, ReadinessFilter},
+    library::{CheckedReadiness, Filter, Game, ReadinessCache, ReadinessFilter, SortOrder},
     media_sources::Kind,
     routes::{Route, Section},
 };
@@ -70,7 +70,13 @@ const ATTENTION_TEXT: Color32 = Color32::from_rgb(232, 170, 62);
 pub(super) const SELECTION_SETTLE_SECS: f64 = 0.35;
 
 /// Platform, search, (readiness view, cache-aware), unverified-only, library.
-type FilterKey = (String, String, (ReadinessFilter, bool), bool, usize);
+type FilterKey = (
+    String,
+    String,
+    (ReadinessFilter, bool),
+    (bool, SortOrder),
+    usize,
+);
 /// Base list address, cache version, view, and the narrowed list.
 type ReadinessView = (usize, u64, ReadinessFilter, Arc<Vec<usize>>);
 
@@ -126,6 +132,9 @@ pub(super) struct BrowsePlayState {
     /// The readiness view of `indices`, rebuilt only when the base list or
     /// the cache changes: (base list address, cache version, filter, result).
     readiness_view: Option<ReadinessView>,
+    /// Games in the shown list missing the sort value:
+    /// (list address, list length, order, count).
+    sort_note: Option<(usize, usize, SortOrder, usize)>,
     /// Background checks for the games on screen.
     background: super::bg_readiness::Scheduler,
     /// The emulator-state snapshot the background checks run against, and the
@@ -400,13 +409,14 @@ impl App {
         // view switch never sit flush against the window edge.
         let page_width = ui.available_width() - theme::SPACE_MD;
 
-        self.browse_play_toolbar(ui);
+        let sort_in_toolbar = self.browse_play_toolbar(ui);
         self.batch_selection
             .retain(|id| library.by_id.contains_key(&id));
         self.browse_play_batch_controls(ui, &library);
         ui.add_space(theme::SPACE_XS);
-        self.browse_play_systems(ui, &library);
+        self.browse_play_systems(ui, &library, !sort_in_toolbar);
         let indices = self.browse_play_indices();
+        self.browse_play_sort_note(ui, &library, &indices);
         let blue = theme::blue_profile(ui);
         self.browse_play_background(ui.ctx(), blue);
         ui.add_space(theme::SPACE_XS);
@@ -552,7 +562,7 @@ impl App {
             self.filter.platform.clone(),
             self.filter.search.trim().to_lowercase(),
             (self.filter.readiness, self.filter.cache_aware),
-            self.filter.unverified_only,
+            (self.filter.unverified_only, self.filter.sort),
             Arc::as_ptr(&self.library) as usize,
         );
         if self.browse_play.key.as_ref() != Some(&key) {
@@ -694,7 +704,11 @@ impl App {
         }
     }
 
-    fn browse_play_toolbar(&mut self, ui: &mut egui::Ui) {
+    /// Returns whether the sort control was drawn here. A narrow window
+    /// stacks the toolbar, and the sort control then joins the view switch's
+    /// row, which has room, instead of wrapping the systems row onto a line
+    /// of its own and pushing the game panel down.
+    fn browse_play_toolbar(&mut self, ui: &mut egui::Ui) -> bool {
         // The view switch keeps its width; the search takes what is left and
         // shrinks before it can run over List/Grid. When even a small search
         // cannot share the row, the switch drops to its own row.
@@ -802,6 +816,7 @@ impl App {
                 view_switch(self, ui);
                 self.browse_play_selection_toggle(ui);
                 self.big_picture_button(ui);
+                self.browse_play_sort_control(ui);
             });
         }
         if blue
@@ -817,6 +832,93 @@ impl App {
                     RichText::new(note)
                         .size(theme::METADATA_SIZE)
                         .color(theme::blue::SECONDARY_TEXT),
+                )
+                .wrap(),
+            );
+        }
+        stacked
+    }
+
+    /// The sort control. It sits at the end of the systems row (or of the
+    /// stacked toolbar's second row), so it adds no row of its own: when the full "Sort: …" label
+    /// does not fit on what is left of the row, a short "Sort" box takes its
+    /// place and names the current order on hover.
+    fn browse_play_sort_control(&mut self, ui: &mut egui::Ui) {
+        let full = sort_button_text(self.filter.sort);
+        // A combo box asks the row only for the space left on it, so the
+        // wrapping row never moves it down and its label runs off the edge.
+        // Claiming the label's width first lets the row place it.
+        let spacing = ui.spacing();
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let icon = spacing.icon_spacing + spacing.icon_width;
+        let pad = spacing.button_padding.x;
+        let combo_width = spacing.combo_width;
+        let height = spacing.interact_size.y;
+        let remaining = ui.available_rect_before_wrap().width();
+        let full_width =
+            (super::title_fit::text_width(ui, &full, &font) + icon + 2.0 * pad).max(combo_width);
+        // The short box also trims its side padding: on a narrow Blue window
+        // that is what keeps it on the row instead of wrapping it.
+        let (text, width, pad) = if full_width <= remaining {
+            (full, full_width, pad)
+        } else {
+            let short_pad = pad.min(SORT_SHORT_PAD);
+            let width = (super::title_fit::text_width(ui, SORT_SHORT_LABEL, &font)
+                + icon
+                + 2.0 * short_pad)
+                .ceil();
+            (SORT_SHORT_LABEL.to_owned(), width, short_pad)
+        };
+        let hover = format!(
+            "{}. {}",
+            sort_button_text(self.filter.sort),
+            self.filter.sort.hint()
+        );
+        ui.allocate_ui(egui::vec2(width, height), |ui| {
+            ui.spacing_mut().button_padding.x = pad;
+            egui::ComboBox::from_id_salt("library_sort")
+                .selected_text(text)
+                .width(width)
+                .wrap_mode(egui::TextWrapMode::Extend)
+                .show_ui(ui, |ui| {
+                    for choice in SortOrder::ALL {
+                        ui.selectable_value(&mut self.filter.sort, choice, choice.label())
+                            .on_hover_text(choice.hint());
+                    }
+                })
+                .response
+                .on_hover_text(hover);
+        });
+    }
+
+    /// When the list is sorted by a value some shown games lack, says how
+    /// many, so a block of them at the end is explained. Nothing is drawn
+    /// otherwise. The count is made once per list.
+    fn browse_play_sort_note(
+        &mut self,
+        ui: &mut egui::Ui,
+        library: &super::library::Library,
+        indices: &Arc<Vec<usize>>,
+    ) {
+        let sort = self.filter.sort;
+        let Some(noun) = sort.missing_noun() else {
+            return;
+        };
+        let key = (Arc::as_ptr(indices) as usize, indices.len(), sort);
+        let missing = match self.browse_play.sort_note {
+            Some((k0, k1, k2, count)) if (k0, k1, k2) == key => count,
+            _ => {
+                let count = library.missing_sort_value(indices, sort);
+                self.browse_play.sort_note = Some((key.0, key.1, key.2, count));
+                count
+            }
+        };
+        if let Some(note) = sort_missing_note(missing, indices.len(), noun) {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(note)
+                        .size(theme::METADATA_SIZE)
+                        .color(theme::SECONDARY_TEXT),
                 )
                 .wrap(),
             );
@@ -884,7 +986,12 @@ impl App {
         }
     }
 
-    fn browse_play_systems(&mut self, ui: &mut egui::Ui, library: &super::library::Library) {
+    fn browse_play_systems(
+        &mut self,
+        ui: &mut egui::Ui,
+        library: &super::library::Library,
+        with_sort: bool,
+    ) {
         let mut ordered: Vec<(String, usize)> = library
             .platforms
             .iter()
@@ -951,6 +1058,9 @@ impl App {
             }
             self.browse_play_verify_button(ui);
             self.browse_play_surprise_button(ui);
+            if with_sort {
+                self.browse_play_sort_control(ui);
+            }
         });
         if let Some(platform) = chosen {
             self.choose_system(platform);
@@ -1212,7 +1322,10 @@ impl App {
         library: &super::library::Library,
         indices: &Arc<Vec<usize>>,
     ) {
-        if indices.len() < ALPHA_STRIP_MIN {
+        // Letters only mean something while the list is in title order.
+        if indices.len() < ALPHA_STRIP_MIN
+            || !matches!(self.filter.sort, SortOrder::TitleAsc | SortOrder::TitleDesc)
+        {
             return;
         }
         let key = (Arc::as_ptr(indices) as usize, indices.len());
@@ -1802,6 +1915,7 @@ impl App {
                     if ui.button("Clear search and system").clicked() {
                         self.filter = Filter {
                             list: self.filter.list,
+                            sort: self.filter.sort,
                             ..Default::default()
                         };
                     }
@@ -1853,6 +1967,34 @@ pub(super) fn retired_note(library: &super::library::Library) -> Option<(String,
 /// Said under every readiness view that could be mistaken for a verdict on
 /// the whole library. Launch checks run for the game you select, so nothing
 /// here has assessed every game.
+/// The sort control's closed text when the row has no room for the order.
+const SORT_SHORT_LABEL: &str = "Sort";
+/// Side padding of the short sort box.
+const SORT_SHORT_PAD: f32 = 6.0;
+
+/// The sort control's closed text: says what it is, not just the order.
+fn sort_button_text(sort: SortOrder) -> String {
+    format!("Sort: {}", sort.label())
+}
+
+/// Plain note for games placed last because they lack the sorted value.
+pub(super) fn sort_missing_note(missing: usize, shown: usize, noun: &str) -> Option<String> {
+    if missing == 0 || shown == 0 {
+        return None;
+    }
+    if missing == shown {
+        return Some(format!(
+            "None of these {shown} games has a {} yet, so they stay in title order.",
+            noun.trim_start_matches("no ")
+        ));
+    }
+    Some(if missing == 1 {
+        format!("1 of {shown} games has {noun}; it is listed after the rest, by title.")
+    } else {
+        format!("{missing} of {shown} games have {noun}; they are listed after the rest, by title.")
+    })
+}
+
 fn readiness_filter_note(
     filter: ReadinessFilter,
     checked: usize,

@@ -400,6 +400,9 @@ pub(super) struct SavedFileFacts {
     /// Game Details' unconfirmed DAT identity for the card's identity line
     /// (pending, not confirmed, or re-check needed); `None` otherwise.
     pub dat_identity: Option<launch_readiness_summary::IdentitySummary>,
+    /// Game Details' identity wording (`detail_identity::identity_wording`),
+    /// shown on the card's identity line in place of the launch projection's.
+    pub identity_label: Option<&'static str>,
     pub file_missing: bool,
 }
 
@@ -1072,7 +1075,7 @@ impl NativeWorkflows {
         if saved.file_missing {
             launch_readiness_summary::note_file_missing(&mut summary);
         }
-        let action = launch_readiness_summary::show(ui, &summary);
+        let action = launch_readiness_summary::show(ui, &summary, saved.identity_label);
         let unchanged = self
             .shown_readiness
             .as_ref()
@@ -4072,6 +4075,14 @@ impl NativeWorkflows {
         );
         // An explicit recheck also forgets any cached MAME answer for this game.
         crate::arcade_mame_probe::invalidate_path(&path);
+        // RetroArch facts (save folders, the zipped-game save check) come from
+        // its background scan, so an explicit recheck refreshes that too.
+        if !matches!(
+            self.app.emulator_readiness.retroarch_profiles,
+            crate::emulator_setup::RetroArchProfilesState::Scanning { .. }
+        ) {
+            self.app.start_retroarch_profile_scan(context.clone());
+        }
         if !running {
             self.app.launch_standalone.clear_cue_review();
             self.app.start_selected_evidence_load(context.clone(), path);
