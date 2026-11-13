@@ -225,11 +225,11 @@ fn setup_and_doctor_leads_with_the_launch_check_above_the_fold_at_1024_by_600() 
     frame(&context, &mut app, [1024.0, 600.0]);
     let output = frame(&context, &mut app, [1024.0, 600.0]);
     let strings = text(&output);
-    assert!(strings.iter().any(|s| s == "Selected game launch check"));
+    assert!(strings.iter().any(|s| s == NO_SELECTION_LINE));
     // No game is selected: reported as not checked, never as ready.
     assert!(strings.iter().any(|s| s == "· Not checked"));
     assert!(!strings.iter().any(|s| s == "Ready"));
-    for needle in ["Selected game launch check", "· Not checked", NO_SELECTION] {
+    for needle in ["· Not checked", NO_SELECTION_LINE] {
         let rects = text_bounds(&output, needle);
         assert!(!rects.is_empty(), "{needle} not drawn");
         assert!(

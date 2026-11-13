@@ -37,6 +37,9 @@ pub(super) struct Diagnosis {
 pub(super) const NO_SELECTION: &str = "No game selected";
 pub(super) const NO_SELECTION_WHY: &str = "Open a game in Browse & Play and its launch check appears here. Setup & Doctor runs no game checks of its own.";
 
+pub(super) const NO_SELECTION_LINE: &str =
+    "Selected game launch check: no game selected. Open one in Browse & Play to see it here.";
+
 fn unsupported(cause: Cause) -> bool {
     matches!(cause, Cause::FormatUnsupported | Cause::PlatformUnsupported)
 }
@@ -140,6 +143,18 @@ pub(super) fn show(
     title: Option<&str>,
     diagnosis: &Diagnosis,
 ) -> Option<ReadinessAction> {
+    if title.is_none() && diagnosis.reason == NO_SELECTION {
+        // Nothing selected: one line, so setup problems below stay in view.
+        ui.horizontal_wrapped(|ui| {
+            status_badge(
+                ui,
+                verdict_label(diagnosis.verdict),
+                verdict_tone(diagnosis.verdict),
+            );
+            ui.label(NO_SELECTION_LINE);
+        });
+        return None;
+    }
     let mut pressed = None;
     card(ui, |ui| {
         ui.set_min_width(ui.available_width());
