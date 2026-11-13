@@ -1065,11 +1065,12 @@ fn choose_view(ui: &mut egui::Ui, state: &mut MountsState) -> Option<PageRequest
         {
             state.platform = Some("Unknown".into());
         }
-        ui.add(
+        let search = ui.add(
             egui::TextEdit::singleline(&mut state.search)
                 .hint_text("Search archives")
                 .desired_width(220.0),
         );
+        crate::gui_v2::shortcuts::register_search(&search);
     });
     ui.add_space(6.0);
     let wide = ui.available_width() >= 1100.0;

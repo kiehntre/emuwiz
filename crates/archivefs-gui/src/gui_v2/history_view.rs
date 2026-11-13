@@ -1741,11 +1741,12 @@ fn show_filters(ui: &mut egui::Ui, view: &mut HistoryViewState) {
     }
     ui.horizontal(|ui| {
         ui.label("Search:");
-        ui.add(
+        let search = ui.add(
             egui::TextEdit::singleline(&mut view.search)
                 .hint_text("operation, file or game")
                 .id_salt("v2_history_search"),
         );
+        crate::gui_v2::shortcuts::register_search(&search);
     });
 }
 

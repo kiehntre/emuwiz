@@ -137,6 +137,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         discovery_import_history: Default::default(),
         database_recovery: Default::default(),
         duckstation_history: Default::default(),
+        recently_played: Default::default(),
         canonical_organisation_generation: 0,
         canonical_organisation_history: Vec::new(),
         mods: super::mods::ModsPageState::default(),
@@ -9585,6 +9586,46 @@ fn game_details_identity_follows_this_games_panel_from_pending_to_answer() {
     }
 }
 
+/// A name-hint-only game and a game with no known system: the Identity line
+/// and the readiness card say the same thing, nothing says Verified, and the
+/// card never turns its own launch state into an identity word.
+#[test]
+fn game_details_hint_and_unknown_games_state_one_identity() {
+    let context = egui::Context::default();
+    let mut app = review_app(&context, vec![(1, "Amidar", "Atari2600")]);
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "Amidar", Some("Atari2600")),
+        archive(2, "Mystery", None),
+    ]));
+    for (id, expected) in [
+        (1, "Name hint only · not verified"),
+        (2, "Unknown · system not known"),
+    ] {
+        app.review.knowledge_for = Some(id);
+        panel_answered(&mut app, id, "Audit not yet performed");
+        app.router.current = Route::Game(id);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        let line = format!("Identity: {expected}");
+        assert_eq!(
+            strings.iter().filter(|shown| shown.contains(&line)).count(),
+            2,
+            "line and card for game {id}: {strings:?}"
+        );
+        for word in [
+            "Identity: Verified",
+            "Strong local identity",
+            "Identity: Needs review",
+            "Launchable with warning",
+            "Mismatch / blocked",
+        ] {
+            assert!(
+                !shows(&strings, word),
+                "game {id} shows {word}: {strings:?}"
+            );
+        }
+    }
+}
+
 /// Only strict invalidation drops that one game's in-memory badge. Setup
 /// gaps, unreadable evidence and a cancelled check drop nothing and never
 /// say Verified.
@@ -9756,20 +9797,25 @@ fn one_game_has_one_identity_status_on_every_page() {
             app.review.knowledge = Some(knowledge(S::NoMatch));
             panel_answered(&mut app, 1, "No catalogue match");
         }
-        let label = app.identity_review_for(1).unwrap().list_label();
+        let game = app.library.game(1).unwrap().clone();
+        let label = app.detail_identity_wording(&game).unwrap().label;
+        assert_eq!(label == "Verified", verified, "{label}");
         // Game Details
         app.router.current = Route::Game(1);
         // The identity result is on the first screen, not below the fold.
         let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
-        assert!(
-            shows(&strings, &format!("Identity: {label}")),
+        // The Identity line and the launch card say the same thing, and the
+        // card never turns its own launch state into "Needs review".
+        assert_eq!(
+            strings
+                .iter()
+                .filter(|line| line.contains(&format!("Identity: {label}")))
+                .count(),
+            2,
             "details {label}: {strings:?}"
         );
-        // The launch card never contradicts it: a verified game is not
-        // "Needs review", and verified identity alone never decides launch.
-        assert_eq!(
-            shows(&strings, "Identity: Needs review"),
-            !verified,
+        assert!(
+            !shows(&strings, "Identity: Needs review"),
             "details {label}: {strings:?}"
         );
         assert!(

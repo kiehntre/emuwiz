@@ -1673,6 +1673,16 @@ impl ReadinessSources<'_> {
             archivefs_core::launch::dolphin_binding_readiness::apply(&mut plan, profiles);
         }
         archivefs_core::launch::nkit_readiness::inspect_and_apply(&mut plan);
+        // A zipped cartridge's launch is refused when RetroArch's save setup
+        // would lose saves; show that same refusal here, before Play.
+        // The findings were computed once on the RetroArch scan thread; this
+        // is a lookup, never a file read, so it is safe on every frame.
+        if let RetroArchProfilesState::Ready(discovery) = &self.readiness.retroarch_profiles {
+            archivefs_core::launch::apply_zipped_cartridge_save_safety(
+                &mut plan,
+                &discovery.zipped_save_findings,
+            );
+        }
         archivefs_core::launch::cemu_readiness::apply_cemu_readiness(
             &mut plan,
             self.readiness.cemu.inspection_for(focused),

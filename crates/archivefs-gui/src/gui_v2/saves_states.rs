@@ -392,10 +392,11 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
                 app.saves_states.filter = filter;
             }
         }
-        ui.add(
+        let search = ui.add(
             egui::TextEdit::singleline(&mut app.saves_states.search)
                 .hint_text("Search game, platform or emulator"),
         );
+        crate::gui_v2::shortcuts::register_search(&search);
     });
 
     let search = app.saves_states.search.to_ascii_lowercase();

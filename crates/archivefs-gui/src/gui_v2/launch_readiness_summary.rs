@@ -272,6 +272,14 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
     let named_disc_refusal = summary
         .explanation
         .starts_with(archivefs_core::launch::evidence_bridge::CUE_BIN_REFUSED_PREFIX);
+    // The zipped-save refusal already offers Recheck (which refreshes
+    // RetroArch, where the answer comes from); the generic safety-refusal
+    // finding must not turn that into "Review problem".
+    let zipped_save_refusal = matches!(input, LaunchReadinessInput::Plan { plan, .. }
+    if plan.candidates.iter().flat_map(|candidate| &candidate.blockers).any(|blocker| {
+        blocker.kind == LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe
+            && blocker.detail == summary.explanation
+    }));
     let mut findings = match input {
         LaunchReadinessInput::IdentityConflicting => diagnosis::single(Cause::IdentityNotConfirmed),
         // Each reason already carries its own wording and next action.
@@ -324,7 +332,10 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
     {
         return;
     }
-    if !named_disc_refusal && let Some(fix) = findings[0].fix {
+    if !named_disc_refusal
+        && !zipped_save_refusal
+        && let Some(fix) = findings[0].fix
+    {
         summary.primary_action = Some(fix);
     }
     summary.findings = findings;
@@ -724,6 +735,28 @@ fn project_plan(
     if let Some(blocker) = candidate
         .blockers
         .iter()
+        .find(|blocker| blocker.kind == LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe)
+    {
+        // Same reason the launch would refuse with; Recheck also refreshes
+        // RetroArch, which is where this answer comes from.
+        return with_details(
+            base(
+                ReadinessPresentationState::Blocked,
+                "RetroArch would lose this zipped game's saves",
+                &blocker.detail,
+                IdentitySummary::StrongLocal,
+                source_for(candidate),
+                firmware_for(candidate),
+                emulator_for(candidate),
+                Some(ReadinessAction::RecheckReadiness),
+            ),
+            details,
+        );
+    }
+
+    if let Some(blocker) = candidate
+        .blockers
+        .iter()
         .find(|blocker| blocker.kind == LaunchBlockerKind::RetroArchArcadeSetNeedsArchive)
     {
         return with_details(
@@ -841,6 +874,15 @@ fn project_plan(
         );
     }
     summary
+}
+
+/// A save-folder finding comes from the last RetroArch scan; offer the
+/// refresh that re-checks it (owner decision 2026-11-13).
+pub(crate) fn offers_retroarch_refresh(summary: &GameReadinessSummary) -> bool {
+    summary
+        .warnings
+        .iter()
+        .any(|warning| warning.ends_with(archivefs_core::launch::RETROARCH_RECHECK_HINT))
 }
 
 fn base(
@@ -1013,7 +1055,9 @@ pub(crate) fn status_label(status: ReadinessPresentationState) -> &'static str {
         ReadinessPresentationState::ReadyWithWarnings => "Ready with warning",
         ReadinessPresentationState::NeedsEmulator => "Emulator needed",
         ReadinessPresentationState::NeedsFirmware => "Firmware needed",
-        ReadinessPresentationState::NeedsIdentityReview => "Identity needs review",
+        // Launch needs the file's own evidence; identity confidence is
+        // stated separately, so this never reads as an identity verdict.
+        ReadinessPresentationState::NeedsIdentityReview => "File check needed",
         ReadinessPresentationState::NeedsSystem => "System needed",
         ReadinessPresentationState::SourceUnavailable => "Game file unavailable",
         ReadinessPresentationState::MediaUnreadable => "Game file unreadable",
@@ -1041,7 +1085,15 @@ pub(crate) fn action_label(action: ReadinessAction) -> &'static str {
     }
 }
 
-pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<ReadinessAction> {
+/// `identity` is the page's identity wording. The launch projection's own
+/// identity value follows which launch branch ran (a missing BIOS, an
+/// emulator, a check still running), so it is only a fallback.
+pub(crate) fn show(
+    ui: &mut egui::Ui,
+    summary: &GameReadinessSummary,
+    identity: Option<&str>,
+) -> Option<ReadinessAction> {
+    let identity = identity.unwrap_or(identity_label(summary.identity));
     let mut action = None;
     crate::ui::components::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -1151,7 +1203,7 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
             if let Some(emulator) = &summary.emulator {
                 ui.label(format!("Using: {}", emulator.name));
             }
-            ui.label(format!("Identity: {}", identity_label(summary.identity)));
+            ui.label(format!("Identity: {identity}"));
             if ui
                 .small_button(action_label(ReadinessAction::LookUpOnline))
                 .on_hover_text(super::hasheous_check::SHORTCUT_HINT)
@@ -1167,6 +1219,9 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
         for warning in summary.warnings.iter().take(2) {
             ui.colored_label(crate::ui::theme::warning(ui), warning);
         }
+        if offers_retroarch_refresh(summary) && ui.small_button("Refresh RetroArch").clicked() {
+            action = Some(ReadinessAction::RecheckReadiness);
+        }
         ui.collapsing("Readiness details", |ui| {
             if let Some(emulator) = &summary.emulator {
                 ui.label(format!("Profile: {}", emulator.profile));
@@ -1179,10 +1234,7 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
                     ui.monospace(line);
                 }
             }
-            ui.label(format!(
-                "Identity evidence: {}",
-                identity_label(summary.identity)
-            ));
+            ui.label(format!("Identity evidence: {identity}"));
             ui.label(format!("Source state: {}", source_label(summary.source)));
             ui.label(format!(
                 "Firmware state: {}",
@@ -2273,6 +2325,82 @@ mod tests {
         assert_eq!(summary.primary_action, Some(ReadinessAction::SetUpEmulator));
     }
 
+    /// The card's identity line is the page's identity wording. The launch
+    /// projection's own value follows the launch branch (missing firmware,
+    /// an emulator needed, a check still running) and used to read as an
+    /// identity verdict beside the page's Identity line.
+    #[test]
+    fn the_card_states_the_pages_identity_never_a_launch_branch_value() {
+        use ReadinessPresentationState as State;
+        let page = "Name hint only · not verified";
+        let cases = [
+            base(
+                State::NeedsFirmware,
+                "This system needs firmware",
+                "fixture",
+                IdentitySummary::StrongLocal,
+                SourceSummary::Available,
+                FirmwareSummary::Missing,
+                None,
+                Some(ReadinessAction::CheckFirmware),
+            ),
+            base(
+                State::NeedsEmulator,
+                "An emulator is needed",
+                "fixture",
+                IdentitySummary::StrongLocal,
+                SourceSummary::Available,
+                FirmwareSummary::Unknown,
+                None,
+                Some(ReadinessAction::SetUpEmulator),
+            ),
+            base(
+                State::ReadyWithWarnings,
+                "Ready, with a warning",
+                "fixture",
+                IdentitySummary::LaunchableWithWarning,
+                SourceSummary::Available,
+                FirmwareSummary::Ready,
+                None,
+                Some(ReadinessAction::Play),
+            ),
+            checking_summary(),
+            identity_summary(true),
+        ];
+        for summary in cases {
+            let context = egui::Context::default();
+            let output = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    show(ui, &summary, Some(page));
+                });
+            });
+            let strings = super::super::tests::text(&output);
+            let status = summary.status;
+            assert!(
+                strings
+                    .iter()
+                    .any(|line| *line == format!("Identity: {page}")),
+                "{status:?}: {strings:?}"
+            );
+            for launch_value in [
+                "Strong local identity",
+                "Launchable with warning",
+                "Needs review",
+                "Mismatch / blocked",
+                "Identity needs review",
+            ] {
+                assert!(
+                    !strings.iter().any(|line| line.contains(launch_value)),
+                    "{status:?} shows {launch_value}: {strings:?}"
+                );
+            }
+        }
+        assert_eq!(
+            status_label(State::NeedsIdentityReview),
+            "File check needed"
+        );
+    }
+
     #[test]
     fn verified_identity_while_checking_changes_only_the_identity_line() {
         let mut checking = project(
@@ -2360,7 +2488,7 @@ mod tests {
         summary: &GameReadinessSummary,
         label: &str,
     ) -> (Vec<String>, Option<ReadinessAction>) {
-        click_rendered_button(summary, label, show)
+        click_rendered_button(summary, label, |ui, summary| show(ui, summary, None))
     }
 
     /// The same, for the Library's compact card at a 1024x600-sized column.
@@ -2923,6 +3051,67 @@ mod tests {
         );
         assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
     }
+
+    #[test]
+    fn save_folder_warning_keeps_play_and_offers_retroarch_refresh() {
+        let detail = format!(
+            "In-game progress may fail to save. RetroArch's save-file folder /gone does not exist. {}",
+            archivefs_core::launch::RETROARCH_RECHECK_HINT
+        );
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::ReadyWithWarnings,
+                FirmwareReadiness::NotRequired,
+                vec![],
+                vec![LaunchWarning::new(
+                    archivefs_core::launch::LaunchWarningKind::RetroArchSaveDirectoryUnusable,
+                    detail.clone(),
+                )],
+                CandidatePreference::SoleEligible,
+                Some("/game.sfc"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(
+            summary.status,
+            ReadinessPresentationState::ReadyWithWarnings
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+        assert!(summary.warnings.contains(&detail));
+        assert!(offers_retroarch_refresh(&summary));
+        let (_, refresh) = click_card_button(&summary, "Refresh RetroArch");
+        assert_eq!(refresh, Some(ReadinessAction::RecheckReadiness));
+    }
+
+    #[test]
+    fn zipped_save_blocker_states_the_reason_and_offers_recheck_not_play() {
+        let reason = format!(
+            "This game is inside a ZIP ... /gone does not exist ... {}",
+            archivefs_core::launch::RETROARCH_RECHECK_HINT
+        );
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::Blocked,
+                FirmwareReadiness::NotRequired,
+                vec![LaunchBlocker::new(
+                    LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe,
+                    reason.clone(),
+                )],
+                vec![],
+                CandidatePreference::SoleEligible,
+                Some("/game.zip"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(summary.status, ReadinessPresentationState::Blocked);
+        assert_eq!(summary.explanation, reason);
+        assert_eq!(
+            summary.primary_action,
+            Some(ReadinessAction::RecheckReadiness)
+        );
+        let (_, play) = click_card_button(&summary, "Play");
+        assert_eq!(play, None, "a refused zipped game must not launch");
+    }
 }
 
 #[cfg(test)]
@@ -2999,7 +3188,8 @@ mod identity_reason_wording_tests {
             ReadinessFreshness::Current,
         );
         assert_eq!(s.primary_action, Some(ReadinessAction::ReviewIdentity));
-        assert_eq!(status_label(s.status), "Identity needs review");
+        // The badge names the launch step; the identity verdict is the page's.
+        assert_eq!(status_label(s.status), "File check needed");
     }
 
     #[test]

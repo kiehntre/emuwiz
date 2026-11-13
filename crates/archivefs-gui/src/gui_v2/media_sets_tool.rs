@@ -270,11 +270,12 @@ fn chips(ui: &mut egui::Ui, state: &mut MediaSetsToolState) {
                 state.chip = chip;
             }
         }
-        ui.add(
+        let search = ui.add(
             egui::TextEdit::singleline(&mut state.query)
                 .hint_text("title or path")
                 .desired_width(200.0),
         );
+        crate::gui_v2::shortcuts::register_search(&search);
     });
     if before != (state.chip, state.query.clone()) {
         state.page = 0;

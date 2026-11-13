@@ -264,11 +264,12 @@ fn filter_row(ui: &mut egui::Ui, state: &mut NeedsAttentionState) {
     const COMBO: f32 = 160.0;
     ui.horizontal_wrapped(|ui| {
         slot(ui, 230.0, &mut |ui| {
-            ui.add(
+            let search = ui.add(
                 egui::TextEdit::singleline(&mut filters.search)
                     .hint_text("Search attention items")
                     .desired_width(220.0),
             );
+            crate::gui_v2::shortcuts::register_search(&search);
         });
         slot(ui, COMBO, &mut |ui| {
             egui::ComboBox::from_id_salt("v2_attention_severity")
