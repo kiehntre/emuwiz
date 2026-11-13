@@ -325,7 +325,7 @@ pub fn plan_organisation_with_exclusions(
         .map(|g| g.path.clone())
         .collect();
     let unknown_folder = Path::new(UNKNOWN_FOLDER);
-    let mut plans: Vec<RootPlan> = by_root
+    let plans: Vec<RootPlan> = by_root
         .into_iter()
         .map(|(root, (candidates, corrections, left_alone))| {
             let mut plan = build_organisation_plan(&OrganisationPlanRequest {
