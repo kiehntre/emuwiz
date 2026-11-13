@@ -106,6 +106,8 @@ impl Styles {
 
 /// Paint the placeholder for `title` on `platform` into `rect`. `label` is
 /// the artwork pipeline's current state ("No picture yet", "Loading…").
+/// `detail_on_tile`: a large single picture (Game Details) rather than a
+/// shelf tile; it shows the label's detail and leaves the title to the page.
 pub(super) fn paint(
     ui: &egui::Ui,
     imagery: &mut Imagery,
@@ -139,11 +141,7 @@ pub(super) fn paint(
         if galley.elided {
             galley = painter.layout_job(one_line(&style.short, font, wrap, TEXT));
         }
-        painter.galley(
-            egui::pos2(band.center().x, band.center().y - galley.size().y / 2.0),
-            galley,
-            TEXT,
-        );
+        painter.galley(band.center() - galley.size() / 2.0, galley, TEXT);
         top = band.bottom();
     }
     // Words only where they fit; a small tile's tooltip carries them.
@@ -160,14 +158,22 @@ pub(super) fn paint(
                 painter.layout_job(job)
             })
             .collect();
-        let title_rows = if rect.height() > 200.0 { 3 } else { 2 };
-        let mut job = one_line(title, egui::FontId::proportional(TITLE_FONT), wrap, TEXT);
-        job.wrap.max_rows = title_rows;
-        job.wrap.break_anywhere = false;
-        galleys.insert(0, painter.layout_job(job));
+        // A shelf tile carries the title like a cover would. Larger pictures
+        // (Game Details) sit beside the page's own heading, so they do not
+        // repeat it.
+        if !detail_on_tile {
+            let mut job = one_line(title, egui::FontId::proportional(TITLE_FONT), wrap, TEXT);
+            job.wrap.max_rows = 2;
+            job.wrap.break_anywhere = false;
+            galleys.insert(0, painter.layout_job(job));
+        }
         for galley in galleys.into_iter().rev() {
             bottom -= galley.size().y;
-            painter.galley(egui::pos2(rect.center().x, bottom), galley, TEXT);
+            painter.galley(
+                egui::pos2(rect.center().x - galley.size().x / 2.0, bottom),
+                galley,
+                TEXT,
+            );
             bottom -= 2.0;
         }
     }
@@ -193,10 +199,10 @@ pub(super) fn paint(
     }
 }
 
-/// A centred, elided text job (one row unless the caller raises `max_rows`).
+/// An elided text job (one row unless the caller raises `max_rows`). Left
+/// aligned so the galley's size is its painted extent; callers centre it.
 fn one_line(text: &str, font: egui::FontId, wrap: f32, color: Color32) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::simple(text.to_owned(), font, color, wrap);
-    job.halign = egui::Align::Center;
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
     job
