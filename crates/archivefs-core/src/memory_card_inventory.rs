@@ -2766,6 +2766,46 @@ pub(crate) mod tests {
         assert_eq!(entry.identity.display_title.as_deref(), Some("Test Save"));
         assert!(entry.warnings.is_empty());
     }
+    /// Validates an externally sourced raw PS1 card that Blue did not write.
+    /// External cards are never committed (licence and provenance stay with
+    /// their source), so this runs only when pointed at one:
+    /// `EMUWIZ_PS1_CARD_FIXTURE=/path/card.mcd EMUWIZ_PS1_CARD_EXPECT=saves,free
+    /// cargo test -p archivefs-core --lib external_ps1_card -- --ignored`.
+    /// `EXPECT` holds the expected save count and free blocks, derived
+    /// outside Blue.  The card must parse as healthy (no false corruption)
+    /// and be byte-for-byte unchanged afterwards.
+    #[test]
+    #[ignore = "needs EMUWIZ_PS1_CARD_FIXTURE pointing at an external card"]
+    fn external_ps1_card_matches_independent_expectation() {
+        let path = std::env::var_os("EMUWIZ_PS1_CARD_FIXTURE").expect("fixture path");
+        let expect = std::env::var("EMUWIZ_PS1_CARD_EXPECT").expect("saves,free");
+        let (saves, free) = expect.split_once(',').expect("saves,free");
+        let before = fs::read(&path).unwrap();
+        let inv = inspect_memory_card(Path::new(&path)).unwrap();
+        for entry in &inv.entries {
+            println!(
+                "slot {:?} {} product {:?} title {:?} deleted {} warnings {:?}",
+                entry.slot,
+                entry.name,
+                entry.identity.product_code,
+                entry.identity.display_title,
+                entry.deleted,
+                entry.warnings
+            );
+        }
+        println!(
+            "{:?} {:?} free {:?} warnings {:?}",
+            inv.format, inv.health, inv.free_blocks, inv.warnings
+        );
+        assert_eq!(inv.format, MemoryCardFormat::Ps1Raw);
+        assert_eq!(inv.health, MemoryCardHealth::Healthy, "{:?}", inv.warnings);
+        assert_eq!(
+            inv.entries.iter().filter(|entry| !entry.deleted).count(),
+            saves.trim().parse::<usize>().unwrap()
+        );
+        assert_eq!(inv.free_blocks, Some(free.trim().parse().unwrap()));
+        assert_eq!(fs::read(&path).unwrap(), before, "card bytes unchanged");
+    }
     #[test]
     fn ps1_formatted_empty_card_is_healthy_and_bad_headers_are_reported() {
         let dir = tempfile::tempdir().unwrap();
