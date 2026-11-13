@@ -1874,44 +1874,58 @@ fn ps1_identity(header: &[u8], data: &[u8]) -> MemoryCardEntryIdentity {
     }
 }
 
+/// Reads a raw 128 KiB PS1 card.  Block 0 is the directory: frame 0 holds the
+/// `MC` header and frames 1-15 (128 bytes each) describe data blocks 1-15.
+/// A save's first data block starts with `SC` and carries its title at
+/// offset 4.  Read-only: damaged structures are reported, never repaired.
 fn inspect_ps1(path: &Path, bytes: &[u8]) -> MemoryCardInventory {
     let mut entries = Vec::new();
     let mut warnings = Vec::new();
     let mut used = 0u32;
     let mut damaged = false;
-    for slot in 0..PS1_SLOT_COUNT {
-        let offset = slot * PS1_BLOCK_BYTES;
-        let header = &bytes[offset..offset + PS1_HEADER_BYTES];
+    if bytes.get(..2) != Some(b"MC".as_slice()) {
+        damaged = true;
+        warnings.push("directory header does not start with `MC`".into());
+    }
+    for slot in 1..=PS1_SLOT_COUNT {
+        let frame_offset = slot * PS1_HEADER_BYTES;
+        let header = &bytes[frame_offset..frame_offset + PS1_HEADER_BYTES];
         let kind = header[0];
-        let valid = matches!(kind, 0xA0 | 0x51 | 0x52 | 0x53 | 0xA1 | 0xA2 | 0xA3);
-        if !valid {
-            if kind != 0 {
-                damaged = true;
-                warnings.push(format!("slot {slot} has unknown block marker 0x{kind:02x}"));
+        let block = &bytes[slot * PS1_BLOCK_BYTES..(slot + 1) * PS1_BLOCK_BYTES];
+        let checksum_ok = header[..127].iter().fold(0u8, |sum, value| sum ^ value) == header[127];
+        match kind {
+            // Free block (a freshly formatted frame).
+            0xA0 => {}
+            // In use: first block of a save, then middle/last links.
+            0x51 => {
+                used += 1;
+                let mut entry_warnings = Vec::new();
+                if !checksum_ok {
+                    entry_warnings
+                        .push("header XOR checksum does not match; bytes were not repaired".into());
+                    damaged = true;
+                }
+                if block.get(..2) != Some(b"SC".as_slice()) {
+                    entry_warnings.push("first save block does not start with `SC`".into());
+                    damaged = true;
+                }
+                let size = le_u32(header, 4).unwrap_or(0) as u64;
+                entries.push(MemoryCardEntry {
+                    slot: Some(slot as u32),
+                    name: text(&header[10..30]).unwrap_or_else(|| format!("slot-{slot}")),
+                    size_bytes: if size == 0 {
+                        PS1_BLOCK_BYTES as u64
+                    } else {
+                        size
+                    },
+                    used_blocks: Some((size.div_ceil(PS1_BLOCK_BYTES as u64)).max(1) as u32),
+                    identity: ps1_identity(header, block),
+                    deleted: false,
+                    warnings: entry_warnings,
+                });
             }
-            continue;
-        }
-        if matches!(kind, 0xA0 | 0x51) {
-            used += 1;
-            let data = &bytes[offset + PS1_HEADER_BYTES..offset + PS1_BLOCK_BYTES];
-            let checksum = header[..127].iter().fold(0u8, |sum, value| sum ^ value);
-            let mut entry_warnings = Vec::new();
-            if checksum != header[127] {
-                entry_warnings
-                    .push("header XOR checksum does not match; bytes were not repaired".into());
-                damaged = true;
-            }
-            entries.push(MemoryCardEntry {
-                slot: Some(slot as u32),
-                name: text(&header[10..30]).unwrap_or_else(|| format!("slot-{slot}")),
-                size_bytes: PS1_BLOCK_BYTES as u64,
-                used_blocks: Some(1),
-                identity: ps1_identity(header, data),
-                deleted: false,
-                warnings: entry_warnings,
-            });
-        } else if matches!(kind, 0xA1..=0xA3) {
-            entries.push(MemoryCardEntry {
+            0x52 | 0x53 => used += 1,
+            0xA1 => entries.push(MemoryCardEntry {
                 slot: Some(slot as u32),
                 name: format!("deleted-slot-{slot}"),
                 size_bytes: 0,
@@ -1926,7 +1940,17 @@ fn inspect_ps1(path: &Path, bytes: &[u8]) -> MemoryCardInventory {
                 warnings: vec![
                     "Deleted slot state is reported only; deleted data is not recovered.".into(),
                 ],
-            });
+            }),
+            // Deleted middle/last links free nothing new to report.
+            0xA2 | 0xA3 => {}
+            // Some tools leave never-formatted frames zero-filled.
+            0x00 if header.iter().all(|byte| *byte == 0) => {}
+            other => {
+                damaged = true;
+                warnings.push(format!(
+                    "slot {slot} has unknown block marker 0x{other:02x}"
+                ));
+            }
         }
     }
     MemoryCardInventory {
@@ -2680,13 +2704,31 @@ pub(crate) mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
-    fn fixture() -> Vec<u8> {
+    /// A raw PS1 card in the real layout: block 0 is the directory (`MC`
+    /// header, then one 128-byte frame per data block); the save lives in
+    /// data block 1, which starts with `SC` and holds the title at offset 4.
+    pub(crate) fn fixture() -> Vec<u8> {
         let mut card = vec![0u8; PS1_CARD_BYTES];
-        card[0] = 0xA0;
-        card[10..26].copy_from_slice(b"BASLUS-00067SAVE");
-        card[12..22].copy_from_slice(b"BASLUS-000");
-        card[128 + 4..128 + 4 + 10].copy_from_slice(b"Test Save\0");
-        card[127] = card[..127].iter().fold(0u8, |sum, value| sum ^ value);
+        let seal = |frame: &mut [u8]| {
+            frame[127] = frame[..127].iter().fold(0u8, |sum, value| sum ^ value);
+        };
+        card[..2].copy_from_slice(b"MC");
+        seal(&mut card[..128]);
+        for slot in 1..=PS1_SLOT_COUNT {
+            let frame = &mut card[slot * 128..(slot + 1) * 128];
+            frame[0] = 0xA0;
+            frame[8] = 0xFF;
+            frame[9] = 0xFF;
+            seal(frame);
+        }
+        let frame = &mut card[128..256];
+        frame[0] = 0x51;
+        frame[4..8].copy_from_slice(&(PS1_BLOCK_BYTES as u32).to_le_bytes());
+        frame[10..26].copy_from_slice(b"BASLUS-00067SAVE");
+        seal(frame);
+        let block = &mut card[PS1_BLOCK_BYTES..2 * PS1_BLOCK_BYTES];
+        block[..4].copy_from_slice(&[b'S', b'C', 0x11, 1]);
+        block[4..14].copy_from_slice(b"Test Save\0");
         card
     }
     #[test]
@@ -2700,6 +2742,54 @@ pub(crate) mod tests {
         assert_eq!(inv.entries.len(), 1);
         assert!(inv.entries[0].identity.product_code.is_some());
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+    #[test]
+    fn ps1_real_directory_layout_lists_saves_without_false_corruption() {
+        // Regression: the parser used to read each 8 KiB block's start as a
+        // directory frame, so a real card's `MC` header was reported as an
+        // unknown marker and its saves (frames 1-15 of block 0) were missed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Crash Bandicoot (USA)_1.mcd");
+        fs::write(&path, fixture()).unwrap();
+        let inv = inspect_memory_card(&path).unwrap();
+        assert_eq!(inv.format, MemoryCardFormat::Ps1Raw);
+        assert_eq!(inv.health, MemoryCardHealth::Healthy, "{:?}", inv.warnings);
+        assert!(inv.warnings.is_empty());
+        assert_eq!((inv.used_blocks, inv.free_blocks), (Some(1), Some(14)));
+        let [entry] = inv.entries.as_slice() else {
+            panic!("one save expected: {:?}", inv.entries);
+        };
+        assert_eq!(entry.slot, Some(1));
+        assert_eq!(entry.name, "BASLUS-00067SAVE");
+        assert_eq!(entry.used_blocks, Some(1));
+        assert_eq!(entry.identity.product_code.as_deref(), Some("SLUS-00067"));
+        assert_eq!(entry.identity.display_title.as_deref(), Some("Test Save"));
+        assert!(entry.warnings.is_empty());
+    }
+    #[test]
+    fn ps1_formatted_empty_card_is_healthy_and_bad_headers_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared_card_1.mcd");
+        let mut card = fixture();
+        // Free the save's frame: a freshly formatted card.
+        card[128] = 0xA0;
+        card[128 + 4..128 + 26].fill(0);
+        card[255] = card[128..255].iter().fold(0u8, |sum, value| sum ^ value);
+        fs::write(&path, &card).unwrap();
+        let inv = inspect_memory_card(&path).unwrap();
+        assert_eq!(inv.health, MemoryCardHealth::Healthy, "{:?}", inv.warnings);
+        assert!(inv.entries.is_empty());
+        assert_eq!(inv.free_blocks, Some(15));
+
+        let mut damaged = fixture();
+        damaged[..2].copy_from_slice(b"XX");
+        damaged[128 + 20] ^= 1; // break frame 1's checksum
+        fs::write(&path, &damaged).unwrap();
+        let inv = inspect_memory_card(&path).unwrap();
+        assert_eq!(inv.health, MemoryCardHealth::CorruptionSuspected);
+        assert_eq!(inv.entries.len(), 1);
+        assert!(!inv.entries[0].warnings.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), damaged, "never repaired");
     }
     #[test]
     fn truncated_and_unknown_fail_closed() {
