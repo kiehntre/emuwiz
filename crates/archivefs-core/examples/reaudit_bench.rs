@@ -12,6 +12,8 @@
 //! reaudit_bench recheck <dir> <games-per-set> [stop-after-sets]
 //! reaudit_bench change <dir> <n>        # rewrite the first n loose games
 //! reaudit_bench catalogue <dir>         # new catalogue bytes, same entries
+//! reaudit_bench upgrade <library.sqlite3>            # protected schema upgrade of a copy
+//! reaudit_bench real <library.sqlite3> <games-per-set>  # re-check a scratch copy (scratch config/data env)
 //! ```
 //!
 //! Every phase prints one JSON line with wall time, bytes and peak memory.
@@ -413,6 +415,235 @@ fn catalogue(bench: &Bench) {
     );
 }
 
+/// Upgrades a disposable copy of a library to the current schema through
+/// the protected upgrade (verified backup first), and reports what it did.
+fn upgrade(database: &Path) {
+    let started = Instant::now();
+    let report = archivefs_core::upgrade_library_database(database).unwrap();
+    self::report(
+        "upgrade",
+        started,
+        report.source_size_bytes_before,
+        serde_json::json!({
+            "from": report.from_version, "to": report.to_version,
+            "applied": report.applied_versions,
+            "backup": report.backup_path.display().to_string(),
+            "backup_sha256": report.backup_sha256,
+        }),
+    );
+}
+
+/// Re-checks whatever a disposable library copy lists, against the
+/// catalogues configured under `EMUWIZ_CONFIG_HOME` / `EMUWIZ_DATA_HOME`.
+/// Run only with those pointed at scratch copies.
+fn real(database: &Path, games_per_set: usize) {
+    for var in ["EMUWIZ_CONFIG_HOME", "EMUWIZ_DATA_HOME"] {
+        assert!(
+            std::env::var_os(var).is_some(),
+            "{var} must point at a scratch copy"
+        );
+    }
+    let started = Instant::now();
+    let catalogues = archivefs_core::dat::reaudit::ReauditCatalogues::load_default().unwrap();
+    let plan = plan_reaudit(database, &catalogues.configured()).unwrap();
+    let planned_at = started.elapsed().as_secs_f64();
+    let bytes = plan.bytes();
+    let blocked = plan.blocked.len();
+    let sampler = JournalSampler::start(database);
+    let result = run_reaudit(
+        database,
+        &plan,
+        &|source_id| catalogues.resolve(source_id),
+        &TrustedRoots::none(),
+        &AtomicBool::new(false),
+        ReauditLimits {
+            max_games_per_set: games_per_set,
+            ..Default::default()
+        },
+        &|_| {},
+    )
+    .unwrap();
+    let journal = sampler.finish();
+    let mut reasons = std::collections::BTreeMap::new();
+    for note in &result.not_checked {
+        *reasons.entry(note.reason.clone()).or_insert(0usize) += 1;
+    }
+    self::report(
+        "real",
+        started,
+        bytes,
+        merged(
+            journal,
+            serde_json::json!({
+                "plan_seconds": (planned_at * 1000.0).round() / 1000.0,
+                "planned": result.planned, "blocked": blocked,
+                "verified": result.verified, "no_match": result.no_match,
+                "ambiguous": result.ambiguous, "saved": result.saved,
+                "sets_saved": result.sets_saved, "not_checked": reasons,
+                "contradictions": result.contradictions.len(),
+                "stopped": format!("{:?}", result.stopped),
+                "games_per_set": games_per_set,
+            }),
+        ),
+    );
+}
+
+/// Hashes one in-memory buffer with each digest a verification computes,
+/// and with the bit-at-a-time CRC-32 the table-driven one replaced. Best of
+/// five passes each, so a busy machine skews it as little as possible.
+fn hash(mib: usize) {
+    use archivefs_core::identity_source::hashing::Crc32;
+    let started = Instant::now();
+    let data = content(42, mib * 1024 * 1024);
+    fn bitwise_crc32(bytes: &[u8]) -> u32 {
+        let mut state = !0_u32;
+        for byte in bytes {
+            state ^= u32::from(*byte);
+            for _ in 0..8 {
+                state = (state >> 1) ^ (0xEDB8_8320 & (state & 1).wrapping_neg());
+            }
+        }
+        !state
+    }
+    let best = |run: &dyn Fn() -> u64| -> (f64, u64) {
+        let mut best = f64::MAX;
+        let mut value = 0;
+        for _ in 0..5 {
+            let t = Instant::now();
+            value = std::hint::black_box(run());
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        ((mib as f64 / best * 10.0).round() / 10.0, value)
+    };
+    let (crc_new, a) = best(&|| {
+        let mut crc = Crc32::new();
+        crc.update(&data);
+        u64::from(crc.finish())
+    });
+    let (crc_old, b) = best(&|| u64::from(bitwise_crc32(&data)));
+    assert_eq!(a, b, "the two CRC-32 implementations disagree");
+    let (md5, _) = best(&|| {
+        use md5::Digest as _;
+        u64::from(md5::Md5::digest(&data)[0])
+    });
+    let (sha1, _) = best(&|| u64::from(Sha1::digest(&data)[0]));
+    // What a loose file costs: all three over the same chunks, as the
+    // verifier does it (256 KiB at a time, one thread).
+    let combined = |crc_table: bool| {
+        best(&|| {
+            use md5::Digest as _;
+            let mut crc = Crc32::new();
+            let mut old = !0_u32;
+            let mut m = md5::Md5::new();
+            let mut s = Sha1::new();
+            for chunk in data.chunks(256 * 1024) {
+                if crc_table {
+                    crc.update(chunk);
+                } else {
+                    for byte in chunk {
+                        old ^= u32::from(*byte);
+                        for _ in 0..8 {
+                            old = (old >> 1) ^ (0xEDB8_8320 & (old & 1).wrapping_neg());
+                        }
+                    }
+                }
+                m.update(chunk);
+                s.update(chunk);
+            }
+            u64::from(m.finalize()[0]) + u64::from(s.finalize()[0]) + u64::from(old)
+        })
+        .0
+    };
+    let (all_new, all_old) = (combined(true), combined(false));
+    report(
+        "hash",
+        started,
+        (mib * 1024 * 1024) as u64,
+        serde_json::json!({
+            "mib": mib,
+            "mib_per_second_each": {"crc32_table": crc_new, "crc32_bitwise_previous": crc_old, "md5": md5, "sha1": sha1},
+            "mib_per_second_crc_md5_sha1_together": {"with_table_crc": all_new, "with_previous_crc": all_old},
+        }),
+    );
+}
+
+/// Times the separate steps a re-check takes on a (scratch) library, to
+/// show where time goes when the library is large and the set is small.
+/// Same scratch environment rules as `real`.
+fn profile(database: &Path, games: usize) {
+    use archivefs_core::dat::library_verification::preview_rows_verification;
+    for var in ["EMUWIZ_CONFIG_HOME", "EMUWIZ_DATA_HOME"] {
+        assert!(
+            std::env::var_os(var).is_some(),
+            "{var} must point at a scratch copy"
+        );
+    }
+    let mut steps = serde_json::Map::new();
+    let mut time = |name: &str, started: Instant| {
+        steps.insert(
+            name.to_string(),
+            serde_json::json!((started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0),
+        );
+    };
+    let total = Instant::now();
+    let t = Instant::now();
+    let catalogues = archivefs_core::dat::reaudit::ReauditCatalogues::load_default().unwrap();
+    let configured = catalogues.configured();
+    time("load_and_hash_catalogues", t);
+    let t = Instant::now();
+    let rows = Database::open_read_only(database)
+        .unwrap()
+        .load_archives()
+        .unwrap();
+    time("load_archives_once", t);
+    let library_rows = rows.len();
+    drop(rows);
+    let t = Instant::now();
+    let plan = plan_reaudit(database, &configured)
+        .unwrap()
+        .truncated(games);
+    time("plan", t);
+    let group = plan.groups.first().expect("something to check");
+    let t = Instant::now();
+    let resolved = catalogues.resolve(&group.source_id).unwrap();
+    time("resolve_catalogue", t);
+    let t = Instant::now();
+    let preview = preview_rows_verification(
+        resolved,
+        database.to_path_buf(),
+        group.platform.clone(),
+        group
+            .items
+            .iter()
+            .map(|i| (i.archive_id, i.path.clone()))
+            .collect(),
+    )
+    .unwrap();
+    time("preview_set", t);
+    let bytes = preview.bytes;
+    let t = Instant::now();
+    let totals = preview
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    time("execute_set_hash_and_save", t);
+    let t = Instant::now();
+    let disc = Database::open_or_create(database)
+        .and_then(|mut db| db.refresh_dat_disc_order(0))
+        .map(|o| o.written)
+        .unwrap();
+    time("refresh_disc_order", t);
+    report(
+        "profile",
+        total,
+        bytes,
+        serde_json::json!({
+            "library_rows": library_rows, "games": group.items.len(),
+            "verified": totals.verified, "saved": totals.saved, "disc_sets": disc,
+            "steps_seconds": steps,
+        }),
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let number = |index: usize| -> usize {
@@ -420,6 +651,9 @@ fn main() {
             .and_then(|value| value.parse().ok())
             .unwrap_or_else(|| panic!("argument {index} must be a number"))
     };
+    if args.first().map(String::as_str) == Some("hash") {
+        return hash(number(1));
+    }
     let (Some(phase), Some(dir)) = (args.first(), args.get(1)) else {
         eprintln!(
             "usage: reaudit_bench <gen|platform|strip|plan|recheck|change|catalogue> <dir> ..."
@@ -437,6 +671,9 @@ fn main() {
         "recheck" => recheck(&bench, number(2), args.get(3).and_then(|v| v.parse().ok())),
         "change" => change(&bench, number(2)),
         "catalogue" => catalogue(&bench),
+        "upgrade" => upgrade(Path::new(dir)),
+        "real" => real(Path::new(dir), number(2)),
+        "profile" => profile(Path::new(dir), number(2)),
         other => panic!("unknown phase {other}"),
     }
 }
