@@ -81,6 +81,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         artwork_totals: super::activity::ArtworkTotals::default(),
         index_job: None,
         browse_play: Default::default(),
+        library_selection: Default::default(),
         batch_selection: super::multi_selection::MultiSelection::with_limit(
             archivefs_core::screenscraper_enrichment::MAX_EXPLICIT_BATCH_SIZE,
         ),
@@ -316,7 +317,7 @@ fn blue_batch_selection_controls_fit_small_library_viewport() {
     let strings = text(&output);
     for expected in [
         "Done selecting",
-        "1 / 25 selected",
+        "1 / 25 selected for artwork",
         "Enrich metadata",
         "Clear selection",
     ] {

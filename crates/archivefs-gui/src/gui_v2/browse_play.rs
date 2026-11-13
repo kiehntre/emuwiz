@@ -25,6 +25,61 @@ use eframe::egui::{self, Color32, RichText};
 // Keep small-catalogue interactions immediate; larger scans use the existing
 // generation-checked, debounced Filter worker rather than blocking paint.
 pub(super) const IMMEDIATE_FILTER_LIMIT: usize = 10_000;
+/// The ScreenScraper artwork batch picker (at most 25 games). It is separate
+/// from the Library's Ctrl/Shift-click selection ("Selected games").
+pub(super) const SELECT_FOR_ARTWORK: &str = "Select for artwork";
+pub(super) const SELECT_FOR_ARTWORK_HINT: &str = "Select for artwork: pick up to 25 games to look \
+     up artwork and details on ScreenScraper. This is separate from Selected games \
+     (Ctrl/Shift-click or Ctrl+A).";
+/// The toggle where "Select for artwork" does not fit but this does.
+pub(super) const SELECT_FOR_ARTWORK_MEDIUM: &str = "Artwork (25 max)";
+/// The toggle on a very narrow toolbar: no wider than "Done selecting", so the
+/// row keeps its layout. Its accessible name is still the full one, and the
+/// picker states its purpose on screen once opened.
+pub(super) const SELECT_FOR_ARTWORK_SHORT: &str = "Artwork";
+/// What keyboard focus and assistive tech announce for the toggle, whatever
+/// label fits on screen.
+pub(super) const SELECT_FOR_ARTWORK_NAME: &str = "Select for artwork (up to 25 games)";
+/// Shown while the artwork picker is open, so its purpose never depends on hover.
+pub(super) const ARTWORK_PICKER_PURPOSE: &str = "Artwork selection: pick up to 25 games, then \
+     Enrich metadata looks up their artwork and details on ScreenScraper. Separate from \
+     Selected games.";
+
+/// Which label the artwork toggle shows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ArtworkLabel {
+    Full,
+    Medium,
+    Short,
+}
+
+impl ArtworkLabel {
+    pub(super) fn text(self) -> &'static str {
+        match self {
+            Self::Full => SELECT_FOR_ARTWORK,
+            Self::Medium => SELECT_FOR_ARTWORK_MEDIUM,
+            Self::Short => SELECT_FOR_ARTWORK_SHORT,
+        }
+    }
+}
+
+/// The widest label whose extra width (over the short one) still leaves
+/// `spare` at least `min`. Pure, so the choice is unit tested.
+pub(super) fn artwork_label_for(
+    spare: f32,
+    full_extra: f32,
+    medium_extra: f32,
+    min: f32,
+) -> ArtworkLabel {
+    if spare - full_extra >= min {
+        ArtworkLabel::Full
+    } else if spare - medium_extra >= min {
+        ArtworkLabel::Medium
+    } else {
+        ArtworkLabel::Short
+    }
+}
+
 const PLATFORM_ICON_SIZE: f32 = 22.0;
 /// Largest systems shown as chips; the rest live in the dropdown.
 const TOP_SYSTEMS: usize = 7;
@@ -416,7 +471,10 @@ impl App {
         ui.add_space(theme::SPACE_XS);
         self.browse_play_systems(ui, &library, !sort_in_toolbar);
         let indices = self.browse_play_indices();
+        self.library_selection_shortcuts(ui.ctx(), &indices);
         self.browse_play_sort_note(ui, &library, &indices);
+        self.library_selection_bar(ui, &indices);
+        self.library_selection_claim_escape(ui.ctx());
         let blue = theme::blue_profile(ui);
         self.browse_play_background(ui.ctx(), blue);
         ui.add_space(theme::SPACE_XS);
@@ -470,7 +528,11 @@ impl App {
             return;
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label(format!("{} / 25 selected", self.batch_selection.len()));
+            ui.label(format!(
+                "{} / 25 selected for artwork",
+                self.batch_selection.len()
+            ))
+            .on_hover_text(SELECT_FOR_ARTWORK_HINT);
             if ui
                 .add_enabled(
                     self.batch_selection.len() > 0 || self.batch_state.active(),
@@ -497,6 +559,16 @@ impl App {
                 self.batch_selection.clear();
             }
         });
+        if self.batch_selecting {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(ARTWORK_PICKER_PURPOSE)
+                        .size(theme::METADATA_SIZE)
+                        .color(theme::SECONDARY_TEXT),
+                )
+                .wrap(),
+            );
+        }
         if let Some(message) = &self.batch_message {
             ui.colored_label(ui.visuals().error_fg_color, message);
         }
@@ -716,11 +788,12 @@ impl App {
         let pad = 2.0 * ui.spacing().button_padding.x;
         let gap = ui.spacing().item_spacing.x;
         let measure = |text: &str| super::title_fit::text_width(ui, text, &font) + pad;
-        let switch = measure("List")
-            + measure("Grid")
-            + measure("Done selecting")
-            + measure(BIG_PICTURE)
-            + 3.0 * gap;
+        // The artwork toggle is laid out at its narrowest labels; a longer
+        // one is shown only where the row has room left for it.
+        let toggle = measure("Done selecting").max(measure(SELECT_FOR_ARTWORK_SHORT));
+        let full_extra = (measure(SELECT_FOR_ARTWORK) - toggle).max(0.0);
+        let medium_extra = (measure(SELECT_FOR_ARTWORK_MEDIUM) - toggle).max(0.0);
+        let switch = measure("List") + measure("Grid") + toggle + measure(BIG_PICTURE) + 3.0 * gap;
         let clear = if self.filter.search.is_empty() {
             0.0
         } else {
@@ -737,8 +810,21 @@ impl App {
             0.0
         };
         let available = ui.available_width();
-        let search = (available - switch - clear - attention - gap).min(300.0);
+        let room = available - switch - clear - attention - gap;
+        let search = room.min(300.0);
         let stacked = search < SEARCH_MIN_WIDTH;
+        // On one row a longer artwork label may take width from the search,
+        // never below the search's minimum.
+        let artwork_in_row = artwork_label_for(room, full_extra, medium_extra, SEARCH_MIN_WIDTH);
+        let search = if stacked {
+            search
+        } else {
+            match artwork_in_row {
+                ArtworkLabel::Full => (room - full_extra).min(300.0),
+                ArtworkLabel::Medium => (room - medium_extra).min(300.0),
+                ArtworkLabel::Short => search,
+            }
+        };
         let search = if stacked {
             (available - clear - gap).clamp(SEARCH_MIN_WIDTH.min(available), 300.0)
         } else {
@@ -805,7 +891,7 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     view_toggle(ui, &mut self.filter.list, true, "List");
                     view_toggle(ui, &mut self.filter.list, false, "Grid");
-                    self.browse_play_selection_toggle(ui);
+                    self.browse_play_selection_toggle(ui, artwork_in_row);
                     self.big_picture_button(ui);
                 });
             }
@@ -814,7 +900,10 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 attention_filter(self, ui);
                 view_switch(self, ui);
-                self.browse_play_selection_toggle(ui);
+                // The very narrow layout: the short label keeps Big Picture
+                // and the Sort box on this row. The full name is announced on
+                // focus and the picker states its purpose once open.
+                self.browse_play_selection_toggle(ui, ArtworkLabel::Short);
                 self.big_picture_button(ui);
                 self.browse_play_sort_control(ui);
             });
@@ -973,15 +1062,29 @@ impl App {
         }
     }
 
-    fn browse_play_selection_toggle(&mut self, ui: &mut egui::Ui) {
-        if ui
-            .button(if self.batch_selecting {
+    /// The ScreenScraper artwork picker toggle, with the label that fits its
+    /// row. Keyboard focus and assistive tech always get the full name.
+    fn browse_play_selection_toggle(&mut self, ui: &mut egui::Ui, label: ArtworkLabel) {
+        let selecting = self.batch_selecting;
+        let response = ui
+            .button(if selecting {
                 "Done selecting"
             } else {
-                "Select games"
+                label.text()
             })
-            .clicked()
-        {
+            .on_hover_text(SELECT_FOR_ARTWORK_HINT);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                true,
+                if selecting {
+                    "Done selecting for artwork"
+                } else {
+                    SELECT_FOR_ARTWORK_NAME
+                },
+            )
+        });
+        if response.clicked() {
             self.batch_selecting = !self.batch_selecting;
         }
     }
@@ -1283,13 +1386,20 @@ impl App {
                             };
                             let selected = selected_id == Some(game.archive.id);
                             if list {
-                                self.browse_play_list_row(ui, game, selected, &mut cover_note);
+                                self.browse_play_list_row(
+                                    ui,
+                                    game,
+                                    selected,
+                                    indices,
+                                    &mut cover_note,
+                                );
                             } else {
                                 self.browse_play_card(
                                     ui,
                                     game,
                                     selected,
                                     card_width,
+                                    indices,
                                     &mut cover_note,
                                 );
                             }
@@ -1433,7 +1543,50 @@ impl App {
         }
     }
 
-    fn card_background(ui: &egui::Ui, rect: egui::Rect, selected: bool, response: &egui::Response) {
+    /// `selected` is the game open in the panel; `in_set` is a game in the
+    /// multi-select set. Both get the selected look; a set member's check mark
+    /// is painted by `paint_selection_mark` once the content is drawn.
+    fn card_background(
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        selected: bool,
+        in_set: bool,
+        response: &egui::Response,
+    ) {
+        Self::card_background_fill(ui, rect, selected || in_set, response);
+    }
+
+    /// The check mark of a multi-select set member, painted after the card's
+    /// content so the cover cannot hide it.
+    fn paint_selection_mark(ui: &egui::Ui, rect: egui::Rect, in_set: bool) {
+        if in_set {
+            let centre = egui::pos2(rect.right() - 14.0, rect.top() + 14.0);
+            let painter = ui.painter();
+            painter.circle_filled(centre, 9.0, theme::primary_action_fill(ui));
+            let stroke = egui::Stroke::new(2.0_f32, egui::Color32::WHITE);
+            painter.line_segment(
+                [
+                    centre + egui::vec2(-4.5, 0.0),
+                    centre + egui::vec2(-1.0, 3.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    centre + egui::vec2(-1.0, 3.5),
+                    centre + egui::vec2(4.5, -3.5),
+                ],
+                stroke,
+            );
+        }
+    }
+
+    fn card_background_fill(
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        selected: bool,
+        response: &egui::Response,
+    ) {
         let hovered = response.hovered();
         let blue = theme::blue_profile(ui);
         let fill = if selected && blue {
@@ -1474,6 +1627,7 @@ impl App {
         game: &Game,
         selected: bool,
         card_width: f32,
+        list: &[usize],
         note: &mut Option<String>,
     ) {
         let id = game.archive.id;
@@ -1496,7 +1650,8 @@ impl App {
             if !ui.is_rect_visible(rect) {
                 return;
             }
-            Self::card_background(ui, rect, selected, &response);
+            let in_set = self.library_selection.contains(id);
+            Self::card_background(ui, rect, selected, in_set, &response);
             let inner = rect.shrink(CARD_PAD);
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
@@ -1538,6 +1693,7 @@ impl App {
                 .wrap()
                 .selectable(false),
             );
+            Self::paint_selection_mark(ui, rect, in_set);
             let response = response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(format!("{}\n{}", game.title, game.platform));
@@ -1556,9 +1712,19 @@ impl App {
                         .map(|limit| format!("Select no more than {limit} games."));
                 }
             } else if response.clicked() {
-                self.go(Route::BrowsePlayGame(id));
+                self.browse_play_row_clicked(ui, id, list);
             }
         });
+    }
+
+    /// A card or list row was clicked (or activated from the keyboard). Ctrl
+    /// and Shift change the multi-select set; a plain click opens the game
+    /// exactly as before and empties the set.
+    fn browse_play_row_clicked(&mut self, ui: &egui::Ui, id: i64, list: &[usize]) {
+        let modifiers = ui.input(|input| input.modifiers);
+        if !self.library_selection_click(id, modifiers, list) {
+            self.go(Route::BrowsePlayGame(id));
+        }
     }
 
     fn browse_play_list_row(
@@ -1566,6 +1732,7 @@ impl App {
         ui: &mut egui::Ui,
         game: &Game,
         selected: bool,
+        list: &[usize],
         note: &mut Option<String>,
     ) {
         let id = game.archive.id;
@@ -1590,7 +1757,8 @@ impl App {
             if !ui.is_rect_visible(rect) {
                 return;
             }
-            Self::card_background(ui, rect, selected, &response);
+            let in_set = self.library_selection.contains(id);
+            Self::card_background(ui, rect, selected, in_set, &response);
             let inner = rect.shrink(CARD_PAD);
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
@@ -1623,6 +1791,7 @@ impl App {
                     .selectable(false),
                 );
             });
+            Self::paint_selection_mark(ui, rect, in_set);
             let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
             if self.batch_selecting {
                 let mark = if self.batch_selection.contains(id) {
@@ -1639,7 +1808,7 @@ impl App {
                         .map(|limit| format!("Select no more than {limit} games."));
                 }
             } else if response.clicked() {
-                self.go(Route::BrowsePlayGame(id));
+                self.browse_play_row_clicked(ui, id, list);
             }
         });
     }
