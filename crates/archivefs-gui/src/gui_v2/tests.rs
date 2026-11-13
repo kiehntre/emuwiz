@@ -317,7 +317,7 @@ fn blue_batch_selection_controls_fit_small_library_viewport() {
     let strings = text(&output);
     for expected in [
         "Done selecting",
-        "1 / 25 selected",
+        "1 / 25 selected for artwork",
         "Enrich metadata",
         "Clear selection",
     ] {

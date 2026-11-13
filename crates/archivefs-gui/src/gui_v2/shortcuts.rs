@@ -232,25 +232,11 @@ pub(super) fn page_keys_allowed(context: &egui::Context) -> bool {
 
 /// A page with its own Escape meaning calls this each frame it has something
 /// for Escape to do; the next Escape is then the page's, not Back.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "hook for the Library multi-select (Batch 3 Job 10); remove once it calls this"
-    )
-)]
 pub(super) fn claim_escape(context: &egui::Context) {
     context.data_mut(|data| data.insert_temp(escape_claim_slot(), true));
 }
 
 /// True on the frame Escape was pressed while this page held its claim.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "hook for the Library multi-select (Batch 3 Job 10); remove once it calls this"
-    )
-)]
 pub(super) fn claimed_escape_pressed(context: &egui::Context) -> bool {
     context
         .data(|data| data.get_temp::<bool>(escape_claimed_slot()))

@@ -4,7 +4,8 @@
 //! exactly as before and the bulk set is emptied. Ctrl+click toggles one game,
 //! Shift+click selects the range from the anchor in the order the list is
 //! shown, Ctrl+Shift+click adds that range. Ctrl+A selects every shown game
-//! and Escape clears the set, both only while no text field has the keyboard.
+//! and Escape clears the set, through the shared keyboard shortcuts: never
+//! while a text field, confirmation, menu, window or overlay owns the keys.
 //!
 //! The set is keyed by catalogue id, never by row, so sorting and filtering
 //! cannot move it onto other games. A reload re-resolves every id (an older
@@ -19,19 +20,16 @@
 //! Adding games to a collection is deferred to the favourites/collections
 //! work (PR #278); it is deliberately not offered.
 
-// Integration pending: Library sort (Batch 1 D) and Ready filter (Batch 2
-// Job 6) are still changing the list code, so the row click and bar are wired
-// in after they merge. Remove this once wired.
-#![allow(dead_code)]
-
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use super::{
     App,
+    browse_play::thousands,
     library::{CheckedReadiness, Game, Library, ReadinessCache},
     routes::Route,
+    shortcuts,
 };
 use crate::ui::theme;
 use eframe::egui::{self, RichText};
@@ -76,14 +74,15 @@ pub(super) struct SelectionCount {
 }
 
 impl SelectionCount {
+    /// "Selected games (N)", with how many the filter hides when any are.
     pub fn label(self) -> String {
-        let games = if self.selected == 1 { "game" } else { "games" };
         if self.hidden == 0 {
-            format!("{} {games} selected", self.selected)
+            format!("{SELECTED_GAMES} ({})", thousands(self.selected))
         } else {
             format!(
-                "{} {games} selected ({} hidden by filter)",
-                self.selected, self.hidden
+                "{SELECTED_GAMES} ({}, {} hidden by filter)",
+                thousands(self.selected),
+                thousands(self.hidden)
             )
         }
     }
@@ -112,6 +111,7 @@ pub(super) struct LibrarySelection {
 }
 
 impl LibrarySelection {
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.ids.len()
     }
@@ -121,6 +121,7 @@ impl LibrarySelection {
     pub fn contains(&self, id: i64) -> bool {
         self.ids.contains(&id)
     }
+    #[cfg(test)]
     pub fn anchor(&self) -> Option<i64> {
         self.anchor
     }
@@ -189,8 +190,8 @@ impl LibrarySelection {
         if order.len() > MAX_SELECTED {
             self.notice = Some(format!(
                 "There are {} games shown; Select all works on up to {}. Narrow the list with search or a system first.",
-                order.len(),
-                MAX_SELECTED
+                thousands(order.len()),
+                thousands(MAX_SELECTED)
             ));
             return;
         }
@@ -279,7 +280,10 @@ impl LibrarySelection {
 }
 
 fn too_many() -> String {
-    format!("A selection holds at most {MAX_SELECTED} games.")
+    format!(
+        "A selection holds at most {} games.",
+        thousands(MAX_SELECTED)
+    )
 }
 
 /// Ids from `from` to `to` inclusive, in list order; `None` when either is
@@ -368,7 +372,9 @@ impl ReadinessTally {
     pub fn line(self) -> String {
         format!(
             "Launch check: {} ready · {} not ready · {} not checked",
-            self.ready, self.not_ready, self.not_checked
+            thousands(self.ready),
+            thousands(self.not_ready),
+            thousands(self.not_checked)
         )
     }
 }
@@ -388,11 +394,26 @@ pub(super) struct BarView<'a> {
     pub notice: Option<&'a str>,
 }
 
-/// The "N selected" bar. Drawn only while something is selected.
+/// Heading of the general selection bar.
+pub(super) const SELECTED_GAMES: &str = "Selected games";
+/// Says the general selection and the artwork picker do not share games.
+pub(super) const SEPARATE_FROM_ARTWORK: &str = "Separate from Select for artwork";
+
+/// The "Selected games" bar. Drawn only while something is selected.
 pub(super) fn show_bar(ui: &mut egui::Ui, view: &BarView<'_>) -> Option<BarAction> {
     let mut action = None;
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(view.count.label()).strong());
+        ui.label(
+            RichText::new(SEPARATE_FROM_ARTWORK)
+                .size(theme::METADATA_SIZE)
+                .color(theme::SECONDARY_TEXT),
+        )
+        .on_hover_text(
+            "Games picked here (Ctrl/Shift-click or Ctrl+A) are not the games \
+             picked with Select for artwork, which looks up artwork on \
+             ScreenScraper for at most 25 games.",
+        );
         if ui.small_button("Clear").clicked() {
             action = Some(BarAction::Clear);
         }
@@ -446,28 +467,28 @@ pub(super) fn show_bar(ui: &mut egui::Ui, view: &BarView<'_>) -> Option<BarActio
     action
 }
 
-/// Ctrl+A or Escape for the Library list, never while a text field has the
-/// keyboard. Escape is taken only while something is selected, so it still
-/// goes Back otherwise.
+/// Ctrl+A or Escape for the Library list.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Shortcut {
     SelectAll,
     Clear,
 }
 
-pub(super) fn take_shortcut(context: &egui::Context, has_selection: bool) -> Option<Shortcut> {
-    if context.wants_keyboard_input() {
+/// Escape clears the set only when the shared shortcuts layer handed it to
+/// this page: the page claimed it on the last frame because something was
+/// selected, and no text field, confirmation, menu, window or overlay owned
+/// the keys. Without a selection Escape stays Back. Ctrl+A acts only while
+/// page keys are free, so it is Select all in a text field's own sense there.
+pub(super) fn take_shortcut(context: &egui::Context) -> Option<Shortcut> {
+    if shortcuts::claimed_escape_pressed(context) {
+        return Some(Shortcut::Clear);
+    }
+    if !shortcuts::page_keys_allowed(context) {
         return None;
     }
-    context.input_mut(|input| {
-        if input.consume_key(egui::Modifiers::COMMAND, egui::Key::A) {
-            Some(Shortcut::SelectAll)
-        } else if has_selection && input.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
-            Some(Shortcut::Clear)
-        } else {
-            None
-        }
-    })
+    context
+        .input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
+        .then_some(Shortcut::SelectAll)
 }
 
 impl App {
@@ -496,13 +517,21 @@ impl App {
         context: &egui::Context,
         list: &Arc<Vec<usize>>,
     ) {
-        match take_shortcut(context, !self.library_selection.is_empty()) {
+        match take_shortcut(context) {
             Some(Shortcut::SelectAll) => {
                 let order = ids_in_order(&self.library, list);
                 self.library_selection.select_all(&order);
             }
             Some(Shortcut::Clear) => self.library_selection.clear(),
             None => {}
+        }
+    }
+
+    /// Call after the bar has drawn (its Clear may have emptied the set): while
+    /// something is still selected, the next Escape clears it instead of Back.
+    pub(super) fn library_selection_claim_escape(&self, context: &egui::Context) {
+        if !self.library_selection.is_empty() {
+            shortcuts::claim_escape(context);
         }
     }
 
