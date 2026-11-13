@@ -400,6 +400,9 @@ pub(super) struct SavedFileFacts {
     /// Game Details' unconfirmed DAT identity for the card's identity line
     /// (pending, not confirmed, or re-check needed); `None` otherwise.
     pub dat_identity: Option<launch_readiness_summary::IdentitySummary>,
+    /// Game Details' identity wording (`detail_identity::identity_wording`),
+    /// shown on the card's identity line in place of the launch projection's.
+    pub identity_label: Option<&'static str>,
     pub file_missing: bool,
 }
 
@@ -1072,7 +1075,7 @@ impl NativeWorkflows {
         if saved.file_missing {
             launch_readiness_summary::note_file_missing(&mut summary);
         }
-        let action = launch_readiness_summary::show(ui, &summary);
+        let action = launch_readiness_summary::show(ui, &summary, saved.identity_label);
         let unchanged = self
             .shown_readiness
             .as_ref()

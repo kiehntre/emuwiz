@@ -771,7 +771,7 @@ fn readiness_card_buttons_stay_inside_a_narrow_card() {
                     |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
                             ui.allocate_ui(egui::vec2(card_width, 0.0), |ui| {
-                                launch_readiness_summary::show(ui, &summary);
+                                launch_readiness_summary::show(ui, &summary, None);
                             });
                         });
                     },

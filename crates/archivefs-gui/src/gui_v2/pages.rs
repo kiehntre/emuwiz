@@ -2645,13 +2645,17 @@ impl App {
                     .game(game_id)
                     .map(|game| (game.title.clone(), game.platform.clone()))
             {
-                let identity = self.identity_review_for(game_id);
+                // The same identity wording as Game Details.
+                let identity = self
+                    .library
+                    .game(game_id)
+                    .and_then(|game| self.detail_identity_wording(game));
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.heading(&title);
                     ui.label(format!("Problems for this game · {platform}"));
-                    if let Some(review) = &identity {
-                        ui.label(format!("Identity: {}", review.list_label()));
-                        if !review.is_verified() && ui.button("Review identity").clicked() {
+                    if let Some(identity) = &identity {
+                        ui.label(format!("Identity: {}", identity.label));
+                        if !identity.is_verified() && ui.button("Review identity").clicked() {
                             self.go(Route::ReviewIdentity(game_id));
                         }
                     }
@@ -3260,6 +3264,8 @@ impl App {
         let identity = self.detail_identity(game);
         let identity_verified = identity.as_ref().is_some_and(|i| i.is_verified());
         let dat_identity = identity.as_ref().and_then(|i| i.card_identity());
+        // The card's identity line says what the Identity line says.
+        let identity_label = self.detail_identity_wording(game).map(|w| w.label);
         let readiness_route = {
             let workflows = self.native_workflows.get_or_insert_with(|| {
                 super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
@@ -3273,6 +3279,7 @@ impl App {
                 super::native_workflows::SavedFileFacts {
                     catalogue_verified: identity_verified,
                     dat_identity,
+                    identity_label,
                     file_missing,
                 },
                 &mut self.activity,
@@ -3376,9 +3383,10 @@ impl App {
         }
         // General file identification and launch readiness remain separate.
         // The identity result leads; the longer verification guidance follows.
-        if let Some(identity) = self.detail_identity(game) {
+        // Identification confidence only; requirements and Play stay on the card.
+        if let Some(identity) = self.detail_identity_wording(game) {
             ui.horizontal_wrapped(|ui| {
-                ui.strong(format!("Identity: {}", identity.label()));
+                ui.strong(format!("Identity: {}", identity.label));
                 let label = if identity.is_verified() {
                     "View evidence"
                 } else {
@@ -3388,6 +3396,13 @@ impl App {
                     self.go(Route::ReviewIdentity(id));
                 }
             });
+            // What a verified answer rests on. An unverified one is explained
+            // by the likely-match card and the Verification card below.
+            if identity.is_verified()
+                && let Some(note) = identity.note
+            {
+                ui.small(note);
+            }
             if !identity.is_verified() {
                 let review = self.identity_review_for(id);
                 let guess = super::detail_identity::likely_match(game, review.as_ref());
@@ -3597,11 +3612,13 @@ impl App {
     ) {
         let id = game.archive.id;
         let key = key.clone();
-        ui.label(match game.dat_exact_label() {
-            Some(label) => label,
-            None if game.identified => "Identified in the saved game list".to_string(),
-            None => "Identity is not confirmed".to_string(),
-        });
+        // The page's one identity answer; a saved record is labelled as saved.
+        if let Some(identity) = self.detail_identity_wording(game) {
+            ui.label(format!("Identity: {}", identity.label));
+        }
+        if let Some(record) = game.dat_exact_label() {
+            ui.label(format!("Saved catalogue record: {record}"));
+        }
         ui.monospace(format!("Source: {}", game.archive.relative_path.display()));
         ui.monospace(format!("Media kind: {}", game.archive.archive_kind));
         for old in library.historical_for(id) {
