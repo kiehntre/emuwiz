@@ -3166,6 +3166,42 @@ fn gui_v2_changed_game_discards_stale_readiness_and_tracks_the_new_game() {
 }
 
 #[test]
+fn gui_v2_library_search_matches_every_word_in_any_order() {
+    let library = Library::new(vec![
+        archive(1, "Legend of Zelda, The - A Link to the Past", Some("SNES")),
+        archive(2, "Zelda II - The Adventure of Link", Some("NES")),
+        archive(3, "Link's Awakening", Some("Game Boy")),
+    ]);
+    let found = |search: &str| {
+        let mut titles: Vec<String> = library
+            .filter(&Filter {
+                search: search.into(),
+                ..Default::default()
+            })
+            .into_iter()
+            .map(|index| library.games[index].title.clone())
+            .collect();
+        titles.sort();
+        titles
+    };
+    assert_eq!(
+        found("zelda link"),
+        vec![
+            "Legend of Zelda, The - A Link to the Past".to_string(),
+            "Zelda II - The Adventure of Link".to_string(),
+        ]
+    );
+    // Extra spaces are ignored and the system name counts.
+    assert_eq!(
+        found("  link   adventure "),
+        vec!["Zelda II - The Adventure of Link".to_string()]
+    );
+    assert_eq!(found("link boy"), vec!["Link's Awakening".to_string()]);
+    assert!(found("zelda awakening").is_empty());
+    assert_eq!(found("").len(), 3);
+}
+
+#[test]
 fn gui_v2_library_search_platform_filter_attention_and_empty_platform() {
     let mut bad = archive(3, "Needs fixing", Some("PS2"));
     bad.last_verified_missing_at = Some("today".into());

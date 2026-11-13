@@ -455,11 +455,14 @@ impl Library {
         self.title_twins.contains(&id)
     }
     pub fn filter(&self, filter: &Filter) -> Vec<usize> {
+        // Every word must appear in the title or system, in any order, so
+        // "zelda link" finds "Legend of Zelda, The - A Link to the Past".
         let needle = filter.search.trim().to_lowercase();
+        let words: Vec<&str> = needle.split_whitespace().collect();
         let matches = |game: &Game| {
             filter.admits_before_check(game)
                 && (!filter.unverified_only || !game.identified)
-                && (needle.is_empty() || game.search.contains(&needle))
+                && words.iter().all(|word| game.search.contains(word))
         };
         if filter.platform.is_empty() {
             self.games
