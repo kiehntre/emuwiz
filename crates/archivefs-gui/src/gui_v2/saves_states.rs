@@ -149,9 +149,9 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
                 .records
                 .iter()
                 .filter(|record| {
-                    selected_game
-                        .as_ref()
-                        .is_none_or(|game| record_belongs_to_game(record, game))
+                    selected_game.as_ref().is_none_or(|game| {
+                        game_association(record, game, &app.library.games).is_some()
+                    })
                 })
                 .filter(|record| record.state_type == PersistentStateType::NativeSave)
                 .count(),
@@ -159,9 +159,9 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
                 .records
                 .iter()
                 .filter(|record| {
-                    selected_game
-                        .as_ref()
-                        .is_none_or(|game| record_belongs_to_game(record, game))
+                    selected_game.as_ref().is_none_or(|game| {
+                        game_association(record, game, &app.library.games).is_some()
+                    })
                 })
                 .filter(|record| record.state_type == PersistentStateType::MemoryCard)
                 .count(),
@@ -169,9 +169,9 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
                 .records
                 .iter()
                 .filter(|record| {
-                    selected_game
-                        .as_ref()
-                        .is_none_or(|game| record_belongs_to_game(record, game))
+                    selected_game.as_ref().is_none_or(|game| {
+                        game_association(record, game, &app.library.games).is_some()
+                    })
                 })
                 .filter(|record| record.state_type == PersistentStateType::SaveState)
                 .count(),
@@ -348,13 +348,15 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
         .filter(|record| {
             selected_game
                 .as_ref()
-                .is_none_or(|game| record_belongs_to_game(record, game))
+                .is_none_or(|game| game_association(record, game, &app.library.games).is_some())
         })
         .collect();
     summary(ui, &records);
     if let Some(game) = &selected_game {
         let targets = records
             .iter()
+            // Serial matches are display-only: never a snapshot target.
+            .filter(|record| record_belongs_to_game(record, game))
             .filter_map(|record| super::save_snapshots::snapshot_target(record, game).ok())
             .collect();
         super::save_snapshots::ensure_history(app, game.archive.id, targets);
@@ -370,7 +372,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
         .filter(|record| {
             selected_game
                 .as_ref()
-                .is_none_or(|game| record_belongs_to_game(record, game))
+                .is_none_or(|game| game_association(record, game, &app.library.games).is_some())
         })
         .collect();
     ui.separator();
@@ -402,7 +404,7 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
         .filter(|record| {
             selected_game
                 .as_ref()
-                .is_none_or(|game| record_belongs_to_game(record, game))
+                .is_none_or(|game| game_association(record, game, &app.library.games).is_some())
                 && filter_matches(record, app.saves_states.filter)
                 && (search.is_empty() || record_matches(record, &search))
         })
@@ -484,7 +486,12 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
                 ui.push_id(&record.path, |ui| {
                     record_card(ui, record, &mut app.imagery);
                     super::save_state_guidance::show(ui, record, state_target.as_ref());
-                    if let Some(game) = &selected_game {
+                    if let Some(game) = &selected_game
+                        && game_association(record, game, &app.library.games)
+                            == Some(GameAssociation::MatchedBySaveSerial)
+                    {
+                        serial_match_note(ui);
+                    } else if let Some(game) = &selected_game {
                         let target = super::save_snapshots::snapshot_target(record, game);
                         super::save_snapshots::show(
                             ui,
@@ -511,6 +518,17 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
             }
         });
     }
+}
+
+/// A serial-matched card save is shown, never acted on from the game page.
+fn serial_match_note(ui: &mut egui::Ui) {
+    ui.strong(MATCHED_BY_SAVE_SERIAL);
+    ui.label(
+        egui::RichText::new(
+            "The save's own product code matches this game's verified serial. It is not a confirmed identity. Back up or restore it through its memory card in the full Saves list.",
+        )
+        .color(theme::muted(ui)),
+    );
 }
 
 /// Game-page snapshot status: last result and unreadable snapshot entries.
@@ -571,6 +589,87 @@ fn summary(ui: &mut egui::Ui, records: &[&PersistentStateRecord]) {
             }
         });
     });
+}
+
+/// Why a record is listed on a game's Saves & States page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GameAssociation {
+    /// The existing verified join ([`record_belongs_to_game`]).
+    Confirmed,
+    /// A PS1 memory-card save whose own product code equals this game's
+    /// verified PS1 serial, and no other library game's.  Display only: the
+    /// save's identity stays a candidate, and it never authorises snapshots,
+    /// restores, overwrites or deletions (those stay on the card).
+    MatchedBySaveSerial,
+}
+
+pub(super) const MATCHED_BY_SAVE_SERIAL: &str = "Matched by save serial";
+
+/// The association, if any, that lists `record` on `game`'s page.
+pub(super) fn game_association(
+    record: &PersistentStateRecord,
+    game: &Game,
+    library: &[Game],
+) -> Option<GameAssociation> {
+    if record_belongs_to_game(record, game) {
+        Some(GameAssociation::Confirmed)
+    } else if ps1_card_save_serial_matches(record, game, library) {
+        Some(GameAssociation::MatchedBySaveSerial)
+    } else {
+        None
+    }
+}
+
+fn verified_ps1_serials(game: &Game) -> impl Iterator<Item = &str> {
+    use archivefs_core::game_identity::{IdentityKind, IdentityStatus};
+    game.archive
+        .identity_report
+        .iter()
+        .flat_map(|report| report.evidence.iter())
+        .filter(|e| e.kind == IdentityKind::Ps1Serial && e.status == IdentityStatus::Verified)
+        .filter_map(|e| e.value.as_deref())
+}
+
+/// A card entry's single PS1 serial: present, a candidate (never already
+/// verified, never missing), and not contradicted by a second value.
+fn ps1_card_save_serial(record: &PersistentStateRecord) -> Option<&str> {
+    use archivefs_core::game_identity::{IdentityKind, IdentityStatus};
+    if record.state_type != PersistentStateType::NativeSave || record.container_path.is_none() {
+        return None;
+    }
+    let mut serials = record
+        .game_identity
+        .iter()
+        .filter(|e| e.kind == IdentityKind::Ps1Serial && e.status == IdentityStatus::Candidate)
+        .filter_map(|e| e.value.as_deref().map(str::trim))
+        .filter(|value| !value.is_empty());
+    let serial = serials.next()?;
+    serials
+        .all(|other| other.eq_ignore_ascii_case(serial))
+        .then_some(serial)
+}
+
+fn ps1_card_save_serial_matches(
+    record: &PersistentStateRecord,
+    game: &Game,
+    library: &[Game],
+) -> bool {
+    let Some(serial) = ps1_card_save_serial(record) else {
+        return false;
+    };
+    if !verified_ps1_serials(game).any(|value| value.eq_ignore_ascii_case(serial)) {
+        return false;
+    }
+    // Exactly one library game may claim the serial; two (duplicate rows,
+    // regional twins sharing a code) leave the save in the full list only.
+    library
+        .iter()
+        .filter(|candidate| {
+            verified_ps1_serials(candidate).any(|value| value.eq_ignore_ascii_case(serial))
+        })
+        .take(2)
+        .count()
+        == 1
 }
 
 pub(super) fn record_belongs_to_game(record: &PersistentStateRecord, game: &Game) -> bool {
@@ -1209,6 +1308,148 @@ mod tests {
         assert_eq!(
             state_type_label(PersistentStateType::SaveState),
             "Savestate"
+        );
+    }
+
+    fn ps1_identity(
+        value: &str,
+        status: archivefs_core::game_identity::IdentityStatus,
+    ) -> archivefs_core::game_identity::IdentityEvidence {
+        use archivefs_core::game_identity::*;
+        IdentityEvidence {
+            kind: IdentityKind::Ps1Serial,
+            status,
+            value: Some(value.into()),
+            confidence: IdentityConfidence::StructuredMetadata,
+            provenance: IdentityProvenance {
+                archive_path: "synthetic".into(),
+                member_path: None,
+                member_index: None,
+                method: "fixture".into(),
+            },
+            diagnostic: "fixture".into(),
+        }
+    }
+
+    fn ps1_game(id: i64, serials: &[&str]) -> Game {
+        use archivefs_core::game_identity::*;
+        let mut archive = super::super::tests::archive(id, "Synthetic PS1 game", Some("PS1"));
+        archive.identity_report = Some(GameIdentityReport {
+            archive_path: archive.absolute_path.clone(),
+            platform: IdentityPlatform::PlayStation,
+            format: IdentityImageFormat::Iso,
+            evidence: serials
+                .iter()
+                .map(|serial| ps1_identity(serial, IdentityStatus::Verified))
+                .collect(),
+            warnings: vec![],
+            bytes_read: 0,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete: true,
+        });
+        Game::from_archive(archive)
+    }
+
+    /// A save listed from inside a PS1 card, as the inventory records it:
+    /// a native save contained by the card, its product code a candidate.
+    fn ps1_card_save(serial: &str) -> PersistentStateRecord {
+        let mut record = record_at("/fixture/memcards/Crash Bandicoot (USA)_1.mcd");
+        record.emulator = StateEmulator::DuckStation;
+        record.state_type = PersistentStateType::NativeSave;
+        record.container_path = Some("/fixture/memcards/Crash Bandicoot (USA)_1.mcd".into());
+        record.warnings = vec!["validated card entry: BASLUS-00067SAVE".into()];
+        record.game_identity = vec![ps1_identity(
+            serial,
+            archivefs_core::game_identity::IdentityStatus::Candidate,
+        )];
+        record
+    }
+
+    #[test]
+    fn ps1_card_save_is_listed_by_unique_save_serial_but_never_confirmed() {
+        let game = ps1_game(1, &["SLUS-00067"]);
+        let other = ps1_game(2, &["SCES-00344"]);
+        let library = vec![game.clone(), other.clone()];
+        let record = ps1_card_save("SLUS-00067");
+
+        assert_eq!(
+            game_association(&record, &game, &library),
+            Some(GameAssociation::MatchedBySaveSerial)
+        );
+        assert_eq!(game_association(&record, &other, &library), None);
+        // Never upgraded: the verified join and everything gated on it
+        // (snapshots, restores) still refuse the save.
+        assert!(!record_belongs_to_game(&record, &game));
+        assert!(
+            record
+                .game_identity
+                .iter()
+                .all(|e| e.status == archivefs_core::game_identity::IdentityStatus::Candidate)
+        );
+        assert!(super::super::save_snapshots::snapshot_target(&record, &game).is_err());
+        // Case differences in the code are not a different game.
+        assert_eq!(
+            game_association(&ps1_card_save("slus-00067"), &game, &library),
+            Some(GameAssociation::MatchedBySaveSerial)
+        );
+        // A multi-disc game matches a save made with any of its discs.
+        let multi = ps1_game(3, &["SLUS-00892", "SLUS-00908"]);
+        assert_eq!(
+            game_association(
+                &ps1_card_save("SLUS-00908"),
+                &multi,
+                std::slice::from_ref(&multi)
+            ),
+            Some(GameAssociation::MatchedBySaveSerial)
+        );
+    }
+
+    #[test]
+    fn missing_ambiguous_or_shared_serials_stay_in_the_full_list_only() {
+        use archivefs_core::game_identity::IdentityStatus;
+        let game = ps1_game(1, &["SLUS-00067"]);
+        let library = vec![game.clone()];
+
+        let mut missing = ps1_card_save("SLUS-00067");
+        missing.game_identity.clear();
+        assert_eq!(game_association(&missing, &game, &library), None);
+
+        let mut unknown = ps1_card_save("SLUS-00067");
+        unknown.game_identity[0].status = IdentityStatus::Missing;
+        assert_eq!(game_association(&unknown, &game, &library), None);
+
+        let mut conflicting = ps1_card_save("SLUS-00067");
+        conflicting
+            .game_identity
+            .push(ps1_identity("SCES-00344", IdentityStatus::Candidate));
+        assert_eq!(game_association(&conflicting, &game, &library), None);
+
+        // Two library games share the serial: no guess between them.
+        let twin = ps1_game(2, &["SLUS-00067"]);
+        let shared = vec![game.clone(), twin.clone()];
+        let record = ps1_card_save("SLUS-00067");
+        assert_eq!(game_association(&record, &game, &shared), None);
+        assert_eq!(game_association(&record, &twin, &shared), None);
+
+        // Only saves inside a card qualify: not the card itself, and not a
+        // loose save file that merely carries a serial.
+        let mut card = ps1_card_save("SLUS-00067");
+        card.state_type = PersistentStateType::MemoryCard;
+        assert_eq!(game_association(&card, &game, &library), None);
+        let mut loose = ps1_card_save("SLUS-00067");
+        loose.container_path = None;
+        assert_eq!(game_association(&loose, &game, &library), None);
+
+        // A game whose serial is not verified offers nothing to match.
+        let mut unverified = ps1_game(4, &["SLUS-00067"]);
+        if let Some(report) = unverified.archive.identity_report.as_mut() {
+            report.evidence[0].status = IdentityStatus::Candidate;
+        }
+        assert_eq!(
+            game_association(&record, &unverified, std::slice::from_ref(&unverified)),
+            None
         );
     }
 }
