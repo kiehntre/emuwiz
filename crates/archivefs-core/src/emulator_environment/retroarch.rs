@@ -5400,6 +5400,7 @@ mod tests {
                 "paths",
                 "playlists",
                 "profile_kind",
+                "save_directories",
                 "scope",
             ]
         );

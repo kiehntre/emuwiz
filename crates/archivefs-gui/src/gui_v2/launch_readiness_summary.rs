@@ -272,6 +272,14 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
     let named_disc_refusal = summary
         .explanation
         .starts_with(archivefs_core::launch::evidence_bridge::CUE_BIN_REFUSED_PREFIX);
+    // The zipped-save refusal already offers Recheck (which refreshes
+    // RetroArch, where the answer comes from); the generic safety-refusal
+    // finding must not turn that into "Review problem".
+    let zipped_save_refusal = matches!(input, LaunchReadinessInput::Plan { plan, .. }
+    if plan.candidates.iter().flat_map(|candidate| &candidate.blockers).any(|blocker| {
+        blocker.kind == LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe
+            && blocker.detail == summary.explanation
+    }));
     let mut findings = match input {
         LaunchReadinessInput::IdentityConflicting => diagnosis::single(Cause::IdentityNotConfirmed),
         // Each reason already carries its own wording and next action.
@@ -324,7 +332,10 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
     {
         return;
     }
-    if !named_disc_refusal && let Some(fix) = findings[0].fix {
+    if !named_disc_refusal
+        && !zipped_save_refusal
+        && let Some(fix) = findings[0].fix
+    {
         summary.primary_action = Some(fix);
     }
     summary.findings = findings;
