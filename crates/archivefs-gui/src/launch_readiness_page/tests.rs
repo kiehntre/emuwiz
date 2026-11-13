@@ -4114,9 +4114,11 @@ fn sega_pico_order_leaves_a_blocked_picodrive_and_other_platforms_alone() {
         super::candidate_display_order(&plan, |_| true),
         vec![0, 1, 2]
     );
+    // Other systems do not get the Pico rule; they get the general one, which
+    // puts the card Play uses (here the Sole eligible core) first.
     let mut md = smoke_test_pico_plan();
     md.platform_id = Some("MegaDrive".into());
-    assert_eq!(super::candidate_display_order(&md, |_| true), vec![0, 1, 2]);
+    assert_eq!(super::candidate_display_order(&md, |_| true), vec![2, 0, 1]);
 }
 
 /// Saves "Default for Sega Pico" on `core` through the real choice state and
