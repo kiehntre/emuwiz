@@ -761,7 +761,7 @@ impl App {
             }
             let mut approve = false;
             let mut discard = false;
-            if let Phase::Preview(plans, folders, summary) = &organise.phase {
+            if let Phase::Preview(plans, folders, summary, excluded) = &organise.phase {
                 let (folder_moves, folders_in_place, folders_refused) =
                     super::organise::folder_counts(folders);
                 ui.label(format!(
@@ -772,6 +772,9 @@ impl App {
                     summary.collisions,
                     summary.left_alone + summary.blocked
                 ));
+                for line in super::organise::excluded_lines(excluded) {
+                    ui.label(line);
+                }
                 if folder_moves + folders_in_place + folders_refused > 0 {
                     ui.label(format!(
                         "Game folders: {folder_moves} will move whole, {folders_in_place} already in place, {folders_refused} stay where they are."
