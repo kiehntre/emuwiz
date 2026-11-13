@@ -472,9 +472,9 @@ fn launch_first_focus(context: &egui::Context, state: &mut BigPicture) {
     if !state.launch_focus {
         return;
     }
-    if context.input(|input| input.pointer.any_pressed()) {
-        state.launch_focus = false;
-    } else if context.memory(|memory| memory.focused()).is_some() {
+    if context.input(|input| input.pointer.any_pressed())
+        || context.memory(|memory| memory.focused()).is_some()
+    {
         state.launch_focus = false;
     } else {
         // From nothing focused, Next lands on the first focusable control.
