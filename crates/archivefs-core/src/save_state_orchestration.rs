@@ -57,21 +57,35 @@ pub fn inventory_discovered_profiles(profiles: &DiscoveredProfiles) -> Configure
                     .and_then(|x| x.version.clone()),
                 profile.provenance,
             );
-            root_or_unavailable(
-                &mut roots,
-                &mut unavailable,
-                PersistentStateRoot {
+            // A custom `[MemoryCards] Directory` that the shared folder rules
+            // refuse is reported, never replaced by a silent scan of the
+            // default folder DuckStation is not using.
+            if let Err(refusal) = crate::patch_manager::resolve_duckstation_memory_cards_folder(
+                &profile.configuration_path,
+            ) {
+                unavailable.push(UnavailableStateRoot {
                     emulator: StateEmulator::DuckStation,
-                    installation: Some(installation.clone()),
-                    path: profile.memory_cards_path.clone(),
-                    path_origin: origin(profile.provenance),
-                    effective_from_configuration: true,
-                    state_type_hint: Some(PersistentStateType::MemoryCard),
-                    container_path: None,
-                    identity_evidence: Vec::new(),
-                },
-                &profile.profile_id,
-            );
+                    profile: Some(profile.profile_id.clone()),
+                    path: None,
+                    reason: format!("DuckStation memory-card folder was refused: {refusal:?}"),
+                });
+            } else {
+                root_or_unavailable(
+                    &mut roots,
+                    &mut unavailable,
+                    PersistentStateRoot {
+                        emulator: StateEmulator::DuckStation,
+                        installation: Some(installation.clone()),
+                        path: profile.memory_cards_path.clone(),
+                        path_origin: origin(profile.provenance),
+                        effective_from_configuration: true,
+                        state_type_hint: Some(PersistentStateType::MemoryCard),
+                        container_path: None,
+                        identity_evidence: Vec::new(),
+                    },
+                    &profile.profile_id,
+                );
+            }
             root_or_unavailable(
                 &mut roots,
                 &mut unavailable,
@@ -347,5 +361,134 @@ impl ProfileResolution for crate::patch_manager::Rpcs3Profile {
 impl ProfileResolution for crate::patch_manager::XemuProfile {
     fn resolved_emulator_executable(&self) -> Option<PathBuf> {
         self.executable_candidates.first().map(|x| x.path.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game_identity::IdentityKind;
+    use crate::patch_manager::{
+        DuckStationProfileDiscovery, DuckStationProfileDiscoveryRoots,
+        discover_duckstation_profiles,
+    };
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    fn ps1_card() -> Vec<u8> {
+        crate::memory_card_inventory::tests::fixture()
+    }
+
+    fn profiles_for(root: &Path) -> DiscoveredProfiles {
+        let home = root.parent().unwrap().to_path_buf();
+        let discovery = discover_duckstation_profiles(&DuckStationProfileDiscoveryRoots {
+            home: home.clone(),
+            xdg_config_home: home.clone(),
+            xdg_data_home: home.join("data"),
+            xdg_config_home_explicit: true,
+            explicit_configuration_roots: vec![root.to_path_buf()],
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: BTreeMap::new(),
+            appimage_directory: None,
+            path_override: Some(Vec::new()),
+        });
+        let profiles: Vec<_> = discovery
+            .profiles
+            .into_iter()
+            .filter(|profile| profile.configuration_path == root && profile.eligible)
+            .collect();
+        assert_eq!(profiles.len(), 1, "fixture profile must be discovered");
+        let not_under_test = || "not under test".to_string();
+        DiscoveredProfiles {
+            dolphin: Err(not_under_test()),
+            preferred_dolphin: None,
+            pcsx2: Err(not_under_test()),
+            xenia: None,
+            ppsspp: Err(not_under_test()),
+            duckstation: Ok(DuckStationProfileDiscovery {
+                profiles,
+                complete: true,
+            }),
+            xemu: Err(not_under_test()),
+            rpcs3: Err(not_under_test()),
+        }
+    }
+
+    fn duckstation_cards(inventory: &ConfiguredStateInventory) -> Vec<PathBuf> {
+        inventory
+            .inventory
+            .records
+            .iter()
+            .filter(|r| {
+                r.emulator == StateEmulator::DuckStation
+                    && r.state_type == PersistentStateType::MemoryCard
+            })
+            .map(|r| r.path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn custom_duckstation_memory_card_folder_is_inventoried_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("duckstation");
+        let custom = temp.path().join("cards").join("ps1");
+        fs::create_dir_all(&custom).unwrap();
+        fs::create_dir_all(root.join("memcards")).unwrap();
+        fs::write(
+            root.join("settings.ini"),
+            format!(
+                "[MemoryCards]\nDirectory = {}\nCard1Type = PerGameTitle\n",
+                custom.display()
+            ),
+        )
+        .unwrap();
+        // DuckStation's default PerGameTitle naming: the card is named by
+        // title, not serial.  Discovery must not depend on the file name.
+        let card = custom.join("Crash Bandicoot (USA)_1.mcd");
+        let bytes = ps1_card();
+        fs::write(&card, &bytes).unwrap();
+        // A stale card in the default folder DuckStation is not using.
+        fs::write(root.join("memcards/stale_1.mcd"), ps1_card()).unwrap();
+
+        let inventory = inventory_discovered_profiles(&profiles_for(&root));
+
+        assert_eq!(duckstation_cards(&inventory), vec![card.clone()]);
+        let save = inventory
+            .inventory
+            .records
+            .iter()
+            .find(|r| {
+                r.emulator == StateEmulator::DuckStation
+                    && r.state_type == PersistentStateType::NativeSave
+                    && r.container_path.as_deref() == Some(card.as_path())
+            })
+            .expect("the save inside the title-named card is listed");
+        assert!(save.game_identity.iter().any(|identity| {
+            identity.kind == IdentityKind::Ps1Serial
+                && identity.value.as_deref() == Some("SLUS-00067")
+        }));
+        assert_eq!(fs::read(&card).unwrap(), bytes, "card bytes unchanged");
+    }
+
+    #[test]
+    fn refused_duckstation_memory_card_folder_is_reported_not_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("duckstation");
+        fs::create_dir_all(root.join("memcards")).unwrap();
+        fs::write(root.join("memcards/shared_card_1.mcd"), ps1_card()).unwrap();
+        fs::write(
+            root.join("settings.ini"),
+            "[MemoryCards]\nDirectory = ../outside\n",
+        )
+        .unwrap();
+
+        let inventory = inventory_discovered_profiles(&profiles_for(&root));
+
+        assert!(duckstation_cards(&inventory).is_empty());
+        assert!(inventory.unavailable.iter().any(|u| {
+            u.emulator == StateEmulator::DuckStation
+                && u.reason.contains("memory-card folder was refused")
+        }));
     }
 }

@@ -615,9 +615,20 @@ fn validate_profile(
         patches_path: candidate.path.join("patches"),
         textures_path: candidate.path.join("textures"),
         bios_path: candidate.path.join("bios"),
-        memory_cards_path: candidate.path.join("memcards"),
+        memory_cards_path: effective_memory_cards_path(&candidate.path),
         save_states_path: candidate.path.join("savestates"),
     }
+}
+
+/// DuckStation's effective memory-card folder: `[MemoryCards] Directory` when
+/// it is set and safe, else the default `memcards`.  The default is only a
+/// fallback for profile construction; read-only consumers that must not
+/// silently scan the wrong folder (the save inventory) check the refusal
+/// themselves via `resolve_duckstation_memory_cards_folder`.
+fn effective_memory_cards_path(profile_root: &Path) -> PathBuf {
+    super::duckstation_native::resolve_duckstation_memory_cards_folder(profile_root)
+        .map(|(path, _custom)| path)
+        .unwrap_or_else(|_| profile_root.join("memcards"))
 }
 
 /// Every DuckStation executable discovery knows, for the profile resolver.

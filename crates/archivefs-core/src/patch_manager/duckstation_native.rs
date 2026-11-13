@@ -1314,40 +1314,12 @@ pub fn resolve_duckstation_folders(
     profile_root: &Path,
 ) -> Result<DuckStationFolders, DuckStationNativeRefusal> {
     let invalid = |reason: String| DuckStationNativeRefusal::InvalidDuckStationProfile { reason };
-    if !profile_root.is_absolute() || has_parent_dir(profile_root) {
-        return Err(invalid("the profile root must be an absolute path".into()));
-    }
-    match fs::metadata(profile_root) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => return Err(invalid("the profile root is not a directory".into())),
-        Err(error) => {
-            return Err(invalid(format!("the profile root cannot be read: {error}")));
-        }
-    }
-    let settings_path = profile_root.join("settings.ini");
-    let (cheats_value, game_settings_value) = match fs::symlink_metadata(&settings_path) {
-        Ok(metadata) if metadata.is_file() => {
-            if metadata.len() > SETTINGS_MAX_BYTES {
-                return Err(invalid("settings.ini is too large".into()));
-            }
-            let mut text = String::new();
-            fs::File::open(&settings_path)
-                .and_then(|file| file.take(SETTINGS_MAX_BYTES).read_to_string(&mut text))
-                .map_err(|error| {
-                    invalid(format!("settings.ini cannot be read as text: {error}"))
-                })?;
-            let cheats = ini_value(&text, "Folders", "Cheats").map_err(|reason| invalid(reason))?;
-            let game_settings =
-                ini_value(&text, "Folders", "GameSettings").map_err(|reason| invalid(reason))?;
-            (cheats, game_settings)
-        }
-        Ok(_) => return Err(invalid("settings.ini is not a regular file".into())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
-        Err(error) => {
-            return Err(invalid(format!(
-                "settings.ini cannot be inspected: {error}"
-            )));
-        }
+    let (cheats_value, game_settings_value) = match read_profile_settings(profile_root)? {
+        Some(text) => (
+            ini_value(&text, "Folders", "Cheats").map_err(|reason| invalid(reason))?,
+            ini_value(&text, "Folders", "GameSettings").map_err(|reason| invalid(reason))?,
+        ),
+        None => (None, None),
     };
     let (cheats, cheats_custom) =
         resolve_folder(profile_root, cheats_value.as_deref(), "cheats", "Cheats")?;
@@ -1364,6 +1336,62 @@ pub fn resolve_duckstation_folders(
         cheats_custom,
         game_settings_custom,
     })
+}
+
+/// Resolves the folder DuckStation keeps memory cards in, and whether it came
+/// from `settings.ini`.  DuckStation reads it from `[MemoryCards] Directory`
+/// (not `[Folders]`), relative to the data root, defaulting to `memcards`.
+/// The same safety rules as the other profile folders apply.  Read-only.
+pub fn resolve_duckstation_memory_cards_folder(
+    profile_root: &Path,
+) -> Result<(PathBuf, bool), DuckStationNativeRefusal> {
+    let configured = match read_profile_settings(profile_root)? {
+        Some(text) => ini_value(&text, "MemoryCards", "Directory")
+            .map_err(|reason| DuckStationNativeRefusal::InvalidDuckStationProfile { reason })?,
+        None => None,
+    };
+    resolve_folder(
+        profile_root,
+        configured.as_deref(),
+        "memcards",
+        "MemoryCards.Directory",
+    )
+}
+
+/// Validates the profile root and returns `settings.ini`'s text, or `None`
+/// when the profile has no `settings.ini` yet.
+fn read_profile_settings(profile_root: &Path) -> Result<Option<String>, DuckStationNativeRefusal> {
+    let invalid = |reason: String| DuckStationNativeRefusal::InvalidDuckStationProfile { reason };
+    if !profile_root.is_absolute() || has_parent_dir(profile_root) {
+        return Err(invalid("the profile root must be an absolute path".into()));
+    }
+    match fs::metadata(profile_root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(invalid("the profile root is not a directory".into())),
+        Err(error) => {
+            return Err(invalid(format!("the profile root cannot be read: {error}")));
+        }
+    }
+    let settings_path = profile_root.join("settings.ini");
+    match fs::symlink_metadata(&settings_path) {
+        Ok(metadata) if metadata.is_file() => {
+            if metadata.len() > SETTINGS_MAX_BYTES {
+                return Err(invalid("settings.ini is too large".into()));
+            }
+            let mut text = String::new();
+            fs::File::open(&settings_path)
+                .and_then(|file| file.take(SETTINGS_MAX_BYTES).read_to_string(&mut text))
+                .map_err(|error| {
+                    invalid(format!("settings.ini cannot be read as text: {error}"))
+                })?;
+            Ok(Some(text))
+        }
+        Ok(_) => Err(invalid("settings.ini is not a regular file".into())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(invalid(format!(
+            "settings.ini cannot be inspected: {error}"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
