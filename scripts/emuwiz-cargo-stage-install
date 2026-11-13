@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Staged, fail-closed installation of the Cargo maintenance tools (maintain, retention,
+# retire) into the root-owned install directory.  Run by the owner, as root, ONLY in an
+# approved deployment.  It refuses, without changing the working version, unless:
+#   1. with --selftest FILE: owner-signature verification works with the SOURCE code: the
+#      allowed-signers file is installed and trusted, lists an owner key restricted to the
+#      retirement namespace, and the owner's self-test signature verifies (signed off this
+#      machine with: ssh-keygen -Y sign -n emuwiz-cargo-retire-selftest@1).
+#      With --without-owner-signing instead: no signers file may be installed yet; routine
+#      maintenance and worktree checks/removal need no signature, and owner-signed
+#      exceptional retirement stays unavailable (the executor refuses it, fail closed,
+#      until the signers file is installed and the tools are re-installed with --selftest);
+#   2. the retirement timer is not enabled or active and no maintenance unit is running;
+#   3. the staged copy passes `verify-install` and the same signing check.
+# Then it swaps the staged copy in and keeps the previous version for rollback:
+#   <install-dir>.rollback-<timestamp>  (restore: see the last line it prints).
+# If the post-install check fails, it restores the previous version automatically.
+#
+# Usage: emuwiz-cargo-stage-install --source <repo>/scripts (--selftest FILE | --without-owner-signing)
+#                                   [--install-dir DIR] [--owner USER]
+# --owner: the account that owns the caches and registry (default: $SUDO_USER); the root
+# verify-install check runs as `emuwiz-cargo-maintain --as-user USER`.
+set -euo pipefail
+unset EMUWIZ_OWNER_SIGNERS        # the production anchor only
+
+install_dir=/usr/local/libexec/emuwiz-cargo-maintain
+source_dir="" selftest="" unsigned=0 owner=${SUDO_USER:-}
+signers=/etc/emuwiz/cargo-retire-allowed-signers
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --source) source_dir=${2:?}; shift 2 ;;
+    --selftest) selftest=${2:?}; shift 2 ;;
+    --without-owner-signing) unsigned=1; shift ;;
+    --install-dir) install_dir=${2:?}; shift 2 ;;
+    --owner) owner=${2:?}; shift 2 ;;
+    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "stage-install: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$source_dir" ] || { echo "stage-install: --source is required" >&2; exit 2; }
+case "$unsigned:${selftest:+set}" in
+  0:set|1:) ;;
+  *) echo "stage-install: give exactly one of --selftest FILE or --without-owner-signing" >&2; exit 2 ;;
+esac
+files=(emuwiz-cargo-maintain emuwiz-cargo-retention emuwiz-cargo-retire)
+for f in "${files[@]}"; do
+  [ -f "$source_dir/$f" ] || { echo "stage-install: $source_dir/$f is missing; nothing changed" >&2; exit 2; }
+done
+
+refuse() { echo "stage-install: REFUSED: $*; the installed version was not changed" >&2; exit 3; }
+
+# 1. read-only preflight with the code that would be installed
+signing_check() {   # $1: the code directory
+  if [ "$unsigned" -eq 1 ]; then return 0; fi
+  /usr/bin/python3 -I -S "$1/emuwiz-cargo-retire" --check-owner-signing --selftest "$selftest" >/dev/null
+}
+if [ "$unsigned" -eq 1 ]; then
+  # an installed signers file is meant to be verified: use --selftest, never skip it
+  if [ -e "$signers" ] || [ -L "$signers" ]; then
+    refuse "$signers is installed: verify it with --selftest instead"
+  fi
+else
+  # the SOURCE copy is not root-owned, so root refuses to run it: check it as the owner
+  preflight=(/usr/bin/python3 -I -S "$source_dir/emuwiz-cargo-retire" --check-owner-signing --selftest "$selftest")
+  if [ "$(id -u)" -eq 0 ]; then
+    if [ -z "$owner" ] || [ "$owner" = root ] || ! id -u -- "$owner" >/dev/null 2>&1; then
+      refuse "name the owning account with --owner USER (not root)"
+    fi
+    preflight=(runuser -u "$owner" -- "${preflight[@]}")
+  fi
+  if ! "${preflight[@]}" >/dev/null; then
+    "${preflight[@]}" >&2 || true
+    refuse "owner-signature verification is missing, invalid or unusable"
+  fi
+fi
+[ "$(id -u)" -eq 0 ] || refuse "must run as root (owner-approved deployment only)"
+[ -d "$install_dir" ] && [ ! -L "$install_dir" ] || refuse "$install_dir is not an existing directory"
+if [ -z "$owner" ] || [ "$owner" = root ] || ! id -u -- "$owner" >/dev/null 2>&1; then
+  refuse "name the owning account with --owner USER (not root)"
+fi
+
+# 2. nothing may be running or scheduled
+# list-unit-files exits 1 when no unit matches: that is "none installed" only when an
+# unfiltered listing works (so systemctl itself answers); anything else refuses
+if listing=$(systemctl list-unit-files --no-legend --plain 'emuwiz-cargo-maintain*' 2>/dev/null); then
+  units=$(printf '%s\n' "$listing" | awk 'NF {print $1}')
+elif [ -z "$listing" ] && systemctl list-unit-files --no-legend --plain >/dev/null 2>&1; then
+  units=""
+else
+  refuse "cannot list the maintenance units"
+fi
+for unit in $units; do
+  case "$unit" in
+    *.timer) if systemctl is-enabled --quiet "$unit" 2>/dev/null || systemctl is-active --quiet "$unit" 2>/dev/null; then
+               refuse "$unit is enabled or active"; fi ;;
+    *.service) # a running oneshot is "activating", which is-active does not count: only
+               # inactive or failed is idle, and an unreadable state refuses
+               state=$(systemctl show -p ActiveState --value -- "$unit" 2>/dev/null) || state=""
+               case "$state" in inactive|failed) ;; *) refuse "$unit is running or its state is unknown (${state:-unreadable})" ;; esac ;;
+  esac
+done
+
+# 3. stage a full copy of the current directory with the new scripts, and check it
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+staged="$install_dir.staged-$stamp"
+rollback="$install_dir.rollback-$stamp"
+cleanup_staged() { rm -rf --one-file-system -- "$staged"; }
+cp -a -- "$install_dir" "$staged"
+rm -rf --one-file-system -- "$staged/__pycache__"
+for f in "${files[@]}"; do
+  mode=$(stat -c %a -- "$install_dir/$f" 2>/dev/null || echo 644)   # keep the installed mode
+  install -o root -g root -m "$mode" -- "$source_dir/$f" "$staged/$f"
+done
+check() {
+  /usr/bin/python3 -I -S "$1/emuwiz-cargo-maintain" --as-user "$owner" verify-install >/dev/null && signing_check "$1"
+}
+if ! check "$staged"; then
+  cleanup_staged
+  refuse "the staged copy failed verify-install or the signing check"
+fi
+
+# swap, keeping the previous version; if interrupted between the two renames (or on any
+# failure afterwards) the trap puts the previous version back
+restore() {
+  if [ ! -e "$install_dir" ] && [ -d "$rollback" ]; then
+    mv -T -- "$rollback" "$install_dir" && echo "stage-install: previous version restored" >&2
+  fi
+}
+trap restore EXIT INT TERM HUP
+mv -T -- "$install_dir" "$rollback"
+if ! mv -T -- "$staged" "$install_dir"; then
+  mv -T -- "$rollback" "$install_dir"
+  refuse "could not move the staged copy into place (previous version restored)"
+fi
+if ! check "$install_dir"; then
+  mv -T -- "$install_dir" "$staged.failed" || true
+  restore
+  echo "stage-install: post-install check FAILED; previous version restored (failed copy: $staged.failed)" >&2
+  exit 4
+fi
+trap - EXIT INT TERM HUP
+echo "installed; previous version kept at $rollback"
+echo "policies and timers were not touched (still disabled). Rollback:"
+if [ "$unsigned" -eq 1 ]; then
+  echo "owner-signed exceptional retirement: UNAVAILABLE until $signers is installed and this is re-run with --selftest"
+fi
+echo "  sudo mv -T $install_dir $install_dir.removed-$stamp && sudo mv -T $rollback $install_dir"

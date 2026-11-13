@@ -34,6 +34,10 @@ def jdump(data, path):
 
 
 class Env(unittest.TestCase):
+    def assertRegistryUntouched(self):
+        """Nothing beyond the HOLD-registry fixture written by setUp exists in the registry."""
+        self.assertEqual(sorted(os.listdir(self.reg)), ["hold-registry.json"])
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="emuwiz-retention-test.")
         self.addCleanup(self.rmtree, self.tmp)
@@ -41,6 +45,12 @@ class Env(unittest.TestCase):
         os.makedirs(self.home)
         self.targets = os.path.join(self.tmp, "targets")
         self.reg = os.path.join(self.tmp, "registry")
+        os.makedirs(self.reg, mode=0o700)
+        with open(os.path.join(self.reg, "hold-registry.json"), "w") as handle:   # the HOLD registry: empty
+            json.dump({"kind": "EMUWIZ_HOLD_REGISTRY", "schema": 1, "generated_at": time.time(),
+                       "max_age_days": 30, "sources": [],
+                       "entries": [{"id": "fixture", "status": "UNRESOLVED", "branches": ["no-such-hold-branch"],
+                                    "heads": [], "paths": []}]}, handle)
         self.fake = os.path.join(self.tmp, "fake-cargo")
         with open(self.fake, "w") as f:
             f.write(
@@ -172,7 +182,7 @@ class IsolationAndCompatibility(Env):
     def test_print_target_is_read_only(self):
         wt = self.worktree("wt-ro")
         self.assertEqual(self.iso(wt, "--print-target").returncode, 0)
-        self.assertFalse(os.path.exists(self.reg))
+        self.assertRegistryUntouched()
         self.assertFalse(os.path.exists(self.targets))
 
     def test_exit_codes_arguments_and_low_debug_are_preserved(self):
@@ -199,7 +209,7 @@ class IsolationAndCompatibility(Env):
         env = dict(self.env, EMUWIZ_MIN_FREE_GB="99999999")
         r = self.iso(wt, "check", env=env)
         self.assertEqual(r.returncode, 4)
-        self.assertFalse(os.path.exists(self.reg))
+        self.assertRegistryUntouched()
         self.assertFalse(os.path.exists(self.env["FAKE_LOG"]))
 
     def test_a_broken_registry_never_blocks_a_build(self):
@@ -507,7 +517,7 @@ class Planning(Env):
         before = sorted(os.listdir(self.targets))
         for cmd in ("status", "list", "plan"):
             self.assertEqual(self.ret(cmd, "--accept-foreign-process-gap").returncode, 0)
-        self.assertFalse(os.path.exists(self.reg))
+        self.assertRegistryUntouched()
         self.assertEqual(sorted(os.listdir(self.targets)), before)
 
 

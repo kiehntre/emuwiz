@@ -17,7 +17,26 @@ const FULL = [
 ];
 const UNEXPANDED_BUILD = 'Reproducibility build ${{ matrix.run }}';
 const ANALYZE = ['actions', 'c-cpp', 'python', 'rust'].map(x => `Analyze (${x})`);
-const marker = (number, sha) => `<!-- emuwiz-ci-final:${number}:${sha} -->`;
+// One marker per PR, exact head and result. A changed result (e.g. FAILED, rerun,
+// then READY) is a new notification; the same result for the same head is not.
+const marker = (number, sha, status = 'READY') => `<!-- emuwiz-ci-final:${number}:${sha}:${status} -->`;
+const MARKER_RE = /<!-- emuwiz-ci-final:(\d+):([a-f0-9]{40}):(READY|FAILED|BLOCKED) -->/;
+const isBot = c => c.user?.login === 'github-actions[bot]';
+// Stale-result handling: the first line is rewritten (marker disarmed, mention
+// removed) so an old FAILED/READY snapshot can neither dedupe nor mislead. Edits
+// do not send email. Only comments authored by the Actions bot are ever touched.
+async function supersede({github, repo, comments, keep, core}) {
+  for (const c of comments) {
+    const m = isBot(c) && c.body?.match(MARKER_RE);
+    if (!m || m[0] === keep) continue;
+    const body = [`~~Superseded~~ — earlier ${m[3]} snapshot for head \`${m[2]}\` is no longer current.`,
+      `<!-- emuwiz-ci-superseded:${m[1]}:${m[2]}:${m[3]} -->`].join('\n');
+    try {
+      await github.rest.issues.updateComment({...repo, comment_id: c.id, body});
+      core.info(`superseded comment ${c.id}`);
+    } catch (e) { core.info(`could not supersede comment ${c.id}: ${e.message}`); }
+  }
+}
 
 function classify(files) {
   if (!files.length || files.length >= 3000) return 'full';
@@ -87,7 +106,7 @@ function decide({runs, jobs, tier, checks, statuses, mergeable, mergeStateStatus
     return {status: 'PENDING'};
   }
   if (draft || mergeable !== 'MERGEABLE' || mergeStateStatus !== 'CLEAN') {
-    return {status: 'BLOCKED', problems: [{name:
+    return {status: 'BLOCKED', draft: !!draft, problems: [{name:
       `Checks passed; mergeability: ${mergeable}/${mergeStateStatus}${draft ? ' (draft)' : ''}`} ]};
   }
   return {status: 'READY', problems: []};
@@ -104,11 +123,7 @@ async function notify({github, context, core, dryRun = false}) {
   const prs = (await all(github.rest.pulls.list, {state: 'open'}))
     .filter(pr => pr.head.sha === sha);
   for (const pr of prs) {
-    const key = marker(pr.number, sha);
     const comments = await all(github.rest.issues.listComments, {issue_number: pr.number});
-    if (comments.some(c => c.user?.login === 'github-actions[bot]' &&
-        c.body?.includes(key))) continue;
-
     const runs = [];
     const workflows = await all(github.rest.actions.listRepoWorkflows, {});
     for (const workflow_id of ['ci.yml', 'dynamic/github-code-scanning/codeql']) {
@@ -124,7 +139,9 @@ async function notify({github, context, core, dryRun = false}) {
         .sort((a, b) => b.id - a.id)[0];
       if (run) runs.push(run);
     }
-    if (runs.length !== 2) { core.info(`PR #${pr.number}: PENDING (missing workflow)`); continue; }
+    if (runs.length !== 2) { core.info(`PR #${pr.number}: PENDING (missing workflow)`);
+      if (!dryRun) await supersede({github, repo, comments, keep: null, core});
+      continue; }
     const jobs = [];
     for (const run of runs) {
       jobs.push(...await all(github.rest.actions.listJobsForWorkflowRun, {
@@ -145,7 +162,20 @@ async function notify({github, context, core, dryRun = false}) {
     if (current.headRefOid !== sha || current.state !== 'OPEN') continue;
     const result = decide({runs, jobs, tier: classify(files), checks, statuses,
       mergeable: current.mergeable, mergeStateStatus: current.mergeStateStatus, draft: current.isDraft});
-    if (result.status === 'PENDING') { core.info(`PR #${pr.number}: PENDING`); continue; }
+    // Quiet states: log only, never mention. A draft is work in progress, and an
+    // UNKNOWN mergeability is GitHub still computing. Any earlier snapshot is stale.
+    const quiet = result.status === 'PENDING' || (result.status === 'BLOCKED' &&
+      (result.draft || current.mergeable === 'UNKNOWN' || current.mergeStateStatus === 'UNKNOWN'));
+    if (quiet) {
+      core.info(`PR #${pr.number}: ${result.status}${result.draft ? ' (draft)' : ''} - no notification`);
+      if (!dryRun) await supersede({github, repo, comments, keep: null, core});
+      continue;
+    }
+    const key = marker(pr.number, sha, result.status);
+    if (comments.some(c => isBot(c) && c.body?.includes(key))) {
+      if (!dryRun) await supersede({github, repo, comments, keep: key, core});
+      continue;
+    }
     // Recheck immediately before writing; a stale event must never bless a new head.
     const {data: fresh} = await github.rest.pulls.get({...repo, pull_number: pr.number});
     if (fresh.head.sha !== sha || fresh.base.sha !== current.baseRefOid || fresh.state !== 'open') continue;
@@ -159,11 +189,12 @@ async function notify({github, context, core, dryRun = false}) {
     const body = [
       key, `@kiehntre **${result.status}** — EmuWiz PR #${pr.number}`,
       '', `Head: \`${sha}\``, `PR: ${pr.html_url}`, '', ...details, ...links,
-      '', 'Snapshot for this exact head. One final notification per head; reruns do not replace it.',
+      '', 'Snapshot for this exact head and result. A changed result posts a new notification and marks this one superseded.',
       'Merge approval and a fresh exact-head merge-readiness check are still required.',
     ].join('\n');
-    if (dryRun) core.info(body);
-    else await github.rest.issues.createComment({...repo, issue_number: pr.number, body});
+    if (dryRun) { core.info(body); continue; }
+    await github.rest.issues.createComment({...repo, issue_number: pr.number, body});
+    await supersede({github, repo, comments, keep: key, core});
   }
 }
 
