@@ -247,6 +247,8 @@ jobs:
         run: python3 -B scripts/test_clippy_ratchet.py
       - name: Test the GUI sandbox's process limits
         run: python3 -B scripts/qa/test_gui_sandbox.py
+      - name: Test the GUI condition waiter
+        run: python3 -B scripts/qa/test_gui_wait.py
       - run: scripts/clippy-ratchet.sh
 
   # Independent of the workspace suite so unrelated failures there cannot stop
