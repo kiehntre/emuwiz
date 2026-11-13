@@ -1501,28 +1501,82 @@ impl App {
     /// The selected game's launch check: read-only, from the readiness
     /// answer Blue already holds. Its one button opens an existing screen.
     fn doctor_launch_check(&mut self, ui: &mut egui::Ui) {
-        let selected = self
+        let library = self.library.clone();
+        // A game chosen here runs the same quick readiness check as selecting
+        // it in the Library (no whole-file checksum). Otherwise the card
+        // follows the game last opened in Browse & Play, read-only.
+        let on_screen = self
             .native_workflows
             .as_ref()
             .and_then(|workflows| workflows.selected_game_on_screen())
-            .filter(|(id, path)| {
-                self.library
-                    .game(*id)
-                    .is_some_and(|game| game.archive.absolute_path == *path)
+            .map(|(id, _)| id);
+        let picked = self
+            .doctor_picker
+            .current(on_screen)
+            .and_then(|id| library.game(id))
+            .cloned();
+        let summary = if let Some(game) = &picked {
+            let id = game.archive.id;
+            let path = &game.archive.absolute_path;
+            let workflows = self.native_workflows.get_or_insert_with(|| {
+                super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
             });
-        let summary = selected.as_ref().and_then(|(id, path)| {
+            workflows.note_catalogue_row(&game.archive);
+            let (summary, _) = workflows.readiness_projection(
+                ui.ctx(),
+                id,
+                path,
+                game.archive.identity_report.as_ref(),
+                game.dat_exact.is_some(),
+                false,
+                &mut self.activity,
+            );
+            // Only this game's own answer is ever shown.
+            (workflows.selected_game_on_screen().as_ref() == Some(&(id, path.clone())))
+                .then_some((id, summary))
+        } else {
             self.native_workflows
                 .as_ref()
-                .and_then(|workflows| workflows.readiness_summary(*id, path))
-        });
-        let diagnosis = super::doctor_launch_check::diagnose(summary.as_ref());
-        let title = selected
-            .as_ref()
-            .and_then(|(id, _)| self.library.game(*id))
+                .and_then(|workflows| workflows.selected_game_on_screen())
+                .filter(|(id, path)| {
+                    library
+                        .game(*id)
+                        .is_some_and(|game| game.archive.absolute_path == *path)
+                })
+                .and_then(|(id, path)| {
+                    self.native_workflows
+                        .as_ref()
+                        .and_then(|workflows| workflows.readiness_summary(id, &path))
+                        .map(|summary| (id, summary))
+                })
+        };
+        let diagnosis = match (&picked, &summary) {
+            (Some(_), None) => super::doctor_launch_check::checking(),
+            _ => super::doctor_launch_check::diagnose(summary.as_ref().map(|(_, summary)| summary)),
+        };
+        if diagnosis.verdict == super::doctor_launch_check::Verdict::Checking {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        let shown = summary.as_ref().map(|(id, _)| *id);
+        let title = shown
+            .and_then(|id| library.game(id))
+            .or(picked.as_ref())
             .map(|game| game.title.clone());
-        let pressed = super::doctor_launch_check::show(ui, title.as_deref(), &diagnosis);
+        let pressed = super::doctor_launch_check::show(
+            ui,
+            title.as_deref(),
+            &diagnosis,
+            &mut self.doctor_picker.query,
+        );
+        if let Some(id) =
+            super::doctor_launch_check::show_matches(ui, &self.doctor_picker.query, &library.games)
+        {
+            self.doctor_picker.pick(id);
+            ui.ctx().request_repaint();
+        }
         ui.add_space(theme::SPACE_SM);
-        if let (Some(action), Some((id, _))) = (pressed, selected)
+        if let (Some(action), Some(id)) = (pressed, shown)
             && let Some(route) = super::doctor_launch_check::route(action, id)
         {
             self.go(route);

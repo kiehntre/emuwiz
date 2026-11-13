@@ -151,8 +151,10 @@ fn unknown_checking_and_stale_states_are_never_ready() {
     assert_eq!(diagnose(None).verdict, Verdict::NotChecked);
     assert_eq!(diagnose(None).action, None);
     let d = diagnose(Some(&summary(S::Checking, vec![])));
-    assert_eq!(d.verdict, Verdict::NotChecked);
+    assert_eq!(d.verdict, Verdict::Checking);
+    assert_eq!(verdict_label(d.verdict), "Checking");
     assert_eq!(d.action, None);
+    assert_eq!(checking().verdict, Verdict::Checking);
     let mut stale = summary(S::Ready, vec![]);
     stale.freshness = ReadinessFreshness::Stale;
     stale.primary_action = Some(ReadinessAction::RecheckReadiness);
@@ -201,7 +203,7 @@ fn status_and_action_fit_a_1024_by_600_window() {
         },
         |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                show(ui, Some("Some Game"), &diagnosis);
+                show(ui, Some("Some Game"), &diagnosis, &mut String::new());
             });
         },
     );
@@ -237,4 +239,96 @@ fn setup_and_doctor_leads_with_the_launch_check_above_the_fold_at_1024_by_600() 
             "{needle} below the fold"
         );
     }
+}
+
+fn picker_library() -> crate::gui_v2::library::Library {
+    use crate::gui_v2::tests::archive;
+    crate::gui_v2::library::Library::new(vec![
+        archive(1, "Super Mario World", Some("SNES")),
+        archive(2, "Sonic the Hedgehog", Some("Mega Drive")),
+        archive(3, "Mario Kart 64", Some("N64")),
+    ])
+}
+
+#[test]
+fn picker_search_matches_every_word_in_title_or_platform() {
+    let library = picker_library();
+    let titles = |query: &str| {
+        matches(&library.games, query)
+            .into_iter()
+            .map(|game| game.title.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(titles("").is_empty(), "an empty query lists nothing");
+    assert!(titles("   ").is_empty());
+    let mario = titles("mario");
+    assert_eq!(mario.len(), 2);
+    assert!(mario.iter().all(|title| title.contains("Mario")));
+    assert_eq!(titles("mario 64").len(), 1);
+    assert_eq!(titles("zelda").len(), 0);
+}
+
+#[test]
+fn picker_limits_the_match_list() {
+    use crate::gui_v2::tests::archive;
+    let many = crate::gui_v2::library::Library::new(
+        (1..=20)
+            .map(|id| archive(id, &format!("Game {id}"), Some("SNES")))
+            .collect(),
+    );
+    assert_eq!(matches(&many.games, "game").len(), PICKER_LIMIT);
+}
+
+#[test]
+fn a_picked_game_is_kept_until_another_game_is_opened_elsewhere() {
+    let mut picker = Picker::default();
+    assert_eq!(
+        picker.current(Some(1)),
+        None,
+        "default follows the last opened game"
+    );
+    picker.pick(2);
+    assert!(picker.query.is_empty());
+    // The pick frame: the check for game 2 has not been started yet.
+    assert_eq!(picker.current(Some(1)), Some(2));
+    // The check now belongs to game 2.
+    assert_eq!(picker.current(Some(2)), Some(2));
+    // Another game opened in Browse & Play: follow it again.
+    assert_eq!(picker.current(Some(3)), None);
+    assert_eq!(picker.game, None);
+}
+
+#[test]
+fn picking_a_game_checks_that_game_and_never_shows_another_games_answer() {
+    use crate::gui_v2::tests::{fixture, frame, text};
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = std::sync::Arc::new(picker_library());
+    app.welcome_dismissed = true;
+    app.router.current = Route::Section(Section::Setup);
+    app.doctor_picker.query = "sonic".into();
+    let strings = text(&frame(&context, &mut app, [1024.0, 600.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.starts_with("Sonic the Hedgehog ("))
+    );
+    assert!(!strings.iter().any(|s| s.starts_with("Super Mario World (")));
+    app.doctor_picker.pick(2);
+    for _ in 0..3 {
+        let strings = text(&frame(&context, &mut app, [1024.0, 600.0]));
+        assert!(strings.iter().any(|s| s == "Sonic the Hedgehog"));
+        assert!(
+            !strings.iter().any(|s| s == "Ready"),
+            "never Ready without an answer"
+        );
+        // The existing readiness check now belongs to the picked game.
+        let on_screen = app
+            .native_workflows
+            .as_ref()
+            .and_then(|workflows| workflows.selected_game_on_screen())
+            .map(|(id, _)| id);
+        assert_eq!(on_screen, Some(2));
+    }
+    assert_eq!(app.doctor_picker.game, Some(2));
 }
