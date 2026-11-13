@@ -1316,7 +1316,6 @@ impl NativeWorkflows {
     /// Reuse the same current plan and candidate policy as Launch. Never
     /// substitute an inventory installation or select a different candidate.
     /// The game a Play is waiting on the Launch page for, if any.
-    #[cfg(test)]
     pub(super) fn play_pending(&self) -> Option<i64> {
         self.pending_play.map(|(game, _)| game)
     }
