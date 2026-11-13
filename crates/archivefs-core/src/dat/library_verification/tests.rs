@@ -1670,3 +1670,23 @@ fn ambiguous_multi_member_and_malformed_zips_stay_unverified() {
             .is_none_or(|(state, _)| state != "verified_single_match")
     );
 }
+
+#[test]
+fn headered_zip_member_of_an_incomplete_multi_rom_set_is_not_verified() {
+    let f = Fixture::new();
+    let (full, payload) = lynx(2, 3);
+    let extra = body(256, 7);
+    std::fs::write(&f.dat, format!(
+        "<datafile><header><name>Atari - Atari Lynx (LYX)</name><description>Atari - Atari Lynx (LYX)</description><version>synthetic-1</version><homepage>No-Intro</homepage><url>https://www.no-intro.org</url></header><game name=\"Cart (USA)\"><rom name=\"Cart (USA).lyx\" size=\"{}\" sha1=\"{}\"/><rom name=\"Extra.bin\" size=\"{}\" sha1=\"{}\"/></game></datafile>",
+        payload.len(), sha1_hex(&payload), extra.len(), sha1_hex(&extra))).unwrap();
+    f.add(1, "partial.zip", Some(b"x"), Some("Atari Lynx"));
+    f.zip("partial.zip", "Cart (USA).lnx", &full);
+    let t = f.run_for("Atari Lynx");
+    assert_eq!(t.verified, 0, "{:?}", t.unchecked);
+    assert!(
+        f.saved_state(1)
+            .is_none_or(|(state, _)| state != "verified_single_match"),
+        "{:?}",
+        f.saved_state(1)
+    );
+}

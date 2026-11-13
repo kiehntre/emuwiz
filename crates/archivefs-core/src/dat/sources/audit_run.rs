@@ -867,7 +867,7 @@ pub fn run_dat_audit_with_targets(
         };
 
     let mut archives = archives;
-    match_zip_members_after_header_removal(
+    let normalized = match_zip_members_after_header_removal(
         &mut archives,
         &index,
         request.platform.as_deref(),
@@ -876,6 +876,22 @@ pub fn run_dat_audit_with_targets(
     );
     if cancelled(cancel) {
         return Err(DatAuditError::Cancelled);
+    }
+    // Set resolutions were classified from the whole-member verdicts; an
+    // archive whose members changed must be reclassified, or an incomplete
+    // multi-ROM set would have no (partial) resolution to block projection.
+    for archive in archives
+        .iter()
+        .filter(|a| normalized.contains(&a.archive_path))
+    {
+        sets.retain(|set| set.archive_path != archive.archive_path);
+        sets.extend(classify_archive_sets(
+            archive,
+            &disk_evidence,
+            disk_scan_complete,
+            &catalogue_games,
+            &request.source_id,
+        ));
     }
 
     // Disk-only sets (a game declaring `<disk>`s and zero `<rom>`s) are never
@@ -1032,13 +1048,14 @@ fn match_zip_members_after_header_removal(
     platform: Option<&str>,
     trusted: &TrustedRoots,
     cancel: &AtomicBool,
-) {
+) -> std::collections::HashSet<PathBuf> {
     use crate::dat::header_match::{
         HeaderHashOutcome, extension_fits_kind, hash_zip_member_after_header,
         header_kind_for_platform, headerless_algorithm_label,
     };
+    let mut normalized = std::collections::HashSet::new();
     let Some(kind) = platform.and_then(header_kind_for_platform) else {
-        return;
+        return normalized;
     };
     for archive in archives.iter_mut() {
         if archive.format != "zip" || !matches!(archive.completion, ArchivePassCompletion::Complete)
@@ -1047,7 +1064,7 @@ fn match_zip_members_after_header_removal(
         }
         for member in archive.members.iter_mut() {
             if cancelled(cancel) {
-                return;
+                return normalized;
             }
             if !matches!(member.verdict, Some(AuditVerdict::NotInDat))
                 || member.evidence.is_nested_archive
@@ -1079,7 +1096,9 @@ fn match_zip_members_after_header_removal(
                     .with_crc32(header_match.headerless_crc32.clone())
                     .with_md5(header_match.headerless_md5.clone())
                     .with_sha1(header_match.headerless_sha1.clone());
-            member.verdict = match audit_one(&headerless, index) {
+            let headerless_verdict = audit_one(&headerless, index);
+            let headerless_refs = matched_refs_for_verdict(&headerless_verdict, &headerless, index);
+            member.verdict = match headerless_verdict {
                 AuditVerdict::Exact {
                     game_name,
                     rom_name,
@@ -1102,11 +1121,13 @@ fn match_zip_members_after_header_removal(
                 }),
                 _ => continue,
             };
-            // Positional refs describe the whole-member lookup; the
-            // headerless verdict carries its own names.
-            member.matched_refs.clear();
+            // Positional refs come from the headerless lookup, so set
+            // classification sees the same slots the verdict names.
+            member.matched_refs = headerless_refs;
+            normalized.insert(archive.archive_path.clone());
         }
     }
+    normalized
 }
 
 /// S03-05 for one catalogue. `platform` is the request's platform: the
