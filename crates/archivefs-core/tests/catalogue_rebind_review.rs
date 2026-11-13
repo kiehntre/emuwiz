@@ -661,7 +661,7 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
 
     archivefs_core::upgrade_library_database(&path).unwrap();
     let db = Database::open_or_create(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 26);
+    assert_eq!(db.schema_version().unwrap(), 27);
     let sql = Connection::open(&path).unwrap();
     // Historical tables are preserved row for row; the new ones start empty.
     let after = everything_but_bindings(&sql);
@@ -732,7 +732,7 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
     drop(db);
     let reopened = everything_but_bindings(&Connection::open(&path).unwrap());
     let db = Database::open_or_create(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 26);
+    assert_eq!(db.schema_version().unwrap(), 27);
     assert_eq!(
         everything_but_bindings(&Connection::open(&path).unwrap()),
         reopened
