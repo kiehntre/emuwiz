@@ -8,7 +8,10 @@
 //! * covers come from the same bounded artwork pipeline, and only the tiles on
 //!   screen are drawn, so the size of the library does not change a frame;
 //! * Play opens the unchanged Launch page. An emulator starts only when its
-//!   Launch button is activated there, with every existing check and refusal.
+//!   Launch button, or Big Picture's own Play above it (the game card's Play:
+//!   the planner's single safe request), is activated there, with every
+//!   existing check and refusal. That Play has the focus when the page opens,
+//!   so A, A, A from the shelf reaches it without hunting for a control.
 //!
 //! Controller input is ignored while an emulator runs or the window is not
 //! focused, because evdev delivers it to every reader regardless of focus.
@@ -145,6 +148,13 @@ pub(super) struct BigPicture {
     actions: Vec<GameAction>,
     action: usize,
     play_refusal: Option<String>,
+    /// The Launch step offers Big Picture's own Play: it was offered where
+    /// the step was opened from.
+    launch_play: bool,
+    /// The Launch step's first focus is still to be given.
+    launch_focus: bool,
+    /// A Play pressed on the Launch step is waiting on its checks.
+    play_waiting: bool,
     notice: Option<Notice>,
     leave_armed_until: Option<f64>,
     /// The last controller X, while a second one would still be a double tap.
@@ -157,6 +167,8 @@ pub(super) struct BigPicture {
     injected: Vec<PadEvent>,
     #[cfg(test)]
     launch_active: bool,
+    #[cfg(test)]
+    play_button: Option<egui::Id>,
 }
 
 impl BigPicture {
@@ -183,6 +195,9 @@ impl BigPicture {
             actions: Vec::new(),
             action: 0,
             play_refusal: None,
+            launch_play: false,
+            launch_focus: false,
+            play_waiting: false,
             notice: None,
             leave_armed_until: None,
             x_tap: None,
@@ -193,6 +208,8 @@ impl BigPicture {
             injected: Vec::new(),
             #[cfg(test)]
             launch_active: false,
+            #[cfg(test)]
+            play_button: None,
         }
     }
 
@@ -297,6 +314,14 @@ impl BigPicture {
     }
 
     fn enter_step(&mut self, step: Step) {
+        let launch = matches!(step, Step::Launch(_));
+        // The shelf has no current answer, so Play is offered as on the
+        // Library card; from the game, only where the game offered it. The
+        // Launch planner still decides either way.
+        self.launch_play =
+            launch && (self.step == Step::Browse || self.actions.contains(&GameAction::Play));
+        self.launch_focus = launch;
+        self.play_waiting = false;
         self.step = step;
         self.action = 0;
         self.actions.clear();
@@ -386,6 +411,74 @@ fn action_label(action: GameAction) -> &'static str {
         GameAction::Play => "Play",
         GameAction::Fix(fix) => readiness::action_label(fix),
         GameAction::Details => "Game details",
+    }
+}
+
+/// Where the Game step's focus goes when its actions are rebuilt: the same
+/// action if it is still offered, else the first (Play when offered, the fix
+/// for a refusal). A check that finishes never moves focus to another button
+/// under the person's thumb.
+fn refocus(previous: Option<GameAction>, actions: &[GameAction]) -> usize {
+    previous
+        .and_then(|previous| actions.iter().position(|action| *action == previous))
+        .unwrap_or(0)
+}
+
+/// What a Launch-step Play says when it did not start the game at once.
+/// `None` once it started: the running-game strip says the rest.
+fn launch_play_notice(started: bool, waiting: bool) -> Option<Notice> {
+    if started {
+        None
+    } else if waiting {
+        Some(Notice::new(
+            Tone::Info,
+            "Checking that this game can start. It starts only if the check passes.",
+        ))
+    } else {
+        Some(Notice::new(
+            Tone::Warning,
+            "Play cannot start this game on its own. The launch check below says why, or asks you to choose an emulator.",
+        ))
+    }
+}
+
+/// An Enter or Space that only auto-repeats (a key still held from the step
+/// before) is not a press, so holding Enter never runs Play by itself.
+fn only_repeated_activation(input: &egui::InputState) -> bool {
+    let (mut fresh, mut repeated) = (false, false);
+    for event in &input.events {
+        if let egui::Event::Key {
+            key: egui::Key::Enter | egui::Key::Space,
+            pressed: true,
+            repeat,
+            ..
+        } = event
+        {
+            if *repeat {
+                repeated = true;
+            } else {
+                fresh = true;
+            }
+        }
+    }
+    repeated && !fresh
+}
+
+/// The Launch step opens with focus on its Play, or, where Play is not
+/// offered, on the page's first control, so A or Enter is never a dead end.
+/// Waits for controls that arrive with the readiness check; ends at the
+/// first focus, the person's first input, or a click.
+fn launch_first_focus(context: &egui::Context, state: &mut BigPicture) {
+    if !state.launch_focus {
+        return;
+    }
+    if context.input(|input| input.pointer.any_pressed()) {
+        state.launch_focus = false;
+    } else if context.memory(|memory| memory.focused()).is_some() {
+        state.launch_focus = false;
+    } else {
+        // From nothing focused, Next lands on the first focusable control.
+        context.memory_mut(|memory| memory.move_focus(egui::FocusDirection::Next));
     }
 }
 
@@ -676,6 +769,8 @@ impl App {
             Step::Browse => self.browse_command(state, command, now),
             Step::Game(id) => self.game_command(state, context, id, command),
             Step::Launch(id) => {
+                // Any input is the person's own move: the first focus is theirs.
+                state.launch_focus = false;
                 if command == Command::Back {
                     state.enter_step(Step::Game(id));
                 } else {
@@ -868,6 +963,83 @@ impl App {
         state.enter_step(Step::Launch(id));
     }
 
+    /// Big Picture's own Play on the Launch step: the game card's Play
+    /// (`ReadinessAction::Play`), the same planner request as X twice. Only
+    /// a fresh press or click runs it; the page below shows every check, and
+    /// a refusal or a needed choice stays there with nothing started.
+    fn big_picture_launch_play(&mut self, ui: &mut egui::Ui, state: &mut BigPicture, id: i64) {
+        if !state.launch_play
+            || self
+                .library
+                .game(id)
+                .is_none_or(|game| game.is_preservation_only())
+        {
+            return;
+        }
+        let pending = |app: &Self| {
+            app.native_workflows
+                .as_ref()
+                .is_some_and(|workflows| workflows.play_pending() == Some(id))
+        };
+        let started = |app: &Self| {
+            app.native_workflows
+                .as_ref()
+                .is_some_and(|workflows| workflows.launch_in_progress())
+        };
+        if state.play_waiting && !pending(self) {
+            // The checks answered: it started, or it was refused below.
+            state.play_waiting = false;
+            state.notice = launch_play_notice(started(self), false);
+        }
+        let mut activated = false;
+        ui.horizontal(|ui| {
+            let button = egui::Button::new(RichText::new("Play").size(24.0).strong())
+                .min_size(egui::vec2(220.0, 72.0))
+                .fill(blue::PRIMARY_ACTION);
+            let response = ui.add(button);
+            if state.launch_focus {
+                response.request_focus();
+            }
+            if response.has_focus() {
+                ui.painter().rect_stroke(
+                    response.rect,
+                    6.0,
+                    egui::Stroke::new(FOCUS_WIDTH, blue::ACCENT),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            activated = response.clicked()
+                && (response.clicked_by(egui::PointerButton::Primary)
+                    || !ui.input(only_repeated_activation));
+            #[cfg(test)]
+            {
+                state.play_button = Some(response.id);
+            }
+            ui.add_space(GAP);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(readiness::PLAY_RUNS_THE_CHECK)
+                        .size(20.0)
+                        .color(blue::BODY_TEXT),
+                )
+                .wrap(),
+            );
+        });
+        ui.add_space(GAP);
+        if !activated {
+            return;
+        }
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        // Already on this game's Launch page: the fallback route is where we are.
+        let _ = workflows.readiness_action_route(ui.ctx(), ReadinessAction::Play, id);
+        let waiting = pending(self);
+        state.play_waiting = waiting;
+        state.notice = launch_play_notice(started(self), waiting);
+        ui.ctx().request_repaint();
+    }
+
     fn game_action(
         &mut self,
         state: &mut BigPicture,
@@ -929,7 +1101,9 @@ impl App {
                     for font in style.text_styles.values_mut() {
                         font.size *= PAGE_TEXT_SCALE;
                     }
+                    self.big_picture_launch_play(ui, state, id);
                     self.launch(ui, id);
+                    launch_first_focus(ui.ctx(), state);
                 }
             });
         if let Some(overlay) = state.overlay.take() {
@@ -1170,10 +1344,11 @@ impl App {
             return;
         };
         let view = (!game.is_preservation_only()).then(|| self.big_picture_readiness(ui, &game));
+        let previous = state.actions.get(state.action).copied();
         state.actions = view
             .as_ref()
             .map_or_else(|| vec![GameAction::Details], game_actions);
-        state.action = state.action.min(state.actions.len() - 1);
+        state.action = refocus(previous, &state.actions);
         state.play_refusal = view
             .as_ref()
             .filter(|view| !view.play_enabled)
@@ -1559,6 +1734,9 @@ impl BigPicture {
     pub(super) fn set_launch_active(&mut self, active: bool) {
         self.launch_active = active;
     }
+    pub(super) fn play_button(&self) -> Option<egui::Id> {
+        self.play_button
+    }
     pub(super) fn set_connected(&mut self) {
         self.pad_status = PadStatus::Connected(vec!["Test pad".into()]);
         self.fullscreen = true;
@@ -1609,6 +1787,61 @@ mod tests {
                 GameAction::Details
             ]
         );
+    }
+
+    #[test]
+    fn a_finished_check_keeps_focus_on_the_same_action_or_falls_back_to_the_first() {
+        let fix = GameAction::Fix(ReadinessAction::ReviewIdentity);
+        let checking = [GameAction::Play, fix, GameAction::Details];
+        assert_eq!(refocus(None, &checking), 0, "Play first on a fresh step");
+        assert_eq!(refocus(Some(fix), &[fix, GameAction::Details]), 0);
+        assert_eq!(
+            refocus(
+                Some(GameAction::Details),
+                &[GameAction::Play, GameAction::Details]
+            ),
+            1,
+            "Details stays focused when the fix goes"
+        );
+        assert_eq!(
+            refocus(Some(GameAction::Play), &[fix, GameAction::Details]),
+            0,
+            "a refusal removes Play: focus is on its fix, never on a stale Play"
+        );
+    }
+
+    #[test]
+    fn launch_offers_play_only_where_it_was_opened_with_play_offered() {
+        let mut state = BigPicture::new(None, None);
+        state.enter_step(Step::Launch(1));
+        assert!(state.launch_play && state.launch_focus, "from the shelf");
+        state.enter_step(Step::Game(1));
+        assert!(!state.launch_play && !state.launch_focus);
+        state.actions = vec![
+            GameAction::Fix(ReadinessAction::ChooseEmulator),
+            GameAction::Details,
+        ];
+        state.enter_step(Step::Launch(1));
+        assert!(!state.launch_play, "a refused game gets no Play there");
+        assert!(
+            state.launch_focus,
+            "but its first control still takes focus"
+        );
+        state.enter_step(Step::Game(1));
+        state.actions = vec![GameAction::Play, GameAction::Details];
+        state.play_waiting = true;
+        state.enter_step(Step::Launch(1));
+        assert!(state.launch_play);
+        assert!(!state.play_waiting, "a new visit never inherits a wait");
+    }
+
+    #[test]
+    fn launch_play_says_what_it_did_without_claiming_a_start() {
+        assert_eq!(launch_play_notice(true, false), None);
+        assert_eq!(launch_play_notice(false, true).unwrap().tone, Tone::Info);
+        let refused = launch_play_notice(false, false).unwrap();
+        assert_eq!(refused.tone, Tone::Warning);
+        assert!(refused.text.contains("cannot start"));
     }
 
     #[test]
