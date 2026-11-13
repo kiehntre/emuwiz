@@ -1271,14 +1271,16 @@ impl App {
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
         workflows.note_catalogue_row(&game.archive);
-        workflows.compact_readiness(
+        let view = workflows.compact_readiness(
             ui.ctx(),
             game.archive.id,
             &game.archive.absolute_path,
             game.archive.identity_report.as_ref(),
             game.dat_exact.is_some(),
             &mut self.activity,
-        )
+        );
+        self.note_checked_readiness(game, &view);
+        view
     }
 
     fn big_picture_overlay(
