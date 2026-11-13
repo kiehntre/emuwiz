@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use sha2::{Digest, Sha256};
 
 use super::catalogue_selection::ResolvedCatalogue;
+use super::header_match::extension_fits_kind;
 use super::identity::{DatPlatformIdentity, identify_dat_source};
 use super::library_identity_projection::project_dat_audit_for_library_identity;
 use super::library_identity_summary::DatVerificationState;
@@ -351,6 +352,7 @@ fn preview_verification(
     if formats.is_empty() {
         return Err("This catalogue has no supported ROM content hashes. Names, CRC-only, SHA-256-only and disk-only catalogues cannot provide this verification.".into());
     }
+    let header_kind = super::header_match::header_kind_for_platform(&platform);
     let db = Database::open_read_only(&database_path).map_err(|e| e.to_string())?;
     let rows = db.load_archives().map_err(|e| e.to_string())?;
     let mut path_counts = BTreeMap::new();
@@ -481,6 +483,12 @@ fn preview_verification(
         } else if !preview.formats.contains(&ext(&path))
             && !(parsed.source.packing_policy != DatPackingPolicy::FileOnly
                 && matches!(ext(&path).as_str(), "zip" | "7z"))
+            // A headered NES/Lynx/7800 file (".nes", ".lnx", ".a78") is
+            // compared with a headerless catalogue (".unh", ".lyx", ".bin")
+            // after its verified header is ignored. Its extension is never in
+            // that catalogue's formats, so it can only be verified, never
+            // recorded as a definitive negative.
+            && !header_kind.is_some_and(|kind| extension_fits_kind(&path, kind))
         {
             Some("Format not represented by this catalogue or unsupported container")
         } else {
