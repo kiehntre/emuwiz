@@ -15,6 +15,11 @@ guessing at intent, dates, or scope.
 
 Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
+- Check Games: a "Saved results that need checking again" card lists saved
+  catalogue results that no longer count (and why), and can check those games
+  again with progress and Stop. Finished sets stay saved; Continue checks the
+  rest. Results that cannot be checked now are listed with the reason.
+- Verifying games is faster: the CRC-32 step no longer limits hashing speed.
 - DAT verification: `emuwiz-cli dat recheck` lists saved DAT results that are
   no longer backed by current evidence (saved before proof was recorded, file
   changed, catalogue changed) and, with `--confirm`, checks those games again
