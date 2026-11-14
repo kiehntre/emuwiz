@@ -4895,7 +4895,19 @@ fn prepare_managed_root(root: &Path) -> Result<(), SharedApplyFailureKind> {
         .parent()
         .ok_or(SharedApplyFailureKind::ManagedRootUnsafe)?;
     reject_symlink_components(parent)?;
-    fs::create_dir(root).map_err(|_| SharedApplyFailureKind::ManagedRootUnsafe)
+    match fs::create_dir(root) {
+        Ok(()) => Ok(()),
+        // Another install made the folder between the look above and this
+        // attempt (two installs starting at once on a profile that has
+        // never had one). It is then judged like any folder that was
+        // already there, not refused for existing.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            validate_destination_root(root)
+                .map(|_| ())
+                .map_err(|_| SharedApplyFailureKind::ManagedRootUnsafe)
+        }
+        Err(_) => Err(SharedApplyFailureKind::ManagedRootUnsafe),
+    }
 }
 
 fn create_one_parent(root: &Path, parent: &Path) -> Result<(), SharedApplyFailureKind> {
@@ -10698,6 +10710,40 @@ mod tests {
         fs::create_dir(&receipt).unwrap();
         assert_eq!(try_undo(&fixture, &journal, "folder"), (false, None));
         assert!(fixture.destination_root().join(INSTALLED).exists());
+    }
+
+    /// Two installs starting at the same moment on a profile that has never
+    /// had one both need EmuWiz's history and backup folders made. Whichever
+    /// loses the race to make a folder must find it made, not be refused.
+    #[test]
+    fn installs_that_start_together_can_both_prepare_a_folder_that_does_not_exist_yet() {
+        use std::sync::{Arc, Barrier};
+        let fixture = Fixture::new("managed-root-race");
+        for round in 0..40 {
+            let root = fixture.0.join(format!("managed-{round}"));
+            let together = Arc::new(Barrier::new(8));
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let root = root.clone();
+                    let together = Arc::clone(&together);
+                    std::thread::spawn(move || {
+                        together.wait();
+                        prepare_managed_root(&root)
+                    })
+                })
+                .collect();
+            for worker in workers {
+                assert_eq!(worker.join().unwrap(), Ok(()), "round {round}");
+            }
+            assert!(root.is_dir());
+        }
+        // Something that is not a folder in its place is still refused.
+        let occupied = fixture.0.join("occupied");
+        fs::write(&occupied, b"not a folder").unwrap();
+        assert_eq!(
+            prepare_managed_root(&occupied),
+            Err(SharedApplyFailureKind::ManagedRootUnsafe)
+        );
     }
 
     #[test]
