@@ -1,0 +1,12 @@
+[INFO] === Build =======================================
+[INFO] CPU Model Name: Example CPU
+[INFO] Capabilities: MMX MMXEXT SSE SSE2 SSE3 SSSE3 SSE4 SSE42 AES AVX AVX2 
+[INFO] Version: 1.21.0
+[INFO] Built: May 28 2025
+[INFO] =================================================
+[INFO] [Input]: Found input driver: "x".
+[INFO] [Core]: Loading dynamic libretro core from: "/scratch/fix/notacore_libretro.so"
+[ERROR] Failed to open libretro core: "/scratch/fix/notacore_libretro.so"
+Error(s): /scratch/fix/notacore_libretro.so: file too short
+[INFO] [Core]: Content ran for a total of: 00 hours, 00 minutes, 00 seconds.
+[INFO] [Core]: Unloading core symbols..

@@ -15,6 +15,17 @@ guessing at intent, dates, or scope.
 
 Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
+- Command line: `emuwiz-cli diagnose-launch` explains a failed emulator launch
+  from what it left behind: how the process ended, what the emulator printed,
+  its settings and a look at the files involved. It reports what happened
+  separately from why, names the evidence behind every conclusion, lists what
+  was not observed, and leaves a failure unexplained when the evidence does not
+  explain it. What happened to the launch is stated apart from the verdict, and
+  what you type about the launch (how it ended, its environment) is taken as
+  supplied: it can suggest a cause, never establish one. Read-only: it starts
+  nothing and changes nothing. RetroArch is the
+  only emulator with log and settings support so far; for others it covers the
+  process exit, missing libraries and sandbox refusals. Not yet in Blue.
 - Check Games: a "Saved results that need checking again" card lists saved
   catalogue results that no longer count (and why), and can check those games
   again with progress and Stop. Finished sets stay saved; Continue checks the
