@@ -377,23 +377,27 @@ fn replaced_or_removed_executable_is_refused() {
 /// the fake's, so no listing made before can match it, whatever inode the
 /// filesystem hands out and however close together the two were written.
 ///
-/// A byte-identical replacement is not a reliable "different file" for a
-/// test: written within one kernel timestamp tick of the original, on the
-/// inode the removed file just freed, it is equal in every attribute a
-/// freshness check compares (device, inode, size, modification time, status
-/// change time). That is the documented limit of `CapturedFileIdentity`,
-/// and it made the test above fail now and then.
+/// A replacement of the *same size* is not a reliable "different file" for a
+/// test, whatever its bytes: written within one kernel timestamp tick of
+/// the original, on the inode the removed file just freed, it is equal in
+/// every attribute a freshness check compares (device, inode, size,
+/// modification time, status change time) and is started. That is the
+/// documented limit of `CapturedFileIdentity` (issue #478), and it made the
+/// test above fail now and then. This helper makes the tests reliable; it
+/// does not remove that limit.
 fn replace_with_a_different_program(executable: &Path) {
     fs::write(executable, "#!/bin/sh\n# a different program\nexit 0\n").unwrap();
     fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[test]
-fn a_replaced_executable_is_refused_however_quickly_it_was_replaced() {
+fn a_replacement_of_a_different_size_is_refused_however_quickly_it_was_written() {
     // Remove and replace as fast as the machine allows, many times over:
     // the replacement often lands on the inode that was just freed, within
-    // the same timestamp tick. It must be refused every time, and never
-    // started.
+    // the same timestamp tick, so size is then the only attribute left that
+    // tells the two apart. It must be refused every time, and never
+    // started. (A same-size replacement in the same tick would not be:
+    // issue #478.)
     for round in 0..500 {
         let f = fixture();
         install(&f.config_root, "PCSE00001", "PCSE00001", "Homebrew", "HB");
