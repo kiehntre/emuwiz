@@ -282,6 +282,7 @@ impl Controller {
                 let result = environment_binding().map(|binding| gather(&key, binding));
                 let _ = sender.send((generation, key, result));
                 if let Some(context) = repaint {
+                    crate::emulator_setup::answers::arrived(&context);
                     context.request_repaint();
                 }
             });
