@@ -1,3 +1,7 @@
+// The independent reviewer's tests further down are kept as written,
+// including a few style points Clippy would rather see written differently.
+#![allow(clippy::let_and_return, clippy::unnecessary_cast)]
+
 use super::*;
 use crate::ingestion::{
     bounded_import::{apply_bounded_import, begin_bounded_preview, prepare_bounded_import},

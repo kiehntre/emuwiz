@@ -1,10 +1,14 @@
+// The independent reviewers' tests further down are kept as they wrote them,
+// including a few style points Clippy would rather see written differently.
+#![allow(clippy::collapsible_match, clippy::let_and_return)]
+
 use super::*;
 use crate::dat::reaudit::{
     ReauditBlock, ReauditLimits, ReauditPlan, ReauditProgress, ReauditReport, ReauditStop,
     plan_reaudit, run_reaudit,
 };
 use crate::database::SavedDatEvidenceStatus as Status;
-use sha1::{Digest as _, Sha1};
+use sha1::Sha1;
 use std::cell::Cell;
 
 fn body(n: usize) -> Vec<u8> {

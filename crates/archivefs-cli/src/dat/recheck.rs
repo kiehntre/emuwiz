@@ -333,7 +333,10 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     }
     // SAFETY: the handler only stores to an atomic.
     unsafe {
-        libc::signal(libc::SIGINT, on_interrupt as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            on_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
     }
     let trusted = Config::load_default()
         .ok()
