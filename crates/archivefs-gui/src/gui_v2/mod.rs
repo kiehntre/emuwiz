@@ -84,6 +84,8 @@ mod organise;
 mod osk;
 mod pad_mouse;
 mod pad_shell;
+#[cfg(target_os = "linux")]
+mod relocation_page;
 mod saved_recheck;
 mod suggest;
 pub(crate) use pad_shell::mark_secret;
