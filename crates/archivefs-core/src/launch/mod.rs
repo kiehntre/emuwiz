@@ -75,6 +75,8 @@ pub mod amiga_whdload_execution;
 pub mod amiga_whdload_trainer_launch;
 #[cfg(target_os = "linux")]
 pub mod atari800;
+#[cfg(target_os = "linux")]
+pub mod atari800_setup;
 pub mod azahar_command;
 pub mod azahar_execution;
 pub mod azahar_homebrew;

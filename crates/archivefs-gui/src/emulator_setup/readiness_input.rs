@@ -1339,6 +1339,11 @@ impl ReadinessSources<'_> {
                     firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
                 }),
         );
+        // Native Atari800: a candidate only when the program exists; its
+        // eligibility and firmware state come from the user's own setup.
+        #[cfg(target_os = "linux")]
+        standalone_profiles
+            .extend(crate::launch_readiness_page::atari800::standalone_profile_input());
         let snes9x_roots =
             archivefs_core::patch_manager::Snes9xProfileDiscoveryRoots::from_environment();
         standalone_profiles.extend(
