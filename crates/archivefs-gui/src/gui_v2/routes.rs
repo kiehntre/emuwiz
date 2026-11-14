@@ -787,10 +787,11 @@ pub(super) enum ToolPage {
     Vita3kTitles,
     OpenRct2,
     FolderCheck,
+    Relocation,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
@@ -812,6 +813,7 @@ impl ToolPage {
         Self::Vita3kTitles,
         Self::OpenRct2,
         Self::FolderCheck,
+        Self::Relocation,
     ];
 
     pub fn title(self) -> &'static str {
@@ -837,6 +839,7 @@ impl ToolPage {
             Self::Vita3kTitles => "PlayStation Vita (Vita3K) titles",
             Self::OpenRct2 => "RollerCoaster Tycoon 2 via OpenRCT2 (alternative)",
             Self::FolderCheck => "Organise my games",
+            Self::Relocation => "Move a game between library folders",
         }
     }
 
@@ -893,6 +896,9 @@ impl ToolPage {
             Self::FolderCheck => {
                 "Identify every game by its content, then move games in the wrong system folder (or with no known system) after one preview and approval. Undo puts them back."
             }
+            Self::Relocation => {
+                "Preview moving one game file to another library folder or drive, and see every recorded move with its true recovery state. Moving is disabled in this build."
+            }
         }
     }
 
@@ -919,6 +925,7 @@ impl ToolPage {
             Self::Vita3kTitles => Section::Games,
             Self::OpenRct2 => Section::Games,
             Self::FolderCheck => Section::Games,
+            Self::Relocation => Section::Games,
         }
     }
 
@@ -944,6 +951,7 @@ impl ToolPage {
             Self::Vita3kTitles => "Games & collection",
             Self::OpenRct2 => "Games & collection",
             Self::FolderCheck => "Games & collection",
+            Self::Relocation => "Games & collection",
         }
     }
 }

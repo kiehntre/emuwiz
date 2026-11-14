@@ -957,6 +957,24 @@ fn fd_entry(dir: &std::fs::File, name: &std::ffi::OsStr) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name)
 }
 
+/// Opens `parent` as a directory descriptor resolved FROM its trusted root
+/// with the per-component `O_NOFOLLOW` walk of [`RenameDirs::open_in`], for
+/// callers (the transformation engine) that need `*at` operations other than
+/// rename. Returns the descriptor and its (device, inode).
+#[cfg(unix)]
+pub(crate) fn open_dir_beneath(
+    parent: &Path,
+    trusted: &crate::safe_read::TrustedRoots,
+) -> io::Result<(std::fs::File, (u64, u64))> {
+    open_under_root(parent, trusted).map(|(file, id, _root)| (file, id))
+}
+
+/// `/proc/self/fd/N/<name>` for a retained directory descriptor.
+#[cfg(unix)]
+pub(crate) fn entry_in(dir: &std::fs::File, name: &std::ffi::OsStr) -> std::path::PathBuf {
+    fd_entry(dir, name)
+}
+
 #[cfg(unix)]
 fn path_identity(path: &Path) -> io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
