@@ -37,7 +37,7 @@ use super::signatures::{HOST_EMULATOR, HOST_SIGNATURES};
 use super::{limitations, retroarch};
 
 /// Changes when the engine's own limits or verdict logic change.
-pub const ENGINE_VERSION: u32 = 1;
+pub const ENGINE_VERSION: u32 = 2;
 
 /// The kinds of problem the rules can tell apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -236,7 +236,7 @@ impl Diagnosis {
     /// confidence, or that it is the emulator's own report.
     pub fn standing(&self) -> &'static str {
         if self.reported {
-            "reported by the emulator"
+            "as reported"
         } else {
             self.confidence.label()
         }
@@ -286,7 +286,47 @@ impl Verdict {
             Self::Explained => "explained",
             Self::PartlyExplained => "partly explained: a cause is suggested but not established",
             Self::Conflicting => "conflicting: the evidence or the findings disagree",
-            Self::Unknown => "unknown: something went wrong and the evidence does not show why",
+            Self::Unknown => {
+                "unknown: a problem was observed or reported, and the evidence does not show why"
+            }
+        }
+    }
+}
+
+/// What the evidence shows about the launch itself. Kept apart from the
+/// [`Verdict`], which is about why: a launch can fail for a known reason,
+/// and a launch that did not fail can still have a serious problem.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchOutcome {
+    /// The process could not be started, crashed, was killed, or ended
+    /// with a failure status.
+    Failed,
+    /// The process was not seen to fail, and a program stated an error
+    /// that stops a game from starting. A report, not an observation.
+    FailureReported,
+    /// The process ended without failing and no such error was stated.
+    /// Not a statement that a game ran.
+    NoFailureObserved,
+    /// How the process ended is not known: no exit was observed, it was
+    /// still running, or the evidence mixes several runs.
+    #[default]
+    NotObserved,
+}
+
+impl LaunchOutcome {
+    /// The outcome as a sentence fragment for a report heading.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Failed => "the emulator process failed",
+            Self::FailureReported => {
+                "an error that stops a game from starting was reported; the process itself \
+                 was not seen to fail"
+            }
+            Self::NoFailureObserved => {
+                "no failure of the launch was observed (this does not show that the game ran)"
+            }
+            Self::NotObserved => "how the launch ended was not observed",
         }
     }
 }
@@ -321,6 +361,9 @@ pub struct DiagnosisReport {
     pub schema_version: u32,
     pub rule_set: RuleSetVersion,
     pub subject: Subject,
+    /// What happened to the launch, apart from why.
+    #[serde(default)]
+    pub launch: LaunchOutcome,
     pub verdict: Verdict,
     /// Why, most firmly supported first.
     pub causes: Vec<Diagnosis>,
@@ -498,6 +541,30 @@ impl<'a> View<'a> {
         exits.next().is_none().then_some(first)
     }
 
+    /// Whether the evidence is about `emulator`, or does not say which
+    /// emulator it is about.
+    pub(crate) fn concerns(&self, emulator: &str) -> bool {
+        self.set
+            .subject
+            .emulator
+            .as_deref()
+            .is_none_or(|name| name == emulator)
+    }
+
+    /// Whether a settings file could not be read, or changed after it was
+    /// read. A value from the files that were read may then not be the one
+    /// the emulator uses.
+    pub(crate) fn settings_unread(&self) -> bool {
+        self.set.items().iter().any(|item| {
+            item.area == EvidenceArea::EmulatorConfiguration
+                && item.trust != Trust::Asserted
+                && matches!(
+                    item.state,
+                    EvidenceState::Stale { .. } | EvidenceState::Unavailable { .. }
+                )
+        })
+    }
+
     pub(crate) fn failed_exit(&self) -> Option<(&'a Evidence, &'a ProcessExit)> {
         self.exit().filter(|(_, exit)| exit.is_failure())
     }
@@ -618,19 +685,21 @@ impl<'a> View<'a> {
                  examined, so the value the emulator really uses may be different.",
             );
         }
-        let overrides = [
+        let unexamined: Vec<&str> = [
             ConfigLayer::Core,
             ConfigLayer::ContentDirectory,
             ConfigLayer::Game,
-        ];
-        if !overrides
-            .iter()
-            .any(|layer| layers_examined.contains(layer))
-        {
-            finding = finding.limit(
-                "Only the main settings file was examined; an override for this core, \
-                 folder or game could set a different value.",
-            );
+        ]
+        .iter()
+        .filter(|layer| !layers_examined.contains(*layer))
+        .map(|layer| layer.label())
+        .collect();
+        if !unexamined.is_empty() {
+            finding = finding.limit(format!(
+                "Not examined: {}. A setting there would take the place of the value used \
+                 here.",
+                unexamined.join("; ")
+            ));
         }
         finding
     }
@@ -1185,9 +1254,11 @@ fn shared_library_missing(view: &View<'_>) -> Vec<Finding> {
         .support(exit_item)
         .limit("EmuWiz has not checked for the library itself.")
         .next(NextCheck::UserAction {
-            what: format!(
-                "Install the package that provides {library}, or reinstall the emulator."
-            ),
+            what: "Reinstall the emulator, or use your system's package tools to find which \
+                   package provides the missing library. Do not install anything on the \
+                   strength of this message alone: the name comes from text the launch \
+                   printed."
+                .into(),
         }),
     ]
 }
@@ -1199,22 +1270,30 @@ fn emulator_program_missing(view: &View<'_>) -> Vec<Finding> {
     let ExitOutcome::SpawnFailed { reason, .. } = exit.outcome else {
         return Vec::new();
     };
+    // A spawn failure EmuWiz saw is the operating system's own answer. One
+    // that was supplied is a premise: the engine holds what rests on it at
+    // possible, and the wording must not put it in the system's mouth.
+    let said = if exit_item.trust == Trust::Supplied {
+        "According to what was supplied, the operating system reported that"
+    } else {
+        "The operating system reported that"
+    };
     let mut finding = match reason {
         SpawnFailure::ProgramNotFound => Finding::cause(
             Confidence::Established,
             Effect::PreventsLaunch,
             "The emulator program could not be started: not found",
-            "The operating system reported that the emulator program, or something it \
-             needs in order to start (such as the interpreter a launcher script names), \
-             does not exist. It may have been moved, removed or updated to a different \
-             location.",
+            format!(
+                "{said} the emulator program, or something it needs in order to start \
+                 (such as the interpreter a launcher script names), does not exist. It may \
+                 have been moved, removed or updated to a different location."
+            ),
         ),
         SpawnFailure::PermissionDenied => Finding::cause(
             Confidence::Established,
             Effect::PreventsLaunch,
             "The emulator program is not allowed to run",
-            "The operating system refused to run the emulator program: this user account \
-             may not execute it.",
+            format!("{said} this user account may not run the emulator program."),
         )
         .in_category(DiagnosisCategory::PermissionError),
         SpawnFailure::Other => return Vec::new(),
@@ -1242,6 +1321,9 @@ fn emulator_program_missing(view: &View<'_>) -> Vec<Finding> {
 }
 
 fn retroarch_core_not_loaded(view: &View<'_>) -> Vec<Finding> {
+    if !view.concerns(RETROARCH) {
+        return Vec::new();
+    }
     let ignored = view.events(LogMeaning::CoreRequestIgnored);
     let core = view.path(PathRole::EmulatorCore);
     let core_missing =
@@ -1257,7 +1339,12 @@ fn retroarch_core_not_loaded(view: &View<'_>) -> Vec<Finding> {
             Effect::PreventsLaunch,
             "The emulator core is missing",
             format!(
-                "The core file EmuWiz asked RetroArch to use does not exist. {clean_exit_note}"
+                "{} does not exist. {clean_exit_note}",
+                if core.is_some_and(|(_, access)| access.role_supplied) {
+                    "The file given as the emulator core"
+                } else {
+                    "The core file EmuWiz asked RetroArch to use"
+                }
             ),
         )
     } else {
@@ -1439,14 +1526,27 @@ fn save_location_unwritable(view: &View<'_>) -> Vec<Finding> {
             "A save could not be written",
             "RetroArch reported that it failed to write save data during this session.",
         )
-        .limit("EmuWiz has not checked the save folder itself.")
-        .next(NextCheck::CollectEvidence {
-            area: EvidenceArea::Filesystem,
-            why: "Check whether the save folder is writable.".into(),
-        })
     }
     .in_category(DiagnosisCategory::PermissionError)
     .support_all(events.iter().map(|(event, _)| *event));
+    match directory {
+        None if !unwritable => {
+            finding = finding
+                .limit("EmuWiz has not looked at the save folder itself.")
+                .next(NextCheck::CollectEvidence {
+                    area: EvidenceArea::Filesystem,
+                    why: "Check whether the save folder is writable.".into(),
+                });
+        }
+        Some((_, access)) if access.writable.is_none() => {
+            finding = finding.limit(format!(
+                "EmuWiz looked at the save folder and found {}, so whether it can be \
+                 written to is not known.",
+                access.presence.describe()
+            ));
+        }
+        _ => {}
+    }
     if let Some((path_item, access)) = directory {
         finding = if access.writable == Some(false) {
             finding.support(path_item)
@@ -1477,10 +1577,10 @@ fn retroarch_audio_failed(view: &View<'_>) -> Vec<Finding> {
         return Vec::new();
     };
     let setting = view.setting(RETROARCH, "audio_driver");
-    if setting
+    let switched_off = setting
         .as_ref()
-        .is_some_and(|setting| setting.value == "null")
-    {
+        .is_some_and(|setting| setting.value == "null");
+    if switched_off && !view.settings_unread() {
         // Sound is switched off on purpose.
         return Vec::new();
     }
@@ -1499,6 +1599,12 @@ fn retroarch_audio_failed(view: &View<'_>) -> Vec<Finding> {
                chosen in RetroArch's settings."
             .into(),
     });
+    if switched_off {
+        finding = finding.limit(
+            "The settings that were read switch sound off, but a settings file that could \
+             not be read may switch it back on.",
+        );
+    }
     if let Some(setting) = setting {
         finding = finding.support(setting.evidence);
         finding = view.qualify_setting_finding(finding, RETROARCH);
@@ -1796,6 +1902,19 @@ fn process_symptoms(view: &View<'_>) -> Vec<Finding> {
                         ),
                     ));
                 }
+                Some((_, info)) if info.kind == SignalKind::StopRequest => {
+                    findings.push(Finding::symptom(
+                        Confidence::Possible,
+                        format!("The emulator may have been asked to stop ({})", info.name),
+                        format!(
+                            "Exit status {code} is what a launcher or a shell reports when \
+                             the program it started was stopped by {}. No launcher is \
+                             recorded for this launch, so the program may equally have \
+                             chosen this status itself.",
+                            info.name
+                        ),
+                    ));
+                }
                 _ => {}
             }
         }
@@ -2006,10 +2125,16 @@ fn rule_set_version(rules: &[Rule]) -> RuleSetVersion {
     feed(format!("engine\u{1f}{ENGINE_VERSION}"));
     for rule in rules {
         feed(format!(
-            "rule\u{1f}{}\u{1f}{}\u{1f}{:?}",
-            rule.id, rule.version, rule.category
+            "rule\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}",
+            rule.id, rule.version, rule.category, rule.summary
         ));
     }
+    for (meaning, category, effect, phrase) in REPORTED_ERRORS {
+        feed(format!(
+            "reported\u{1f}{meaning:?}\u{1f}{category:?}\u{1f}{effect:?}\u{1f}{phrase}"
+        ));
+    }
+    feed(format!("signals\u{1f}{}", super::process::digest_text()));
     for signature in HOST_SIGNATURES.iter().chain(retroarch::SIGNATURES) {
         feed(format!("signature\u{1f}{}", signature.digest_text()));
     }
@@ -2107,8 +2232,8 @@ fn finalise(rule: &Rule, finding: Finding, evidence: &EvidenceSet) -> Result<Dia
             return Err("it presents something other than emulator output as a report".into());
         }
         limitations.push(
-            "This is what the emulator printed. That it reported this is established; \
-             that it is the underlying cause is not."
+            "This is what was printed when the launch ran. That it was reported is \
+             established; that it is the underlying cause is not."
                 .into(),
         );
         return Ok(Diagnosis {
@@ -2137,13 +2262,23 @@ fn finalise(rule: &Rule, finding: Finding, evidence: &EvidenceSet) -> Result<Dia
             && !matches!(&item.fact, Fact::ProcessExit(exit)
                 if !matches!(exit.outcome, ExitOutcome::SpawnFailed { .. }))
     });
+    let has_supplied = items.iter().any(|item| item.trust == Trust::Supplied);
     if !has_firm {
         confidence = confidence.at_most(Confidence::Possible);
-        limitations.push(
-            "It rests only on text the emulator printed, which a game or a damaged file \
-             could also have produced."
-                .into(),
-        );
+        if has_untrusted_text {
+            limitations.push(
+                "It rests only on text the emulator printed, which a game or a damaged \
+                 file could also have produced."
+                    .into(),
+            );
+        }
+        if has_supplied {
+            limitations.push(
+                "It rests on what was stated by whoever asked for this diagnosis. EmuWiz \
+                 did not observe it."
+                    .into(),
+            );
+        }
     } else if has_untrusted_text
         && !has_firm_beyond_exit
         && confidence.rank() > Confidence::Possible.rank()
@@ -2268,14 +2403,38 @@ pub(crate) fn diagnose_with(rules: &[Rule], evidence: &EvidenceSet) -> Diagnosis
         })
         .collect();
     let mixed_runs = exits.len() > 1;
+    let single_exit = match exits.as_slice() {
+        [exit] => Some(*exit),
+        _ => None,
+    };
+    // What happened to the launch, apart from why.
+    let stated_failure = symptoms
+        .iter()
+        .any(|symptom| symptom.reported && symptom.effect != Effect::Degrades);
+    let launch = match single_exit {
+        Some(exit) if exit.is_failure() => LaunchOutcome::Failed,
+        _ if stated_failure => LaunchOutcome::FailureReported,
+        Some(exit)
+            if matches!(
+                exit.outcome,
+                ExitOutcome::Exited { .. } | ExitOutcome::Signaled { .. }
+            ) =>
+        {
+            LaunchOutcome::NoFailureObserved
+        }
+        _ => LaunchOutcome::NotObserved,
+    };
     // A failure is something that stopped the launch: the process failing,
-    // or the emulator saying so. Once there is one, only a cause that can
+    // or a program saying so. Once there is one, or the evidence mixes
+    // several runs so that one cannot be ruled out, only a cause that can
     // prevent a launch explains it; a cause that merely degrades the game
     // (no sound, saves not written) is still reported but does not.
-    let failure_observed = symptoms
-        .iter()
-        .any(|symptom| symptom.effect != Effect::Degrades);
-    let explains = |cause: &&Diagnosis| !failure_observed || cause.effect != Effect::Degrades;
+    let failure_observed = launch == LaunchOutcome::Failed
+        || symptoms
+            .iter()
+            .any(|symptom| symptom.effect != Effect::Degrades);
+    let needs_a_stopping_cause = failure_observed || mixed_runs;
+    let explains = |cause: &&Diagnosis| !needs_a_stopping_cause || cause.effect != Effect::Degrades;
     let has_contradicted_cause = causes.iter().any(|cause| !cause.contradicting.is_empty());
     let verdict = if !conflicts.is_empty() || has_contradicted_cause {
         Verdict::Conflicting
@@ -2287,27 +2446,51 @@ pub(crate) fn diagnose_with(rules: &[Rule], evidence: &EvidenceSet) -> Diagnosis
         Verdict::Explained
     } else if causes.iter().any(|cause| explains(&cause)) {
         Verdict::PartlyExplained
-    } else if failure_observed || mixed_runs {
+    } else if needs_a_stopping_cause || !symptoms.is_empty() {
+        // Something failed, or a problem was reported, and nothing that
+        // was found explains it. A reported problem that only degrades the
+        // game (a save that could not be written) belongs here too: it is
+        // a problem, whatever the launch itself did.
         Verdict::Unknown
     } else {
         Verdict::NoProblemObserved
     };
 
     let mut notes = Vec::new();
-    for exit in &exits {
-        if let ExitOutcome::Exited { code } = exit.outcome
-            && !exit.is_failure()
-            && code != 0
+    if let Some(exit) = single_exit {
+        if let (Some(signal), ExitOutcome::Exited { code }) =
+            (exit.relayed_stop_request(), &exit.outcome)
         {
+            let name = signal_info(signal).map_or("a stop signal", |info| info.name);
             notes.push(format!(
                 "Exit status {code} is what a launcher reports after the program was asked \
-                 to stop. It is treated as a stop request, not as a failure."
+                 to stop ({name}). It is treated as a stop request, not as a failure."
+            ));
+        }
+        if let ExitOutcome::Signaled { signal, .. } = exit.outcome
+            && let Some(info) = signal_info(signal)
+            && info.kind == SignalKind::StopRequest
+        {
+            notes.push(format!(
+                "The emulator process was stopped by {}, which is how a program is asked \
+                 to quit. That is not a failure, and it does not show that a game ran.",
+                info.name
             ));
         }
     }
     if evidence.items().iter().any(|item| {
+        item.is_observed() && matches!(&item.fact, Fact::PathAccess(access) if access.role_supplied)
+    }) {
+        notes.push(
+            "Which files and folders the launch used (the game, the core, the save folder) \
+             was stated by whoever asked for this diagnosis. EmuWiz looked at those paths; \
+             it did not observe the launch using them."
+                .to_string(),
+        );
+    }
+    if evidence.items().iter().any(|item| {
         item.is_observed()
-            && item.trust == Trust::Reported
+            && item.trust == Trust::Supplied
             && matches!(
                 item.area,
                 EvidenceArea::ProcessExit | EvidenceArea::LaunchEnvironment
@@ -2363,6 +2546,7 @@ pub(crate) fn diagnose_with(rules: &[Rule], evidence: &EvidenceSet) -> Diagnosis
     }
 
     DiagnosisReport {
+        launch,
         schema_version: EVIDENCE_SCHEMA_VERSION,
         rule_set: rule_set_version(rules),
         subject: evidence.subject.clone(),

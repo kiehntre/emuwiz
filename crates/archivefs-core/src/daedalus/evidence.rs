@@ -139,6 +139,11 @@ pub enum Trust {
     /// A host tool or the emulator reported it through a structured,
     /// well-defined channel that content cannot write to.
     Reported,
+    /// Stated by whoever asked for the diagnosis: typed on a command line,
+    /// or handed over by a caller that did not observe it. A rule may
+    /// reason from it, but it is not firm: nothing that rests on it alone
+    /// is more than possible.
+    Supplied,
     /// Free text that an emulator, a game or a third party can influence:
     /// log lines, stderr. Matched against fixed signatures only.
     UntrustedText,
@@ -214,6 +219,10 @@ pub struct SourceFingerprint {
     pub changed: Option<Timestamp>,
     /// Lower-case hex SHA-256 of the content, when it was hashed.
     pub sha256: Option<String>,
+    /// True when this records that nothing existed at the path. It stays
+    /// unchanged for as long as nothing exists there.
+    #[serde(default)]
+    pub absent: bool,
 }
 
 /// Result of comparing a fingerprint with the file as it is now.
@@ -242,6 +251,23 @@ impl SourceFingerprint {
             modified: Timestamp::from_system_time(identity.modified),
             changed: Timestamp::from_system_time(identity.changed),
             sha256: None,
+            absent: false,
+        }
+    }
+
+    /// A record that nothing exists at `path`, so that a file appearing
+    /// there later is noticed like any other change.
+    pub fn absent(path: &Path) -> Self {
+        Self {
+            path: text::sanitise(&path.display().to_string(), text::PATH_LIMIT),
+            real_path: path.to_path_buf(),
+            device: 0,
+            inode: 0,
+            size: 0,
+            modified: None,
+            changed: None,
+            sha256: None,
+            absent: true,
         }
     }
 
@@ -303,6 +329,22 @@ impl SourceFingerprint {
             };
         }
         let path = self.real_path.as_path();
+        if self.absent {
+            return match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    FingerprintCheck::Unchanged
+                }
+                Ok(_) => FingerprintCheck::Changed {
+                    detail: format!(
+                        "{}: something now exists where there was nothing",
+                        self.path
+                    ),
+                },
+                Err(error) => FingerprintCheck::Unavailable {
+                    detail: format!("{}: {}", self.path, error.kind()),
+                },
+            };
+        }
         let current = if self.sha256.is_some() {
             Self::read_with_digest(path, FINGERPRINT_DIGEST_LIMIT).map(|(_, current)| current)
         } else {
@@ -464,19 +506,28 @@ impl ProcessExit {
                 Some(super::process::SignalKind::StopRequest)
             ),
             // A launcher reports a program that was asked to stop as exit
-            // status 128 + the signal number. That is the same stop request,
-            // one step removed.
-            ExitOutcome::Exited { code } => {
-                code != 0
-                    && !super::process::possibly_relayed_signal(code).is_some_and(|signal| {
-                        matches!(
-                            super::process::signal_info(signal).map(|info| info.kind),
-                            Some(super::process::SignalKind::StopRequest)
-                        )
-                    })
-            }
+            // status 128 + the signal number: the same stop request, one
+            // step removed. Without a launcher the program chose its own
+            // status, and a status other than zero is a failure.
+            ExitOutcome::Exited { code } => code != 0 && self.relayed_stop_request().is_none(),
             ExitOutcome::StillRunning | ExitOutcome::StatusUnavailable => false,
         }
+    }
+
+    /// The stop signal a launcher is relaying with this exit status: set
+    /// only when a launcher is recorded and the status is 128 plus a signal
+    /// that asks a program to stop.
+    pub fn relayed_stop_request(&self) -> Option<i32> {
+        let ExitOutcome::Exited { code } = self.outcome else {
+            return None;
+        };
+        self.launcher.as_ref()?;
+        super::process::possibly_relayed_signal(code).filter(|signal| {
+            matches!(
+                super::process::signal_info(*signal).map(|info| info.kind),
+                Some(super::process::SignalKind::StopRequest)
+            )
+        })
     }
 }
 
@@ -662,6 +713,11 @@ pub struct PathAccess {
     pub presence: PathPresence,
     pub readable: Option<bool>,
     pub writable: Option<bool>,
+    /// True when whoever asked for the diagnosis named this path as playing
+    /// this role. EmuWiz looked at the path itself; that the launch used
+    /// it is the caller's statement.
+    #[serde(default)]
+    pub role_supplied: bool,
 }
 
 /// Which settings file a value was read from. Later layers override
@@ -848,6 +904,7 @@ impl Trust {
         match self {
             Self::Measured => "measured",
             Self::Reported => "reported",
+            Self::Supplied => "supplied, not observed",
             Self::UntrustedText => "emulator output",
             Self::Asserted => "asserted, not observed",
         }
@@ -1265,7 +1322,11 @@ impl EvidenceSet {
     pub fn refresh_freshness(&mut self) -> Vec<EvidenceId> {
         let mut stale = Vec::new();
         // One check per distinct source file, however many items share it.
-        let mut checked: BTreeMap<String, FingerprintCheck> = BTreeMap::new();
+        // The key is the path the file is really read from: two files whose
+        // names differ only in characters that are replaced for display
+        // must not share a check.
+        let mut checked: BTreeMap<(std::path::PathBuf, String, Option<String>), FingerprintCheck> =
+            BTreeMap::new();
         for item in &mut self.items {
             if !item.state.is_observed() {
                 continue;
@@ -1273,7 +1334,11 @@ impl EvidenceSet {
             let Some(fingerprint) = &item.fingerprint else {
                 continue;
             };
-            let key = format!("{}\0{:?}", fingerprint.path, fingerprint.sha256);
+            let key = (
+                fingerprint.real_path.clone(),
+                fingerprint.path.clone(),
+                fingerprint.sha256.clone(),
+            );
             let check = checked
                 .entry(key)
                 .or_insert_with(|| fingerprint.check())
@@ -1311,7 +1376,18 @@ impl EvidenceSet {
                         EvidenceState::Observed if item.trust == Trust::Asserted => {
                             coverage.asserted += 1;
                         }
-                        EvidenceState::Observed => coverage.observed += 1,
+                        EvidenceState::Observed => {
+                            coverage.observed += 1;
+                            // Looked for and found absent: an observation,
+                            // and one a reader must be able to see, because
+                            // a mistyped path looks exactly like this.
+                            if let Fact::ConfigLayerAbsent { layer, .. } = &item.fact {
+                                coverage.missing.push(format!(
+                                    "no settings file exists at the place given for: {}",
+                                    layer.label()
+                                ));
+                            }
+                        }
                         EvidenceState::Stale { .. } => coverage.stale += 1,
                         EvidenceState::Unavailable { reason } => {
                             coverage.missing.push(format!("unavailable: {reason}"));
@@ -1364,6 +1440,7 @@ pub fn observe_path_access(role: PathRole, path: &Path) -> PathAccess {
         presence,
         readable: may(libc::R_OK),
         writable: may(libc::W_OK),
+        role_supplied: false,
     }
 }
 

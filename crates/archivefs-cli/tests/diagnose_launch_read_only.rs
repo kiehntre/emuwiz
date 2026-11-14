@@ -202,7 +202,7 @@ fn the_rules_listing_is_available_as_text_and_json() {
     ])))
     .unwrap();
     assert!(json["rules"].as_array().unwrap().len() >= 20);
-    assert_eq!(json["engine_version"], 1);
+    assert_eq!(json["engine_version"], 2);
 }
 
 #[test]
@@ -260,7 +260,11 @@ fn what_was_typed_is_reported_as_supplied_and_every_unread_input_is_listed() {
     assert!(text.contains("could not be read"), "{text}");
     assert!(text.contains("[possible]"), "{text}");
     assert!(text.contains("EmuWiz did not observe it"), "{text}");
-    assert!(text.contains("reported by the emulator"), "{text}");
+    assert!(text.contains("[as reported]"), "{text}");
+    assert!(
+        text.contains("Launch: the emulator process failed"),
+        "{text}"
+    );
 
     let mut json_args = args.to_vec();
     json_args.push("--json");
@@ -272,7 +276,7 @@ fn what_was_typed_is_reported_as_supplied_and_every_unread_input_is_listed() {
         .iter()
         .find(|item| item["area"] == "process_exit")
         .unwrap();
-    assert_eq!(exit["trust"], "reported");
+    assert_eq!(exit["trust"], "supplied");
     assert!(exit["source"].as_str().unwrap().contains("supplied"));
     assert_ne!(report["verdict"], "explained");
 }
@@ -406,4 +410,147 @@ fn values_that_are_not_what_they_claim_to_be_are_refused() {
         assert!(!output.status.success(), "{args:?}");
         assert!(output.stdout.is_empty(), "{args:?}");
     }
+}
+
+#[test]
+fn a_failure_that_was_only_typed_is_never_called_established_or_explained() {
+    let fixture = Fixture::new();
+    for reason in ["not-found", "permission-denied"] {
+        let args = [
+            "diagnose-launch",
+            "--emulator",
+            "retroarch",
+            "--spawn-error",
+            reason,
+        ];
+        let text = stdout(&fixture.run(&args));
+        assert!(text.contains("[possible]"), "{text}");
+        assert!(!text.contains("[established]"), "{text}");
+        assert!(text.contains("Verdict: partly explained"), "{text}");
+        assert!(text.contains("According to what was supplied"), "{text}");
+        assert!(text.contains("EmuWiz did not observe it"), "{text}");
+
+        let mut json_args = args.to_vec();
+        json_args.push("--json");
+        let report: serde_json::Value =
+            serde_json::from_str(&stdout(&fixture.run(&json_args))).unwrap();
+        assert_eq!(report["verdict"], "partly_explained", "{reason}");
+        assert_eq!(report["launch"], "failed", "{reason}");
+        for cause in report["causes"].as_array().unwrap() {
+            assert_eq!(cause["confidence"], "possible", "{cause}");
+        }
+    }
+
+    // No display, from a typed exit status and a typed environment.
+    let report: serde_json::Value = serde_json::from_str(&stdout(&fixture.run(&[
+        "diagnose-launch",
+        "--emulator",
+        "retroarch",
+        "--exit-code",
+        "1",
+        "--env-unset",
+        "DISPLAY",
+        "--env-unset",
+        "WAYLAND_DISPLAY",
+        "--json",
+    ])))
+    .unwrap();
+    assert_ne!(report["verdict"], "explained");
+    for finding in report["causes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(report["symptoms"].as_array().unwrap())
+    {
+        assert_eq!(finding["confidence"], "possible", "{finding}");
+    }
+}
+
+#[test]
+fn a_mistyped_path_is_worded_as_given_and_a_missing_settings_file_is_listed() {
+    let fixture = Fixture::new();
+    let missing_core = fixture.path("work/typo_libretro.so");
+    let missing_settings = fixture.path("work/retroarch.cgf");
+    let text = stdout(&fixture.run(&[
+        "diagnose-launch",
+        "--emulator",
+        "retroarch",
+        "--core",
+        missing_core.to_str().unwrap(),
+        "--settings",
+        missing_settings.to_str().unwrap(),
+    ]));
+    assert!(
+        text.contains("The file given as the emulator core does not exist."),
+        "{text}"
+    );
+    assert!(!text.contains("EmuWiz asked RetroArch"), "{text}");
+    assert!(
+        text.contains("did not observe the launch using them"),
+        "{text}"
+    );
+    assert!(
+        text.contains("no settings file exists at the place given for: main settings"),
+        "{text}"
+    );
+
+    // Another emulator's launch is not judged by RetroArch's rules.
+    let text = stdout(&fixture.run(&[
+        "diagnose-launch",
+        "--emulator",
+        "dolphin",
+        "--core",
+        missing_core.to_str().unwrap(),
+    ]));
+    assert!(!text.contains("RetroArch"), "{text}");
+}
+
+#[test]
+fn a_status_a_shell_would_relay_is_a_failure_when_no_launcher_is_named() {
+    let fixture = Fixture::new();
+    let report: serde_json::Value = serde_json::from_str(&stdout(&fixture.run(&[
+        "diagnose-launch",
+        "--emulator",
+        "retroarch",
+        "--exit-code",
+        "143",
+        "--json",
+    ])))
+    .unwrap();
+    assert_eq!(report["launch"], "failed");
+    assert_eq!(report["verdict"], "unknown");
+    let symptoms = report["symptoms"].to_string();
+    assert!(
+        symptoms.contains("may have been asked to stop"),
+        "{symptoms}"
+    );
+}
+
+#[test]
+fn hostile_log_text_never_reaches_the_json_raw_either() {
+    let fixture = Fixture::new();
+    let stderr = fixture.write(
+        "work/stderr.txt",
+        "[ERROR] Failed to open libretro core: \"\u{1b}[2J\u{202e}evil\u{200b}\u{fe0f}\u{34f}\"\n",
+    );
+    let json = stdout(&fixture.run(&[
+        "diagnose-launch",
+        "--emulator",
+        "retroarch",
+        "--exit-code",
+        "1",
+        "--stderr-file",
+        &stderr,
+        "--json",
+    ]));
+    for raw in ['\u{1b}', '\u{202e}', '\u{200b}', '\u{fe0f}', '\u{34f}'] {
+        assert!(!json.contains(raw), "{raw:?} in {json}");
+    }
+    for escaped in ["\\u001b", "\\u202e", "\\u200b", "\\ufe0f", "\\u034f"] {
+        assert!(
+            !json.to_lowercase().contains(escaped),
+            "{escaped} in {json}"
+        );
+    }
+    assert!(json.contains("evil"), "{json}");
 }

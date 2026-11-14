@@ -235,11 +235,15 @@ pub fn record_config(set: &mut EvidenceSet, path: &Path, layer: ConfigLayer) -> 
                     && std::fs::symlink_metadata(path)
                         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
             {
+                // Fingerprinted as absent, so a file that appears there
+                // later makes this out of date like any other change.
                 return set
-                    .observe(
+                    .push(
                         EvidenceArea::EmulatorConfiguration,
+                        EvidenceState::Observed,
                         Trust::Measured,
                         source,
+                        Some(SourceFingerprint::absent(path)),
                         Fact::ConfigLayerAbsent {
                             emulator: EMULATOR.to_string(),
                             layer,
@@ -253,7 +257,7 @@ pub fn record_config(set: &mut EvidenceSet, path: &Path, layer: ConfigLayer) -> 
                     .unavailable(
                         EvidenceArea::EmulatorConfiguration,
                         source,
-                        format!("could not be read: {}", error.kind()),
+                        format!("{}: could not be read: {}", layer.label(), error.kind()),
                     )
                     .into_iter()
                     .collect();

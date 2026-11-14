@@ -136,7 +136,7 @@ pub fn record_exit_from(
             "exit status of the launched process, as reported by the operating system",
         ),
         ExitSource::SuppliedByCaller => (
-            Trust::Reported,
+            Trust::Supplied,
             "how the process ended, as supplied by whoever asked for this diagnosis",
         ),
     };
@@ -189,7 +189,21 @@ pub fn record_supplied_output(
     emulator: &str,
     emulator_signatures: &[Signature],
 ) -> Vec<EvidenceId> {
-    record_output(set, output, emulator, emulator_signatures, false)
+    // A file exactly as long as a launcher's capture may be one, cut off at
+    // that length. Anything else is taken as complete.
+    let may_be_cut = output.len() == crate::launch::process_spawn::PROCESS_STDERR_CAPTURE_LIMIT;
+    record_output(set, output, emulator, emulator_signatures, may_be_cut)
+}
+
+/// The signal table as text, for the rule-set digest.
+pub(super) fn digest_text() -> String {
+    (1..=64)
+        .filter_map(|signal| {
+            signal_info(signal)
+                .map(|info| format!("{signal}\u{1f}{}\u{1f}{:?}", info.name, info.kind))
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1e}")
 }
 
 fn record_output(

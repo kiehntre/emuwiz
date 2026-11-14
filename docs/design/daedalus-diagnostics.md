@@ -60,7 +60,8 @@ An `Evidence` item is one observation:
   `filesystem`, `modifications`, `known_limitations`);
 - `state`: `observed`, `unavailable`, `not_collected` or `stale`;
 - `trust`: `measured` (EmuWiz read it from the operating system or a file),
-  `reported` (a structured channel content cannot write to),
+  `reported` (a structured channel content cannot write to), `supplied`
+  (stated by whoever asked for the diagnosis; a premise, never firm),
   `untrusted_text` (logs, stderr) or `asserted` (a person or an AI said so);
 - `fingerprint`: identity and, for settings files, SHA-256 of the exact bytes
   read, so a later change is detected (`EvidenceSet::refresh_freshness`);
@@ -99,25 +100,54 @@ A report separates **symptoms** (what happened) from **causes** (why).
 Symptoms are how the process ended and what a program said outright: an
 explicit error line becomes a *reported* symptom ("RetroArch reported that it
 could not set up Vulkan"), established as a report and never, by itself, a
-cause. Verdicts: `explained` (an established cause, no contradiction),
-`partly_explained`, `conflicting`, `unknown`, `no_problem_observed` (which is
-explicitly not a statement that the game works). Once something failed, only
-a cause that can prevent a launch explains it; a problem that merely degrades
+cause. A reported symptom carries `confidence: established` and
+`reported: true`: the confidence is in the fact that it was printed, never in
+a cause, so a reader that filters on confidence must read `reported` and
+`explains_cause` with it.
+
+What happened to the launch is stated apart from why. `launch` is `failed`
+(the process could not be started, crashed, was killed or ended with a
+failure status), `failure_reported` (the process was not seen to fail, and a
+program stated an error that stops a game from starting: a report, not an
+observation), `no_failure_observed` (not a statement that a game ran) or
+`not_observed`. A launch that did not fail can still have a serious problem,
+for example a save that could not be written.
+
+Verdicts are about why: `explained` (an established cause, no contradiction),
+`partly_explained`, `conflicting`, `unknown` (a problem was observed or
+reported and nothing found explains it), `no_problem_observed` (which is
+explicitly not a statement that the game works). Once something failed, or
+the evidence mixes several runs so that a failure cannot be ruled out, only a
+cause that can prevent a launch explains it; a problem that merely degrades
 the game (no sound, saves not written) is still reported but does not turn an
-unexplained crash into an explained one. An exit status that only relays a
-request to stop (143 and the like) is a note, not a failure.
+unexplained crash into an explained one.
+
+An exit status of 128 plus a stop signal (143 and the like) is read as a
+relayed request to stop only when a launcher is recorded between EmuWiz and
+the emulator; it is then a note, not a failure. With no launcher the program
+chose that status itself: it is a failure, and the other reading is offered
+as no more than possible. A stop signal delivered to the watched process is
+not a failure and is stated in a note.
 
 Settings are read per layer (main file, core, folder and game overrides). A
 layer whose file does not exist is recorded as absent, which is an
-observation. A layer that exists and could not be read, or changed while it
-was being examined, holds every setting-based finding at `possible`, because
-it may hold the value the emulator really uses.
+observation: it is listed in the report (a mistyped path looks the same) and
+goes out of date if a file appears there. A layer that exists and could not
+be read, or changed while it was being examined, holds every setting-based
+finding at `possible`, because it may hold the value the emulator really
+uses. Each override layer nobody examined is named as a limit of the finding.
 
 Whoever supplies evidence is stated. What EmuWiz observed itself is
-`measured`; an exit status or environment typed on the command line is
-`reported`, its source says it was supplied, and the report carries a note.
-A report restored from JSON is for display only: it cannot be compared with
-the files it was made from and is never diagnosed again.
+`measured`. An exit status or environment typed on the command line is
+`supplied`: a rule may reason from it, but nothing that rests on supplied
+facts alone, cause or symptom, is more than `possible`, its source says it
+was supplied, and the report carries a note. A path typed on the command
+line is looked at by EmuWiz, so what is there is `measured`; that the launch
+used it in that role is the caller's statement, which the wording and a note
+say. A collector that is not told otherwise records everything as supplied.
+A report restored from JSON is for display: its fingerprints can no longer be
+compared with the files it was made from, and say so instead of opening
+whatever their text names.
 
 Categories: missing firmware, invalid or unsupported media, unsupported
 emulator version, graphics initialisation, missing dependency, sandbox failure,
@@ -126,7 +156,10 @@ modifications, crash, unexplained exit, and "stopped before launch" for planner
 refusals outside those.
 
 Compatibility limits come only from the compiled-in table
-(`daedalus::limitations`), which is part of the rule-set digest. Its one entry
+(`daedalus::limitations`), which is part of the rule-set digest. The digest
+covers every rule (id, version, category, summary), every signature, the
+table of reported errors with their effects, the signal table and the
+compatibility table with its summaries. Its one entry
 restates the OpenRCT2 minimum already enforced in `launch/openrct2.rs`.
 
 ### Rules without a production collector yet
@@ -177,14 +210,15 @@ given, and prints a report. It opens no database and starts no emulator.
 | `schema_version` | `1`. Raised when a key is removed or changes meaning. |
 | `rule_set` | `engine_version` and the `digest` of the rules, signatures and compatibility table used. |
 | `subject` | `emulator` and `game`, as supplied. |
+| `launch` | What happened to the launch, apart from why: `failed`, `failure_reported`, `no_failure_observed` or `not_observed`. |
 | `verdict` | `explained`, `partly_explained`, `conflicting`, `unknown` or `no_problem_observed`. |
 | `causes` | Why. Each has `rule`, `rule_version`, `category`, `confidence` (`established`, `probable`, `possible`), `effect`, `title`, `explanation`, `supporting` and `contradicting` evidence ids, `limitations`, `next_checks`, `repairs` (pointers only; nothing is applied) and `claims`. |
-| `symptoms` | What happened. Same shape, with `explains_cause: false`. `reported: true` marks one that restates what a program printed. |
+| `symptoms` | What happened. Same shape, with `explains_cause: false`. `reported: true` marks one that restates what a program printed; its `confidence` is then `established` as a report only, never as a cause. |
 | `conflicts` | Pairs of rules whose findings contradict each other. |
 | `rejected` | Findings the engine refused, with the reason. |
 | `coverage` | One entry per evidence area: `observed`, `stale`, `asserted` (statements that are not observations) and the reasons anything is `missing`. |
 | `notes` | Limits that apply to the whole report. |
-| `evidence` | `subject`, `truncated` and `items`; each item has `id`, `area`, `state`, `trust` (`measured`, `reported`, `untrusted_text`, `asserted`), `source`, `fingerprint` and a typed `fact`. Paths are sanitised for display. |
+| `evidence` | `subject`, `truncated` and `items`; each item has `id`, `area`, `state`, `trust` (`measured`, `reported`, `supplied`, `untrusted_text`, `asserted`), `source`, `fingerprint` and a typed `fact`. Paths are sanitised for display. |
 
 `diagnose-launch --rules --json` prints `engine_version`, `digest` and `rules`
 (`id`, `version`, `category`, `summary`). New keys may be added without a

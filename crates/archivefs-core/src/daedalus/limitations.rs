@@ -95,8 +95,8 @@ pub(super) fn digest_text() -> String {
         .iter()
         .map(|entry| {
             format!(
-                "{}\u{1f}{}\u{1f}{}\u{1f}{:?}",
-                entry.id, entry.version, entry.emulator, entry.minimum
+                "{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}",
+                entry.id, entry.version, entry.emulator, entry.minimum, entry.summary
             )
         })
         .collect::<Vec<_>>()

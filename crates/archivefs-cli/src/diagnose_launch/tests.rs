@@ -168,7 +168,12 @@ fn the_text_report_separates_what_happened_from_why_and_lists_gaps() {
     assert!(position("What happened") < position("Why (most firmly supported first)"));
     assert!(position("Why (most firmly supported first)") < position("Not observed"));
     position("Vulkan graphics could not start [possible]");
-    position("The emulator exited with status 1 [established]");
+    // The exit status was typed, not observed: stated, and no more than
+    // possible.
+    position("The emulator exited with status 1 [possible]");
+    position("Launch: the emulator process failed");
+    assert!(position("Launch: ") < position("Verdict: "));
+    position("EmuWiz did not observe it");
     position("(not applied)");
     position("Graphics card, driver and graphics API: not collected");
     position("nothing was started or changed");

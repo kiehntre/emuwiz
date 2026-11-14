@@ -41,12 +41,24 @@ pub struct LaunchArtefacts {
     /// Variables of the environment the emulator was started in, with
     /// `None` for a variable that was checked and found unset.
     pub environment: Vec<(String, Option<String>)>,
-    /// True when `exit`, `duration`, `launcher`, `environment` and `stderr`
-    /// were handed over by whoever asked for the diagnosis rather than
-    /// observed by EmuWiz launching the process itself. They are then
-    /// recorded as reported, their source says so, and the report carries a
-    /// note. Files and paths are always looked at by EmuWiz itself.
-    pub supplied_by_caller: bool,
+    /// Who vouches for `exit`, `duration`, `launcher` and `environment`,
+    /// and for which path played which role. Unless a caller says EmuWiz
+    /// observed them, they are recorded as supplied: usable as a premise,
+    /// never firm, with a note in the report. Output and files are always
+    /// read, and paths always looked at, by EmuWiz itself.
+    pub provenance: Provenance,
+}
+
+/// Who vouches for how a launch ended and what it ran in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Provenance {
+    /// Handed over by whoever asked for the diagnosis. The default, so
+    /// that a caller that says nothing is never taken to have observed
+    /// anything.
+    #[default]
+    SuppliedByCaller,
+    /// EmuWiz started the process itself and observed these.
+    ObservedByEmuWiz,
 }
 
 /// Read at most [`text::LOG_BYTES_LIMIT`] bytes (plus one, so that a longer
@@ -72,7 +84,8 @@ pub fn collect(artefacts: &LaunchArtefacts) -> EvidenceSet {
             .map(|game| text::sanitise(game, text::VALUE_LIMIT)),
     });
 
-    let exit_source = if artefacts.supplied_by_caller {
+    let supplied = artefacts.provenance == Provenance::SuppliedByCaller;
+    let exit_source = if supplied {
         process::ExitSource::SuppliedByCaller
     } else {
         process::ExitSource::Observed
@@ -105,7 +118,7 @@ pub fn collect(artefacts: &LaunchArtefacts) -> EvidenceSet {
         any_log = true;
         // A capture EmuWiz made is cut at a fixed size; a file someone
         // saved is complete as supplied.
-        let record = if artefacts.supplied_by_caller {
+        let record = if supplied {
             process::record_supplied_output
         } else {
             process::record_stderr
@@ -176,11 +189,19 @@ pub fn collect(artefacts: &LaunchArtefacts) -> EvidenceSet {
     }
     for (role, path) in paths {
         if let Some(path) = path {
+            // What is at the path is measured. That the launch used it in
+            // this role is the caller's statement unless EmuWiz ran it.
+            let mut access = observe_path_access(role, path);
+            access.role_supplied = supplied;
             set.observe(
                 EvidenceArea::Filesystem,
                 Trust::Measured,
-                "read-only look at the path",
-                Fact::PathAccess(observe_path_access(role, path)),
+                if supplied {
+                    "read-only look at a path named by whoever asked for this diagnosis"
+                } else {
+                    "read-only look at the path"
+                },
+                Fact::PathAccess(access),
             );
         }
     }
@@ -191,9 +212,9 @@ pub fn collect(artefacts: &LaunchArtefacts) -> EvidenceSet {
             "the launch environment was not supplied",
         );
     }
-    let (environment_trust, environment_source) = if artefacts.supplied_by_caller {
+    let (environment_trust, environment_source) = if supplied {
         (
-            Trust::Reported,
+            Trust::Supplied,
             "launch environment, as supplied by whoever asked for this diagnosis",
         )
     } else {

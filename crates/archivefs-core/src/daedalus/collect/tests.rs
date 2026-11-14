@@ -233,6 +233,7 @@ fn what_the_caller_states_is_recorded_as_supplied_and_a_saved_log_is_complete() 
         exit: Some(ExitOutcome::Exited { code: 1 }),
         stderr: Some(stderr),
         environment: vec![("DISPLAY".into(), Some(":0".into()))],
+        provenance: Provenance::ObservedByEmuWiz,
         ..LaunchArtefacts::default()
     };
     let cut = |set: &EvidenceSet| {
@@ -254,10 +255,10 @@ fn what_the_caller_states_is_recorded_as_supplied_and_a_saved_log_is_complete() 
     };
 
     let supplied = collect(&LaunchArtefacts {
-        supplied_by_caller: true,
+        provenance: Provenance::SuppliedByCaller,
         ..base.clone()
     });
-    assert_eq!(trusts(&supplied), [Trust::Reported, Trust::Reported]);
+    assert_eq!(trusts(&supplied), [Trust::Supplied, Trust::Supplied]);
     assert!(!cut(&supplied));
     assert!(
         diagnose(&supplied)
@@ -300,4 +301,67 @@ fn a_pipe_or_a_device_where_a_file_was_expected_is_refused_without_waiting() {
             .count()
             >= 2
     );
+}
+
+#[test]
+fn a_caller_that_says_nothing_is_never_taken_to_have_observed_the_launch() {
+    assert_eq!(
+        LaunchArtefacts::default().provenance,
+        Provenance::SuppliedByCaller
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let set = collect(&LaunchArtefacts {
+        emulator: "retroarch".into(),
+        exit: Some(ExitOutcome::Exited { code: 1 }),
+        core: Some(dir.path().join("missing_libretro.so")),
+        ..LaunchArtefacts::default()
+    });
+    let exit = set
+        .items()
+        .iter()
+        .find(|item| item.area == EvidenceArea::ProcessExit)
+        .unwrap();
+    assert_eq!(exit.trust, Trust::Supplied);
+    // The path was looked at by EmuWiz; its role is the caller's word.
+    let path = set
+        .items()
+        .iter()
+        .find_map(|item| match &item.fact {
+            Fact::PathAccess(access) => Some((item, access)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(path.0.trust, Trust::Measured);
+    assert!(path.1.role_supplied);
+    assert!(path.0.source.contains("named by whoever asked"));
+
+    let observed = collect(&LaunchArtefacts {
+        emulator: "retroarch".into(),
+        core: Some(dir.path().join("missing_libretro.so")),
+        provenance: Provenance::ObservedByEmuWiz,
+        ..LaunchArtefacts::default()
+    });
+    assert!(
+        observed.items().iter().all(|item| {
+            !matches!(&item.fact, Fact::PathAccess(access) if access.role_supplied)
+        })
+    );
+}
+
+#[test]
+fn a_supplied_file_exactly_as_long_as_a_launcher_capture_may_have_been_cut() {
+    let limit = crate::launch::process_spawn::PROCESS_STDERR_CAPTURE_LIMIT;
+    let cut = |bytes: Vec<u8>| {
+        collect(&LaunchArtefacts {
+            emulator: "retroarch".into(),
+            stderr: Some(bytes),
+            ..LaunchArtefacts::default()
+        })
+        .items()
+        .iter()
+        .any(|item| matches!(&item.fact, Fact::LogCoverage(coverage) if coverage.truncated))
+    };
+    assert!(cut(vec![b'x'; limit]));
+    assert!(!cut(vec![b'x'; limit - 1]));
+    assert!(!cut(vec![b'x'; limit + 1]));
 }

@@ -370,15 +370,109 @@ fn asserted_statements_are_counted_apart_from_observations() {
 
 #[test]
 fn an_exit_status_that_relays_a_stop_request_is_not_a_failure() {
-    let exit = |code| ProcessExit {
+    let exit = |code, launcher: Option<&str>| ProcessExit {
         outcome: ExitOutcome::Exited { code },
         duration_ms: None,
-        launcher: None,
+        launcher: launcher.map(str::to_string),
     };
     for stop in [129, 130, 131, 143] {
-        assert!(!exit(stop).is_failure(), "{stop}");
+        // A launcher relays the stop request as an exit status.
+        let relayed = exit(stop, Some("flatpak run"));
+        assert!(!relayed.is_failure(), "{stop}");
+        assert_eq!(relayed.relayed_stop_request(), Some(stop - 128));
+        // With no launcher in between, the program chose the status itself.
+        let direct = exit(stop, None);
+        assert!(direct.is_failure(), "{stop}");
+        assert_eq!(direct.relayed_stop_request(), None);
     }
     for failure in [1, 127, 134, 137, 139, 255] {
-        assert!(exit(failure).is_failure(), "{failure}");
+        assert!(exit(failure, None).is_failure(), "{failure}");
+        assert!(exit(failure, Some("flatpak run")).is_failure(), "{failure}");
     }
+    assert!(!exit(0, None).is_failure());
+}
+
+#[test]
+fn files_whose_names_differ_only_in_replaced_characters_are_checked_separately() {
+    let dir = tempfile::tempdir().unwrap();
+    // The two names are shown identically once sanitised.
+    let first = dir.path().join("settings\u{1}.cfg");
+    let second = dir.path().join("settings\u{2}.cfg");
+    let mut set = EvidenceSet::default();
+    let mut ids = Vec::new();
+    for path in [&first, &second] {
+        std::fs::write(path, "video_driver = \"gl\"\n").unwrap();
+        let (_, fingerprint) = SourceFingerprint::read_with_digest(path, 4096).unwrap();
+        ids.push(
+            set.push(
+                EvidenceArea::EmulatorConfiguration,
+                EvidenceState::Observed,
+                Trust::Measured,
+                "settings file",
+                Some(fingerprint),
+                Fact::Absent,
+            )
+            .unwrap(),
+        );
+    }
+    let shown: Vec<&str> = set
+        .items()
+        .iter()
+        .filter_map(|item| item.fingerprint.as_ref().map(|print| print.path.as_str()))
+        .collect();
+    assert_eq!(shown[0], shown[1]);
+
+    std::fs::write(&second, "video_driver = \"vulkan\"\n").unwrap();
+    assert_eq!(set.refresh_freshness(), [ids[1].clone()]);
+}
+
+#[test]
+fn a_record_that_nothing_was_there_goes_stale_when_something_appears() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("override.cfg");
+    let absent = SourceFingerprint::absent(&path);
+    assert!(absent.absent);
+    assert_eq!(absent.check(), FingerprintCheck::Unchanged);
+    let mut set = EvidenceSet::default();
+    let id = set
+        .push(
+            EvidenceArea::EmulatorConfiguration,
+            EvidenceState::Observed,
+            Trust::Measured,
+            "settings file",
+            Some(absent.clone()),
+            Fact::ConfigLayerAbsent {
+                emulator: "retroarch".into(),
+                layer: ConfigLayer::Game,
+            },
+        )
+        .unwrap();
+    assert!(set.refresh_freshness().is_empty());
+    // Looked for and absent is listed, so a mistyped path can be seen.
+    let coverage = set.coverage();
+    let settings = coverage
+        .iter()
+        .find(|area| area.area == EvidenceArea::EmulatorConfiguration)
+        .unwrap();
+    assert_eq!(settings.observed, 1);
+    assert_eq!(
+        settings.missing,
+        ["no settings file exists at the place given for: override for this game"]
+    );
+
+    std::fs::write(&path, "video_driver = \"gl\"\n").unwrap();
+    assert!(matches!(absent.check(), FingerprintCheck::Changed { .. }));
+    assert_eq!(set.refresh_freshness(), [id]);
+}
+
+#[test]
+fn supplied_facts_are_not_firm() {
+    assert!(Trust::Measured.is_firm() && Trust::Reported.is_firm());
+    assert!(!Trust::Supplied.is_firm());
+    assert!(!Trust::UntrustedText.is_firm() && !Trust::Asserted.is_firm());
+    assert!(Trust::Reported < Trust::Supplied && Trust::Supplied < Trust::UntrustedText);
+    assert_eq!(
+        serde_json::to_string(&Trust::Supplied).unwrap(),
+        "\"supplied\""
+    );
 }

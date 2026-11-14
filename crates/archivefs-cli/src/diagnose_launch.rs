@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use archivefs_core::daedalus::collect::{LaunchArtefacts, collect, read_log_prefix};
+use archivefs_core::daedalus::collect::{LaunchArtefacts, Provenance, collect, read_log_prefix};
 use archivefs_core::daedalus::evidence::{ConfigLayer, ExitOutcome, SpawnFailure};
 use archivefs_core::daedalus::rules::{Diagnosis, DiagnosisReport, diagnose, rule_set};
 
@@ -269,7 +269,7 @@ fn artefacts(parsed: Parsed) -> Result<LaunchArtefacts, String> {
         environment: parsed.environment,
         // Everything typed on the command line is the caller's account of
         // the launch. EmuWiz observed none of it.
-        supplied_by_caller: true,
+        provenance: Provenance::SuppliedByCaller,
     })
 }
 
@@ -368,9 +368,10 @@ fn format_report(report: &DiagnosisReport) -> String {
         out.push_str(&format!("Game: {game}\n"));
     }
     out.push_str(&format!(
-        "Rules: engine version {}, rule set {}\n\nVerdict: {}\n",
+        "Rules: engine version {}, rule set {}\n\nLaunch: {}\nVerdict: {}\n",
         report.rule_set.engine_version,
         &report.rule_set.digest[..16.min(report.rule_set.digest.len())],
+        report.launch.describe(),
         report.verdict.headline()
     ));
     if !report.symptoms.is_empty() {

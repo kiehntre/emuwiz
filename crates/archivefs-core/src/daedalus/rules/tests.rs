@@ -68,6 +68,7 @@ fn path(
             presence,
             readable,
             writable,
+            role_supplied: false,
         }),
     )
     .unwrap()
@@ -1287,7 +1288,10 @@ fn a_cause_named_from_a_generic_error_and_an_exit_status_is_rejected() {
     assert_eq!(report.rejected.len(), 1);
     assert_eq!(report.rejected[0].rule, "test.guess");
     assert!(report.rejected[0].reason.contains("unspecific"));
-    assert_eq!(report.verdict, Verdict::NoProblemObserved);
+    // The process failed, whatever the rules made of it, and nothing that
+    // was accepted explains it.
+    assert_eq!(report.launch, LaunchOutcome::Failed);
+    assert_eq!(report.verdict, Verdict::Unknown);
 }
 
 #[test]
@@ -1438,7 +1442,7 @@ fn an_explicit_graphics_error_is_an_established_report_and_not_an_established_ca
     let report = diagnose(&set);
     let said = reported(&report, "could not set up Vulkan");
     assert_eq!(said.confidence, Confidence::Established);
-    assert_eq!(said.standing(), "reported by the emulator");
+    assert_eq!(said.standing(), "as reported");
     assert!(!said.explains_cause);
     assert_eq!(said.category, DiagnosisCategory::GraphicsInitialisation);
     assert!(
@@ -1608,7 +1612,7 @@ fn a_settings_layer_that_could_not_be_read_holds_setting_based_findings_at_possi
         found
             .limitations
             .iter()
-            .any(|limit| limit.contains("Only the main settings file was examined"))
+            .any(|limit| limit.contains("Not examined: override for this core"))
     );
 
     let incomplete = build(true);
@@ -1652,7 +1656,7 @@ fn an_override_layer_that_does_not_exist_is_examined_and_changes_nothing() {
         !found
             .limitations
             .iter()
-            .any(|limit| limit.contains("Only the main settings file"))
+            .any(|limit| limit.contains("Not examined"))
     );
 }
 
@@ -1676,6 +1680,10 @@ fn an_exit_status_that_relays_a_stop_request_is_not_a_failure_or_a_crash() {
         let report = diagnose(&set_with_stop);
         assert!(exit_symptoms(&report).is_empty(), "{code}");
         assert!(!has_cause(&report, VULKAN_RULE), "{code}");
+        // The process did not fail; the error it printed is still a report
+        // of a failure, and nothing explains it.
+        assert_eq!(report.launch, LaunchOutcome::FailureReported, "{code}");
+        assert_eq!(report.verdict, Verdict::Unknown, "{code}");
         assert!(
             report
                 .notes
@@ -1747,10 +1755,15 @@ fn a_caller_supplied_exit_is_reported_not_measured_and_the_report_says_so() {
     )
     .unwrap();
     let item = set.get(&id).unwrap();
-    assert_eq!(item.trust, Trust::Reported);
+    assert_eq!(item.trust, Trust::Supplied);
+    assert!(!item.trust.is_firm());
     assert!(item.source.contains("supplied"));
     assert!(!item.source.contains("operating system"));
     let report = diagnose(&set);
+    // A premise, not an observation: the cause it suggests is possible.
+    let found = cause(&report, "dependency.emulator_program_unavailable");
+    assert_eq!(found.confidence, Confidence::Possible);
+    assert_eq!(report.verdict, Verdict::PartlyExplained);
     assert!(
         report
             .notes
@@ -1927,4 +1940,466 @@ fn the_rule_set_digest_covers_signatures_and_the_compatibility_table() {
     bumped.version += 1;
     assert_ne!(signature.digest_text(), bumped.digest_text());
     assert!(limitations::digest_text().contains(limitations::MINIMUM_VERSIONS[0].id));
+}
+
+fn supplied_exit(set: &mut EvidenceSet, outcome: ExitOutcome) -> EvidenceId {
+    process::record_exit_from(
+        set,
+        outcome,
+        None,
+        None,
+        process::ExitSource::SuppliedByCaller,
+    )
+    .unwrap()
+}
+
+#[test]
+fn what_the_caller_states_never_establishes_a_cause_or_a_symptom() {
+    const RULE: &str = "dependency.emulator_program_unavailable";
+    for reason in [
+        SpawnFailure::ProgramNotFound,
+        SpawnFailure::PermissionDenied,
+    ] {
+        let mut set = EvidenceSet::default();
+        supplied_exit(
+            &mut set,
+            ExitOutcome::SpawnFailed {
+                reason,
+                os_error: None,
+            },
+        );
+        let report = diagnose(&set);
+        let found = cause(&report, RULE);
+        assert_eq!(found.confidence, Confidence::Possible, "{reason:?}");
+        assert!(
+            found
+                .explanation
+                .starts_with("According to what was supplied"),
+            "{}",
+            found.explanation
+        );
+        assert!(
+            found
+                .limitations
+                .iter()
+                .any(|limit| limit.contains("stated by whoever asked")),
+            "{:?}",
+            found.limitations
+        );
+        assert_eq!(report.verdict, Verdict::PartlyExplained, "{reason:?}");
+        assert_eq!(report.launch, LaunchOutcome::Failed);
+    }
+
+    // The same failure seen by EmuWiz is the operating system's own answer.
+    let mut set = EvidenceSet::default();
+    process::record_exit(
+        &mut set,
+        ExitOutcome::SpawnFailed {
+            reason: SpawnFailure::ProgramNotFound,
+            os_error: None,
+        },
+        None,
+        None,
+    );
+    let report = diagnose(&set);
+    let found = cause(&report, RULE);
+    assert_eq!(found.confidence, Confidence::Established);
+    assert!(
+        found
+            .explanation
+            .starts_with("The operating system reported that")
+    );
+    assert_eq!(report.verdict, Verdict::Explained);
+
+    // A supplied exit and a supplied environment: no display is possible,
+    // and the exit itself is not an established symptom.
+    let mut set = EvidenceSet::default();
+    supplied_exit(&mut set, ExitOutcome::Exited { code: 1 });
+    for name in ["DISPLAY", "WAYLAND_DISPLAY"] {
+        set.observe(
+            EvidenceArea::LaunchEnvironment,
+            Trust::Supplied,
+            "launch environment, as supplied",
+            Fact::EnvironmentVariable {
+                name: name.into(),
+                value: None,
+            },
+        );
+    }
+    let report = diagnose(&set);
+    assert_eq!(
+        cause(&report, "environment.no_display").confidence,
+        Confidence::Possible
+    );
+    assert_ne!(report.verdict, Verdict::Explained);
+    let symptoms = exit_symptoms(&report);
+    assert!(!symptoms.is_empty());
+    for symptom in symptoms {
+        assert_eq!(
+            symptom.confidence,
+            Confidence::Possible,
+            "{}",
+            symptom.title
+        );
+    }
+}
+
+#[test]
+fn a_path_the_caller_named_is_worded_as_given_and_the_report_says_who_named_it() {
+    const RULE: &str = "retroarch.core.not_loaded";
+    let build = |emulator: &str, role_supplied: bool| {
+        let mut set = EvidenceSet::new(Subject {
+            emulator: Some(emulator.into()),
+            game: None,
+        });
+        exited(&mut set, 0);
+        set.observe(
+            EvidenceArea::Filesystem,
+            Trust::Measured,
+            "read-only look at the path",
+            Fact::PathAccess(PathAccess {
+                role: PathRole::EmulatorCore,
+                path: "/typo.so".into(),
+                presence: PathPresence::Missing,
+                readable: None,
+                writable: None,
+                role_supplied,
+            }),
+        );
+        diagnose(&set)
+    };
+    let supplied = build(RA, true);
+    let found = cause(&supplied, RULE);
+    assert!(
+        found
+            .explanation
+            .starts_with("The file given as the emulator core does not exist."),
+        "{}",
+        found.explanation
+    );
+    assert!(
+        supplied
+            .notes
+            .iter()
+            .any(|note| note.contains("did not observe the launch using them")),
+        "{:?}",
+        supplied.notes
+    );
+
+    let observed = build(RA, false);
+    assert!(
+        cause(&observed, RULE)
+            .explanation
+            .starts_with("The core file EmuWiz asked RetroArch to use does not exist.")
+    );
+    assert!(
+        !observed
+            .notes
+            .iter()
+            .any(|note| note.contains("did not observe the launch"))
+    );
+
+    // The rule is about RetroArch. Evidence about another emulator does not
+    // reach it.
+    assert!(!has_cause(&build("dolphin", true), RULE));
+}
+
+#[test]
+fn a_stop_status_is_a_stop_request_only_when_a_launcher_relays_it() {
+    // Through a launcher, 143 is SIGTERM one step removed.
+    let mut set = EvidenceSet::default();
+    process::record_exit(
+        &mut set,
+        ExitOutcome::Exited { code: 143 },
+        None,
+        Some("flatpak run"),
+    );
+    let report = diagnose(&set);
+    assert_eq!(report.launch, LaunchOutcome::NoFailureObserved);
+    assert_eq!(report.verdict, Verdict::NoProblemObserved);
+    assert!(exit_symptoms(&report).is_empty());
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("stop request") && note.contains("SIGTERM")),
+        "{:?}",
+        report.notes
+    );
+
+    // Watched directly, the program chose 143 itself: a failure, with the
+    // other reading offered as no more than possible.
+    let mut set = EvidenceSet::default();
+    exited(&mut set, 143);
+    let report = diagnose(&set);
+    assert_eq!(report.launch, LaunchOutcome::Failed);
+    assert_eq!(report.verdict, Verdict::Unknown);
+    let symptoms = exit_symptoms(&report);
+    assert!(symptoms.iter().any(|symptom| {
+        symptom.title == "The emulator exited with status 143"
+            && symptom.confidence == Confidence::Established
+    }));
+    assert!(symptoms.iter().any(|symptom| {
+        symptom.title == "The emulator may have been asked to stop (SIGTERM)"
+            && symptom.confidence == Confidence::Possible
+    }));
+
+    // A stop signal delivered to the watched process is not a failure, and
+    // the report says what happened instead of saying nothing.
+    let mut set = EvidenceSet::default();
+    ended_by_signal(&mut set, libc::SIGTERM);
+    let report = diagnose(&set);
+    assert_eq!(report.launch, LaunchOutcome::NoFailureObserved);
+    assert_eq!(report.verdict, Verdict::NoProblemObserved);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("stopped by SIGTERM") && note.contains("not a failure")),
+        "{:?}",
+        report.notes
+    );
+}
+
+#[test]
+fn what_happened_to_the_launch_is_reported_apart_from_why() {
+    // Did not fail, and a save could not be written: a problem all the
+    // same, with a cause that is only suggested.
+    let mut set = EvidenceSet::default();
+    exited(&mut set, 0);
+    ra_log(&mut set, "[ERROR] [SRAM]: Failed to save SRAM.\n");
+    let report = diagnose(&set);
+    assert_eq!(report.launch, LaunchOutcome::NoFailureObserved);
+    assert_ne!(report.verdict, Verdict::NoProblemObserved);
+    assert_eq!(report.verdict, Verdict::PartlyExplained);
+    assert_eq!(reported(&report, "save data").effect, Effect::Degrades);
+
+    // The save folder measured as not writable explains it. The launch
+    // still did not fail.
+    path(
+        &mut set,
+        PathRole::SaveDirectory,
+        PathPresence::Directory,
+        Some(true),
+        Some(false),
+    );
+    let report = diagnose(&set);
+    assert_eq!(report.launch, LaunchOutcome::NoFailureObserved);
+    assert_eq!(report.verdict, Verdict::Explained);
+
+    // A clean exit and an error that stops a game from starting: the
+    // failure is reported, not observed, and the wording keeps them apart.
+    let mut set = EvidenceSet::default();
+    exited(&mut set, 0);
+    ra_log(&mut set, fixtures::RA_CORE_IGNORED);
+    let report = diagnose(&set);
+    assert_eq!(report.launch, LaunchOutcome::FailureReported);
+    assert!(report.launch.describe().contains("was not seen to fail"));
+    assert_ne!(report.verdict, Verdict::NoProblemObserved);
+
+    // A healthy run.
+    let mut set = EvidenceSet::default();
+    exited(&mut set, 0);
+    ra_log(&mut set, fixtures::RA_GL_OK);
+    let report = diagnose(&set);
+    assert_eq!(report.launch, LaunchOutcome::NoFailureObserved);
+    assert_eq!(report.verdict, Verdict::NoProblemObserved);
+    assert!(
+        report
+            .launch
+            .describe()
+            .contains("does not show that the game ran")
+    );
+
+    // Nothing known about how it ended, and a process still running.
+    assert_eq!(
+        diagnose(&EvidenceSet::default()).launch,
+        LaunchOutcome::NotObserved
+    );
+    let mut set = EvidenceSet::default();
+    process::record_exit(&mut set, ExitOutcome::StillRunning, None, None);
+    assert_eq!(diagnose(&set).launch, LaunchOutcome::NotObserved);
+
+    // A failed process.
+    let mut set = EvidenceSet::default();
+    exited(&mut set, 1);
+    assert_eq!(diagnose(&set).launch, LaunchOutcome::Failed);
+}
+
+#[test]
+fn several_runs_mixed_together_are_not_explained_by_a_problem_that_only_degrades() {
+    let mut set = EvidenceSet::default();
+    ended_by_signal(&mut set, libc::SIGSEGV);
+    exited(&mut set, 0);
+    path(
+        &mut set,
+        PathRole::SaveDirectory,
+        PathPresence::Directory,
+        Some(true),
+        Some(false),
+    );
+    let report = diagnose(&set);
+    assert!(has_cause(&report, "permission.save_location_unwritable"));
+    assert_eq!(report.verdict, Verdict::Unknown);
+    assert_eq!(report.launch, LaunchOutcome::NotObserved);
+}
+
+#[test]
+fn a_higher_settings_layer_that_went_stale_or_was_not_examined_limits_the_finding() {
+    let probed = |set: &mut EvidenceSet| {
+        probe(
+            set,
+            GraphicsApi::Vulkan,
+            ProbeScope::LaunchEnvironment,
+            false,
+        );
+    };
+    // An override that was read, and changed afterwards.
+    let mut set = vulkan_failure(fixtures::RA_VULKAN_NO_DRIVER);
+    probed(&mut set);
+    set.push(
+        EvidenceArea::EmulatorConfiguration,
+        EvidenceState::Stale {
+            reason: "content changed since it was read".into(),
+        },
+        Trust::Measured,
+        "RetroArch settings file",
+        None,
+        Fact::ConfigValue {
+            emulator: RA.into(),
+            layer: ConfigLayer::Game,
+            key: "video_driver".into(),
+            value: Some("gl".into()),
+            line: Some(1),
+        },
+    );
+    let report = diagnose(&set);
+    let found = cause(&report, VULKAN_RULE);
+    assert_eq!(found.confidence, Confidence::Possible);
+    assert!(
+        found
+            .limitations
+            .iter()
+            .any(|limit| limit.contains("changed while it was being")),
+        "{:?}",
+        found.limitations
+    );
+    assert_ne!(report.verdict, Verdict::Explained);
+
+    // One override examined does not vouch for the two that were not.
+    let mut set = vulkan_failure(fixtures::RA_VULKAN_NO_DRIVER);
+    probed(&mut set);
+    set.observe(
+        EvidenceArea::EmulatorConfiguration,
+        Trust::Measured,
+        "RetroArch settings file",
+        Fact::ConfigLayerAbsent {
+            emulator: RA.into(),
+            layer: ConfigLayer::Core,
+        },
+    );
+    let report = diagnose(&set);
+    let found = cause(&report, VULKAN_RULE);
+    let limit = found
+        .limitations
+        .iter()
+        .find(|limit| limit.starts_with("Not examined:"))
+        .unwrap_or_else(|| panic!("{:?}", found.limitations));
+    assert!(limit.contains("override for this folder"), "{limit}");
+    assert!(limit.contains("override for this game"), "{limit}");
+    assert!(!limit.contains("override for this core"), "{limit}");
+}
+
+#[test]
+fn the_sound_finding_is_not_dropped_on_the_word_of_a_file_another_may_override() {
+    const RULE: &str = "retroarch.audio.driver_failed";
+    let build = |unread_override: bool| {
+        // A core that makes sound, and RetroArch's audio driver failing.
+        let mut set = audio_failure("44100.00");
+        setting(&mut set, "audio_driver", "null", ConfigLayer::Main);
+        if unread_override {
+            set.unavailable(
+                EvidenceArea::EmulatorConfiguration,
+                "RetroArch settings file",
+                "override for this game: could not be read: permission denied",
+            );
+        }
+        diagnose(&set)
+    };
+    // Sound switched off on purpose, in settings that were all read.
+    assert!(!has_cause(&build(false), RULE));
+    // The same, with an override nobody could read: the finding stays, held
+    // at possible, and says why it was not dropped.
+    let report = build(true);
+    let found = cause(&report, RULE);
+    assert_eq!(found.confidence, Confidence::Possible);
+    assert!(
+        found
+            .limitations
+            .iter()
+            .any(|limit| limit.contains("may switch it back on")),
+        "{:?}",
+        found.limitations
+    );
+}
+
+#[test]
+fn a_missing_library_never_becomes_an_instruction_to_install_what_the_text_names() {
+    let mut set = EvidenceSet::default();
+    exited(&mut set, 127);
+    process::record_stderr(
+        &mut set,
+        b"retroarch: error while loading shared libraries: totally-legit-helper.so.1: cannot open shared object file: No such file or directory\n",
+        RA,
+        &[],
+    );
+    let report = diagnose(&set);
+    let found = cause(&report, "dependency.shared_library_missing");
+    for check in &found.next_checks {
+        let text = check.describe();
+        assert!(!text.contains("totally-legit-helper"), "{text}");
+        assert!(
+            text.contains("Do not install anything on the strength"),
+            "{text}"
+        );
+    }
+    assert!(!found.next_checks.is_empty());
+}
+
+#[test]
+fn the_rule_set_digest_changes_with_whatever_decides_a_report() {
+    let base = rule_set_version(RULES);
+    assert_eq!(base.engine_version, ENGINE_VERSION);
+    assert_eq!(base.digest.len(), 64);
+    assert_eq!(base, rule_set_version(RULES));
+    let copy = |change: &dyn Fn(usize, &Rule) -> Rule| -> Vec<Rule> {
+        RULES
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| change(index, rule))
+            .collect()
+    };
+    let same = |_: usize, rule: &Rule| Rule {
+        id: rule.id,
+        version: rule.version,
+        category: rule.category,
+        summary: rule.summary,
+        evaluate: rule.evaluate,
+    };
+    assert_eq!(rule_set_version(&copy(&same)).digest, base.digest);
+    let bumped = copy(&|index, rule| Rule {
+        version: rule.version + u32::from(index == 0),
+        ..same(index, rule)
+    });
+    assert_ne!(rule_set_version(&bumped).digest, base.digest);
+    let reworded = copy(&|index, rule| Rule {
+        summary: if index == 0 {
+            "Something else."
+        } else {
+            rule.summary
+        },
+        ..same(index, rule)
+    });
+    assert_ne!(rule_set_version(&reworded).digest, base.digest);
+    assert_ne!(rule_set_version(&RULES[1..]).digest, base.digest);
 }

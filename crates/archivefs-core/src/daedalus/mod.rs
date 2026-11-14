@@ -17,8 +17,18 @@
 //! - **Text is data.** Emulator logs, stderr and anything a game or third
 //!   party can influence are matched against fixed signatures and otherwise
 //!   only displayed, sanitised and bounded. They are never interpreted as
-//!   instructions, and on their own they never raise a conclusion above
-//!   [`rules::Confidence::Possible`].
+//!   instructions, and on their own they never raise a cause above
+//!   [`rules::Confidence::Possible`]. An error a program states outright is
+//!   restated as a reported symptom: established as a report (marked
+//!   `reported`), never as a cause.
+//! - **Supplied is not observed.** What whoever asked for a diagnosis states
+//!   about a launch (how it ended, what it ran in) is a premise. Nothing
+//!   that rests on it alone is more than possible, and the report says who
+//!   stated it.
+//! - **Outcome and explanation are separate.** What happened to the launch
+//!   ([`rules::LaunchOutcome`]) is reported apart from why
+//!   ([`rules::Verdict`]): a launch that did not fail can still have a
+//!   serious problem.
 //! - **Deterministic.** The same evidence and rule set always produce the
 //!   same report. Rules are versioned; a report records the digest of the
 //!   rule set that produced it.
@@ -54,5 +64,6 @@ pub use evidence::{
     FingerprintCheck, SourceFingerprint, Trust,
 };
 pub use rules::{
-    Confidence, Diagnosis, DiagnosisCategory, DiagnosisReport, Verdict, diagnose, rule_set,
+    Confidence, Diagnosis, DiagnosisCategory, DiagnosisReport, LaunchOutcome, Verdict, diagnose,
+    rule_set,
 };

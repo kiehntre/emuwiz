@@ -52,6 +52,11 @@ fn is_unsafe(character: char) -> bool {
             | '\u{2028}' | '\u{2029}'
             // Tag characters are invisible and can carry hidden text.
             | '\u{E0000}'..='\u{E007F}'
+            // Variation selectors, the combining grapheme joiner and musical
+            // format controls are invisible and change how their neighbours
+            // are shown or compared.
+            | '\u{034F}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}'
+            | '\u{1D173}'..='\u{1D17A}'
         )
 }
 
