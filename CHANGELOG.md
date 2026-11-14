@@ -28,13 +28,17 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   restored only from that install's own backup of it, and only while the
   file still holds what the install's receipt says was put there. An empty
   folder is removed only if it is on the way to a file Undo has just
-  removed, or is the destination folder itself. Installs made before this version have no receipts: Undo no
-  longer removes the files they added, and still restores the files they
-  replaced. An older install that did both is refused as a whole; its files,
+  removed, or is the destination folder itself. Installs made before this
+  version have no receipts: Undo no longer removes the files they added,
+  and still restores the files they replaced. An older install that did both is refused as a whole; its files,
   its backups and its History entry are kept. Empty folders above the
-  destination folder are left in place after Undo. An install with a file
-  whose writing could not be confirmed, but which is in fact there, is now
-  refused Undo until it is looked at, instead of being undone around it.
+  destination folder are left in place after Undo. Undo of an install is
+  now refused, until it is looked at, while EmuWiz still holds a receipt for
+  one of its files that the record says was not installed and something
+  other than the original stands at that path: a file whose writing could
+  not be confirmed, or, after an interrupted install, an original that was
+  edited since or another file that has appeared there. Before, Undo went
+  ahead around that file. There is not yet a way to clear this in the app.
   Limits: this does not protect against something able to change both
   EmuWiz's history folder and its backup folder. A rewritten record can
   still choose the permission bits of a restored file. For an install made

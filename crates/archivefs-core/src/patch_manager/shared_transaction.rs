@@ -10404,10 +10404,11 @@ mod tests {
     }
 
     #[test]
-    fn a_receipt_left_by_an_interrupted_install_does_not_block_undo_of_the_rest() {
-        // What a crash between writing a receipt and publishing the file
-        // leaves: the receipt, and no file (or, for a replacement, the
-        // original). The record honestly says that file was not installed.
+    fn a_held_receipt_contradicts_a_denied_file_only_while_something_of_the_install_may_be_there() {
+        // The check a record's "not installed" is put to, by itself. What a
+        // crash between writing a receipt and publishing the file leaves:
+        // the receipt, and no file (or, for a replacement, the original).
+        // The record honestly says that file was not installed.
         let fixture = Fixture::new("orphan-receipt");
         let journal = install_also(
             &fixture,
@@ -10462,6 +10463,32 @@ mod tests {
                 "{relative:?}"
             );
         }
+        // A planned replacement whose file is gone altogether: nothing of
+        // the install is there either.
+        fs::remove_file(root.join(original)).unwrap();
+        assert!(!receipt_contradicts_not_installed(
+            &fixture.backup_root(),
+            "orphan-receipt",
+            &root,
+            original,
+            &root.join(original),
+            &plan(
+                original,
+                PreviewProposedAction::Replace,
+                Some(b"original".as_slice())
+            ),
+        ));
+        // Something there that cannot be read as a file: not believed.
+        fs::create_dir(root.join(absent)).unwrap();
+        assert!(receipt_contradicts_not_installed(
+            &fixture.backup_root(),
+            "orphan-receipt",
+            &root,
+            absent,
+            &root.join(absent),
+            &plan(absent, PreviewProposedAction::Install, None),
+        ));
+        fs::remove_dir(root.join(absent)).unwrap();
         // The same receipts with a file of the install's there: refused.
         fs::write(root.join(absent), b"was to be installed").unwrap();
         fs::write(root.join(original), b"was to be installed").unwrap();
