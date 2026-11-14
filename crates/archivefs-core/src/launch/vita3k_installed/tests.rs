@@ -365,12 +365,47 @@ fn replaced_or_removed_executable_is_refused() {
         preflight_and_launch_vita3k_installed(&request, &f.roots),
         Err(Vita3kInstalledLaunchError::Missing(_))
     ));
-    // Replaced by a new file (new inode): the executable drifted.
-    fake_vita3k(f.dir.path());
+    // Replaced by a different program: the executable drifted.
+    replace_with_a_different_program(&f.executable);
     assert!(matches!(
         preflight_and_launch_vita3k_installed(&request, &f.roots),
         Err(Vita3kInstalledLaunchError::Changed(_))
     ));
+}
+
+/// Puts a different program where the executable was. Its size differs from
+/// the fake's, so no listing made before can match it, whatever inode the
+/// filesystem hands out and however close together the two were written.
+///
+/// A byte-identical replacement is not a reliable "different file" for a
+/// test: written within one kernel timestamp tick of the original, on the
+/// inode the removed file just freed, it is equal in every attribute a
+/// freshness check compares (device, inode, size, modification time, status
+/// change time). That is the documented limit of `CapturedFileIdentity`,
+/// and it made the test above fail now and then.
+fn replace_with_a_different_program(executable: &Path) {
+    fs::write(executable, "#!/bin/sh\n# a different program\nexit 0\n").unwrap();
+    fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn a_replaced_executable_is_refused_however_quickly_it_was_replaced() {
+    // Remove and replace as fast as the machine allows, many times over:
+    // the replacement often lands on the inode that was just freed, within
+    // the same timestamp tick. It must be refused every time, and never
+    // started.
+    for round in 0..500 {
+        let f = fixture();
+        install(&f.config_root, "PCSE00001", "PCSE00001", "Homebrew", "HB");
+        let request = request_for(&scan_vita3k_installed_titles(&f.roots), "PCSE00001");
+        fs::remove_file(&f.executable).unwrap();
+        replace_with_a_different_program(&f.executable);
+        let result = preflight_and_launch_vita3k_installed(&request, &f.roots);
+        assert!(
+            matches!(result, Err(Vita3kInstalledLaunchError::Changed(_))),
+            "round {round}: a replaced executable was not refused as changed"
+        );
+    }
 }
 
 #[test]
