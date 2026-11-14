@@ -224,8 +224,9 @@ from `emuwiz-installer/previous`:
    exits `2` (`BLOCKED`) while any folder-move record is open (`Planned`,
    `Undoing`, `NeedsReview`), names a state it does not know, cannot be read,
    or is settled but contradicted by the files or, read-only, the library.
-   Only the newest record for a folder is checked against them: an older
-   settled record that a later move of the same folder replaced is history.
+   Only the newest record for a folder is checked for where the folder is;
+   an older settled record that a later move replaced still has its library
+   rows checked, except those the later move covered.
 2. If it blocks on an interrupted move or Undo (`Planned`, `Undoing`), let
    the newest installed EmuWiz finish recovery: in All tools > Organise my
    games choose **Finish interrupted folder moves** (it appears whenever one

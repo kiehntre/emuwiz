@@ -326,7 +326,7 @@ def absolute_bytes(value: Any) -> bytes | None:
     return None
 
 
-def folder_move_report(path: Path, parsed: Any) -> tuple[str, list[str], list[str]]:
+def folder_move_report(path: Path, parsed: Any, replaced: tuple[Path, set[int]] | None = None) -> tuple[str, list[str], list[str]]:
     """State, blockers and warnings for one folder-move record.
 
     Open records (a move or Undo still in progress, or one needing review),
@@ -356,16 +356,21 @@ def folder_move_report(path: Path, parsed: Any) -> tuple[str, list[str], list[st
     source, destination = parsed.get("source"), parsed.get("destination")
     if not isinstance(source, str) or not isinstance(destination, str) or not isinstance(parsed.get("rows"), list):
         return state, [f"folder-move record is malformed; review it before changing EmuWiz: {path}"], []
-    at_source, at_destination = is_present(Path(source)), is_present(Path(destination))
-    here = destination if state == "Committed" else source
-    there = source if state == "Committed" else destination
-    if not at_source and not at_destination:
-        warnings.append(f"folder-move record {path} ({state}) cannot be verified: neither {source} nor {destination} is present (drive not mounted, or moved since)")
-        return state, blockers, warnings
-    if is_present(Path(there)) and not is_present(Path(here)):
-        blockers.append(f"folder-move record {path} says {state} but the folder is at {there}, not {here}; review it before changing EmuWiz")
-        return state, blockers, warnings
     rows = parsed["rows"]
+    if replaced is not None:
+        # A later move of the same folder says where it is now; rows that the
+        # later moves did not cover are still checked below.
+        rows = [row for row in rows if not (isinstance(row, dict) and row.get("archive") in replaced[1])]
+    else:
+        at_source, at_destination = is_present(Path(source)), is_present(Path(destination))
+        here = destination if state == "Committed" else source
+        there = source if state == "Committed" else destination
+        if not at_source and not at_destination:
+            warnings.append(f"folder-move record {path} ({state}) cannot be verified: neither {source} nor {destination} is present (drive not mounted, or moved since)")
+            return state, blockers, warnings
+        if is_present(Path(there)) and not is_present(Path(here)):
+            blockers.append(f"folder-move record {path} says {state} but the folder is at {there}, not {here}; review it before changing EmuWiz")
+            return state, blockers, warnings
     if not rows:
         return state, blockers, warnings
     database = parsed.get("database")
@@ -409,30 +414,44 @@ def folder_move_order(parsed: Any) -> tuple[int, int] | None:
     return (int(match.group(1)), int(match.group(2))) if match else None
 
 
-def superseded_folder_moves(records: list[tuple[Path, Any]]) -> dict[Path, Path]:
+def folder_move_rows(parsed: dict[str, Any]) -> set[int]:
+    rows = parsed.get("rows")
+    return {row["archive"] for row in rows if isinstance(row, dict) and type(row.get("archive")) is int} if isinstance(rows, list) else set()
+
+
+def well_formed_folder_move(parsed: Any) -> bool:
+    return (isinstance(parsed, dict) and type(parsed.get("version")) is int
+            and parsed["version"] == FOLDER_MOVE_RECORD_VERSION and isinstance(parsed.get("state"), str)
+            and parsed["state"] in FOLDER_MOVE_SETTLED | FOLDER_MOVE_OPEN
+            and isinstance(parsed.get("source"), str) and isinstance(parsed.get("destination"), str)
+            and isinstance(parsed.get("rows"), list) and folder_move_order(parsed) is not None)
+
+
+def superseded_folder_moves(records: list[tuple[Path, Any]]) -> dict[Path, tuple[Path, set[int]]]:
     """Settled records that a later record for the same folder replaced.
 
     Organise, Undo and Organise again leaves an older Undone (or RolledBack)
-    record and a newer Committed one for the same paths. Only the newest
-    record says where the folder and its library rows should be now, so an
-    older settled record is not checked against today's files and library.
-    The newer record is checked (or blocks, if open or unreadable) as usual.
-    A record whose start cannot be told from its id is never treated as
-    replaced, and never replaces another: it is checked on its own.
+    record and a newer Committed one for the same paths. Only the newest says
+    where the folder is now, so an older settled record that shares a path with
+    a later one is not checked for where the folder is. Its library rows are
+    still checked, except those the later records also moved. Only well-formed
+    records of a known version and state take part, on both sides: anything
+    else is checked on its own exactly as before. Open records are never
+    replaced. Returns the earliest later record and the archive ids covered.
     """
-    known = []
-    for path, parsed in records:
-        order = folder_move_order(parsed)
-        source, destination = (parsed.get("source"), parsed.get("destination")) if isinstance(parsed, dict) else (None, None)
-        if order is not None and isinstance(source, str) and isinstance(destination, str):
-            known.append((order, path, {source, destination}, parsed.get("state")))
-    replaced: dict[Path, Path] = {}
-    for order, path, paths, state in known:
-        if state not in FOLDER_MOVE_SETTLED:
+    known = [(folder_move_order(parsed), path, parsed) for path, parsed in records if well_formed_folder_move(parsed)]
+    replaced: dict[Path, tuple[Path, set[int]]] = {}
+    for order, path, parsed in known:
+        if parsed["state"] not in FOLDER_MOVE_SETTLED:
             continue
-        later = [(o, p) for o, p, other, _ in known if o > order and paths & other]
+        paths = {parsed["source"], parsed["destination"]}
+        later = sorted((o, p, other) for o, p, other in known
+                       if o > order and paths & {other["source"], other["destination"]})
         if later:
-            replaced[path] = min(later)[1]
+            covered: set[int] = set()
+            for _, _, other in later:
+                covered |= folder_move_rows(other)
+            replaced[path] = (later[0][1], covered)
     return replaced
 
 
@@ -455,11 +474,8 @@ def transactions_report(data_root: Path) -> tuple[dict[str, Any], list[str], lis
             parsed = folder_moves[path]
             entry: dict[str, Any] = {"path": str(path), "kind": "folder_move"}
             if path in replaced:
-                # Settled, and a later move of the same folder replaced it.
-                state, found_blockers, found_warnings = parsed["state"], [], []
-                entry["superseded_by"] = str(replaced[path])
-            else:
-                state, found_blockers, found_warnings = folder_move_report(path, parsed)
+                entry["superseded_by"] = str(replaced[path][0])
+            state, found_blockers, found_warnings = folder_move_report(path, parsed, replaced.get(path))
             counts[state] = counts.get(state, 0) + 1
             entry.update({"state": state, "recognized": state in FOLDER_MOVE_SETTLED | FOLDER_MOVE_OPEN})
             entries.append(entry)

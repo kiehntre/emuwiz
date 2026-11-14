@@ -38,9 +38,12 @@ checked individually: an open record (`Planned`, `Undoing`, `NeedsReview`), an
 unknown state or an unreadable record blocks, and so does a settled record
 contradicted by the files or by the library (opened read-only). When several
 records name the same folder (Organise, Undo, then Organise again; or a
-rolled-back move retried), only the newest is checked; an older settled one
-is reported as `superseded_by` the newer record, and an open record always
-blocks. A record whose id carries no start time is checked on its own. Evidence that
+rolled-back move retried), only the newest says where the folder is: an older
+settled one is reported as `superseded_by` the newer record and its folder
+location is not checked, but its library rows that no later move covered still
+are. Only well-formed records of a known version and state take part; an open
+record always blocks; a record whose id carries no start time is checked on
+its own. Evidence that
 cannot be checked (a folder on an unmounted drive, a library row changed
 later) is a warning. Run the newest copy of this tool before any upgrade,
 rollback or downgrade, and before restoring a binary from

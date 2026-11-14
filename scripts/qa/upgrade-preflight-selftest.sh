@@ -241,4 +241,56 @@ folder_history_case newest-open Undone folder-move-100-1-5 Planned folder-move-2
 # record is checked on its own and the folder contradicts it.
 folder_history_case order-unknown Undone folder-move-old Committed folder-move-200-1-5 destination new 2
 
+# General history cases: SPEC is JSON {"dirs": [...], "rows": {id: path},
+# "records": [{"id", "state", "src", "dst", "rows": [[id, old, new]], "version"?}]}
+# with paths relative to the case's library folder.
+folder_records_case() {
+    local name="$1" expected="$2" spec="$3"
+    local base="$ROOT/fmr-$name"
+    mkdir -p "$base/config" "$base/data/rename-transactions-sealed-v1/folder-moves" "$base/lib"
+    make_db "$base/data/library.sqlite3" "$CURRENT"
+    python3 - "$base" "$spec" <<'PY'
+import json, os, sqlite3, sys
+base, spec = sys.argv[1], json.loads(sys.argv[2])
+lib = f"{base}/lib"
+for d in spec["dirs"]:
+    os.makedirs(f"{lib}/{d}")
+db = f"{lib}/catalogue.sqlite3"
+c = sqlite3.connect(db)
+c.execute("CREATE TABLE archives(id INTEGER PRIMARY KEY, absolute_path_cached BLOB)")
+for archive, p in spec["rows"].items():
+    c.execute("INSERT INTO archives VALUES (?, ?)", (int(archive), f"{lib}/{p}".encode()))
+c.commit(); c.close()
+assoc = lambda p: {"folder": 1, "root": lib, "root_identity": None, "relative": [], "absolute": list(f"{lib}/{p}".encode())}
+for r in spec["records"]:
+    record = {"version": r.get("version", 1), "id": r["id"], "source": f"{lib}/{r['src']}", "destination": f"{lib}/{r['dst']}",
+              "root": lib, "platform": "P", "database": db, "layout_digest": "", "entries": 1, "total_bytes": 1,
+              "rows": [{"archive": a, "old": assoc(o), "new": assoc(n), "fingerprint": False} for a, o, n in r["rows"]],
+              "created_dirs": [], "state": r["state"], "at_unix": 0}
+    with open(f"{base}/data/rename-transactions-sealed-v1/folder-moves/{r['id']}.json", "w", encoding="utf-8") as f:
+        json.dump(record, f)
+PY
+    run_case "fmr-$name" "$expected" --config-root "$base/config" --data-root "$base/data" \
+        --legacy-config-root "$base/legacy-config" --legacy-data-root "$base/legacy-data"
+}
+# An older record of an unknown version is never treated as replaced.
+folder_records_case older-wrong-version 2 '{"dirs": ["Z"], "rows": {"1": "Z/g"}, "records": [
+  {"id": "folder-move-100-1-0", "version": 2, "state": "Committed", "src": "X", "dst": "Y", "rows": [[1, "X/g", "Y/g"]]},
+  {"id": "folder-move-200-1-0", "state": "Committed", "src": "Y", "dst": "Z", "rows": [[1, "Y/g", "Z/g"]]}]}'
+# A later move of a different folder that shares one path does not hide the
+# older record's library row that it never moved.
+folder_records_case other-folder-one-path 2 '{"dirs": ["X", "Y"], "rows": {"1": "X/a", "2": "X/b"}, "records": [
+  {"id": "folder-move-100-1-0", "state": "Committed", "src": "X", "dst": "Y", "rows": [[1, "X/a", "Y/a"]]},
+  {"id": "folder-move-200-1-0", "state": "Committed", "src": "W", "dst": "X", "rows": [[2, "W/b", "X/b"]]}]}'
+# The same, when the later move did cover the row: the history is consistent.
+folder_records_case other-folder-row-covered 0 '{"dirs": ["Z"], "rows": {"1": "Z/a"}, "records": [
+  {"id": "folder-move-100-1-0", "state": "Undone", "src": "X", "dst": "Y", "rows": [[1, "X/a", "Y/a"]]},
+  {"id": "folder-move-200-1-0", "state": "Committed", "src": "X", "dst": "Z", "rows": [[1, "X/a", "Z/a"]]}]}'
+# A state that is not a string blocks (exit 2), never a tool error.
+folder_records_case list-state-with-id 2 '{"dirs": ["Y"], "rows": {"1": "Y/a"}, "records": [
+  {"id": "folder-move-100-1-0", "state": ["Committed"], "src": "X", "dst": "Y", "rows": [[1, "X/a", "Y/a"]]},
+  {"id": "folder-move-200-1-0", "state": "Committed", "src": "X", "dst": "Y", "rows": [[1, "X/a", "Y/a"]]}]}'
+folder_records_case dict-state-with-id 2 '{"dirs": ["Y"], "rows": {"1": "Y/a"}, "records": [
+  {"id": "folder-move-100-1-0", "state": {"s": "Committed"}, "src": "X", "dst": "Y", "rows": [[1, "X/a", "Y/a"]]}]}'
+
 echo "UPGRADE PREFLIGHT SELF-TEST: PASS"
