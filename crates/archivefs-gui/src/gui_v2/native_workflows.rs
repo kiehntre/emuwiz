@@ -4112,6 +4112,12 @@ impl NativeWorkflows {
         // and the launch input the pages were drawing.
         crate::arcade_mame_probe::invalidate_path(&path);
         self.launch_input_memo.forget();
+        // ... and has the BIOS answers the card shows verified again.
+        self.app.emulator_readiness.pcsx2_bios_cache.verify_again();
+        self.app
+            .emulator_readiness
+            .flycast_bios_cache
+            .verify_again();
         // RetroArch facts (save folders, the zipped-game save check) come from
         // its background scan, so an explicit recheck refreshes that too.
         if !matches!(
@@ -4225,7 +4231,8 @@ impl NativeWorkflows {
 
     /// A launch input built now. Everything that starts or authorises a
     /// launch (Play, the Launch page, the bezel preview) uses this and never
-    /// the drawing memo.
+    /// the drawing memo. Its BIOS answers are fresh ones, never ones held for
+    /// drawing.
     fn launch_input(&self) -> launch_readiness_page::LaunchReadinessInput {
         self.launch_input_memo.fresh(|| self.build_launch_input())
     }
@@ -4239,6 +4246,18 @@ impl NativeWorkflows {
         self.app.build_launch_readiness_input(live)
     }
 
+    /// The input the drawing memo remembers. It differs from
+    /// [`Self::build_launch_input`] in one way only: its BIOS answers may be
+    /// ones already held while they are verified again off this thread.
+    fn build_shown_launch_input(&self) -> launch_readiness_page::LaunchReadinessInput {
+        let live = match &self.app.state {
+            LoadState::Ready(data) => Some(data.as_ref()),
+            LoadState::Loading { previous, .. } => previous.as_deref(),
+            LoadState::Error(_) => None,
+        };
+        self.app.build_shown_launch_readiness_input(live)
+    }
+
     /// The launch input for drawing. Reused across frames while nothing it
     /// was built from has changed; see [`launch_input_memo`]. Only read by
     /// code that shows readiness, never by code that launches.
@@ -4246,7 +4265,7 @@ impl NativeWorkflows {
         let key = self.launch_input_key(self.launch_input_memo.now());
         let shown = self
             .launch_input_memo
-            .shown(key, || self.build_launch_input());
+            .shown(key, || self.build_shown_launch_input());
         if let Some(recheck_in) = shown.recheck_in {
             // Whoever draws from a remembered input gets one more frame at
             // the moment it may be rebuilt, so no page depends on some other

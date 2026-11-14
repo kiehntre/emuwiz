@@ -70,16 +70,13 @@ pub(crate) struct EmulatorReadinessState {
     pub(crate) pcsx2_status_generation: u64,
     pub(crate) pcsx2_status_archive_path: Option<PathBuf>,
     /// Each PCSX2 / Flycast profile's BIOS answer for the launch planner,
-    /// reused briefly; see `readiness_input::FirmwareAnswerCache`.
-    pub(crate) pcsx2_bios_cache: std::sync::Mutex<
-        crate::emulator_setup::readiness_input::FirmwareAnswerCache<
-            archivefs_core::patch_manager::Pcsx2BiosVerification,
-        >,
+    /// reused while its files are unchanged and verified again off the
+    /// interface thread; see `firmware_answers::FirmwareAnswerCache`.
+    pub(crate) pcsx2_bios_cache: crate::emulator_setup::firmware_answers::FirmwareAnswerCache<
+        archivefs_core::patch_manager::Pcsx2BiosVerification,
     >,
-    pub(crate) flycast_bios_cache: std::sync::Mutex<
-        crate::emulator_setup::readiness_input::FirmwareAnswerCache<
-            archivefs_core::patch_manager::FlycastSystemFileState,
-        >,
+    pub(crate) flycast_bios_cache: crate::emulator_setup::firmware_answers::FirmwareAnswerCache<
+        archivefs_core::patch_manager::FlycastSystemFileState,
     >,
 }
 
