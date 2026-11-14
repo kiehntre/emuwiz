@@ -1378,6 +1378,30 @@ fn execute_shared_apply_internal(
             };
         }
     }
+    // Before anything in the destination is touched, the backup store is
+    // told which install this is: this operation, for this destination
+    // root, with exactly these files. Undo later holds the journal to it.
+    if !effective_dry_run
+        && let Err(kind) = write_operation_receipt(&journal, plan, &options.backup_root)
+    {
+        journal.entries = plan
+            .entries
+            .iter()
+            .map(|entry| {
+                failed_entry(
+                    entry,
+                    kind,
+                    "EmuWiz could not record which install this is, so nothing was changed",
+                )
+            })
+            .collect();
+        journal.status = SharedApplyStatus::Failed;
+        return SharedApplyResult {
+            journal,
+            journal_path: None,
+            journal_failure: None,
+        };
+    }
     let mut lock = None;
     let mut created_root_directories: Vec<CreatedRootDirectory> = Vec::new();
     if !effective_dry_run {
@@ -1978,6 +2002,10 @@ fn apply_one(
                 .push(SharedTransactionPath::from_path(dir));
         }
     }
+    let output_digest = materialized.map_or_else(
+        || source_hash.digest.clone(),
+        |value| value.output_digest.clone(),
+    );
     if plan.proposed_action == PreviewProposedAction::Replace {
         let Some(existing) = current.as_ref() else {
             return fail_result(
@@ -2035,24 +2063,33 @@ fn apply_one(
             "destination mutation intent checkpoint failed",
         );
     }
-    let output_digest = materialized.map_or_else(
-        || source_hash.digest.clone(),
-        |value| value.output_digest.clone(),
-    );
-    // A file installed where there was none leaves no backup behind. Its
-    // receipt goes into the backup store first, so that Undo later has
-    // something other than the journal to show the file is this install's.
-    if plan.proposed_action == PreviewProposedAction::Install
-        && let Err(error) =
-            write_install_receipt(&destination, &output_digest, backup_root, operation_id)
+    // What is about to be put at the destination goes into the backup
+    // store first, so that Undo later has something other than the journal
+    // to show what this install wrote: for a new file, that the file is
+    // this install's at all; for a replacement, what was put over the
+    // original.
+    let receipt_kind = match plan.proposed_action {
+        PreviewProposedAction::Install => Some(INSTALL_RECEIPT_SUFFIX),
+        PreviewProposedAction::Replace => Some(REPLACEMENT_RECEIPT_SUFFIX),
+        _ => None,
+    };
+    if let Some(kind) = receipt_kind
+        && let Err(error) = write_receipt(
+            kind,
+            destination_root,
+            &relative,
+            &output_digest,
+            backup_root,
+            operation_id,
+        )
     {
         return fail_result(
             result,
             SharedApplyOutcome::BackupFailed,
             error,
             Some(&destination),
-            "EmuWiz could not record that it is installing this file, so nothing was \
-             installed",
+            "EmuWiz could not record what it is about to install here, so the file was \
+             left as it was",
         );
     }
     // A replaced user file keeps the bits recorded with its backup; a new
@@ -2172,16 +2209,16 @@ fn apply_one(
             result = fail_result(result, outcome, kind, Some(&destination), &detail);
         }
     }
-    // The receipt was written before the file. If the file is definitely
-    // not there now, the receipt goes too. The early returns above all
-    // leave the file published, and keep it.
-    if plan.proposed_action == PreviewProposedAction::Install
+    // The receipt was written before the file. If what it describes is
+    // definitely not there now, the receipt goes too. The early returns
+    // above all leave the file published, and keep it.
+    if let Some(kind) = receipt_kind
         && matches!(
             result.publication,
             SharedPublicationState::NotPublished | SharedPublicationState::PublishedThenRestored
         )
     {
-        withdraw_install_receipt(&destination, backup_root, operation_id);
+        withdraw_receipt(kind, destination_root, &relative, backup_root, operation_id);
     }
     result
 }
@@ -2594,6 +2631,16 @@ fn rollback_preview_of(
                 .collect()
         })
         .unwrap_or_default();
+    // Nothing in a journal decides where Undo acts: the folder this Undo
+    // was opened for does. A journal that names anything outside it is
+    // refused as a whole, never trimmed to the entries that look fine, and
+    // before any file it names is opened.
+    let violation = if root_matches {
+        journal_boundary_violation(journal, expected_destination_root)
+            .or_else(|| operation_receipt_violation(journal, journal_path, backup_root))
+    } else {
+        None
+    };
     let mut entries = Vec::new();
     for (index, entry) in journal
         .entries
@@ -2601,6 +2648,23 @@ fn rollback_preview_of(
         .take(SHARED_MAX_ROLLBACK_ENTRIES)
         .enumerate()
     {
+        if let Some(reason) = violation {
+            entries.push(SharedRollbackEntry {
+                destination: None,
+                backup: None,
+                expected_installed_digest: entry.final_destination_digest.clone(),
+                observed_destination_digest: None,
+                observed_backup_digest: None,
+                outcome: SharedRollbackOutcome::JournalMalformed,
+                failure: Some(failure(
+                    SharedApplyFailureKind::InvalidJournal,
+                    None,
+                    reason,
+                )),
+                permissions: None,
+            });
+            continue;
+        }
         entries.push(rollback_entry_preview(
             entry,
             expected_destination_root,
@@ -2610,21 +2674,6 @@ fn rollback_preview_of(
             journal.rollback_operation_id.is_some() || rollback_marker_exists,
             recorded_rolled_back.get(index).copied().unwrap_or(false),
         ));
-    }
-    // Nothing in a journal decides where Undo acts: the folder this Undo
-    // was opened for does. A journal that names anything outside it is
-    // refused as a whole, never trimmed to the entries that look fine.
-    if root_matches
-        && let Some(reason) = journal_boundary_violation(journal, expected_destination_root)
-    {
-        for entry in &mut entries {
-            entry.outcome = SharedRollbackOutcome::JournalMalformed;
-            entry.failure = Some(failure(
-                SharedApplyFailureKind::InvalidJournal,
-                None,
-                reason,
-            ));
-        }
     }
     let available = entries
         .iter()
@@ -2646,6 +2695,15 @@ fn rollback_preview_of(
     };
     preview.preview_id = rollback_preview_digest(&preview);
     preview
+}
+
+/// Records that an entry Undo refused to act on needs review. Its pending
+/// record otherwise goes on saying the entry is being undone, which a later
+/// preview takes as proof that a file now missing was removed by that Undo.
+fn mark_needs_review(durable: &mut SharedDurableJournal, index: usize) {
+    if let Some(entry) = durable.entries.get_mut(index) {
+        entry.state = SharedEntryRecoveryState::NeedsReview;
+    }
 }
 
 pub fn execute_shared_rollback(
@@ -2788,20 +2846,21 @@ pub fn execute_shared_rollback(
                 status: SharedApplyStatus::PartialFailure,
             };
         }
-        // Where to act is the folder the caller opened this Undo for,
-        // joined with a plain relative path. The root an entry names is
-        // never used: it is only ever compared with the caller's.
-        let destination = install
+        // Where to act is the folder this Undo was opened for, joined with
+        // a plain relative path. The root an entry names is never used: it
+        // is only ever compared with that folder.
+        let relative = install
             .plan_entry
             .destination_relative_path
             .to_path_buf()
             .ok()
-            .filter(|relative| is_plain_relative(relative))
-            .map(|relative| root.join(relative));
-        let Some(destination) = destination else {
+            .filter(|relative| is_plain_relative(relative));
+        let Some(relative) = relative else {
             rollback.outcome = SharedRollbackOutcome::Failed;
+            mark_needs_review(&mut durable, index);
             continue;
         };
+        let destination = root.join(&relative);
         let existed_before = install.destination_existed_before_apply.unwrap_or(matches!(
             install.outcome,
             SharedApplyOutcome::ReplacedExisting
@@ -2811,7 +2870,8 @@ pub fn execute_shared_rollback(
                 if !install_receipt_matches(
                     &options.backup_root,
                     &original.operation_id,
-                    &destination,
+                    &root,
+                    &relative,
                     install.final_destination_digest.as_deref(),
                 ) {
                     rollback.outcome = SharedRollbackOutcome::Failed;
@@ -2821,6 +2881,7 @@ pub fn execute_shared_rollback(
                         "EmuWiz has no record of its own that it installed this file; it was \
                          kept as it is",
                     ));
+                    mark_needs_review(&mut durable, index);
                     continue;
                 }
                 match remove_and_verify_new_destination(
@@ -2832,8 +2893,10 @@ pub fn execute_shared_rollback(
                 ) {
                     Ok(()) => {
                         rollback.outcome = SharedRollbackOutcome::RemovedInstalledFile;
-                        withdraw_install_receipt(
-                            &destination,
+                        withdraw_receipt(
+                            INSTALL_RECEIPT_SUFFIX,
+                            &root,
+                            &relative,
                             &options.backup_root,
                             &original.operation_id,
                         );
@@ -2894,6 +2957,23 @@ pub fn execute_shared_rollback(
                         "the backup is not the one EmuWiz keeps for this file, or a link \
                          stands between a folder this Undo was opened for and the file",
                     ));
+                    mark_needs_review(&mut durable, index);
+                    continue;
+                }
+                if let Err(reason) = replacement_receipt_agrees(
+                    &options.backup_root,
+                    &original.operation_id,
+                    &root,
+                    &relative,
+                    install.final_destination_digest.as_deref(),
+                ) {
+                    rollback.outcome = SharedRollbackOutcome::Failed;
+                    rollback.failure = Some(failure(
+                        SharedApplyFailureKind::InvalidJournal,
+                        Some(&destination),
+                        reason,
+                    ));
+                    mark_needs_review(&mut durable, index);
                     continue;
                 }
                 let expected = install.backup_digest.as_deref().unwrap_or_default();
@@ -2930,7 +3010,16 @@ pub fn execute_shared_rollback(
                     Ok(installed) => {
                         match atomic_write(&backup, &destination, expected, false, mode, installed)
                         {
-                            Ok(_) => rollback.outcome = SharedRollbackOutcome::RestoredBackup,
+                            Ok(_) => {
+                                rollback.outcome = SharedRollbackOutcome::RestoredBackup;
+                                withdraw_receipt(
+                                    REPLACEMENT_RECEIPT_SUFFIX,
+                                    &root,
+                                    &relative,
+                                    &options.backup_root,
+                                    &original.operation_id,
+                                );
+                            }
                             Err((kind, temp)) => {
                                 let detail = match kind {
                                     // Nothing was undone: say so, and how to
@@ -4376,11 +4465,11 @@ fn rollback_entry_preview(
     already_rolled_back: bool,
     recorded_rolled_back: bool,
 ) -> SharedRollbackEntry {
-    let destination = entry
-        .plan_entry
-        .destination_relative_path
-        .to_path_buf()
-        .map(|relative| root.join(relative));
+    let relative = entry.plan_entry.destination_relative_path.to_path_buf();
+    let destination = relative
+        .as_ref()
+        .map(|relative| root.join(relative))
+        .map_err(|kind| *kind);
     let mut result = SharedRollbackEntry {
         destination: destination
             .as_deref()
@@ -4448,6 +4537,22 @@ fn rollback_entry_preview(
         entry.outcome,
         SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
     ) {
+        // The journal says this file was not installed. If EmuWiz's own
+        // receipt says it put these very bytes here, and they are here,
+        // going on would undo the rest of the install and leave this file
+        // behind as if it had never been part of it.
+        if let (Ok(destination), Ok(relative)) = (destination.as_ref(), relative.as_ref())
+            && receipt_names_what_is_there(backup_root, operation_id, root, relative, destination)
+        {
+            result.outcome = SharedRollbackOutcome::DestinationChanged;
+            result.failure = Some(failure(
+                SharedApplyFailureKind::RollbackBlocked,
+                Some(destination),
+                "EmuWiz's own record says it put this file here, and this history entry says \
+                 it did not. Undo is blocked until that is resolved by hand.",
+            ));
+            return result;
+        }
         result.outcome = SharedRollbackOutcome::NoChangeRequired;
         return result;
     }
@@ -4465,7 +4570,7 @@ fn rollback_entry_preview(
         ));
         return result;
     }
-    let Ok(destination) = destination else {
+    let (Ok(destination), Ok(relative)) = (destination, relative) else {
         result.outcome = SharedRollbackOutcome::DestinationUnsafe;
         return result;
     };
@@ -4525,7 +4630,8 @@ fn rollback_entry_preview(
         && !install_receipt_matches(
             backup_root,
             operation_id,
-            &destination,
+            root,
+            &relative,
             entry.final_destination_digest.as_deref(),
         )
     {
@@ -4564,6 +4670,25 @@ fn rollback_entry_preview(
                 .is_some_and(|below| reject_links_below(backup_root, below).is_ok())
         {
             result.outcome = SharedRollbackOutcome::BackupChanged;
+            return result;
+        }
+        // The file holds what the journal says was installed. Whether that
+        // is what EmuWiz installed is EmuWiz's own word, where it kept one:
+        // otherwise a journal could have the original put back over newer
+        // content merely by naming that content as the install's.
+        if let Err(reason) = replacement_receipt_agrees(
+            backup_root,
+            operation_id,
+            root,
+            &relative,
+            entry.final_destination_digest.as_deref(),
+        ) {
+            result.outcome = SharedRollbackOutcome::JournalMalformed;
+            result.failure = Some(failure(
+                SharedApplyFailureKind::InvalidJournal,
+                Some(&destination),
+                reason,
+            ));
             return result;
         }
         match stable_hash(&backup, SHARED_MAX_SOURCE_BYTES) {
@@ -5291,13 +5416,28 @@ fn cleanup_transaction_created_root_directories(journal: &SharedApplyJournal, ro
 /// File-name ending of a backup of a replaced file, in the backup store.
 const BACKUP_SUFFIX: &str = ".bak";
 /// File-name ending of the receipt for a file installed where there was
-/// none, in the backup store. See [`write_install_receipt`].
+/// none, in the backup store. See [`write_receipt`].
 const INSTALL_RECEIPT_SUFFIX: &str = ".new";
+/// Name of the receipt, in an operation's folder in the backup store, that
+/// says which install the folder belongs to. See [`write_operation_receipt`].
+const OPERATION_RECEIPT_NAME: &str = "operation.plan";
+/// How [`operation_identity_document`] is laid out. The receipt of every
+/// install is read for as long as that install can be undone, so a change
+/// to the layout, or to how any type in it is written out, needs a new
+/// number here and the old reading kept beside the new.
+const OPERATION_RECEIPT_FORMAT: u32 = 1;
+/// File-name ending of the receipt for a file installed over an existing
+/// one, in the backup store beside the backup of the file it replaced.
+/// The two kinds of receipt are different files on purpose: a receipt for
+/// a replacement can never stand in for the receipt of a new file, so it
+/// can never be used to have a file removed. See [`write_receipt`].
+const REPLACEMENT_RECEIPT_SUFFIX: &str = ".replacement";
 
-/// Where the backup store keeps one operation's own evidence about one
-/// destination file: the backup of the file it replaced, or the receipt for
-/// a file it installed where there was none. The name is derived from the
-/// operation and the destination path, and from nothing a journal says.
+/// Where the backup store keeps one operation's backup of the file it
+/// replaced at `destination`. The place follows from the operation and the
+/// file's path as text, exactly as it has since backups were first made,
+/// so the backups of installs made by earlier versions are found. A
+/// journal names its backup too; it may only agree with this.
 fn operation_evidence_path(
     backup_root: &Path,
     operation_id: &str,
@@ -5306,27 +5446,46 @@ fn operation_evidence_path(
 ) -> Result<PathBuf, SharedApplyFailureKind> {
     Ok(backup_root
         .join(safe_identifier(operation_id)?)
-        .join(evidence_name(destination, suffix)))
+        .join(format!(
+            "{}{suffix}",
+            digest_text(&destination.to_string_lossy())
+        )))
 }
 
-/// The file name of a piece of evidence about `destination`.
+/// Where the backup store keeps one operation's receipt for the file it
+/// installed at `relative` below the destination root `root`.
 ///
-/// A backup is named as it always has been, from the path as text, so that
-/// the backups of installs made by earlier versions are still found. A
-/// receipt is named from the exact bytes of the path, so that two paths
-/// that differ only in bytes that are not text can never share one: no
-/// change to a path in a journal makes it name another path's receipt.
-/// For a path that is text the two names are built from the same bytes.
-fn evidence_name(destination: &Path, suffix: &str) -> String {
+/// The name is the digest of the root and of the path below it, each by
+/// its exact bytes and kept apart by a byte no path can hold. So a receipt
+/// belongs to one file of one install made for one destination root. A
+/// journal that names the same file through another root (a wider one,
+/// say, with the rest moved into the path) names a receipt that is not
+/// there, and so does one that differs only in bytes that are not text.
+///
+/// This matters because not every caller has a destination root of its
+/// own to open Undo for: History opens it for the root the journal names.
+/// The root a journal names is therefore tied to the install by the
+/// receipt, not by the caller.
+fn operation_receipt_path(
+    backup_root: &Path,
+    operation_id: &str,
+    root: &Path,
+    relative: &Path,
+    suffix: &str,
+) -> Result<PathBuf, SharedApplyFailureKind> {
     #[cfg(unix)]
-    if suffix == INSTALL_RECEIPT_SUFFIX {
+    let named = {
         use std::os::unix::ffi::OsStrExt;
-        return format!(
-            "{}{suffix}",
-            digest_bytes(destination.as_os_str().as_bytes())
-        );
-    }
-    format!("{}{suffix}", digest_text(&destination.to_string_lossy()))
+        let mut named = root.as_os_str().as_bytes().to_vec();
+        named.push(0);
+        named.extend_from_slice(relative.as_os_str().as_bytes());
+        named
+    };
+    #[cfg(not(unix))]
+    let named = format!("{}\0{}", root.to_string_lossy(), relative.to_string_lossy()).into_bytes();
+    Ok(backup_root
+        .join(safe_identifier(operation_id)?)
+        .join(format!("{}{suffix}", digest_bytes(&named))))
 }
 
 /// The folder in the backup store that holds one operation's evidence,
@@ -5350,52 +5509,58 @@ fn operation_evidence_folder(
     }
 }
 
-/// Records, in the backup store and under this operation, that EmuWiz is
-/// about to install a file where there is none. The receipt holds the
-/// digest of the bytes about to be installed. It is written before the
-/// file is published, so an interrupted install can leave a receipt with
-/// no file but never a file with no receipt.
+/// Records, in the backup store and under this operation, what EmuWiz is
+/// about to install at `destination`: the digest of the bytes about to be
+/// written. `suffix` says which kind of install it is, a new file or a
+/// replacement. The receipt is written before the file is published, and
+/// for a replacement before the backup is made, so an interrupted install
+/// can leave a receipt with no file. A crash of EmuWiz cannot leave a file
+/// it installed, or a backup it made, without its receipt; after a power
+/// cut that rests on the filesystem having kept the receipt, and if it did
+/// not, the file is treated as not EmuWiz's, which is the safe direction.
 ///
-/// A replaced file leaves a backup behind, which shows that the operation
-/// was there. A new file leaves nothing but the journal, and a journal is
-/// a file that anything able to write the history folder can write. The
-/// receipt is the same kind of evidence as a backup, in the same place,
-/// under the same name: something Undo can check that a journal cannot
-/// supply.
-fn write_install_receipt(
-    destination: &Path,
+/// A journal is a file that anything able to write the history folder can
+/// write. A receipt is in the backup store, where a journal cannot put it:
+/// it is something Undo can check that a journal cannot supply.
+/// - For a new file it is the only thing that shows the file is this
+///   install's. No receipt, no removal.
+/// - For a replaced file the backup already shows that EmuWiz replaced the
+///   file and what the original was. The receipt adds what was installed
+///   over it, so that a journal cannot have the original put back over
+///   something else merely by saying that is what was installed.
+fn write_receipt(
+    suffix: &str,
+    root: &Path,
+    relative: &Path,
     installed_digest: &str,
     backup_root: &Path,
     operation_id: &str,
 ) -> Result<PathBuf, SharedApplyFailureKind> {
     operation_evidence_folder(backup_root, operation_id)?;
-    let receipt = operation_evidence_path(
-        backup_root,
-        operation_id,
-        destination,
-        INSTALL_RECEIPT_SUFFIX,
-    )?;
+    let receipt = operation_receipt_path(backup_root, operation_id, root, relative, suffix)?;
     atomic_managed_write(&receipt, installed_digest.as_bytes())?;
     Ok(receipt)
 }
 
-/// Removes this operation's receipt for `destination`, once the engine
-/// itself has established that the file the receipt vouches for is not
-/// there: the install never published it, or published it, failed its
-/// check and took it back, or Undo has removed it. A receipt must not
-/// outlive the only thing it vouches for, or a later file with the same
+/// Removes this operation's receipt for one file, once the engine itself
+/// has established that what the receipt describes is not there: the
+/// install never published it, or published it, failed its check and took
+/// it back, or Undo has removed it or put the original back. A receipt
+/// must not outlive what it vouches for, or a later file with the same
 /// bytes at the same place could be claimed with it. Where the outcome is
 /// uncertain the receipt is left beside the file it may describe.
 ///
-/// Nothing depends on this succeeding: a receipt that could not be removed
-/// names a file that is absent.
-fn withdraw_install_receipt(destination: &Path, backup_root: &Path, operation_id: &str) {
-    let Ok(receipt) = operation_evidence_path(
-        backup_root,
-        operation_id,
-        destination,
-        INSTALL_RECEIPT_SUFFIX,
-    ) else {
+/// A receipt that could not be removed is still held to the file: Undo
+/// acts on it only while the file holds exactly the bytes it names.
+fn withdraw_receipt(
+    suffix: &str,
+    root: &Path,
+    relative: &Path,
+    backup_root: &Path,
+    operation_id: &str,
+) {
+    let Ok(receipt) = operation_receipt_path(backup_root, operation_id, root, relative, suffix)
+    else {
         return;
     };
     // Only ever a plain file strictly inside the backup folder the caller
@@ -5407,6 +5572,180 @@ fn withdraw_install_receipt(destination: &Path, backup_root: &Path, operation_id
     }
 }
 
+/// What ties a journal to one install: the operation, its destination
+/// root, and its whole plan (every file, in order, with what was to be
+/// done to it, where it came from and which game it was for). All of it is
+/// in the journal, and all of it is known before the install touches
+/// anything.
+fn operation_identity_document(
+    operation_id: &str,
+    context: &SharedApplyContext,
+    approved_source_root: &SharedTransactionPath,
+    destination_root: &SharedTransactionPath,
+    plan_id: &str,
+    entries: &[&SharedPlanEntry],
+) -> Option<Vec<u8>> {
+    serde_json::to_vec(&(
+        OPERATION_RECEIPT_FORMAT,
+        operation_id,
+        context,
+        approved_source_root,
+        destination_root,
+        plan_id,
+        entries,
+    ))
+    .ok()
+}
+
+/// What an operation receipt holds for an install described by `document`.
+fn operation_receipt_content(document: &[u8]) -> String {
+    format!("{OPERATION_RECEIPT_FORMAT}:{}", digest_bytes(document))
+}
+
+/// Records in the backup store, before the install touches anything, which
+/// install this operation's folder belongs to. If it cannot be written the
+/// install does not start.
+///
+/// A file's receipt shows that EmuWiz installed that file. It does not
+/// show which journal may speak for it: without this, a journal could
+/// carry another install's operation and files, or leave some of its own
+/// out, and Undo would act on whatever it listed. This receipt is written
+/// by the install itself, from the plan it is about to carry out, and a
+/// journal cannot put it there.
+fn write_operation_receipt(
+    journal: &SharedApplyJournal,
+    plan: &SharedTransactionPlan,
+    backup_root: &Path,
+) -> Result<(), SharedApplyFailureKind> {
+    let entries: Vec<&SharedPlanEntry> = plan.entries.iter().collect();
+    let document = operation_identity_document(
+        &journal.operation_id,
+        &journal.context,
+        &journal.approved_source_root,
+        &journal.destination_root,
+        &journal.plan_id,
+        &entries,
+    )
+    .ok_or(SharedApplyFailureKind::BackupFailed)?;
+    let folder = operation_evidence_folder(backup_root, &journal.operation_id)?;
+    atomic_managed_write(
+        &folder.join(OPERATION_RECEIPT_NAME),
+        operation_receipt_content(&document).as_bytes(),
+    )
+    .map(|_| ())
+}
+
+/// What is wrong with `journal` as the record of the install the backup
+/// store knows under its operation, if anything.
+///
+/// - A history entry is filed under its own operation's name. One filed
+///   under another name is a copy of some other install's record.
+/// - Where the install left an operation receipt, the journal must
+///   describe exactly that install: the same operation, destination root
+///   and plan. A journal that carries another install's files, adds to its
+///   own, leaves some out, or describes itself as something else, does
+///   not.
+/// - An install made before these receipts existed left none, and nothing
+///   else of the kind either ([`operation_keeps_receipts`]). Its journal
+///   is believed as far as the per-file rules allow, as before.
+fn operation_receipt_violation(
+    journal: &SharedApplyJournal,
+    journal_path: &Path,
+    backup_root: &Path,
+) -> Option<&'static str> {
+    const UNUSABLE: &str = "EmuWiz's own record of which install this is cannot be read";
+    let Ok(operation) = safe_identifier(&journal.operation_id) else {
+        return Some("this history entry does not name its operation plainly");
+    };
+    if journal_path.file_name() != Some(OsStr::new(&format!("{operation}.json"))) {
+        return Some("this history entry is filed under another install's name");
+    }
+    let below = Path::new(&operation).join(OPERATION_RECEIPT_NAME);
+    if reject_links_below(backup_root, &below).is_err() {
+        return Some(UNUSABLE);
+    }
+    let receipt = backup_root.join(below);
+    match fs::symlink_metadata(&receipt) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if operation_keeps_receipts(backup_root, &journal.operation_id) {
+                Some(
+                    "EmuWiz kept receipts for this install, but not the one that says which \
+                     install it is",
+                )
+            } else {
+                None
+            }
+        }
+        Ok(metadata) if metadata.is_file() => {
+            let entries: Vec<&SharedPlanEntry> = journal
+                .entries
+                .iter()
+                .map(|entry| &entry.plan_entry)
+                .collect();
+            let expected = operation_identity_document(
+                &journal.operation_id,
+                &journal.context,
+                &journal.approved_source_root,
+                &journal.destination_root,
+                &journal.plan_id,
+                &entries,
+            )
+            .map(|document| operation_receipt_content(&document));
+            match read_bounded(&receipt, 256) {
+                Ok(bytes) if expected.is_some_and(|expected| bytes == expected.as_bytes()) => None,
+                Ok(_) => Some(
+                    "this history entry is not the record of the install EmuWiz kept under \
+                     this name: its files, its folder or its description have been changed",
+                ),
+                Err(_) => Some(UNUSABLE),
+            }
+        }
+        _ => Some(UNUSABLE),
+    }
+}
+
+/// Whether the backup store holds a receipt, of either kind, saying that
+/// this operation put at `destination` exactly the bytes that are there
+/// now. Used where a journal says a file was not installed: if EmuWiz's
+/// own receipt and the file itself say otherwise, the journal is leaving
+/// one of the install's files out. A receipt that cannot be read is
+/// answered the strict way.
+fn receipt_names_what_is_there(
+    backup_root: &Path,
+    operation_id: &str,
+    root: &Path,
+    relative: &Path,
+    destination: &Path,
+) -> bool {
+    for suffix in [INSTALL_RECEIPT_SUFFIX, REPLACEMENT_RECEIPT_SUFFIX] {
+        let Ok(receipt) = operation_receipt_path(backup_root, operation_id, root, relative, suffix)
+        else {
+            continue;
+        };
+        let Some(below) = strictly_inside(&receipt, backup_root) else {
+            continue;
+        };
+        if matches!(
+            fs::symlink_metadata(&receipt),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            continue;
+        }
+        if reject_links_below(backup_root, below).is_err() {
+            return true;
+        }
+        let Ok(named) = read_bounded(&receipt, 256) else {
+            return true;
+        };
+        if stable_hash(destination, SHARED_MAX_SOURCE_BYTES)
+            .is_ok_and(|hash| hash.digest.as_bytes() == named)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether the backup store holds this operation's receipt for
 /// `destination`, saying it installed exactly `installed_digest` there.
 /// The receipt is looked for where EmuWiz would have put it, inside the
@@ -5414,16 +5753,18 @@ fn withdraw_install_receipt(destination: &Path, backup_root: &Path, operation_id
 fn install_receipt_matches(
     backup_root: &Path,
     operation_id: &str,
-    destination: &Path,
+    root: &Path,
+    relative: &Path,
     installed_digest: Option<&str>,
 ) -> bool {
     let Some(installed_digest) = installed_digest else {
         return false;
     };
-    let Ok(receipt) = operation_evidence_path(
+    let Ok(receipt) = operation_receipt_path(
         backup_root,
         operation_id,
-        destination,
+        root,
+        relative,
         INSTALL_RECEIPT_SUFFIX,
     ) else {
         return false;
@@ -5436,6 +5777,108 @@ fn install_receipt_matches(
     }
     // A receipt is one digest: anything longer is not a receipt.
     read_bounded(&receipt, 256).is_ok_and(|bytes| bytes == installed_digest.as_bytes())
+}
+
+/// Whether this operation's folder in the backup store holds a receipt of
+/// any kind. An EmuWiz that keeps receipts writes the operation's own
+/// before it touches anything, and never removes it; so a folder with a
+/// backup and no receipt at all is from an EmuWiz that did not keep them,
+/// and so is an operation with no folder. Anything else that cannot be
+/// read is answered the strict way.
+fn operation_keeps_receipts(backup_root: &Path, operation_id: &str) -> bool {
+    let Ok(operation) = safe_identifier(operation_id) else {
+        return true;
+    };
+    if reject_links_below(backup_root, Path::new(&operation)).is_err() {
+        return true;
+    }
+    let entries = match fs::read_dir(backup_root.join(&operation)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == OPERATION_RECEIPT_NAME
+            || name.ends_with(REPLACEMENT_RECEIPT_SUFFIX)
+            || name.ends_with(INSTALL_RECEIPT_SUFFIX)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the journal's word for what was installed over the file at
+/// `relative` below `root` may be believed: it must agree with this
+/// operation's own receipt for that replacement.
+///
+/// Installs made before EmuWiz kept receipts have backups and no receipt
+/// of any kind. For them there is nothing to hold the journal to, and Undo
+/// goes on the journal's word, as it always did: refusing would make
+/// every backup made by an earlier EmuWiz unusable. Whether an operation
+/// is one of those is decided by what its folder in the backup store
+/// holds ([`operation_keeps_receipts`]), never by how a journal names a
+/// file: a journal can neither remove a receipt nor, by naming the file
+/// some other way, make a newer install look like an older one. For an
+/// install that kept receipts, a replaced file with no receipt is one
+/// EmuWiz did not replace, or has already put back.
+fn replacement_receipt_agrees(
+    backup_root: &Path,
+    operation_id: &str,
+    root: &Path,
+    relative: &Path,
+    installed_digest: Option<&str>,
+) -> Result<(), &'static str> {
+    const UNUSABLE: &str = "EmuWiz's own record of what it installed over this file cannot be \
+                            read, so the file was kept as it is";
+    let Ok(receipt) = operation_receipt_path(
+        backup_root,
+        operation_id,
+        root,
+        relative,
+        REPLACEMENT_RECEIPT_SUFFIX,
+    ) else {
+        return Err(UNUSABLE);
+    };
+    let Some(below) = strictly_inside(&receipt, backup_root) else {
+        return Err(UNUSABLE);
+    };
+    if reject_links_below(backup_root, below).is_err() {
+        return Err(UNUSABLE);
+    }
+    match fs::symlink_metadata(&receipt) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if operation_keeps_receipts(backup_root, operation_id) {
+                Err(
+                    "EmuWiz kept its own record of what this install put over files, and has \
+                     none for this file as this history entry names it, so the file was kept \
+                     as it is",
+                )
+            } else {
+                // A backup from before these receipts existed.
+                Ok(())
+            }
+        }
+        Ok(metadata) if metadata.is_file() => {
+            // A receipt is one digest: anything longer is not a receipt.
+            match read_bounded(&receipt, 256) {
+                Ok(bytes) if installed_digest.is_some_and(|digest| bytes == digest.as_bytes()) => {
+                    Ok(())
+                }
+                Ok(_) => Err(
+                    "this history entry does not agree with EmuWiz's own record of what it \
+                     installed over this file, so the file was kept as it is",
+                ),
+                Err(_) => Err(UNUSABLE),
+            }
+        }
+        _ => Err(UNUSABLE),
+    }
 }
 
 /// Whether `path` is one or more plain names: no root, no `.`, no `..`.
@@ -5455,7 +5898,7 @@ fn is_plain_relative(path: &Path) -> bool {
 /// The part of `path` below `root`, when `path` is absolute and lies
 /// strictly inside `root` by plain names alone. The comparison is by
 /// components, which is exact because the remainder may hold no `..`.
-/// Links are dealt with where a path is used, by never following one.
+/// Links are not looked at here; they are dealt with where a path is used.
 fn strictly_inside<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
     if !path.is_absolute() {
         return None;
@@ -5512,22 +5955,30 @@ fn journal_boundary_violation(journal: &SharedApplyJournal, root: &Path) -> Opti
                 );
             }
         }
-        match entry.plan_entry.destination_relative_path.to_path_buf() {
-            Ok(relative) if is_plain_relative(&relative) => {}
+        let destination = match entry.plan_entry.destination_relative_path.to_path_buf() {
+            Ok(relative) if is_plain_relative(&relative) => root.join(relative),
             _ => {
                 return Some(
                     "this record names a file by a path that is not a plain path inside \
                      the destination folder",
                 );
             }
+        };
+        // An install only ever creates the folders on the way to its own
+        // file. A folder anywhere else, however empty, is not one of them.
+        if entry.created_directories.len() > SHARED_MAX_CREATED_DIRECTORIES {
+            return Some("this record claims more created folders than an install makes");
         }
         for created in &entry.created_directories {
             match created.to_path_buf() {
-                Ok(path) if strictly_inside(&path, root).is_some() => {}
+                Ok(path)
+                    if strictly_inside(&path, root).is_some()
+                        && path != destination
+                        && destination.starts_with(&path) => {}
                 _ => {
                     return Some(
                         "this record claims a created folder that is not inside the \
-                         destination folder",
+                         destination folder, on the way to its own file",
                     );
                 }
             }
@@ -8913,6 +9364,17 @@ mod tests {
             outcome.0,
             outcome.1
         );
+        // The record is refused as a whole: the folder is not on the way
+        // to the install's own file.
+        assert!(!outcome.0);
+        // And the clean-up itself, handed the claim directly, does not
+        // follow the link.
+        let forged = read_journal(&journal).unwrap();
+        cleanup_created_directories(&forged.entries[0], &fixture.destination_root());
+        assert!(
+            theirs.is_dir(),
+            "the clean-up followed a link out of the root"
+        );
     }
 
     #[test]
@@ -8970,14 +9432,39 @@ mod tests {
         );
     }
 
+    /// Makes the operation `label` look as an earlier EmuWiz left it: its
+    /// backups, and no receipt of any kind.
+    fn forget_receipts(fixture: &Fixture, label: &str) {
+        for entry in fs::read_dir(fixture.backup_root().join(label)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension() != Some(OsStr::new("bak")) {
+                fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
     /// Where the backup store keeps the receipt for the file an honest
     /// install made, under the operation `label`.
     fn receipt_for(fixture: &Fixture, label: &str, relative: &str) -> PathBuf {
-        operation_evidence_path(
+        operation_receipt_path(
             &fixture.backup_root(),
             label,
-            &fixture.destination_root().join(relative),
+            &fixture.destination_root(),
+            Path::new(relative),
             INSTALL_RECEIPT_SUFFIX,
+        )
+        .unwrap()
+    }
+
+    /// Where the backup store keeps the receipt for what an honest install
+    /// put over an existing file, under the operation `label`.
+    fn replacement_receipt_for(fixture: &Fixture, label: &str, relative: &str) -> PathBuf {
+        operation_receipt_path(
+            &fixture.backup_root(),
+            label,
+            &fixture.destination_root(),
+            Path::new(relative),
+            REPLACEMENT_RECEIPT_SUFFIX,
         )
         .unwrap()
     }
@@ -8993,10 +9480,21 @@ mod tests {
             digest_bytes(b"new").as_bytes(),
             "the receipt is the digest of what was installed"
         );
-        // A replaced file is shown by its backup; it gets no receipt.
+        // A replaced file is shown by its backup. Its receipt says what was
+        // installed over it, and is not the receipt of a new file.
         let fixture = Fixture::new("receipt-replace");
         let journal = honest_replacement(&fixture, "receipt-replace");
         assert!(!receipt_for(&fixture, "receipt-replace", INSTALLED).exists());
+        assert_eq!(
+            fs::read(replacement_receipt_for(
+                &fixture,
+                "receipt-replace",
+                INSTALLED
+            ))
+            .unwrap(),
+            digest_bytes(b"new").as_bytes(),
+            "the receipt is the digest of what was installed over the file"
+        );
         let recorded = read_journal(&journal).unwrap();
         let backup = recorded.entries[0]
             .backup_path
@@ -9017,34 +9515,65 @@ mod tests {
     }
 
     #[test]
-    fn a_receipt_that_cannot_be_written_stops_the_install() {
-        let fixture = Fixture::new("receipt-unwritable");
-        let report = preview(&fixture, b"new", None);
-        let plan = make_plan(&fixture, &report);
-        // Something that is not a folder stands where this operation's
-        // evidence would go.
-        fs::create_dir_all(fixture.backup_root()).unwrap();
-        fs::write(
-            fixture.backup_root().join("receipt-unwritable"),
-            b"in the way",
-        )
-        .unwrap();
-        let result = execute_shared_apply(
-            &plan,
-            &options(&fixture, &plan, "receipt-unwritable", false, true, false),
-        );
-        assert_ne!(result.journal.status, SharedApplyStatus::Success);
-        assert_eq!(
-            result.journal.entries[0].outcome,
-            SharedApplyOutcome::BackupFailed
-        );
-        // No receipt, so no file: nothing is installed that Undo could not
-        // later show to be the install's.
-        assert!(!fixture.destination_root().join(INSTALLED).exists());
-        assert_eq!(
-            fs::read(fixture.backup_root().join("receipt-unwritable")).unwrap(),
-            b"in the way"
-        );
+    fn an_install_that_cannot_record_itself_does_not_start() {
+        for (label, existing) in [
+            ("operation-unwritable-new", None),
+            ("operation-unwritable-replace", Some(b"old".as_slice())),
+        ] {
+            let fixture = Fixture::new(label);
+            let report = preview(&fixture, b"new", existing);
+            let plan = make_plan(&fixture, &report);
+            // Something that is not a folder stands where this operation's
+            // evidence would go.
+            fs::create_dir_all(fixture.backup_root()).unwrap();
+            fs::write(fixture.backup_root().join(label), b"in the way").unwrap();
+            let result =
+                execute_shared_apply(&plan, &options(&fixture, &plan, label, false, true, true));
+            assert_eq!(result.journal.status, SharedApplyStatus::Failed, "{label}");
+            assert!(result.journal.entries[0].backup_path.is_none(), "{label}");
+            // Nothing recorded, so nothing touched.
+            let live = fixture.destination_root().join(INSTALLED);
+            match existing {
+                None => assert!(!live.exists(), "{label}"),
+                Some(bytes) => assert_eq!(fs::read(&live).unwrap(), bytes, "{label}"),
+            }
+            assert_eq!(
+                fs::read(fixture.backup_root().join(label)).unwrap(),
+                b"in the way"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_whose_receipt_cannot_be_written_is_left_as_it_was() {
+        for (label, existing) in [
+            ("receipt-unwritable-new", None),
+            ("receipt-unwritable-replace", Some(b"old".as_slice())),
+        ] {
+            let fixture = Fixture::new(label);
+            let report = preview(&fixture, b"new", existing);
+            let plan = make_plan(&fixture, &report);
+            // Something already stands exactly where this file's receipt
+            // would go, in the operation's own folder.
+            let receipt = match existing {
+                None => receipt_for(&fixture, label, INSTALLED),
+                Some(_) => replacement_receipt_for(&fixture, label, INSTALLED),
+            };
+            fs::create_dir_all(&receipt).unwrap();
+            let result =
+                execute_shared_apply(&plan, &options(&fixture, &plan, label, false, true, true));
+            assert_ne!(result.journal.status, SharedApplyStatus::Success, "{label}");
+            assert_eq!(
+                result.journal.entries[0].outcome,
+                SharedApplyOutcome::BackupFailed,
+                "{label}"
+            );
+            let live = fixture.destination_root().join(INSTALLED);
+            match existing {
+                None => assert!(!live.exists(), "{label}"),
+                Some(bytes) => assert_eq!(fs::read(&live).unwrap(), bytes, "{label}"),
+            }
+        }
     }
 
     #[test]
@@ -9129,37 +9658,646 @@ mod tests {
     }
 
     #[test]
-    fn a_receipt_is_named_from_the_exact_bytes_of_its_path() {
+    fn a_receipt_is_named_from_its_root_and_its_path_kept_apart() {
         use std::os::unix::ffi::OsStrExt;
-        let root = Path::new("/backups");
-        let name = |bytes: &[u8], suffix: &str| {
-            operation_evidence_path(root, "op", Path::new(OsStr::from_bytes(bytes)), suffix)
-                .unwrap()
+        let store = Path::new("/backups");
+        let name = |root: &[u8], relative: &[u8], suffix: &str| {
+            operation_receipt_path(
+                store,
+                "op",
+                Path::new(OsStr::from_bytes(root)),
+                Path::new(OsStr::from_bytes(relative)),
+                suffix,
+            )
+            .unwrap()
         };
-        // Two paths that differ only in a byte that is not text read the
-        // same as text. Their receipts are still different files.
-        let first = b"/games/save\xff.cht";
-        let second = b"/games/save\xfe.cht";
-        assert_eq!(name(first, BACKUP_SUFFIX), name(second, BACKUP_SUFFIX));
+        // The same file named through a wider root is another receipt.
         assert_ne!(
-            name(first, INSTALL_RECEIPT_SUFFIX),
-            name(second, INSTALL_RECEIPT_SUFFIX)
+            name(b"/games/cheats", b"nes/save.cht", INSTALL_RECEIPT_SUFFIX),
+            name(b"/games", b"cheats/nes/save.cht", INSTALL_RECEIPT_SUFFIX)
         );
-        // For a path that is text, a receipt and a backup share their stem,
-        // and both sit in the operation's own folder.
-        let plain = b"/games/save.cht";
-        let receipt = name(plain, INSTALL_RECEIPT_SUFFIX);
-        let backup = name(plain, BACKUP_SUFFIX);
-        assert_eq!(receipt.file_stem(), backup.file_stem());
-        assert_eq!(receipt.parent(), Some(Path::new("/backups/op")));
+        assert_ne!(
+            name(
+                b"/games/cheats",
+                b"nes/save.cht",
+                REPLACEMENT_RECEIPT_SUFFIX
+            ),
+            name(
+                b"/games",
+                b"cheats/nes/save.cht",
+                REPLACEMENT_RECEIPT_SUFFIX
+            )
+        );
+        // Two paths that differ only in a byte that is not text read the
+        // same as text, and share a backup name. Their receipts are still
+        // different files.
+        let backup = |path: &[u8]| {
+            operation_evidence_path(
+                store,
+                "op",
+                Path::new(OsStr::from_bytes(path)),
+                BACKUP_SUFFIX,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            backup(b"/games/save\xff.cht"),
+            backup(b"/games/save\xfe.cht")
+        );
+        assert_ne!(
+            name(b"/games", b"save\xff.cht", INSTALL_RECEIPT_SUFFIX),
+            name(b"/games", b"save\xfe.cht", INSTALL_RECEIPT_SUFFIX)
+        );
+        // The receipt of a new file and the receipt of a replacement are
+        // never the same file, and both sit in the operation's own folder.
+        let new = name(b"/games", b"save.cht", INSTALL_RECEIPT_SUFFIX);
+        let replacement = name(b"/games", b"save.cht", REPLACEMENT_RECEIPT_SUFFIX);
+        assert_ne!(new, replacement);
+        assert_eq!(new.parent(), Some(Path::new("/backups/op")));
+        assert_eq!(replacement.parent(), Some(Path::new("/backups/op")));
         // The operation is one plain name: it cannot point elsewhere.
         for operation in ["", ".", "..", "a/b", "../op"] {
             assert!(
-                operation_evidence_path(root, operation, Path::new("/x"), INSTALL_RECEIPT_SUFFIX)
-                    .is_err(),
+                operation_receipt_path(
+                    store,
+                    operation,
+                    Path::new("/x"),
+                    Path::new("y"),
+                    INSTALL_RECEIPT_SUFFIX
+                )
+                .is_err(),
                 "{operation:?}"
             );
         }
+    }
+
+    /// History opens Undo for the folder the record names. A record that
+    /// names a wider folder, with the rest moved into the path, points at
+    /// the very same file. It must gain nothing by it.
+    #[test]
+    fn a_record_that_widens_its_destination_folder_removes_nothing() {
+        let fixture = Fixture::new("forged-wider-root");
+        let journal = honest_install(&fixture, "forged-wider-root");
+        let installed = fixture.destination_root().join(INSTALLED);
+        // An empty folder beside the real destination folder.
+        let theirs = fixture.0.join("someones-empty-folder");
+        fs::create_dir(&theirs).unwrap();
+        let wider = fixture.0.clone();
+        let moved = Path::new("destination").join(INSTALLED);
+        rewrite_journal(&journal, |journal| {
+            journal.destination_root = SharedTransactionPath::from_path(&wider);
+            let entry = &mut journal.entries[0];
+            entry.plan_entry.destination_root = SharedTransactionPath::from_path(&wider);
+            entry.plan_entry.destination_relative_path = SharedTransactionPath::from_path(&moved);
+            entry.destination_parent_existed_before_apply = Some(false);
+            // Only folders on the way to the file, so the path rules pass:
+            // the real destination folder and the folder below it.
+            entry.created_directories = vec![
+                SharedTransactionPath::from_path(&fixture.destination_root()),
+                SharedTransactionPath::from_path(
+                    &fixture.destination_root().join("Nintendo - NES"),
+                ),
+            ];
+        });
+        // Undo is opened for the folder the record names, as History does.
+        let preview = preview_shared_rollback(&journal, &wider, &fixture.backup_root());
+        assert_eq!(
+            preview.entries[0].outcome,
+            SharedRollbackOutcome::JournalMalformed,
+            "this is no longer the record of the install EmuWiz kept: {:?}",
+            preview.entries[0]
+        );
+        assert!(!preview.available);
+        let result = execute_shared_rollback(
+            &preview,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "forged-wider-root-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(result.status, SharedApplyStatus::Failed);
+        assert_eq!(fs::read(&installed).unwrap(), b"new");
+        assert!(fixture.destination_root().join("Nintendo - NES").is_dir());
+        assert!(theirs.is_dir());
+        // The receipt the honest install wrote is still there for an Undo
+        // opened for the real folder.
+        assert!(receipt_for(&fixture, "forged-wider-root", INSTALLED).exists());
+
+        // Naming the neighbour's folder as one the install created is
+        // refused outright: it is not on the way to the file.
+        rewrite_journal(&journal, |journal| {
+            journal.entries[0]
+                .created_directories
+                .push(SharedTransactionPath::from_path(&theirs));
+        });
+        let preview = preview_shared_rollback(&journal, &wider, &fixture.backup_root());
+        assert_eq!(
+            preview.entries[0].outcome,
+            SharedRollbackOutcome::JournalMalformed
+        );
+        assert!(theirs.is_dir());
+        assert_eq!(fs::read(&installed).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_wider_destination_folder_does_not_make_a_replacement_look_like_an_older_install() {
+        let fixture = Fixture::new("forged-wider-root-replace");
+        let journal = honest_replacement(&fixture, "forged-wider-root-replace");
+        let live = fixture.destination_root().join(INSTALLED);
+        fs::write(&live, b"changed since").unwrap();
+        let wider = fixture.0.clone();
+        let moved = Path::new("destination").join(INSTALLED);
+        rewrite_journal(&journal, |journal| {
+            journal.destination_root = SharedTransactionPath::from_path(&wider);
+            let entry = &mut journal.entries[0];
+            entry.plan_entry.destination_root = SharedTransactionPath::from_path(&wider);
+            entry.plan_entry.destination_relative_path = SharedTransactionPath::from_path(&moved);
+            entry.final_destination_digest = Some(digest_bytes(b"changed since"));
+        });
+        // Named this way the file has no receipt. The operation kept
+        // receipts all the same, so its backup is not believed on the
+        // record's word as an older install's would be.
+        let preview = preview_shared_rollback(&journal, &wider, &fixture.backup_root());
+        assert_eq!(
+            preview.entries[0].outcome,
+            SharedRollbackOutcome::JournalMalformed,
+            "{:?}",
+            preview.entries[0]
+        );
+        assert!(!preview.available);
+        assert_eq!(fs::read(&live).unwrap(), b"changed since");
+    }
+
+    #[test]
+    fn a_record_cannot_claim_an_empty_folder_that_is_not_on_the_way_to_its_file() {
+        let fixture = Fixture::new("forged-unrelated-folder");
+        let journal = honest_install(&fixture, "forged-unrelated-folder");
+        let theirs = fixture.destination_root().join("Someone's saves");
+        fs::create_dir(&theirs).unwrap();
+        rewrite_journal(&journal, |journal| {
+            journal.entries[0]
+                .created_directories
+                .push(SharedTransactionPath::from_path(&theirs));
+        });
+        assert_eq!(try_undo(&fixture, &journal, "unrelated"), (false, None));
+        assert!(theirs.is_dir());
+        assert_eq!(
+            fs::read(fixture.destination_root().join(INSTALLED)).unwrap(),
+            b"new"
+        );
+        // Nor more folders than an install makes.
+        rewrite_journal(&journal, |journal| {
+            let parent = SharedTransactionPath::from_path(
+                &fixture.destination_root().join("Nintendo - NES"),
+            );
+            journal.entries[0].created_directories =
+                vec![parent; SHARED_MAX_CREATED_DIRECTORIES + 1];
+        });
+        assert_eq!(try_undo(&fixture, &journal, "too-many"), (false, None));
+        assert_eq!(
+            fs::read(fixture.destination_root().join(INSTALLED)).unwrap(),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn a_record_that_breaks_the_path_rules_is_refused_before_any_file_it_names_is_read() {
+        let check = |label: &str, forge: &dyn Fn(&mut SharedApplyJournal, &Path)| {
+            let fixture = Fixture::new(label);
+            let journal = honest_install(&fixture, label);
+            let theirs = someone_elses_file(&fixture, "keep.cht");
+            rewrite_journal(&journal, |journal| forge(journal, &theirs));
+            let preview = preview_shared_rollback(
+                &journal,
+                &fixture.destination_root(),
+                &fixture.backup_root(),
+            );
+            assert!(!preview.available, "{label}");
+            for entry in &preview.entries {
+                // Refused by the path rules themselves, not for want of a
+                // receipt, and without opening what the record names.
+                assert_eq!(
+                    entry.outcome,
+                    SharedRollbackOutcome::JournalMalformed,
+                    "{label}"
+                );
+                assert!(entry.observed_destination_digest.is_none(), "{label}");
+                assert!(entry.destination.is_none(), "{label}");
+            }
+        };
+        check("rules-absolute", &|journal, theirs| {
+            journal.entries[0].plan_entry.destination_relative_path =
+                SharedTransactionPath::from_path(theirs);
+        });
+        check("rules-parent", &|journal, _| {
+            journal.entries[0].plan_entry.destination_relative_path =
+                SharedTransactionPath::from_path(Path::new("../outside/keep.cht"));
+        });
+        check("rules-entry-root", &|journal, theirs| {
+            journal.entries[0].plan_entry.destination_root =
+                SharedTransactionPath::from_path(theirs.parent().unwrap());
+        });
+    }
+
+    #[test]
+    fn a_record_rewritten_after_undo_was_approved_is_not_acted_on() {
+        let fixture = Fixture::new("rewritten-after-approval");
+        let journal = honest_replacement(&fixture, "rewritten-after-approval");
+        let live = fixture.destination_root().join(INSTALLED);
+        let approved = preview_shared_rollback(
+            &journal,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert!(approved.available);
+        // Between the approval and the Undo the file changes, and the
+        // record is rewritten to match it.
+        fs::write(&live, b"changed since").unwrap();
+        rewrite_journal(&journal, |journal| {
+            journal.entries[0].final_destination_digest = Some(digest_bytes(b"changed since"));
+        });
+        let result = execute_shared_rollback(
+            &approved,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: approved.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "rewritten-after-approval-rollback".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        assert_eq!(result.status, SharedApplyStatus::Failed);
+        assert!(result.journal_path.is_none());
+        assert_eq!(fs::read(&live).unwrap(), b"changed since");
+    }
+
+    #[test]
+    fn an_older_install_that_added_and_replaced_files_is_refused_as_a_whole_and_everything_is_kept()
+    {
+        let fixture = Fixture::new("legacy-mixed");
+        let plan = mixed_plan(
+            &fixture,
+            &[
+                ("Nintendo - NES/aaa-overlay.cfg", None, b"overlay"),
+                ("Nintendo - NES/game.cht", Some(b"old"), b"new"),
+            ],
+        );
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "legacy-mixed", false, true, true),
+        );
+        assert_eq!(applied.journal.status, SharedApplyStatus::Success);
+        let journal = applied.journal_path.clone().unwrap();
+        // As an earlier EmuWiz left it: the backup, and no receipt of
+        // either kind.
+        let evidence = fixture.backup_root().join("legacy-mixed");
+        let mut backups = 0;
+        for entry in fs::read_dir(&evidence).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension() == Some(OsStr::new("bak")) {
+                backups += 1;
+            } else {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        assert_eq!(backups, 1);
+        let recorded = fs::read(&journal).unwrap();
+        assert_eq!(try_undo(&fixture, &journal, "legacy-mixed"), (false, None));
+        assert_eq!(
+            fs::read(
+                fixture
+                    .destination_root()
+                    .join("Nintendo - NES/aaa-overlay.cfg")
+            )
+            .unwrap(),
+            b"overlay"
+        );
+        assert_eq!(
+            fs::read(fixture.destination_root().join("Nintendo - NES/game.cht")).unwrap(),
+            b"new"
+        );
+        assert_eq!(fs::read(&journal).unwrap(), recorded);
+        assert_eq!(
+            fs::read_dir(&evidence).unwrap().count(),
+            1,
+            "the backup of the replaced original is kept"
+        );
+    }
+
+    /// Another install into the same fixture: its own source files, its
+    /// own operation. Returns its record.
+    fn install_also(fixture: &Fixture, label: &str, items: &[MixedItem]) -> PathBuf {
+        fs::create_dir_all(fixture.source_root()).unwrap();
+        fs::create_dir_all(fixture.destination_root().join("Nintendo - NES")).unwrap();
+        let source_items = items
+            .iter()
+            .enumerate()
+            .map(|(index, (relative, existing, new))| {
+                let source = fixture.source_root().join(format!("{label}-{index}"));
+                fs::write(&source, new).unwrap();
+                if let Some(bytes) = existing {
+                    fs::write(fixture.destination_root().join(relative), bytes).unwrap();
+                }
+                PreviewSourceItem {
+                    adapter: PreviewAdapter::RetroArch,
+                    source_path: source,
+                    expected_source_digest: None,
+                    destination_relative_paths: vec![PathBuf::from(relative)],
+                    match_strength: PreviewMatchStrength::VerifiedExact,
+                }
+            })
+            .collect();
+        let report = build_shared_preview(&SharedPreviewRequest {
+            adapter: PreviewAdapter::RetroArch,
+            selected_archive: fixture.0.join(format!("{label}.zip")),
+            platform: Some("NES".into()),
+            identity: PreviewIdentity {
+                kind: PreviewIdentityKind::RetroArchCatalogueMatch,
+                state: PreviewIdentityState::Verified,
+                value: Some("archive-1".into()),
+                archive_path: fixture.0.join(format!("{label}.zip")),
+                revision: None,
+            },
+            destination_root: fixture.destination_root(),
+            source_items,
+        })
+        .unwrap();
+        let plan = make_plan(fixture, &report);
+        let applied =
+            execute_shared_apply(&plan, &options(fixture, &plan, label, false, true, true));
+        assert_eq!(
+            applied.journal.status,
+            SharedApplyStatus::Success,
+            "{:?}",
+            applied.journal
+        );
+        applied.journal_path.unwrap()
+    }
+
+    #[test]
+    fn one_installs_record_cannot_undo_another_installs_files() {
+        let fixture = Fixture::new("cross-install");
+        let x = install_also(
+            &fixture,
+            "mod-x",
+            &[
+                ("Nintendo - NES/x-added.cht", None, b"x-added"),
+                (
+                    "Nintendo - NES/x-replaced.cfg",
+                    Some(b"x-before"),
+                    b"x-after",
+                ),
+            ],
+        );
+        let y = install_also(
+            &fixture,
+            "mod-y",
+            &[
+                ("Nintendo - NES/y-added.cht", None, b"y-added"),
+                (
+                    "Nintendo - NES/y-replaced.cfg",
+                    Some(b"y-before"),
+                    b"y-after",
+                ),
+            ],
+        );
+        let file = |name: &str| fixture.destination_root().join("Nintendo - NES").join(name);
+        let refused_and_untouched = |record: &Path, what: &str| {
+            assert_eq!(
+                try_undo(&fixture, record, "tampered"),
+                (false, None),
+                "{what}"
+            );
+            assert_eq!(fs::read(file("x-added.cht")).unwrap(), b"x-added", "{what}");
+            assert_eq!(
+                fs::read(file("x-replaced.cfg")).unwrap(),
+                b"x-after",
+                "{what}"
+            );
+            assert_eq!(fs::read(file("y-added.cht")).unwrap(), b"y-added", "{what}");
+            assert_eq!(
+                fs::read(file("y-replaced.cfg")).unwrap(),
+                b"y-after",
+                "{what}"
+            );
+        };
+        let honest_x = fs::read(&x).unwrap();
+        let honest_y = fs::read(&y).unwrap();
+        let ys = read_journal(&y).unwrap();
+
+        // X's record carrying Y's files in place of its own.
+        rewrite_journal(&x, |journal| journal.entries = ys.entries.clone());
+        refused_and_untouched(&x, "Y's entries in X's record");
+        // X's record carrying Y's files beside its own.
+        fs::write(&x, &honest_x).unwrap();
+        rewrite_journal(&x, |journal| journal.entries.extend(ys.entries.clone()));
+        refused_and_untouched(&x, "Y's entries added to X's record");
+        // X's record claiming to be Y's operation, with Y's files.
+        fs::write(&x, &honest_x).unwrap();
+        rewrite_journal(&x, |journal| {
+            journal.operation_id = ys.operation_id.clone();
+            journal.plan_id = ys.plan_id.clone();
+            journal.entries = ys.entries.clone();
+        });
+        refused_and_untouched(&x, "X's record renamed to Y's operation");
+        // Y's whole record, byte for byte, filed under X's name.
+        fs::write(&x, &honest_y).unwrap();
+        refused_and_untouched(&x, "Y's record filed as X");
+        fs::write(&x, &honest_x).unwrap();
+
+        // Y's own record with one of its files left out: half an Undo.
+        rewrite_journal(&y, |journal| journal.entries.truncate(1));
+        refused_and_untouched(&y, "Y's record with a file left out");
+        // Y's own record saying one of its files was never installed.
+        for index in [0, 1] {
+            fs::write(&y, &honest_y).unwrap();
+            rewrite_journal(&y, |journal| {
+                let entry = &mut journal.entries[index];
+                entry.outcome = SharedApplyOutcome::AlreadyInstalled;
+                entry.backup_path = None;
+                entry.backup_digest = None;
+            });
+            refused_and_untouched(&y, "Y's record denying one of its files");
+        }
+        // Y's own record describing itself as something else.
+        fs::write(&y, &honest_y).unwrap();
+        rewrite_journal(&y, |journal| {
+            journal.context.verified_game_identity = "another game".into();
+        });
+        refused_and_untouched(&y, "Y's record relabelled");
+
+        // The honest records still undo, each its own install, whole, and
+        // nothing of the other's.
+        fs::write(&y, &honest_y).unwrap();
+        assert_eq!(
+            try_undo(&fixture, &y, "mod-y"),
+            (true, Some(SharedApplyStatus::Success))
+        );
+        assert!(!file("y-added.cht").exists());
+        assert_eq!(fs::read(file("y-replaced.cfg")).unwrap(), b"y-before");
+        assert_eq!(fs::read(file("x-added.cht")).unwrap(), b"x-added");
+        assert_eq!(fs::read(file("x-replaced.cfg")).unwrap(), b"x-after");
+        assert_eq!(
+            try_undo(&fixture, &x, "mod-x"),
+            (true, Some(SharedApplyStatus::Success))
+        );
+        assert!(!file("x-added.cht").exists());
+        assert_eq!(fs::read(file("x-replaced.cfg")).unwrap(), b"x-before");
+    }
+
+    #[test]
+    fn an_install_leaves_its_operation_receipt_before_it_touches_anything() {
+        let fixture = Fixture::new("operation-receipt");
+        let journal = honest_install(&fixture, "operation-receipt");
+        let receipt = fixture
+            .backup_root()
+            .join("operation-receipt")
+            .join(OPERATION_RECEIPT_NAME);
+        let held = fs::read_to_string(&receipt).unwrap();
+        assert!(held.starts_with("1:"), "{held}");
+        // It is what the record works out to, and stops being so the moment
+        // the record says anything else about the install.
+        assert!(
+            operation_receipt_violation(
+                &read_journal(&journal).unwrap(),
+                &journal,
+                &fixture.backup_root()
+            )
+            .is_none()
+        );
+        // Without it, an install that kept receipts is not believed.
+        fs::remove_file(&receipt).unwrap();
+        assert_eq!(
+            try_undo(&fixture, &journal, "no-operation-receipt"),
+            (false, None)
+        );
+        assert!(fixture.destination_root().join(INSTALLED).exists());
+
+        // A dry run leaves nothing.
+        let fixture = Fixture::new("operation-receipt-dry");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "operation-receipt-dry", true, true, false),
+        );
+        assert!(!fixture.backup_root().join("operation-receipt-dry").exists());
+
+        // An install interrupted before its first file still left it.
+        let fixture = Fixture::new("operation-receipt-early");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::Rename));
+        execute_shared_apply(
+            &plan,
+            &options(
+                &fixture,
+                &plan,
+                "operation-receipt-early",
+                false,
+                true,
+                false,
+            ),
+        );
+        inject_fault(None);
+        assert!(
+            fixture
+                .backup_root()
+                .join("operation-receipt-early")
+                .join(OPERATION_RECEIPT_NAME)
+                .is_file()
+        );
+    }
+
+    /// The operation receipt is kept for as long as an install can be
+    /// undone, and is worked out again from the record at every Undo. This
+    /// pins what goes into it. If this test has to change, installs made
+    /// before the change would all be refused Undo: give the new layout a
+    /// new [`OPERATION_RECEIPT_FORMAT`] and keep reading the old one.
+    #[test]
+    fn what_goes_into_an_operation_receipt_does_not_drift() {
+        let path = |text: &str| SharedTransactionPath::from_path(Path::new(text));
+        let context = SharedApplyContext {
+            adapter: PreviewAdapter::RetroArch,
+            selected_archive: path("/roms/game.zip"),
+            verified_game_identity: "archive-1".into(),
+            profile_id: "retroarch-native".into(),
+            source_mode: "trusted-catalogue".into(),
+        };
+        let entry = SharedPlanEntry {
+            adapter: PreviewAdapter::RetroArch,
+            selected_archive: path("/roms/game.zip"),
+            verified_game_identity: "archive-1".into(),
+            source_path: path("/staged/game.cht"),
+            source_digest: "aa".into(),
+            destination_root: path("/cheats"),
+            destination_relative_path: path("NES/game.cht"),
+            destination_pre_state: PreviewDestinationState::Missing,
+            destination_pre_digest: None,
+            proposed_action: PreviewProposedAction::Install,
+            backup_required: false,
+            parent_creation_approved: true,
+            content_verification: None,
+        };
+        let document = operation_identity_document(
+            "op-1",
+            &context,
+            &path("/staged"),
+            &path("/cheats"),
+            "plan-1",
+            &[&entry],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(document).unwrap(),
+            concat!(
+                r#"[1,"op-1","#,
+                r#"{"adapter":"retro_arch","#,
+                r#""selected_archive":{"display":"/roms/game.zip","unix_bytes_hex":"2f726f6d732f67616d652e7a6970"},"#,
+                r#""verified_game_identity":"archive-1","profile_id":"retroarch-native","source_mode":"trusted-catalogue"},"#,
+                r#"{"display":"/staged","unix_bytes_hex":"2f737461676564"},"#,
+                r#"{"display":"/cheats","unix_bytes_hex":"2f636865617473"},"#,
+                r#""plan-1","#,
+                r#"[{"adapter":"retro_arch","#,
+                r#""selected_archive":{"display":"/roms/game.zip","unix_bytes_hex":"2f726f6d732f67616d652e7a6970"},"#,
+                r#""verified_game_identity":"archive-1","#,
+                r#""source_path":{"display":"/staged/game.cht","unix_bytes_hex":"2f7374616765642f67616d652e636874"},"#,
+                r#""source_digest":"aa","#,
+                r#""destination_root":{"display":"/cheats","unix_bytes_hex":"2f636865617473"},"#,
+                r#""destination_relative_path":{"display":"NES/game.cht","unix_bytes_hex":"4e45532f67616d652e636874"},"#,
+                r#""destination_pre_state":"missing","destination_pre_digest":null,"#,
+                r#""proposed_action":"install","backup_required":false,"#,
+                r#""parent_creation_approved":true,"content_verification":null}]]"#,
+            )
+        );
+    }
+
+    #[test]
+    fn a_receipt_that_is_a_link_is_not_accepted() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("receipt-link");
+        let journal = honest_install(&fixture, "receipt-link");
+        let receipt = receipt_for(&fixture, "receipt-link", INSTALLED);
+        // A link in the receipt's place, to a file holding the right
+        // digest. It is not followed.
+        let elsewhere = fixture.0.join("elsewhere");
+        fs::write(&elsewhere, digest_bytes(b"new")).unwrap();
+        fs::remove_file(&receipt).unwrap();
+        symlink(&elsewhere, &receipt).unwrap();
+        assert_eq!(try_undo(&fixture, &journal, "receipt-link"), (false, None));
+        assert_eq!(
+            fs::read(fixture.destination_root().join(INSTALLED)).unwrap(),
+            b"new"
+        );
     }
 
     #[test]
@@ -9196,7 +10334,8 @@ mod tests {
         assert!(fixture.destination_root().join(INSTALLED).exists());
         assert!(receipt_for(&fixture, "forged-inside-root", INSTALLED).exists());
 
-        // The preview says why, for the person looking at it.
+        // The preview says why, for the person looking at it: this is no
+        // longer the record of the install EmuWiz kept under this name.
         let preview = preview_shared_rollback(
             &journal,
             &fixture.destination_root(),
@@ -9204,13 +10343,13 @@ mod tests {
         );
         assert_eq!(
             preview.entries[0].outcome,
-            SharedRollbackOutcome::BackupMissing
+            SharedRollbackOutcome::JournalMalformed
         );
         assert!(
             preview.entries[0]
                 .failure
                 .as_ref()
-                .is_some_and(|failure| failure.detail.contains("no record of its own")),
+                .is_some_and(|failure| failure.detail.contains("not the record of the install")),
             "{:?}",
             preview.entries[0].failure
         );
@@ -9247,7 +10386,7 @@ mod tests {
         // not offered, and the files and the record stay.
         let fixture = Fixture::new("legacy-new");
         let journal = honest_install(&fixture, "legacy-new");
-        fs::remove_file(receipt_for(&fixture, "legacy-new", INSTALLED)).unwrap();
+        forget_receipts(&fixture, "legacy-new");
         let recorded = fs::read(&journal).unwrap();
         assert_eq!(try_undo(&fixture, &journal, "legacy-new"), (false, None));
         assert_eq!(
@@ -9257,9 +10396,11 @@ mod tests {
         assert_eq!(fs::read(&journal).unwrap(), recorded);
 
         // A replaced file from such an install is still restored: its
-        // backup has always been kept, where Undo expects it.
+        // backup has always been kept, where Undo expects it, and there
+        // never was a receipt beside it.
         let fixture = Fixture::new("legacy-replace");
         let journal = honest_replacement(&fixture, "legacy-replace");
+        forget_receipts(&fixture, "legacy-replace");
         assert_eq!(
             try_undo(&fixture, &journal, "legacy-replace"),
             (true, Some(SharedApplyStatus::Success))
@@ -9296,14 +10437,8 @@ mod tests {
         assert!(!outcome.0);
     }
 
-    /// The limit of what the backup store proves for a replaced file. That
-    /// EmuWiz replaced this file in this operation, and what the original
-    /// was, is shown by the operation's own backup. What EmuWiz installed
-    /// over it is still only the record's word. So a rewritten record can
-    /// have Undo put the genuine original back over a file that has changed
-    /// since the install, and can do nothing else to it.
     #[test]
-    fn a_rewritten_record_can_still_put_the_genuine_original_back_over_a_changed_file() {
+    fn a_rewritten_record_cannot_put_the_original_back_over_a_file_changed_since() {
         let fixture = Fixture::new("forged-installed-digest");
         let journal = honest_replacement(&fixture, "forged-installed-digest");
         let live = fixture.destination_root().join(INSTALLED);
@@ -9311,8 +10446,41 @@ mod tests {
         // longer holds what EmuWiz installed.
         fs::write(&live, b"changed since").unwrap();
         assert_eq!(try_undo(&fixture, &journal, "honest"), (false, None));
-        assert_eq!(fs::read(&live).unwrap(), b"changed since");
         // The record is rewritten to say that this is what was installed.
+        // The backup is genuine and is this operation's own; that is not
+        // enough. EmuWiz's receipt says what it installed, and it was not
+        // this.
+        rewrite_journal(&journal, |journal| {
+            journal.entries[0].final_destination_digest = Some(digest_bytes(b"changed since"));
+        });
+        let preview = preview_shared_rollback(
+            &journal,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        assert_eq!(
+            preview.entries[0].outcome,
+            SharedRollbackOutcome::JournalMalformed
+        );
+        assert_eq!(try_undo(&fixture, &journal, "forged"), (false, None));
+        assert_eq!(fs::read(&live).unwrap(), b"changed since");
+    }
+
+    /// The limit that remains, for installs from before these receipts
+    /// existed. Their backups have no receipt beside them, so what was
+    /// installed over the file is still only the record's word: a rewritten
+    /// record can have Undo put the genuine original back over a file that
+    /// has changed since. Refusing instead would make every backup made by
+    /// an earlier EmuWiz unusable.
+    #[test]
+    fn for_an_install_from_before_receipts_a_rewritten_record_can_still_restore_over_a_changed_file()
+     {
+        let fixture = Fixture::new("legacy-forged-installed-digest");
+        let journal = honest_replacement(&fixture, "legacy-forged-installed-digest");
+        forget_receipts(&fixture, "legacy-forged-installed-digest");
+        let live = fixture.destination_root().join(INSTALLED);
+        fs::write(&live, b"changed since").unwrap();
+        assert_eq!(try_undo(&fixture, &journal, "honest"), (false, None));
         rewrite_journal(&journal, |journal| {
             journal.entries[0].final_destination_digest = Some(digest_bytes(b"changed since"));
         });
@@ -9323,6 +10491,146 @@ mod tests {
         // What comes back is the original EmuWiz itself kept, from this
         // operation's own backup of this file: never bytes a record names.
         assert_eq!(fs::read(&live).unwrap(), b"old");
+    }
+
+    #[test]
+    fn an_honest_replacement_is_undone_and_its_backup_is_kept() {
+        let fixture = Fixture::new("replace-honest");
+        let journal = honest_replacement(&fixture, "replace-honest");
+        let live = fixture.destination_root().join(INSTALLED);
+        let receipt = replacement_receipt_for(&fixture, "replace-honest", INSTALLED);
+        let backup = operation_evidence_path(
+            &fixture.backup_root(),
+            "replace-honest",
+            &live,
+            BACKUP_SUFFIX,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&live).unwrap(), b"new");
+        assert_eq!(fs::read(&receipt).unwrap(), digest_bytes(b"new").as_bytes());
+        let recorded = fs::read(&journal).unwrap();
+        assert_eq!(
+            try_undo(&fixture, &journal, "replace-honest"),
+            (true, Some(SharedApplyStatus::Success))
+        );
+        assert_eq!(fs::read(&live).unwrap(), b"old");
+        // The backup and the record stay. The receipt went with what it
+        // vouched for: EmuWiz's file is no longer there.
+        assert_eq!(fs::read(&backup).unwrap(), b"old");
+        assert_eq!(fs::read(&journal).unwrap(), recorded);
+        assert!(!receipt.exists());
+        // The same bytes put there again later are not this install's to
+        // undo, though its record is put back as it was.
+        fs::write(&live, b"new").unwrap();
+        for entry in fs::read_dir(fixture.history_root()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() && path != journal {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        assert_eq!(try_undo(&fixture, &journal, "replace-again"), (false, None));
+        assert_eq!(fs::read(&live).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_replacement_receipt_cannot_be_used_to_have_the_file_removed() {
+        let fixture = Fixture::new("replace-as-new");
+        let journal = honest_replacement(&fixture, "replace-as-new");
+        let live = fixture.destination_root().join(INSTALLED);
+        // The record is rewritten to say the file was installed where
+        // there was none. The receipt it would need is the receipt of a
+        // new file, which this operation never wrote.
+        rewrite_journal(&journal, |journal| {
+            let entry = &mut journal.entries[0];
+            entry.outcome = SharedApplyOutcome::InstalledNew;
+            entry.destination_existed_before_apply = Some(false);
+            entry.backup_path = None;
+            entry.backup_digest = None;
+        });
+        assert_eq!(
+            try_undo(&fixture, &journal, "replace-as-new"),
+            (false, None)
+        );
+        assert_eq!(fs::read(&live).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_replacement_that_failed_leaves_no_receipt_and_its_backup_cannot_be_misused() {
+        let fixture = Fixture::new("replace-failed");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::Rename));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "replace-failed", false, true, true),
+        );
+        inject_fault(None);
+        assert_ne!(result.journal.status, SharedApplyStatus::Success);
+        let live = fixture.destination_root().join(INSTALLED);
+        assert_eq!(fs::read(&live).unwrap(), b"old", "nothing was replaced");
+        // The backup was made before the failed publish. The receipt was
+        // withdrawn with it: EmuWiz replaced nothing.
+        let receipt = replacement_receipt_for(&fixture, "replace-failed", INSTALLED);
+        assert!(!receipt.exists());
+        let backup = operation_evidence_path(
+            &fixture.backup_root(),
+            "replace-failed",
+            &live,
+            BACKUP_SUFFIX,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), b"old");
+        // Later the file is the person's own. A record written to claim
+        // that it is what this operation installed is refused: this install
+        // kept receipts, and has none for a replacement here. The backup
+        // does not come to look like an older install's.
+        fs::write(&live, b"mine").unwrap();
+        let journal = result
+            .journal_path
+            .clone()
+            .unwrap_or_else(|| fixture.history_root().join("replace-failed.json"));
+        let mut forged = result.journal.clone();
+        {
+            let entry = &mut forged.entries[0];
+            entry.outcome = SharedApplyOutcome::ReplacedExisting;
+            entry.verification_succeeded = true;
+            entry.publication = SharedPublicationState::Published;
+            entry.failures.clear();
+            entry.destination_existed_before_apply = Some(true);
+            entry.final_destination_digest = Some(digest_bytes(b"mine"));
+            entry.backup_path = Some(SharedTransactionPath::from_path(&backup));
+            entry.backup_digest = Some(digest_bytes(b"old"));
+        }
+        forged.status = SharedApplyStatus::Success;
+        fs::create_dir_all(fixture.history_root()).unwrap();
+        fs::write(&journal, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
+        assert_eq!(
+            try_undo(&fixture, &journal, "replace-failed"),
+            (false, None)
+        );
+        assert_eq!(fs::read(&live).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn a_replacement_receipt_that_is_not_a_plain_file_refuses_undo() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("replace-receipt-link");
+        let journal = honest_replacement(&fixture, "replace-receipt-link");
+        let live = fixture.destination_root().join(INSTALLED);
+        let receipt = replacement_receipt_for(&fixture, "replace-receipt-link", INSTALLED);
+        // The receipt is swapped for a link to a file holding the right
+        // digest. It is not followed.
+        let elsewhere = fixture.0.join("elsewhere");
+        fs::write(&elsewhere, digest_bytes(b"new")).unwrap();
+        fs::remove_file(&receipt).unwrap();
+        symlink(&elsewhere, &receipt).unwrap();
+        assert_eq!(try_undo(&fixture, &journal, "link"), (false, None));
+        assert_eq!(fs::read(&live).unwrap(), b"new");
+        // A folder in its place is no receipt either.
+        fs::remove_file(&receipt).unwrap();
+        fs::create_dir(&receipt).unwrap();
+        assert_eq!(try_undo(&fixture, &journal, "folder"), (false, None));
+        assert_eq!(fs::read(&live).unwrap(), b"new");
     }
 
     #[test]
