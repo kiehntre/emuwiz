@@ -24,8 +24,13 @@
 //!   to [`SETTLED_AGE`], and drops back to [`SETTLING_AGE`] the moment an
 //!   answer differs or the key changes. The age is counted from when the
 //!   build finished and is never less than [`BUILD_SHARE`] times what the
-//!   build took, so rebuilding can never occupy more than a small, fixed
-//!   share of the interface thread however slow the machine or the disk is.
+//!   build took (up to [`SLOW_BUILD_AGE_CAP`]), so rebuilding cannot occupy
+//!   more than a small share of the interface thread on a slow machine or
+//!   disk.
+//!
+//! Every reuse reports how long the input may still be drawn, so the page
+//! can ask for one more frame at that moment and never depends on some other
+//! timer to notice a change the key does not cover.
 
 use std::cell::{Cell, RefCell};
 use std::hash::Hasher;
@@ -36,13 +41,17 @@ use crate::launch_readiness_page::LaunchReadinessInput;
 
 /// How long an input is reused right after anything changed.
 pub(super) const SETTLING_AGE: Duration = Duration::from_millis(250);
-/// The longest an unchanged input is reused. Equal to the firmware answer
-/// recheck, the existing bound on how old a readiness fact on screen may be.
+/// How long an unchanged input is reused once its answer has settled, unless
+/// the build itself was slow (see [`BUILD_SHARE`]). Equal to the firmware
+/// answer recheck, the existing bound on how old a readiness fact on screen
+/// may be.
 pub(super) const SETTLED_AGE: Duration =
     crate::emulator_setup::readiness_input::FIRMWARE_ANSWER_RECHECK;
 /// An input is reused for at least this many times as long as it took to
 /// build: at most one part in nine of the thread's time goes on rebuilding.
 pub(super) const BUILD_SHARE: u32 = 8;
+/// The most a slow build can stretch the reuse of its own answer.
+pub(super) const SLOW_BUILD_AGE_CAP: Duration = Duration::from_secs(10);
 
 struct Entry {
     key: u64,
@@ -69,8 +78,8 @@ pub(super) struct LaunchInputMemo {
     frozen: Cell<Option<Instant>>,
 }
 
-/// An input for drawing, and how long it may still be reused while its
-/// answer is settling (`None` once it has settled or was not remembered).
+/// An input for drawing, and how long it may still be reused (`None` when it
+/// was not remembered, because every call then builds again anyway).
 pub(super) struct Shown {
     pub(super) input: Rc<LaunchReadinessInput>,
     pub(super) recheck_in: Option<Duration>,
@@ -108,30 +117,37 @@ impl LaunchInputMemo {
             };
         };
         let started = self.now();
-        let mut entry = self.entry.borrow_mut();
-        if let Some(current) = entry.as_ref()
-            && current.key == key
-        {
-            let age = started.saturating_duration_since(current.built_at);
-            if age < current.allowed_age {
-                return Shown {
-                    input: Rc::clone(&current.input),
-                    recheck_in: (current.step < SETTLED_AGE).then(|| current.allowed_age - age),
-                };
+        // What the last build under this key said, unless it can still be drawn.
+        let previous = {
+            let entry = self.entry.borrow();
+            match entry.as_ref() {
+                Some(current) if current.key == key => {
+                    let age = started.saturating_duration_since(current.built_at);
+                    if age < current.allowed_age {
+                        return Shown {
+                            input: Rc::clone(&current.input),
+                            recheck_in: Some(current.allowed_age - age),
+                        };
+                    }
+                    Some((current.digest, current.step))
+                }
+                _ => None,
             }
-        }
+        };
+        // No borrow is held while the build runs.
         let input = self.counted(build);
         let built_at = self.now();
         let digest = digest(&input);
-        let step = match entry.as_ref() {
-            Some(previous) if previous.key == key && previous.digest == digest => {
-                (previous.step * 2).min(SETTLED_AGE)
+        let step = match previous {
+            Some((last_digest, last_step)) if last_digest == digest => {
+                (last_step * 2).min(SETTLED_AGE)
             }
             _ => SETTLING_AGE,
         };
-        let allowed_age = step.max(built_at.saturating_duration_since(started) * BUILD_SHARE);
+        let build_time = built_at.saturating_duration_since(started);
+        let allowed_age = step.max((build_time * BUILD_SHARE).min(SLOW_BUILD_AGE_CAP));
         let input = Rc::new(input);
-        *entry = Some(Entry {
+        *self.entry.borrow_mut() = Some(Entry {
             key,
             built_at,
             step,
@@ -141,8 +157,14 @@ impl LaunchInputMemo {
         });
         Shown {
             input,
-            recheck_in: (step < SETTLED_AGE).then_some(allowed_age),
+            recheck_in: Some(allowed_age),
         }
+    }
+
+    /// Whether nothing is remembered (tests only).
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.entry.borrow().is_none()
     }
 
     /// Drop the remembered input: the next draw builds a new one.
@@ -280,15 +302,8 @@ mod tests {
         }
         assert_eq!(
             ages,
-            [
-                Some(Duration::from_millis(250)),
-                Some(Duration::from_millis(500)),
-                Some(Duration::from_millis(1000)),
-                None,
-                None,
-                None,
-            ],
-            "settling steps, then the settled age with no recheck request"
+            [250, 500, 1000, 2000, 2000, 2000].map(|ms| Some(Duration::from_millis(ms))),
+            "settling steps, then the settled age, each with its own recheck time"
         );
         assert_eq!(
             memo.entry.borrow().as_ref().unwrap().allowed_age,
@@ -344,6 +359,45 @@ mod tests {
         memo.freeze(start + slow + slow * BUILD_SHARE);
         memo.shown(Some(1), || LaunchReadinessInput::IdentityConflicting);
         assert_eq!(memo.builds(), 2);
+    }
+
+    #[test]
+    fn a_very_slow_build_stretches_reuse_only_up_to_the_cap() {
+        let start = Instant::now();
+        let memo = memo_at(start);
+        let slow = Duration::from_secs(5);
+        let shown = memo.shown(Some(1), || {
+            memo.freeze(start + slow);
+            LaunchReadinessInput::IdentityConflicting
+        });
+        assert_eq!(shown.recheck_in, Some(SLOW_BUILD_AGE_CAP));
+        memo.freeze(start + slow + SLOW_BUILD_AGE_CAP);
+        memo.shown(Some(1), || LaunchReadinessInput::IdentityConflicting);
+        assert_eq!(memo.builds(), 2, "rebuilt at the cap, not after 40 s");
+    }
+
+    #[test]
+    fn a_reused_answer_always_says_when_it_will_be_rebuilt() {
+        let start = Instant::now();
+        let memo = memo_at(start);
+        memo.shown(Some(1), || LaunchReadinessInput::IdentityConflicting);
+        memo.freeze(start + Duration::from_millis(100));
+        let reused = memo.shown(Some(1), || unreachable!());
+        assert_eq!(reused.recheck_in, Some(Duration::from_millis(150)));
+    }
+
+    /// The build may itself read the memo (it does not today). That must not
+    /// be a double borrow.
+    #[test]
+    fn a_build_that_reads_the_memo_does_not_panic() {
+        let memo = memo_at(Instant::now());
+        memo.shown(Some(1), || {
+            memo.forget();
+            assert!(memo.is_empty());
+            memo.fresh(|| LaunchReadinessInput::DosBoxReview)
+        });
+        assert_eq!(memo.builds(), 2);
+        assert!(!memo.is_empty());
     }
 
     #[test]

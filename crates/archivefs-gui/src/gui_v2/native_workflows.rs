@@ -592,7 +592,10 @@ impl NativeWorkflows {
             context.request_repaint();
         }
         self.observe_launch_activity(activity);
-        self.observe_readiness_activity(activity);
+        if self.readiness_job.is_some() {
+            let shown = self.shown_launch_input().input;
+            self.observe_readiness_activity(activity, &shown);
+        }
         self.observe_source_activity(activity);
         self.observe_catalogue_activity(activity);
         self.poll_remote_source_probes(context);
@@ -646,7 +649,14 @@ impl NativeWorkflows {
         self.launch_was_active = active;
     }
 
-    fn observe_readiness_activity(&mut self, activity: &mut Activity) {
+    /// Finishes the "Preparing launch" job from the input its caller is
+    /// working with, so the page that queued the job and the check that ends
+    /// it never disagree about whether the evidence has loaded.
+    fn observe_readiness_activity(
+        &mut self,
+        activity: &mut Activity,
+        input: &launch_readiness_page::LaunchReadinessInput,
+    ) {
         let Some(job) = self.readiness_job else {
             return;
         };
@@ -658,7 +668,7 @@ impl NativeWorkflows {
             );
             self.readiness_job = None;
         } else if !matches!(
-            *self.shown_launch_input().input,
+            input,
             launch_readiness_page::LaunchReadinessInput::EvidenceNotLoaded
         ) {
             activity.finish(job, "Launch readiness is ready to review.".into(), None);
@@ -791,7 +801,7 @@ impl NativeWorkflows {
             activity.start(job);
             self.readiness_job = Some(job);
         }
-        self.observe_readiness_activity(activity);
+        self.observe_readiness_activity(activity, &input);
         // A Play pressed while the plan was still loading waits, however long
         // the checks take, only while this game's Launch page stays on screen;
         // it can never fire on a later visit or for another game.
@@ -1240,7 +1250,7 @@ impl NativeWorkflows {
         } else {
             ReadinessFreshness::Current
         };
-        self.observe_readiness_activity(activity);
+        self.observe_readiness_activity(activity, &input);
         let mut summary = launch_readiness_summary::project(&input, freshness);
         if let Some(error) = &error {
             launch_readiness_summary::describe_check_error(&mut summary, error);
@@ -4229,6 +4239,19 @@ impl NativeWorkflows {
             .shown(key, || self.build_launch_input())
     }
 
+    /// How many launch inputs have been built, for drawing or for an action.
+    #[cfg(test)]
+    pub(super) fn launch_input_builds(&self) -> u64 {
+        self.launch_input_memo.builds()
+    }
+
+    /// Stops the drawn input's clock now, so a test can show that Play does
+    /// not depend on the remembered answer expiring.
+    #[cfg(test)]
+    pub(super) fn freeze_drawn_launch_input(&self) {
+        self.launch_input_memo.freeze(self.launch_input_memo.now());
+    }
+
     /// The emulator-environment signature the background readiness checks
     /// use: `None` while a scan it covers is unfinished.
     pub(super) fn environment_signature(&self, now: std::time::Instant) -> Option<u64> {
@@ -4285,7 +4308,17 @@ impl NativeWorkflows {
         self.app.catalogued_platform_hint.hash(&mut hasher);
         self.app.catalogued_platform_source.hash(&mut hasher);
         self.app.catalogued_row_health.hash(&mut hasher);
+        self.app.catalogued_loose_content.hash(&mut hasher);
+        self.app
+            .catalogued_scummvm_folder
+            .as_ref()
+            .map(|folder| (folder.id, &folder.absolute_path))
+            .hash(&mut hasher);
         self.app.launch_system_trial.hash(&mut hasher);
+        // Scans the environment signature does not cover, by state only, and
+        // whether a cheat workflow is open (it can supply a fallback identity).
+        std::mem::discriminant(&self.app.emulator_readiness.flycast_profiles).hash(&mut hasher);
+        self.app.cheat_workflow.is_some().hash(&mut hasher);
         Some(hasher.finish())
     }
 

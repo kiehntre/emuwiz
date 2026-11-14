@@ -115,7 +115,38 @@ fn the_key_changes_with_everything_the_drawn_input_depends_on() {
     let after_hint = workflows.launch_input_key(now);
     assert_ne!(after_hint, after_library);
     workflows.app.launch_system_trial = Some((path.clone(), "snes"));
-    assert_ne!(workflows.launch_input_key(now), after_hint);
+    let after_trial = workflows.launch_input_key(now);
+    assert_ne!(after_trial, after_hint);
+
+    // Each remaining input changes the key on its own.
+    let mut last = after_trial;
+    let mut changed = |workflows: &NativeWorkflows, what: &str| {
+        let key = workflows.launch_input_key(now);
+        assert!(key.is_some(), "{what}: still a settled game");
+        assert_ne!(key, last, "{what} must change the key");
+        last = key;
+    };
+    workflows.app.archive_context.focused = Some(directory.path().join("focused elsewhere.zzz"));
+    changed(&workflows, "the focused archive");
+    workflows.app.catalogued_platform_source = Some((path.clone(), "manual".into()));
+    changed(&workflows, "how the platform was set");
+    workflows.app.catalogued_row_health = Some((path.clone(), "ok".into()));
+    changed(&workflows, "the catalogue row's health");
+    workflows.app.catalogued_loose_content = Some((path.clone(), archivefs_core::ArchiveKind::Zip));
+    changed(&workflows, "the catalogued loose content");
+    workflows.app.emulator_readiness.flycast_profiles = FlycastProfilesState::Error("none".into());
+    changed(&workflows, "the Flycast scan state");
+    let selected_evidence_page::SelectedEvidenceState::Ready { hasheous, .. } =
+        &mut workflows.app.selected_evidence_ui.selected_evidence
+    else {
+        unreachable!()
+    };
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    *hasheous = selected_evidence_page::HasheousState::Loading {
+        generation: 1,
+        receiver,
+    };
+    changed(&workflows, "an online lookup starting");
 }
 
 #[test]
@@ -176,11 +207,15 @@ fn play_and_the_bezel_preview_build_their_own_input_and_never_read_the_drawn_one
 #[test]
 fn an_explicit_recheck_forgets_the_drawn_input() {
     let directory = tempfile::tempdir().unwrap();
-    let (workflows, _path) = settled(directory.path());
+    let (mut workflows, _path) = settled(directory.path());
     workflows.shown_launch_input();
-    workflows.launch_input_memo.forget();
-    workflows.shown_launch_input();
-    assert_eq!(builds(&workflows), 2);
+    assert!(!workflows.launch_input_memo.is_empty());
+    // The card's own Recheck button, not the memo's method.
+    workflows.recheck_readiness_in_place(&egui::Context::default());
+    assert!(
+        workflows.launch_input_memo.is_empty(),
+        "Recheck must drop what the pages were drawing"
+    );
 }
 
 #[test]
