@@ -82,6 +82,7 @@ impl Cache {
                 let proof = resolve();
                 let _ = sender.send(proof);
                 if let Some(context) = context {
+                    crate::emulator_setup::answers::arrived(&context);
                     context.request_repaint();
                 }
             });

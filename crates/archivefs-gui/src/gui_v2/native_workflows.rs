@@ -83,6 +83,10 @@ pub(super) struct NativeWorkflows {
     /// The launch input the pages are drawing. Never read by Play or any
     /// other action; see [`launch_input_memo`].
     launch_input_memo: launch_input_memo::LaunchInputMemo,
+    /// The interface's context: where background readiness workers count
+    /// the answers they hand back, and what a drawn input asks for its next
+    /// frame.
+    context: egui::Context,
     /// The scan-result part of the emulator-environment signature, shared by
     /// the drawing memo and the Library's background readiness checks.
     environment_heavy: std::cell::RefCell<super::bg_readiness::HeavySignatureCache>,
@@ -526,6 +530,7 @@ impl NativeWorkflows {
             saved_source_history: SavedSourceHistory::default(),
             route_truth: Default::default(),
             launch_input_memo: Default::default(),
+            context: context.clone(),
             environment_heavy: Default::default(),
             source_job: None,
             cheat_catalogues: Default::default(),
@@ -592,10 +597,7 @@ impl NativeWorkflows {
             context.request_repaint();
         }
         self.observe_launch_activity(activity);
-        if self.readiness_job.is_some() {
-            let shown = self.shown_launch_input().input;
-            self.observe_readiness_activity(activity, &shown);
-        }
+        self.observe_readiness_activity_now(activity);
         self.observe_source_activity(activity);
         self.observe_catalogue_activity(activity);
         self.poll_remote_source_probes(context);
@@ -652,6 +654,18 @@ impl NativeWorkflows {
     /// Finishes the "Preparing launch" job from the input its caller is
     /// working with, so the page that queued the job and the check that ends
     /// it never disagree about whether the evidence has loaded.
+    /// Settles a "Preparing launch" job from an input built now, never from
+    /// the remembered one. The Launch page queues that job from a fresh
+    /// build; settling it from an older answer lets the two disagree, and
+    /// the job is then finished and queued again on every frame. Builds
+    /// nothing unless such a job exists.
+    fn observe_readiness_activity_now(&mut self, activity: &mut Activity) {
+        if self.readiness_job.is_some() {
+            let input = self.launch_input();
+            self.observe_readiness_activity(activity, &input);
+        }
+    }
+
     fn observe_readiness_activity(
         &mut self,
         activity: &mut Activity,
@@ -1238,19 +1252,14 @@ impl NativeWorkflows {
         self.catalogue_identity_report = catalogue_identity_report.cloned();
         self.select(path);
         self.start_launch_readiness_with(context, checksum);
-        let launch_input_memo::Shown { input, recheck_in } = self.shown_launch_input();
-        if let Some(recheck_in) = recheck_in {
-            // While an answer is still settling, draw again when it may be
-            // rebuilt, so a late emulator answer is never left off screen.
-            context.request_repaint_after(recheck_in);
-        }
+        let input = self.shown_launch_input().input;
         let error = self.readiness_error();
         let freshness = if error.is_some() {
             ReadinessFreshness::Stale
         } else {
             ReadinessFreshness::Current
         };
-        self.observe_readiness_activity(activity, &input);
+        self.observe_readiness_activity_now(activity);
         let mut summary = launch_readiness_summary::project(&input, freshness);
         if let Some(error) = &error {
             launch_readiness_summary::describe_check_error(&mut summary, error);
@@ -4235,8 +4244,16 @@ impl NativeWorkflows {
     /// code that shows readiness, never by code that launches.
     fn shown_launch_input(&self) -> launch_input_memo::Shown {
         let key = self.launch_input_key(self.launch_input_memo.now());
-        self.launch_input_memo
-            .shown(key, || self.build_launch_input())
+        let shown = self
+            .launch_input_memo
+            .shown(key, || self.build_launch_input());
+        if let Some(recheck_in) = shown.recheck_in {
+            // Whoever draws from a remembered input gets one more frame at
+            // the moment it may be rebuilt, so no page depends on some other
+            // timer to show a change the key does not cover.
+            self.context.request_repaint_after(recheck_in);
+        }
+        shown
     }
 
     /// How many launch inputs have been built, for drawing or for an action.
@@ -4319,6 +4336,10 @@ impl NativeWorkflows {
         // whether a cheat workflow is open (it can supply a fallback identity).
         std::mem::discriminant(&self.app.emulator_readiness.flycast_profiles).hash(&mut hasher);
         self.app.cheat_workflow.is_some().hash(&mut hasher);
+        // Answers from the per-game background checks (Mesen, shadPS4, Hatari,
+        // the MAME probe, the content inspections). They are only collected
+        // by a build, so the frame a worker wakes must build again.
+        crate::emulator_setup::answers::count(&self.context).hash(&mut hasher);
         Some(hasher.finish())
     }
 

@@ -235,3 +235,65 @@ fn the_library_and_the_drawn_input_share_one_environment_signature() {
         Pcsx2FirmwareEvidenceState::NotLoaded;
     assert_eq!(workflows.environment_signature(now), None);
 }
+
+#[test]
+fn an_answer_from_a_background_check_is_collected_on_the_frame_it_wakes() {
+    let directory = tempfile::tempdir().unwrap();
+    let (workflows, _path) = settled(directory.path());
+    let now = workflows.launch_input_memo.now();
+    workflows.shown_launch_input();
+    workflows.shown_launch_input();
+    assert_eq!(builds(&workflows), 1);
+    let before = workflows.launch_input_key(now);
+    // What a worker does after sending its answer and before waking the
+    // interface. The clock has not moved: only the key can cause a build.
+    crate::emulator_setup::answers::arrived(&workflows.context);
+    assert_ne!(workflows.launch_input_key(now), before);
+    workflows.shown_launch_input();
+    assert_eq!(builds(&workflows), 2, "the older input was not drawn again");
+    workflows.shown_launch_input();
+    assert_eq!(builds(&workflows), 2, "and one answer costs one build");
+    // An answer in another window is not this window's.
+    crate::emulator_setup::answers::arrived(&egui::Context::default());
+    workflows.shown_launch_input();
+    assert_eq!(builds(&workflows), 2);
+}
+
+#[test]
+fn a_preparing_launch_job_is_settled_from_an_input_built_now() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut workflows, _path) = settled(directory.path());
+    let mut activity = crate::gui_v2::activity::Activity::default();
+    workflows.shown_launch_input();
+    assert_eq!(builds(&workflows), 1);
+    // No job: nothing is built for it.
+    workflows.observe_readiness_activity_now(&mut activity);
+    assert_eq!(builds(&workflows), 1);
+    // The Launch page queued a job from its own fresh input. It is settled
+    // from another fresh build, while the remembered input is still inside
+    // its reuse window; the remembered one is never consulted.
+    let job = activity.queue(
+        "Preparing launch",
+        Route::Task {
+            section: crate::gui_v2::routes::Section::Launch,
+            game: 1,
+        },
+        false,
+    );
+    activity.start(job);
+    workflows.readiness_job = Some(job);
+    workflows.observe_readiness_activity_now(&mut activity);
+    assert_eq!(builds(&workflows), 2, "built now, not read from the memo");
+    assert!(
+        workflows.readiness_job.is_none(),
+        "this game's input is not \"evidence not loaded\", so the job is finished"
+    );
+    workflows.observe_readiness_activity_now(&mut activity);
+    assert_eq!(builds(&workflows), 2, "a finished job costs nothing more");
+    workflows.shown_launch_input();
+    assert_eq!(
+        builds(&workflows),
+        2,
+        "the drawn input was neither replaced nor refreshed"
+    );
+}

@@ -107,6 +107,7 @@ impl State {
                 truncated,
             };
             let _ = sender.send(report);
+            crate::emulator_setup::answers::arrived(&ctx);
             ctx.request_repaint();
         });
     }

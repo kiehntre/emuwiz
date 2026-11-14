@@ -15,14 +15,18 @@
 //!
 //! * its key is unchanged. The key covers the selected game, the selected
 //!   evidence report (by generation), the same emulator-environment
-//!   signature the background readiness checks use, the library generation
-//!   and the catalogue hints for the game;
+//!   signature the background readiness checks use, the library generation,
+//!   the catalogue hints for the game, and how many answers the per-game
+//!   background checks have handed back (`emulator_setup::answers`), so the
+//!   frame a worker wakes always builds again and collects its answer;
 //! * it is younger than its allowed age. Some inputs are not visible to the
 //!   key (controllers that answer only after a game is selected, files that
 //!   changed on disk), so every input is rebuilt on a timer as well. The age
 //!   starts short and doubles each time a rebuild gives the same answer, up
 //!   to [`SETTLED_AGE`], and drops back to [`SETTLING_AGE`] the moment an
-//!   answer differs or the key changes. The age is counted from when the
+//!   answer differs or the key changes. An answer that says a check is
+//!   still running never settles: it keeps the short age, and a slow build
+//!   stretches it no further than [`SETTLED_AGE`]. The age is counted from when the
 //!   build finished and is never less than [`BUILD_SHARE`] times what the
 //!   build took (up to [`SLOW_BUILD_AGE_CAP`]), so rebuilding cannot occupy
 //!   more than a small share of the interface thread on a slow machine or
@@ -43,8 +47,9 @@ use crate::launch_readiness_page::LaunchReadinessInput;
 pub(super) const SETTLING_AGE: Duration = Duration::from_millis(250);
 /// How long an unchanged input is reused once its answer has settled, unless
 /// the build itself was slow (see [`BUILD_SHARE`]). Equal to the firmware
-/// answer recheck, the existing bound on how old a readiness fact on screen
-/// may be.
+/// answer recheck. The two add up: a firmware fact on screen can be one
+/// firmware recheck old when the input is built and this much older before
+/// the input is built again.
 pub(super) const SETTLED_AGE: Duration =
     crate::emulator_setup::readiness_input::FIRMWARE_ANSWER_RECHECK;
 /// An input is reused for at least this many times as long as it took to
@@ -138,14 +143,23 @@ impl LaunchInputMemo {
         let input = self.counted(build);
         let built_at = self.now();
         let digest = digest(&input);
-        let step = match previous {
-            Some((last_digest, last_step)) if last_digest == digest => {
-                (last_step * 2).min(SETTLED_AGE)
-            }
-            _ => SETTLING_AGE,
-        };
         let build_time = built_at.saturating_duration_since(started);
-        let allowed_age = step.max((build_time * BUILD_SHARE).min(SLOW_BUILD_AGE_CAP));
+        let (step, allowed_age) = if still_checking(&input) {
+            // An answer that is about to change: it never settles, however
+            // often it repeats, and a slow build stretches it only as far as
+            // a settled answer would be reused anyway.
+            let stretched = (build_time * BUILD_SHARE).min(SETTLED_AGE);
+            (SETTLING_AGE, SETTLING_AGE.max(stretched))
+        } else {
+            let step = match previous {
+                Some((last_digest, last_step)) if last_digest == digest => {
+                    (last_step * 2).min(SETTLED_AGE)
+                }
+                _ => SETTLING_AGE,
+            };
+            let stretched = (build_time * BUILD_SHARE).min(SLOW_BUILD_AGE_CAP);
+            (step, step.max(stretched))
+        };
         let input = Rc::new(input);
         *self.entry.borrow_mut() = Some(Entry {
             key,
@@ -190,6 +204,21 @@ impl LaunchInputMemo {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn builds(&self) -> u64 {
         self.builds.get()
+    }
+}
+
+/// Whether the input says a check is still running: the evidence is not
+/// loaded, RetroArch has not been scanned, or the plan was built before an
+/// emulator scan it depends on had finished.
+fn still_checking(input: &LaunchReadinessInput) -> bool {
+    match input {
+        LaunchReadinessInput::EvidenceNotLoaded | LaunchReadinessInput::RetroArchNotScanned => true,
+        LaunchReadinessInput::Plan {
+            retroarch_scanned,
+            standalone_scans_complete,
+            ..
+        } => !retroarch_scanned || !standalone_scans_complete,
+        _ => false,
     }
 }
 
@@ -374,6 +403,35 @@ mod tests {
         memo.freeze(start + slow + SLOW_BUILD_AGE_CAP);
         memo.shown(Some(1), || LaunchReadinessInput::IdentityConflicting);
         assert_eq!(memo.builds(), 2, "rebuilt at the cap, not after 40 s");
+    }
+
+    #[test]
+    fn an_answer_that_says_a_check_is_still_running_never_settles() {
+        let mut now = Instant::now();
+        let memo = memo_at(now);
+        for _ in 0..5 {
+            let shown = memo.shown(Some(1), || LaunchReadinessInput::EvidenceNotLoaded);
+            assert_eq!(
+                shown.recheck_in,
+                Some(SETTLING_AGE),
+                "the same answer again does not lengthen its reuse"
+            );
+            now += SETTLING_AGE;
+            memo.freeze(now);
+        }
+        assert_eq!(memo.builds(), 5);
+        // A slow build stretches it to the settled age at most, never to the
+        // ten-second cap a settled answer gets.
+        let slow = Duration::from_secs(5);
+        let shown = memo.shown(Some(2), || {
+            memo.freeze(now + slow);
+            LaunchReadinessInput::RetroArchNotScanned
+        });
+        assert_eq!(shown.recheck_in, Some(SETTLED_AGE));
+        // The moment the answer is a real one, the normal steps apply.
+        memo.freeze(now + slow + SETTLED_AGE);
+        let settled = memo.shown(Some(2), || LaunchReadinessInput::IdentityConflicting);
+        assert_eq!(settled.recheck_in, Some(SETTLING_AGE));
     }
 
     #[test]

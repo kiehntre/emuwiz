@@ -98,6 +98,7 @@ pub(crate) fn spawn_ppsspp_resolution(
         let view = compute_ppsspp_resolution(&inputs);
         let _ = sender.send((generation, view));
         if let Some(context) = context {
+            crate::emulator_setup::answers::arrived(&context);
             context.request_repaint();
         }
     });
