@@ -764,6 +764,107 @@ mod tests {
         ));
     }
 
+    /// Acceptance: a Dolphin OnFrame patch installed and undone through this
+    /// session's own steps, the ones the panel's buttons call, in a scratch
+    /// profile. The patch goes into a game settings file the person already
+    /// has; Undo puts that file back and touches nothing else.
+    #[test]
+    fn an_onframe_patch_is_installed_and_undone_through_the_sessions_own_steps() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-gui-onframe-acceptance-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let settings = root.join("GameSettings");
+        fs::create_dir_all(&settings).unwrap();
+        let destination = settings.join("GMSE01.ini");
+        let original = "[Core]\nCPUThread = True\n";
+        fs::write(&destination, original).unwrap();
+        let another_game = settings.join("GZLE01.ini");
+        fs::write(&another_game, "[Core]\nCPUThread = False\n").unwrap();
+        let dolphin_ini = root.join("Dolphin.ini");
+        fs::write(&dolphin_ini, "[Interface]\nConfirmStop = True\n").unwrap();
+
+        // A real patch file the person picked, found by the session's own
+        // discovery.
+        let source = root.with_extension("source").join("GMSE01.ini");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "[OnFrame]\n$60 FPS\n0x80001234:dword:0x1\n").unwrap();
+        let mut session = OnFrameInstallSession::default();
+        session.discover(source.clone(), CheatPlatform::GameCube);
+        assert_eq!(
+            session.source_candidates.candidates.len(),
+            1,
+            "{:?}",
+            session.error
+        );
+        assert!(session.select_candidate(0));
+        assert!(
+            session.bind_selected(Some("GMSE01"), Some(&root), false),
+            "{:?}",
+            session.error
+        );
+        assert!(session.prepare_preview(), "{:?}", session.error);
+        session.request_confirmation();
+        assert!(
+            session.apply_confirmed("dolphin-onframe-acceptance"),
+            "{:?} {:#?}",
+            session.error,
+            session.preview.as_ref().map(|preview| &preview.report)
+        );
+        let transaction = session
+            .transaction
+            .as_ref()
+            .expect("the apply result is kept");
+        assert_eq!(
+            transaction.journal.status,
+            archivefs_core::patch_manager::SharedApplyStatus::Success,
+            "{:#?}",
+            transaction.journal.entries
+        );
+        let operation = transaction.journal.operation_id.clone();
+        let installed = fs::read_to_string(&destination).unwrap();
+        assert_ne!(installed, original);
+        assert!(installed.contains("[OnFrame]"), "{installed}");
+        // The install left its receipts in EmuWiz's own backup store.
+        let kept: Vec<String> =
+            fs::read_dir(default_shared_backup_root().unwrap().join(&operation))
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+        assert!(kept.iter().any(|name| name == "operation.plan"), "{kept:?}");
+        assert!(
+            kept.iter().any(|name| name.ends_with(".replacement")),
+            "{kept:?}"
+        );
+
+        // The session's own Undo: opened for the profile folder the patch
+        // was bound to, then confirmed.
+        assert!(
+            session.prepare_rollback(),
+            "{:?} {:#?}",
+            session.error,
+            session.rollback_preview
+        );
+        assert_eq!(fs::read_to_string(&destination).unwrap(), installed);
+        assert!(session.rollback_confirmed(), "{:?}", session.error);
+        assert_eq!(fs::read_to_string(&destination).unwrap(), original);
+        assert_eq!(
+            fs::read_to_string(&another_game).unwrap(),
+            "[Core]\nCPUThread = False\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&dolphin_ini).unwrap(),
+            "[Interface]\nConfirmStop = True\n"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(source.parent().unwrap());
+    }
+
     #[test]
     fn the_retained_apply_keeps_shared_transaction_warnings_for_the_panel() {
         use crate::shared_apply_warnings::test_support::{WARNED_FILE, WARNING, warned_result};

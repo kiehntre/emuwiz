@@ -2810,6 +2810,292 @@ fn pcsx2_undo_from_gamer_view_switches_to_the_history_screen() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// Waits for the Apply the screen itself started, and keeps the result where
+/// the screen keeps it. Returns the record's path and the operation.
+fn finish_the_screens_apply(app: &mut ArchiveFsApp) -> (PathBuf, String) {
+    let workflow = app.cheat_workflow.as_mut().unwrap();
+    let state = std::mem::replace(&mut workflow.transaction, CheatTransactionState::Idle);
+    let CheatTransactionState::Applying { key, receiver } = state else {
+        panic!(
+            "the screen's Apply did not start: {:?}",
+            workflow.transaction_notice
+        );
+    };
+    let result = receiver
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the apply worker answers")
+        .expect("the apply ran");
+    assert_eq!(
+        result.journal.status,
+        SharedApplyStatus::Success,
+        "entries: {:#?}",
+        result.journal.entries
+    );
+    let journal_path = result.journal_path.clone().expect("a record was written");
+    let operation = result.journal.operation_id.clone();
+    workflow.transaction = CheatTransactionState::Result { key, result };
+    (journal_path, operation)
+}
+
+/// Runs the screen's own poll until its Undo is waiting for the person or
+/// has finished.
+fn settle_the_screens_undo(app: &mut ArchiveFsApp) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        app.poll_shared_rollback();
+        if !matches!(
+            app.shared_rollback,
+            SharedRollbackState::Previewing { .. } | SharedRollbackState::Applying { .. }
+        ) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the Undo worker did not answer"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The names of everything EmuWiz kept for one operation in its backup store.
+fn kept_for_operation(operation: &str) -> Vec<String> {
+    let folder = archivefs_core::patch_manager::default_shared_backup_root()
+        .unwrap()
+        .join(operation);
+    let mut names: Vec<String> = std::fs::read_dir(folder)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// In the real application the Apply and the Undo both use EmuWiz's own
+/// history and backup folders. Under test the Undo asks a test machine for
+/// them; this gives it the very folders the Apply used.
+fn undo_uses_the_folders_apply_used()
+-> crate::cheats_mods::duckstation_environment::test_environment::Guard {
+    use crate::cheats_mods::duckstation_environment::test_environment::{TestMachine, install};
+    install(TestMachine {
+        duckstation: None,
+        history_root: archivefs_core::patch_manager::default_shared_history_root().unwrap(),
+        backup_root: archivefs_core::patch_manager::default_shared_backup_root().unwrap(),
+    })
+}
+
+/// Acceptance: a real install and a real Undo through the main Cheats & Mods
+/// screen's own handlers, in a scratch profile. The screen's Apply installs
+/// over a person's own file; the screen's "Undo installation" opens the
+/// review; the review's Confirm restores the original. Nothing else in the
+/// profile is touched.
+#[test]
+fn cheats_and_mods_apply_then_undo_restores_the_original_through_the_screens_own_handlers() {
+    let directory = std::env::temp_dir().join(format!(
+        "archivefs-gui-cheats-mods-acceptance-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cheats_directory = directory.join("cheats");
+    std::fs::create_dir_all(&cheats_directory).unwrap();
+    let destination = cheats_directory.join("SLUS-20312_A1B2C3D4.pnach");
+    let original = b"// a user's own hand-written notes\r\npatch=0,EE,00100000,word,0\r\n";
+    std::fs::write(&destination, original).unwrap();
+    // Files the install has nothing to do with: another game's cheats in
+    // the same folder, and a settings file beside it.
+    let another_game = cheats_directory.join("SLUS-99999_00000000.pnach");
+    std::fs::write(&another_game, b"patch=1,EE,00200000,word,1\r\n").unwrap();
+    let settings = directory.join("PCSX2.ini");
+    std::fs::write(&settings, b"[UI]\nTheme = dark\n").unwrap();
+
+    let mut profile = pcsx2_profile_fixture();
+    profile.configuration_path = directory.clone();
+    profile.patch_directories = vec![Pcsx2PatchDirectory {
+        path: cheats_directory,
+        category: Pcsx2PatchCategory::Cheats,
+        state: Pcsx2PatchDirectoryState::Available,
+        warning: None,
+        identity: None,
+    }];
+    let mut app = pcsx2_workflow_with_verified_identity_and_selected_cheat(profile);
+    app.start_pcsx2_install_preview();
+    // The person ticks "replace the existing file" on the review.
+    match &mut app.cheat_workflow.as_mut().unwrap().transaction {
+        CheatTransactionState::Review {
+            replacement_approved,
+            ..
+        } => *replacement_approved = true,
+        _ => panic!("expected a reviewed plan awaiting confirmation"),
+    }
+
+    // The screen's own Apply.
+    app.start_cheat_apply(egui::Context::default());
+    let (journal_path, operation) = finish_the_screens_apply(&mut app);
+    let installed = std::fs::read(&destination).unwrap();
+    assert!(installed.starts_with(original));
+    assert_ne!(installed, original);
+    // What the install left in EmuWiz's own backup store: which install
+    // this is, the original, and what was put over it.
+    let kept = kept_for_operation(&operation);
+    assert!(kept.iter().any(|name| name == "operation.plan"), "{kept:?}");
+    assert!(kept.iter().any(|name| name.ends_with(".bak")), "{kept:?}");
+    assert!(
+        kept.iter().any(|name| name.ends_with(".replacement")),
+        "{kept:?}"
+    );
+
+    // The screen's own "Undo installation".
+    let _folders = undo_uses_the_folders_apply_used();
+    app.start_cheat_install_rollback(egui::Context::default());
+    assert_eq!(app.view, MainView::HistoryLogs);
+    settle_the_screens_undo(&mut app);
+    match &app.shared_rollback {
+        SharedRollbackState::Review { preview, .. } => {
+            assert!(
+                preview.available,
+                "the screen's Undo was refused: {:#?}",
+                preview.entries
+            );
+            assert_eq!(
+                preview.destination_root.to_path_buf().unwrap(),
+                directory,
+                "the screen opened Undo for the profile's own folder"
+            );
+        }
+        SharedRollbackState::Failed(message) => panic!("the screen's Undo failed: {message}"),
+        _ => panic!("the screen's Undo did not reach its review"),
+    }
+    // Nothing has changed yet: the review only shows.
+    assert_eq!(std::fs::read(&destination).unwrap(), installed);
+
+    // The review's Confirm.
+    app.start_shared_rollback(egui::Context::default());
+    settle_the_screens_undo(&mut app);
+    match &app.shared_rollback {
+        SharedRollbackState::Result(result) => {
+            assert_eq!(
+                result.status,
+                SharedApplyStatus::Success,
+                "{:#?}",
+                result.preview.entries
+            );
+        }
+        SharedRollbackState::Failed(message) => panic!("the screen's Undo failed: {message}"),
+        _ => panic!("the screen's Undo did not finish"),
+    }
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        original,
+        "the person's own file is back, byte for byte"
+    );
+    assert_eq!(
+        std::fs::read(&another_game).unwrap(),
+        b"patch=1,EE,00200000,word,1\r\n"
+    );
+    assert_eq!(std::fs::read(&settings).unwrap(), b"[UI]\nTheme = dark\n");
+    // The record is kept, and marked undone.
+    assert!(journal_path.is_file());
+    assert!(
+        journal_path
+            .with_file_name(format!("{operation}.rollback.json"))
+            .is_file()
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// Acceptance: the History & Logs page's own route. The page offers
+/// "Preview rollback" on a record's row and opens Undo for the folder that
+/// record names; its Confirm then runs the Undo. Here the install added a
+/// file where there was none, through the Cheats & Mods screen's Apply.
+#[test]
+fn history_and_logs_preview_then_confirm_removes_what_the_screens_apply_added() {
+    let directory = std::env::temp_dir().join(format!(
+        "archivefs-gui-history-logs-acceptance-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let settings = directory.join("PCSX2.ini");
+    std::fs::write(&settings, b"[UI]\nTheme = dark\n").unwrap();
+    let mut app = pcsx2_workflow_reviewed_for_apply(&directory);
+    let destination = directory.join("cheats/SLUS-20312_A1B2C3D4.pnach");
+    assert!(!destination.exists());
+
+    // The Cheats & Mods screen's own Apply.
+    app.start_cheat_apply(egui::Context::default());
+    let (journal_path, operation) = finish_the_screens_apply(&mut app);
+    assert!(destination.is_file());
+    let kept = kept_for_operation(&operation);
+    assert!(kept.iter().any(|name| name == "operation.plan"), "{kept:?}");
+    assert!(kept.iter().any(|name| name.ends_with(".new")), "{kept:?}");
+
+    // What the History & Logs page does for this record's row: the record
+    // is one of those it lists, and the folder is the one the record names.
+    let _folders = undo_uses_the_folders_apply_used();
+    let history_root = archivefs_core::patch_manager::default_shared_history_root().unwrap();
+    let listed = discover_shared_apply_history(&history_root);
+    let (listed_path, journal) = listed
+        .journals
+        .iter()
+        .find(|(_, journal)| journal.operation_id == operation)
+        .expect("History lists the install");
+    assert_eq!(listed_path.to_path_buf().unwrap(), journal_path);
+    let destination_root = journal
+        .destination_root
+        .to_path_buf()
+        .expect("the record names its folder");
+    app.start_shared_rollback_preview(
+        egui::Context::default(),
+        journal_path.clone(),
+        destination_root,
+    );
+    settle_the_screens_undo(&mut app);
+    match &app.shared_rollback {
+        SharedRollbackState::Review { preview, .. } => assert!(
+            preview.available,
+            "History's Undo was refused: {:#?}",
+            preview.entries
+        ),
+        SharedRollbackState::Failed(message) => panic!("History's Undo failed: {message}"),
+        _ => panic!("History's Undo did not reach its review"),
+    }
+    assert!(destination.is_file(), "the review only shows");
+
+    // The page's Confirm.
+    app.start_shared_rollback(egui::Context::default());
+    settle_the_screens_undo(&mut app);
+    match &app.shared_rollback {
+        SharedRollbackState::Result(result) => {
+            assert_eq!(
+                result.status,
+                SharedApplyStatus::Success,
+                "{:#?}",
+                result.preview.entries
+            );
+        }
+        SharedRollbackState::Failed(message) => panic!("History's Undo failed: {message}"),
+        _ => panic!("History's Undo did not finish"),
+    }
+    assert!(!destination.exists(), "the added file is gone");
+    assert_eq!(std::fs::read(&settings).unwrap(), b"[UI]\nTheme = dark\n");
+    // The receipt went with the file; the operation's own receipt stays.
+    let kept = kept_for_operation(&operation);
+    assert!(!kept.iter().any(|name| name.ends_with(".new")), "{kept:?}");
+    assert!(kept.iter().any(|name| name == "operation.plan"), "{kept:?}");
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 fn ctx_run_pcsx2_gamehacking(
     workflow: &mut CheatWorkflowState,
     cheats_directory: Option<&Path>,

@@ -1338,9 +1338,18 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
             normalized.as_str(),
             "nds" | "nintendo ds" | "nintendo ds / dsi" | "melonds"
         ),
+        // "gamecube/wii" is what a Dolphin install that does not depend on
+        // which of the two the game is for says: an OnFrame patch goes into
+        // the same game settings file either way.
         PreviewAdapter::Dolphin => matches!(
             normalized.as_str(),
-            "gamecube" | "nintendo gamecube" | "gc" | "gcn" | "wii" | "nintendo wii"
+            "gamecube"
+                | "nintendo gamecube"
+                | "gc"
+                | "gcn"
+                | "wii"
+                | "nintendo wii"
+                | "gamecube/wii"
         ),
         PreviewAdapter::Ppsspp => matches!(
             normalized.as_str(),

@@ -13,9 +13,9 @@ use sha2::{Digest, Sha256};
 use crate::mod_activation::ActivationReceipt;
 use crate::mod_provider::{ModCompatibilityLevel, ModPackageJoin, ModProviderProvenance};
 use crate::patch_manager::{
-    PreviewAdapter, SharedApplyJournal, SharedApplyOutcome, SharedHistoryReport,
-    SharedRollbackOutcome, SharedRollbackPreview, discover_shared_apply_history,
-    preview_shared_rollback,
+    PreviewAdapter, SharedApplyFailureKind, SharedApplyJournal, SharedApplyOutcome,
+    SharedHistoryReport, SharedRollbackOutcome, SharedRollbackPreview,
+    discover_shared_apply_history, preview_shared_rollback,
 };
 use crate::patch_package_composition::PatchCompositionProvenance;
 use crate::standalone_patch::DerivedPatchProvenance;
@@ -709,11 +709,47 @@ fn rollback_status(
         .entries
         .iter()
         .find_map(|entry| match entry.outcome {
+            // Where the engine itself says why it will not go on, History
+            // says that, not a general sentence that may not fit.
+            SharedRollbackOutcome::DestinationChanged | SharedRollbackOutcome::JournalMalformed
+                if entry.failure.as_ref().is_some_and(|failure| {
+                    matches!(
+                        failure.kind,
+                        SharedApplyFailureKind::RollbackBlocked
+                            | SharedApplyFailureKind::InvalidJournal
+                    )
+                }) =>
+            {
+                entry.failure.as_ref().map(|failure| {
+                    let detail = failure.detail.trim_end_matches('.');
+                    let mut sentence = String::with_capacity(detail.len() + 1);
+                    let mut letters = detail.chars();
+                    if let Some(first) = letters.next() {
+                        sentence.extend(first.to_uppercase());
+                        sentence.push_str(letters.as_str());
+                    }
+                    sentence.push('.');
+                    sentence
+                })
+            }
             SharedRollbackOutcome::DestinationChanged => Some(
                 "One or more installed files have changed since this mod was installed.".into(),
             ),
+            // The engine says which proof is missing when it knows: for a
+            // file installed where there was none, that is EmuWiz's own
+            // record of installing it, not a backup.
             SharedRollbackOutcome::BackupMissing => Some(
-                "A required backup is missing; EmuWiz will not remove the destination file.".into(),
+                entry
+                    .failure
+                    .as_ref()
+                    .filter(|failure| failure.kind == SharedApplyFailureKind::BackupMissing)
+                    .map_or_else(
+                        || {
+                            "A required backup is missing; EmuWiz will not remove the destination file."
+                                .into()
+                        },
+                        |failure| failure.detail.clone(),
+                    ),
             ),
             SharedRollbackOutcome::BackupChanged => {
                 Some("A required backup changed after install; review is required.".into())
@@ -1284,6 +1320,33 @@ mod tests {
         assert!(
             matches!(missing.rollback, ModRollbackStatus::CannotSafelyUndo { ref reason } if reason.contains("backup is missing"))
         );
+        // A file EmuWiz has no record of installing is not a missing
+        // backup: History gives the engine's own reason.
+        let mut unrecorded = preview(
+            "unrecorded",
+            "file.bin",
+            SharedRollbackOutcome::BackupMissing,
+        );
+        unrecorded.entries[0].failure = Some(crate::patch_manager::SharedApplyFailure {
+            kind: SharedApplyFailureKind::BackupMissing,
+            path: None,
+            detail: "EmuWiz has no record of its own that it installed this file.".into(),
+        });
+        let unrecorded = ModReceiptSummary::from_shared_journal(
+            &journal(
+                "unrecorded",
+                3,
+                "file.bin",
+                SharedApplyOutcome::InstalledNew,
+            ),
+            None,
+            Path::new("/b"),
+            &unrecorded,
+        )
+        .unwrap();
+        assert!(
+            matches!(unrecorded.rollback, ModRollbackStatus::CannotSafelyUndo { ref reason } if reason == "EmuWiz has no record of its own that it installed this file.")
+        );
     }
 
     #[test]
@@ -1306,6 +1369,28 @@ mod tests {
         .unwrap();
         assert!(
             matches!(value.rollback, ModRollbackStatus::CannotSafelyUndo { ref reason } if reason.contains("changed since"))
+        );
+        // Where the engine gives its own reason for refusing a record,
+        // History gives that reason, as a sentence.
+        let mut refused = preview(
+            "refused",
+            "file.bin",
+            SharedRollbackOutcome::JournalMalformed,
+        );
+        refused.entries[0].failure = Some(crate::patch_manager::SharedApplyFailure {
+            kind: SharedApplyFailureKind::InvalidJournal,
+            path: None,
+            detail: "this history entry is filed under another install's name".into(),
+        });
+        let refused = ModReceiptSummary::from_shared_journal(
+            &journal("refused", 9, "file.bin", SharedApplyOutcome::InstalledNew),
+            None,
+            Path::new("/backups"),
+            &refused,
+        )
+        .unwrap();
+        assert!(
+            matches!(refused.rollback, ModRollbackStatus::CannotSafelyUndo { ref reason } if reason == "This history entry is filed under another install's name.")
         );
     }
 
