@@ -709,6 +709,29 @@ fn rollback_status(
         .entries
         .iter()
         .find_map(|entry| match entry.outcome {
+            // Where the engine itself says why it will not go on, History
+            // says that, not a general sentence that may not fit.
+            SharedRollbackOutcome::DestinationChanged | SharedRollbackOutcome::JournalMalformed
+                if entry.failure.as_ref().is_some_and(|failure| {
+                    matches!(
+                        failure.kind,
+                        SharedApplyFailureKind::RollbackBlocked
+                            | SharedApplyFailureKind::InvalidJournal
+                    )
+                }) =>
+            {
+                entry.failure.as_ref().map(|failure| {
+                    let detail = failure.detail.trim_end_matches('.');
+                    let mut sentence = String::with_capacity(detail.len() + 1);
+                    let mut letters = detail.chars();
+                    if let Some(first) = letters.next() {
+                        sentence.extend(first.to_uppercase());
+                        sentence.push_str(letters.as_str());
+                    }
+                    sentence.push('.');
+                    sentence
+                })
+            }
             SharedRollbackOutcome::DestinationChanged => Some(
                 "One or more installed files have changed since this mod was installed.".into(),
             ),
@@ -1346,6 +1369,28 @@ mod tests {
         .unwrap();
         assert!(
             matches!(value.rollback, ModRollbackStatus::CannotSafelyUndo { ref reason } if reason.contains("changed since"))
+        );
+        // Where the engine gives its own reason for refusing a record,
+        // History gives that reason, as a sentence.
+        let mut refused = preview(
+            "refused",
+            "file.bin",
+            SharedRollbackOutcome::JournalMalformed,
+        );
+        refused.entries[0].failure = Some(crate::patch_manager::SharedApplyFailure {
+            kind: SharedApplyFailureKind::InvalidJournal,
+            path: None,
+            detail: "this history entry is filed under another install's name".into(),
+        });
+        let refused = ModReceiptSummary::from_shared_journal(
+            &journal("refused", 9, "file.bin", SharedApplyOutcome::InstalledNew),
+            None,
+            Path::new("/backups"),
+            &refused,
+        )
+        .unwrap();
+        assert!(
+            matches!(refused.rollback, ModRollbackStatus::CannotSafelyUndo { ref reason } if reason == "This history entry is filed under another install's name.")
         );
     }
 

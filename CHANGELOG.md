@@ -28,7 +28,7 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   restored only from that install's own backup of it, and only while the
   file still holds what the install's receipt says was put there. An empty
   folder is removed only if it is on the way to a file Undo has just
-  removed. Installs made before this version have no receipts: Undo no
+  removed, or is the destination folder itself. Installs made before this version have no receipts: Undo no
   longer removes the files they added, and still restores the files they
   replaced. An older install that did both is refused as a whole; its files,
   its backups and its History entry are kept. Empty folders above the
@@ -39,8 +39,8 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   EmuWiz's history folder and its backup folder. A rewritten record can
   still choose the permission bits of a restored file. For an install made
   before this version it can also leave some of that install's own files
-  out of an Undo, and have a genuine original put back over a replaced file
-  that has changed since.
+  out of an Undo, and have that install's genuine original put back over a
+  file it replaced that has changed since.
 - Check Games: a "Saved results that need checking again" card lists saved
   catalogue results that no longer count (and why), and can check those games
   again with progress and Stop. Finished sets stay saved; Continue checks the
