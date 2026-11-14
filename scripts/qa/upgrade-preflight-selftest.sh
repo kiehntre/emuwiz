@@ -293,4 +293,15 @@ folder_records_case list-state-with-id 2 '{"dirs": ["Y"], "rows": {"1": "Y/a"}, 
 folder_records_case dict-state-with-id 2 '{"dirs": ["Y"], "rows": {"1": "Y/a"}, "records": [
   {"id": "folder-move-100-1-0", "state": {"s": "Committed"}, "src": "X", "dst": "Y", "rows": [[1, "X/a", "Y/a"]]}]}'
 
+# The older record's location check is waived only when the newest record
+# positively finds its folder: here the folder was put back at X by hand.
+folder_records_case chain-unverifiable 2 '{"dirs": ["X"], "rows": {"1": "Z/a"}, "records": [
+  {"id": "folder-move-100-1-0", "state": "Committed", "src": "X", "dst": "Y", "rows": [[1, "X/a", "Y/a"]]},
+  {"id": "folder-move-200-1-0", "state": "Committed", "src": "Y", "dst": "Z", "rows": [[1, "Y/a", "Z/a"]]}]}'
+# A replaced record's malformed row still blocks (exit 2), never a tool error.
+folder_records_case replaced-list-archive 2 '{"dirs": ["Z"], "rows": {"1": "Z/a"}, "records": [
+  {"id": "folder-move-100-1-0", "state": "Undone", "src": "X", "dst": "Y", "rows": [[[1], "X/a", "Y/a"]]},
+  {"id": "folder-move-200-1-0", "state": "Committed", "src": "X", "dst": "Z", "rows": [[1, "X/a", "Z/a"]]}]}'
+grep -q "malformed library row" "$ROOT/fmr-replaced-list-archive.out" || { echo "self-test failed: malformed row in a replaced record not reported" >&2; exit 1; }
+
 echo "UPGRADE PREFLIGHT SELF-TEST: PASS"

@@ -40,7 +40,8 @@ contradicted by the files or by the library (opened read-only). When several
 records name the same folder (Organise, Undo, then Organise again; or a
 rolled-back move retried), only the newest says where the folder is: an older
 settled one is reported as `superseded_by` the newer record and its folder
-location is not checked, but its library rows that no later move covered still
+location is not checked (only when the newest record positively finds its own
+folder), but its library rows that no later move covered still
 are. Only well-formed records of a known version and state take part; an open
 record always blocks; a record whose id carries no start time is checked on
 its own. Evidence that

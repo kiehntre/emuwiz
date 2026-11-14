@@ -326,7 +326,7 @@ def absolute_bytes(value: Any) -> bytes | None:
     return None
 
 
-def folder_move_report(path: Path, parsed: Any, replaced: tuple[Path, set[int]] | None = None) -> tuple[str, list[str], list[str]]:
+def folder_move_report(path: Path, parsed: Any, replaced: tuple[Path, set[tuple[Any, int]]] | None = None) -> tuple[str, list[str], list[str]]:
     """State, blockers and warnings for one folder-move record.
 
     Open records (a move or Undo still in progress, or one needing review),
@@ -360,7 +360,8 @@ def folder_move_report(path: Path, parsed: Any, replaced: tuple[Path, set[int]] 
     if replaced is not None:
         # A later move of the same folder says where it is now; rows that the
         # later moves did not cover are still checked below.
-        rows = [row for row in rows if not (isinstance(row, dict) and row.get("archive") in replaced[1])]
+        rows = [row for row in rows if not (isinstance(row, dict) and type(row.get("archive")) is int
+                                            and (parsed.get("database"), row["archive"]) in replaced[1])]
     else:
         at_source, at_destination = is_present(Path(source)), is_present(Path(destination))
         here = destination if state == "Committed" else source
@@ -414,9 +415,22 @@ def folder_move_order(parsed: Any) -> tuple[int, int] | None:
     return (int(match.group(1)), int(match.group(2))) if match else None
 
 
-def folder_move_rows(parsed: dict[str, Any]) -> set[int]:
+def folder_move_rows(parsed: dict[str, Any]) -> set[tuple[Any, int]]:
+    """(library, archive id) of every well-formed row of a record."""
     rows = parsed.get("rows")
-    return {row["archive"] for row in rows if isinstance(row, dict) and type(row.get("archive")) is int} if isinstance(rows, list) else set()
+    database = parsed.get("database")
+    return {(database, row["archive"]) for row in rows
+            if isinstance(row, dict) and type(row.get("archive")) is int} if isinstance(rows, list) else set()
+
+
+def folder_location_verified(parsed: dict[str, Any]) -> bool:
+    """A settled record whose folder is where it says (positively seen)."""
+    state = parsed["state"]
+    if state not in FOLDER_MOVE_SETTLED:
+        return False
+    here = parsed["destination"] if state == "Committed" else parsed["source"]
+    there = parsed["source"] if state == "Committed" else parsed["destination"]
+    return is_present(Path(here)) and not is_present(Path(there))
 
 
 def well_formed_folder_move(parsed: Any) -> bool:
@@ -427,7 +441,7 @@ def well_formed_folder_move(parsed: Any) -> bool:
             and isinstance(parsed.get("rows"), list) and folder_move_order(parsed) is not None)
 
 
-def superseded_folder_moves(records: list[tuple[Path, Any]]) -> dict[Path, tuple[Path, set[int]]]:
+def superseded_folder_moves(records: list[tuple[Path, Any]]) -> dict[Path, tuple[Path, set[tuple[Any, int]]]]:
     """Settled records that a later record for the same folder replaced.
 
     Organise, Undo and Organise again leaves an older Undone (or RolledBack)
@@ -437,21 +451,25 @@ def superseded_folder_moves(records: list[tuple[Path, Any]]) -> dict[Path, tuple
     still checked, except those the later records also moved. Only well-formed
     records of a known version and state take part, on both sides: anything
     else is checked on its own exactly as before. Open records are never
-    replaced. Returns the earliest later record and the archive ids covered.
+    replaced, and nothing is replaced unless the newest sharing record
+    positively finds its own folder. Returns that record and the
+    (library, archive id) pairs the later records covered.
     """
     known = [(folder_move_order(parsed), path, parsed) for path, parsed in records if well_formed_folder_move(parsed)]
-    replaced: dict[Path, tuple[Path, set[int]]] = {}
+    replaced: dict[Path, tuple[Path, set[tuple[Any, int]]]] = {}
     for order, path, parsed in known:
         if parsed["state"] not in FOLDER_MOVE_SETTLED:
             continue
         paths = {parsed["source"], parsed["destination"]}
         later = sorted((o, p, other) for o, p, other in known
                        if o > order and paths & {other["source"], other["destination"]})
-        if later:
-            covered: set[int] = set()
+        # Waive the older record's location check only when the newest record
+        # sharing its paths positively finds its folder where it says.
+        if later and folder_location_verified(later[-1][2]):
+            covered: set[tuple[Any, int]] = set()
             for _, _, other in later:
                 covered |= folder_move_rows(other)
-            replaced[path] = (later[0][1], covered)
+            replaced[path] = (later[-1][1], covered)
     return replaced
 
 
