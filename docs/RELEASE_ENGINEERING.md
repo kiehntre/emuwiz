@@ -204,6 +204,97 @@ truncated by an interruption, the existing strict-parser refusal still
 applies after restoring (`--replace-foreign` then moves the restored binaries
 aside before installing).
 
+### Rollback, downgrade and unfinished Organise operations
+
+Organise records every game-folder move under the data folder
+(`rename-transactions-sealed-v1/folder-moves/*.json`) so that an interrupted
+move or Undo can be finished after a crash: the next Organise apply settles
+it from what the files and the library show. A folder Undo records the state
+`Undoing` before it changes anything. **EmuWiz releases built before durable
+folder Undo do not know that state and skip such a record without a word**,
+so after a downgrade to one of them an interrupted Undo would stay
+unfinished, and its folder and library could disagree about where the game
+is. No game file is lost: folders are only ever renamed.
+
+Before any upgrade, rollback or downgrade, and before restoring a kept copy
+from `emuwiz-installer/previous`:
+
+1. Run the newest `scripts/qa/upgrade_preflight.py` from an up-to-date
+   checkout (not the copy shipped with the release being installed). It
+   exits `2` (`BLOCKED`) while any folder-move record is open (`Planned`,
+   `Undoing`, `NeedsReview`), names a state it does not know, cannot be read,
+   or is settled but contradicted by the files or, read-only, the library.
+2. If it blocks on an interrupted move or Undo (`Planned`, `Undoing`), let
+   the newest installed EmuWiz finish recovery: in All tools > Organise my
+   games choose **Finish interrupted folder moves** (it appears whenever one
+   is open; any Organise apply also finishes them first), then run the
+   preflight again. Completion is shown by the preflight reading the durable
+   records, the folders and the library, not by the application's message.
+   For any other blocking record, see "Records EmuWiz cannot settle" below.
+3. Only then install or restore the other version.
+
+#### Records EmuWiz cannot settle
+
+A folder-move record that cannot be read, has a newer record version or a
+state this release does not know, or is `NeedsReview`, is never settled by
+this release. The installer and the preflight keep refusing while it is in
+the active recovery set (any `folder-moves` journal folder EmuWiz uses).
+That is intended. **Taking such a record out of the active set is not an
+installation workaround**, and nothing in EmuWiz does it.
+
+1. **A newer record version or unknown state:** use a recovery-capable
+   EmuWiz that reads that format (the release that wrote it, or a later
+   one), and let it settle the record with **Finish interrupted folder
+   moves**. Prefer this whenever such a release exists. Do not resolve such
+   a record by hand while one is available.
+2. **Otherwise** (a damaged record, `NeedsReview`, or no compatible release
+   exists), resolving it is an **explicit administrator decision**, made for
+   one record at a time and backed by evidence:
+   1. Close EmuWiz, and run no Organise operation until this is finished.
+   2. Preserve the evidence in a new folder outside EmuWiz's data and
+      journal folders, on storage that is backed up:
+      - an exact copy of the record (`cp -p`) and its SHA-256
+        (`sha256sum`);
+      - every other journal entry with the same id;
+      - a listing of the record's `source` and `destination` and of
+        everything below them;
+      - for each library row the record names, the row as the library holds
+        it now, read with `sqlite3 -readonly`;
+      - a backup copy of the library database.
+   3. Reconcile. The game folder must exist at exactly one of `source` and
+      `destination`, its contents must match the record's entry count and
+      size, and every library row the record names must point at that same
+      place. **If the files and the library cannot be reconciled with
+      confidence, stop: the record stays where it is and the blocker
+      stays.** Do not move game folders or edit the library to force
+      agreement.
+   4. Record the decision in the evidence folder: who decided, when, the
+      record's path and SHA-256, what the evidence showed, the decision and
+      why.
+   5. Only then remove the record from the active set: move it (do not copy
+      it, edit it or delete it) into the evidence folder. Check that its
+      SHA-256 still matches, then run the preflight again. The original
+      record, its checksum, the evidence and the decision are kept for good.
+
+`install.sh` performs the same check itself (see the ORGANISE RECOVERY GATE
+comment in it): it refuses to install, replace or uninstall any binary while
+an open, unknown or unreadable folder-move record exists anywhere EmuWiz
+might keep its data, with nothing changed, and it reports `NeedsReview`
+records without blocking. It sees only the data locations named in the
+environment it runs in: a data folder EmuWiz is given only elsewhere (for
+example an `EMUWIZ_DATA_HOME` set in a desktop launcher) is not checked, so
+run it with the same environment. Kept copies of earlier binaries are never
+deleted, so the recovery-capable version stays available under `previous/`
+after an upgrade; while the gate refuses, the installed version stays in
+place.
+
+**Limitation, not eliminated.** The gate runs only in installers that
+contain it. Running an older release's own `install.sh`, or copying a binary
+from `previous/` (or anywhere else) into place by hand, bypasses it, and the
+EmuWiz installed before this change cannot enforce anything. The preflight
+step above is the safeguard for those routes; it has to be run by whoever
+performs the rollback.
+
 ### Installer requirements and failure behaviour
 
 `install.sh` is Linux-only. Publishing the release assets needs Python 3,

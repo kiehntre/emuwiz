@@ -33,7 +33,19 @@ Exit codes are stable:
 - `2` — `BLOCKED`
 - `3` — inspection/tool error or unreadable/invalid input
 
-Schema 20 is the current target. Schema 19 and other recognized older schemas
+Organise game-folder move records (`<journal>/folder-moves/*.json`) are
+checked individually: an open record (`Planned`, `Undoing`, `NeedsReview`), an
+unknown state or an unreadable record blocks, and so does a settled record
+contradicted by the files or by the library (opened read-only). Evidence that
+cannot be checked (a folder on an unmounted drive, a library row changed
+later) is a warning. Run the newest copy of this tool before any upgrade,
+rollback or downgrade, and before restoring a binary from
+`emuwiz-installer/previous`: EmuWiz releases before durable folder Undo skip
+`Undoing` records without a word (see docs/RELEASE_ENGINEERING.md, "Rollback,
+downgrade and unfinished Organise operations").
+
+The current target schema is the library's newest migration; the self-test
+fails if the two disagree. Older recognized schemas
 are reported as upgrade-required. A newer schema is unsupported and blocks the
 preflight. Meaningful state in both EmuWiz and ArchiveFS roots is a blocker;
 the tool never merges them. Actionable or unknown transaction journals are also
