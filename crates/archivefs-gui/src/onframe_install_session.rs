@@ -253,10 +253,18 @@ impl OnFrameInstallSession {
             self.set_error("OnFrame preview requires a verified binding");
             return false;
         };
-        let existing = match fs::read_to_string(&binding.gamesettings_destination) {
-            Ok(contents) => Some(contents),
+        let existing_bytes = match fs::read(&binding.gamesettings_destination) {
+            Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
+                self.set_error(format!("could not read Dolphin GameSettings: {error}"));
+                return false;
+            }
+        };
+        let existing = match existing_bytes.as_deref().map(std::str::from_utf8) {
+            None => None,
+            Some(Ok(contents)) => Some(contents.to_string()),
+            Some(Err(error)) => {
                 self.set_error(format!("could not read Dolphin GameSettings: {error}"));
                 return false;
             }
@@ -303,6 +311,13 @@ impl OnFrameInstallSession {
                     return false;
                 }
             };
+        if !preview_saw_the_file_that_was_read(&preview.report, existing_bytes.as_deref()) {
+            self.set_error(
+                "The game's Dolphin settings file changed while the preview was being made. \
+                 Nothing was installed. Preview again.",
+            );
+            return false;
+        }
         self.retain_plan_and_preview(plan, preview)
     }
 
@@ -471,7 +486,16 @@ impl OnFrameInstallSession {
             archivefs_core::patch_manager::SharedApplyStatus::PartialFailure
                 | archivefs_core::patch_manager::SharedApplyStatus::Failed
         );
-        self.rollback_available = result.journal.rollback_operation_id.is_some();
+        // An install can be undone when its record was saved and it changed
+        // something, the same rule as the Cheats & Mods screen's "Undo
+        // installation". (`rollback_operation_id` belongs to an Undo's own
+        // record; an install's record never has one.)
+        self.rollback_available = result.journal_path.is_some()
+            && matches!(
+                result.journal.status,
+                archivefs_core::patch_manager::SharedApplyStatus::Success
+                    | archivefs_core::patch_manager::SharedApplyStatus::PartialFailure
+            );
         self.transaction = Some(result);
         if needs_recovery {
             self.recovery_required = Some("Dolphin OnFrame apply requires recovery review".into());
@@ -559,6 +583,32 @@ impl OnFrameInstallSession {
         self.rollback_preview = None;
         self.recovery_required = None;
     }
+}
+
+/// Whether the preview looked at the same game settings file the new
+/// contents were built from. The contents are built from the file as read
+/// here; the preview hashes the file again a moment later, and Apply checks
+/// the file against that hash. If Dolphin saved the file (or it appeared or
+/// went) in between, Apply would put the older settings back over the newer
+/// ones, so the preview is not kept. An entry the preview blocked installs
+/// nothing and is not compared.
+fn preview_saw_the_file_that_was_read(
+    report: &archivefs_core::patch_manager::SharedPreviewReport,
+    read: Option<&[u8]>,
+) -> bool {
+    use sha2::{Digest, Sha256};
+    let read_digest = read.map(|bytes| {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
+    report.entries.iter().all(|entry| {
+        !matches!(
+            entry.eligibility,
+            archivefs_core::patch_manager::PreviewEligibility::Eligible
+        ) || entry.existing_destination_digest == read_digest
+    })
 }
 
 #[cfg(test)]
@@ -741,14 +791,24 @@ mod tests {
             dry_run: false,
             entries: Vec::new(),
             status: archivefs_core::patch_manager::SharedApplyStatus::PartialFailure,
-            rollback_operation_id: Some("rollback-op".into()),
+            rollback_operation_id: None,
         };
+        session.workflow_state = OnFrameInstallState::Applying {
+            binding: session.binding.as_ref().unwrap().backend.clone(),
+        };
+        // Without a saved record there is nothing to undo from.
+        session.retain_apply_result(SharedApplyResult {
+            journal: journal.clone(),
+            journal_path: None,
+            journal_failure: None,
+        });
+        assert!(!session.rollback_available);
         session.workflow_state = OnFrameInstallState::Applying {
             binding: session.binding.as_ref().unwrap().backend.clone(),
         };
         session.retain_apply_result(SharedApplyResult {
             journal,
-            journal_path: None,
+            journal_path: Some(PathBuf::from("/history/onframe-op.json")),
             journal_failure: None,
         });
         assert!(session.apply_warnings().is_empty());
@@ -825,6 +885,8 @@ mod tests {
             "{:#?}",
             transaction.journal.entries
         );
+        // The panel draws its Undo button from this.
+        assert!(session.rollback_available);
         let operation = transaction.journal.operation_id.clone();
         let installed = fs::read_to_string(&destination).unwrap();
         assert_ne!(installed, original);
@@ -861,6 +923,54 @@ mod tests {
             fs::read_to_string(&dolphin_ini).unwrap(),
             "[Interface]\nConfirmStop = True\n"
         );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(source.parent().unwrap());
+    }
+
+    /// The preview is kept only when it hashed the very file the new
+    /// contents were built from: a file that changed, appeared or went in
+    /// between does not match. Checked against real previews, with the
+    /// file present and with it absent.
+    #[test]
+    fn a_preview_counts_only_for_the_settings_file_it_was_built_from() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-gui-onframe-read-match-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let settings = root.join("GameSettings");
+        fs::create_dir_all(&settings).unwrap();
+        let source = root.with_extension("source").join("GMSE01.ini");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "[OnFrame]\n$60 FPS\n0x80001234:dword:0x1\n").unwrap();
+        let destination = settings.join("GMSE01.ini");
+        let original = b"[Core]\nCPUThread = True\n";
+        let newer = b"[Core]\nCPUThread = False\n";
+
+        let preview_now = || {
+            let mut session = OnFrameInstallSession::default();
+            session.discover(source.clone(), CheatPlatform::GameCube);
+            assert!(session.select_candidate(0));
+            assert!(session.bind_selected(Some("GMSE01"), Some(&root), false));
+            assert!(session.prepare_preview(), "{:?}", session.error);
+            session.preview.take().unwrap().report
+        };
+
+        // With no settings file yet.
+        let report = preview_now();
+        assert!(preview_saw_the_file_that_was_read(&report, None));
+        assert!(!preview_saw_the_file_that_was_read(&report, Some(original)));
+
+        // With the file there.
+        fs::write(&destination, original).unwrap();
+        let report = preview_now();
+        assert!(preview_saw_the_file_that_was_read(&report, Some(original)));
+        assert!(!preview_saw_the_file_that_was_read(&report, Some(newer)));
+        assert!(!preview_saw_the_file_that_was_read(&report, None));
+
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(source.parent().unwrap());
     }

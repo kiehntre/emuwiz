@@ -83,7 +83,7 @@ fn extension(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn is_descriptor(path: &Path) -> bool {
+pub(crate) fn is_descriptor(path: &Path) -> bool {
     DESCRIPTORS.contains(&extension(path).as_str())
 }
 
@@ -99,7 +99,7 @@ fn name(path: &Path) -> String {
 
 /// The files a descriptor references, strictly: every reference must resolve
 /// to an existing regular file directly in the descriptor's folder.
-fn descriptor_references(descriptor: &Path) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn descriptor_references(descriptor: &Path) -> Result<Vec<PathBuf>, String> {
     let meta = std::fs::symlink_metadata(descriptor).map_err(|e| e.to_string())?;
     if !meta.file_type().is_file() {
         return Err(format!("{} is not a regular file", name(descriptor)));
