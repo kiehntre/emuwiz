@@ -15,17 +15,36 @@ guessing at intent, dates, or scope.
 
 Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
-- Command line: `emuwiz-cli diagnose-launch` explains a failed emulator launch
-  from what it left behind: how the process ended, what the emulator printed,
-  its settings and a look at the files involved. It reports what happened
-  separately from why, names the evidence behind every conclusion, lists what
-  was not observed, and leaves a failure unexplained when the evidence does not
-  explain it. What happened to the launch is stated apart from the verdict, and
-  what you type about the launch (how it ended, its environment) is taken as
-  supplied: it can suggest a cause, never establish one. Read-only: it starts
-  nothing and changes nothing. RetroArch is the
-  only emulator with log and settings support so far; for others it covers the
-  process exit, missing libraries and sandbox refusals. Not yet in Blue.
+- Undo for mods, cheats and texture packs no longer takes its saved record's
+  word for what it may touch. What ties a record, its destination folder and
+  each file to an install is what EmuWiz itself kept in its backup store
+  when it installed, not the record. A record is accepted only as the record
+  of the one install it was written for, with all of that install's files:
+  it cannot carry another install's files or leave its own out. A record
+  that names a file or folder by anything but a plain path inside its
+  destination folder is refused as a whole: nothing it names is read or
+  changed. A file EmuWiz added is removed only if the backup store holds
+  EmuWiz's receipt for that file under that folder. A replaced file is
+  restored only from that install's own backup of it, and only while the
+  file still holds what the install's receipt says was put there. An empty
+  folder is removed only if it is on the way to a file Undo has just
+  removed, or is the destination folder itself. Installs made before this
+  version have no receipts: Undo no longer removes the files they added,
+  and still restores the files they replaced. An older install that did both is refused as a whole; its files,
+  its backups and its History entry are kept. Empty folders above the
+  destination folder are left in place after Undo. Undo of an install is
+  now refused, until it is looked at, while EmuWiz still holds a receipt for
+  one of its files that the record says was not installed and something
+  other than the original stands at that path: a file whose writing could
+  not be confirmed, or, after an interrupted install, an original that was
+  edited since or another file that has appeared there. Before, Undo went
+  ahead around that file. There is not yet a way to clear this in the app.
+  Limits: this does not protect against something able to change both
+  EmuWiz's history folder and its backup folder. A rewritten record can
+  still choose the permission bits of a restored file. For an install made
+  before this version it can also leave some of that install's own files
+  out of an Undo, and have that install's genuine original put back over a
+  file it replaced that has changed since.
 - Check Games: a "Saved results that need checking again" card lists saved
   catalogue results that no longer count (and why), and can check those games
   again with progress and Stop. Finished sets stay saved; Continue checks the
