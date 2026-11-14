@@ -90,6 +90,7 @@ mod cheatbase;
 mod dat;
 mod discovery;
 mod inspect;
+mod journal_recovery;
 mod mame_evidence;
 mod mame_normalise;
 mod mame_staging;
@@ -157,7 +158,12 @@ fn startup_registration(cli: &CliArgs) -> StartupRegistration {
     }
 }
 
-/// Commands that only read journals, seals and the catalogue.
+/// Commands that never write rename journals or seals, so they register
+/// with the sealed-writer gate as readers. Most only read the catalogue too.
+/// `database-recover-journal` is here because the gate is not what protects
+/// the catalogue from it: with `--apply --confirm` it lets SQLite recover the
+/// library database, under the database's own upgrade lock and only when no
+/// process has the database open.
 fn is_read_only_invocation(cli: &CliArgs) -> bool {
     matches!(
         cli.command.as_str(),
@@ -176,6 +182,7 @@ fn is_read_only_invocation(cli: &CliArgs) -> bool {
             | "data-dir"
             | "library-status"
             | "database-check"
+            | "database-recover-journal"
     )
 }
 
@@ -1301,6 +1308,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 print_library_scan(&report);
             }
+        }
+        "database-recover-journal" => {
+            print!("{}", journal_recovery::run(args.collect())?);
         }
         "library-upgrade" => {
             let input_args: Vec<String> = args.collect();

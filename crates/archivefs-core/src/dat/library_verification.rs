@@ -122,6 +122,8 @@ pub struct VerificationPreview {
     /// One selected game: its save touches only that game's evidence, so the
     /// library-wide disc-order rebuild is not run.
     single_game: bool,
+    /// A bounded set of rows chosen by a re-check (see `execute`).
+    rows_population: bool,
 }
 
 /// Which library rows a verification may hash and save.
@@ -132,6 +134,12 @@ pub enum VerificationPopulation {
     /// Exactly one library row, bound to the path the person was shown. Any
     /// other row is never examined, and the preview fails rather than widen.
     Game { archive_id: i64, path: PathBuf },
+    /// A bounded set of library rows, each bound to the path it had when the
+    /// set was chosen. Rows outside the set are never examined. A row that
+    /// has moved, left the library or changed system is excluded with its
+    /// reason; the rest are still checked. Used by the saved-evidence
+    /// re-audit, which commits one such set at a time.
+    Rows { rows: BTreeMap<i64, PathBuf> },
 }
 
 fn ext(path: &Path) -> String {
@@ -239,6 +247,23 @@ pub fn preview_library_verification(
     )
 }
 
+/// The same preview for a bounded set of library rows (see
+/// [`VerificationPopulation::Rows`]). The library-wide disc-order rebuild is
+/// left to the caller, once, after its last set.
+pub fn preview_rows_verification(
+    resolved: ResolvedCatalogue,
+    database_path: PathBuf,
+    platform: String,
+    rows: BTreeMap<i64, PathBuf>,
+) -> Result<VerificationPreview, String> {
+    preview_verification(
+        resolved,
+        database_path,
+        platform,
+        VerificationPopulation::Rows { rows },
+    )
+}
+
 /// The same preview for exactly one library game. Fails, and checks nothing,
 /// when that game is gone, moved, on another system, shared by several rows
 /// or not eligible; it never falls back to the platform population.
@@ -265,11 +290,15 @@ fn preview_verification(
 ) -> Result<VerificationPreview, String> {
     let collection = match &population {
         VerificationPopulation::Platform { collection } => collection.clone(),
-        VerificationPopulation::Game { .. } => None,
+        VerificationPopulation::Game { .. } | VerificationPopulation::Rows { .. } => None,
     };
     let single = match &population {
         VerificationPopulation::Game { archive_id, path } => Some((*archive_id, path.clone())),
-        VerificationPopulation::Platform { .. } => None,
+        VerificationPopulation::Platform { .. } | VerificationPopulation::Rows { .. } => None,
+    };
+    let mut chosen_rows = match &population {
+        VerificationPopulation::Rows { rows } => Some(rows.clone()),
+        _ => None,
     };
     if resolved.kind != DatSourceKind::File {
         return Err("Choose one installed DAT file, not an aggregate folder.".into());
@@ -421,7 +450,8 @@ fn preview_verification(
         fingerprints: BTreeMap::new(),
         targets: CatalogueAuditTargets::default(),
         _snapshot: snapshot,
-        single_game: single.is_some(),
+        single_game: single.is_some() || chosen_rows.is_some(),
+        rows_population: chosen_rows.is_some(),
     };
     preview.request.dat_path = frozen;
     preview.request.platform = Some(platform);
@@ -437,11 +467,36 @@ fn preview_verification(
                 );
             }
         }
+        let chosen_path = match chosen_rows.as_mut() {
+            Some(chosen) => match chosen.remove(&row.id) {
+                Some(path) => Some(path),
+                None => continue,
+            },
+            None => None,
+        };
+        if let Some(expected) = &chosen_path
+            && expected != &row.absolute_path
+        {
+            preview.selected_games += 1;
+            preview.exclusions.push(VerificationExclusion {
+                path: expected.clone(),
+                reason: "Library location changed since this check was planned".into(),
+            });
+            continue;
+        }
         let assigned = row
             .platform
             .as_deref()
             .and_then(crate::canonical_platform_for_alias);
         if assigned != Some(preview.platform.as_str()) {
+            if chosen_path.is_some() {
+                preview.selected_games += 1;
+                preview.exclusions.push(VerificationExclusion {
+                    path: row.absolute_path,
+                    reason: format!("No longer assigned to {}", preview.platform),
+                });
+                continue;
+            }
             if single.is_some() {
                 return Err(format!(
                     "This game is not assigned to {}. Nothing was checked.",
@@ -507,6 +562,13 @@ fn preview_verification(
         preview.fingerprints.insert(path.clone(), metadata);
         preview.scope.eligible.insert(path, row.id);
     }
+    for path in chosen_rows.into_iter().flatten().map(|(_, path)| path) {
+        preview.selected_games += 1;
+        preview.exclusions.push(VerificationExclusion {
+            path,
+            reason: "No longer in the library".into(),
+        });
+    }
     if single.is_some() {
         if preview.selected_games == 0 {
             return Err("This game is no longer in the library. Nothing was checked.".into());
@@ -549,12 +611,58 @@ pub struct VerificationTotals {
     pub errors: usize,
     pub saved: usize,
     pub protected_prior: usize,
+    /// The definitive result reached for each library row in this run.
+    pub findings: Vec<VerificationFinding>,
+    /// Set only for a bounded row set: the save committed, but some results
+    /// in it were withheld (their rows are simply still not current).
+    pub save_withheld: Option<String>,
     /// The disc-order refresh that follows a successful save. An error here
     /// never undoes the saved evidence.
     pub disc_order: Option<Result<crate::DatDiscOrderOutcome, String>>,
 }
 
+/// A definitive per-row result of one verification run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerificationFindingKind {
+    Verified,
+    NoMatch,
+    Ambiguous,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerificationFinding {
+    pub path: PathBuf,
+    pub kind: VerificationFindingKind,
+}
+
+/// The files one preview confirmed, as they were then. Lets a caller name
+/// which of them changed after a run refused to save.
+#[derive(Clone, Debug)]
+pub struct VerificationInputWatch {
+    fingerprints: BTreeMap<PathBuf, std::fs::Metadata>,
+}
+
+impl VerificationInputWatch {
+    /// Confirmed files that are no longer the same object. Metadata only.
+    pub fn changed(&self) -> Vec<PathBuf> {
+        self.fingerprints
+            .iter()
+            .filter(|(path, before)| {
+                !std::fs::symlink_metadata(path).is_ok_and(|after| same_file(before, &after))
+            })
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+}
+
 impl VerificationPreview {
+    /// The confirmed files as previewed (see [`VerificationInputWatch`]).
+    pub fn input_watch(&self) -> VerificationInputWatch {
+        VerificationInputWatch {
+            fingerprints: self.fingerprints.clone(),
+        }
+    }
+
     /// Exact physical paths in this confirmed library population (no folder walk).
     pub fn eligible_paths(&self) -> impl Iterator<Item = &Path> {
         self.scope.eligible.keys().map(PathBuf::as_path)
@@ -675,17 +783,29 @@ impl VerificationPreview {
             match &item.identity.verification_state {
                 DatVerificationState::VerifiedSingleMatch { .. } => {
                     totals.verified += 1;
+                    totals.findings.push(VerificationFinding {
+                        path: PathBuf::from(&item.local_path),
+                        kind: VerificationFindingKind::Verified,
+                    });
                     totals.not_checked -= 1;
                     definitive.insert(item.local_path.as_str());
                 }
                 DatVerificationState::NoMatch => {
                     totals.no_match += 1;
+                    totals.findings.push(VerificationFinding {
+                        path: PathBuf::from(&item.local_path),
+                        kind: VerificationFindingKind::NoMatch,
+                    });
                     totals.not_checked -= 1;
                     definitive.insert(item.local_path.as_str());
                 }
                 DatVerificationState::AmbiguousMultipleCandidates { .. }
                 | DatVerificationState::Conflicting { .. } => {
                     totals.ambiguous += 1;
+                    totals.findings.push(VerificationFinding {
+                        path: PathBuf::from(&item.local_path),
+                        kind: VerificationFindingKind::Ambiguous,
+                    });
                     totals.not_checked -= 1;
                     definitive.insert(item.local_path.as_str());
                 }
@@ -749,7 +869,19 @@ impl VerificationPreview {
             || saved.ambiguous != 0
             || saved.negative_platform_unproven_skipped != 0
         {
-            return Err(format!("Verification save was incomplete: {saved:?}"));
+            // The transaction has committed. A whole-system or one-game
+            // check reports that as an error, as it always has. A bounded
+            // row set must not: its caller would take "error" to mean
+            // nothing was saved, read the set again and stop at it forever.
+            if !self.rows_population {
+                return Err(format!("Verification save was incomplete: {saved:?}"));
+            }
+            totals.save_withheld = Some(format!(
+                "Some results in this set were not saved ({} refused, {} not tied to one library row, {} negative results that do not apply to the game's system)",
+                usize::from(saved.refused.is_some()),
+                saved.unassociated + saved.ambiguous,
+                saved.negative_platform_unproven_skipped
+            ));
         }
         totals.saved = saved.inserted + saved.updated;
         totals.protected_prior = saved.skipped_protected_prior_result;

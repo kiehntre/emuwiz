@@ -375,7 +375,7 @@ fn membership_change_during_hashing_prevents_transactional_save() {
 }
 fn other_tables(db: &Path) -> BTreeMap<String, Vec<String>> {
     let conn = rusqlite::Connection::open(db).unwrap();
-    let names:Vec<String>=conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('library_dat_identities', 'dat_expected_entries', 'dat_expected_inventory_meta') ORDER BY name").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    let names:Vec<String>=conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('library_dat_identities', 'library_dat_identity_history', 'dat_recheck_attempts', 'dat_expected_entries', 'dat_expected_inventory_meta') ORDER BY name").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
     names
         .into_iter()
         .map(|name| {
@@ -1690,3 +1690,6 @@ fn headered_zip_member_of_an_incomplete_multi_rom_set_is_not_verified() {
         f.saved_state(1)
     );
 }
+
+// Issue #279: the bounded, resumable re-check of saved evidence.
+mod reaudit;
