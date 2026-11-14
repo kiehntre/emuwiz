@@ -193,10 +193,17 @@ impl ArchiveFsApp {
                 context.request_repaint();
             });
         }
-        if self
-            .needs_attention
-            .last_session_refresh
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+        // The merged snapshot is only ever read by the Needs Attention page
+        // (`show_needs_attention_page`), which is drawn after this poll in
+        // the same frame. Building it rebuilds the selected game's whole
+        // launch-readiness input, so it is skipped while that page is not
+        // the one on screen: every second on every other page, and in Blue,
+        // which has its own Needs Attention page and never shows this one.
+        if self.view == MainView::NeedsAttention
+            && self
+                .needs_attention
+                .last_session_refresh
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
         {
             let mut snapshot = self.needs_attention.stored.clone();
             if let Some(outcome) = self.doctor_repair.doctor_scan.displayed() {

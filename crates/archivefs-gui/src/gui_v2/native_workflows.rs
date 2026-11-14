@@ -25,6 +25,7 @@ mod native_texture_packs;
 
 #[path = "game_firmware_guidance.rs"]
 mod game_firmware_guidance;
+mod launch_input_memo;
 
 #[path = "dat_name_review.rs"]
 mod dat_name_review;
@@ -79,6 +80,12 @@ pub(super) struct NativeWorkflows {
     saved_source_history: SavedSourceHistory,
     /// The last "can a launch request be built" answer, for the game shown.
     route_truth: std::cell::RefCell<launch_readiness_summary::route_truth::RouteCache>,
+    /// The launch input the pages are drawing. Never read by Play or any
+    /// other action; see [`launch_input_memo`].
+    launch_input_memo: launch_input_memo::LaunchInputMemo,
+    /// The scan-result part of the emulator-environment signature, shared by
+    /// the drawing memo and the Library's background readiness checks.
+    environment_heavy: std::cell::RefCell<super::bg_readiness::HeavySignatureCache>,
     source_job: Option<u64>,
     cheat_catalogues: native_cheat_catalogues::State,
     provider_job: Option<u64>,
@@ -518,6 +525,8 @@ impl NativeWorkflows {
             pending_play: None,
             saved_source_history: SavedSourceHistory::default(),
             route_truth: Default::default(),
+            launch_input_memo: Default::default(),
+            environment_heavy: Default::default(),
             source_job: None,
             cheat_catalogues: Default::default(),
             provider_job: None,
@@ -649,7 +658,7 @@ impl NativeWorkflows {
             );
             self.readiness_job = None;
         } else if !matches!(
-            self.launch_input(),
+            *self.shown_launch_input().input,
             launch_readiness_page::LaunchReadinessInput::EvidenceNotLoaded
         ) {
             activity.finish(job, "Launch readiness is ready to review.".into(), None);
@@ -1213,13 +1222,18 @@ impl NativeWorkflows {
         activity: &mut Activity,
     ) -> (
         launch_readiness_summary::GameReadinessSummary,
-        launch_readiness_page::LaunchReadinessInput,
+        std::rc::Rc<launch_readiness_page::LaunchReadinessInput>,
     ) {
         self.selected_game = Some(game_id);
         self.catalogue_identity_report = catalogue_identity_report.cloned();
         self.select(path);
         self.start_launch_readiness_with(context, checksum);
-        let input = self.launch_input();
+        let launch_input_memo::Shown { input, recheck_in } = self.shown_launch_input();
+        if let Some(recheck_in) = recheck_in {
+            // While an answer is still settling, draw again when it may be
+            // rebuilt, so a late emulator answer is never left off screen.
+            context.request_repaint_after(recheck_in);
+        }
         let error = self.readiness_error();
         let freshness = if error.is_some() {
             ReadinessFreshness::Stale
@@ -1233,7 +1247,7 @@ impl NativeWorkflows {
         }
         if let launch_readiness_page::LaunchReadinessInput::Plan {
             plan, retroarch, ..
-        } = &input
+        } = &*input
             && let Some(candidate) = launch_readiness_summary::selected_candidate(plan)
             && matches!(
                 candidate.target,
@@ -1369,7 +1383,7 @@ impl NativeWorkflows {
         } else {
             ReadinessFreshness::Current
         };
-        let input = self.launch_input();
+        let input = self.shown_launch_input().input;
         let mut summary = launch_readiness_summary::project(&input, freshness);
         if let Some(error) = &error {
             launch_readiness_summary::describe_check_error(&mut summary, error);
@@ -1416,13 +1430,14 @@ impl NativeWorkflows {
         {
             return None;
         }
+        let input = self.shown_launch_input().input;
         let launch_readiness_page::LaunchReadinessInput::Plan {
             plan, duckstation, ..
-        } = self.launch_input()
+        } = &*input
         else {
             return None;
         };
-        let candidate = launch_readiness_summary::selected_candidate(&plan)?;
+        let candidate = launch_readiness_summary::selected_candidate(plan)?;
         let game = self
             .catalogue_identity_report
             .as_ref()
@@ -1518,13 +1533,14 @@ impl NativeWorkflows {
         )?
         .with_disc_members(&snapshot.disc_members);
         let set = context.sets.first()?;
-        let decision = match self.launch_input() {
+        let input = self.shown_launch_input().input;
+        let decision = match &*input {
             launch_readiness_page::LaunchReadinessInput::Plan {
                 plan,
                 retroarch,
                 duckstation,
                 ..
-            } => launch_readiness_summary::selected_candidate(&plan).map(|candidate| {
+            } => launch_readiness_summary::selected_candidate(plan).map(|candidate| {
                 launch_readiness_page::multidisc_decision_with(
                     candidate,
                     retroarch.as_ref(),
@@ -4073,8 +4089,10 @@ impl NativeWorkflows {
             selected_evidence_page::SelectedEvidenceState::Loading { path: current, .. }
                 if current == &path
         );
-        // An explicit recheck also forgets any cached MAME answer for this game.
+        // An explicit recheck also forgets any cached MAME answer for this game,
+        // and the launch input the pages were drawing.
         crate::arcade_mame_probe::invalidate_path(&path);
+        self.launch_input_memo.forget();
         // RetroArch facts (save folders, the zipped-game save check) come from
         // its background scan, so an explicit recheck refreshes that too.
         if !matches!(
@@ -4186,13 +4204,89 @@ impl NativeWorkflows {
         }
     }
 
+    /// A launch input built now. Everything that starts or authorises a
+    /// launch (Play, the Launch page, the bezel preview) uses this and never
+    /// the drawing memo.
     fn launch_input(&self) -> launch_readiness_page::LaunchReadinessInput {
+        self.launch_input_memo.fresh(|| self.build_launch_input())
+    }
+
+    fn build_launch_input(&self) -> launch_readiness_page::LaunchReadinessInput {
         let live = match &self.app.state {
             LoadState::Ready(data) => Some(data.as_ref()),
             LoadState::Loading { previous, .. } => previous.as_deref(),
             LoadState::Error(_) => None,
         };
         self.app.build_launch_readiness_input(live)
+    }
+
+    /// The launch input for drawing. Reused across frames while nothing it
+    /// was built from has changed; see [`launch_input_memo`]. Only read by
+    /// code that shows readiness, never by code that launches.
+    fn shown_launch_input(&self) -> launch_input_memo::Shown {
+        let key = self.launch_input_key(self.launch_input_memo.now());
+        self.launch_input_memo
+            .shown(key, || self.build_launch_input())
+    }
+
+    /// The emulator-environment signature the background readiness checks
+    /// use: `None` while a scan it covers is unfinished.
+    pub(super) fn environment_signature(&self, now: std::time::Instant) -> Option<u64> {
+        super::bg_readiness::EnvSnapshot::cached_signature(
+            &self.app.emulator_readiness,
+            &mut self.environment_heavy.borrow_mut(),
+            now,
+        )
+    }
+
+    /// Everything a drawn launch input is known to depend on, or `None` when
+    /// nothing may be reused: the evidence is not ready or an emulator scan
+    /// is still running, and the input is then built on every call.
+    fn launch_input_key(&self, now: std::time::Instant) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let selected_evidence_page::SelectedEvidenceState::Ready {
+            generation,
+            report,
+            hasheous,
+        } = &self.app.selected_evidence_ui.selected_evidence
+        else {
+            return None;
+        };
+        let environment = self.environment_signature(now)?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // The game.
+        self.selected_game.hash(&mut hasher);
+        self.selected.hash(&mut hasher);
+        self.app.archive_context.focused.hash(&mut hasher);
+        // Its identity evidence: a new check has a new generation, and the
+        // deferred checksum pass and an online lookup change the report in place.
+        generation.hash(&mut hasher);
+        report.path.hash(&mut hasher);
+        std::mem::discriminant(&report.enrichment).hash(&mut hasher);
+        report.hashes.is_some().hash(&mut hasher);
+        report.dat_identity.is_some().hash(&mut hasher);
+        std::mem::discriminant(hasheous).hash(&mut hasher);
+        // Emulator scans, firmware evidence, emulator choices and settings.
+        environment.hash(&mut hasher);
+        // The library: generation, and which loaded snapshots are in use.
+        self.app.database_generation.0.hash(&mut hasher);
+        self.app
+            .database_state
+            .snapshot()
+            .map(std::ptr::from_ref)
+            .hash(&mut hasher);
+        match &self.app.state {
+            LoadState::Ready(data) => Some(std::ptr::from_ref(data.as_ref())),
+            LoadState::Loading { previous, .. } => previous.as_deref().map(std::ptr::from_ref),
+            LoadState::Error(_) => None,
+        }
+        .hash(&mut hasher);
+        // What the catalogue says about this file, and a one-launch choice.
+        self.app.catalogued_platform_hint.hash(&mut hasher);
+        self.app.catalogued_platform_source.hash(&mut hasher);
+        self.app.catalogued_row_health.hash(&mut hasher);
+        self.app.launch_system_trial.hash(&mut hasher);
+        Some(hasher.finish())
     }
 
     /// An emulator is starting or running, whichever page started it.
@@ -4319,6 +4413,9 @@ mod source_presentation_tests {
     }
 }
 
+#[cfg(test)]
+#[path = "native_workflows/launch_input_memo_tests.rs"]
+mod launch_input_memo_tests;
 #[cfg(test)]
 #[path = "native_workflows/launch_recovery_tests.rs"]
 mod launch_recovery_tests;
