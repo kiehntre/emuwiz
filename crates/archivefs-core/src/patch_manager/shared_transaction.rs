@@ -4900,11 +4900,17 @@ fn prepare_managed_root(root: &Path) -> Result<(), SharedApplyFailureKind> {
         // Another install made the folder between the look above and this
         // attempt (two installs starting at once on a profile that has
         // never had one). It is then judged like any folder that was
-        // already there, not refused for existing.
+        // already there, not refused for existing: but only a real folder
+        // that is there now counts. A link at that name, whether or not
+        // it leads anywhere, a file, or a name that is gone again by the
+        // time it is looked at, is refused as before.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            validate_destination_root(root)
-                .map(|_| ())
-                .map_err(|_| SharedApplyFailureKind::ManagedRootUnsafe)
+            match validate_destination_root(root) {
+                Ok(validated) if validated.state() == DestinationRootState::ExistingDirectory => {
+                    Ok(())
+                }
+                _ => Err(SharedApplyFailureKind::ManagedRootUnsafe),
+            }
         }
         Err(_) => Err(SharedApplyFailureKind::ManagedRootUnsafe),
     }
@@ -10744,6 +10750,19 @@ mod tests {
             prepare_managed_root(&occupied),
             Err(SharedApplyFailureKind::ManagedRootUnsafe)
         );
+        // A link that leads nowhere does not look as if it exists, so it
+        // is the making of the folder that finds the name taken: the very
+        // path a lost race takes, every time. It is refused there, and
+        // nothing is made where the link points.
+        let nowhere = fixture.0.join("not-made");
+        let dangling = fixture.0.join("dangling");
+        std::os::unix::fs::symlink(&nowhere, &dangling).unwrap();
+        assert!(!dangling.exists());
+        assert_eq!(
+            prepare_managed_root(&dangling),
+            Err(SharedApplyFailureKind::ManagedRootUnsafe)
+        );
+        assert!(!nowhere.exists());
     }
 
     #[test]
