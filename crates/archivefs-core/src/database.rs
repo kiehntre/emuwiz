@@ -530,8 +530,12 @@ fn topology_source_fingerprint(
 /// What one topology persistence call wrote and what it refused to replace.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TopologyPersistOutcome {
+    /// Sets accepted as the saved evidence, including the unchanged ones.
     pub written: usize,
     pub conflicts_kept: usize,
+    /// Accepted sets whose saved row was already byte-identical, so no row
+    /// was written for them at all.
+    pub unchanged: usize,
 }
 
 /// Two claims about one release agree when no source moves to another
@@ -1487,8 +1491,8 @@ impl Database {
                 )
                 .optional()
                 .map_err(|e| db_error("failed to read saved topology evidence", e))?;
-            if let Some((saved_fingerprint, saved_json)) = saved
-                && let Ok(saved_set) = serde_json::from_slice::<MediaSet>(&saved_json)
+            if let Some((saved_fingerprint, saved_json)) = &saved
+                && let Ok(saved_set) = serde_json::from_slice::<MediaSet>(saved_json)
                 && !topology_claims_agree(&saved_set, &set)
                 && topology_source_fingerprint(&saved_set, None).as_deref()
                     == Some(saved_fingerprint.as_str())
@@ -1499,6 +1503,22 @@ impl Database {
             let json = serde_json::to_vec(&set).map_err(|e| {
                 ArchiveFsError::Database(format!("failed to serialize topology evidence: {e}"))
             })?;
+            // A refresh that would store the very same evidence writes
+            // nothing. Rewriting an identical row is still a row change: it
+            // fires the Discovery import triggers, which then mark every
+            // untouched import in the library as modified and refuse its
+            // Undo, although nothing about any game changed. A new or
+            // different row is still written, and still marks them.
+            if saved
+                .as_ref()
+                .is_some_and(|(saved_fingerprint, saved_json)| {
+                    *saved_fingerprint == fingerprint && *saved_json == json
+                })
+            {
+                outcome.written += 1;
+                outcome.unchanged += 1;
+                continue;
+            }
             tx.execute(
                 "INSERT INTO media_topology_evidence
                  (set_namespace,set_value,producer,producer_version,producer_schema,source_fingerprint,generation,created_at,refreshed_at,evidence_json)
