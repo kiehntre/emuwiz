@@ -638,7 +638,8 @@ fn downgrade_to_21(connection: &Connection) {
     }
     connection
         .execute_batch(
-            "DROP TABLE discovery_import_records; DROP TABLE discovery_import_operations; \
+            "DROP TABLE IF EXISTS library_dat_identity_history; DROP TABLE IF EXISTS dat_recheck_attempts; \
+             DROP TABLE discovery_import_records; DROP TABLE discovery_import_operations; \
              ALTER TABLE dat_expected_inventory_meta DROP COLUMN catalogue_sha256; \
              DROP TABLE IF EXISTS source_review_required; DROP TABLE source_nested_boundaries; DROP TABLE source_scan_bindings; \
              DROP TABLE catalogue_health_epoch; DELETE FROM schema_migrations WHERE version=23; \
@@ -668,7 +669,7 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
     for (table, rows) in history.iter().filter(|(t, _)| *t != "schema_migrations") {
         assert_eq!(after.get(table), Some(rows), "table {table} changed");
     }
-    // The migration ledger only gains exactly the missing versions 22 through 26.
+    // The migration ledger only gains exactly the missing versions 22 through 27.
     let versions = |connection: &Connection| -> Vec<i64> {
         connection
             .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -678,7 +679,7 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(versions(&sql), (1..=26).collect::<Vec<_>>());
+    assert_eq!(versions(&sql), (1..=27).collect::<Vec<_>>());
     assert_eq!(binding_rows(&sql), 0, "migration must not bind any source");
     assert_eq!(
         sql.query_row("SELECT COUNT(*) FROM source_nested_boundaries", [], |r| r
