@@ -2595,7 +2595,21 @@ fn rollback_preview_of(
     backup_root: &Path,
 ) -> SharedRollbackPreview {
     let journal_root = journal.destination_root.to_path_buf().ok();
+    // The folder this Undo was opened for and the folder the install
+    // recorded must be the same folder: the same names in the same order.
+    // They need not be spelled alike (a trailing slash, a doubled slash).
+    // Nothing is resolved, so a link that leads to the same folder under
+    // another name is another path, and does not match.
     let root_matches = journal_root.as_deref() == Some(expected_destination_root);
+    // From here on the install's own spelling of that folder is the one
+    // used, for where Undo acts and for the names of the backups and
+    // receipts the install made from it. A caller that spells the same
+    // folder differently finds the same evidence; a caller that names a
+    // different folder has already not matched.
+    let expected_destination_root = match journal_root.as_deref() {
+        Some(recorded) if root_matches => recorded,
+        _ => expected_destination_root,
+    };
     let rollback_marker_exists = journal_path.parent().is_some_and(|parent| {
         safe_identifier(&journal.operation_id)
             .ok()
@@ -9796,6 +9810,133 @@ mod tests {
     /// History opens Undo for the folder the record names. A record that
     /// names a wider folder, with the rest moved into the path, points at
     /// the very same file. It must gain nothing by it.
+    /// An Undo opened for `root`, as a screen would open it with whatever
+    /// spelling of the folder it holds.
+    fn try_undo_for(
+        fixture: &Fixture,
+        journal_path: &Path,
+        root: &Path,
+        label: &str,
+    ) -> (bool, Option<SharedApplyStatus>) {
+        let preview = preview_shared_rollback(journal_path, root, &fixture.backup_root());
+        if !preview.available {
+            return (false, None);
+        }
+        let result = execute_shared_rollback(
+            &preview,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: format!("{label}-rollback"),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        (true, Some(result.status))
+    }
+
+    /// The same folder, spelled three other ways.
+    fn other_spellings(root: &Path) -> Vec<(&'static str, PathBuf)> {
+        let text = root.to_str().unwrap();
+        let (parent, name) = text.rsplit_once('/').unwrap();
+        vec![
+            ("trailing-slash", PathBuf::from(format!("{text}/"))),
+            ("doubled-slash", PathBuf::from(format!("{parent}//{name}"))),
+            ("dot-segment", PathBuf::from(format!("{parent}/./{name}"))),
+        ]
+    }
+
+    #[test]
+    fn undo_opened_for_the_same_folder_spelled_differently_finds_the_installs_evidence() {
+        let spellings = other_spellings(Path::new("/x/destination"));
+        for (index, (spelling, _)) in spellings.iter().enumerate() {
+            // A file installed where there was none.
+            let label = format!("spelled-new-{spelling}");
+            let fixture = Fixture::new(&label);
+            let journal = honest_install(&fixture, &label);
+            let root = other_spellings(&fixture.destination_root()).remove(index).1;
+            assert_ne!(root.as_os_str(), fixture.destination_root().as_os_str());
+            assert_eq!(
+                try_undo_for(&fixture, &journal, &root, &label),
+                (true, Some(SharedApplyStatus::Success)),
+                "{spelling}"
+            );
+            assert!(!fixture.destination_root().join(INSTALLED).exists());
+
+            // A replaced file.
+            let label = format!("spelled-replace-{spelling}");
+            let fixture = Fixture::new(&label);
+            let journal = honest_replacement(&fixture, &label);
+            let root = other_spellings(&fixture.destination_root()).remove(index).1;
+            assert_eq!(
+                try_undo_for(&fixture, &journal, &root, &label),
+                (true, Some(SharedApplyStatus::Success)),
+                "{spelling}"
+            );
+            assert_eq!(
+                fs::read(fixture.destination_root().join(INSTALLED)).unwrap(),
+                b"old"
+            );
+
+            // A replaced file from an install made before receipts: its
+            // backup is found under the name it was given at install.
+            let label = format!("spelled-legacy-{spelling}");
+            let fixture = Fixture::new(&label);
+            let journal = honest_replacement(&fixture, &label);
+            forget_receipts(&fixture, &label);
+            let root = other_spellings(&fixture.destination_root()).remove(index).1;
+            assert_eq!(
+                try_undo_for(&fixture, &journal, &root, &label),
+                (true, Some(SharedApplyStatus::Success)),
+                "{spelling}"
+            );
+            assert_eq!(
+                fs::read(fixture.destination_root().join(INSTALLED)).unwrap(),
+                b"old"
+            );
+        }
+    }
+
+    #[test]
+    fn undo_opened_for_another_folder_is_refused_however_it_leads_to_the_same_place() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("another-folder");
+        let journal = honest_install(&fixture, "another-folder");
+        let installed = fixture.destination_root().join(INSTALLED);
+        // A link to the very same folder is another path.
+        let alias = fixture.0.join("alias");
+        symlink(fixture.destination_root(), &alias).unwrap();
+        // So is the same folder reached by going up and back down.
+        let around = fixture.destination_root().join("..").join("destination");
+        // And the folder above it, and a folder beside it.
+        let beside = fixture.0.join("beside");
+        fs::create_dir(&beside).unwrap();
+        for (what, root) in [
+            ("a link to the folder", alias),
+            ("up and back down", around),
+            ("the folder above", fixture.0.clone()),
+            ("a folder beside it", beside),
+        ] {
+            let preview = preview_shared_rollback(&journal, &root, &fixture.backup_root());
+            assert!(!preview.available, "{what}");
+            assert_eq!(
+                preview.entries[0].outcome,
+                SharedRollbackOutcome::RootMismatch,
+                "{what}"
+            );
+            assert_eq!(fs::read(&installed).unwrap(), b"new", "{what}");
+        }
+        // The folder itself, as recorded, is still undone.
+        assert_eq!(
+            try_undo(&fixture, &journal, "another-folder"),
+            (true, Some(SharedApplyStatus::Success))
+        );
+        assert!(!installed.exists());
+    }
+
     #[test]
     fn a_record_that_widens_its_destination_folder_removes_nothing() {
         let fixture = Fixture::new("forged-wider-root");

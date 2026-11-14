@@ -985,8 +985,33 @@ fn same_destination_concurrent_installs_never_both_write() {
             .filter(|e| e.file_name().to_string_lossy().starts_with(".archivefs-"))
             .collect();
         assert!(hidden.is_empty(), "temp debris: {hidden:?}");
-        let backups = fs::read_dir(&first.backup_root).unwrap().count();
-        assert_eq!(backups, 0, "no backup for a fresh install or refused job");
+        // The backup store holds each operation's own receipts, and
+        // nothing else: no backup, because a fresh install replaces
+        // nothing, and a receipt for the file only under the job that
+        // installed it.
+        let evidence: Vec<String> = fs::read_dir(&first.backup_root)
+            .unwrap()
+            .flatten()
+            .flat_map(|operation| fs::read_dir(operation.path()).into_iter().flatten())
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        let ending = |suffix: &str| {
+            evidence
+                .iter()
+                .filter(|name| name.ends_with(suffix))
+                .count()
+        };
+        assert_eq!(
+            ending(".bak"),
+            0,
+            "no backup for a fresh install or refused job: {evidence:?}"
+        );
+        assert_eq!(
+            ending(".new"),
+            1,
+            "only the job that installed the file holds a receipt for it: {evidence:?}"
+        );
         // The refused job's reviewed source is untouched; the winner's spent
         // staging directory is retired once its journal is durable.
         let jobs = [(&first, &results[0]), (&second, &results[1])];
