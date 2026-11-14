@@ -289,19 +289,11 @@ fn poll_standalone(state: &mut StandalonePatchPageState) -> bool {
     changed
 }
 
+/// CRC-32 (IEEE) of a buffer, through the core's table-driven implementation.
 fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xedb8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
+    let mut crc = archivefs_core::identity_source::hashing::Crc32::new();
+    crc.update(bytes);
+    crc.finish()
 }
 
 fn patch_candidate_rank(candidate: &StandalonePatchCandidate) -> u8 {
@@ -2605,3 +2597,47 @@ mod tests {
 #[cfg(test)]
 #[path = "local_mod_package_page/representation_guidance_tests.rs"]
 mod representation_guidance_tests;
+
+#[cfg(test)]
+mod crc32_vector_tests {
+    /// The definition, one bit at a time: the code this file used before it
+    /// switched to the shared table-driven implementation.
+    fn bitwise(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffff_u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn crc32_gives_the_published_answers() {
+        assert_eq!(super::crc32(b""), 0);
+        assert_eq!(super::crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(
+            super::crc32(b"The quick brown fox jumps over the lazy dog"),
+            0x414f_a339
+        );
+    }
+
+    #[test]
+    fn crc32_agrees_with_the_bit_at_a_time_definition_at_every_length() {
+        let data: Vec<u8> = (0..4099_u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        for length in (0..=40).chain([255, 256, 257, 4095, 4096, 4097, 4099]) {
+            assert_eq!(
+                super::crc32(&data[..length]),
+                bitwise(&data[..length]),
+                "length {length}"
+            );
+        }
+    }
+}

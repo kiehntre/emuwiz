@@ -23,6 +23,7 @@ use crate::chd_identity::{
 };
 use crate::chd_logical_media::open_chd_track_logical_media_file;
 use crate::dat::model::DatChecksum;
+use crate::identity_source::hashing::Crc32;
 use crate::logical_media::{LogicalMedia, LogicalMediaError};
 use crate::optical_fingerprint::{
     OpticalFingerprintComparison, compare_optical_fingerprints, fingerprint_chd,
@@ -446,35 +447,43 @@ pub fn compare_cue_bin_chd_logical(
     )
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Crc32(u32);
-
-impl Crc32 {
-    fn new() -> Self {
-        Self(0xffff_ffff)
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 ^= u32::from(byte);
-            for _ in 0..8 {
-                self.0 = if self.0 & 1 != 0 {
-                    (self.0 >> 1) ^ 0xedb8_8320
-                } else {
-                    self.0 >> 1
-                };
-            }
-        }
-    }
-
-    fn finish_hex(self) -> String {
-        format!("{:08x}", !self.0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A track longer than one read is hashed in chunks; its CRC-32 must be
+    /// the bit-at-a-time definition's, whatever the chunking.
+    #[test]
+    fn a_track_hashed_in_chunks_has_the_crc32_of_the_whole_track() {
+        fn bitwise(bytes: &[u8]) -> u32 {
+            let mut crc = 0xffff_ffff_u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xedb8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        for length in [0, 9, LOGICAL_HASH_CHUNK_BYTES, LOGICAL_HASH_CHUNK_BYTES + 5] {
+            let data: Vec<u8> = (0..length as u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+                .collect();
+            let hashes = hash_logical_media(&crate::logical_media::SliceMedia(&data)).unwrap();
+            assert_eq!(
+                hashes.crc32.as_deref(),
+                Some(format!("{:08x}", bitwise(&data)).as_str()),
+                "length {length}"
+            );
+        }
+        let published =
+            hash_logical_media(&crate::logical_media::SliceMedia(b"123456789")).unwrap();
+        assert_eq!(published.crc32.as_deref(), Some("cbf43926"));
+    }
 
     fn expected(number: u32, mode: &str) -> ExpectedTrack {
         ExpectedTrack {

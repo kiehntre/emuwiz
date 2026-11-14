@@ -1,0 +1,238 @@
+//! Evidence from a launched process: how it ended and what it wrote to
+//! standard error.
+//!
+//! The launch executor already owns the process and reports
+//! [`ProcessExitReport`](crate::launch::process_spawn::ProcessExitReport);
+//! this module only turns that report into evidence. It starts nothing and
+//! signals nothing.
+
+use std::os::unix::process::ExitStatusExt;
+use std::process::ExitStatus;
+use std::time::Duration;
+
+use super::evidence::{
+    EvidenceArea, EvidenceId, EvidenceSet, ExitOutcome, Fact, LogStream, ProcessExit, SpawnFailure,
+    Trust,
+};
+use super::signatures::{self, HOST_EMULATOR, HOST_SIGNATURES, Signature};
+use super::text;
+use crate::launch::process_spawn::ProcessExitReport;
+
+/// The outcome for a process that could not be started.
+pub fn spawn_failure(error: &std::io::Error) -> ExitOutcome {
+    ExitOutcome::SpawnFailed {
+        reason: match error.kind() {
+            std::io::ErrorKind::NotFound => SpawnFailure::ProgramNotFound,
+            std::io::ErrorKind::PermissionDenied => SpawnFailure::PermissionDenied,
+            _ => SpawnFailure::Other,
+        },
+        os_error: error.raw_os_error(),
+    }
+}
+
+/// The outcome for a process that was waited on.
+pub fn exit_outcome(status: &std::io::Result<ExitStatus>) -> ExitOutcome {
+    match status {
+        Err(_) => ExitOutcome::StatusUnavailable,
+        Ok(status) => match (status.signal(), status.code()) {
+            (Some(signal), _) => ExitOutcome::Signaled {
+                signal,
+                core_dumped: status.core_dumped(),
+            },
+            (None, Some(code)) => ExitOutcome::Exited { code },
+            (None, None) => ExitOutcome::StatusUnavailable,
+        },
+    }
+}
+
+/// What is known about a signal number on this platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignalInfo {
+    pub name: &'static str,
+    pub kind: SignalKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalKind {
+    /// The program itself faulted or aborted.
+    Fault,
+    /// Something asked the program to stop: the user, EmuWiz, a session
+    /// ending. Not a crash.
+    StopRequest,
+    /// Forcibly ended from outside. The kernel's out-of-memory handling
+    /// does this, and so does a user's forced stop; the signal alone does
+    /// not say which.
+    ForcedKill,
+    Other,
+}
+
+pub fn signal_info(signal: i32) -> Option<SignalInfo> {
+    let (name, kind) = match signal {
+        libc::SIGSEGV => ("SIGSEGV", SignalKind::Fault),
+        libc::SIGABRT => ("SIGABRT", SignalKind::Fault),
+        libc::SIGBUS => ("SIGBUS", SignalKind::Fault),
+        libc::SIGILL => ("SIGILL", SignalKind::Fault),
+        libc::SIGFPE => ("SIGFPE", SignalKind::Fault),
+        libc::SIGSYS => ("SIGSYS", SignalKind::Fault),
+        libc::SIGTRAP => ("SIGTRAP", SignalKind::Fault),
+        libc::SIGTERM => ("SIGTERM", SignalKind::StopRequest),
+        libc::SIGINT => ("SIGINT", SignalKind::StopRequest),
+        libc::SIGHUP => ("SIGHUP", SignalKind::StopRequest),
+        libc::SIGQUIT => ("SIGQUIT", SignalKind::StopRequest),
+        libc::SIGKILL => ("SIGKILL", SignalKind::ForcedKill),
+        libc::SIGPIPE => ("SIGPIPE", SignalKind::Other),
+        libc::SIGXCPU => ("SIGXCPU", SignalKind::Other),
+        libc::SIGXFSZ => ("SIGXFSZ", SignalKind::Other),
+        _ => return None,
+    };
+    Some(SignalInfo { name, kind })
+}
+
+/// The signal a shell-style launcher would be relaying with this exit
+/// code. Shells and many wrappers report a child killed by signal `N` as
+/// exit code `128 + N`, but a program can also simply exit with such a
+/// code, so this is a possibility, never a fact.
+pub fn possibly_relayed_signal(code: i32) -> Option<i32> {
+    let signal = code.checked_sub(128)?;
+    (1..=64).contains(&signal).then_some(signal)
+}
+
+/// Who says how the process ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitSource {
+    /// EmuWiz started the process and read its status from the operating
+    /// system.
+    Observed,
+    /// Whoever asked for the diagnosis supplied it. EmuWiz did not see the
+    /// process.
+    SuppliedByCaller,
+}
+
+/// Record how a process EmuWiz itself watched ended. `duration` is the time
+/// from start to exit as measured by the caller; `launcher` names the
+/// wrapper when the watched process is not the emulator itself.
+pub fn record_exit(
+    set: &mut EvidenceSet,
+    outcome: ExitOutcome,
+    duration: Option<Duration>,
+    launcher: Option<&str>,
+) -> Option<EvidenceId> {
+    record_exit_from(set, outcome, duration, launcher, ExitSource::Observed)
+}
+
+/// Record how a process ended, stating who says so. A status supplied by
+/// the caller is recorded as reported, never as measured, and its source
+/// says that it was supplied.
+pub fn record_exit_from(
+    set: &mut EvidenceSet,
+    outcome: ExitOutcome,
+    duration: Option<Duration>,
+    launcher: Option<&str>,
+    source: ExitSource,
+) -> Option<EvidenceId> {
+    let (trust, described) = match source {
+        ExitSource::Observed => (
+            Trust::Measured,
+            "exit status of the launched process, as reported by the operating system",
+        ),
+        ExitSource::SuppliedByCaller => (
+            Trust::Supplied,
+            "how the process ended, as supplied by whoever asked for this diagnosis",
+        ),
+    };
+    set.observe(
+        EvidenceArea::ProcessExit,
+        trust,
+        described,
+        Fact::ProcessExit(ProcessExit {
+            outcome,
+            duration_ms: duration.map(|duration| duration.as_millis().min(u64::MAX as u128) as u64),
+            launcher: launcher.map(|name| text::sanitise(name, text::VALUE_LIMIT)),
+        }),
+    )
+}
+
+/// Record an executor's exit report: the exit itself, then standard error
+/// scanned against the host signatures and the emulator's own
+/// (`emulator_signatures`). Returns the id of the exit item.
+pub fn record_exit_report(
+    set: &mut EvidenceSet,
+    report: &ProcessExitReport,
+    duration: Option<Duration>,
+    launcher: Option<&str>,
+    emulator: &str,
+    emulator_signatures: &[Signature],
+) -> Option<EvidenceId> {
+    let exit = record_exit(set, exit_outcome(&report.status), duration, launcher);
+    record_stderr(set, &report.stderr, emulator, emulator_signatures);
+    exit
+}
+
+/// Scan the standard error an executor captured. The executor keeps only
+/// the first part of the stream, so the coverage is marked truncated when
+/// the capture is full: an error printed later would not be in it.
+pub fn record_stderr(
+    set: &mut EvidenceSet,
+    stderr: &[u8],
+    emulator: &str,
+    emulator_signatures: &[Signature],
+) -> Vec<EvidenceId> {
+    let capture_full = stderr.len() >= crate::launch::process_spawn::PROCESS_STDERR_CAPTURE_LIMIT;
+    record_output(set, stderr, emulator, emulator_signatures, capture_full)
+}
+
+/// Scan output that is complete as supplied (a file someone saved), with no
+/// capture limit to account for beyond the examination limits themselves.
+pub fn record_supplied_output(
+    set: &mut EvidenceSet,
+    output: &[u8],
+    emulator: &str,
+    emulator_signatures: &[Signature],
+) -> Vec<EvidenceId> {
+    // A file exactly as long as a launcher's capture may be one, cut off at
+    // that length. Anything else is taken as complete.
+    let may_be_cut = output.len() == crate::launch::process_spawn::PROCESS_STDERR_CAPTURE_LIMIT;
+    record_output(set, output, emulator, emulator_signatures, may_be_cut)
+}
+
+/// The signal table as text, for the rule-set digest.
+pub(super) fn digest_text() -> String {
+    (1..=64)
+        .filter_map(|signal| {
+            signal_info(signal)
+                .map(|info| format!("{signal}\u{1f}{}\u{1f}{:?}", info.name, info.kind))
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1e}")
+}
+
+fn record_output(
+    set: &mut EvidenceSet,
+    output: &[u8],
+    emulator: &str,
+    emulator_signatures: &[Signature],
+    cut_short: bool,
+) -> Vec<EvidenceId> {
+    let examined = text::examine(output);
+    let mut ids = Vec::new();
+    for (name, table) in [
+        (HOST_EMULATOR, HOST_SIGNATURES),
+        (emulator, emulator_signatures),
+    ] {
+        if table.is_empty() {
+            continue;
+        }
+        let mut scan = signatures::scan(&examined, table, name, LogStream::Stderr);
+        scan.coverage.truncated |= cut_short;
+        ids.extend(signatures::record_scan(
+            set,
+            scan,
+            "standard error of the launched process",
+        ));
+    }
+    ids
+}
+
+#[cfg(test)]
+#[path = "process/tests.rs"]
+mod tests;
