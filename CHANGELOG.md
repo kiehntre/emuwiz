@@ -15,6 +15,20 @@ guessing at intent, dates, or scope.
 
 Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
+- Undo for mods, cheats and texture packs no longer takes its saved record's
+  word for what it may touch. Undo acts only inside the folder it was opened
+  for: a record that names a file or folder outside it, or reaches one through
+  a link, is refused as a whole and nothing is changed. A file EmuWiz added is
+  removed only if EmuWiz's own backup store holds its receipt for that file,
+  and a replaced file is restored only from that install's own backup of it.
+  Installs made before this version have no receipts, so Undo no longer
+  removes the files they added; it still restores files they replaced. An
+  older install that did both is refused as a whole: its files, its backups
+  and its History entry are kept. Empty folders above the destination folder
+  are left in place after Undo. Limits: this does not protect against
+  something able to change both EmuWiz's history folder and its backup
+  folder, and a rewritten record can still have Undo put a genuine original
+  back over a replaced file that has changed since.
 - Command line: `emuwiz-cli diagnose-launch` explains a failed emulator launch
   from what it left behind: how the process ended, what the emulator printed,
   its settings and a look at the files involved. It reports what happened
