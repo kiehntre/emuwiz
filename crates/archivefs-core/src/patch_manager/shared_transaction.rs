@@ -4986,11 +4986,19 @@ fn remove_verified_root_chain(_chain: &[CreatedRootDirectory]) -> usize {
 ///   no empty component);
 /// - entries must form one exact, contiguous parent/child chain - each
 ///   entry after the first must be a direct child of the previous one, so
-///   there is no gap, no repeat, and no out-of-order entry; this also
-///   structurally guarantees no entry can equal the chain's own implied
-///   anchor (a path is never its own parent), which is what keeps "the
-///   destination root's pre-existing ancestor" out of the chain a tampered
-///   journal could otherwise try to claim;
+///   there is no gap, no repeat, and no out-of-order entry. Structure alone
+///   does **not** keep a pre-existing ancestor out of the chain: a journal
+///   that prepends ancestors of the destination root still forms a
+///   contiguous chain, as many levels longer as it names (up to the limit
+///   above), and passes this function. What protects those ancestors is
+///   [`remove_verified_root_chain`]: a claim whose `(device, inode)` is not
+///   the directory's own stops the walk before anything is removed, and
+///   removal is `rmdir`, which refuses a directory that holds anything.
+///   The limit of that proof: a pre-existing directory that holds nothing
+///   but this chain, claimed with its exact identity, cannot be told apart
+///   from one this transaction created, and is removed. This layer assumes
+///   the journal was written by EmuWiz; it does not defend against a
+///   journal rewritten by something else that can write it;
 /// - the *last* entry must equal `root` itself - a chain that does not
 ///   actually terminate at this rollback's destination is rejected;
 /// - every entry must carry an `identity` - one without it is unprovable
@@ -8066,20 +8074,28 @@ mod tests {
         assert_eq!(fs::read(&root).unwrap(), b"now a plain file");
     }
 
-    // --- malformed journal claiming the pre-existing ancestor --------------
+    // --- journal that also claims the pre-existing ancestor ----------------
 
-    #[test]
-    fn a_journal_claiming_the_pre_existing_ancestor_is_rejected() {
-        let fixture = Fixture::new("bootstrap-malformed-claims-ancestor");
+    /// Applies into `<fixture>/dolphin/Load/Textures`, where only `dolphin`
+    /// existed beforehand, then rewrites the persisted journal so that it
+    /// also claims `dolphin` as created by the transaction. `claim` is given
+    /// `dolphin` and the identity of the first directory the transaction
+    /// really created, and returns the identity the forged entry carries.
+    /// Returns `dolphin`, the destination root and the rollback's status.
+    fn roll_back_a_journal_that_also_claims_the_ancestor(
+        fixture: &Fixture,
+        label: &str,
+        claim: impl FnOnce(&Path, SharedDirectoryIdentity) -> SharedDirectoryIdentity,
+    ) -> (PathBuf, PathBuf, SharedApplyStatus) {
         let dolphin = fixture.0.join("dolphin");
-        fs::create_dir(&dolphin).unwrap();
+        if !dolphin.exists() {
+            fs::create_dir(&dolphin).unwrap();
+        }
         let root = dolphin.join("Load").join("Textures");
-        let report = preview_at_root(&fixture, root.clone(), b"new");
-        let plan = make_plan(&fixture, &report);
-        let result = execute_shared_apply(
-            &plan,
-            &options(&fixture, &plan, "malformed-ancestor", false, true, false),
-        );
+        let report = preview_at_root(fixture, root.clone(), b"new");
+        let plan = make_plan(fixture, &report);
+        let result =
+            execute_shared_apply(&plan, &options(fixture, &plan, label, false, true, false));
         assert_eq!(result.journal.status, SharedApplyStatus::Success);
         let journal_path = result.journal_path.unwrap();
 
@@ -8087,18 +8103,14 @@ mod tests {
         // ancestor to the claimed chain, as if this transaction had
         // created it too.
         let mut tampered = read_journal(&journal_path).unwrap();
-        let mut identity = tampered.created_root_directories[0].identity;
-        // A plausible-looking (but fabricated) identity - the chain must
-        // still be rejected on structure alone before identity is ever
-        // consulted for the injected entry.
-        if let Some(value) = &mut identity {
-            value.inode = value.inode.wrapping_add(1);
-        }
+        let created = tampered.created_root_directories[0]
+            .identity
+            .expect("a created directory always carries its identity");
         tampered.created_root_directories.insert(
             0,
             SharedCreatedRootDirectory {
                 path: SharedTransactionPath::from_path(&dolphin),
-                identity,
+                identity: Some(claim(&dolphin, created)),
             },
         );
         fs::write(&journal_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
@@ -8112,24 +8124,128 @@ mod tests {
                     preview_id: rollback.preview_id.clone(),
                     approved: true,
                 },
-                rollback_operation_id: "malformed-ancestor-rollback".into(),
+                rollback_operation_id: format!("{label}-rollback"),
                 timestamp_unix_seconds: 1_700_000_001,
                 history_root: fixture.history_root(),
                 backup_root: fixture.backup_root(),
             },
         );
-        assert_eq!(rolled_back.status, SharedApplyStatus::Success);
-        // The whole claimed chain is rejected as malformed (an entry whose
-        // parent/child relationship to its neighbour does not hold), so
-        // *nothing* in it is acted on - the pre-existing ancestor
-        // survives, but so does the genuinely transaction-created leaf.
-        assert!(
-            dolphin.is_dir(),
-            "the pre-existing ancestor must never be removed"
+        (dolphin, root, rolled_back.status)
+    }
+
+    fn real_identity_of(directory: &Path) -> SharedDirectoryIdentity {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(directory).unwrap();
+        SharedDirectoryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    #[test]
+    fn a_journal_claiming_the_pre_existing_ancestor_with_a_wrong_identity_removes_nothing() {
+        // The forged chain is well formed: prepending an ancestor keeps it
+        // contiguous, so it is not structure that stops it. The walk in
+        // `remove_verified_root_chain` stops at its first entry, whose
+        // identity is not the directory's own, and nothing below an entry
+        // that stopped the walk is reached.
+        //
+        // Each case is wrong in exactly one field, and cannot be right by
+        // chance, so that each comparison is pinned on its own. (This test
+        // used to claim "the created folder's inode + 1". On a filesystem
+        // that reuses freed inode numbers the ancestor can have exactly
+        // that inode; the claim is then indistinguishable from a true one
+        // and the ancestor is removed, which is the only way found by which
+        // this test could fail, as it did now and then in CI.)
+        type Claim = fn(&Path, SharedDirectoryIdentity) -> SharedDirectoryIdentity;
+        // The inode of the folder the transaction created: on the same
+        // device as the ancestor, and a different inode for as long as both
+        // exist.
+        fn the_created_folders_identity(
+            _ancestor: &Path,
+            created: SharedDirectoryIdentity,
+        ) -> SharedDirectoryIdentity {
+            created
+        }
+        // The ancestor's own inode on another device.
+        fn the_ancestors_inode_on_another_device(
+            ancestor: &Path,
+            _created: SharedDirectoryIdentity,
+        ) -> SharedDirectoryIdentity {
+            let real = real_identity_of(ancestor);
+            SharedDirectoryIdentity {
+                device: real.device.wrapping_add(1),
+                inode: real.inode,
+            }
+        }
+        let cases: [(&str, Claim); 2] = [
+            ("wrong-inode", the_created_folders_identity),
+            ("wrong-device", the_ancestors_inode_on_another_device),
+        ];
+        for (label, claim) in cases {
+            let fixture = Fixture::new(&format!("bootstrap-forged-ancestor-{label}"));
+            let (dolphin, root, status) =
+                roll_back_a_journal_that_also_claims_the_ancestor(&fixture, label, claim);
+            assert_eq!(status, SharedApplyStatus::Success, "{label}");
+            assert!(
+                dolphin.is_dir(),
+                "{label}: the pre-existing ancestor must never be removed"
+            );
+            assert!(
+                root.exists(),
+                "{label}: a chain that stopped at its first entry must not be partially honoured"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ancestor_claimed_with_its_real_identity_survives_when_it_holds_anything_else() {
+        let fixture = Fixture::new("bootstrap-forged-ancestor-in-use");
+        let dolphin = fixture.0.join("dolphin");
+        fs::create_dir(&dolphin).unwrap();
+        // What a real emulator folder looks like: it holds other things.
+        fs::write(dolphin.join("Dolphin.ini"), b"[General]\n").unwrap();
+        let (dolphin, root, status) = roll_back_a_journal_that_also_claims_the_ancestor(
+            &fixture,
+            "forged-ancestor-in-use",
+            |ancestor, _| real_identity_of(ancestor),
         );
+        assert_eq!(status, SharedApplyStatus::Success);
+        // With the ancestor's exact identity the forged claim cannot be told
+        // from a true one, so the chain is walked. Removal is `rmdir`: the
+        // two directories the transaction did create go, as in an honest
+        // rollback, and the ancestor, which holds something, cannot.
+        assert!(!root.exists());
+        assert!(!dolphin.join("Load").exists());
+        assert!(dolphin.is_dir());
+        assert_eq!(
+            fs::read(dolphin.join("Dolphin.ini")).unwrap(),
+            b"[General]\n"
+        );
+    }
+
+    /// The limit of proving ownership by identity, stated as a test so that
+    /// it cannot drift from the documentation of
+    /// `validate_created_root_chain`: a pre-existing directory that holds
+    /// nothing but the transaction's own chain, claimed with its exact
+    /// `(device, inode)`, is removed. A passing run here records a known
+    /// limit, not the absence of a defect: see issue #477. This is the
+    /// mechanism behind the intermittent failure of the test above, whose
+    /// made-up identity used to be "the next inode number".
+    #[test]
+    fn an_empty_ancestor_claimed_with_its_real_identity_is_the_limit_of_identity_proof() {
+        let fixture = Fixture::new("bootstrap-forged-ancestor-empty");
+        let (dolphin, root, status) = roll_back_a_journal_that_also_claims_the_ancestor(
+            &fixture,
+            "forged-ancestor-empty",
+            |ancestor, _| real_identity_of(ancestor),
+        );
+        assert_eq!(status, SharedApplyStatus::Success);
+        assert!(!root.exists());
         assert!(
-            root.exists(),
-            "a malformed chain must not be partially honoured either"
+            !dolphin.exists(),
+            "if this now survives, the limit has been closed: update the documentation of \
+             validate_created_root_chain and turn this into the stronger guarantee"
         );
     }
 
