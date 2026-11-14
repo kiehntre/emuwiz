@@ -448,6 +448,7 @@ jobs:
       - run: bash tests/test_install.sh
       - run: python3 tests/test_installer_asset_races.py
       - run: python3 tests/test_installer_upgrade_preservation.py
+      - run: python3 tests/test_installer_d5_regressions.py
 
   # Cargo retention and retirement delete real data on developer machines, so
   # their safety tests run here too. Any change under scripts/ selects the full
