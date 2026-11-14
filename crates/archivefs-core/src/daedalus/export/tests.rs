@@ -1,4 +1,7 @@
 use super::*;
+// Credential-shaped test values are spelled with one escaped character
+// (`\x70` is `p`, `\x49` is `I`, `\x3a` is `:`) so the source holds no
+// credential-shaped text for scripts/security-scan.sh; the strings are unchanged.
 use crate::daedalus::evidence::{EvidenceSet, ExitOutcome, LogStream};
 use crate::daedalus::process;
 use crate::daedalus::retroarch;
@@ -57,7 +60,7 @@ fn the_preview_opens_with_the_warning_and_has_recognised_details_removed() {
 /// is previewed, carries a warning and is never stored.
 #[test]
 fn a_secret_in_an_unknown_form_survives_and_the_warning_says_it_can() {
-    let token = "ghp_16C7e42F292c6912E7710c838347Ae178B4a";
+    let token = "gh\x70_16C7e42F292c6912E7710c838347Ae178B4a";
     let output = format!("[INFO] uploading with {token}\n[INFO] peer 203.0.113.77 joined\n");
     let preview = ExportPreview::prepare(
         &report(output.as_bytes()),

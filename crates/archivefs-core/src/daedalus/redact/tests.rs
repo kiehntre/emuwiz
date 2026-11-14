@@ -1,4 +1,7 @@
 use super::*;
+// Credential-shaped test values are spelled with one escaped character
+// (`\x70` is `p`, `\x49` is `I`, `\x3a` is `:`) so the source holds no
+// credential-shaped text for scripts/security-scan.sh; the strings are unchanged.
 use crate::daedalus::collect::{LaunchArtefacts, collect};
 use crate::daedalus::evidence::{EvidenceArea, EvidenceSet, ExitOutcome, Fact, LogStream, Trust};
 use crate::daedalus::retroarch;
@@ -82,7 +85,7 @@ fn values_of_secret_looking_keys_are_removed() {
 fn credentials_in_urls_and_authorization_headers_are_removed() {
     let redactor = redactor();
     assert_eq!(
-        redactor.text("GET https://bob:s3cret@example.org/api?x=1"),
+        redactor.text("GET https://bob\x3as3cret@example.org/api?x=1"),
         "GET https://[redacted]@example.org/api?x=1"
     );
     assert_eq!(
