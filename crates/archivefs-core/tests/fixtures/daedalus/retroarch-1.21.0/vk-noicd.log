@@ -1,0 +1,42 @@
+[INFO] === Build =======================================
+[INFO] CPU Model Name: Example CPU
+[INFO] Capabilities: MMX MMXEXT SSE SSE2 SSE3 SSSE3 SSE4 SSE42 AES AVX AVX2 
+[INFO] Version: 1.21.0
+[INFO] Built: May 28 2025
+[INFO] =================================================
+[INFO] [Input]: Found input driver: "x".
+[INFO] [Core]: Loading dynamic libretro core from: "/usr/lib/x86_64-linux-gnu/libretro/2048_libretro.so"
+[INFO] [Overrides]: Redirecting save file to "/scratch/home/.config/retroarch/saves/2048/2048.srm".
+[INFO] [Overrides]: Redirecting save state to "/scratch/home/.config/retroarch/states/2048/2048.state".
+[INFO] [Environ]: SET_SUPPORT_NO_GAME: yes.
+[INFO] [Environ]: SET_VARIABLES.
+[INFO] [Environ]: GET_VFS_INTERFACE. Core requested version >= V1, providing V3.
+[INFO] [Environ]: GET_LOG_INTERFACE.
+[INFO] [Environ]: SET_INPUT_DESCRIPTORS:
+[INFO] [Environ]: SET_PIXEL_FORMAT: XRGB8888.
+[INFO] [Environ]: SET_FRAME_TIME_CALLBACK.
+[INFO] [SRAM]: Skipping SRAM load.
+[INFO] [Core]: Version of libretro API: 1, Compiled against API: 1
+[INFO] [Core]: Geometry: 376x464, Aspect: 0.000, FPS: 60.00, Sample rate: 0.00 Hz.
+[INFO] [Video]: Set video size to: 875x1080.
+[ERROR] [Wayland]: Failed to connect to Wayland server.
+[INFO] [Vulkan]: Vulkan dynamic library loaded.
+[ERROR] [Vulkan]: Could not find required instance extensions. Will attempt without them.
+[ERROR] [Vulkan]: Instance does not support required extensions.
+[ERROR] Failed to create Vulkan instance.
+[INFO] [Vulkan]: Vulkan dynamic library loaded.
+[ERROR] [Vulkan]: Could not find required instance extensions. Will attempt without them.
+[ERROR] [Vulkan]: Instance does not support required extensions.
+[ERROR] Failed to create Vulkan instance.
+[ERROR] [Vulkan]: Failed to create Vulkan context.
+[INFO] [Vulkan]: Found vulkan context: "null".
+[INFO] [Vulkan]: Detecting screen resolution: 320x240.
+[INFO] [Vulkan]: Using resolution 320x240.
+[ERROR] [Vulkan]: Failed to get context data.
+[ERROR] [Video]: Cannot open video driver.. Exiting..
+[ERROR] Fatal error received in: "video_driver_init_internal()"
+[INFO] [Core]: Content ran for a total of: 00 hours, 00 minutes, 00 seconds.
+[INFO] [Core]: Unloading game..
+[INFO] [Core]: Unloading core..
+[INFO] [Core]: Unloading core symbols..
+[INFO] [Core]: Saved core options file to "/scratch/home/.config/retroarch/config/2048/2048.opt".
