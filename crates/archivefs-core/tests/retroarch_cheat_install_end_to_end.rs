@@ -1012,6 +1012,12 @@ fn same_destination_concurrent_installs_never_both_write() {
             1,
             "only the job that installed the file holds a receipt for it: {evidence:?}"
         );
+        assert!(
+            evidence
+                .iter()
+                .all(|name| name == "operation.plan" || name.ends_with(".new")),
+            "nothing but receipts: {evidence:?}"
+        );
         // The refused job's reviewed source is untouched; the winner's spent
         // staging directory is retired once its journal is durable.
         let jobs = [(&first, &results[0]), (&second, &results[1])];

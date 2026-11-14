@@ -9807,9 +9807,6 @@ mod tests {
         }
     }
 
-    /// History opens Undo for the folder the record names. A record that
-    /// names a wider folder, with the rest moved into the path, points at
-    /// the very same file. It must gain nothing by it.
     /// An Undo opened for `root`, as a screen would open it with whatever
     /// spelling of the folder it holds.
     fn try_undo_for(
@@ -9937,6 +9934,9 @@ mod tests {
         assert!(!installed.exists());
     }
 
+    /// History opens Undo for the folder the record names. A record that
+    /// names a wider folder, with the rest moved into the path, points at
+    /// the very same file. It must gain nothing by it.
     #[test]
     fn a_record_that_widens_its_destination_folder_removes_nothing() {
         let fixture = Fixture::new("forged-wider-root");
