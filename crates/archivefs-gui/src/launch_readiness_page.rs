@@ -64,6 +64,8 @@ mod retroarch_setup;
 mod retroarch_stop;
 #[cfg(test)]
 pub(crate) use retroarch_stop::retroarch_test_request;
+#[cfg(target_os = "linux")]
+pub(crate) mod atari800;
 pub(crate) mod azahar;
 pub(crate) mod hatari;
 pub(crate) mod launch_choice;
@@ -605,6 +607,12 @@ impl TypedLaunchRequest {
             Self::Standalone(StandaloneLaunchRequest::Stella(_)) => vec![stella::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Hatari(_)) => vec![hatari::LIMITATION],
             Self::Standalone(StandaloneLaunchRequest::Snes9x(_)) => vec![snes9x::LIMITATION],
+            #[cfg(target_os = "linux")]
+            Self::Standalone(StandaloneLaunchRequest::Atari800(_)) => vec![
+                atari800::LIMITATION,
+                atari800::FIRMWARE_CAVEAT,
+                archivefs_core::launch::atari800::DISPOSABLE_SESSION_WARNING,
+            ],
             _ => Vec::new(),
         }
     }
@@ -625,6 +633,10 @@ impl TypedLaunchRequest {
                 | StandaloneLaunchRequest::Stella(_)
                 | StandaloneLaunchRequest::Snes9x(_),
             ) => "Ready, local launch identity",
+            #[cfg(target_os = "linux")]
+            Self::Standalone(StandaloneLaunchRequest::Atari800(_)) => {
+                "Ready, temporary session, firmware unverified"
+            }
             _ => "Ready, compatibility unverified",
         }
     }
@@ -1056,6 +1068,22 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                     StandaloneLaunchRequest::Stella(request),
                 ));
             }
+            // Atari800: click-time setup, firmware and disk recheck, then
+            // Core's sandboxed disposable session.
+            // Play starts it only as the chosen route or the sole ready one.
+            // When the other routes are merely tied, nothing is preferred and
+            // every candidate reaches this point: native Atari800 must then
+            // wait for the person's choice like the rest, never win by default.
+            #[cfg(target_os = "linux")]
+            if matches!(
+                candidate.preference,
+                CandidatePreference::Remembered | CandidatePreference::SoleEligible
+            ) && let Some(Ok(request)) = atari800::offer_for(plan, candidate)
+            {
+                return Some(TypedLaunchRequest::Standalone(
+                    StandaloneLaunchRequest::Atari800(request),
+                ));
+            }
             // Snes9x: the same click-time rediscovery, content and identity
             // recheck, Core preflight and spawn as the Gold panel's offer.
             if let Some(Ok(request)) = snes9x::offer_for(plan, candidate) {
@@ -1139,6 +1167,33 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
                 _ => {}
             }
         }
+    }
+    // Atari800 is the only way to play this game and its setup is incomplete:
+    // say exactly what is missing instead of a generic "not eligible".
+    #[cfg(target_os = "linux")]
+    if requests.is_empty()
+        && let mut preferred_candidates = plan.candidates.iter().filter(preferred)
+        && let (Some(only), None) = (preferred_candidates.next(), preferred_candidates.next())
+        && let Some(Err(reason)) = atari800::offer_for(plan, only)
+    {
+        // The background setup check has not answered yet: keep repainting.
+        if atari800::is_checking(&reason) {
+            return GamerPlayAction::BlockedTyped(GamerBlocker::new(
+                GamerBlockerKind::CheckingGame,
+                reason,
+            ));
+        }
+        // A blocked candidate is a setup problem; anything else (a format
+        // Atari800 is not given, a held emulator choice) is not.
+        return GamerPlayAction::BlockedTyped(if only.readiness == LaunchReadiness::Blocked {
+            GamerBlocker::for_emulator(
+                GamerBlockerKind::EmulatorSetupIncomplete,
+                "Atari800",
+                reason,
+            )
+        } else {
+            GamerBlocker::new(GamerBlockerKind::NoSafeEmulator, reason)
+        });
     }
     if requests.len() == 1 {
         return GamerPlayAction::Launch(Box::new(
@@ -1350,6 +1405,9 @@ pub(crate) enum StandaloneProcess {
     Mgba(archivefs_core::launch::process_spawn::WatchedProcess),
     Desmume(archivefs_core::launch::process_spawn::WatchedProcess),
     Stella(archivefs_core::launch::process_spawn::WatchedProcess),
+    /// Atari800 in its private scratch workspace; the sandbox owns cleanup.
+    #[cfg(target_os = "linux")]
+    Atari800(Box<archivefs_core::launch::atari800_setup::LaunchedAtari800>),
     Hatari(archivefs_core::launch::process_spawn::WatchedProcess),
     Snes9x(archivefs_core::launch::process_spawn::WatchedProcess),
     SameBoy(archivefs_core::launch::LaunchedSameBoyProcess),
@@ -1433,6 +1491,8 @@ pub(crate) struct StandaloneLaunchState {
     tsugaru: tsugaru::Panel,
     amiberry_cd: amiberry_cd::Panel,
     vice_trainers: vice::trainers::Chooser,
+    #[cfg(target_os = "linux")]
+    atari800: atari800::Panel,
 }
 
 impl StandaloneLaunchState {
@@ -1630,6 +1690,8 @@ impl StandaloneLaunchState {
                     StandaloneProcess::Mgba(p) => p.poll().is_some(),
                     StandaloneProcess::Desmume(p) => p.poll().is_some(),
                     StandaloneProcess::Stella(p) => p.poll().is_some(),
+                    #[cfg(target_os = "linux")]
+                    StandaloneProcess::Atari800(p) => p.process.process.poll().is_some(),
                     StandaloneProcess::Hatari(p) => p.poll().is_some(),
                     StandaloneProcess::Snes9x(p) => p.poll().is_some(),
                     StandaloneProcess::SameBoy(p) => p.poll().is_some(),
@@ -1709,6 +1771,10 @@ impl StandaloneLaunchState {
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Hatari(process)))) => {
                 process.exit_report().and_then(hatari::exit_failure)
             }
+            #[cfg(target_os = "linux")]
+            Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Atari800(launched)))) => {
+                atari800::exit_failure(launched)
+            }
             Some((_, _, StandaloneLaunchStage::Exited(StandaloneProcess::Snes9x(process)))) => {
                 process.exit_report().and_then(snes9x::exit_failure)
             }
@@ -1753,6 +1819,9 @@ impl StandaloneLaunchState {
             return;
         }
         let plain_error = matches!(request, StandaloneLaunchRequest::OpenRct2(_));
+        // Atari800 refusals are already complete sentences for the user.
+        #[cfg(target_os = "linux")]
+        let plain_error = plain_error || matches!(request, StandaloneLaunchRequest::Atari800(_));
         thread::spawn(move || {
             // OpenRCT2 already returns a readable sentence; Debug-formatting
             // it would wrap it in quotes and escape them.
@@ -1894,6 +1963,8 @@ pub(crate) enum StandaloneLaunchRequest {
     Mgba(mgba::Request),
     Desmume(desmume::Request),
     Stella(stella::Request),
+    #[cfg(target_os = "linux")]
+    Atari800(atari800::Request),
     Hatari(hatari::Request),
     Snes9x(snes9x::Request),
     SameBoy(sameboy::Request),
@@ -1950,6 +2021,8 @@ impl StandaloneLaunchRequest {
             Self::Mgba(_) => "mGBA",
             Self::Desmume(_) => "DeSmuME",
             Self::Stella(_) => "Stella",
+            #[cfg(target_os = "linux")]
+            Self::Atari800(_) => "Atari800",
             Self::Hatari(_) => "Hatari",
             Self::Snes9x(_) => "Snes9x",
             Self::SameBoy(_) => "SameBoy",
@@ -1984,6 +2057,8 @@ impl StandaloneLaunchRequest {
             Self::Mgba(r) => r.key(),
             Self::Desmume(r) => r.key(),
             Self::Stella(r) => r.key(),
+            #[cfg(target_os = "linux")]
+            Self::Atari800(r) => r.key(),
             Self::Hatari(r) => r.key(),
             Self::Snes9x(r) => r.key(),
             Self::SameBoy(r) => r.key(),
@@ -2029,6 +2104,8 @@ impl StandaloneLaunchRequest {
             Self::Mgba(r) => r.execute().map(StandaloneProcess::Mgba),
             Self::Desmume(r) => r.execute().map(StandaloneProcess::Desmume),
             Self::Stella(r) => r.execute().map(StandaloneProcess::Stella),
+            #[cfg(target_os = "linux")]
+            Self::Atari800(r) => r.execute().map(StandaloneProcess::Atari800),
             Self::Hatari(r) => r.execute().map(StandaloneProcess::Hatari),
             Self::Snes9x(r) => r.execute().map(StandaloneProcess::Snes9x),
             Self::SameBoy(r) => r.execute().map(StandaloneProcess::SameBoy),
@@ -5596,6 +5673,12 @@ fn show_candidate(
         let desmume_blocked = matches!(desmume_offer, Some(Err(_)));
         let stella_offer = stella::offer_for(plan, candidate);
         let stella_blocked = matches!(stella_offer, Some(Err(_)));
+        #[cfg(target_os = "linux")]
+        let atari800_offer = atari800::offer_for(plan, candidate);
+        #[cfg(target_os = "linux")]
+        let atari800_blocked = matches!(atari800_offer, Some(Err(_)));
+        #[cfg(not(target_os = "linux"))]
+        let atari800_blocked = false;
         let snes9x_offer = snes9x::offer_for(plan, candidate);
         let snes9x_blocked = matches!(snes9x_offer, Some(Err(_)));
         let sameboy_offer = sameboy::offer_for(plan, candidate);
@@ -5607,6 +5690,7 @@ fn show_candidate(
             || mgba_blocked
             || desmume_blocked
             || stella_blocked
+            || atari800_blocked
             || snes9x_blocked
             || sameboy_blocked
             || rmg_blocked)
@@ -5666,6 +5750,7 @@ fn show_candidate(
                                 amiga_whdload,
                             )
                             .is_some()
+                                || atari800_launchable(&chosen_plan, chosen)
                         })
                 });
             if let Some(choice) = launch_choice::show_controls(
@@ -5804,6 +5889,10 @@ fn show_candidate(
         if let Some(offer) = stella_offer {
             stella::show_offer(ui, standalone_launch_state, offer);
         }
+        #[cfg(target_os = "linux")]
+        if let Some(offer) = atari800_offer {
+            atari800::show_offer(ui, standalone_launch_state, offer);
+        }
         if let Some(offer) = snes9x_offer {
             snes9x::show_offer(ui, standalone_launch_state, offer);
         }
@@ -5864,6 +5953,20 @@ fn show_candidate(
 /// never whether the game booted or played.
 fn melonds_exit_line(report: &archivefs_core::launch::process_spawn::ProcessExitReport) -> String {
     exit_line("melonDS", report)
+}
+
+/// Whether choosing native Atari800 would produce a real launch request, for
+/// the emulator chooser's own "can this be chosen" gate.
+fn atari800_launchable(plan: &LaunchPlan, candidate: &LaunchCandidate) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(atari800::offer_for(plan, candidate), Some(Ok(_)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (plan, candidate);
+        false
+    }
 }
 
 /// The same honest wording for any adapter: a process result only.
@@ -5942,6 +6045,14 @@ pub(crate) fn show_standalone_launch_action(
             }
             Some(StandaloneLaunchStage::Exited(StandaloneProcess::Stella(p))) => {
                 if p.exit_report().and_then(stella::exit_failure).is_some() {
+                    "Failed"
+                } else {
+                    "Exited"
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Some(StandaloneLaunchStage::Exited(StandaloneProcess::Atari800(launched))) => {
+                if atari800::exit_failure(launched).is_some() {
                     "Failed"
                 } else {
                     "Exited"
@@ -6039,6 +6150,10 @@ pub(crate) fn show_standalone_launch_action(
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Hatari(p)))) => {
                 hatari::show_running(ui, p);
             }
+            #[cfg(target_os = "linux")]
+            Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Atari800(launched)))) => {
+                atari800::show_running(ui, launched);
+            }
             Some((_, _, StandaloneLaunchStage::Running(StandaloneProcess::Snes9x(p)))) => {
                 snes9x::show_running(ui, p);
             }
@@ -6095,6 +6210,10 @@ pub(crate) fn show_standalone_launch_action(
                 }
                 if let StandaloneProcess::Hatari(p) = process {
                     hatari::show_exited(ui, p);
+                }
+                #[cfg(target_os = "linux")]
+                if let StandaloneProcess::Atari800(launched) = process {
+                    atari800::show_exited(ui, launched);
                 }
                 if let StandaloneProcess::Snes9x(p) = process {
                     snes9x::show_exited(ui, p);
@@ -6219,6 +6338,14 @@ pub(crate) fn show_standalone_launch_action(
         if adapter == "stella"
             && !state.is_active()
             && ui.button("Launch Stella again (recheck)").clicked()
+        {
+            state.start(request);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if adapter == atari800::ADAPTER_KEY
+            && !state.is_active()
+            && ui.button("Launch Atari800 again (recheck)").clicked()
         {
             state.start(request);
             return;
