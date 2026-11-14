@@ -758,6 +758,12 @@ pub fn flycast_profile_dreamcast_bios(profile: &FlycastProfile) -> FlycastSystem
         TRUSTED_DC_BOOT_BIN,
     )
 }
+
+/// The file [`flycast_profile_dreamcast_bios`] reads its answer from. A
+/// caller that keeps the answer can watch it to learn when to ask again.
+pub fn flycast_profile_dreamcast_bios_inputs(profile: &FlycastProfile) -> Vec<PathBuf> {
+    vec![profile.system_path.join("dc_boot.bin")]
+}
 /// The trusted content identities used by Flycast's own public system-file
 /// documentation/catalogue. These are metadata only; EmuWiz never bundles or
 /// downloads firmware bytes. The two sources agree on these complete
@@ -1329,6 +1335,25 @@ mod tests {
             verified_dreamcast_product_code: Some(key.to_string()),
             ..Default::default()
         }
+    }
+    #[test]
+    fn dreamcast_bios_inputs_name_the_file_the_answer_is_read_from() {
+        let t = TempDir::new().unwrap();
+        let root = t.path().join("fly");
+        write(&root, "");
+        let p = profile(root);
+        let inputs = flycast_profile_dreamcast_bios_inputs(&p);
+        assert_eq!(inputs, vec![p.system_path.join("dc_boot.bin")]);
+        assert_eq!(
+            flycast_profile_dreamcast_bios(&p),
+            FlycastSystemFileState::Missing
+        );
+        fs::create_dir_all(&p.system_path).unwrap();
+        fs::write(&inputs[0], b"not the boot ROM").unwrap();
+        assert_eq!(
+            flycast_profile_dreamcast_bios(&p),
+            FlycastSystemFileState::PresentUnverified
+        );
     }
     #[test]
     fn discovery_version_and_missing_executable() {

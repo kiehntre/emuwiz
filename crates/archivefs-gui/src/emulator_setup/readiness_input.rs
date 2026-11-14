@@ -44,6 +44,10 @@ pub(crate) struct ReadinessSources<'a> {
     /// The catalogue row for this file is known and records no system at all
     /// (distinct from "not loaded yet").
     pub(crate) system_unknown: &'a dyn Fn(&Path) -> bool,
+    /// How fresh the PCSX2 and Flycast BIOS answers must be. Only the drawn
+    /// readiness card may ask for `Shown`; everything that can lead to a
+    /// launch asks for `Fresh` (see `firmware_answers`).
+    pub(crate) firmware_use: super::firmware_answers::FirmwareUse,
 }
 
 impl ReadinessSources<'_> {
@@ -855,21 +859,26 @@ impl ReadinessSources<'_> {
             pcsx2_context
                 .as_ref()
                 .map(|context| {
-                    let verifications = self
-                        .readiness
-                        .pcsx2_bios_cache
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .answers(
-                            &(&context.discovery.profiles, &context.firmware_evidence),
-                            std::time::Instant::now(),
-                            |index| {
+                    let verifications = self.readiness.pcsx2_bios_cache.answers(
+                        self.firmware_use,
+                        &(&context.discovery.profiles, &context.firmware_evidence),
+                        std::time::Instant::now(),
+                        |index| {
+                            archivefs_core::patch_manager::pcsx2_profile_bios_inputs(
+                                &context.discovery.profiles[index],
+                            )
+                        },
+                        || {
+                            let profiles = context.discovery.profiles.clone();
+                            let evidence = context.firmware_evidence.clone();
+                            move |index: usize| {
                                 archivefs_core::patch_manager::pcsx2_profile_bios_verification(
-                                    &context.discovery.profiles[index],
-                                    &context.firmware_evidence,
+                                    &profiles[index],
+                                    &evidence,
                                 )
-                            },
-                        );
+                            }
+                        },
+                    );
                     context
                         .discovery
                         .profiles
@@ -897,22 +906,30 @@ impl ReadinessSources<'_> {
         // unsafe or ambiguous executable is shown as blocked rather than
         // advertised as launch-ready. Core preflight repeats the same check.
         // Only the profile's Dreamcast BIOS state is used here; it never
-        // depends on the game, so it comes from the same short-lived cache as
-        // the PCSX2 answers instead of a full game inspection on every frame.
+        // depends on the game, so it is kept like the PCSX2 answers (see
+        // `firmware_answers`) instead of a full game inspection on every build.
         let flycast_standalone_profiles: Vec<archivefs_core::launch::StandaloneProfileInput> =
             match &self.readiness.flycast_profiles {
                 FlycastProfilesState::Ready(ready) => {
                     let profiles = &ready.discovery.profiles;
-                    let bios = self
-                        .readiness
-                        .flycast_bios_cache
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .answers(profiles, std::time::Instant::now(), |index| {
-                            archivefs_core::patch_manager::flycast_profile_dreamcast_bios(
+                    let bios = self.readiness.flycast_bios_cache.answers(
+                        self.firmware_use,
+                        profiles,
+                        std::time::Instant::now(),
+                        |index| {
+                            archivefs_core::patch_manager::flycast_profile_dreamcast_bios_inputs(
                                 &profiles[index],
                             )
-                        });
+                        },
+                        || {
+                            let profiles = profiles.clone();
+                            move |index: usize| {
+                                archivefs_core::patch_manager::flycast_profile_dreamcast_bios(
+                                    &profiles[index],
+                                )
+                            }
+                        },
+                    );
                     profiles
                         .iter()
                         .zip(bios)
@@ -2587,130 +2604,5 @@ mod arcade_set_shape_tests {
             &dir.join("19xx.zip")
         ));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-/// How long a profile's firmware answer is reused before its files are read
-/// again. Matches the RetroArch installation revalidation interval.
-pub(crate) const FIRMWARE_ANSWER_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Per-profile firmware answers for the launch planner (PCSX2 BIOS, Flycast
-/// Dreamcast BIOS). Building the readiness input runs on every drawn frame
-/// (twice: the Play row and the attention poll), and each answer reads and
-/// hashes the BIOS file. The answers never depend on the selected game, so
-/// they are kept for [`FIRMWARE_ANSWER_RECHECK`] and recomputed at once when
-/// what they were computed from (the discovered profiles, the firmware
-/// evidence) changes. Each launch re-checks the firmware in its own preflight.
-pub(crate) struct FirmwareAnswerCache<T> {
-    entry: Option<(u64, std::time::Instant, Vec<T>)>,
-    /// Answers actually computed, for tests.
-    pub(crate) computed: u64,
-}
-
-impl<T> Default for FirmwareAnswerCache<T> {
-    fn default() -> Self {
-        Self {
-            entry: None,
-            computed: 0,
-        }
-    }
-}
-
-impl<T: Clone> FirmwareAnswerCache<T> {
-    /// One answer per item of `inputs` (a list, or a tuple whose first part is
-    /// the list), each from `compute(index)`; reused while `inputs` hash the
-    /// same and the answers are younger than [`FIRMWARE_ANSWER_RECHECK`].
-    pub(crate) fn answers<I: std::fmt::Debug + ProfileCount>(
-        &mut self,
-        inputs: &I,
-        now: std::time::Instant,
-        mut compute: impl FnMut(usize) -> T,
-    ) -> Vec<T> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        format!("{inputs:?}").hash(&mut hasher);
-        let key = hasher.finish();
-        if let Some((cached_key, at, answers)) = &self.entry
-            && *cached_key == key
-            && now.saturating_duration_since(*at) < FIRMWARE_ANSWER_RECHECK
-        {
-            return answers.clone();
-        }
-        let answers: Vec<T> = (0..inputs.profile_count())
-            .map(|index| {
-                self.computed += 1;
-                compute(index)
-            })
-            .collect();
-        self.entry = Some((key, now, answers.clone()));
-        answers
-    }
-}
-
-/// How many profiles a cache key describes.
-pub(crate) trait ProfileCount {
-    fn profile_count(&self) -> usize;
-}
-
-impl<P> ProfileCount for Vec<P> {
-    fn profile_count(&self) -> usize {
-        self.len()
-    }
-}
-
-impl<P, E> ProfileCount for (&Vec<P>, &Vec<E>) {
-    fn profile_count(&self) -> usize {
-        self.0.len()
-    }
-}
-
-#[cfg(test)]
-mod firmware_answer_cache_tests {
-    use super::*;
-
-    #[test]
-    fn answers_are_reused_inside_the_window_and_recomputed_after() {
-        let profiles = vec![crate::tests::pcsx2_profile_fixture()];
-        let mut cache = FirmwareAnswerCache::<usize>::default();
-        let now = std::time::Instant::now();
-        let first = cache.answers(&profiles, now, |index| index + 10);
-        assert_eq!(first, vec![10]);
-        assert_eq!(cache.computed, 1);
-        // Every frame inside the window reuses the answer: no file is read.
-        for _ in 0..10 {
-            assert_eq!(cache.answers(&profiles, now, |_| unreachable!()), first);
-        }
-        assert_eq!(cache.computed, 1);
-        // After the window the files are read again.
-        let later = now + FIRMWARE_ANSWER_RECHECK;
-        assert_eq!(cache.answers(&profiles, later, |index| index + 10), first);
-        assert_eq!(cache.computed, 2);
-    }
-
-    #[test]
-    fn a_changed_profile_list_or_evidence_is_answered_at_once() {
-        let mut profiles = vec![crate::tests::pcsx2_profile_fixture()];
-        let evidence: Vec<String> = Vec::new();
-        let mut cache = FirmwareAnswerCache::<usize>::default();
-        let now = std::time::Instant::now();
-        cache.answers(&(&profiles, &evidence), now, |index| index);
-        let mut second = crate::tests::pcsx2_profile_fixture();
-        second.profile_id = "pcsx2-second".into();
-        profiles.push(second);
-        let answers = cache.answers(&(&profiles, &evidence), now, |index| index);
-        assert_eq!(
-            answers,
-            vec![0, 1],
-            "one answer per profile, never a stale shorter list"
-        );
-        assert_eq!(cache.computed, 3);
-        // A changed profile (same count) is a new key.
-        profiles[1].configuration_path = "/isolated/elsewhere".into();
-        cache.answers(&(&profiles, &evidence), now, |index| index);
-        assert_eq!(cache.computed, 5);
-        // New firmware evidence is a new key.
-        let evidence = vec!["record".to_string()];
-        cache.answers(&(&profiles, &evidence), now, |index| index);
-        assert_eq!(cache.computed, 7);
     }
 }

@@ -539,6 +539,55 @@ fn profile_at(root: &std::path::Path) -> Pcsx2Profile {
     }
 }
 
+/// What a caller is told to watch is what the BIOS-only answer is read from:
+/// the candidates are direct entries of the folder, and the configuration
+/// file chooses between them.
+#[test]
+fn bios_inputs_are_the_files_the_bios_only_answer_is_read_from() {
+    let root = fixture_root("bios-inputs");
+    let profile = profile_at(&root);
+    let inputs = pcsx2_profile_bios_inputs(&profile);
+    assert_eq!(
+        inputs,
+        vec![
+            root.join("inis/PCSX2.ini"),
+            root.join("PCSX2.ini"),
+            root.join("bios")
+        ]
+    );
+    // Whichever configuration file is in use is one of them.
+    assert!(inputs.contains(&pcsx2_global_config_path(&root)));
+    assert_eq!(
+        pcsx2_profile_bios_verification(&profile, &[]),
+        Pcsx2BiosVerification::Missing
+    );
+
+    // A file directly inside the watched folder changes the answer.
+    write_bios(&inputs[2], "a.bin", BIOS_BYTES);
+    let evidence = vec![record_for("a.bin", BIOS_BYTES)];
+    assert_eq!(
+        pcsx2_profile_bios_verification(&profile, &evidence),
+        Pcsx2BiosVerification::Verified
+    );
+
+    // So does the watched configuration file, by naming another entry.
+    write_bios(&inputs[2], "b.bin", b"other synthetic bytes, not a BIOS");
+    fs::write(&inputs[1], "[Filenames]\nBIOS = b.bin\n").unwrap();
+    assert_ne!(
+        pcsx2_profile_bios_verification(&profile, &evidence),
+        Pcsx2BiosVerification::Verified
+    );
+
+    // And the newer location, once it exists, is the one that is read.
+    fs::create_dir_all(inputs[0].parent().unwrap()).unwrap();
+    fs::write(&inputs[0], "[Filenames]\nBIOS = a.bin\n").unwrap();
+    assert!(inputs.contains(&pcsx2_global_config_path(&root)));
+    assert_eq!(
+        pcsx2_profile_bios_verification(&profile, &evidence),
+        Pcsx2BiosVerification::Verified
+    );
+}
+
 /// The BIOS-only answer the launch planner uses is the same answer the full
 /// game inspection gives, for every BIOS state.
 #[test]

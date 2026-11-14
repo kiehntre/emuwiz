@@ -519,6 +519,7 @@ pub(super) fn build_input(
             remembered_system:
                 &archivefs_core::launch::remembered_launch_system::remembered_launch_system,
             system_unknown: &|p| p == archive.absolute_path && archive.platform.is_none(),
+            firmware_use: crate::emulator_setup::firmware_answers::FirmwareUse::Fresh,
         }
         .build(None)
     });

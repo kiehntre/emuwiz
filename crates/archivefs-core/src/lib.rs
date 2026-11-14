@@ -66,6 +66,8 @@ pub mod bios_projection;
 pub mod catalogue_health;
 pub mod catalogue_reconciliation;
 pub mod catalogue_supersession;
+/// Daedalus: evidence-driven diagnosis of emulator launch problems.
+pub mod daedalus;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation
