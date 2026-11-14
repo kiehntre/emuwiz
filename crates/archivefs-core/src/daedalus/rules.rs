@@ -28,12 +28,12 @@ use sha2::{Digest, Sha256};
 
 use super::evidence::{
     AreaCoverage, BlockerFamily, ConfigLayer, EVIDENCE_SCHEMA_VERSION, Evidence, EvidenceArea,
-    EvidenceId, EvidenceSet, ExitOutcome, Fact, FirmwareStatus, GraphicsApi, LogEvent, LogMeaning,
-    MediaIntegrityStatus, PathAccess, PathPresence, PathRole, ProbeScope, ProcessExit,
-    SpawnFailure, Subject, Trust,
+    EvidenceId, EvidenceSet, EvidenceState, ExitOutcome, Fact, FirmwareStatus, GraphicsApi,
+    LogEvent, LogMeaning, MediaIntegrityStatus, PathAccess, PathPresence, PathRole, ProbeScope,
+    ProcessExit, SpawnFailure, Subject, Trust,
 };
 use super::process::{SignalKind, possibly_relayed_signal, signal_info};
-use super::signatures::HOST_SIGNATURES;
+use super::signatures::{HOST_EMULATOR, HOST_SIGNATURES};
 use super::{limitations, retroarch};
 
 /// Changes when the engine's own limits or verdict logic change.
@@ -213,6 +213,12 @@ pub struct Diagnosis {
     /// True for a cause; false for a symptom, which says what happened
     /// without saying why.
     pub explains_cause: bool,
+    /// True when this restates an error the emulator itself printed. That
+    /// the emulator reported it is established; that it is the underlying
+    /// cause is not, and a cause is reported separately when the evidence
+    /// supports one.
+    #[serde(default)]
+    pub reported: bool,
     pub effect: Effect,
     pub title: String,
     pub explanation: String,
@@ -223,6 +229,18 @@ pub struct Diagnosis {
     pub next_checks: Vec<NextCheck>,
     pub repairs: Vec<RepairHint>,
     pub claims: Vec<Claim>,
+}
+
+impl Diagnosis {
+    /// How the finding stands, for display next to its title: its
+    /// confidence, or that it is the emulator's own report.
+    pub fn standing(&self) -> &'static str {
+        if self.reported {
+            "reported by the emulator"
+        } else {
+            self.confidence.label()
+        }
+    }
 }
 
 /// Two findings that cannot both be right.
@@ -322,6 +340,7 @@ pub(crate) struct Finding {
     category: Option<DiagnosisCategory>,
     confidence: Confidence,
     explains_cause: bool,
+    reported: bool,
     effect: Effect,
     title: String,
     explanation: String,
@@ -344,6 +363,7 @@ impl Finding {
             category: None,
             confidence,
             explains_cause: true,
+            reported: false,
             effect,
             title: title.into(),
             explanation: explanation.into(),
@@ -365,6 +385,19 @@ impl Finding {
             explains_cause: false,
             ..Self::cause(confidence, Effect::Unknown, title, explanation)
         }
+    }
+
+    /// A symptom that restates what the emulator itself printed.
+    pub(crate) fn reported(title: impl Into<String>, explanation: impl Into<String>) -> Self {
+        Self {
+            reported: true,
+            ..Self::symptom(Confidence::Established, title, explanation)
+        }
+    }
+
+    pub(crate) fn with_effect(mut self, effect: Effect) -> Self {
+        self.effect = effect;
+        self
     }
 
     pub(crate) fn in_category(mut self, category: DiagnosisCategory) -> Self {
@@ -538,6 +571,68 @@ impl<'a> View<'a> {
             }
         }
         caveats
+    }
+
+    /// Whether any examined log, of any program, was at informational level.
+    pub(crate) fn any_verbose_log(&self) -> bool {
+        self.observed(EvidenceArea::LogEvents)
+            .any(|item| matches!(&item.fact, Fact::LogCoverage(coverage) if coverage.verbose))
+    }
+
+    /// Qualify a finding that rests on a setting's value.
+    ///
+    /// A settings file that could not be read, or that changed after it was
+    /// read, may hold the value the emulator really uses: the finding is
+    /// then held at possible. Features of the files that were read
+    /// (included files, repeated keys) and layers nobody looked at become
+    /// limitations.
+    pub(crate) fn qualify_setting_finding(&self, mut finding: Finding, emulator: &str) -> Finding {
+        for caveat in self.setting_caveats(emulator) {
+            finding = finding.limit(caveat);
+        }
+        let mut unreadable = 0usize;
+        let mut layers_examined = BTreeSet::new();
+        for item in self.set.items() {
+            if item.area != EvidenceArea::EmulatorConfiguration || item.trust == Trust::Asserted {
+                continue;
+            }
+            match (&item.state, &item.fact) {
+                (EvidenceState::Stale { .. } | EvidenceState::Unavailable { .. }, _) => {
+                    unreadable += 1;
+                }
+                (
+                    EvidenceState::Observed,
+                    Fact::ConfigValue { layer, .. }
+                    | Fact::ConfigStructure { layer, .. }
+                    | Fact::ConfigLayerAbsent { layer, .. },
+                ) => {
+                    layers_examined.insert(*layer);
+                }
+                _ => {}
+            }
+        }
+        if unreadable > 0 {
+            finding.confidence = finding.confidence.at_most(Confidence::Possible);
+            finding = finding.limit(
+                "A settings file could not be read, or changed while it was being \
+                 examined, so the value the emulator really uses may be different.",
+            );
+        }
+        let overrides = [
+            ConfigLayer::Core,
+            ConfigLayer::ContentDirectory,
+            ConfigLayer::Game,
+        ];
+        if !overrides
+            .iter()
+            .any(|layer| layers_examined.contains(layer))
+        {
+            finding = finding.limit(
+                "Only the main settings file was examined; an override for this core, \
+                 folder or game could set a different value.",
+            );
+        }
+        finding
     }
 
     pub(crate) fn environment(&self, name: &str) -> Option<(&'a Evidence, Option<&'a str>)> {
@@ -715,6 +810,9 @@ fn retroarch_content_rejected(view: &View<'_>) -> Vec<Finding> {
     let (Some((event, _)), Some((exit_item, _))) = (events.first(), view.failed_exit()) else {
         return Vec::new();
     };
+    // Held at possible whatever else is known: a readable file rules out a
+    // read problem, but it is true of every healthy setup and says nothing
+    // about whether the core refused the file.
     let mut finding = Finding::cause(
         Confidence::Possible,
         Effect::PreventsLaunch,
@@ -730,9 +828,9 @@ fn retroarch_content_rejected(view: &View<'_>) -> Vec<Finding> {
         Some((path_item, access))
             if access.presence == PathPresence::RegularFile && access.readable == Some(true) =>
         {
-            // The file is there and readable, so this is not a read problem.
-            finding.confidence = Confidence::Probable;
-            finding = finding.support(path_item);
+            finding = finding
+                .support(path_item)
+                .limit("The file is present and readable, so this is not a problem reading it.");
         }
         Some(_) => {}
         None => {
@@ -757,14 +855,17 @@ fn retroarch_content_read_failed(view: &View<'_>) -> Vec<Finding> {
         return Vec::new();
     };
     let exit = view.failed_exit();
-    match view.path(PathRole::GameFile) {
+    let path = view.path(PathRole::GameFile);
+    match path {
         // Missing and unreadable files have their own rules.
         Some((_, access))
             if access.presence == PathPresence::Missing || access.readable == Some(false) =>
         {
             Vec::new()
         }
-        Some((path_item, access)) if access.readable == Some(true) => {
+        Some((path_item, access))
+            if access.presence == PathPresence::RegularFile && access.readable == Some(true) =>
+        {
             // Readable on the host, yet RetroArch could not read it.
             let mut finding = Finding::cause(
                 Confidence::Possible,
@@ -802,12 +903,20 @@ fn retroarch_content_read_failed(view: &View<'_>) -> Vec<Finding> {
                 "RetroArch reported that it could not read the game file. It prints the \
                  same message for a missing file and for one it is not allowed to read.",
             )
-            .support(event)
-            .limit("EmuWiz has not looked at the file itself.")
-            .next(NextCheck::CollectEvidence {
-                area: EvidenceArea::Filesystem,
-                why: "Check whether the game file exists and can be read.".into(),
-            });
+            .support(event);
+            finding = match path {
+                // Looked at, and what is there is not a plain readable file.
+                Some((path_item, access)) => finding.support(path_item).limit(format!(
+                    "EmuWiz looked at the path and it {}.",
+                    access.presence.describe()
+                )),
+                None => finding
+                    .limit("EmuWiz has not looked at the file itself.")
+                    .next(NextCheck::CollectEvidence {
+                        area: EvidenceArea::Filesystem,
+                        why: "Check whether the game file exists and can be read.".into(),
+                    }),
+            };
             if let Some((exit_item, _)) = exit {
                 finding = finding.support(exit_item);
             }
@@ -819,12 +928,14 @@ fn retroarch_content_read_failed(view: &View<'_>) -> Vec<Finding> {
 fn emulator_version_unsupported(view: &View<'_>) -> Vec<Finding> {
     view.observed(EvidenceArea::KnownLimitations)
         .filter_map(|item| match &item.fact {
+            // Only an entry of the compiled-in table, evaluated by EmuWiz,
+            // counts: a limit that merely claims to be one does not.
             Fact::KnownLimitation {
+                id,
                 summary,
                 violated: true,
-                ..
-            } => {
-                let mut finding = Finding::cause(
+            } if item.trust == Trust::Measured && limitations::is_table_entry(id, summary) => Some(
+                Finding::cause(
                     Confidence::Established,
                     Effect::PreventsLaunch,
                     "This emulator version is not supported",
@@ -833,12 +944,8 @@ fn emulator_version_unsupported(view: &View<'_>) -> Vec<Finding> {
                 .support(item)
                 .next(NextCheck::UserAction {
                     what: "Update the emulator, then check again.".into(),
-                });
-                for executable in view.observed(EvidenceArea::EmulatorExecutable) {
-                    finding = finding.support(executable);
-                }
-                Some(finding)
-            }
+                }),
+            ),
             _ => None,
         })
         .collect()
@@ -857,20 +964,35 @@ fn retroarch_vulkan_unavailable(view: &View<'_>) -> Vec<Finding> {
     let vulkan_events = view.events(LogMeaning::VulkanUnavailable);
     let init_events = view.events(LogMeaning::VideoDriverInitFailed);
     let probe = view.graphics(GraphicsApi::Vulkan, ProbeScope::LaunchEnvironment);
+    let host_probe = view.graphics(GraphicsApi::Vulkan, ProbeScope::Host);
     let probe_says_unusable = matches!(probe, Some((_, false)));
-    if vulkan_events.is_empty() && init_events.is_empty() && !probe_says_unusable {
+    let host_says_unusable = matches!(host_probe, Some((_, false)));
+    if vulkan_events.is_empty()
+        && init_events.is_empty()
+        && !probe_says_unusable
+        && !host_says_unusable
+    {
         // Set to Vulkan and failed: that alone points at nothing.
         return Vec::new();
     }
+    // What RetroArch printed is never more than a possibility on its own:
+    // being set to Vulkan is true of every healthy Vulkan setup, so it does
+    // not corroborate the message. Only a check of Vulkan itself does.
     let (confidence, explanation) = if probe_says_unusable {
         (
             Confidence::Established,
             "RetroArch is set to use the Vulkan video driver, and a check made in the same \
              environment it was started in found that Vulkan cannot be used there.",
         )
-    } else if !vulkan_events.is_empty() {
+    } else if host_says_unusable {
         (
             Confidence::Probable,
+            "RetroArch is set to use the Vulkan video driver, and a check of this computer \
+             found that Vulkan cannot be used on it.",
+        )
+    } else if !vulkan_events.is_empty() {
+        (
+            Confidence::Possible,
             "RetroArch is set to use the Vulkan video driver and reported that it could \
              not set Vulkan up before it stopped.",
         )
@@ -904,11 +1026,15 @@ fn retroarch_vulkan_unavailable(view: &View<'_>) -> Vec<Finding> {
                 });
         }
     }
-    if let Some((_, true)) = view.graphics(GraphicsApi::Vulkan, ProbeScope::Host) {
-        finding = finding.limit(
-            "Vulkan works on this computer outside the launch environment, so something \
-             about how RetroArch is started (for example a sandbox) may be what blocks it.",
-        );
+    match host_probe {
+        Some((host_item, false)) => finding = finding.support(host_item),
+        Some((_, true)) if !matches!(probe, Some((_, true))) => {
+            finding = finding.limit(
+                "Vulkan works on this computer outside the launch environment, so something \
+                 about how RetroArch is started (for example a sandbox) may be what blocks it.",
+            );
+        }
+        _ => {}
     }
     if !view.verbose_log(RETROARCH) {
         finding = finding
@@ -920,9 +1046,7 @@ fn retroarch_vulkan_unavailable(view: &View<'_>) -> Vec<Finding> {
                 why: "Get RetroArch's own account of the video driver failure.".into(),
             });
     }
-    for caveat in view.setting_caveats(RETROARCH) {
-        finding = finding.limit(caveat);
-    }
+    finding = view.qualify_setting_finding(finding, RETROARCH);
     match view.graphics(GraphicsApi::OpenGl, ProbeScope::LaunchEnvironment) {
         Some((_, false)) => {
             finding = finding.limit(
@@ -987,7 +1111,10 @@ fn retroarch_video_driver_failed(view: &View<'_>) -> Vec<Finding> {
     .support(exit_item)
     .limit("Why the video driver failed is not shown.");
     match setting {
-        Some(setting) => finding = finding.support(setting.evidence),
+        Some(setting) => {
+            finding = finding.support(setting.evidence);
+            finding = view.qualify_setting_finding(finding, RETROARCH);
+        }
         None => {
             finding = finding.next(NextCheck::CollectEvidence {
                 area: EvidenceArea::EmulatorConfiguration,
@@ -1023,8 +1150,10 @@ fn no_display(view: &View<'_>) -> Vec<Finding> {
     .in_category(DiagnosisCategory::GraphicsInitialisation)
     .support(x11_item)
     .support(wayland_item)
-    .support(exit_item)
-    .limit("The emulator's own account of the failure was not available.");
+    .support(exit_item);
+    if !view.any_verbose_log() {
+        finding = finding.limit("The emulator's own account of the failure was not available.");
+    }
     // A video driver that reports itself ready did find a display.
     for (event, _) in view.events(LogMeaning::VideoDriverReady) {
         finding = finding.contradict(event);
@@ -1074,9 +1203,11 @@ fn emulator_program_missing(view: &View<'_>) -> Vec<Finding> {
         SpawnFailure::ProgramNotFound => Finding::cause(
             Confidence::Established,
             Effect::PreventsLaunch,
-            "The emulator program was not found",
-            "The operating system could not find the emulator program EmuWiz tried to \
-             start. It may have been moved, removed or updated to a different location.",
+            "The emulator program could not be started: not found",
+            "The operating system reported that the emulator program, or something it \
+             needs in order to start (such as the interpreter a launcher script names), \
+             does not exist. It may have been moved, removed or updated to a different \
+             location.",
         ),
         SpawnFailure::PermissionDenied => Finding::cause(
             Confidence::Established,
@@ -1092,8 +1223,20 @@ fn emulator_program_missing(view: &View<'_>) -> Vec<Finding> {
     .next(NextCheck::UserAction {
         what: "Open Emulator setup and check the emulator's location.".into(),
     });
-    if let Some((path_item, _)) = view.path(PathRole::EmulatorExecutable) {
-        finding = finding.support(path_item);
+    // The path check is cited only when it says the same thing.
+    if let Some((path_item, access)) = view.path(PathRole::EmulatorExecutable) {
+        match (reason, access.presence) {
+            (SpawnFailure::ProgramNotFound, PathPresence::Missing) => {
+                finding = finding.support(path_item);
+            }
+            (SpawnFailure::ProgramNotFound, PathPresence::RegularFile) => {
+                finding = finding.limit(
+                    "The program file itself exists, so what is missing is something it \
+                     needs in order to start.",
+                );
+            }
+            _ => {}
+        }
     }
     vec![finding]
 }
@@ -1134,11 +1277,17 @@ fn retroarch_core_not_loaded(view: &View<'_>) -> Vec<Finding> {
         Some((path_item, access)) if access.presence == PathPresence::Missing => {
             finding = finding.support(path_item);
         }
-        Some((path_item, _)) => {
+        Some((path_item, access)) if access.presence == PathPresence::RegularFile => {
             finding = finding.contradict(path_item).limit(
                 "A file is present at the core's location now, so RetroArch may be \
                  running somewhere it is not visible.",
             );
+        }
+        Some((_, access)) => {
+            finding = finding.limit(format!(
+                "EmuWiz looked at the core's location and it {}.",
+                access.presence.describe()
+            ));
         }
         None => {
             finding = finding
@@ -1167,27 +1316,44 @@ fn retroarch_core_open_failed(view: &View<'_>) -> Vec<Finding> {
     let finding = match view.path(PathRole::EmulatorCore) {
         // The missing-core rule reports this.
         Some((_, access)) if access.presence == PathPresence::Missing => return Vec::new(),
-        Some((path_item, access)) if access.readable == Some(false) => base(
-            Confidence::Established,
-            "The emulator core cannot be read",
-            "The core file exists, but this user account is not allowed to read it.",
-        )
-        .in_category(DiagnosisCategory::PermissionError)
-        .support(path_item),
+        // Established by the look at the file, not by the message.
+        Some((path_item, access))
+            if access.presence == PathPresence::RegularFile && access.readable == Some(false) =>
+        {
+            base(
+                Confidence::Established,
+                "The emulator core cannot be read",
+                "The core file exists, but this user account is not allowed to read it.",
+            )
+            .in_category(DiagnosisCategory::PermissionError)
+            .support(path_item)
+        }
+        // A readable core file is true of every healthy setup: it rules out
+        // two other explanations without supporting this one.
         Some((path_item, access))
             if access.presence == PathPresence::RegularFile && access.readable == Some(true) =>
         {
             base(
-                Confidence::Probable,
+                Confidence::Possible,
                 "The emulator core could not be loaded",
-                "The core file exists and can be read, but RetroArch could not load it as \
-                 a program library. It may be damaged, built for a different kind of \
+                "RetroArch reported that it could not open the core, and the core file \
+                 exists and can be read. It may be damaged, built for a different kind of \
                  computer, or need a library that is not installed.",
             )
             .support(path_item)
             .limit("The system's own reason for refusing the core was not captured.")
         }
-        _ => base(
+        Some((path_item, access)) => base(
+            Confidence::Possible,
+            "The emulator core could not be opened",
+            "RetroArch reported that it could not open the core it was asked to use.",
+        )
+        .support(path_item)
+        .limit(format!(
+            "EmuWiz looked at the core's location and it {}.",
+            access.presence.describe()
+        )),
+        None => base(
             Confidence::Possible,
             "The emulator core could not be opened",
             "RetroArch reported that it could not open the core it was asked to use.",
@@ -1209,19 +1375,22 @@ fn sandbox_refused(view: &View<'_>) -> Vec<Finding> {
         return Vec::new();
     };
     let detail = log.value.as_deref().unwrap_or_default();
-    let (title, explanation) = if log.signature == "host.flatpak.app_not_installed" {
+    let flatpak = log.signature == "host.flatpak.app_not_installed";
+    let (title, explanation) = if flatpak {
         (
-            "The Flatpak emulator is not installed",
-            format!("Flatpak reported that the application {detail} is not installed."),
+            "The Flatpak emulator may not be installed",
+            format!("Flatpak reported that the application \"{detail}\" is not installed."),
         )
     } else {
         (
-            "The sandbox could not be set up",
-            format!("The sandbox the emulator runs in refused to start: {detail}"),
+            "The sandbox may not have started",
+            format!("The sandbox the emulator runs in reported: \"{detail}\"."),
         )
     };
+    // Held at possible: the message is text, and how the emulator is
+    // installed does not show that the sandbox refused it.
     let mut finding = Finding::cause(
-        Confidence::Probable,
+        Confidence::Possible,
         Effect::PreventsLaunch,
         title,
         explanation,
@@ -1229,7 +1398,12 @@ fn sandbox_refused(view: &View<'_>) -> Vec<Finding> {
     .support(event)
     .support(exit_item);
     match view.installation() {
-        Some((install_item, _)) => finding = finding.support(install_item),
+        Some((install_item, installation))
+            if flatpak && installation.eq_ignore_ascii_case("flatpak") =>
+        {
+            finding = finding.support(install_item);
+        }
+        Some(_) => {}
         None => {
             finding = finding.next(NextCheck::CollectEvidence {
                 area: EvidenceArea::EmulatorExecutable,
@@ -1298,7 +1472,7 @@ fn retroarch_audio_failed(view: &View<'_>) -> Vec<Finding> {
             .value
             .as_deref()
             .and_then(|rate| rate.parse::<f64>().ok())
-            .is_some_and(|rate| rate > 0.0)
+            .is_some_and(|rate| rate.is_finite() && rate > 0.0)
     }) else {
         return Vec::new();
     };
@@ -1327,6 +1501,7 @@ fn retroarch_audio_failed(view: &View<'_>) -> Vec<Finding> {
     });
     if let Some(setting) = setting {
         finding = finding.support(setting.evidence);
+        finding = view.qualify_setting_finding(finding, RETROARCH);
     }
     vec![finding]
 }
@@ -1423,6 +1598,117 @@ fn readiness_blocked(view: &View<'_>) -> Vec<Finding> {
         .collect()
 }
 
+/// Errors a program states outright, as symptoms. Audio is absent on
+/// purpose: RetroArch prints its audio failure on healthy runs of cores that
+/// make no sound, so on its own that line reports nothing.
+const REPORTED_ERRORS: &[(LogMeaning, DiagnosisCategory, Effect, &str)] = &[
+    (
+        LogMeaning::VulkanUnavailable,
+        DiagnosisCategory::GraphicsInitialisation,
+        Effect::PreventsLaunch,
+        "it could not set up Vulkan",
+    ),
+    (
+        LogMeaning::VideoDriverInitFailed,
+        DiagnosisCategory::GraphicsInitialisation,
+        Effect::PreventsLaunch,
+        "it could not start its video driver",
+    ),
+    (
+        LogMeaning::CoreRequestIgnored,
+        DiagnosisCategory::MissingDependency,
+        Effect::PreventsLaunch,
+        "it ignored the emulator core it was asked to use",
+    ),
+    (
+        LogMeaning::CoreOpenFailed,
+        DiagnosisCategory::MissingDependency,
+        Effect::PreventsLaunch,
+        "it could not open the emulator core",
+    ),
+    (
+        LogMeaning::ContentReadFailed,
+        DiagnosisCategory::InvalidOrUnsupportedMedia,
+        Effect::PreventsLaunch,
+        "it could not read the game file",
+    ),
+    (
+        LogMeaning::ContentRejected,
+        DiagnosisCategory::InvalidOrUnsupportedMedia,
+        Effect::PreventsLaunch,
+        "its core refused the game file",
+    ),
+    (
+        LogMeaning::SaveWriteFailed,
+        DiagnosisCategory::PermissionError,
+        Effect::Degrades,
+        "it could not write save data",
+    ),
+    (
+        LogMeaning::SharedLibraryMissing,
+        DiagnosisCategory::MissingDependency,
+        Effect::PreventsLaunch,
+        "a library the program needs could not be found",
+    ),
+    (
+        LogMeaning::SandboxRefused,
+        DiagnosisCategory::SandboxFailure,
+        Effect::PreventsLaunch,
+        "the sandbox or application runtime refused to start the program",
+    ),
+    (
+        LogMeaning::FatalErrorUnspecific,
+        DiagnosisCategory::UnexplainedExit,
+        Effect::Unknown,
+        "it hit a fatal error, without saying what caused it",
+    ),
+];
+
+fn reported_errors(view: &View<'_>) -> Vec<Finding> {
+    REPORTED_ERRORS
+        .iter()
+        .flat_map(|(meaning, category, effect, what)| {
+            // One report per program that said it, so a host message and an
+            // emulator message of the same kind are not merged.
+            let events = view.events(*meaning);
+            let mut speakers: Vec<&str> = events
+                .iter()
+                .map(|(_, event)| event.emulator.as_str())
+                .collect();
+            speakers.sort_unstable();
+            speakers.dedup();
+            speakers
+                .into_iter()
+                .filter_map(|speaker| {
+                    let said: Vec<&(&Evidence, &LogEvent)> = events
+                        .iter()
+                        .filter(|(_, event)| event.emulator == speaker)
+                        .collect();
+                    let (_, first) = said.first()?;
+                    let name = match speaker {
+                        RETROARCH => "RetroArch",
+                        HOST_EMULATOR => "The system",
+                        _ => "The emulator",
+                    };
+                    let times = match said.len() {
+                        1 => String::new(),
+                        count => format!(" This kind of message was printed {count} times."),
+                    };
+                    Some(
+                        Finding::reported(
+                            format!("{name} reported that {what}"),
+                            format!("The output contains: \"{}\".{times}", first.excerpt),
+                        )
+                        .in_category(*category)
+                        .with_effect(*effect)
+                        .support_all(said.iter().map(|(item, _)| *item)),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn process_symptoms(view: &View<'_>) -> Vec<Finding> {
     let Some((exit_item, exit)) = view.exit() else {
         return Vec::new();
@@ -1470,27 +1756,47 @@ fn process_symptoms(view: &View<'_>) -> Vec<Finding> {
                 )),
             }
         }
-        ExitOutcome::Exited { code } if code != 0 => {
+        // A status that only relays a request to stop is not a failure and
+        // is reported as a note, not here.
+        ExitOutcome::Exited { code } if exit.is_failure() => {
             findings.push(Finding::symptom(
                 Confidence::Established,
                 format!("The emulator exited with status {code}"),
                 format!("The emulator process ended with exit status {code}{after}."),
             ));
-            if let Some(signal) = possibly_relayed_signal(code) {
-                let name = signal_info(signal)
-                    .map_or_else(|| format!("signal {signal}"), |info| info.name.into());
-                findings.push(
+            let relayed = possibly_relayed_signal(code)
+                .and_then(|signal| signal_info(signal).map(|info| (signal, info)));
+            match relayed {
+                Some((_, info)) if info.kind == SignalKind::Fault => findings.push(
                     Finding::symptom(
                         Confidence::Possible,
-                        format!("The emulator may have crashed ({name})"),
+                        format!("The emulator may have crashed ({})", info.name),
                         format!(
                             "Exit status {code} is what a launcher reports when the program \
-                             it started was ended by {name}. A program can also choose this \
-                             status itself, so this is not certain."
+                             it started was ended by {}. A program can also choose this \
+                             status itself, so this is not certain.",
+                            info.name
                         ),
                     )
                     .in_category(DiagnosisCategory::Crash),
-                );
+                ),
+                Some((_, info)) if info.kind == SignalKind::ForcedKill => {
+                    findings.push(Finding::symptom(
+                        Confidence::Possible,
+                        format!(
+                            "The emulator may have been forcibly stopped ({})",
+                            info.name
+                        ),
+                        format!(
+                            "Exit status {code} is what a launcher reports when the program \
+                             it started was ended by {}. The system does that when memory \
+                             runs out, and a person can do it too. A program can also choose \
+                             this status itself, so this is not certain.",
+                            info.name
+                        ),
+                    ));
+                }
+                _ => {}
             }
         }
         ExitOutcome::SpawnFailed {
@@ -1544,6 +1850,14 @@ pub(crate) const RULES: &[Rule] = &[
         summary: "The program loader reported a missing shared library and the launch \
                   ended with status 127.",
         evaluate: shared_library_missing,
+    },
+    Rule {
+        id: "emulator.reported_error",
+        version: 1,
+        category: DiagnosisCategory::UnexplainedExit,
+        summary: "Restates an error the emulator, the program loader or the sandbox printed. \
+                  Established as a report; a symptom, not a cause.",
+        evaluate: reported_errors,
     },
     Rule {
         id: "emulator.version_unsupported",
@@ -1653,14 +1967,16 @@ pub(crate) const RULES: &[Rule] = &[
         id: "retroarch.core.open_failed",
         version: 1,
         category: DiagnosisCategory::MissingDependency,
-        summary: "RetroArch reported it could not open a core file that exists.",
+        summary: "RetroArch reported it could not open the core file, which is not known to \
+                  be missing.",
         evaluate: retroarch_core_open_failed,
     },
     Rule {
         id: "retroarch.video.driver_failed",
         version: 1,
         category: DiagnosisCategory::GraphicsInitialisation,
-        summary: "RetroArch stopped while starting a video driver other than Vulkan.",
+        summary: "RetroArch stopped while starting its video driver, which is not known to \
+                  be set to Vulkan.",
         evaluate: retroarch_video_driver_failed,
     },
     Rule {
@@ -1668,7 +1984,8 @@ pub(crate) const RULES: &[Rule] = &[
         version: 1,
         category: DiagnosisCategory::GraphicsInitialisation,
         summary: "RetroArch is set to Vulkan and failed, with a Vulkan probe, a Vulkan \
-                  error or a video driver failure to show for it.",
+                  error or a video driver failure to show for it. Established only by a \
+                  probe of the launch environment.",
         evaluate: retroarch_vulkan_unavailable,
     },
     Rule {
@@ -1779,6 +2096,39 @@ fn finalise(rule: &Rule, finding: Finding, evidence: &EvidenceSet) -> Result<Dia
             "it names a cause from an exit status and an unspecific error message alone".into(),
         );
     }
+    if finding.reported {
+        // A report is a statement about the emulator's output and nothing
+        // else, so it may cite only that output and may not name a cause.
+        if finding.explains_cause
+            || !items
+                .iter()
+                .all(|item| matches!(item.fact, Fact::LogEvent(_)))
+        {
+            return Err("it presents something other than emulator output as a report".into());
+        }
+        limitations.push(
+            "This is what the emulator printed. That it reported this is established; \
+             that it is the underlying cause is not."
+                .into(),
+        );
+        return Ok(Diagnosis {
+            rule: rule.id.to_string(),
+            rule_version: rule.version,
+            category: finding.category.unwrap_or(rule.category),
+            confidence: Confidence::Established,
+            explains_cause: false,
+            reported: true,
+            effect: finding.effect,
+            title: finding.title,
+            explanation: finding.explanation,
+            supporting,
+            contradicting: Vec::new(),
+            limitations,
+            next_checks: finding.next_checks,
+            repairs: Vec::new(),
+            claims: Vec::new(),
+        });
+    }
     let mut confidence = finding.confidence;
     let has_untrusted_text = items.iter().any(|item| item.trust == Trust::UntrustedText);
     let has_firm = items.iter().any(|item| item.trust.is_firm());
@@ -1795,7 +2145,6 @@ fn finalise(rule: &Rule, finding: Finding, evidence: &EvidenceSet) -> Result<Dia
                 .into(),
         );
     } else if has_untrusted_text
-        && finding.explains_cause
         && !has_firm_beyond_exit
         && confidence.rank() > Confidence::Possible.rank()
     {
@@ -1809,7 +2158,11 @@ fn finalise(rule: &Rule, finding: Finding, evidence: &EvidenceSet) -> Result<Dia
     let contradicting: Vec<EvidenceId> = finding
         .contradicting
         .into_iter()
-        .filter(|id| evidence.get(id).is_some_and(Evidence::is_observed))
+        .filter(|id| {
+            evidence
+                .get(id)
+                .is_some_and(|item| item.is_observed() && item.trust != Trust::Asserted)
+        })
         .collect();
     if !contradicting.is_empty() {
         confidence = confidence.at_most(Confidence::Possible);
@@ -1821,6 +2174,7 @@ fn finalise(rule: &Rule, finding: Finding, evidence: &EvidenceSet) -> Result<Dia
         category: finding.category.unwrap_or(rule.category),
         confidence,
         explains_cause: finding.explains_cause,
+        reported: false,
         effect: finding.effect,
         title: finding.title,
         explanation: finding.explanation,
@@ -1905,29 +2259,66 @@ pub(crate) fn diagnose_with(rules: &[Rule], evidence: &EvidenceSet) -> Diagnosis
     // Several process exits mean the evidence mixes several runs. Which
     // log line belongs to which run cannot be known, so no rule reads any
     // of them (see `View::exit`) and the report cannot call the picture
-    // clean.
-    let mixed_runs = evidence
+    // clean. Asserted exits are not evidence and are not counted.
+    let exits: Vec<&ProcessExit> = view
         .observed(EvidenceArea::ProcessExit)
-        .filter(|item| matches!(item.fact, Fact::ProcessExit(_)))
-        .count()
-        > 1;
+        .filter_map(|item| match &item.fact {
+            Fact::ProcessExit(exit) => Some(exit),
+            _ => None,
+        })
+        .collect();
+    let mixed_runs = exits.len() > 1;
+    // A failure is something that stopped the launch: the process failing,
+    // or the emulator saying so. Once there is one, only a cause that can
+    // prevent a launch explains it; a cause that merely degrades the game
+    // (no sound, saves not written) is still reported but does not.
+    let failure_observed = symptoms
+        .iter()
+        .any(|symptom| symptom.effect != Effect::Degrades);
+    let explains = |cause: &&Diagnosis| !failure_observed || cause.effect != Effect::Degrades;
     let has_contradicted_cause = causes.iter().any(|cause| !cause.contradicting.is_empty());
     let verdict = if !conflicts.is_empty() || has_contradicted_cause {
         Verdict::Conflicting
     } else if causes
         .iter()
+        .filter(explains)
         .any(|cause| cause.confidence == Confidence::Established)
     {
         Verdict::Explained
-    } else if !causes.is_empty() {
+    } else if causes.iter().any(|cause| explains(&cause)) {
         Verdict::PartlyExplained
-    } else if !symptoms.is_empty() || mixed_runs {
+    } else if failure_observed || mixed_runs {
         Verdict::Unknown
     } else {
         Verdict::NoProblemObserved
     };
 
     let mut notes = Vec::new();
+    for exit in &exits {
+        if let ExitOutcome::Exited { code } = exit.outcome
+            && !exit.is_failure()
+            && code != 0
+        {
+            notes.push(format!(
+                "Exit status {code} is what a launcher reports after the program was asked \
+                 to stop. It is treated as a stop request, not as a failure."
+            ));
+        }
+    }
+    if evidence.items().iter().any(|item| {
+        item.is_observed()
+            && item.trust == Trust::Reported
+            && matches!(
+                item.area,
+                EvidenceArea::ProcessExit | EvidenceArea::LaunchEnvironment
+            )
+    }) {
+        notes.push(
+            "How the process ended, or the environment it ran in, was supplied by whoever \
+             asked for this diagnosis. EmuWiz did not observe it."
+                .to_string(),
+        );
+    }
     if mixed_runs {
         notes.push(
             "The evidence holds more than one process exit, so it mixes several runs. None \
@@ -1944,7 +2335,7 @@ pub(crate) fn diagnose_with(rules: &[Rule], evidence: &EvidenceSet) -> Diagnosis
     let stale = evidence
         .items()
         .iter()
-        .filter(|item| matches!(item.state, super::evidence::EvidenceState::Stale { .. }))
+        .filter(|item| matches!(item.state, EvidenceState::Stale { .. }))
         .count();
     if stale > 0 {
         notes.push(format!(

@@ -37,16 +37,28 @@ const ELLIPSIS: char = '\u{2026}';
 
 fn is_unsafe(character: char) -> bool {
     character.is_control()
-        // Direction overrides and isolates can reorder how text is shown.
-        || matches!(character, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-        // Zero-width and invisible formatting characters can hide content.
-        || matches!(character, '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}')
-        // Line and paragraph separators would split one line into several.
-        || matches!(character, '\u{2028}' | '\u{2029}')
+        || matches!(
+            character,
+            // Direction marks, embeddings, overrides and isolates can reorder
+            // how text is shown.
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            // Zero-width, invisible and deprecated formatting characters can
+            // hide content or join what should be separate.
+            | '\u{00AD}' | '\u{180E}' | '\u{200B}'..='\u{200D}' | '\u{2060}'..='\u{2064}'
+            | '\u{206A}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+            // Fillers render as nothing but are not spaces.
+            | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'
+            // Line and paragraph separators would split one line into several.
+            | '\u{2028}' | '\u{2029}'
+            // Tag characters are invisible and can carry hidden text.
+            | '\u{E0000}'..='\u{E007F}'
+        )
 }
 
 /// Make text safe to display: unsafe characters become a visible
-/// replacement character and the result is at most `limit` characters.
+/// replacement character, and text longer than `limit` characters is cut
+/// there and ends with an ellipsis (so the result is at most `limit + 1`
+/// characters).
 pub fn sanitise(input: &str, limit: usize) -> String {
     let mut output = String::with_capacity(input.len().min(limit * 4));
     for (count, character) in input.chars().enumerate() {
@@ -100,14 +112,15 @@ impl Examined {
 /// [`LOG_LINES_LIMIT`] lines.
 ///
 /// Invalid UTF-8 becomes replacement characters rather than an error: a log
-/// that cannot be decoded is still evidence that a log exists. Lines end at
+/// that cannot be decoded is still evidence that a log exists. Every limit,
+/// and the byte count, is measured on the captured bytes before decoding. Lines end at
 /// `\n`; a trailing `\r` is dropped. A line over [`LOG_LINE_LIMIT`] bytes
 /// is skipped and counted, and a final line cut by the byte limit is
 /// dropped, so a signature is never matched against part of a line.
 pub fn examine(bytes: &[u8]) -> Examined {
     let cut = bytes.len() > LOG_BYTES_LIMIT;
     let window = &bytes[..bytes.len().min(LOG_BYTES_LIMIT)];
-    // When the input was cut, drop the partial last line before decoding.
+    // When the input was cut, drop the partial last line.
     let window = if cut {
         match window.iter().rposition(|&byte| byte == b'\n') {
             Some(index) => &window[..=index],
@@ -116,32 +129,34 @@ pub fn examine(bytes: &[u8]) -> Examined {
     } else {
         window
     };
-    let text = String::from_utf8_lossy(window).into_owned();
+    let mut text = String::new();
     let mut spans = Vec::new();
     let mut lines_ignored = 0u32;
     let mut truncated = cut;
     let mut number = 0u32;
-    let mut offset = 0usize;
-    for raw in text.split_inclusive('\n') {
+    let mut bytes_examined = 0u64;
+    for raw in window.split_inclusive(|&byte| byte == b'\n') {
         if number as usize == LOG_LINES_LIMIT {
             truncated = true;
             break;
         }
         number += 1;
-        let start = offset;
-        offset += raw.len();
-        let line = raw.strip_suffix('\n').unwrap_or(raw);
-        let line = line.strip_suffix('\r').unwrap_or(line);
+        bytes_examined += raw.len() as u64;
+        let line = raw.strip_suffix(b"\n").unwrap_or(raw);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        // Measured on the captured bytes, before decoding.
         if line.len() > LOG_LINE_LIMIT {
             lines_ignored += 1;
             continue;
         }
-        spans.push((number, start..start + line.len()));
+        let start = text.len();
+        text.push_str(&String::from_utf8_lossy(line));
+        spans.push((number, start..text.len()));
     }
     Examined {
         text,
         spans,
-        bytes_examined: offset as u64,
+        bytes_examined,
         truncated,
         lines_ignored,
     }

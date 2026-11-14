@@ -46,10 +46,13 @@ pub enum Matcher {
         after: &'static str,
         until: &'static str,
     },
-    /// `marker` somewhere after a program name; the value is the text
-    /// between `marker` and the first following `until`. Used only for the
-    /// dynamic loader, whose message starts with the path of the program.
-    AfterMarker {
+    /// A line that starts with one word (a program path without spaces)
+    /// directly followed by `marker`; the value is the text between `marker`
+    /// and the first following `until`, and must be a plain file name
+    /// (letters, digits, `.`, `_`, `+`, `-`). Used only for the dynamic
+    /// loader, whose message starts with the path of the program and names
+    /// a library.
+    ProgramThenMarker {
         marker: &'static str,
         until: &'static str,
     },
@@ -88,10 +91,20 @@ impl Signature {
                 let end = rest[start..].find(until)?;
                 Some(Some(&rest[start..start + end]))
             }
-            Matcher::AfterMarker { marker, until } => {
-                let start = line.find(marker)? + marker.len();
+            Matcher::ProgramThenMarker { marker, until } => {
+                let program_end = line.find(marker)?;
+                let program = &line[..program_end];
+                if program.is_empty() || program.chars().any(char::is_whitespace) {
+                    return None;
+                }
+                let start = program_end + marker.len();
                 let end = line[start..].find(until)?;
-                Some(Some(&line[start..start + end]))
+                let value = &line[start..start + end];
+                let plain = !value.is_empty()
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')
+                    });
+                plain.then_some(Some(value))
             }
         }
     }
@@ -117,7 +130,7 @@ pub const HOST_SIGNATURES: &[Signature] = &[
         id: "host.loader.shared_library_missing",
         version: 1,
         meaning: LogMeaning::SharedLibraryMissing,
-        matcher: Matcher::AfterMarker {
+        matcher: Matcher::ProgramThenMarker {
             marker: ": error while loading shared libraries: ",
             until: ": cannot open shared object file",
         },

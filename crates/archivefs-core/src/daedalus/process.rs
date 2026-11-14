@@ -97,19 +97,53 @@ pub fn possibly_relayed_signal(code: i32) -> Option<i32> {
     (1..=64).contains(&signal).then_some(signal)
 }
 
-/// Record how a process ended. `duration` is the time from start to exit
-/// as measured by the caller; `launcher` names the wrapper when the watched
-/// process is not the emulator itself.
+/// Who says how the process ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitSource {
+    /// EmuWiz started the process and read its status from the operating
+    /// system.
+    Observed,
+    /// Whoever asked for the diagnosis supplied it. EmuWiz did not see the
+    /// process.
+    SuppliedByCaller,
+}
+
+/// Record how a process EmuWiz itself watched ended. `duration` is the time
+/// from start to exit as measured by the caller; `launcher` names the
+/// wrapper when the watched process is not the emulator itself.
 pub fn record_exit(
     set: &mut EvidenceSet,
     outcome: ExitOutcome,
     duration: Option<Duration>,
     launcher: Option<&str>,
 ) -> Option<EvidenceId> {
+    record_exit_from(set, outcome, duration, launcher, ExitSource::Observed)
+}
+
+/// Record how a process ended, stating who says so. A status supplied by
+/// the caller is recorded as reported, never as measured, and its source
+/// says that it was supplied.
+pub fn record_exit_from(
+    set: &mut EvidenceSet,
+    outcome: ExitOutcome,
+    duration: Option<Duration>,
+    launcher: Option<&str>,
+    source: ExitSource,
+) -> Option<EvidenceId> {
+    let (trust, described) = match source {
+        ExitSource::Observed => (
+            Trust::Measured,
+            "exit status of the launched process, as reported by the operating system",
+        ),
+        ExitSource::SuppliedByCaller => (
+            Trust::Reported,
+            "how the process ended, as supplied by whoever asked for this diagnosis",
+        ),
+    };
     set.observe(
         EvidenceArea::ProcessExit,
-        Trust::Measured,
-        "exit status of the launched process, as reported by the operating system",
+        trust,
+        described,
         Fact::ProcessExit(ProcessExit {
             outcome,
             duration_ms: duration.map(|duration| duration.as_millis().min(u64::MAX as u128) as u64),
@@ -134,17 +168,38 @@ pub fn record_exit_report(
     exit
 }
 
-/// Scan captured standard error. The executor keeps only the first part of
-/// the stream, so the coverage is marked truncated when the capture is
-/// full: an error printed later would not be in it.
+/// Scan the standard error an executor captured. The executor keeps only
+/// the first part of the stream, so the coverage is marked truncated when
+/// the capture is full: an error printed later would not be in it.
 pub fn record_stderr(
     set: &mut EvidenceSet,
     stderr: &[u8],
     emulator: &str,
     emulator_signatures: &[Signature],
 ) -> Vec<EvidenceId> {
-    let examined = text::examine(stderr);
     let capture_full = stderr.len() >= crate::launch::process_spawn::PROCESS_STDERR_CAPTURE_LIMIT;
+    record_output(set, stderr, emulator, emulator_signatures, capture_full)
+}
+
+/// Scan output that is complete as supplied (a file someone saved), with no
+/// capture limit to account for beyond the examination limits themselves.
+pub fn record_supplied_output(
+    set: &mut EvidenceSet,
+    output: &[u8],
+    emulator: &str,
+    emulator_signatures: &[Signature],
+) -> Vec<EvidenceId> {
+    record_output(set, output, emulator, emulator_signatures, false)
+}
+
+fn record_output(
+    set: &mut EvidenceSet,
+    output: &[u8],
+    emulator: &str,
+    emulator_signatures: &[Signature],
+    cut_short: bool,
+) -> Vec<EvidenceId> {
+    let examined = text::examine(output);
     let mut ids = Vec::new();
     for (name, table) in [
         (HOST_EMULATOR, HOST_SIGNATURES),
@@ -154,7 +209,7 @@ pub fn record_stderr(
             continue;
         }
         let mut scan = signatures::scan(&examined, table, name, LogStream::Stderr);
-        scan.coverage.truncated |= capture_full;
+        scan.coverage.truncated |= cut_short;
         ids.extend(signatures::record_scan(
             set,
             scan,

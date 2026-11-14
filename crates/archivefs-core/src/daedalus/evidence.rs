@@ -29,8 +29,8 @@ use crate::launch::process_spawn::{
 pub const EVIDENCE_SCHEMA_VERSION: u32 = 1;
 
 /// Upper bound on evidence items in one set. A collector that would exceed
-/// it stops adding items and the set records that it was truncated; the
-/// engine then refuses to call the picture complete.
+/// it stops adding items and the set records that it was truncated; every
+/// report made from it then carries a note saying so.
 pub const MAX_EVIDENCE_ITEMS: usize = 2_000;
 
 /// Identifies one evidence item inside one [`EvidenceSet`]. Assigned by the
@@ -199,7 +199,14 @@ pub const FINGERPRINT_DIGEST_LIMIT: u64 = 4 * 1024 * 1024;
 /// later change can be detected instead of silently trusted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceFingerprint {
+    /// The file's path, sanitised for display and export.
     pub path: String,
+    /// The exact path the file was read from, used to look at it again. It
+    /// is never serialised: a report restored from JSON cannot be compared
+    /// with the file, and says so rather than opening whatever its text
+    /// names.
+    #[serde(skip)]
+    real_path: std::path::PathBuf,
     pub device: u64,
     pub inode: u64,
     pub size: u64,
@@ -227,7 +234,8 @@ pub enum FingerprintCheck {
 impl SourceFingerprint {
     fn from_identity(path: &Path, identity: CapturedFileIdentity) -> Self {
         Self {
-            path: path.display().to_string(),
+            path: text::sanitise(&path.display().to_string(), text::PATH_LIMIT),
+            real_path: path.to_path_buf(),
             device: identity.device,
             inode: identity.inode,
             size: identity.size,
@@ -286,7 +294,15 @@ impl SourceFingerprint {
     /// digest the content is hashed again; otherwise identity, size and
     /// timestamps decide.
     pub fn check(&self) -> FingerprintCheck {
-        let path = Path::new(&self.path);
+        if self.real_path.as_os_str().is_empty() {
+            return FingerprintCheck::Unavailable {
+                detail: format!(
+                    "{}: this report was restored and can no longer be compared with the file",
+                    self.path
+                ),
+            };
+        }
+        let path = self.real_path.as_path();
         let current = if self.sha256.is_some() {
             Self::read_with_digest(path, FINGERPRINT_DIGEST_LIMIT).map(|(_, current)| current)
         } else {
@@ -447,7 +463,18 @@ impl ProcessExit {
                 super::process::signal_info(signal).map(|info| info.kind),
                 Some(super::process::SignalKind::StopRequest)
             ),
-            ExitOutcome::Exited { code } => code != 0,
+            // A launcher reports a program that was asked to stop as exit
+            // status 128 + the signal number. That is the same stop request,
+            // one step removed.
+            ExitOutcome::Exited { code } => {
+                code != 0
+                    && !super::process::possibly_relayed_signal(code).is_some_and(|signal| {
+                        matches!(
+                            super::process::signal_info(signal).map(|info| info.kind),
+                            Some(super::process::SignalKind::StopRequest)
+                        )
+                    })
+            }
             ExitOutcome::StillRunning | ExitOutcome::StatusUnavailable => false,
         }
     }
@@ -605,7 +632,25 @@ pub enum PathPresence {
     Directory,
     SymbolicLink,
     Missing,
+    /// Something else: a device, a socket, a pipe.
     Other,
+    /// The path could not be examined (for example a folder on the way to
+    /// it denies access), so what is there is not known.
+    Unknown,
+}
+
+impl PathPresence {
+    /// Completes the sentence "the path ...".
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::RegularFile => "is a file",
+            Self::Directory => "is a folder",
+            Self::SymbolicLink => "is a symbolic link, which was not followed",
+            Self::Missing => "does not exist",
+            Self::Other => "is not a file or a folder",
+            Self::Unknown => "could not be examined",
+        }
+    }
 }
 
 /// A read-only look at one path: what is there, and whether this user may
@@ -707,6 +752,11 @@ pub enum Fact {
         key: String,
         value: Option<String>,
         line: Option<u32>,
+    },
+    /// No settings file exists for this layer, so it overrides nothing.
+    ConfigLayerAbsent {
+        emulator: String,
+        layer: ConfigLayer,
     },
     /// Features of a settings file that limit how far its values can be
     /// taken as the settings the emulator will actually use.
@@ -984,6 +1034,9 @@ impl Fact {
                     layer.label()
                 )
             }
+            Self::ConfigLayerAbsent { layer, .. } => {
+                format!("no settings file exists for {}", layer.label())
+            }
             Self::EnvironmentVariable { name, value } => match value {
                 Some(value) => format!("{name}={value}"),
                 None => format!("{name} is not set"),
@@ -1025,9 +1078,10 @@ impl Fact {
             }
             Self::PathAccess(access) => {
                 let state = match access.presence {
-                    PathPresence::Missing => "does not exist".to_string(),
-                    PathPresence::SymbolicLink => "is a symbolic link (not followed)".to_string(),
-                    PathPresence::Other => "is not a file or folder".to_string(),
+                    PathPresence::Missing
+                    | PathPresence::SymbolicLink
+                    | PathPresence::Other
+                    | PathPresence::Unknown => access.presence.describe().to_string(),
                     PathPresence::RegularFile => format!(
                         "is a file{}{}",
                         yes_no(access.readable, "readable", "not readable"),
@@ -1072,8 +1126,13 @@ pub struct Subject {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AreaCoverage {
     pub area: EvidenceArea,
+    /// Items observed by something, and still current.
     pub observed: usize,
     pub stale: usize,
+    /// Statements that were only asserted. They are not observations and do
+    /// not count as coverage.
+    #[serde(default)]
+    pub asserted: usize,
     /// Reasons collection failed or was not attempted. An area with no
     /// items at all reports a single "not collected" reason.
     pub missing: Vec<String>,
@@ -1242,12 +1301,16 @@ impl EvidenceSet {
                     area,
                     observed: 0,
                     stale: 0,
+                    asserted: 0,
                     missing: Vec::new(),
                 };
                 let mut any = false;
                 for item in self.items.iter().filter(|item| item.area == area) {
                     any = true;
                     match &item.state {
+                        EvidenceState::Observed if item.trust == Trust::Asserted => {
+                            coverage.asserted += 1;
+                        }
                         EvidenceState::Observed => coverage.observed += 1,
                         EvidenceState::Stale { .. } => coverage.stale += 1,
                         EvidenceState::Unavailable { reason } => {
@@ -1260,6 +1323,8 @@ impl EvidenceSet {
                 }
                 if !any {
                     coverage.missing.push("not collected".into());
+                } else if coverage.observed == 0 && coverage.asserted > 0 {
+                    coverage.missing.push("only asserted, not observed".into());
                 }
                 coverage
             })
@@ -1278,7 +1343,7 @@ pub fn observe_path_access(role: PathRole, path: &Path) -> PathAccess {
         Ok(metadata) if metadata.file_type().is_dir() => PathPresence::Directory,
         Ok(_) => PathPresence::Other,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => PathPresence::Missing,
-        Err(_) => PathPresence::Other,
+        Err(_) => PathPresence::Unknown,
     };
     let may = |mode: libc::c_int| -> Option<bool> {
         if !matches!(

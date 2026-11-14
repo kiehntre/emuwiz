@@ -76,20 +76,48 @@ statement of what it concludes from what. `emuwiz-cli diagnose-launch --rules`
 prints them. The engine applies limits no rule can opt out of:
 
 - support must be observed and current; stale, unavailable and asserted items
-  are not support, and asserted items are not even shown to rules;
-- a finding resting on untrusted text needs a firm observation other than the
-  process exit to rise above `possible`;
+  are not support, and asserted items are not shown to rules, do not count as
+  coverage and cannot contradict anything;
+- a finding (cause or symptom) resting on untrusted text needs a firm
+  observation other than the process exit to rise above `possible`;
 - a cause named from only an exit status and an unspecific message is
   rejected and listed under `rejected`;
 - contradicting evidence, or a contradicting finding, holds a finding at
   `possible` and makes the verdict `conflicting`;
 - evidence holding more than one process exit is not interpreted.
 
-A report separates **symptoms** (what happened: a crash signal, an exit
-status) from **causes** (why). Verdicts: `explained` (an established cause, no
-contradiction), `partly_explained`, `conflicting`, `unknown`,
-`no_problem_observed` (which is explicitly not a statement that the game
-works).
+The built-in rules go further than the engine requires: a cause drawn from
+what the emulator printed stays at `possible` even when a firm fact
+accompanies it, unless that fact is a check of the very thing claimed. A
+readable game file, a readable core, or a setting that says "vulkan" is true
+of every healthy setup and corroborates nothing. So the Vulkan diagnosis is
+`possible` from the log, `probable` when a probe finds Vulkan unusable on the
+host, and `established` only when a probe finds it unusable in the launch
+environment itself.
+
+A report separates **symptoms** (what happened) from **causes** (why).
+Symptoms are how the process ended and what a program said outright: an
+explicit error line becomes a *reported* symptom ("RetroArch reported that it
+could not set up Vulkan"), established as a report and never, by itself, a
+cause. Verdicts: `explained` (an established cause, no contradiction),
+`partly_explained`, `conflicting`, `unknown`, `no_problem_observed` (which is
+explicitly not a statement that the game works). Once something failed, only
+a cause that can prevent a launch explains it; a problem that merely degrades
+the game (no sound, saves not written) is still reported but does not turn an
+unexplained crash into an explained one. An exit status that only relays a
+request to stop (143 and the like) is a note, not a failure.
+
+Settings are read per layer (main file, core, folder and game overrides). A
+layer whose file does not exist is recorded as absent, which is an
+observation. A layer that exists and could not be read, or changed while it
+was being examined, holds every setting-based finding at `possible`, because
+it may hold the value the emulator really uses.
+
+Whoever supplies evidence is stated. What EmuWiz observed itself is
+`measured`; an exit status or environment typed on the command line is
+`reported`, its source says it was supplied, and the report carries a note.
+A report restored from JSON is for display only: it cannot be compared with
+the files it was made from and is never diagnosed again.
 
 Categories: missing firmware, invalid or unsupported media, unsupported
 emulator version, graphics initialisation, missing dependency, sandbox failure,
@@ -151,12 +179,12 @@ given, and prints a report. It opens no database and starts no emulator.
 | `subject` | `emulator` and `game`, as supplied. |
 | `verdict` | `explained`, `partly_explained`, `conflicting`, `unknown` or `no_problem_observed`. |
 | `causes` | Why. Each has `rule`, `rule_version`, `category`, `confidence` (`established`, `probable`, `possible`), `effect`, `title`, `explanation`, `supporting` and `contradicting` evidence ids, `limitations`, `next_checks`, `repairs` (pointers only; nothing is applied) and `claims`. |
-| `symptoms` | What happened. Same shape, with `explains_cause: false`. |
+| `symptoms` | What happened. Same shape, with `explains_cause: false`. `reported: true` marks one that restates what a program printed. |
 | `conflicts` | Pairs of rules whose findings contradict each other. |
 | `rejected` | Findings the engine refused, with the reason. |
-| `coverage` | One entry per evidence area: `observed`, `stale` and the reasons anything is `missing`. |
+| `coverage` | One entry per evidence area: `observed`, `stale`, `asserted` (statements that are not observations) and the reasons anything is `missing`. |
 | `notes` | Limits that apply to the whole report. |
-| `evidence` | `subject`, `truncated` and `items`; each item has `id`, `area`, `state`, `trust`, `source`, `fingerprint` and a typed `fact`. |
+| `evidence` | `subject`, `truncated` and `items`; each item has `id`, `area`, `state`, `trust` (`measured`, `reported`, `untrusted_text`, `asserted`), `source`, `fingerprint` and a typed `fact`. Paths are sanitised for display. |
 
 `diagnose-launch --rules --json` prints `engine_version`, `digest` and `rules`
 (`id`, `version`, `category`, `summary`). New keys may be added without a
@@ -223,4 +251,5 @@ commands, change settings or approve a repair, and everything works without it.
 - Leviathan (DAT evidence, schema 27) and Ouroboros (transaction engine,
   schema 29+): Daedalus edits none of their files and plans no migration.
 - Shared registration files (`lib.rs`, CLI `main.rs`, `gui_v2/mod.rs`,
-  `routes.rs`) receive one-line additions only.
+  `routes.rs`) receive registration lines only (a module line, a dispatch
+  arm, a help line), never logic.

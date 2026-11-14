@@ -300,3 +300,85 @@ fn only_measured_and_reported_evidence_is_firm() {
     assert!(!Trust::UntrustedText.is_firm());
     assert!(!Trust::Asserted.is_firm());
 }
+
+#[test]
+fn a_fingerprint_shows_a_sanitised_path_and_checks_the_real_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retro\u{202E}arch\x1b[2J.cfg");
+    std::fs::write(&path, "a = \"1\"\n").unwrap();
+    let (_, fingerprint) = SourceFingerprint::read_with_digest(&path, 1 << 20).unwrap();
+    assert!(!fingerprint.path.contains('\u{202E}') && !fingerprint.path.contains('\x1b'));
+    // The check still finds the file by its real name.
+    assert_eq!(fingerprint.check(), FingerprintCheck::Unchanged);
+    std::fs::write(&path, "a = \"2\"\n").unwrap();
+    assert!(matches!(
+        fingerprint.check(),
+        FingerprintCheck::Changed { .. }
+    ));
+
+    // The real path is not part of the serialised form, so a restored
+    // fingerprint opens nothing and says it cannot be compared.
+    let json = serde_json::to_string(&fingerprint).unwrap();
+    assert!(!json.contains("real_path"));
+    let restored: SourceFingerprint = serde_json::from_str(&json).unwrap();
+    assert!(matches!(
+        restored.check(),
+        FingerprintCheck::Unavailable { .. }
+    ));
+}
+
+#[test]
+fn a_path_that_cannot_be_examined_is_unknown_not_something_else() {
+    if running_as_root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let inside = locked.join("game.gb");
+    std::fs::write(&inside, "rom").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let access = observe_path_access(PathRole::GameFile, &inside);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(access.presence, PathPresence::Unknown);
+    assert_eq!((access.readable, access.writable), (None, None));
+    assert!(
+        Fact::PathAccess(access)
+            .describe()
+            .contains("could not be examined")
+    );
+}
+
+#[test]
+fn asserted_statements_are_counted_apart_from_observations() {
+    let mut set = EvidenceSet::default();
+    set.observe(
+        EvidenceArea::Graphics,
+        Trust::Asserted,
+        "someone said",
+        Fact::Absent,
+    );
+    let coverage = set.coverage();
+    let graphics = coverage
+        .iter()
+        .find(|entry| entry.area == EvidenceArea::Graphics)
+        .unwrap();
+    assert_eq!((graphics.observed, graphics.asserted), (0, 1));
+    assert!(!graphics.has_current_evidence());
+    assert_eq!(graphics.missing, ["only asserted, not observed"]);
+}
+
+#[test]
+fn an_exit_status_that_relays_a_stop_request_is_not_a_failure() {
+    let exit = |code| ProcessExit {
+        outcome: ExitOutcome::Exited { code },
+        duration_ms: None,
+        launcher: None,
+    };
+    for stop in [129, 130, 131, 143] {
+        assert!(!exit(stop).is_failure(), "{stop}");
+    }
+    for failure in [1, 127, 134, 137, 139, 255] {
+        assert!(exit(failure).is_failure(), "{failure}");
+    }
+}

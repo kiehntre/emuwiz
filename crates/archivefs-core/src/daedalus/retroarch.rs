@@ -227,6 +227,27 @@ pub fn record_config(set: &mut EvidenceSet, path: &Path, layer: ConfigLayer) -> 
     let (bytes, fingerprint) =
         match SourceFingerprint::read_with_digest(path, MAX_CONFIG_BYTES as u64) {
             Ok(read) => read,
+            // No file for this layer: it overrides nothing, which is a fact
+            // about the settings and not a gap in what was read. A dangling
+            // link is not "no file": something is there and was not read.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(path)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return set
+                    .observe(
+                        EvidenceArea::EmulatorConfiguration,
+                        Trust::Measured,
+                        source,
+                        Fact::ConfigLayerAbsent {
+                            emulator: EMULATOR.to_string(),
+                            layer,
+                        },
+                    )
+                    .into_iter()
+                    .collect();
+            }
             Err(error) => {
                 return set
                     .unavailable(

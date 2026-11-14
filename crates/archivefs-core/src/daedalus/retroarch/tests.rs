@@ -268,7 +268,9 @@ fn a_settings_file_that_cannot_be_read_safely_yields_no_values() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let binary = dir.path().join("binary.cfg");
     std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
-    for path in [link, binary, dir.path().join("absent.cfg")] {
+    let dangling = dir.path().join("dangling.cfg");
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+    for path in [link, binary, dangling] {
         let mut set = EvidenceSet::default();
         let ids = record_config(&mut set, &path, ConfigLayer::Main);
         assert_eq!(ids.len(), 1, "{}", path.display());
@@ -278,6 +280,25 @@ fn a_settings_file_that_cannot_be_read_safely_yields_no_values() {
         ));
         assert!(config_values(&set).is_empty());
     }
+}
+
+#[test]
+fn a_settings_file_that_does_not_exist_is_recorded_as_an_absent_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut set = EvidenceSet::default();
+    let ids = record_config(&mut set, &dir.path().join("absent.cfg"), ConfigLayer::Game);
+    assert_eq!(ids.len(), 1);
+    let item = &set.items()[0];
+    assert!(item.is_observed());
+    assert_eq!(item.trust, Trust::Measured);
+    assert!(matches!(
+        item.fact,
+        Fact::ConfigLayerAbsent {
+            layer: ConfigLayer::Game,
+            ..
+        }
+    ));
+    assert!(item.summary().contains("no settings file exists"));
 }
 
 #[test]

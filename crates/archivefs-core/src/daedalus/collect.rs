@@ -41,6 +41,12 @@ pub struct LaunchArtefacts {
     /// Variables of the environment the emulator was started in, with
     /// `None` for a variable that was checked and found unset.
     pub environment: Vec<(String, Option<String>)>,
+    /// True when `exit`, `duration`, `launcher`, `environment` and `stderr`
+    /// were handed over by whoever asked for the diagnosis rather than
+    /// observed by EmuWiz launching the process itself. They are then
+    /// recorded as reported, their source says so, and the report carries a
+    /// note. Files and paths are always looked at by EmuWiz itself.
+    pub supplied_by_caller: bool,
 }
 
 /// Read at most [`text::LOG_BYTES_LIMIT`] bytes (plus one, so that a longer
@@ -66,13 +72,19 @@ pub fn collect(artefacts: &LaunchArtefacts) -> EvidenceSet {
             .map(|game| text::sanitise(game, text::VALUE_LIMIT)),
     });
 
+    let exit_source = if artefacts.supplied_by_caller {
+        process::ExitSource::SuppliedByCaller
+    } else {
+        process::ExitSource::Observed
+    };
     match &artefacts.exit {
         Some(outcome) => {
-            process::record_exit(
+            process::record_exit_from(
                 &mut set,
                 outcome.clone(),
                 artefacts.duration,
                 artefacts.launcher.as_deref(),
+                exit_source,
             );
         }
         None => {
@@ -91,12 +103,19 @@ pub fn collect(artefacts: &LaunchArtefacts) -> EvidenceSet {
     let mut any_log = false;
     if let Some(stderr) = &artefacts.stderr {
         any_log = true;
+        // A capture EmuWiz made is cut at a fixed size; a file someone
+        // saved is complete as supplied.
+        let record = if artefacts.supplied_by_caller {
+            process::record_supplied_output
+        } else {
+            process::record_stderr
+        };
         if is_retroarch {
             // One pass that also decides whether the output was verbose.
             retroarch::record_log(&mut set, stderr, LogStream::Stderr);
-            process::record_stderr(&mut set, stderr, emulator, &[]);
+            record(&mut set, stderr, emulator, &[]);
         } else {
-            process::record_stderr(&mut set, stderr, emulator, emulator_signatures);
+            record(&mut set, stderr, emulator, emulator_signatures);
         }
     }
     if let Some(log_file) = &artefacts.log_file {
@@ -172,11 +191,19 @@ pub fn collect(artefacts: &LaunchArtefacts) -> EvidenceSet {
             "the launch environment was not supplied",
         );
     }
+    let (environment_trust, environment_source) = if artefacts.supplied_by_caller {
+        (
+            Trust::Reported,
+            "launch environment, as supplied by whoever asked for this diagnosis",
+        )
+    } else {
+        (Trust::Measured, "environment the emulator was started in")
+    };
     for (name, value) in &artefacts.environment {
         set.observe(
             EvidenceArea::LaunchEnvironment,
-            Trust::Measured,
-            "environment the emulator was started in",
+            environment_trust,
+            environment_source,
             Fact::EnvironmentVariable {
                 name: text::sanitise(name, text::VALUE_LIMIT),
                 value: value

@@ -65,7 +65,7 @@ fn a_retroarch_failure_is_diagnosed_from_its_files() {
         .iter()
         .find(|cause| cause.rule == "retroarch.video.vulkan_unavailable")
         .unwrap();
-    assert_eq!(cause.confidence, Confidence::Probable);
+    assert_eq!(cause.confidence, Confidence::Possible);
     assert_eq!(report.verdict, Verdict::PartlyExplained);
     assert!(missing_areas(&set).contains(&EvidenceArea::Graphics));
 }
@@ -218,5 +218,86 @@ fn a_long_log_file_is_read_only_up_to_the_limit() {
         set.items().iter().any(|item| {
             matches!(&item.fact, Fact::LogCoverage(coverage) if coverage.truncated)
         })
+    );
+}
+
+#[test]
+fn what_the_caller_states_is_recorded_as_supplied_and_a_saved_log_is_complete() {
+    // 80 KiB of saved output: larger than a launcher capture, and complete.
+    let mut stderr = Vec::new();
+    while stderr.len() < 80 * 1024 {
+        stderr.extend_from_slice(b"[INFO] [Playlist]: padding\n");
+    }
+    let base = LaunchArtefacts {
+        emulator: "retroarch".into(),
+        exit: Some(ExitOutcome::Exited { code: 1 }),
+        stderr: Some(stderr),
+        environment: vec![("DISPLAY".into(), Some(":0".into()))],
+        ..LaunchArtefacts::default()
+    };
+    let cut = |set: &EvidenceSet| {
+        set.items()
+            .iter()
+            .any(|item| matches!(&item.fact, Fact::LogCoverage(coverage) if coverage.truncated))
+    };
+    let trusts = |set: &EvidenceSet| -> Vec<Trust> {
+        set.items()
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.area,
+                    EvidenceArea::ProcessExit | EvidenceArea::LaunchEnvironment
+                )
+            })
+            .map(|item| item.trust)
+            .collect()
+    };
+
+    let supplied = collect(&LaunchArtefacts {
+        supplied_by_caller: true,
+        ..base.clone()
+    });
+    assert_eq!(trusts(&supplied), [Trust::Reported, Trust::Reported]);
+    assert!(!cut(&supplied));
+    assert!(
+        diagnose(&supplied)
+            .notes
+            .iter()
+            .any(|note| note.contains("EmuWiz did not observe it"))
+    );
+
+    // The same bytes as a launcher capture are known to be cut at 64 KiB.
+    let observed = collect(&base);
+    assert_eq!(trusts(&observed), [Trust::Measured, Trust::Measured]);
+    assert!(cut(&observed));
+}
+
+#[test]
+fn a_pipe_or_a_device_where_a_file_was_expected_is_refused_without_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("retroarch.log");
+    let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path; mkfifo does not retain it.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let started = std::time::Instant::now();
+    assert!(read_log_prefix(&fifo).is_err());
+    let set = collect(&LaunchArtefacts {
+        emulator: "retroarch".into(),
+        log_file: Some(fifo.clone()),
+        settings: vec![(fifo, ConfigLayer::Main)],
+        ..LaunchArtefacts::default()
+    });
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        !set.items()
+            .iter()
+            .any(|item| matches!(item.fact, Fact::LogEvent(_)))
+    );
+    assert!(
+        set.items()
+            .iter()
+            .filter(|item| matches!(item.state, EvidenceState::Unavailable { .. }))
+            .count()
+            >= 2
     );
 }

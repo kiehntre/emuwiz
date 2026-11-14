@@ -129,6 +129,24 @@ fn has_cause(report: &DiagnosisReport, rule: &str) -> bool {
     report.causes.iter().any(|cause| cause.rule == rule)
 }
 
+/// Symptoms about how the process ended, leaving out what the emulator
+/// itself reported.
+fn exit_symptoms(report: &DiagnosisReport) -> Vec<&Diagnosis> {
+    report
+        .symptoms
+        .iter()
+        .filter(|symptom| !symptom.reported)
+        .collect()
+}
+
+fn reported<'a>(report: &'a DiagnosisReport, what: &str) -> &'a Diagnosis {
+    report
+        .symptoms
+        .iter()
+        .find(|symptom| symptom.reported && symptom.title.contains(what))
+        .unwrap_or_else(|| panic!("no reported symptom about {what}: {:#?}", report.symptoms))
+}
+
 /// The Vulkan failure exactly as captured: settings say Vulkan, the run
 /// exited with status 1, and the log is RetroArch's own.
 fn vulkan_failure(log: &str) -> EvidenceSet {
@@ -142,11 +160,11 @@ fn vulkan_failure(log: &str) -> EvidenceSet {
 const VULKAN_RULE: &str = "retroarch.video.vulkan_unavailable";
 
 #[test]
-fn a_real_vulkan_failure_is_probable_until_vulkan_is_actually_probed() {
+fn a_real_vulkan_failure_is_only_possible_until_vulkan_is_actually_probed() {
     let set = vulkan_failure(fixtures::RA_VULKAN_NO_DRIVER);
     let report = diagnose(&set);
     let found = cause(&report, VULKAN_RULE);
-    assert_eq!(found.confidence, Confidence::Probable);
+    assert_eq!(found.confidence, Confidence::Possible);
     assert_eq!(found.category, DiagnosisCategory::GraphicsInitialisation);
     assert_eq!(report.verdict, Verdict::PartlyExplained);
     assert!(found.supporting.len() >= 3);
@@ -163,9 +181,14 @@ fn a_real_vulkan_failure_is_probable_until_vulkan_is_actually_probed() {
             .iter()
             .any(|hint| hint.template == "retroarch.video_driver")
     );
-    // The exit itself is reported as what happened, not why.
-    assert_eq!(report.symptoms.len(), 1);
-    assert!(!report.symptoms[0].explains_cause);
+    // The exit itself is what happened, not why; so is what RetroArch said.
+    assert_eq!(exit_symptoms(&report).len(), 1);
+    assert!(
+        report
+            .symptoms
+            .iter()
+            .all(|symptom| !symptom.explains_cause)
+    );
 }
 
 #[test]
@@ -213,7 +236,7 @@ fn a_host_probe_never_stands_in_for_the_launch_environment() {
     probe(&mut set, GraphicsApi::Vulkan, ProbeScope::Host, true);
     let report = diagnose(&set);
     let found = cause(&report, VULKAN_RULE);
-    assert_eq!(found.confidence, Confidence::Probable);
+    assert_eq!(found.confidence, Confidence::Possible);
     assert!(found.contradicting.is_empty());
     assert!(
         found
@@ -221,6 +244,16 @@ fn a_host_probe_never_stands_in_for_the_launch_environment() {
             .iter()
             .any(|limit| limit.contains("sandbox"))
     );
+
+    // A host on which Vulkan does not work at all makes it probable, and
+    // only a check of the launch environment itself establishes it.
+    let mut set = vulkan_failure(fixtures::RA_VULKAN_NO_DRIVER);
+    let host = probe(&mut set, GraphicsApi::Vulkan, ProbeScope::Host, false);
+    let report = diagnose(&set);
+    let found = cause(&report, VULKAN_RULE);
+    assert_eq!(found.confidence, Confidence::Probable);
+    assert!(found.supporting.contains(&host));
+    assert_ne!(report.verdict, Verdict::Explained);
 }
 
 #[test]
@@ -342,7 +375,7 @@ fn a_clean_exit_with_an_ignored_core_is_still_a_problem() {
     assert_eq!(found.confidence, Confidence::Possible);
     assert!(found.explanation.contains("clean exit"));
     assert_ne!(report.verdict, Verdict::NoProblemObserved);
-    assert!(report.symptoms.is_empty());
+    assert!(exit_symptoms(&report).is_empty());
 
     path(
         &mut set,
@@ -397,7 +430,9 @@ fn a_core_that_exists_but_will_not_load_is_a_load_problem_not_a_missing_file() {
     );
     let report = diagnose(&set);
     let found = cause(&report, "retroarch.core.open_failed");
-    assert_eq!(found.confidence, Confidence::Probable);
+    // A readable core is true of every healthy setup: it does not make the
+    // emulator's message more than a possibility.
+    assert_eq!(found.confidence, Confidence::Possible);
     assert_eq!(found.category, DiagnosisCategory::MissingDependency);
     assert!(!has_cause(&report, "retroarch.core.not_loaded"));
 }
@@ -471,7 +506,7 @@ fn a_file_readable_on_the_host_but_not_by_retroarch_points_at_visibility() {
 }
 
 #[test]
-fn a_rejected_game_file_is_probable_only_once_the_file_is_known_readable() {
+fn a_rejected_game_file_stays_a_possibility_even_when_the_file_is_readable() {
     let mut set = EvidenceSet::default();
     exited(&mut set, 1);
     ra_log(&mut set, fixtures::RA_CONTENT_GARBAGE);
@@ -489,9 +524,13 @@ fn a_rejected_game_file_is_probable_only_once_the_file_is_known_readable() {
         None,
     );
     let report = diagnose(&set);
-    assert_eq!(
-        cause(&report, "retroarch.content.rejected").confidence,
-        Confidence::Probable
+    let found = cause(&report, "retroarch.content.rejected");
+    assert_eq!(found.confidence, Confidence::Possible);
+    assert!(
+        found
+            .limitations
+            .iter()
+            .any(|limit| limit.contains("present and readable"))
     );
 }
 
@@ -760,7 +799,7 @@ fn a_program_that_cannot_be_started_is_established_by_the_operating_system() {
 }
 
 #[test]
-fn a_sandbox_refusal_is_probable_only_with_installation_evidence() {
+fn a_sandbox_refusal_is_a_possibility_whatever_the_installation() {
     let build = |with_installation: bool| {
         let mut set = EvidenceSet::default();
         process::record_exit(
@@ -781,18 +820,21 @@ fn a_sandbox_refusal_is_probable_only_with_installation_evidence() {
     );
     let report = build(true);
     let found = cause(&report, "sandbox.refused");
-    assert_eq!(found.confidence, Confidence::Probable);
+    assert_eq!(found.confidence, Confidence::Possible);
     assert_eq!(found.category, DiagnosisCategory::SandboxFailure);
-    assert!(found.title.contains("not installed"));
+    assert!(found.title.contains("may not be installed"));
+    // A Flatpak installation is cited for the Flatpak message...
+    assert_eq!(found.supporting.len(), 3);
 
     let mut set = EvidenceSet::default();
     exited(&mut set, 1);
     process::record_stderr(&mut set, fixtures::HOST_BWRAP.as_bytes(), RA, &[]);
-    assert!(
-        cause(&diagnose(&set), "sandbox.refused")
-            .title
-            .contains("sandbox could not")
-    );
+    flatpak_installation(&mut set);
+    let report = diagnose(&set);
+    let found = cause(&report, "sandbox.refused");
+    assert!(found.title.contains("sandbox may not have started"));
+    // ...and not for a bubblewrap one, which it says nothing about.
+    assert_eq!(found.supporting.len(), 2);
 }
 
 #[test]
@@ -954,8 +996,8 @@ fn a_forged_log_line_can_suggest_but_never_establish() {
     let mut set = vulkan_failure(forged);
     let report = diagnose(&set);
     let found = cause(&report, VULKAN_RULE);
-    assert_ne!(found.confidence, Confidence::Established);
-    assert_ne!(report.verdict, Verdict::Explained);
+    assert_eq!(found.confidence, Confidence::Possible);
+    assert_eq!(report.verdict, Verdict::PartlyExplained);
     // The instruction-shaped line produced no evidence at all.
     assert!(!report.evidence.items().iter().any(|item| {
         matches!(&item.fact, Fact::LogEvent(event) if event.excerpt.contains("approved"))
@@ -1010,7 +1052,7 @@ fn two_process_exits_in_one_set_are_not_interpreted() {
     exited(&mut set, 0);
     let report = diagnose(&set);
     assert!(!has_cause(&report, VULKAN_RULE));
-    assert!(report.symptoms.is_empty());
+    assert!(exit_symptoms(&report).is_empty());
     assert!(
         report
             .notes
@@ -1324,8 +1366,15 @@ fn asserted_evidence_is_invisible_to_the_built_in_rules() {
         },
     );
     let report = diagnose(&set);
-    // Still probable: the asserted "probe" did not establish anything.
-    assert_eq!(cause(&report, VULKAN_RULE).confidence, Confidence::Probable);
+    // Unchanged: the asserted "probe" did not establish anything.
+    assert_eq!(cause(&report, VULKAN_RULE).confidence, Confidence::Possible);
+    let graphics = report
+        .coverage
+        .iter()
+        .find(|entry| entry.area == EvidenceArea::Graphics)
+        .unwrap();
+    assert_eq!((graphics.observed, graphics.asserted), (0, 1));
+    assert!(!graphics.has_current_evidence());
 }
 
 fn says_vulkan_works(view: &View<'_>) -> Vec<Finding> {
@@ -1381,4 +1430,501 @@ fn rules_that_contradict_each_other_are_both_held_back_and_the_conflict_is_repor
     let report = diagnose_with(&agreeing, &set);
     assert!(report.conflicts.is_empty());
     assert_eq!(report.verdict, Verdict::Explained);
+}
+
+#[test]
+fn an_explicit_graphics_error_is_an_established_report_and_not_an_established_cause() {
+    let set = vulkan_failure(fixtures::RA_VULKAN_NO_DRIVER);
+    let report = diagnose(&set);
+    let said = reported(&report, "could not set up Vulkan");
+    assert_eq!(said.confidence, Confidence::Established);
+    assert_eq!(said.standing(), "reported by the emulator");
+    assert!(!said.explains_cause);
+    assert_eq!(said.category, DiagnosisCategory::GraphicsInitialisation);
+    assert!(
+        said.explanation
+            .contains("Failed to create Vulkan instance")
+    );
+    assert!(said.repairs.is_empty());
+    assert!(
+        said.limitations
+            .iter()
+            .any(|limit| limit.contains("that it is the underlying cause is not"))
+    );
+    reported(&report, "could not start its video driver");
+    // The cause is still only as firm as its own evidence.
+    assert_eq!(cause(&report, VULKAN_RULE).confidence, Confidence::Possible);
+    assert_eq!(cause(&report, VULKAN_RULE).standing(), "possible");
+    assert_ne!(report.verdict, Verdict::Explained);
+}
+
+#[test]
+fn a_reported_error_with_nothing_else_leaves_the_cause_unknown() {
+    let mut set = EvidenceSet::default();
+    ra_log(&mut set, fixtures::RA_VULKAN_NO_DRIVER);
+    let report = diagnose(&set);
+    assert!(report.causes.is_empty());
+    assert!(!report.symptoms.is_empty());
+    assert!(report.symptoms.iter().all(|symptom| symptom.reported));
+    assert_eq!(report.verdict, Verdict::Unknown);
+}
+
+#[test]
+fn every_kind_of_error_retroarch_states_outright_is_reported_once() {
+    for (log, what) in [
+        (fixtures::RA_CORE_IGNORED, "ignored the emulator core"),
+        (
+            fixtures::RA_CORE_NOT_A_LIBRARY,
+            "could not open the emulator core",
+        ),
+        (fixtures::RA_CONTENT_MISSING, "could not read the game file"),
+        (fixtures::RA_CONTENT_GARBAGE, "refused the game file"),
+        (fixtures::RA_SAVE_DIR_READ_ONLY, "could not write save data"),
+    ] {
+        let mut set = EvidenceSet::default();
+        ra_log(&mut set, log);
+        let report = diagnose(&set);
+        let matching = report
+            .symptoms
+            .iter()
+            .filter(|symptom| symptom.reported && symptom.title.contains(what))
+            .count();
+        assert_eq!(matching, 1, "{what}");
+    }
+    // The audio line is printed on healthy runs and is not a report.
+    let mut set = EvidenceSet::default();
+    ra_log(&mut set, fixtures::RA_SILENT_CORE_AUDIO);
+    assert!(diagnose(&set).symptoms.is_empty());
+}
+
+#[test]
+fn repeated_messages_are_one_report_that_says_how_often() {
+    let mut set = EvidenceSet::default();
+    ra_log(
+        &mut set,
+        "[ERROR] Failed to create Vulkan instance.\n[ERROR] Failed to create Vulkan instance.\n",
+    );
+    let report = diagnose(&set);
+    let said = reported(&report, "could not set up Vulkan");
+    assert_eq!(said.supporting.len(), 2);
+    assert!(said.explanation.contains("2 times"));
+}
+
+fn reports_a_measurement(view: &View<'_>) -> Vec<Finding> {
+    view.environment("DISPLAY")
+        .map(|(item, _)| Finding::reported("RetroArch reported something", "e").support(item))
+        .into_iter()
+        .collect()
+}
+
+#[test]
+fn only_emulator_output_can_be_presented_as_a_report() {
+    let mut set = EvidenceSet::default();
+    environment(&mut set, "DISPLAY", Some(":0"));
+    let report = diagnose_with(&[test_rule("test.report", reports_a_measurement)], &set);
+    assert!(report.symptoms.is_empty());
+    assert_eq!(report.rejected.len(), 1);
+    assert!(report.rejected[0].reason.contains("emulator output"));
+}
+
+// --- findings of the independent review of 9f15c1d5 ---------------------------
+
+#[test]
+fn a_crash_is_not_explained_by_a_problem_that_only_degrades_the_game() {
+    let mut set = EvidenceSet::default();
+    ended_by_signal(&mut set, libc::SIGSEGV);
+    path(
+        &mut set,
+        PathRole::SaveDirectory,
+        PathPresence::Directory,
+        Some(true),
+        Some(false),
+    );
+    set.observe(
+        EvidenceArea::EmulatorConfiguration,
+        Trust::Measured,
+        "settings",
+        Fact::ControllerBinding {
+            emulator: "pcsx2".into(),
+            player: 1,
+            bound: false,
+        },
+    );
+    let report = diagnose(&set);
+    // Both are still reported, as established, but neither is why it crashed.
+    assert_eq!(report.causes.len(), 2);
+    assert!(
+        report
+            .causes
+            .iter()
+            .all(|cause| cause.confidence == Confidence::Established)
+    );
+    assert_eq!(report.verdict, Verdict::Unknown);
+
+    // With nothing failing, the same finding is the whole story.
+    let mut set = EvidenceSet::default();
+    exited(&mut set, 0);
+    path(
+        &mut set,
+        PathRole::SaveDirectory,
+        PathPresence::Directory,
+        Some(true),
+        Some(false),
+    );
+    assert_eq!(diagnose(&set).verdict, Verdict::Explained);
+}
+
+#[test]
+fn a_settings_layer_that_could_not_be_read_holds_setting_based_findings_at_possible() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("retroarch.cfg");
+    std::fs::write(&main, "video_driver = \"vulkan\"\n").unwrap();
+    let real_override = dir.path().join("real.cfg");
+    std::fs::write(&real_override, "video_driver = \"gl\"\n").unwrap();
+    let game_override = dir.path().join("game.cfg");
+    std::os::unix::fs::symlink(&real_override, &game_override).unwrap();
+
+    let build = |with_unreadable_override: bool| {
+        let mut set = EvidenceSet::default();
+        retroarch::record_config(&mut set, &main, ConfigLayer::Main);
+        if with_unreadable_override {
+            // A symbolic link is not followed, so this layer stays unread.
+            retroarch::record_config(&mut set, &game_override, ConfigLayer::Game);
+        }
+        exited(&mut set, 1);
+        ra_log(&mut set, fixtures::RA_VULKAN_NO_DRIVER);
+        probe(
+            &mut set,
+            GraphicsApi::Vulkan,
+            ProbeScope::LaunchEnvironment,
+            false,
+        );
+        diagnose(&set)
+    };
+    let complete = build(false);
+    let found = cause(&complete, VULKAN_RULE);
+    assert_eq!(found.confidence, Confidence::Established);
+    assert!(
+        found
+            .limitations
+            .iter()
+            .any(|limit| limit.contains("Only the main settings file was examined"))
+    );
+
+    let incomplete = build(true);
+    let found = cause(&incomplete, VULKAN_RULE);
+    assert_eq!(found.confidence, Confidence::Possible);
+    assert!(
+        found
+            .limitations
+            .iter()
+            .any(|limit| limit.contains("could not be read"))
+    );
+    assert_ne!(incomplete.verdict, Verdict::Explained);
+}
+
+#[test]
+fn an_override_layer_that_does_not_exist_is_examined_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("retroarch.cfg");
+    std::fs::write(&main, "video_driver = \"vulkan\"\n").unwrap();
+    let mut set = EvidenceSet::default();
+    retroarch::record_config(&mut set, &main, ConfigLayer::Main);
+    for layer in [
+        ConfigLayer::Core,
+        ConfigLayer::ContentDirectory,
+        ConfigLayer::Game,
+    ] {
+        retroarch::record_config(&mut set, &dir.path().join("absent.cfg"), layer);
+    }
+    exited(&mut set, 1);
+    ra_log(&mut set, fixtures::RA_VULKAN_NO_DRIVER);
+    probe(
+        &mut set,
+        GraphicsApi::Vulkan,
+        ProbeScope::LaunchEnvironment,
+        false,
+    );
+    let report = diagnose(&set);
+    let found = cause(&report, VULKAN_RULE);
+    assert_eq!(found.confidence, Confidence::Established);
+    assert!(
+        !found
+            .limitations
+            .iter()
+            .any(|limit| limit.contains("Only the main settings file"))
+    );
+}
+
+#[test]
+fn an_exit_status_that_relays_a_stop_request_is_not_a_failure_or_a_crash() {
+    for code in [129, 130, 131, 143] {
+        let mut set_with_stop = EvidenceSet::default();
+        setting(
+            &mut set_with_stop,
+            "video_driver",
+            "vulkan",
+            ConfigLayer::Main,
+        );
+        process::record_exit(
+            &mut set_with_stop,
+            ExitOutcome::Exited { code },
+            None,
+            Some("flatpak run"),
+        );
+        ra_log(&mut set_with_stop, fixtures::RA_VULKAN_NO_DRIVER_QUIET);
+        let report = diagnose(&set_with_stop);
+        assert!(exit_symptoms(&report).is_empty(), "{code}");
+        assert!(!has_cause(&report, VULKAN_RULE), "{code}");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("stop request") && note.contains(&code.to_string())),
+            "{code}"
+        );
+    }
+    // A relayed forced stop is a possibility, and not a crash.
+    let mut set = EvidenceSet::default();
+    exited(&mut set, 137);
+    let report = diagnose(&set);
+    let possible: Vec<&Diagnosis> = report
+        .symptoms
+        .iter()
+        .filter(|symptom| symptom.confidence == Confidence::Possible)
+        .collect();
+    assert_eq!(possible.len(), 1);
+    assert!(possible[0].title.contains("forcibly stopped"));
+    assert_ne!(possible[0].category, DiagnosisCategory::Crash);
+    assert_eq!(report.verdict, Verdict::Unknown);
+}
+
+#[test]
+fn error_lines_without_any_exit_status_are_not_reported_as_no_problem() {
+    for log in [
+        fixtures::RA_VULKAN_NO_DRIVER,
+        fixtures::RA_VULKAN_NO_DRIVER_QUIET,
+        "Fatal error received in: \"something_else()\"\n",
+    ] {
+        let mut set = EvidenceSet::default();
+        setting(&mut set, "video_driver", "vulkan", ConfigLayer::Main);
+        ra_log(&mut set, log);
+        let report = diagnose(&set);
+        assert_eq!(report.verdict, Verdict::Unknown, "{log}");
+        assert!(report.symptoms.iter().all(|symptom| symptom.reported));
+    }
+    for (stderr, what) in [
+        (fixtures::HOST_LOADER, "library"),
+        (fixtures::HOST_FLATPAK, "sandbox"),
+        (fixtures::HOST_BWRAP, "sandbox"),
+    ] {
+        let mut set = EvidenceSet::default();
+        exited(&mut set, 0);
+        process::record_stderr(&mut set, stderr.as_bytes(), RA, &[]);
+        let report = diagnose(&set);
+        assert_eq!(report.verdict, Verdict::Unknown, "{what}");
+        let said = reported(&report, what);
+        assert!(
+            said.title.starts_with("The system reported"),
+            "{}",
+            said.title
+        );
+    }
+}
+
+#[test]
+fn a_caller_supplied_exit_is_reported_not_measured_and_the_report_says_so() {
+    let mut set = EvidenceSet::default();
+    let id = process::record_exit_from(
+        &mut set,
+        ExitOutcome::SpawnFailed {
+            reason: SpawnFailure::ProgramNotFound,
+            os_error: None,
+        },
+        None,
+        None,
+        process::ExitSource::SuppliedByCaller,
+    )
+    .unwrap();
+    let item = set.get(&id).unwrap();
+    assert_eq!(item.trust, Trust::Reported);
+    assert!(item.source.contains("supplied"));
+    assert!(!item.source.contains("operating system"));
+    let report = diagnose(&set);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("EmuWiz did not observe it"))
+    );
+
+    let mut observed = EvidenceSet::default();
+    exited(&mut observed, 1);
+    assert!(
+        !diagnose(&observed)
+            .notes
+            .iter()
+            .any(|note| note.contains("did not observe"))
+    );
+}
+
+#[test]
+fn asserted_items_do_not_mix_runs_contradict_or_count_as_coverage() {
+    let mut set = vulkan_failure(fixtures::RA_VULKAN_NO_DRIVER);
+    set.observe(
+        EvidenceArea::ProcessExit,
+        Trust::Asserted,
+        "AI suggestion",
+        Fact::ProcessExit(ProcessExit {
+            outcome: ExitOutcome::Exited { code: 0 },
+            duration_ms: None,
+            launcher: None,
+        }),
+    );
+    let report = diagnose(&set);
+    // One real exit: it is still interpreted, and nothing says "mixed".
+    assert!(has_cause(&report, VULKAN_RULE));
+    assert_eq!(exit_symptoms(&report).len(), 1);
+    assert!(
+        !report
+            .notes
+            .iter()
+            .any(|note| note.contains("more than one"))
+    );
+}
+
+fn symptom_from_text_and_exit(view: &View<'_>) -> Vec<Finding> {
+    let events = view.events(LogMeaning::VulkanUnavailable);
+    let (Some((event, _)), Some((exit, _))) = (events.first(), view.failed_exit()) else {
+        return Vec::new();
+    };
+    vec![
+        Finding::symptom(Confidence::Established, "t", "e")
+            .support(event)
+            .support(exit),
+    ]
+}
+
+#[test]
+fn the_text_limit_applies_to_symptoms_as_well_as_causes() {
+    let mut set = EvidenceSet::default();
+    exited(&mut set, 1);
+    ra_log(&mut set, fixtures::RA_VULKAN_NO_DRIVER);
+    let report = diagnose_with(
+        &[test_rule("test.symptom", symptom_from_text_and_exit)],
+        &set,
+    );
+    assert_eq!(report.symptoms.len(), 1);
+    assert_eq!(report.symptoms[0].confidence, Confidence::Possible);
+}
+
+#[test]
+fn a_limit_that_only_looks_like_a_table_entry_is_not_accepted() {
+    let entry = &limitations::MINIMUM_VERSIONS[0];
+    let observe = |id: &str, summary: &str, trust: Trust| {
+        let mut set = EvidenceSet::default();
+        set.observe(
+            EvidenceArea::KnownLimitations,
+            trust,
+            "somewhere",
+            Fact::KnownLimitation {
+                id: id.into(),
+                summary: summary.into(),
+                violated: true,
+            },
+        );
+        diagnose(&set).causes.len()
+    };
+    assert_eq!(observe(entry.id, entry.summary, Trust::Measured), 1);
+    assert_eq!(observe("made.up", entry.summary, Trust::Measured), 0);
+    assert_eq!(
+        observe(entry.id, "Reinstall everything.", Trust::Measured),
+        0
+    );
+    assert_eq!(observe(entry.id, entry.summary, Trust::Reported), 0);
+    assert_eq!(observe(entry.id, entry.summary, Trust::UntrustedText), 0);
+}
+
+#[test]
+fn the_emulator_path_is_cited_only_when_it_agrees_with_the_spawn_failure() {
+    let build = |presence| {
+        let mut set = EvidenceSet::default();
+        process::record_exit(
+            &mut set,
+            ExitOutcome::SpawnFailed {
+                reason: SpawnFailure::ProgramNotFound,
+                os_error: Some(libc::ENOENT),
+            },
+            None,
+            None,
+        );
+        let item = path(
+            &mut set,
+            PathRole::EmulatorExecutable,
+            presence,
+            Some(true),
+            None,
+        );
+        (diagnose(&set), item)
+    };
+    let (report, item) = build(PathPresence::Missing);
+    assert!(
+        cause(&report, "dependency.emulator_program_unavailable")
+            .supporting
+            .contains(&item)
+    );
+    let (report, item) = build(PathPresence::RegularFile);
+    let found = cause(&report, "dependency.emulator_program_unavailable");
+    assert!(!found.supporting.contains(&item));
+    assert!(
+        found
+            .limitations
+            .iter()
+            .any(|limit| limit.contains("program file itself exists"))
+    );
+}
+
+#[test]
+fn the_no_display_finding_only_misses_the_emulator_s_account_when_there_is_none() {
+    let build = |log: Option<&str>| {
+        let mut set = EvidenceSet::default();
+        ended_by_signal(&mut set, libc::SIGABRT);
+        environment(&mut set, "DISPLAY", None);
+        environment(&mut set, "WAYLAND_DISPLAY", None);
+        if let Some(log) = log {
+            ra_log(&mut set, log);
+        }
+        let report = diagnose(&set);
+        cause(&report, "environment.no_display").limitations.clone()
+    };
+    assert!(
+        build(None)
+            .iter()
+            .any(|limit| limit.contains("own account"))
+    );
+    assert!(
+        !build(Some(fixtures::RA_CONTENT_MISSING))
+            .iter()
+            .any(|limit| limit.contains("own account"))
+    );
+}
+
+#[test]
+fn the_rule_set_digest_covers_signatures_and_the_compatibility_table() {
+    // The digest text of every signature and table entry is distinct, and
+    // changes with the version and the pattern.
+    let mut texts: Vec<String> = HOST_SIGNATURES
+        .iter()
+        .chain(retroarch::SIGNATURES)
+        .map(|signature| signature.digest_text())
+        .collect();
+    let count = texts.len();
+    texts.sort();
+    texts.dedup();
+    assert_eq!(texts.len(), count);
+    let signature = HOST_SIGNATURES[0];
+    let mut bumped = signature;
+    bumped.version += 1;
+    assert_ne!(signature.digest_text(), bumped.digest_text());
+    assert!(limitations::digest_text().contains(limitations::MINIMUM_VERSIONS[0].id));
 }

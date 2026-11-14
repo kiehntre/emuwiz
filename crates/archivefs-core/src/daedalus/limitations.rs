@@ -82,6 +82,14 @@ pub fn record(set: &mut EvidenceSet, emulator: &str, version: Option<&str>) -> V
     ids
 }
 
+/// Whether `id` and `summary` are exactly an entry of the table. The rules
+/// accept a compatibility limit only when this holds.
+pub fn is_table_entry(id: &str, summary: &str) -> bool {
+    MINIMUM_VERSIONS
+        .iter()
+        .any(|entry| entry.id == id && entry.summary == summary)
+}
+
 pub(super) fn digest_text() -> String {
     MINIMUM_VERSIONS
         .iter()

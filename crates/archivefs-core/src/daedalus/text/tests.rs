@@ -89,3 +89,44 @@ fn quoted_after_takes_the_first_quoted_string_after_the_prefix() {
     assert_eq!(quoted_after("key: \"unterminated", "key: "), None);
     assert_eq!(quoted_after(" key: \"value\"", "key: "), None);
 }
+
+#[test]
+fn sanitise_covers_the_invisible_and_reordering_characters_beyond_ascii() {
+    for hidden in [
+        '\u{061C}',
+        '\u{00AD}',
+        '\u{180E}',
+        '\u{200E}',
+        '\u{206A}',
+        '\u{206F}',
+        '\u{FFF9}',
+        '\u{FFFB}',
+        '\u{3164}',
+        '\u{115F}',
+        '\u{E0001}',
+        '\u{E007F}',
+        '\u{009B}',
+        '\u{007F}',
+        '\u{2066}',
+        '\u{202E}',
+    ] {
+        let clean = sanitise(&format!("a{hidden}b"), 10);
+        assert_eq!(clean, "a\u{FFFD}b", "U+{:04X}", hidden as u32);
+    }
+    // Ordinary non-ASCII text is left alone.
+    assert_eq!(sanitise("Pokémon ポケモン – ½", 40), "Pokémon ポケモン – ½");
+}
+
+#[test]
+fn limits_and_byte_counts_are_those_of_the_captured_bytes() {
+    // 3,000 undecodable bytes become 9,000 bytes of replacement characters,
+    // which must not push the line over the limit or inflate the count.
+    let mut input = vec![0xff; 3_000];
+    input.extend_from_slice(b"\nnext\n");
+    let examined = examine(&input);
+    assert_eq!(examined.lines_ignored, 0);
+    assert_eq!(examined.line_count(), 2);
+    assert_eq!(examined.bytes_examined, input.len() as u64);
+    let all_bad = vec![0xff; LOG_BYTES_LIMIT];
+    assert!(examine(&all_bad).bytes_examined <= LOG_BYTES_LIMIT as u64);
+}

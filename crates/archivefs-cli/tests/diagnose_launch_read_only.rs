@@ -123,7 +123,7 @@ fn a_captured_vulkan_failure_is_diagnosed_and_nothing_is_touched() {
     ];
     let text = stdout(&fixture.run(&args));
     assert!(
-        text.contains("Vulkan graphics could not start [probable]"),
+        text.contains("Vulkan graphics could not start [possible]"),
         "{text}"
     );
     assert!(text.contains("Verdict:"), "{text}");
@@ -138,7 +138,7 @@ fn a_captured_vulkan_failure_is_diagnosed_and_nothing_is_touched() {
         report["causes"][0]["rule"],
         "retroarch.video.vulkan_unavailable"
     );
-    assert_eq!(report["causes"][0]["confidence"], "probable");
+    assert_eq!(report["causes"][0]["confidence"], "possible");
     assert_eq!(report["symptoms"][0]["explains_cause"], false);
     assert!(report["rule_set"]["digest"].as_str().unwrap().len() == 64);
     // Every supporting id resolves to an evidence item in the same report.
@@ -225,4 +225,185 @@ fn hostile_log_text_never_reaches_the_terminal_raw() {
     let text = stdout(&output);
     assert!(text.contains("core could not be opened"), "{text}");
     assert!(!text.contains('\x1b') && !text.contains('\x07') && !text.contains('\u{202E}'));
+}
+
+#[test]
+fn what_was_typed_is_reported_as_supplied_and_every_unread_input_is_listed() {
+    let fixture = Fixture::new();
+    let main = fixture.write("work/retroarch.cfg", "video_driver = \"gl\"\n");
+    let hidden = fixture.write("work/real-override.cfg", "video_driver = \"vulkan\"\n");
+    let link = fixture.path("work/game.cfg");
+    std::os::unix::fs::symlink(&hidden, &link).unwrap();
+    let stderr = fixture.write(
+        "work/stderr.txt",
+        "Fatal error received in: \"video_driver_init_internal()\"\n",
+    );
+    let args = [
+        "diagnose-launch",
+        "--emulator",
+        " RetroArch ",
+        "--exit-code",
+        "1",
+        "--settings",
+        &main,
+        "--game-settings",
+        link.to_str().unwrap(),
+        "--stderr-file",
+        &stderr,
+    ];
+    let text = stdout(&fixture.run(&args));
+    // The unread override is named, even though the area has other evidence.
+    assert!(
+        text.contains("Emulator settings (partly observed):"),
+        "{text}"
+    );
+    assert!(text.contains("could not be read"), "{text}");
+    assert!(text.contains("[possible]"), "{text}");
+    assert!(text.contains("EmuWiz did not observe it"), "{text}");
+    assert!(text.contains("reported by the emulator"), "{text}");
+
+    let mut json_args = args.to_vec();
+    json_args.push("--json");
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout(&fixture.run(&json_args))).unwrap();
+    let exit = report["evidence"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["area"] == "process_exit")
+        .unwrap();
+    assert_eq!(exit["trust"], "reported");
+    assert!(exit["source"].as_str().unwrap().contains("supplied"));
+    assert_ne!(report["verdict"], "explained");
+}
+
+#[test]
+fn a_crash_next_to_an_unwritable_save_folder_is_not_called_explained() {
+    let fixture = Fixture::new();
+    let saves = fixture.path("work/saves");
+    fs::create_dir(&saves).unwrap();
+    fs::set_permissions(&saves, std::os::unix::fs::PermissionsExt::from_mode(0o555)).unwrap();
+    let output = fixture.run(&[
+        "diagnose-launch",
+        "--emulator",
+        "retroarch",
+        "--signal",
+        "11",
+        "--save-dir",
+        saves.to_str().unwrap(),
+        "--json",
+    ]);
+    fs::set_permissions(&saves, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    // Running as root makes the folder writable; then there is no cause at all.
+    assert_eq!(report["verdict"], "unknown");
+}
+
+#[test]
+fn stop_requests_relayed_by_a_launcher_are_not_failures() {
+    let fixture = Fixture::new();
+    for code in ["143", "130"] {
+        let report: serde_json::Value = serde_json::from_str(&stdout(&fixture.run(&[
+            "diagnose-launch",
+            "--emulator",
+            "retroarch",
+            "--exit-code",
+            code,
+            "--launcher",
+            "flatpak run",
+            "--json",
+        ])))
+        .unwrap();
+        assert_eq!(report["verdict"], "no_problem_observed", "{code}");
+        assert!(report["symptoms"].as_array().unwrap().is_empty(), "{code}");
+        let notes = report["notes"].to_string();
+        assert!(notes.contains("stop request"), "{notes}");
+    }
+}
+
+#[test]
+fn hostile_paths_reach_neither_the_error_message_nor_the_json_raw() {
+    let fixture = Fixture::new();
+    let missing = fixture
+        .path("work/gone\x1b]0;owned\x07.txt")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let output = fixture.run(&[
+        "diagnose-launch",
+        "--emulator",
+        "retroarch",
+        "--stderr-file",
+        &missing,
+    ]);
+    assert!(!output.status.success());
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(message.contains("cannot read"), "{message}");
+    assert!(
+        !message.contains('\x1b') && !message.contains('\x07'),
+        "{message:?}"
+    );
+
+    let odd = fixture.write("work/odd\u{202E}\u{9b}name.cfg", "video_driver = \"gl\"\n");
+    for extra in [&[][..], &["--json"][..]] {
+        let mut args = vec![
+            "diagnose-launch",
+            "--emulator",
+            "retroarch",
+            "--settings",
+            &odd,
+            "--game-file",
+            &odd,
+        ];
+        args.extend_from_slice(extra);
+        let text = stdout(&fixture.run(&args));
+        for raw in ['\u{202E}', '\u{9b}', '\x1b'] {
+            assert!(
+                !text.contains(raw),
+                "U+{:04X} in {extra:?} output",
+                raw as u32
+            );
+        }
+    }
+}
+
+#[test]
+fn values_that_are_not_what_they_claim_to_be_are_refused() {
+    let fixture = Fixture::new();
+    for args in [
+        &[
+            "diagnose-launch",
+            "--emulator",
+            "retroarch",
+            "--exit-code",
+            "256",
+        ][..],
+        &[
+            "diagnose-launch",
+            "--emulator",
+            "retroarch",
+            "--exit-code",
+            "-1",
+        ],
+        &[
+            "diagnose-launch",
+            "--emulator",
+            "retroarch",
+            "--game-file",
+            "",
+        ],
+        &[
+            "diagnose-launch",
+            "--emulator",
+            "retroarch",
+            "--env",
+            "DISPLAY=:0",
+            "--env-unset",
+            "DISPLAY",
+        ],
+    ] {
+        let output = fixture.run(args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
 }

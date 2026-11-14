@@ -13,7 +13,9 @@ use archivefs_core::daedalus::rules::{Diagnosis, DiagnosisReport, diagnose, rule
 
 pub const HELP: &str = "  diagnose-launch --emulator <name> [evidence...] [--json]
                              Read-only: explain a failed emulator launch from the files it left behind.
-                             Starts nothing and changes nothing. Evidence (all optional):
+                             Starts nothing and changes nothing. How the process ended and its
+                             environment are taken as you state them and reported as supplied, not
+                             observed. Evidence (all optional):
                                --exit-code <n> | --signal <n> | --spawn-error not-found|permission-denied|other
                                --duration-ms <n>  --launcher <name>  --game <title>
                                --stderr-file <path>  --log-file <path>
@@ -108,7 +110,13 @@ fn parse(args: &[String]) -> Result<Request, String> {
                         .map_err(|_| usage(format!("{flag} needs a whole number, not {text:?}")))
                 };
                 parsed.exit = Some(match flag {
-                    "--exit-code" => ExitOutcome::Exited { code: number()? },
+                    "--exit-code" => {
+                        let code = number()?;
+                        if !(0..=255).contains(&code) {
+                            return Err(usage(format!("{code} is not an exit status (0 to 255)")));
+                        }
+                        ExitOutcome::Exited { code }
+                    }
                     "--signal" => {
                         let signal = number()?;
                         if !(1..=64).contains(&signal) {
@@ -183,6 +191,10 @@ fn parse(args: &[String]) -> Result<Request, String> {
                     .split_once('=')
                     .filter(|(name, _)| !name.is_empty())
                     .ok_or_else(|| usage(format!("--env needs NAME=VALUE, not {pair:?}")))?;
+                once(
+                    parsed.environment.iter().any(|(known, _)| known == name),
+                    &format!("the variable {name:?}"),
+                )?;
                 parsed
                     .environment
                     .push((name.to_string(), Some(setting.to_string())));
@@ -194,6 +206,10 @@ fn parse(args: &[String]) -> Result<Request, String> {
                         "--env-unset needs a variable name, not {name:?}"
                     )));
                 }
+                once(
+                    parsed.environment.iter().any(|(known, _)| *known == name),
+                    &format!("the variable {name:?}"),
+                )?;
                 parsed.environment.push((name, None));
             }
             other => return Err(usage(format!("unsupported argument {other:?}"))),
@@ -208,8 +224,22 @@ fn parse(args: &[String]) -> Result<Request, String> {
         };
     }
     parsed.emulator = emulator
-        .filter(|name| !name.trim().is_empty())
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
         .ok_or_else(|| usage("--emulator <name> is required"))?;
+    // An empty path is a mistake in the command, not a missing file.
+    let paths = parsed
+        .settings
+        .iter()
+        .map(|(path, _)| path)
+        .chain(&parsed.stderr_file)
+        .chain(&parsed.log_file)
+        .chain(&parsed.game_file)
+        .chain(&parsed.core)
+        .chain(&parsed.save_directory);
+    if paths.into_iter().any(|path| path.as_os_str().is_empty()) {
+        return Err(usage("a path argument is empty"));
+    }
     Ok(Request::Diagnose {
         artefacts: Box::new(parsed),
         json,
@@ -220,12 +250,12 @@ fn artefacts(parsed: Parsed) -> Result<LaunchArtefacts, String> {
     let stderr = match &parsed.stderr_file {
         Some(path) => Some(
             read_log_prefix(path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
+                .map_err(|error| format!("cannot read {:?}: {}", path.display(), error.kind()))?,
         ),
         None => None,
     };
     Ok(LaunchArtefacts {
-        emulator: parsed.emulator.to_ascii_lowercase(),
+        emulator: parsed.emulator,
         game: parsed.game,
         exit: parsed.exit,
         duration: parsed.duration_ms.map(Duration::from_millis),
@@ -237,6 +267,9 @@ fn artefacts(parsed: Parsed) -> Result<LaunchArtefacts, String> {
         core: parsed.core,
         save_directory: parsed.save_directory,
         environment: parsed.environment,
+        // Everything typed on the command line is the caller's account of
+        // the launch. EmuWiz observed none of it.
+        supplied_by_caller: true,
     })
 }
 
@@ -296,7 +329,7 @@ fn push_diagnosis(
     out.push_str(&format!(
         "\n  {number}. {} [{}]\n     {}\n     {}\n",
         diagnosis.title,
-        diagnosis.confidence.label(),
+        diagnosis.standing(),
         diagnosis.category.label(),
         diagnosis.explanation
     ));
@@ -370,21 +403,33 @@ fn format_report(report: &DiagnosisReport) -> String {
             out.push_str(&format!("  - {note}\n"));
         }
     }
-    out.push_str("\nNot observed\n");
+    out.push_str("\nNot observed, or not fully\n");
     let mut any_gap = false;
     for coverage in &report.coverage {
-        if coverage.has_current_evidence() {
+        let mut gaps = coverage.missing.clone();
+        if coverage.stale > 0 {
+            gaps.push(format!(
+                "{} observation(s) out of date because the source changed",
+                coverage.stale
+            ));
+        }
+        if gaps.is_empty() {
             continue;
         }
         any_gap = true;
+        let partly = if coverage.has_current_evidence() {
+            " (partly observed)"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "  - {}: {}\n",
+            "  - {}{partly}: {}\n",
             coverage.area.label(),
-            coverage.missing.join("; ")
+            gaps.join("; ")
         ));
     }
     if !any_gap {
-        out.push_str("  (every area has some evidence)\n");
+        out.push_str("  (every area has some evidence and nothing failed to read)\n");
     }
     out
 }
