@@ -438,6 +438,7 @@ def well_formed_folder_move(parsed: Any) -> bool:
             and parsed["version"] == FOLDER_MOVE_RECORD_VERSION and isinstance(parsed.get("state"), str)
             and parsed["state"] in FOLDER_MOVE_SETTLED | FOLDER_MOVE_OPEN
             and isinstance(parsed.get("source"), str) and isinstance(parsed.get("destination"), str)
+            and isinstance(parsed.get("database"), str)
             and isinstance(parsed.get("rows"), list) and folder_move_order(parsed) is not None)
 
 

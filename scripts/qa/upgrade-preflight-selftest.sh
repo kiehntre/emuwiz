@@ -264,7 +264,7 @@ c.commit(); c.close()
 assoc = lambda p: {"folder": 1, "root": lib, "root_identity": None, "relative": [], "absolute": list(f"{lib}/{p}".encode())}
 for r in spec["records"]:
     record = {"version": r.get("version", 1), "id": r["id"], "source": f"{lib}/{r['src']}", "destination": f"{lib}/{r['dst']}",
-              "root": lib, "platform": "P", "database": db, "layout_digest": "", "entries": 1, "total_bytes": 1,
+              "root": lib, "platform": "P", "database": r.get("database", db), "layout_digest": "", "entries": 1, "total_bytes": 1,
               "rows": [{"archive": a, "old": assoc(o), "new": assoc(n), "fingerprint": False} for a, o, n in r["rows"]],
               "created_dirs": [], "state": r["state"], "at_unix": 0}
     with open(f"{base}/data/rename-transactions-sealed-v1/folder-moves/{r['id']}.json", "w", encoding="utf-8") as f:
@@ -303,5 +303,10 @@ folder_records_case replaced-list-archive 2 '{"dirs": ["Z"], "rows": {"1": "Z/a"
   {"id": "folder-move-100-1-0", "state": "Undone", "src": "X", "dst": "Y", "rows": [[[1], "X/a", "Y/a"]]},
   {"id": "folder-move-200-1-0", "state": "Committed", "src": "X", "dst": "Z", "rows": [[1, "X/a", "Z/a"]]}]}'
 grep -q "malformed library row" "$ROOT/fmr-replaced-list-archive.out" || { echo "self-test failed: malformed row in a replaced record not reported" >&2; exit 1; }
+# A record whose library is not a path takes no part in replacing: the older
+# Undone record is checked on its own (its folder is at Y) and blocks.
+folder_records_case list-database 2 '{"dirs": ["Y"], "rows": {"1": "Y/a"}, "records": [
+  {"id": "folder-move-100-1-0", "state": "Undone", "src": "X", "dst": "Y", "rows": [[1, "X/a", "Y/a"]]},
+  {"id": "folder-move-200-1-0", "state": "Committed", "src": "X", "dst": "Y", "rows": [[1, "X/a", "Y/a"]], "database": ["x"]}]}'
 
 echo "UPGRADE PREFLIGHT SELF-TEST: PASS"
