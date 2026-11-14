@@ -8,3 +8,7 @@ ps2-index.html*
 ps2-index-root.html*
 ps2-index-page-*.html*
 __pycache__/
+
+# Per-worktree Claude Code overrides (for example a temporary
+# `claude plugin enable ... --scope local`); never committed.
+.claude/settings.local.json
