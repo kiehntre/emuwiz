@@ -821,12 +821,30 @@ fn destination_storage_disappearing_fails_closed_then_recovers() {
         fx.source,
         "the catalogue never names vanished storage"
     );
-    assert_eq!(read(&fx.source).as_deref(), Some(&fx.content[..]));
+    if plan.strategy == Strategy::AtomicRename {
+        // Same drive: the one rename had already put the file inside the
+        // storage that then vanished, so it cannot be back at the source
+        // yet. It went with that storage, intact.
+        let gone_with = away.join(plan.destination_path.strip_prefix(&root).unwrap());
+        assert_eq!(read(&gone_with).as_deref(), Some(&fx.content[..]));
+        assert!(!exists(&fx.source), "no second copy appears at the source");
+    } else {
+        // Copy: the original never left the source.
+        assert_eq!(read(&fx.source).as_deref(), Some(&fx.content[..]));
+    }
     // Storage comes back; recovery finishes the compensation.
     std::fs::rename(&away, &root).unwrap();
     let after = recover(&fx.ctx(), &plan.txn_id).unwrap();
     assert!(after.is_terminal(), "{after:?}");
     fx.assert_safe(&plan, "after storage returned");
+    // The transaction was not committed, so recovery puts the file back
+    // where the catalogue still names it, on either strategy.
+    assert_eq!(fx.catalogue_path(), fx.source);
+    assert_eq!(read(&fx.source).as_deref(), Some(&fx.content[..]));
+    assert!(
+        !exists(&plan.destination_path),
+        "no copy left at the destination"
+    );
 }
 
 // ---- catalogue concurrency ------------------------------------------------------

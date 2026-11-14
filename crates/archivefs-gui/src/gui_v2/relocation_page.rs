@@ -226,7 +226,7 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut State) {
 
 fn preview_card(ui: &mut egui::Ui, p: &Preview) {
     ui.group(|ui| {
-        ui.strong(format!("{}  →  {}", p.source.display(), p.destination.display()));
+        ui.strong(format!("{} to {}", p.source.display(), p.destination.display()));
         if let Some(s) = p.strategy {
             ui.label(match s {
                 transform::Strategy::AtomicRename => "Same drive: one rename that never overwrites.",
@@ -269,7 +269,7 @@ fn row_card(ui: &mut egui::Ui, row: &Row) {
                 "Move"
             };
             ui.label(format!(
-                "{kind}: {} → {}",
+                "{kind}: {} to {}",
                 p.source_path.display(),
                 p.destination_path.display()
             ));
