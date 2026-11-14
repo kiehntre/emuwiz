@@ -13,9 +13,9 @@ use sha2::{Digest, Sha256};
 use crate::mod_activation::ActivationReceipt;
 use crate::mod_provider::{ModCompatibilityLevel, ModPackageJoin, ModProviderProvenance};
 use crate::patch_manager::{
-    PreviewAdapter, SharedApplyJournal, SharedApplyOutcome, SharedHistoryReport,
-    SharedRollbackOutcome, SharedRollbackPreview, discover_shared_apply_history,
-    preview_shared_rollback,
+    PreviewAdapter, SharedApplyFailureKind, SharedApplyJournal, SharedApplyOutcome,
+    SharedHistoryReport, SharedRollbackOutcome, SharedRollbackPreview,
+    discover_shared_apply_history, preview_shared_rollback,
 };
 use crate::patch_package_composition::PatchCompositionProvenance;
 use crate::standalone_patch::DerivedPatchProvenance;
@@ -712,8 +712,21 @@ fn rollback_status(
             SharedRollbackOutcome::DestinationChanged => Some(
                 "One or more installed files have changed since this mod was installed.".into(),
             ),
+            // The engine says which proof is missing when it knows: for a
+            // file installed where there was none, that is EmuWiz's own
+            // record of installing it, not a backup.
             SharedRollbackOutcome::BackupMissing => Some(
-                "A required backup is missing; EmuWiz will not remove the destination file.".into(),
+                entry
+                    .failure
+                    .as_ref()
+                    .filter(|failure| failure.kind == SharedApplyFailureKind::BackupMissing)
+                    .map_or_else(
+                        || {
+                            "A required backup is missing; EmuWiz will not remove the destination file."
+                                .into()
+                        },
+                        |failure| failure.detail.clone(),
+                    ),
             ),
             SharedRollbackOutcome::BackupChanged => {
                 Some("A required backup changed after install; review is required.".into())
@@ -1283,6 +1296,33 @@ mod tests {
         .unwrap();
         assert!(
             matches!(missing.rollback, ModRollbackStatus::CannotSafelyUndo { ref reason } if reason.contains("backup is missing"))
+        );
+        // A file EmuWiz has no record of installing is not a missing
+        // backup: History gives the engine's own reason.
+        let mut unrecorded = preview(
+            "unrecorded",
+            "file.bin",
+            SharedRollbackOutcome::BackupMissing,
+        );
+        unrecorded.entries[0].failure = Some(crate::patch_manager::SharedApplyFailure {
+            kind: SharedApplyFailureKind::BackupMissing,
+            path: None,
+            detail: "EmuWiz has no record of its own that it installed this file.".into(),
+        });
+        let unrecorded = ModReceiptSummary::from_shared_journal(
+            &journal(
+                "unrecorded",
+                3,
+                "file.bin",
+                SharedApplyOutcome::InstalledNew,
+            ),
+            None,
+            Path::new("/b"),
+            &unrecorded,
+        )
+        .unwrap();
+        assert!(
+            matches!(unrecorded.rollback, ModRollbackStatus::CannotSafelyUndo { ref reason } if reason == "EmuWiz has no record of its own that it installed this file.")
         );
     }
 
