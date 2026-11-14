@@ -64,6 +64,8 @@ pub fn discover_dolphin_onframe_candidates(
     let mut ops = Vec::new();
     let mut issues = Vec::new();
     let mut out = Vec::new();
+    // Patch lines that come before any `$name` in an OnFrame section.
+    let mut orphans = Vec::<String>::new();
     let flush = |original_lines: &mut Vec<String>,
                  title: &mut Option<String>,
                  ops: &mut Vec<CheatOperation>,
@@ -135,6 +137,13 @@ pub fn discover_dolphin_onframe_candidates(
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
+        if title.is_none() {
+            // A line that belongs to no named patch here: at the top of a
+            // section, or in a second `[OnFrame]` section before its first
+            // `$name`. It is never added to the next patch.
+            orphans.push(t.to_string());
+            continue;
+        }
         original_lines.push(line.to_string());
         // The project's one strict reading of an OnFrame line: exactly an
         // address, a width and a value. Anything else (a conditional line
@@ -157,6 +166,19 @@ pub fn discover_dolphin_onframe_candidates(
             &mut issues,
             &mut out,
         );
+    }
+    // Which patch such a line belongs to is not certain (Dolphin may give it
+    // to the patch before it, or to none), so nothing from this file is
+    // installable: every patch it holds carries the issue.
+    if let Some(first) = orphans.first() {
+        for candidate in &mut out {
+            candidate
+                .document
+                .issues
+                .push(CheatIssue::UnsupportedOperation(format!(
+                    "OnFrame line outside any named patch: {first}"
+                )));
+        }
     }
     Ok(out)
 }
@@ -232,6 +254,42 @@ mod tests {
                 bind_dolphin_onframe_candidate(&found[0], Some("GMSE01"), Path::new("/p"), false)
                     .unwrap();
             assert!(!binding.can_install, "{body}");
+        }
+    }
+
+    /// A patch line that belongs to no named patch is never added to the
+    /// next one; while the file holds one, none of its patches can be
+    /// installed.
+    #[test]
+    fn a_line_outside_any_named_patch_makes_the_file_uninstallable() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, patches) in [
+            (
+                "[OnFrame]\n0x80000000:dword:0x0\n$60 FPS\n0x80001234:dword:0x1\n",
+                1,
+            ),
+            (
+                "[OnFrame]\n$A\n0x80000004:dword:0x1\n[Core]\nCPUThread = True\n[OnFrame]\n0x80000008:dword:0x2\n$B\n0x8000000C:dword:0x3\n",
+                2,
+            ),
+        ] {
+            let path = dir.path().join("GMSE01.ini");
+            fs::write(&path, text).unwrap();
+            let found =
+                discover_dolphin_onframe_candidates(&path, CheatPlatform::GameCube).unwrap();
+            assert_eq!(found.len(), patches, "{text}");
+            for candidate in &found {
+                assert_eq!(candidate.document.operations.len(), 1, "{text}");
+                assert_eq!(candidate.document.issues.len(), 1, "{text}");
+                let binding = bind_dolphin_onframe_candidate(
+                    candidate,
+                    Some("GMSE01"),
+                    Path::new("/p"),
+                    false,
+                )
+                .unwrap();
+                assert!(!binding.can_install, "{text}");
+            }
         }
     }
 
