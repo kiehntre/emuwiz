@@ -25,6 +25,7 @@ pub(crate) mod answers;
 pub(crate) mod azahar_homebrew;
 pub(crate) mod cemu;
 mod controller;
+pub(crate) mod firmware_answers;
 pub(crate) mod flycast_gdi;
 pub(crate) mod hatari;
 pub(crate) mod mesen;

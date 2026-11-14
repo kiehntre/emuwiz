@@ -676,8 +676,8 @@ pub use flycast_local::{
     FlycastProfileDiscoveryRoots, FlycastSaveStateInventory, FlycastSettings,
     FlycastSystemFileState, FlycastSystemHealth, FlycastTextureInventory, FlycastVmuInventory,
     FlycastWarning, FlycastWarningKind, discover_flycast_profiles, flycast_profile_dreamcast_bios,
-    inspect_flycast_game, is_appimage_executable, parse_flycast_version,
-    resolve_flycast_native_launch_binding,
+    flycast_profile_dreamcast_bios_inputs, inspect_flycast_game, is_appimage_executable,
+    parse_flycast_version, resolve_flycast_native_launch_binding,
 };
 pub use fuse_local::{
     FUSE_MAX_PROFILES, FUSE_NATIVE_BINARY_NAMES, FuseExecutable, FuseInstallationType,
@@ -870,7 +870,8 @@ pub use pcsx2::{
 };
 pub use pcsx2_firmware::{
     Pcsx2BiosVerificationOutcome, Pcsx2GameInspectionWithFirmware, Pcsx2VerifiedBios,
-    inspect_pcsx2_game_with_firmware_evidence, pcsx2_profile_bios_verification, resolve_pcsx2_bios,
+    inspect_pcsx2_game_with_firmware_evidence, pcsx2_profile_bios_inputs,
+    pcsx2_profile_bios_verification, resolve_pcsx2_bios,
 };
 pub use pcsx2_identity::{
     Pcsx2GameIdentity, Pcsx2IdentityState, Pcsx2ProfileChoiceError, confirmed_pcsx2_profile,
