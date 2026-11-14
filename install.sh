@@ -1819,6 +1819,114 @@ script_dir=$(CDPATH= cd -- "$script_dir" && pwd) || fail "could not resolve the 
 desktop_template="$script_dir/assets/linux/$desktop_id.desktop.in"
 branding_dir="$script_dir/assets/branding"
 
+# ORGANISE RECOVERY GATE
+#
+# EmuWiz's Organise keeps a record of every game-folder move
+# (<data>/rename-transactions-sealed-v1/folder-moves/*.json) so an
+# interrupted move or Undo can be finished after a crash. A record that is
+# still open (Planned, Undoing), names a state this installer does not know,
+# carries another record version, or cannot be read is an operation only the EmuWiz installed now can safely
+# finish: EmuWiz releases before durable folder Undo do not know "Undoing"
+# and skip such a record without a word. So before any EmuWiz binary is
+# installed, replaced or removed, this looks for such records in every
+# location EmuWiz could be using (EMUWIZ_DATA_HOME, then the emuwiz and
+# legacy archivefs folders under XDG_DATA_HOME and ~/.local/share) and
+# refuses, with nothing changed, while one exists. NeedsReview records are
+# reported but do not block: every release knows them and none settles them
+# by itself. The check only reads. It sees the data locations named by this
+# shell's environment: one EmuWiz is given only elsewhere (say, an
+# EMUWIZ_DATA_HOME set in a desktop launcher) is not checked. It cannot protect a downgrade done with an
+# older installer or by copying an older binary into place (for example from
+# emuwiz-installer/previous), because those never run it: run
+# scripts/qa/upgrade_preflight.py from the newest checkout first.
+organise_recovery_gate() {
+    command -v python3 >/dev/null 2>&1 ||
+        fail "python3 is required to check for unfinished Organise folder moves; nothing was changed"
+    python3 -I - "$program_name" <<'PY' || exit 1
+import json, os, sys
+from pathlib import Path
+
+program = sys.argv[1]
+SETTLED = {"Committed", "Undone", "RolledBack"}
+
+
+def absolute(name):
+    value = os.environ.get(name, "")
+    return Path(value) if value.startswith("/") else None
+
+
+roots = []
+explicit = absolute("EMUWIZ_DATA_HOME")
+if explicit:
+    roots += [explicit, explicit / "emuwiz", explicit / "archivefs"]
+home = absolute("HOME")
+for base in (absolute("XDG_DATA_HOME"), home / ".local/share" if home else None):
+    if base:
+        roots += [base / "emuwiz", base / "archivefs"]
+
+blocked, review, seen = [], [], set()
+for root in roots:
+    for journal in ("rename-transactions-sealed-v1", "rename-transactions"):
+        folder = root / journal / "folder-moves"
+        try:
+            entries = sorted(os.scandir(folder), key=lambda e: e.name)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            blocked.append(f"{folder} cannot be read ({error.strerror})")
+            continue
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            path = Path(entry.path)
+            try:
+                key = (os.stat(path, follow_symlinks=False).st_dev, os.stat(path, follow_symlinks=False).st_ino)
+            except OSError as error:
+                blocked.append(f"{path} cannot be read ({error.strerror})")
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    raise ValueError("not a regular file")
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(record, dict):
+                    raise ValueError("not a record")
+                state, version = record.get("state"), record.get("version")
+            except (OSError, UnicodeDecodeError, ValueError):
+                blocked.append(f"{path} cannot be read")
+                continue
+            if type(version) is not int or version != 1:
+                blocked.append(f"{path} has record version {version!r}, probably from a newer EmuWiz")
+                continue
+            if not isinstance(state, str):
+                blocked.append(f"{path} has no readable state")
+                continue
+            if state in SETTLED:
+                continue
+            if state == "NeedsReview":
+                review.append(str(path))
+                continue
+            blocked.append(f"{path} is in state {state!r}")
+
+for path in review:
+    print(f"{program}: warning: an Organise folder move needs review (its folder is recorded in two places): {path}", file=sys.stderr)
+if blocked:
+    print(f"{program}: refusing: Organise has unfinished game-folder operations that only the EmuWiz installed now can safely finish:", file=sys.stderr)
+    for line in blocked:
+        print(f"  {line}", file=sys.stderr)
+    print("Nothing was installed, replaced or removed. Open the EmuWiz installed now, go to All tools > Organise my "
+          "games and choose \"Finish interrupted folder moves\" (any Organise apply also finishes them first). A record "
+          "that cannot be read, or comes from a newer EmuWiz, is never settled by this EmuWiz: it needs a recovery-capable "
+          "EmuWiz that reads it or an explicit administrator decision (see \"Records EmuWiz cannot settle\" in "
+          "docs/RELEASE_ENGINEERING.md). Then run this installer again. Meanwhile do not copy "
+          "another emuwiz binary into place: EmuWiz releases before this check cannot see an interrupted folder Undo.",
+          file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 if [ "$do_uninstall" -eq 1 ]; then
     # bin_dir must be an absolute, resolved path for manifest bin_dir
     # comparison to have any chance of matching what install recorded -
@@ -1828,6 +1936,7 @@ if [ "$do_uninstall" -eq 1 ]; then
         bin_dir=$(CDPATH= cd -- "$bin_dir" && pwd -P) || fail "could not resolve install prefix: $bin_dir"
     fi
 
+    organise_recovery_gate
     manifest_dir_kind=$(manifest_dir_state)
     if [ "$manifest_dir_kind" = dir ]; then lock_manifest_dir; fi
     if [ "$manifest_dir_kind" = dir ] && { [ -e "$manifest_dir/upgrade-pending" ] || [ -L "$manifest_dir/upgrade-pending" ]; }; then
@@ -2580,6 +2689,8 @@ else
         "$program_name" "$src_mode" >&2
 fi
 
+# Before anything is created or published (see ORGANISE RECOVERY GATE).
+organise_recovery_gate
 mkdir -p -- "$bin_dir"
 bin_dir=$(CDPATH= cd -- "$bin_dir" && pwd -P) || fail "could not resolve install prefix: $bin_dir"
 
