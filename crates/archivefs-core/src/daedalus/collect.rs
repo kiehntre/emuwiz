@@ -7,7 +7,6 @@
 //! instead of implying the area was clean.
 
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -16,6 +15,7 @@ use super::evidence::{
     observe_path_access,
 };
 use super::{process, retroarch, text};
+use crate::launch::process_spawn::open_regular_file_nonblocking;
 
 /// What is known about one launch. Every field is optional: supply what
 /// exists.
@@ -47,16 +47,7 @@ pub struct LaunchArtefacts {
 /// file is recognised as cut) from a regular file, without following a
 /// final symbolic link.
 pub fn read_log_prefix(path: &Path) -> std::io::Result<Vec<u8>> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
-    if !file.metadata()?.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
+    let file = open_regular_file_nonblocking(path)?;
     let mut bytes = Vec::new();
     file.take(text::LOG_BYTES_LIMIT as u64 + 1)
         .read_to_end(&mut bytes)?;

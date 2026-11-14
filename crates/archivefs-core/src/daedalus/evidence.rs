@@ -14,7 +14,6 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::text;
-use crate::launch::process_spawn::{CapturedFileIdentity, capture_file_identity};
+use crate::launch::process_spawn::{
+    CapturedFileIdentity, capture_file_identity, open_regular_file_nonblocking,
+};
 
 /// Version of the serialised evidence and report shape.
 pub const EVIDENCE_SCHEMA_VERSION: u32 = 1;
@@ -256,17 +257,8 @@ impl SourceFingerprint {
     /// rather than fingerprinting a prefix.
     pub fn read_with_digest(path: &Path, limit: u64) -> std::io::Result<(Vec<u8>, Self)> {
         let limit = limit.min(FINGERPRINT_DIGEST_LIMIT);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)?;
+        let file = open_regular_file_nonblocking(path)?;
         let metadata = file.metadata()?;
-        if !metadata.file_type().is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "not a regular file",
-            ));
-        }
         if metadata.len() > limit {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

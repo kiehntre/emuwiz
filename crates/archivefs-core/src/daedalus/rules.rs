@@ -784,13 +784,13 @@ fn retroarch_content_read_failed(view: &View<'_>) -> Vec<Finding> {
             if let Some((exit_item, _)) = exit {
                 finding = finding.support(exit_item);
             }
-            if let Some((install_item, installation)) = view.installation() {
-                if installation.eq_ignore_ascii_case("flatpak") {
-                    finding = finding.support(install_item).limit(
-                        "RetroArch is installed as a Flatpak, which only sees folders it \
-                         has been granted.",
-                    );
-                }
+            if let Some((install_item, installation)) = view.installation()
+                && installation.eq_ignore_ascii_case("flatpak")
+            {
+                finding = finding.support(install_item).limit(
+                    "RetroArch is installed as a Flatpak, which only sees folders it has \
+                     been granted.",
+                );
             }
             vec![finding]
         }

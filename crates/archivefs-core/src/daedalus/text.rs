@@ -49,8 +49,7 @@ fn is_unsafe(character: char) -> bool {
 /// replacement character and the result is at most `limit` characters.
 pub fn sanitise(input: &str, limit: usize) -> String {
     let mut output = String::with_capacity(input.len().min(limit * 4));
-    let mut count = 0usize;
-    for character in input.chars() {
+    for (count, character) in input.chars().enumerate() {
         if count == limit {
             output.push(ELLIPSIS);
             break;
@@ -60,7 +59,6 @@ pub fn sanitise(input: &str, limit: usize) -> String {
         } else {
             character
         });
-        count += 1;
     }
     output
 }

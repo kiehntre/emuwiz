@@ -124,7 +124,8 @@ RetroArch 1.21.0 facts that shaped the rules:
 - "Failed to initialize audio driver" is printed on healthy runs of cores that
   produce no sound;
 - the first occurrence of a repeated settings key wins;
-- `--appendconfig` overrides `video_driver` for that launch.
+- `--appendconfig` overrides `video_driver` for that launch, but appended
+  values leak into the base settings file (see Repair below).
 
 ## Command line
 
@@ -163,11 +164,20 @@ version change. Text fields are for people and are not stable.
 
 ## Repair (next slice; owner policy of 2026-11-14)
 
-Scope order: **this launch only** (a session settings file passed with
-`--appendconfig`), then **this game** (a per-game override, only where the
-emulator applies the setting from one), then **all games** (the main settings
-file, with explicit confirmation that every game using it is affected). An
-override layer that an emulator does not honour for a setting is never offered.
+Scope order: **this launch only**, then **this game** (a per-game override,
+only where the emulator applies the setting from one), then **all games** (the
+main settings file, with explicit confirmation that every game using it is
+affected). An override layer that an emulator does not honour for a setting is
+never offered.
+
+"This launch only" for RetroArch means a disposable profile: a scratch settings
+file seeded read-only from the real one, with the repaired key changed and
+`config_save_on_exit = "false"`, passed with `--config`. It does **not** mean
+`--appendconfig` on top of the real settings file: RetroArch writes appended
+values back into the base file by default, even when it is killed
+(`docs/research/RETROARCH_APPENDCONFIG_PERSISTENCE_TEST.md`), so that would be
+a silent permanent change. The disposable-profile mechanism already exists for
+cheat launches (`launch/cheat_runtime_retroarch.rs`) and is reused.
 
 Every repair:
 
