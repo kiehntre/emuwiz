@@ -9,6 +9,11 @@ pub(crate) fn is_private_recovery_path(path: &Path) -> bool {
             name == ".emuwiz-r2-holding"
                 || name == "emuwiz-enrolled-recovery-v3"
                 || name.to_string_lossy().starts_with(".emuwiz-copy-")
+                // Ouroboros: a relocation's private staging folder and the
+                // folder retaining its original. A scan must not catalogue
+                // either as a game.
+                || name.to_string_lossy().starts_with(".emuwiz-transform-")
+                || name.to_string_lossy().starts_with(".emuwiz-retired-")
         })
     })
 }
@@ -31,6 +36,8 @@ mod tests {
             ".emuwiz-r2-holding",
             "emuwiz-enrolled-recovery-v3",
             ".emuwiz-copy-fixture",
+            ".emuwiz-transform-0123456789abcdef0123456789abcdef",
+            ".emuwiz-retired-0123456789abcdef0123456789abcdef",
         ] {
             let private = home.path().join(name);
             std::fs::create_dir_all(private.join("tx")).unwrap();
