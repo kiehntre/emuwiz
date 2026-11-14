@@ -47,12 +47,12 @@ use crate::launch_readiness_page::LaunchReadinessInput;
 /// How long an input is reused right after anything changed.
 pub(super) const SETTLING_AGE: Duration = Duration::from_millis(250);
 /// How long an unchanged input is reused once its answer has settled, unless
-/// the build itself was slow (see [`BUILD_SHARE`]). Equal to the firmware
-/// answer recheck. The two add up: a firmware fact on screen can be one
-/// firmware recheck old when the input is built and this much older before
-/// the input is built again.
-pub(super) const SETTLED_AGE: Duration =
-    crate::emulator_setup::readiness_input::FIRMWARE_ANSWER_RECHECK;
+/// the build itself was slow (see [`BUILD_SHARE`]). A changed BIOS file is
+/// noticed when the input is next built, so a firmware fact on screen is
+/// normally at most this old plus the time its new answer takes to verify;
+/// `firmware_answers` lists the changes that are only picked up by its
+/// backstop.
+pub(super) const SETTLED_AGE: Duration = Duration::from_secs(2);
 /// An input is reused for at least this many times as long as it took to
 /// build: at most one part in nine of the thread's time goes on rebuilding.
 pub(super) const BUILD_SHARE: u32 = 8;

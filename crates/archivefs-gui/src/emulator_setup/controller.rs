@@ -950,6 +950,25 @@ impl ArchiveFsApp {
         &self,
         live: Option<&LoadedData>,
     ) -> launch_readiness_page::LaunchReadinessInput {
+        self.build_launch_readiness_input_for(live, super::firmware_answers::FirmwareUse::Fresh)
+    }
+
+    /// The same input, for the drawn readiness card and nothing else: its
+    /// PCSX2 and Flycast BIOS answers may be ones already held while they are
+    /// verified again off the interface thread (see `firmware_answers`).
+    /// Never use this for anything that can lead to a launch.
+    pub(crate) fn build_shown_launch_readiness_input(
+        &self,
+        live: Option<&LoadedData>,
+    ) -> launch_readiness_page::LaunchReadinessInput {
+        self.build_launch_readiness_input_for(live, super::firmware_answers::FirmwareUse::Shown)
+    }
+
+    fn build_launch_readiness_input_for(
+        &self,
+        live: Option<&LoadedData>,
+        firmware_use: super::firmware_answers::FirmwareUse,
+    ) -> launch_readiness_page::LaunchReadinessInput {
         let freshness_for =
             |path: &Path, live: Option<&LoadedData>| self.evidence_freshness_for(path, live);
         let member_path = |record: &ArchiveRecord| self.resolved_archive_member_path(record);
@@ -1001,6 +1020,7 @@ impl ArchiveFsApp {
             remembered_system:
                 &archivefs_core::launch::remembered_launch_system::remembered_launch_system,
             system_unknown: &system_unknown,
+            firmware_use,
         }
         .build(live)
     }

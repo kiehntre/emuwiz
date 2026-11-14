@@ -4944,6 +4944,35 @@ fn selected_page_pcsx2_readiness_requires_matching_firmware_evidence_and_threads
         LoadState::Ready(data) => Some(data.as_ref()),
         _ => None,
     };
+    // The drawn card may show the BIOS answer it already holds for a moment,
+    // while the BIOS is verified against the new evidence on another thread.
+    let shown = app.build_shown_launch_readiness_input(live);
+    let launch_readiness_page::LaunchReadinessInput::Plan {
+        plan: shown_plan, ..
+    } = shown
+    else {
+        panic!("verified PS2 identity must reach planning");
+    };
+    let held = shown_plan
+        .candidates
+        .iter()
+        .find(|candidate| {
+            matches!(
+                candidate.target,
+                archivefs_core::launch::LaunchTarget::Standalone {
+                    adapter_id: "pcsx2",
+                    ..
+                }
+            )
+        })
+        .expect("PCSX2 candidate must remain present");
+    assert_eq!(
+        held.firmware,
+        archivefs_core::launch::FirmwareReadiness::PresentUnverified,
+        "the card is not made to wait for the verification"
+    );
+    // What Play and the Launch page build is never that held answer: it is
+    // verified there and then.
     let input = app.build_launch_readiness_input(live);
     let launch_readiness_page::LaunchReadinessInput::Plan { plan, pcsx2, .. } = input else {
         panic!("verified PS2 identity must reach planning");
