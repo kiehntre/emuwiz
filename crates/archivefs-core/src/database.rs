@@ -1491,8 +1491,8 @@ impl Database {
                 )
                 .optional()
                 .map_err(|e| db_error("failed to read saved topology evidence", e))?;
-            if let Some((saved_fingerprint, saved_json)) = saved
-                && let Ok(saved_set) = serde_json::from_slice::<MediaSet>(&saved_json)
+            if let Some((saved_fingerprint, saved_json)) = &saved
+                && let Ok(saved_set) = serde_json::from_slice::<MediaSet>(saved_json)
                 && !topology_claims_agree(&saved_set, &set)
                 && topology_source_fingerprint(&saved_set, None).as_deref()
                     == Some(saved_fingerprint.as_str())
