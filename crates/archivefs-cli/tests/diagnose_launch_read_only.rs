@@ -262,7 +262,9 @@ fn what_was_typed_is_reported_as_supplied_and_every_unread_input_is_listed() {
     assert!(text.contains("EmuWiz did not observe it"), "{text}");
     assert!(text.contains("[as reported]"), "{text}");
     assert!(
-        text.contains("Launch: the emulator process failed"),
+        text.contains(
+            "Launch (as supplied; EmuWiz did not observe it): the emulator process failed"
+        ),
         "{text}"
     );
 
@@ -553,4 +555,76 @@ fn hostile_log_text_never_reaches_the_json_raw_either() {
         );
     }
     assert!(json.contains("evil"), "{json}");
+}
+
+#[test]
+fn a_typed_path_never_gives_an_established_cause_or_an_explained_verdict() {
+    let fixture = Fixture::new();
+    let missing = fixture.path("work/typo.rom");
+    let unwritable = fixture.path("work/saves");
+    fs::create_dir(&unwritable).unwrap();
+    fs::set_permissions(
+        &unwritable,
+        std::os::unix::fs::PermissionsExt::from_mode(0o555),
+    )
+    .unwrap();
+    let cases: [Vec<&str>; 3] = [
+        vec![
+            "--emulator",
+            "retroarch",
+            "--exit-code",
+            "1",
+            "--game-file",
+            missing.to_str().unwrap(),
+        ],
+        vec![
+            "--emulator",
+            "retroarch",
+            "--core",
+            missing.to_str().unwrap(),
+        ],
+        vec![
+            "--emulator",
+            "x",
+            "--save-dir",
+            unwritable.to_str().unwrap(),
+        ],
+    ];
+    for case in &cases {
+        let mut args = vec!["diagnose-launch"];
+        args.extend(case);
+        let text = stdout(&fixture.run(&args));
+        assert!(!text.contains("[established]"), "{case:?}\n{text}");
+        assert!(!text.contains("Verdict: explained"), "{case:?}\n{text}");
+        args.push("--json");
+        let report: serde_json::Value = serde_json::from_str(&stdout(&fixture.run(&args))).unwrap();
+        assert_ne!(report["verdict"], "explained", "{case:?}");
+        for cause in report["causes"].as_array().unwrap() {
+            assert_ne!(cause["confidence"], "established", "{case:?} {cause}");
+            assert!(
+                cause["limitations"]
+                    .to_string()
+                    .contains("is what was stated"),
+                "{case:?} {cause}"
+            );
+        }
+    }
+    fs::set_permissions(
+        &unwritable,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+
+    // A clean exit that was only typed is labelled as such too.
+    let text = stdout(&fixture.run(&[
+        "diagnose-launch",
+        "--emulator",
+        "retroarch",
+        "--exit-code",
+        "0",
+    ]));
+    assert!(
+        text.contains("Launch (as supplied; EmuWiz did not observe it): no failure"),
+        "{text}"
+    );
 }

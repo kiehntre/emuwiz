@@ -368,9 +368,14 @@ fn format_report(report: &DiagnosisReport) -> String {
         out.push_str(&format!("Game: {game}\n"));
     }
     out.push_str(&format!(
-        "Rules: engine version {}, rule set {}\n\nLaunch: {}\nVerdict: {}\n",
+        "Rules: engine version {}, rule set {}\n\n{}: {}\nVerdict: {}\n",
         report.rule_set.engine_version,
         &report.rule_set.digest[..16.min(report.rule_set.digest.len())],
+        if report.launch_was_supplied() {
+            "Launch (as supplied; EmuWiz did not observe it)"
+        } else {
+            "Launch"
+        },
         report.launch.describe(),
         report.verdict.headline()
     ));

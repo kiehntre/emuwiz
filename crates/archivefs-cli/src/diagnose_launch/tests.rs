@@ -171,8 +171,8 @@ fn the_text_report_separates_what_happened_from_why_and_lists_gaps() {
     // The exit status was typed, not observed: stated, and no more than
     // possible.
     position("The emulator exited with status 1 [possible]");
-    position("Launch: the emulator process failed");
-    assert!(position("Launch: ") < position("Verdict: "));
+    position("Launch (as supplied; EmuWiz did not observe it): the emulator process failed");
+    assert!(position("Launch (as supplied") < position("Verdict: "));
     position("EmuWiz did not observe it");
     position("(not applied)");
     position("Graphics card, driver and graphics API: not collected");

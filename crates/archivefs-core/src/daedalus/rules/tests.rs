@@ -2070,6 +2070,17 @@ fn a_path_the_caller_named_is_worded_as_given_and_the_report_says_who_named_it()
     };
     let supplied = build(RA, true);
     let found = cause(&supplied, RULE);
+    // Measured path, stated role: not established, and the finding says why.
+    assert_eq!(found.confidence, Confidence::Probable);
+    assert_eq!(supplied.verdict, Verdict::PartlyExplained);
+    assert!(
+        found
+            .limitations
+            .iter()
+            .any(|limit| limit.contains("That the launch used it is what was stated")),
+        "{:?}",
+        found.limitations
+    );
     assert!(
         found
             .explanation
@@ -2087,6 +2098,8 @@ fn a_path_the_caller_named_is_worded_as_given_and_the_report_says_who_named_it()
     );
 
     let observed = build(RA, false);
+    assert_eq!(cause(&observed, RULE).confidence, Confidence::Established);
+    assert_eq!(observed.verdict, Verdict::Explained);
     assert!(
         cause(&observed, RULE)
             .explanation
@@ -2402,4 +2415,126 @@ fn the_rule_set_digest_changes_with_whatever_decides_a_report() {
     });
     assert_ne!(rule_set_version(&reworded).digest, base.digest);
     assert_ne!(rule_set_version(&RULES[1..]).digest, base.digest);
+}
+
+#[test]
+fn a_stated_fact_beside_a_measured_exit_is_still_only_a_premise() {
+    // The environment was stated; the failed exit was measured. The exit
+    // says that the launch failed, not why, so the cause stays possible.
+    let mut set = EvidenceSet::default();
+    exited(&mut set, 1);
+    for name in ["DISPLAY", "WAYLAND_DISPLAY"] {
+        set.observe(
+            EvidenceArea::LaunchEnvironment,
+            Trust::Supplied,
+            "launch environment, as supplied",
+            Fact::EnvironmentVariable {
+                name: name.into(),
+                value: None,
+            },
+        );
+    }
+    let report = diagnose(&set);
+    let found = cause(&report, "environment.no_display");
+    assert_eq!(found.confidence, Confidence::Possible);
+    assert!(
+        found.limitations.iter().any(|limit| limit
+            .contains("Apart from the fact that the launch failed")
+            && limit.contains("stated by")),
+        "{:?}",
+        found.limitations
+    );
+    assert_ne!(report.verdict, Verdict::Explained);
+
+    // The same environment measured by EmuWiz keeps the rule's own standing.
+    let mut set = EvidenceSet::default();
+    exited(&mut set, 1);
+    for name in ["DISPLAY", "WAYLAND_DISPLAY"] {
+        set.observe(
+            EvidenceArea::LaunchEnvironment,
+            Trust::Measured,
+            "environment the emulator was started in",
+            Fact::EnvironmentVariable {
+                name: name.into(),
+                value: None,
+            },
+        );
+    }
+    assert_eq!(
+        cause(&diagnose(&set), "environment.no_display").confidence,
+        Confidence::Probable
+    );
+}
+
+#[test]
+fn a_typed_game_file_or_save_folder_is_not_an_established_cause() {
+    let named = |set: &mut EvidenceSet, role, presence, writable| {
+        set.observe(
+            EvidenceArea::Filesystem,
+            Trust::Measured,
+            "read-only look at a path named by whoever asked for this diagnosis",
+            Fact::PathAccess(PathAccess {
+                role,
+                path: "/tmp/typo".into(),
+                presence,
+                readable: None,
+                writable,
+                role_supplied: true,
+            }),
+        );
+    };
+    // A game file that is not there, with a typed exit status.
+    let mut set = EvidenceSet::default();
+    supplied_exit(&mut set, ExitOutcome::Exited { code: 1 });
+    named(&mut set, PathRole::GameFile, PathPresence::Missing, None);
+    let report = diagnose(&set);
+    assert!(!report.causes.is_empty());
+    for found in &report.causes {
+        assert_ne!(found.confidence, Confidence::Established, "{}", found.title);
+        assert!(
+            found
+                .limitations
+                .iter()
+                .any(|limit| limit.contains("is what was stated")),
+            "{:?}",
+            found.limitations
+        );
+    }
+    assert_eq!(report.verdict, Verdict::PartlyExplained);
+    assert!(report.launch_was_supplied());
+
+    // A save folder that cannot be written to, and nothing else.
+    let mut set = EvidenceSet::default();
+    named(
+        &mut set,
+        PathRole::SaveDirectory,
+        PathPresence::Directory,
+        Some(false),
+    );
+    let report = diagnose(&set);
+    let found = cause(&report, "permission.save_location_unwritable");
+    assert_eq!(found.confidence, Confidence::Probable);
+    assert_eq!(report.verdict, Verdict::PartlyExplained);
+    assert!(!report.launch_was_supplied());
+
+    // A missing save folder beside a failed save reads as a sentence.
+    let mut set = EvidenceSet::default();
+    exited(&mut set, 0);
+    ra_log(&mut set, "[ERROR] [SRAM]: Failed to save SRAM.\n");
+    path(
+        &mut set,
+        PathRole::SaveDirectory,
+        PathPresence::Missing,
+        None,
+        None,
+    );
+    let report = diagnose(&set);
+    let found = cause(&report, "permission.save_location_unwritable");
+    assert!(
+        found.limitations.iter().any(|limit| limit
+            == "EmuWiz looked at the save folder: the path does not exist, so whether it \
+                can be written to is not known."),
+        "{:?}",
+        found.limitations
+    );
 }

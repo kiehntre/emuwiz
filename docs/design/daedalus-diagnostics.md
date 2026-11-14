@@ -143,8 +143,13 @@ Whoever supplies evidence is stated. What EmuWiz observed itself is
 facts alone, cause or symptom, is more than `possible`, its source says it
 was supplied, and the report carries a note. A path typed on the command
 line is looked at by EmuWiz, so what is there is `measured`; that the launch
-used it in that role is the caller's statement, which the wording and a note
-say. A collector that is not told otherwise records everything as supplied.
+used it in that role is the caller's statement. A finding whose only firm
+support is such a path says so in its limits and is held at `probable`, and
+the report carries a note. The same holds when the only firm support beside a
+stated fact is that the launch failed: the finding stays `possible`. When how
+the launch ended was itself stated, the `Launch` line of the text report is
+labelled as supplied; in JSON, `launch` follows the `process_exit` item, whose
+`trust` is then `supplied`. A collector that is not told otherwise records everything as supplied.
 A report restored from JSON is for display: its fingerprints can no longer be
 compared with the files it was made from, and say so instead of opening
 whatever their text names.

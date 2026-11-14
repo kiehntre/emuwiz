@@ -314,6 +314,17 @@ pub enum LaunchOutcome {
     NotObserved,
 }
 
+impl DiagnosisReport {
+    /// Whether how the process ended was stated by whoever asked for the
+    /// diagnosis instead of observed by EmuWiz. [`Self::launch`] is then
+    /// their account, and anything that shows it must say so.
+    pub fn launch_was_supplied(&self) -> bool {
+        self.evidence
+            .observed(EvidenceArea::ProcessExit)
+            .any(|item| item.trust == Trust::Supplied)
+    }
+}
+
 impl LaunchOutcome {
     /// The outcome as a sentence fragment for a report heading.
     pub fn describe(self) -> &'static str {
@@ -1540,7 +1551,7 @@ fn save_location_unwritable(view: &View<'_>) -> Vec<Finding> {
         }
         Some((_, access)) if access.writable.is_none() => {
             finding = finding.limit(format!(
-                "EmuWiz looked at the save folder and found {}, so whether it can be \
+                "EmuWiz looked at the save folder: the path {}, so whether it can be \
                  written to is not known.",
                 access.presence.describe()
             ));
@@ -2279,16 +2290,45 @@ fn finalise(rule: &Rule, finding: Finding, evidence: &EvidenceSet) -> Result<Dia
                     .into(),
             );
         }
-    } else if has_untrusted_text
+    } else if (has_untrusted_text || has_supplied)
         && !has_firm_beyond_exit
         && confidence.rank() > Confidence::Possible.rank()
     {
+        // The only firm support is that the launch failed. What says why is
+        // text or a statement, and neither is firm.
         confidence = Confidence::Possible;
+        if has_untrusted_text {
+            limitations.push(
+                "Apart from the fact that the launch failed, it rests on text the emulator \
+                 printed; nothing else confirms it."
+                    .into(),
+            );
+        }
+        if has_supplied {
+            limitations.push(
+                "Apart from the fact that the launch failed, it rests on what was stated by \
+                 whoever asked for this diagnosis. EmuWiz did not observe it."
+                    .into(),
+            );
+        }
+    }
+    // A path EmuWiz looked at, in a role that was only stated: what is at
+    // the path is measured, but that the launch used it is a premise. When
+    // nothing else firm supports the finding, it is not established.
+    let stated_role =
+        |item: &&Evidence| matches!(&item.fact, Fact::PathAccess(access) if access.role_supplied);
+    if items.iter().any(stated_role) {
         limitations.push(
-            "Apart from the fact that the launch failed, it rests on text the emulator \
-             printed; nothing else confirms it."
+            "EmuWiz looked at this path itself. That the launch used it is what was stated \
+             by whoever asked for this diagnosis."
                 .into(),
         );
+        let firm_apart_from_stated_roles = items
+            .iter()
+            .any(|item| item.trust.is_firm() && !stated_role(item));
+        if !firm_apart_from_stated_roles {
+            confidence = confidence.at_most(Confidence::Probable);
+        }
     }
     let contradicting: Vec<EvidenceId> = finding
         .contradicting

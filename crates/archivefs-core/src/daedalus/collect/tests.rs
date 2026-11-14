@@ -131,11 +131,14 @@ fn paths_are_looked_at_and_never_opened() {
         before
     );
     assert_eq!(std::fs::read(&game).unwrap(), b"rom");
-    // The missing core is an established cause with no log at all.
+    // The missing core is a cause with no log at all. The path was named by
+    // the caller, so it is held at probable; when EmuWiz ran the launch
+    // itself the same finding is established.
     let report = diagnose(&set);
     assert!(report.causes.iter().any(|cause| {
-        cause.rule == "retroarch.core.not_loaded" && cause.confidence == Confidence::Established
+        cause.rule == "retroarch.core.not_loaded" && cause.confidence == Confidence::Probable
     }));
+    assert_ne!(report.verdict, Verdict::Explained);
 }
 
 #[test]
