@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::cheat_ir::{
     CheatDocument, CheatIssue, CheatOperation, CheatPlatform, CheatSourceFormat,
+    dolphin_on_frame_line_to_ir,
 };
 
 #[derive(Debug, Clone)]
@@ -63,6 +64,8 @@ pub fn discover_dolphin_onframe_candidates(
     let mut ops = Vec::new();
     let mut issues = Vec::new();
     let mut out = Vec::new();
+    // Patch lines that come before any `$name` in an OnFrame section.
+    let mut orphans = Vec::<String>::new();
     let flush = |original_lines: &mut Vec<String>,
                  title: &mut Option<String>,
                  ops: &mut Vec<CheatOperation>,
@@ -134,37 +137,25 @@ pub fn discover_dolphin_onframe_candidates(
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
-        original_lines.push(line.to_string());
-        let mut parts = t.split(':');
-        let (Some(a), Some(width), Some(v)) = (parts.next(), parts.next(), parts.next()) else {
+        if title.is_none() {
+            // A line that belongs to no named patch here: at the top of a
+            // section, or in a second `[OnFrame]` section before its first
+            // `$name`. It is never added to the next patch.
+            orphans.push(t.to_string());
             continue;
-        };
-        let parsed = u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok();
-        let value = u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok();
-        let op = match (parsed, value, width.trim().to_ascii_lowercase().as_str()) {
-            (Some(address), Some(value), "byte") if value <= 0xff => {
-                Some(CheatOperation::OnFrameWrite8 {
-                    address,
-                    value: value as u8,
-                })
+        }
+        original_lines.push(line.to_string());
+        // The project's one strict reading of an OnFrame line: exactly an
+        // address, a width and a value. Anything else (a conditional line
+        // with more fields, a line with fewer) is an issue that stops the
+        // install, never a different write or a line quietly left out.
+        match dolphin_on_frame_line_to_ir(t) {
+            CheatOperation::UnsupportedRaw { reason, .. } => {
+                issues.push(CheatIssue::UnsupportedOperation(format!(
+                    "unsupported OnFrame line: {t} ({reason})"
+                )));
             }
-            (Some(address), Some(value), "word") if value <= 0xffff => {
-                Some(CheatOperation::OnFrameWrite16 {
-                    address,
-                    value: value as u16,
-                })
-            }
-            (Some(address), Some(value), "dword") => {
-                Some(CheatOperation::OnFrameWrite32 { address, value })
-            }
-            _ => None,
-        };
-        if let Some(op) = op {
-            ops.push(op);
-        } else {
-            issues.push(CheatIssue::UnsupportedOperation(format!(
-                "unsupported OnFrame line: {t}"
-            )));
+            operation => ops.push(operation),
         }
     }
     if in_section {
@@ -175,6 +166,19 @@ pub fn discover_dolphin_onframe_candidates(
             &mut issues,
             &mut out,
         );
+    }
+    // Which patch such a line belongs to is not certain (Dolphin may give it
+    // to the patch before it, or to none), so nothing from this file is
+    // installable: every patch it holds carries the issue.
+    if let Some(first) = orphans.first() {
+        for candidate in &mut out {
+            candidate
+                .document
+                .issues
+                .push(CheatIssue::UnsupportedOperation(format!(
+                    "OnFrame line outside any named patch: {first}"
+                )));
+        }
     }
     Ok(out)
 }
@@ -227,6 +231,96 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].title, "60 FPS");
     }
+    /// A line this module cannot read exactly is not installed as something
+    /// else: a conditional line with four fields is not cut down to an
+    /// unconditional write, and a line with too few fields is not dropped
+    /// while the rest of the patch installs as if it were complete.
+    #[test]
+    fn a_line_that_is_not_an_exact_write_stops_the_install() {
+        let dir = tempfile::tempdir().unwrap();
+        for (body, kept) in [
+            ("$Conditional\n0x80001234:dword:0x1:0x0\n", 0),
+            ("$Short\n0x80001234:dword\n0x80005678:dword:0x2\n", 1),
+        ] {
+            let path = dir.path().join("GMSE01.ini");
+            fs::write(&path, format!("[OnFrame]\n{body}")).unwrap();
+            let found =
+                discover_dolphin_onframe_candidates(&path, CheatPlatform::GameCube).unwrap();
+            assert_eq!(found.len(), 1, "{body}");
+            let document = &found[0].document;
+            assert_eq!(document.operations.len(), kept, "{body}");
+            assert_eq!(document.issues.len(), 1, "{body}");
+            let binding =
+                bind_dolphin_onframe_candidate(&found[0], Some("GMSE01"), Path::new("/p"), false)
+                    .unwrap();
+            assert!(!binding.can_install, "{body}");
+        }
+    }
+
+    /// A patch line that belongs to no named patch is never added to the
+    /// next one; while the file holds one, none of its patches can be
+    /// installed.
+    #[test]
+    fn a_line_outside_any_named_patch_makes_the_file_uninstallable() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, patches) in [
+            (
+                "[OnFrame]\n0x80000000:dword:0x0\n$60 FPS\n0x80001234:dword:0x1\n",
+                1,
+            ),
+            (
+                "[OnFrame]\n$A\n0x80000004:dword:0x1\n[Core]\nCPUThread = True\n[OnFrame]\n0x80000008:dword:0x2\n$B\n0x8000000C:dword:0x3\n",
+                2,
+            ),
+        ] {
+            let path = dir.path().join("GMSE01.ini");
+            fs::write(&path, text).unwrap();
+            let found =
+                discover_dolphin_onframe_candidates(&path, CheatPlatform::GameCube).unwrap();
+            assert_eq!(found.len(), patches, "{text}");
+            for candidate in &found {
+                assert_eq!(candidate.document.operations.len(), 1, "{text}");
+                assert_eq!(candidate.document.issues.len(), 1, "{text}");
+                let binding = bind_dolphin_onframe_candidate(
+                    candidate,
+                    Some("GMSE01"),
+                    Path::new("/p"),
+                    false,
+                )
+                .unwrap();
+                assert!(!binding.can_install, "{text}");
+            }
+        }
+    }
+
+    /// The `=` spelling the strict reader accepts is read as the same write.
+    #[test]
+    fn an_exact_write_in_either_spelling_is_installable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("GMSE01.ini");
+        fs::write(
+            &path,
+            "[OnFrame]\n$Both\n0x80001234:dword:0x1\n0x80001238=word:0x2\n",
+        )
+        .unwrap();
+        let found = discover_dolphin_onframe_candidates(&path, CheatPlatform::GameCube).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].document.issues.is_empty());
+        assert_eq!(
+            found[0].document.operations,
+            vec![
+                CheatOperation::OnFrameWrite32 {
+                    address: 0x8000_1234,
+                    value: 1
+                },
+                CheatOperation::OnFrameWrite16 {
+                    address: 0x8000_1238,
+                    value: 2
+                },
+            ]
+        );
+    }
+
     #[test]
     fn binding_requires_verified_identity() {
         let candidate = DolphinOnFrameCandidate {

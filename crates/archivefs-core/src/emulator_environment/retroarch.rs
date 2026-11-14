@@ -1506,6 +1506,44 @@ fn parse_config(text: &str, recognized_keys: &[&'static str]) -> ParsedConfig {
     }
 }
 
+/// Every occurrence of the requested keys in one settings file, in file
+/// order, for callers that must point at the exact line a value came from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ConfigKeyOccurrences {
+    /// `(one-based line number, key, value)`.
+    pub(crate) occurrences: Vec<(u32, String, String)>,
+    /// Lines holding an `#include` directive. Included files are not read.
+    pub(crate) include_lines: Vec<u32>,
+    pub(crate) malformed_lines: Vec<u32>,
+}
+
+/// Lists every occurrence of `keys` using the same grammar as
+/// [`parse_config`], without collapsing repeats. RetroArch honours the
+/// *first* occurrence of a repeated key (checked against RetroArch 1.21.0),
+/// which is also what [`parse_config`] keeps.
+pub(crate) fn config_key_occurrences(text: &str, keys: &[&str]) -> ConfigKeyOccurrences {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut found = ConfigKeyOccurrences::default();
+    for (index, raw_line) in text.split('\n').enumerate() {
+        let line_number = (index + 1) as u32;
+        match classify_line(raw_line) {
+            LineKind::Blank | LineKind::WholeLineComment => {}
+            LineKind::Include => found.include_lines.push(line_number),
+            LineKind::Malformed => found.malformed_lines.push(line_number),
+            LineKind::KeyValue { key, value_region } => {
+                if keys.contains(&key) {
+                    found.occurrences.push((
+                        line_number,
+                        key.to_string(),
+                        extract_value(value_region),
+                    ));
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Which sub-field a `firmwareN_*` key names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirmwareField {

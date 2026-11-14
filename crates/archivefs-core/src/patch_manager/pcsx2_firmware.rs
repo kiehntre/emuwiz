@@ -306,5 +306,20 @@ pub fn pcsx2_profile_bios_verification(
     .as_legacy_state()
 }
 
+/// The files [`pcsx2_profile_bios_verification`] reads its answer from: the
+/// two places the profile's global configuration can be (it may name the
+/// BIOS file), and its `bios` folder, whose direct entries are the
+/// candidates. A caller that keeps the answer can watch these paths, and the
+/// entries directly inside the folder, to learn when it has to ask again. A
+/// configured BIOS name that is not a plain file name in that folder (one
+/// with a subfolder, `..` or an absolute path in it) is not covered by that.
+pub fn pcsx2_profile_bios_inputs(profile: &Pcsx2Profile) -> Vec<PathBuf> {
+    vec![
+        profile.configuration_path.join("inis/PCSX2.ini"),
+        profile.configuration_path.join("PCSX2.ini"),
+        profile.configuration_path.join("bios"),
+    ]
+}
+
 #[cfg(test)]
 mod tests;

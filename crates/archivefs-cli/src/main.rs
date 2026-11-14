@@ -88,6 +88,7 @@ mod cheat_reconcile;
 mod cheat_source;
 mod cheatbase;
 mod dat;
+mod diagnose_launch;
 mod discovery;
 mod inspect;
 mod journal_recovery;
@@ -173,6 +174,7 @@ fn is_read_only_invocation(cli: &CliArgs) -> bool {
             | "-h"
             | "--help"
             | "inspect"
+            | "diagnose-launch"
             | "saves"
             | "emulators"
             | "activity"
@@ -322,6 +324,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match command.as_str() {
         "emulators" | "activity" | "history" => read_only_status::run(&command, args.collect())?,
         "inspect" => inspect::run(args.collect())?,
+        "diagnose-launch" => diagnose_launch::run(args.collect())?,
         "discovery" => discovery::run(args)?,
         "saves" => saves::run(args.collect())?,
         "media-set" => media_set::run(args)?,
@@ -6100,6 +6103,7 @@ fn print_help() {
     println!();
     println!("Commands:");
     println!("{}", read_only_status::HELP);
+    println!("{}", diagnose_launch::HELP);
     println!("  media-set <inspect|explain|plan>  Read-only optical/floppy/tape topology (JSON)");
     println!(
         "  inspect <path>  Read-only view of what EmuWiz believes one file is, the evidence and provenance, launch topology readiness and why an operation would be blocked. Views: --identity --evidence --readiness --media --provenance (default: all); --json, --platform <name>, --root <dir>. Never opens the database or writes anything."
