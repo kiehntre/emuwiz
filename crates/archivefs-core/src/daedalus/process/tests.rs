@@ -151,3 +151,36 @@ fn a_full_stderr_capture_is_reported_as_cut_short() {
         .any(|item| matches!(&item.fact, Fact::LogCoverage(coverage) if coverage.truncated));
     assert!(!cut);
 }
+
+#[test]
+fn a_diagnostic_capture_is_cut_short_only_where_it_says_output_was_left_out() {
+    use crate::launch::process_spawn::{
+        OUTPUT_OMITTED_MARKER_PREFIX, OUTPUT_OMITTED_MARKER_SUFFIX,
+    };
+    let cut_short = |bytes: &[u8]| {
+        let mut set = EvidenceSet::default();
+        record_stderr(&mut set, bytes, "retroarch", &[]);
+        set.items()
+            .iter()
+            .any(|item| matches!(&item.fact, Fact::LogCoverage(coverage) if coverage.truncated))
+    };
+
+    // More than a plain capture holds, and complete: a start-and-end capture
+    // kept every byte, so nothing was left out.
+    let whole = b"line\n".repeat(PROCESS_STDERR_CAPTURE_LIMIT / 5 + 100);
+    assert!(whole.len() > PROCESS_STDERR_CAPTURE_LIMIT);
+    assert!(!cut_short(&whole));
+
+    let mut with_gap = b"start\n".to_vec();
+    with_gap.extend_from_slice(
+        format!("{OUTPUT_OMITTED_MARKER_PREFIX}4096{OUTPUT_OMITTED_MARKER_SUFFIX}\n").as_bytes(),
+    );
+    with_gap.extend_from_slice(b"end\n");
+    assert!(cut_short(&with_gap));
+
+    // The marker is a whole line. The same words inside a longer line are
+    // something the program printed.
+    let inline =
+        format!("core said {OUTPUT_OMITTED_MARKER_PREFIX}1{OUTPUT_OMITTED_MARKER_SUFFIX} ok\n");
+    assert!(!cut_short(inline.as_bytes()));
+}

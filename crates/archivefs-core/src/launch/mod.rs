@@ -170,6 +170,7 @@ pub mod installation_support;
 pub mod readiness;
 pub mod resource_grants;
 pub mod retroarch_command;
+pub mod retroarch_launch_diagnostics;
 pub mod retroarch_launch_visibility;
 pub mod retroarch_resource_projection;
 pub mod rmg_command;

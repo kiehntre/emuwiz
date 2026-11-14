@@ -92,6 +92,7 @@ mod diagnose_launch;
 mod discovery;
 mod inspect;
 mod journal_recovery;
+mod launch_history;
 mod mame_evidence;
 mod mame_normalise;
 mod mame_staging;
@@ -164,7 +165,10 @@ fn startup_registration(cli: &CliArgs) -> StartupRegistration {
 /// `database-recover-journal` is here because the gate is not what protects
 /// the catalogue from it: with `--apply --confirm` it lets SQLite recover the
 /// library database, under the database's own upgrade lock and only when no
-/// process has the database open.
+/// process has the database open. `launch-history` is here whatever it is
+/// asked to do: deleting, clearing and switching change only its own
+/// `launch-diagnostics` folder, so starting it never opens the Undo seal
+/// store, the writer registry in the data directory or the library database.
 fn is_read_only_invocation(cli: &CliArgs) -> bool {
     matches!(
         cli.command.as_str(),
@@ -175,6 +179,7 @@ fn is_read_only_invocation(cli: &CliArgs) -> bool {
             | "--help"
             | "inspect"
             | "diagnose-launch"
+            | "launch-history"
             | "saves"
             | "emulators"
             | "activity"
@@ -325,6 +330,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "emulators" | "activity" | "history" => read_only_status::run(&command, args.collect())?,
         "inspect" => inspect::run(args.collect())?,
         "diagnose-launch" => diagnose_launch::run(args.collect())?,
+        "launch-history" => launch_history::run(args.collect())?,
         "discovery" => discovery::run(args)?,
         "saves" => saves::run(args.collect())?,
         "media-set" => media_set::run(args)?,
@@ -6104,6 +6110,7 @@ fn print_help() {
     println!("Commands:");
     println!("{}", read_only_status::HELP);
     println!("{}", diagnose_launch::HELP);
+    println!("{}", launch_history::HELP);
     println!("  media-set <inspect|explain|plan>  Read-only optical/floppy/tape topology (JSON)");
     println!(
         "  inspect <path>  Read-only view of what EmuWiz believes one file is, the evidence and provenance, launch topology readiness and why an operation would be blocked. Views: --identity --evidence --readiness --media --provenance (default: all); --json, --platform <name>, --root <dir>. Never opens the database or writes anything."
@@ -7511,6 +7518,10 @@ mod tests {
             &["config-check"],
             &["config-dir"],
             &["data-dir"],
+            &["launch-history"],
+            &["launch-history", "clear"],
+            &["launch-history", "off"],
+            &["launch-history", "delete", "20270115T080000Z-0123abcd"],
         ] {
             assert!(invocation(read_only), "{read_only:?}");
         }

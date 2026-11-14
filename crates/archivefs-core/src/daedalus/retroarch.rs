@@ -172,6 +172,31 @@ pub const SIGNATURES: &[Signature] = &[
         meaning: LogMeaning::SaveWriteFailed,
         matcher: Matcher::Exact("[ERROR] [SRAM]: Failed to save SRAM."),
     },
+    // Both printed with detailed logging only, and both carry a path, which
+    // is never copied into anything that is stored.
+    Signature {
+        id: "retroarch.save.written",
+        version: 1,
+        meaning: LogMeaning::SaveWritten,
+        matcher: Matcher::PrefixQuoted("[INFO] [SRAM]: Saved successfully to "),
+    },
+    Signature {
+        id: "retroarch.save.recovery_written",
+        version: 1,
+        meaning: LogMeaning::SaveRecoveryWritten,
+        matcher: Matcher::PrefixQuoted("[WARN] [SRAM]: Succeeded in saving RAM data to "),
+    },
+    // Printed with detailed logging just before a battery save is written,
+    // whichever way the write then goes. Seeing it is what shows that this
+    // RetroArch, in its language and version and with its log going where
+    // EmuWiz reads it, reports saves in the wording the lines above expect.
+    // Without it, the absence of a failure line means nothing.
+    Signature {
+        id: "retroarch.save.attempted",
+        version: 1,
+        meaning: LogMeaning::SaveAttempted,
+        matcher: Matcher::Prefix("[INFO] [SRAM]: Saving RAM type "),
+    },
 ];
 
 /// Settings read for diagnosis. Nothing else in the file is recorded.

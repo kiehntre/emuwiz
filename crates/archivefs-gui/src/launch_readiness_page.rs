@@ -2290,6 +2290,16 @@ impl RetroArchLaunchStage {
     }
 }
 
+/// The end of what RetroArch printed, for the technical-details box of a
+/// failed launch. RetroArch launches capture detailed output for diagnosis;
+/// that capture is not shown whole. This is its last lines only, with the
+/// private details EmuWiz recognises removed and every character visible.
+fn shown_output_tail(stderr: &[u8]) -> String {
+    use archivefs_core::daedalus::redact::{Redactor, output_tail_for_display};
+    const SHOWN_OUTPUT_LINES: usize = 40;
+    output_tail_for_display(stderr, &Redactor::for_current_user(), SHOWN_OUTPUT_LINES)
+}
+
 /// Owned presentation snapshot for the launch currently associated with one
 /// exact request. Both Advanced View and Gamer View render this same state,
 /// so a preflight/spawn failure cannot disappear merely because the launch
@@ -2657,7 +2667,12 @@ impl RetroArchLaunchState {
                         Err(error) => format!("wait() failed: {error}"),
                     };
                     let stderr_tail = (!success && !report.stderr.is_empty())
-                        .then(|| String::from_utf8_lossy(&report.stderr).into_owned());
+                        .then(|| shown_output_tail(&report.stderr));
+                    if success {
+                        // Nothing a launch that ended well printed is held
+                        // once it has been seen to end well.
+                        process.discard_captured_output();
+                    }
                     RetroArchLaunchDisplay::Exited {
                         success,
                         status_detail,
@@ -2698,9 +2713,12 @@ impl RetroArchLaunchState {
                                 .process_mut()
                                 .and_then(|p| p.poll())
                                 .filter(|report| !report.stderr.is_empty())
-                                .map(|report| String::from_utf8_lossy(&report.stderr).into_owned())
+                                .map(|report| shown_output_tail(&report.stderr))
                         })
                         .flatten();
+                    if success && let Some(process) = session.process_mut() {
+                        process.discard_captured_output();
+                    }
                     RetroArchLaunchDisplay::Exited {
                         success,
                         status_detail,

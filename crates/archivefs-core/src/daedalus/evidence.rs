@@ -568,6 +568,16 @@ pub enum LogMeaning {
     AudioDriverInitFailed,
     /// Writing save data failed.
     SaveWriteFailed,
+    /// The emulator said it wrote save data; `value` is where.
+    SaveWritten,
+    /// After a failed save, the emulator said it kept a recovery copy of
+    /// the save data; `value` is where.
+    SaveRecoveryWritten,
+    /// The emulator said it was starting to write save data. It says so
+    /// before it says how the write went, so seeing it is what shows that
+    /// a failed write would have been reported in the wording that is
+    /// looked for.
+    SaveAttempted,
     /// The dynamic loader could not find a shared library; `value` is its
     /// name.
     SharedLibraryMissing,

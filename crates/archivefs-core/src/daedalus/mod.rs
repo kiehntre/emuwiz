@@ -43,16 +43,35 @@
 //! - [`text`]: bounded, sanitised handling of untrusted text.
 //! - [`signatures`]: fixed log signatures and the scanner that applies them.
 //! - [`process`]: evidence from a finished process.
+//! - [`redact`]: removes the private details it recognises before a report is
+//!   shown or exported. Best effort, and described as such.
+//! - [`render`]: a report as plain text.
+//! - [`history`]: the private, bounded record of failed launches. Structured
+//!   summaries only; no emulator output.
+//! - [`export`]: detailed diagnostics as text, for a person who asks.
+//! - [`saves`]: whether a save write was seen to fail, and which kinds of
+//!   save were being watched at all.
+//! - [`notice`]: what an interface shows about a finished launch, as plain
+//!   values: a prominent failure or save warning, or one quiet line.
+//! - [`session`]: one call for a launch that has just finished: diagnose,
+//!   assess saves, record when it is one to keep.
 //! - [`retroarch`]: RetroArch log signatures and settings evidence.
 //! - [`limitations`]: the built-in table of known compatibility limits.
 //! - [`rules`]: the versioned rule set and the diagnostic engine.
 
 pub mod collect;
 pub mod evidence;
+pub mod export;
+pub mod history;
 pub mod limitations;
+pub mod notice;
 pub mod process;
+pub mod redact;
+pub mod render;
 pub mod retroarch;
 pub mod rules;
+pub mod saves;
+pub mod session;
 pub mod signatures;
 pub mod text;
 

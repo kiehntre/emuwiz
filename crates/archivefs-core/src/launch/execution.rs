@@ -81,10 +81,13 @@ fn swap_content_argument(
     }
 }
 
-/// Caps how much of a launched process's stderr this module ever retains
-/// in memory - a diagnostic aid for a failed/crashed launch, never a full
-/// log. Re-exports [`process_spawn::PROCESS_STDERR_CAPTURE_LIMIT`] under
-/// this module's existing name.
+/// Caps how much of the *start* of a launched process's output this module
+/// retains in memory - a diagnostic aid for a failed/crashed launch, never a
+/// full log. Re-exports [`process_spawn::PROCESS_STDERR_CAPTURE_LIMIT`] under
+/// this module's existing name. A launch that asks RetroArch for detailed
+/// logging also keeps up to
+/// [`process_spawn::DIAGNOSTIC_TAIL_CAPTURE_LIMIT`] bytes from the end, plus
+/// one marker line: see [`process_spawn::OutputCapture::Diagnostic`].
 pub const LAUNCH_STDERR_CAPTURE_LIMIT: usize = process_spawn::PROCESS_STDERR_CAPTURE_LIMIT;
 
 // ---------------------------------------------------------------------------
@@ -1023,6 +1026,12 @@ impl LaunchedRetroArchProcess {
         self.watched.is_running()
     }
 
+    /// Let go of what RetroArch printed, keeping how it ended: see
+    /// [`WatchedProcess::discard_captured_output`].
+    pub fn discard_captured_output(&mut self) {
+        self.watched.discard_captured_output();
+    }
+
     /// Whether a stop request would reach RetroArch itself. Only a native
     /// profile whose owned child is executing the file it launched qualifies:
     /// an AppImage or other launcher may exit while the emulator keeps
@@ -1074,12 +1083,16 @@ impl LaunchedRetroArchProcess {
 ///   inert data, never re-parsed as syntax.
 /// - `stdin` is `Stdio::null()` - RetroArch never needs to read from this
 ///   process's stdin.
-/// - `stdout` is `Stdio::null()` - RetroArch is a graphical process; it
-///   does not need its own stdout consumed by this process, and inheriting
-///   it would tie this process's terminal to RetroArch's for no benefit.
-/// - `stderr` is `Stdio::piped()` and drained on a background thread,
-///   bounded at [`LAUNCH_STDERR_CAPTURE_LIMIT`], purely as a diagnostic aid
-///   if the launch fails or crashes.
+/// - `stdout` and `stderr`: RetroArch is asked for detailed logging and
+///   both go through one pipe into a bounded capture (the first
+///   [`LAUNCH_STDERR_CAPTURE_LIMIT`] bytes and the last
+///   [`process_spawn::DIAGNOSTIC_TAIL_CAPTURE_LIMIT`]); see
+///   [`super::retroarch_launch_diagnostics`]. With the quiet switch, or when
+///   RetroArch's arguments cannot be located, `stdout` is `Stdio::null()`
+///   and only the start of `stderr` is kept. Either way the output is
+///   drained on a background thread and is purely a diagnostic aid if the
+///   launch fails or crashes; neither stream is inherited, which would tie
+///   this process's terminal to RetroArch's for no benefit.
 /// - Display/XDG/RetroArch settings are inherited. A supported native SRAM
 ///   observer adds only private per-child loader/IPC variables; the parent
 ///   environment and emulator configuration are unchanged. Native sessions
@@ -1234,8 +1247,12 @@ pub(crate) fn spawn_retroarch_guarded(
         }
     }
     let launched_file = process_spawn::ExecutableFile::of(&command.executable).ok();
+    // Asked for last, after every check above: the planned and verified
+    // command is untouched, and the only difference from a quiet launch is
+    // one argument. See the module for what was verified about it.
+    let capture = super::retroarch_launch_diagnostics::prepare_launch(&mut prepared.arguments);
     let watched = observation
-        .spawn(&prepared)
+        .spawn(&prepared, capture)
         .map_err(LaunchSpawnError::Spawn)?;
     Ok(LaunchedRetroArchProcess {
         staged_cartridge: None,

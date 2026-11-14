@@ -16,7 +16,10 @@ use super::evidence::{
 };
 use super::signatures::{self, HOST_EMULATOR, HOST_SIGNATURES, Signature};
 use super::text;
-use crate::launch::process_spawn::ProcessExitReport;
+use crate::launch::process_spawn::{
+    OUTPUT_OMITTED_MARKER_PREFIX, OUTPUT_OMITTED_MARKER_SUFFIX, PROCESS_STDERR_CAPTURE_LIMIT,
+    ProcessExitReport,
+};
 
 /// The outcome for a process that could not be started.
 pub fn spawn_failure(error: &std::io::Error) -> ExitOutcome {
@@ -168,17 +171,29 @@ pub fn record_exit_report(
     exit
 }
 
-/// Scan the standard error an executor captured. The executor keeps only
+/// Scan the standard error an executor captured. A plain capture keeps only
 /// the first part of the stream, so the coverage is marked truncated when
-/// the capture is full: an error printed later would not be in it.
+/// that capture is full: an error printed later would not be in it. A
+/// diagnostic capture keeps the start and the end and says so itself, with a
+/// marker line where output was left out.
 pub fn record_stderr(
     set: &mut EvidenceSet,
     stderr: &[u8],
     emulator: &str,
     emulator_signatures: &[Signature],
 ) -> Vec<EvidenceId> {
-    let capture_full = stderr.len() >= crate::launch::process_spawn::PROCESS_STDERR_CAPTURE_LIMIT;
+    let capture_full = stderr.len() == PROCESS_STDERR_CAPTURE_LIMIT || has_omission_marker(stderr);
     record_output(set, stderr, emulator, emulator_signatures, capture_full)
+}
+
+/// Whether a capture holds the line the executor writes where it left output
+/// out. A program can print that line itself; the only effect is that its
+/// output is treated as incomplete, which is the cautious reading.
+fn has_omission_marker(stderr: &[u8]) -> bool {
+    stderr.split(|byte| *byte == b'\n').any(|line| {
+        line.starts_with(OUTPUT_OMITTED_MARKER_PREFIX.as_bytes())
+            && line.ends_with(OUTPUT_OMITTED_MARKER_SUFFIX.as_bytes())
+    })
 }
 
 /// Scan output that is complete as supplied (a file someone saved), with no
