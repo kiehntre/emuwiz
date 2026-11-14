@@ -397,21 +397,72 @@ def folder_move_report(path: Path, parsed: Any) -> tuple[str, list[str], list[st
     return state, blockers, warnings
 
 
+FOLDER_MOVE_ID = re.compile(r"folder-move-(\d+)-\d+-(\d+)")
+
+
+def folder_move_order(parsed: Any) -> tuple[int, int] | None:
+    """When a folder-move record was started, from its id
+    (folder-move-<seconds>-<pid>-<nanoseconds>), or None if that cannot be told."""
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("id"), str):
+        return None
+    match = FOLDER_MOVE_ID.fullmatch(parsed["id"])
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def superseded_folder_moves(records: list[tuple[Path, Any]]) -> dict[Path, Path]:
+    """Settled records that a later record for the same folder replaced.
+
+    Organise, Undo and Organise again leaves an older Undone (or RolledBack)
+    record and a newer Committed one for the same paths. Only the newest
+    record says where the folder and its library rows should be now, so an
+    older settled record is not checked against today's files and library.
+    The newer record is checked (or blocks, if open or unreadable) as usual.
+    A record whose start cannot be told from its id is never treated as
+    replaced, and never replaces another: it is checked on its own.
+    """
+    known = []
+    for path, parsed in records:
+        order = folder_move_order(parsed)
+        source, destination = (parsed.get("source"), parsed.get("destination")) if isinstance(parsed, dict) else (None, None)
+        if order is not None and isinstance(source, str) and isinstance(destination, str):
+            known.append((order, path, {source, destination}, parsed.get("state")))
+    replaced: dict[Path, Path] = {}
+    for order, path, paths, state in known:
+        if state not in FOLDER_MOVE_SETTLED:
+            continue
+        later = [(o, p) for o, p, other, _ in known if o > order and paths & other]
+        if later:
+            replaced[path] = min(later)[1]
+    return replaced
+
+
 def transactions_report(data_root: Path) -> tuple[dict[str, Any], list[str], list[str]]:
     counts: dict[str, int] = {}
     entries = []
     blockers: list[str] = []
     warnings: list[str] = []
-    for path in journal_files(data_root):
+    files = journal_files(data_root)
+    folder_moves: dict[Path, Any] = {}
+    for path in files:
         if is_folder_move_record(path):
             try:
-                parsed = json.loads(path.read_text(encoding="utf-8"))
+                folder_moves[path] = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                parsed = None
-            state, found_blockers, found_warnings = folder_move_report(path, parsed)
+                folder_moves[path] = None
+    replaced = superseded_folder_moves(list(folder_moves.items()))
+    for path in files:
+        if is_folder_move_record(path):
+            parsed = folder_moves[path]
+            entry: dict[str, Any] = {"path": str(path), "kind": "folder_move"}
+            if path in replaced:
+                # Settled, and a later move of the same folder replaced it.
+                state, found_blockers, found_warnings = parsed["state"], [], []
+                entry["superseded_by"] = str(replaced[path])
+            else:
+                state, found_blockers, found_warnings = folder_move_report(path, parsed)
             counts[state] = counts.get(state, 0) + 1
-            entries.append({"path": str(path), "state": state, "kind": "folder_move",
-                            "recognized": state in FOLDER_MOVE_SETTLED | FOLDER_MOVE_OPEN})
+            entry.update({"state": state, "recognized": state in FOLDER_MOVE_SETTLED | FOLDER_MOVE_OPEN})
+            entries.append(entry)
             blockers.extend(found_blockers)
             warnings.extend(found_warnings)
             continue

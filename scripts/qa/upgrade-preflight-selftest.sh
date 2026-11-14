@@ -199,4 +199,46 @@ grep -q "newer EmuWiz" "$ROOT/fm-newer-version.out" || { echo "self-test failed:
 folder_case boolean-version Committed destination new 2 '{"version": true, "state": "Committed", "source": "/nowhere/a", "destination": "/nowhere/b", "rows": []}'
 folder_case list-state Committed destination new 2 '{"version": 1, "state": ["Committed"]}'
 
+# Two records for the same folder (Organise, Undo, Organise again; or a
+# rolled-back move retried): only the newest one is checked against today's
+# files and library. Ids carry the start time (folder-move-<s>-<pid>-<ns>).
+folder_history_case() {
+    local name="$1" older_state="$2" older_id="$3" newer_state="$4" newer_id="$5" at="$6" row_at="$7" expected="$8"
+    local base="$ROOT/fmh-$name"
+    mkdir -p "$base/config" "$base/data/rename-transactions-sealed-v1/folder-moves" "$base/lib/mixed" "$base/lib/ScummVM"
+    make_db "$base/data/library.sqlite3" "$CURRENT"
+    case "$at" in
+        source) mkdir -p "$base/lib/mixed/Adventure" ;;
+        destination) mkdir -p "$base/lib/ScummVM/Adventure" ;;
+    esac
+    python3 - "$base" "$older_state" "$older_id" "$newer_state" "$newer_id" "$row_at" <<'PY'
+import json, sqlite3, sys
+base, older_state, older_id, newer_state, newer_id, row_at = sys.argv[1:7]
+old, new = f"{base}/lib/mixed/Adventure", f"{base}/lib/ScummVM/Adventure"
+db = f"{base}/lib/catalogue.sqlite3"
+c = sqlite3.connect(db)
+c.execute("CREATE TABLE archives(id INTEGER PRIMARY KEY, absolute_path_cached BLOB)")
+c.execute("INSERT INTO archives VALUES (7, ?)", ((old if row_at == "old" else new).encode(),))
+c.commit(); c.close()
+assoc = lambda p: {"folder": 1, "root": f"{base}/lib", "root_identity": None, "relative": [], "absolute": list(p.encode())}
+for record_id, state in ((older_id, older_state), (newer_id, newer_state)):
+    record = {"version": 1, "id": record_id, "source": old, "destination": new, "root": f"{base}/lib",
+              "platform": "ScummVM", "database": db, "layout_digest": "", "entries": 1, "total_bytes": 1,
+              "rows": [{"archive": 7, "old": assoc(old), "new": assoc(new), "fingerprint": False}],
+              "created_dirs": [], "state": state, "at_unix": 0}
+    with open(f"{base}/data/rename-transactions-sealed-v1/folder-moves/{record_id}.json", "w", encoding="utf-8") as f:
+        json.dump(record, f)
+PY
+    run_case "fmh-$name" "$expected" --config-root "$base/config" --data-root "$base/data" \
+        --legacy-config-root "$base/legacy-config" --legacy-data-root "$base/legacy-data"
+}
+folder_history_case undone-then-committed Undone folder-move-100-1-5 Committed folder-move-200-1-5 destination new 0
+folder_history_case rolledback-then-committed RolledBack folder-move-100-1-5 Committed folder-move-100-2-9 destination new 0
+# The newest record is still checked, and an open newest record still blocks.
+folder_history_case newest-disagrees Undone folder-move-100-1-5 Committed folder-move-200-1-5 source old 2
+folder_history_case newest-open Undone folder-move-100-1-5 Planned folder-move-200-1-5 destination new 2
+# Without a start time in the id nothing is treated as replaced: the Undone
+# record is checked on its own and the folder contradicts it.
+folder_history_case order-unknown Undone folder-move-old Committed folder-move-200-1-5 destination new 2
+
 echo "UPGRADE PREFLIGHT SELF-TEST: PASS"
