@@ -5,9 +5,10 @@ formatting, temporary files, commits). Everything there applies to Claude Code.
 
 ## Starting a session
 
-Start at the root of the worktree assigned to the task, never in the home directory or
-in a subdirectory. The rust-analyzer language server is off by default here; see
-"Coding sessions and code indexing" in `AGENTS.md` before enabling it.
+Start at the root of the worktree assigned to the task, never in the home directory
+and, except for the code-navigation procedure in `AGENTS.md`, never in a subdirectory.
+The rust-analyzer language server is off by default here; see "Coding sessions and code
+indexing" in `AGENTS.md` before enabling it.
 
 ## Cargo builds
 
