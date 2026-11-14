@@ -158,6 +158,8 @@ pub mod tape_audio;
 pub mod test_environment;
 /// Bounded, read-only Thomson SAP floppy evidence.
 pub mod thomson_sap;
+#[cfg(target_os = "linux")]
+pub mod transform;
 pub mod uef_tape;
 /// A disposable profile holding one production-verified synthetic game.
 #[cfg(any(test, feature = "test-support"))]

@@ -33,6 +33,8 @@ pub(super) struct ToolPagesState {
     pub arcade_shelf: arcade_shelf::State,
     pub vita3k_titles: vita3k_titles::State,
     pub openrct2: openrct2::State,
+    #[cfg(target_os = "linux")]
+    pub relocation: super::relocation_page::State,
 }
 
 impl ToolPagesState {
@@ -52,6 +54,8 @@ impl ToolPagesState {
             arcade_shelf: Default::default(),
             vita3k_titles: Default::default(),
             openrct2: Default::default(),
+            #[cfg(target_os = "linux")]
+            relocation: Default::default(),
             host_diagnostics: Default::default(),
             homebrew_browser: Default::default(),
             patch_package_preview: Default::default(),
@@ -143,6 +147,12 @@ impl App {
             ToolPage::ArcadeShelf => self.arcade_shelf_page(ui),
             ToolPage::Vita3kTitles => self.vita3k_titles_page(ui),
             ToolPage::FolderCheck => self.folder_check_page(ui),
+            ToolPage::Relocation => {
+                #[cfg(target_os = "linux")]
+                super::relocation_page::show(ui, &mut self.tools.relocation);
+                #[cfg(not(target_os = "linux"))]
+                ui.label("Moving games between library folders is available on Linux only.");
+            }
             ToolPage::OpenRct2 => self.openrct2_page(ui),
             ToolPage::ViewHistory => {
                 use super::view_history_page::{Request, show};

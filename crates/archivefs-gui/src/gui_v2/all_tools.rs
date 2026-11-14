@@ -199,6 +199,13 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         purpose: ToolPage::FolderCheck.purpose(),
         safety: ToolSafety::AsksFirst,
     });
+    #[cfg(target_os = "linux")]
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::Relocation),
+        title: ToolPage::Relocation.title(),
+        purpose: ToolPage::Relocation.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     games.tools.push(Tool {
         route: Route::Tool(ToolPage::ArcadeShelf),
         title: ToolPage::ArcadeShelf.title(),

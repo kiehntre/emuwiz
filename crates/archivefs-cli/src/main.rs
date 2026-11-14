@@ -104,6 +104,8 @@ mod retroarch_cheat_sources;
 mod rom_organise;
 mod romm_identity;
 mod saves;
+#[cfg(target_os = "linux")]
+mod transform;
 
 static LOGGER: StderrLogger = StderrLogger;
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
@@ -539,6 +541,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "repair" => {
             repair::run(args.collect())?;
+        }
+        #[cfg(target_os = "linux")]
+        "transform" => {
+            transform::run(args.collect())?;
         }
         "pcsx2-patch-preview" => {
             let mut input_args = args.collect::<Vec<_>>();
