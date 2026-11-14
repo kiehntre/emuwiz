@@ -1,8 +1,8 @@
 //! Answers handed back by background readiness workers.
 //!
 //! Several emulator checks run on their own thread for the selected game
-//! (Mesen, shadPS4, Hatari, the MAME machine probe, the per-game content
-//! inspections). Each leaves its answer in a channel that is only read the
+//! (Mesen, shadPS4, Hatari, VICE, the MAME machine probe, the per-game
+//! content inspections). Each leaves its answer in a channel that is only read the
 //! next time the launch-readiness input is built, then wakes the interface.
 //!
 //! A worker calls [`arrived`] after sending its answer and before that

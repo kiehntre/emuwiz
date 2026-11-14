@@ -24,9 +24,10 @@
 //!   changed on disk), so every input is rebuilt on a timer as well. The age
 //!   starts short and doubles each time a rebuild gives the same answer, up
 //!   to [`SETTLED_AGE`], and drops back to [`SETTLING_AGE`] the moment an
-//!   answer differs or the key changes. An answer that says a check is
-//!   still running never settles: it keeps the short age, and a slow build
-//!   stretches it no further than [`SETTLED_AGE`]. The age is counted from when the
+//!   answer differs or the key changes. An answer that is no plan at all
+//!   because a check is still running never settles: it keeps the short
+//!   age, and a slow build stretches it no further than [`SETTLED_AGE`]. The
+//!   age is counted from when the
 //!   build finished and is never less than [`BUILD_SHARE`] times what the
 //!   build took (up to [`SLOW_BUILD_AGE_CAP`]), so rebuilding cannot occupy
 //!   more than a small share of the interface thread on a slow machine or
@@ -208,18 +209,20 @@ impl LaunchInputMemo {
 }
 
 /// Whether the input says a check is still running: the evidence is not
-/// loaded, RetroArch has not been scanned, or the plan was built before an
-/// emulator scan it depends on had finished.
+/// loaded (with a key, that is the MAME machine probe still at work) or
+/// RetroArch has not been scanned.
+///
+/// A plan built before an emulator scan finished is deliberately not
+/// counted. For some games that scan never runs or has ended in an error
+/// (Xenia outside the cheats workflow, a failed PCSX2 or Dolphin scan, an
+/// Amiga game with no WHDLoad or ADF context), so the plan would be rebuilt
+/// four times a second for as long as the game stays selected. Every change
+/// to those scan states already changes the key.
 fn still_checking(input: &LaunchReadinessInput) -> bool {
-    match input {
-        LaunchReadinessInput::EvidenceNotLoaded | LaunchReadinessInput::RetroArchNotScanned => true,
-        LaunchReadinessInput::Plan {
-            retroarch_scanned,
-            standalone_scans_complete,
-            ..
-        } => !retroarch_scanned || !standalone_scans_complete,
-        _ => false,
-    }
+    matches!(
+        input,
+        LaunchReadinessInput::EvidenceNotLoaded | LaunchReadinessInput::RetroArchNotScanned
+    )
 }
 
 /// A fingerprint of what the input says: the variant, and for a plan its
@@ -428,10 +431,16 @@ mod tests {
             LaunchReadinessInput::RetroArchNotScanned
         });
         assert_eq!(shown.recheck_in, Some(SETTLED_AGE));
-        // The moment the answer is a real one, the normal steps apply.
-        memo.freeze(now + slow + SETTLED_AGE);
+        // The moment the answer is a real one, the normal steps apply: it
+        // starts short and doubles when it repeats.
+        let mut at = now + slow + SETTLED_AGE;
+        memo.freeze(at);
         let settled = memo.shown(Some(2), || LaunchReadinessInput::IdentityConflicting);
         assert_eq!(settled.recheck_in, Some(SETTLING_AGE));
+        at += SETTLING_AGE;
+        memo.freeze(at);
+        let repeated = memo.shown(Some(2), || LaunchReadinessInput::IdentityConflicting);
+        assert_eq!(repeated.recheck_in, Some(SETTLING_AGE * 2));
     }
 
     #[test]
