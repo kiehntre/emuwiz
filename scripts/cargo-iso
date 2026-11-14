@@ -150,7 +150,9 @@
 # combined with an EXPLICIT incremental request (--incremental or EMUWIZ_CARGO_INCREMENTAL=1;
 # refused, exit 2). A worktree that is merely designated is built non-incremental under
 # --sccache, with a note. It never starts or stops a server you did not need;
-# it never deletes anything itself.
+# it never deletes anything itself. The server is started (or reused) before the
+# build takes any lock, with no inherited lock descriptors, so a long-lived server
+# never holds a finished target's lifecycle lock or a build slot.
 #
 # Exit codes of its own: 2 usage/not a git worktree, 3 refused target,
 # 4 not enough free disk, 5 reserved (an enforcing budget mode is not available: the
@@ -546,6 +548,24 @@ if [ "$use_sccache" = "1" ]; then
   export SCCACHE_CACHE_SIZE="$sccache_size"
   export SCCACHE_SERVER_PORT="${EMUWIZ_SCCACHE_PORT:-4241}"
   export CARGO_INCREMENTAL=0
+  # Start (or reuse) the shared sccache server NOW, before this build takes its
+  # build slot or lifecycle lock, with every inherited descriptor above stderr
+  # closed. Otherwise the first rustc of the build starts it inside the build, and
+  # the long-lived server inherits the target's lifecycle lock (which the tracker
+  # deliberately passes to cargo so a live build stays protected) and any build-slot
+  # lock: --finish-task and retirement of that target stay refused, and the slot
+  # stays taken, for as long as the server lives (it serves other worktrees' builds
+  # too). A server that is already running is reused unchanged. A failure here
+  # never blocks the build: the first rustc then starts the server as before.
+  (
+    for fd_path in /proc/"$BASHPID"/fd/*; do
+      fd=${fd_path##*/}
+      case "$fd" in ''|*[!0-9]*) continue ;; esac
+      # 255 is bash's own script descriptor; harmless to keep, risky to close.
+      if [ "$fd" -gt 2 ] && [ "$fd" -ne 255 ]; then exec {fd}>&-; fi
+    done
+    exec "$sccache_bin" --start-server
+  ) </dev/null >/dev/null 2>&1 || true
 elif [ "$incremental" = "1" ]; then
   export CARGO_INCREMENTAL=1
 elif [ "$inc_explicit" -eq 1 ]; then

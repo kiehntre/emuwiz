@@ -36,6 +36,10 @@ cat >"$fake" <<'E'
   echo "argc=$#"
   i=0; for a in "$@"; do i=$((i + 1)); echo "arg$i=$a"; done
 } >"${FAKE_CARGO_LOG:?}"
+# Like a real build's first rustc: call the compiler wrapper (sccache) once.
+if [ -n "${FAKE_CARGO_RUN_WRAPPER:-}" ] && [ -n "${RUSTC_WRAPPER:-}" ]; then
+  "$RUSTC_WRAPPER" rustc -vV >/dev/null 2>&1 || true
+fi
 exit "${FAKE_CARGO_EXIT:-0}"
 E
 chmod +x "$fake"
@@ -297,6 +301,67 @@ check "EMUWIZ_CARGO_SCCACHE=0 is the default" test "$rc" = 0
 check "a malformed cache size is refused (2)" test "$rc" = 2
 (cd "$tmp/wt-one" && PATH="$fakebin:$PATH" EMUWIZ_SCCACHE_SIZE=512M EMUWIZ_SCCACHE_DIR="$tmp/sc" "$iso" --sccache check >/dev/null 2>&1)
 check "size and dir overrides are honoured" test "$(logged sccache_size)/$(logged sccache_dir)" = "512M/$tmp/sc"
+
+# ---- --sccache: the long-lived server never inherits a build's lifecycle lock or build slot
+# A fake sccache that behaves like the real client: "--start-server" starts the server
+# unless one runs, and a compiler call starts it too when none runs. The "server"
+# records the descriptors it inherited, then lives until the test releases it.
+fakebin2="$tmp/fakebin2"; mkdir -p "$fakebin2"
+cat >"$fakebin2/sccache" <<'E'
+#!/usr/bin/env bash
+s="${FAKE_SCCACHE_STATE:?}"
+if [ "${1:-}" = "--start-server" ] && [ -n "${FAKE_SCCACHE_START_FAILS:-}" ]; then exit 1; fi
+if [ ! -e "$s/server.pid" ]; then
+  (
+    ls -l "/proc/$BASHPID/fd" >"$s/server-fds" 2>&1
+    echo "${1:-}" >"$s/started-by"
+    timeout 60 cat "$s/stop" >/dev/null
+  ) </dev/null >/dev/null 2>&1 &
+  echo $! >"$s/server.pid"
+fi
+exit 0
+E
+chmod +x "$fakebin2/sccache"
+srv="$tmp/sccache-state"; mkdir -p "$srv"; mkfifo "$srv/stop"
+server_alive() { [ -e "$srv/server.pid" ] && kill -0 "$(cat "$srv/server.pid")" 2>/dev/null; }
+# Release the fake server (it is not our child, so wait by polling, bounded).
+stop_server() {
+  local n=0
+  if server_alive; then echo >"$srv/stop"; fi
+  while server_alive && [ "$n" -lt 100 ]; do n=$((n + 1)); sleep 0.05; done
+  rm -f "$srv/server.pid" "$srv/server-fds" "$srv/started-by"
+}
+git -C "$repo" worktree add -q "$tmp/wt-sc" -b sccache-server
+# The build runs inside a build-slot style wrapper holding fd 9 on a lock, as
+# 2026-11-13-dev-batch/build-slot does.
+sc_build() {
+  (
+    exec 9>"$tmp/outer-slot.lock"; flock 9
+    cd "$tmp/wt-sc" && PATH="$fakebin2:$PATH" FAKE_SCCACHE_STATE="$srv" FAKE_CARGO_RUN_WRAPPER=1 "$@" "$iso" --sccache check
+  ) >/dev/null 2>&1
+}
+sc_build env; rc=$?
+check "--sccache with a server-starting compiler builds" test "$rc" = 0
+check "the sccache server is started by cargo-iso before the build" test "$(cat "$srv/started-by" 2>/dev/null)" = "--start-server"
+check "the sccache server holds no lifecycle lock" bash -c "test -s '$srv/server-fds' && ! grep -q 'emuwiz-cargo-retention/locks' '$srv/server-fds'"
+check "the sccache server holds no build-slot lock" bash -c "test -s '$srv/server-fds' && ! grep -qE 'outer-slot.lock|emuwiz-cargo-build-slots' '$srv/server-fds'"
+check "the sccache server outlives the build" server_alive
+(cd "$tmp/wt-sc" && "$iso" --finish-task >"$tmp/finish-out" 2>&1); rc=$?
+check "--finish-task releases the target while the server keeps running" bash -c "test '$rc' = 0 && ! grep -q 'active cargo-iso build' '$tmp/finish-out'"
+check "the server is still running after --finish-task" server_alive
+stop_server
+# Protection is not weakened: a process the build itself starts still holds the
+# lifecycle lock (here a server started by the compiler call because the early start
+# failed), so completion is refused while it lives, exactly as before.
+sc_build env FAKE_SCCACHE_START_FAILS=1; rc=$?
+check "a failed early server start never blocks the build" test "$rc" = 0
+check "the compiler call then starts the server inside the build" test "$(cat "$srv/started-by" 2>/dev/null)" = "rustc"
+check "a process started inside the build still holds the lifecycle lock" grep -q 'emuwiz-cargo-retention/locks' "$srv/server-fds"
+(cd "$tmp/wt-sc" && "$iso" --finish-task >"$tmp/finish-out" 2>&1)
+check "--finish-task is refused while a process from inside the build lives" grep -q 'active cargo-iso build' "$tmp/finish-out"
+stop_server
+(cd "$tmp/wt-sc" && "$iso" --finish-task >"$tmp/finish-out" 2>&1); rc=$?
+check "--finish-task releases once that process has exited" bash -c "test '$rc' = 0 && ! grep -q 'active cargo-iso build' '$tmp/finish-out'"
 
 # ---- automatic designation is OFF by default (owner decision): opt in with EMUWIZ_CARGO_AUTO_DESIGNATE=1
 git -C "$repo" worktree add -q "$tmp/wt-default" -b default
