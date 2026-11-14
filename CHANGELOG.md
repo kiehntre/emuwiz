@@ -26,6 +26,32 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   nothing and changes nothing. RetroArch is the
   only emulator with log and settings support so far; for others it covers the
   process exit, missing libraries and sandbox refusals. Not yet in Blue.
+- Check Games: a "Saved results that need checking again" card lists saved
+  catalogue results that no longer count (and why), and can check those games
+  again with progress and Stop. Finished sets stay saved; Continue checks the
+  rest. Results that cannot be checked now are listed with the reason.
+- Verifying games is faster: the CRC-32 step no longer limits hashing speed.
+- DAT verification: `emuwiz-cli dat recheck` lists saved DAT results that are
+  no longer backed by current evidence (saved before proof was recorded, file
+  changed, catalogue changed) and, with `--confirm`, checks those games again
+  by reading them. Work is saved one bounded set at a time, so stopping,
+  a crash or a restart keeps every finished set and the next run continues
+  with the rest. A saved result is never upgraded without reading the game
+  again; the result it replaces is kept for the record. A verified file
+  matches its catalogue entry; that says nothing about emulator compatibility.
+- Database: library schema 27 adds two tables (replaced DAT evidence, and why
+  a re-check saved nothing). Existing rows are not changed. A library that
+  another build took to a different "schema 27" is now refused instead of
+  opened.
+- Database recovery: `emuwiz-cli database-recover-journal` handles a library
+  that EmuWiz refuses to open after a write was cut off. It copies the
+  database and its journal, lets SQLite recover the copy, checks it and
+  reports, without changing the library. `--apply <folder> --confirm` then
+  lets SQLite recover the library itself, only if it is still exactly what was
+  checked. The refusal to open such a library is unchanged.
+- Discovery import Undo: refreshing disc order after a DAT verification no
+  longer rewrites unchanged records, which used to mark every import in the
+  library as modified and refuse its Undo.
 - Games & collection: an explicitly labelled alternative way to play
   RollerCoaster Tycoon 2 with an OpenRCT2 you already installed and your own
   game folder. Readiness comes from the existing alternative-provider planner;

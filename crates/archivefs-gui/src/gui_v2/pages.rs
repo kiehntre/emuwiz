@@ -2138,6 +2138,9 @@ impl App {
         // not beside a promise that nothing is renamed here.
         ui.label("Read-only verification. Your original game files are never renamed, moved or deleted here. Verification is optional; you do not need it to play.");
         if self.check_platform.is_none() {
+            // Saved results that stopped counting, and the way to check
+            // those games again. Shows nothing when there are none.
+            self.saved_recheck.show(ui);
             ui.label(theme::card_title("Choose a platform"));
             // Arcade readiness is read from the saved DAT registry, the same
             // way the platform Check page decides whether it can verify

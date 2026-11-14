@@ -153,7 +153,10 @@ impl ArchiveFsApp {
         self.needs_attention.invalidate();
     }
 
-    /// Independent of the selected page. The page only renders memory.
+    /// The catalogue snapshot is loaded in the background whatever page is
+    /// shown. The session merge on top of it runs only for the Needs
+    /// Attention page: from the frame's poll while that page is the view, and
+    /// from the page itself just before it draws.
     pub(crate) fn poll_needs_attention(&mut self, context: &egui::Context) {
         if let Some(receiver) = &self.needs_attention.receiver {
             match receiver.try_recv() {
@@ -193,10 +196,18 @@ impl ArchiveFsApp {
                 context.request_repaint();
             });
         }
-        if self
-            .needs_attention
-            .last_session_refresh
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+        // The merged snapshot is only ever read by the Needs Attention page
+        // (`show_needs_attention_page`). Building it rebuilds the selected
+        // game's whole launch-readiness input, so it is skipped while that
+        // page is not the view: every second on every other page, and in
+        // Blue, which has its own Needs Attention page and never shows this
+        // one. The page calls this poll again just before it draws, because
+        // navigation changes the view after the frame's poll has run.
+        if self.view == MainView::NeedsAttention
+            && self
+                .needs_attention
+                .last_session_refresh
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
         {
             let mut snapshot = self.needs_attention.stored.clone();
             if let Some(outcome) = self.doctor_repair.doctor_scan.displayed() {

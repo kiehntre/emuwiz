@@ -80,10 +80,10 @@ fn terminal_completion_is_not_lost_or_reclassified_as_disconnect() {
     c.receiver = Some(receiver);
     sender.send(Message::Progress("hashing".into())).unwrap();
     sender
-        .send(Message::Finished(Ok(VerificationTotals {
+        .send(Message::Finished(Ok(Box::new(VerificationTotals {
             verified: 1,
             ..Default::default()
-        })))
+        }))))
         .unwrap();
     drop(sender);
     c.poll();

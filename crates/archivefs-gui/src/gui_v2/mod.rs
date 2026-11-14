@@ -84,6 +84,7 @@ mod organise;
 mod osk;
 mod pad_mouse;
 mod pad_shell;
+mod saved_recheck;
 mod suggest;
 pub(crate) use pad_shell::mark_secret;
 mod amiga_hdf_storage;
@@ -422,6 +423,7 @@ pub(super) struct App {
     moved_game: Option<i64>,
     review: identity_review_page::ReviewUi,
     game_dat_check: game_dat_check::State,
+    saved_recheck: saved_recheck::State,
     folder_check: folder_check::State,
     hasheous_check: hasheous_check::State,
     notice: Option<Notice>,
@@ -568,6 +570,7 @@ impl App {
             moved_game: None,
             review: Default::default(),
             game_dat_check: Default::default(),
+            saved_recheck: Default::default(),
             folder_check: Default::default(),
             hasheous_check: Default::default(),
             notice: None,
@@ -2618,6 +2621,7 @@ impl eframe::App for App {
         // A finished one-game check saves new evidence even when its page is
         // no longer showing; reload so Game Details reads it.
         self.game_dat_check.poll();
+        self.saved_recheck.poll();
         self.folder_check.poll();
         self.folder_check.organise.poll();
         if self.load_job.is_none() && self.folder_check.organise.take_library_changed() {
@@ -2634,6 +2638,9 @@ impl eframe::App for App {
         }
         self.hasheous_check.poll();
         if self.load_job.is_none() && self.game_dat_check.take_saved() {
+            reload_library = true;
+        }
+        if self.load_job.is_none() && self.saved_recheck.take_saved() {
             reload_library = true;
         }
         if reload_library {

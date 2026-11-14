@@ -128,6 +128,8 @@ fn wake_ui() {
     if let Ok(slot) = manager().repaint.lock()
         && let Some(context) = slot.as_ref()
     {
+        // A probe has finished: its answer is collected by the next build.
+        crate::emulator_setup::answers::arrived(context);
         context.request_repaint();
     }
 }

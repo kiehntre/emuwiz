@@ -348,8 +348,10 @@ pub(super) fn require_inert_rollback_journal(database_path: &Path) -> Result<()>
              is visible: a writer may have been interrupted, or a writer EmuWiz cannot see may \
              still be running. Opening the database could make SQLite roll that journal back \
              and delete it, so EmuWiz will not. Close every other EmuWiz window and process, \
-             preserve the database and the journal together, and follow the copy-first recovery \
-             procedure in docs/DATABASE_RECOVERY.md. Nothing was changed.",
+             then run `emuwiz-cli database-recover-journal`: it copies the database and the \
+             journal, lets SQLite recover the copy, checks it and reports, without changing \
+             the library. The manual copy-first procedure is in docs/DATABASE_RECOVERY.md. \
+             Nothing was changed.",
             journal.display()
         ))),
     }

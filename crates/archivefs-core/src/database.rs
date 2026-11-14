@@ -93,7 +93,9 @@ mod gdi_disc_tests;
 mod preservation_fingerprint;
 pub use preservation_fingerprint::PreservationFreshness;
 mod disc_order;
-pub use dat_current::CurrentLibraryDatEvidence;
+pub use dat_current::{
+    CurrentLibraryDatEvidence, DatRecheckAttempt, SavedDatEvidenceRow, SavedDatEvidenceStatus,
+};
 pub use disc_order::DatDiscOrderOutcome;
 #[cfg(test)]
 #[path = "database/catalogue_health_tests.rs"]
@@ -104,7 +106,18 @@ mod disc_order_tests;
 pub(crate) mod forget_missing;
 mod missing_cleanup;
 pub use missing_cleanup::MissingCleanupTarget;
+#[cfg(test)]
+#[path = "database/dat_evidence_history_tests.rs"]
+mod dat_evidence_history_tests;
+mod journal_recovery;
+#[cfg(test)]
+#[path = "database/journal_recovery_tests.rs"]
+mod journal_recovery_tests;
 mod journal_state;
+pub use journal_recovery::{
+    JournalRecoveryReceipt, JournalRecoveryState, PreservedFile, apply_journal_recovery,
+    prepare_journal_recovery, read_journal_recovery_receipt,
+};
 #[cfg(test)]
 #[path = "database/migration_protection_tests.rs"]
 mod migration_protection_tests;
@@ -400,7 +413,60 @@ const MIGRATIONS: &[Migration] = &[
         description: "bind DAT inventories to exact catalogue bytes",
         sql: include_str!("migrations/0026_dat_inventory_digest.sql"),
     },
+    Migration {
+        version: 27,
+        description: "keep replaced DAT evidence and unfinished re-check reasons",
+        sql: include_str!("migrations/0027_dat_evidence_history.sql"),
+    },
 ];
+
+/// From this version on, a migration's description is part of its identity
+/// and must never be edited: [`verify_migration_lineage`] compares it with
+/// what the database recorded when that version was applied.
+const LINEAGE_CHECKED_FROM_VERSION: i64 = 27;
+
+/// Refuses a database whose recorded migrations are not this build's.
+///
+/// `user_version` alone cannot tell two different migrations that were both
+/// numbered N apart (two branches each adding "the next" migration). Such a
+/// database has the right number and the wrong tables. Every applied version
+/// from [`LINEAGE_CHECKED_FROM_VERSION`] on must therefore be recorded, with
+/// the description this build has for it. Read-only.
+fn verify_migration_lineage(connection: &Connection, migrations: &[Migration]) -> Result<()> {
+    let current = schema_version(connection)?;
+    if current < LINEAGE_CHECKED_FROM_VERSION {
+        return Ok(());
+    }
+    let mut statement = connection
+        .prepare("SELECT version, description FROM schema_migrations WHERE version >= ?1")
+        .map_err(|error| db_error("failed to read the applied migrations", error))?;
+    let recorded: HashMap<i64, String> = statement
+        .query_map([LINEAGE_CHECKED_FROM_VERSION], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .and_then(|rows| rows.collect())
+        .map_err(|error| db_error("failed to read the applied migrations", error))?;
+    for migration in migrations.iter().filter(|migration| {
+        migration.version >= LINEAGE_CHECKED_FROM_VERSION && migration.version <= current
+    }) {
+        match recorded.get(&migration.version) {
+            Some(description) if description == migration.description => {}
+            Some(description) => {
+                return Err(ArchiveFsError::Database(format!(
+                    "this library database was taken to schema {} by a different EmuWiz build (it recorded \"{description}\"; this build's schema {} is \"{}\"). The two are not compatible. Refusing to use or migrate it. Nothing was changed.",
+                    migration.version, migration.version, migration.description
+                )));
+            }
+            None => {
+                return Err(ArchiveFsError::Database(format!(
+                    "this library database reports schema {current} but has no record of schema {} being applied. Refusing to use or migrate it. Nothing was changed.",
+                    migration.version
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
     migrations
@@ -1406,6 +1472,7 @@ impl Database {
                 "library database schema version {current_version} is not the required current version {expected_version}; refusing to migrate or repair it during a read-only operation"
             )));
         }
+        verify_migration_lineage(&connection, MIGRATIONS)?;
 
         Ok(Self {
             connection,
@@ -1859,6 +1926,9 @@ fn classify_existing_database(path: &Path, migrations: &[Migration]) -> Result<E
     let connection = open_read_only_connection(path)?;
     let version = schema_version(&connection)?;
     let latest = latest_known_version(migrations);
+    if version <= latest {
+        verify_migration_lineage(&connection, migrations)?;
+    }
     if version == latest {
         return Ok(ExistingDatabase::Current);
     }
@@ -1908,6 +1978,7 @@ fn open_existing_current(path: &Path, migrations: &[Migration]) -> Result<Databa
             path.display()
         )));
     }
+    verify_migration_lineage(&connection, migrations)?;
     Ok(Database {
         connection,
         path: path.to_path_buf(),
@@ -2892,6 +2963,8 @@ fn apply_migrations_checked(
              automatically"
         )));
     }
+
+    verify_migration_lineage(connection, migrations)?;
 
     for migration in migrations {
         if migration.version <= current_version {
@@ -4161,6 +4234,35 @@ fn persist_library_dat_identity_row(
         LibraryDatIdentityPersistOutcome::Inserted
     };
 
+    // Evidence about to be replaced is kept, in this same transaction, unless
+    // this check re-confirmed the same proof-bearing conclusion (same verdict,
+    // catalogue bytes and content hashes): only then is nothing lost.
+    let reconfirmed = existing.as_ref().is_some_and(|prior| {
+        (prior.audit_file.is_some() || !prior.disc_members.is_empty())
+            && prior.source.catalogue_sha256.is_some()
+            && prior.source.catalogue_sha256 == persisted.source.catalogue_sha256
+            && prior.verification_state == persisted.verification_state
+            && prior.audited_hashes == persisted.audited_hashes
+    });
+    if existing.is_some() && !reconfirmed {
+        conn.execute(
+            "INSERT INTO library_dat_identity_history \
+             (archive_id, archive_path, dat_source_id, verification_state, completeness, audited_at, \
+              revision_marked_stale, facts_json, row_created_at, row_updated_at, replaced_at, replaced_by_state) \
+             SELECT d.archive_id, (SELECT absolute_path_cached FROM archives WHERE id = d.archive_id), \
+                    d.dat_source_id, d.verification_state, d.completeness, d.audited_at, \
+                    d.revision_marked_stale, d.facts_json, d.created_at, d.updated_at, ?3, ?4 \
+             FROM library_dat_identities d WHERE d.archive_id = ?1 AND d.dat_source_id = ?2",
+            params![archive_id, source_id, now, state],
+        )
+        .map_err(|error| db_error("failed to keep replaced library DAT identity", error))?;
+    }
+    conn.execute(
+        "DELETE FROM dat_recheck_attempts WHERE archive_id = ?1 AND dat_source_id = ?2",
+        params![archive_id, source_id],
+    )
+    .map_err(|error| db_error("failed to clear a finished DAT re-check note", error))?;
+
     conn.execute(
         "INSERT INTO library_dat_identities \
          (archive_id, dat_source_id, dat_ecosystem, source_revision, verification_state, \
@@ -4798,12 +4900,40 @@ impl Database {
             None => {
                 // Discovery ownership rows retain deleted IDs permanently. This
                 // keeps delayed verification/metadata workers from targeting a
-                // different record after selective Undo. Legacy schemas have
-                // no import tombstones and retain their former allocation.
-                let has_import_history: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='discovery_import_records')", [], |r|r.get(0)).map_err(|e|db_error("check retained import identities",e))?;
-                let max_id: i64 = if has_import_history {
-                    tx.query_row("SELECT max(value) FROM (SELECT coalesce(max(id),0) AS value FROM archives UNION ALL SELECT coalesce(max(archive_id),0) AS value FROM discovery_import_records)",[],|r|r.get(0))
-                } else { tx.query_row("SELECT coalesce(max(id),0) FROM archives",[],|r|r.get(0)) }.map_err(|e|db_error("reserve new archive identity",e))?;
+                // different record after selective Undo. Kept DAT evidence and
+                // re-check notes (schema 27) also outlive their game and are
+                // keyed by its id, so those ids are never handed out again
+                // either: a new game must not inherit another game's records
+                // (which would, among other things, refuse its import's Undo
+                // for good). Legacy schemas without these tables keep their
+                // former allocation.
+                let mut sources =
+                    vec!["SELECT coalesce(max(id),0) AS value FROM archives".to_string()];
+                for table in [
+                    "discovery_import_records",
+                    "library_dat_identity_history",
+                    "dat_recheck_attempts",
+                ] {
+                    let exists: bool = tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                            [table],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| db_error("check retained archive identities", e))?;
+                    if exists {
+                        sources.push(format!(
+                            "SELECT coalesce(max(archive_id),0) AS value FROM {table}"
+                        ));
+                    }
+                }
+                let max_id: i64 = tx
+                    .query_row(
+                        &format!("SELECT max(value) FROM ({})", sources.join(" UNION ALL ")),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| db_error("reserve new archive identity", e))?;
                 let new_id = max_id.checked_add(1).ok_or_else(|| {
                     ArchiveFsError::Database(
                         "Archive identity space exhausted; insertion refused".into(),
@@ -7439,7 +7569,17 @@ impl Database {
         persisted: &crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
     ) -> Result<LibraryDatIdentityPersistOutcome> {
         let now = now_utc_string();
-        persist_library_dat_identity_row(&self.connection, archive_id, persisted, &now)
+        // Keeping the replaced row, clearing its note and writing the new
+        // row are one change.
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
+        let outcome = persist_library_dat_identity_row(&tx, archive_id, persisted, &now)?;
+        tx.commit().map_err(|error| {
+            db_error("failed to commit library DAT identity transaction", error)
+        })?;
+        Ok(outcome)
     }
 
     /// The stored DAT identity for one library item and one DAT source, if
@@ -7608,12 +7748,15 @@ impl Database {
         outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
         scope: Option<&crate::dat::library_verification::VerificationScope>,
     ) -> Result<LibraryDatIdentityAuditPersistOutcome> {
-        // Reads and writes share one SQLite snapshot. Concurrent membership
-        // changes either precede validation or prevent upgrading this transaction.
-        let tx = self
-            .connection
-            .unchecked_transaction()
-            .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
+        // Reads and writes share one SQLite snapshot. The write lock is taken
+        // at the start (waiting out another writer for the busy timeout), so
+        // a membership change either precedes validation or waits for this
+        // save; a save is never refused only because it had read first.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
         if let Some(scope) = scope {
             scope
                 .validate(&self.load_archives()?, outcome)
@@ -11279,21 +11422,21 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 26);
+        assert_eq!(report.to_version, 27);
         assert_eq!(
             report.applied_versions,
-            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
         );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 26);
+        assert_eq!(upgraded.schema_version().unwrap(), 27);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         assert_eq!(
             pending_schema_migration_versions(19).unwrap(),
-            vec![20, 21, 22, 23, 24, 25, 26]
+            vec![20, 21, 22, 23, 24, 25, 26, 27]
         );
 
         let quick_check: String = upgraded
@@ -11313,11 +11456,11 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 20);
-        assert_eq!(report.to_version, 26);
-        assert_eq!(report.applied_versions, vec![21, 22, 23, 24, 25, 26]);
+        assert_eq!(report.to_version, 27);
+        assert_eq!(report.applied_versions, vec![21, 22, 23, 24, 25, 26, 27]);
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 26);
+        assert_eq!(upgraded.schema_version().unwrap(), 27);
         assert_eq!(upgraded.list_source_folders().unwrap().len(), 1);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         let table_count: i64 = upgraded
@@ -11332,7 +11475,7 @@ mod tests {
         upgraded.close().unwrap();
 
         let reopened = Database::open_read_only(&database_path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 26);
+        assert_eq!(reopened.schema_version().unwrap(), 27);
         reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -12192,12 +12335,14 @@ mod tests {
                 "catalogue_health_epoch",
                 "dat_expected_entries",
                 "dat_expected_inventory_meta",
+                "dat_recheck_attempts",
                 "dat_set_audit_dependencies",
                 "dat_set_audit_results",
                 "discovery_details",
                 "discovery_import_operations",
                 "discovery_import_records",
                 "library_dat_identities",
+                "library_dat_identity_history",
                 "mame_member_evidence",
                 "media_topology_evidence",
                 "mod_catalogue_records",
@@ -22307,7 +22452,7 @@ echo "$out"
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 26);
+            assert_eq!(latest_known_version(MIGRATIONS), 27);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")
