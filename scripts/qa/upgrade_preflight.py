@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any
 
 TOOL_VERSION = "1"
-CURRENT_SCHEMA = 20
-KNOWN_HISTORICAL_SCHEMAS = {3, 6, 12, 16, 19, 20}
+CURRENT_SCHEMA = 27
+KNOWN_HISTORICAL_SCHEMAS = {3, 6, 12, 16, 19, 20, 21, 22, 23, 24, 25, 26}
 SECRET_KEY = re.compile(r"(token|secret|password|passwd|api[_-]?key|credential|bearer)", re.I)
 ACTIONABLE_STATES = {
     "applying",
@@ -303,12 +303,204 @@ def state_from_value(value: Any) -> str | None:
     return None
 
 
+# Organise game-folder move records (<journal>/folder-moves/<id>.json).
+FOLDER_MOVE_SETTLED = {"Committed", "Undone", "RolledBack"}
+FOLDER_MOVE_OPEN = {"Planned", "Undoing", "NeedsReview"}
+FOLDER_MOVE_RECORD_VERSION = 1
+SETTLE_HINT = ("let the newest installed EmuWiz settle it first (All tools > Organise my games > "
+               "\"Finish interrupted folder moves\"; any Organise apply also finishes them first), then "
+               "run this preflight again; do not install, upgrade, roll back or copy in another EmuWiz "
+               "binary meanwhile")
+REVIEW_HINT = ("no EmuWiz settles it by itself; it needs a recovery-capable EmuWiz that reads it or an "
+               "explicit administrator decision: see \"Records EmuWiz cannot settle\" in "
+               "docs/RELEASE_ENGINEERING.md")
+
+
+def is_folder_move_record(path: Path) -> bool:
+    return path.parent.name == "folder-moves" and path.suffix == ".json"
+
+
+def absolute_bytes(value: Any) -> bytes | None:
+    if isinstance(value, list) and all(isinstance(b, int) and 0 <= b < 256 for b in value):
+        return bytes(value)
+    return None
+
+
+def folder_move_report(path: Path, parsed: Any, replaced: tuple[Path, set[tuple[Any, int]]] | None = None) -> tuple[str, list[str], list[str]]:
+    """State, blockers and warnings for one folder-move record.
+
+    Open records (a move or Undo still in progress, or one needing review),
+    unknown states and malformed records block: only the EmuWiz that wrote
+    them can finish them, and releases before durable folder Undo skip an
+    `Undoing` record without a word. A settled record is checked against the
+    files and, read-only, the library: a contradiction blocks; evidence that
+    cannot be checked (a path on an unmounted drive, a row changed later) is a
+    warning. Nothing is changed.
+    """
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("state"), str):
+        return "UnknownSchema", [f"folder-move record has no readable state: {path}; {REVIEW_HINT}"], []
+    version = parsed.get("version")
+    if type(version) is not int or version != FOLDER_MOVE_RECORD_VERSION:
+        return "UnknownSchema", [f"folder-move record version {version!r} is not one this preflight knows: {path}; it was probably written by a newer EmuWiz: do not downgrade; {REVIEW_HINT}"], []
+    state = parsed["state"]
+    if state == "Undoing":
+        return state, [f"interrupted folder Undo needs the EmuWiz that started it (earlier releases cannot see it): {path}; {SETTLE_HINT}"], []
+    if state == "Planned":
+        return state, [f"interrupted folder move: {path}; {SETTLE_HINT}"], []
+    if state == "NeedsReview":
+        return state, [f"folder move needs review (its folder is recorded in two places): {path}; {REVIEW_HINT}"], []
+    if state not in FOLDER_MOVE_SETTLED:
+        return state, [f"folder-move record has a state this preflight does not know ({state}): {path}; it was written by a newer EmuWiz: do not downgrade"], []
+    source, destination = parsed.get("source"), parsed.get("destination")
+    if not isinstance(source, str) or not isinstance(destination, str) or not isinstance(parsed.get("rows"), list):
+        return state, [f"folder-move record is malformed; review it before changing EmuWiz: {path}"], []
+    rows = parsed["rows"]
+    if replaced is not None:
+        # A later move of the same folder says where it is now; rows that the
+        # later moves did not cover are still checked below.
+        rows = [row for row in rows if not (isinstance(row, dict) and type(row.get("archive")) is int
+                                            and (parsed.get("database"), row["archive"]) in replaced[1])]
+    else:
+        at_source, at_destination = is_present(Path(source)), is_present(Path(destination))
+        here = destination if state == "Committed" else source
+        there = source if state == "Committed" else destination
+        if not at_source and not at_destination:
+            warnings.append(f"folder-move record {path} ({state}) cannot be verified: neither {source} nor {destination} is present (drive not mounted, or moved since)")
+            return state, blockers, warnings
+        if is_present(Path(there)) and not is_present(Path(here)):
+            blockers.append(f"folder-move record {path} says {state} but the folder is at {there}, not {here}; review it before changing EmuWiz")
+            return state, blockers, warnings
+    if not rows:
+        return state, blockers, warnings
+    database = parsed.get("database")
+    if not isinstance(database, str) or not is_present(Path(database)):
+        warnings.append(f"folder-move record {path} ({state}): its library {database} is not present, so the library side was not verified")
+        return state, blockers, warnings
+    try:
+        connection = sqlite3.connect(f"file:{quote(str(Path(database).absolute()), safe='/')}?mode=ro", uri=True)
+        try:
+            for row in rows:
+                side = row.get("new" if state == "Committed" else "old", {}) if isinstance(row, dict) else {}
+                other = row.get("old" if state == "Committed" else "new", {}) if isinstance(row, dict) else {}
+                expected, opposite = absolute_bytes(side.get("absolute")), absolute_bytes(other.get("absolute"))
+                archive = row.get("archive") if isinstance(row, dict) else None
+                if expected is None or opposite is None or not isinstance(archive, int):
+                    blockers.append(f"folder-move record {path} has a malformed library row; review it before changing EmuWiz")
+                    continue
+                found = connection.execute("SELECT absolute_path_cached FROM archives WHERE id=?", (archive,)).fetchone()
+                if found is None:
+                    warnings.append(f"folder-move record {path} ({state}): library row {archive} no longer exists")
+                elif bytes(found[0]) == opposite:
+                    blockers.append(f"folder-move record {path} says {state} but library row {archive} still names {opposite.decode(errors='replace')}; review it before changing EmuWiz")
+                elif bytes(found[0]) != expected:
+                    warnings.append(f"folder-move record {path} ({state}): library row {archive} has moved since")
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError) as error:
+        blockers.append(f"folder-move record {path} ({state}): its library could not be read to verify it ({error})")
+    return state, blockers, warnings
+
+
+FOLDER_MOVE_ID = re.compile(r"folder-move-(\d+)-\d+-(\d+)")
+
+
+def folder_move_order(parsed: Any) -> tuple[int, int] | None:
+    """When a folder-move record was started, from its id
+    (folder-move-<seconds>-<pid>-<nanoseconds>), or None if that cannot be told."""
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("id"), str):
+        return None
+    match = FOLDER_MOVE_ID.fullmatch(parsed["id"])
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def folder_move_rows(parsed: dict[str, Any]) -> set[tuple[Any, int]]:
+    """(library, archive id) of every well-formed row of a record."""
+    rows = parsed.get("rows")
+    database = parsed.get("database")
+    return {(database, row["archive"]) for row in rows
+            if isinstance(row, dict) and type(row.get("archive")) is int} if isinstance(rows, list) else set()
+
+
+def folder_location_verified(parsed: dict[str, Any]) -> bool:
+    """A settled record whose folder is where it says (positively seen)."""
+    state = parsed["state"]
+    if state not in FOLDER_MOVE_SETTLED:
+        return False
+    here = parsed["destination"] if state == "Committed" else parsed["source"]
+    there = parsed["source"] if state == "Committed" else parsed["destination"]
+    return is_present(Path(here)) and not is_present(Path(there))
+
+
+def well_formed_folder_move(parsed: Any) -> bool:
+    return (isinstance(parsed, dict) and type(parsed.get("version")) is int
+            and parsed["version"] == FOLDER_MOVE_RECORD_VERSION and isinstance(parsed.get("state"), str)
+            and parsed["state"] in FOLDER_MOVE_SETTLED | FOLDER_MOVE_OPEN
+            and isinstance(parsed.get("source"), str) and isinstance(parsed.get("destination"), str)
+            and isinstance(parsed.get("database"), str)
+            and isinstance(parsed.get("rows"), list) and folder_move_order(parsed) is not None)
+
+
+def superseded_folder_moves(records: list[tuple[Path, Any]]) -> dict[Path, tuple[Path, set[tuple[Any, int]]]]:
+    """Settled records that a later record for the same folder replaced.
+
+    Organise, Undo and Organise again leaves an older Undone (or RolledBack)
+    record and a newer Committed one for the same paths. Only the newest says
+    where the folder is now, so an older settled record that shares a path with
+    a later one is not checked for where the folder is. Its library rows are
+    still checked, except those the later records also moved. Only well-formed
+    records of a known version and state take part, on both sides: anything
+    else is checked on its own exactly as before. Open records are never
+    replaced, and nothing is replaced unless the newest sharing record
+    positively finds its own folder. Returns that record and the
+    (library, archive id) pairs the later records covered.
+    """
+    known = [(folder_move_order(parsed), path, parsed) for path, parsed in records if well_formed_folder_move(parsed)]
+    replaced: dict[Path, tuple[Path, set[tuple[Any, int]]]] = {}
+    for order, path, parsed in known:
+        if parsed["state"] not in FOLDER_MOVE_SETTLED:
+            continue
+        paths = {parsed["source"], parsed["destination"]}
+        later = sorted((o, p, other) for o, p, other in known
+                       if o > order and paths & {other["source"], other["destination"]})
+        # Waive the older record's location check only when the newest record
+        # sharing its paths positively finds its folder where it says.
+        if later and folder_location_verified(later[-1][2]):
+            covered: set[tuple[Any, int]] = set()
+            for _, _, other in later:
+                covered |= folder_move_rows(other)
+            replaced[path] = (later[-1][1], covered)
+    return replaced
+
+
 def transactions_report(data_root: Path) -> tuple[dict[str, Any], list[str], list[str]]:
     counts: dict[str, int] = {}
     entries = []
     blockers: list[str] = []
     warnings: list[str] = []
-    for path in journal_files(data_root):
+    files = journal_files(data_root)
+    folder_moves: dict[Path, Any] = {}
+    for path in files:
+        if is_folder_move_record(path):
+            try:
+                folder_moves[path] = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                folder_moves[path] = None
+    replaced = superseded_folder_moves(list(folder_moves.items()))
+    for path in files:
+        if is_folder_move_record(path):
+            parsed = folder_moves[path]
+            entry: dict[str, Any] = {"path": str(path), "kind": "folder_move"}
+            if path in replaced:
+                entry["superseded_by"] = str(replaced[path][0])
+            state, found_blockers, found_warnings = folder_move_report(path, parsed, replaced.get(path))
+            counts[state] = counts.get(state, 0) + 1
+            entry.update({"state": state, "recognized": state in FOLDER_MOVE_SETTLED | FOLDER_MOVE_OPEN})
+            entries.append(entry)
+            blockers.extend(found_blockers)
+            warnings.extend(found_warnings)
+            continue
         try:
             raw = path.read_text(encoding="utf-8")
             parsed = json.loads(raw)

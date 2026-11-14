@@ -539,6 +539,28 @@ fn unrelated_audit_and_fingerprint_collisions_are_never_rewritten() {
     }
 }
 
+/// Organise's catalogue commit is durable across power loss: in the
+/// library's rollback-journal mode the commit is the journal's unlink, which
+/// only synchronous=EXTRA makes durable (a directory fsync). The journal
+/// mode is never changed.
+#[test]
+fn organise_catalogue_commits_are_durable() {
+    let f = Fixture::new(OrganisationMode::RenameInPlace);
+    let mode = || -> String {
+        rusqlite::Connection::open(f.db.path())
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap()
+    };
+    let mode_before = mode();
+    let guard = crate::database::organisation_paths::begin(&f.tx.entries[0], false, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(guard.synchronous_level(), 3, "synchronous=EXTRA");
+    drop(guard);
+    assert_eq!(mode_before, mode(), "the journal mode is never changed");
+}
+
 #[test]
 fn backing_replacement_during_mutation_cannot_commit_catalogue_success() {
     for database in [false, true] {

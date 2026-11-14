@@ -861,6 +861,32 @@ impl App {
             if let Phase::Failed(error) = &organise.phase {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
+            // Interrupted folder moves can be finished even when nothing
+            // else needs organising (the installer refuses until they are).
+            let (interrupted, unreadable) = *organise
+                .pending_folder_moves
+                .get_or_insert_with(super::organise::pending_folder_moves);
+            if interrupted > 0 {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!("{interrupted} folder move(s) or Undo(s) were interrupted earlier."),
+                    );
+                    if ui
+                        .add_enabled(!checking && !organise.busy(), egui::Button::new("Finish interrupted folder moves"))
+                        .clicked()
+                    {
+                        organise.finish_interrupted();
+                    }
+                });
+                ui.small("This settles each one from where its folder and library entry are now. Nothing new is moved.");
+            }
+            if unreadable > 0 {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!("{unreadable} folder-move record(s) cannot be read by this EmuWiz and were left untouched. This EmuWiz never settles them: they need a recovery-capable EmuWiz that reads them, or an explicit administrator decision (see \"Records EmuWiz cannot settle\" in docs/RELEASE_ENGINEERING.md)."),
+                );
+            }
             if (!organise.applied.is_empty() || !organise.applied_folders.is_empty())
                 && !organise.busy()
                 && ui.button("Undo this organisation").clicked()

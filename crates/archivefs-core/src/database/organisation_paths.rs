@@ -280,7 +280,7 @@ impl CatalogueMove {
             return Err("catalogue binding does not match the sealed move".into());
         }
         b.verify_storage()?;
-        let c = open_connection_with(&b.database, false).map_err(|e| e.to_string())?;
+        let c = open_durable_connection(&b.database)?;
         c.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| e.to_string())?;
         b.verify_storage()?;
@@ -370,12 +370,26 @@ impl CatalogueMove {
         if fingerprint(&c, at)? != b.fingerprint || fingerprint(&c, free)? {
             return Err("catalogue fingerprint path collision or stale association".into());
         }
+        if already {
+            // Recovery found the move's catalogue change already visible.
+            // Visible is not durable: a process that died after SQLite
+            // unlinked the rollback journal (the commit point) but before
+            // the directory fsync leaves a commit that a power loss can
+            // still roll back. Make it durable before anyone records it.
+            persist_visible_state(&b.database)?;
+        }
         Ok(Self {
             connection: c,
             binding: b,
             reverse,
             already,
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn synchronous_level(&self) -> i64 {
+        self.connection
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap()
     }
     pub(crate) fn commit(self) -> std::result::Result<(), String> {
         // SQLite serializes database writers, not namespace replacements.
@@ -504,6 +518,102 @@ pub(crate) fn begin(
     CatalogueMove::open(binding, entry, reverse, recovery).map(Some)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only record of which catalogues this thread made durable.
+    pub(crate) static PERSISTED: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Makes the catalogue state this process can see durable: its write-ahead
+/// log or rollback journal if one exists, and its folder. The folder fsync
+/// makes the deletion of a committed transaction's rollback journal
+/// durable. Any failure is returned, so callers record nothing.
+///
+/// The database file itself is deliberately never opened here. Closing any
+/// descriptor of it would drop every POSIX lock this process holds on it,
+/// including SQLite's (a documented way to corrupt a database). It needs no
+/// sync: SQLite syncs it before the commit point (deleting, truncating or
+/// zeroing the journal) of every commit, and before deleting a hot journal
+/// it has played back, and both callers read through SQLite first.
+fn persist_visible_state(database: &Path) -> std::result::Result<(), String> {
+    let done = persist_visible_state_inner(database);
+    #[cfg(test)]
+    if done.is_ok() {
+        PERSISTED.with(|p| p.borrow_mut().push(database.to_path_buf()));
+    }
+    done
+}
+
+fn persist_visible_state_inner(database: &Path) -> std::result::Result<(), String> {
+    let sync = |p: &Path| {
+        std::fs::File::open(p)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| format!("cannot make the catalogue durable ({}): {e}", p.display()))
+    };
+    // The write-ahead log, and the rollback journal (TRUNCATE and PERSIST
+    // modes commit by truncating or zeroing it instead of deleting it). A
+    // concurrent writer can create and remove either at any moment. One that
+    // is gone was removed; the folder fsync below makes that durable, so
+    // "not found" is not an error. Any other error is.
+    for suffix in ["-wal", "-journal"] {
+        let mut side = database.as_os_str().to_owned();
+        side.push(suffix);
+        let side = PathBuf::from(side);
+        match std::fs::File::open(&side) {
+            Ok(f) => f.sync_all().map_err(|e| {
+                format!(
+                    "cannot make the catalogue durable ({}): {e}",
+                    side.display()
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "cannot make the catalogue durable ({}): {e}",
+                    side.display()
+                ));
+            }
+        }
+    }
+    sync(database.parent().ok_or("the catalogue has no folder")?)
+}
+
+/// A write connection whose commits survive power loss, or a refusal when
+/// the database's journal mode cannot give that. Every organisation path
+/// move (Organise, its recovery and Undo, and folder moves) commits on
+/// one: the journal mode must be a persistent one, and `synchronous=EXTRA`.
+/// In rollback-journal mode (the library's mode) a commit takes effect when
+/// the journal file is unlinked; only EXTRA fsyncs the directory after that
+/// unlink, so with FULL a power loss shortly after a commit can resurrect
+/// the journal and roll the commit back, after the caller has already
+/// recorded it as done. The journal mode itself is never changed.
+pub(crate) fn open_durable_connection(path: &Path) -> std::result::Result<Connection, String> {
+    let c = open_connection_with(path, false).map_err(|e| e.to_string())?;
+    let mode: String = c
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if !matches!(
+        mode.to_ascii_lowercase().as_str(),
+        "delete" | "truncate" | "persist" | "wal"
+    ) {
+        return Err(format!(
+            "the catalogue's journal mode ({mode}) cannot commit durably; nothing was changed"
+        ));
+    }
+    c.pragma_update(None, "synchronous", "EXTRA")
+        .map_err(|e| e.to_string())?;
+    let level: i64 = c
+        .query_row("PRAGMA synchronous", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if level != 3 {
+        return Err(
+            "the catalogue connection refused synchronous=EXTRA; nothing was changed".into(),
+        );
+    }
+    Ok(c)
+}
+
 /// Apply may only use a binding carried from preview, never the current row
 /// occupying its pathname. Opening here also checks the supplied DB identity.
 pub(crate) fn validate_bound(
@@ -607,7 +717,7 @@ impl FolderCatalogueMove {
         rows: &[FolderRow],
         reverse: bool,
     ) -> std::result::Result<Self, String> {
-        let connection = open_connection_with(database_path, false).map_err(|e| e.to_string())?;
+        let connection = open_durable_connection(database_path)?;
         connection
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| e.to_string())?;
@@ -690,6 +800,10 @@ pub(crate) fn folder_rows_moved(
             original += 1;
         }
     }
+    // Recovery settles the move from this answer and records it. Visible is
+    // not durable: make the state read here durable first, whichever it is.
+    drop(c);
+    persist_visible_state(database_path)?;
     Ok(if moved == rows.len() {
         Some(true)
     } else if original == rows.len() {
