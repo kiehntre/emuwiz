@@ -23,6 +23,7 @@ use crate::chd_identity::{
 };
 use crate::chd_logical_media::open_chd_track_logical_media_file;
 use crate::dat::model::DatChecksum;
+use crate::identity_source::hashing::Crc32;
 use crate::logical_media::{LogicalMedia, LogicalMediaError};
 use crate::optical_fingerprint::{
     OpticalFingerprintComparison, compare_optical_fingerprints, fingerprint_chd,
@@ -444,32 +445,6 @@ pub fn compare_cue_bin_chd_logical(
             TrackVerificationStatus::Mismatch
         },
     )
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Crc32(u32);
-
-impl Crc32 {
-    fn new() -> Self {
-        Self(0xffff_ffff)
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 ^= u32::from(byte);
-            for _ in 0..8 {
-                self.0 = if self.0 & 1 != 0 {
-                    (self.0 >> 1) ^ 0xedb8_8320
-                } else {
-                    self.0 >> 1
-                };
-            }
-        }
-    }
-
-    fn finish_hex(self) -> String {
-        format!("{:08x}", !self.0)
-    }
 }
 
 #[cfg(test)]
