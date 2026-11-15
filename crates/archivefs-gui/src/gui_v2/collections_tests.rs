@@ -105,7 +105,7 @@ fn a_row_this_library_does_not_list_is_gone_until_it_does() {
 }
 
 #[test]
-fn a_superseded_row_shows_its_current_game_once() {
+fn a_row_replaced_by_name_and_size_only_proposes_its_replacement() {
     let mut old = archive(10, "Mario", "SNES", 1);
     old.relative_path = "old/mario.zip".into();
     old.absolute_path = "/fixture/old/mario.zip".into();
@@ -118,8 +118,11 @@ fn a_superseded_row_shows_its_current_game_once() {
     assert_eq!(library.resolve(10), 11);
     let items = vec![item(10, Some(10), "a"), item(11, Some(11), "b")];
     let views = build_views(&favourites(items), &library);
+    // Owner decision 2026-11-15: a same-name-and-size link is a guess.
     assert_eq!(views[0].members.len(), 1);
-    assert_eq!(views[0].members[&11].stored.len(), 2);
+    assert_eq!(views[0].members[&11].stored.len(), 1);
+    assert_eq!(views[0].gone.len(), 1);
+    assert_eq!(views[0].gone[0].proposed, Some(11));
 }
 
 #[test]
@@ -543,14 +546,18 @@ fn superseded(evidence_journal: bool) -> (Library, GameCollectionItem) {
 }
 
 #[test]
-fn a_derived_link_or_a_recorded_rename_steers_the_display_only() {
-    for journal in [false, true] {
-        let (library, item) = superseded(journal);
-        assert_eq!(library.resolve(10), 11);
-        let views = build_views(&favourites(vec![item]), &library);
-        assert!(views[0].members.contains_key(&11), "{journal}");
-        assert!(views[0].gone.is_empty(), "{journal}");
-    }
+fn a_recorded_rename_keeps_the_star_and_a_derived_link_is_only_proposed() {
+    let (library, item) = superseded(true);
+    assert_eq!(library.resolve(10), 11);
+    let views = build_views(&favourites(vec![item]), &library);
+    assert!(views[0].members.contains_key(&11));
+    assert!(views[0].gone.is_empty());
+
+    let (library, item) = superseded(false);
+    assert_eq!(library.resolve(10), 11, "the library still shows 11 for 10");
+    let views = build_views(&favourites(vec![item]), &library);
+    assert!(views[0].members.is_empty(), "not starred on a guess");
+    assert_eq!(views[0].gone[0].proposed, Some(11));
 }
 
 /// Owner decision 2026-11-15: a match by place, name and size is proposed,
@@ -1366,14 +1373,127 @@ fn a_completed_rename_is_saved_on_load_and_a_guess_is_not() {
     expected.sort();
     assert_eq!(stored, expected, "the rename was saved, the guess was not");
     assert!(f.state.is_favourite(renamed));
-    // The hand-moved file is shown through the library's own display link
-    // (same name and size), as the whole library shows it, but the saved item
-    // still names Beta's old entry: nothing was written for it.
+    // The hand-moved file: the library links it by name and size, which is a
+    // guess, so it is only proposed and nothing was written for it.
     assert_eq!(library.resolve(beta), moved);
+    assert!(!f.state.is_favourite(moved), "a guess is never starred");
+    let gone = &f.state.favourites().unwrap().gone;
+    assert_eq!(gone.len(), 1);
+    assert_eq!(gone[0].proposed, Some(moved));
     assert!(stored.contains(&beta) && !stored.contains(&moved));
     // A second load changes nothing.
     let before = std::fs::read(&f.path).unwrap();
     f.state.library_changed(&library);
     f.settle();
     assert_eq!(std::fs::read(&f.path).unwrap(), before);
+}
+
+/// Owner follow-up 2026-11-15: when automatic updates are paused by an
+/// untrusted rename record, Blue says so quietly; it says nothing otherwise,
+/// and browsing and stars work as usual either way.
+#[test]
+fn the_paused_note_shows_only_while_paused_and_stars_still_work() {
+    let context = eframe::egui::Context::default();
+    let mut app = star_app(&context);
+    let shown = |app: &mut super::super::App| {
+        frame(&context, app, vec![]);
+        let drawn = frame(&context, app, vec![]);
+        super::super::tests::text(&drawn)
+            .iter()
+            .any(|s| s == super::JOURNAL_PAUSED)
+    };
+    assert!(!shown(&mut app), "no note without a problem");
+    app.collections.journal_paused = true;
+    assert!(shown(&mut app), "the note appears");
+    // Manual favourites still work while it shows.
+    frame(&context, &mut app, vec![]);
+    let drawn = frame(&context, &mut app, vec![]);
+    let alpha_star = stars(&drawn)[0];
+    click_at(&context, &mut app, alpha_star);
+    assert!(app.collections.is_favourite(1));
+    app.collections.journal_paused = false;
+    assert!(!shown(&mut app), "the note goes when the problem does");
+}
+
+#[test]
+fn an_unreadable_rename_record_pauses_automatic_updates_until_it_is_gone() {
+    let mut f = fixture();
+    let favourites = f.favourites_id();
+    let library = f.library.clone();
+    let alpha = f.ids[0];
+    f.state.toggle(favourites, alpha, &library);
+    f.settle();
+    assert!(!f.state.journal_paused);
+    let source = f.path.parent().unwrap().join("source");
+    let journals = f
+        .path
+        .parent()
+        .unwrap()
+        .join(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY);
+    // A finished rename that would otherwise be saved ...
+    std::fs::rename(source.join("Alpha.zip"), source.join("Alpha (Renamed).zip")).unwrap();
+    let transaction: archivefs_core::dat::rename_apply::model::RenameTransaction =
+        serde_json::from_value(serde_json::json!({
+            "transaction_id": "1-0", "plan_generation": 0, "created_at_unix": 1,
+            "source_scan_root": source, "state": "applied",
+            "entries": [{
+                "source_path": source.join("Alpha.zip"),
+                "destination_path": source.join("Alpha (Renamed).zip"),
+                "original_basename": "Alpha.zip", "proposed_basename": "Alpha (Renamed).zip",
+                "identity": {"size_bytes": 9, "modified_unix": 1, "kind": "regular_file"},
+                "state": "applied"
+            }]
+        }))
+        .unwrap();
+    archivefs_core::dat::rename_apply::journal::write_journal(&journals, &transaction).unwrap();
+    let mut database = Database::open_existing(&f.path).unwrap();
+    archivefs_core::scan_and_persist(
+        &mut database,
+        &archivefs_core::Config {
+            source_folders: vec![source.clone()],
+            mount_root: f.path.parent().unwrap().join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+            configured_source_roots: None,
+        },
+        "after rename",
+    )
+    .unwrap();
+    let archives = database.load_archives().unwrap();
+    database.close().unwrap();
+    // ... beside a record that cannot be read.
+    let broken = journals.join("2-0.json");
+    std::fs::write(&broken, b"{ not a journal").unwrap();
+    f.library = Arc::new(Library::new(archives));
+    let library = f.library.clone();
+    let before = std::fs::read(&f.path).unwrap();
+    f.state.library_changed(&library);
+    f.settle();
+    assert!(f.state.journal_paused, "the pause is shown");
+    assert_eq!(
+        std::fs::read(&f.path).unwrap(),
+        before,
+        "fail closed: nothing moved"
+    );
+    let saved = Database::open_read_only(&f.path)
+        .unwrap()
+        .load_game_collections()
+        .unwrap();
+    assert_eq!(
+        saved[0].items[0].stored_archive_id, alpha,
+        "the favourite is kept as it was"
+    );
+    // The problem goes: the note goes, and the proven rename is saved.
+    std::fs::remove_file(&broken).unwrap();
+    f.state.library_changed(&library);
+    f.settle();
+    assert!(!f.state.journal_paused);
+    let saved = Database::open_read_only(&f.path)
+        .unwrap()
+        .load_game_collections()
+        .unwrap();
+    assert_ne!(
+        saved[0].items[0].stored_archive_id, alpha,
+        "now saved to the new entry"
+    );
 }

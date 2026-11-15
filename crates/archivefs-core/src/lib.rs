@@ -198,9 +198,9 @@ pub use database::{
 pub use database::{
     CollectionItemKey, CollectionReanchor, DiscoveryImportExclusion, DiscoveryImportItem,
     DiscoveryImportOperation, DiscoveryImportUndoPreview, DiscoveryImportUndoResult,
-    GameCollection, GameCollectionItem, GameCollectionKind, MAX_COLLECTION_NAME_CHARS,
-    MissingCleanupTarget, NestedMountOutcome, NestedMountState, PreservationFreshness,
-    validate_collection_name,
+    GameCollection, GameCollectionItem, GameCollectionKind, JournalledMoves,
+    MAX_COLLECTION_NAME_CHARS, MissingCleanupTarget, NestedMountOutcome, NestedMountState,
+    PreservationFreshness, validate_collection_name,
 };
 pub use database::{
     FileIdentity, InterruptedRestoreAssessment, InterruptedRestoreOutcome,

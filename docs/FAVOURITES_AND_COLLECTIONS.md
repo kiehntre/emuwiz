@@ -29,36 +29,53 @@ A favourite belongs to one catalogue entry, not to a title, so two copies with
 the same title are separate. Hover over a card to see which copy it is.
 
 An item belongs to the catalogue row it was saved against (same id and creation
-time), wherever that row now lives. If that row has been replaced by another,
-for example by a recorded rename, the page shows the replacement. A title match
+time), wherever that row now lives. If EmuWiz's own rename record shows that row
+was replaced, the item follows to the replacement. A replacement the library
+only infers (same name and size, a case-only difference) is offered as a
+possible match, as below, and is not starred until you confirm it. A title match
 is never enough, and a reused id is never accepted: a saved game and a current
 game can even hold the same id and stay separate items. A game whose row remains
 but whose file is missing stays in the list, marked as needing attention.
 
-When the saved row is gone, the item stays saved and appears under
-**no longer in the library** with its saved title, system and file name. If a
-current game sits in the same folder with the same file name and size, it is
-shown there as a **possible match**. That is not proof that it is the same game,
+When the saved row is gone or only replaced by such an inference, the item stays
+saved and appears under **no longer in the library** with its saved title,
+system and file name. If a current game sits in the same folder with the same
+file name and size, or the library infers it replaced the saved row, it is shown
+there as a **possible match**. Confirming applies to that saved game in every
+collection that holds it. That is not proof that it is the same game,
 so the item is not starred on it and nothing is saved. Choose
 **Keep as this game** to save the item against that game, or **Remove** to drop
 the item. Until you choose, the item stays as it is.
 
-Loading the library makes one kind of change to saved Favourites and
-collections, and only when EmuWiz's own rename record proves it. When Organise
-renamed or moved a game in a transaction that finished (not undone, failed or
-interrupted), the item is saved against the game's new entry once a scan has
-found it there, so it keeps its star after the old entry is cleaned up. The
-record must lead to exactly one destination, with exactly one current entry
-there of the same size, and the item's old entry, if it is still listed, must be
-marked missing. Anything less certain changes nothing. Running it again changes
-nothing, and it never uses file names, paths or sizes alone.
+Organise renames and moves keep the game's own entry, and so does their Undo,
+so a favourite or collection entry simply stays on the game.
+
+Loading the library makes one other kind of change to saved Favourites and
+collections, and only when EmuWiz's own sealed rename record proves it. When a
+DAT rename finished (not failed or interrupted), or a finished Undo put the file
+back, the item is saved against the game's new entry once a scan has found it
+there, so it keeps its star after the old entry is cleaned up. The record must
+lead to exactly one destination, with exactly one current entry there of the
+same size, and the item's old entry, if it is still listed, must be marked
+missing. A file that an unfinished rename touched is never followed. Anything
+less certain changes nothing. Running it again changes nothing, and it never
+uses file names, paths or sizes alone.
+
+Rename records written by older builds, in the unsealed `rename-transactions`
+folder, are never used as evidence. They are only read: an unfinished one stops
+the files it touched from being followed. If any rename record, old or new,
+cannot be read, automatic updates pause and Blue shows a short note above the
+games; favourites and collections stay as they are and can still be changed by
+hand.
 
 Every other change comes from you: a star, the Collections menu, create,
 rename, delete, Remove and Keep as this game.
 
 Discovery import Undo refuses a game that is in Favourites or a collection, or is
-offered there as a possible match for a saved item, and says so. Remove the item
-there first, then Undo. Undo never deletes an item. Forget and missing cleanup
+offered there as a possible match by folder, file name and size for a saved item
+whose own entry is gone, and says so. Remove the item there first, then Undo. A
+possible match the library only infers from a still-listed old entry does not
+block Undo; the saved item is kept either way and Undo never deletes it. Forget and missing cleanup
 remove the row and leave the item showing as no longer in the library.
 
 ## Upgrade and compatibility

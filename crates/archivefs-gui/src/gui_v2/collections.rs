@@ -98,11 +98,27 @@ pub(super) struct View {
     pub platforms: Vec<(String, usize)>,
 }
 
-/// Saved collections as this library shows them. Read-only: a game is a member
-/// only through its own saved row (followed to the row that now stands for it);
-/// a match by place and size is only proposed, on the item's gone entry.
+/// Saved collections as this library shows them. Read-only. A game is a member
+/// only through its own saved row, or the row EmuWiz's own rename record moved
+/// it to. Every other link (same name and size, a path match after the row was
+/// forgotten) is a guess: it is only proposed, on the item's gone entry.
 pub(super) fn build_views(collections: &[GameCollection], library: &Library) -> Vec<View> {
+    use archivefs_core::catalogue_supersession::SupersessionEvidence;
     let listed = |id: i64| Some(library.resolve(id)).filter(|id| library.by_id.contains_key(id));
+    // (member, proposal) for an item whose own row still exists.
+    let own_row = |own: i64| -> (Option<i64>, Option<i64>) {
+        if library.by_id.contains_key(&own) {
+            return (Some(own), None);
+        }
+        match library.historical_links.get(&own) {
+            Some(link) if !library.by_id.contains_key(&link.current_id) => (None, None),
+            Some(link) if link.evidence == SupersessionEvidence::JournalRename => {
+                (Some(link.current_id), None)
+            }
+            Some(link) => (None, Some(link.current_id)),
+            None => (None, None),
+        }
+    };
     collections
         .iter()
         .map(|collection| {
@@ -113,7 +129,9 @@ pub(super) fn build_views(collections: &[GameCollection], library: &Library) -> 
                     archive_id: item.stored_archive_id,
                     created_at: item.stored_created_at.clone(),
                 };
-                match item.resolved_archive_id.and_then(listed) {
+                let (member, link_proposal) =
+                    item.resolved_archive_id.map_or((None, None), own_row);
+                match member {
                     Some(id) => {
                         let member = members.entry(id).or_insert_with(|| Member {
                             stored: Vec::new(),
@@ -138,7 +156,7 @@ pub(super) fn build_views(collections: &[GameCollection], library: &Library) -> 
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default(),
-                        proposed: item.proposed_archive_id.and_then(listed),
+                        proposed: link_proposal.or(item.proposed_archive_id.and_then(listed)),
                     }),
                 }
             }
@@ -243,6 +261,9 @@ struct Answer {
     saved: Option<Vec<GameCollection>>,
     error: Option<String>,
     created: Option<i64>,
+    /// After a load: whether automatic updates for renamed games were paused
+    /// because a rename record could not be trusted. `None`: not checked.
+    journal_paused: Option<bool>,
 }
 
 fn apply(path: &Path, change: Change) -> Result<Option<i64>, String> {
@@ -281,25 +302,38 @@ fn apply(path: &Path, change: Change) -> Result<Option<i64>, String> {
 /// record proves moved (see `save_journalled_collection_moves`). Guesses by
 /// name, path or size are never saved here. It is retried at the next load if
 /// it fails, and items still show through the rename record meanwhile.
-fn save_journalled_moves(path: &Path) {
+/// Returns whether automatic updates were paused by an untrusted record
+/// (`Some(false)` when there is no record to check); `None` when the library
+/// could not be opened, which changes nothing on screen.
+fn save_journalled_moves(path: &Path) -> Option<bool> {
     let Some(journals) = path
         .parent()
         .map(|dir| dir.join(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY))
         .filter(|dir| dir.is_dir())
     else {
-        return;
+        return Some(false);
     };
-    if let Err(error) = Database::open_existing(path)
+    match Database::open_existing(path)
         .and_then(|mut database| database.save_journalled_collection_moves(&journals))
     {
-        log::warn!("collections: renamed games were not saved to their new entry: {error}");
+        Ok(result) => {
+            if let Some(reason) = &result.paused {
+                log::warn!("collections: automatic updates for renamed games paused: {reason}");
+            }
+            Some(result.paused.is_some())
+        }
+        Err(error) => {
+            log::warn!("collections: renamed games were not saved to their new entry: {error}");
+            None
+        }
     }
 }
 
 fn answer(path: &Path, job: Job) -> Answer {
+    let mut journal_paused = None;
     let (error, created) = match job {
         Job::Reload => {
-            save_journalled_moves(path);
+            journal_paused = save_journalled_moves(path);
             (None, None)
         }
         Job::Change(change) => match apply(path, change) {
@@ -318,6 +352,7 @@ fn answer(path: &Path, job: Job) -> Answer {
         saved,
         error,
         created,
+        journal_paused,
     }
 }
 
@@ -340,6 +375,7 @@ fn start_worker(
 
 const UNAVAILABLE: &str = "Collections are unavailable. Reopen EmuWiz.";
 const READ_FAILED: &str = "Saved collections could not be read just now.";
+const JOURNAL_PAUSED: &str = "Automatic updates for renamed games are paused: a rename record could not be read or is unfinished. Your favourites and collections are kept as they are, and you can still change them yourself.";
 
 #[derive(Default)]
 enum Dialog {
@@ -376,6 +412,9 @@ pub(super) struct State {
     /// Confirmed moves sent and not yet read back; a removal must follow them.
     reanchoring: Vec<CollectionReanchor>,
     message: Option<String>,
+    /// Automatic updates for renamed games are paused: a rename record could
+    /// not be trusted. Shown as a note; nothing else changes.
+    journal_paused: bool,
     dialog: Dialog,
     open_after_create: bool,
     pub(super) scope: Option<i64>,
@@ -457,6 +496,9 @@ impl State {
             self.pending = self.pending.saturating_sub(1);
             if let Some(error) = &answer.error {
                 self.message = Some(format!("That change was not saved: {error}"));
+            }
+            if let Some(paused) = answer.journal_paused {
+                self.journal_paused = paused;
             }
             if self.open_after_create && answer.created.is_some() {
                 self.scope = answer.created;
@@ -627,9 +669,22 @@ impl App {
         }
     }
 
+    /// A quiet note while automatic updates for renamed games are paused.
+    /// Browsing and every manual control work as usual.
+    pub(super) fn collection_journal_note(&self, ui: &mut egui::Ui) {
+        if self.collections.journal_paused {
+            ui.label(
+                RichText::new(JOURNAL_PAUSED)
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+            );
+        }
+    }
+
     /// Which games the page lists, and the tools for that collection.
     pub(super) fn browse_play_scope_bar(&mut self, ui: &mut egui::Ui) {
         self.collection_message(ui);
+        self.collection_journal_note(ui);
         if !self.collections.ready() {
             return;
         }
@@ -914,7 +969,7 @@ impl App {
                                                 let title = library
                                                     .game(proposed)
                                                     .map_or_else(String::new, |found| found.title.clone());
-                                                ui.small(format!("Possible match: {title}. Same folder, file name and size, but that does not prove it is the same game. Nothing is saved unless you confirm."));
+                                                ui.small(format!("Possible match: {title}. It looks the same by name and size, but that does not prove it is the same game. Nothing is saved unless you confirm, and confirming applies to this saved game in every collection that holds it."));
                                                 if ui
                                                     .add_enabled(settled, egui::Button::new("Keep as this game").small())
                                                     .clicked()

@@ -390,11 +390,20 @@ impl Database {
     /// destination, or a part in a transaction that did not finish cleanly is
     /// never followed. File names, paths or sizes alone never move an item.
     /// Nothing is written when nothing qualifies; running it again changes
-    /// nothing. Returns how many items were moved.
-    pub fn save_journalled_collection_moves(&mut self, journals: &Path) -> Result<usize> {
-        let renames = completed_rename_ends(journals);
+    /// nothing. When a rename record cannot be trusted at all (see
+    /// `completed_rename_ends`) nothing is moved and the result says why.
+    pub fn save_journalled_collection_moves(&mut self, journals: &Path) -> Result<JournalledMoves> {
+        let renames = match completed_rename_ends(journals) {
+            Ok(renames) => renames,
+            Err(reason) => {
+                return Ok(JournalledMoves {
+                    moved: 0,
+                    paused: Some(reason),
+                });
+            }
+        };
         if renames.is_empty() || journalled_moves(&self.connection, &renames)?.is_empty() {
-            return Ok(0);
+            return Ok(JournalledMoves::default());
         }
         let error = |error| db_error("failed to update saved games", error);
         let tx = self
@@ -405,45 +414,96 @@ impl Database {
         let moves = journalled_moves(&tx, &renames)?;
         reanchor_in(&tx, &moves)?;
         tx.commit().map_err(error)?;
-        Ok(moves.len())
+        Ok(JournalledMoves {
+            moved: moves.len(),
+            paused: None,
+        })
     }
 }
 
+/// What [`Database::save_journalled_collection_moves`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JournalledMoves {
+    /// Saved games moved onto a renamed game's new entry, each updated in
+    /// every collection that holds it.
+    pub moved: usize,
+    /// Set when a rename record could not be trusted, so automatic updates
+    /// were paused and nothing was moved; the reason, for the log.
+    pub paused: Option<String>,
+}
+
 /// Start path -> final path for every chain of rename-moves that EmuWiz's own
-/// journals record as applied in a finished transaction (Applied or
-/// Finalised). Undone, failed, interrupted and planned transactions add no
-/// link, and a path any unfinished transaction touched is never followed.
-fn completed_rename_ends(dir: &Path) -> HashMap<PathBuf, PathBuf> {
+/// sealed journals prove: an applied rename-move in a finished transaction
+/// (Applied or Finalised) links source to destination, and a rename-move a
+/// finished Undo reversed (transaction and entry RolledBack) links destination
+/// back to source. Failed, interrupted and planned transactions add no link,
+/// and a path any unfinished transaction touched is never followed.
+///
+/// Journals in the older, unsealed folder beside it are never evidence: they
+/// only mark the paths of an unfinished transaction as not to be followed.
+///
+/// Fails closed: if any journal in either folder cannot be read, the reason is
+/// returned and nothing is moved.
+fn completed_rename_ends(dir: &Path) -> std::result::Result<HashMap<PathBuf, PathBuf>, String> {
     const MAX_HOPS: usize = 16;
-    let (transactions, _problems) = list_journals(dir);
+    let (transactions, problems) = list_journals(dir);
+    if let Some(problem) = problems.first() {
+        return Err(format!("a rename record could not be read: {problem}"));
+    }
+    let settled = |state: &TransactionState| {
+        matches!(
+            state,
+            TransactionState::Planned
+                | TransactionState::Applied
+                | TransactionState::RolledBack
+                | TransactionState::Finalised
+        )
+    };
+    let mut unsettled: HashSet<PathBuf> = HashSet::new();
+    if let Some(legacy) = dir
+        .parent()
+        .map(|parent| parent.join(crate::dat::rename_apply::LEGACY_RENAME_TRANSACTIONS_DIRECTORY))
+        .filter(|legacy| legacy.exists())
+    {
+        let (old, old_problems) = list_journals(&legacy);
+        if let Some(problem) = old_problems.first() {
+            return Err(format!(
+                "an older rename record could not be read: {problem}"
+            ));
+        }
+        for transaction in old.into_iter().filter(|t| !settled(&t.state)) {
+            for entry in transaction.entries {
+                unsettled.insert(entry.source_path);
+                unsettled.insert(entry.destination_path);
+            }
+        }
+    }
     let mut next: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
     let mut into: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
-    let mut unsettled: HashSet<PathBuf> = HashSet::new();
     for transaction in transactions {
         let finished = matches!(
             transaction.state,
             TransactionState::Applied | TransactionState::Finalised
         );
-        let settled = finished
-            || matches!(
-                transaction.state,
-                TransactionState::Planned | TransactionState::RolledBack
-            );
+        let undone = transaction.state == TransactionState::RolledBack;
+        let is_settled = settled(&transaction.state);
         for entry in transaction.entries {
             if !matches!(entry.operation, TransactionOperation::RenameMove) {
                 continue;
             }
-            if finished && entry.state == EntryState::Applied {
-                next.entry(entry.source_path.clone())
-                    .or_default()
-                    .insert(entry.destination_path.clone());
-                into.entry(entry.destination_path)
-                    .or_default()
-                    .insert(entry.source_path);
-            } else if !settled {
-                unsettled.insert(entry.source_path);
-                unsettled.insert(entry.destination_path);
-            }
+            let (from, to) = if finished && entry.state == EntryState::Applied {
+                (entry.source_path, entry.destination_path)
+            } else if undone && entry.state == EntryState::RolledBack {
+                (entry.destination_path, entry.source_path)
+            } else {
+                if !is_settled {
+                    unsettled.insert(entry.source_path);
+                    unsettled.insert(entry.destination_path);
+                }
+                continue;
+            };
+            next.entry(from.clone()).or_default().insert(to.clone());
+            into.entry(to).or_default().insert(from);
         }
     }
     let step = |at: &Path| -> Option<PathBuf> {
@@ -473,7 +533,7 @@ fn completed_rename_ends(dir: &Path) -> HashMap<PathBuf, PathBuf> {
             ends.insert(start.clone(), at);
         }
     }
-    ends
+    Ok(ends)
 }
 
 /// The items `renames` proves moved, each onto the one current row at the end

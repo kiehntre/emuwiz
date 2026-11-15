@@ -569,7 +569,11 @@ fn a_completed_rename_saves_favourites_and_collections_once_and_survives_a_resta
     let dir = journals(&f);
     assert_eq!(
         f.database.save_journalled_collection_moves(&dir).unwrap(),
-        1
+        super::JournalledMoves {
+            moved: 1,
+            paused: None
+        },
+        "a normal run reports no pause"
     );
     assert_eq!(stored_ids(&f.database), vec![vec![new], vec![new]]);
     let items = f.database.load_game_collections().unwrap();
@@ -582,7 +586,10 @@ fn a_completed_rename_saves_favourites_and_collections_once_and_survives_a_resta
     // Idempotent: nothing left to do, and the file is not even written.
     let before = fs::read(&f.db_path).unwrap();
     assert_eq!(
-        f.database.save_journalled_collection_moves(&dir).unwrap(),
+        f.database
+            .save_journalled_collection_moves(&dir)
+            .unwrap()
+            .moved,
         0
     );
     assert_eq!(fs::read(&f.db_path).unwrap(), before);
@@ -608,7 +615,8 @@ fn a_completed_rename_still_applies_after_the_old_entry_was_cleaned_up() {
     assert_eq!(
         f.database
             .save_journalled_collection_moves(&journals(&f))
-            .unwrap(),
+            .unwrap()
+            .moved,
         1
     );
     assert_eq!(stored_ids(&f.database), vec![vec![new]]);
@@ -680,7 +688,8 @@ fn failed_undone_unfinished_ambiguous_or_stale_records_change_nothing() {
         assert_eq!(
             f.database
                 .save_journalled_collection_moves(&journals(&f))
-                .unwrap(),
+                .unwrap()
+                .moved,
             0,
             "{name}"
         );
@@ -703,7 +712,10 @@ fn a_record_that_disagrees_with_the_catalogue_changes_nothing() {
     record(&f, 1, "applied", "applied", &[("a.zip", "b.zip")]);
     let dir = journals(&f);
     assert_eq!(
-        f.database.save_journalled_collection_moves(&dir).unwrap(),
+        f.database
+            .save_journalled_collection_moves(&dir)
+            .unwrap()
+            .moved,
         0
     );
     assert_eq!(stored_ids(&f.database), vec![vec![old]]);
@@ -720,7 +732,8 @@ fn a_record_that_disagrees_with_the_catalogue_changes_nothing() {
     assert_eq!(
         g.database
             .save_journalled_collection_moves(&journals(&g))
-            .unwrap(),
+            .unwrap()
+            .moved,
         0
     );
     assert_eq!(stored_ids(&g.database), vec![vec![old]]);
@@ -744,8 +757,135 @@ fn a_guess_by_name_path_or_size_alone_is_never_saved() {
     assert_eq!(
         f.database
             .save_journalled_collection_moves(&journals(&f))
-            .unwrap(),
+            .unwrap()
+            .moved,
         0
+    );
+    assert_eq!(stored_ids(&f.database), vec![vec![old]]);
+}
+
+fn legacy(f: &Fixture, id: u32, state: &str, entry_state: &str, moves: &[(&str, &str)]) {
+    let entries: Vec<serde_json::Value> = moves
+        .iter()
+        .map(|(from, to)| {
+            serde_json::json!({
+                "source_path": f.source.join(from), "destination_path": f.source.join(to),
+                "original_basename": "x", "proposed_basename": "y",
+                "identity": {"size_bytes": 1, "modified_unix": 1, "kind": "regular_file"},
+                "state": entry_state
+            })
+        })
+        .collect();
+    let transaction: crate::dat::rename_apply::model::RenameTransaction =
+        serde_json::from_value(serde_json::json!({
+            "transaction_id": format!("{id}-0"), "plan_generation": 0, "created_at_unix": id,
+            "source_scan_root": f.source, "state": state, "entries": entries
+        }))
+        .unwrap();
+    let dir = f
+        .db_path
+        .parent()
+        .unwrap()
+        .join(crate::dat::rename_apply::LEGACY_RENAME_TRANSACTIONS_DIRECTORY);
+    crate::dat::rename_apply::journal::write_journal(&dir, &transaction).unwrap();
+}
+
+/// Owner follow-ups 2026-11-15: an unreadable record pauses every automatic
+/// update and says so; older (unsealed) records are never evidence, an
+/// unfinished one blocks only the files it touched, and ordinary settled ones
+/// neither warn nor block.
+#[test]
+fn record_problems_pause_or_block_exactly_as_much_as_they_must() {
+    type Setup = fn(&Fixture);
+    // (case, setup, expect moved, expect a pause)
+    let cases: [(&str, Setup, bool, bool); 6] = [
+        (
+            "unreadable sealed record",
+            |f| fs::write(journals(f).join("2-0.json"), b"{ not a journal").unwrap(),
+            false,
+            true,
+        ),
+        (
+            "unreadable older record",
+            |f| {
+                let dir = f
+                    .db_path
+                    .parent()
+                    .unwrap()
+                    .join(crate::dat::rename_apply::LEGACY_RENAME_TRANSACTIONS_DIRECTORY);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("9-0.json"), b"{ not a journal").unwrap()
+            },
+            false,
+            true,
+        ),
+        (
+            "older unfinished record on this file",
+            |f| legacy(f, 9, "applying", "applying", &[("a.zip", "c.zip")]),
+            false,
+            false,
+        ),
+        (
+            "older unfinished record elsewhere",
+            |f| legacy(f, 9, "applying", "applying", &[("z.zip", "q.zip")]),
+            true,
+            false,
+        ),
+        (
+            "ordinary settled older records",
+            |f| {
+                legacy(f, 8, "applied", "applied", &[("z.zip", "q.zip")]);
+                legacy(f, 9, "rolled_back", "rolled_back", &[("z.zip", "r.zip")]);
+            },
+            true,
+            false,
+        ),
+        ("no problem at all", |_| {}, true, false),
+    ];
+    for (case, setup, moves, paused) in cases {
+        let mut f = fixture(&["a.zip", "z.zip"]);
+        let favourites = f.database.favourites_collection_id().unwrap();
+        let old = id_of(&f.database, "a.zip");
+        f.database.add_game_to_collection(favourites, old).unwrap();
+        let new = rename_on_disk(&mut f, "a.zip", "b.zip");
+        record(&f, 1, "applied", "applied", &[("a.zip", "b.zip")]);
+        setup(&f);
+        let before = fs::read(&f.db_path).unwrap();
+        let result = f
+            .database
+            .save_journalled_collection_moves(&journals(&f))
+            .unwrap();
+        assert_eq!(result.paused.is_some(), paused, "{case}: {result:?}");
+        assert_eq!(result.moved, usize::from(moves), "{case}");
+        let expected = if moves { new } else { old };
+        assert_eq!(stored_ids(&f.database), vec![vec![expected]], "{case}");
+        if !moves {
+            assert_eq!(
+                fs::read(&f.db_path).unwrap(),
+                before,
+                "{case}: nothing written"
+            );
+        }
+    }
+}
+
+#[test]
+fn older_unsealed_records_alone_are_never_evidence() {
+    let mut f = fixture(&["a.zip"]);
+    let favourites = f.database.favourites_collection_id().unwrap();
+    let old = id_of(&f.database, "a.zip");
+    f.database.add_game_to_collection(favourites, old).unwrap();
+    rename_on_disk(&mut f, "a.zip", "b.zip");
+    legacy(&f, 1, "applied", "applied", &[("a.zip", "b.zip")]);
+    fs::create_dir_all(journals(&f)).unwrap();
+    let result = f
+        .database
+        .save_journalled_collection_moves(&journals(&f))
+        .unwrap();
+    assert_eq!(
+        result,
+        super::JournalledMoves::default(),
+        "no move, no warning"
     );
     assert_eq!(stored_ids(&f.database), vec![vec![old]]);
 }

@@ -77,7 +77,7 @@ mod collections_upgrade_tests;
 mod discovery_import;
 pub use collections::{
     CollectionItemKey, CollectionReanchor, GameCollection, GameCollectionItem, GameCollectionKind,
-    MAX_COLLECTION_NAME_CHARS, validate_collection_name,
+    JournalledMoves, MAX_COLLECTION_NAME_CHARS, validate_collection_name,
 };
 pub use discovery_import::{
     DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
