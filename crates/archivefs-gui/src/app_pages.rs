@@ -654,6 +654,10 @@ pub(crate) fn show_pages(
             }
 
             if app.view == MainView::NeedsAttention {
+                // Navigation set this view after the frame's poll ran, so the
+                // snapshot is merged here, before the page's first draw. On
+                // later frames the poll's own one-second gate makes this free.
+                app.poll_needs_attention(ui.ctx());
                 if let Some(destination) = needs_attention::show_needs_attention_page(
                     ui,
                     &mut app.needs_attention,

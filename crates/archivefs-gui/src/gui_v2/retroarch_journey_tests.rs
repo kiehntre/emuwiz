@@ -403,6 +403,9 @@ fn child_entry() {
                 println!("coords {label}\t{:.0}\t{:.0}", centre.x, centre.y);
             }
         }
+        "memo-stale-ready" => {
+            readiness_memo::run(&mut blue, &fixture, &record);
+        }
         other => panic!("unknown scenario {other}"),
     }
     println!("journey {scenario}: ok");
@@ -977,6 +980,7 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
 
 mod cartridge_cue;
 mod installation_save;
+mod readiness_memo;
 mod selection_truth;
 
 mod fuse_snapshot;

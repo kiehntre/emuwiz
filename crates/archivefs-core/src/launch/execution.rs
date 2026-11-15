@@ -81,10 +81,13 @@ fn swap_content_argument(
     }
 }
 
-/// Caps how much of a launched process's stderr this module ever retains
-/// in memory - a diagnostic aid for a failed/crashed launch, never a full
-/// log. Re-exports [`process_spawn::PROCESS_STDERR_CAPTURE_LIMIT`] under
-/// this module's existing name.
+/// Caps how much of the *start* of a launched process's output this module
+/// retains in memory - a diagnostic aid for a failed/crashed launch, never a
+/// full log. Re-exports [`process_spawn::PROCESS_STDERR_CAPTURE_LIMIT`] under
+/// this module's existing name. A launch that asks RetroArch for detailed
+/// logging also keeps up to
+/// [`process_spawn::DIAGNOSTIC_TAIL_CAPTURE_LIMIT`] bytes from the end, plus
+/// one marker line: see [`process_spawn::OutputCapture::Diagnostic`].
 pub const LAUNCH_STDERR_CAPTURE_LIMIT: usize = process_spawn::PROCESS_STDERR_CAPTURE_LIMIT;
 
 // ---------------------------------------------------------------------------
@@ -1023,6 +1026,12 @@ impl LaunchedRetroArchProcess {
         self.watched.is_running()
     }
 
+    /// Let go of what RetroArch printed, keeping how it ended: see
+    /// [`WatchedProcess::discard_captured_output`].
+    pub fn discard_captured_output(&mut self) {
+        self.watched.discard_captured_output();
+    }
+
     /// Whether a stop request would reach RetroArch itself. Only a native
     /// profile whose owned child is executing the file it launched qualifies:
     /// an AppImage or other launcher may exit while the emulator keeps
@@ -1074,12 +1083,16 @@ impl LaunchedRetroArchProcess {
 ///   inert data, never re-parsed as syntax.
 /// - `stdin` is `Stdio::null()` - RetroArch never needs to read from this
 ///   process's stdin.
-/// - `stdout` is `Stdio::null()` - RetroArch is a graphical process; it
-///   does not need its own stdout consumed by this process, and inheriting
-///   it would tie this process's terminal to RetroArch's for no benefit.
-/// - `stderr` is `Stdio::piped()` and drained on a background thread,
-///   bounded at [`LAUNCH_STDERR_CAPTURE_LIMIT`], purely as a diagnostic aid
-///   if the launch fails or crashes.
+/// - `stdout` and `stderr`: RetroArch is asked for detailed logging and
+///   both go through one pipe into a bounded capture (the first
+///   [`LAUNCH_STDERR_CAPTURE_LIMIT`] bytes and the last
+///   [`process_spawn::DIAGNOSTIC_TAIL_CAPTURE_LIMIT`]); see
+///   [`super::retroarch_launch_diagnostics`]. With the quiet switch, or when
+///   RetroArch's arguments cannot be located, `stdout` is `Stdio::null()`
+///   and only the start of `stderr` is kept. Either way the output is
+///   drained on a background thread and is purely a diagnostic aid if the
+///   launch fails or crashes; neither stream is inherited, which would tie
+///   this process's terminal to RetroArch's for no benefit.
 /// - Display/XDG/RetroArch settings are inherited. A supported native SRAM
 ///   observer adds only private per-child loader/IPC variables; the parent
 ///   environment and emulator configuration are unchanged. Native sessions
@@ -1234,8 +1247,12 @@ pub(crate) fn spawn_retroarch_guarded(
         }
     }
     let launched_file = process_spawn::ExecutableFile::of(&command.executable).ok();
+    // Asked for last, after every check above: the planned and verified
+    // command is untouched, and the only difference from a quiet launch is
+    // one argument. See the module for what was verified about it.
+    let capture = super::retroarch_launch_diagnostics::prepare_launch(&mut prepared.arguments);
     let watched = observation
-        .spawn(&prepared)
+        .spawn(&prepared, capture)
         .map_err(LaunchSpawnError::Spawn)?;
     Ok(LaunchedRetroArchProcess {
         staged_cartridge: None,
@@ -1358,10 +1375,77 @@ fn staged_launch_findings(
     filesystem: &dyn ReadOnlyHostFilesystem,
     environment: &DiscoveryEnvironment,
 ) -> Vec<String> {
+    staged_launch_findings_for(&request.profile, filesystem, environment)
+}
+
+/// Readiness projection of the launch-time zipped-cartridge refusal: every
+/// RetroArch candidate for zipped content is blocked with exactly the
+/// findings [`staged_launch_is_safe`] would refuse the launch with (computed
+/// by [`zipped_cartridge_save_findings`] for the same RetroArch scan the
+/// plan was built from), so readiness and Play agree. Pure: no file access,
+/// safe to call every frame. Other content is untouched.
+pub fn apply_zipped_cartridge_save_safety(
+    plan: &mut super::planning::LaunchPlan,
+    findings_by_profile: &[(ProfileRef, Vec<String>)],
+) {
+    for candidate in &mut plan.candidates {
+        if candidate.content.provenance != super::ZIPPED_CARTRIDGE_PROVENANCE {
+            continue;
+        }
+        let LaunchTarget::RetroArchCore { profile, .. } = &candidate.target else {
+            continue;
+        };
+        // Not checked (no completed RetroArch scan for this profile): leave
+        // readiness as planned; the launch itself still runs the full check.
+        let Some((_, findings)) = findings_by_profile.iter().find(|(p, _)| p == profile) else {
+            continue;
+        };
+        if findings.is_empty() {
+            continue;
+        }
+        candidate.blockers.push(super::readiness::LaunchBlocker::new(
+            super::readiness::LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe,
+            format!(
+                "This game is inside a ZIP, so EmuWiz plays a temporary copy that is deleted when you quit, and RetroArch's save setup would lose your saves: {}. {}",
+                findings.join("; "),
+                super::planning::RETROARCH_RECHECK_HINT
+            ),
+        ));
+        candidate.readiness = super::readiness::LaunchReadiness::Blocked;
+    }
+    plan.summary = super::planning::summarize(&plan.candidates);
+}
+
+fn staged_launch_findings_for(
+    request_profile: &ProfileRef,
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    environment: &DiscoveryEnvironment,
+) -> Vec<String> {
+    if request_profile.profile_kind != ProfileKind::Native {
+        return zipped_cartridge_save_findings(None, request_profile, environment);
+    }
+    match discover_retroarch_environment(filesystem, environment) {
+        Ok(report) => zipped_cartridge_save_findings(Some(&report), request_profile, environment),
+        Err(error) => vec![format!("RetroArch could not be inspected: {error}")],
+    }
+}
+
+/// The zipped-cartridge save-safety findings for one RetroArch profile of an
+/// already-discovered `report` (empty means safe). The launch-time refusal
+/// ([`staged_launch_is_safe`]) discovers fresh and calls this; Blue calls it
+/// once per profile on its RetroArch scan thread and reuses the result for
+/// readiness, never per frame. `report` may be `None` only for a non-native
+/// profile, which is refused without inspection. Reads the settings file and
+/// override folders; never writes.
+pub fn zipped_cartridge_save_findings(
+    report: Option<&RetroArchEnvironmentReport>,
+    request_profile: &ProfileRef,
+    environment: &DiscoveryEnvironment,
+) -> Vec<String> {
     use crate::emulator_environment::retroarch::{PathPurpose, ResolutionState};
     use std::io::Read as _;
 
-    if request.profile.profile_kind != ProfileKind::Native {
+    if request_profile.profile_kind != ProfileKind::Native {
         return vec![
             "a zipped cartridge can only be launched with a native RetroArch \
              installation, because an AppImage or Flatpak launcher may exit while \
@@ -1369,13 +1453,12 @@ fn staged_launch_findings(
                 .into(),
         ];
     }
-    let report = match discover_retroarch_environment(filesystem, environment) {
-        Ok(report) => report,
-        Err(error) => return vec![format!("RetroArch could not be inspected: {error}")],
+    let Some(report) = report else {
+        return vec!["RetroArch could not be inspected".into()];
     };
     let Some(profile) = report.profiles.iter().find(|profile| {
-        profile.profile_kind == request.profile.profile_kind
-            && profile.scope == request.profile.scope
+        profile.profile_kind == request_profile.profile_kind
+            && profile.scope == request_profile.scope
     }) else {
         return vec!["the selected RetroArch settings could not be found".into()];
     };

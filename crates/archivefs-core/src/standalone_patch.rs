@@ -1670,19 +1670,12 @@ fn hex_digest(b: &[u8]) -> String {
         .map(|x| format!("{x:02x}"))
         .collect()
 }
+/// CRC-32 (IEEE) of a buffer, through the shared table-driven implementation.
+/// Patch formats checksum whole source and target images with it.
 fn crc32(b: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffff;
-    for &x in b {
-        crc ^= x as u32;
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xedb8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
+    let mut crc = crate::identity_source::hashing::Crc32::new();
+    crc.update(b);
+    crc.finish()
 }
 
 #[cfg(test)]
@@ -2307,5 +2300,49 @@ mod tests {
         assert_eq!(result.provenance.output_path, output_path);
         assert!(temp.path().join("patched.sfc.emuwiz-patch.json").is_file());
         assert!(result.provenance.applied_at_unix_seconds > 0);
+    }
+}
+
+#[cfg(test)]
+mod crc32_vector_tests {
+    /// The definition, one bit at a time: the code this file used before it
+    /// switched to the shared table-driven implementation.
+    fn bitwise(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffff_u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn crc32_gives_the_published_answers() {
+        assert_eq!(super::crc32(b""), 0);
+        assert_eq!(super::crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(
+            super::crc32(b"The quick brown fox jumps over the lazy dog"),
+            0x414f_a339
+        );
+    }
+
+    #[test]
+    fn crc32_agrees_with_the_bit_at_a_time_definition_at_every_length() {
+        let data: Vec<u8> = (0..4099_u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        for length in (0..=40).chain([255, 256, 257, 4095, 4096, 4097, 4099]) {
+            assert_eq!(
+                super::crc32(&data[..length]),
+                bitwise(&data[..length]),
+                "length {length}"
+            );
+        }
     }
 }

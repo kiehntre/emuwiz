@@ -75,6 +75,8 @@ pub mod amiga_whdload_execution;
 pub mod amiga_whdload_trainer_launch;
 #[cfg(target_os = "linux")]
 pub mod atari800;
+#[cfg(target_os = "linux")]
+pub mod atari800_setup;
 pub mod azahar_command;
 pub mod azahar_execution;
 pub mod azahar_homebrew;
@@ -168,6 +170,7 @@ pub mod installation_support;
 pub mod readiness;
 pub mod resource_grants;
 pub mod retroarch_command;
+pub mod retroarch_launch_diagnostics;
 pub mod retroarch_launch_visibility;
 pub mod retroarch_resource_projection;
 pub mod rmg_command;
@@ -352,9 +355,10 @@ pub use execution::{
     LAUNCH_STDERR_CAPTURE_LIMIT, LaunchCommandFacts, LaunchContentIdentity, LaunchExecutionError,
     LaunchExitReport, LaunchPreflightError, LaunchPreflightErrorKind, LaunchSpawnError,
     LaunchedRetroArchProcess, PreparedRetroArchLaunch, RetroArchLaunchRequest,
-    preflight_and_launch_retroarch, preflight_and_launch_retroarch_with_playlist,
-    preflight_retroarch_launch, preflight_retroarch_launch_with_playlist,
-    prepare_retroarch_launch_with_playlist, spawn_retroarch,
+    apply_zipped_cartridge_save_safety, preflight_and_launch_retroarch,
+    preflight_and_launch_retroarch_with_playlist, preflight_retroarch_launch,
+    preflight_retroarch_launch_with_playlist, prepare_retroarch_launch_with_playlist,
+    spawn_retroarch, zipped_cartridge_save_findings,
 };
 pub use fbneo_command::{
     FBNEO_SUPPORTED_PLATFORM_ID, FbneoCommand, FbneoCommandPlan, FbneoIdentityEvidence,
@@ -473,8 +477,8 @@ pub use pcsx2_execution::{
 pub use planning::{
     CandidatePreference, CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind,
     LaunchContentKind, LaunchContentRef, LaunchPlan, LaunchPlanSummary, LaunchTarget,
-    RememberedPreference, ResolvedIdentity, StandaloneProfileInput, VerifiedWHDLoadContent,
-    build_launch_plan,
+    RETROARCH_RECHECK_HINT, RememberedPreference, ResolvedIdentity, StandaloneProfileInput,
+    VerifiedWHDLoadContent, build_launch_plan,
 };
 pub use platform_map::{
     LAUNCH_COMPATIBILITY, LaunchCompatibility, MappingConfidence, extension_narrows_candidate,

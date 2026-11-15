@@ -150,6 +150,85 @@ overrides it (and prints a one-line note), so using the wrapper is always safe. 
 interactive shell you can also run `unset CARGO_TARGET_DIR`. Once the global defaults are
 removed (a separate, coordinated step), new shells no longer carry it.
 
+## Coding sessions and code indexing
+
+Start every coding session at the root of the worktree assigned to the task
+(`cd <worktree> && claude`). Never start one in the home directory (`/home/davedap` on
+the maintainer's machine), in a folder that holds several checkouts, or in a
+subdirectory of the worktree unless you mean to (see below).
+
+Why: Claude Code starts the `rust-analyzer` language server the first time a session
+edits a `.rs` file with Edit or Write, rooted at the directory the session was started
+in. Started from a home directory with 198 Cargo workspaces under it, one server loaded
+all 198 and reached 24 GB of memory plus 20 GB of swap; three of them filled the
+machine twice in one night (measured 2026-11-14).
+
+The language server is off by default in this repository. `.claude/settings.json`
+disables the `rust-analyzer-lsp` plugin for a session started at the root of a worktree
+whose branch contains that file. Before the first `.rs` edit, `claude plugin list` run
+from the directory the session was started in must say `disabled`. Search with
+`grep`/`rg`. Take build and correctness evidence only from `scripts/cargo-iso check`,
+`clippy` and `test`; nothing a language server reports counts as validation.
+
+An enabled server rooted in one worktree loads only that workspace, but it is still
+heavy: more than 6 GB within its first 30 seconds on this repository, and in that time
+it compiled at least 0.5 GB of build scripts and proc macros with plain `cargo` into
+`<worktree>/target`, outside `cargo-iso` and the Cargo budget. That is a cost to know
+about, not permission to build there. `scripts/emuwiz-rust-analyzer` is the managed
+route that keeps those builds in the `cargo-iso` target; the plugin uses it only when a
+`rust-analyzer` link to it is first on the session's `PATH`, which is the owner's
+decision and is not set up by this file.
+
+When a task genuinely needs code navigation (go to definition, find references):
+
+1. Treat it like a build. Tell the owner, or note it in the maintainer's coordination
+   ledger (`COORDINATION.md`), first. One language server at a time on the machine:
+   `pgrep -x rust-analyzer` must print nothing before you start.
+2. Start that one session in a subdirectory of the worktree, for example
+   `<worktree>/crates`. Claude Code reads `.claude/settings.json` only from the
+   directory a session starts in, so that session alone has the plugin on. Check that
+   `claude plugin list` run there says `enabled`. If it says `disabled`, the owner has
+   turned the plugin off for every worktree on that machine: ask the owner, and do not
+   enable it yourself. In that session the worktree root is outside the working
+   directory: run repository scripts by path (`../scripts/cargo-iso …`; it finds the
+   worktree itself) and expect approval prompts outside the subdirectory. Do not add
+   the root with `--add-dir` or `/add-dir`: that loads `enabledPlugins` from its
+   `.claude/settings.json`.
+3. End that session when the task is done, then check that no `rust-analyzer` of yours
+   is left: `ps -o pid,ppid,lstart,cmd -C rust-analyzer` (yours has your session's
+   `claude` process as its parent). Stop a leftover of your own only by that verified
+   PID. Never stop a language server that belongs to another session; ask its owner.
+
+Do not use `claude plugin enable` for this. With `--scope local` it writes the main
+checkout's `.claude/settings.local.json`, which every linked worktree reads, so it turns
+the plugin on for sessions in every worktree. With `--scope project` it edits the
+tracked file.
+
+Know these limits:
+
+- A session started in a subdirectory does not read `.claude/settings.json` and has the
+  plugin on.
+- A worktree whose branch does not contain `.claude/settings.json` still has the plugin
+  on. It gets the file when its branch next takes `main` in the normal course; do not
+  merge or rebase only for this. Turning it off for all existing worktrees at once (one
+  `claude plugin disable rust-analyzer-lsp@claude-plugins-official --scope local`, which
+  also turns it off in subdirectories) is the owner's decision.
+- A session that was already running when a setting changed may keep the plugin. Only
+  ending that session is certain; `/reload-plugins`, typed by the person at that
+  session, is the documented alternative.
+- `claude --settings '{"enabledPlugins":…}'` and `--plugin-dir` did not turn it on over
+  the project setting (tested with Claude Code 2.1.325).
+- This changes nothing in `cargo-iso`, `sccache`, the Cargo budget, or
+  `~/.config/rust-analyzer`.
+- On the maintainer's machine the plugin is also off for sessions started from the home
+  directory (`~/.claude/settings.local.json`) and, since 2026-11-14, for every worktree
+  of this repository, subdirectories included (the main checkout's
+  `.claude/settings.local.json`). Each file has a backup beside it. The first only
+  catches a stray session; it is not a reason to start one there.
+- Never delete an existing `<worktree>/target` because of this section. Its owner and
+  whether it is in use must be established first (see the Cargo cache release rules
+  below).
+
 ## Temporary files
 
 Use `tempfile::TempDir`, `/tmp/emuwiz-<task>...`, or a deliberate checked-in

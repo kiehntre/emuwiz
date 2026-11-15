@@ -255,6 +255,7 @@ fn picker_search_matches_every_word_in_title_or_platform() {
     let library = picker_library();
     let titles = |query: &str| {
         matches(&library.games, query)
+            .shown
             .into_iter()
             .map(|game| game.title.clone())
             .collect::<Vec<_>>()
@@ -276,7 +277,132 @@ fn picker_limits_the_match_list() {
             .map(|id| archive(id, &format!("Game {id}"), Some("SNES")))
             .collect(),
     );
-    assert_eq!(matches(&many.games, "game").len(), PICKER_LIMIT);
+    let found = matches(&many.games, "game");
+    assert_eq!(found.shown.len(), PICKER_LIMIT);
+    assert_eq!(found.total, 20);
+    assert_eq!(found.hidden(), 12);
+}
+
+fn ranked(titles: &[(&str, &str)], query: &str) -> Vec<String> {
+    use crate::gui_v2::tests::archive;
+    let library = crate::gui_v2::library::Library::new(
+        titles
+            .iter()
+            .zip(1..)
+            .map(|((title, platform), id)| archive(id, title, Some(platform)))
+            .collect(),
+    );
+    matches(&library.games, query)
+        .shown
+        .into_iter()
+        .map(|game| game.title.clone())
+        .collect()
+}
+
+#[test]
+fn picker_ranks_exact_then_prefix_then_words_then_other() {
+    let got = ranked(
+        &[
+            ("Super Mario World", "SNES"),
+            ("Dr. Mario", "NES"),
+            ("Mariokart Clone", "PC"),
+            ("Mario Kart 64", "N64"),
+            ("Mario", "NES"),
+            ("Supermario Remix", "PC"),
+        ],
+        "mario",
+    );
+    // Library order is by lowercase title (then id), so within one relevance
+    // "Mario Kart 64" comes before "Mariokart Clone" and "Dr. Mario" before
+    // "Super Mario World".
+    assert_eq!(
+        got,
+        [
+            "Mario",             // exact
+            "Mario Kart 64",     // prefix (library order among prefixes)
+            "Mariokart Clone",   // prefix
+            "Dr. Mario",         // word (library order among words)
+            "Super Mario World", // word
+            "Supermario Remix",  // inside a word
+        ]
+    );
+}
+
+#[test]
+fn picker_exact_match_ignores_case_spacing_and_punctuation() {
+    let got = ranked(
+        &[
+            ("Zelda: A Link to the Past Randomizer", "SNES"),
+            ("The Legend of Zelda", "NES"),
+            ("Zelda: A Link to the Past", "SNES"),
+        ],
+        "  ZELDA a link to   the past ",
+    );
+    assert_eq!(got[0], "Zelda: A Link to the Past");
+    assert_eq!(got[1], "Zelda: A Link to the Past Randomizer");
+    assert_eq!(got.len(), 2);
+}
+
+#[test]
+fn picker_multi_word_prefix_and_platform_only_matches_rank_last() {
+    let got = ranked(
+        &[
+            ("Kart Racer", "Mario"), // matches "mario kart" only via the platform
+            ("Super Mario Kart", "SNES"),
+            ("Mario Kart: Double Dash", "GameCube"),
+        ],
+        "mario kart",
+    );
+    assert_eq!(
+        got,
+        ["Mario Kart: Double Dash", "Super Mario Kart", "Kart Racer"]
+    );
+}
+
+#[test]
+fn picker_shows_the_best_matches_even_beyond_the_first_eight_in_library_order() {
+    use crate::gui_v2::tests::archive;
+    // "A Tetris Tale N" sorts before "Tetris" in library order (lowercase
+    // title), so the exact title is the 31st game the search meets.
+    let mut titles: Vec<(String, &str)> = (1..=30)
+        .map(|n| (format!("A Tetris Tale {n}"), "PC"))
+        .collect();
+    titles.push(("Tetris".into(), "Game Boy"));
+    let refs: Vec<(&str, &str)> = titles.iter().map(|(t, p)| (t.as_str(), *p)).collect();
+    let library = crate::gui_v2::library::Library::new(
+        refs.iter()
+            .zip(1..)
+            .map(|((title, platform), id)| archive(id, title, Some(platform)))
+            .collect(),
+    );
+    assert_eq!(
+        library.games.last().map(|game| game.title.as_str()),
+        Some("Tetris"),
+        "precondition: the exact title is last in library order"
+    );
+    let got = ranked(&refs, "tetris");
+    assert_eq!(
+        got[0], "Tetris",
+        "the exact title is listed first though it is last in the library"
+    );
+    assert_eq!(got.len(), PICKER_LIMIT);
+    // Equal relevance keeps library order (stable): lowercase title order.
+    assert_eq!(&got[1..3], ["A Tetris Tale 1", "A Tetris Tale 10"]);
+}
+
+#[test]
+fn picker_overflow_note_says_how_many_are_hidden() {
+    assert_eq!(overflow_note(0), None);
+    assert!(
+        overflow_note(1)
+            .unwrap()
+            .starts_with("1 more match not shown")
+    );
+    assert!(
+        overflow_note(12)
+            .unwrap()
+            .starts_with("12 more matches not shown")
+    );
 }
 
 #[test]

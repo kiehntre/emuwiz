@@ -4,6 +4,7 @@ use super::super::library::Library;
 use super::super::tests::archive;
 use super::*;
 use crate::launch_readiness_page::LaunchReadinessInput;
+use archivefs_core::LibraryDatState;
 
 fn game() -> Game {
     Library::new(vec![archive(1, "Amidar", Some("Atari2600"))])

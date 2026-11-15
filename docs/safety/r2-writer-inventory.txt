@@ -182,7 +182,7 @@ C. Patch/mod/cheat publication
 12. Standalone patch output and composition.
     core/standalone_patch.rs:413 Apply -> patch_output_recovery publication
     (:488); separately stages/publishes provenance (:589/:597/:599).
-    gui/local_mod_package_page.rs:1043 starts the actual background Apply.
+    gui/local_mod_package_page.rs:1035 starts the actual background Apply.
     core/patch_package_composition.rs:564 exported Apply sequences standalone
     patches (:622) with intermediate staging/cleanup; no normal GUI/CLI caller
     of composition Apply found. core/patch_output_recovery.rs:353 publishes
@@ -210,7 +210,7 @@ C. Patch/mod/cheat publication
     This is the principal family for texture packs, ordinary mods, many native
     cheat/patch/trainer resources and bezel deployment. Preparation/extraction
     wrappers can write owned staging before the shared executor.
-    Actual GUI calls include local_mod_package_page.rs:1590/:1666;
+    Actual GUI calls include local_mod_package_page.rs:1582/:1658;
     user_cheat_import_page.rs (multiple install/Undo families);
     cheats_mods/controller.rs:2421/:2246;
     onframe_install_session.rs:354/:426;

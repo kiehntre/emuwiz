@@ -455,6 +455,10 @@ pub enum LaunchBlockerKind {
     /// libretro cores cannot load; they need an archived ROM set. The file has
     /// not moved and nothing is missing.
     RetroArchArcadeSetNeedsArchive,
+    /// Zipped content plays from a temporary extracted copy, and RetroArch's
+    /// save setup would write saves beside it (lost at exit). The same check
+    /// refuses the launch itself (`staged_launch_is_safe`).
+    RetroArchZippedSaveLocationUnsafe,
     HatariCandidateRequired,
     HatariPlatformMismatch,
     HatariProfileUnavailable,
@@ -627,6 +631,13 @@ pub enum LaunchWarningKind {
     /// feature, special controls, gambling/fruit machine). Informational:
     /// never a launch gate.
     MameMachineFlagged,
+    /// The save-file or save-state folder RetroArch would use for this core
+    /// (from `retroarch.cfg` or the core's per-core override) is missing,
+    /// not a folder, a link, not writable, or could not be checked. The
+    /// detail names the folder, the setting, why, and what to do. Play stays
+    /// available (owner decision 2026-11-13): saves or states may fail to be
+    /// kept, which the detail says; it never makes the candidate `Ready`.
+    RetroArchSaveDirectoryUnusable,
 }
 
 impl LaunchWarningKind {
@@ -635,11 +646,14 @@ impl LaunchWarningKind {
     /// RetroArch with a visible warning. This is the ALLOW-LIST of warning
     /// kinds that do not withdraw RetroArch Play; every other kind (present
     /// or future) still does. Add a kind here only with explicit owner
-    /// approval (`IdentityUnverified`: ZX/X68000 decision, 2026-11-07).
+    /// approval (`IdentityUnverified`: ZX/X68000 decision, 2026-11-07;
+    /// `RetroArchSaveDirectoryUnusable`: save-folder decision, 2026-11-13).
     pub fn permits_retroarch_play(self) -> bool {
         matches!(
             self,
-            Self::FirmwarePresentUnverified | Self::IdentityUnverified
+            Self::FirmwarePresentUnverified
+                | Self::IdentityUnverified
+                | Self::RetroArchSaveDirectoryUnusable
         )
     }
 }
@@ -1152,6 +1166,7 @@ mod tests {
     fn only_unverified_firmware_warning_permits_retroarch_play() {
         assert!(LaunchWarningKind::FirmwarePresentUnverified.permits_retroarch_play());
         assert!(LaunchWarningKind::IdentityUnverified.permits_retroarch_play());
+        assert!(LaunchWarningKind::RetroArchSaveDirectoryUnusable.permits_retroarch_play());
         for kind in [
             LaunchWarningKind::OptionalFirmwareMissing,
             LaunchWarningKind::MultipleEligibleProfiles,

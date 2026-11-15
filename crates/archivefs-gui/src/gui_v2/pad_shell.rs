@@ -231,6 +231,11 @@ pub(super) fn neighbour_destination(
 impl App {
     /// Called once per frame by the ordinary shell. Big Picture owns its own
     /// reader, so this one lives only while Big Picture is closed.
+    /// The controller keyboard is open over a text field and owns the keys.
+    pub(super) fn controller_keyboard_open(&self) -> bool {
+        self.pad_shell.as_ref().is_some_and(|s| s.osk.is_some())
+    }
+
     pub(super) fn drive_pad_shell(&mut self, context: &egui::Context) {
         if self.big_picture.is_some() {
             self.pad_shell = None;
@@ -966,8 +971,10 @@ fn capture_slot() -> egui::Id {
 }
 
 /// Mark a text field as a title search: the controller keyboard offers game
-/// title suggestions for it. Call every frame the field is drawn.
+/// title suggestions for it, and `/` or Ctrl+F focuses it. Call every frame
+/// the field is drawn.
 pub(super) fn mark_suggestions(response: &egui::Response) {
+    super::shortcuts::register_search(response);
     response
         .ctx
         .data_mut(|d| d.insert_temp(egui::Id::new("pad_suggest").with(response.id), true));

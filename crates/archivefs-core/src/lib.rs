@@ -66,6 +66,8 @@ pub mod bios_projection;
 pub mod catalogue_health;
 pub mod catalogue_reconciliation;
 pub mod catalogue_supersession;
+/// Daedalus: evidence-driven diagnosis of emulator launch problems.
+pub mod daedalus;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation
@@ -158,6 +160,8 @@ pub mod tape_audio;
 pub mod test_environment;
 /// Bounded, read-only Thomson SAP floppy evidence.
 pub mod thomson_sap;
+#[cfg(target_os = "linux")]
+pub mod transform;
 pub mod uef_tape;
 /// A disposable profile holding one production-verified synthetic game.
 #[cfg(any(test, feature = "test-support"))]
@@ -169,24 +173,27 @@ pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueStats, CompletedScanSummary,
     CueDiscCatalogue, CueDiscRevalidation, CurrentLibraryDatEvidence, DAT_ROMM_AGREEMENT_SOURCE,
-    DatDiscOrderOutcome, Database, DatabaseCheckOutcome, DatabaseCheckStatus, DatabaseDiagnostic,
-    DatabaseDiagnosticCode, DatabaseDiagnosticSeverity, DatabaseFileFinding, DatabaseHealth,
-    DatabaseHealthReport, DatabaseOpenOutcome, DatabaseRestorePlan, DatabaseRestoreReceipt,
-    DatabaseRestoreResult, DatabaseRestoreState, DatabaseSidecarFinding, DatabaseSidecarKind,
-    DatabaseUpgradeReport, DiscoveryDetailFilter, DiscoveryDetailRecord, DiscoveryDetailsPage,
-    DiscoveryRunId, DiscoveryRunStatus, GameScanDisposition, LibraryDatState,
-    MANUAL_PLATFORM_SOURCE, MAX_RETAINED_DISCOVERY_RUNS, MissingArchiveRemovalResult,
-    PersistedArchive, PersistedSetAuditDependency, PersistedSetAuditResult, PlatformAlias,
-    PlatformAssignmentChange, PlatformIdentityApplyOutcome, PlatformIdentityConflictDetail,
-    PlatformIdentityEnrichmentSummary, PlatformProvenanceDetails, ROMM_PLATFORM_SOURCE,
-    RecentScanAdditions, RegisteredSourceFolder, SOURCE_PLATFORM_ASSIGNMENT_SOURCE,
+    DatDiscOrderOutcome, DatRecheckAttempt, Database, DatabaseCheckOutcome, DatabaseCheckStatus,
+    DatabaseDiagnostic, DatabaseDiagnosticCode, DatabaseDiagnosticSeverity, DatabaseFileFinding,
+    DatabaseHealth, DatabaseHealthReport, DatabaseOpenOutcome, DatabaseRestorePlan,
+    DatabaseRestoreReceipt, DatabaseRestoreResult, DatabaseRestoreState, DatabaseSidecarFinding,
+    DatabaseSidecarKind, DatabaseUpgradeReport, DiscoveryDetailFilter, DiscoveryDetailRecord,
+    DiscoveryDetailsPage, DiscoveryRunId, DiscoveryRunStatus, GameScanDisposition,
+    JournalRecoveryReceipt, JournalRecoveryState, LibraryDatState, MANUAL_PLATFORM_SOURCE,
+    MAX_RETAINED_DISCOVERY_RUNS, MissingArchiveRemovalResult, PersistedArchive,
+    PersistedSetAuditDependency, PersistedSetAuditResult, PlatformAlias, PlatformAssignmentChange,
+    PlatformIdentityApplyOutcome, PlatformIdentityConflictDetail,
+    PlatformIdentityEnrichmentSummary, PlatformProvenanceDetails, PreservedFile,
+    ROMM_PLATFORM_SOURCE, RecentScanAdditions, RegisteredSourceFolder,
+    SOURCE_PLATFORM_ASSIGNMENT_SOURCE, SavedDatEvidenceRow, SavedDatEvidenceStatus,
     ScanPersistSummary, ScanRunCounts, ScummVmScanReport, SourceFolderRecord, SourceRole,
     SourceScanStatus, TopologyPersistOutcome, UpgradeBackupInspection, UpgradeBackupState,
-    VERIFIED_DAT_PLATFORM_SOURCE, check_database_health, default_database_path, diagnose_database,
-    format_unix_timestamp_utc, inspect_upgrade_backup_evidence, inspect_upgrade_backups,
-    latest_schema_version, pending_schema_migration_versions,
-    persisted_archive_has_unknown_platform, prepare_database_restore, restore_database,
-    rollback_database_restore, scan_and_persist, upgrade_library_database,
+    VERIFIED_DAT_PLATFORM_SOURCE, apply_journal_recovery, check_database_health,
+    default_database_path, diagnose_database, format_unix_timestamp_utc,
+    inspect_upgrade_backup_evidence, inspect_upgrade_backups, latest_schema_version,
+    pending_schema_migration_versions, persisted_archive_has_unknown_platform,
+    prepare_database_restore, prepare_journal_recovery, read_journal_recovery_receipt,
+    restore_database, rollback_database_restore, scan_and_persist, upgrade_library_database,
 };
 pub use database::{
     DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
@@ -199,6 +206,7 @@ pub use database::{
     interrupted_restore_receipts, preview_interrupted_restore, read_database_restore_receipt,
     review_database_rollback,
 };
+pub use database::{MAX_SCAN_HISTORY_RUNS, RecordedScanCounts, ScanRunCoverage, ScanRunRecord};
 
 mod inspector;
 pub use inspector::{

@@ -35,7 +35,10 @@ fn a_saved_dat_match_is_checking_until_this_games_panel_answers() {
     let pending = identity(&game, None);
     assert_eq!(pending, DetailIdentity::Checking);
     assert!(!pending.is_verified());
-    assert_eq!(pending.label(), "Checking verification");
+    assert_eq!(
+        identity_wording(Some(&pending), &game, None).label,
+        "Checking verification"
+    );
     assert!(!disproves_library_match(&game, None));
 }
 
@@ -44,7 +47,10 @@ fn current_proof_from_the_panel_is_verified() {
     let game = game(1, true);
     let verified = identity(&game, Some(&answer("Verified")));
     assert!(verified.is_verified());
-    assert_eq!(verified.label(), "Verified");
+    assert_eq!(
+        identity_wording(Some(&verified), &game, None).label,
+        "Verified"
+    );
     assert!(!disproves_library_match(&game, Some(&answer("Verified"))));
 }
 
@@ -78,7 +84,10 @@ fn setup_gaps_errors_and_unknown_answers_are_not_confirmed_and_keep_the_badge() 
             "{reason}"
         );
         assert_eq!(settled, DetailIdentity::NotConfirmed, "{reason}");
-        assert_eq!(settled.label(), "Verification not yet confirmed");
+        assert_eq!(
+            identity_wording(Some(&settled), &game, None).label,
+            "Verification not yet confirmed"
+        );
         assert!(!settled.is_verified(), "{reason}");
         assert!(
             !disproves_library_match(&game, Some(&answer(reason))),
@@ -159,7 +168,10 @@ fn only_strict_invalidation_reads_recheck_needed() {
     let stale = answer(STALE_OR_CHANGED);
     let settled = identity(&game, Some(&stale));
     assert_eq!(settled, DetailIdentity::RecheckNeeded);
-    assert_eq!(settled.label(), "Re-check needed");
+    assert_eq!(
+        identity_wording(Some(&settled), &game, None).label,
+        "Re-check needed"
+    );
     assert!(!settled.is_verified());
     // Once applied in memory, the game keeps saying so, whatever the panel
     // says on a later visit, until the Library reloads from the database.
@@ -239,4 +251,158 @@ fn the_likely_match_card_is_honest_and_routes_to_review_and_check() {
     }
     assert!(!painted.contains("Verified"), "{painted}");
     let _ = Route::GameCheck(9);
+}
+
+/// Game Details' one identity wording over every identity state and guess
+/// basis. Only a verified review says Verified, a hint always says "not
+/// verified", and no answer names a requirement (BIOS, emulator) or the
+/// state of an action (Play, launch, blocked).
+#[test]
+fn identity_wording_table_never_overstates_or_mixes_in_requirements() {
+    use super::super::identity_review::{DumpQuality, NoMatchReason, ReviewState, VerifiedFacts};
+    use archivefs_core::LibraryDatState;
+    let known = |state| {
+        DetailIdentity::Known(Review {
+            state,
+            apparent_release: None,
+        })
+    };
+    let verified = |by_file_evidence| {
+        ReviewState::Verified(VerifiedFacts {
+            title: "Amidar".into(),
+            region: None,
+            release: None,
+            dump: DumpQuality::Clean,
+            source: None,
+            by_file_evidence,
+        })
+    };
+    // (identified by the file's own evidence, saved catalogue state) and
+    // what an unverified, uncompared answer then reads.
+    let bases = [
+        (
+            false,
+            None,
+            "Name hint only · not verified",
+            Confidence::Unknown,
+        ),
+        (true, None, "Likely · not verified", Confidence::Probable),
+        (
+            false,
+            Some(LibraryDatState::Probable),
+            "Possible match · not verified",
+            Confidence::Probable,
+        ),
+        (
+            true,
+            Some(LibraryDatState::Ambiguous),
+            "Several possible matches · not verified",
+            Confidence::Ambiguous,
+        ),
+    ];
+    let hints = [
+        ReviewState::NotCompared,
+        ReviewState::NoMatch(NoMatchReason::NotInData),
+        ReviewState::NoMatch(NoMatchReason::WeakEvidenceOnly),
+        ReviewState::NoMatch(NoMatchReason::NoUsableEvidence),
+        ReviewState::NoData {
+            reference_source_exists: true,
+        },
+        ReviewState::NoData {
+            reference_source_exists: false,
+        },
+    ];
+    let settled = [
+        (known(verified(true)), "Verified", Confidence::Verified),
+        (known(verified(false)), "Verified", Confidence::Verified),
+        (
+            DetailIdentity::Checking,
+            "Checking verification",
+            Confidence::Checking,
+        ),
+        (
+            DetailIdentity::NotConfirmed,
+            "Verification not yet confirmed",
+            Confidence::Probable,
+        ),
+        (
+            known(ReviewState::ReferenceMatched),
+            "Matched to reference data",
+            Confidence::Probable,
+        ),
+        (
+            known(ReviewState::Ambiguous {
+                candidates: Vec::new(),
+            }),
+            "Several possible matches",
+            Confidence::Ambiguous,
+        ),
+        (
+            known(ReviewState::Conflict {
+                detail: "header and serial disagree".into(),
+            }),
+            "Evidence disagrees",
+            Confidence::Ambiguous,
+        ),
+        (
+            known(ReviewState::NoSystem),
+            "Unknown · system not known",
+            Confidence::Unknown,
+        ),
+    ];
+    let requirement_or_action = [
+        "BIOS",
+        "firmware",
+        "emulator",
+        "Play",
+        "launch",
+        "Launch",
+        "blocked",
+        "Strong local",
+        "Needs review",
+    ];
+    for (identified, dat_state, hint_label, hint_confidence) in bases {
+        let mut game = game(1, false);
+        game.identified = identified;
+        game.dat_state = dat_state;
+        let several = dat_state == Some(LibraryDatState::Ambiguous);
+        let mut rows: Vec<(DetailIdentity, &str, Confidence)> = hints
+            .iter()
+            .cloned()
+            .map(|state| (known(state), hint_label, hint_confidence))
+            .collect();
+        for (identity, label, confidence) in settled.iter().cloned() {
+            // Several saved candidates make any unverified answer ambiguous.
+            let confidence = match confidence {
+                Confidence::Probable | Confidence::Unknown if several => Confidence::Ambiguous,
+                other => other,
+            };
+            rows.push((identity, label, confidence));
+        }
+        for (identity, label, confidence) in rows {
+            let wording = identity_wording(Some(&identity), &game, None);
+            let case = format!("{identity:?} identified={identified} {dat_state:?}");
+            assert_eq!(wording.label, label, "{case}");
+            assert_eq!(wording.confidence, confidence, "{case}");
+            assert_eq!(wording.is_verified(), identity.is_verified(), "{case}");
+            assert_eq!(
+                wording.label.starts_with("Verified"),
+                wording.is_verified(),
+                "{case}"
+            );
+            for text in std::iter::once(wording.label).chain(wording.note) {
+                for word in requirement_or_action {
+                    assert!(!text.contains(word), "{case}: {text}");
+                }
+            }
+        }
+    }
+    let game = game(1, false);
+    let recheck = identity_wording(Some(&DetailIdentity::RecheckNeeded), &game, None);
+    assert_eq!(recheck.label, "Re-check needed");
+    assert!(!recheck.is_verified());
+    assert_eq!(
+        identity_wording(None, &game, None).confidence,
+        Confidence::Unknown
+    );
 }

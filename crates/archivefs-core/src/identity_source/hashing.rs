@@ -482,10 +482,46 @@ fn hex(bytes: &[u8]) -> String {
 /// CRC-32 as used by ZIP and by RomM's `crc_hash` - the IEEE 802.3 polynomial,
 /// reflected, initialised to all ones and finally inverted.
 ///
-/// Implemented here rather than pulling in a dependency: it is a fixed twenty-line
-/// algorithm, and the test asserts it against published vectors.
+/// Implemented here rather than pulling in a dependency: it is a small fixed
+/// algorithm, and the tests assert it against published vectors and against
+/// the bit-at-a-time definition.
+///
+/// Eight bytes are folded per step through eight 256-entry tables built at
+/// compile time ("slicing by 8"). The bit-at-a-time loop this replaces was
+/// the slowest part of verifying a game: slower than MD5 and SHA-1 together.
 pub struct Crc32 {
     state: u32,
+}
+
+/// `CRC32_TABLES[0]` is the classic byte table for the reflected polynomial
+/// 0xEDB88320; `CRC32_TABLES[k][b]` is the CRC of byte `b` followed by `k`
+/// zero bytes.
+static CRC32_TABLES: [[u32; 256]; 8] = crc32_tables();
+
+const fn crc32_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0_u32; 256]; 8];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut crc = byte as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+            bit += 1;
+        }
+        tables[0][byte] = crc;
+        byte += 1;
+    }
+    let mut table = 1;
+    while table < 8 {
+        let mut byte = 0;
+        while byte < 256 {
+            let previous = tables[table - 1][byte];
+            tables[table][byte] = (previous >> 8) ^ tables[0][(previous & 0xff) as usize];
+            byte += 1;
+        }
+        table += 1;
+    }
+    tables
 }
 
 impl Default for Crc32 {
@@ -500,14 +536,25 @@ impl Crc32 {
     }
 
     pub fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.state ^= u32::from(*byte);
-            for _ in 0..8 {
-                // Reflected polynomial 0x04C11DB7.
-                let mask = (self.state & 1).wrapping_neg();
-                self.state = (self.state >> 1) ^ (0xEDB8_8320 & mask);
-            }
+        let tables = &CRC32_TABLES;
+        let mut crc = self.state;
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let low = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ crc;
+            let high = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            crc = tables[7][(low & 0xff) as usize]
+                ^ tables[6][((low >> 8) & 0xff) as usize]
+                ^ tables[5][((low >> 16) & 0xff) as usize]
+                ^ tables[4][(low >> 24) as usize]
+                ^ tables[3][(high & 0xff) as usize]
+                ^ tables[2][((high >> 8) & 0xff) as usize]
+                ^ tables[1][((high >> 16) & 0xff) as usize]
+                ^ tables[0][(high >> 24) as usize];
         }
+        for byte in chunks.remainder() {
+            crc = tables[0][((crc ^ u32::from(*byte)) & 0xff) as usize] ^ (crc >> 8);
+        }
+        self.state = crc;
     }
 
     pub fn finish(self) -> u32 {
@@ -528,3 +575,70 @@ impl Crc32 {
 
 #[cfg(all(test, unix))]
 mod fd_binding_tests;
+
+#[cfg(test)]
+mod crc32_tests {
+    use super::Crc32;
+
+    /// The definition, one bit at a time.
+    fn reference(bytes: &[u8]) -> u32 {
+        let mut state = !0_u32;
+        for byte in bytes {
+            state ^= u32::from(*byte);
+            for _ in 0..8 {
+                state = (state >> 1) ^ (0xEDB8_8320 & (state & 1).wrapping_neg());
+            }
+        }
+        !state
+    }
+
+    fn crc(parts: &[&[u8]]) -> u32 {
+        let mut crc = Crc32::new();
+        for part in parts {
+            crc.update(part);
+        }
+        crc.finish()
+    }
+
+    #[test]
+    fn published_vectors() {
+        assert_eq!(crc(&[b""]), 0);
+        assert_eq!(crc(&[b"123456789"]), 0xCBF4_3926);
+        assert_eq!(
+            crc(&[b"The quick brown fox jumps over the lazy dog"]),
+            0x414F_A339
+        );
+        assert_eq!(crc(&[&[0_u8; 32]]), 0x190A_55AD);
+        assert_eq!(crc(&[&[0xFF_u8; 32]]), 0xFF6C_AB0B);
+    }
+
+    #[test]
+    fn every_length_and_every_split_agrees_with_the_bit_at_a_time_definition() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let data: Vec<u8> = (0..4200)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        // Every length up to several 8-byte steps, whole and split anywhere.
+        for len in 0..80 {
+            let expected = reference(&data[..len]);
+            for split in 0..=len {
+                assert_eq!(
+                    crc(&[&data[..split], &data[split..len]]),
+                    expected,
+                    "length {len}, split {split}"
+                );
+            }
+        }
+        // Long inputs fed in uneven pieces, as a stream delivers them.
+        let expected = reference(&data);
+        for piece in [1, 3, 7, 8, 9, 64, 255, 4096] {
+            let parts: Vec<&[u8]> = data.chunks(piece).collect();
+            assert_eq!(crc(&parts), expected, "pieces of {piece}");
+        }
+    }
+}

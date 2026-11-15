@@ -223,6 +223,13 @@ impl EnvSnapshot {
         // Only what changes a plan; the launch-observation flag does not.
         hash_debug(&mut hasher, &state.launch_choices.preferences);
         hash_debug(&mut hasher, &state.launch_choices.once);
+        // The native Atari800 setup: a verdict made before its first check
+        // answered, or before the setup changed, is recomputed.
+        #[cfg(target_os = "linux")]
+        hash_debug(
+            &mut hasher,
+            &crate::launch_readiness_page::atari800::plan_signature(),
+        );
         hasher.finish()
     }
 
@@ -512,6 +519,7 @@ pub(super) fn build_input(
             remembered_system:
                 &archivefs_core::launch::remembered_launch_system::remembered_launch_system,
             system_unknown: &|p| p == archive.absolute_path && archive.platform.is_none(),
+            firmware_use: crate::emulator_setup::firmware_answers::FirmwareUse::Fresh,
         }
         .build(None)
     });

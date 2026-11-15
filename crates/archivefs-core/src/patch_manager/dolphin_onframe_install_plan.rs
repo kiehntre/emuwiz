@@ -472,6 +472,48 @@ mod tests {
         assert!(plan.new_contents.contains("[OnFrame_Enabled]\n$Frame Fix"));
     }
 
+    /// A settings file without OnFrame patches keeps every byte it had: the
+    /// patch and its enable entry are added after it.
+    #[test]
+    fn an_existing_file_is_kept_byte_for_byte_ahead_of_the_patch() {
+        let existing = "[Core]\nCPUThread = True\n; a comment\n\n[Video_Settings]\nAspectRatio = 1\n[Gecko]\n$G\n04000000 00000002\n";
+        let plan = plan_dolphin_onframe_install(&DolphinOnFrameInstallRequest {
+            game_id: "GALE01",
+            revision: None,
+            document: &document("Frame Fix"),
+            existing_contents: Some(existing),
+        })
+        .unwrap();
+        assert!(plan.can_apply);
+        assert!(
+            plan.new_contents.starts_with(existing),
+            "{}",
+            plan.new_contents
+        );
+    }
+
+    /// Pins what happens to a file with Windows line endings: it comes back
+    /// with plain newlines, every line otherwise as it was and in order.
+    /// Dolphin reads either.
+    #[test]
+    fn a_file_with_windows_line_endings_keeps_every_line_with_plain_newlines() {
+        let existing = "[Core]\r\nCPUThread = True\r\n[Gecko]\r\n$G\r\n04000000 00000002\r\n";
+        let plan = plan_dolphin_onframe_install(&DolphinOnFrameInstallRequest {
+            game_id: "GALE01",
+            revision: None,
+            document: &document("Frame Fix"),
+            existing_contents: Some(existing),
+        })
+        .unwrap();
+        assert!(!plan.new_contents.contains('\r'));
+        assert!(
+            plan.new_contents
+                .starts_with(&existing.replace("\r\n", "\n")),
+            "{}",
+            plan.new_contents
+        );
+    }
+
     #[test]
     fn identical_enabled_patch_is_noop() {
         let first = plan_dolphin_onframe_install(&DolphinOnFrameInstallRequest {

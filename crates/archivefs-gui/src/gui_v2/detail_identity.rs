@@ -63,15 +63,6 @@ pub(super) enum DetailIdentity {
 }
 
 impl DetailIdentity {
-    pub(super) fn label(&self) -> &'static str {
-        match self {
-            Self::Checking => "Checking verification",
-            Self::NotConfirmed => "Verification not yet confirmed",
-            Self::RecheckNeeded => "Re-check needed",
-            Self::Known(review) => review.list_label(),
-        }
-    }
-
     pub(super) fn is_verified(&self) -> bool {
         matches!(self, Self::Known(review) if review.is_verified())
     }
@@ -144,6 +135,13 @@ impl super::App {
             &self.library.identity_context,
             self.review.verification_guidance.result_for(id),
         ))
+    }
+
+    /// Game Details' one identity wording for `game` (`identity_wording`).
+    pub(super) fn detail_identity_wording(&self, game: &Game) -> Option<IdentityWording> {
+        let identity = self.detail_identity(game)?;
+        let review = self.identity_review_for(game.archive.id);
+        Some(identity_wording(Some(&identity), game, review.as_ref()))
     }
 
     /// Owner-approved: once this game's own fresh check disproves its
@@ -224,9 +222,7 @@ pub(super) fn basis_text(basis: GuessBasis) -> &'static str {
         GuessBasis::PossibleCatalogueMatch => {
             "Possible match from a saved catalogue comparison. Not verified."
         }
-        GuessBasis::FileEvidence => {
-            "From the file's own evidence. Not checked against a catalogue."
-        }
+        GuessBasis::FileEvidence => "From the file's own evidence. Not verified.",
         GuessBasis::FileName => "From the file name and folder only. Not verified.",
     }
 }
@@ -283,4 +279,177 @@ pub(super) fn show_likely_match(
         });
     });
     route
+}
+
+/// How sure Game Details is which game this file is: identification
+/// confidence only. A missing BIOS, emulator or catalogue, and whether Play
+/// can run, never change it; the readiness card states those separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Confidence {
+    /// Current, trusted evidence verifies this exact game.
+    Verified,
+    /// A saved catalogue match is being re-read; no answer yet.
+    Checking,
+    /// One likely identity, not verified.
+    Probable,
+    /// More than one candidate, or the evidence disagrees.
+    Ambiguous,
+    /// Nothing beyond the file name establishes which game this is.
+    Unknown,
+}
+
+impl Confidence {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Verified => "Verified identity",
+            Self::Probable => "Probable identity (not verified)",
+            Self::Ambiguous => "Ambiguous identity",
+            Self::Unknown => "Unknown identity",
+            Self::Checking => "Identity still being checked",
+        }
+    }
+}
+
+/// Game Details' identity wording. Every identity statement on the page (the
+/// Identity line, the readiness card's identity chip, Advanced details and
+/// the Game Doctor) reads this one answer, so no two places can disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct IdentityWording {
+    pub confidence: Confidence,
+    /// The short answer each "Identity:" line shows.
+    pub label: &'static str,
+    /// What the answer rests on, or which identification step is still
+    /// missing. Never a launch requirement or an action's state.
+    pub note: Option<&'static str>,
+    /// The answer is Ambiguous only because a saved catalogue comparison
+    /// found several candidates.
+    pub from_saved_comparison: bool,
+}
+
+impl IdentityWording {
+    pub(super) fn is_verified(&self) -> bool {
+        self.confidence == Confidence::Verified
+    }
+}
+
+/// The one mapping from Game Details' identity answer (`decide`) and the
+/// canonical review to wording. Pure; reads no evidence and decides nothing:
+/// a hint stays a hint, and only a verified review reads "Verified".
+pub(super) fn identity_wording(
+    identity: Option<&DetailIdentity>,
+    game: &Game,
+    review: Option<&Review>,
+) -> IdentityWording {
+    use super::identity_review::{NoMatchReason, ReviewState};
+    let wording = |confidence, label, note: &'static str| IdentityWording {
+        confidence,
+        label,
+        note: Some(note),
+        from_saved_comparison: false,
+    };
+    let basis = likely_match(game, review).basis;
+    let guessed = match basis {
+        GuessBasis::PossibleCatalogueMatch => Confidence::Probable,
+        GuessBasis::FileEvidence => Confidence::Probable,
+        GuessBasis::FileName => Confidence::Unknown,
+    };
+    // Not verified: what the guess rests on leads, the missing step follows.
+    let hint = |note| {
+        let label = match basis {
+            GuessBasis::PossibleCatalogueMatch => "Possible match · not verified",
+            GuessBasis::FileEvidence => "Likely · not verified",
+            GuessBasis::FileName => "Name hint only · not verified",
+        };
+        wording(guessed, label, note)
+    };
+    let mut answer = match identity {
+        None => IdentityWording {
+            confidence: Confidence::Unknown,
+            label: "Not known yet",
+            note: None,
+            from_saved_comparison: false,
+        },
+        Some(DetailIdentity::Checking) => wording(
+            Confidence::Checking,
+            "Checking verification",
+            "A saved catalogue match is being re-read. It is not verified until that finishes.",
+        ),
+        Some(DetailIdentity::NotConfirmed) => wording(
+            Confidence::Probable,
+            "Verification not yet confirmed",
+            "A saved catalogue match could not be confirmed as current. Not verified.",
+        ),
+        Some(DetailIdentity::RecheckNeeded) => wording(
+            match review.map(|review| &review.state) {
+                Some(ReviewState::Ambiguous { .. } | ReviewState::Conflict { .. }) => {
+                    Confidence::Ambiguous
+                }
+                _ => guessed,
+            },
+            "Re-check needed",
+            "The earlier catalogue match no longer holds for this file. Not verified.",
+        ),
+        Some(DetailIdentity::Known(known)) => match &known.state {
+            ReviewState::Verified(facts) if facts.by_file_evidence => wording(
+                Confidence::Verified,
+                "Verified",
+                "From the file's own contents, not from a catalogue.",
+            ),
+            ReviewState::Verified(_) => wording(
+                Confidence::Verified,
+                "Verified",
+                "Exact match in trusted identification data.",
+            ),
+            ReviewState::ReferenceMatched => wording(
+                Confidence::Probable,
+                "Matched to reference data",
+                "A set audit against arcade reference data. Not an exact verification.",
+            ),
+            ReviewState::Ambiguous { .. } => wording(
+                Confidence::Ambiguous,
+                "Several possible matches",
+                "More than one trusted entry fits this file. EmuWiz will not guess.",
+            ),
+            ReviewState::Conflict { .. } => wording(
+                Confidence::Ambiguous,
+                "Evidence disagrees",
+                "Trusted evidence points to different games. EmuWiz will not pick one.",
+            ),
+            ReviewState::NoSystem => wording(
+                Confidence::Unknown,
+                "Unknown · system not known",
+                "No trusted system is on record for this file, so it cannot be looked up.",
+            ),
+            ReviewState::NotCompared => hint("Not checked against a catalogue yet."),
+            ReviewState::NoMatch(NoMatchReason::NotInData) => hint(
+                "Not in the installed catalogue for this system. That does not mean the file is bad.",
+            ),
+            ReviewState::NoMatch(NoMatchReason::WeakEvidenceOnly) => {
+                hint("Only a weak clue matched a catalogue. That is not verification.")
+            }
+            ReviewState::NoMatch(NoMatchReason::NoUsableEvidence) => {
+                hint("The file could not be read well enough to compare it.")
+            }
+            ReviewState::NoData {
+                reference_source_exists: true,
+            } => hint("Identification data for this system is not installed."),
+            ReviewState::NoData {
+                reference_source_exists: false,
+            } => hint("No trusted identification data exists for this system."),
+        },
+    };
+    // A saved catalogue comparison that found several candidates is
+    // ambiguity, not a probable identity, whatever the review settled on.
+    if matches!(
+        answer.confidence,
+        Confidence::Probable | Confidence::Unknown
+    ) && game.dat_state == Some(archivefs_core::LibraryDatState::Ambiguous)
+    {
+        answer.confidence = Confidence::Ambiguous;
+        answer.from_saved_comparison = true;
+        if answer.label.ends_with("· not verified") {
+            answer.label = "Several possible matches · not verified";
+        }
+    }
+    answer
 }

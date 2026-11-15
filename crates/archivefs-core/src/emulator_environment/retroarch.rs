@@ -12,7 +12,10 @@
 //! This module owns no shared state with `crate::patch_manager` and is not
 //! imported by it.
 
+pub mod content_history;
 pub mod installation_selection;
+mod save_directories;
+pub use save_directories::{SaveDirectoryFinding, SaveDirectoryStatus};
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -715,6 +718,9 @@ pub struct RetroArchProfile {
     /// evidence never merges with a Flatpak sandbox's own path roots.
     /// Sorted by encoded AppImage path bytes.
     pub app_images: Vec<AppImageCandidate>,
+    /// Health of the configured save-file/save-state folders, from
+    /// `retroarch.cfg` and each installed core's per-core override.
+    pub save_directories: Vec<SaveDirectoryFinding>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -1133,11 +1139,13 @@ fn discover_profile(
     let config_directory_found = config_directory_probe == FsProbe::PresentDirectory;
 
     let config_file_path = config_dir.join("retroarch.cfg");
+    let mut config_keys = path_purpose_keys().to_vec();
+    config_keys.push(save_directories::OVERRIDE_DIRECTORY_KEY);
     let (config_probe, config_outcome, parsed) = read_config_file(
         filesystem,
         &config_file_path,
         MAX_CONFIG_BYTES,
-        &path_purpose_keys(),
+        &config_keys,
     );
     record_config_diagnostics(
         &config_probe,
@@ -1185,6 +1193,22 @@ fn discover_profile(
     // finding appears twice in JSON for no benefit.
     let playlists = discover_playlists(filesystem, &path_results.resolved_dirs, profile_ref);
 
+    let save_directories = save_directories::discover_save_directories(
+        filesystem,
+        &config_file_path,
+        |key| {
+            parsed
+                .as_ref()
+                .and_then(|parsed| parsed.values.get(key))
+                .map(String::as_str)
+        },
+        tilde_home,
+        cores.iter().filter_map(|core| match &core.info {
+            CoreInfoFinding::Found { core_name, .. } => core_name.as_deref(),
+            _ => None,
+        }),
+    );
+
     let evidence = Evidence {
         executables: executables.clone(),
         flatpak_metadata_found: flatpak_metadata_found.unwrap_or(false),
@@ -1209,6 +1233,7 @@ fn discover_profile(
         cores,
         playlists,
         app_images: Vec::new(), // filled in by discover_retroarch_environment, native/AppImage profiles only
+        save_directories,
         diagnostics: Vec::new(), // filled in by the caller after global sort
     };
 
@@ -1479,6 +1504,44 @@ fn parse_config(text: &str, recognized_keys: &[&'static str]) -> ParsedConfig {
         malformed_lines,
         include_detected,
     }
+}
+
+/// Every occurrence of the requested keys in one settings file, in file
+/// order, for callers that must point at the exact line a value came from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ConfigKeyOccurrences {
+    /// `(one-based line number, key, value)`.
+    pub(crate) occurrences: Vec<(u32, String, String)>,
+    /// Lines holding an `#include` directive. Included files are not read.
+    pub(crate) include_lines: Vec<u32>,
+    pub(crate) malformed_lines: Vec<u32>,
+}
+
+/// Lists every occurrence of `keys` using the same grammar as
+/// [`parse_config`], without collapsing repeats. RetroArch honours the
+/// *first* occurrence of a repeated key (checked against RetroArch 1.21.0),
+/// which is also what [`parse_config`] keeps.
+pub(crate) fn config_key_occurrences(text: &str, keys: &[&str]) -> ConfigKeyOccurrences {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut found = ConfigKeyOccurrences::default();
+    for (index, raw_line) in text.split('\n').enumerate() {
+        let line_number = (index + 1) as u32;
+        match classify_line(raw_line) {
+            LineKind::Blank | LineKind::WholeLineComment => {}
+            LineKind::Include => found.include_lines.push(line_number),
+            LineKind::Malformed => found.malformed_lines.push(line_number),
+            LineKind::KeyValue { key, value_region } => {
+                if keys.contains(&key) {
+                    found.occurrences.push((
+                        line_number,
+                        key.to_string(),
+                        extract_value(value_region),
+                    ));
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Which sub-field a `firmwareN_*` key names.
@@ -5376,6 +5439,7 @@ mod tests {
                 "paths",
                 "playlists",
                 "profile_kind",
+                "save_directories",
                 "scope",
             ]
         );

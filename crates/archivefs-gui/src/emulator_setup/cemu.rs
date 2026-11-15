@@ -75,6 +75,7 @@ impl Controller {
                 None
             };
             let _ = sender.send(result);
+            crate::emulator_setup::answers::arrived(&ctx);
             ctx.request_repaint();
         });
     }

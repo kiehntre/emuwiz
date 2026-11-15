@@ -34,14 +34,16 @@ pub const CLASSIFICATION: super::native_support::NativeAdapterClassification =
 pub const PLATFORM_ID: &str = "Atari 8-bit";
 pub const DISPOSABLE_SESSION_WARNING: &str = "Temporary Atari800 session: disk changes and new saves are discarded. Existing saves are not imported. Persistent-save sessions are not supported.";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Atari800Machine {
     Atari400800,
     Atari800Xl,
     Atari130Xe,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Atari800Video {
     Pal,
     Ntsc,

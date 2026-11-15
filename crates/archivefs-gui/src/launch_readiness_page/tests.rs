@@ -3343,6 +3343,7 @@ mod multidisc {
                     complete: true,
                 },
                 app_images: Vec::new(),
+                save_directories: Vec::new(),
                 diagnostics: Vec::new(),
             }],
             diagnostics: Vec::new(),

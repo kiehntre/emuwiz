@@ -73,6 +73,7 @@ pub mod neogeo_set;
 pub mod parser;
 pub mod parsers;
 pub mod policy;
+pub mod reaudit;
 #[cfg(test)]
 mod regression;
 pub mod rename_apply;

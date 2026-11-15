@@ -8,7 +8,8 @@ not a trust anchor for launch or apply. Read-only catalogue, report, and
 database-check paths use an explicit read-only open and do not create a
 database, parent directory, sidecar, or migration.
 
-The committed migration chain currently ends at 0010:
+The table below lists the first ten migrations; the chain continues to 0027
+(see `crates/archivefs-core/src/migrations/`):
 
 | Migration | High-level ownership |
 |---|---|
@@ -22,6 +23,7 @@ The committed migration chain currently ends at 0010:
 | 0008 | per-library-item DAT identity results and evidence snapshots |
 | 0009 | DAT set-audit and dependency verdicts |
 | 0010 | verified identity facts with file freshness snapshots |
+| 0027 | replaced DAT evidence kept for the record; reasons a re-check saved nothing |
 
 The identity layers are intentionally distinct. Discovery details describe
 what ingestion saw; identity reports explain structural inspection; DAT rows

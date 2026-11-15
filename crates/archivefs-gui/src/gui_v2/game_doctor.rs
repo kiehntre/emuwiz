@@ -11,7 +11,7 @@
 //! primary action. Recognition and passing launch checks are never presented
 //! as proof that the game plays; EmuWiz keeps no record of gameplay.
 
-use super::detail_identity::{DetailIdentity, GuessBasis, basis_text, likely_match};
+use super::detail_identity::{DetailIdentity, basis_text, identity_wording, likely_match};
 use super::identity_review::{Review, ReviewState};
 use super::launch_readiness_summary::{
     Cause, FirmwareSummary, GameReadinessSummary, ReadinessFreshness, ReadinessPresentationState,
@@ -19,35 +19,11 @@ use super::launch_readiness_summary::{
 };
 use super::library::Game;
 use crate::ui::theme;
-use archivefs_core::LibraryDatState;
 use eframe::egui::{self, RichText};
 
-/// How strongly the existing evidence identifies this exact game.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum IdentityTier {
-    /// Current, trusted evidence verifies this exact game.
-    Verified,
-    /// One likely identity, not verified.
-    Probable,
-    /// More than one candidate, or the evidence disagrees.
-    Ambiguous,
-    /// Nothing beyond the file name establishes which game this is.
-    Unknown,
-    /// A saved catalogue match is being re-read; no answer yet.
-    Checking,
-}
-
-impl IdentityTier {
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Self::Verified => "Verified identity",
-            Self::Probable => "Probable identity (not verified)",
-            Self::Ambiguous => "Ambiguous identity",
-            Self::Unknown => "Unknown identity",
-            Self::Checking => "Identity still being checked",
-        }
-    }
-}
+/// How strongly the existing evidence identifies this exact game: the
+/// confidence of Game Details' one identity wording.
+pub(super) use super::detail_identity::Confidence as IdentityTier;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct IdentityDiagnosis {
@@ -103,83 +79,53 @@ pub(super) fn identity_diagnosis(
     let mut notes = Vec::new();
     let mut candidates = Vec::new();
     let guess = likely_match(game, review);
-    let from_guess = |guess_basis: GuessBasis| match guess_basis {
-        GuessBasis::PossibleCatalogueMatch | GuessBasis::FileEvidence => IdentityTier::Probable,
-        GuessBasis::FileName => IdentityTier::Unknown,
-    };
-    let (mut tier, basis) = match identity {
-        None => (
-            IdentityTier::Unknown,
-            "No identity answer is available for this game right now.".to_string(),
-        ),
-        Some(DetailIdentity::Checking) => (
-            IdentityTier::Checking,
-            "A catalogue (DAT) match is on record; this game's current proof is still being re-read. It is not treated as verified until that finishes.".into(),
-        ),
-        Some(DetailIdentity::NotConfirmed) => (
-            IdentityTier::Probable,
-            "A catalogue (DAT) match is on record, but its current proof could not be confirmed. Not verified.".into(),
-        ),
+    // The tier is the page's own identity confidence, never a second mapping.
+    let wording = identity_wording(identity, game, review);
+    let basis = match identity {
+        None => "No identity answer is available for this game right now.".to_string(),
+        Some(DetailIdentity::Checking) => "A catalogue (DAT) match is on record; this game's current proof is still being re-read. It is not treated as verified until that finishes.".into(),
+        Some(DetailIdentity::NotConfirmed) => "A catalogue (DAT) match is on record, but its current proof could not be confirmed. Not verified.".into(),
         Some(DetailIdentity::RecheckNeeded) => {
             notes.push("This game's earlier catalogue verification no longer holds; it needs a re-check.".into());
             match review.map(|review| &review.state) {
                 Some(ReviewState::Ambiguous { candidates: found }) => {
                     candidates = found.iter().take(5).cloned().collect();
-                    (
-                        IdentityTier::Ambiguous,
-                        "The saved evidence matches more than one game.".into(),
-                    )
+                    "The saved evidence matches more than one game.".into()
                 }
-                Some(ReviewState::Conflict { .. }) => (
-                    IdentityTier::Ambiguous,
-                    "The identity evidence disagrees with itself.".into(),
-                ),
-                _ => (from_guess(guess.basis), basis_text(guess.basis).into()),
+                Some(ReviewState::Conflict { .. }) => {
+                    "The identity evidence disagrees with itself.".into()
+                }
+                _ => basis_text(guess.basis).into(),
             }
         }
         Some(DetailIdentity::Known(known)) => match &known.state {
-            ReviewState::Verified(_) => (
-                IdentityTier::Verified,
-                "Current evidence (the file's own identity evidence, or a catalogue match this game has re-confirmed) verifies this exact game.".into(),
-            ),
-            ReviewState::ReferenceMatched => (
-                IdentityTier::Probable,
-                "Matched to arcade reference data by a set audit. Not a verified identity.".into(),
-            ),
+            ReviewState::Verified(_) => "Current evidence (the file's own identity evidence, or a catalogue match this game has re-confirmed) verifies this exact game.".into(),
+            ReviewState::ReferenceMatched => {
+                "Matched to arcade reference data by a set audit. Not a verified identity.".into()
+            }
             ReviewState::Ambiguous { candidates: found } => {
                 candidates = found.iter().take(5).cloned().collect();
-                (
-                    IdentityTier::Ambiguous,
-                    "The saved evidence matches more than one game.".into(),
-                )
+                "The saved evidence matches more than one game.".into()
             }
             ReviewState::Conflict { detail } => {
                 if !detail.is_empty() {
                     notes.push(detail.clone());
                 }
-                (
-                    IdentityTier::Ambiguous,
-                    "The identity evidence disagrees with itself.".into(),
-                )
+                "The identity evidence disagrees with itself.".into()
             }
-            ReviewState::NoSystem => (
-                IdentityTier::Unknown,
-                "No trusted system is on record for this file.".into(),
-            ),
+            ReviewState::NoSystem => "No trusted system is on record for this file.".into(),
             ReviewState::NotCompared | ReviewState::NoMatch(_) | ReviewState::NoData { .. } => {
-                notes.push(format!("Identity review: {}.", known.list_label()));
-                (from_guess(guess.basis), basis_text(guess.basis).into())
+                if let Some(note) = wording.note {
+                    notes.push(note.into());
+                }
+                basis_text(guess.basis).into()
             }
         },
     };
-    // A saved catalogue comparison that found several candidates is
-    // ambiguity, not a probable identity, whatever the review settled on.
-    if matches!(tier, IdentityTier::Probable | IdentityTier::Unknown)
-        && game.dat_state == Some(LibraryDatState::Ambiguous)
-    {
-        tier = IdentityTier::Ambiguous;
+    if wording.from_saved_comparison {
         notes.push("A saved catalogue (DAT) comparison found more than one possible match.".into());
     }
+    let tier = wording.confidence;
     IdentityDiagnosis {
         tier,
         basis,

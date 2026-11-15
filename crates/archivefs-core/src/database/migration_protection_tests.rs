@@ -646,8 +646,8 @@ fn spectrum_schema25_to26_preserves_history_and_leaves_legacy_digest_unknown() {
     c.execute_batch("INSERT INTO discovery_import_operations VALUES('fixture','committed','old',NULL,x'7b7d'); INSERT INTO discovery_import_records VALUES('fixture',7,1,x'61',x'62',x'7b7d',0); INSERT INTO dat_expected_inventory_meta VALUES('fixture','old-version','tosec',0,0,'old','old');").unwrap();
     drop(c);
     let report = super::upgrade_library_database(&path).unwrap();
-    assert_eq!((report.from_version, report.to_version), (25, 26));
-    assert_eq!(report.applied_versions, vec![26]);
+    assert_eq!((report.from_version, report.to_version), (25, 27));
+    assert_eq!(report.applied_versions, vec![26, 27]);
     let c = Connection::open(&path).unwrap();
     assert_eq!(
         c.query_row(
@@ -692,7 +692,7 @@ fn spectrum_schema25_to26_preserves_history_and_leaves_legacy_digest_unknown() {
         &inspect_upgrade_backups(&path).unwrap()[0].state,
         UpgradeBackupState::Verified {
             from_version: 25,
-            to_version: 26,
+            to_version: 27,
             ..
         }
     ));
@@ -737,7 +737,7 @@ fn spectrum_schema26_bookkeeping_failure_rolls_back_column_and_keeps_backup() {
         &inspect_upgrade_backups(&path).unwrap()[0].state,
         UpgradeBackupState::Verified {
             from_version: 25,
-            to_version: 26,
+            to_version: 27,
             ..
         }
     ));

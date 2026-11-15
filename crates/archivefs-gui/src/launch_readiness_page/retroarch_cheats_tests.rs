@@ -765,8 +765,15 @@ fn a_verified_fixture_game_reaches_retroarch_with_core_config_and_selected_cheat
         !config.starts_with(world.root.join("config")),
         "RetroArch must get a temporary profile, not the user's: {args:?}"
     );
-    // Exactly: -L <core> <content> --config <temporary profile>.
-    assert_eq!(args.len(), 5, "{args:?}");
+    // Exactly: --verbose -L <core> <content> --config <temporary profile>.
+    // `--verbose` is how a managed launch gets RetroArch to say why it
+    // failed; it is an argument for this run only and changes no setting.
+    assert_eq!(
+        args.first().map(String::as_str),
+        Some("--verbose"),
+        "{args:?}"
+    );
+    assert_eq!(args.len(), 6, "{args:?}");
     assert_eq!(
         Path::new(&args[core_at + 2]),
         fixture.rom.as_path(),

@@ -132,11 +132,12 @@ fn tile_id(game: i64) -> egui::Id {
     egui::Id::new(("v2_arcade_shelf_cover", game))
 }
 
-/// Shelf keys, read only when typing is not in progress and focus is either
-/// nowhere or on a cover, so a focused button elsewhere keeps its keys.
+/// Shelf keys, read only when no text field, dialog or menu owns the keys and
+/// focus is either nowhere or on a cover, so a focused button elsewhere keeps
+/// its keys.
 fn read_keys(ctx: &egui::Context, tile_focused: bool) -> (Option<Move>, bool) {
     let focused_elsewhere = ctx.memory(|memory| memory.focused().is_some()) && !tile_focused;
-    if ctx.text_edit_focused() || focused_elsewhere {
+    if !crate::gui_v2::shortcuts::page_keys_allowed(ctx) || focused_elsewhere {
         return (None, false);
     }
     let (moved, open) = ctx.input_mut(|input| {

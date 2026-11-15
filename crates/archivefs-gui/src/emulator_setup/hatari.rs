@@ -483,6 +483,7 @@ impl Controller {
                     });
                 let _ = tx.send(snapshot);
                 if let Some(ctx) = repaint {
+                    crate::emulator_setup::answers::arrived(&ctx);
                     ctx.request_repaint();
                 }
             });

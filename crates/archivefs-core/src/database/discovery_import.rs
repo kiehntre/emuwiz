@@ -10,7 +10,11 @@ use std::sync::OnceLock;
 
 // Schema 26 reviewed: nullable source-level DAT inventory digest only; no
 // archive dependencies or Undo deletion policy changes.
-const REVIEWED_SCHEMA: i64 = 26;
+// Schema 27 reviewed: two per-game record tables (replaced DAT evidence and
+// re-check notes). Neither has a foreign key or cascade. Both carry touch
+// triggers and are protected dependents in `check_import_undo`, so Undo is
+// refused for a game that has either and never deletes them.
+const REVIEWED_SCHEMA: i64 = 27;
 const MAX_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BATCH: usize = crate::ingestion::saved_discovery::MAX_SELECTED;
 
@@ -533,6 +537,8 @@ impl Database {
             for table in [
                 "archive_scan_observations",
                 "library_dat_identities",
+                "library_dat_identity_history",
+                "dat_recheck_attempts",
                 "verified_identity_facts",
                 "screenscraper_enrichments",
                 "dat_set_audit_results",

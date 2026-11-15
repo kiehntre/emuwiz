@@ -149,13 +149,55 @@ impl Report {
 /// Game folders in a preview, with what will happen to each.
 pub(super) type FolderPreviews = Vec<(FolderCandidate, FolderPreview)>;
 
+/// A finished preview: plans, folder moves, and games no plan covers.
+type Planned = (Vec<RootPlan>, FolderPreviews, Vec<(PathBuf, String)>);
+
 enum Message {
-    Planned(Result<(Vec<RootPlan>, FolderPreviews), String>, bool),
+    Planned(Result<Planned, String>, bool),
     Applied(
         Box<Report>,
         Vec<archivefs_core::dat::rename_apply::RenameTransaction>,
         Vec<FolderMoveRecord>,
     ),
+    /// Only interrupted folder moves were settled; nothing new was moved.
+    Settled(Box<Report>),
+}
+
+/// Folder-move records left for this release to finish or a person to
+/// review: (interrupted moves or Undos, unreadable records).
+pub(super) fn pending_folder_moves() -> (usize, usize) {
+    match archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir() {
+        Ok(journal) => (
+            folder_move::interrupted(&journal).len(),
+            folder_move::unreadable(&journal).len(),
+        ),
+        Err(_) => (0, 0),
+    }
+}
+
+/// Reports unreadable folder-move records (left untouched) and settles
+/// every interrupted folder move or Undo from the files and the library.
+fn settle_folder_moves(journal: &Path, report: &mut Report) {
+    // A folder-move record this release cannot read (damaged, or written by
+    // a newer EmuWiz) is reported and left untouched, never skipped silently.
+    for (path, why) in folder_move::unreadable(journal) {
+        report.failed.push(format!(
+            "A folder-move record cannot be read and was left untouched: {} ({why}). Review it before moving that folder again.",
+            path.display()
+        ));
+    }
+    for mut record in folder_move::interrupted(journal) {
+        match folder_move::recover(&mut record, journal) {
+            Ok(state) => report.recovered.push(format!(
+                "An interrupted earlier move of {} was settled: {state:?}.",
+                record.source.display()
+            )),
+            Err(why) => report.failed.push(format!(
+                "An interrupted earlier move of {} needs review: {why}",
+                record.source.display()
+            )),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -163,9 +205,36 @@ pub(super) enum Phase {
     #[default]
     Idle,
     Working(&'static str),
-    Preview(Vec<RootPlan>, FolderPreviews, Summary),
+    /// Plans, folder moves, counts, and picked games no plan covers (outside
+    /// every source folder, or nothing to plan), each with its reason.
+    Preview(
+        Vec<RootPlan>,
+        FolderPreviews,
+        Summary,
+        Vec<(PathBuf, String)>,
+    ),
     Done(Report),
     Failed(String),
+}
+
+/// Preview lines for picked games that no plan covers, so a preview of only
+/// such games explains itself instead of showing zero. Lists at most 50.
+pub(super) fn excluded_lines(excluded: &[(PathBuf, String)]) -> Vec<String> {
+    if excluded.is_empty() {
+        return Vec::new();
+    }
+    let n = excluded.len();
+    let mut lines = vec![format!(
+        "{n} picked game{} not included in this preview and will not be moved:",
+        if n == 1 { " is" } else { "s are" }
+    )];
+    for (path, why) in excluded.iter().take(50) {
+        lines.push(format!("Not moved: {} - {why}", path.display()));
+    }
+    if n > 50 {
+        lines.push(format!("...and {} more.", n - 50));
+    }
+    lines
 }
 
 /// Folder moves in a preview: (to move, already in place, refused).
@@ -193,6 +262,9 @@ pub(super) struct State {
     /// The last run's folder moves, for Undo.
     pub applied_folders: Vec<FolderMoveRecord>,
     pub undo_message: Option<String>,
+    /// Interrupted and unreadable folder-move records, as of the last
+    /// preview or run (read once when the page first shows, if unknown).
+    pub pending_folder_moves: Option<(usize, usize)>,
     receiver: Option<Receiver<Message>>,
 }
 
@@ -242,14 +314,21 @@ impl State {
                         }
                     }
                 }
-                let mut plans =
-                    org::plan_organisation_with_choices(&refs, &chosen_files, &unknown, &roots, 1);
+                let (mut plans, mut excluded) = org::plan_organisation_with_exclusions(
+                    &refs,
+                    &chosen_files,
+                    &unknown,
+                    &roots,
+                    1,
+                );
                 for f in findings.iter().filter(|f| !f.tier.is_movable()) {
-                    if let Some(first) = plans.first_mut() {
-                        first.left_alone.push((
-                            f.path.clone(),
-                            format!("{}: not moved ({}).", f.title, f.tier.label()),
-                        ));
+                    let note = (
+                        f.path.clone(),
+                        format!("{}: not moved ({}).", f.title, f.tier.label()),
+                    );
+                    match plans.first_mut() {
+                        Some(first) => first.left_alone.push(note),
+                        None => excluded.push(note),
                     }
                 }
                 let database = archivefs_core::default_database_path()
@@ -263,7 +342,7 @@ impl State {
                     }
                 }
                 let folder_previews = org::preview_folders(&database, &roots, &folders);
-                Ok((plans, folder_previews))
+                Ok((plans, folder_previews, excluded))
             })();
             let _ = sender.send(Message::Planned(result, then_apply));
         });
@@ -271,7 +350,7 @@ impl State {
 
     /// The person's one approval for every Suggested entry in the preview.
     pub(super) fn approve(&mut self) {
-        let Phase::Preview(plans, folders, _) = std::mem::take(&mut self.phase) else {
+        let Phase::Preview(plans, folders, _, _) = std::mem::take(&mut self.phase) else {
             return;
         };
         self.start_apply(plans, folders);
@@ -287,6 +366,27 @@ impl State {
         });
     }
 
+    /// Settles interrupted folder moves and Undos without moving anything
+    /// new, for when no preview has anything to organise.
+    pub(super) fn finish_interrupted(&mut self) {
+        if self.busy() {
+            return;
+        }
+        self.phase = Phase::Working("Finishing interrupted folder moves. Nothing new is moved.");
+        let (sender, receiver) = mpsc::channel();
+        self.receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let mut report = Report::default();
+            match archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir() {
+                Ok(journal) => settle_folder_moves(&journal, &mut report),
+                Err(error) => report
+                    .failed
+                    .push(format!("the journal folder is not available: {error}")),
+            }
+            let _ = sender.send(Message::Settled(Box::new(report)));
+        });
+    }
+
     pub(super) fn poll(&mut self) {
         let Some(receiver) = &self.receiver else {
             return;
@@ -295,10 +395,11 @@ impl State {
             Ok(Message::Planned(result, then_apply)) => {
                 self.receiver = None;
                 match result {
-                    Ok((plans, folders)) if then_apply => self.start_apply(plans, folders),
-                    Ok((plans, folders)) => {
+                    Ok((plans, folders, _)) if then_apply => self.start_apply(plans, folders),
+                    Ok((plans, folders, excluded)) => {
+                        self.pending_folder_moves = Some(pending_folder_moves());
                         let summary = org::summarise(&plans);
-                        self.phase = Phase::Preview(plans, folders, summary);
+                        self.phase = Phase::Preview(plans, folders, summary, excluded);
                     }
                     Err(error) => self.phase = Phase::Failed(error),
                 }
@@ -310,6 +411,15 @@ impl State {
                 }
                 self.applied = transactions;
                 self.applied_folders = records;
+                self.pending_folder_moves = Some(pending_folder_moves());
+                self.phase = Phase::Done(*report);
+            }
+            Ok(Message::Settled(report)) => {
+                self.receiver = None;
+                if !report.recovered.is_empty() {
+                    self.library_changed = true;
+                }
+                self.pending_folder_moves = Some(pending_folder_moves());
                 self.phase = Phase::Done(*report);
             }
             Err(TryRecvError::Empty) => {}
@@ -383,6 +493,8 @@ impl State {
             }
         }
         self.library_changed = true;
+        // An Undo that failed part-way leaves a record open: read it again.
+        self.pending_folder_moves = None;
         self.undo_message = Some(if problems.is_empty() {
             format!(
                 "Undo reversed {restored} move(s): every game, set and game folder is back where it was, with its previous system."
@@ -434,19 +546,8 @@ fn apply_plans(
             return (report, transactions, records);
         }
     };
-    // Settle any folder move an earlier run left interrupted.
-    for mut record in folder_move::interrupted(&journal) {
-        match folder_move::recover(&mut record, &journal) {
-            Ok(state) => report.recovered.push(format!(
-                "An interrupted earlier move of {} was settled: {state:?}.",
-                record.source.display()
-            )),
-            Err(why) => report.failed.push(format!(
-                "An interrupted earlier move of {} needs review: {why}",
-                record.source.display()
-            )),
-        }
-    }
+    // Settle any folder move or Undo an earlier run left interrupted.
+    settle_folder_moves(&journal, &mut report);
     let mut moves: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     for plan in plans {
         let approved: BTreeSet<String> = plan
@@ -611,5 +712,29 @@ mod tests {
         assert!(text.contains("Already correct: 2. Collisions left untouched: 1. Left for you to review: 4. Failed: 1."));
         assert!(text.contains("RomM: run a Quick scan of Nintendo Entertainment System"));
         assert!(text.contains("Undo"));
+    }
+
+    #[test]
+    fn excluded_games_are_named_with_their_reason() {
+        assert!(excluded_lines(&[]).is_empty());
+        let one = excluded_lines(&[(
+            PathBuf::from("/tmp/Game.zip"),
+            "Outside every library source folder.".into(),
+        )]);
+        assert_eq!(
+            one[0],
+            "1 picked game is not included in this preview and will not be moved:"
+        );
+        assert_eq!(
+            one[1],
+            "Not moved: /tmp/Game.zip - Outside every library source folder."
+        );
+        let many: Vec<(PathBuf, String)> = (0..52)
+            .map(|i| (PathBuf::from(format!("/x/{i}.zip")), "why".into()))
+            .collect();
+        let lines = excluded_lines(&many);
+        assert!(lines[0].starts_with("52 picked games are"));
+        assert_eq!(lines.len(), 1 + 50 + 1);
+        assert_eq!(lines.last().unwrap(), "...and 2 more.");
     }
 }

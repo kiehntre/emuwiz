@@ -208,6 +208,8 @@ fn attention_background_replacement_resolves_without_navigation_or_manual_flags(
     let (sender, receiver) = mpsc::channel();
     app.needs_attention.receiver = Some(receiver);
     sender.send(failed).unwrap();
+    // The merged snapshot is built for the page that shows it.
+    app.view = MainView::NeedsAttention;
     app.poll_needs_attention(&egui::Context::default());
     assert!(
         app.needs_attention
@@ -226,4 +228,41 @@ fn attention_background_replacement_resolves_without_navigation_or_manual_flags(
             .any(|i| i.id == "source:1")
     );
     assert!(app.needs_attention.receiver.is_none());
+}
+
+/// Merging the session snapshot rebuilds the selected game's whole
+/// launch-readiness input. Only the Needs Attention page reads the result,
+/// so no other page (and no Blue page) pays for it once a second.
+#[test]
+fn the_session_snapshot_is_merged_only_while_its_page_is_on_screen() {
+    let mut app = crate::tests::app_for_operation_tests();
+    app.needs_attention.last_started = Some(Instant::now());
+    app.needs_attention.generation = Some(app.database_generation.0);
+    app.needs_attention.stored.insert(AttentionItem::new(
+        "source:1".into(),
+        AttentionCategory::Sources,
+        AttentionSeverity::ActionNeeded,
+        "Scan failed".into(),
+        AttentionDestination::Sources,
+    ));
+    assert_ne!(app.view, MainView::NeedsAttention);
+    for _ in 0..3 {
+        app.poll_needs_attention(&egui::Context::default());
+    }
+    assert!(
+        app.needs_attention.last_session_refresh.is_none(),
+        "nothing was merged off the page"
+    );
+    assert_eq!(app.needs_attention.snapshot.items().count(), 0);
+
+    // Opening the page: the poll that runs before it is drawn merges at once.
+    app.view = MainView::NeedsAttention;
+    app.poll_needs_attention(&egui::Context::default());
+    assert!(
+        app.needs_attention
+            .snapshot
+            .items()
+            .any(|i| i.id == "source:1")
+    );
+    assert!(app.needs_attention.last_session_refresh.is_some());
 }

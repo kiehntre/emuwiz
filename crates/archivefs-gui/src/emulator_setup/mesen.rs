@@ -156,6 +156,7 @@ impl Controller {
                     .unwrap_or_else(|e| Snapshot::unavailable(&e.to_string()));
                 let _ = tx.send(snapshot);
                 if let Some(context) = repaint {
+                    crate::emulator_setup::answers::arrived(&context);
                     context.request_repaint();
                 }
             });

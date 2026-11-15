@@ -26,12 +26,15 @@ pub(super) struct ToolPagesState {
     pub view_history: super::view_history_page::ViewHistoryState,
     pub platform_aliases: super::platform_aliases_page::PlatformAliasesState,
     pub database: super::database_status_page::DatabaseStatusState,
+    pub scan_history: super::scan_history::ScanHistoryState,
     pub alternative_provider_preview: super::alternative_provider_preview::State,
     pub netplay: super::netplay_preview::State,
     pub cheat_extras: super::cheat_extras_page::CheatExtrasState,
     pub arcade_shelf: arcade_shelf::State,
     pub vita3k_titles: vita3k_titles::State,
     pub openrct2: openrct2::State,
+    #[cfg(target_os = "linux")]
+    pub relocation: super::relocation_page::State,
 }
 
 impl ToolPagesState {
@@ -44,12 +47,15 @@ impl ToolPagesState {
             view_history: Default::default(),
             platform_aliases: super::platform_aliases_page::PlatformAliasesState::live(),
             database: super::database_status_page::DatabaseStatusState::live(),
+            scan_history: super::scan_history::ScanHistoryState::live(),
             alternative_provider_preview: Default::default(),
             netplay: Default::default(),
             cheat_extras: Default::default(),
             arcade_shelf: Default::default(),
             vita3k_titles: Default::default(),
             openrct2: Default::default(),
+            #[cfg(target_os = "linux")]
+            relocation: Default::default(),
             host_diagnostics: Default::default(),
             homebrew_browser: Default::default(),
             patch_package_preview: Default::default(),
@@ -111,6 +117,11 @@ impl App {
                 }
                 state.saw_app_scan = app_scan;
                 let request = show(ui, state, app_scan);
+                // Read-only history of saved runs, with Blue's own scan as
+                // Activity tracks it. Starts, queues and cancels nothing new.
+                let upgrading = state.upgrading();
+                let scan_job = super::scan_history::session_scan_job(&self.activity, self.scan_job);
+                super::scan_history::show(ui, &mut self.tools.scan_history, scan_job, upgrading);
                 // Kept until no other load is in flight, so the reload is not lost.
                 if self.load_job.is_none()
                     && std::mem::take(&mut self.tools.database.library_changed)
@@ -136,6 +147,12 @@ impl App {
             ToolPage::ArcadeShelf => self.arcade_shelf_page(ui),
             ToolPage::Vita3kTitles => self.vita3k_titles_page(ui),
             ToolPage::FolderCheck => self.folder_check_page(ui),
+            ToolPage::Relocation => {
+                #[cfg(target_os = "linux")]
+                super::relocation_page::show(ui, &mut self.tools.relocation);
+                #[cfg(not(target_os = "linux"))]
+                ui.label("Moving games between library folders is available on Linux only.");
+            }
             ToolPage::OpenRct2 => self.openrct2_page(ui),
             ToolPage::ViewHistory => {
                 use super::view_history_page::{Request, show};

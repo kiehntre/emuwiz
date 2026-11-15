@@ -7,6 +7,7 @@ mod arcade_compat_panel;
 mod arcade_input_details;
 mod archive_inspector;
 mod artwork;
+mod artwork_fallback;
 mod backend;
 mod bezel;
 mod bezel_history;
@@ -57,6 +58,7 @@ mod legacy;
 pub(crate) mod library;
 mod library_failure;
 mod library_reconciliation;
+mod library_selection;
 mod library_views_page;
 mod local_artwork_folders;
 mod mame_collection_health;
@@ -82,6 +84,9 @@ mod organise;
 mod osk;
 mod pad_mouse;
 mod pad_shell;
+#[cfg(target_os = "linux")]
+mod relocation_page;
+mod saved_recheck;
 mod suggest;
 pub(crate) use pad_shell::mark_secret;
 mod amiga_hdf_storage;
@@ -97,6 +102,7 @@ mod psp_iso_analyser;
 mod quarantine_confirm;
 mod quarantine_outcome;
 mod r2_rename;
+mod recently_played;
 mod recording_integrity;
 #[cfg(test)]
 mod retroarch_journey_tests;
@@ -107,12 +113,14 @@ mod save_compatibility;
 mod save_snapshots;
 mod save_state_guidance;
 mod saves_states;
+mod scan_history;
 #[cfg(test)]
 mod scummvm_journey_tests;
 mod setup_portability;
 #[cfg(test)]
 #[path = "tests/shared_scroll.rs"]
 mod shared_scroll_tests;
+mod shortcuts;
 mod simple_shell;
 mod single_file_restore;
 mod source_impact;
@@ -398,6 +406,8 @@ pub(super) struct App {
     index_job: Option<u64>,
     /// How many shelf cards Browse & Play draws, and the scope it was chosen for.
     browse_play: browse_play::BrowsePlayState,
+    /// Ctrl/Shift multi-select over the Library list (read-only bulk actions).
+    library_selection: library_selection::LibrarySelection,
     batch_selection: multi_selection::MultiSelection,
     batch_state: crate::screenscraper_batch_enrichment_page::ScreenScraperBatchState,
     batch_open: bool,
@@ -415,6 +425,7 @@ pub(super) struct App {
     moved_game: Option<i64>,
     review: identity_review_page::ReviewUi,
     game_dat_check: game_dat_check::State,
+    saved_recheck: saved_recheck::State,
     folder_check: folder_check::State,
     hasheous_check: hasheous_check::State,
     notice: Option<Notice>,
@@ -466,6 +477,8 @@ pub(super) struct App {
     discovery_import_history: history_discovery_import::State,
     database_recovery: database_recovery::State,
     duckstation_history: history_duckstation::State,
+    /// Home's "Continue playing" row, from RetroArch's own history.
+    recently_played: recently_played::State,
     canonical_organisation_generation: u64,
     canonical_organisation_history:
         Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
@@ -543,6 +556,7 @@ impl App {
             artwork_totals: activity::ArtworkTotals::default(),
             index_job: None,
             browse_play: Default::default(),
+            library_selection: Default::default(),
             batch_selection: multi_selection::MultiSelection::with_limit(
                 archivefs_core::screenscraper_enrichment::MAX_EXPLICIT_BATCH_SIZE,
             ),
@@ -558,6 +572,7 @@ impl App {
             moved_game: None,
             review: Default::default(),
             game_dat_check: Default::default(),
+            saved_recheck: Default::default(),
             folder_check: Default::default(),
             hasheous_check: Default::default(),
             notice: None,
@@ -606,6 +621,7 @@ impl App {
             discovery_import_history: Default::default(),
             database_recovery: Default::default(),
             duckstation_history: Default::default(),
+            recently_played: Default::default(),
             canonical_organisation_generation: 0,
             canonical_organisation_history: Vec::new(),
             mods: ModsPageState::default(),
@@ -888,7 +904,7 @@ impl App {
         }
         let id = self.activity.queue(
             if scan {
-                "Scanning your game folders"
+                scan_history::SCAN_JOB_TITLE
             } else {
                 "Loading your library"
             },
@@ -2607,6 +2623,7 @@ impl eframe::App for App {
         // A finished one-game check saves new evidence even when its page is
         // no longer showing; reload so Game Details reads it.
         self.game_dat_check.poll();
+        self.saved_recheck.poll();
         self.folder_check.poll();
         self.folder_check.organise.poll();
         if self.load_job.is_none() && self.folder_check.organise.take_library_changed() {
@@ -2625,6 +2642,9 @@ impl eframe::App for App {
         if self.load_job.is_none() && self.game_dat_check.take_saved() {
             reload_library = true;
         }
+        if self.load_job.is_none() && self.saved_recheck.take_saved() {
+            reload_library = true;
+        }
         if reload_library {
             self.load(false);
         }
@@ -2633,7 +2653,7 @@ impl eframe::App for App {
         }
         self.poll(ui.ctx());
         self.note_window_resize(ui.ctx());
-        self.show(ui.ctx());
+        self.show_with_shortcuts(ui.ctx());
         self.simple.paint_focus_ring(ui.ctx());
         self.finish_frame();
     }

@@ -15,6 +15,88 @@ guessing at intent, dates, or scope.
 
 Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
+- Undo for mods, cheats and texture packs no longer takes its saved record's
+  word for what it may touch. What ties a record, its destination folder and
+  each file to an install is what EmuWiz itself kept in its backup store
+  when it installed, not the record. A record is accepted only as the record
+  of the one install it was written for, with all of that install's files:
+  it cannot carry another install's files or leave its own out. A record
+  that names a file or folder by anything but a plain path inside its
+  destination folder is refused as a whole: nothing it names is read or
+  changed. A file EmuWiz added is removed only if the backup store holds
+  EmuWiz's receipt for that file under that folder. A replaced file is
+  restored only from that install's own backup of it, and only while the
+  file still holds what the install's receipt says was put there. An empty
+  folder is removed only if it is on the way to a file Undo has just
+  removed, or is the destination folder itself. Installs made before this
+  version have no receipts: Undo no longer removes the files they added,
+  and still restores the files they replaced. An older install that did both is refused as a whole; its files,
+  its backups and its History entry are kept. Empty folders above the
+  destination folder are left in place after Undo. Undo of an install is
+  now refused, until it is looked at, while EmuWiz still holds a receipt for
+  one of its files that the record says was not installed and something
+  other than the original stands at that path: a file whose writing could
+  not be confirmed, or, after an interrupted install, an original that was
+  edited since or another file that has appeared there. Before, Undo went
+  ahead around that file. There is not yet a way to clear this in the app.
+  Limits: this does not protect against something able to change both
+  EmuWiz's history folder and its backup folder. A rewritten record can
+  still choose the permission bits of a restored file. For an install made
+  before this version it can also leave some of that install's own files
+  out of an Undo, and have that install's genuine original put back over a
+  file it replaced that has changed since.
+- Launching with RetroArch: EmuWiz now asks RetroArch for detailed output and
+  keeps a bounded copy in memory (the first and last 64 KiB) to explain a
+  launch that goes wrong. No RetroArch setting is changed. When a launch
+  fails, the technical details show the last 40 lines only, with your home
+  folder, your user name in paths, and the values next to a short list of
+  labels (such as `password`, `token` and `api_key`) removed. The list is not
+  complete: read the details before you share them.
+  `EMUWIZ_RETROARCH_QUIET_LAUNCH=1` turns the detailed output off.
+- Command line: `emuwiz-cli launch-history` lists, shows, deletes and clears
+  the record EmuWiz keeps of launches that went wrong, and switches recording
+  off or on. A record is kept for a failed launch and for a launch whose
+  emulator said a save could not be written; it holds structured facts only
+  (no emulator output, paths or addresses), at most 20 records for 14 days.
+  Nothing writes to this history yet: Blue starts recording in a later
+  change.
+- Command line: `emuwiz-cli diagnose-launch` explains a failed emulator launch
+  from what it left behind: how the process ended, what the emulator printed,
+  its settings and a look at the files involved. It reports what happened
+  separately from why, names the evidence behind every conclusion, lists what
+  was not observed, and leaves a failure unexplained when the evidence does not
+  explain it. What happened to the launch is stated apart from the verdict, and
+  what you type about the launch (how it ended, its environment) is taken as
+  supplied: it can suggest a cause, never establish one. Read-only: it starts
+  nothing and changes nothing. RetroArch is the
+  only emulator with log and settings support so far; for others it covers the
+  process exit, missing libraries and sandbox refusals. Not yet in Blue.
+- Check Games: a "Saved results that need checking again" card lists saved
+  catalogue results that no longer count (and why), and can check those games
+  again with progress and Stop. Finished sets stay saved; Continue checks the
+  rest. Results that cannot be checked now are listed with the reason.
+- Verifying games is faster: the CRC-32 step no longer limits hashing speed.
+- DAT verification: `emuwiz-cli dat recheck` lists saved DAT results that are
+  no longer backed by current evidence (saved before proof was recorded, file
+  changed, catalogue changed) and, with `--confirm`, checks those games again
+  by reading them. Work is saved one bounded set at a time, so stopping,
+  a crash or a restart keeps every finished set and the next run continues
+  with the rest. A saved result is never upgraded without reading the game
+  again; the result it replaces is kept for the record. A verified file
+  matches its catalogue entry; that says nothing about emulator compatibility.
+- Database: library schema 27 adds two tables (replaced DAT evidence, and why
+  a re-check saved nothing). Existing rows are not changed. A library that
+  another build took to a different "schema 27" is now refused instead of
+  opened.
+- Database recovery: `emuwiz-cli database-recover-journal` handles a library
+  that EmuWiz refuses to open after a write was cut off. It copies the
+  database and its journal, lets SQLite recover the copy, checks it and
+  reports, without changing the library. `--apply <folder> --confirm` then
+  lets SQLite recover the library itself, only if it is still exactly what was
+  checked. The refusal to open such a library is unchanged.
+- Discovery import Undo: refreshing disc order after a DAT verification no
+  longer rewrites unchanged records, which used to mark every import in the
+  library as modified and refuse its Undo.
 - Games & collection: an explicitly labelled alternative way to play
   RollerCoaster Tycoon 2 with an OpenRCT2 you already installed and your own
   game folder. Readiness comes from the existing alternative-provider planner;

@@ -162,6 +162,28 @@ pub fn plan_organisation_with_choices(
     roots: &[PathBuf],
     generation: u64,
 ) -> Vec<RootPlan> {
+    let (mut plans, outside) =
+        plan_organisation_with_exclusions(findings, chosen, unknown, roots, generation);
+    if let Some(first) = plans.first_mut() {
+        first.left_alone.extend(outside);
+    }
+    plans
+}
+
+/// Plain reason shown for a game that is not inside any registered source
+/// folder. Organise never moves such a file.
+pub const OUTSIDE_SOURCES_REASON: &str = "Outside every library source folder, so EmuWiz cannot keep its records and will not move it. To organise it, add its folder in Sources & Providers and scan it, or move it into a source folder yourself.";
+
+/// [`plan_organisation_with_choices`], but games outside every registered
+/// source folder come back separately (path, reason) instead of riding on the
+/// first plan, so they are reported even when no plan exists at all.
+pub fn plan_organisation_with_exclusions(
+    findings: &[&Finding],
+    chosen: &[ChosenGame],
+    unknown: &[UnknownGame],
+    roots: &[PathBuf],
+    generation: u64,
+) -> (Vec<RootPlan>, Vec<(PathBuf, String)>) {
     let mut by_root: BTreeMap<PathBuf, RootParts> = BTreeMap::new();
     let mut orphans = Vec::new();
     // Package boundaries first: a set moves whole, a member never alone, and
@@ -184,15 +206,17 @@ pub fn plan_organisation_with_choices(
         .flat_map(|p| p.paths().into_iter().skip(1))
         .collect();
     let mut refused: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+    let mut unrooted: Vec<PathBuf> = Vec::new();
     let mut usable = |path: &Path| -> bool {
         match packages.get(path) {
             Some(Ok(p)) if p.shape == crate::game_package::PackageShape::GameFolder => {
-                if let Some(root) = root_of(path, roots) {
-                    refused.push((
+                match root_of(path, roots) {
+                    Some(root) => refused.push((
                         root.clone(),
                         path.to_path_buf(),
                         "This game is a folder; it is offered under Game folders.".into(),
-                    ));
+                    )),
+                    None => unrooted.push(path.to_path_buf()),
                 }
                 false
             }
@@ -200,12 +224,13 @@ pub fn plan_organisation_with_choices(
             // Moves with a set that is itself being organised.
             Some(Err(_)) if members_of_leads.contains(path) => false,
             Some(Err(why)) => {
-                if let Some(root) = root_of(path, roots) {
-                    refused.push((
+                match root_of(path, roots) {
+                    Some(root) => refused.push((
                         root.clone(),
                         path.to_path_buf(),
                         format!("Not moved: {why}."),
-                    ));
+                    )),
+                    None => unrooted.push(path.to_path_buf()),
                 }
                 false
             }
@@ -219,6 +244,7 @@ pub fn plan_organisation_with_choices(
         .collect();
     let chosen: Vec<&ChosenGame> = chosen.iter().filter(|g| usable(&g.path)).collect();
     let unknown: Vec<&UnknownGame> = unknown.iter().filter(|g| usable(&g.path)).collect();
+    orphans.extend(unrooted);
     for finding in &findings {
         let Some(root) = root_of(&finding.path, roots) else {
             orphans.push(finding.path.clone());
@@ -299,7 +325,7 @@ pub fn plan_organisation_with_choices(
         .map(|g| g.path.clone())
         .collect();
     let unknown_folder = Path::new(UNKNOWN_FOLDER);
-    let mut plans: Vec<RootPlan> = by_root
+    let plans: Vec<RootPlan> = by_root
         .into_iter()
         .map(|(root, (candidates, corrections, left_alone))| {
             let mut plan = build_organisation_plan(&OrganisationPlanRequest {
@@ -326,15 +352,13 @@ pub fn plan_organisation_with_choices(
             }
         })
         .collect();
-    if !orphans.is_empty() {
-        let reason = "This file is not inside a registered source folder, so EmuWiz cannot keep its records; nothing was moved.";
-        if let Some(first) = plans.first_mut() {
-            first
-                .left_alone
-                .extend(orphans.into_iter().map(|p| (p, reason.to_string())));
-        }
-    }
-    plans
+    orphans.sort();
+    orphans.dedup();
+    let outside = orphans
+        .into_iter()
+        .map(|p| (p, OUTSIDE_SOURCES_REASON.to_string()))
+        .collect();
+    (plans, outside)
 }
 
 /// Gives every Suggested set lead its members' destinations (beside the
