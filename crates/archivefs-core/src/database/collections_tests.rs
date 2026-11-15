@@ -491,22 +491,43 @@ fn journals(f: &Fixture) -> PathBuf {
         .join(crate::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
 }
 
-/// Records one rename transaction in `state`, each entry in `entry_state`.
+/// Records one rename transaction in `state`, each entry in `entry_state`,
+/// as written now, with each file's real size.
 fn record(f: &Fixture, id: u32, state: &str, entry_state: &str, moves: &[(&str, &str)]) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    record_at(f, id, now + u64::from(id), None, state, entry_state, moves);
+}
+
+fn record_at(
+    f: &Fixture,
+    id: u32,
+    unix: u64,
+    size: Option<u64>,
+    state: &str,
+    entry_state: &str,
+    moves: &[(&str, &str)],
+) {
     let entries: Vec<serde_json::Value> = moves
         .iter()
         .map(|(from, to)| {
+            let real = [to, from]
+                .iter()
+                .find_map(|name| fs::metadata(f.source.join(name)).ok())
+                .map_or(1, |meta| meta.len());
             serde_json::json!({
                 "source_path": f.source.join(from), "destination_path": f.source.join(to),
                 "original_basename": "x", "proposed_basename": "y",
-                "identity": {"size_bytes": 1, "modified_unix": 1, "kind": "regular_file"},
+                "identity": {"size_bytes": size.unwrap_or(real), "modified_unix": 1, "kind": "regular_file"},
                 "state": entry_state
             })
         })
         .collect();
     let transaction: crate::dat::rename_apply::model::RenameTransaction =
         serde_json::from_value(serde_json::json!({
-            "transaction_id": format!("{id}-0"), "plan_generation": 0, "created_at_unix": id,
+            "transaction_id": format!("{id}-0"), "plan_generation": 0, "created_at_unix": unix,
             "source_scan_root": f.source, "state": state, "entries": entries
         }))
         .unwrap();
@@ -888,4 +909,74 @@ fn older_unsealed_records_alone_are_never_evidence() {
         "no move, no warning"
     );
     assert_eq!(stored_ids(&f.database), vec![vec![old]]);
+}
+
+/// Review condition on 1371cef3: a path reused after a rename was recorded,
+/// and favourited then, names a different game; the old record must not move
+/// it, whether the record is a rename (old path -> new) or an Undo (new path
+/// -> old). A record whose size disagrees proves nothing either.
+#[test]
+fn a_path_reused_and_saved_after_the_record_never_follows_it() {
+    let long_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 1_000;
+    for case in ["rename", "undo", "size"] {
+        let mut f = fixture(&["a.zip"]);
+        let original = id_of(&f.database, "a.zip");
+        // The path the record leaves from, which the newer game then uses.
+        let reused = if case == "undo" { "b.zip" } else { "a.zip" };
+        if case == "undo" {
+            record_at(
+                &f,
+                1,
+                long_ago,
+                None,
+                "rolled_back",
+                "rolled_back",
+                &[("a.zip", "b.zip")],
+            );
+        } else {
+            rename_on_disk(&mut f, "a.zip", "b.zip");
+            let size = (case == "size").then_some(99);
+            let when = if case == "size" {
+                long_ago + 2_000
+            } else {
+                long_ago
+            };
+            record_at(
+                &f,
+                1,
+                when,
+                size,
+                "applied",
+                "applied",
+                &[("a.zip", "b.zip")],
+            );
+        }
+        // A different game, the same size, arrives at the reused path.
+        fs::write(f.source.join(reused), b"other").unwrap();
+        scan_and_persist(&mut f.database, &f.config, "newer game").unwrap();
+        let newer = id_by_path(&f.database, reused);
+        let favourites = f.database.favourites_collection_id().unwrap();
+        f.database
+            .add_game_to_collection(favourites, newer)
+            .unwrap();
+        fs::remove_file(f.source.join(reused)).unwrap();
+        scan_and_persist(&mut f.database, &f.config, "newer game gone").unwrap();
+        let before = fs::read(&f.db_path).unwrap();
+        let result = f
+            .database
+            .save_journalled_collection_moves(&journals(&f))
+            .unwrap();
+        assert_eq!(result, super::JournalledMoves::default(), "{case}");
+        assert_eq!(stored_ids(&f.database), vec![vec![newer]], "{case}");
+        assert_eq!(
+            fs::read(&f.db_path).unwrap(),
+            before,
+            "{case}: nothing written"
+        );
+        let _ = original;
+    }
 }

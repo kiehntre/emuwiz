@@ -1306,15 +1306,23 @@ fn a_completed_rename_is_saved_on_load_and_a_guess_is_not() {
     let source = f.path.parent().unwrap().join("source");
     // Alpha: renamed by EmuWiz, recorded as a finished transaction.
     std::fs::rename(source.join("Alpha.zip"), source.join("Alpha (Renamed).zip")).unwrap();
+    // Recorded as the rename happened: now, with the file's real size.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let size = std::fs::metadata(source.join("Alpha (Renamed).zip"))
+        .unwrap()
+        .len();
     let transaction: archivefs_core::dat::rename_apply::model::RenameTransaction =
         serde_json::from_value(serde_json::json!({
-            "transaction_id": "1-0", "plan_generation": 0, "created_at_unix": 1,
+            "transaction_id": "1-0", "plan_generation": 0, "created_at_unix": now,
             "source_scan_root": source, "state": "applied",
             "entries": [{
                 "source_path": source.join("Alpha.zip"),
                 "destination_path": source.join("Alpha (Renamed).zip"),
                 "original_basename": "Alpha.zip", "proposed_basename": "Alpha (Renamed).zip",
-                "identity": {"size_bytes": 9, "modified_unix": 1, "kind": "regular_file"},
+                "identity": {"size_bytes": size, "modified_unix": 1, "kind": "regular_file"},
                 "state": "applied"
             }]
         }))
@@ -1432,15 +1440,23 @@ fn an_unreadable_rename_record_pauses_automatic_updates_until_it_is_gone() {
         .join(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY);
     // A finished rename that would otherwise be saved ...
     std::fs::rename(source.join("Alpha.zip"), source.join("Alpha (Renamed).zip")).unwrap();
+    // Recorded as the rename happened: now, with the file's real size.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let size = std::fs::metadata(source.join("Alpha (Renamed).zip"))
+        .unwrap()
+        .len();
     let transaction: archivefs_core::dat::rename_apply::model::RenameTransaction =
         serde_json::from_value(serde_json::json!({
-            "transaction_id": "1-0", "plan_generation": 0, "created_at_unix": 1,
+            "transaction_id": "1-0", "plan_generation": 0, "created_at_unix": now,
             "source_scan_root": source, "state": "applied",
             "entries": [{
                 "source_path": source.join("Alpha.zip"),
                 "destination_path": source.join("Alpha (Renamed).zip"),
                 "original_basename": "Alpha.zip", "proposed_basename": "Alpha (Renamed).zip",
-                "identity": {"size_bytes": 9, "modified_unix": 1, "kind": "regular_file"},
+                "identity": {"size_bytes": size, "modified_unix": 1, "kind": "regular_file"},
                 "state": "applied"
             }]
         }))

@@ -56,8 +56,9 @@ DAT rename finished (not failed or interrupted), or a finished Undo put the file
 back, the item is saved against the game's new entry once a scan has found it
 there, so it keeps its star after the old entry is cleaned up. The record must
 lead to exactly one destination, with exactly one current entry there of the
-same size, and the item's old entry, if it is still listed, must be marked
-missing. A file that an unfinished rename touched is never followed. Anything
+size the record names, the item must have been saved before the rename was
+recorded (an item saved later names whatever came to that path afterwards), and
+the item's old entry, if it is still listed, must be marked missing. A file that an unfinished rename touched is never followed. Anything
 less certain changes nothing. Running it again changes nothing, and it never
 uses file names, paths or sizes alone.
 

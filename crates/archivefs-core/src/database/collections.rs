@@ -444,7 +444,18 @@ pub struct JournalledMoves {
 ///
 /// Fails closed: if any journal in either folder cannot be read, the reason is
 /// returned and nothing is moved.
-fn completed_rename_ends(dir: &Path) -> std::result::Result<HashMap<PathBuf, PathBuf>, String> {
+/// Where a chain of recorded renames ends, and what its first hop recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenameEnd {
+    end: PathBuf,
+    /// The first hop's transaction time: an item saved later than this was
+    /// saved against whatever was at the path afterwards, so it never moves.
+    recorded_unix: u64,
+    /// The file size the first hop recorded.
+    size_bytes: u64,
+}
+
+fn completed_rename_ends(dir: &Path) -> std::result::Result<HashMap<PathBuf, RenameEnd>, String> {
     const MAX_HOPS: usize = 16;
     let (transactions, problems) = list_journals(dir);
     if let Some(problem) = problems.first() {
@@ -480,6 +491,8 @@ fn completed_rename_ends(dir: &Path) -> std::result::Result<HashMap<PathBuf, Pat
     }
     let mut next: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
     let mut into: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
+    // (from, to) -> the latest transaction time and the sizes recorded for it.
+    let mut recorded: HashMap<(PathBuf, PathBuf), (u64, BTreeSet<u64>)> = HashMap::new();
     for transaction in transactions {
         let finished = matches!(
             transaction.state,
@@ -502,6 +515,9 @@ fn completed_rename_ends(dir: &Path) -> std::result::Result<HashMap<PathBuf, Pat
                 }
                 continue;
             };
+            let hop = recorded.entry((from.clone(), to.clone())).or_default();
+            hop.0 = hop.0.max(transaction.created_at_unix);
+            hop.1.insert(entry.identity.size_bytes);
             next.entry(from.clone()).or_default().insert(to.clone());
             into.entry(to).or_default().insert(from);
         }
@@ -529,9 +545,27 @@ fn completed_rename_ends(dir: &Path) -> std::result::Result<HashMap<PathBuf, Pat
                 }
             }
         }
-        if ok && at != *start {
-            ends.insert(start.clone(), at);
+        if !ok || at == *start {
+            continue;
         }
+        let Some(first) = step(start) else {
+            continue;
+        };
+        let Some((recorded_unix, sizes)) = recorded.get(&(start.clone(), first)) else {
+            continue;
+        };
+        // Two records of the same hop that disagree on the size prove nothing.
+        let [size_bytes] = sizes.iter().copied().collect::<Vec<_>>()[..] else {
+            continue;
+        };
+        ends.insert(
+            start.clone(),
+            RenameEnd {
+                end: at,
+                recorded_unix: *recorded_unix,
+                size_bytes,
+            },
+        );
     }
     Ok(ends)
 }
@@ -540,13 +574,17 @@ fn completed_rename_ends(dir: &Path) -> std::result::Result<HashMap<PathBuf, Pat
 /// of its chain. Read-only.
 fn journalled_moves(
     connection: &rusqlite::Connection,
-    renames: &HashMap<PathBuf, PathBuf>,
+    renames: &HashMap<PathBuf, RenameEnd>,
 ) -> Result<Vec<CollectionReanchor>> {
     let error = |error| db_error("failed to read collection games", error);
     let mut items = connection
         .prepare(
-            "SELECT DISTINCT archive_id, archive_created_at, absolute_path, size_bytes \
-             FROM game_collection_items",
+            // The latest time the saved game was added anywhere: an
+            // unreadable time reads as NULL and never moves.
+            "SELECT archive_id, archive_created_at, absolute_path, size_bytes, \
+                    MAX(CAST(strftime('%s', added_at) AS INTEGER)) \
+             FROM game_collection_items \
+             GROUP BY archive_id, archive_created_at, absolute_path, size_bytes",
         )
         .map_err(error)?;
     let rows = items
@@ -556,16 +594,34 @@ fn journalled_moves(
                 row.get::<_, String>(1)?,
                 row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         })
         .and_then(|rows| rows.collect::<std::result::Result<Vec<_>, _>>())
         .map_err(error)?;
     let mut moves = Vec::new();
-    for (id, created_at, path, size) in rows {
+    for (id, created_at, path, size, added_unix) in rows {
         let saved = PathBuf::from(std::ffi::OsString::from_vec(path.clone()));
-        let Some(end) = renames.get(&saved) else {
+        let Some(RenameEnd {
+            end,
+            recorded_unix,
+            size_bytes: recorded_size,
+        }) = renames.get(&saved)
+        else {
             continue;
         };
+        // Saved after the rename was recorded: the item names whatever came to
+        // the old path later, which the record says nothing about.
+        if !added_unix.is_some_and(|added| u64::try_from(added).is_ok_and(|a| a <= *recorded_unix))
+        {
+            continue;
+        }
+        let same_size = |known: Option<i64>| {
+            known.is_none_or(|bytes| u64::try_from(bytes).is_ok_and(|b| b == *recorded_size))
+        };
+        if !same_size(size) {
+            continue;
+        }
         // The item's own row, if it still exists, must agree that the file left.
         let own: Option<(Vec<u8>, Option<String>)> = connection
             .query_row(
@@ -594,7 +650,7 @@ fn journalled_moves(
         let [(target, target_size)] = targets.as_slice() else {
             continue;
         };
-        if matches!((size, target_size), (Some(a), Some(b)) if a != *b) || *target == id {
+        if !same_size(*target_size) || *target == id {
             continue;
         }
         moves.push(CollectionReanchor {
