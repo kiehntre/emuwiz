@@ -1030,3 +1030,93 @@ fn selecting_for_artwork_hides_the_star_and_never_changes_favourites() {
     assert!(app.collections.is_favourite(2));
     assert_eq!(app.collections.saved, saved_before, "Favourites unchanged");
 }
+
+/// Review finding (2026-11-15): every card holds a focusable star. A
+/// controller Up/Down from that star must step one grid row exactly as it does
+/// from the card, even far down a scrolled shelf, rather than escape it.
+#[test]
+fn controller_up_and_down_from_a_cards_star_step_one_grid_row() {
+    use super::super::big_picture::nav::{Control, Direction, PadEvent};
+    use super::super::browse_play::{focused_card_control_id, focused_card_id};
+    use eframe::egui::{Event, Key, Modifiers};
+
+    let titles: Vec<String> = (1..=90).map(|i| format!("Game {i:03}")).collect();
+    let context = eframe::egui::Context::default();
+    let mut app = super::super::tests::review_app(
+        &context,
+        titles
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i as i64 + 1, t.as_str(), "SNES"))
+            .collect(),
+    );
+    app.simple.enabled = true;
+    app.collections.saved = favourites(vec![]);
+    let library = app.library.clone();
+    app.collections.library_changed(&library);
+    app.router.current = super::super::routes::Route::BrowsePlay;
+    let frames = |app: &mut super::super::App, events: Vec<Event>| {
+        frame(&context, app, events);
+        frame(&context, app, vec![]);
+        frame(&context, app, vec![]);
+    };
+    let tab = || Event::Key {
+        key: Key::Tab,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    };
+    let focused = || context.memory(|m| m.focused());
+    let card_game = || context.data(|d| d.get_temp::<i64>(focused_card_id()));
+    let is_card = |id| context.read_response(id).expect("drawn").rect.height() > 50.0;
+    let pad = |app: &mut super::super::App, direction| {
+        let control = Control::Direction(direction);
+        let shell = app.pad_shell.as_mut().expect("shell exists after a frame");
+        shell.inject(PadEvent::Pressed { device: 1, control });
+        shell.inject(PadEvent::Released { device: 1, control });
+    };
+    frames(&mut app, vec![]);
+    // Tab to the first card (the star follows its card in Tab order).
+    for _ in 0..80 {
+        if focused().is_some_and(|id| card_game().is_some() && is_card(id)) {
+            break;
+        }
+        frames(&mut app, vec![tab()]);
+    }
+    assert_eq!(card_game(), Some(1), "Tab reached the first card");
+    app.pad_shell.as_mut().unwrap().set_pad_mode_for_test();
+    pad(&mut app, Direction::Down);
+    frames(&mut app, vec![]);
+    let columns = card_game().expect("a card below") - 1;
+    assert!(columns >= 1);
+    for _ in 0..5 {
+        pad(&mut app, Direction::Down); // scroll well down the shelf
+        frames(&mut app, vec![]);
+    }
+    let from = card_game().expect("still on a card");
+    assert_eq!(from, 1 + 6 * columns);
+    for (direction, expected) in [(Direction::Down, from + columns), (Direction::Up, from)] {
+        let start = card_game().unwrap();
+        frames(&mut app, vec![tab()]);
+        let star = focused().expect("the star has focus");
+        assert!(!is_card(star), "Tab moved to the card's star");
+        assert_eq!(
+            context.data(|d| d.get_temp::<eframe::egui::Id>(focused_card_control_id())),
+            Some(star),
+            "a focused star counts as its card"
+        );
+        assert_eq!(card_game(), Some(start));
+        pad(&mut app, direction);
+        frames(&mut app, vec![]);
+        assert_eq!(
+            card_game(),
+            Some(expected),
+            "{direction:?} from the star stepped one row"
+        );
+        assert!(
+            focused().is_some_and(is_card),
+            "and landed on the card itself"
+        );
+    }
+}

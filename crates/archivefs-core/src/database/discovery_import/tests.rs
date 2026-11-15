@@ -1870,3 +1870,53 @@ fn an_undone_games_id_is_never_given_out_while_a_membership_names_it() {
     let second = r.inserted.iter().map(|(_, id)| *id).max().unwrap();
     assert!(second > first, "id {first} was given out again");
 }
+
+#[test]
+fn a_saved_item_blue_shows_on_the_imported_row_by_its_path_blocks_undo() {
+    // Review finding 2026-11-15: a favourite whose own row was forgotten is
+    // shown on a re-imported row at the same source, path and size before any
+    // background re-save. Undo must refuse that row too, as Blue shows it
+    // starred.
+    let f = Fixture::new();
+    f.write("new.z80", 2);
+    let r = f.import();
+    let id = r.inserted[0].1;
+    let op = r.operation_id.as_deref().unwrap().to_string();
+    let favourites = f.db().favourites_collection_id().unwrap();
+    let saved = |size: &str| {
+        format!(
+            "INSERT INTO game_collection_items(collection_id,archive_id,archive_created_at,source_folder_id,relative_path,absolute_path,size_bytes,title,platform,added_at) SELECT {favourites},990000001,'a forgotten row',source_folder_id,relative_path,x'2f6f6c64',{size},'Old',NULL,'then' FROM archives WHERE id={id}"
+        )
+    };
+    for size in ["size_bytes", "NULL"] {
+        f.mutate(&saved(size));
+        let shown = f.db().load_game_collections().unwrap();
+        assert_eq!(
+            shown[0].items[0].resolved_archive_id,
+            Some(id),
+            "{size}: Blue shows the item on the imported row"
+        );
+        assert_eq!(touched(&f, id), 0, "{size}");
+        let p = f.preview(&op);
+        assert!(!p.can_undo(), "{size}");
+        assert!(
+            p.blockers.iter().any(|b| b.contains("Favourites")),
+            "{size}"
+        );
+        f.mutate("DELETE FROM game_collection_items");
+    }
+    // A different size is a different file: not shown there, not blocking.
+    f.mutate(&saved("size_bytes + 1"));
+    assert_eq!(
+        f.db().load_game_collections().unwrap()[0].items[0].resolved_archive_id,
+        None
+    );
+    let p = f.preview(&op);
+    assert!(p.can_undo(), "{:?}", p.blockers);
+    Database::undo_discovery_import(&p).unwrap();
+    assert_eq!(
+        gate_count(&f, "SELECT count(*) FROM game_collection_items"),
+        1,
+        "Undo never deletes a saved item"
+    );
+}

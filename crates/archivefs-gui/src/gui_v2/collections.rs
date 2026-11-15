@@ -559,11 +559,15 @@ fn scope_button(ui: &mut egui::Ui, text: String, selected: bool) -> bool {
 }
 
 impl App {
-    /// The star on a card, row or panel: one click, no dialog.
-    pub(super) fn favourite_star(&mut self, ui: &mut egui::Ui, game: i64, title: &str) {
-        let Some(view) = self.collections.favourites() else {
-            return;
-        };
+    /// The star on a card, row or panel: one click, no dialog. Returns its
+    /// response so a card can treat a focused star as focus on the card.
+    pub(super) fn favourite_star(
+        &mut self,
+        ui: &mut egui::Ui,
+        game: i64,
+        title: &str,
+    ) -> Option<egui::Response> {
+        let view = self.collections.favourites()?;
         let favourites = view.id;
         let on = view.members.contains_key(&game);
         let hint = if on {
@@ -574,14 +578,18 @@ impl App {
         let star = RichText::new(STAR)
             .size(18.0)
             .color(if on { STAR_ON } else { STAR_OFF });
-        if ui
-            .add(egui::Button::new(star).frame(false))
-            .on_hover_text(hint)
-            .clicked()
-        {
+        let response = ui.add(egui::Button::new(star).frame(false));
+        // Name it by what it does, not by its glyph.
+        let name = hint.clone();
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name.clone())
+        });
+        let response = response.on_hover_text(hint);
+        if response.clicked() {
             let library = self.library.clone();
             self.collections.toggle(favourites, game, &library);
         }
+        Some(response)
     }
 
     /// Star, plain words, and the collections menu, for one selected game.
@@ -869,8 +877,9 @@ impl App {
                     .resizable(false)
                     .show(context, |ui| {
                         ui.label(format!(
-                            "Delete {name}? Its list of {} games cannot be brought back. The games stay in your library and no files change.",
-                            thousands(count)
+                            "Delete {name}? Its list of {} {} cannot be brought back. The games stay in your library and no files change.",
+                            thousands(count),
+                            if count == 1 { "game" } else { "games" }
                         ));
                         ui.horizontal(|ui| {
                             if ui

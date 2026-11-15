@@ -49,11 +49,11 @@ back: it stays on the renamed row, which then shows as missing or under
 also ends a derived link, so its star goes off and the item waits in the same list
 until you remove it. Neither deletes the item.
 
-Discovery import Undo refuses a game whose saved item points at the imported
-row, and says so. Remove it there first, then Undo. An item that has not yet been
-saved against that row does not block Undo; it shows as no longer in the library
-afterwards. Forget and missing cleanup also remove the row and leave the item
-showing that way.
+Discovery import Undo refuses a game that Blue shows in Favourites or a
+collection, and says so: an item saved against the imported row, or one whose own
+row is gone and which matches the imported row by source, path and size. Remove
+it there first, then Undo. Undo never deletes an item. Forget and missing cleanup
+remove the row and leave the item showing as no longer in the library.
 
 ## Upgrade and compatibility
 

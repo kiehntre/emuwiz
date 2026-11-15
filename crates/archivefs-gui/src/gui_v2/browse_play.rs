@@ -1761,7 +1761,8 @@ impl App {
             if !self.batch_selecting {
                 let mut over_cover =
                     child.new_child(egui::UiBuilder::new().max_rect(grid_star_rect(rect)));
-                self.favourite_star(&mut over_cover, id, &game.title);
+                let star = self.favourite_star(&mut over_cover, id, &game.title);
+                self.note_focused_star(star, id);
             }
             Self::paint_selection_mark(ui, rect, in_set);
             let response = response
@@ -1785,6 +1786,14 @@ impl App {
                 self.browse_play_row_clicked(ui, id, list);
             }
         });
+    }
+
+    /// A focused star counts as focus on its card, so a controller Up/Down
+    /// from the star still steps one grid row instead of escaping the shelf.
+    fn note_focused_star(&mut self, star: Option<egui::Response>, game: i64) {
+        if let Some(star) = star.filter(egui::Response::has_focus) {
+            self.browse_play.focused_card = Some((star.id, game));
+        }
     }
 
     /// A card or list row was clicked (or activated from the keyboard). Ctrl
@@ -1863,7 +1872,8 @@ impl App {
             });
             // Centred in the row, so below the selection tick in its corner.
             if !self.batch_selecting {
-                self.favourite_star(&mut child, id, &game.title);
+                let star = self.favourite_star(&mut child, id, &game.title);
+                self.note_focused_star(star, id);
             }
             Self::paint_selection_mark(ui, rect, in_set);
             let response = response
@@ -2219,7 +2229,6 @@ const SORT_SHORT_LABEL: &str = "Sort";
 /// Side padding of the short sort box.
 const SORT_SHORT_PAD: f32 = 6.0;
 
-/// The sort control's closed text: says what it is, not just the order.
 /// Where a multi-selected card or row draws its tick: the top-right corner.
 fn selection_mark_rect(rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_center_size(
@@ -2238,6 +2247,7 @@ fn grid_star_rect(rect: egui::Rect) -> egui::Rect {
     )
 }
 
+/// The sort control's closed text: says what it is, not just the order.
 fn sort_button_text(sort: SortOrder) -> String {
     format!("Sort: {}", sort.label())
 }

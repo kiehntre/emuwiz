@@ -562,11 +562,22 @@ impl Database {
                     blockers.push(format!("{label}: {count} dependent {table} rows are protected; none will be deleted."));
                 }
             }
+            // An item counts if it is saved against this row, or if its own row
+            // is gone and Blue shows it on this row because the source, path
+            // and size match (the same rule as `load_game_collections`), so
+            // Undo never deletes a game the user sees starred.
             let collections: i64 = self
                 .connection
                 .query_row(
-                    "SELECT count(*) FROM game_collection_items i JOIN archives a \
-                     ON a.id=i.archive_id AND a.created_at=i.archive_created_at WHERE a.id=?1",
+                    "SELECT count(*) FROM game_collection_items i JOIN archives a ON a.id=?1 \
+                     WHERE (i.archive_id=a.id AND i.archive_created_at=a.created_at) \
+                        OR (NOT EXISTS (SELECT 1 FROM archives own \
+                                        WHERE own.id=i.archive_id \
+                                          AND own.created_at=i.archive_created_at) \
+                            AND i.source_folder_id=a.source_folder_id \
+                            AND i.relative_path=a.relative_path \
+                            AND (a.size_bytes IS NULL OR i.size_bytes IS NULL \
+                                 OR a.size_bytes=i.size_bytes))",
                     [item.archive_id],
                     |r| r.get(0),
                 )
