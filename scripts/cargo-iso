@@ -151,8 +151,12 @@
 # refused, exit 2). A worktree that is merely designated is built non-incremental under
 # --sccache, with a note. It never starts or stops a server you did not need;
 # it never deletes anything itself. The server is started (or reused) before the
-# build takes any lock, with no inherited lock descriptors, so a long-lived server
-# never holds a finished target's lifecycle lock or a build slot.
+# build takes any lock, with no inherited lock descriptors, so a server started this
+# way holds no lifecycle lock or build slot (--finish-task is not held up by it); if
+# this start fails, the build's first rustc starts the server as before, and that
+# server holds the target's lifecycle lock for as long as it lives. Retirement still
+# counts the target as in use while a server lives: its environment (and possibly its
+# working directory) names the target, as it always did.
 #
 # Exit codes of its own: 2 usage/not a git worktree, 3 refused target,
 # 4 not enough free disk, 5 reserved (an enforcing budget mode is not available: the
@@ -553,10 +557,12 @@ if [ "$use_sccache" = "1" ]; then
   # closed. Otherwise the first rustc of the build starts it inside the build, and
   # the long-lived server inherits the target's lifecycle lock (which the tracker
   # deliberately passes to cargo so a live build stays protected) and any build-slot
-  # lock: --finish-task and retirement of that target stay refused, and the slot
-  # stays taken, for as long as the server lives (it serves other worktrees' builds
-  # too). A server that is already running is reused unchanged. A failure here
-  # never blocks the build: the first rustc then starts the server as before.
+  # lock: --finish-task of that target stays refused for as long as the server
+  # lives (it serves other worktrees' builds too). Retirement still sees the target
+  # as in use through the server's environment; that hold is unchanged and errs
+  # towards keeping the target. A server that is already running is reused
+  # unchanged. A failure here never blocks the build: the first rustc then starts
+  # the server as before.
   (
     for fd_path in /proc/"$BASHPID"/fd/*; do
       fd=${fd_path##*/}
