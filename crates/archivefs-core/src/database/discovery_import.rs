@@ -14,7 +14,14 @@ use std::sync::OnceLock;
 // re-check notes). Neither has a foreign key or cascade. Both carry touch
 // triggers and are protected dependents in `check_import_undo`, so Undo is
 // refused for a game that has either and never deletes them.
-const REVIEWED_SCHEMA: i64 = 27;
+// Schema 28 reviewed: game_collection_items names archive ids with no foreign
+// key. A game kept in Favourites or a collection is a person's choice, so it
+// is a protected dependency in `check_import_undo` (matched on the archive id
+// and created_at, so another game's membership never counts) and Undo refuses
+// that record and never deletes the membership. The id allocator in
+// `upsert_archive` also never reuses an id a membership still names. No touch
+// trigger: the blocker is re-read under the Undo transaction itself.
+const REVIEWED_SCHEMA: i64 = 28;
 const MAX_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BATCH: usize = crate::ingestion::saved_discovery::MAX_SELECTED;
 
@@ -554,6 +561,29 @@ impl Database {
                 if count != 0 {
                     blockers.push(format!("{label}: {count} dependent {table} rows are protected; none will be deleted."));
                 }
+            }
+            // An item counts if it is saved against this row, or if its own row
+            // is gone and Blue proposes this row for it because the source,
+            // path and size match (the same rule as `load_game_collections`),
+            // so Undo never deletes a game the user may still confirm.
+            let collections: i64 = self
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM game_collection_items i JOIN archives a ON a.id=?1 \
+                     WHERE (i.archive_id=a.id AND i.archive_created_at=a.created_at) \
+                        OR (NOT EXISTS (SELECT 1 FROM archives own \
+                                        WHERE own.id=i.archive_id \
+                                          AND own.created_at=i.archive_created_at) \
+                            AND i.source_folder_id=a.source_folder_id \
+                            AND i.relative_path=a.relative_path \
+                            AND (a.size_bytes IS NULL OR i.size_bytes IS NULL \
+                                 OR a.size_bytes=i.size_bytes))",
+                    [item.archive_id],
+                    |r| r.get(0),
+                )
+                .map_err(string_error)?;
+            if collections != 0 {
+                blockers.push(format!("{label}: this game is in Favourites or a collection, or is proposed there for a saved game. Remove it there first; none will be deleted."));
             }
         }
         Ok(blockers)

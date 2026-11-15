@@ -88,6 +88,15 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   a re-check saved nothing). Existing rows are not changed. A library that
   another build took to a different "schema 27" is now refused instead of
   opened.
+- Favourites and collections in Browse & Play: a star on every game, user
+  collections you can create, rename and delete, and a scope above the shelf
+  (All games, Favourites, a collection) with its own sort. Library schema 28
+  adds two tables for them and changes no existing row; it needs the explicit
+  upgrade, and builds for schema 27 refuse an upgraded library. Loading the
+  library saves an item automatically only when EmuWiz's own finished rename
+  record proves where the game went; a saved game whose catalogue entry is
+  gone is otherwise only offered a possible match by folder, file name and
+  size, saved when you confirm it. See `docs/FAVOURITES_AND_COLLECTIONS.md`.
 - Database recovery: `emuwiz-cli database-recover-journal` handles a library
   that EmuWiz refuses to open after a write was cut off. It copies the
   database and its journal, lets SQLite recover the copy, checks it and

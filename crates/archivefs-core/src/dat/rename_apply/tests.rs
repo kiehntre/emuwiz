@@ -5017,3 +5017,132 @@ fn an_unproven_folder_can_be_abandoned_and_the_evidence_names_the_quarantine() {
     );
     assert!(tree_names(&m.hard).is_empty(), "nothing was touched");
 }
+
+/// PR #278 owner follow-up 2026-11-15: a real DAT rename and its Undo, both
+/// recorded by the executor in the sealed journal folder beside the library,
+/// carry a favourite and a collection entry to the renamed file and back, once
+/// each, across restarts; an unrelated favourite is never touched.
+#[test]
+fn a_real_rename_and_its_undo_carry_favourites_and_collections_with_the_game() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = write(&roms, "a.zip");
+    std::fs::write(roms.join("other.zip"), b"another game").unwrap();
+    let db_path = dir.path().join("library.sqlite3");
+    let journal = dir.path().join(RENAME_TRANSACTIONS_DIRECTORY);
+    std::fs::create_dir_all(&journal).unwrap();
+    let config = crate::Config {
+        source_folders: vec![roms.clone()],
+        mount_root: dir.path().join("mount"),
+        ratarmount_bin: "ratarmount".to_string(),
+        master_rom_root: None,
+        configured_source_roots: None,
+    };
+    let scan = |db: &mut crate::Database| {
+        crate::scan_and_persist(db, &config, "test").unwrap();
+    };
+    let at = |db: &crate::Database, name: &str| -> i64 {
+        db.load_archives()
+            .unwrap()
+            .iter()
+            .find(|a| a.absolute_path == roms.join(name) && a.last_verified_missing_at.is_none())
+            .unwrap()
+            .id
+    };
+    let members = |db: &crate::Database| -> Vec<Vec<i64>> {
+        db.load_game_collections()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                let mut ids: Vec<i64> = c
+                    .items
+                    .iter()
+                    .map(|i| i.resolved_archive_id.expect("every entry is its own row"))
+                    .collect();
+                ids.sort();
+                ids
+            })
+            .collect()
+    };
+    let mut db = crate::Database::open_or_create(&db_path).unwrap();
+    scan(&mut db);
+    let (game, other) = (at(&db, "a.zip"), at(&db, "other.zip"));
+    let favourites = db.favourites_collection_id().unwrap();
+    let shelf = db.create_game_collection("Shelf").unwrap();
+    db.add_game_to_collection(favourites, game).unwrap();
+    db.add_game_to_collection(favourites, other).unwrap();
+    db.add_game_to_collection(shelf, game).unwrap();
+
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.zip",
+            "b.zip",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
+    let cancel = no_cancel();
+    let outcome = apply(
+        &plan,
+        approved_of(&[&source]),
+        TrustedRoots::from_paths([&roms]),
+        &journal,
+        HardConflictMode::AbortAll,
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(outcome.transaction.state, TransactionState::Applied);
+    let mut tx = outcome.transaction;
+    scan(&mut db);
+    let renamed = at(&db, "b.zip");
+    assert_ne!(renamed, game, "the rename produced a new catalogue row");
+    let moved = db.save_journalled_collection_moves(&journal).unwrap();
+    assert_eq!(
+        moved,
+        crate::JournalledMoves {
+            moved: 1,
+            paused: None
+        },
+        "one saved game, in both collections"
+    );
+    drop(db);
+    let mut db = crate::Database::open_or_create(&db_path).unwrap();
+    let mut both = vec![renamed, other];
+    both.sort();
+    assert_eq!(
+        members(&db),
+        vec![both, vec![renamed]],
+        "kept after a restart"
+    );
+    assert_eq!(
+        db.save_journalled_collection_moves(&journal).unwrap().moved,
+        0,
+        "saved once only"
+    );
+
+    let undone = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    assert_eq!(undone.result, RollbackResult::FullyRolledBack);
+    scan(&mut db);
+    let back = at(&db, "a.zip");
+    let moved = db.save_journalled_collection_moves(&journal).unwrap();
+    assert_eq!(
+        moved,
+        crate::JournalledMoves {
+            moved: 1,
+            paused: None
+        },
+        "one saved game, in both collections"
+    );
+    drop(db);
+    let mut db = crate::Database::open_or_create(&db_path).unwrap();
+    let mut both = vec![back, other];
+    both.sort();
+    assert_eq!(members(&db), vec![both, vec![back]], "followed the Undo");
+    assert_eq!(
+        db.save_journalled_collection_moves(&journal).unwrap().moved,
+        0
+    );
+}

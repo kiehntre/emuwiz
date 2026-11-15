@@ -94,7 +94,7 @@ fn a_fresh_library_has_the_new_tables_and_they_are_empty() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("library.sqlite3");
     let db = Database::open_or_create(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 27);
+    assert_eq!(db.schema_version().unwrap(), 28);
     assert_eq!(db.replaced_dat_evidence_count().unwrap(), 0);
     assert!(db.dat_recheck_attempts().unwrap().is_empty());
     drop(db);
@@ -111,18 +111,28 @@ fn upgrading_26_to_27_changes_no_existing_row_and_verifies_nothing() {
     make_schema_26(&path, 25);
     let before = contents(&path);
     let report = super::upgrade_library_database(&path).unwrap();
-    assert_eq!((report.from_version, report.to_version), (26, 27));
-    assert_eq!(report.applied_versions, vec![27]);
+    // A schema-26 library takes 27 and then 28 (Favourites) in one upgrade.
+    assert_eq!((report.from_version, report.to_version), (26, 28));
+    assert_eq!(report.applied_versions, vec![27, 28]);
     assert_eq!(integrity(&path), "ok");
     let after = contents(&path);
     for (table, rows) in &before {
         if table == "schema_migrations" {
-            assert_eq!(after[table].len(), rows.len() + 1);
+            assert_eq!(after[table].len(), rows.len() + 2);
             continue;
         }
         assert_eq!(&after[table], rows, "{table} changed");
     }
-    let added: Vec<_> = after.keys().filter(|t| !before.contains_key(*t)).collect();
+    let added: Vec<_> = after
+        .keys()
+        // Schema 28's tables (and SQLite's AUTOINCREMENT counter) are not
+        // migration 27's.
+        .filter(|t| {
+            !before.contains_key(*t)
+                && !t.starts_with("game_collection")
+                && t.as_str() != "sqlite_sequence"
+        })
+        .collect();
     assert_eq!(added, NEW_TABLES);
     for table in NEW_TABLES {
         assert!(after[table].is_empty(), "{table} must start empty");
@@ -190,13 +200,16 @@ fn a_library_taken_to_27_by_another_build_line_is_refused_and_untouched() {
         } else {
             "no record of schema 27"
         };
-        for error in [
-            Database::open_or_create(&path).err().unwrap().to_string(),
-            Database::open_read_only(&path).err().unwrap().to_string(),
-        ] {
-            assert!(error.contains(expected), "{error}");
-            assert!(error.contains("Nothing was changed"), "{error}");
-        }
+        let error = Database::open_or_create(&path).err().unwrap().to_string();
+        assert!(error.contains(expected), "{error}");
+        assert!(error.contains("Nothing was changed"), "{error}");
+        // Since schema 28 a "27" is simply older than this build, so the
+        // read-only open refuses it before looking at its history.
+        let error = Database::open_read_only(&path).err().unwrap().to_string();
+        assert!(
+            error.contains(expected) || error.contains("is not the required current version 28"),
+            "{error}"
+        );
         // Nor can a later build migrate past the foreign step.
         let later = [
             Migration {
@@ -225,10 +238,16 @@ fn a_library_taken_to_27_by_another_build_line_is_refused_and_untouched() {
 /// here would make every library already at that schema refuse to open.
 #[test]
 fn shipped_migration_descriptions_from_27_on_are_pinned() {
-    let shipped = [(
-        27,
-        "keep replaced DAT evidence and unfinished re-check reasons",
-    )];
+    let shipped = [
+        (
+            27,
+            "keep replaced DAT evidence and unfinished re-check reasons",
+        ),
+        (
+            28,
+            "game collections: Favourites and user-created collections",
+        ),
+    ];
     for (version, description) in shipped {
         let migration = MIGRATIONS
             .iter()
@@ -303,7 +322,7 @@ fn killing_the_upgrade_at_any_moment_leaves_schema_26_or_a_whole_schema_27() {
                         .and_then(|c| {
                             c.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                         });
-                if seen == Ok(27) {
+                if seen == Ok(28) {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_micros(100));
@@ -344,11 +363,22 @@ fn killing_the_upgrade_at_any_moment_leaves_schema_26_or_a_whole_schema_27() {
                 );
                 // The interrupted upgrade can simply be run again.
                 let report = super::upgrade_library_database(&path).unwrap();
-                assert_eq!((report.from_version, report.to_version), (26, 27));
+                assert_eq!((report.from_version, report.to_version), (26, 28));
             }
+            // Each migration commits on its own: a kill between 27 and 28
+            // leaves a whole schema 27, and running the upgrade again ends it.
             27 => {
                 at_27 += 1;
-                Database::open_or_create(&path).expect("a whole schema 27 opens");
+                assert!(
+                    Database::open_or_create(&path).is_err(),
+                    "27 is not current"
+                );
+                let report = super::upgrade_library_database(&path).unwrap();
+                assert_eq!((report.from_version, report.to_version), (27, 28));
+            }
+            28 => {
+                at_27 += 1;
+                Database::open_or_create(&path).expect("a whole schema 28 opens");
             }
             other => panic!("schema {other} after a killed upgrade"),
         }
@@ -361,10 +391,10 @@ fn killing_the_upgrade_at_any_moment_leaves_schema_26_or_a_whole_schema_27() {
         for table in NEW_TABLES {
             assert!(done[table].is_empty());
         }
-        assert_eq!(version(&path), 27);
+        assert_eq!(version(&path), 28);
     }
     eprintln!(
-        "upgrade kill test: {at_26} left schema 26, {at_27} reached 27, {journals} rollback journals"
+        "upgrade kill test: {at_26} left schema 26, {at_27} reached 27 or 28, {journals} rollback journals"
     );
     assert!(at_26 > 0, "no kill landed before the migration committed");
     assert!(at_27 > 0, "no kill landed after the migration committed");

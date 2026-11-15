@@ -131,7 +131,10 @@ type FilterKey = (
     (ReadinessFilter, bool),
     (bool, SortOrder),
     usize,
+    CollectionKey,
 );
+/// Which collection is listed, its version, and its order.
+type CollectionKey = Option<(i64, u64, super::collections::CollectionSort)>;
 /// Base list address, cache version, view, and the narrowed list.
 type ReadinessView = (usize, u64, ReadinessFilter, Arc<Vec<usize>>);
 
@@ -462,6 +465,7 @@ impl App {
         let page_width = ui.available_width() - theme::SPACE_MD;
 
         let sort_in_toolbar = self.browse_play_toolbar(ui);
+        self.browse_play_scope_bar(ui);
         self.batch_selection
             .retain(|id| library.by_id.contains_key(&id));
         self.browse_play_batch_controls(ui, &library);
@@ -517,6 +521,7 @@ impl App {
             self.browse_play_games(ui, &library, &indices, selected_id);
         }
         self.browse_play_batch_window(ui.ctx());
+        self.collection_dialogs(ui.ctx());
         self.surprise_me_window(ui.ctx());
     }
 
@@ -633,9 +638,19 @@ impl App {
             (self.filter.readiness, self.filter.cache_aware),
             (self.filter.unverified_only, self.filter.sort),
             Arc::as_ptr(&self.library) as usize,
+            self.collections
+                .scoped()
+                .map(|view| (view.id, self.collections.version(), self.collections.sort)),
         );
+        let scoped = key.5.is_some();
         if self.browse_play.key.as_ref() != Some(&key) {
-            self.browse_play.reset_scroll = true;
+            // Starring inside a collection keeps the place in the list.
+            let only_members_changed = self.browse_play.key.as_ref().is_some_and(|old| {
+                (&old.0, &old.1, old.2, old.3, old.4) == (&key.0, &key.1, key.2, key.3, key.4)
+                    && old.5.map(|(id, _, sort)| (id, sort))
+                        == key.5.map(|(id, _, sort)| (id, sort))
+            });
+            self.browse_play.reset_scroll |= !only_members_changed;
             if self
                 .browse_play
                 .key
@@ -648,7 +663,18 @@ impl App {
             }
             self.browse_play.key = Some(key);
             self.browse_play.library_token = Arc::downgrade(&self.library);
-            if self.library.games.len() <= IMMEDIATE_FILTER_LIMIT {
+            if let Some(view) = self.collections.scoped() {
+                self.browse_play.indices = Arc::new(super::collections::scoped_indices(
+                    &self.library,
+                    view,
+                    &self.filter,
+                    self.collections.sort,
+                ));
+                // Classic shares the filter and reads the worker's list.
+                if !only_members_changed && self.library.games.len() > IMMEDIATE_FILTER_LIMIT {
+                    self.change_filter();
+                }
+            } else if self.library.games.len() <= IMMEDIATE_FILTER_LIMIT {
                 self.browse_play.indices = Arc::new(self.library.filter(&self.filter));
             } else {
                 self.browse_play.indices = Arc::default();
@@ -656,7 +682,8 @@ impl App {
                 self.change_filter();
             }
         }
-        if self.library.games.len() > IMMEDIATE_FILTER_LIMIT
+        if !scoped
+            && self.library.games.len() > IMMEDIATE_FILTER_LIMIT
             && self.filter_dirty.is_none()
             && !self.filter_inflight
             && self.browse_play.applied_generation != Some(self.filter_generation)
@@ -932,6 +959,10 @@ impl App {
     /// does not fit on what is left of the row, a short "Sort" box takes its
     /// place and names the current order on hover.
     fn browse_play_sort_control(&mut self, ui: &mut egui::Ui) {
+        // Inside a collection its own order (scope bar) applies instead.
+        if self.collections.scoped().is_some() {
+            return;
+        }
         let full = sort_button_text(self.filter.sort);
         // A combo box asks the row only for the space left on it, so the
         // wrapping row never moves it down and its label runs off the edge.
@@ -992,6 +1023,9 @@ impl App {
         let Some(noun) = sort.missing_noun() else {
             return;
         };
+        if self.collections.scoped().is_some() {
+            return;
+        }
         let key = (Arc::as_ptr(indices) as usize, indices.len(), sort);
         let missing = match self.browse_play.sort_note {
             Some((k0, k1, k2, count)) if (k0, k1, k2) == key => count,
@@ -1094,12 +1128,18 @@ impl App {
         library: &super::library::Library,
         with_sort: bool,
     ) {
-        let mut ordered: Vec<(String, usize)> = library
-            .platforms
-            .iter()
-            .map(|(name, count)| (name.clone(), *count))
-            .collect();
-        ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let ordered: Vec<(String, usize)> = match self.collections.scoped() {
+            Some(view) => view.platforms.clone(),
+            None => {
+                let mut ordered: Vec<(String, usize)> = library
+                    .platforms
+                    .iter()
+                    .map(|(name, count)| (name.clone(), *count))
+                    .collect();
+                ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ordered
+            }
+        };
         let total: usize = ordered.iter().map(|(_, count)| count).sum();
         let mut chosen: Option<String> = None;
 
@@ -1275,7 +1315,8 @@ impl App {
         indices: &Arc<Vec<usize>>,
         selected_id: Option<i64>,
     ) {
-        if library.games.len() > IMMEDIATE_FILTER_LIMIT
+        if self.collections.scoped().is_none()
+            && library.games.len() > IMMEDIATE_FILTER_LIMIT
             && (self.filter_dirty.is_some() || self.filter_inflight)
         {
             ui.spinner();
@@ -1283,6 +1324,9 @@ impl App {
             return;
         }
         self.browse_play_summary(ui, indices.len());
+        if indices.is_empty() && self.collection_empty(ui) {
+            return;
+        }
         if indices.is_empty() {
             self.browse_play_empty(ui, library.games.is_empty());
             return;
@@ -1559,7 +1603,7 @@ impl App {
     /// content so the cover cannot hide it.
     fn paint_selection_mark(ui: &egui::Ui, rect: egui::Rect, in_set: bool) {
         if in_set {
-            let centre = egui::pos2(rect.right() - 14.0, rect.top() + 14.0);
+            let centre = selection_mark_rect(rect).center();
             let painter = ui.painter();
             painter.circle_filled(centre, 9.0, theme::primary_action_fill(ui));
             let stroke = egui::Stroke::new(2.0_f32, egui::Color32::WHITE);
@@ -1616,6 +1660,26 @@ impl App {
             if let Some(Picture::Unavailable { issue, .. }) = self.artwork.pictures.get(&key) {
                 *note = Some(issue.plain_message().to_string());
             }
+        }
+    }
+
+    /// Title and system, and which copy this is when another shares the title:
+    /// favourites belong to one copy, not to a title.
+    fn game_hover(&self, game: &Game) -> String {
+        let copy = self
+            .library
+            .has_title_twin(game.archive.id)
+            .then(|| {
+                super::pages::disambiguating_hint(
+                    &game.title,
+                    &game.archive.relative_path,
+                    &game.archive.absolute_path,
+                )
+            })
+            .flatten();
+        match copy {
+            Some(copy) => format!("{}\n{}\n{copy}", game.title, game.platform),
+            None => format!("{}\n{}", game.title, game.platform),
         }
     }
 
@@ -1692,10 +1756,18 @@ impl App {
                 .wrap()
                 .selectable(false),
             );
+            // The star stays usable while games are multi-selected; it sits
+            // beside the selection tick, never under it.
+            if !self.batch_selecting {
+                let mut over_cover =
+                    child.new_child(egui::UiBuilder::new().max_rect(grid_star_rect(rect)));
+                let star = self.favourite_star(&mut over_cover, id, &game.title);
+                self.note_focused_star(star, id);
+            }
             Self::paint_selection_mark(ui, rect, in_set);
             let response = response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(format!("{}\n{}", game.title, game.platform));
+                .on_hover_text(self.game_hover(game));
             if self.batch_selecting {
                 let mark = if self.batch_selection.contains(id) {
                     "☑"
@@ -1714,6 +1786,14 @@ impl App {
                 self.browse_play_row_clicked(ui, id, list);
             }
         });
+    }
+
+    /// A focused star counts as focus on its card, so a controller Up/Down
+    /// from the star still steps one grid row instead of escaping the shelf.
+    fn note_focused_star(&mut self, star: Option<egui::Response>, game: i64) {
+        if let Some(star) = star.filter(egui::Response::has_focus) {
+            self.browse_play.focused_card = Some((star.id, game));
+        }
     }
 
     /// A card or list row was clicked (or activated from the keyboard). Ctrl
@@ -1766,7 +1846,7 @@ impl App {
             );
             self.picture_tile(&mut child, game, Kind::Cover, LIST_COVER_SIZE);
             self.note_cover_problem(game, note);
-            let text_width = (inner.width() - LIST_COVER_SIZE.x - 12.0).max(80.0);
+            let text_width = (inner.width() - LIST_COVER_SIZE.x - 44.0).max(80.0);
             child.vertical(|ui| {
                 ui.set_width(text_width);
                 ui.add(
@@ -1790,8 +1870,15 @@ impl App {
                     .selectable(false),
                 );
             });
+            // Centred in the row, so below the selection tick in its corner.
+            if !self.batch_selecting {
+                let star = self.favourite_star(&mut child, id, &game.title);
+                self.note_focused_star(star, id);
+            }
             Self::paint_selection_mark(ui, rect, in_set);
-            let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+            let response = response
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(self.game_hover(game));
             if self.batch_selecting {
                 let mark = if self.batch_selection.contains(id) {
                     "☑"
@@ -1868,6 +1955,7 @@ impl App {
                                             .wrap()
                                             .selectable(false),
                                         );
+                                        this.game_collection_actions(ui, id, &game.title);
                                     },
                                 );
                                 ui.allocate_ui_with_layout(
@@ -1919,6 +2007,7 @@ impl App {
                                     };
                                     ui.label(format!("DAT: {}", game.dat_identity_summary()));
                                 }
+                                this.game_collection_actions(ui, id, &game.title);
                                 if tight {
                                     // The detail scroll bar takes 12 points.
                                     let scrollbar = if compact { 0.0 } else { 12.0 };
@@ -2140,6 +2229,24 @@ const SORT_SHORT_LABEL: &str = "Sort";
 /// Side padding of the short sort box.
 const SORT_SHORT_PAD: f32 = 6.0;
 
+/// Where a multi-selected card or row draws its tick: the top-right corner.
+fn selection_mark_rect(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 14.0, rect.top() + 14.0),
+        egui::vec2(18.0, 18.0),
+    )
+}
+
+/// A grid card's favourite star: over the cover, just left of the selection
+/// tick, so both stay visible and the star never moves when a game is selected.
+fn grid_star_rect(rect: egui::Rect) -> egui::Rect {
+    let mark = selection_mark_rect(rect);
+    egui::Rect::from_min_size(
+        egui::pos2(mark.left() - 1.0 - 28.0, rect.top() + CARD_PAD),
+        egui::vec2(28.0, 28.0),
+    )
+}
+
 /// The sort control's closed text: says what it is, not just the order.
 fn sort_button_text(sort: SortOrder) -> String {
     format!("Sort: {}", sort.label())
@@ -2288,5 +2395,44 @@ mod play_wording_tests {
             assert!(!lower.contains("until you confirm"), "{text}");
             assert!(!lower.contains("readiness check first"), "{text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod favourite_star_placement_tests {
+    use eframe::egui;
+
+    use super::{
+        CARD_HEIGHT, CARD_PAD, COVER_HEIGHT, LIST_ROW_HEIGHT, grid_star_rect, selection_mark_rect,
+    };
+
+    /// Multi-selection draws a tick; the favourite star stays visible and
+    /// clickable beside it, on the cover, at every card width Blue uses.
+    #[test]
+    fn the_grid_star_never_sits_under_the_selection_tick() {
+        for width in [150.0_f32, 170.0, 200.0, 260.0] {
+            let card =
+                egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(width, CARD_HEIGHT));
+            let star = grid_star_rect(card);
+            let mark = selection_mark_rect(card);
+            assert!(!star.intersects(mark), "{width}: {star:?} {mark:?}");
+            let cover = egui::Rect::from_min_size(
+                card.min + egui::vec2(CARD_PAD, CARD_PAD),
+                egui::vec2(width - 2.0 * CARD_PAD, COVER_HEIGHT),
+            );
+            assert!(cover.contains_rect(star), "{width}: star leaves the cover");
+            assert!(card.contains_rect(mark));
+        }
+    }
+
+    /// A list row centres its star vertically; the tick sits in the top corner,
+    /// so even a 28-point star stays clear of it.
+    #[test]
+    fn the_list_star_is_centred_below_the_selection_tick() {
+        let row =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, LIST_ROW_HEIGHT));
+        let mark = selection_mark_rect(row);
+        let star_top = row.center().y - 14.0;
+        assert!(star_top > mark.bottom(), "{star_top} vs {}", mark.bottom());
     }
 }

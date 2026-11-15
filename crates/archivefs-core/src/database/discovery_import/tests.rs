@@ -713,8 +713,8 @@ fn gate_topology_report(path: &Path) -> crate::media_set::TopologyReport {
 #[test]
 fn gate_schema_27_untouched_import_undoes_and_leaves_the_new_tables_empty() {
     let f = Fixture::new();
-    assert_eq!(f.db().schema_version().unwrap(), 27);
-    assert_eq!(REVIEWED_SCHEMA, 27);
+    assert_eq!(f.db().schema_version().unwrap(), 28);
+    assert_eq!(REVIEWED_SCHEMA, 28);
     f.write("new.z80", 2);
     let r = f.import();
     let id = r.inserted[0].1;
@@ -1272,7 +1272,7 @@ fn gate_migration_26_to_27_keeps_discovery_records_and_protections_and_matches_f
     let before = dump(&c);
     assert_eq!(before.len(), 4);
     apply_migrations(&mut c, MIGRATIONS).unwrap();
-    assert_eq!(schema_version(&c).unwrap(), 27);
+    assert_eq!(schema_version(&c).unwrap(), 28);
     assert_eq!(dump(&c), before, "the upgrade changed Discovery evidence");
 
     // Identical to a fresh schema 27 for the gate: digest and history.
@@ -1355,16 +1355,16 @@ fn gate_an_import_made_before_schema_27_undoes_after_the_upgrade_unless_it_was_m
         let receipts = "SELECT quote(operation_id)||quote(state)||quote(created_at)||quote(undone_at)||quote(receipt_json) FROM discovery_import_operations ORDER BY 1";
         let before = (gate_rows(&f, records), gate_rows(&f, receipts));
         // Take the library back to exactly what a schema-26 build leaves: the
-        // real receipt and ownership rows, none of schema 27's objects.
+        // real receipt and ownership rows, none of schema 27's or 28's objects.
         f.mutate(
-            "DROP TABLE library_dat_identity_history; DROP TABLE dat_recheck_attempts; DELETE FROM schema_migrations WHERE version=27; PRAGMA user_version=26;",
+            "DROP TABLE game_collection_items; DROP TABLE game_collections; DELETE FROM sqlite_sequence WHERE name='game_collections'; DELETE FROM schema_migrations WHERE version=28; DROP TABLE library_dat_identity_history; DROP TABLE dat_recheck_attempts; DELETE FROM schema_migrations WHERE version=27; PRAGMA user_version=26;",
         );
         assert!(
             Database::open_read_only(&f.db).is_err(),
             "a schema-26 library must not be read as current"
         );
         let report = crate::upgrade_library_database(&f.db).unwrap();
-        assert_eq!((report.from_version, report.to_version), (26, 27));
+        assert_eq!((report.from_version, report.to_version), (26, 28));
         assert_eq!((gate_rows(&f, records), gate_rows(&f, receipts)), before);
         let c = Connection::open(&f.db).unwrap();
         require_reviewed_schema(&c).unwrap();
@@ -1438,6 +1438,27 @@ fn gate_every_table_naming_an_archive_id_is_on_the_reviewed_list_with_touch_trig
         if table == "discovery_import_records" {
             continue;
         }
+        if table == "game_collection_items" {
+            // Reviewed for schema 28 (#278): deliberately NO touch trigger. A
+            // membership is the person's own choice, not evidence: adding one
+            // blocks Undo only while it lasts (re-read by `check_import_undo`
+            // inside Undo's BEGIN IMMEDIATE), and removing it lets Undo run
+            // again. A touch trigger would seal the import for good. Items
+            // match on id AND created_at, and the id allocator never reuses an
+            // id an item names, so no other game inherits one.
+            let triggers: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND tbl_name='game_collection_items'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                triggers, 0,
+                "a trigger on game_collection_items needs review"
+            );
+            continue;
+        }
         for event in ["INSERT", "UPDATE", "DELETE"] {
             let count: i64 = c
                 .query_row(
@@ -1459,6 +1480,7 @@ fn gate_every_table_naming_an_archive_id_is_on_the_reviewed_list_with_touch_trig
             "dat_recheck_attempts",
             "dat_set_audit_results",
             "discovery_import_records",
+            "game_collection_items",
             "library_dat_identities",
             "library_dat_identity_history",
             "platform_assignments",
@@ -1474,17 +1496,20 @@ fn gate_every_table_naming_an_archive_id_is_on_the_reviewed_list_with_touch_trig
         [
             "dat_recheck_attempts",
             "discovery_import_records",
+            "game_collection_items",
             "library_dat_identity_history",
         ]
     );
 }
 
 #[test]
-fn gate_the_collections_tables_of_pr_278_are_refused_until_reviewed() {
-    // The shape open PR #278 adds: an archive_id with no foreign key and no
-    // touch trigger. Present without a reviewed schema, import and Undo stop.
+fn gate_unreviewed_changes_including_to_the_collections_tables_are_refused() {
+    // Schema 28 (#278) made the collections tables part of the reviewed
+    // schema. Any change to them, or to schema 27's objects, that this build
+    // did not make stops import and Undo.
     for sql in [
-        "CREATE TABLE game_collections (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, name TEXT NOT NULL, name_key TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE game_collection_items (collection_id INTEGER NOT NULL REFERENCES game_collections(id) ON DELETE CASCADE, archive_id INTEGER NOT NULL, archive_created_at TEXT NOT NULL, source_folder_id INTEGER NOT NULL, relative_path BLOB NOT NULL, absolute_path BLOB NOT NULL, size_bytes INTEGER, title TEXT NOT NULL, platform TEXT, added_at TEXT NOT NULL, PRIMARY KEY (collection_id, archive_id, archive_created_at));",
+        "CREATE TRIGGER gate_extra_collection_trigger AFTER INSERT ON game_collection_items BEGIN SELECT 1; END;",
+        "CREATE INDEX gate_extra_collection_index ON game_collection_items(title)",
         "CREATE INDEX gate_extra_index ON library_dat_identity_history(archive_path)",
         "DROP TRIGGER discovery_touch_dat_recheck_attempts_insert",
         "DROP TRIGGER discovery_touch_library_dat_identity_history_update",
@@ -1639,5 +1664,259 @@ fn fix_f1_a_game_removed_by_undo_keeps_its_id_reserved_for_good() {
     assert!(
         second > first,
         "an undone import's id {first} was given out again"
+    );
+}
+
+// ---- Favourites and collections (schema 28) ----
+
+#[test]
+fn a_game_kept_in_favourites_blocks_undo_until_it_is_removed_there() {
+    let f = Fixture::new();
+    f.write("new.z80", 2);
+    let r = f.import();
+    let operation = r.operation_id.as_deref().unwrap().to_string();
+    let id = r.inserted[0].1;
+    let favourites = f.db().favourites_collection_id().unwrap();
+    Database::open_existing(&f.db)
+        .unwrap()
+        .add_game_to_collection(favourites, id)
+        .unwrap();
+
+    let p = f.preview(&operation);
+    assert!(!p.can_undo());
+    assert!(p.blockers.iter().any(|b| b.contains("Favourites")));
+
+    Database::open_existing(&f.db)
+        .unwrap()
+        .remove_current_game_from_collection(favourites, id)
+        .unwrap();
+    assert!(f.preview(&operation).can_undo());
+}
+
+#[test]
+fn favouriting_after_the_preview_stops_the_confirmed_undo() {
+    let f = Fixture::new();
+    f.write("new.z80", 2);
+    let r = f.import();
+    let id = r.inserted[0].1;
+    let p = f.preview(r.operation_id.as_deref().unwrap());
+    assert!(p.can_undo(), "{:?}", p.blockers);
+    let favourites = f.db().favourites_collection_id().unwrap();
+    Database::open_existing(&f.db)
+        .unwrap()
+        .add_game_to_collection(favourites, id)
+        .unwrap();
+    assert!(Database::undo_discovery_import(&p).is_err());
+    assert!(f.db().load_archives().unwrap().iter().any(|a| a.id == id));
+}
+
+// ---- schema 28 exception: membership blocks only while it lasts -----------
+//
+// Owner requirement 2026-11-15: removing a favourite must never reopen Undo
+// when any other per-game state changed; membership, deleted games, id reuse
+// and import history stay protected; the permanent seal of every other table
+// is unchanged.
+
+fn favourite(f: &Fixture, id: i64) -> i64 {
+    let favourites = f.db().favourites_collection_id().unwrap();
+    Database::open_existing(&f.db)
+        .unwrap()
+        .add_game_to_collection(favourites, id)
+        .unwrap();
+    favourites
+}
+
+fn unfavourite(f: &Fixture, collection: i64, id: i64) {
+    Database::open_existing(&f.db)
+        .unwrap()
+        .remove_current_game_from_collection(collection, id)
+        .unwrap();
+}
+
+fn touched(f: &Fixture, id: i64) -> i64 {
+    gate_count(
+        f,
+        &format!("SELECT touched FROM discovery_import_records WHERE archive_id={id}"),
+    )
+}
+
+#[test]
+fn favouriting_alone_never_seals_the_import() {
+    let f = Fixture::new();
+    f.write("new.z80", 2);
+    let r = f.import();
+    let id = r.inserted[0].1;
+    let op = r.operation_id.as_deref().unwrap().to_string();
+    let favourites = favourite(&f, id);
+    assert_eq!(touched(&f, id), 0, "membership is not a change to the game");
+    assert!(!f.preview(&op).can_undo());
+    unfavourite(&f, favourites, id);
+    assert_eq!(touched(&f, id), 0);
+    let p = f.preview(&op);
+    assert!(p.can_undo(), "{:?}", p.blockers);
+    Database::undo_discovery_import(&p).unwrap();
+    assert_eq!(f.db().load_archives().unwrap().len(), 1);
+}
+
+#[test]
+fn removing_the_favourite_never_reopens_undo_after_any_other_change() {
+    for change in ["dat_history", "recheck_note", "row_edit"] {
+        let f = Fixture::new();
+        f.write("new.z80", 2);
+        let r = f.import();
+        let id = r.inserted[0].1;
+        let op = r.operation_id.as_deref().unwrap().to_string();
+        let favourites = favourite(&f, id);
+        match change {
+            "dat_history" => f.mutate(&gate_history_sql(id)),
+            "recheck_note" => f.mutate(&gate_note_sql(id)),
+            "row_edit" => f.mutate(&format!(
+                "UPDATE archives SET display_name='edited' WHERE id={id}"
+            )),
+            _ => unreachable!(),
+        }
+        unfavourite(&f, favourites, id);
+        assert_eq!(touched(&f, id), 1, "{change}: the other change still seals");
+        let fresh = f.preview(&op);
+        assert!(!fresh.can_undo(), "{change}");
+        assert!(Database::undo_discovery_import(&fresh).is_err(), "{change}");
+        assert_eq!(f.db().load_archives().unwrap().len(), 2, "{change}");
+    }
+}
+
+#[test]
+fn a_refused_undo_keeps_membership_receipt_and_records_exactly() {
+    let f = Fixture::new();
+    f.write("new.z80", 2);
+    f.write("other.z80", 3);
+    let r = f.import();
+    let id = r.inserted[0].1;
+    let op = r.operation_id.as_deref().unwrap().to_string();
+    let p = f.preview(&op);
+    assert!(p.can_undo(), "{:?}", p.blockers);
+    let user = Database::open_existing(&f.db)
+        .unwrap()
+        .create_game_collection("Mine")
+        .unwrap();
+    Database::open_existing(&f.db)
+        .unwrap()
+        .add_game_to_collection(user, id)
+        .unwrap();
+    let items = "SELECT quote(collection_id)||quote(archive_id)||quote(archive_created_at)||quote(relative_path)||quote(title)||quote(added_at) FROM game_collection_items ORDER BY 1";
+    let records = "SELECT quote(operation_id)||quote(archive_id)||quote(snapshot_json)||quote(touched) FROM discovery_import_records ORDER BY 1";
+    let receipts = "SELECT quote(operation_id)||quote(state)||quote(undone_at)||quote(receipt_json) FROM discovery_import_operations ORDER BY 1";
+    let before = (
+        gate_rows(&f, items),
+        gate_rows(&f, records),
+        gate_rows(&f, receipts),
+    );
+    // A user collection blocks like Favourites; the sealed preview and a
+    // fresh one are both refused, and nothing changes.
+    let error = Database::undo_discovery_import(&p).unwrap_err();
+    assert!(error.contains("Entire batch refused"), "{error}");
+    let fresh = f.preview(&op);
+    assert!(fresh.blockers.iter().any(|b| b.contains("collection")));
+    assert!(Database::undo_discovery_import(&fresh).is_err());
+    assert_eq!(
+        (
+            gate_rows(&f, items),
+            gate_rows(&f, records),
+            gate_rows(&f, receipts),
+        ),
+        before
+    );
+    assert_eq!(f.db().load_archives().unwrap().len(), 3);
+}
+
+#[test]
+fn another_games_membership_on_the_same_id_does_not_count() {
+    let f = Fixture::new();
+    f.write("new.z80", 2);
+    let r = f.import();
+    let id = r.inserted[0].1;
+    let op = r.operation_id.as_deref().unwrap().to_string();
+    // A saved item for an earlier game that held this id (other created_at).
+    let favourites = f.db().favourites_collection_id().unwrap();
+    f.mutate(&format!(
+        "INSERT INTO game_collection_items(collection_id,archive_id,archive_created_at,source_folder_id,relative_path,absolute_path,size_bytes,title,platform,added_at) SELECT {favourites},{id},'an earlier game',source_folder_id,x'6f6c64',x'2f6f6c64',1,'Old',NULL,'then' FROM archives WHERE id={id}"
+    ));
+    assert_eq!(touched(&f, id), 0);
+    let p = f.preview(&op);
+    assert!(p.can_undo(), "{:?}", p.blockers);
+    Database::undo_discovery_import(&p).unwrap();
+    // The other game's saved item is kept, never deleted by Undo.
+    assert_eq!(
+        gate_count(&f, "SELECT count(*) FROM game_collection_items"),
+        1
+    );
+}
+
+#[test]
+fn an_undone_games_id_is_never_given_out_while_a_membership_names_it() {
+    // Undo is refused while the game is a member, so the membership that can
+    // survive Undo is one saved for an earlier game on the same id. Neither
+    // that id nor the undone game's is handed out again.
+    let f = Fixture::new();
+    f.write("first.z80", 2);
+    let r = f.import();
+    let first = r.inserted[0].1;
+    let favourites = f.db().favourites_collection_id().unwrap();
+    f.mutate(&format!(
+        "INSERT INTO game_collection_items(collection_id,archive_id,archive_created_at,source_folder_id,relative_path,absolute_path,size_bytes,title,platform,added_at) SELECT {favourites},{first},'an earlier game',source_folder_id,x'6f6c64',x'2f6f6c64',1,'Old',NULL,'then' FROM archives WHERE id={first}"
+    ));
+    Database::undo_discovery_import(&f.preview(r.operation_id.as_deref().unwrap())).unwrap();
+    f.write("second.z80", 3);
+    let r = f.import();
+    let second = r.inserted.iter().map(|(_, id)| *id).max().unwrap();
+    assert!(second > first, "id {first} was given out again");
+}
+
+#[test]
+fn a_saved_item_blue_shows_on_the_imported_row_by_its_path_blocks_undo() {
+    // Review finding 2026-11-15: a favourite whose own row was forgotten is
+    // proposed for a re-imported row at the same source, path and size, for
+    // the user to confirm. Undo refuses that row too, so a proposal is never
+    // left pointing at a deleted game.
+    let f = Fixture::new();
+    f.write("new.z80", 2);
+    let r = f.import();
+    let id = r.inserted[0].1;
+    let op = r.operation_id.as_deref().unwrap().to_string();
+    let favourites = f.db().favourites_collection_id().unwrap();
+    let saved = |size: &str| {
+        format!(
+            "INSERT INTO game_collection_items(collection_id,archive_id,archive_created_at,source_folder_id,relative_path,absolute_path,size_bytes,title,platform,added_at) SELECT {favourites},990000001,'a forgotten row',source_folder_id,relative_path,x'2f6f6c64',{size},'Old',NULL,'then' FROM archives WHERE id={id}"
+        )
+    };
+    for size in ["size_bytes", "NULL"] {
+        f.mutate(&saved(size));
+        let shown = f.db().load_game_collections().unwrap();
+        assert_eq!(
+            shown[0].items[0].proposed_archive_id,
+            Some(id),
+            "{size}: Blue proposes the imported row for the item"
+        );
+        assert_eq!(touched(&f, id), 0, "{size}");
+        let p = f.preview(&op);
+        assert!(!p.can_undo(), "{size}");
+        assert!(
+            p.blockers.iter().any(|b| b.contains("Favourites")),
+            "{size}"
+        );
+        f.mutate("DELETE FROM game_collection_items");
+    }
+    // A different size is a different file: not shown there, not blocking.
+    f.mutate(&saved("size_bytes + 1"));
+    assert_eq!(
+        f.db().load_game_collections().unwrap()[0].items[0].proposed_archive_id,
+        None
+    );
+    let p = f.preview(&op);
+    assert!(p.can_undo(), "{:?}", p.blockers);
+    Database::undo_discovery_import(&p).unwrap();
+    assert_eq!(
+        gate_count(&f, "SELECT count(*) FROM game_collection_items"),
+        1,
+        "Undo never deletes a saved item"
     );
 }

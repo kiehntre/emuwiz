@@ -53,6 +53,13 @@ pub(super) struct Preferences {
     /// Interface scale used with the Simple v1 shell; 1.0 when absent.
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    /// How Favourites and collections are listed. The default is not
+    /// written, so a first-start save is unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "super::collections::CollectionSort::is_default"
+    )]
+    pub collection_sort: super::collections::CollectionSort,
 }
 
 fn default_ui_scale() -> f32 {
@@ -77,6 +84,7 @@ impl Default for Preferences {
             simple_shell: true,
             classic_view: false,
             ui_scale: 1.0,
+            collection_sort: Default::default(),
         }
     }
 }

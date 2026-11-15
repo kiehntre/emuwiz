@@ -454,6 +454,30 @@ impl Library {
     pub(super) fn has_title_twin(&self, id: i64) -> bool {
         self.title_twins.contains(&id)
     }
+    /// [`Self::filter`] over `members` only, in title order: walks the members,
+    /// not the library.
+    pub(super) fn filter_members(
+        &self,
+        filter: &Filter,
+        members: &std::collections::HashSet<i64>,
+    ) -> Vec<usize> {
+        // Same matching as `filter`: every word, in any order.
+        let needle = filter.search.trim().to_lowercase();
+        let words: Vec<&str> = needle.split_whitespace().collect();
+        let mut indices: Vec<usize> = members
+            .iter()
+            .filter_map(|id| self.by_id.get(id).copied())
+            .filter(|index| {
+                let game = &self.games[*index];
+                (filter.platform.is_empty() || game.platform == filter.platform)
+                    && filter.admits_before_check(game)
+                    && (!filter.unverified_only || !game.identified)
+                    && words.iter().all(|word| game.search.contains(word))
+            })
+            .collect();
+        indices.sort_unstable();
+        indices
+    }
     pub fn filter(&self, filter: &Filter) -> Vec<usize> {
         // Every word must appear in the title or system, in any order, so
         // "zelda link" finds "Legend of Zelda, The - A Link to the Past".

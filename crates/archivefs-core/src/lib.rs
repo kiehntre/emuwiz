@@ -196,9 +196,11 @@ pub use database::{
     restore_database, rollback_database_restore, scan_and_persist, upgrade_library_database,
 };
 pub use database::{
-    DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
-    DiscoveryImportUndoPreview, DiscoveryImportUndoResult, MissingCleanupTarget,
-    NestedMountOutcome, NestedMountState, PreservationFreshness,
+    CollectionItemKey, CollectionReanchor, DiscoveryImportExclusion, DiscoveryImportItem,
+    DiscoveryImportOperation, DiscoveryImportUndoPreview, DiscoveryImportUndoResult,
+    GameCollection, GameCollectionItem, GameCollectionKind, JournalledMoves,
+    MAX_COLLECTION_NAME_CHARS, MissingCleanupTarget, NestedMountOutcome, NestedMountState,
+    PreservationFreshness, validate_collection_name,
 };
 pub use database::{
     FileIdentity, InterruptedRestoreAssessment, InterruptedRestoreOutcome,

@@ -67,7 +67,18 @@ mod backup_ownership;
 #[path = "database/backup_ownership_tests.rs"]
 mod backup_ownership_tests;
 mod bounded_import;
+mod collections;
+#[cfg(test)]
+#[path = "database/collections_tests.rs"]
+mod collections_tests;
+#[cfg(test)]
+#[path = "database/collections_upgrade_tests.rs"]
+mod collections_upgrade_tests;
 mod discovery_import;
+pub use collections::{
+    CollectionItemKey, CollectionReanchor, GameCollection, GameCollectionItem, GameCollectionKind,
+    JournalledMoves, MAX_COLLECTION_NAME_CHARS, validate_collection_name,
+};
 pub use discovery_import::{
     DiscoveryImportExclusion, DiscoveryImportItem, DiscoveryImportOperation,
     DiscoveryImportUndoPreview, DiscoveryImportUndoResult,
@@ -417,6 +428,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 27,
         description: "keep replaced DAT evidence and unfinished re-check reasons",
         sql: include_str!("migrations/0027_dat_evidence_history.sql"),
+    },
+    Migration {
+        version: 28,
+        description: "game collections: Favourites and user-created collections",
+        sql: include_str!("migrations/0028_game_collections.sql"),
     },
 ];
 
@@ -1959,7 +1975,8 @@ fn classify_existing_database(path: &Path, migrations: &[Migration]) -> Result<E
     }
     Err(ArchiveFsError::Database(format!(
         "The library database at {} uses schema {version}, but this build requires schema \
-         {latest}. It has not been changed. Upgrade it with \"Scan and upgrade library\" (the \
+         {latest}. It has not been changed. Upgrade it with \"Scan and upgrade library\", or \
+         with `emuwiz-cli library-upgrade --confirm`, which does not scan (both are the \
          protected upgrade that takes a verified backup first); ordinary opens never migrate.",
         path.display()
     )))
@@ -4905,14 +4922,16 @@ impl Database {
                 // keyed by its id, so those ids are never handed out again
                 // either: a new game must not inherit another game's records
                 // (which would, among other things, refuse its import's Undo
-                // for good). Legacy schemas without these tables keep their
-                // former allocation.
+                // for good). Favourites and collection memberships (schema 28)
+                // outlive their game in the same way. Legacy schemas without
+                // these tables keep their former allocation.
                 let mut sources =
                     vec!["SELECT coalesce(max(id),0) AS value FROM archives".to_string()];
                 for table in [
                     "discovery_import_records",
                     "library_dat_identity_history",
                     "dat_recheck_attempts",
+                    "game_collection_items",
                 ] {
                     let exists: bool = tx
                         .query_row(
@@ -11422,21 +11441,21 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 27);
+        assert_eq!(report.to_version, 28);
         assert_eq!(
             report.applied_versions,
-            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
         );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 27);
+        assert_eq!(upgraded.schema_version().unwrap(), 28);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         assert_eq!(
             pending_schema_migration_versions(19).unwrap(),
-            vec![20, 21, 22, 23, 24, 25, 26, 27]
+            vec![20, 21, 22, 23, 24, 25, 26, 27, 28]
         );
 
         let quick_check: String = upgraded
@@ -11456,11 +11475,14 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 20);
-        assert_eq!(report.to_version, 27);
-        assert_eq!(report.applied_versions, vec![21, 22, 23, 24, 25, 26, 27]);
+        assert_eq!(report.to_version, 28);
+        assert_eq!(
+            report.applied_versions,
+            vec![21, 22, 23, 24, 25, 26, 27, 28]
+        );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 27);
+        assert_eq!(upgraded.schema_version().unwrap(), 28);
         assert_eq!(upgraded.list_source_folders().unwrap().len(), 1);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         let table_count: i64 = upgraded
@@ -11475,7 +11497,7 @@ mod tests {
         upgraded.close().unwrap();
 
         let reopened = Database::open_read_only(&database_path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 27);
+        assert_eq!(reopened.schema_version().unwrap(), 28);
         reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -12341,6 +12363,8 @@ mod tests {
                 "discovery_details",
                 "discovery_import_operations",
                 "discovery_import_records",
+                "game_collection_items",
+                "game_collections",
                 "library_dat_identities",
                 "library_dat_identity_history",
                 "mame_member_evidence",
@@ -12358,6 +12382,7 @@ mod tests {
                 "source_nested_boundaries",
                 "source_review_required",
                 "source_scan_bindings",
+                "sqlite_sequence",
                 "verified_identity_facts",
             ]
         );
@@ -22452,7 +22477,7 @@ echo "$out"
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 27);
+            assert_eq!(latest_known_version(MIGRATIONS), 28);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")

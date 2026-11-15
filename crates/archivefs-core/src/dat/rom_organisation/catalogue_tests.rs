@@ -1217,3 +1217,74 @@ fn a_platform_change_after_preview_refuses_the_apply() {
     assert!(result.is_err());
     assert!(f.plan.entries[0].source_path.exists(), "nothing moved");
 }
+
+/// PR #278 owner follow-up 2026-11-15: an Organise rename and its Undo keep the
+/// same catalogue row, so a favourite or collection entry stays on that game
+/// across a restart with nothing to reconcile and nothing proposed.
+#[test]
+fn organise_and_undo_keep_favourites_and_collections_on_the_same_game() {
+    for mode in [
+        OrganisationMode::RenameInPlace,
+        OrganisationMode::MoveRealFile,
+    ] {
+        let mut f = Fixture::new(mode);
+        let favourites = f.db.favourites_collection_id().unwrap();
+        let shelf = f.db.create_game_collection("Shelf").unwrap();
+        f.db.add_game_to_collection(favourites, f.id).unwrap();
+        f.db.add_game_to_collection(shelf, f.id).unwrap();
+        let members = |db: &crate::Database| -> Vec<(i64, Option<i64>, Option<i64>)> {
+            db.load_game_collections()
+                .unwrap()
+                .iter()
+                .flat_map(|c| c.items.iter())
+                .map(|i| {
+                    (
+                        i.stored_archive_id,
+                        i.resolved_archive_id,
+                        i.proposed_archive_id,
+                    )
+                })
+                .collect()
+        };
+        let expected = vec![(f.id, Some(f.id), None); 2];
+        let reopen = |f: &mut Fixture| {
+            let path = f.db.path().to_path_buf();
+            f.db = crate::Database::open_or_create(path).unwrap();
+        };
+        assert_eq!(
+            f.apply().unwrap().transaction.state,
+            TransactionState::Applied
+        );
+        reopen(&mut f);
+        assert_eq!(
+            members(&f.db),
+            expected,
+            "{mode:?}: after Organise and a restart"
+        );
+        let journal = f.journal();
+        let saved = f.db.save_journalled_collection_moves(&journal).unwrap();
+        assert_eq!(
+            saved,
+            crate::JournalledMoves::default(),
+            "{mode:?}: nothing to move"
+        );
+        f.reload();
+        assert_eq!(
+            f.undo().unwrap().rollback.result,
+            crate::dat::rename_apply::RollbackResult::FullyRolledBack
+        );
+        reopen(&mut f);
+        assert_eq!(
+            members(&f.db),
+            expected,
+            "{mode:?}: after Undo and a restart"
+        );
+        let saved = f.db.save_journalled_collection_moves(&journal).unwrap();
+        assert_eq!(
+            saved,
+            crate::JournalledMoves::default(),
+            "{mode:?}: nothing to move"
+        );
+        assert_eq!(members(&f.db), expected);
+    }
+}
