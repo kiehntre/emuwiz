@@ -852,6 +852,7 @@ fn bound_organisation_apply(
         content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
         candidates: std::slice::from_ref(&candidate),
         generation: 1,
+        unknown_folder: None,
     });
     org::prepare_organisation_catalogue(&mut plan, &db).unwrap();
     let approved: std::collections::BTreeSet<String> =

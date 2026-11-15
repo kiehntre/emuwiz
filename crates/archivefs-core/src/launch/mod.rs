@@ -68,13 +68,18 @@ pub mod amiberry_cd_execution;
 pub mod amiberry_cd_profile;
 pub mod amiberry_command;
 pub mod amiberry_execution;
+pub mod amiga_caps_plugin;
+pub mod amiga_hdf_working_copy;
 pub mod amiga_whdload_command;
 pub mod amiga_whdload_execution;
 pub mod amiga_whdload_trainer_launch;
 #[cfg(target_os = "linux")]
 pub mod atari800;
+#[cfg(target_os = "linux")]
+pub mod atari800_setup;
 pub mod azahar_command;
 pub mod azahar_execution;
+pub mod azahar_homebrew;
 #[cfg(target_os = "linux")]
 pub mod b_em;
 #[cfg(target_os = "linux")]
@@ -92,6 +97,7 @@ pub mod dosbox_command;
 pub mod dosbox_execution;
 pub mod dosbox_sandbox;
 pub mod dosbox_target;
+pub mod unverified_media;
 pub use dosbox_target::{DosBoxLaunchIdentity, UserApprovedDosBoxTarget};
 pub mod duckstation_command;
 pub mod duckstation_execution;
@@ -108,11 +114,13 @@ pub mod flycast_command;
 pub mod flycast_execution;
 pub mod flycast_gdi_readiness;
 pub mod fsuae_adf;
+pub mod fsuae_adf_local;
 pub mod fsuae_command;
 pub mod fsuae_execution;
 pub mod fuse_command;
 pub mod hatari_command;
 pub mod hatari_execution;
+pub mod hatari_session;
 pub mod input_projection;
 pub mod integration;
 pub mod mame_command;
@@ -134,6 +142,7 @@ pub mod native_support;
 pub mod np2kai;
 pub mod openmsx_command;
 pub mod openmsx_execution;
+pub mod openrct2;
 #[cfg(target_os = "linux")]
 pub mod oricutron;
 pub mod pcsx2_command;
@@ -161,6 +170,7 @@ pub mod installation_support;
 pub mod readiness;
 pub mod resource_grants;
 pub mod retroarch_command;
+pub mod retroarch_launch_diagnostics;
 pub mod retroarch_launch_visibility;
 pub mod retroarch_resource_projection;
 pub mod rmg_command;
@@ -191,6 +201,8 @@ pub mod vice_command;
 pub mod vice_execution;
 pub mod vita3k_command;
 pub mod vita3k_execution;
+pub mod vita3k_installed;
+pub mod vita3k_library;
 pub mod xemu_command;
 pub mod xemu_execution;
 pub mod xenia_command;
@@ -249,6 +261,11 @@ pub use azahar_command::{
 pub use azahar_execution::{
     AzaharPreflightError, AzaharPreflightErrorKind, LaunchedAzaharProcess, preflight_azahar_launch,
     spawn_azahar,
+};
+pub use azahar_homebrew::{
+    AZAHAR_HOMEBREW_KEY_PREFIX, AzaharHomebrewLaunchError, AzaharHomebrewLaunchRequest,
+    ThreeDsxEvidence, ThreeDsxRefusal, ThreeDsxRefusalKind, preflight_and_launch_azahar_homebrew,
+    verify_three_dsx,
 };
 pub use cemu_command::{
     CEMU_SUPPORTED_PLATFORM_ID, CemuCommand, CemuCommandPlan, CemuCommandSelection,
@@ -327,7 +344,8 @@ pub use es_de_export::{
     es_de_system_for_platform,
 };
 pub use evidence_bridge::{
-    canonical_identity_from_game_report, launch_content_ref_for_unmounted,
+    ZIPPED_CARTRIDGE_PROVENANCE, canonical_identity_from_game_report,
+    launch_content_ref_for_unmounted, launch_content_ref_for_zipped_cartridge,
     launch_content_ref_from_archive_record,
 };
 pub use evidence_freshness::{
@@ -336,9 +354,11 @@ pub use evidence_freshness::{
 pub use execution::{
     LAUNCH_STDERR_CAPTURE_LIMIT, LaunchCommandFacts, LaunchContentIdentity, LaunchExecutionError,
     LaunchExitReport, LaunchPreflightError, LaunchPreflightErrorKind, LaunchSpawnError,
-    LaunchedRetroArchProcess, RetroArchLaunchRequest, preflight_and_launch_retroarch,
+    LaunchedRetroArchProcess, PreparedRetroArchLaunch, RetroArchLaunchRequest,
+    apply_zipped_cartridge_save_safety, preflight_and_launch_retroarch,
     preflight_and_launch_retroarch_with_playlist, preflight_retroarch_launch,
-    preflight_retroarch_launch_with_playlist, spawn_retroarch,
+    preflight_retroarch_launch_with_playlist, prepare_retroarch_launch_with_playlist,
+    spawn_retroarch, zipped_cartridge_save_findings,
 };
 pub use fbneo_command::{
     FBNEO_SUPPORTED_PLATFORM_ID, FbneoCommand, FbneoCommandPlan, FbneoIdentityEvidence,
@@ -359,9 +379,13 @@ pub use flycast_execution::{
     preflight_flycast_launch, spawn_flycast,
 };
 pub use fsuae_adf::{
-    FsUaeAdfLaunchError, FsUaeAdfLaunchRequest, adf_canonical_identity, build_fsuae_adf_request,
-    current_adf_launch_identity, default_adf_identity_paths, fsuae_adf_config,
-    fsuae_adf_profile_refusal, preflight_and_launch_fsuae_adf, preflight_fsuae_adf_launch,
+    FsUaeAdfLaunchError, FsUaeAdfLaunchRequest, FsUaeAdfRoute, adf_canonical_identity,
+    build_fsuae_adf_request, current_adf_launch_decision, current_adf_launch_identity,
+    default_adf_identity_paths, fsuae_adf_config, fsuae_adf_profile_refusal,
+    preflight_and_launch_fsuae_adf, preflight_fsuae_adf_launch,
+};
+pub use fsuae_adf_local::{
+    LOCAL_ADF_KEY_PREFIX, LocalAdfMedia, build_fsuae_local_adf_request, local_adf_media,
 };
 pub use fsuae_command::{
     FSUAE_SUPPORTED_PLATFORM_ID, FsUaeCommand, FsUaeCommandPlan, FsUaeCommandSelection,
@@ -399,6 +423,7 @@ pub use integration::{
 };
 pub use mame_command::{
     MAME_SUPPORTED_PLATFORM_IDS, MameCommand, MameCommandPlan, build_mame_command_plan,
+    build_mame_command_plan_with_extra,
 };
 pub use mame_execution::{
     MameLaunchExecutionError, MameLaunchPreflightError, MameLaunchRequest,
@@ -432,6 +457,13 @@ pub use openmsx_execution::{
     OpenMsxLaunchExecutionError, OpenMsxLaunchPreflightError, OpenMsxLaunchPreflightErrorKind,
     OpenMsxLaunchRequest, preflight_and_launch_openmsx, preflight_openmsx_launch, spawn_openmsx,
 };
+pub use openrct2::{
+    OpenRct2CheckError, OpenRct2Install, OpenRct2LaunchError, OpenRct2LaunchRequest,
+    PinnedOpenRct2, PreparedOpenRct2Launch, Rct2DataReport, check_openrct2,
+    default_search_dirs as openrct2_search_dirs, discover_openrct2, inspect_rct2_data,
+    plan_openrct2, preflight_and_launch_openrct2, preflight_openrct2_launch,
+    probe_openrct2_version, spawn_prepared_openrct2,
+};
 pub use pcsx2_command::{
     PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2Command, Pcsx2CommandPlan, Pcsx2CommandSelection,
     build_pcsx2_command_plan,
@@ -445,8 +477,8 @@ pub use pcsx2_execution::{
 pub use planning::{
     CandidatePreference, CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind,
     LaunchContentKind, LaunchContentRef, LaunchPlan, LaunchPlanSummary, LaunchTarget,
-    RememberedPreference, ResolvedIdentity, StandaloneProfileInput, VerifiedWHDLoadContent,
-    build_launch_plan,
+    RETROARCH_RECHECK_HINT, RememberedPreference, ResolvedIdentity, StandaloneProfileInput,
+    VerifiedWHDLoadContent, build_launch_plan,
 };
 pub use platform_map::{
     LAUNCH_COMPATIBILITY, LaunchCompatibility, MappingConfidence, extension_narrows_candidate,
@@ -573,6 +605,16 @@ pub use vita3k_execution::{
     Vita3kLaunchPreflightError, Vita3kLaunchPreflightErrorKind, Vita3kLaunchRequest,
     preflight_vita3k_launch, spawn_vita3k,
 };
+pub use vita3k_installed::{
+    VITA3K_INSTALLED_KEY_PREFIX, Vita3kInstalledEntry, Vita3kInstalledLaunchError,
+    Vita3kInstalledLaunchRequest, Vita3kInventory, Vita3kProfileSummary,
+    preflight_and_launch_vita3k_installed, scan_vita3k_installed_titles,
+};
+pub use vita3k_library::{
+    Vita3kLibraryLaunchError, Vita3kLibraryLaunchRequest, Vita3kLibraryResolution, VpkEvidence,
+    VpkRefusal, VpkRefusalKind, inspect_vpk, is_vpk, preflight_and_launch_vita3k_library,
+    resolve_vpk, resolve_vpk_against,
+};
 pub use xemu_command::{
     XEMU_SUPPORTED_PLATFORM_ID, XemuCommand, XemuCommandPlan, XemuCommandSelection,
     build_xemu_command_plan,
@@ -614,6 +656,13 @@ pub mod dolphin_profile_composition;
 pub mod mesen_nes;
 
 pub mod nkit_readiness;
+
+/// Explicit user choice between tied launch candidates.
+pub mod launch_choice;
+pub mod remembered_launch_system;
+
+/// Dolphin profiles are launch options only with a provable binding.
+pub mod dolphin_binding_readiness;
 
 #[cfg(target_os = "linux")]
 pub mod fsuae_whdload_boot;

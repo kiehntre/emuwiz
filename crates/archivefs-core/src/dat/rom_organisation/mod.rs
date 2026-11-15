@@ -43,10 +43,11 @@ mod tests;
 pub use model::{OrganisationMode, OrganisationPlan, OrganisationPlanEntry, OrganisationStatus};
 pub use plan::{
     OrganisationCandidate, OrganisationPlanRequest, build_organisation_plan,
-    build_organisation_plan_reporting,
+    build_organisation_plan_reporting, layout_folder_in,
 };
 pub use transaction::{
-    OrganisationRollbackOutcome, apply_organisation_transaction, build_organisation_transaction,
-    is_organisation_transaction, open_history_transaction_for_undo, prepare_organisation_catalogue,
+    OrganisationRollbackOutcome, PlatformCorrection, apply_organisation_transaction,
+    build_organisation_transaction, is_organisation_transaction, open_history_transaction_for_undo,
+    prepare_organisation_catalogue, prepare_organisation_catalogue_with_platforms,
     revalidate_organisation_plan, rollback_organisation_transaction, undo_blocker,
 };

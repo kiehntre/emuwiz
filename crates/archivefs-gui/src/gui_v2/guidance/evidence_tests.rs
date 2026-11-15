@@ -34,6 +34,7 @@ fn summary(status: State, freshness: ReadinessFreshness) -> GameReadinessSummary
         freshness,
         findings: Vec::new(),
         attempt: None,
+        other_emulator_choosable: false,
     }
 }
 

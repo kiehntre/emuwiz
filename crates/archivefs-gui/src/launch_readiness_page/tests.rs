@@ -58,6 +58,8 @@ fn plan_input(plan: LaunchPlan) -> LaunchReadinessInput {
         cemu: None,
         flycast: None,
         xroar: None,
+        azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -82,6 +84,8 @@ fn dolphin_plan_input(plan: LaunchPlan, context: DolphinLaunchContext) -> Launch
         cemu: None,
         flycast: None,
         xroar: None,
+        azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -106,6 +110,8 @@ fn pcsx2_plan_input(plan: LaunchPlan, context: Pcsx2LaunchContext) -> LaunchRead
         cemu: None,
         flycast: None,
         xroar: None,
+        azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -340,6 +346,8 @@ fn verified_pbp_candidate_reaches_the_existing_ppsspp_launch_request() {
         cemu: None,
         flycast: None,
         xroar: None,
+        azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -609,6 +617,7 @@ fn render_with_states(
                 pcsx2_state,
                 standalone_state,
                 &mut AmigaWHDLoadLaunchState::default(),
+                &Default::default(),
             );
         });
     })
@@ -617,9 +626,10 @@ fn render_with_states(
 /// Spawns a real, short-lived process via the same [`spawn_retroarch`] core
 /// entry point production code uses - never a shell string, an explicit
 /// executable plus argv, exactly like [`RetroArchCommand`] requires.
-fn spawn_test_process(executable: &str, arguments: &[&str]) -> LaunchedRetroArchProcess {
+pub(super) fn spawn_test_process(executable: &str, arguments: &[&str]) -> LaunchedRetroArchProcess {
     let command = RetroArchCommand {
         saturn_core_selection: None,
+        unverified_game_key: None,
         snapshot_evidence: None,
         executable: PathBuf::from(executable),
         arguments: arguments
@@ -638,7 +648,7 @@ fn spawn_test_process(executable: &str, arguments: &[&str]) -> LaunchedRetroArch
     spawn_retroarch(command).expect("spawning the fixture test process must succeed")
 }
 
-fn wait_until_exited(process: &mut LaunchedRetroArchProcess) {
+pub(super) fn wait_until_exited(process: &mut LaunchedRetroArchProcess) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while process.poll().is_none() {
         assert!(Instant::now() < deadline, "fixture process never exited");
@@ -692,10 +702,28 @@ fn retroarch_not_scanned_shows_the_exact_prerequisite_message() {
 
 #[test]
 fn unknown_identity_shows_an_honest_unresolved_message_never_no_emulator_found() {
-    let output = render(&LaunchReadinessInput::IdentityUnknown);
+    let output = render(&LaunchReadinessInput::IdentityUnknown(
+        crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+    ));
     assert!(rendered_text_contains(&output, "Identity unresolved"));
     assert!(rendered_text_contains(&output, "could not be verified"));
     assert!(!rendered_text_contains(&output, "No emulator found"));
+}
+
+#[test]
+fn each_unknown_identity_reason_renders_its_own_banner() {
+    use crate::launch_readiness_page::IdentityUnknownReason as R;
+    let system = render(&LaunchReadinessInput::IdentityUnknown(R::SystemNotChosen));
+    assert!(rendered_text_contains(&system, "System not chosen"));
+    assert!(!rendered_text_contains(&system, "Identity unresolved"));
+    let archive = render(&LaunchReadinessInput::IdentityUnknown(
+        R::UnsupportedArchive,
+    ));
+    assert!(rendered_text_contains(
+        &archive,
+        "Archive format not supported"
+    ));
+    assert!(!rendered_text_contains(&archive, "Identity unresolved"));
 }
 
 // --- conflicting identity ----------------------------------------------------
@@ -787,6 +815,68 @@ fn gamer_action_launches_the_exact_ready_retroarch_request() {
     ));
 }
 
+fn psx_chd_candidate(core: &str, preference: CandidatePreference, warned: bool) -> LaunchCandidate {
+    let mut candidate = ready_candidate();
+    candidate.target = LaunchTarget::RetroArchCore {
+        profile: retroarch_profile(),
+        core_stem: core.to_string(),
+        platform_id: "PSX",
+    };
+    candidate.content = resolved_content("/library/Game.chd");
+    candidate.preference = preference;
+    if warned {
+        candidate.readiness = LaunchReadiness::ReadyWithWarnings;
+        candidate
+            .warnings
+            .push(archivefs_core::launch::LaunchWarning::new(
+                archivefs_core::launch::LaunchWarningKind::RetroArchChdSupportUnconfirmed,
+                "CHD unconfirmed",
+            ));
+    }
+    candidate
+}
+
+#[test]
+fn gamer_action_launches_swanstation_for_psx_chd() {
+    let plan = plan_with(vec![
+        psx_chd_candidate("mednafen_psx", CandidatePreference::Undetermined, true),
+        psx_chd_candidate("swanstation", CandidatePreference::SoleEligible, false),
+    ]);
+    let action = gamer_play_action(&plan_input(plan));
+    assert!(matches!(
+        action,
+        GamerPlayAction::Launch(request)
+            if matches!(
+                request.as_ref(),
+                TypedLaunchRequest::RetroArch(request, _) if request.core_stem == "swanstation"
+            )
+    ));
+}
+
+#[test]
+fn explicit_launch_of_an_unpreferred_swanstation_still_yields_a_request() {
+    let plan = plan_with(vec![psx_chd_candidate(
+        "swanstation",
+        CandidatePreference::Undetermined,
+        false,
+    )]);
+    assert!(retroarch_launch_request(&plan, &plan.candidates[0], None).is_some());
+}
+
+#[test]
+fn only_an_unconfirmed_beetle_core_explains_why_play_is_missing() {
+    let plan = plan_with(vec![psx_chd_candidate(
+        "mednafen_psx",
+        CandidatePreference::SoleEligible,
+        true,
+    )]);
+    let GamerPlayAction::BlockedTyped(blocker) = gamer_play_action(&plan_input(plan)) else {
+        panic!("a CHD-unconfirmed core must not be offered as Play");
+    };
+    assert_eq!(blocker.kind, GamerBlockerKind::NoSafeEmulator);
+    assert!(blocker.detail.contains("SwanStation") && blocker.detail.contains("DuckStation"));
+}
+
 #[test]
 fn gamer_action_can_launch_pcsx2_without_retroarch_discovery() {
     let ready = build_ready_pcsx2_fixture("gamer-pcsx2");
@@ -810,6 +900,8 @@ fn gamer_action_can_launch_pcsx2_without_retroarch_discovery() {
         cemu: None,
         flycast: None,
         xroar: None,
+        azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -845,6 +937,8 @@ fn gamer_action_can_launch_dolphin_without_retroarch_discovery() {
         cemu: None,
         flycast: None,
         xroar: None,
+        azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -882,6 +976,8 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         cemu: None,
         flycast: None,
         xroar: None,
+        azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -918,6 +1014,8 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
         cemu: None,
         flycast: None,
         xroar: None,
+        azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -936,7 +1034,9 @@ fn gamer_blockers_are_typed_and_name_the_actual_standalone_emulator() {
 #[test]
 fn gamer_blockers_route_identity_content_choice_and_no_safe_states() {
     assert!(matches!(
-        gamer_play_action(&LaunchReadinessInput::IdentityUnknown),
+        gamer_play_action(&LaunchReadinessInput::IdentityUnknown(
+            crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed
+        )),
         GamerPlayAction::BlockedTyped(GamerBlocker {
             kind: GamerBlockerKind::UnknownSystem,
             ..
@@ -1404,6 +1504,169 @@ fn eligible_candidate_yields_the_exact_expected_retroarch_launch_request_facts()
     assert_eq!(request.core_stem, "mednafen_psx_hw");
 }
 
+fn warned_retroarch_candidate(
+    firmware: FirmwareReadiness,
+    kinds: &[archivefs_core::launch::LaunchWarningKind],
+    blocked: bool,
+) -> LaunchCandidate {
+    let mut candidate = ready_candidate();
+    candidate.firmware = firmware;
+    candidate.warnings = kinds
+        .iter()
+        .map(|kind| archivefs_core::launch::LaunchWarning::new(*kind, "fixture warning"))
+        .collect();
+    candidate.readiness = if blocked {
+        candidate.blockers = vec![archivefs_core::launch::LaunchBlocker::new(
+            archivefs_core::launch::LaunchBlockerKind::RequiredFirmwareMissing,
+            "required firmware/BIOS is missing",
+        )];
+        LaunchReadiness::Blocked
+    } else if kinds.is_empty() {
+        LaunchReadiness::Ready
+    } else {
+        LaunchReadiness::ReadyWithWarnings
+    };
+    candidate
+}
+
+/// Policy B (owner-approved): only the unverified-firmware warning keeps
+/// RetroArch Play; the gate is equivalent across firmware outcomes x warnings.
+#[test]
+fn only_the_allow_listed_unverified_firmware_warning_keeps_retroarch_play() {
+    use archivefs_core::launch::LaunchWarningKind as K;
+    let plan = plan_with(vec![ready_candidate()]);
+    let unverified = [K::FirmwarePresentUnverified];
+    // (firmware, warnings, blocked, Play expected)
+    let cases: Vec<(FirmwareReadiness, Vec<K>, bool, bool)> = vec![
+        (FirmwareReadiness::Verified, vec![], false, true),
+        (FirmwareReadiness::NotRequired, vec![], false, true),
+        (FirmwareReadiness::Unknown, vec![], false, true), // unchanged legacy behaviour
+        (
+            FirmwareReadiness::PresentUnverified,
+            unverified.to_vec(),
+            false,
+            true,
+        ),
+        (FirmwareReadiness::Missing, vec![], true, false),
+        // Missing can never launch, even if a stray allow-listed warning rides along.
+        (FirmwareReadiness::Missing, unverified.to_vec(), true, false),
+        // A warning from an unverified state with a different firmware state is not trusted.
+        (
+            FirmwareReadiness::Unknown,
+            unverified.to_vec(),
+            false,
+            false,
+        ),
+        (
+            FirmwareReadiness::Verified,
+            unverified.to_vec(),
+            false,
+            false,
+        ),
+        (
+            FirmwareReadiness::NotRequired,
+            unverified.to_vec(),
+            false,
+            false,
+        ),
+        // Any additional warning kind withdraws Play.
+        (
+            FirmwareReadiness::PresentUnverified,
+            vec![K::FirmwarePresentUnverified, K::MultipleEligibleProfiles],
+            false,
+            false,
+        ),
+        (
+            FirmwareReadiness::PresentUnverified,
+            vec![
+                K::FirmwarePresentUnverified,
+                K::PreferredLaunchChoiceUnavailable,
+            ],
+            false,
+            false,
+        ),
+        (
+            FirmwareReadiness::PresentUnverified,
+            vec![K::FirmwarePresentUnverified, K::OptionalFirmwareMissing],
+            false,
+            false,
+        ),
+        (
+            FirmwareReadiness::NotRequired,
+            vec![K::OptionalFirmwareMissing],
+            false,
+            false,
+        ),
+        (
+            FirmwareReadiness::NotRequired,
+            vec![K::MultipleEligibleProfiles],
+            false,
+            false,
+        ),
+    ];
+    for (firmware, kinds, blocked, expected) in cases {
+        let candidate = warned_retroarch_candidate(firmware, &kinds, blocked);
+        assert_eq!(
+            retroarch_launch_request(&plan, &candidate, None).is_some(),
+            expected,
+            "{firmware:?} {kinds:?} blocked={blocked}"
+        );
+        assert_eq!(candidate.retroarch_play_eligible(), expected);
+    }
+    // A blocker on an otherwise allow-listed candidate still refuses, and a
+    // Ready-labelled candidate that carries the warning is not trusted either.
+    let mut with_blocker =
+        warned_retroarch_candidate(FirmwareReadiness::PresentUnverified, &unverified, false);
+    with_blocker.blockers = vec![archivefs_core::launch::LaunchBlocker::new(
+        archivefs_core::launch::LaunchBlockerKind::AmbiguousCore,
+        "ambiguous",
+    )];
+    assert!(retroarch_launch_request(&plan, &with_blocker, None).is_none());
+    let mut ready_labelled =
+        warned_retroarch_candidate(FirmwareReadiness::PresentUnverified, &unverified, false);
+    ready_labelled.readiness = LaunchReadiness::Ready;
+    assert!(retroarch_launch_request(&plan, &ready_labelled, None).is_none());
+}
+
+#[test]
+fn unverified_firmware_candidate_gets_gamer_play_and_shows_the_warning() {
+    use archivefs_core::launch::LaunchWarningKind as K;
+    let mut candidate = warned_retroarch_candidate(
+        FirmwareReadiness::PresentUnverified,
+        &[K::FirmwarePresentUnverified],
+        false,
+    );
+    candidate.warnings[0].detail =
+        "Firmware found but not verified: kick34005.A500 is present but its contents were not checked.".into();
+    let plan = plan_with(vec![candidate]);
+    let input = plan_input(plan);
+    assert!(matches!(
+        gamer_play_action(&input),
+        GamerPlayAction::Launch(_)
+    ));
+    let output = render(&input);
+    assert!(rendered_text_contains(
+        &output,
+        "Firmware found but not verified"
+    ));
+    assert!(rendered_text_contains(&output, "kick34005.A500"));
+}
+
+#[test]
+fn unverified_firmware_with_another_warning_kind_has_no_gamer_play() {
+    use archivefs_core::launch::LaunchWarningKind as K;
+    let candidate = warned_retroarch_candidate(
+        FirmwareReadiness::PresentUnverified,
+        &[K::FirmwarePresentUnverified, K::MultipleEligibleProfiles],
+        false,
+    );
+    let input = plan_input(plan_with(vec![candidate]));
+    assert!(matches!(
+        gamer_play_action(&input),
+        GamerPlayAction::BlockedTyped(_)
+    ));
+}
+
 #[test]
 fn ineligible_candidates_never_yield_a_launch_request() {
     let plan = plan_with(vec![ready_candidate()]);
@@ -1458,14 +1721,14 @@ fn running_stage_shows_running_status_and_pid() {
     let process = spawn_test_process("/bin/sleep", &["1"]);
     let pid = process.pid;
     let mut state = RetroArchLaunchState {
-        tracked: Some((key, RetroArchLaunchStage::Running { process })),
+        tracked: Some((key, RetroArchLaunchStage::running(process))),
         ..Default::default()
     };
 
     let output = render_with_state(&plan_input(plan), &mut state);
     assert!(rendered_text_contains(&output, "RetroArch running"));
     assert!(rendered_text_contains(&output, &pid.to_string()));
-    assert!(!rendered_text_contains(&output, "Stop"));
+    assert!(rendered_text_contains(&output, "Stop RetroArch"));
     assert!(!rendered_text_contains(&output, "Kill"));
 }
 
@@ -1480,7 +1743,13 @@ fn clean_process_exit_enters_exited_and_shows_a_clean_exit_message() {
     let mut process = spawn_test_process("/bin/true", &[]);
     wait_until_exited(&mut process);
     let mut state = RetroArchLaunchState {
-        tracked: Some((key, RetroArchLaunchStage::Exited { process })),
+        tracked: Some((
+            key,
+            RetroArchLaunchStage::Exited {
+                process,
+                stop: Default::default(),
+            },
+        )),
         ..Default::default()
     };
 
@@ -1505,7 +1774,13 @@ fn non_zero_exit_shows_bounded_stderr_behind_technical_details() {
     );
     wait_until_exited(&mut process);
     let mut state = RetroArchLaunchState {
-        tracked: Some((key, RetroArchLaunchStage::Exited { process })),
+        tracked: Some((
+            key,
+            RetroArchLaunchStage::Exited {
+                process,
+                stop: Default::default(),
+            },
+        )),
         ..Default::default()
     };
 
@@ -1571,7 +1846,7 @@ fn changing_selected_candidate_never_shows_another_selections_running_process_as
     let other_key = RetroArchLaunchKey::from_request(&other_request);
     let process = spawn_test_process("/bin/sleep", &["1"]);
     let mut state = RetroArchLaunchState {
-        tracked: Some((other_key, RetroArchLaunchStage::Running { process })),
+        tracked: Some((other_key, RetroArchLaunchStage::running(process))),
         ..Default::default()
     };
 
@@ -1595,7 +1870,7 @@ fn changing_selected_candidate_never_shows_another_selections_running_process_as
 
 // --- repeat launch / one launch at a time --------------------------------------
 
-fn request_for(path: &str) -> RetroArchLaunchRequest {
+pub(super) fn request_for(path: &str) -> RetroArchLaunchRequest {
     let mut candidate = ready_candidate();
     candidate.content = resolved_content(path);
     let plan = plan_with(vec![candidate]);
@@ -1609,10 +1884,7 @@ fn a_second_game_cannot_start_while_another_retroarch_is_running() {
     let process = spawn_test_process("/bin/sleep", &["2"]);
     let pid = process.pid;
     let mut state = RetroArchLaunchState {
-        tracked: Some((
-            running_key.clone(),
-            RetroArchLaunchStage::Running { process },
-        )),
+        tracked: Some((running_key.clone(), RetroArchLaunchStage::running(process))),
         ..Default::default()
     };
 
@@ -1621,7 +1893,7 @@ fn a_second_game_cannot_start_while_another_retroarch_is_running() {
     state.poll();
 
     match &state.tracked {
-        Some((key, RetroArchLaunchStage::Running { process })) => {
+        Some((key, RetroArchLaunchStage::Running { process, .. })) => {
             assert_eq!(*key, running_key, "the running launch must stay tracked");
             assert_eq!(process.pid, pid, "the tracked handle must not be replaced");
         }
@@ -1661,7 +1933,7 @@ fn another_games_running_launch_disables_play_and_explains_why() {
     let running_key = RetroArchLaunchKey::from_request(&running_request);
     let process = spawn_test_process("/bin/sleep", &["1"]);
     let mut state = RetroArchLaunchState {
-        tracked: Some((running_key, RetroArchLaunchStage::Running { process })),
+        tracked: Some((running_key, RetroArchLaunchStage::running(process))),
         ..Default::default()
     };
     assert!(state.blocked_by_other_launch(&request_for("/library/OtherGame.bin")));
@@ -1687,7 +1959,13 @@ fn relaunch_is_allowed_after_clean_exit_non_zero_exit_and_failure() {
         let mut process = spawn_test_process(executable, &arguments);
         wait_until_exited(&mut process);
         let mut state = RetroArchLaunchState {
-            tracked: Some((key.clone(), RetroArchLaunchStage::Exited { process })),
+            tracked: Some((
+                key.clone(),
+                RetroArchLaunchStage::Exited {
+                    process,
+                    stop: Default::default(),
+                },
+            )),
             ..Default::default()
         };
         assert!(!state.is_active(), "{name}: an exited launch is not active");
@@ -1732,6 +2010,7 @@ fn show_launch_readiness_panel_takes_no_command_or_process_handle_parameter() {
     // tracker - never a command string, argv, or `std::process` type. If a
     // future change widened this signature to accept one, this line would
     // fail to compile.
+    #[allow(clippy::type_complexity)]
     fn assert_signature(
         _: fn(
             &mut egui::Ui,
@@ -1741,6 +2020,7 @@ fn show_launch_readiness_panel_takes_no_command_or_process_handle_parameter() {
             &mut Pcsx2LaunchState,
             &mut StandaloneLaunchState,
             &mut AmigaWHDLoadLaunchState,
+            &launch_choice::LaunchChoiceState,
         ) -> Option<LaunchReadinessPageAction>,
     ) {
     }
@@ -3063,6 +3343,7 @@ mod multidisc {
                     complete: true,
                 },
                 app_images: Vec::new(),
+                save_directories: Vec::new(),
                 diagnostics: Vec::new(),
             }],
             diagnostics: Vec::new(),
@@ -3187,6 +3468,8 @@ mod multidisc {
             cemu: None,
             flycast: None,
             xroar: None,
+            azahar: None,
+            vita3k: None,
             vice: None,
             amiga_whdload: None,
             #[cfg(target_os = "linux")]
@@ -3506,4 +3789,431 @@ fn controller_setup_panel_renders_honest_scope_on_pcsx2_candidate() {
     let candidate = pcsx2_candidate(&ready.profile_id, &ready.content_path);
     let output = render(&pcsx2_plan_input(plan_with(vec![candidate]), ready.context));
     assert!(rendered_text_contains(&output, "Controller setup"));
+}
+
+#[test]
+fn zipped_cartridge_play_is_ready_plain_and_blocked_with_cheats_or_playlist() {
+    let mut zipped = request_for("/roms/Game.zip");
+    zipped.expected_platform_id = "SNES".into();
+    assert_eq!(zipped_play_block_reason(&zipped, false, false), None);
+    let cheats = zipped_play_block_reason(&zipped, true, false).expect("blocked with cheats");
+    assert!(cheats.contains("cheats and pokes aren't supported for zipped games"));
+    let playlist = zipped_play_block_reason(&zipped, false, true).expect("blocked multi-disc");
+    assert!(playlist.contains("multi-disc"));
+    // A loose ROM keeps every workflow.
+    let loose = request_for("/roms/Game.sfc");
+    assert_eq!(zipped_play_block_reason(&loose, true, true), None);
+    let mut upper = request_for("/roms/GAME.ZIP");
+    upper.expected_platform_id = "SNES".into();
+    assert!(is_zipped_cartridge_request(&upper));
+    // Arcade/other platforms' ZIPs are native content: nothing changes.
+    // An Amiga ZIP is a zipped floppy game: staged like a cartridge.
+    let mut amiga = request_for("/roms/game.zip");
+    amiga.expected_platform_id = "Amiga".into();
+    assert!(is_zipped_cartridge_request(&amiga));
+    for platform in ["Arcade", "MAME", "PlayStation"] {
+        let mut native = request_for("/roms/game.zip");
+        native.expected_platform_id = platform.into();
+        assert!(!is_zipped_cartridge_request(&native), "{platform}");
+        assert_eq!(
+            zipped_play_block_reason(&native, true, true),
+            None,
+            "{platform}"
+        );
+    }
+}
+
+fn gba_candidate(
+    target: LaunchTarget,
+    readiness: LaunchReadiness,
+    pref: CandidatePreference,
+) -> LaunchCandidate {
+    LaunchCandidate {
+        target,
+        readiness,
+        preference: pref,
+        blockers: Vec::new(),
+        ..ready_candidate()
+    }
+}
+
+fn standalone(adapter_id: &'static str) -> LaunchTarget {
+    LaunchTarget::Standalone {
+        adapter_id,
+        profile_id: adapter_id.into(),
+        profile_path: None,
+    }
+}
+
+fn gba_plan(candidates: Vec<LaunchCandidate>) -> LaunchPlan {
+    let mut plan = plan_with(candidates);
+    plan.platform_id = Some("Game Boy Advance".into());
+    plan
+}
+
+#[test]
+fn gba_retroarch_moves_first_and_is_recommended_when_launchable() {
+    use CandidatePreference::Undetermined;
+    let plan = gba_plan(vec![
+        gba_candidate(standalone("mgba"), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(standalone("other"), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+    ]);
+    assert_eq!(super::recommended_gba_candidate(&plan, |_| true), Some(2));
+    assert_eq!(
+        super::candidate_display_order(&plan, |_| true),
+        vec![2, 0, 1]
+    );
+}
+
+#[test]
+fn gba_order_is_unchanged_without_a_launchable_retroarch() {
+    use CandidatePreference::Undetermined;
+    let plan = gba_plan(vec![
+        gba_candidate(standalone("mgba"), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+    ]);
+    // RetroArch present but not launchable (not scanned/refused).
+    assert_eq!(super::candidate_display_order(&plan, |_| false), vec![0, 1]);
+    // RetroArch blocked.
+    let blocked = gba_plan(vec![
+        gba_candidate(standalone("mgba"), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Blocked, Undetermined),
+    ]);
+    assert_eq!(
+        super::candidate_display_order(&blocked, |_| true),
+        vec![0, 1]
+    );
+    // No RetroArch candidate at all.
+    let none = gba_plan(vec![gba_candidate(
+        standalone("mgba"),
+        LaunchReadiness::Ready,
+        Undetermined,
+    )]);
+    assert_eq!(super::candidate_display_order(&none, |_| true), vec![0]);
+}
+
+#[test]
+fn explicit_or_remembered_choice_is_never_reordered_or_overridden() {
+    use CandidatePreference::{Remembered, Undetermined};
+    let plan = gba_plan(vec![
+        gba_candidate(standalone("mgba"), LaunchReadiness::Ready, Remembered),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+    ]);
+    assert_eq!(super::recommended_gba_candidate(&plan, |_| true), None);
+    assert_eq!(super::candidate_display_order(&plan, |_| true), vec![0, 1]);
+}
+
+#[test]
+fn other_platforms_keep_core_plan_order() {
+    use CandidatePreference::Undetermined;
+    let plan = plan_with(vec![
+        gba_candidate(
+            standalone("duckstation"),
+            LaunchReadiness::Ready,
+            Undetermined,
+        ),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+    ]);
+    assert_eq!(super::candidate_display_order(&plan, |_| true), vec![0, 1]);
+}
+
+#[test]
+fn blocked_standalone_cards_follow_the_card_play_uses() {
+    use CandidatePreference::{SoleEligible, Undetermined};
+    // NES ZIP: a blocked native Mesen first in the plan, then RetroArch cores.
+    let mut plan = plan_with(vec![
+        gba_candidate(standalone("mesen"), LaunchReadiness::Blocked, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, SoleEligible),
+    ]);
+    plan.platform_id = Some("NES".into());
+    assert_eq!(
+        super::candidate_display_order(&plan, |_| true),
+        vec![2, 1, 0]
+    );
+}
+
+#[test]
+fn a_remembered_choice_stays_first_even_when_blocked() {
+    use CandidatePreference::{Remembered, Undetermined};
+    let plan = plan_with(vec![
+        gba_candidate(standalone("other"), LaunchReadiness::Blocked, Undetermined),
+        gba_candidate(standalone("mesen"), LaunchReadiness::Blocked, Remembered),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+    ]);
+    // Nothing usable stands out, so plan order, with the blocked
+    // Remembered card kept ahead of the other blocked one.
+    assert_eq!(
+        super::candidate_display_order(&plan, |_| true),
+        vec![1, 2, 0]
+    );
+}
+
+#[test]
+fn gba_recommendation_follows_the_sole_eligible_core_play_uses() {
+    use CandidatePreference::{SoleEligible, Undetermined};
+    let plan = gba_plan(vec![
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, SoleEligible),
+    ]);
+    assert_eq!(super::recommended_gba_candidate(&plan, |_| true), Some(1));
+    assert_eq!(super::candidate_display_order(&plan, |_| true), vec![1, 0]);
+}
+
+#[test]
+fn gba_sole_eligible_not_launchable_recommends_nothing() {
+    use CandidatePreference::{SoleEligible, Undetermined};
+    let plan = gba_plan(vec![
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, SoleEligible),
+    ]);
+    let sole_not_launchable = |c: &LaunchCandidate| c.preference != SoleEligible;
+    assert_eq!(
+        super::recommended_gba_candidate(&plan, sole_not_launchable),
+        None
+    );
+    assert_eq!(
+        super::candidate_display_order(&plan, sole_not_launchable),
+        vec![0, 1]
+    );
+}
+
+#[test]
+fn gba_remembered_anywhere_recommends_nothing_even_with_sole_eligible() {
+    use CandidatePreference::{Remembered, SoleEligible, Undetermined};
+    let plan = gba_plan(vec![
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, Undetermined),
+        gba_candidate(retroarch_target(), LaunchReadiness::Ready, SoleEligible),
+        gba_candidate(standalone("mgba"), LaunchReadiness::Ready, Remembered),
+    ]);
+    assert_eq!(super::recommended_gba_candidate(&plan, |_| true), None);
+}
+
+#[test]
+fn mame_driver_flags_do_not_withdraw_play_but_other_warnings_still_do() {
+    let mame = |warnings: Vec<LaunchWarning>, readiness| LaunchCandidate {
+        target: LaunchTarget::Standalone {
+            adapter_id: "mame",
+            profile_id: "mame:/x/mame".into(),
+            profile_path: Some("/x/mame".into()),
+        },
+        content: LaunchContentRef {
+            kind: None,
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some("/x/set".into()),
+            requires_mount: false,
+            provenance: "fixture".into(),
+        },
+        firmware: FirmwareReadiness::NotRequired,
+        blockers: vec![],
+        warnings,
+        readiness,
+        preference: CandidatePreference::SoleEligible,
+    };
+    let flag = LaunchWarning::new(LaunchWarningKind::MameMachineFlagged, "sound imperfect");
+    assert!(standalone_status_allows_request(&mame(
+        vec![flag.clone()],
+        LaunchReadiness::ReadyWithWarnings
+    )));
+    // The same flag on a candidate the planner labelled plain Ready.
+    assert!(standalone_status_allows_request(&mame(
+        vec![flag.clone()],
+        LaunchReadiness::Ready
+    )));
+    // Clean Ready still works.
+    assert!(standalone_status_allows_request(&mame(
+        vec![],
+        LaunchReadiness::Ready
+    )));
+    // Any other warning kind still withdraws Play.
+    let other = LaunchWarning::new(LaunchWarningKind::FirmwarePresentUnverified, "bios");
+    assert!(!standalone_status_allows_request(&mame(
+        vec![flag.clone(), other.clone()],
+        LaunchReadiness::ReadyWithWarnings
+    )));
+    // A blocker always wins.
+    let mut blocked = mame(vec![flag.clone()], LaunchReadiness::ReadyWithWarnings);
+    blocked.blockers.push(LaunchBlocker::new(
+        LaunchBlockerKind::MameSetVerdictUnavailable,
+        "x",
+    ));
+    assert!(!standalone_status_allows_request(&blocked));
+    // Another adapter's MAME-style flag is not tolerated.
+    let mut dolphin = mame(vec![flag], LaunchReadiness::ReadyWithWarnings);
+    dolphin.target = LaunchTarget::Standalone {
+        adapter_id: "dolphin",
+        profile_id: "d".into(),
+        profile_path: Some("/x/d".into()),
+    };
+    assert!(!standalone_status_allows_request(&dolphin));
+}
+
+// ---- Sega Pico: PicoDrive first, explicit defaults kept, controls follow the core ----
+
+fn pico_core(core_stem: &str) -> LaunchTarget {
+    LaunchTarget::RetroArchCore {
+        profile: retroarch_profile(),
+        core_stem: core_stem.to_string(),
+        platform_id: "Sega Pico",
+    }
+}
+
+/// The three cores the 2026-11-10 smoke test listed, in planner order
+/// (alphabetical), with PicoDrive as the reviewed-preferred core.
+fn smoke_test_pico_plan() -> LaunchPlan {
+    use CandidatePreference::{SoleEligible, Undetermined};
+    let mut plan = plan_with(vec![
+        gba_candidate(
+            pico_core("genesis_plus_gx"),
+            LaunchReadiness::ReadyWithWarnings,
+            Undetermined,
+        ),
+        gba_candidate(
+            pico_core("genesis_plus_gx_wide"),
+            LaunchReadiness::ReadyWithWarnings,
+            Undetermined,
+        ),
+        gba_candidate(
+            pico_core("picodrive"),
+            LaunchReadiness::ReadyWithWarnings,
+            SoleEligible,
+        ),
+    ]);
+    plan.platform_id = Some("Sega Pico".into());
+    plan.game_key = Some("unverified:sega-pico-test".into());
+    plan
+}
+
+fn core_at(plan: &LaunchPlan, index: usize) -> &str {
+    match &plan.candidates[index].target {
+        LaunchTarget::RetroArchCore { core_stem, .. } => core_stem,
+        LaunchTarget::Standalone { adapter_id, .. } => adapter_id,
+    }
+}
+
+#[test]
+fn sega_pico_picodrive_card_is_listed_first_and_alternatives_stay() {
+    let plan = smoke_test_pico_plan();
+    let order = super::candidate_display_order(&plan, |_| true);
+    assert_eq!(order, vec![2, 0, 1]);
+    assert_eq!(core_at(&plan, order[0]), "picodrive");
+    // Genesis Plus GX cores remain listed as choices; nothing is removed or
+    // re-ranked in the plan itself.
+    assert_eq!(order.len(), 3);
+    assert_eq!(
+        plan.candidates[0].preference,
+        CandidatePreference::Undetermined
+    );
+}
+
+#[test]
+fn sega_pico_order_leaves_a_blocked_picodrive_and_other_platforms_alone() {
+    let mut plan = smoke_test_pico_plan();
+    plan.candidates[2].readiness = LaunchReadiness::Blocked;
+    assert_eq!(
+        super::candidate_display_order(&plan, |_| true),
+        vec![0, 1, 2]
+    );
+    // Other systems do not get the Pico rule; they get the general one, which
+    // puts the card Play uses (here the Sole eligible core) first.
+    let mut md = smoke_test_pico_plan();
+    md.platform_id = Some("MegaDrive".into());
+    assert_eq!(super::candidate_display_order(&md, |_| true), vec![2, 0, 1]);
+}
+
+/// Saves "Default for Sega Pico" on `core` through the real choice state and
+/// preferences file, reloads it, and applies it to a fresh smoke-test plan.
+fn plan_with_saved_pico_default(
+    label: &str,
+    core: &str,
+) -> (
+    LaunchPlan,
+    Vec<archivefs_core::launch::launch_choice::LaunchPreference>,
+) {
+    use archivefs_core::launch::launch_choice as core_choice;
+    let dir = std::env::temp_dir().join(format!(
+        "emuwiz-pico-default-{label}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("launch_preferences.json");
+    let mut state = launch_choice::LaunchChoiceState::load_at(path.clone());
+    let option_id = core_choice::launch_option_id(&pico_core(core));
+    state.handle(launch_choice::LaunchChoiceAction::SetDefault(
+        core_choice::LaunchPreference::system("Sega Pico", &option_id),
+    ));
+    let reloaded = launch_choice::LaunchChoiceState::load_at(path);
+    let saved = reloaded.preferences.clone().expect("preferences readable");
+    let mut plan = smoke_test_pico_plan();
+    core_choice::apply(&mut plan, reloaded.inputs());
+    let _ = std::fs::remove_dir_all(&dir);
+    (plan, saved)
+}
+
+#[test]
+fn sega_pico_default_saves_the_explicitly_selected_core() {
+    use archivefs_core::launch::launch_choice as core_choice;
+    for core in ["picodrive", "genesis_plus_gx"] {
+        let (plan, saved) = plan_with_saved_pico_default(core, core);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].platform_id, "Sega Pico");
+        assert_eq!(
+            saved[0].option_id,
+            core_choice::launch_option_id(&pico_core(core))
+        );
+        let remembered: Vec<&str> = (0..plan.candidates.len())
+            .filter(|&i| plan.candidates[i].preference == CandidatePreference::Remembered)
+            .map(|i| core_at(&plan, i))
+            .collect();
+        assert_eq!(
+            remembered,
+            vec![core],
+            "only the selected core is the default"
+        );
+    }
+}
+
+#[test]
+fn sega_pico_existing_user_default_stays_first_and_keeps_its_controls_note() {
+    // A user who chose Genesis Plus GX keeps it: it is listed first, PicoDrive
+    // stays available, and the controls note no longer claims PicoDrive's pen.
+    let (plan, _) = plan_with_saved_pico_default("gpgx-kept", "genesis_plus_gx");
+    let order = super::candidate_display_order(&plan, |_| true);
+    assert_eq!(core_at(&plan, order[0]), "genesis_plus_gx");
+    assert!(order.iter().any(|&i| core_at(&plan, i) == "picodrive"));
+    let note = crate::emulator_setup::unverified_media::sega_pico_controls_note(&plan).unwrap();
+    assert!(note.starts_with("Sega Pico with genesis_plus_gx"), "{note}");
+    assert!(note.contains("choose the picodrive card"), "{note}");
+    assert_ne!(
+        note,
+        crate::emulator_setup::unverified_media::SEGA_PICO_CONTROLS
+    );
+}
+
+#[test]
+fn sega_pico_controls_note_describes_picodrive_only_when_picodrive_is_selected() {
+    use crate::emulator_setup::unverified_media::{SEGA_PICO_CONTROLS, sega_pico_controls_note};
+    let plan = smoke_test_pico_plan();
+    assert_eq!(
+        sega_pico_controls_note(&plan).as_deref(),
+        Some(SEGA_PICO_CONTROLS)
+    );
+    let (picked, _) = plan_with_saved_pico_default("pd-kept", "picodrive");
+    assert_eq!(
+        sega_pico_controls_note(&picked).as_deref(),
+        Some(SEGA_PICO_CONTROLS)
+    );
+    // No PicoDrive installed: the first usable core is named, not PicoDrive's pen.
+    let mut no_pd = smoke_test_pico_plan();
+    no_pd.candidates.pop();
+    let note = sega_pico_controls_note(&no_pd).unwrap();
+    assert!(
+        note.starts_with("Sega Pico with genesis_plus_gx:"),
+        "{note}"
+    );
+    // Not a Pico plan: no note.
+    no_pd.platform_id = Some("MegaDrive".into());
+    assert_eq!(sega_pico_controls_note(&no_pd), None);
 }

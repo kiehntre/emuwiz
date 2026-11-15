@@ -571,6 +571,19 @@ pub fn preflight_and_launch_retroarch_with_cheats(
     cheats: &RetroArchCheatSelection,
     launch_id: &str,
 ) -> Result<RetroArchCheatLaunch, RetroArchCheatLaunchError> {
+    if !cheats.selections.is_empty()
+        && crate::zip_cartridge_stage::is_zipped_cartridge_request(
+            &request.selected_content_path,
+            &request.expected_platform_id,
+        )
+    {
+        return Err(RetroArchCheatLaunchError::Preflight(
+            super::execution::LaunchPreflightError {
+                kind: super::execution::LaunchPreflightErrorKind::ContentRequiresMount,
+                detail: "cheats are not supported for a zipped cartridge".into(),
+            },
+        ));
+    }
     let command = preflight_retroarch_launch(request, filesystem, environment)
         .map_err(RetroArchCheatLaunchError::Preflight)?;
     if cheats.selections.is_empty() {

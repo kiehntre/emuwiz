@@ -460,7 +460,7 @@ fn a_region_declared_on_the_dat_rom_metadata_wins_over_the_name_scan() {
     let outcome = base_outcome();
     let verdict = exact("Game (Europe)");
     let audited = hashes();
-    let mut reference = DatRomRef {
+    let reference = DatRomRef {
         game_index: 0,
         game_name: "Game (Europe)".to_string(),
         rom_index: 0,
@@ -474,13 +474,13 @@ fn a_region_declared_on_the_dat_rom_metadata_wins_over_the_name_scan() {
         status: None,
         merge: None,
         content_classification: Default::default(),
-        original_metadata: Default::default(),
+        original_metadata: std::sync::Arc::new(crate::dat::classification::DatOriginalMetadata {
+            fields: [("region".to_string(), "Japan".to_string())]
+                .into_iter()
+                .collect(),
+        }),
         clone_of: None,
     };
-    reference
-        .original_metadata
-        .fields
-        .insert("region".to_string(), "Japan".to_string());
     let refs = vec![reference];
     let summary = summarize_library_dat_identity(&LibraryDatIdentityQuery {
         outcome: &outcome,

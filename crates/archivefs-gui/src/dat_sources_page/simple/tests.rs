@@ -446,6 +446,7 @@ mod audit_population {
             std::fs::write(folder.join("assets").join(name), vec![9u8; 4096]).unwrap();
         }
         let config = Config {
+            configured_source_roots: Some(vec![source.clone()]),
             source_folders: vec![source],
             mount_root: dir.path().join("mounts"),
             ratarmount_bin: "ratarmount".into(),
@@ -954,3 +955,6 @@ fn a_refused_or_failed_assignment_reports_it_and_changes_nothing() {
     );
     assert!(page.view().rows.iter().all(|row| row.platform_id.is_none()));
 }
+
+#[path = "recognition_journey_tests.rs"]
+mod recognition_journey;

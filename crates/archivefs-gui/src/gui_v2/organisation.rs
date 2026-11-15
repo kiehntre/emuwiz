@@ -385,6 +385,7 @@ impl App {
         let mut canonical_action = None;
         let mut playing_action = None;
         let mut review_pending = false;
+        let mut open_organise_games = false;
         let mut open_history = false;
         let mut open_mame_history = false;
 
@@ -425,7 +426,15 @@ impl App {
                                 widgets::StatusTone::Info,
                             )),
                             None,
-                            |_ui| {},
+                            |ui| {
+                                if ui
+                                    .button("Organise my games")
+                                    .on_hover_text("Move misfiled games to their system's folder after a preview.")
+                                    .clicked()
+                                {
+                                    open_organise_games = true;
+                                }
+                            },
                             |_ui| {},
                         );
                     }
@@ -520,6 +529,14 @@ impl App {
                         ui.label("Read-only arcade set inspection: ROM checksums, shared support files and preservation gaps. Storage completeness does not prove game runnability.");
                         if ui.button("Check MAME collection health").clicked() {
                             self.organisation.view = OrganisationView::MameHealth;
+                        }
+                    });
+                    ui.add_space(theme::SPACE_SM);
+                    widgets::workflow_card(ui, theme::accent(ui), |ui| {
+                        ui.heading("Organise my games");
+                        ui.label("Mixed or misfiled folders: EmuWiz identifies each game by its content and moves it to its system's folder after one preview and approval.");
+                        if ui.button("Organise my games").clicked() {
+                            open_organise_games = true;
                         }
                     });
                     ui.add_space(theme::SPACE_SM);
@@ -645,6 +662,9 @@ impl App {
                 }
             }
         }
+        if open_organise_games {
+            self.go(Route::Tool(super::routes::ToolPage::FolderCheck));
+        }
         if review_pending {
             self.organisation.view = OrganisationView::PlayingLibrary;
         }
@@ -663,6 +683,8 @@ impl App {
                 RomOrganisationPageAction::Rollback => self.start_canonical_organisation_job(
                     super::CanonicalOrganisationJobKind::Rollback,
                 ),
+                RomOrganisationPageAction::Rescan => self
+                    .start_canonical_organisation_job(super::CanonicalOrganisationJobKind::Rescan),
                 RomOrganisationPageAction::OpenAdvanced => {}
                 RomOrganisationPageAction::OpenDat => {}
                 RomOrganisationPageAction::OpenCheck => {}
@@ -711,6 +733,8 @@ impl App {
                 RomOrganisationPageAction::Rollback => self.start_canonical_organisation_job(
                     super::CanonicalOrganisationJobKind::Rollback,
                 ),
+                RomOrganisationPageAction::Rescan => self
+                    .start_canonical_organisation_job(super::CanonicalOrganisationJobKind::Rescan),
                 RomOrganisationPageAction::OpenAdvanced => {
                     self.organisation.view = OrganisationView::VerifiedGames;
                     self.go(Route::Section(Section::Build));

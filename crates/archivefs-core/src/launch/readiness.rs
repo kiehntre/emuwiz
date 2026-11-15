@@ -455,6 +455,10 @@ pub enum LaunchBlockerKind {
     /// libretro cores cannot load; they need an archived ROM set. The file has
     /// not moved and nothing is missing.
     RetroArchArcadeSetNeedsArchive,
+    /// Zipped content plays from a temporary extracted copy, and RetroArch's
+    /// save setup would write saves beside it (lost at exit). The same check
+    /// refuses the launch itself (`staged_launch_is_safe`).
+    RetroArchZippedSaveLocationUnsafe,
     HatariCandidateRequired,
     HatariPlatformMismatch,
     HatariProfileUnavailable,
@@ -594,6 +598,12 @@ pub enum LaunchWarningKind {
     /// none is remembered/preferred - still launchable, just ambiguous
     /// which one is "the" one.
     MultipleEligibleProfiles,
+    /// The user's saved or one-time emulator choice for this game or system
+    /// names a launch option that is missing, changed or blocked (or the
+    /// saved choices cannot be read). No other option is used in its place
+    /// until the user explicitly chooses again - see
+    /// [`crate::launch::launch_choice`].
+    PreferredLaunchChoiceUnavailable,
     /// The selected Cemu extracted title has no `meta.xml`, or `meta.xml`
     /// could not be read - the layout is still launched from its `.rpx`,
     /// but with no self-reported title identity to show.
@@ -604,6 +614,48 @@ pub enum LaunchWarningKind {
     CemuKeysPresentUnverified,
     SameBoyRomHeaderChecksumInvalid,
     SameBoyCustomBootRomUnavailable,
+    /// A RetroArch core was matched to CHD content, but whether the installed
+    /// core build can actually read CHD cannot be proven without running it
+    /// (its `.info` lists `chd` for every build, including builds without
+    /// CHD support). Launch is not blocked; a route with known CHD support
+    /// is preferred when one is ready.
+    RetroArchChdSupportUnconfirmed,
+    /// The file's system, format and structure were confirmed (so it can be
+    /// launched safely), but EmuWiz could not establish WHICH game it is:
+    /// no header identity exists for this system and optional DAT matching
+    /// has not been done. Owner-approved 2026-11-07 for ZX Spectrum `.tap` /
+    /// `.tzx` and shown to the user as a visible warning; never a verified
+    /// identity.
+    IdentityUnverified,
+    /// MAME's own driver data flags this machine (imperfect or unemulated
+    /// feature, special controls, gambling/fruit machine). Informational:
+    /// never a launch gate.
+    MameMachineFlagged,
+    /// The save-file or save-state folder RetroArch would use for this core
+    /// (from `retroarch.cfg` or the core's per-core override) is missing,
+    /// not a folder, a link, not writable, or could not be checked. The
+    /// detail names the folder, the setting, why, and what to do. Play stays
+    /// available (owner decision 2026-11-13): saves or states may fail to be
+    /// kept, which the detail says; it never makes the candidate `Ready`.
+    RetroArchSaveDirectoryUnusable,
+}
+
+impl LaunchWarningKind {
+    /// Owner-approved policy (option B, 2026-11-06): a readable, regular
+    /// firmware file whose hash is not verified may stay launchable through
+    /// RetroArch with a visible warning. This is the ALLOW-LIST of warning
+    /// kinds that do not withdraw RetroArch Play; every other kind (present
+    /// or future) still does. Add a kind here only with explicit owner
+    /// approval (`IdentityUnverified`: ZX/X68000 decision, 2026-11-07;
+    /// `RetroArchSaveDirectoryUnusable`: save-folder decision, 2026-11-13).
+    pub fn permits_retroarch_play(self) -> bool {
+        matches!(
+            self,
+            Self::FirmwarePresentUnverified
+                | Self::IdentityUnverified
+                | Self::RetroArchSaveDirectoryUnusable
+        )
+    }
 }
 
 /// One non-blocking condition on a [`crate::launch::planning::LaunchCandidate`].
@@ -745,6 +797,82 @@ pub fn xenia_firmware_readiness() -> FirmwareReadiness {
     FirmwareReadiness::NotRequired
 }
 
+/// Required `.info` entries that are known regional ALTERNATIVES: the core
+/// needs only one of them, although `.info` lists each as non-optional.
+/// Deliberately a short, conservative table keyed by file name (verified
+/// against libretro info files: Beetle/DuckStation PSX JP/US/EU BIOS and
+/// Beetle Saturn JP vs US/EU BIOS). Everything else is not grouped, so a
+/// missing required file there still blocks.
+const ALTERNATIVE_FIRMWARE_GROUPS: &[&[&str]] = &[
+    &["scph5500.bin", "scph5501.bin", "scph5502.bin"],
+    &["sega_101.bin", "mpr-17933.bin"],
+];
+
+/// One effective requirement: a single required file, or a whole alternative
+/// group collapsed to one judgement.
+pub(crate) struct EffectiveRequirement<'a> {
+    pub members: Vec<&'a crate::emulator_environment::retroarch::FirmwareRequirement>,
+    pub presence: FirmwarePresence,
+}
+
+fn alternative_group_of(path: Option<&str>) -> Option<usize> {
+    let name = path?.rsplit('/').next()?.to_ascii_lowercase();
+    ALTERNATIVE_FIRMWARE_GROUPS
+        .iter()
+        .position(|group| group.contains(&name.as_str()))
+}
+
+/// Collapses required entries into effective requirements. A group only
+/// forms when at least two of its files are listed as required; it is
+/// satisfied by any present member, `Missing` only when every member is
+/// missing, and otherwise `Unknown`.
+pub(crate) fn effective_required_firmware(
+    firmware: &[crate::emulator_environment::retroarch::FirmwareRequirement],
+) -> Vec<EffectiveRequirement<'_>> {
+    let required: Vec<_> = firmware.iter().filter(|entry| !entry.optional).collect();
+    let mut out: Vec<EffectiveRequirement<'_>> = Vec::new();
+    let mut seen_groups: Vec<usize> = Vec::new();
+    for entry in &required {
+        let group = alternative_group_of(entry.path.as_deref()).filter(|g| {
+            required
+                .iter()
+                .filter(|e| alternative_group_of(e.path.as_deref()) == Some(*g))
+                .count()
+                >= 2
+        });
+        match group {
+            None => out.push(EffectiveRequirement {
+                members: vec![*entry],
+                presence: entry.presence,
+            }),
+            Some(g) if seen_groups.contains(&g) => {}
+            Some(g) => {
+                seen_groups.push(g);
+                let members: Vec<_> = required
+                    .iter()
+                    .copied()
+                    .filter(|e| alternative_group_of(e.path.as_deref()) == Some(g))
+                    .collect();
+                let presence = if members
+                    .iter()
+                    .any(|m| m.presence == FirmwarePresence::PresentUnverified)
+                {
+                    FirmwarePresence::PresentUnverified
+                } else if members
+                    .iter()
+                    .all(|m| m.presence == FirmwarePresence::Missing)
+                {
+                    FirmwarePresence::Missing
+                } else {
+                    FirmwarePresence::Unknown
+                };
+                out.push(EffectiveRequirement { members, presence });
+            }
+        }
+    }
+    out
+}
+
 /// Projects a RetroArch core's declared, non-optional `firmwareN_*` entries
 /// onto [`FirmwareReadiness`]. This performs no I/O: discovery already
 /// probed each entry read-only and no-follow under the profile's system
@@ -754,25 +882,28 @@ pub fn xenia_firmware_readiness() -> FirmwareReadiness {
 /// say which required files are alternatives (e.g. Mednafen PSX lists the
 /// JP, US and EU BIOS all as required, though the core uses the one matching
 /// the disc). EmuWiz does not invent such groups, so:
-/// - every required entry `Missing` is `Missing` (nothing usable exists);
-/// - some `Missing` alongside any present or unjudgeable entry is `Unknown`
-///   (it could be an unused regional alternative - not claimed either way);
+/// - known regional alternatives (see `ALTERNATIVE_FIRMWARE_GROUPS`) count
+///   as one requirement, satisfied by any present member;
+/// - any other required entry `Missing` is `Missing`, even when other required
+///   entries are present (owner policy: a missing required file is never a
+///   Play-ready result; the user can install it or the core can be
+///   reviewed - EmuWiz does not guess an unused regional alternative);
 /// - all required entries present is `PresentUnverified`; any other
-///   unjudgeable entry, or an unreadable `.info`, is `Unknown`.
+///   unjudgeable entry (with none missing), or an unreadable `.info`, is
+///   `Unknown`.
 ///
 /// Never `Verified`: file contents are not hashed.
 pub fn retroarch_core_firmware_readiness(info: &CoreInfoFinding) -> FirmwareReadiness {
     let CoreInfoFinding::Found { firmware, .. } = info else {
         return FirmwareReadiness::Unknown;
     };
-    let required: Vec<FirmwarePresence> = firmware
-        .iter()
-        .filter(|entry| !entry.optional)
-        .map(|entry| entry.presence)
+    let required: Vec<FirmwarePresence> = effective_required_firmware(firmware)
+        .into_iter()
+        .map(|group| group.presence)
         .collect();
     if required.is_empty() {
         FirmwareReadiness::NotRequired
-    } else if required.iter().all(|p| *p == FirmwarePresence::Missing) {
+    } else if required.contains(&FirmwarePresence::Missing) {
         FirmwareReadiness::Missing
     } else if required
         .iter()
@@ -816,15 +947,19 @@ mod tests {
     #[test]
     fn retroarch_core_firmware_projection() {
         use FirmwarePresence::*;
-        let cases: [(&[(bool, FirmwarePresence)], FirmwareReadiness); 8] = [
+        let cases: [(&[(bool, FirmwarePresence)], FirmwareReadiness); 9] = [
             (&[], FirmwareReadiness::NotRequired),
             (&[(true, Missing)], FirmwareReadiness::NotRequired),
             (&[(false, Missing)], FirmwareReadiness::Missing),
             // Mednafen PSX-style: JP/US/EU all "required"; only one installed.
-            // Alternatives are not invented, so this is Unknown, not Missing.
+            // Alternatives are not invented, so a missing required file blocks.
             (
                 &[(false, PresentUnverified), (false, Missing)],
-                FirmwareReadiness::Unknown,
+                FirmwareReadiness::Missing,
+            ),
+            (
+                &[(false, Unknown), (false, Missing)],
+                FirmwareReadiness::Missing,
             ),
             (
                 &[(false, Missing), (false, Missing), (false, Missing)],
@@ -850,6 +985,79 @@ mod tests {
         assert_eq!(
             retroarch_core_firmware_readiness(&CoreInfoFinding::Missing),
             FirmwareReadiness::Unknown
+        );
+    }
+
+    fn named_core(entries: &[(&str, FirmwarePresence)]) -> CoreInfoFinding {
+        use crate::emulator_environment::retroarch::FirmwareRequirement;
+        CoreInfoFinding::Found {
+            display_name: None,
+            display_version: None,
+            system_name: None,
+            supported_extensions: Vec::new(),
+            core_name: None,
+            manufacturer: None,
+            categories: None,
+            database: None,
+            firmware: entries
+                .iter()
+                .enumerate()
+                .map(|(i, (path, presence))| FirmwareRequirement {
+                    index: i as u32,
+                    path: Some((*path).into()),
+                    description: None,
+                    optional: false,
+                    presence: *presence,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn beetle_psx_region_alternatives_need_only_one_present() {
+        use FirmwarePresence::*;
+        let psx = |a, b, c| {
+            retroarch_core_firmware_readiness(&named_core(&[
+                ("scph5500.bin", a),
+                ("scph5501.bin", b),
+                ("scph5502.bin", c),
+            ]))
+        };
+        assert_eq!(
+            psx(Missing, PresentUnverified, Missing),
+            FirmwareReadiness::PresentUnverified
+        );
+        assert_eq!(psx(Missing, Missing, Missing), FirmwareReadiness::Missing);
+        assert_eq!(psx(Missing, Unknown, Missing), FirmwareReadiness::Unknown);
+    }
+
+    #[test]
+    fn saturn_alternatives_ok_but_puae_style_mixed_still_blocks() {
+        use FirmwarePresence::*;
+        assert_eq!(
+            retroarch_core_firmware_readiness(&named_core(&[
+                ("sega_101.bin", Missing),
+                ("mpr-17933.bin", PresentUnverified),
+            ])),
+            FirmwareReadiness::PresentUnverified
+        );
+        // Not alternatives: a present Kickstart does not excuse another
+        // required file that is missing.
+        assert_eq!(
+            retroarch_core_firmware_readiness(&named_core(&[
+                ("kick34005.A500", PresentUnverified),
+                ("kick40068.A1200", Missing),
+            ])),
+            FirmwareReadiness::Missing
+        );
+        // An alternative group does not excuse a different missing file.
+        assert_eq!(
+            retroarch_core_firmware_readiness(&named_core(&[
+                ("scph5500.bin", PresentUnverified),
+                ("scph5501.bin", Missing),
+                ("other.bin", Missing),
+            ])),
+            FirmwareReadiness::Missing
         );
     }
 
@@ -952,5 +1160,39 @@ mod tests {
     #[test]
     fn ppsspp_never_requires_firmware() {
         assert_eq!(ppsspp_firmware_readiness(), FirmwareReadiness::NotRequired);
+    }
+
+    #[test]
+    fn only_unverified_firmware_warning_permits_retroarch_play() {
+        assert!(LaunchWarningKind::FirmwarePresentUnverified.permits_retroarch_play());
+        assert!(LaunchWarningKind::IdentityUnverified.permits_retroarch_play());
+        assert!(LaunchWarningKind::RetroArchSaveDirectoryUnusable.permits_retroarch_play());
+        for kind in [
+            LaunchWarningKind::OptionalFirmwareMissing,
+            LaunchWarningKind::MultipleEligibleProfiles,
+            LaunchWarningKind::PreferredLaunchChoiceUnavailable,
+            LaunchWarningKind::ShadPs4PrerequisitesUnverified,
+            LaunchWarningKind::CemuKeysPresentUnverified,
+            LaunchWarningKind::SameBoyRomHeaderChecksumInvalid,
+        ] {
+            assert!(!kind.permits_retroarch_play(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn unverified_warning_names_the_required_files_only() {
+        let info = core_with(&[
+            (false, FirmwarePresence::PresentUnverified),
+            (true, FirmwarePresence::PresentUnverified),
+        ]);
+        let text = crate::launch::planning::unverified_firmware_detail(&info);
+        assert!(
+            text.starts_with("Firmware found but not verified"),
+            "{text}"
+        );
+        assert!(
+            text.contains("f0.bin") && !text.contains("f1.bin"),
+            "{text}"
+        );
     }
 }

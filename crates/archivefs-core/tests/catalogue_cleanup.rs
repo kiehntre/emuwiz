@@ -8,6 +8,7 @@ fn fixture() -> (tempfile::TempDir, Database, Config, PathBuf, i64) {
     let path = source.join("game.zip");
     fs::write(&path, b"synthetic").unwrap();
     let config = Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source],
         mount_root: root.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),

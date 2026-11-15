@@ -187,6 +187,28 @@ pub(in crate::gui_v2) enum Reply {
         image: Option<egui::ColorImage>,
     },
 }
+/// One listed file: name, the size RomM reports, and which hashes it lists.
+fn related_file_line(
+    file: &archivefs_core::identity_source::romm::browser::RommRelatedFile,
+) -> String {
+    let mut line = file
+        .filename
+        .as_deref()
+        .unwrap_or("Unnamed file")
+        .to_string();
+    if let Some(size) = file.size_bytes {
+        line.push_str(&format!(" - {}", crate::romm_source::human_bytes(size)));
+    }
+    if !file.hashes.is_empty() {
+        let names: Vec<String> = file
+            .hashes
+            .iter()
+            .map(|h| format!("{:?}", h.algorithm))
+            .collect();
+        line.push_str(&format!(" - hashes listed: {}", names.join(", ")));
+    }
+    line
+}
 pub(in crate::gui_v2) struct Work {
     pub request: Request,
     pub roots: Vec<PathBuf>,
@@ -1182,8 +1204,9 @@ impl State {
         if !detail.files.is_empty() {
             ui.strong("Files listed by RomM");
             for file in &detail.files {
-                ui.label(self.display(file.filename.as_deref().unwrap_or("Unnamed file")));
+                ui.label(self.display(&related_file_line(file)));
             }
+            ui.weak("Sizes and hashes are what RomM reports. EmuWiz has not checked them against any local file.");
         }
         ui.collapsing("Details", |ui| {
             ui.label(format!("RomM item: {}", game.id));

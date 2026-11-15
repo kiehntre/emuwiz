@@ -29,7 +29,7 @@ fn ps2_fixture(page_stride: usize) -> Vec<u8> {
     card
 }
 
-fn ps2_inventory_fixture() -> Vec<u8> {
+pub(crate) fn ps2_inventory_fixture() -> Vec<u8> {
     let mut card = ps2_fixture(PS2_PAGE_DATA_BYTES);
     card[0x50..0x54].copy_from_slice(&7u32.to_le_bytes());
     card[8 * 1024..8 * 1024 + 4].copy_from_slice(&0x8000_0009u32.to_le_bytes());

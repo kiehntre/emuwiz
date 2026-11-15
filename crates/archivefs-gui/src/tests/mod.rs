@@ -101,6 +101,7 @@ impl GuiConfigSnapshot {
 #[cfg(test)]
 fn hermetic_gui_config() -> Result<Config, String> {
     Ok(Config {
+        configured_source_roots: Some(vec![PathBuf::from("/library")]),
         source_folders: vec![PathBuf::from("/library")],
         mount_root: PathBuf::from("/mount"),
         ratarmount_bin: "ratarmount".to_string(),
@@ -254,6 +255,7 @@ mod platform_shelf_and_library_shell;
 mod selected;
 mod selected_context_and_bsfree;
 mod selected_page_mount_removal;
+mod startup_shared_recovery;
 mod transactions;
 
 // -- Hoisted shared test fixtures ------------------------------------
@@ -379,7 +381,7 @@ fn loose_mega_drive_record(path: &str) -> ArchiveRecord {
     )
 }
 
-fn cheat_profile(profile_id: &str, eligible: bool) -> RetroArchCheatSetupProfile {
+pub(crate) fn cheat_profile(profile_id: &str, eligible: bool) -> RetroArchCheatSetupProfile {
     RetroArchCheatSetupProfile {
         profile_id: profile_id.to_string(),
         installation_type: ProfileKind::Native,
@@ -406,7 +408,9 @@ fn cheat_profile(profile_id: &str, eligible: bool) -> RetroArchCheatSetupProfile
     }
 }
 
-fn cheat_discovery(profiles: Vec<RetroArchCheatSetupProfile>) -> RetroArchCheatSetupDiscovery {
+pub(crate) fn cheat_discovery(
+    profiles: Vec<RetroArchCheatSetupProfile>,
+) -> RetroArchCheatSetupDiscovery {
     RetroArchCheatSetupDiscovery {
         schema_version: RETROARCH_CHEAT_SETUP_SCHEMA_VERSION,
         profiles,
@@ -416,6 +420,7 @@ fn cheat_discovery(profiles: Vec<RetroArchCheatSetupProfile>) -> RetroArchCheatS
             profiles: Vec::new(),
             diagnostics: Vec::new(),
         },
+        zipped_save_findings: Vec::new(),
     }
 }
 
@@ -655,7 +660,7 @@ pub(crate) fn app_with_cheats_mods_context() -> ArchiveFsApp {
     app
 }
 
-fn pcsx2_profile_fixture() -> Pcsx2Profile {
+pub(crate) fn pcsx2_profile_fixture() -> Pcsx2Profile {
     Pcsx2Profile {
         profile_id: "pcsx2-native-test".to_string(),
         installation_type: Pcsx2InstallationType::Native,
@@ -935,6 +940,7 @@ fn successful_shared_apply_result() -> SharedApplyResult {
         replacement_approved: false,
         verification_succeeded: true,
         outcome: SharedApplyOutcome::InstalledNew,
+        publication: Default::default(),
         stages: vec![SharedTransactionStage::Success],
         warnings: Vec::new(),
         failures: Vec::new(),
@@ -1056,6 +1062,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         database_generation: DatabaseGeneration::INITIAL,
         doctor_repair: DoctorRepairState {
             database_restore_plan: None,
+            database_rollback_receipt: None,
             database_restore_confirmation: String::new(),
             database_restore_feedback: None,
             diagnostics: DiagnosticsState::Ready {
@@ -1115,6 +1122,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         mount_ui: MountUiState::default(),
         history_filters: HistoryLogFilters::default(),
         shared_history: SharedHistoryState::NotLoaded,
+        startup_shared_recovery: StartupSharedRecoveryState::NotStarted,
         shared_history_operation: None,
         shared_rollback: SharedRollbackState::Idle,
         shared_rollback_action: ActivityAction::CheatPreview,
@@ -1139,6 +1147,10 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         snapshot_stale: false,
         catalogued_scummvm_folder: None,
         catalogued_platform_hint: None,
+        catalogued_platform_source: None,
+        launch_system_trial: None,
+        launch_remember_choice: None,
+        launch_remember_error: None,
         catalogued_row_health: None,
         catalogued_loose_content: None,
         refresh_generation: RefreshGeneration::INITIAL,
@@ -1174,6 +1186,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         select_all_visible_requested: false,
         catalogue_bsfree_ui: CatalogueBsFreeUiState::default(),
         gui_config: GuiConfigSnapshot::from_config(Config {
+            configured_source_roots: Some(vec![PathBuf::from("/library")]),
             source_folders: vec![PathBuf::from("/library")],
             mount_root: PathBuf::from("/mount"),
             ratarmount_bin: "ratarmount".to_string(),
@@ -1194,6 +1207,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         // `~/.config/archivefs/library_views.json` happens to contain.
         library_views: Vec::new(),
         library_view_action: None,
+        external_catalogue_writer_busy: false,
         library_view_last_plan: None,
         library_view_form_dialog: None,
         library_view_remove_dialog: None,
@@ -1366,6 +1380,7 @@ fn write_archive_file(dir: &Path, relative_path: &str, content: &[u8]) -> PathBu
 
 fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
     Config {
+        configured_source_roots: Some(vec![source_dir.to_path_buf()]),
         source_folders: vec![source_dir.to_path_buf()],
         mount_root: mount_dir.to_path_buf(),
         ratarmount_bin: "ratarmount".to_string(),
@@ -1556,6 +1571,7 @@ fn skipped_files_summary(
         ingestion_skip_reasons: Default::default(),
         ingestion_platform_counts: Default::default(),
         arcade_ingestion: Default::default(),
+        nested_mounts: Vec::new(),
         ingestion_skipped: Vec::new(),
         ingestion_recognised_sample: Vec::new(),
     }

@@ -199,3 +199,17 @@ fn full_page_ppsspp_route_and_diagnostics_offer_local_preview() {
     assert!(!rendered.contains("Unsupported platform"));
     assert!(!rendered.contains("GUI workflow does not apply it yet"));
 }
+
+#[test]
+fn apply_result_shows_shared_transaction_warnings() {
+    use crate::shared_apply_warnings::test_support::{assert_shows_warning, warned_result};
+    let (tx, rx) = mpsc::channel();
+    let mut state = State {
+        receiver: Some(rx),
+        ..Default::default()
+    };
+    tx.send((state.generation, Ok(Message::Applied(warned_result()))))
+        .unwrap();
+    state.poll();
+    assert_shows_warning(state.notice.as_deref().unwrap());
+}

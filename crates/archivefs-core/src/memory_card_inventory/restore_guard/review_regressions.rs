@@ -421,7 +421,8 @@ fn real_proc_detects_child_holding_a_hardlink_alias() {
         ready && found,
         "real /proc must identify the synthetic alias holder by inode"
     );
-    assert_eq!(report.state, EmulatorQuiescence::Running);
+    // Refused; a holder that is not the emulator is "in use", not "running".
+    assert_eq!(report.state, EmulatorQuiescence::CardInUse);
 }
 
 #[test]
@@ -433,7 +434,7 @@ fn proc_aliases_match_by_inode_and_notes_do_not_match_emulator_name() {
     assert_eq!(
         ProcScanQuiescence::with_root(proc.path().to_path_buf())
             .observe(&ps2_card_binding(&world.card, "synthetic")),
-        EmulatorQuiescence::Running
+        EmulatorQuiescence::CardInUse
     );
     let proc = fake_proc(&[("992", "vim", "vim\0notes-about-pcsx2.txt\0", None)]);
     assert_eq!(

@@ -275,6 +275,64 @@ fn selected_cheats_install_into_the_real_destination_and_preserve_user_codes() {
     assert!(!installed.contains("Encrypted"));
 }
 
+/// The command-line rollback takes the profile folder as it is typed, in a
+/// separate invocation from the install. The same folder typed with a
+/// trailing slash, or a doubled one, is still the folder the install was
+/// made for; a different folder is not.
+#[test]
+fn rollback_accepts_the_same_folder_however_it_is_typed_and_no_other() {
+    for (label, respell) in [
+        (
+            "trailing",
+            (|text: &str| format!("{text}/")) as fn(&str) -> String,
+        ),
+        ("doubled", |text: &str| {
+            let (parent, name) = text.rsplit_once('/').unwrap();
+            format!("{parent}//{name}")
+        }),
+    ] {
+        let fixture = Fixture::new(&format!("rollback-typed-{label}"));
+        let workflow = Workflow::new(&fixture, Some(EXISTING_INI));
+        let destination = workflow.destination();
+        let original = fs::read_to_string(&destination).expect("original file");
+        let (report, _) = workflow.prepare_install();
+        let result = workflow.apply(&report, true);
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        let journal_path = result.journal_path.clone().expect("journal written");
+
+        // Another folder, though it is the one above: refused.
+        let above = workflow.configuration_path.parent().unwrap();
+        let refused = preview_shared_rollback(&journal_path, above, &workflow.backup_root);
+        assert!(!refused.available, "{label}: {refused:?}");
+        assert_ne!(fs::read_to_string(&destination).unwrap(), original);
+
+        let typed =
+            std::path::PathBuf::from(respell(workflow.configuration_path.to_str().unwrap()));
+        assert_ne!(typed.as_os_str(), workflow.configuration_path.as_os_str());
+        let preview = preview_shared_rollback(&journal_path, &typed, &workflow.backup_root);
+        assert!(preview.available, "{label}: {preview:?}");
+        let rollback = execute_shared_rollback(
+            &preview,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: preview.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: format!("test-bsfree-typed-{label}"),
+                timestamp_unix_seconds: 1_700_001_600,
+                history_root: workflow.history_root.clone(),
+                backup_root: workflow.backup_root.clone(),
+            },
+        );
+        assert_eq!(rollback.status, SharedApplyStatus::Success, "{label}");
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            original,
+            "{label}"
+        );
+    }
+}
+
 #[test]
 fn install_and_rollback_round_trip_restores_the_exact_original_file() {
     let fixture = Fixture::new("rollback");

@@ -54,6 +54,7 @@ impl Fixture {
     /// fixture, so no test can reach real data.
     fn config(&self) -> Config {
         Config {
+            configured_source_roots: Some(vec![self.dir("roms")]),
             source_folders: vec![self.dir("roms")],
             mount_root: self.dir("mnt"),
             ratarmount_bin: "ratarmount".to_string(),
@@ -348,6 +349,7 @@ fn a_path_inside_a_configured_source_folder_is_always_refused() {
     let fixture = Fixture::new("source-root");
     let source = fixture.dir("roms");
     let config = Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source],
         mount_root: fixture.dir("roms/mnt"),
         ratarmount_bin: "ratarmount".to_string(),
@@ -356,7 +358,10 @@ fn a_path_inside_a_configured_source_folder_is_always_refused() {
     let inside = fixture.dir("roms/mnt/SNES/Old Game");
     let before = snapshot(&fixture.root);
 
-    let mut scan = scan_with_stale_directories(&config);
+    // The read-only planner itself refuses this overlapping configuration,
+    // so the finding is forged to prove the executor's own gate holds too.
+    assert!(crate::plan_stale_mount_directories(&config).is_err());
+    let mut scan = scan_with_forged_stale_directories(std::slice::from_ref(&inside));
     if scan.finding("mount_root.stale_mount_directory").is_none() {
         scan.findings.push(forged_clean_path_finding(&inside));
     }
@@ -743,6 +748,7 @@ fn a_refused_rebuild_leaves_the_previous_valid_index_byte_identical() {
     // No configured source folder exists, so a rebuild would produce an
     // empty index. The guard must refuse before anything is written.
     let config = Config {
+        configured_source_roots: Some(vec![fixture.root.join("roms-missing")]),
         source_folders: vec![fixture.root.join("roms-missing")],
         mount_root: fixture.dir("mnt"),
         ratarmount_bin: "ratarmount".to_string(),
@@ -1698,4 +1704,282 @@ fn rebuild_index_refuses_an_index_path_the_finding_did_not_name() {
     );
     assert!(!other.exists(), "no index was written anywhere else");
     assert_eq!(before, snapshot(&fixture.root));
+}
+
+// --- Mount root overlapping a source folder (Night Watch D4-01) ----------
+
+/// A doctor scan carrying a leftover-folder finding for `stale`, built without
+/// the planner (which must refuse an overlapping mount root), so the executor's
+/// own gate is what is exercised.
+fn scan_with_forged_stale_directories(stale: &[PathBuf]) -> DoctorScan {
+    let mut inputs = DoctorScanInputs::none_loaded();
+    inputs.stale_mount_directories = Gathered::Ready(stale);
+    run_doctor_scan(&inputs)
+}
+
+/// Asserts that every read-only plan, bulk cleanup and doctor repair refuses
+/// `config` and that `preserved` (empty folders the user owns inside a source)
+/// all survive with the tree byte-for-byte unchanged.
+fn assert_overlapping_mount_root_is_refused(
+    fixture: &Fixture,
+    config: &Config,
+    preserved: &[PathBuf],
+) {
+    let before = snapshot(&fixture.root);
+    let plan = crate::plan_stale_mount_directories(config);
+    assert!(
+        plan.is_err(),
+        "an overlapping mount root must not be planned for cleanup: {plan:?}"
+    );
+    let cleaned = crate::clean_mount_root(config);
+    assert!(
+        cleaned.is_err(),
+        "clean must refuse an overlapping mount root: {cleaned:?}"
+    );
+    let scan = scan_with_forged_stale_directories(preserved);
+    for dry_run in [true, false] {
+        let mut repair = request(
+            DoctorRepairAction::CleanMountRoot,
+            "mount_root.stale_mount_directories",
+        );
+        repair.dry_run = dry_run;
+        let outcome =
+            execute_doctor_repair(&repair, &context(config, &scan, &fixture.index_path()));
+        assert_eq!(
+            outcome.record.status,
+            DoctorRepairStatus::Rejected,
+            "{:?}",
+            outcome.record
+        );
+        // Compared by name so this also compiles, and fails, before the fix.
+        assert_eq!(
+            format!("{:?}", outcome.record.rejection),
+            "Some(MountRootOverlapsSource)"
+        );
+        assert!(outcome.record.changed_paths.is_empty());
+        // Each listed folder, repaired one at a time, is refused too: by the
+        // source-folder boundary or by the overlap gate.
+        for path in preserved {
+            let mut targeted = request_for(
+                DoctorRepairAction::CleanMountPath,
+                "mount_root.stale_mount_directory",
+                path,
+            );
+            targeted.dry_run = dry_run;
+            let outcome =
+                execute_doctor_repair(&targeted, &context(config, &scan, &fixture.index_path()));
+            assert_eq!(
+                outcome.record.status,
+                DoctorRepairStatus::Rejected,
+                "{}: {:?}",
+                path.display(),
+                outcome.record
+            );
+            let rejection = format!("{:?}", outcome.record.rejection);
+            assert!(
+                rejection == "Some(PathUnderSourceRoot)"
+                    || rejection == "Some(MountRootOverlapsSource)",
+                "{}: {rejection}",
+                path.display()
+            );
+        }
+    }
+    for path in preserved {
+        assert!(path.is_dir(), "source folder removed: {}", path.display());
+    }
+    assert_eq!(before, snapshot(&fixture.root));
+}
+
+#[test]
+fn clean_and_doctor_refuse_a_mount_root_equal_to_a_source() {
+    let fixture = Fixture::new("overlap-equal");
+    let source = fixture.dir("src");
+    fixture.file("src/roms/Good.zip", b"archive bytes");
+    let config = Config {
+        configured_source_roots: Some(vec![source.clone()]),
+        source_folders: vec![source.clone()],
+        mount_root: source.clone(),
+        ratarmount_bin: "ratarmount".to_string(),
+        master_rom_root: None,
+    };
+    // The user's own empty folder at exactly the path a mount plan would use,
+    // plus an unrelated empty folder.
+    let plan_shaped = crate::ArchiveScanner::new(&config)
+        .mount_plans()
+        .expect("plans")
+        .remove(0)
+        .mount_path;
+    fs::create_dir_all(&plan_shaped).expect("plan-shaped user dir");
+    let saves = fixture.dir("src/Saves/slot1");
+    assert_overlapping_mount_root_is_refused(&fixture, &config, &[plan_shaped, saves]);
+}
+
+#[test]
+fn clean_and_doctor_refuse_a_mount_root_inside_a_source() {
+    let fixture = Fixture::new("overlap-child");
+    let source = fixture.dir("src");
+    fixture.file("src/roms/Good.zip", b"archive bytes");
+    let leftover = fixture.dir("src/mnt/Unknown/Good");
+    let config = Config {
+        configured_source_roots: Some(vec![source.clone()]),
+        source_folders: vec![source],
+        mount_root: fixture.root.join("src/mnt"),
+        ratarmount_bin: "ratarmount".to_string(),
+        master_rom_root: None,
+    };
+    assert_overlapping_mount_root_is_refused(&fixture, &config, &[leftover]);
+}
+
+#[test]
+fn clean_and_doctor_refuse_a_mount_root_containing_a_source() {
+    let fixture = Fixture::new("overlap-parent");
+    let source = fixture.dir("mnt/library");
+    let empty_in_source = fixture.dir("mnt/library/Empty Folder");
+    // Outside the source but under the overlapping mount root: only the
+    // overlap gate can refuse this one.
+    let empty_beside_source = fixture.dir("mnt/Other/Empty");
+    let config = Config {
+        configured_source_roots: Some(vec![source.clone()]),
+        source_folders: vec![source],
+        mount_root: fixture.root.join("mnt"),
+        ratarmount_bin: "ratarmount".to_string(),
+        master_rom_root: None,
+    };
+    assert_overlapping_mount_root_is_refused(
+        &fixture,
+        &config,
+        &[empty_in_source, empty_beside_source],
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn clean_and_doctor_refuse_a_mount_root_equal_to_a_symlinked_source() {
+    let fixture = Fixture::new("overlap-symlinked-source");
+    let real = fixture.dir("real-library");
+    fixture.file("real-library/roms/Good.zip", b"archive bytes");
+    let empty_in_source = fixture.dir("real-library/Saves/slot1");
+    let linked = fixture.root.join("library-link");
+    std::os::unix::fs::symlink(&real, &linked).expect("symlink");
+    // The source is configured through the link; the mount root names the
+    // real folder. Only a symlink-resolved comparison sees they are the same.
+    let config = Config {
+        configured_source_roots: Some(vec![linked.clone()]),
+        source_folders: vec![linked],
+        mount_root: real,
+        ratarmount_bin: "ratarmount".to_string(),
+        master_rom_root: None,
+    };
+    assert_overlapping_mount_root_is_refused(&fixture, &config, &[empty_in_source]);
+}
+
+#[cfg(unix)]
+#[test]
+fn clean_and_doctor_refuse_a_symlinked_mount_root_resolving_into_a_source() {
+    let fixture = Fixture::new("overlap-symlinked-mount-root");
+    let source = fixture.dir("src");
+    let leftover = fixture.dir("src/mnt/Unknown/Good");
+    let linked = fixture.root.join("mnt-link");
+    std::os::unix::fs::symlink(source.join("mnt"), &linked).expect("symlink");
+    let config = Config {
+        configured_source_roots: Some(vec![source.clone()]),
+        source_folders: vec![source],
+        mount_root: linked,
+        ratarmount_bin: "ratarmount".to_string(),
+        master_rom_root: None,
+    };
+    assert_overlapping_mount_root_is_refused(&fixture, &config, &[leftover]);
+}
+
+#[test]
+fn clean_still_removes_leftovers_under_a_disjoint_mount_root() {
+    let fixture = Fixture::new("overlap-disjoint-control");
+    let config = fixture.config();
+    let planned = planned_mount_paths(&fixture, &config, &["Old Game"]);
+    let empty_in_source = fixture.dir("roms/Empty Folder");
+    let stale = crate::plan_stale_mount_directories(&config).expect("plan");
+    assert!(stale.contains(&planned[0]), "{stale:?}");
+    assert!(
+        stale
+            .iter()
+            .all(|path| !path.starts_with(&config.source_folders[0]))
+    );
+    let removed = crate::clean_mount_root(&config).expect("clean");
+    assert!(removed.contains(&planned[0]), "{removed:?}");
+    assert!(!planned[0].exists());
+    assert!(empty_in_source.is_dir());
+    assert!(config.mount_root.is_dir());
+}
+
+#[test]
+fn clean_and_doctor_refuse_a_mount_root_containing_the_master_rom_root() {
+    let fixture = Fixture::new("overlap-master-root");
+    let config = Config {
+        master_rom_root: Some(fixture.dir("mnt/organised")),
+        ..fixture.config()
+    };
+    // An empty canonical platform folder in the organised library.
+    let platform = fixture.dir("mnt/organised/SNES");
+    assert_overlapping_mount_root_is_refused(&fixture, &config, &[platform]);
+}
+
+// --- Disabled `[[source]]` overlapping the mount root (round 3, F2) ------
+
+/// Writes a `[[source]]` config (enabled `roms`, disabled `disabled`) and
+/// loads it the way the CLI and GUI do, so the disabled source is known only
+/// through `Config::load_from`.
+fn config_with_disabled_source(fixture: &Fixture, mount_root: &str, disabled: &str) -> Config {
+    let path = fixture.root.join("config.toml");
+    fs::write(
+        &path,
+        format!(
+            "mount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n\n[[source]]\npath = \"{}\"\nenabled = true\n\n[[source]]\npath = \"{}\"\nenabled = false\n",
+            fixture.root.join(mount_root).display(),
+            fixture.dir("roms").display(),
+            fixture.dir(disabled).display()
+        ),
+    )
+    .expect("config");
+    let config = crate::Config::load_from(&path).expect("load");
+    assert_eq!(config.source_folders, vec![fixture.root.join("roms")]);
+    config
+}
+
+#[test]
+fn clean_and_doctor_refuse_a_mount_root_equal_to_a_disabled_source() {
+    let fixture = Fixture::new("disabled-equal");
+    let config = config_with_disabled_source(&fixture, "off", "off");
+    let saves = fixture.dir("off/Saves/slot1");
+    assert_overlapping_mount_root_is_refused(&fixture, &config, &[saves]);
+}
+
+#[test]
+fn clean_and_doctor_refuse_a_mount_root_containing_a_disabled_source() {
+    let fixture = Fixture::new("disabled-inside-mount-root");
+    let config = config_with_disabled_source(&fixture, "mnt", "mnt/off");
+    let in_source = fixture.dir("mnt/off/Empty");
+    let beside_source = fixture.dir("mnt/Other/Empty");
+    assert_overlapping_mount_root_is_refused(&fixture, &config, &[in_source, beside_source]);
+}
+
+#[test]
+fn clean_and_doctor_refuse_a_mount_root_inside_a_disabled_source() {
+    let fixture = Fixture::new("disabled-contains-mount-root");
+    let config = config_with_disabled_source(&fixture, "off/mnt", "off");
+    let leftover = fixture.dir("off/mnt/Unknown/Good");
+    assert_overlapping_mount_root_is_refused(&fixture, &config, &[leftover]);
+}
+
+#[test]
+fn a_disjoint_disabled_source_still_allows_cleanup() {
+    let fixture = Fixture::new("disabled-disjoint");
+    let config = config_with_disabled_source(&fixture, "mnt", "off");
+    let empty_in_disabled = fixture.dir("off/Empty");
+    let planned = planned_mount_paths(&fixture, &config, &["Old Game"]);
+    let stale = crate::plan_stale_mount_directories(&config).expect("plan");
+    assert!(stale.contains(&planned[0]), "{stale:?}");
+    let removed = crate::clean_mount_root(&config).expect("clean");
+    assert!(removed.contains(&planned[0]), "{removed:?}");
+    assert!(empty_in_disabled.is_dir());
+    assert!(config.mount_root.is_dir());
 }

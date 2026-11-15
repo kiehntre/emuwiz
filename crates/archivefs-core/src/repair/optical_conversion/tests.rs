@@ -1688,3 +1688,107 @@ fn regression_the_spawned_chdman_receives_only_the_helper_arguments() {
         before
     );
 }
+
+/// Storage Review's read-only admission must agree with the plan builder's
+/// source checks, case by case. The plan uses an explicit stand-in chdman,
+/// which planning only inspects and never runs.
+#[cfg(unix)]
+#[test]
+fn source_admission_agrees_with_the_plan_builder() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempdir().unwrap();
+    let chdman = root.path().join("chdman-stand-in");
+    std::fs::write(&chdman, b"never executed").unwrap();
+    std::fs::set_permissions(&chdman, std::fs::Permissions::from_mode(0o755)).unwrap();
+    /// (case, CUE text, files to create with their sizes, admitted?)
+    type Case = (
+        &'static str,
+        &'static str,
+        &'static [(&'static str, usize)],
+        bool,
+    );
+    let cases: [Case; 8] = [
+        (
+            "admitted",
+            "FILE \"d.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+            &[("d.bin", 2048 * 4)],
+            true,
+        ),
+        (
+            "raw MODE1/2352",
+            "FILE \"d.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+            &[("d.bin", 2352 * 4)],
+            false,
+        ),
+        (
+            "MODE2/2352",
+            "FILE \"d.bin\" BINARY\nTRACK 01 MODE2/2352\nINDEX 01 00:00:00\n",
+            &[("d.bin", 2352 * 4)],
+            false,
+        ),
+        (
+            "multi-track",
+            "FILE \"d.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n\
+             FILE \"a.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n",
+            &[("d.bin", 2048 * 4), ("a.bin", 2352 * 4)],
+            false,
+        ),
+        (
+            "INDEX 00",
+            "FILE \"d.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\nINDEX 01 00:00:02\n",
+            &[("d.bin", 2048 * 4)],
+            false,
+        ),
+        (
+            "PREGAP",
+            "FILE \"d.bin\" BINARY\nTRACK 01 MODE1/2048\nPREGAP 00:02:00\nINDEX 01 00:00:00\n",
+            &[("d.bin", 2048 * 4)],
+            false,
+        ),
+        (
+            "unaligned BIN",
+            "FILE \"d.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+            &[("d.bin", 2048 * 4 + 1)],
+            false,
+        ),
+        (
+            "missing BIN",
+            "FILE \"d.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+            &[],
+            false,
+        ),
+    ];
+    let check = |case: &str, cue: &std::path::Path, expected: bool| {
+        let admitted = check_chd_conversion_source(cue);
+        let planned = build_chd_conversion_plan(
+            cue,
+            &cue.with_extension("chd"),
+            ChdConversionSourceMode::KeepSource,
+            Some(&chdman),
+        );
+        assert_eq!(admitted.is_ok(), expected, "{case}: {admitted:?}");
+        assert_eq!(planned.is_ok(), expected, "{case}: {:?}", planned.err());
+    };
+    for (index, (case, text, files, expected)) in cases.into_iter().enumerate() {
+        let dir = root.path().join(format!("case-{index}"));
+        std::fs::create_dir(&dir).unwrap();
+        for (name, len) in files {
+            std::fs::write(dir.join(name), vec![0_u8; *len]).unwrap();
+        }
+        let cue = dir.join("disc.cue");
+        std::fs::write(&cue, text).unwrap();
+        check(case, &cue, expected);
+    }
+    // A symlinked sheet is refused by both, even though it names a good BIN.
+    let dir = root.path().join("symlinked-cue");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("d.bin"), vec![0_u8; 2048 * 4]).unwrap();
+    std::fs::write(
+        dir.join("real.cue"),
+        "FILE \"d.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+    )
+    .unwrap();
+    let link = dir.join("disc.cue");
+    std::os::unix::fs::symlink(dir.join("real.cue"), &link).unwrap();
+    check("symlinked CUE", &link, false);
+}

@@ -1,4 +1,5 @@
 use super::*;
+use crate::LibraryDatState;
 use crate::dat::catalogue_selection::{CatalogueInventoryInputs, CatalogueRef, resolve_catalogue};
 use crate::dat::sources::{DatSourceEntry, DatSourceRegistry};
 use std::io::Write;
@@ -374,7 +375,7 @@ fn membership_change_during_hashing_prevents_transactional_save() {
 }
 fn other_tables(db: &Path) -> BTreeMap<String, Vec<String>> {
     let conn = rusqlite::Connection::open(db).unwrap();
-    let names:Vec<String>=conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('library_dat_identities', 'dat_expected_entries', 'dat_expected_inventory_meta') ORDER BY name").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    let names:Vec<String>=conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('library_dat_identities', 'library_dat_identity_history', 'dat_recheck_attempts', 'dat_expected_entries', 'dat_expected_inventory_meta') ORDER BY name").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
     names
         .into_iter()
         .map(|name| {
@@ -819,6 +820,7 @@ fn native_cue_verification_survives_unchanged_production_rescans() {
     let (f, _, _) = cue_fixture(["Track01.bin", "Track02.bin"]);
     assert_eq!(cue_run(&f).verified, 1);
     let config = crate::Config {
+        configured_source_roots: Some(vec![f.root.clone()]),
         source_folders: vec![f.root.clone()],
         mount_root: f.dir.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),
@@ -951,3 +953,743 @@ fn cue_launch_content(f: &Fixture) -> crate::launch::planning::LaunchContentRef 
     );
     crate::launch::evidence_bridge::launch_content_ref_from_archive_record(&record, None)
 }
+
+// Issue #279: saved evidence written before the audit-bound proof fields
+// (`audit_file`, `source.catalogue_sha256`) were mandatory never counts as
+// current. These pin what an explicit, confirmed re-verification does to it.
+impl Fixture {
+    fn configured(
+        &self,
+    ) -> std::collections::HashMap<String, crate::dat::configured_catalogues::ConfiguredCatalogue>
+    {
+        let mut registry = DatSourceRegistry::default();
+        registry
+            .add(DatSourceEntry::new(
+                "synthetic".into(),
+                "Synthetic TOSEC".into(),
+                self.dat.clone(),
+                DatSourceKind::File,
+            ))
+            .unwrap();
+        crate::dat::configured_catalogues::configured_catalogues(CatalogueInventoryInputs {
+            local_registry: &registry,
+            managed_sources: &Default::default(),
+            managed_root: self.dir.path(),
+            limits: DatLimits::default(),
+        })
+    }
+    /// Rewrites every saved row as a pre-proof legacy row: the verdict, hashes
+    /// and source stay; only the two proof fields are removed.
+    fn strip_proof(&self) {
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        let rows: Vec<(i64, Vec<u8>)> = conn
+            .prepare("SELECT archive_id, facts_json FROM library_dat_identities")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(!rows.is_empty());
+        for (id, bytes) in rows {
+            let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let object = v.as_object_mut().unwrap();
+            object.remove("audit_file");
+            object["source"]
+                .as_object_mut()
+                .unwrap()
+                .remove("catalogue_sha256");
+            conn.execute(
+                "UPDATE library_dat_identities SET facts_json = ?1, audited_at = '2026-10-08T00:00:00Z' WHERE archive_id = ?2",
+                rusqlite::params![serde_json::to_vec(&v).unwrap(), id],
+            )
+            .unwrap();
+        }
+    }
+    /// Records each existing file's size on its row, as a scan does; the
+    /// current-evidence filter compares it with the audited size.
+    fn sized(&self) {
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        let rows: Vec<(i64, Vec<u8>)> = conn
+            .prepare("SELECT id, absolute_path_cached FROM archives")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for (id, path) in rows {
+            let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&path));
+            if let Some(metadata) = std::fs::metadata(&path).ok().filter(|m| m.is_file()) {
+                conn.execute(
+                    "UPDATE archives SET size_bytes = ?1 WHERE id = ?2 AND size_bytes IS NOT ?1",
+                    rusqlite::params![metadata.len() as i64, id],
+                )
+                .unwrap();
+            }
+        }
+    }
+    fn evidence(&self) -> crate::database::CurrentLibraryDatEvidence {
+        self.sized();
+        Database::open_read_only(&self.db)
+            .unwrap()
+            .current_library_dat_evidence(&self.configured())
+            .unwrap()
+    }
+    fn facts(&self, id: i64) -> serde_json::Value {
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT facts_json FROM library_dat_identities WHERE archive_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+}
+
+#[test]
+fn fresh_verification_is_current_evidence() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(2, "b.tap", Some(b"different tape"), Some("ZX Spectrum"));
+    f.run();
+    let e = f.evidence();
+    assert!(e.exact.contains_key(&1), "{e:?}");
+    assert_eq!(e.states.get(&1), Some(&LibraryDatState::Verified));
+    assert_eq!(e.states.get(&2), Some(&LibraryDatState::NoMatch));
+    assert!(e.exact_hashes.contains_key(&1));
+}
+
+#[test]
+fn current_hashes_cover_no_match_rows_but_never_mark_them_exact() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(2, "b.tap", Some(b"different tape"), Some("ZX Spectrum"));
+    f.run();
+    let e = f.evidence();
+    // The unmatched file's audited hashes are available for lookups...
+    let unmatched = e.current_hashes.get(&2).expect("no-match row hashes");
+    assert!(unmatched.sha1.is_some(), "{unmatched:?}");
+    // ...without ever becoming an exact match or its proof hashes.
+    assert!(!e.exact.contains_key(&2) && !e.exact_hashes.contains_key(&2));
+    assert_eq!(e.current_hashes.get(&1), e.exact_hashes.get(&1));
+    // Stripped (non-current) rows contribute no hashes at all.
+    f.strip_proof();
+    assert!(f.evidence().current_hashes.is_empty());
+}
+
+#[test]
+fn legacy_rows_without_proof_are_not_current_and_reverification_restores_them() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(2, "b.tap", Some(b"different tape"), Some("ZX Spectrum"));
+    f.run();
+    f.strip_proof();
+    let before = f.evidence();
+    assert!(
+        before.exact.is_empty() && before.states.is_empty(),
+        "{before:?}"
+    );
+    let legacy = f.facts(1);
+    assert!(legacy.get("audit_file").is_none());
+
+    let t = f.run();
+    assert_eq!(
+        (t.verified, t.no_match, t.saved, t.protected_prior),
+        (1, 1, 2, 0)
+    );
+    let after = f.evidence();
+    assert_eq!(after.states.get(&1), Some(&LibraryDatState::Verified));
+    assert_eq!(after.states.get(&2), Some(&LibraryDatState::NoMatch));
+    assert!(after.exact.contains_key(&1) && after.exact_hashes.contains_key(&1));
+    let fresh = f.facts(1);
+    assert!(fresh["audit_file"].is_object(), "{fresh}");
+    assert!(fresh["source"]["catalogue_sha256"].is_string(), "{fresh}");
+    // Exactly one row per item and source: the legacy row was replaced, not duplicated.
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM library_dat_identities", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 2);
+}
+
+#[test]
+fn reverification_does_not_upgrade_a_legacy_match_whose_file_changed() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.run();
+    f.strip_proof();
+    std::fs::write(f.root.join("a.tap"), b"replaced different tape").unwrap();
+    let t = f.run();
+    assert_eq!((t.verified, t.no_match), (0, 1));
+    let e = f.evidence();
+    assert!(e.exact.is_empty(), "{e:?}");
+    assert_eq!(e.states.get(&1), Some(&LibraryDatState::NoMatch));
+}
+
+#[test]
+fn a_one_file_collection_bound_rechecks_only_that_game() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(
+        2,
+        "b.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.run();
+    f.strip_proof();
+    let other_before = f.facts(2);
+    let p = preview_library_verification(
+        f.resolved(),
+        f.db.clone(),
+        "ZX Spectrum".into(),
+        Some(f.root.join("a.tap")),
+    )
+    .unwrap();
+    assert_eq!(
+        (p.selected_games, p.eligible_games, p.outside_collection),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        p.eligible_paths().collect::<Vec<_>>(),
+        vec![f.root.join("a.tap").as_path()]
+    );
+    let t = p
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    assert_eq!((t.verified, t.saved), (1, 1));
+    let e = f.evidence();
+    assert_eq!(e.states.get(&1), Some(&LibraryDatState::Verified));
+    assert!(!e.states.contains_key(&2), "{e:?}");
+    assert_eq!(f.facts(2), other_before);
+}
+
+// One-game verification (Game Details "Re-check this game"): the same engine,
+// bound to exactly one library row, never widened to the platform.
+impl Fixture {
+    fn game_preview(&self, id: i64, name: &str) -> Result<VerificationPreview, String> {
+        preview_game_verification(
+            self.resolved(),
+            self.db.clone(),
+            "ZX Spectrum".into(),
+            id,
+            self.root.join(name),
+        )
+    }
+    fn dat_rows(&self) -> Vec<(i64, Vec<u8>)> {
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        conn.prepare(
+            "SELECT archive_id, facts_json FROM library_dat_identities ORDER BY archive_id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+}
+
+#[test]
+fn one_game_check_hashes_and_saves_only_the_selected_game() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(
+        2,
+        "b.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(3, "c.tap", Some(b"different tape"), Some("ZX Spectrum"));
+    f.run();
+    f.strip_proof();
+    // A FIFO in the same system: opening it for hashing would block forever.
+    let fifo = f.root.join("fifo.tap");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    f.add(4, "fifo.tap", None, Some("ZX Spectrum"));
+    f.sized();
+    let others: Vec<_> = f
+        .dat_rows()
+        .into_iter()
+        .filter(|(id, _)| *id != 1)
+        .collect();
+    let tables = other_tables(&f.db);
+
+    let p = f.game_preview(1, "a.tap").unwrap();
+    let a = f.root.join("a.tap");
+    assert_eq!(p.eligible_paths().collect::<Vec<_>>(), vec![a.as_path()]);
+    assert_eq!(p.fingerprints.keys().collect::<Vec<_>>(), vec![&a]);
+    assert_eq!(p.targets.files, vec![a.clone()]);
+    assert_eq!(
+        (
+            p.selected_games,
+            p.eligible_games,
+            p.wrong_system,
+            p.unknown_system,
+            p.outside_collection
+        ),
+        (1, 1, 0, 0, 0)
+    );
+    assert!(p.exclusions.is_empty());
+    let t = p
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    assert_eq!(
+        (t.verified, t.no_match, t.saved, t.not_checked),
+        (1, 0, 1, 0)
+    );
+    assert!(t.disc_order.is_none());
+    let e = f.evidence();
+    assert_eq!(e.states.get(&1), Some(&LibraryDatState::Verified));
+    assert!(e.exact.contains_key(&1));
+    assert_eq!(e.states.len(), 1, "{e:?}");
+    let after: Vec<_> = f
+        .dat_rows()
+        .into_iter()
+        .filter(|(id, _)| *id != 1)
+        .collect();
+    assert_eq!(after, others);
+    assert_eq!(other_tables(&f.db), tables);
+    for name in ["a.tap", "b.tap"] {
+        assert_eq!(
+            std::fs::read(f.root.join(name)).unwrap(),
+            b"matching synthetic tape"
+        );
+    }
+}
+
+#[test]
+fn one_game_check_reports_a_mismatch_for_that_game_only() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(2, "b.tap", Some(b"different tape"), Some("ZX Spectrum"));
+    let t = f
+        .game_preview(2, "b.tap")
+        .unwrap()
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    assert_eq!((t.verified, t.no_match, t.saved), (0, 1, 1));
+    assert_eq!(
+        f.dat_rows().iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![2]
+    );
+}
+
+#[test]
+fn one_game_check_refuses_instead_of_widening() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(2, "missing.tap", None, Some("ZX Spectrum"));
+    f.add(
+        3,
+        "gb.tap",
+        Some(b"matching synthetic tape"),
+        Some("Game Boy"),
+    );
+    f.add(
+        4,
+        "dup.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    f.add(5, "shadow.tap", None, Some("ZX Spectrum"));
+    rusqlite::Connection::open(&f.db)
+        .unwrap()
+        .execute(
+            "UPDATE archives SET absolute_path_cached=?1 WHERE id=5",
+            [f.root.join("dup.tap").as_os_str().as_bytes()],
+        )
+        .unwrap();
+    // An unavailable mount: the game's folder is not there at all.
+    let gone = f.root.join("unmounted");
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    conn.execute("INSERT INTO archives(id,source_folder_id,relative_path,absolute_path_cached,file_name_cached,archive_kind,display_name,normalized_name,first_seen_at,last_seen_at,created_at,updated_at) VALUES(6,1,?2,?1,?3,'direct_game_image','x','x','now','now','now','now')", rusqlite::params![gone.join("x.tap").as_os_str().as_bytes(), b"unmounted/x.tap".as_slice(), b"x.tap".as_slice()]).unwrap();
+    conn.execute("INSERT INTO platform_assignments(archive_id,platform,source,is_current,assigned_at) VALUES(6,'ZX Spectrum','manual',1,'now')", []).unwrap();
+    drop(conn);
+    for (id, path, expected) in [
+        (2, f.root.join("missing.tap"), "Unavailable file"),
+        (6, gone.join("x.tap"), "Unavailable file"),
+        (3, f.root.join("gb.tap"), "not assigned to ZX Spectrum"),
+        (4, f.root.join("dup.tap"), "Ambiguous library path"),
+        (99, f.root.join("a.tap"), "no longer in the library"),
+        (1, f.root.join("b.tap"), "location changed"),
+    ] {
+        let error =
+            preview_game_verification(f.resolved(), f.db.clone(), "ZX Spectrum".into(), id, path)
+                .err()
+                .unwrap_or_else(|| panic!("game {id} was not refused"));
+        assert!(error.contains(expected), "game {id}: {error}");
+        assert!(error.contains("Nothing was checked"), "game {id}: {error}");
+    }
+    assert!(f.dat_rows().is_empty());
+}
+
+#[test]
+fn one_game_check_cancelled_or_changed_saves_nothing() {
+    let f = Fixture::new();
+    f.add(
+        1,
+        "a.tap",
+        Some(b"matching synthetic tape"),
+        Some("ZX Spectrum"),
+    );
+    let cancelled = f.game_preview(1, "a.tap").unwrap().execute(
+        &TrustedRoots::none(),
+        &AtomicBool::new(true),
+        &|_| {},
+    );
+    assert!(cancelled.unwrap_err().contains("Cancelled"));
+    let p = f.game_preview(1, "a.tap").unwrap();
+    std::fs::write(f.root.join("a.tap"), b"matching synthetic tape").unwrap();
+    let changed = p.execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {});
+    assert!(changed.unwrap_err().contains("File changed after preview"));
+    assert!(f.dat_rows().is_empty());
+}
+
+#[test]
+fn one_game_cue_check_reads_its_tracks_but_saves_only_the_sheet_row() {
+    let (f, _, _) = cue_fixture(["Track01.bin", "Track02.bin"]);
+    // The first track is also its own library row, as a scan can leave it.
+    f.add(2, "Track01.bin", None, Some("PSX"));
+    f.add(
+        3,
+        "other.cue",
+        Some(b"FILE \"x.bin\" BINARY\n"),
+        Some("PSX"),
+    );
+    f.sized();
+    let tables = other_tables(&f.db);
+    let p = preview_game_verification(
+        f.resolved(),
+        f.db.clone(),
+        "PSX".into(),
+        1,
+        f.root.join("Synthetic Disc.cue"),
+    )
+    .unwrap();
+    let mut files = p.targets.files.clone();
+    files.sort();
+    assert_eq!(
+        files,
+        vec![
+            f.root.join("Synthetic Disc.cue"),
+            f.root.join("Track01.bin"),
+            f.root.join("Track02.bin"),
+        ]
+    );
+    assert_eq!(p.eligible_paths().count(), 1);
+    let t = p
+        .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+        .unwrap();
+    assert_eq!((t.verified, t.saved), (1, 1), "{t:?}");
+    assert_eq!(
+        f.dat_rows().iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(other_tables(&f.db), tables);
+}
+
+// ---- S03-05 in library verification: headered Lynx / 7800 files against the
+// headerless main catalogues (No-Intro "Atari Lynx (LYX)", "Atari 7800 (BIN)").
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    use sha1::digest::Digest;
+    sha1::Sha1::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+fn body(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
+}
+fn lynx(pages: u16, seed: u8) -> (Vec<u8>, Vec<u8>) {
+    let mut header = vec![0_u8; 64];
+    header[..4].copy_from_slice(b"LYNX");
+    header[4..6].copy_from_slice(&pages.to_le_bytes());
+    let payload = body(usize::from(pages) * 256, seed);
+    ([header, payload.clone()].concat(), payload)
+}
+fn a7800(len: u32) -> (Vec<u8>, Vec<u8>) {
+    let mut header = vec![0_u8; 128];
+    header[1..10].copy_from_slice(b"ATARI7800");
+    header[49..53].copy_from_slice(&len.to_be_bytes());
+    let payload = body(len as usize, 5);
+    ([header, payload.clone()].concat(), payload)
+}
+impl Fixture {
+    fn write_headerless_dat(&self, header: &str, rom: &str, payload: &[u8]) {
+        std::fs::write(&self.dat, format!(
+            "<datafile><header><name>{header}</name><description>{header}</description><version>synthetic-1</version><homepage>No-Intro</homepage><url>https://www.no-intro.org</url></header><game name=\"Cart (USA)\"><rom name=\"{rom}\" size=\"{}\" sha1=\"{}\"/></game></datafile>",
+            payload.len(), sha1_hex(payload))).unwrap();
+    }
+    fn run_for(&self, platform: &str) -> VerificationTotals {
+        preview_library_verification(self.resolved(), self.db.clone(), platform.into(), None)
+            .unwrap()
+            .execute(&TrustedRoots::none(), &AtomicBool::new(false), &|_| {})
+            .unwrap()
+    }
+    fn saved_state(&self, id: i64) -> Option<(String, String)> {
+        let conn = rusqlite::Connection::open(&self.db).unwrap();
+        conn.query_row(
+            "SELECT verification_state, CAST(facts_json AS TEXT) FROM library_dat_identities WHERE archive_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
+    }
+}
+
+#[test]
+fn headered_lynx_file_is_verified_against_the_headerless_catalogue() {
+    let f = Fixture::new();
+    let (full, payload) = lynx(2, 3);
+    f.write_headerless_dat("Atari - Atari Lynx (LYX)", "Cart (USA).lyx", &payload);
+    f.add(1, "cart.lnx", Some(&full), Some("Atari Lynx"));
+    let preview =
+        preview_library_verification(f.resolved(), f.db.clone(), "Atari Lynx".into(), None)
+            .unwrap();
+    assert_eq!(preview.eligible_games, 1, "{:?}", preview.exclusions);
+    let t = f.run_for("Atari Lynx");
+    assert_eq!(
+        (t.verified, t.no_match, t.saved),
+        (1, 0, 1),
+        "{:?}",
+        t.unchecked
+    );
+    let (state, facts) = f.saved_state(1).unwrap();
+    assert_eq!(state, "verified_single_match");
+    assert!(facts.contains("after header removal"), "{facts}");
+    // Read-only: the ROM is untouched.
+    assert_eq!(std::fs::read(f.root.join("cart.lnx")).unwrap(), full);
+}
+
+#[test]
+fn headered_7800_file_is_verified_against_the_headerless_catalogue() {
+    let f = Fixture::new();
+    let (full, payload) = a7800(16 * 1024);
+    f.write_headerless_dat("Atari - Atari 7800 (BIN)", "Cart (USA).bin", &payload);
+    f.add(1, "cart.a78", Some(&full), Some("Atari7800"));
+    let t = f.run_for("Atari7800");
+    assert_eq!(
+        (t.verified, t.no_match, t.saved),
+        (1, 0, 1),
+        "{:?}",
+        t.unchecked
+    );
+}
+
+#[test]
+fn unmatched_or_malformed_headered_file_is_not_a_definitive_negative() {
+    let f = Fixture::new();
+    let (_, payload) = lynx(2, 3);
+    f.write_headerless_dat("Atari - Atari Lynx (LYX)", "Cart (USA).lyx", &payload);
+    // A valid header over different content.
+    let (other, _) = lynx(2, 9);
+    f.add(1, "other.lnx", Some(&other), Some("Atari Lynx"));
+    // A header declaring the wrong size over the catalogued content.
+    let (mut lying, _) = lynx(2, 3);
+    lying[4] = 3;
+    f.add(2, "lying.lnx", Some(&lying), Some("Atari Lynx"));
+    let t = f.run_for("Atari Lynx");
+    assert_eq!((t.verified, t.no_match, t.saved), (0, 0, 0));
+    assert_eq!(t.unchecked.len(), 2, "{:?}", t.unchecked);
+    assert!(f.saved_state(1).is_none() && f.saved_state(2).is_none());
+}
+
+#[test]
+fn headered_file_is_not_admitted_for_a_platform_without_a_header_transform() {
+    let f = Fixture::new();
+    let (full, _) = lynx(2, 3);
+    f.add(1, "cart.lnx", Some(&full), Some("ZX Spectrum"));
+    let preview = f.preview();
+    assert_eq!(preview.eligible_games, 0);
+}
+
+impl Fixture {
+    fn zip_members(&self, name: &str, members: &[(&str, &[u8])]) {
+        let file = std::fs::File::create(self.root.join(name)).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (member, body) in members {
+            zip.start_file(*member, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    fn write_headerless_dat_games(&self, header: &str, games: &[(&str, &str, &[u8])]) {
+        let body: String = games
+            .iter()
+            .map(|(game, rom, payload)| {
+                format!(
+                    "<game name=\"{game}\"><rom name=\"{rom}\" size=\"{}\" sha1=\"{}\"/></game>",
+                    payload.len(),
+                    sha1_hex(payload)
+                )
+            })
+            .collect();
+        std::fs::write(&self.dat, format!(
+            "<datafile><header><name>{header}</name><description>{header}</description><version>synthetic-1</version><homepage>No-Intro</homepage><url>https://www.no-intro.org</url></header>{body}</datafile>")).unwrap();
+    }
+}
+
+#[test]
+fn headered_lynx_zip_member_is_verified_without_changing_the_archive() {
+    let f = Fixture::new();
+    let (full, payload) = lynx(2, 3);
+    f.write_headerless_dat("Atari - Atari Lynx (LYX)", "Cart (USA).lyx", &payload);
+    f.add(1, "cart.zip", Some(b"placeholder"), Some("Atari Lynx"));
+    f.zip("cart.zip", "Cart (USA).lnx", &full);
+    let before = std::fs::read(f.root.join("cart.zip")).unwrap();
+    let t = f.run_for("Atari Lynx");
+    assert_eq!(
+        (t.verified, t.no_match, t.saved),
+        (1, 0, 1),
+        "{:?}",
+        t.unchecked
+    );
+    let (state, facts) = f.saved_state(1).unwrap();
+    assert_eq!(state, "verified_single_match");
+    assert!(facts.contains("after header removal"), "{facts}");
+    // The headered member is named as the evidence; the archive itself and
+    // its whole-file identity are what was saved.
+    assert!(
+        facts.contains("\"member_name\":\"Cart (USA).lnx\""),
+        "{facts}"
+    );
+    assert_eq!(std::fs::read(f.root.join("cart.zip")).unwrap(), before);
+}
+
+#[test]
+fn headered_7800_zip_member_is_verified() {
+    let f = Fixture::new();
+    let (full, payload) = a7800(16 * 1024);
+    f.write_headerless_dat("Atari - Atari 7800 (BIN)", "Cart (USA).bin", &payload);
+    f.add(1, "cart.zip", Some(b"placeholder"), Some("Atari7800"));
+    f.zip("cart.zip", "Cart (USA).a78", &full);
+    let t = f.run_for("Atari7800");
+    assert_eq!(
+        (t.verified, t.no_match, t.saved),
+        (1, 0, 1),
+        "{:?}",
+        t.unchecked
+    );
+}
+
+#[test]
+fn ambiguous_multi_member_and_malformed_zips_stay_unverified() {
+    let f = Fixture::new();
+    let (full, payload) = lynx(2, 3);
+    let (other, _) = lynx(2, 9);
+    // Two catalogue games share the headerless content: ambiguous.
+    f.write_headerless_dat_games(
+        "Atari - Atari Lynx (LYX)",
+        &[
+            ("Cart (USA)", "Cart (USA).lyx", &payload),
+            ("Cart (Europe)", "Cart (Europe).lyx", &payload),
+        ],
+    );
+    f.add(1, "ambiguous.zip", Some(b"x"), Some("Atari Lynx"));
+    f.zip("ambiguous.zip", "Cart.lnx", &full);
+    // Two members: one would match, one does not; never a single identity.
+    f.add(2, "two.zip", Some(b"x"), Some("Atari Lynx"));
+    f.zip_members("two.zip", &[("a.lnx", &full), ("b.lnx", &other)]);
+    // Not a ZIP at all.
+    f.add(
+        3,
+        "broken.zip",
+        Some(b"PK\x03\x04 not really a zip"),
+        Some("Atari Lynx"),
+    );
+    // A member whose header declares the wrong size.
+    let mut lying = full.clone();
+    lying[4] = 3;
+    f.add(4, "lying.zip", Some(b"x"), Some("Atari Lynx"));
+    f.zip("lying.zip", "Cart.lnx", &lying);
+    let t = f.run_for("Atari Lynx");
+    assert_eq!((t.verified, t.no_match), (0, 0), "{:?}", t.unchecked);
+    for id in [2, 3, 4] {
+        assert!(
+            f.saved_state(id)
+                .is_none_or(|(state, _)| state != "verified_single_match"),
+            "{id}: {:?}",
+            f.saved_state(id)
+        );
+    }
+    assert!(
+        f.saved_state(1)
+            .is_none_or(|(state, _)| state != "verified_single_match")
+    );
+}
+
+#[test]
+fn headered_zip_member_of_an_incomplete_multi_rom_set_is_not_verified() {
+    let f = Fixture::new();
+    let (full, payload) = lynx(2, 3);
+    let extra = body(256, 7);
+    std::fs::write(&f.dat, format!(
+        "<datafile><header><name>Atari - Atari Lynx (LYX)</name><description>Atari - Atari Lynx (LYX)</description><version>synthetic-1</version><homepage>No-Intro</homepage><url>https://www.no-intro.org</url></header><game name=\"Cart (USA)\"><rom name=\"Cart (USA).lyx\" size=\"{}\" sha1=\"{}\"/><rom name=\"Extra.bin\" size=\"{}\" sha1=\"{}\"/></game></datafile>",
+        payload.len(), sha1_hex(&payload), extra.len(), sha1_hex(&extra))).unwrap();
+    f.add(1, "partial.zip", Some(b"x"), Some("Atari Lynx"));
+    f.zip("partial.zip", "Cart (USA).lnx", &full);
+    let t = f.run_for("Atari Lynx");
+    assert_eq!(t.verified, 0, "{:?}", t.unchecked);
+    assert!(
+        f.saved_state(1)
+            .is_none_or(|(state, _)| state != "verified_single_match"),
+        "{:?}",
+        f.saved_state(1)
+    );
+}
+
+// Issue #279: the bounded, resumable re-check of saved evidence.
+mod reaudit;

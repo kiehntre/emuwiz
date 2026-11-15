@@ -42,11 +42,15 @@ pub mod app_dirs;
 /// Bounded, read-only Apple II disk structural evidence.
 pub mod apple2_disk;
 /// Read-only orchestration of independent MAME and FBNeo compatibility results.
+pub mod arcade_compat_check;
 pub mod arcade_compatibility;
 /// Read-only per-set compatibility against an explicitly pinned FBNeo source.
 pub mod arcade_fbneo_compatibility;
 /// Read-only per-set compatibility against pinned installed MAME evidence.
 pub mod arcade_mame_compatibility;
+/// Per-set routing of extracted Arcade set directories to the installed MAME
+/// from MAME's own `-listxml` / `-verifyroms` data (no category gates).
+pub mod arcade_mame_routing;
 /// Deterministic emulator recommendation from existing arcade evidence.
 pub mod arcade_recommendation;
 /// Bounded Atari 8-bit standard cassette WAV evidence.
@@ -62,6 +66,8 @@ pub mod bios_projection;
 pub mod catalogue_health;
 pub mod catalogue_reconciliation;
 pub mod catalogue_supersession;
+/// Daedalus: evidence-driven diagnosis of emulator launch problems.
+pub mod daedalus;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation
@@ -77,6 +83,7 @@ pub mod emulator_update;
 /// Deterministic, read-only reconciliation of existing identity, topology and
 /// readiness evidence. This derived layer never mutates the catalogue.
 pub mod evidence_resolution;
+pub mod external_tools;
 /// Adapter evidence for per-game firmware guidance; never changes Launch.
 pub mod game_firmware_adapters;
 /// Structured, read-only per-game firmware readiness projection over an
@@ -153,41 +160,55 @@ pub mod tape_audio;
 pub mod test_environment;
 /// Bounded, read-only Thomson SAP floppy evidence.
 pub mod thomson_sap;
+#[cfg(target_os = "linux")]
+pub mod transform;
 pub mod uef_tape;
 /// A disposable profile holding one production-verified synthetic game.
 #[cfg(any(test, feature = "test-support"))]
 pub mod verified_game_fixture;
 pub mod whdload_options;
-use database::scan_and_persist_folders;
+#[cfg(any(test, feature = "test-support"))]
+pub use database::database_restore_fault_injection;
 pub use database::{
     ArchiveChangeKind, ArchiveObservationKind, ArchiveUpsertOutcome, AutomaticPlatformDetails,
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueStats, CompletedScanSummary,
     CueDiscCatalogue, CueDiscRevalidation, CurrentLibraryDatEvidence, DAT_ROMM_AGREEMENT_SOURCE,
-    DatDiscOrderOutcome, Database, DatabaseCheckOutcome, DatabaseCheckStatus, DatabaseDiagnostic,
-    DatabaseDiagnosticCode, DatabaseDiagnosticSeverity, DatabaseFileFinding, DatabaseHealth,
-    DatabaseHealthReport, DatabaseOpenOutcome, DatabaseRestorePlan, DatabaseRestoreReceipt,
-    DatabaseRestoreResult, DatabaseRestoreState, DatabaseSidecarFinding, DatabaseSidecarKind,
-    DatabaseUpgradeReport, DiscoveryDetailFilter, DiscoveryDetailRecord, DiscoveryDetailsPage,
-    DiscoveryRunId, DiscoveryRunStatus, GameScanDisposition, LibraryDatState,
-    MANUAL_PLATFORM_SOURCE, MAX_RETAINED_DISCOVERY_RUNS, MissingArchiveRemovalResult,
-    PersistedArchive, PersistedSetAuditDependency, PersistedSetAuditResult, PlatformAlias,
-    PlatformAssignmentChange, PlatformIdentityApplyOutcome, PlatformIdentityConflictDetail,
-    PlatformIdentityEnrichmentSummary, PlatformProvenanceDetails, ROMM_PLATFORM_SOURCE,
-    RecentScanAdditions, RegisteredSourceFolder, SOURCE_PLATFORM_ASSIGNMENT_SOURCE,
+    DatDiscOrderOutcome, DatRecheckAttempt, Database, DatabaseCheckOutcome, DatabaseCheckStatus,
+    DatabaseDiagnostic, DatabaseDiagnosticCode, DatabaseDiagnosticSeverity, DatabaseFileFinding,
+    DatabaseHealth, DatabaseHealthReport, DatabaseOpenOutcome, DatabaseRestorePlan,
+    DatabaseRestoreReceipt, DatabaseRestoreResult, DatabaseRestoreState, DatabaseSidecarFinding,
+    DatabaseSidecarKind, DatabaseUpgradeReport, DiscoveryDetailFilter, DiscoveryDetailRecord,
+    DiscoveryDetailsPage, DiscoveryRunId, DiscoveryRunStatus, GameScanDisposition,
+    JournalRecoveryReceipt, JournalRecoveryState, LibraryDatState, MANUAL_PLATFORM_SOURCE,
+    MAX_RETAINED_DISCOVERY_RUNS, MissingArchiveRemovalResult, PersistedArchive,
+    PersistedSetAuditDependency, PersistedSetAuditResult, PlatformAlias, PlatformAssignmentChange,
+    PlatformIdentityApplyOutcome, PlatformIdentityConflictDetail,
+    PlatformIdentityEnrichmentSummary, PlatformProvenanceDetails, PreservedFile,
+    ROMM_PLATFORM_SOURCE, RecentScanAdditions, RegisteredSourceFolder,
+    SOURCE_PLATFORM_ASSIGNMENT_SOURCE, SavedDatEvidenceRow, SavedDatEvidenceStatus,
     ScanPersistSummary, ScanRunCounts, ScummVmScanReport, SourceFolderRecord, SourceRole,
     SourceScanStatus, TopologyPersistOutcome, UpgradeBackupInspection, UpgradeBackupState,
-    VERIFIED_DAT_PLATFORM_SOURCE, check_database_health, default_database_path, diagnose_database,
-    format_unix_timestamp_utc, inspect_upgrade_backup_evidence, inspect_upgrade_backups,
-    latest_schema_version, pending_schema_migration_versions,
-    persisted_archive_has_unknown_platform, prepare_database_restore, restore_database,
-    rollback_database_restore, scan_and_persist, upgrade_library_database,
+    VERIFIED_DAT_PLATFORM_SOURCE, apply_journal_recovery, check_database_health,
+    default_database_path, diagnose_database, format_unix_timestamp_utc,
+    inspect_upgrade_backup_evidence, inspect_upgrade_backups, latest_schema_version,
+    pending_schema_migration_versions, persisted_archive_has_unknown_platform,
+    prepare_database_restore, prepare_journal_recovery, read_journal_recovery_receipt,
+    restore_database, rollback_database_restore, scan_and_persist, upgrade_library_database,
 };
 pub use database::{
     CollectionItemKey, CollectionReanchor, DiscoveryImportExclusion, DiscoveryImportItem,
     DiscoveryImportOperation, DiscoveryImportUndoPreview, DiscoveryImportUndoResult,
     GameCollection, GameCollectionItem, GameCollectionKind, MAX_COLLECTION_NAME_CHARS,
-    MissingCleanupTarget, PreservationFreshness, validate_collection_name,
+    MissingCleanupTarget, NestedMountOutcome, NestedMountState, PreservationFreshness,
+    validate_collection_name,
 };
+pub use database::{
+    FileIdentity, InterruptedRestoreAssessment, InterruptedRestoreOutcome,
+    assess_interrupted_restore, database_restore_receipt_path, finalise_interrupted_restore,
+    interrupted_restore_receipts, preview_interrupted_restore, read_database_restore_receipt,
+    review_database_rollback,
+};
+pub use database::{MAX_SCAN_HISTORY_RUNS, RecordedScanCounts, ScanRunCoverage, ScanRunRecord};
 
 mod inspector;
 pub use inspector::{
@@ -198,12 +219,14 @@ pub use inspector::{
 
 pub mod archive_member_resolver;
 pub mod archive_workflow;
+pub mod folder_platform_check;
 pub mod memory_card_inventory;
 pub mod persistent_state_inventory;
 pub mod save_state_compatibility;
 pub mod save_state_orchestration;
 pub mod save_state_resume_readiness;
 /// Verified ZIP creation and extraction for the Converter page.
+pub mod zip_cartridge_select;
 pub mod zip_converter;
 pub(crate) mod zip_member_name;
 pub use archive_member_resolver::{
@@ -214,6 +237,8 @@ pub use archive_member_resolver::{
 
 pub mod game_identity;
 pub mod scummvm_detection;
+pub mod zip_cartridge_stage;
+pub mod zip_floppy_set;
 
 mod library_view_history;
 pub use library_view_history::{
@@ -658,6 +683,7 @@ pub mod platform;
 pub mod platform_artwork;
 
 pub mod patch_manager;
+pub mod path_alias;
 
 /// Read-only inspection and deterministic planning for caller-supplied local
 /// game-mod package directories. This is intentionally separate from the
@@ -687,6 +713,10 @@ pub mod mod_history;
 pub mod classic_poke_family;
 /// Per-game, read-only view of classic POKE trainers (never applies anything).
 pub mod classic_trainer_evidence;
+/// Game package boundaries (single file, CUE/GDI/M3U set, game folder).
+pub mod game_package;
+/// Manual system choices kept outside the database (survive rebuilds).
+pub mod manual_platform_choices;
 /// Provider-neutral, metadata-only catalogue records for future mod sources.
 pub mod mod_catalogue;
 /// Provider-neutral, metadata-only discovery and user-acquisition handoff.
@@ -697,6 +727,8 @@ pub mod mod_provider;
 pub mod moddb;
 /// Legal/open cheat-provider metadata and conservative local projections.
 pub mod open_retro_cheat_providers;
+/// Re-points RetroArch JSON playlists at games EmuWiz moved.
+pub mod retroarch_playlist_relink;
 /// Bounded import of user-supplied local ROM-hack metadata.
 pub mod rom_hack_catalogue;
 
@@ -902,6 +934,14 @@ pub struct Config {
     /// platform directories beneath it. `None` when the user has not
     /// configured one; configuring it never moves anything by itself.
     pub master_rom_root: Option<PathBuf>,
+    /// Every configured source path, enabled *and disabled*, exactly as the
+    /// configuration lists them. `source_folders` holds only the enabled
+    /// ones; this is what keeps a disabled source safe from mount-root
+    /// creation, mounting and cleanup. `None` means the complete set is not
+    /// known (a hand-built or partial `Config`), and every operation that
+    /// creates, mounts into or removes folders under the mount root then
+    /// fails closed. [`parse_config`] always sets it.
+    pub configured_source_roots: Option<Vec<PathBuf>>,
 }
 
 impl Config {
@@ -1290,7 +1330,10 @@ fn complete_doctor_report(
             false
         }
         PathInspection::Missing if create_mount_root => {
-            match fs::create_dir_all(&config.mount_root) {
+            match ensure_mount_root_disjoint_from_config(config).and_then(|()| {
+                fs::create_dir_all(&config.mount_root)
+                    .map_err(|source| ArchiveFsError::io(config.mount_root.clone(), source))
+            }) {
                 Ok(()) => {
                     report.pass(
                         "mount root",
@@ -1668,6 +1711,11 @@ fn run_setup_diagnostics_with_checks(
         && mount_root.as_ref().is_some_and(|root| {
             root.parent()
                 .is_some_and(|parent| inspect(parent).is_directory())
+        })
+        && mount_root.as_ref().is_some_and(|root| {
+            contents.as_deref().is_some_and(|contents| {
+                mount_root_disjoint_from_config_text(root, contents).is_ok()
+            })
         });
     let sources_ready =
         !source_states.is_empty() && source_states.iter().all(|(_, state)| state.is_directory());
@@ -1986,12 +2034,28 @@ pub fn create_configured_mount_root_default() -> Result<PathBuf> {
     let root = parse_config_fields(&contents)?
         .mount_root
         .ok_or_else(|| ArchiveFsError::Config("missing mount_root".to_string()))?;
+    mount_root_disjoint_from_config_text(&root, &contents)?;
     create_mount_root(&root)?;
     Ok(root)
 }
 
 pub fn create_configured_mount_root(config: &Config) -> Result<()> {
+    ensure_mount_root_disjoint_from_config(config)?;
     create_mount_root(&config.mount_root)
+}
+
+/// The disjointness rule against everything the config text protects:
+/// every configured source (enabled or disabled) and the master ROM root.
+fn mount_root_disjoint_from_config_text(mount_root: &Path, contents: &str) -> Result<()> {
+    let sources: Vec<PathBuf> = parse_source_folder_configs(contents)?
+        .into_iter()
+        .map(|source| source.path)
+        .collect();
+    ensure_mount_root_disjoint_from_sources(mount_root, &sources)?;
+    if let Some(master_rom_root) = parse_config_fields(contents)?.master_rom_root {
+        ensure_mount_root_disjoint_from(mount_root, &master_rom_root, "master ROM root")?;
+    }
+    Ok(())
 }
 
 fn create_mount_root(root: &Path) -> Result<()> {
@@ -2158,6 +2222,28 @@ fn run_config_check_with_mount_root_creation(
     match &fields.mount_root {
         Some(mount_root) => {
             report.pass("mount_root set", format!("{}", mount_root.display()));
+            // Report an overlapping legacy config instead of fixing it, and
+            // never create the mount root inside a source folder.
+            let source_paths: Vec<PathBuf> = fields
+                .source_folders
+                .iter()
+                .flatten()
+                .map(PathBuf::from)
+                .collect();
+            let overlap = ensure_mount_root_disjoint_from_sources(mount_root, &source_paths)
+                .and_then(|()| match &fields.master_rom_root {
+                    Some(master_rom_root) => ensure_mount_root_disjoint_from(
+                        mount_root,
+                        master_rom_root,
+                        "master ROM root",
+                    ),
+                    None => Ok(()),
+                })
+                .err();
+            if let Some(error) = &overlap {
+                report.error("mount_root separate from source folders", error.to_string());
+            }
+            let create_mount_root = create_mount_root && overlap.is_none();
             match inspect_path(mount_root) {
                 PathInspection::Directory => {
                     report.pass(
@@ -2334,6 +2420,20 @@ impl PendingSourceEntry {
 pub fn parse_config(contents: &str) -> Result<Config> {
     let fields = parse_config_fields(contents)?;
 
+    let configured_source_roots = if !fields.structured_sources.is_empty() {
+        fields
+            .structured_sources
+            .iter()
+            .map(|source| source.path.clone())
+            .collect::<Vec<_>>()
+    } else {
+        fields
+            .source_folders
+            .iter()
+            .flatten()
+            .map(PathBuf::from)
+            .collect()
+    };
     let source_folders = if !fields.structured_sources.is_empty() {
         fields
             .structured_sources
@@ -2359,6 +2459,7 @@ pub fn parse_config(contents: &str) -> Result<Config> {
             .ratarmount_bin
             .unwrap_or_else(|| "ratarmount".to_string()),
         master_rom_root: fields.master_rom_root,
+        configured_source_roots: Some(configured_source_roots),
     })
 }
 
@@ -2570,6 +2671,9 @@ pub fn set_master_rom_root_to(config_path: &Path, path: &Path) -> Result<Option<
         .as_ref()
         .map(|config| config.ratarmount_bin.clone())
         .unwrap_or_else(|| "ratarmount".to_string());
+    // Organised games must never be moved into the mount root, nor the
+    // mount root sit inside the organised library.
+    ensure_mount_root_disjoint_from(&mount_root, path, "master ROM root")?;
     let previous = config.and_then(|config| config.master_rom_root);
     save_source_folder_configs_to(
         config_path,
@@ -2603,6 +2707,15 @@ pub fn set_mount_root_to(config_path: &Path, path: &Path) -> Result<PathBuf> {
     // removes a temp file inside it) or anything written.
     let contents = read_config_for_update(config_path)?;
     validate_mount_root_selection(path)?;
+    // Every configured source counts, enabled or not.
+    let sources: Vec<PathBuf> = parse_source_folder_configs(&contents)?
+        .into_iter()
+        .map(|source| source.path)
+        .collect();
+    ensure_mount_root_disjoint_from_sources(path, &sources)?;
+    if let Some(master_rom_root) = parse_config_fields(&contents)?.master_rom_root {
+        ensure_mount_root_disjoint_from(path, &master_rom_root, "master ROM root")?;
+    }
     let updated = replace_mount_root_assignment(&contents, path)?;
     // The exact bytes about to be published must parse and round-trip the
     // requested folder. This is what stops a path containing an embedded
@@ -3074,6 +3187,192 @@ pub(crate) fn validate_configured_source_roots(paths: &[PathBuf]) -> Result<()> 
     Ok(())
 }
 
+/// How a mount root overlaps a source folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountRootSourceOverlap {
+    /// The mount root is the source folder itself.
+    SameFolder,
+    /// The mount root is inside the source folder.
+    MountRootInsideSource,
+    /// The source folder is inside the mount root.
+    SourceInsideMountRoot,
+}
+
+impl MountRootSourceOverlap {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::SameFolder => "is the same folder as",
+            Self::MountRootInsideSource => "is inside",
+            Self::SourceInsideMountRoot => "contains",
+        }
+    }
+}
+
+/// Resolves every symlink in `path`. A path that does not exist yet resolves
+/// its nearest existing ancestor and re-appends the missing components, so a
+/// folder that would be created later is compared where it would really be.
+fn resolve_through_nearest_existing_ancestor(path: &Path) -> io::Result<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        match fs::canonicalize(current) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A dangling symlink is not a folder that does not exist
+                // yet: its real target is unknown, so fail closed.
+                if fs::symlink_metadata(current).is_ok() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{} is a dangling symbolic link", current.display()),
+                    ));
+                }
+                match (current.parent(), current.file_name()) {
+                    (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                        missing.push(name.to_os_string());
+                        current = parent;
+                    }
+                    _ => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn classify_mount_root_overlap(mount_root: &Path, source: &Path) -> Option<MountRootSourceOverlap> {
+    if mount_root == source {
+        Some(MountRootSourceOverlap::SameFolder)
+    } else if mount_root.starts_with(source) {
+        Some(MountRootSourceOverlap::MountRootInsideSource)
+    } else if source.starts_with(mount_root) {
+        Some(MountRootSourceOverlap::SourceInsideMountRoot)
+    } else {
+        None
+    }
+}
+
+/// Compares `mount_root` and `source` both as spelled (normalised) and with
+/// symlinks resolved, so neither an alias nor a symlinked spelling hides an
+/// overlap. An error means the overlap could not be ruled out.
+pub fn mount_root_source_overlap(
+    mount_root: &Path,
+    source: &Path,
+) -> io::Result<Option<MountRootSourceOverlap>> {
+    let lexical_mount: PathBuf = mount_root.components().collect();
+    let lexical_source: PathBuf = source.components().collect();
+    if let Some(overlap) = classify_mount_root_overlap(&lexical_mount, &lexical_source) {
+        return Ok(Some(overlap));
+    }
+    let resolved_mount = resolve_through_nearest_existing_ancestor(mount_root)?;
+    let resolved_source = resolve_through_nearest_existing_ancestor(source)?;
+    Ok(classify_mount_root_overlap(
+        &resolved_mount,
+        &resolved_source,
+    ))
+}
+
+/// The single mount-root/source disjointness rule. The mount root must not be
+/// a source folder, be inside one, or contain one: EmuWiz creates, mounts
+/// into and cleans up empty folders below the mount root, which must never
+/// reach the user's library. Fails closed when the comparison cannot be made.
+/// An empty mount root (none configured) overlaps nothing.
+pub fn ensure_mount_root_disjoint_from_sources(
+    mount_root: &Path,
+    sources: &[PathBuf],
+) -> Result<()> {
+    for source in sources {
+        ensure_mount_root_disjoint_from(mount_root, source, "source folder")?;
+    }
+    Ok(())
+}
+
+/// [`ensure_mount_root_disjoint_from_sources`] for every root `config`
+/// protects: its enabled sources, every configured source (disabled ones
+/// included) and its master ROM root. Fails closed when the complete set of
+/// configured sources is unknown.
+pub(crate) fn ensure_mount_root_disjoint_from_config(config: &Config) -> Result<()> {
+    let Some(configured_source_roots) = &config.configured_source_roots else {
+        return Err(ArchiveFsError::Config(format!(
+            "cannot verify that the temporary preparation folder {} is separate from every configured source folder: the complete list of configured source folders (including disabled ones) is not known, so nothing was created, mounted or removed",
+            config.mount_root.display()
+        )));
+    };
+    ensure_mount_root_disjoint_from_sources(&config.mount_root, &config.source_folders)?;
+    ensure_mount_root_disjoint_from_sources(&config.mount_root, configured_source_roots)?;
+    if let Some(master_rom_root) = &config.master_rom_root {
+        ensure_mount_root_disjoint_from(&config.mount_root, master_rom_root, "master ROM root")?;
+    }
+    Ok(())
+}
+
+fn ensure_mount_root_disjoint_from(mount_root: &Path, protected: &Path, label: &str) -> Result<()> {
+    if mount_root.as_os_str().is_empty() || protected.as_os_str().is_empty() {
+        return Ok(());
+    }
+    match mount_root_source_overlap(mount_root, protected) {
+        Ok(None) => Ok(()),
+        Ok(Some(overlap)) => Err(ArchiveFsError::Config(format!(
+            "the temporary preparation folder {} {} the {label} {}; EmuWiz refuses to create, mount into or clean up folders in an overlapping preparation folder, so choose a separate one",
+            mount_root.display(),
+            overlap.describe(),
+            protected.display()
+        ))),
+        Err(error) => Err(ArchiveFsError::Config(format!(
+            "cannot verify that the temporary preparation folder {} is separate from the {label} {}: {error}",
+            mount_root.display(),
+            protected.display()
+        ))),
+    }
+}
+
+/// Folders a source scan must not enter because they belong to the mount
+/// root. New configurations can no longer overlap, but a legacy config may:
+/// a mount root inside the source is excluded whole; when the mount root is
+/// the source or contains it, only its live mount points can be told apart
+/// from the user's own folders, so those are excluded.
+pub(crate) fn mount_root_scan_exclusions(source: &Path, mount_root: &Path) -> Vec<PathBuf> {
+    if mount_root.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    match mount_root_source_overlap(mount_root, source) {
+        Ok(Some(MountRootSourceOverlap::MountRootInsideSource)) => {
+            let mut excluded = Vec::new();
+            let lexical: PathBuf = mount_root.components().collect();
+            if lexical.starts_with(source) {
+                excluded.push(lexical);
+            }
+            if let (Ok(resolved_mount), Ok(resolved_source)) = (
+                resolve_through_nearest_existing_ancestor(mount_root),
+                fs::canonicalize(source),
+            ) && let Ok(relative) = resolved_mount.strip_prefix(&resolved_source)
+            {
+                excluded.push(source.join(relative));
+            }
+            excluded
+        }
+        Ok(Some(_)) => match mounted_paths_under(mount_root) {
+            Ok(paths) => paths
+                .into_iter()
+                .filter(|path| path != source && path.starts_with(source))
+                .collect(),
+            Err(error) => {
+                log::warn!(
+                    "mount root {} overlaps source {} and its live mounts could not be listed: {error}",
+                    mount_root.display(),
+                    source.display()
+                );
+                Vec::new()
+            }
+        },
+        Ok(None) | Err(_) => Vec::new(),
+    }
+}
+
 /// Returns explicitly configured roots strictly below `source`, in stable
 /// order. A child source owns its subtree when the parent is scanned, so a
 /// pathological child cannot consume the parent's whole entry budget and no
@@ -3500,6 +3799,10 @@ pub fn add_source_folder_at(
 
     let existing_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let validated_path = validate_new_source_folder(candidate, &existing_paths)?;
+    ensure_mount_root_disjoint_from_sources(
+        &config.mount_root,
+        std::slice::from_ref(&validated_path),
+    )?;
 
     let new_source = SourceFolderConfig {
         path: validated_path,
@@ -3578,6 +3881,12 @@ pub fn set_source_folder_enabled_at(
                 target.display()
             ))
         })?;
+    if enabled {
+        ensure_mount_root_disjoint_from_sources(
+            &config.mount_root,
+            std::slice::from_ref(&sources[index].path),
+        )?;
+    }
     sources[index].enabled = enabled;
     let updated = sources[index].clone();
 
@@ -3602,10 +3911,11 @@ pub fn set_source_folder_enabled_at(
                     target.display()
                 ))
             })?;
-        Some(scan_and_persist_folders(
+        Some(database::scan_and_persist_folders_excluding_mount_root(
             &mut database,
             std::slice::from_ref(&folder),
             "source-enable",
+            &config.mount_root,
         )?)
     } else {
         None
@@ -3779,8 +4089,12 @@ pub fn scan_source_folder_at(
             ))
         })?;
 
-    let summary =
-        scan_and_persist_folders(&mut database, std::slice::from_ref(&folder), triggered_by)?;
+    let summary = database::scan_and_persist_folders_excluding_mount_root(
+        &mut database,
+        std::slice::from_ref(&folder),
+        triggered_by,
+        &configured_mount_root_at(config_path)?,
+    )?;
     refresh_configured_mame_arcade_identity(&mut database, &[target.to_path_buf()])?;
     Ok(summary)
 }
@@ -3797,6 +4111,17 @@ pub fn scan_all_enabled_sources_default() -> Result<ScanPersistSummary> {
         &default_database_path()?,
         "cli-scan-all-sources",
     )
+}
+
+/// The configured mount root (empty when none is set), so persisted scans
+/// and bounded imports can exclude mount-root content from a legacy
+/// overlapping source.
+pub fn configured_mount_root_at(config_path: &Path) -> Result<PathBuf> {
+    let contents = fs::read_to_string(config_path)
+        .map_err(|source| ArchiveFsError::io(config_path.to_path_buf(), source))?;
+    Ok(parse_config_fields(&contents)?
+        .mount_root
+        .unwrap_or_default())
 }
 
 pub fn scan_all_enabled_sources_at(
@@ -3830,6 +4155,7 @@ pub fn scan_all_enabled_sources_at(
         &enabled_folders,
         triggered_by,
         &skipped,
+        &configured_mount_root_at(config_path)?,
     )?;
     let paths = enabled_folders
         .iter()
@@ -5705,6 +6031,7 @@ impl ArchiveMountSession {
         &self,
         archive_paths: &[PathBuf],
     ) -> Result<Vec<MountBatchTargetValidation>> {
+        ensure_mount_root_disjoint_from_config(&self.config)?;
         fs::create_dir_all(&self.config.mount_root)
             .map_err(|source| ArchiveFsError::io(self.config.mount_root.clone(), source))?;
         let active_mount_paths = current_mount_paths()?;
@@ -5787,6 +6114,9 @@ pub struct ArchiveStatus {
 
 pub struct ArchiveScanner<'a> {
     config: &'a Config,
+    /// Nested mounts whose cached observations may be reused (see
+    /// [`ArchiveScanner::with_trusted_nested_areas`]).
+    trusted_nested_areas: Vec<PathBuf>,
 }
 
 // v2 records that stable direct-media classifications are reusable under the
@@ -5928,6 +6258,32 @@ pub struct ArchiveScanDiscovery {
     /// parent directory's, so same-device bind mounts count). Remembered so a later scan that finds one gone or
     /// replaced cannot treat the files formerly beneath it as deleted.
     pub nested_boundaries: Vec<catalogue_health::NestedBoundaryObservation>,
+    /// Every nested mount met, in walk order. Errors inside a walked area
+    /// are counted there, not against the source, so one unreadable mount
+    /// cannot make the rest of the source partial.
+    pub nested_areas: Vec<DiscoveredNestedArea>,
+}
+
+/// One nested filesystem found inside a source during discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredNestedArea {
+    pub path: PathBuf,
+    /// The area this one is nested in, if any.
+    pub parent_area: Option<usize>,
+    pub mount_id: u64,
+    pub device: u64,
+    pub inode: u64,
+    /// A FUSE archive mount that was walked. Anything else was not entered.
+    pub supported: bool,
+    pub archives: usize,
+    pub scan_errors: Vec<ScanError>,
+    pub scan_errors_total: usize,
+}
+
+impl DiscoveredNestedArea {
+    pub fn is_complete(&self) -> bool {
+        self.supported && self.scan_errors_total == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5954,6 +6310,23 @@ impl ArchiveScanDiscovery {
         self.scan_errors_total == 0
     }
 
+    /// Records an error against the nested area it happened in, or against
+    /// the source itself outside every area.
+    fn record_error_in(&mut self, area: Option<usize>, path: PathBuf, message: impl Into<String>) {
+        let Some(index) = area else {
+            self.record_scan_error(path, message);
+            return;
+        };
+        let area = &mut self.nested_areas[index];
+        area.scan_errors_total = area.scan_errors_total.saturating_add(1);
+        if area.scan_errors.len() < MAX_RETAINED_SCAN_ERRORS {
+            area.scan_errors.push(ScanError {
+                path,
+                message: message.into(),
+            });
+        }
+    }
+
     pub fn scan_errors_truncated(&self) -> bool {
         self.scan_errors_total > self.scan_errors.len()
     }
@@ -5976,7 +6349,18 @@ impl ArchiveScanDiscovery {
 
 impl<'a> ArchiveScanner<'a> {
     pub fn new(config: &'a Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            trusted_nested_areas: Vec::new(),
+        }
+    }
+
+    /// Nested mounts the caller has proven to be the same trusted mount as
+    /// at the last scan. Cached file observations are reused only inside
+    /// these; every other nested mount is inspected afresh.
+    pub fn with_trusted_nested_areas(mut self, areas: Vec<PathBuf>) -> Self {
+        self.trusted_nested_areas = areas;
+        self
     }
 
     pub fn scan_archives(&self) -> Result<Vec<Archive>> {
@@ -6025,6 +6409,7 @@ impl<'a> ArchiveScanner<'a> {
                     .filter(|root| root.starts_with(source) && *root != source)
                     .cloned(),
             );
+            excluded_roots.extend(mount_root_scan_exclusions(source, &self.config.mount_root));
             excluded_roots.sort();
             excluded_roots.dedup();
             self.scan_source(
@@ -6121,14 +6506,16 @@ impl<'a> ArchiveScanner<'a> {
         let root_mount = catalogue_health::directory_mount(source)
             .map(|mount| mount.mount_id)
             .map_err(|error| ArchiveFsError::io(source.to_path_buf(), error))?;
-        let mut directories = vec![(source.to_path_buf(), 0_usize, root_mount)];
-        while let Some((directory, depth, parent_mount)) = directories.pop() {
+        let mut directories = vec![(source.to_path_buf(), 0_usize, root_mount, None::<usize>)];
+        let untrusted_fingerprints = HashMap::new();
+        while let Some((directory, depth, parent_mount, mut area)) = directories.pop() {
             discovery.timings.directories_visited += 1;
             let traversal_started = Instant::now();
             let before = match fs::symlink_metadata(&directory) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    discovery.record_scan_error(
+                    discovery.record_error_in(
+                        area,
                         directory.clone(),
                         ArchiveFsError::io(directory.clone(), error).to_string(),
                     );
@@ -6136,7 +6523,8 @@ impl<'a> ArchiveScanner<'a> {
                 }
             };
             if before.file_type().is_symlink() || !before.is_dir() {
-                discovery.record_scan_error(
+                discovery.record_error_in(
+                    area,
                     directory.clone(),
                     format!(
                         "source directory changed or became unsafe during scan: {}",
@@ -6149,7 +6537,8 @@ impl<'a> ArchiveScanner<'a> {
                 Ok(mount) => mount,
                 Err(error) => {
                     // Without a mount identity a boundary cannot be excluded.
-                    discovery.record_scan_error(
+                    discovery.record_error_in(
+                        area,
                         directory.clone(),
                         format!(
                             "mount identity unavailable for {}: {error}",
@@ -6168,12 +6557,47 @@ impl<'a> ArchiveScanner<'a> {
                         inode: directory_mount.inode,
                         mount_id: directory_mount.mount_id,
                     });
+                // A nested filesystem is its own ownership boundary. FUSE
+                // archive mounts are walked as a separate area (persistence
+                // opens each one as its own root); any other filesystem is
+                // left unwalked and reported, never resolved across.
+                let supported = catalogue_health::directory_filesystem_type(&directory)
+                    .is_ok_and(catalogue_health::is_supported_area_filesystem);
+                discovery.nested_areas.push(DiscoveredNestedArea {
+                    path: directory.clone(),
+                    parent_area: area,
+                    mount_id: directory_mount.mount_id,
+                    device: directory_mount.device,
+                    inode: directory_mount.inode,
+                    supported,
+                    archives: 0,
+                    scan_errors: Vec::new(),
+                    scan_errors_total: 0,
+                });
+                if !supported {
+                    continue;
+                }
+                area = Some(discovery.nested_areas.len() - 1);
             }
+            // Cached observations are reused inside a nested mount only when
+            // the caller proved it is the same trusted mount; otherwise every
+            // file there is inspected afresh.
+            let fingerprints = match area {
+                Some(index)
+                    if !self
+                        .trusted_nested_areas
+                        .contains(&discovery.nested_areas[index].path) =>
+                {
+                    &untrusted_fingerprints
+                }
+                _ => fingerprints,
+            };
             let directory_device = directory_mount.mount_id;
             let read_dir = match fs::read_dir(&directory) {
                 Ok(read_dir) => read_dir,
                 Err(error) => {
-                    discovery.record_scan_error(
+                    discovery.record_error_in(
+                        area,
                         directory.clone(),
                         ArchiveFsError::io(directory.clone(), error).to_string(),
                     );
@@ -6187,7 +6611,8 @@ impl<'a> ArchiveScanner<'a> {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
-                        discovery.record_scan_error(
+                        discovery.record_error_in(
+                            area,
                             directory.clone(),
                             ArchiveFsError::io(directory.clone(), error).to_string(),
                         );
@@ -6199,7 +6624,8 @@ impl<'a> ArchiveScanner<'a> {
                 let file_type = match entry.file_type() {
                     Ok(file_type) => file_type,
                     Err(error) => {
-                        discovery.record_scan_error(
+                        discovery.record_error_in(
+                            area,
                             path.clone(),
                             ArchiveFsError::io(path.clone(), error).to_string(),
                         );
@@ -6223,7 +6649,7 @@ impl<'a> ArchiveScanner<'a> {
                     None
                 };
                 if let Some(error) = metadata_error {
-                    discovery.record_scan_error(path.clone(), error);
+                    discovery.record_error_in(area, path.clone(), error);
                     continue;
                 }
                 if file_type.is_dir() {
@@ -6246,13 +6672,14 @@ impl<'a> ArchiveScanner<'a> {
                         continue;
                     }
                     if depth >= MAX_SCAN_DEPTH {
-                        discovery.record_scan_error(path.clone(), format!("source scan exceeded the {MAX_SCAN_DEPTH} directory depth limit at {}", path.display()));
+                        discovery.record_error_in(area, path.clone(), format!("source scan exceeded the {MAX_SCAN_DEPTH} directory depth limit at {}", path.display()));
                         continue;
                     }
-                    child_directories.push((path, depth + 1, directory_device));
+                    child_directories.push((path, depth + 1, directory_device, area));
                 } else if let Some(archive) = candidate {
                     if archive.identity.size_bytes.is_none() {
-                        discovery.record_scan_error(
+                        discovery.record_error_in(
+                            area,
                             path.clone(),
                             format!(
                                 "archive changed or became unreadable during scan: {}",
@@ -6262,6 +6689,9 @@ impl<'a> ArchiveScanner<'a> {
                         continue;
                     }
                     debug!("discovered archive {}", archive.path.display());
+                    if let Some(index) = area {
+                        discovery.nested_areas[index].archives += 1;
+                    }
                     discovery.archives.push(archive);
                     discovery.timings.candidate_discovery_ns +=
                         candidate_started.elapsed().as_nanos();
@@ -6347,7 +6777,8 @@ impl<'a> ArchiveScanner<'a> {
                     let non_archive_metadata = match fs::metadata(&path) {
                         Ok(metadata) => metadata,
                         Err(error) => {
-                            discovery.record_scan_error(
+                            discovery.record_error_in(
+                                area,
                                 path.clone(),
                                 ArchiveFsError::io(path.clone(), error).to_string(),
                             );
@@ -6401,7 +6832,8 @@ impl<'a> ArchiveScanner<'a> {
             let after = match fs::symlink_metadata(&directory) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    discovery.record_scan_error(
+                    discovery.record_error_in(
+                        area,
                         directory.clone(),
                         ArchiveFsError::io(directory.clone(), error).to_string(),
                     );
@@ -6412,7 +6844,8 @@ impl<'a> ArchiveScanner<'a> {
                 || !after.is_dir()
                 || filesystem_identity(&before) != filesystem_identity(&after)
             {
-                discovery.record_scan_error(
+                discovery.record_error_in(
+                    area,
                     directory.clone(),
                     format!(
                         "source directory changed during scan: {}",
@@ -6684,7 +7117,21 @@ pub fn scan_archives(config: &Config) -> Result<Vec<Archive>> {
     ArchiveScanner::new(config).scan_archives()
 }
 
+/// Source-root-only revalidation; production resolves through
+/// [`revalidate_archive_within`] so nested mounts use their own root.
+#[cfg(test)]
 pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> {
+    revalidate_archive_within(archive, None)
+}
+
+/// Revalidates an archive before it is saved, resolving the archive from the
+/// pinned root of the nested mount that owns it (`area`: its path,
+/// device/inode and unique mount ID) when it lies inside one. The source
+/// root is still checked.
+pub(crate) fn revalidate_archive_within(
+    archive: &Archive,
+    area: Option<(&Path, (u64, u64), u64)>,
+) -> Result<()> {
     let source_identity = validate_source_root(&archive.identity.source_root)?;
     if archive.identity.source_filesystem_device != Some(source_identity.device)
         || archive.identity.source_filesystem_inode != Some(source_identity.inode)
@@ -6702,8 +7149,20 @@ pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> 
     }
     // One descriptor-relative resolution (no symlinks, beneath, no xdev): a
     // component swapped after the scan cannot redirect to outside content.
-    let root = catalogue_health::BoundRoot::open(&archive.identity.source_root)
-        .filter(|root| root.identity == (source_identity.device, source_identity.inode))
+    let (owner, owner_identity, owner_mount) = match area {
+        Some((path, identity, mount_id)) if archive.path.starts_with(path) => {
+            (path, identity, Some(mount_id))
+        }
+        _ => (
+            archive.identity.source_root.as_path(),
+            (source_identity.device, source_identity.inode),
+            None,
+        ),
+    };
+    let root = catalogue_health::BoundRoot::open(owner)
+        .filter(|root| root.identity == owner_identity)
+        // Inside a nested mount: the very instance settlement proved.
+        .filter(|root| owner_mount.is_none_or(|expected| root.mount_id().ok() == Some(expected)))
         .ok_or_else(|| {
             ArchiveFsError::Scanner(format!(
                 "source root changed after scan: {}",
@@ -7280,19 +7739,17 @@ fn detect_platform_from_folder_alias_with_match(
     let mut components: Vec<_> = relative.components().collect();
     components.pop(); // the archive's own filename never counts as a folder.
 
-    components
+    // One folder-choice rule for scans and the detection report.
+    let mut folders: Vec<String> = components
         .iter()
         .rev()
-        .find_map(|component| {
-            let matched_folder = component.as_os_str().to_string_lossy();
-            folder_platform_alias(&matched_folder)
-                .map(|platform| (platform, matched_folder.into_owned()))
-        })
-        .or_else(|| {
-            let matched_folder = source_root.file_name()?.to_string_lossy();
-            folder_platform_alias(&matched_folder)
-                .map(|platform| (platform, matched_folder.into_owned()))
-        })
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if let Some(root) = source_root.file_name() {
+        folders.push(root.to_string_lossy().into_owned());
+    }
+    platform::detect::nearest_platform_folder(&folders)
+        .map(|(platform, folder)| (platform.id, folder))
 }
 
 /// Normalizes one path segment for alias matching. Delegates to the registry
@@ -8354,6 +8811,7 @@ pub fn mount_archives_with_backend(
 ) -> Result<Vec<ArchiveStatus>> {
     let scanner = ArchiveScanner::new(config);
     let plans = scanner.mount_plans()?;
+    ensure_mount_root_disjoint_from_config(config)?;
     prepare_mount_root(&config.mount_root)?;
 
     let archive_paths = plans
@@ -8484,6 +8942,7 @@ fn mount_one_plan_outcome(
         plan.mount_path.display()
     );
 
+    ensure_mount_root_disjoint_from_config(config)?;
     prepare_mount_root(&config.mount_root)?;
     let active_mount_paths = backend.active_mount_paths(&config.mount_root)?;
     mount_one_plan_outcome_with_active_mounts(config, plan, backend, &active_mount_paths)
@@ -8510,6 +8969,7 @@ fn mount_unmounted_plan(
     plan: MountPlan,
     backend: &impl MountBackend,
 ) -> Result<MountPlan> {
+    ensure_mount_root_disjoint_from_config(config)?;
     prepare_mount_root(&config.mount_root)?;
     validate_archive_for_mount(&plan.archive)?;
     validate_mount_target_parent(config, &plan.mount_path)?;
@@ -9062,6 +9522,7 @@ fn validated_unmount_parent_identity(
 
 pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<bool> {
     ensure_no_symlink_components(&config.mount_root)?;
+    ensure_mount_root_disjoint_from_config(config)?;
     if mount_path == config.mount_root
         || !path_is_under(mount_path, &config.mount_root)
         || !mount_path.is_dir()
@@ -9076,6 +9537,7 @@ pub fn cleanup_selected_mount_dir(config: &Config, mount_path: &Path) -> Result<
 /// Removes an empty selected mount directory and its empty ancestors below the mount root.
 pub fn cleanup_selected_mount_tree(config: &Config, mount_path: &Path) -> Result<Vec<PathBuf>> {
     ensure_no_symlink_components(&config.mount_root)?;
+    ensure_mount_root_disjoint_from_config(config)?;
     if mount_path == config.mount_root
         || !path_is_under(mount_path, &config.mount_root)
         || !mount_path.is_dir()
@@ -9149,6 +9611,8 @@ pub fn plan_stale_mount_directories(config: &Config) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
     ensure_no_symlink_components(&config.mount_root)?;
+    // Every empty folder in an overlapping source would look like a leftover.
+    ensure_mount_root_disjoint_from_config(config)?;
     let mounted_paths = mounted_paths_under(&config.mount_root)?;
     let mut stale = Vec::new();
     let mut inspected = 0usize;
@@ -9219,6 +9683,7 @@ pub fn clean_mount_root(config: &Config) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
     ensure_no_symlink_components(&config.mount_root)?;
+    ensure_mount_root_disjoint_from_config(config)?;
     let mut plans = ArchiveScanner::new(config).mount_plans()?;
     plans.sort_by(|left, right| right.mount_path.cmp(&left.mount_path));
     let mut removed = Vec::new();
@@ -9539,6 +10004,7 @@ mod tests {
         fs::write(root.join("specific.sMd"), b"rom").unwrap();
 
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
@@ -9610,6 +10076,7 @@ mod tests {
         fs::write(root.join("Disc.iso"), vec![0_u8; 64]).unwrap();
         fs::write(root.join("Animal Crossing (USA).zip"), b"zip fixture").unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
@@ -9673,6 +10140,7 @@ mod tests {
         .unwrap();
 
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
@@ -9781,6 +10249,7 @@ mod tests {
         fs::write(&boxart, b"not a rom").unwrap();
 
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
@@ -9812,6 +10281,7 @@ mod tests {
         fs::write(&resource, b"scummvm resource, not a rom").unwrap();
 
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
@@ -9843,6 +10313,7 @@ mod tests {
         fs::write(root.join("Sonic.zip"), b"zip bytes").unwrap();
 
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
@@ -9875,6 +10346,7 @@ mod tests {
         }
 
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
@@ -9914,6 +10386,7 @@ mod tests {
         }
 
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
@@ -10067,6 +10540,7 @@ mod tests {
 
     fn scan_wiiu(root: &Path) -> ArchiveScanDiscovery {
         let config = Config {
+            configured_source_roots: Some(vec![root.to_path_buf()]),
             source_folders: vec![root.to_path_buf()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
@@ -10306,6 +10780,7 @@ mod tests {
         let path = directory.join(name);
         fs::write(&path, b"rom").unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
@@ -10553,6 +11028,7 @@ mod tests {
         let mount_root = root.join("mounts");
         fs::create_dir_all(&mount_root).unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![root.join("roms")]),
             source_folders: vec![root.join("roms")],
             mount_root: mount_root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
@@ -10576,6 +11052,7 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         symlink(&outside, mount_root.join("escape")).unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![root.join("roms")]),
             source_folders: vec![root.join("roms")],
             mount_root: mount_root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
@@ -10595,8 +11072,11 @@ mod tests {
         let real_parent = mount_root.join("Real");
         fs::create_dir_all(&real_parent).unwrap();
         symlink(&real_parent, mount_root.join("Alias")).unwrap();
-        let first_archive = root.join("First.zip");
-        let second_archive = root.join("Second.zip");
+        // The library sits beside the mount root: an overlapping one is refused.
+        let library = root.join("library");
+        fs::create_dir_all(&library).unwrap();
+        let first_archive = library.join("First.zip");
+        let second_archive = library.join("Second.zip");
         fs::write(&first_archive, b"archive").unwrap();
         fs::write(&second_archive, b"archive").unwrap();
         let plans = vec![
@@ -10610,7 +11090,8 @@ mod tests {
             ),
         ];
         let config = Config {
-            source_folders: vec![root.clone()],
+            configured_source_roots: Some(vec![library.clone()]),
+            source_folders: vec![library],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -10660,6 +11141,7 @@ mod tests {
             mount_root.join("Alias/Game"),
         )];
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
@@ -10706,6 +11188,7 @@ mod tests {
             mount_path.clone(),
         );
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
@@ -10736,6 +11219,7 @@ mod tests {
             mount_path.clone(),
         );
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
@@ -10779,6 +11263,7 @@ mod tests {
         let mount_root = root.join("mounts");
         fs::create_dir_all(&mount_root).unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: mount_root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
@@ -10810,6 +11295,7 @@ mod tests {
         fs::create_dir_all(&source_root).unwrap();
         fs::write(source_root.join("Game.zip"), b"archive").unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![root.join("roms")]),
             source_folders: vec![root.join("roms")],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
@@ -10840,6 +11326,7 @@ mod tests {
         let nested = mount_path.join("child");
         fs::create_dir_all(mount_path.parent().unwrap()).unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
@@ -10871,6 +11358,7 @@ mod tests {
         fs::create_dir_all(&mount_path).unwrap();
         fs::write(mount_path.join("owner-file"), b"owner data").unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![root.join("roms")]),
             source_folders: vec![root.join("roms")],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
@@ -10923,6 +11411,7 @@ mod tests {
         fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
         fs::write(&archive_path, b"archive").unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![root.join("roms")]),
             source_folders: vec![root.join("roms")],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
@@ -10971,6 +11460,7 @@ mod tests {
             ),
         ];
         let config = Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
@@ -11007,6 +11497,7 @@ mod tests {
         fs::write(&first, b"").unwrap();
         fs::write(&second, b"").unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![source_root.clone()]),
             source_folders: vec![source_root],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
@@ -11095,6 +11586,7 @@ mod tests {
         fs::write(xbox360.join("007 Legends.zip"), b"").unwrap();
         fs::write(xbox360.join("Halo 3.zip"), b"").unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![source_root.clone()]),
             source_folders: vec![source_root],
             mount_root: mount_root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
@@ -11117,6 +11609,7 @@ mod tests {
         fs::create_dir_all(&source_root).unwrap();
         fs::write(source_root.join("Halo.zip"), b"").unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![source_root.clone()]),
             source_folders: vec![source_root],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
@@ -11139,6 +11632,7 @@ mod tests {
         fs::create_dir_all(&source_root).unwrap();
         fs::write(source_root.join("Game.zip"), b"archive").unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![source_root.clone()]),
             source_folders: vec![source_root],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
@@ -11159,6 +11653,7 @@ mod tests {
         fs::create_dir_all(&source_root).unwrap();
         fs::write(&archive_path, b"").unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![root.join("roms")]),
             source_folders: vec![root.join("roms")],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
@@ -11178,6 +11673,7 @@ mod tests {
         let root = test_root("lazy_unmount_boundaries");
         let outside = test_root("lazy_unmount_outside");
         let config = Config {
+            configured_source_roots: Some(vec![root.join("roms")]),
             source_folders: vec![root.join("roms")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
@@ -11201,6 +11697,7 @@ mod tests {
         let mount_path = parent.join("Broken_Game");
         fs::create_dir_all(&parent).unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![root.join("roms")]),
             source_folders: vec![root.join("roms")],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
@@ -11224,6 +11721,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, mount_root.join("escape")).unwrap();
         let mount_path = mount_root.join("escape").join("Game");
         let config = Config {
+            configured_source_roots: Some(vec![root.join("roms")]),
             source_folders: vec![root.join("roms")],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
@@ -12340,6 +12838,7 @@ mod tests {
         fs::create_dir_all(&source_root).unwrap();
         fs::write(source_root.join("Game.zip"), b"archive").unwrap();
         let config = Config {
+            configured_source_roots: Some(vec![root.join("roms")]),
             source_folders: vec![root.join("roms")],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
@@ -12474,7 +12973,9 @@ mod tests {
         let mount_path = root.join("Xbox360").join("Game");
         fs::create_dir_all(&mount_path).unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12489,7 +12990,9 @@ mod tests {
     fn cleanup_selected_mount_dir_never_removes_mount_root() {
         let root = test_root("cleanup_selected_root");
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12506,7 +13009,9 @@ mod tests {
         fs::create_dir_all(&mount_path).unwrap();
         fs::write(mount_path.join("file.txt"), b"keep").unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root,
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12522,7 +13027,9 @@ mod tests {
         let outside = test_root("cleanup_selected_outside_target").join("Game");
         fs::create_dir_all(&outside).unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root,
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12539,7 +13046,9 @@ mod tests {
         let mount_path = platform_path.join("Game");
         fs::create_dir_all(&mount_path).unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12557,7 +13066,9 @@ mod tests {
     fn cleanup_selected_mount_tree_rejects_mount_root_itself() {
         let root = test_root("cleanup_selected_tree_root");
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12577,7 +13088,9 @@ mod tests {
         let outside = test_root("cleanup_selected_tree_outside_target").join("Game");
         fs::create_dir_all(&outside).unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root,
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12603,7 +13116,9 @@ mod tests {
         symlink(&outside, root.join("Platform")).unwrap();
         let linked_mount = root.join("Platform").join("Game");
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root,
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12624,7 +13139,9 @@ mod tests {
         fs::create_dir_all(&mount_path).unwrap();
         fs::write(mount_path.join("file.txt"), b"keep").unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -12648,7 +13165,9 @@ mod tests {
         fs::create_dir_all(&mount_path).unwrap();
         fs::create_dir_all(&other_mount_path).unwrap();
         let config = Config {
-            source_folders: vec![root.join("roms")],
+            // The library sits beside the mount root: an overlapping one is refused.
+            configured_source_roots: Some(vec![root.with_file_name("cleanup-fixture-library")]),
+            source_folders: vec![root.with_file_name("cleanup-fixture-library")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
@@ -13323,6 +13842,43 @@ mod tests {
         }
     }
 
+    /// Real library 2026-11-12: `pc-8800-series/Enterprise (MIA)/Enterprise
+    /// [CT].7z` was filed as the Enterprise 64/128 computer.
+    #[test]
+    fn a_title_folder_never_outranks_the_enclosing_platform_folder() {
+        let root = "/library/games";
+        assert_eq!(
+            detect_platform(
+                format!("{root}/pc-8800-series/Enterprise (MIA)/Enterprise [CT].7z"),
+                root
+            ),
+            Some("NEC PC-8801".to_string())
+        );
+        let report = crate::platform::detect::detect_platform_report(
+            &crate::platform::detect::DetectionRequest::new(
+                Path::new(&format!(
+                    "{root}/pc-8800-series/Enterprise (MIA)/Enterprise [CT].7z"
+                )),
+                Path::new(root),
+            ),
+        );
+        assert_eq!(report.platform, Some("NEC PC-8801"));
+        // Unchanged: an exact platform folder still wins when nearest, and a
+        // suffixed platform folder with nothing above it still counts.
+        assert_eq!(
+            detect_platform(format!("{root}/pc-8800-series/enterprise/Game.7z"), root),
+            Some("Enterprise".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/Enterprise (2024)/Game.7z"), root),
+            Some("Enterprise".to_string())
+        );
+        assert_eq!(
+            detect_platform(format!("{root}/NEC PC-8801 (TOSEC)/Game.d88"), root),
+            Some("NEC PC-8801".to_string())
+        );
+    }
+
     #[test]
     fn acorn_archimedes_conservative_aliases_detect_the_canonical_platform() {
         let root = "/home/davedap/Archives";
@@ -13834,6 +14390,7 @@ mod tests {
 
     fn scanner_config(root: &Path) -> Config {
         Config {
+            configured_source_roots: Some(vec![root.to_path_buf()]),
             source_folders: vec![root.to_path_buf()],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
@@ -14004,6 +14561,7 @@ mod tests {
     fn scanner_rejects_relative_and_filesystem_root_sources() {
         for source in [PathBuf::from("relative/source"), PathBuf::from("/")] {
             let config = Config {
+                configured_source_roots: Some(vec![source.clone()]),
                 source_folders: vec![source],
                 mount_root: PathBuf::from("/tmp/archivefs-test-mounts"),
                 ratarmount_bin: "ratarmount".to_string(),
@@ -16774,6 +17332,60 @@ mod tests {
         fn active_mount_paths(&self, _root: &Path) -> Result<HashSet<PathBuf>> {
             Ok(self.active.borrow().clone())
         }
+    }
+
+    /// A `Config` that does not know its complete configured source set (a
+    /// hand-built or partial one) must never clean, create or mount.
+    #[test]
+    fn unknown_configured_source_roots_fail_closed_for_cleanup_create_and_mount() {
+        let root = test_root("unknown_configured_source_roots");
+        let source = root.join("roms");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("Good.zip"), b"archive").unwrap();
+        let mount_root = root.join("mounts");
+        let leftover = mount_root.join("Leftover");
+        fs::create_dir_all(&leftover).unwrap();
+        let config = Config {
+            configured_source_roots: None,
+            source_folders: vec![source.clone()],
+            mount_root: mount_root.clone(),
+            ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
+        };
+
+        let error = plan_stale_mount_directories(&config).unwrap_err();
+        assert!(error.to_string().contains("cannot verify"), "{error}");
+        assert!(clean_mount_root(&config).is_err());
+        assert!(cleanup_selected_mount_tree(&config, &leftover).is_err());
+        assert!(cleanup_selected_mount_dir(&config, &leftover).is_err());
+        assert!(leftover.is_dir());
+
+        let plan = ArchiveScanner::new(&config)
+            .mount_plans()
+            .unwrap()
+            .remove(0);
+        let backend = RecordingBackend::default();
+        assert!(mount_one_plan_outcome(&config, plan.clone(), &backend).is_err());
+        assert!(backend.mounted.borrow().is_empty());
+        assert!(!plan.mount_path.exists());
+
+        let fresh = Config {
+            mount_root: root.join("fresh-mounts"),
+            ..config.clone()
+        };
+        assert!(create_configured_mount_root(&fresh).is_err());
+        assert!(!fresh.mount_root.exists());
+
+        // The same configuration with its complete source set known works.
+        let known = Config {
+            configured_source_roots: Some(vec![source]),
+            ..config
+        };
+        assert_eq!(
+            plan_stale_mount_directories(&known).unwrap(),
+            vec![leftover]
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     struct RecordingLazyUnmountBackend {

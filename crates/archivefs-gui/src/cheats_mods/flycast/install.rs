@@ -86,10 +86,12 @@ impl InstallState {
                     Some("Selection changed while Preview was running; Preview again".into());
             }
             Ok(Message::Applied(r)) => {
-                self.outcome = Some(format!(
+                let mut outcome = format!(
                     "Install status: {:?}. Journal: {:?}. In-game effectiveness has not been tested.",
                     r.journal.status, r.journal_path
-                ));
+                );
+                crate::shared_apply_warnings::append(&mut outcome, &r);
+                self.outcome = Some(outcome);
                 if r.journal.status != SharedApplyStatus::Success || r.journal_failure.is_some() {
                     self.failure = Some(format!(
                         "Incomplete or uncertain installation: {:?}; durable-record failure {:?}. Inspect History & Logs and recovery guidance.",
@@ -460,6 +462,20 @@ pub(super) fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn apply_result_shows_shared_transaction_warnings() {
+        use crate::shared_apply_warnings::test_support::{assert_shows_warning, warned_result};
+        let (tx, rx) = mpsc::channel();
+        let mut state = InstallState {
+            receiver: Some(rx),
+            ..Default::default()
+        };
+        tx.send(Ok(Message::Applied(Box::new(warned_result()))))
+            .unwrap();
+        state.poll();
+        assert_shows_warning(state.outcome.as_deref().unwrap());
+    }
+
     use archivefs_core::emulator_profile_resolver::EmulatorSelectionMode;
     fn binding() -> FlycastInstallBinding {
         FlycastInstallBinding {

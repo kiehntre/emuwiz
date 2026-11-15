@@ -71,6 +71,8 @@ pub(super) struct Imagery {
     showcase: Option<Showcase>,
     /// Games opened this session, most recent first (never persisted).
     recent: Vec<i64>,
+    /// Missing-artwork tile styles, one per platform for the session.
+    placeholders: super::artwork_fallback::Styles,
     pub decoded: u64,
 }
 
@@ -185,8 +187,21 @@ impl Imagery {
         }
         let asset_id = platform_asset_id(platform, false);
         let fallback = platform_fallback_asset_id(platform, false);
+        self.paint_platform_asset(ui, rect, &asset_id, fallback, tint)
+    }
+
+    /// [`Self::paint_platform`] for an already resolved asset id, so a caller
+    /// that keeps the id (the missing-artwork tile) resolves it only once.
+    pub fn paint_platform_asset(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        asset_id: &str,
+        fallback: &'static str,
+        tint: egui::Color32,
+    ) -> PlatformPaint {
         let side = rect.width().min(rect.height());
-        if let Some(texture) = self.texture(ui.ctx(), &asset_id, fallback) {
+        if let Some(texture) = self.texture(ui.ctx(), asset_id, fallback) {
             ui.painter().image(
                 texture.id(),
                 fitted_artwork_rect(rect.center(), side, texture.size_vec2()),
@@ -203,6 +218,14 @@ impl Imagery {
             fallback,
         );
         PlatformPaint::Glyph
+    }
+
+    /// The shared missing-artwork style for `platform` (built once).
+    pub(super) fn placeholder_style(
+        &mut self,
+        platform: &str,
+    ) -> std::sync::Arc<super::artwork_fallback::Style> {
+        self.placeholders.get(platform)
     }
 
     /// Allocate a square of `side` points and paint the platform into it.

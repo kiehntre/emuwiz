@@ -945,3 +945,16 @@ fn a_local_permitted_assertion_is_returned_unchanged_and_grants_nothing() {
         }
     }
 }
+
+#[test]
+fn bundled_starter_catalogue_loads_through_the_normal_validator() {
+    let provider = LocalCatalogueProvider::bundled_starter().unwrap();
+    assert!(!provider.discover_projects("").unwrap().is_empty());
+    assert_eq!(
+        provider.discover_projects("").unwrap(),
+        LocalCatalogueProvider::from_json(BUNDLED_STARTER_CATALOGUE_JSON)
+            .unwrap()
+            .discover_projects("")
+            .unwrap()
+    );
+}

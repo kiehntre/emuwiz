@@ -153,6 +153,9 @@ impl StorageHealthPageState {
                         if let Some(inventory) = &self.tool_inventory {
                             let conversion = capability_for_item(item, inventory);
                             ui.label(format!("Conversion capability: {:?}", conversion.eligibility));
+                            if let Some(detail) = conversion.eligibility_detail.as_deref() {
+                                ui.small(detail);
+                            }
                             if let Some(tool) = conversion.tool.as_deref() {
                                 ui.small(format!("Tool: {tool} · target: {} · mode: {}", conversion.target_format.map(|f| f.to_string()).unwrap_or_else(|| "unknown".into()), conversion.mode.as_deref().unwrap_or("unknown")));
                                 ui.small(format!("Options: {}", conversion.options.join("; ")));

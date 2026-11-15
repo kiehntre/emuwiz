@@ -17,8 +17,8 @@ is not evidence of what a game is.
 
 ## What is saved
 
-Schema 27 adds `game_collections` and `game_collection_items` to
-`library.sqlite3`, so database backups cover them. Migration 27 changes no
+Schema 28 adds `game_collections` and `game_collection_items` to
+`library.sqlite3`, so database backups cover them. Migration 28 changes no
 existing table, row or index.
 
 A favourite belongs to one catalogue entry, not to a title, so two copies with
@@ -58,34 +58,35 @@ showing that way.
 ## Upgrade and compatibility
 
 **Older builds cannot open an upgraded library.** After the upgrade, every build
-made for schema 26 refuses it, and the only way back restores the whole library
+made for schema 27 refuses it, and the only way back restores the whole library
 to its state before the upgrade.
 
-Schema 27 is one-way; see [Upgrading](UPGRADING.md#schema-27-favourites-and-collections).
+Schema 28 is one-way; see [Upgrading](UPGRADING.md#schema-28-favourites-and-collections).
 
-- A schema 27 build does not open a schema 26 library until you run the explicit
+- A schema 28 build does not open a schema 27 library until you run the explicit
   upgrade. There is no automatic upgrade.
-- A schema 26 build refuses a library that has been upgraded.
+- A schema 27 build refuses a library that has been upgraded.
 - The upgrade writes and verifies a backup before changing anything, and keeps
-  it afterwards. From schema 26 it is normally
-  `library.sqlite3.schema-26-before-27.backup`. If that name is taken it gets a
+  it afterwards. From schema 27 it is normally
+  `library.sqlite3.schema-27-before-28.backup`. If that name is taken it gets a
   numeric suffix, so always use the path the upgrade printed.
 - If the upgrade stops or fails, the migration rolls back whole. The library
-  stays at schema 26, the backup stays, and the upgrade can be run again.
+  stays at schema 27, the backup stays, and the upgrade can be run again.
 
-Install this after any build you still intend to run against schema 26, and move
-other builds to a base that includes migration 27 before pointing them at the
-upgraded library. Another branch that adds its own migration must take number 28.
+Install this after any build you still intend to run against schema 27, and move
+other builds to a base that includes migration 28 before pointing them at the
+upgraded library. Another branch that adds its own migration must take number 29
+or later (numbers are assigned in the coordination ledger).
 
 ## Upgrading a live library without a scan
 
-Use `emuwiz-cli library-upgrade --confirm` from the schema 27 build. Do not use
+Use `emuwiz-cli library-upgrade --confirm` from the schema 28 build. Do not use
 **Scan and upgrade library** while any source drive, mount or migration is in
 doubt: that action also scans every game folder, and a scan with a drive absent
 can mark games missing.
 
 The CLI command opens only the database and its backup. It reads no game folder
-and changes no mount. Migration 27 changes no existing row, adding only its own `schema_migrations` entry, so paths, missing
+and changes no mount. Migration 28 changes no existing row, adding only its own `schema_migrations` entry, so paths, missing
 flags and platforms are as they were. A later scan is optional and is not needed
 for Favourites.
 
@@ -93,17 +94,17 @@ Before upgrading:
 
 1. Confirm the release, library and any pending database work are ready, and
    that nothing else is using the library: no EmuWiz window, no worker, no scan.
-2. Use the schema 27 build by its full path, and record its SHA-256. An
+2. Use the schema 28 build by its full path, and record its SHA-256. An
    installed `emuwiz-cli` is a different program, and `--version` does not tell
-   them apart: schema 26 and 27 builds can both print `0.10.0`. Run the upgrade
+   them apart: schema 27 and 28 builds can both print `0.10.0`. Run the upgrade
    from an ordinary login shell. A different `XDG_DATA_HOME` or `HOME` selects a
    different database folder.
 3. Run `<build>/emuwiz-cli database-check`. Stop unless it is healthy.
 4. Check that no `library.sqlite3-wal`, `-shm` or `-journal` file exists, and
    that the database's folder has room for one more copy of it.
 5. Run `<build>/emuwiz-cli library-upgrade` without `--confirm`. It leaves the
-   library unchanged. Stop unless it names the expected database and says schema 26 would
-   become schema 27.
+   library unchanged. Stop unless it names the expected database and says schema 27 would
+   become schema 28.
 6. Record the counts in [Checking the result](#checking-the-result).
 
 Then run `<build>/emuwiz-cli library-upgrade --confirm` once and keep its output.
@@ -116,7 +117,7 @@ database: `undo-seals.sqlite3` with its `-wal` and `-shm` files, and the
 
 If it fails or is stopped, run `database-check` before anything else.
 
-- If it reports schema 26 and a clean quick check, with no live rollback journal,
+- If it reports schema 27 and a clean quick check, with no live rollback journal,
   run the same command again. In testing, a kill during the backup and a kill
   during the migration both ended this way, with every record unchanged.
 - If it reports a hot rollback journal, **stop**. EmuWiz refuses that database
@@ -146,12 +147,12 @@ sqlite3 -readonly library.sqlite3 "PRAGMA user_version; PRAGMA integrity_check;
 sha256sum "<backup path the upgrade printed>"
 ```
 
-Expect schema 27, integrity `ok`, the archive, missing and scan-run counts
+Expect schema 28, integrity `ok`, the archive, missing and scan-run counts
 unchanged, one collection and no items. The SHA-256 must match the upgrade's
-output, and the same counts run against the backup must report schema 26. Leave
+output, and the same counts run against the backup must report schema 27. Leave
 `library-scan` for a time when every source drive is ready.
 
-## Going back to schema 26
+## Going back to schema 27
 
 **The backup is the whole library, not just Favourites.** It is every table of
 `library.sqlite3` as it stood just before the upgrade. Restoring it removes
@@ -160,12 +161,16 @@ verification results, platform changes, the catalogue's record of organisation
 moves, and all Favourites and collections. Nothing is merged back. Treat it as a
 last resort, and only after working out what it would cost.
 
-Going back also means going back to a schema 26 build. A schema 26 build refuses
-a schema 27 library, and a schema 27 build refuses the restored schema 26 library
+Going back also means going back to a schema 27 build. A schema 27 build refuses
+a schema 28 library, and a schema 28 build refuses the restored schema 27 library
 until it is upgraded again. EmuWiz has no downgrade: there is no automatic route
-either way. The current app has no restore screen, and the core restore routine
-accepts only backups at the running build's schema, so this backup goes back by
-hand, as below.
+either way, so going back to schema 27 is by hand, as below.
+
+History's **Review restore** is not a way back to schema 27. Run from a schema 28
+build on this backup, it puts the whole library back as it was before the
+upgrade (losing every later change, as above) and then upgrades a staging copy
+to schema 28 before swapping it in, so the library stays at schema 28 with empty
+Favourites. See [database restore](DATABASE_RESTORE.md).
 
 Rename and organisation journals, and game files, live outside the database and
 are not rewound. Anything moved after the upgrade stays moved, and its journal
@@ -188,6 +193,8 @@ SELECT 'platform assignments',count(*) FROM platform_assignments;
 SELECT 'source folders',count(*) FROM source_folders;
 SELECT 'import receipts',count(*) FROM discovery_import_operations;
 SELECT 'DAT identity results',count(*) FROM library_dat_identities;
+SELECT 'replaced DAT evidence',count(*) FROM library_dat_identity_history;
+SELECT 'DAT re-check notes',count(*) FROM dat_recheck_attempts;
 SELECT 'set audit results',count(*) FROM dat_set_audit_results;
 SELECT 'verified facts',count(*) FROM verified_identity_facts;
 SELECT 'metadata enrichments',count(*) FROM screenscraper_enrichments;
@@ -236,16 +243,16 @@ out, so ask before doing it.
    the database. If one does, stop and follow
    [database recovery](DATABASE_RECOVERY.md).
 3. Set aside the current database, not deleting it:
-   `mv library.sqlite3 library.sqlite3.schema-27-set-aside`
+   `mv library.sqlite3 library.sqlite3.schema-28-set-aside`
 4. Copy the backup into place, keeping the original:
    `cp -p "<backup path the upgrade printed>" library.sqlite3`
 5. Compare `sha256sum` of `library.sqlite3` with the SHA-256 the upgrade printed.
    The backup is a fresh SQLite copy, so that value is not the hash of the
    library from before the upgrade.
-6. Run `database-check` and `library-status` from the schema 26 build by its full
-   path. Expect schema 26, a clean quick check and the counts from before the
+6. Run `database-check` and `library-status` from the schema 27 build by its full
+   path. Expect schema 27, a clean quick check and the counts from before the
    upgrade.
 7. Do not scan until your source drives are ready.
 
 The set-aside copy is then the only record of what the restore removed. Taking
-schema 27 again starts with empty Favourites.
+schema 28 again starts with empty Favourites.

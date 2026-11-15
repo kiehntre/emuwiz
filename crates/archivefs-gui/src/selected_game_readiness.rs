@@ -385,6 +385,12 @@ impl ArchiveFsApp {
         self.emulator_readiness
             .xroar_cassette
             .show(ui, self.archive_context.focused.as_deref());
+        self.emulator_readiness
+            .azahar_homebrew
+            .show(ui, self.archive_context.focused.as_deref());
+        self.emulator_readiness
+            .vita3k_library
+            .show(ui, self.archive_context.focused.as_deref());
         let launch_readiness_input = self.build_launch_readiness_input(live_for_launch_readiness);
         if self.launch_retroarch.poll() || self.launch_retroarch.is_active() {
             ui.ctx().request_repaint();
@@ -411,7 +417,15 @@ impl ArchiveFsApp {
             &mut self.launch_pcsx2,
             &mut self.launch_standalone,
             &mut self.launch_amiga_whdload,
+            &self.emulator_readiness.launch_choices,
         );
+        if let Some(launch_readiness_page::LaunchReadinessPageAction::LaunchChoice(choice)) =
+            &launch_readiness_action
+        {
+            self.emulator_readiness
+                .launch_choices
+                .handle(choice.clone());
+        }
         if matches!(
             launch_readiness_action,
             Some(launch_readiness_page::LaunchReadinessPageAction::OpenDoctor)

@@ -438,6 +438,8 @@ mod tests {
             cemu: None,
             flycast: None,
             xroar: Some(fixture.context.clone()),
+            azahar: None,
+            vita3k: None,
             vice: None,
             amiga_whdload: None,
             #[cfg(target_os = "linux")]

@@ -1307,6 +1307,10 @@ fn bare_config_entry(id: &str, path: &str) -> DatSourceConfigEntry {
         enabled: None,
         priority: None,
         platform: None,
+        platform_recognised_from_header: None,
+        platform_recognised_batch: None,
+        platform_recognised_platform: None,
+        platform_set_by: None,
         origin: None,
         added_unix_seconds: None,
         health_state: None,
@@ -1320,6 +1324,9 @@ fn bare_config_entry(id: &str, path: &str) -> DatSourceConfigEntry {
         health_observed_modified_unix_seconds: None,
         health_observed_modified_subsec_nanos: None,
         health_arcade_catalogue_revisions: None,
+        health_header_name: None,
+        health_header_ecosystem: None,
+        health_header_observed: None,
         unknown_fields: toml::Table::new(),
     }
 }

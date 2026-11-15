@@ -57,7 +57,7 @@ pub(super) struct Selection {
 enum Message {
     Preview(Result<Box<VerificationPreview>, String>),
     Progress(String),
-    Finished(Result<VerificationTotals, String>),
+    Finished(Result<Box<VerificationTotals>, String>),
 }
 #[derive(Default)]
 pub(super) struct Controller {
@@ -136,7 +136,7 @@ impl Controller {
                                 self.saved = true;
                                 self.completions += 1;
                                 self.assignable = self.executing.take();
-                                self.totals = Some(totals);
+                                self.totals = Some(*totals);
                             }
                             Err(e) => {
                                 self.executing = None;
@@ -211,7 +211,7 @@ impl Controller {
                 };
                 let _ = sender.send(Message::Progress(text));
             });
-            let _ = sender.send(Message::Finished(result));
+            let _ = sender.send(Message::Finished(result.map(Box::new)));
         });
     }
     pub fn show(

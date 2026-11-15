@@ -283,7 +283,10 @@ pub fn discover_managed_appimage_installations() -> Vec<LinuxEmulatorInstallatio
 }
 
 fn discover_managed_emulator_installations(home: &Path) -> Vec<LinuxEmulatorInstallationEvidence> {
-    let data_dir = crate::app_dirs::data_dir_in(home);
+    // An unresolvable (ambiguous) data directory has no managed installs to report.
+    let Ok(data_dir) = crate::app_dirs::data_dir_in(home) else {
+        return Vec::new();
+    };
     let mut evidence = Vec::new();
     for spec in crate::emulator_download::EMULATOR_DOWNLOAD_CATALOGUE {
         if let Some(binary) = crate::emulator_download::managed_appimage_install(&data_dir, spec) {

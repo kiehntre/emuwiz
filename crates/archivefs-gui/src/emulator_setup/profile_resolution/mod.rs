@@ -148,6 +148,7 @@ pub(crate) fn spawn_duckstation_resolution(
         let view = compute_duckstation_resolution(&inputs);
         let _ = sender.send((generation, view));
         if let Some(context) = context {
+            crate::emulator_setup::answers::arrived(&context);
             context.request_repaint();
         }
     });

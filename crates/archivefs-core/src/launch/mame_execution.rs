@@ -8,7 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::dat::set::SetResolution;
-use crate::launch::mame_command::{MameCommand, build_mame_command_plan};
+use crate::launch::mame_command::{MameCommand, build_mame_command_plan_with_extra};
 use crate::launch::planning::CanonicalIdentityStatus;
 use crate::launch::process_spawn::{
     CapturedFileIdentity, PreparedProcessCommand, WatchedProcess, spawn_watched_process,
@@ -29,6 +29,9 @@ pub struct MameLaunchRequest {
     /// Exact collection root supplied to MAME with `-rompath`. It is derived
     /// from the trusted logical-set path, never from a product hard-code.
     pub rom_search_path: PathBuf,
+    /// Additional read-only ROM search paths (default empty), passed after
+    /// `rom_search_path`. Re-validated at preflight; never written to.
+    pub extra_rompaths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,11 +134,12 @@ pub fn preflight_mame_launch(
             )],
         });
     }
-    let plan = build_mame_command_plan(
+    let plan = build_mame_command_plan_with_extra(
         &request.identity,
         &request.set_resolutions,
         Some(executable),
         Some(&request.rom_search_path),
+        &request.extra_rompaths,
     );
     match (plan.command, plan.blockers.is_empty()) {
         (Some(command), true) => Ok(command),
@@ -204,6 +208,7 @@ mod tests {
             selected_content,
             expected_content_identity,
             rom_search_path,
+            extra_rompaths: Vec::new(),
         }
     }
 

@@ -311,6 +311,8 @@ pub fn verify_mame_internal_repair_after_apply(
             transaction_id: apply_result.outcome.transaction.transaction_id.clone(),
             repair_plan_digest: apply_plan.plan_digest.clone(),
             expected_destinations: Vec::new(),
+            // A transaction that is not Applied must never start MAME.
+            executable: None,
             ..request
         });
         result.state = crate::mame_post_repair::MameRepairVerificationState::StaleEvidence;

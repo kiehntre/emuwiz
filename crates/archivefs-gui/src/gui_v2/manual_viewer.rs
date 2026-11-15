@@ -232,6 +232,10 @@ pub(super) struct ManualViewer {
 }
 
 impl ManualViewer {
+    pub(super) fn is_open(&self) -> bool {
+        self.session.is_some()
+    }
+
     fn open_associated(
         &mut self,
         context: &egui::Context,

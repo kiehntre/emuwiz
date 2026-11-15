@@ -181,6 +181,11 @@ fn requirement_for(platform: IdentityPlatform) -> Option<LaunchIdentityRequireme
         | IdentityPlatform::NeoGeoCd
         | IdentityPlatform::Ngp
         | IdentityPlatform::Ngpc
+        | IdentityPlatform::GameGear
+        | IdentityPlatform::MasterSystem
+        | IdentityPlatform::Sega32x
+        | IdentityPlatform::ColecoVision
+        | IdentityPlatform::TurboGrafx16
         | IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
         | IdentityPlatform::Atari7800

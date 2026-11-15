@@ -430,15 +430,19 @@ mod launch {
         let machine = Machine::new();
         let (a_exe, a_root) = machine.default_install("Main", true, true);
         let (b_exe, _) = machine.portable_weak("Spare");
-        // Legacy discovery alone sees two executables for the default root.
+        // The portable AppImage belongs to its own folder even when it is an
+        // explicit (user-chosen) executable, so it never competes for the
+        // default root.
         let legacy = archivefs_core::patch_manager::discover_duckstation_profiles(
             &machine.inputs(&[&a_exe, &b_exe]).roots,
         );
-        let blocked = resolve_duckstation_native_launch_binding(
-            &legacy.profiles[0],
-            &machine.inputs(&[&a_exe, &b_exe]).roots,
-        );
-        assert!(blocked.is_err(), "legacy alone is ambiguous: {blocked:?}");
+        assert!(legacy.profiles.iter().all(|profile| {
+            !profile.executable_candidates.iter().any(|candidate| {
+                candidate.path == b_exe
+                    && candidate.installation_type
+                        != archivefs_core::patch_manager::DuckStationInstallationType::Portable
+            })
+        }));
 
         let selection = selection(&machine, &[&a_exe, &b_exe]);
         assert_eq!(authorised(&selection), (a_exe.as_path(), a_root.as_path()));
@@ -469,12 +473,16 @@ mod launch {
 
     #[test]
     fn a_resolver_pair_legacy_launch_cannot_start_is_refused_not_substituted() {
-        // AUTO picks the stronger portable explicit executable; legacy
-        // Launch binding cannot start it. The weaker, launchable install must
-        // NOT be used instead.
+        // AUTO picks a stronger portable pair that the launch binding cannot
+        // start (a non-AppImage executable: only portable AppImages bind to
+        // their own folder). The weaker, launchable install must NOT be used
+        // instead.
         let machine = Machine::new();
         let (a_exe, _) = machine.default_install("Weak", false, false);
-        let (b_exe, b_root) = machine.portable_explicit("Strong");
+        let (_, b_root) = machine.portable_explicit("Strong");
+        let b_exe = b_root.join("duckstation-qt");
+        executable(&b_exe);
+        fs::remove_file(b_root.join("DuckStation.AppImage")).unwrap();
         let selection = selection(&machine, &[&a_exe, &b_exe]);
         assert!(
             refused(&selection).contains("cannot start exactly that pair"),
@@ -654,4 +662,41 @@ mod launch {
         );
         assert!(builder.contains("select_for_launch("));
     }
+}
+
+#[test]
+fn choosing_the_portable_installation_in_setup_keeps_it_launchable() {
+    // Real shape: a portable AppImage plus a second AppImage on the per-user
+    // profile. Setup's "Use this installation" stores the portable executable
+    // as the override, which reaches the resolver as an explicit executable.
+    // Before the fix Launch refused that pair ("cannot start exactly that
+    // pair") and fell back to RetroArch.
+    let machine = Machine::new();
+    let (exe, root) = machine.portable("DuckStation");
+    let (other, _) = machine.user_profile_install("emulators", false);
+    let inputs = machine.inputs(&[&exe, &other]);
+    let selection = select_for_launch(&inputs);
+    match &selection.authority {
+        DuckStationLaunchAuthority::Authorised {
+            executable,
+            profile_root,
+            ..
+        } => {
+            assert_eq!(executable, &exe);
+            assert_eq!(profile_root, &root);
+        }
+        refused => panic!("expected the chosen portable install to launch, got {refused:?}"),
+    }
+    let profile = selection
+        .discovery
+        .profiles
+        .iter()
+        .find(|profile| profile.configuration_path == root)
+        .expect("Launch keeps the chosen profile");
+    let binding = archivefs_core::patch_manager::resolve_duckstation_native_launch_binding(
+        profile,
+        &selection.roots,
+    )
+    .expect("the chosen pair binds");
+    assert_eq!(binding.executable, exe);
 }

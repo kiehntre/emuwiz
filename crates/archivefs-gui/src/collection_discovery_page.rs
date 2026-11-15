@@ -1175,6 +1175,7 @@ mod tests {
             ingestion_skip_reasons,
             ingestion_platform_counts: std::collections::BTreeMap::new(),
             arcade_ingestion: Default::default(),
+            nested_mounts: Vec::new(),
             ingestion_skipped: vec![
                 item("mystery1.xyz", SkipReason::UnsupportedExtension),
                 item("mystery2.xyz", SkipReason::UnsupportedExtension),
@@ -1258,6 +1259,7 @@ mod tests {
         }
         let database_path = root.join("library.sqlite3");
         let config = archivefs_core::Config {
+            configured_source_roots: Some(vec![source.clone()]),
             source_folders: vec![source],
             mount_root: root.join("mount"),
             ratarmount_bin: String::new(),
@@ -1286,6 +1288,7 @@ mod tests {
             ingestion_skip_reasons,
             ingestion_platform_counts: std::collections::BTreeMap::new(),
             arcade_ingestion: Default::default(),
+            nested_mounts: Vec::new(),
             ingestion_skipped: Vec::new(),
             ingestion_recognised_sample: Vec::new(),
         }

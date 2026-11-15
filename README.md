@@ -259,6 +259,7 @@ Important examples:
 ## CLI quick start
 
 ```sh
+emuwiz-cli config-dir      # which settings folder this build uses (data-dir: library data)
 emuwiz-cli config-check
 emuwiz-cli doctor
 emuwiz-cli library-scan

@@ -3,6 +3,13 @@
 Read `AGENTS.md` first: it holds the repository's agent rules (worktree safety, file scope,
 formatting, temporary files, commits). Everything there applies to Claude Code.
 
+## Starting a session
+
+Start at the root of the worktree assigned to the task, never in the home directory
+and, except for the code-navigation procedure in `AGENTS.md`, never in a subdirectory.
+The rust-analyzer language server is off by default here; see "Coding sessions and code
+indexing" in `AGENTS.md` before enabling it.
+
 ## Cargo builds
 
 Run every Cargo command through `scripts/cargo-iso` (for example

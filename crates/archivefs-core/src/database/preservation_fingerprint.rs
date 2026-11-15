@@ -223,6 +223,7 @@ mod tests {
         bytes.extend_from_slice(&[0x80, 10, 0, 0, 0, 0, 0, 0, 0, 0]);
         std::fs::write(&path, &bytes).unwrap();
         let config = Config {
+            configured_source_roots: None,
             source_folders: vec![source.clone()],
             mount_root: dir.path().join("mount"),
             ratarmount_bin: String::new(),

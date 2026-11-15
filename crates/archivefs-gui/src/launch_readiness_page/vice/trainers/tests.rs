@@ -235,6 +235,7 @@ fn render_panel(input: &LaunchReadinessInput, state: &mut StandaloneLaunchState)
                 &mut Default::default(),
                 state,
                 &mut Default::default(),
+                &Default::default(),
             );
         });
     });
@@ -388,7 +389,12 @@ fn leaving_the_supported_lane_revokes_trainer_approval() {
             && state.vice_trainers.approved
             && state.vice_trainers.selected.contains(&0)
     );
-    render_panel(&LaunchReadinessInput::IdentityUnknown, &mut state);
+    render_panel(
+        &LaunchReadinessInput::IdentityUnknown(
+            crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+        ),
+        &mut state,
+    );
     assert!(
         !state.vice_trainers.enabled
             && !state.vice_trainers.approved

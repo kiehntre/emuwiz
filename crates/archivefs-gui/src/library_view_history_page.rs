@@ -54,8 +54,9 @@ impl LibraryViewHistoryPageState {
     /// same one `apply_library_view`/`remove_library_view_symlinks` already
     /// write through `record_library_view_operation`).
     pub(crate) fn load() -> Self {
-        let history_dir = default_library_view_history_dir()
-            .unwrap_or_else(|_| PathBuf::from("library-view-history"));
+        // Never a folder relative to the working directory: when the data
+        // folder cannot be resolved, an empty path lists nothing.
+        let history_dir = default_library_view_history_dir().unwrap_or_default();
         Self::load_with_history_dir(history_dir)
     }
 

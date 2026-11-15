@@ -245,6 +245,7 @@ fn fixture() -> Fixture {
             mount_root: temp.path().join("mount"),
             ratarmount_bin: "ratarmount".into(),
             master_rom_root: None,
+            configured_source_roots: None,
         },
         "fixture",
     )
@@ -887,4 +888,145 @@ fn a_worker_that_dies_mid_job_does_not_leave_the_buttons_off() {
     state.poll(&Arc::new(library()));
     assert_eq!(state.pending, 0);
     assert_eq!(state.message.as_deref(), Some(super::UNAVAILABLE));
+}
+
+/// Search inside a collection matches the way the whole library does: every
+/// word, in any order.
+#[test]
+fn a_search_of_several_words_matches_inside_a_collection_as_in_the_library() {
+    let library = library();
+    let view = view_of(&library, &[(1, "a"), (3, "b"), (4, "c")]);
+    let search = Filter {
+        search: "megadrive mario".into(),
+        ..Filter::default()
+    };
+    let inside = titles(
+        &library,
+        &scoped_indices(&library, &view, &search, CollectionSort::TitleAscending),
+    );
+    assert_eq!(inside, vec![("Mario".to_string(), 4)]);
+    let everywhere: Vec<i64> = library
+        .filter(&search)
+        .iter()
+        .map(|index| library.games[*index].archive.id)
+        .collect();
+    assert_eq!(everywhere, vec![4]);
+}
+
+/// Inside a collection its own order applies; the Library sort (hidden there)
+/// does not reorder it.
+#[test]
+fn the_library_sort_does_not_reorder_a_collection() {
+    let library = library();
+    let view = view_of(&library, &[(1, "2026-01"), (2, "2026-03"), (3, "2026-02")]);
+    for sort in super::super::library::SortOrder::ALL {
+        let filter = Filter {
+            sort,
+            ..Filter::default()
+        };
+        let ids: Vec<i64> = titles(
+            &library,
+            &scoped_indices(&library, &view, &filter, CollectionSort::TitleAscending),
+        )
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
+        assert_eq!(ids, vec![1, 3, 2], "{sort:?}");
+    }
+}
+
+fn click_at(
+    context: &eframe::egui::Context,
+    app: &mut super::super::App,
+    target: eframe::egui::Pos2,
+) {
+    use eframe::egui::{Event, PointerButton};
+    let click = |pressed| Event::PointerButton {
+        pos: target,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    frame(context, app, vec![Event::PointerMoved(target)]);
+    frame(context, app, vec![click(true)]);
+    frame(context, app, vec![click(false)]);
+}
+
+/// Where each drawn text equal to `wanted` sits, top to bottom.
+fn texts(output: &eframe::egui::FullOutput, wanted: &str) -> Vec<eframe::egui::Pos2> {
+    fn walk(shape: &eframe::egui::Shape, wanted: &str, found: &mut Vec<eframe::egui::Pos2>) {
+        match shape {
+            eframe::egui::Shape::Text(text) if text.galley.text() == wanted => {
+                found.push(text.pos + text.galley.rect.center().to_vec2());
+            }
+            eframe::egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, wanted, found)),
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    output
+        .shapes
+        .iter()
+        .for_each(|clipped| walk(&clipped.shape, wanted, &mut found));
+    found.sort_by(|a, b| (a.y, a.x).partial_cmp(&(b.y, b.x)).unwrap());
+    found
+}
+
+/// Owner decision (2026-11-15): during Ctrl/Shift multi-selection every star
+/// stays drawn and usable beside the selection tick, and starring a selected
+/// game leaves the selection as it was.
+#[test]
+fn stars_stay_visible_and_usable_while_games_are_multi_selected() {
+    let context = eframe::egui::Context::default();
+    let mut app = star_app(&context);
+    frame(&context, &mut app, vec![]);
+    let drawn = frame(&context, &mut app, vec![]);
+    let unselected = stars(&drawn);
+    assert_eq!(unselected.len(), 3);
+    let alpha = texts(&drawn, "Alpha")[0];
+    app.library_selection.select_all(&[1, 2, 3]);
+    frame(&context, &mut app, vec![]);
+    let drawn = frame(&context, &mut app, vec![]);
+    let selected = stars(&drawn);
+    // The selection bar above the shelf moves every card down alike; on its
+    // card each star stays where it was.
+    let shift = texts(&drawn, "Alpha")[0] - alpha;
+    let moved: Vec<_> = unselected.iter().map(|star| *star + shift).collect();
+    assert_eq!(selected, moved, "selection must not move or hide a star");
+    // Alpha (first in title order) is selected; its star still favourites it.
+    click_at(&context, &mut app, selected[0]);
+    assert!(app.collections.is_favourite(1));
+    assert!(app.collections.is_favourite(2));
+    assert_eq!(
+        app.library_selection.len(),
+        3,
+        "starring kept the selection"
+    );
+    assert!((1..=3).all(|id| app.library_selection.contains(id)));
+}
+
+/// Owner decision (2026-11-15): "Select for artwork" shows only its own
+/// checkbox, no star, and a click there never changes Favourites.
+#[test]
+fn selecting_for_artwork_hides_the_star_and_never_changes_favourites() {
+    let context = eframe::egui::Context::default();
+    let mut app = star_app(&context);
+    frame(&context, &mut app, vec![]);
+    let drawn = frame(&context, &mut app, vec![]);
+    let where_stars_were = stars(&drawn);
+    assert_eq!(where_stars_were.len(), 3);
+    let alpha = texts(&drawn, "Alpha")[0];
+    app.batch_selecting = true;
+    frame(&context, &mut app, vec![]);
+    let drawn = frame(&context, &mut app, vec![]);
+    assert!(stars(&drawn).is_empty());
+    let shift = texts(&drawn, "Alpha")[0] - alpha;
+    let saved_before = app.collections.saved.clone();
+    // Click exactly where Alpha's star was on its card: it selects for
+    // artwork only.
+    click_at(&context, &mut app, where_stars_were[0] + shift);
+    assert!(app.batch_selection.contains(1), "the click selected Alpha");
+    assert!(!app.collections.is_favourite(1));
+    assert!(app.collections.is_favourite(2));
+    assert_eq!(app.collections.saved, saved_before, "Favourites unchanged");
 }

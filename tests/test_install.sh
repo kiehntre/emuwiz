@@ -593,25 +593,6 @@ assert_no_such_path "no EmuWiz config is created beside a legacy profile" \
     "$home/.config/emuwiz/config.toml"
 rm -rf -- "$work"
 
-echo "=== test: EmuWiz config takes precedence when both directories exist ==="
-work=$(mktemp -d)
-make_bundle "$work/bundle"
-home="$work/home"
-mkdir -p -- "$home/.config/emuwiz" "$home/.config/archivefs"
-primary_marker="PRIMARY CONFIG - KEEP USING"
-legacy_marker="LEGACY CONFIG - DO NOT SELECT"
-printf '%s\n' "$primary_marker" >"$home/.config/emuwiz/config.toml"
-printf '%s\n' "$legacy_marker" >"$home/.config/archivefs/config.toml"
-bin_dir="$work/bin"
-
-assert_success "install with both config directories succeeds" \
-    env HOME="$home" sh "$work/bundle/install.sh" --developer-unchecked-install --prefix "$bin_dir"
-kept=$(cat "$home/.config/emuwiz/config.toml")
-assert_contains "EmuWiz config wins and is preserved" "$kept" "$primary_marker"
-legacy_kept=$(cat "$home/.config/archivefs/config.toml")
-assert_contains "unselected legacy config is untouched" "$legacy_kept" "$legacy_marker"
-rm -rf -- "$work"
-
 echo "=== test: install from a workspace checkout (target/release) ==="
 work=$(mktemp -d)
 make_workspace "$work/workspace"
@@ -1616,15 +1597,183 @@ for var in EMUWIZ_CONFIG_HOME XDG_CONFIG_HOME; do
     rm -rf -- "$cfg_work"
 done
 
-# A broken ~/.config/emuwiz entry still has precedence over a legacy profile
-# (matches the application), so no starter config is written to the legacy one.
+# A broken ~/.config/emuwiz entry beside a legacy profile is two established
+# setups to the application (a dangling symlink is never "empty"), so no
+# starter config is written anywhere and the run says why.
 cfg_case
 mkdir -p -- "$cfg_home/.config/archivefs"
 printf 'legacy\n' >"$cfg_home/.config/archivefs/config.toml"
 ln -s -- "$cfg_work/gone" "$cfg_home/.config/emuwiz"
-env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" >/dev/null 2>&1 || true
+broken_rc=0
+env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" >/dev/null 2>"$cfg_work/err" || broken_rc=$?
+if [ "$broken_rc" -ne 0 ]; then ok "broken emuwiz entry: exits non-zero"; else bad "broken emuwiz entry: exits non-zero"; fi
+assert_contains "broken emuwiz entry: refusal names two places" "$(cat "$cfg_work/err")" "settings in two places"
 assert_contains "broken emuwiz entry: legacy config untouched" "$(cat "$cfg_home/.config/archivefs/config.toml")" "legacy"
 assert_no_such_path "broken emuwiz entry: symlink target not created" "$cfg_work/gone"
+rm -rf -- "$cfg_work"
+
+echo "=== test: the config directory follows the application rule (NW2-D-01) ==="
+# install.sh must agree with archivefs-core app_dirs::choose_dir: an empty
+# EmuWiz folder never displaces an established legacy one, an XDG root only
+# looks at its own children, and two established folders are refused rather
+# than chosen between (the application refuses to start on that layout, so a
+# starter config written into either would only make it worse). The default
+# stub emuwiz-cli cannot answer `config-dir`, so these cases exercise the
+# script's own mirrored rule; the handover to the binary is covered below.
+
+# Legacy settings plus an empty EmuWiz folder: the layout a launcher that
+# exports XDG variables leaves behind, and the layout an upgrade from a
+# pre-#309 install meets (that build created ~/.config/emuwiz whenever it
+# ran). Legacy is reused, the run says so, and the empty folder stays empty.
+cfg_case
+mkdir -p -- "$cfg_home/.config/archivefs" "$cfg_home/.config/emuwiz"
+printf 'legacy\n' >"$cfg_home/.config/archivefs/config.toml"
+empty_rc=0
+empty_out=$(env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" 2>/dev/null) || empty_rc=$?
+if [ "$empty_rc" -eq 0 ]; then ok "legacy + empty emuwiz folder: install succeeds"; else bad "legacy + empty emuwiz folder: install succeeds (exit $empty_rc)"; fi
+assert_contains "legacy + empty emuwiz folder: the run names the chosen folder" "$empty_out" "Configuration directory: $cfg_home/.config/archivefs"
+assert_contains "legacy + empty emuwiz folder: the existing legacy config is reported" "$empty_out" "Existing config found at $cfg_home/.config/archivefs/config.toml"
+assert_contains "legacy + empty emuwiz folder: legacy config preserved" "$(cat "$cfg_home/.config/archivefs/config.toml")" "legacy"
+assert_no_such_path "legacy + empty emuwiz folder: no starter config in the empty folder" "$cfg_home/.config/emuwiz/config.toml"
+if [ -z "$(ls -A -- "$cfg_home/.config/emuwiz")" ]; then
+    ok "legacy + empty emuwiz folder: the empty folder stays empty"
+else
+    bad "legacy + empty emuwiz folder: the empty folder stays empty (got: $(ls -A -- "$cfg_home/.config/emuwiz"))"
+fi
+rm -rf -- "$cfg_work"
+
+# XDG_CONFIG_HOME equal to the default base behaves exactly like an unset
+# variable: the legacy profile is reused and nothing is created beside it.
+cfg_case
+mkdir -p -- "$cfg_home/.config/archivefs"
+printf 'legacy\n' >"$cfg_home/.config/archivefs/config.toml"
+assert_success "legacy + XDG_CONFIG_HOME=~/.config: install succeeds" \
+    env HOME="$cfg_home" XDG_CONFIG_HOME="$cfg_home/.config" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin"
+assert_contains "legacy + XDG_CONFIG_HOME=~/.config: legacy config preserved" "$(cat "$cfg_home/.config/archivefs/config.toml")" "legacy"
+assert_no_such_path "legacy + XDG_CONFIG_HOME=~/.config: no emuwiz folder created" "$cfg_home/.config/emuwiz"
+rm -rf -- "$cfg_work"
+
+# An isolated XDG root is inspected the same way: its own archivefs child is
+# reused when it is the only one there.
+cfg_case
+mkdir -p -- "$cfg_work/xdg/archivefs"
+printf 'xdg-legacy\n' >"$cfg_work/xdg/archivefs/config.toml"
+assert_success "XDG root with only a legacy child: install succeeds" \
+    env HOME="$cfg_home" XDG_CONFIG_HOME="$cfg_work/xdg" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin"
+assert_contains "XDG root with only a legacy child: it is preserved" "$(cat "$cfg_work/xdg/archivefs/config.toml")" "xdg-legacy"
+assert_no_such_path "XDG root with only a legacy child: no emuwiz child created" "$cfg_work/xdg/emuwiz"
+rm -rf -- "$cfg_work"
+
+# Settings in both folders: refused, both left exactly as found, the user is
+# told which folder is which and both ways out, binaries still installed.
+cfg_case
+mkdir -p -- "$cfg_home/.config/emuwiz" "$cfg_home/.config/archivefs"
+printf 'PRIMARY CONFIG\n' >"$cfg_home/.config/emuwiz/config.toml"
+printf 'LEGACY CONFIG\n' >"$cfg_home/.config/archivefs/config.toml"
+both_rc=0
+env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" >/dev/null 2>"$cfg_work/err" || both_rc=$?
+if [ "$both_rc" -ne 0 ]; then ok "two established config folders: exits non-zero"; else bad "two established config folders: exits non-zero"; fi
+both_err=$(cat "$cfg_work/err")
+assert_contains "two established config folders: refusal names two places" "$both_err" "settings in two places"
+assert_contains "two established config folders: names the EmuWiz folder" "$both_err" "$cfg_home/.config/emuwiz (the EmuWiz folder)"
+assert_contains "two established config folders: names the legacy folder" "$both_err" "$cfg_home/.config/archivefs (the legacy ArchiveFS folder)"
+assert_contains "two established config folders: names what the EmuWiz folder holds" "$both_err" "holds config.toml"
+assert_contains "two established config folders: offers EMUWIZ_CONFIG_HOME" "$both_err" "EMUWIZ_CONFIG_HOME"
+assert_contains "two established config folders: offers moving unrelated entries out" "$both_err" "move the entries that are not EmuWiz settings out of $cfg_home/.config/emuwiz"
+assert_contains "two established config folders: says no starter config was written" "$both_err" "no starter config was written"
+assert_contains "two established config folders: EmuWiz config untouched" "$(cat "$cfg_home/.config/emuwiz/config.toml")" "PRIMARY CONFIG"
+assert_contains "two established config folders: legacy config untouched" "$(cat "$cfg_home/.config/archivefs/config.toml")" "LEGACY CONFIG"
+assert_executable "two established config folders: binaries still installed" "$cfg_bin/emuwiz-cli"
+rm -rf -- "$cfg_work"
+
+# Legacy settings plus an EmuWiz folder holding one unrelated file (NW2-E-01:
+# a host tooling file). The application counts that folder as established and
+# refuses; the installer must not write a starter config next to the file,
+# and must name the file so the user knows what to move.
+cfg_case
+mkdir -p -- "$cfg_home/.config/emuwiz" "$cfg_home/.config/archivefs"
+printf 'legacy\n' >"$cfg_home/.config/archivefs/config.toml"
+printf 'export SOMETHING=1\n' >"$cfg_home/.config/emuwiz/host-tooling.sh"
+unrelated_rc=0
+env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" >/dev/null 2>"$cfg_work/err" || unrelated_rc=$?
+if [ "$unrelated_rc" -ne 0 ]; then ok "unrelated file beside legacy: exits non-zero"; else bad "unrelated file beside legacy: exits non-zero"; fi
+unrelated_err=$(cat "$cfg_work/err")
+assert_contains "unrelated file beside legacy: refusal names the file" "$unrelated_err" "holds host-tooling.sh"
+case "$unrelated_err" in
+    *SOMETHING*) bad "unrelated file beside legacy: file contents are never printed" ;;
+    *) ok "unrelated file beside legacy: file contents are never printed" ;;
+esac
+assert_no_such_path "unrelated file beside legacy: no starter config beside the file" "$cfg_home/.config/emuwiz/config.toml"
+assert_contains "unrelated file beside legacy: legacy config untouched" "$(cat "$cfg_home/.config/archivefs/config.toml")" "legacy"
+assert_contains "unrelated file beside legacy: the file is untouched" "$(cat "$cfg_home/.config/emuwiz/host-tooling.sh")" "export SOMETHING=1"
+rm -rf -- "$cfg_work"
+
+# The entry list in the refusal is bounded: five names, then a count.
+cfg_case
+mkdir -p -- "$cfg_home/.config/emuwiz" "$cfg_home/.config/archivefs"
+printf 'legacy\n' >"$cfg_home/.config/archivefs/config.toml"
+for name in g.txt b.txt a.txt f.txt c.txt d.txt e.txt; do printf 'x\n' >"$cfg_home/.config/emuwiz/$name"; done
+env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" >/dev/null 2>"$cfg_work/err" || true
+assert_contains "many unrelated entries: five sorted names and a count" "$(cat "$cfg_work/err")" "holds a.txt, b.txt, c.txt, d.txt, e.txt and 2 more."
+rm -rf -- "$cfg_work"
+
+# An established EmuWiz folder beside an empty legacy directory: EmuWiz wins
+# and the starter config lands there; the empty legacy folder stays empty.
+cfg_case
+mkdir -p -- "$cfg_home/.config/emuwiz" "$cfg_home/.config/archivefs"
+printf '{}\n' >"$cfg_home/.config/emuwiz/launch_preferences.json"
+assert_success "established emuwiz + empty legacy: install succeeds" \
+    env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin"
+assert_files_equal "established emuwiz + empty legacy: starter config lands in emuwiz" \
+    "$config_example" "$cfg_home/.config/emuwiz/config.toml"
+if [ -z "$(ls -A -- "$cfg_home/.config/archivefs")" ]; then
+    ok "established emuwiz + empty legacy: the empty legacy folder stays empty"
+else
+    bad "established emuwiz + empty legacy: the empty legacy folder stays empty"
+fi
+rm -rf -- "$cfg_work"
+
+# Without a binary that can answer, the script says it used its own rule.
+cfg_case
+fallback_out=$(env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" 2>/dev/null) || true
+assert_contains "stub binary: the script reports it resolved the directory itself" "$fallback_out" "resolved by this script"
+rm -rf -- "$cfg_work"
+
+echo "=== test: the installed emuwiz-cli is asked for its config directory (NW2-D-01) ==="
+# The real binary answers `emuwiz-cli config-dir` with one absolute path, or
+# refuses with its own "config error:" message. The installer uses the
+# answer when there is one, relays a refusal and writes nothing, and ignores
+# anything else (see the fallback case above).
+cfg_case
+printf '#!/bin/sh\nif [ "${1:-}" = config-dir ]; then printf "%%s\\n" %s; exit 0; fi\necho fake-cli\n' \
+    "'$cfg_work/answered'" >"$cfg_work/bundle/emuwiz-cli"
+answer_out=$(env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" 2>/dev/null) || true
+assert_files_equal "binary answers: starter config lands where emuwiz-cli said" \
+    "$config_example" "$cfg_work/answered/config.toml"
+assert_contains "binary answers: the script says who decided" "$answer_out" "$cfg_work/answered (reported by emuwiz-cli)"
+assert_no_such_path "binary answers: the mirrored rule's directory is not used" "$cfg_home/.config/emuwiz"
+rm -rf -- "$cfg_work"
+
+cfg_case
+printf '#!/bin/sh\nif [ "${1:-}" = config-dir ]; then echo "emuwiz-cli: config error: EmuWiz found settings in two places (stub refusal)" >&2; exit 1; fi\necho fake-cli\n' \
+    >"$cfg_work/bundle/emuwiz-cli"
+refuse_rc=0
+env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" >/dev/null 2>"$cfg_work/err" || refuse_rc=$?
+if [ "$refuse_rc" -ne 0 ]; then ok "binary refuses: exits non-zero"; else bad "binary refuses: exits non-zero"; fi
+assert_contains "binary refuses: the refusal is relayed" "$(cat "$cfg_work/err")" "two places (stub refusal)"
+assert_contains "binary refuses: says no starter config was written" "$(cat "$cfg_work/err")" "no starter config was written"
+assert_no_such_path "binary refuses: nothing created under ~/.config" "$cfg_home/.config"
+assert_executable "binary refuses: binaries still installed" "$cfg_bin/emuwiz-cli"
+rm -rf -- "$cfg_work"
+
+# A multi-line or relative answer is not an answer: the mirrored rule stands.
+cfg_case
+printf '#!/bin/sh\nif [ "${1:-}" = config-dir ]; then echo relative/dir; echo second; exit 0; fi\necho fake-cli\n' \
+    >"$cfg_work/bundle/emuwiz-cli"
+odd_out=$(env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --developer-unchecked-install --prefix "$cfg_bin" 2>/dev/null) || true
+assert_files_equal "binary answers oddly: starter config lands under ~/.config/emuwiz" \
+    "$config_example" "$cfg_home/.config/emuwiz/config.toml"
+assert_contains "binary answers oddly: the script reports its own rule" "$odd_out" "resolved by this script"
 rm -rf -- "$cfg_work"
 
 echo "=== test: uninstall precisely removes owned binaries and desktop assets ==="

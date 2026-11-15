@@ -21,6 +21,7 @@ jobs:
   classify:
     name: Classify change risk
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     outputs:
       tier: ${{ steps.classify.outputs.tier }}
       shards: ${{ steps.classify.outputs.shards }}
@@ -53,6 +54,7 @@ jobs:
   repository-guardrails:
     name: Repository guardrails
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v5
@@ -76,20 +78,27 @@ jobs:
   validation:
     name: Formatting and relevant tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs: [classify]
     env:
-      # Test builds of the whole workspace with full debuginfo (debuginfo=2)
-      # exhausted the runner disk ("No space left on device", linker bus
-      # errors). Line tables keep panic backtraces readable at a fraction of
-      # the size. Scoped to this job: release/packaging builds are separate
-      # workflows and their profiles are untouched.
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # A whole-workspace test build with line tables took 22 GiB, more than
+      # the 16 GiB free on the smallest runners ("No space left on device",
+      # linker bus errors, crashed runner workers). Without debuginfo it takes
+      # 6.3 GiB and links about 35 s faster. CI sets no RUST_BACKTRACE, and panic
+      # messages keep their file and line. Scoped to this job: release and
+      # packaging builds are separate and their profiles are untouched.
+      CARGO_PROFILE_DEV_DEBUG: 0
     strategy:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(needs.classify.outputs.shards) }}
     steps:
       - uses: actions/checkout@v5
+      # First, before anything is written: the build needs about 7 GiB, the
+      # ext4 image up to 4 GiB and the toolchain, tools and cache about 3 GiB,
+      # with margin for growth. Roomy runners skip this at no cost.
+      - name: Ensure runner disk headroom
+        run: scripts/ci-disk.sh ensure 20
       - name: Install tools for real patch and optical-conversion tests
         run: |
           sudo apt-get update
@@ -173,8 +182,8 @@ jobs:
       - name: Disk space after tests
         if: always()
         run: |
-          df -h / "$RUNNER_TEMP" /tmp/r2e || true
-          du -sh target 2>/dev/null || true
+          df -h "$RUNNER_TEMP" /tmp/r2e || true
+          scripts/ci-disk.sh report
       - name: Report and enforce formatting outcome
         if: always()
         env:
@@ -192,6 +201,7 @@ jobs:
   test-shard-coverage:
     name: Test shard coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [classify, validation]
     if: ${{ !cancelled() && needs.classify.result == 'success' }}
     steps:
@@ -201,6 +211,8 @@ jobs:
           toolchain: "1.97.1"
       - name: Test shard partitioning against a real libtest binary
         run: python3 -B scripts/test_ci_test_shards.py
+      - name: Test the runner disk guard
+        run: python3 -B scripts/test_ci_disk.py
       - uses: actions/download-artifact@v5
         with:
           pattern: test-shard-list-*
@@ -219,6 +231,7 @@ jobs:
   clippy:
     name: Clippy warning ratchet
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -232,6 +245,10 @@ jobs:
       # suppress workspace or release validation.
       - name: Test ratchet and workflow conditions
         run: python3 -B scripts/test_clippy_ratchet.py
+      - name: Test the GUI sandbox's process limits
+        run: python3 -B scripts/qa/test_gui_sandbox.py
+      - name: Test the GUI condition waiter
+        run: python3 -B scripts/qa/test_gui_wait.py
       - run: scripts/clippy-ratchet.sh
 
   # Independent of the workspace suite so unrelated failures there cannot stop
@@ -239,6 +256,7 @@ jobs:
   r2-filesystem-gate:
     name: R2 filesystem gate
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -280,6 +298,7 @@ jobs:
         # stock denial); ubuntu-latest (26.04 at the time of writing) lets bwrap through.
         os: [ubuntu-24.04, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -386,6 +405,7 @@ jobs:
   security:
     name: Dependency and secret audit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -412,6 +432,7 @@ jobs:
   install-script-tests:
     name: Installer script tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: [classify]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
@@ -427,6 +448,22 @@ jobs:
       - run: bash tests/test_install.sh
       - run: python3 tests/test_installer_asset_races.py
       - run: python3 tests/test_installer_upgrade_preservation.py
+      - run: python3 tests/test_installer_organise_gate.py
+      - run: bash scripts/qa/upgrade-preflight-selftest.sh
+
+  # Cargo retention and retirement delete real data on developer machines, so
+  # their safety tests run here too. Any change under scripts/ selects the full
+  # tier, and main always runs it. Python 3.12 is what the real-root tests and
+  # the supported hosts use, and the runner is disposable, so sudo is safe.
+  maintenance-script-tests:
+    name: Maintenance script tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: [classify]
+    if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+      - run: scripts/ci-maintenance-tests.sh
 
   release-artifact:
     name: Create canonical artifact
@@ -434,6 +471,7 @@ jobs:
     # Ubuntu 24.04 (glibc 2.39). Release binaries must be built on the oldest
     # supported baseline; scripts/release/check_glibc_compat.py enforces it.
     runs-on: ubuntu-24.04
+    timeout-minutes: 50
     # Keep release qualification observable even when a workspace test fails;
     # the failed validation job still fails CI and blocks merging normally.
     # Installer tests run in parallel rather than first: they share no output
@@ -480,6 +518,7 @@ jobs:
   verify-artifact:
     name: Verify downloaded artifact
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     needs: [classify, release-artifact]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
@@ -506,6 +545,7 @@ jobs:
   reproducibility-build:
     name: Reproducibility build ${{ matrix.run }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 50
     needs: [classify, security]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     strategy:
@@ -531,6 +571,7 @@ jobs:
   reproducibility:
     name: Reproducibility
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [classify, reproducibility-build]
     if: needs.classify.outputs.tier == 'full' || github.event_name != 'pull_request'
     steps:
@@ -553,3 +594,36 @@ jobs:
           second=("$RUNNER_TEMP"/reproducibility/reproducibility-run2/*.tar.xz)
           ((${#first[@]} == 1 && ${#second[@]} == 1)) || { echo "expected one archive per build" >&2; exit 1; }
           scripts/compare-release-builds.sh --archives "${first[0]}" "${second[0]}"
+
+  # The one stable check for branch protection: test shard and reproducibility
+  # names change with the tier, and a skipped required check counts as passed,
+  # so this runs always() and scripts/ci_gate.py accepts only exact outcomes.
+  ci-gate:
+    name: CI gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - classify
+      - repository-guardrails
+      - validation
+      - test-shard-coverage
+      - clippy
+      - r2-filesystem-gate
+      - dosbox-sandbox-enforcement
+      - security
+      - install-script-tests
+      - maintenance-script-tests
+      - release-artifact
+      - verify-artifact
+      - reproducibility-build
+      - reproducibility
+    if: ${{ always() }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Test the gate
+        run: python3 -B scripts/test_ci_gate.py
+      - name: Every job finished as its tier and event allow
+        env:
+          CI_GATE_NEEDS: ${{ toJSON(needs) }}
+          CI_GATE_EVENT: ${{ github.event_name }}
+        run: python3 -I scripts/ci_gate.py

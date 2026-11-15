@@ -98,6 +98,7 @@ fn supported_closure_creates_a_verified_snapshot_and_history_shows_it() {
         &root,
         std::slice::from_ref(&target),
         &Observed(EmulatorQuiescence::Closed),
+        None,
     );
     let snapshots = &report.records[&card];
     assert_eq!(snapshots.emulator_use, Some(EmulatorUseStatus::NotDetected));
@@ -133,6 +134,9 @@ fn active_ambiguous_or_unsupported_closure_refuses_without_copying() {
         closure_message(StateEmulator::Pcsx2, Some(EmulatorUseStatus::Running))
             .contains("Close it")
     );
+    let in_use = closure_message(StateEmulator::Pcsx2, Some(EmulatorUseStatus::CardInUse));
+    assert!(in_use.contains("in use") && in_use.contains("Another application"));
+    assert!(!in_use.contains("emulator is running"), "{in_use}");
 }
 
 #[test]
@@ -156,6 +160,7 @@ fn stale_snapshot_and_incompatible_profile_are_explained() {
         &root,
         &[other_profile],
         &Observed(EmulatorQuiescence::Closed),
+        None,
     );
     let entry = &report.records[&card].entries[0];
     assert_eq!(entry.freshness, SnapshotFreshness::CurrentSaveNewer);
@@ -210,6 +215,7 @@ fn report_for(path: &Path, emulator_use: EmulatorUseStatus) -> SnapshotReport {
         RecordSnapshots {
             entries: Vec::new(),
             emulator_use: Some(emulator_use),
+            undoable: None,
         },
     );
     report

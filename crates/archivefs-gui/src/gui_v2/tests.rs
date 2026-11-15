@@ -1,5 +1,9 @@
 use super::*;
 
+#[path = "tests/database_recovery.rs"]
+mod database_recovery;
+#[path = "tests/first_start_preferences.rs"]
+mod first_start_preferences;
 #[path = "tests/visual_polish.rs"]
 mod visual_polish;
 
@@ -54,11 +58,17 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         library: Arc::new(Library::default()),
         moved_game: None,
         review: Default::default(),
+        game_dat_check: Default::default(),
+        saved_recheck: Default::default(),
+        folder_check: Default::default(),
+        hasheous_check: Default::default(),
         indices: Vec::new(),
         filter: Filter::default(),
         collections: Default::default(),
         filter_generation: 0,
         filter_inflight: false,
+        big_picture: None,
+        pad_shell: None,
         filter_dirty: None,
         detail: None,
         detail_pending: None,
@@ -68,9 +78,12 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         artwork: Artwork::with_indexer(context.clone(), None, Arc::new(|_| MediaIndex::default())),
         imagery: super::imagery::Imagery::default(),
         load_job: None,
+        scan_job: None,
         artwork_job: None,
+        artwork_totals: super::activity::ArtworkTotals::default(),
         index_job: None,
         browse_play: Default::default(),
+        library_selection: Default::default(),
         batch_selection: super::multi_selection::MultiSelection::with_limit(
             archivefs_core::screenscraper_enrichment::MAX_EXPLICIT_BATCH_SIZE,
         ),
@@ -117,13 +130,17 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         playing_library_generation: 0,
         organisation: super::organisation::OrganisationState::default(),
         arcade_input_details: super::arcade_input_details::State::default(),
+        arcade_compat_panel: Default::default(),
         classic_trainers: super::classic_trainers::State::default(),
         recording_integrity: Default::default(),
+        game_detail_facts: Default::default(),
         canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::default(),
         canonical_organisation_job: None,
         history_view: Default::default(),
         discovery_import_history: Default::default(),
+        database_recovery: Default::default(),
         duckstation_history: Default::default(),
+        recently_played: Default::default(),
         canonical_organisation_generation: 0,
         canonical_organisation_history: Vec::new(),
         mods: super::mods::ModsPageState::default(),
@@ -134,6 +151,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         welcome_dismissed: false,
         beginner_hints_enabled: true,
         doctor_platform: None,
+        doctor_picker: Default::default(),
         guidance: super::guidance::GuidanceState::default(),
         saves_states: super::saves_states::SavesStatesState::default(),
         converter: crate::optical_conversion_page::OpticalConversionPageState::default(),
@@ -144,6 +162,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         romm_library_job: None,
         reset_page_scroll: false,
         reset_all_tools_scroll: false,
+        last_screen_size: None,
         scrolled_organisation_view: organisation::OrganisationView::default(),
         manual_viewer: super::manual_viewer::ManualViewer::default(),
         text_guide_viewer: Default::default(),
@@ -153,6 +172,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         document_index: None,
         document_issue: None,
         setup_portability: super::setup_portability::SetupPortabilityState::default(),
+        amiga_hdf_storage: super::amiga_hdf_storage::AmigaHdfStorageState::default(),
         update_check: super::update_check::UpdateCheckState::default(),
         missing: Default::default(),
         equiv: Default::default(),
@@ -180,6 +200,26 @@ fn gui_v2_converter_is_a_native_workflow() {
             "missing native converter content: {expected}"
         );
     }
+}
+
+#[test]
+fn browse_play_system_chip_deselects_a_game_the_new_system_hides() {
+    // Real session 2026-11-12: an Acorn Electron game stayed in the panel
+    // after the Acorn Archimedes chip was chosen.
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "Yie Ar Kung Fu 2", Some("Acorn Electron")),
+        archive(2, "Alerion", Some("Acorn Archimedes")),
+    ]));
+    app.router.current = Route::BrowsePlayGame(1);
+    app.choose_system("Acorn Electron".into());
+    assert_eq!(app.router.current, Route::BrowsePlayGame(1));
+    app.choose_system("Acorn Archimedes".into());
+    assert_eq!(app.router.current, Route::BrowsePlay);
+    app.router.current = Route::BrowsePlayGame(2);
+    app.choose_system(String::new());
+    assert_eq!(app.router.current, Route::BrowsePlayGame(2));
 }
 
 #[test]
@@ -279,7 +319,7 @@ fn blue_batch_selection_controls_fit_small_library_viewport() {
     let strings = text(&output);
     for expected in [
         "Done selecting",
-        "1 / 25 selected",
+        "1 / 25 selected for artwork",
         "Enrich metadata",
         "Clear selection",
     ] {
@@ -676,7 +716,7 @@ pub(super) fn text(output: &egui::FullOutput) -> Vec<String> {
     texts
 }
 
-fn text_bounds(output: &egui::FullOutput, wanted: &str) -> Vec<egui::Rect> {
+pub(super) fn text_bounds(output: &egui::FullOutput, wanted: &str) -> Vec<egui::Rect> {
     fn gather(shape: &egui::Shape, wanted: &str, output: &mut Vec<egui::Rect>) {
         match shape {
             egui::Shape::Text(text) if text.galley.text() == wanted => {
@@ -1160,6 +1200,7 @@ fn gui_v2_playing_library_preview_runs_on_the_background_worker() {
             super::backend::Command::PlayingLibraryPreview {
                 state: Box::new(state),
                 generation: 9,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         )
         .unwrap();
@@ -1793,13 +1834,107 @@ fn assert_viewport_is(context: &egui::Context, output: &egui::FullOutput, size: 
         "effective viewport {:?} is not the constrained {size:?}",
         content.size()
     );
+    if let Err(message) = clip_rects_within_viewport(&output.shapes, size) {
+        panic!("{message}");
+    }
+}
+
+/// Every clip rect that can paint must lie inside the `size` viewport.
+///
+/// A clip rect that is not positive (zero or negative width or height, e.g. a
+/// nested scroll area laid out entirely below its parent's clip, whose
+/// intersection is inverted) paints nothing: epaint's tessellator skips any
+/// shape whose `clip_rect.is_positive()` is false. Only those are ignored; a
+/// positive clip rect outside the viewport, or a NaN one, is still a failure.
+fn clip_rects_within_viewport(
+    shapes: &[egui::epaint::ClippedShape],
+    size: [f32; 2],
+) -> Result<(), String> {
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
-    for clipped in &output.shapes {
-        assert!(
-            screen.expand(1.0).contains_rect(clipped.clip_rect),
-            "clip rect {:?} escapes the {size:?} viewport",
-            clipped.clip_rect
+    for clipped in shapes {
+        // NaN is never positive, but it signals a broken layout, so it still fails.
+        if clipped.clip_rect.any_nan() {
+            return Err(format!("clip rect {:?} is NaN", clipped.clip_rect));
+        }
+        if !clipped.clip_rect.is_positive() {
+            continue;
+        }
+        if !screen.expand(1.0).contains_rect(clipped.clip_rect) {
+            return Err(format!(
+                "clip rect {:?} escapes the {size:?} viewport",
+                clipped.clip_rect
+            ));
+        }
+    }
+    Ok(())
+}
+
+mod clip_rects_within_viewport_tests {
+    use super::{clip_rects_within_viewport, egui};
+
+    fn shape(min: [f32; 2], max: [f32; 2]) -> egui::epaint::ClippedShape {
+        egui::epaint::ClippedShape {
+            clip_rect: egui::Rect::from_min_max(min.into(), max.into()),
+            shape: egui::Shape::rect_filled(
+                egui::Rect::from_min_max(min.into(), max.into()),
+                0.0,
+                egui::Color32::WHITE,
+            ),
+        }
+    }
+
+    const SIZE: [f32; 2] = [1024.0, 600.0];
+
+    #[test]
+    fn inverted_clip_rect_outside_the_viewport_paints_nothing_and_passes() {
+        // The exact rect seen in the CI flake: min.y 714 > max.y 551.
+        let shapes = [shape([230.0, 714.0], [1024.0, 551.0])];
+        assert_eq!(clip_rects_within_viewport(&shapes, SIZE), Ok(()));
+    }
+
+    #[test]
+    fn empty_clip_rect_outside_the_viewport_paints_nothing_and_passes() {
+        let zero_height = shape([0.0, 900.0], [1024.0, 900.0]);
+        let zero_width = shape([2000.0, 0.0], [2000.0, 600.0]);
+        assert_eq!(
+            clip_rects_within_viewport(&[zero_height, zero_width], SIZE),
+            Ok(())
         );
+    }
+
+    #[test]
+    fn positive_clip_rect_partly_outside_the_viewport_still_fails() {
+        let shapes = [
+            shape([0.0, 0.0], [1024.0, 600.0]),
+            shape([230.0, 500.0], [1024.0, 714.0]),
+        ];
+        let error = clip_rects_within_viewport(&shapes, SIZE)
+            .expect_err("a positive clip rect escaping the viewport must fail");
+        assert!(
+            error.contains("escapes the [1024.0, 600.0] viewport"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn positive_clip_rect_wider_than_the_viewport_still_fails() {
+        let shapes = [shape([0.0, 0.0], [1400.0, 600.0])];
+        assert!(clip_rects_within_viewport(&shapes, SIZE).is_err());
+    }
+
+    #[test]
+    fn nan_clip_rect_still_fails() {
+        let shapes = [shape([0.0, f32::NAN], [1024.0, 600.0])];
+        assert!(clip_rects_within_viewport(&shapes, SIZE).is_err());
+    }
+
+    #[test]
+    fn positive_clip_rect_inside_the_viewport_passes() {
+        let shapes = [
+            shape([0.0, 0.0], [1024.0, 600.0]),
+            shape([230.0, 120.0], [1024.0, 551.0]),
+        ];
+        assert_eq!(clip_rects_within_viewport(&shapes, SIZE), Ok(()));
     }
 }
 
@@ -3035,6 +3170,42 @@ fn gui_v2_changed_game_discards_stale_readiness_and_tracks_the_new_game() {
 }
 
 #[test]
+fn gui_v2_library_search_matches_every_word_in_any_order() {
+    let library = Library::new(vec![
+        archive(1, "Legend of Zelda, The - A Link to the Past", Some("SNES")),
+        archive(2, "Zelda II - The Adventure of Link", Some("NES")),
+        archive(3, "Link's Awakening", Some("Game Boy")),
+    ]);
+    let found = |search: &str| {
+        let mut titles: Vec<String> = library
+            .filter(&Filter {
+                search: search.into(),
+                ..Default::default()
+            })
+            .into_iter()
+            .map(|index| library.games[index].title.clone())
+            .collect();
+        titles.sort();
+        titles
+    };
+    assert_eq!(
+        found("zelda link"),
+        vec![
+            "Legend of Zelda, The - A Link to the Past".to_string(),
+            "Zelda II - The Adventure of Link".to_string(),
+        ]
+    );
+    // Extra spaces are ignored and the system name counts.
+    assert_eq!(
+        found("  link   adventure "),
+        vec!["Zelda II - The Adventure of Link".to_string()]
+    );
+    assert_eq!(found("link boy"), vec!["Link's Awakening".to_string()]);
+    assert!(found("zelda awakening").is_empty());
+    assert_eq!(found("").len(), 3);
+}
+
+#[test]
 fn gui_v2_library_search_platform_filter_attention_and_empty_platform() {
     let mut bad = archive(3, "Needs fixing", Some("PS2"));
     bad.last_verified_missing_at = Some("today".into());
@@ -3182,7 +3353,9 @@ fn gui_v2_large_library_projection_measurement() {
         load.as_millis(),
         start.elapsed().as_micros()
     );
-    assert_eq!(indices.len(), 500);
+    // Every word must match: "049" also appears later in some numbers
+    // (Game 004903, Game 010490, ...), so more than the 500 "Game 049xxx".
+    assert_eq!(indices.len(), 575);
     assert_eq!(library.games.len(), 50_000);
 }
 
@@ -3194,6 +3367,7 @@ fn gui_v2_database_load_is_real_and_read_only() {
     fs::write(source.join("game.zip"), b"fixture archive").unwrap();
     let database_path = directory.path().join("library.sqlite3");
     let config = archivefs_core::Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source],
         mount_root: directory.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),
@@ -4017,11 +4191,13 @@ fn gui_v2_game_detail_exposes_contextual_actions_and_lazy_screenshots() {
     let mut app = fixture(&context);
     app.library = Arc::new(Library::new(vec![archive(1, "Example Game", Some("PS2"))]));
     app.router.current = Route::Game(1);
+    // The card is still reading; no worker opens the real profile.
+    panel_pending(&mut app, 1);
     let texts = scrolled_text(&context, &mut app, [1280.0, 1200.0]);
     for label in [
         "Play",
         "Checking whether this game is ready",
-        "Verify",
+        "Verify this game",
         "Artwork, Manuals & Extras",
         "Mods & Cheats",
         "Fix Problems",
@@ -4053,6 +4229,8 @@ fn gui_v2_game_details_lead_with_title_and_play_and_keep_reference_material_last
         Some("Saturn"),
     )]));
     app.router.current = Route::Game(1);
+    // The card is still reading; no worker opens the real profile.
+    panel_pending(&mut app, 1);
     let output = frame(&context, &mut app, [1280.0, 2400.0]);
     let y = |label: &str| {
         bounds_below_chrome(&output, label)
@@ -4065,7 +4243,7 @@ fn gui_v2_game_details_lead_with_title_and_play_and_keep_reference_material_last
     let order = [
         y("Example Game"),
         y("Play"),
-        y("Verify"),
+        y("Verify this game"),
         y("Screenshots"),
         y("Disc & ROM evidence"),
         y("Advanced details"),
@@ -4120,7 +4298,7 @@ fn gui_v2_game_details_show_evidence_section_only_when_the_media_has_evidence() 
     );
     // With nothing associated, Game Details still offers the Manuals section
     // (it carries "Associate local document…") and says plainly it is empty.
-    let strings = text(&output);
+    let strings = scrolled_text(&context, &mut app, [1280.0, 1600.0]);
     assert!(strings.iter().any(|line| line == "Manuals & Guides"));
     assert!(
         strings
@@ -4831,7 +5009,7 @@ fn gui_v2_selected_dreamcast_game_shows_native_ipbin_boundary() {
     app.library = Arc::new(Library::new(vec![archive(9, "Rez", Some("Dreamcast"))]));
     app.router.current = Route::Game(9);
 
-    let closed = text(&frame(&context, &mut app, [1280.0, 1600.0]));
+    let closed = scrolled_text(&context, &mut app, [1280.0, 1600.0]);
     assert!(closed.iter().any(|value| value == "Disc & ROM evidence"));
     assert!(
         !closed
@@ -4882,7 +5060,7 @@ fn gui_v2_selected_saturn_game_shows_read_only_disc_manifest_boundary() {
     )]));
     app.router.current = Route::Game(9);
 
-    let closed = text(&frame(&context, &mut app, [1280.0, 1600.0]));
+    let closed = scrolled_text(&context, &mut app, [1280.0, 1600.0]);
     assert!(closed.iter().any(|value| value == "Disc & ROM evidence"));
     assert!(!closed.iter().any(|value| value == "Saturn disc layout"));
     let _ = click_label(&context, &mut app, [1280.0, 2600.0], "Disc & ROM evidence");
@@ -5129,15 +5307,17 @@ fn gui_v2_game_details_keep_artwork_actions_and_metadata_together() {
     let context = egui::Context::default();
     let mut app = visual_fixture(&context);
     app.go(Route::Game(1));
+    // The card is still reading; no worker opens the real profile.
+    panel_pending(&mut app, 1);
     let mut strings = text(&pump_imagery(&context, &mut app, [1280.0, 1200.0]));
-    assert!(strings.iter().any(|value| value == "Verify"));
+    assert!(strings.iter().any(|value| value == "Verify this game"));
     assert!(strings.iter().any(|value| value == "Open Folder"));
     // Screenshots may be below the fold after the upper guidance/readiness
     // content; they must remain reachable with ordinary page scrolling.
     let expected = [
         "Play",
         "PSX · Game image",
-        "Verify",
+        "Verify this game",
         "Open Folder",
         "No screenshots found for this game.",
     ];
@@ -6006,18 +6186,31 @@ fn hackhash_normal_view_is_plain_english_and_keeps_internals_under_advanced() {
     }
     assert!(!strings.iter().any(|v| v.starts_with("Parser schema")));
     for plain in [
-        "Check for a newer list",
-        "Download list",
-        "Load list from a file…",
+        "Add HackHash list…",
         "Review downloaded list",
         "Use this list",
     ] {
         assert!(strings.iter().any(|v| v == plain), "missing {plain}");
     }
+    // The web-address features only appear once an address is set under
+    // Advanced details, so the normal path never asks for a URL.
+    for hidden in ["Check for a newer list", "Download list"] {
+        assert!(
+            !strings.iter().any(|v| v == hidden),
+            "{hidden} shown without a configured address"
+        );
+    }
     assert!(
-        strings
-            .iter()
-            .any(|v| v.starts_with("Download address: not set"))
+        !strings.iter().any(|v| v.starts_with("Download address")),
+        "the normal view must not ask for a download address"
+    );
+    assert!(
+        strings.iter().any(|v| v.starts_with("Optional. HackHash")),
+        "the page must say HackHash is optional"
+    );
+    assert!(
+        strings.iter().any(|v| v.starts_with("To add it:")),
+        "the page must say how to add the list in one plain step"
     );
     assert!(strings.iter().any(|v| v == "Advanced details"));
 }
@@ -6705,6 +6898,56 @@ fn gui_v2_browse_play_many_platforms_do_not_push_the_selected_game_off_screen() 
     );
 }
 
+/// Owner screenshots 03/04/15 (7 Nov build): after picking a system from
+/// "More systems", the dropdown went off-screen and its list covered the
+/// selected-game panel. With a non-top system selected, the dropdown and the
+/// selected game's Play must both stay on screen at the owner's widths.
+#[test]
+fn gui_v2_browse_play_a_system_picked_from_more_systems_keeps_the_dropdown_on_screen() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(
+        (1..=200)
+            .map(|id| {
+                archive(
+                    id,
+                    &format!("Game {id}"),
+                    Some(&format!("Platform {}", id % 70)),
+                )
+            })
+            .collect(),
+    ));
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.filter.select_platform("Platform 69".to_string());
+    app.indices = (0..app.library.games.len())
+        .filter(|&i| app.library.games[i].platform == "Platform 69")
+        .collect();
+    let game = app.library.games[app.indices[0]].archive.id;
+    for width in [2048.0, 1880.0, 1400.0] {
+        app.router.current = Route::BrowsePlayGame(game);
+        let output = frame(&context, &mut app, [width, 1100.0]);
+        let more = text(&output)
+            .into_iter()
+            .find(|t| t.starts_with("More systems"))
+            .unwrap_or_else(|| "More systems".to_string());
+        for needle in [more.as_str(), "Play"] {
+            let bounds = text_bounds(&output, needle);
+            assert!(
+                !bounds.is_empty(),
+                "{needle} must be drawn at {width}px; drawn: {:?}",
+                text(&output)
+                    .iter()
+                    .filter(|t| t.contains("Platform") || t.contains("systems"))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                bounds.iter().all(|rect| rect.max.x <= width),
+                "{needle} must be on screen at {width}px: {bounds:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn gui_v2_browse_play_says_loading_while_the_library_loads() {
     let context = egui::Context::default();
@@ -6759,6 +7002,21 @@ fn gui_v2_setup_portability_is_visible_in_settings() {
         "Export setup",
         "Preview setup file",
         "Applying imports is not available yet",
+    ] {
+        scroll_to_text(&context, &mut app, [1280.0, 900.0], expected);
+    }
+}
+
+#[test]
+fn gui_v2_amiga_hdf_storage_is_visible_in_settings() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Settings);
+    // Rendering only reads the saved choice and free space; it writes nothing.
+    for expected in [
+        "Amiga hard-disk game copies",
+        "they are not a cache",
+        "Choose folder",
     ] {
         scroll_to_text(&context, &mut app, [1280.0, 900.0], expected);
     }
@@ -6833,7 +7091,7 @@ fn open_jump_to(context: &egui::Context, app: &mut App, size: [f32; 2]) {
 
 #[test]
 fn escape_policy_prefers_modal_then_popup_then_text_then_back() {
-    use super::pages::{EscapeAction::*, escape_action};
+    use super::shortcuts::{EscapeAction::*, escape_action};
     assert_eq!(escape_action(true, true, true, true), CloseModal);
     assert_eq!(escape_action(false, true, true, true), PopupHandles);
     assert_eq!(escape_action(false, false, true, true), KeepDialogOpen);
@@ -7770,6 +8028,116 @@ fn real_catalogue_supersession_counts() {
         .filter(|game| game.archive.last_verified_missing_at.is_some())
         .count();
     println!("missing rows still visible (unresolved)={still_missing}");
+    let mut retired = std::collections::BTreeMap::new();
+    for reason in after.retired_reasons.values() {
+        *retired.entry(format!("{reason:?}")).or_insert(0usize) += 1;
+    }
+    println!(
+        "retired old-location rows={} (kept, not listed) by reason: {retired:?}",
+        after.retired.len()
+    );
+    // Optional: a TSV whose first column is an archive id, to show where each
+    // listed row now sits (superseded, retired, or still listed).
+    if let Ok(list) = std::env::var("STALE_ROWS") {
+        let ids: Vec<i64> = std::fs::read_to_string(list)
+            .expect("STALE_ROWS")
+            .lines()
+            .filter_map(|line| line.split('\t').next()?.parse().ok())
+            .collect();
+        let mut outcome = std::collections::BTreeMap::new();
+        for id in &ids {
+            let key = if after.historical_links.contains_key(id) {
+                "superseded by a current row".to_string()
+            } else if let Some(reason) = after.retired_reasons.get(id) {
+                format!("retired: {reason:?}")
+            } else if after.by_id.contains_key(id) {
+                "still listed".to_string()
+            } else {
+                "not in catalogue".to_string()
+            };
+            *outcome.entry(key).or_insert(0usize) += 1;
+        }
+        println!("stale rows={} outcome: {outcome:?}", ids.len());
+    }
+}
+
+#[test]
+fn absent_rows_of_a_removed_source_are_retired_not_listed_and_not_organised() {
+    use archivefs_core::catalogue_supersession::Retirement;
+    let removed = |id, rel: &str, platform: &str| {
+        let mut row = moved_row(id, rel, 10 + id as u64, false);
+        row.source_folder_id = 9;
+        row.platform = Some(platform.into());
+        row.platform_source = Some("folder".into());
+        row
+    };
+    let current = |id, rel: &str, size, platform: &str| {
+        let mut row = moved_row(id, rel, size, false);
+        row.platform = Some(platform.into());
+        row.platform_source = Some("folder".into());
+        row
+    };
+    let rows = vec![
+        // Labelled SNES at the old location, NES at the new one.
+        removed(1, "roms/snes/Mario.nes", "SNES"),
+        current(2, "nes/Mario.nes", 11, "NES"),
+        removed(3, "roms/snes/Gone.sfc", "SNES"),
+        // Still on disk at the old path: stays listed.
+        removed(4, "roms/snes/Here.sfc", "SNES"),
+        current(5, "snes/Real.sfc", 50, "SNES"),
+    ];
+    let configured = std::collections::HashSet::from([1]);
+    let library = Library::with_history_retiring(rows, &[], Some(&configured), |path| {
+        !path.ends_with("Here.sfc")
+    });
+    let mut listed: Vec<i64> = library.games.iter().map(|g| g.archive.id).collect();
+    listed.sort_unstable();
+    assert_eq!(listed, vec![2, 4, 5]);
+    assert_eq!(
+        library.retired_reasons,
+        std::collections::HashMap::from([
+            (1, Retirement::UnresolvedCopies),
+            (3, Retirement::NotFoundAnywhere)
+        ])
+    );
+    assert_eq!(library.retired.len(), 2, "kept, not deleted");
+    let (note, detail) = super::browse_play::retired_note(&library).expect("a note");
+    assert!(note.starts_with("2 older records not listed"), "{note}");
+    assert!(
+        detail.contains("not deleted")
+            && detail.contains("1 have a file with the same name")
+            && detail.contains("1 were not found"),
+        "{detail}"
+    );
+    assert!(super::browse_play::retired_note(&Library::default()).is_none());
+    let snes = &library
+        .games
+        .iter()
+        .find(|g| g.archive.id == 5)
+        .unwrap()
+        .platform;
+    assert_eq!(
+        library.platforms.get(snes),
+        Some(&2),
+        "{:?}",
+        library.platforms
+    );
+    assert!(library.historical.is_empty() && library.resolve(1) == 1);
+    let organised: Vec<i64> = super::folder_check::candidates_of(&library.games)
+        .iter()
+        .map(|c| c.archive_id)
+        .collect();
+    assert!(
+        !organised.contains(&1) && !organised.contains(&3),
+        "{organised:?}"
+    );
+    // Without an absence check nothing is retired (the previous behaviour).
+    let plain = Library::with_history(
+        library.retired.iter().map(|g| g.archive.clone()).collect(),
+        &[],
+        Some(&configured),
+    );
+    assert_eq!(plain.games.len(), 2);
 }
 
 #[test]
@@ -8603,6 +8971,26 @@ fn shows(strings: &[String], needle: &str) -> bool {
     strings.iter().any(|value| value.contains(needle))
 }
 
+/// This game's verification panel has answered `reason` (no worker runs).
+fn panel_answered(app: &mut App, game: i64, reason: &'static str) {
+    app.review.verification_guidance.set_for_test(
+        game,
+        None,
+        Some(super::game_verification_guidance::Guidance {
+            reason,
+            explanation: String::new(),
+            action: super::game_verification_guidance::Action::Review,
+        }),
+    );
+}
+
+/// This game's panel is still reading its saved evidence (no worker runs).
+pub(super) fn panel_pending(app: &mut App, game: i64) {
+    app.review
+        .verification_guidance
+        .set_for_test(game, None, None);
+}
+
 fn knowledge(
     state: archivefs_core::dat::library_identity_summary::DatVerificationState,
 ) -> DatKnowledge {
@@ -8617,6 +9005,7 @@ fn knowledge(
         ecosystem: Some("No-Intro"),
         candidates: vec!["Amidar (USA)".into(), "Amidar (Europe)".into()],
         technical: "SHA-1 abc".into(),
+        header: Default::default(),
     }
 }
 
@@ -8675,7 +9064,7 @@ fn review_identity_explains_each_failed_state_with_its_direct_next_action() {
     let mut app = review_app(&context, vec![(1, "Game", "SNES")]);
     let strings = render_review(&context, &mut app, 1);
     assert!(
-        shows(&strings, "This game is ready to verify"),
+        shows(&strings, "This game has not been verified yet"),
         "{strings:?}"
     );
     assert!(!shows(&strings, "Unknown"));
@@ -8940,6 +9329,7 @@ fn temp_catalogue() -> (
     let archive_path = source.join("misc/GameCube Demo.zip");
     std::fs::write(&archive_path, b"contents").unwrap();
     let config = archivefs_core::Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source],
         mount_root: dir.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),
@@ -9083,6 +9473,315 @@ fn check_games_leads_with_what_verified_automatically_and_lists_only_the_rest() 
     assert!(!shows(&strings, "Manage DAT sources") && !shows(&strings, "Unknown:"));
 }
 
+/// An older library flag cannot outvote the current per-game lookup: stale or
+/// untrusted DAT evidence is never labelled Verified anywhere in Game Details.
+#[test]
+fn stale_or_untrusted_dat_evidence_is_never_labelled_verified_in_game_details() {
+    use archivefs_core::dat::library_identity_summary::DatVerificationState as S;
+    let context = egui::Context::default();
+    for (stale, trusted) in [(true, true), (false, false)] {
+        let mut app = review_app(&context, vec![(1, "Amidar", "Atari2600")]);
+        Arc::make_mut(&mut app.library).games[0].mark_dat_exact(Some("No-Intro"));
+        let mut current = knowledge(S::VerifiedSingleMatch {
+            algorithm: "SHA-1".into(),
+        });
+        current.stale = stale;
+        current.trusted_source = trusted;
+        app.review.knowledge = Some(current);
+        let review = app.identity_review_for(1).unwrap();
+        assert!(!review.is_verified(), "stale={stale} trusted={trusted}");
+        panel_answered(&mut app, 1, "File evidence stale or changed");
+        app.router.current = Route::Game(1);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        assert!(
+            shows(&strings, "Identity: Re-check needed"),
+            "stale={stale} trusted={trusted}: {strings:?}"
+        );
+        assert!(
+            !strings
+                .iter()
+                .any(|line| line.starts_with("Identity: Verified") || line.starts_with("Verified")),
+            "stale={stale} trusted={trusted}: {strings:?}"
+        );
+    }
+}
+
+/// Game Details never says Verified from a saved Library flag alone: before
+/// this game's panel answers, the Identity line and the readiness card both
+/// say "Checking verification"; afterwards both follow the panel's answer.
+/// Launch readiness is decided separately throughout.
+#[test]
+fn game_details_identity_follows_this_games_panel_from_pending_to_answer() {
+    let context = egui::Context::default();
+    let size = [1280.0, 900.0];
+    for (answer, settled, badge) in [
+        ("Verified", "Verified", "Verified"),
+        (
+            "File evidence stale or changed",
+            "Re-check needed",
+            "Re-check needed",
+        ),
+        (
+            "Catalogue selection required",
+            "Verification not yet confirmed",
+            "Verified",
+        ),
+        (
+            "Catalogue system coverage unresolved",
+            "Verification not yet confirmed",
+            "Verified",
+        ),
+        (
+            "Verification evidence unavailable",
+            "Verification not yet confirmed",
+            "Verified",
+        ),
+    ] {
+        let verified = settled == "Verified";
+        let mut app = review_app(&context, vec![(1, "Amidar", "Atari2600")]);
+        app.review.knowledge_for = None;
+        Arc::make_mut(&mut app.library).games[0].mark_dat_exact(Some("No-Intro"));
+        app.router.current = Route::Game(1);
+
+        // Before the panel answers
+        panel_pending(&mut app, 1);
+        let strings = text(&frame(&context, &mut app, size));
+        let pending = strings
+            .iter()
+            .filter(|line| line.contains("Identity: Checking verification"))
+            .count();
+        assert_eq!(pending, 2, "line and card, {answer}: {strings:?}");
+        assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+        assert!(
+            shows(&strings, "Checking whether this game is ready"),
+            "launch is still undecided: {strings:?}"
+        );
+
+        // After it answers
+        panel_answered(&mut app, 1, answer);
+        let strings = text(&frame(&context, &mut app, size));
+        assert!(
+            !shows(&strings, "Checking verification"),
+            "{answer}: {strings:?}"
+        );
+        // The Identity line and the card say the same thing.
+        let settled_lines = strings
+            .iter()
+            .filter(|line| line.contains(&format!("Identity: {settled}")))
+            .count();
+        assert_eq!(settled_lines, 2, "{answer}: {strings:?}");
+        if !verified {
+            assert!(
+                !shows(&strings, "Identity: Verified"),
+                "{answer}: {strings:?}"
+            );
+        }
+        assert!(
+            shows(&strings, "Checking whether this game is ready"),
+            "verified identity never decides launch: {strings:?}"
+        );
+        // The in-memory Library badge: kept unless strictly invalidated.
+        // The database is never written here.
+        assert_eq!(
+            app.library.game(1).unwrap().dat_identity_summary(),
+            badge,
+            "{answer}"
+        );
+    }
+}
+
+/// A name-hint-only game and a game with no known system: the Identity line
+/// and the readiness card say the same thing, nothing says Verified, and the
+/// card never turns its own launch state into an identity word.
+#[test]
+fn game_details_hint_and_unknown_games_state_one_identity() {
+    let context = egui::Context::default();
+    let mut app = review_app(&context, vec![(1, "Amidar", "Atari2600")]);
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "Amidar", Some("Atari2600")),
+        archive(2, "Mystery", None),
+    ]));
+    for (id, expected) in [
+        (1, "Name hint only · not verified"),
+        (2, "Unknown · system not known"),
+    ] {
+        app.review.knowledge_for = Some(id);
+        panel_answered(&mut app, id, "Audit not yet performed");
+        app.router.current = Route::Game(id);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        let line = format!("Identity: {expected}");
+        assert_eq!(
+            strings.iter().filter(|shown| shown.contains(&line)).count(),
+            2,
+            "line and card for game {id}: {strings:?}"
+        );
+        for word in [
+            "Identity: Verified",
+            "Strong local identity",
+            "Identity: Needs review",
+            "Launchable with warning",
+            "Mismatch / blocked",
+        ] {
+            assert!(
+                !shows(&strings, word),
+                "game {id} shows {word}: {strings:?}"
+            );
+        }
+    }
+}
+
+/// Only strict invalidation drops that one game's in-memory badge. Setup
+/// gaps, unreadable evidence and a cancelled check drop nothing and never
+/// say Verified.
+#[test]
+fn only_a_disproving_answer_clears_only_that_games_library_badge() {
+    let context = egui::Context::default();
+    let mut app = review_app(
+        &context,
+        vec![(1, "Amidar", "Atari2600"), (2, "Pitfall", "Atari2600")],
+    );
+    app.review.knowledge_for = None;
+    for game in &mut Arc::make_mut(&mut app.library).games {
+        game.mark_dat_exact(Some("No-Intro"));
+    }
+    app.router.current = Route::Game(1);
+    panel_answered(&mut app, 1, "Verification evidence unavailable");
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(
+        shows(&strings, "Identity: Verification not yet confirmed"),
+        "{strings:?}"
+    );
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert_eq!(
+        app.library.game(1).unwrap().dat_identity_summary(),
+        "Verified"
+    );
+
+    for setup_gap in [
+        "Catalogue selection required",
+        "Catalogue system coverage unresolved",
+    ] {
+        panel_answered(&mut app, 1, setup_gap);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        assert!(
+            shows(&strings, "Identity: Verification not yet confirmed"),
+            "{setup_gap}: {strings:?}"
+        );
+        assert_eq!(
+            app.library.game(1).unwrap().dat_identity_summary(),
+            "Verified",
+            "{setup_gap} is not disproof"
+        );
+    }
+    // A check cancelled, or whose worker failed, before it answered.
+    let (cancelled, receiver) = std::sync::mpsc::channel();
+    app.review
+        .verification_guidance
+        .set_for_test(1, Some(receiver), None);
+    drop(cancelled);
+    frame(&context, &mut app, [1280.0, 900.0]);
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(
+        shows(&strings, "Identity: Verification not yet confirmed"),
+        "{strings:?}"
+    );
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert_eq!(
+        app.library.game(1).unwrap().dat_identity_summary(),
+        "Verified"
+    );
+
+    panel_answered(&mut app, 1, "File evidence stale or changed");
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert_eq!(
+        app.library.game(1).unwrap().dat_identity_summary(),
+        "Re-check needed"
+    );
+    assert_eq!(
+        strings
+            .iter()
+            .filter(|line| line.contains("Identity: Re-check needed"))
+            .count(),
+        2,
+        "line and card: {strings:?}"
+    );
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert_eq!(
+        app.library.game(2).unwrap().dat_identity_summary(),
+        "Verified",
+        "another game is untouched"
+    );
+}
+
+/// One game's answer never applies to another, and a late result from an
+/// earlier game or an earlier check cannot land after the panel moved on.
+#[test]
+fn a_panel_answer_never_crosses_games_or_outlives_its_check() {
+    use super::detail_identity::DetailIdentity;
+    let context = egui::Context::default();
+    let mut app = review_app(
+        &context,
+        vec![(1, "Amidar", "Atari2600"), (2, "Pitfall", "Atari2600")],
+    );
+    app.review.knowledge_for = None;
+    for game in &mut Arc::make_mut(&mut app.library).games {
+        game.mark_dat_exact(Some("No-Intro"));
+    }
+    let second = app.library.game(2).unwrap().clone();
+    panel_answered(&mut app, 1, "Verified");
+    assert!(
+        app.detail_identity(&app.library.game(1).unwrap().clone())
+            .unwrap()
+            .is_verified()
+    );
+    assert_eq!(app.detail_identity(&second), Some(DetailIdentity::Checking));
+
+    // A check for game 1 is in flight; the panel then moves to game 2.
+    let (late, receiver) = std::sync::mpsc::channel();
+    app.review
+        .verification_guidance
+        .set_for_test(1, Some(receiver), None);
+    app.review.verification_guidance.invalidate();
+    panel_pending(&mut app, 2);
+    let answer = super::game_verification_guidance::Guidance {
+        reason: "Verified",
+        explanation: String::new(),
+        action: super::game_verification_guidance::Action::Review,
+    };
+    assert!(
+        late.send(answer.clone()).is_err(),
+        "the old check was dropped"
+    );
+    app.router.current = Route::Game(2);
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert_eq!(app.detail_identity(&second), Some(DetailIdentity::Checking));
+
+    // A re-check of the same game: only the newer check's answer counts.
+    let (older, older_receiver) = std::sync::mpsc::channel();
+    app.review
+        .verification_guidance
+        .set_for_test(2, Some(older_receiver), None);
+    app.review.verification_guidance.invalidate();
+    let (newer, newer_receiver) = std::sync::mpsc::channel();
+    app.review
+        .verification_guidance
+        .set_for_test(2, Some(newer_receiver), None);
+    assert!(
+        older.send(answer.clone()).is_err(),
+        "the older check was dropped"
+    );
+    newer
+        .send(super::game_verification_guidance::Guidance {
+            reason: "File evidence stale or changed",
+            ..answer
+        })
+        .unwrap();
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(!shows(&strings, "Identity: Verified"), "{strings:?}");
+    assert!(!app.detail_identity(&second).unwrap().is_verified());
+}
+
 #[test]
 fn one_game_has_one_identity_status_on_every_page() {
     use archivefs_core::dat::library_identity_summary::DatVerificationState as S;
@@ -9096,16 +9795,36 @@ fn one_game_has_one_identity_status_on_every_page() {
             app.review.knowledge = Some(knowledge(S::VerifiedSingleMatch {
                 algorithm: "SHA-1".into(),
             }));
+            // This game's own panel confirmed current proof.
+            panel_answered(&mut app, 1, "Verified");
         } else {
             app.review.knowledge = Some(knowledge(S::NoMatch));
+            panel_answered(&mut app, 1, "No catalogue match");
         }
-        let label = app.identity_review_for(1).unwrap().list_label();
+        let game = app.library.game(1).unwrap().clone();
+        let label = app.detail_identity_wording(&game).unwrap().label;
+        assert_eq!(label == "Verified", verified, "{label}");
         // Game Details
         app.router.current = Route::Game(1);
+        // The identity result is on the first screen, not below the fold.
         let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
-        assert!(
-            shows(&strings, &format!("Identity: {label}")),
+        // The Identity line and the launch card say the same thing, and the
+        // card never turns its own launch state into "Needs review".
+        assert_eq!(
+            strings
+                .iter()
+                .filter(|line| line.contains(&format!("Identity: {label}")))
+                .count(),
+            2,
             "details {label}: {strings:?}"
+        );
+        assert!(
+            !shows(&strings, "Identity: Needs review"),
+            "details {label}: {strings:?}"
+        );
+        assert!(
+            shows(&strings, "Checking whether this game is ready"),
+            "launch readiness stays separate: {strings:?}"
         );
         // Problems for this one game
         app.router.current = Route::Task {
@@ -9238,10 +9957,17 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
     let review = app.identity_review_for(vid).unwrap();
     assert!(review.is_verified() && review.list_label() == "Verified");
     assert!(!app.identity_review_for(uid).unwrap().is_verified());
-    // Game Details
+    // Game Details, once this game's panel has confirmed current proof
+    panel_answered(&mut app, vid, "Verified");
     app.router.current = Route::Game(vid);
     let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
     assert!(shows(&strings, "Identity: Verified"), "{strings:?}");
+    // One identity status on the page; launch is still decided separately.
+    assert!(!shows(&strings, "Identity: Needs review"), "{strings:?}");
+    assert!(
+        shows(&strings, "Checking whether this game is ready"),
+        "{strings:?}"
+    );
     // Review Identity: verified, nothing to confirm
     app.router.current = Route::ReviewIdentity(vid);
     let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
@@ -9282,7 +10008,9 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
     assert!(shows(&strings, &format!("{count} verified")), "{strings:?}");
     // Launch: unchanged policy, but never a contradictory "not confirmed"
     use super::launch_readiness_summary::{ReadinessFreshness, note_catalogue_verified, project};
-    let input = crate::launch_readiness_page::LaunchReadinessInput::IdentityUnknown;
+    let input = crate::launch_readiness_page::LaunchReadinessInput::IdentityUnknown(
+        crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+    );
     let mut for_verified = project(&input, ReadinessFreshness::Current);
     note_catalogue_verified(&mut for_verified);
     assert!(
@@ -9295,8 +10023,35 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
         for_verified.primary_action.is_some(),
         "still blocked, with a way forward"
     );
+    // Without a DAT match, launch names its own reason (the file's identity
+    // evidence), says optional DAT verification is separate, and offers one
+    // fix. It is still blocked and never reads as verified.
     let unresolved_summary = project(&input, ReadinessFreshness::Current);
-    assert!(unresolved_summary.headline.contains("not confirmed"));
+    assert_eq!(
+        unresolved_summary.headline,
+        "EmuWiz cannot tell which game this file is yet"
+    );
+    assert!(
+        unresolved_summary
+            .explanation
+            .contains("file's own identity evidence"),
+        "{}",
+        unresolved_summary.explanation
+    );
+    assert!(
+        unresolved_summary
+            .explanation
+            .contains("Optional catalogue (DAT) verification is a separate check"),
+        "{}",
+        unresolved_summary.explanation
+    );
+    assert!(!unresolved_summary.headline.contains("Verified"));
+    // Identity is unconfirmed (not conflicting, not a missing system), so the
+    // one fix offered is Verify identity.
+    assert_eq!(
+        unresolved_summary.primary_action,
+        Some(super::launch_readiness_summary::ReadinessAction::VerifyIdentity)
+    );
 }
 
 // ---- Library files check (read-only reconciliation) ---------------------------
@@ -10109,6 +10864,7 @@ mod library_files_check {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("stray.xyz"), b"stray").unwrap();
         let config = archivefs_core::Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: dir.path().join("mounts"),
             ratarmount_bin: "ratarmount".into(),
@@ -10292,6 +11048,7 @@ mod library_files_check {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("stray.xyz"), b"stray").unwrap();
         let config = archivefs_core::Config {
+            configured_source_roots: Some(vec![root.clone()]),
             source_folders: vec![root.clone()],
             mount_root: dir.path().join("mounts"),
             ratarmount_bin: "ratarmount".into(),
@@ -11003,11 +11760,15 @@ mod history_page {
 
 mod blue_home_library;
 mod blue_usability;
+mod game_detail_facts;
+mod hasheous_check;
 mod history_records;
 mod organisation_outcomes;
+mod ready_filter_consistency;
 mod simple_shell_ui;
 mod slice2b_layout;
 mod spectrum_preservation;
+mod verify_games_entry;
 
 mod duckstation_profile_resolution {
     use super::*;
@@ -11458,11 +12219,23 @@ mod ppsspp_profile_resolution {
 #[path = "tests/save_vault.rs"]
 mod blue_save_vault;
 
+#[path = "tests/card_restore.rs"]
+mod blue_card_restore;
 #[path = "tests/save_snapshots.rs"]
 mod blue_save_snapshots;
+#[path = "tests/single_file_restore.rs"]
+mod blue_single_file_restore;
 
+#[path = "tests/blue_worker_lane.rs"]
+mod blue_worker_lane;
 #[path = "tests/repair.rs"]
 mod repair;
+
+#[path = "tests/blue_catalogue_writers.rs"]
+mod blue_catalogue_writers;
+
+#[path = "tests/blue_truth_outcomes.rs"]
+mod blue_truth_outcomes;
 
 #[path = "tests/frontend_export.rs"]
 mod frontend_export;
@@ -11470,8 +12243,14 @@ mod frontend_export;
 #[path = "tests/nkit.rs"]
 mod nkit_gui;
 
+#[path = "tests/big_picture.rs"]
+mod big_picture_journey;
+#[path = "tests/launch_census.rs"]
+mod launch_census;
 #[path = "tests/launch_focus.rs"]
 mod launch_focus;
+#[path = "tests/pad_shell.rs"]
+mod pad_shell_journey;
 
 #[cfg(target_os = "linux")]
 #[path = "tests/large_library_performance.rs"]
@@ -11512,4 +12291,14 @@ fn gui_v2_same_destination_reentry_discards_an_older_preview() {
     );
     assert!(app.playing_library_job.is_none());
     assert!(app.activity.jobs[&id].summary.contains("discarded"));
+}
+
+#[test]
+fn a_window_resize_requests_a_repaint_but_the_first_frame_does_not() {
+    use super::resize_needs_repaint;
+    let a = egui::vec2(1280.0, 820.0);
+    assert!(!resize_needs_repaint(None, a));
+    assert!(!resize_needs_repaint(Some(a), a));
+    assert!(resize_needs_repaint(Some(a), egui::vec2(1800.0, 820.0)));
+    assert!(resize_needs_repaint(Some(a), egui::vec2(1280.0, 1000.0)));
 }

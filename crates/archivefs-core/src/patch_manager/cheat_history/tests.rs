@@ -87,6 +87,7 @@ fn installed_entry(fixture: &Fixture, name: &str, bytes: &[u8]) -> CheatInstallE
             super::super::cheat_install_result::PreviousDestinationState::Absent,
         previous_destination_hash: None,
         backup_path: None,
+        planned_backup_path: None,
         resulting_destination_hash: Some(installed_hash),
         outcome: CheatInstallOutcome::InstalledNew,
         reason_code: "installed_new".into(),
@@ -134,6 +135,8 @@ fn install_run(
         entries,
         summary,
         status: CheatInstallRunStatus::derive(&summary, false),
+        settled_entries: 0,
+        temp_file_prefix: None,
     }
 }
 

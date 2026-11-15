@@ -132,7 +132,13 @@ pub struct ReadyToPlayEvidence<'a> {
 
 impl<'a> ReadyToPlayEvidence<'a> {
     pub fn from_launch_plan(item_identity: impl Into<String>, plan: &'a LaunchPlan) -> Self {
-        let identity = if plan.platform_id.is_some() && plan.game_key.is_some() {
+        // A bytes-derived local-media token is not a game identity.
+        let identity = if plan.platform_id.is_some()
+            && plan
+                .game_key
+                .as_deref()
+                .is_some_and(|key| !key.starts_with(crate::launch::LOCAL_ADF_KEY_PREFIX))
+        {
             IdentityEvidenceState::Resolved
         } else {
             IdentityEvidenceState::Unknown
@@ -546,6 +552,21 @@ mod tests {
                 .reasons
                 .iter()
                 .any(|r| r.family == ReadinessReasonFamily::Identity)
+        );
+    }
+
+    #[test]
+    fn a_local_media_token_is_not_a_resolved_identity() {
+        let mut local = plan(LaunchReadiness::Ready, None);
+        local.game_key = Some(format!("{}abc", crate::launch::LOCAL_ADF_KEY_PREFIX));
+        assert_eq!(
+            ReadyToPlayEvidence::from_launch_plan("x", &local).identity,
+            IdentityEvidenceState::Unknown
+        );
+        let verified = plan(LaunchReadiness::Ready, None);
+        assert_eq!(
+            ReadyToPlayEvidence::from_launch_plan("x", &verified).identity,
+            IdentityEvidenceState::Resolved
         );
     }
 }

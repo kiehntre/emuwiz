@@ -72,6 +72,7 @@ fn library_in(folder: &str, catalogue: &[(&str, &str)], library: &[(&str, &str)]
 
 fn config(root: &Path) -> crate::Config {
     crate::Config {
+        configured_source_roots: None,
         source_folders: vec![root.join("games")],
         mount_root: root.join("mount"),
         ratarmount_bin: "ratarmount".into(),

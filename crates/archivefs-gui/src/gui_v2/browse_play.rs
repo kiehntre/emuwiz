@@ -14,16 +14,72 @@ use std::sync::Arc;
 use super::{
     App,
     artwork::Picture,
-    library::{CheckedReadiness, Filter, Game, ReadinessCache, ReadinessFilter},
+    library::{CheckedReadiness, Filter, Game, ReadinessCache, ReadinessFilter, SortOrder},
     media_sources::Kind,
     routes::{Route, Section},
 };
+use crate::gamer_view::alpha_jump::{ALPHA_BUCKETS, bucket_for_title, bucket_label};
 use crate::ui::theme;
 use eframe::egui::{self, Color32, RichText};
 
 // Keep small-catalogue interactions immediate; larger scans use the existing
 // generation-checked, debounced Filter worker rather than blocking paint.
-const IMMEDIATE_FILTER_LIMIT: usize = 10_000;
+pub(super) const IMMEDIATE_FILTER_LIMIT: usize = 10_000;
+/// The ScreenScraper artwork batch picker (at most 25 games). It is separate
+/// from the Library's Ctrl/Shift-click selection ("Selected games").
+pub(super) const SELECT_FOR_ARTWORK: &str = "Select for artwork";
+pub(super) const SELECT_FOR_ARTWORK_HINT: &str = "Select for artwork: pick up to 25 games to look \
+     up artwork and details on ScreenScraper. This is separate from Selected games \
+     (Ctrl/Shift-click or Ctrl+A).";
+/// The toggle where "Select for artwork" does not fit but this does.
+pub(super) const SELECT_FOR_ARTWORK_MEDIUM: &str = "Artwork (25 max)";
+/// The toggle on a very narrow toolbar: no wider than "Done selecting", so the
+/// row keeps its layout. Its accessible name is still the full one, and the
+/// picker states its purpose on screen once opened.
+pub(super) const SELECT_FOR_ARTWORK_SHORT: &str = "Artwork";
+/// What keyboard focus and assistive tech announce for the toggle, whatever
+/// label fits on screen.
+pub(super) const SELECT_FOR_ARTWORK_NAME: &str = "Select for artwork (up to 25 games)";
+/// Shown while the artwork picker is open, so its purpose never depends on hover.
+pub(super) const ARTWORK_PICKER_PURPOSE: &str = "Artwork selection: pick up to 25 games, then \
+     Enrich metadata looks up their artwork and details on ScreenScraper. Separate from \
+     Selected games.";
+
+/// Which label the artwork toggle shows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ArtworkLabel {
+    Full,
+    Medium,
+    Short,
+}
+
+impl ArtworkLabel {
+    pub(super) fn text(self) -> &'static str {
+        match self {
+            Self::Full => SELECT_FOR_ARTWORK,
+            Self::Medium => SELECT_FOR_ARTWORK_MEDIUM,
+            Self::Short => SELECT_FOR_ARTWORK_SHORT,
+        }
+    }
+}
+
+/// The widest label whose extra width (over the short one) still leaves
+/// `spare` at least `min`. Pure, so the choice is unit tested.
+pub(super) fn artwork_label_for(
+    spare: f32,
+    full_extra: f32,
+    medium_extra: f32,
+    min: f32,
+) -> ArtworkLabel {
+    if spare - full_extra >= min {
+        ArtworkLabel::Full
+    } else if spare - medium_extra >= min {
+        ArtworkLabel::Medium
+    } else {
+        ArtworkLabel::Short
+    }
+}
+
 const PLATFORM_ICON_SIZE: f32 = 22.0;
 /// Largest systems shown as chips; the rest live in the dropdown.
 const TOP_SYSTEMS: usize = 7;
@@ -38,9 +94,14 @@ const SELECTED_COVER_SIZE: egui::Vec2 = egui::vec2(150.0, 196.0);
 const COMPACT_COVER_SIZE: egui::Vec2 = egui::vec2(70.0, 92.0);
 /// Below this width the selected-game panel becomes a strip above the shelf.
 const SIDE_BY_SIDE_MIN_WIDTH: f32 = 1100.0;
+const BIG_PICTURE: &str = "Big Picture";
 /// Narrowest the Library search field is allowed to become before the
 /// List/Grid switch moves to its own row.
 const SEARCH_MIN_WIDTH: f32 = 140.0;
+/// The button at the end of the systems row that opens the Surprise Me picker.
+pub(super) const SURPRISE_ME: &str = "Surprise me";
+/// The Library's way into the existing read-only Check Games workflow.
+pub(super) const VERIFY_GAMES: &str = "Verify Games";
 /// Below this height the selected-game panel uses the compact cover so Play
 /// stays beside it instead of below a tall picture.
 const TIGHT_PANEL_HEIGHT: f32 = 440.0;
@@ -68,7 +129,7 @@ type FilterKey = (
     String,
     String,
     (ReadinessFilter, bool),
-    bool,
+    (bool, SortOrder),
     usize,
     CollectionKey,
 );
@@ -77,9 +138,40 @@ type CollectionKey = Option<(i64, u64, super::collections::CollectionSort)>;
 /// Base list address, cache version, view, and the narrowed list.
 type ReadinessView = (usize, u64, ReadinessFilter, Arc<Vec<usize>>);
 
+/// Fewest games for which the A-Z strip is worth its row.
+const ALPHA_STRIP_MIN: usize = 30;
+
+/// Set (by the controller layer) to ask the shelf to move focus one grid row:
+/// -1 up, +1 down. The shelf knows its own columns and which rows are drawn;
+/// egui's spatial search cannot see a card that is fully scrolled out of view.
+pub(super) fn row_step_id() -> egui::Id {
+    egui::Id::new("browse_play_row_step")
+}
+
+/// The game id of the focused Library card, kept for the controller layer.
+pub(super) fn focused_card_id() -> egui::Id {
+    egui::Id::new("browse_play_focused_card")
+}
+
+/// The egui control id of that card.
+pub(super) fn focused_card_control_id() -> egui::Id {
+    egui::Id::new("browse_play_focused_card_control")
+}
+
 /// Cached filter result so typing or scrolling never rescans the catalogue.
 #[derive(Default)]
 pub(super) struct BrowsePlayState {
+    /// The A-Z strip: where each letter first appears in the list shown, for
+    /// the list it was made from (address and length of the shown indices).
+    alpha: Option<(usize, usize, [Option<usize>; ALPHA_BUCKETS])>,
+    /// A jump asked for by the strip, applied by the shelf in the same pass.
+    alpha_jump: Option<usize>,
+    /// The game to focus once the shelf has drawn it (after a jump).
+    focus_game: Option<i64>,
+    /// The card holding keyboard focus this frame: (control, game id).
+    focused_card: Option<(egui::Id, i64)>,
+    /// Where the shelf's scrolling viewport was drawn last frame.
+    pub(super) shelf_rect: Option<egui::Rect>,
     key: Option<FilterKey>,
     indices: Arc<Vec<usize>>,
     applied_generation: Option<u64>,
@@ -94,10 +186,13 @@ pub(super) struct BrowsePlayState {
     settling: Option<(i64, f64)>,
     /// Games whose readiness check has finished positive. Filled only by the
     /// selection check; the Ready view never plans launches in bulk.
-    readiness: ReadinessCache,
+    pub(super) readiness: ReadinessCache,
     /// The readiness view of `indices`, rebuilt only when the base list or
     /// the cache changes: (base list address, cache version, filter, result).
     readiness_view: Option<ReadinessView>,
+    /// Games in the shown list missing the sort value:
+    /// (list address, list length, order, count).
+    sort_note: Option<(usize, usize, SortOrder, usize)>,
     /// Background checks for the games on screen.
     background: super::bg_readiness::Scheduler,
     /// The emulator-state snapshot the background checks run against, and the
@@ -109,6 +204,8 @@ pub(super) struct BrowsePlayState {
     /// Ids drawn this frame / last frame, nearest the top first.
     visible_now: Vec<i64>,
     visible: Vec<i64>,
+    /// The Surprise Me picker's filter, seeded generator and current pick.
+    pub(super) surprise: super::surprise_me::SurpriseState,
 }
 
 impl BrowsePlayState {
@@ -267,10 +364,10 @@ fn status_text(game: &Game, blue: bool) -> (&'static str, Color32) {
 
 /// Shown under Play in Blue (board `D10-GP-SelectVsPlay`).
 pub(super) const SELECT_VS_PLAY: &str =
-    "Clicking a cover only selects it. Play opens the launch-readiness check first.";
+    "Clicking a cover only selects it. Press Play to start the game when it is ready.";
 /// Preservation-only media has no launch route, so it gets this instead of
 /// a readiness check.
-const PRESERVATION_ONLY_SENTENCE: &str = "A recording of a play session, kept for \
+pub(super) const PRESERVATION_ONLY_SENTENCE: &str = "A recording of a play session, kept for \
      preservation. EmuWiz has no verified replay workflow, so Play is not offered.";
 
 /// One sentence that says what Play will do for this game.
@@ -280,9 +377,9 @@ fn readiness_sentence(game: &Game) -> &'static str {
     } else if game.identity_summary() == "Mismatch" {
         "Game identity evidence conflicts. Review it before play."
     } else if game.identified {
-        "Play checks that everything is ready first. Nothing starts until you confirm."
+        "Play starts this game when it is ready."
     } else if game.platform != super::library::UNKNOWN_PLATFORM {
-        "The platform is recognised. Check a suitable catalogue to identify the exact game."
+        "Play checks that this game can start, then starts it. Catalogue (DAT) verification is optional."
     } else {
         "More platform evidence is needed. Assign the platform or review the source folder."
     }
@@ -367,14 +464,18 @@ impl App {
         // view switch never sit flush against the window edge.
         let page_width = ui.available_width() - theme::SPACE_MD;
 
-        self.browse_play_toolbar(ui);
+        let sort_in_toolbar = self.browse_play_toolbar(ui);
         self.browse_play_scope_bar(ui);
         self.batch_selection
             .retain(|id| library.by_id.contains_key(&id));
         self.browse_play_batch_controls(ui, &library);
         ui.add_space(theme::SPACE_XS);
-        self.browse_play_systems(ui, &library);
+        self.browse_play_systems(ui, &library, !sort_in_toolbar);
         let indices = self.browse_play_indices();
+        self.library_selection_shortcuts(ui.ctx(), &indices);
+        self.browse_play_sort_note(ui, &library, &indices);
+        self.library_selection_bar(ui, &indices);
+        self.library_selection_claim_escape(ui.ctx());
         let blue = theme::blue_profile(ui);
         self.browse_play_background(ui.ctx(), blue);
         ui.add_space(theme::SPACE_XS);
@@ -421,6 +522,7 @@ impl App {
         }
         self.browse_play_batch_window(ui.ctx());
         self.collection_dialogs(ui.ctx());
+        self.surprise_me_window(ui.ctx());
     }
 
     fn browse_play_batch_controls(&mut self, ui: &mut egui::Ui, library: &super::library::Library) {
@@ -428,7 +530,11 @@ impl App {
             return;
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label(format!("{} / 25 selected", self.batch_selection.len()));
+            ui.label(format!(
+                "{} / 25 selected for artwork",
+                self.batch_selection.len()
+            ))
+            .on_hover_text(SELECT_FOR_ARTWORK_HINT);
             if ui
                 .add_enabled(
                     self.batch_selection.len() > 0 || self.batch_state.active(),
@@ -455,6 +561,16 @@ impl App {
                 self.batch_selection.clear();
             }
         });
+        if self.batch_selecting {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(ARTWORK_PICKER_PURPOSE)
+                        .size(theme::METADATA_SIZE)
+                        .color(theme::SECONDARY_TEXT),
+                )
+                .wrap(),
+            );
+        }
         if let Some(message) = &self.batch_message {
             ui.colored_label(ui.visuals().error_fg_color, message);
         }
@@ -515,12 +631,12 @@ impl App {
 
     /// The games matching the current search and system. Recomputed only when
     /// the filter or the library changes.
-    fn browse_play_indices(&mut self) -> Arc<Vec<usize>> {
+    pub(super) fn browse_play_indices(&mut self) -> Arc<Vec<usize>> {
         let key = (
             self.filter.platform.clone(),
             self.filter.search.trim().to_lowercase(),
             (self.filter.readiness, self.filter.cache_aware),
-            self.filter.unverified_only,
+            (self.filter.unverified_only, self.filter.sort),
             Arc::as_ptr(&self.library) as usize,
             self.collections
                 .scoped()
@@ -598,30 +714,27 @@ impl App {
         view
     }
 
-    /// Keep the background readiness checks in step with what is on screen.
-    /// Blue only. Never selects a game, loads evidence for the details panel,
-    /// or starts any scan; it waits until the foreground has finished them.
-    fn browse_play_background(&mut self, context: &egui::Context, blue: bool) {
-        if !blue {
-            return;
-        }
+    /// Drop every readiness answer whose inputs moved: the library snapshot
+    /// (disc sets, catalogue rows) or what the checks read (emulator scans,
+    /// BIOS evidence, emulator choice, settings). Until a game has been
+    /// selected once, no scan has run and there is nothing to check against.
+    fn sync_readiness_freshness(&mut self) {
         let state = &mut self.browse_play;
-        // The library snapshot (and so every disc-set decision) changed: games
-        // held back for want of it are looked at again.
         let generation = self
             .native_workflows
             .as_ref()
             .map(|w| w.database_generation());
         state.note_database_generation(generation);
-        // What the checks read changed (emulator scans, settings): drop
-        // everything decided under the old state.
-        // Until a game has been selected once, no scan has run and there is
-        // nothing to check against.
         let readiness = self
             .native_workflows
             .as_ref()
             .map(|w| w.emulator_readiness());
-        let signature = readiness.and_then(super::bg_readiness::EnvSnapshot::signature);
+        // One signature, and one reuse window for its expensive part, shared
+        // with the selected game's drawn launch input.
+        let signature = self
+            .native_workflows
+            .as_ref()
+            .and_then(|w| w.environment_signature(std::time::Instant::now()));
         if state.env_signature != signature {
             state.env_signature = signature;
             state.background.invalidate();
@@ -629,6 +742,36 @@ impl App {
             state.env =
                 signature.zip(readiness.and_then(super::bg_readiness::EnvSnapshot::capture));
         }
+    }
+
+    /// Record a launch check another screen (Game Details, Setup & Doctor,
+    /// Big Picture) just showed for `game` in the Library's one readiness
+    /// cache, so the Ready view agrees with it. Freshness is checked first,
+    /// so the answer is stored against the inputs it was taken under; a
+    /// checking, stale or partial answer forgets the game (Not checked).
+    /// Preservation-only media gets no launch check here, as in the Library.
+    pub(super) fn note_checked_readiness(
+        &mut self,
+        game: &Game,
+        view: &super::launch_readiness_summary::CompactReadiness,
+    ) {
+        if game.is_preservation_only() {
+            return;
+        }
+        self.sync_readiness_freshness();
+        let result = CheckedReadiness::from_compact(view);
+        self.browse_play.readiness.record(game, result);
+    }
+
+    /// Keep the background readiness checks in step with what is on screen.
+    /// Blue only. Never selects a game, loads evidence for the details panel,
+    /// or starts any scan; it waits until the foreground has finished them.
+    fn browse_play_background(&mut self, context: &egui::Context, blue: bool) {
+        if !blue {
+            return;
+        }
+        self.sync_readiness_freshness();
+        let state = &mut self.browse_play;
         for (id, outcome) in state.background.drain() {
             if let Some(game) = self.library.game(id) {
                 super::bg_readiness::record_outcome(&mut state.readiness, game, outcome);
@@ -659,7 +802,11 @@ impl App {
         }
     }
 
-    fn browse_play_toolbar(&mut self, ui: &mut egui::Ui) {
+    /// Returns whether the sort control was drawn here. A narrow window
+    /// stacks the toolbar, and the sort control then joins the view switch's
+    /// row, which has room, instead of wrapping the systems row onto a line
+    /// of its own and pushing the game panel down.
+    fn browse_play_toolbar(&mut self, ui: &mut egui::Ui) -> bool {
         // The view switch keeps its width; the search takes what is left and
         // shrinks before it can run over List/Grid. When even a small search
         // cannot share the row, the switch drops to its own row.
@@ -667,7 +814,12 @@ impl App {
         let pad = 2.0 * ui.spacing().button_padding.x;
         let gap = ui.spacing().item_spacing.x;
         let measure = |text: &str| super::title_fit::text_width(ui, text, &font) + pad;
-        let switch = measure("List") + measure("Grid") + measure("Done selecting") + 2.0 * gap;
+        // The artwork toggle is laid out at its narrowest labels; a longer
+        // one is shown only where the row has room left for it.
+        let toggle = measure("Done selecting").max(measure(SELECT_FOR_ARTWORK_SHORT));
+        let full_extra = (measure(SELECT_FOR_ARTWORK) - toggle).max(0.0);
+        let medium_extra = (measure(SELECT_FOR_ARTWORK_MEDIUM) - toggle).max(0.0);
+        let switch = measure("List") + measure("Grid") + toggle + measure(BIG_PICTURE) + 3.0 * gap;
         let clear = if self.filter.search.is_empty() {
             0.0
         } else {
@@ -684,8 +836,21 @@ impl App {
             0.0
         };
         let available = ui.available_width();
-        let search = (available - switch - clear - attention - gap).min(300.0);
+        let room = available - switch - clear - attention - gap;
+        let search = room.min(300.0);
         let stacked = search < SEARCH_MIN_WIDTH;
+        // On one row a longer artwork label may take width from the search,
+        // never below the search's minimum.
+        let artwork_in_row = artwork_label_for(room, full_extra, medium_extra, SEARCH_MIN_WIDTH);
+        let search = if stacked {
+            search
+        } else {
+            match artwork_in_row {
+                ArtworkLabel::Full => (room - full_extra).min(300.0),
+                ArtworkLabel::Medium => (room - medium_extra).min(300.0),
+                ArtworkLabel::Short => search,
+            }
+        };
         let search = if stacked {
             (available - clear - gap).clamp(SEARCH_MIN_WIDTH.min(available), 300.0)
         } else {
@@ -737,12 +902,13 @@ impl App {
             view_toggle(ui, &mut this.filter.list, true, "List");
         };
         ui.horizontal(|ui| {
-            ui.add_sized(
+            let field = ui.add_sized(
                 [search, 34.0],
                 egui::TextEdit::singleline(&mut self.filter.search)
                     .hint_text("Search by title or system")
                     .desired_width(search),
             );
+            super::pad_shell::mark_suggestions(&field);
             if !self.filter.search.is_empty() && ui.button("Clear").clicked() {
                 self.filter.search.clear();
             }
@@ -751,7 +917,8 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     view_toggle(ui, &mut self.filter.list, true, "List");
                     view_toggle(ui, &mut self.filter.list, false, "Grid");
-                    self.browse_play_selection_toggle(ui);
+                    self.browse_play_selection_toggle(ui, artwork_in_row);
+                    self.big_picture_button(ui);
                 });
             }
         });
@@ -759,7 +926,12 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 attention_filter(self, ui);
                 view_switch(self, ui);
-                self.browse_play_selection_toggle(ui);
+                // The very narrow layout: the short label keeps Big Picture
+                // and the Sort box on this row. The full name is announced on
+                // focus and the picker states its purpose once open.
+                self.browse_play_selection_toggle(ui, ArtworkLabel::Short);
+                self.big_picture_button(ui);
+                self.browse_play_sort_control(ui);
             });
         }
         if blue
@@ -779,22 +951,183 @@ impl App {
                 .wrap(),
             );
         }
+        stacked
     }
 
-    fn browse_play_selection_toggle(&mut self, ui: &mut egui::Ui) {
+    /// The sort control. It sits at the end of the systems row (or of the
+    /// stacked toolbar's second row), so it adds no row of its own: when the full "Sort: …" label
+    /// does not fit on what is left of the row, a short "Sort" box takes its
+    /// place and names the current order on hover.
+    fn browse_play_sort_control(&mut self, ui: &mut egui::Ui) {
+        // Inside a collection its own order (scope bar) applies instead.
+        if self.collections.scoped().is_some() {
+            return;
+        }
+        let full = sort_button_text(self.filter.sort);
+        // A combo box asks the row only for the space left on it, so the
+        // wrapping row never moves it down and its label runs off the edge.
+        // Claiming the label's width first lets the row place it.
+        let spacing = ui.spacing();
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let icon = spacing.icon_spacing + spacing.icon_width;
+        let pad = spacing.button_padding.x;
+        let combo_width = spacing.combo_width;
+        let height = spacing.interact_size.y;
+        let remaining = ui.available_rect_before_wrap().width();
+        let full_width =
+            (super::title_fit::text_width(ui, &full, &font) + icon + 2.0 * pad).max(combo_width);
+        // The short box also trims its side padding: on a narrow Blue window
+        // that is what keeps it on the row instead of wrapping it.
+        let (text, width, pad) = if full_width <= remaining {
+            (full, full_width, pad)
+        } else {
+            let short_pad = pad.min(SORT_SHORT_PAD);
+            let width = (super::title_fit::text_width(ui, SORT_SHORT_LABEL, &font)
+                + icon
+                + 2.0 * short_pad)
+                .ceil();
+            (SORT_SHORT_LABEL.to_owned(), width, short_pad)
+        };
+        let hover = format!(
+            "{}. {}",
+            sort_button_text(self.filter.sort),
+            self.filter.sort.hint()
+        );
+        ui.allocate_ui(egui::vec2(width, height), |ui| {
+            ui.spacing_mut().button_padding.x = pad;
+            egui::ComboBox::from_id_salt("library_sort")
+                .selected_text(text)
+                .width(width)
+                .wrap_mode(egui::TextWrapMode::Extend)
+                .show_ui(ui, |ui| {
+                    for choice in SortOrder::ALL {
+                        ui.selectable_value(&mut self.filter.sort, choice, choice.label())
+                            .on_hover_text(choice.hint());
+                    }
+                })
+                .response
+                .on_hover_text(hover);
+        });
+    }
+
+    /// When the list is sorted by a value some shown games lack, says how
+    /// many, so a block of them at the end is explained. Nothing is drawn
+    /// otherwise. The count is made once per list.
+    fn browse_play_sort_note(
+        &mut self,
+        ui: &mut egui::Ui,
+        library: &super::library::Library,
+        indices: &Arc<Vec<usize>>,
+    ) {
+        let sort = self.filter.sort;
+        let Some(noun) = sort.missing_noun() else {
+            return;
+        };
+        if self.collections.scoped().is_some() {
+            return;
+        }
+        let key = (Arc::as_ptr(indices) as usize, indices.len(), sort);
+        let missing = match self.browse_play.sort_note {
+            Some((k0, k1, k2, count)) if (k0, k1, k2) == key => count,
+            _ => {
+                let count = library.missing_sort_value(indices, sort);
+                self.browse_play.sort_note = Some((key.0, key.1, key.2, count));
+                count
+            }
+        };
+        if let Some(note) = sort_missing_note(missing, indices.len(), noun) {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(note)
+                        .size(theme::METADATA_SIZE)
+                        .color(theme::SECONDARY_TEXT),
+                )
+                .wrap(),
+            );
+        }
+    }
+
+    fn big_picture_button(&mut self, ui: &mut egui::Ui) {
         if ui
-            .button(if self.batch_selecting {
-                "Done selecting"
-            } else {
-                "Select games"
-            })
+            .button(BIG_PICTURE)
+            .on_hover_text("Browse and launch from the sofa with a controller")
             .clicked()
         {
+            self.enter_big_picture(ui.ctx());
+        }
+    }
+
+    fn browse_play_surprise_button(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .button(SURPRISE_ME)
+            .on_hover_text("Pick a random game from your library")
+            .clicked()
+        {
+            self.open_surprise_me();
+        }
+    }
+
+    fn browse_play_verify_button(&mut self, ui: &mut egui::Ui) {
+        let hint = if self.filter.platform.is_empty() {
+            "Check your games against trusted catalogues. Opens Check Games; no game file is read until you preview and confirm.".to_string()
+        } else {
+            format!(
+                "Check your {} games against trusted catalogues. Opens Check Games; no game file is read until you preview and confirm.",
+                self.filter.platform
+            )
+        };
+        if ui.button(VERIFY_GAMES).on_hover_text(hint).clicked() {
+            self.open_verify_games();
+        }
+    }
+
+    /// Navigation only: the existing Check Games page, on the system chosen in
+    /// the Library when there is one, otherwise on its platform list. That
+    /// page owns the summary, catalogue setup, Preview and confirmation.
+    pub(super) fn open_verify_games(&mut self) {
+        let platform = self.filter.platform.clone();
+        if platform.is_empty() {
+            self.check_platform = None;
+            self.verification = None;
+            self.go(Route::Section(Section::Check));
+        } else {
+            self.check_platform(platform);
+        }
+    }
+
+    /// The ScreenScraper artwork picker toggle, with the label that fits its
+    /// row. Keyboard focus and assistive tech always get the full name.
+    fn browse_play_selection_toggle(&mut self, ui: &mut egui::Ui, label: ArtworkLabel) {
+        let selecting = self.batch_selecting;
+        let response = ui
+            .button(if selecting {
+                "Done selecting"
+            } else {
+                label.text()
+            })
+            .on_hover_text(SELECT_FOR_ARTWORK_HINT);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                true,
+                if selecting {
+                    "Done selecting for artwork"
+                } else {
+                    SELECT_FOR_ARTWORK_NAME
+                },
+            )
+        });
+        if response.clicked() {
             self.batch_selecting = !self.batch_selecting;
         }
     }
 
-    fn browse_play_systems(&mut self, ui: &mut egui::Ui, library: &super::library::Library) {
+    fn browse_play_systems(
+        &mut self,
+        ui: &mut egui::Ui,
+        library: &super::library::Library,
+        with_sort: bool,
+    ) {
         let ordered: Vec<(String, usize)> = match self.collections.scoped() {
             Some(view) => view.platforms.clone(),
             None => {
@@ -848,7 +1181,9 @@ impl App {
                     .selected_text(format!("More systems ({})", rest.len()))
                     // A known width lets the wrapping row place it instead of overflowing.
                     .width(190.0)
-                    .height(360.0)
+                    // Tall enough for the whole list but never taller than the
+                    // window, so the menu is not cut off on short screens.
+                    .height((ui.ctx().screen_rect().height() * 0.75).clamp(160.0, 720.0))
                     .show_ui(ui, |ui| {
                         for (name, count) in rest {
                             if ui
@@ -863,9 +1198,30 @@ impl App {
                         }
                     });
             }
+            self.browse_play_verify_button(ui);
+            self.browse_play_surprise_button(ui);
+            if with_sort {
+                self.browse_play_sort_control(ui);
+            }
         });
         if let Some(platform) = chosen {
-            self.filter.select_platform(platform);
+            self.choose_system(platform);
+        }
+    }
+
+    /// Applies a system chip. A selected game the new system hides is
+    /// deselected, so the panel never shows (for example) an Acorn Electron
+    /// game while the list is filtered to Acorn Archimedes.
+    pub(super) fn choose_system(&mut self, platform: String) {
+        self.filter.select_platform(platform);
+        if let Route::BrowsePlayGame(id) = self.router.current
+            && !self.filter.platform.is_empty()
+            && self
+                .library
+                .game(id)
+                .is_none_or(|game| game.platform != self.filter.platform)
+        {
+            self.go(Route::BrowsePlay);
         }
     }
 
@@ -976,6 +1332,7 @@ impl App {
             return;
         }
 
+        self.browse_play_alpha_strip(ui, library, indices);
         let reset = std::mem::take(&mut self.browse_play.reset_scroll);
         let list = self.filter.list;
         let scroll_height = ui.available_height().max(160.0);
@@ -1006,26 +1363,159 @@ impl App {
         if reset {
             area = area.vertical_scroll_offset(0.0);
         }
-        area.show_rows(ui, row_height, rows, |ui, range| {
-            for row in range {
-                let start = row * columns;
-                let end = (start + columns).min(indices.len());
-                ui.horizontal_top(|ui| {
-                    for position in start..end {
-                        let Some(game) = library.games.get(indices[position]) else {
-                            continue;
-                        };
-                        let selected = selected_id == Some(game.archive.id);
-                        if list {
-                            self.browse_play_list_row(ui, game, selected, &mut cover_note);
-                        } else {
-                            self.browse_play_card(ui, game, selected, card_width, &mut cover_note);
+        if let Some(position) = self.browse_play.alpha_jump.take() {
+            // Land on the letter's first game: scroll its row to the top and
+            // hand it keyboard/controller focus when it is drawn.
+            let row = (position / columns) as f32;
+            area = area.vertical_scroll_offset(row * (row_height + spacing.y));
+            self.browse_play.focus_game = indices
+                .get(position)
+                .and_then(|i| library.games.get(*i))
+                .map(|game| game.archive.id);
+        }
+        // Virtualised like `show_rows` (which already draws one row below the
+        // viewport), plus one row ABOVE it: a controller move to the row above
+        // the first visible one must find a card there, or it escapes to the
+        // controls over the shelf instead of scrolling up.
+        self.browse_play.focused_card = None;
+        let row_step = row_height + spacing.y;
+        // A controller Up/Down on a card: move one grid row in the list shown
+        // (spatial search at the edge of a scrolling shelf would miss it).
+        if let Some(step) = ui.data_mut(|d| d.remove_temp::<i32>(row_step_id())) {
+            let current = ui.data(|d| d.get_temp::<i64>(focused_card_id()));
+            let position = current.and_then(|game| {
+                indices
+                    .iter()
+                    .position(|i| library.games.get(*i).is_some_and(|g| g.archive.id == game))
+            });
+            let target = position
+                .map(|p| p as isize + step as isize * columns as isize)
+                .filter(|t| *t >= 0 && (*t as usize) < indices.len());
+            match target.and_then(|t| library.games.get(indices[t as usize])) {
+                Some(game) => self.browse_play.focus_game = Some(game.archive.id),
+                None => ui.ctx().memory_mut(|m| {
+                    m.move_focus(if step < 0 {
+                        egui::FocusDirection::Up
+                    } else {
+                        egui::FocusDirection::Down
+                    })
+                }),
+            }
+        }
+        let shelf = area.show_viewport(ui, |ui, viewport| {
+            ui.set_height((row_step * rows as f32 - spacing.y).max(0.0));
+            let first = ((viewport.min.y / row_step).floor().max(0.0) as usize).saturating_sub(1);
+            let mut last = (viewport.max.y / row_step).ceil() as usize + 1;
+            let mut first = first;
+            if last > rows {
+                let span = last.saturating_sub(first);
+                last = rows;
+                first = rows.saturating_sub(span);
+            }
+            let top = ui.max_rect().top();
+            let band = egui::Rect::from_x_y_ranges(
+                ui.max_rect().x_range(),
+                (top + first as f32 * row_step)..=(top + last as f32 * row_step),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(band), |ui| {
+                ui.skip_ahead_auto_ids(first);
+                for row in first..last {
+                    let start = row * columns;
+                    let end = (start + columns).min(indices.len());
+                    ui.horizontal_top(|ui| {
+                        for position in start..end {
+                            let Some(game) = library.games.get(indices[position]) else {
+                                continue;
+                            };
+                            let selected = selected_id == Some(game.archive.id);
+                            if list {
+                                self.browse_play_list_row(
+                                    ui,
+                                    game,
+                                    selected,
+                                    indices,
+                                    &mut cover_note,
+                                );
+                            } else {
+                                self.browse_play_card(
+                                    ui,
+                                    game,
+                                    selected,
+                                    card_width,
+                                    indices,
+                                    &mut cover_note,
+                                );
+                            }
                         }
-                    }
-                });
+                    });
+                }
+            });
+        });
+        ui.data_mut(|d| match self.browse_play.focused_card {
+            Some((control, game)) => {
+                d.insert_temp(focused_card_id(), game);
+                d.insert_temp(focused_card_control_id(), control);
+            }
+            None => {
+                d.remove::<i64>(focused_card_id());
+                d.remove::<egui::Id>(focused_card_control_id());
             }
         });
+        self.browse_play.shelf_rect = Some(shelf.inner_rect);
         self.browse_play.cover_note = cover_note;
+    }
+
+    /// `#` and A-Z over the list shown: each letter jumps to its first game,
+    /// and a letter with no game is disabled (so the controller skips it). It
+    /// follows the current sort, filter and search because it is made from
+    /// the list the shelf is showing; it is rebuilt only when that list changes.
+    fn browse_play_alpha_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        library: &super::library::Library,
+        indices: &Arc<Vec<usize>>,
+    ) {
+        // Letters only mean something while the list is in title order.
+        if indices.len() < ALPHA_STRIP_MIN
+            || !matches!(self.filter.sort, SortOrder::TitleAsc | SortOrder::TitleDesc)
+        {
+            return;
+        }
+        let key = (Arc::as_ptr(indices) as usize, indices.len());
+        if self.browse_play.alpha.as_ref().map(|a| (a.0, a.1)) != Some(key) {
+            let mut first = [None; ALPHA_BUCKETS];
+            for (position, index) in indices.iter().enumerate() {
+                if let Some(game) = library.games.get(*index) {
+                    let slot = &mut first[bucket_for_title(&game.title)];
+                    if slot.is_none() {
+                        *slot = Some(position);
+                    }
+                }
+            }
+            self.browse_play.alpha = Some((key.0, key.1, first));
+        }
+        let first = self
+            .browse_play
+            .alpha
+            .as_ref()
+            .map(|a| a.2)
+            .unwrap_or_default();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (bucket, position) in first.iter().enumerate() {
+                let button = egui::Button::new(RichText::new(bucket_label(bucket)).strong())
+                    .min_size(egui::vec2(28.0, 28.0));
+                let response = ui
+                    .add_enabled(position.is_some(), button)
+                    .on_hover_text(format!("Jump to {}", bucket_label(bucket)));
+                if response.clicked()
+                    && let Some(position) = position
+                {
+                    self.browse_play.alpha_jump = Some(*position);
+                }
+            }
+        });
+        ui.add_space(theme::SPACE_XS);
     }
 
     /// "392 games matching "005" in Arcade" with one-click removal of each part.
@@ -1056,6 +1546,14 @@ impl App {
             {
                 self.filter.select_platform(String::new());
             }
+            if let Some((note, detail)) = retired_note(&self.library) {
+                ui.label(
+                    RichText::new(note)
+                        .size(theme::METADATA_SIZE)
+                        .color(theme::SECONDARY_TEXT),
+                )
+                .on_hover_text(detail);
+            }
             if let Some(note) = self.browse_play.cover_note.as_deref() {
                 ui.label(
                     RichText::new(format!("Some covers cannot load right now: {note}"))
@@ -1071,12 +1569,67 @@ impl App {
     /// shown. Pointer presses and the wheel never scroll it.
     fn reveal_keyboard_focus(ui: &egui::Ui, response: &egui::Response) {
         let pointer = ui.input(|input| input.pointer.any_pressed() || input.pointer.any_released());
-        if response.gained_focus() && !pointer {
-            ui.scroll_to_rect(response.rect, None);
+        // egui reports `gained_focus` for Tab but not for a directional
+        // (controller) move, so notice the change ourselves: the focused card
+        // is revealed once, in the pass that finds it newly focused.
+        let key = egui::Id::new("browse_play_revealed_card");
+        let revealed = ui.data(|d| d.get_temp::<egui::Id>(key));
+        if response.has_focus() {
+            if revealed != Some(response.id) {
+                ui.data_mut(|d| d.insert_temp(key, response.id));
+                if !pointer {
+                    ui.scroll_to_rect(response.rect, None);
+                }
+            }
+        } else if revealed == Some(response.id) {
+            ui.data_mut(|d| d.remove::<egui::Id>(key));
         }
     }
 
-    fn card_background(ui: &egui::Ui, rect: egui::Rect, selected: bool, response: &egui::Response) {
+    /// `selected` is the game open in the panel; `in_set` is a game in the
+    /// multi-select set. Both get the selected look; a set member's check mark
+    /// is painted by `paint_selection_mark` once the content is drawn.
+    fn card_background(
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        selected: bool,
+        in_set: bool,
+        response: &egui::Response,
+    ) {
+        Self::card_background_fill(ui, rect, selected || in_set, response);
+    }
+
+    /// The check mark of a multi-select set member, painted after the card's
+    /// content so the cover cannot hide it.
+    fn paint_selection_mark(ui: &egui::Ui, rect: egui::Rect, in_set: bool) {
+        if in_set {
+            let centre = selection_mark_rect(rect).center();
+            let painter = ui.painter();
+            painter.circle_filled(centre, 9.0, theme::primary_action_fill(ui));
+            let stroke = egui::Stroke::new(2.0_f32, egui::Color32::WHITE);
+            painter.line_segment(
+                [
+                    centre + egui::vec2(-4.5, 0.0),
+                    centre + egui::vec2(-1.0, 3.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    centre + egui::vec2(-1.0, 3.5),
+                    centre + egui::vec2(4.5, -3.5),
+                ],
+                stroke,
+            );
+        }
+    }
+
+    fn card_background_fill(
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        selected: bool,
+        response: &egui::Response,
+    ) {
         let hovered = response.hovered();
         let blue = theme::blue_profile(ui);
         let fill = if selected && blue {
@@ -1137,6 +1690,7 @@ impl App {
         game: &Game,
         selected: bool,
         card_width: f32,
+        list: &[usize],
         note: &mut Option<String>,
     ) {
         let id = game.archive.id;
@@ -1144,11 +1698,23 @@ impl App {
         ui.push_id(("v2_browse_play_game", id), |ui| {
             let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(card_width, CARD_HEIGHT), egui::Sense::click());
+            if self.browse_play.focus_game == Some(id) {
+                self.browse_play.focus_game = None;
+                response.request_focus();
+            }
+            if response.has_focus() {
+                self.browse_play.focused_card = Some((response.id, id));
+            }
             Self::reveal_keyboard_focus(ui, &response);
+            // Name the card for assistive tech and the controller layer.
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, game.title.clone())
+            });
             if !ui.is_rect_visible(rect) {
                 return;
             }
-            Self::card_background(ui, rect, selected, &response);
+            let in_set = self.library_selection.contains(id);
+            Self::card_background(ui, rect, selected, in_set, &response);
             let inner = rect.shrink(CARD_PAD);
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
@@ -1190,14 +1756,14 @@ impl App {
                 .wrap()
                 .selectable(false),
             );
+            // The star stays usable while games are multi-selected; it sits
+            // beside the selection tick, never under it.
             if !self.batch_selecting {
-                let star = egui::Rect::from_min_size(
-                    inner.right_top() - egui::vec2(28.0, 0.0),
-                    egui::vec2(28.0, 28.0),
-                );
-                let mut over_cover = child.new_child(egui::UiBuilder::new().max_rect(star));
+                let mut over_cover =
+                    child.new_child(egui::UiBuilder::new().max_rect(grid_star_rect(rect)));
                 self.favourite_star(&mut over_cover, id, &game.title);
             }
+            Self::paint_selection_mark(ui, rect, in_set);
             let response = response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(self.game_hover(game));
@@ -1216,9 +1782,19 @@ impl App {
                         .map(|limit| format!("Select no more than {limit} games."));
                 }
             } else if response.clicked() {
-                self.go(Route::BrowsePlayGame(id));
+                self.browse_play_row_clicked(ui, id, list);
             }
         });
+    }
+
+    /// A card or list row was clicked (or activated from the keyboard). Ctrl
+    /// and Shift change the multi-select set; a plain click opens the game
+    /// exactly as before and empties the set.
+    fn browse_play_row_clicked(&mut self, ui: &egui::Ui, id: i64, list: &[usize]) {
+        let modifiers = ui.input(|input| input.modifiers);
+        if !self.library_selection_click(id, modifiers, list) {
+            self.go(Route::BrowsePlayGame(id));
+        }
     }
 
     fn browse_play_list_row(
@@ -1226,6 +1802,7 @@ impl App {
         ui: &mut egui::Ui,
         game: &Game,
         selected: bool,
+        list: &[usize],
         note: &mut Option<String>,
     ) {
         let id = game.archive.id;
@@ -1235,11 +1812,23 @@ impl App {
                 egui::vec2(ui.available_width(), LIST_ROW_HEIGHT - 8.0),
                 egui::Sense::click(),
             );
+            if self.browse_play.focus_game == Some(id) {
+                self.browse_play.focus_game = None;
+                response.request_focus();
+            }
+            if response.has_focus() {
+                self.browse_play.focused_card = Some((response.id, id));
+            }
             Self::reveal_keyboard_focus(ui, &response);
+            // Name the card for assistive tech and the controller layer.
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, game.title.clone())
+            });
             if !ui.is_rect_visible(rect) {
                 return;
             }
-            Self::card_background(ui, rect, selected, &response);
+            let in_set = self.library_selection.contains(id);
+            Self::card_background(ui, rect, selected, in_set, &response);
             let inner = rect.shrink(CARD_PAD);
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
@@ -1272,9 +1861,11 @@ impl App {
                     .selectable(false),
                 );
             });
+            // Centred in the row, so below the selection tick in its corner.
             if !self.batch_selecting {
                 self.favourite_star(&mut child, id, &game.title);
             }
+            Self::paint_selection_mark(ui, rect, in_set);
             let response = response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(self.game_hover(game));
@@ -1293,7 +1884,7 @@ impl App {
                         .map(|limit| format!("Select no more than {limit} games."));
                 }
             } else if response.clicked() {
-                self.go(Route::BrowsePlayGame(id));
+                self.browse_play_row_clicked(ui, id, list);
             }
         });
     }
@@ -1515,6 +2106,7 @@ impl App {
         if details {
             this.go(Route::Game(id));
         }
+        this.surprise_retry_offer(ui, game);
         if !game.is_preservation_only() && !tight && theme::blue_profile(ui) {
             ui.add(
                 egui::Label::new(
@@ -1570,6 +2162,7 @@ impl App {
                     if ui.button("Clear search and system").clicked() {
                         self.filter = Filter {
                             list: self.filter.list,
+                            sort: self.filter.sort,
                             ..Default::default()
                         };
                     }
@@ -1591,9 +2184,82 @@ fn readiness_filter_hint(filter: ReadinessFilter) -> &'static str {
     }
 }
 
+/// How many records of removed library locations are not listed, and why.
+/// The records are kept; this only says they exist.
+pub(super) fn retired_note(library: &super::library::Library) -> Option<(String, String)> {
+    use archivefs_core::catalogue_supersession::Retirement;
+    if library.retired.is_empty() {
+        return None;
+    }
+    let count = |reason| {
+        library
+            .retired_reasons
+            .values()
+            .filter(|r| **r == reason)
+            .count()
+    };
+    Some((
+        format!(
+            "{} older records not listed: their library location was removed and the files are no longer there.",
+            thousands(library.retired.len())
+        ),
+        format!(
+            "Kept in the database, not deleted. {} have a file with the same name in your library that could not be confirmed as the same game; {} were not found in your library.",
+            thousands(count(Retirement::UnresolvedCopies)),
+            thousands(count(Retirement::NotFoundAnywhere))
+        ),
+    ))
+}
+
 /// Said under every readiness view that could be mistaken for a verdict on
 /// the whole library. Launch checks run for the game you select, so nothing
 /// here has assessed every game.
+/// The sort control's closed text when the row has no room for the order.
+const SORT_SHORT_LABEL: &str = "Sort";
+/// Side padding of the short sort box.
+const SORT_SHORT_PAD: f32 = 6.0;
+
+/// The sort control's closed text: says what it is, not just the order.
+/// Where a multi-selected card or row draws its tick: the top-right corner.
+fn selection_mark_rect(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 14.0, rect.top() + 14.0),
+        egui::vec2(18.0, 18.0),
+    )
+}
+
+/// A grid card's favourite star: over the cover, just left of the selection
+/// tick, so both stay visible and the star never moves when a game is selected.
+fn grid_star_rect(rect: egui::Rect) -> egui::Rect {
+    let mark = selection_mark_rect(rect);
+    egui::Rect::from_min_size(
+        egui::pos2(mark.left() - 1.0 - 28.0, rect.top() + CARD_PAD),
+        egui::vec2(28.0, 28.0),
+    )
+}
+
+fn sort_button_text(sort: SortOrder) -> String {
+    format!("Sort: {}", sort.label())
+}
+
+/// Plain note for games placed last because they lack the sorted value.
+pub(super) fn sort_missing_note(missing: usize, shown: usize, noun: &str) -> Option<String> {
+    if missing == 0 || shown == 0 {
+        return None;
+    }
+    if missing == shown {
+        return Some(format!(
+            "None of these {shown} games has a {} yet, so they stay in title order.",
+            noun.trim_start_matches("no ")
+        ));
+    }
+    Some(if missing == 1 {
+        format!("1 of {shown} games has {noun}; it is listed after the rest, by title.")
+    } else {
+        format!("{missing} of {shown} games have {noun}; they are listed after the rest, by title.")
+    })
+}
+
 fn readiness_filter_note(
     filter: ReadinessFilter,
     checked: usize,
@@ -1697,5 +2363,66 @@ mod classic_identity_status_tests {
         exact.mark_dat_exact(Some("DAT"));
         assert_eq!(exact.identity_summary(), "Mismatch");
         assert_eq!(exact.status(), "Identity conflict · review evidence");
+    }
+}
+
+#[cfg(test)]
+mod play_wording_tests {
+    use super::SELECT_VS_PLAY;
+    use crate::gui_v2::launch_readiness_summary::PLAY_RUNS_THE_CHECK;
+
+    /// Play launches directly now; no hint may still promise a detour through
+    /// a readiness page or a confirmation step.
+    #[test]
+    fn play_hints_do_not_describe_the_old_detour() {
+        for text in [
+            SELECT_VS_PLAY,
+            PLAY_RUNS_THE_CHECK,
+            crate::gui_v2::surprise_me::PLAY_NOTE,
+        ] {
+            let lower = text.to_lowercase();
+            assert!(!lower.contains("opens the"), "{text}");
+            assert!(!lower.contains("until you confirm"), "{text}");
+            assert!(!lower.contains("readiness check first"), "{text}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod favourite_star_placement_tests {
+    use eframe::egui;
+
+    use super::{
+        CARD_HEIGHT, CARD_PAD, COVER_HEIGHT, LIST_ROW_HEIGHT, grid_star_rect, selection_mark_rect,
+    };
+
+    /// Multi-selection draws a tick; the favourite star stays visible and
+    /// clickable beside it, on the cover, at every card width Blue uses.
+    #[test]
+    fn the_grid_star_never_sits_under_the_selection_tick() {
+        for width in [150.0_f32, 170.0, 200.0, 260.0] {
+            let card =
+                egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(width, CARD_HEIGHT));
+            let star = grid_star_rect(card);
+            let mark = selection_mark_rect(card);
+            assert!(!star.intersects(mark), "{width}: {star:?} {mark:?}");
+            let cover = egui::Rect::from_min_size(
+                card.min + egui::vec2(CARD_PAD, CARD_PAD),
+                egui::vec2(width - 2.0 * CARD_PAD, COVER_HEIGHT),
+            );
+            assert!(cover.contains_rect(star), "{width}: star leaves the cover");
+            assert!(card.contains_rect(mark));
+        }
+    }
+
+    /// A list row centres its star vertically; the tick sits in the top corner,
+    /// so even a 28-point star stays clear of it.
+    #[test]
+    fn the_list_star_is_centred_below_the_selection_tick() {
+        let row =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, LIST_ROW_HEIGHT));
+        let mark = selection_mark_rect(row);
+        let star_top = row.center().y - 14.0;
+        assert!(star_top > mark.bottom(), "{star_top} vs {}", mark.bottom());
     }
 }

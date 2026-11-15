@@ -10,10 +10,18 @@ use std::sync::OnceLock;
 
 // Schema 26 reviewed: nullable source-level DAT inventory digest only; no
 // archive dependencies or Undo deletion policy changes.
-// Schema 27 reviewed: game_collection_items names archive ids with no foreign
+// Schema 27 reviewed: two per-game record tables (replaced DAT evidence and
+// re-check notes). Neither has a foreign key or cascade. Both carry touch
+// triggers and are protected dependents in `check_import_undo`, so Undo is
+// refused for a game that has either and never deletes them.
+// Schema 28 reviewed: game_collection_items names archive ids with no foreign
 // key. A game kept in Favourites or a collection is a person's choice, so it
-// joins the protected dependencies below and Undo refuses that record.
-const REVIEWED_SCHEMA: i64 = 27;
+// is a protected dependency in `check_import_undo` (matched on the archive id
+// and created_at, so another game's membership never counts) and Undo refuses
+// that record and never deletes the membership. The id allocator in
+// `upsert_archive` also never reuses an id a membership still names. No touch
+// trigger: the blocker is re-read under the Undo transaction itself.
+const REVIEWED_SCHEMA: i64 = 28;
 const MAX_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BATCH: usize = crate::ingestion::saved_discovery::MAX_SELECTED;
 
@@ -536,6 +544,8 @@ impl Database {
             for table in [
                 "archive_scan_observations",
                 "library_dat_identities",
+                "library_dat_identity_history",
+                "dat_recheck_attempts",
                 "verified_identity_facts",
                 "screenscraper_enrichments",
                 "dat_set_audit_results",

@@ -100,6 +100,8 @@ class Base(M.MaintBase):
         self.approve()
         self.call("run")
         self.assertEqual(self.last_cycle()["outcome"], "RETIRED")
+        # the fixture's stray debug/UNKNOWN.txt holds the gate (UNRECOGNISED_RESIDUE) until reviewed
+        self.review_unrecognised(wt, t)
         self.assertEqual(self.m.worktree_gate(wt)["status"], "CLEAR")
         return self.last_cycle()
 
@@ -585,8 +587,8 @@ class PolicyState(Base):
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                  for op in ("enable", "disable", "enable", "disable", "enable", "disable")]
         for p in procs:
-            p.communicate()
-            self.assertEqual(p.returncode, 0)
+            _out, err = p.communicate()
+            self.assertEqual(p.returncode, 0, err.decode(errors="replace"))
         gens = [e["generation"] for e in self.events()]
         self.assertEqual(len(gens), len(set(gens)))
         self.assertEqual(gens, sorted(gens))

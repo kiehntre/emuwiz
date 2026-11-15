@@ -1,4 +1,4 @@
--- Migration 0027: Favourites and user-created game collections.
+-- Migration 0028: Favourites and user-created game collections.
 --
 -- Additive only: no existing table or row changes. Favourites is the one
 -- reserved collection, so both features share one model. Membership is user

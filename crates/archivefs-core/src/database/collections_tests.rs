@@ -25,6 +25,7 @@ fn fixture(files: &[&str]) -> Fixture {
         mount_root: temp.path().join("mount"),
         ratarmount_bin: "ratarmount".to_string(),
         master_rom_root: None,
+        configured_source_roots: None,
     };
     let mut database = Database::open_or_create(&db_path).unwrap();
     scan_and_persist(&mut database, &config, "test").unwrap();
@@ -410,4 +411,45 @@ fn a_collection_renamed_since_it_was_seen_is_left_alone() {
         f.database.load_game_collections().unwrap()[1].name,
         "Second"
     );
+}
+
+/// The scanner hands out max(id)+1. Once the highest row is forgotten, a new
+/// game must not be given the id a membership still names: within one second
+/// it could even share that row's created_at.
+#[test]
+fn the_scanner_never_reuses_an_id_a_membership_still_names() {
+    let mut f = fixture(&["a.zip", "z.zip"]);
+    let favourites_id = f.database.favourites_collection_id().unwrap();
+    let highest = f
+        .database
+        .load_archives()
+        .unwrap()
+        .iter()
+        .map(|archive| archive.id)
+        .max()
+        .unwrap();
+    f.database
+        .add_game_to_collection(favourites_id, highest)
+        .unwrap();
+    f.database
+        .connection
+        .execute_batch(&format!(
+            "DELETE FROM archive_scan_observations WHERE archive_id={highest}; \
+             DELETE FROM platform_assignments WHERE archive_id={highest}; \
+             DELETE FROM archives WHERE id={highest};"
+        ))
+        .unwrap();
+    // Its file is gone too, so the only new row is a different game.
+    let gone = f.database.load_game_collections().unwrap()[0].items[0]
+        .absolute_path
+        .clone();
+    fs::remove_file(&gone).unwrap();
+    fs::write(f.source.join("new.zip"), b"a different game").unwrap();
+    scan_and_persist(&mut f.database, &f.config, "test").unwrap();
+    let new_id = id_of(&f.database, "new.zip");
+    assert!(
+        new_id > highest,
+        "id {highest} named by a favourite was given to another game"
+    );
+    assert_eq!(favourites(&f.database), vec![(highest, None)]);
 }

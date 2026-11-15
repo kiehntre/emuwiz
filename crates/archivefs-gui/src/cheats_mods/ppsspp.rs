@@ -106,10 +106,12 @@ impl State {
                 self.notice = Some("Preview only; nothing installed.".into());
             }
             Ok(Message::Applied(r)) => {
-                self.notice = Some(format!(
+                let mut notice = format!(
                     "Install: {:?}; receipt: {:?}. Entries are disabled. Global settings unchanged; effectiveness untested.",
                     r.journal.status, r.journal_path
-                ));
+                );
+                crate::shared_apply_warnings::append(&mut notice, &r);
+                self.notice = Some(notice);
                 if r.journal.status != pm::SharedApplyStatus::Success || r.journal_failure.is_some()
                 {
                     self.error = Some(format!(

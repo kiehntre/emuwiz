@@ -42,7 +42,7 @@ use crate::dat::firmware_evidence::{
 
 use super::pcsx2_local::{
     Pcsx2BiosVerification, Pcsx2Config, Pcsx2GameInspection, Pcsx2GameRequest, Pcsx2Profile,
-    inspect_pcsx2_game,
+    inspect_pcsx2_config, inspect_pcsx2_game, pcsx2_global_config_path,
 };
 
 const HASH_CHUNK_BYTES: usize = 256 * 1024;
@@ -285,6 +285,40 @@ pub fn inspect_pcsx2_game_with_firmware_evidence(
         inspection,
         bios_verification,
     }
+}
+
+/// Only the BIOS answer of [`inspect_pcsx2_game_with_firmware_evidence`],
+/// for a profile with no particular game: the same global configuration and
+/// the same [`resolve_pcsx2_bios`], without the per-game settings and the
+/// cheat-file inventory the full inspection also reads. The launch planner
+/// asks this on every readiness refresh, so it must stay cheap.
+pub fn pcsx2_profile_bios_verification(
+    profile: &Pcsx2Profile,
+    firmware_evidence: &[FirmwareIdentityRecord],
+) -> Pcsx2BiosVerification {
+    let global_config =
+        inspect_pcsx2_config(&pcsx2_global_config_path(&profile.configuration_path));
+    resolve_pcsx2_bios(
+        &profile.configuration_path.join("bios"),
+        &global_config,
+        firmware_evidence,
+    )
+    .as_legacy_state()
+}
+
+/// The files [`pcsx2_profile_bios_verification`] reads its answer from: the
+/// two places the profile's global configuration can be (it may name the
+/// BIOS file), and its `bios` folder, whose direct entries are the
+/// candidates. A caller that keeps the answer can watch these paths, and the
+/// entries directly inside the folder, to learn when it has to ask again. A
+/// configured BIOS name that is not a plain file name in that folder (one
+/// with a subfolder, `..` or an absolute path in it) is not covered by that.
+pub fn pcsx2_profile_bios_inputs(profile: &Pcsx2Profile) -> Vec<PathBuf> {
+    vec![
+        profile.configuration_path.join("inis/PCSX2.ini"),
+        profile.configuration_path.join("PCSX2.ini"),
+        profile.configuration_path.join("bios"),
+    ]
 }
 
 #[cfg(test)]

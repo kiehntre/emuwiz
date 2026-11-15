@@ -294,6 +294,46 @@ fn a_card_replaced_immediately_before_publication_is_never_overwritten() {
 
 #[test]
 fn an_in_place_edit_after_the_final_recheck_is_detected_and_kept() {
+    // Another program edits the card in place right before publication. The
+    // kernel holds its open back (our lease breaks), the restore stops with
+    // nothing published, and the edit then lands on the untouched card.
+    let world = World::new();
+    let card = world.card.clone();
+    let inode = fs::metadata(&card).unwrap().ino();
+    let editor = std::cell::RefCell::new(None);
+    let result = world.apply_hooked(&CLOSED, &|step| {
+        if step == Ps2RestoreStep::BeforeRename {
+            let card = card.clone();
+            *editor.borrow_mut() = Some(std::thread::spawn(move || flip(&card, 12_345)));
+            let needle = format!(":{inode} ");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !fs::read_to_string("/proc/locks")
+                .unwrap_or_default()
+                .lines()
+                .any(|line| line.contains("BREAKING") && line.contains(&needle))
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the in-place edit never broke the publication lease"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        Ok(())
+    });
+    editor.take().unwrap().join().unwrap();
+    assert_eq!(result.unwrap_err(), Ps2PsuRestoreError::CardInUse);
+    let mut expected = world.original.clone();
+    expected[12_345] ^= 0xff;
+    assert_eq!(world.card_bytes(), expected);
+    assert!(world.stray_temp_files().is_empty());
+}
+
+#[test]
+fn without_leases_an_in_place_edit_is_caught_by_the_exchange_checks() {
+    // Systems without lease support: the edit lands, and the post-exchange
+    // identity/SHA-256 checks reverse publication and keep the edit.
+    card_lease::LEASES_DISABLED.with(|disabled| disabled.set(true));
     let world = World::new();
     let card = world.card.clone();
     let result = world.apply_hooked(&CLOSED, &|step| {
@@ -302,6 +342,7 @@ fn an_in_place_edit_after_the_final_recheck_is_detected_and_kept() {
         }
         Ok(())
     });
+    card_lease::LEASES_DISABLED.with(|disabled| disabled.set(false));
     assert_eq!(result.unwrap_err(), Ps2PsuRestoreError::CardChanged);
     let mut expected = world.original.clone();
     expected[12_345] ^= 0xff;
@@ -827,6 +868,7 @@ fn fake_proc(entries: &[(&str, &str, &str, Option<&Path>)]) -> tempfile::TempDir
         fs::create_dir_all(dir.join("fd")).unwrap();
         fs::write(dir.join("comm"), comm).unwrap();
         fs::write(dir.join("cmdline"), cmdline.replace(' ', "\0")).unwrap();
+        fs::write(dir.join("cgroup"), "0::/user.slice/user-1000.slice\n").unwrap();
         if let Some(target) = fd_target {
             std::os::unix::fs::symlink(target, dir.join("fd/7")).unwrap();
         }
@@ -865,11 +907,12 @@ fn the_proc_detector_distinguishes_closed_running_and_unknown() {
             "{comm}"
         );
     }
-    // Any process holding this card open, whatever its name.
+    // Any process holding this card open, whatever its name: refused, and
+    // reported as the card being in use, not as the emulator running.
     let holder = fake_proc(&[("300", "someapp", "someapp", Some(&world.card))]);
     assert_eq!(
         observe(holder.path(), &world.card),
-        EmulatorQuiescence::Running
+        EmulatorQuiescence::CardInUse
     );
     // Unreadable or missing /proc: cannot say.
     assert_eq!(
@@ -889,7 +932,8 @@ fn an_unreadable_process_of_our_own_user_makes_the_state_unknown() {
     let fd = proc.path().join("400/fd");
     fs::set_permissions(&fd, fs::Permissions::from_mode(0o000)).unwrap();
     assert_eq!(
-        observe(proc.path(), &world.card),
+        ProcScanQuiescence::with_root(proc.path().to_path_buf())
+            .observe(&ps2_card_binding(&world.card, "SAVE")),
         EmulatorQuiescence::Unknown
     );
     fs::set_permissions(&fd, fs::Permissions::from_mode(0o755)).unwrap();
@@ -971,5 +1015,7 @@ fn an_undo_target_replaced_at_the_last_instant_is_swapped_back_untouched() {
     );
 }
 
+#[path = "lease_regressions.rs"]
+mod lease_regressions;
 #[path = "review_regressions.rs"]
 mod review_regressions;

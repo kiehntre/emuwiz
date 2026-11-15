@@ -62,6 +62,55 @@ fn exact_match_has_working_proposal_provenance_and_no_mutation() {
     assert_eq!(fs::read(&outcome.dat_path).unwrap(), before_dat);
     assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
 }
+/// S03-02 / D3-02: rename review must not offer an eligible rename from
+/// cached hashes of bytes that were rewritten in place with the mtime restored.
+#[cfg(unix)]
+#[test]
+fn warm_cache_does_not_make_a_rewritten_file_eligible() {
+    let (root, _) = fixture("Example (USA)");
+    let cache = root.path().join("audit-cache.json");
+    let audit = || {
+        run_dat_audit_with_cache(
+            &DatAuditRequest {
+                source_id: "test".into(),
+                source_display_name: "Selected local DAT".into(),
+                dat_path: root.path().join("catalogue.dat"),
+                dat_kind: DatSourceKind::File,
+                scan_root: root.path().join("roms"),
+                limits: Default::default(),
+                policy: None,
+                platform: Some("nes".into()),
+            },
+            &TrustedRoots::none(),
+            &AtomicBool::new(false),
+            &|_| {},
+            AuditCacheConfig::At(cache.clone()),
+        )
+        .unwrap()
+    };
+    let warm = audit();
+    assert_eq!(
+        review(&warm).rows[0].disposition,
+        ReviewDisposition::Eligible
+    );
+
+    crate::dat::sources::audit_cache::rewrite_in_place_keeping_mtime(
+        &root.path().join("roms/old.nes"),
+        b"abd",
+    );
+
+    let after = audit();
+    assert_eq!(after.cache.cache_hits, 0, "stale hashes were reused");
+    let result = review(&after);
+    assert!(
+        result
+            .rows
+            .iter()
+            .all(|row| row.disposition != ReviewDisposition::Eligible && row.proposal.is_none()),
+        "{:?}",
+        result.rows
+    );
+}
 #[test]
 fn stale_catalogue_and_source_are_held() {
     let (_root, outcome) = fixture("Example");

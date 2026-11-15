@@ -783,10 +783,15 @@ pub(super) enum ToolPage {
     WhdloadOptions,
     OpticalCompare,
     SourceImpact,
+    ArcadeShelf,
+    Vita3kTitles,
+    OpenRct2,
+    FolderCheck,
+    Relocation,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 22] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
@@ -804,6 +809,11 @@ impl ToolPage {
         Self::WhdloadOptions,
         Self::OpticalCompare,
         Self::SourceImpact,
+        Self::ArcadeShelf,
+        Self::Vita3kTitles,
+        Self::OpenRct2,
+        Self::FolderCheck,
+        Self::Relocation,
     ];
 
     pub fn title(self) -> &'static str {
@@ -821,10 +831,15 @@ impl ToolPage {
             Self::WhdloadOptions => "WHDLoad ToolType review",
             Self::OpticalCompare => "Compare optical layouts",
             Self::SourceImpact => "Source-location impact preview",
-            Self::HomebrewBrowser => "Offline homebrew catalogue",
+            Self::HomebrewBrowser => "Homebrew",
             Self::NetplayPreview => "Netplay comparison",
             Self::HostDiagnostics => "Host capability diagnostics",
             Self::CheatExtras => "Providers and code previews",
+            Self::ArcadeShelf => "Virtual Arcade Shelf",
+            Self::Vita3kTitles => "PlayStation Vita (Vita3K) titles",
+            Self::OpenRct2 => "RollerCoaster Tycoon 2 via OpenRCT2 (alternative)",
+            Self::FolderCheck => "Organise my games",
+            Self::Relocation => "Move a game between library folders",
         }
     }
 
@@ -858,7 +873,7 @@ impl ToolPage {
                 "Preview one library source at a new folder without relocating anything."
             }
             Self::HomebrewBrowser => {
-                "Search a local catalogue and review dated claims without acquiring games."
+                "Browse homebrew titles offline, or look up a GitHub repository's releases on request. Nothing is downloaded."
             }
             Self::NetplayPreview => {
                 "Compare two manually supplied peer observations without connecting."
@@ -868,6 +883,21 @@ impl ToolPage {
             }
             Self::CheatExtras => {
                 "Licences for open and local cheat providers, and read-only code previews."
+            }
+            Self::ArcadeShelf => {
+                "Browse your covers on one shelf per system, then open Game Details for any game."
+            }
+            Self::Vita3kTitles => {
+                "Start a title that is already installed in Vita3K; EmuWiz installs and changes nothing."
+            }
+            Self::OpenRct2 => {
+                "Play RollerCoaster Tycoon 2 with an OpenRCT2 you installed, using your own game folder; nothing is installed or copied."
+            }
+            Self::FolderCheck => {
+                "Identify every game by its content, then move games in the wrong system folder (or with no known system) after one preview and approval. Undo puts them back."
+            }
+            Self::Relocation => {
+                "Preview moving one game file to another library folder or drive, and see every recorded move with its true recovery state. Moving is disabled in this build."
             }
         }
     }
@@ -891,6 +921,11 @@ impl ToolPage {
             Self::NetplayPreview => Section::Launch,
             Self::HostDiagnostics => Section::Setup,
             Self::CheatExtras => Section::Mods,
+            Self::ArcadeShelf => Section::Games,
+            Self::Vita3kTitles => Section::Games,
+            Self::OpenRct2 => Section::Games,
+            Self::FolderCheck => Section::Games,
+            Self::Relocation => Section::Games,
         }
     }
 
@@ -912,6 +947,11 @@ impl ToolPage {
             Self::NetplayPreview => "Games & collection",
             Self::HostDiagnostics => "Tools",
             Self::CheatExtras => "Enhance",
+            Self::ArcadeShelf => "Games & collection",
+            Self::Vita3kTitles => "Games & collection",
+            Self::OpenRct2 => "Games & collection",
+            Self::FolderCheck => "Games & collection",
+            Self::Relocation => "Games & collection",
         }
     }
 }
@@ -933,6 +973,8 @@ pub(super) enum Route {
     /// The platform-first Check My Games flow for one canonical platform, so
     /// the destination already knows which platform the person came from.
     PlatformCheck(String),
+    /// Game Details' one-game DAT check: reads and saves only this game.
+    GameCheck(i64),
     /// Read-only comparison of the files in the game folders with the catalogue.
     LibraryFiles,
     /// A native page for a former legacy-only tool.
@@ -955,6 +997,7 @@ impl Route {
             Self::ReviewIdentity(_) => Section::Check,
             Self::QuickRename => Section::Dat,
             Self::PlatformCheck(_) => Section::Check,
+            Self::GameCheck(_) => Section::Check,
             Self::LibraryFiles => Section::Problems,
             Self::Tool(tool) => tool.home(),
         }
@@ -962,7 +1005,10 @@ impl Route {
     pub fn game(&self) -> Option<i64> {
         match self {
             Self::BrowsePlayGame(id) => Some(*id),
-            Self::Game(id) | Self::ReviewIdentity(id) | Self::Task { game: id, .. } => Some(*id),
+            Self::Game(id)
+            | Self::ReviewIdentity(id)
+            | Self::GameCheck(id)
+            | Self::Task { game: id, .. } => Some(*id),
             _ => None,
         }
     }
@@ -973,6 +1019,7 @@ impl Route {
             Self::BrowsePlayGame(_) => Self::BrowsePlayGame(new),
             Self::Game(_) => Self::Game(new),
             Self::ReviewIdentity(_) => Self::ReviewIdentity(new),
+            Self::GameCheck(_) => Self::GameCheck(new),
             Self::Task { section, .. } => Self::Task {
                 section: *section,
                 game: new,
@@ -1004,12 +1051,19 @@ pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<
     if let Route::PlatformCheck(platform) = route {
         return vec!["Check Games".into(), platform.clone()];
     }
-    if matches!(route, Route::ReviewIdentity(_)) {
+    if matches!(route, Route::ReviewIdentity(_) | Route::GameCheck(_)) {
         let mut labels = vec!["Games".to_string()];
         if let Some(game_title) = game_title.filter(|title| !title.trim().is_empty()) {
             labels.push(game_title.to_string());
         }
-        labels.push("Review identity".to_string());
+        labels.push(
+            if matches!(route, Route::GameCheck(_)) {
+                "Check this game"
+            } else {
+                "Review identity"
+            }
+            .to_string(),
+        );
         return labels;
     }
     if matches!(route, Route::Game(_)) {

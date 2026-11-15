@@ -18,12 +18,7 @@ pub(super) enum Action {
 impl Action {
     fn label(self) -> &'static str {
         match self {
-            Self::Verification(VerificationAction::SelectDat | VerificationAction::Validate) => {
-                "Choose DAT"
-            }
-            Self::Verification(VerificationAction::Audit) => "Verify",
-            Self::Verification(VerificationAction::Recheck) => "Re-check",
-            Self::Verification(VerificationAction::Review) => "Review Identity",
+            Self::Verification(action) => action.label(),
             Self::FindMissingFile => "Find Missing File",
             Self::RepairReview => "Repair Review",
         }
@@ -123,7 +118,12 @@ impl super::super::App {
                 self.open_identification_data(id, &game.platform);
                 return;
             }
-            _ => {}
+            Action::Verification(_) => {
+                // A game with no known system opens Check Games on its system
+                // list, not on a system chosen there earlier.
+                self.go_verification(action.route(&game));
+                return;
+            }
         }
         self.go(action.route(&game));
     }

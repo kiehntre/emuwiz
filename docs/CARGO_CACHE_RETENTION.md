@@ -87,6 +87,98 @@ device holding the target root; other devices are reported separately. `status` 
 protected targets that stop further reduction. Active or protected caches are never
 evicted.
 
+## Who may authorise a deletion (2026-11-12)
+
+There are two modes.
+
+**Routine retirement (hands-off; `emuwiz-cargo-maintain run`, executor `--routine`).** No signature is needed.
+It is limited to what every existing safety gate accepts:
+- cargo-iso-participating caches, released by `--finish-task`, idle, not pinned or held;
+- a live privileged process census with no users, writers, open files or maps;
+- fresh lifecycle-lock and identity checks immediately before each deletion;
+- the worktree's HEAD merged into main (origin/main when present), with the checkout clean and its history preserved (`SOURCE_NOT_MERGED`, `SOURCE_HISTORY_UNPRESERVED`).
+
+A finished task alone is never enough.
+- Selection starts when usage exceeds the policy soft budget (recommended 160 GiB), or when free space drops below the trigger.
+- Cycles are bounded by the policy caps (recommended 10 targets / 60 GB; the executor hard-caps routine cycles at 10 targets).
+- A routine cycle stops at the first target that is not fully RETIRED at execution time, and reports it.
+- It refuses every exceptional option: maintenance window, adoption, journal resume, orphan or source-less caches.
+- It never removes worktrees or branches.
+
+The unit runs this routine cycle. It exits 75 while the policy is DISABLED, and timers stay disabled until the owner approves activation.
+
+**Exceptional retirement (owner-signed).** Every other `--execute` needs two separate things:
+
+1. **A scoped-run record.** This is accident protection only. `emuwiz-cargo-maintain request-retirement --only NAME... | --manifest FILE` writes
+   `<registry>/maintenance[-inst]/scoped-runs/scoped-<content-hash>.json`. It names:
+   - the operation, host and cache root;
+   - each canonical cache directory with its (device, inode);
+   - the manifest path and digest;
+   - an expiry of at most 24 h and a one-time nonce.
+
+   The executor refuses unless the manifest matches the record exactly: no extra, missing or substituted target, and the same identities now.
+   It consumes the record once (an O_EXCL marker, plus a nonce check against every journal) before anything is changed.
+   **Any process of this account can write a record, so a record proves nothing about consent.**
+2. **An owner signature over the record's exact bytes.** It is made off this machine:
+   `ssh-keygen -Y sign -n emuwiz-cargo-retire@1 -f <owner key> scoped-<id>.json`, which writes `scoped-<id>.json.sig` next to the record.
+   It is verified against `/etc/emuwiz/cargo-retire-allowed-signers` for principal `emuwiz-owner`.
+   That file must be root-owned all the way up, and the key line must carry `namespaces="emuwiz-cargo-retire@1,..."`.
+   Each receipt records the signer fingerprint and the digest of the signers file.
+
+   There is no command-line or environment override for an unprivileged run.
+   Without the signers file every execution is refused with `OWNER_SIGNERS_UNAVAILABLE`.
+   That is the state until the owner installs a public key.
+
+Refusal codes:
+- `SCOPED_RUN_REQUIRED`, `SCOPED_RUN_INVALID`, `SCOPED_RUN_WRONG_ROOT`, `SCOPED_RUN_MISMATCH`;
+- `SCOPED_RUN_IDENTITY_CHANGED`, `SCOPED_RUN_EXPIRED`, `SCOPED_RUN_REPLAYED`;
+- `OWNER_SIGNERS_UNAVAILABLE`, `OWNER_SIGNATURE_REQUIRED`, `OWNER_SIGNATURE_INVALID`.
+
+**Limitation.** While the agent account has `sudo NOPASSWD: ALL` (or is in the root-equivalent `docker`/`lxd` groups), an agent can become root.
+It can then replace the signers file or this code. Signature verification then makes a forged authorisation **detectable** but not **impossible**.
+To detect one, compare the receipt's `signer_fingerprint` and `signers_sha256` with your own key.
+Genuine enforcement needs the agent to run as an account that cannot become root and cannot write the signers file, the installed tools or the protected cache roots.
+See the privilege-migration plan in the audit ledger (2026-11-12-lifecycle-overhaul/PRIVILEGE-MIGRATION.md).
+
+Signed records expire after at most 6 hours. A signed execution must write its receipt in the instance's receipts directory.
+The gate re-verifies the owner signature whenever it relies on a signed receipt, so a stored "VERIFIED" is never trusted on its own.
+
+**Routine mode and the same-account limitation, honestly.** Routine retirement needs no consent, because it deletes only caches that are reproducible by construction: compiler output of finished, merged, preserved work, with no live user.
+An agent that runs a routine cycle itself can do nothing the timer could not do.
+The owner signature protects only the exceptional operations. While agents can become root, that protection is tamper-evident rather than enforced (see below).
+
+**Temporary enablement.** `--enable-for-cycle` (with `--only`) enables a DISABLED policy for that one cycle, routine or signed.
+It restores DISABLED in a `finally` block and on SIGTERM/SIGHUP/SIGINT; those signals are blocked across the enable step.
+If the process dies with SIGKILL or the machine loses power, the next maintenance command restores DISABLED, using the `temporary-enable.json` marker and its lock.
+If restoring fails, the cycle exits 70.
+
+**Self-test (harmless).** `emuwiz-cargo-retire --check-owner-signing [--selftest FILE]` is read-only.
+It checks the anchor and the key lines, and verifies `FILE.sig`, which must be made with `-n emuwiz-cargo-retire-selftest@1` over a file starting `EMUWIZ OWNER SIGNING SELF-TEST`.
+A self-test signature can never authorise a retirement, because it uses a different namespace.
+
+**Installation.** `scripts/emuwiz-cargo-stage-install --source <repo>/scripts (--selftest FILE | --without-owner-signing) [--owner USER]` is run by the owner, as root, in an approved deployment.
+`--owner` defaults to `$SUDO_USER`.
+
+Routine maintenance and the worktree checks and removal need no signature. Before a signers file exists, install with `--without-owner-signing`.
+Owner-signed exceptional retirement then stays unavailable: the executor refuses it with `OWNER_SIGNERS_UNAVAILABLE`.
+Once the signers file is installed, re-install with `--selftest`; `--without-owner-signing` is refused from then on.
+
+The installer refuses, leaving the installed version unchanged, when:
+- with `--selftest`, the signing check fails (it checks the source copy as the owner);
+- a maintenance timer is enabled or active, or a maintenance service is running;
+- the staged copy fails `verify-install`.
+
+It keeps `<install-dir>.rollback-<stamp>` and restores it automatically if the post-install check fails.
+
+**Historical attestation** (`attest-retirement`) records retirement *evidence* only for a receipt executed before this gate existed.
+It does this once per receipt, and only if the original receipt, journal and manifest still verify.
+It never authorises a deletion; the executor never reads it.
+The worktree gate uses it only to answer "was this retirement verified?", and every other condition is still checked.
+
+**rust-analyzer.** `scripts/emuwiz-rust-analyzer` sets `CARGO=scripts/emuwiz-ra-cargo`, which runs `cargo-iso --rust-analyzer` inside EmuWiz checkouts.
+That uses the same guard, lock and registry, with output in `<target>/rust-analyzer`, which retirement classifies like the target itself.
+It never builds into the worktree's own `target/`. The editor/plugin configuration is not changed by these scripts.
+
 ## Manifest-authorised retirement (`scripts/emuwiz-cargo-retire`)
 
 Dry run by default; deletes only with `--execute --approved-sha256 <digest> --receipt-dir DIR`.
@@ -231,13 +323,24 @@ worktree must stay until `worktree-check` reports CLEAR (artifacts retired with 
 receipt/journal, or none was ever created: no record of a cargo-iso build and an absent or empty cache
 directory). Missing artifacts alone prove nothing: they HOLD as `ARTIFACTS_MISSING_UNVERIFIED`. HOLD reasons: `NOT_RELEASED`, `OWNER_UNVERIFIED`, `COMPLETION_UNVERIFIED`,
 `WRITTEN_AFTER_RELEASE`, `AWAITING_RETIREMENT`, `ACTIVE`, `PINNED`, `PROTECTED_REMNANTS`,
-`SOURCE_MISSING`, `NO_LIFECYCLE_RECORD`, `RECEIPT_UNVERIFIED`, `ARTIFACTS_MISSING_UNVERIFIED`. The gate also holds on the checkout's own
+`SOURCE_MISSING`, `NO_LIFECYCLE_RECORD`, `RECEIPT_UNVERIFIED`, `ARTIFACTS_MISSING_UNVERIFIED`, `UNRECOGNISED_RESIDUE`. The gate also holds on the checkout's own
 Git state, because `git worktree remove` deletes its reflog, ORIG_HEAD, per-worktree refs and ignored files:
 `CHECKOUT_NOT_CLEAN`, `CHECKOUT_INDEX_UNVERIFIED`, `CHECKOUT_PATH_UNVERIFIED`, `GIT_WORKTREE_PROTECTED`,
 `GIT_HISTORY_NOT_PRESERVED`, `GIT_STATE_UNVERIFIED`. A commit counts as preserved only when a ref names it, so
 retain orphans under `refs/preservation/`. `--cargo-state-only` reports the Cargo half alone and never authorises
 removal. A path with no `.git` always holds, including one already removed correctly: the gate cannot
 tell that from a checkout that vanished while still registered, so check before removing, not after.
+
+`UNRECOGNISED_RESIDUE`: even with a verified retirement receipt, the gate is CLEAR only if the cache directory holds nothing
+but directories, Cargo's own empty lock files (`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`) and the preserved
+evidence directories (`emuwiz-test-env`, `tmp`, `history`, `undo`, `receipts`, `backups`, `audit-ledger`, directly under the
+cache or one to three levels down, where a profile directory lives; their contents are not inspected). Anything else (a
+standalone executable with no sibling `.d`, a stray or nested file, a symlink, a special file, another filesystem, an
+unreadable or oversized tree) is output retirement does not recognise and so can never retire; with the worktree gone it
+would be an orphan (`SOURCE_MISSING`) that no gate can release. The result carries `residue` (`items`, `bytes`, a few
+example paths) in `--json`. The check is read-only (`lstat`/directory listing only, symlinks never followed), is shared by the
+plain and `--cargo-state-only` paths, and never deletes or selects anything: review the files by hand, then re-check. Every
+earlier hold (`ACTIVE`, `PINNED`, `NOT_RELEASED`, `RECEIPT_UNVERIFIED`, ...) keeps its own reason.
 A release record alone never
 clears the gate or authorises deletion; releasing does not stop builds, remove pins or claim
 processes have exited. The release command takes the target's exclusive lifecycle lock and
@@ -314,7 +417,14 @@ A later wrapper build removes the release, including after successful retirement
 --max-gb N]` records a persistent, digest-protected, bounded policy (target root, owner labels,
 per-cycle limits; default idle delay 0 h, free reserve 100 GiB). It is **disabled** until `policy enable`, which writes a separate
 enable record bound to the policy digest plus a history event; the `enabled` flag inside the policy
-file is ignored, and re-approving requires a fresh enable. A malformed policy, one missing fields
+file is ignored, and re-approving requires a fresh enable. The policy carries a `schema` (currently 2); a
+policy approved under an older schema is invalid (fail closed, every cycle REFUSED with the reason) and must be
+approved again, because schema 2 widened what a cycle retires to post-retirement binary residue in a markerless
+`debug` profile, which an older approval never covered. Its old digest cannot be reused. After installing a
+schema-2 tool over a schema-1 policy, every timer cycle exits 1 (REFUSED) until the owner re-approves
+(`policy approve` leaves it DISABLED; enabling stays a separate step). A manifest run by hand through
+`emuwiz-cargo-retire` is different: its owner-approved digest covers exactly the paths it lists, so a residue
+path is retired only if that manifest names it. A malformed policy, one missing fields
 (`scope.kinds`, limits), one owned by an account other than the effective user or registry owner
 (root is not a wildcard), or a group/world-writable file or state directory fails closed. A generated
 manifest hash is never the authorisation: the manifest must name the live policy digest and only
@@ -328,6 +438,50 @@ it to the executor **without** `--maintenance-window-attested`, so legacy or
 non-participating targets stay held with an explanation. Incomplete journals are never
 auto-acknowledged. `status`, `plan`, `run --dry-run` and `history` report decisions, held reasons
 (actionable), reclaimed space and the last cleanup.
+
+**Free-space trigger (optional).** `--reserve-trigger-free-gib T` (T must not exceed
+`--reserve-free-gib R`) adds `limits.reserve_trigger_free_bytes`: the free-space reserve asks for
+nothing while free space is at or above T, and once it falls below T a cycle aims to restore R
+(`need = R - free`), still within the per-cycle caps, so it can take several cycles. Without it the
+trigger is R itself (the original behaviour); existing policies, and their digests, are unchanged.
+The soft budget remains a separate trigger: a cycle runs when either one asks for space.
+
+**A second target root (policy instance).** One policy covers one target root. For another root
+(e.g. `/mnt/nvme2/emuwiz-cargo-targets`, where `cargo-env.sh` sends builds) set
+`EMUWIZ_MAINTENANCE_INSTANCE=NAME` together with `EMUWIZ_TARGET_ROOT=<root>`. The instance keeps its
+own policy, enablement, history, manifests and receipts in `<registry>/maintenance-NAME/` over the
+same shared lifecycle registry (target records, pins and locks), so the two policies never share
+authority: each only plans targets directly under its own root (`OUTSIDE_POLICY_ROOT` otherwise),
+and an instance whose policy names a root other than `EMUWIZ_TARGET_ROOT` is invalid (fail closed).
+The default instance (no variable) is `<registry>/maintenance/`, unchanged. `units` run with both
+variables writes `emuwiz-cargo-maintain-NAME.service`/`.timer` carrying them and
+`ReadWritePaths=<registry> <root>` and `RequiresMountsFor=<root>` (a cycle never runs against an
+unmounted root). Commands that act for an instance (`policy`, `plan`, `status`, `run`, `history`,
+`admit`, and `emuwiz-cargo-retire --resolve-journal`/`--inspect-journal` for its journals) need the
+same two variables. Retirement evidence is found from the target itself: `worktree-check`,
+`task-complete` and `cargo-iso --finish-task` verify a target another instance retired using that
+instance's `maintenance-NAME/` evidence, accepted only when that directory's own valid policy
+covers the target's root, so a shell that sets only `EMUWIZ_TARGET_ROOT` works.
+
+Constraints: one policy per root (`policy approve` refuses a root another instance's policy already
+names, so the default policy cannot silently move to `/mnt/nvme2` from a shell that exports
+`EMUWIZ_TARGET_ROOT`); each instance must name `EMUWIZ_TARGET_ROOT` as its root; and the roots must
+be on **different filesystems**, because budgets count every registered target on the root's device
+(two roots on one device would count each other's bytes). `--only NAME` resolves the basename across
+both roots; if the same worktree built into both, the home item is chosen and an instance's `--only`
+refuses (fail closed). Unknown free space never requests cleanup (the budget still applies).
+
+Owner-approved /mnt/nvme2 numbers (180 GiB cache budget; clean below 240 GiB free, restore 260 GiB;
+3 targets / 20 GB per cycle). `--soft-gb` is decimal GB, so 180 GiB is 193.274 GB; the hard budget
+only drives the advisory admission note and must exceed the soft one:
+
+```
+EMUWIZ_MAINTENANCE_INSTANCE=nvme2 EMUWIZ_TARGET_ROOT=/mnt/nvme2/emuwiz-cargo-targets \
+  emuwiz-cargo-maintain policy approve --owners davedap --soft-gb 193.274 --hard-gb 214.748 \
+  --reserve-free-gib 260 --reserve-trigger-free-gib 240 --max-targets 3 --max-gb 20
+```
+
+The build guards (`cargo-iso`/`emuwiz-cargo-guard`, `EMUWIZ_MIN_FREE_GB`) are separate and unchanged.
 
 ### Admission and the minimum-free guard (ADVISORY ONLY)
 `cargo-iso` calls `emuwiz-cargo-maintain admit` for a new or re-created (artifact-free) target.
@@ -558,7 +712,21 @@ recognise arbitrary content simply because its directory is named `incremental`.
 The planner can locate an orphan incremental unit in `debug`/`release`, including
 under a target triple, after `.fingerprint` and `deps` have been retired. Other
 profile/output classification (`deps`, `.fingerprint`, `build`, examples and
-executables with `.d` files) is unchanged. `tests`/`benches`, unknown files and
+executables with `.d` files) is unchanged. Post-retirement binary residue (Fix B) is the only addition:
+a file directly in a `debug` profile (or `<triple>/debug`) qualifies only if every condition below holds, freshly:
+- the profile is markerless: none of `.fingerprint`, `deps`, `build`, `examples` or `incremental` remains,
+  no leftover compiler file (`.d`, `.rlib`, `.rmeta`, `.so`, ...) sits in it, and it can be listed;
+- the name is Cargo-binary-shaped (letters, digits, `_`, `-`; no dot) and does not contain `journal`;
+- it is a regular file, executable, owned by this user, with exactly one link;
+- it starts with the ELF magic, read through an `O_NOFOLLOW` descriptor whose identity matches the `lstat`.
+
+The planner selects it as `post-retirement binary residue`. The executor re-applies the same predicate to the
+very `lstat` it compares with the manifest identity, so a reappeared, relinked or swapped file is held.
+Any directory directly under the cache whose name has three or more hyphen-separated parts is treated as a
+target triple, here as elsewhere in the tool.
+A changed, relinked, swapped or non-ELF file is held. `release` binaries are never selected this way, because
+they are the usual install and rollback source. A symlink, a script, a hard link, a suffixed name, or a binary
+beside remaining Cargo output stays unrecognised, so the residue gate keeps holding the worktree. `tests`/`benches`, unknown files and
 source/worktree/audit/evidence paths do not acquire a new classification. If
 incremental contents are unrecognised, planning preserves the profile's other
 outputs too, so it does not remove their markers and strand incremental output.
@@ -573,6 +741,23 @@ new or changed files stop retirement. For compiler hardlinks, a retained descrip
 proves the exact inode and unchanged content metadata when our own unlink advances
 ctime; other planned aliases receive that transition. Final-link block accounting
 remains separate from retained links. No generic `.bin` exception is introduced.
+
+**Ordering and resume (2026-11-05).** Compiler files in `incremental` may be hardlinks of
+files in `deps`/`build`. Unlinking those other names first drops the link count and advances
+the ctime that the incremental evidence records, so the tool's own earlier deletions looked
+like an external change (`INCREMENTAL_FILE_CHANGED`, PARTIAL). The executor therefore retires
+the `incremental` entry first within a group (other entries keep manifest order); a real
+external change is still refused. A PARTIAL run can still leave one crate directory with a
+session whose `.lock` was already unlinked, which the strict recogniser rejects as a whole.
+`emuwiz-cargo-retire --manifest M --approved-sha256 D --resume-journal J` re-runs the SAME
+approved manifest and accepts only that residue, only if J is the finished journal of that
+manifest on this host with one adjacent intent/outcome pair for the exact incremental path
+(same device/inode) ending PARTIAL / `INCREMENTAL_FILE_CHANGED`. Journals now list the lock files
+and session directories they unlinked (`removed_units`) and every mismatch must be named there;
+older journals (or a truncated list) attest exactly one session whose lock is missing, in one crate directory. The journal
+is not signed (it relies on the owner-only receipt directory); every other check still applies.
+The flag is ignored for any other path and refuses on any mismatch. It does not depend on where
+`EMUWIZ_TARGET_ROOT` points: identities are compared with the target's own device and inode.
 
 The non-Cargo route `bash scripts/test-cargo-retention.sh` includes realistic
 synthetic rustc layouts and interrupted sessions, lease/completion/owner/pin and
@@ -660,3 +845,51 @@ checkout's `.git`; anything else records no evidence and the route refuses.
 A build that finds no valid linked checkout at the recorded path removes any earlier `checkout` evidence (never paired with a newer
 HEAD); a non-UTF-8 registered worktree name is decoded with surrogateescape and cannot abort a run; git errors, non-zero exits and
 timeouts are `ORPHAN_REPO_UNVERIFIED`.
+
+### Owner-attested orphan route (`GIT_PRESERVED_ATTESTED`)
+
+A record without cargo-iso `checkout` evidence can never use `GIT_PRESERVED` (`ORPHAN_EVIDENCE_MISSING`).
+That covers builds made before evidence was recorded, and also builds where cargo-iso could not establish it,
+such as a main (non-linked) checkout or a broken gitdir back-link. For any such record, a manifest group may set
+`"orphan_route": "GIT_PRESERVED_ATTESTED"` with `"orphan_attestation": {"repo", "worktree", "head",
+"attested_by", "reason"}` (all non-empty strings). The attestation lives in the manifest whose digest the owner
+approves, so it is an owner decision bound to that exact list; it only nominates the repository, and every
+fact is re-checked when the executor runs:
+- **The record:** it must have a cargo-iso build with a 40-hex HEAD equal to `source_head` and to the attested
+  head; a normalised absolute worktree equal to the attested worktree; and the target name bound to that path by its hash.
+- **The repository:** canonical, meaning a real `.git` directory with no symlink and an absolute normalised
+  path. It must equal any `orphan_repo`.
+- **The worktree:** its path must be absent (`lstat` ENOENT/ENOTDIR only). No `<repo>/.git/worktrees/*/gitdir`
+  entry may point at it (a relative `gitdir` is resolved against its entry), every such entry must be readable,
+  and `git worktree list` must not register it. A `worktrees` directory that cannot be judged (EACCES, EIO, a
+  stale mount; anything but ENOENT/ENOTDIR) is `ORPHAN_SOURCE_UNKNOWN`, never "no entries".
+- **Other repositories:** such a record does not say which repository the worktree belonged to, and the
+  worktree is gone, so it cannot be derived. As a bounded check, every repository directly inside the
+  worktree's parent directory or the attested repository's parent directory (`<dir>/.git/worktrees`, or a bare
+  `<dir>/worktrees`) must not register the worktree either (`ORPHAN_SOURCE_PRESENT`); anything there that
+  cannot be judged, or an unreadable mount table, is `ORPHAN_SOURCE_UNKNOWN`. Mount points in those
+  directories are not entered, and repositories anywhere else (or offline, for example on an unmounted volume)
+  cannot be seen. **The owner must attest the exact repository the worktree was created from**, not merely
+  one whose `origin/main` contains the HEAD.
+- **The history:** the HEAD must be a commit contained in that repository's `refs/remotes/origin/main`.
+
+Holds:
+- `ORPHAN_ATTESTATION_INVALID` (missing or empty attestation fields);
+- `OWNER_UNVERIFIED`;
+- `ORPHAN_REPO_UNVERIFIED`;
+- `ORPHAN_SOURCE_PRESENT`;
+- `ORPHAN_SOURCE_UNKNOWN`;
+- `GIT_HISTORY_NOT_PRESERVED`.
+
+A record that has a `checkout` key at all (valid or malformed) is always judged by the stronger evidence route,
+with the attested repository required to match the recorded one, so an attestation can never bypass moved-checkout
+detection or upgrade a corrupted record. The receipt's `orphan_route` names the route that decided
+(`GIT_PRESERVED` in that case, `SOURCE` when a live source checkout was used) and `orphan_route_requested`
+the route the manifest asked for. `GIT_PRESERVED` without evidence still refuses, and an attestation
+never upgrades it. The receipt records the route and the attestation. The pin, lock, census, idle, identity,
+journal and approved-manifest gates are unchanged.
+
+The limit is wider than the evidence route's, because there is no checkout inode to compare: ANY moved checkout,
+including one moved with `git worktree move` (git then names only the new path), is indistinguishable from a
+removed one. A moved checkout builds into a different, hash-bound target, so the cost is a rebuild. Only regenerable
+compiler output is removed; the HEAD is already in `origin/main`, and git, source and the repository are never touched.

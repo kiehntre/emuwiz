@@ -173,4 +173,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod save_fixture_tests;
+pub(crate) mod save_fixture_tests;

@@ -888,6 +888,36 @@ fn no_database_error_is_ever_downgraded_below_error() {
 }
 
 #[test]
+fn a_sqlite_check_that_could_not_run_is_a_warning_not_corruption() {
+    // D1-02: quick_check that never ran (database busy during a scan, or
+    // read-only recovery pending) must not be reported as "reported
+    // problems" at Critical: the catalogue was not judged either way.
+    let mut report = database_report(vec![database_diagnostic(
+        DatabaseDiagnosticCode::DatabaseBusy,
+        DatabaseDiagnosticSeverity::Error,
+    )]);
+    report.quick_check = DatabaseCheckOutcome {
+        status: DatabaseCheckStatus::Error,
+        messages: Vec::new(),
+    };
+    let findings = findings_from_database_report(&report);
+    let check = findings
+        .iter()
+        .find(|finding| finding.id.starts_with("database.quick_check"))
+        .expect("the quick check outcome is reported");
+    assert_eq!(check.id, "database.quick_check_not_run");
+    assert_eq!(check.severity, DoctorSeverity::Warning);
+    assert!(check.title.contains("could not run"), "{}", check.title);
+    assert!(!check.title.contains("reported problems"));
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.id != "database.quick_check_failed"),
+        "{findings:?}"
+    );
+}
+
+#[test]
 fn a_failing_sqlite_check_is_reported_even_with_no_diagnostic() {
     let mut report = database_report(Vec::new());
     report.integrity_check = DatabaseCheckOutcome {
@@ -1478,7 +1508,7 @@ fn a_non_utf8_path_is_flagged_lossy_rather_than_silently_mangled() {
 /// (the string scan below, over Doctor's own source files only).
 #[test]
 fn stage_1a_introduces_no_database_migration() {
-    const EXPECTED: [&str; 27] = [
+    const EXPECTED: [&str; 28] = [
         include_str!("../migrations/0001_initial.sql"),
         include_str!("../migrations/0002_platform_aliases.sql"),
         include_str!("../migrations/0003_source_folder_scan_status.sql"),
@@ -1505,7 +1535,8 @@ fn stage_1a_introduces_no_database_migration() {
         include_str!("../migrations/0024_source_enablement.sql"),
         include_str!("../migrations/0025_discovery_import_history.sql"),
         include_str!("../migrations/0026_dat_inventory_digest.sql"),
-        include_str!("../migrations/0027_game_collections.sql"),
+        include_str!("../migrations/0027_dat_evidence_history.sql"),
+        include_str!("../migrations/0028_game_collections.sql"),
     ];
     assert_eq!(
         crate::latest_schema_version(),

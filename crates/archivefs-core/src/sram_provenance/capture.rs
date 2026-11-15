@@ -439,17 +439,18 @@ impl LaunchObservation {
     pub(crate) fn spawn(
         self,
         prepared: &PreparedProcessCommand,
+        capture: process_spawn::OutputCapture,
     ) -> std::io::Result<WatchedProcess> {
         #[cfg(target_os = "linux")]
         {
             match self.observed {
-                Some(observation) => spawn_observed(observation, prepared),
-                None => spawn_unobserved(self.unobserved, prepared),
+                Some(observation) => spawn_observed(observation, prepared, capture),
+                None => spawn_unobserved(self.unobserved, prepared, capture),
             }
         }
         #[cfg(not(target_os = "linux"))]
         {
-            process_spawn::spawn_watched_process(prepared)
+            process_spawn::spawn_watched_process_captured(prepared, capture)
         }
     }
 }
@@ -457,6 +458,7 @@ impl LaunchObservation {
 fn spawn_observed(
     observation: Prepared,
     prepared: &PreparedProcessCommand,
+    capture: process_spawn::OutputCapture,
 ) -> std::io::Result<WatchedProcess> {
     let (parent, child) = UnixStream::pair()?;
     let child: File = OwnedFd::from(child).into();
@@ -476,7 +478,7 @@ fn spawn_observed(
             "Native socket identity unavailable; automatic SRAM capture disabled".into(),
         );
         let Prepared { store, lease, .. } = observation;
-        return spawn_unobserved(Some((store, lease)), prepared);
+        return spawn_unobserved(Some((store, lease)), prepared, capture);
     }
     let environment: Vec<(OsString, OsString)> = vec![
         (
@@ -534,6 +536,7 @@ fn spawn_observed(
             stop.store(true, Ordering::Release);
             observation.finish(report, result);
         },
+        capture,
     );
     if result.is_err() {
         failure_stop.store(true, Ordering::Release);
@@ -544,6 +547,7 @@ fn spawn_observed(
 fn spawn_unobserved(
     ownership: Option<(store::Store, Lease)>,
     prepared: &PreparedProcessCommand,
+    capture: process_spawn::OutputCapture,
 ) -> std::io::Result<WatchedProcess> {
     if let Some((store, lease)) = ownership {
         let file = lease.file.try_clone()?;
@@ -557,9 +561,10 @@ fn spawn_unobserved(
                 drop(store);
                 REVISION.fetch_add(1, Ordering::Release);
             },
+            capture,
         );
     }
-    process_spawn::spawn_watched_process(prepared)
+    process_spawn::spawn_watched_process_captured(prepared, capture)
 }
 
 #[cfg(test)]

@@ -249,7 +249,7 @@ fn only_a_single_exact_match_verifies_a_game() {
     // Saved evidence is shown for what it is; none of it is a verification.
     for (file, label) in [
         ("ambiguous.gbc", "Ambiguous match"),
-        ("probable.gbc", "Probable match"),
+        ("probable.gbc", "Possible match"),
         // The fixture's files have no platform, so "not in this catalogue"
         // is not evidence about them (`negative_dat_result_applies`).
         ("unlisted.gbc", "Unknown platform"),

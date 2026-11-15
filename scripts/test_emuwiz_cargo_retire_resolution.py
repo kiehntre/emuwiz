@@ -155,9 +155,10 @@ class Resolution(R.Corrections):
     def test_inode_change_after_review_invalidates_the_approval(self):
         wt, t, path, digest, journal = self.interrupted()
         _, rep = self.resolve(journal)
-        victim = os.path.join(t, "debug/incremental")
-        shutil.rmtree(victim)
-        os.makedirs(victim)
+        victim = os.path.join(t, "debug/emuwiz")  # the untouched third entry: replace it by another inode
+        os.unlink(victim)
+        with open(victim, "w") as handle:
+            handle.write("replacement")
         rc, out = self.approve(journal, rep)
         self.assertEqual(rc, 8)
         self.assertIn("APPROVAL_DIGEST_MISMATCH", self.codes(out))

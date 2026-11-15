@@ -1,0 +1,1012 @@
+//! Big Picture journeys through real frames of the App. Controller input goes
+//! in at the same `PadEvent` level the evdev reader produces.
+use super::big_picture::{
+    Step,
+    nav::{Button, Control, Direction, PadEvent},
+};
+use super::*;
+
+const SIZE: [f32; 2] = [1600.0, 900.0];
+
+fn app_with(context: &egui::Context, count: i64) -> App {
+    let mut app = fixture(context);
+    app.library = Arc::new(Library::new(
+        (1..=count)
+            .map(|id| {
+                archive(
+                    id,
+                    &format!("Game {id:06}"),
+                    Some(if id % 2 == 0 { "SNES" } else { "Amiga" }),
+                )
+            })
+            .collect(),
+    ));
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.loaded = true;
+    app.router.current = Route::BrowsePlay;
+    app
+}
+
+fn opened(context: &egui::Context, count: i64) -> App {
+    let mut app = app_with(context, count);
+    app.enter_big_picture(context);
+    settle(context, &mut app);
+    app
+}
+
+fn settle(context: &egui::Context, app: &mut App) -> egui::FullOutput {
+    let _ = frame(context, app, SIZE);
+    frame(context, app, SIZE)
+}
+
+fn tap(context: &egui::Context, app: &mut App, control: Control) -> egui::FullOutput {
+    let state = app.big_picture.as_mut().expect("Big Picture is open");
+    state.inject(PadEvent::Pressed { device: 1, control });
+    state.inject(PadEvent::Released { device: 1, control });
+    settle(context, app)
+}
+
+const SOUTH: Control = Control::Button(Button::South);
+const EAST: Control = Control::Button(Button::East);
+const START: Control = Control::Button(Button::Start);
+const WEST: Control = Control::Button(Button::West);
+const R3: Control = Control::Button(Button::RightStick);
+const NORTH: Control = Control::Button(Button::North);
+const RIGHT: Control = Control::Direction(Direction::Right);
+const DOWN: Control = Control::Direction(Direction::Down);
+
+fn key(k: egui::Key) -> Vec<egui::Event> {
+    [true, false]
+        .map(|pressed| egui::Event::Key {
+            key: k,
+            physical_key: Some(k),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        })
+        .to_vec()
+}
+
+fn state(app: &App) -> &big_picture::BigPicture {
+    app.big_picture.as_ref().expect("Big Picture is open")
+}
+
+fn after_launch_page_loads(context: &egui::Context, app: &mut App) -> Vec<String> {
+    text(&settle(context, app))
+}
+
+#[test]
+fn the_library_button_opens_big_picture_and_shows_large_tiles_only_for_the_screen() {
+    let context = egui::Context::default();
+    let mut app = app_with(&context, 200);
+    let output = frame(&context, &mut app, SIZE);
+    assert!(text(&output).iter().any(|s| s == "Big Picture"));
+    app.enter_big_picture(&context);
+    let strings = text(&settle(&context, &mut app));
+    assert!(strings.iter().any(|s| s == "Game 000001"));
+    assert!(strings.iter().any(|s| s.contains("200 games")));
+    let titles = strings.iter().filter(|s| s.starts_with("Game 0")).count();
+    assert!(titles <= 24, "virtualised, drew {titles}");
+    assert!(
+        !strings.iter().any(|s| s.contains("Ready · browsing")),
+        "no desktop chrome"
+    );
+}
+
+#[test]
+fn no_controller_means_a_window_with_keyboard_hints_and_a_plain_statement() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 5);
+    assert!(
+        !state(&app).fullscreen(),
+        "a desktop user keeps their window"
+    );
+    let strings = text(&frame(&context, &mut app, SIZE));
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.contains("not supported") || s.contains("No controller"))
+    );
+    for hint in [
+        "A / Enter  Select",
+        "B / Esc  Back",
+        "Start / L  Launch",
+        "R3 / S  Search",
+    ] {
+        assert!(strings.iter().any(|s| s == hint), "{hint}");
+    }
+}
+
+#[test]
+fn d_pad_moves_focus_and_select_opens_the_focused_game() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 100);
+    let columns = state(&app).columns();
+    assert!(columns > 1);
+    tap(&context, &mut app, RIGHT);
+    assert_eq!(state(&app).focus(), 1);
+    tap(&context, &mut app, DOWN);
+    assert_eq!(state(&app).focus(), 1 + columns);
+    let id = state(&app).focused_game().unwrap();
+    assert_eq!(id, 2 + columns as i64);
+    tap(&context, &mut app, SOUTH);
+    assert_eq!(state(&app).step(), Step::Game(id));
+}
+
+#[test]
+fn keyboard_has_the_same_moves_as_the_controller() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 100);
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::ArrowRight));
+    assert_eq!(state(&app).focus(), 1);
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::End));
+    assert_eq!(state(&app).focus(), 99);
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Home));
+    assert_eq!(state(&app).focus(), 0);
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Enter));
+    assert!(matches!(state(&app).step(), Step::Game(_)));
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Escape));
+    assert_eq!(state(&app).step(), Step::Browse);
+}
+
+#[test]
+fn back_walks_out_one_step_at_a_time_and_leaving_needs_a_second_press() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    tap(&context, &mut app, SOUTH);
+    tap(&context, &mut app, START);
+    assert!(matches!(state(&app).step(), Step::Launch(_)));
+    tap(&context, &mut app, EAST);
+    assert!(matches!(state(&app).step(), Step::Game(_)));
+    tap(&context, &mut app, EAST);
+    assert_eq!(state(&app).step(), Step::Browse);
+    tap(&context, &mut app, EAST);
+    assert!(app.big_picture.is_some(), "one stray press does not leave");
+    assert!(state(&app).notice_text().unwrap().contains("again"));
+    tap(&context, &mut app, RIGHT);
+    assert_eq!(state(&app).notice_text(), None, "moving disarms it");
+    tap(&context, &mut app, EAST);
+    tap(&context, &mut app, EAST);
+    assert!(app.big_picture.is_none());
+    assert_eq!(
+        app.router.current,
+        Route::BrowsePlay,
+        "the desktop page is unchanged"
+    );
+}
+
+#[test]
+fn launch_only_opens_the_existing_launch_page_and_starts_nothing() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    tap(&context, &mut app, START);
+    let strings = after_launch_page_loads(&context, &mut app);
+    assert!(matches!(state(&app).step(), Step::Launch(1)), "{strings:?}");
+    assert!(strings.iter().any(|s| s == "Play / Launch readiness"));
+    let workflows = app.native_workflows.as_ref().unwrap();
+    assert!(!workflows.launch_in_progress());
+    // Pressing Start again on that page is not a confirmation either.
+    tap(&context, &mut app, START);
+    tap(&context, &mut app, START);
+    assert!(!app.native_workflows.as_ref().unwrap().launch_in_progress());
+}
+
+#[test]
+fn controller_walks_launch_controls_keeps_them_on_screen_and_clicks_only_the_focused_one() {
+    use super::big_picture::{nav::Command, page_command};
+    let context = egui::Context::default();
+    let ids = std::cell::RefCell::new(Vec::new());
+    let clicked = std::cell::RefCell::new(Vec::new());
+    let clip = std::cell::Cell::new(egui::Rect::NOTHING);
+    let run = |command: Option<Command>| {
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SIZE.into())),
+                ..Default::default()
+            },
+            |context| {
+                if let Some(command) = command {
+                    page_command(context, command);
+                }
+                ids.borrow_mut().clear();
+                egui::CentralPanel::default().show(context, |ui| {
+                    super::super::native_workflows::launch_scroll(ui, 7, |ui| {
+                        clip.set(ui.clip_rect());
+                        for label in ["Check profile", "Launch RetroArch", "Technical details"] {
+                            ui.allocate_space(egui::vec2(100.0, 700.0));
+                            let response = ui.button(label);
+                            if response.clicked() {
+                                clicked.borrow_mut().push(label);
+                            }
+                            ids.borrow_mut().push((response.id, response.rect));
+                        }
+                    });
+                });
+            },
+        );
+    };
+    let down = Command::Move(Direction::Down);
+    let up = Command::Move(Direction::Up);
+    let settled = |command| {
+        run(Some(command));
+        for _ in 0..5 {
+            run(None);
+        }
+        let focused = context
+            .memory(|m| m.focused())
+            .expect("a control has focus");
+        let (id, rect) = ids
+            .borrow()
+            .iter()
+            .copied()
+            .find(|(id, _)| *id == focused)
+            .unwrap();
+        assert!(
+            clip.get().contains_rect(rect.shrink(1.0)),
+            "{rect:?} off {:?}",
+            clip.get()
+        );
+        ids.borrow()
+            .iter()
+            .position(|(other, _)| *other == id)
+            .unwrap()
+    };
+    run(None);
+    assert_eq!(context.memory(|m| m.focused()), None);
+    assert_eq!(settled(down), 0);
+    assert_eq!(settled(down), 1);
+    assert_eq!(settled(down), 2);
+    assert_eq!(settled(up), 1);
+    assert!(clicked.borrow().is_empty(), "moving clicks nothing");
+    run(Some(Command::Select));
+    run(None);
+    assert_eq!(*clicked.borrow(), ["Launch RetroArch"]);
+}
+
+#[test]
+fn input_held_or_pressed_while_a_game_runs_never_reaches_the_browser() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    tap(&context, &mut app, START);
+    let id = match state(&app).step() {
+        Step::Launch(id) => id,
+        other => panic!("{other:?}"),
+    };
+    app.big_picture.as_mut().unwrap().set_connected();
+    app.big_picture.as_mut().unwrap().set_launch_active(true);
+    let strings = text(&settle(&context, &mut app));
+    assert!(strings.iter().any(|s| s.contains("ignores the controller")));
+    let focused = context.memory(|m| m.focused());
+    tap(&context, &mut app, DOWN);
+    tap(&context, &mut app, EAST);
+    tap(&context, &mut app, SOUTH);
+    assert_eq!(
+        state(&app).step(),
+        Step::Launch(id),
+        "the game's input moved EmuWiz"
+    );
+    assert_eq!(context.memory(|m| m.focused()), focused);
+
+    // The player holds A as the emulator closes.
+    app.big_picture.as_mut().unwrap().inject(PadEvent::Pressed {
+        device: 1,
+        control: SOUTH,
+    });
+    settle(&context, &mut app);
+    app.big_picture.as_mut().unwrap().set_launch_active(false);
+    settle(&context, &mut app);
+    assert_eq!(state(&app).step(), Step::Browse, "back at the browser");
+    assert_eq!(state(&app).focused_game(), Some(id), "on the same game");
+    assert!(state(&app).notice_text().unwrap().contains("has closed"));
+    settle(&context, &mut app);
+    assert_eq!(
+        state(&app).step(),
+        Step::Browse,
+        "the held button did not reselect"
+    );
+}
+
+#[test]
+fn input_is_ignored_during_the_grace_period_after_an_emulator_exits() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    tap(&context, &mut app, START);
+    app.big_picture.as_mut().unwrap().set_launch_active(true);
+    settle(&context, &mut app);
+    app.big_picture.as_mut().unwrap().set_launch_active(false);
+    settle(&context, &mut app);
+    tap(&context, &mut app, SOUTH);
+    assert_eq!(state(&app).step(), Step::Browse);
+}
+
+#[test]
+fn an_unfocused_window_ignores_the_controller() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    let state_mut = app.big_picture.as_mut().unwrap();
+    state_mut.inject(PadEvent::Pressed {
+        device: 1,
+        control: RIGHT,
+    });
+    let _ = context.run(
+        egui::RawInput {
+            focused: false,
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SIZE.into())),
+            ..Default::default()
+        },
+        |context| app.show(context),
+    );
+    assert_eq!(state(&app).focus(), 0);
+}
+
+#[test]
+fn a_missing_game_is_labelled_and_a_recording_cannot_be_launched() {
+    let context = egui::Context::default();
+    let mut missing = archive(1, "Lost Game", Some("SNES"));
+    missing.last_verified_missing_at = Some("2026-11-01".into());
+    let mut recording = archive(2, "Recording", Some("ZX Spectrum"));
+    recording.archive_kind = "preservation_recording".into();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![missing, recording]));
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.loaded = true;
+    assert!(app.library.games[1].is_preservation_only(), "fixture kind");
+    app.enter_big_picture(&context);
+    let strings = text(&settle(&context, &mut app));
+    assert!(
+        strings.iter().any(|s| s.contains("Missing file")),
+        "{strings:?}"
+    );
+    assert!(strings.iter().any(|s| s.contains("Not playable")));
+    tap(&context, &mut app, RIGHT);
+    tap(&context, &mut app, START);
+    assert_eq!(state(&app).step(), Step::Browse);
+    assert!(
+        state(&app)
+            .notice_text()
+            .unwrap()
+            .contains("Play is not offered")
+    );
+    let strings = text(&tap(&context, &mut app, SOUTH));
+    assert!(matches!(state(&app).step(), Step::Game(2)));
+    assert!(!strings.iter().any(|s| s == "Play"));
+    assert!(strings.iter().any(|s| s == "Game details"));
+    tap(&context, &mut app, START);
+    assert_eq!(state(&app).step(), Step::Game(2));
+}
+
+#[test]
+fn game_details_leaves_for_the_desktop_page_instead_of_stranding_the_controller() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 3);
+    tap(&context, &mut app, SOUTH);
+    tap(&context, &mut app, RIGHT);
+    tap(&context, &mut app, SOUTH);
+    assert!(app.big_picture.is_none());
+    assert_eq!(app.router.current, Route::Game(1));
+}
+
+#[test]
+fn loading_and_empty_states_are_said_plainly() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.loaded = false;
+    app.enter_big_picture(&context);
+    let strings = text(&settle(&context, &mut app));
+    assert!(strings.iter().any(|s| s.contains("Loading your game list")));
+    app.loaded = true;
+    let strings = text(&settle(&context, &mut app));
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.contains("No games have been added"))
+    );
+    tap(&context, &mut app, SOUTH);
+    tap(&context, &mut app, START);
+    assert_eq!(state(&app).step(), Step::Browse, "nothing to select");
+}
+
+#[test]
+fn on_screen_keyboard_searches_and_keeps_keyboard_typing() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 30);
+    tap(&context, &mut app, R3);
+    assert!(state(&app).search_open());
+    // A, then Right x9, Down... : press the first key.
+    tap(&context, &mut app, SOUTH);
+    assert_eq!(app.filter.search, "A");
+    tap(&context, &mut app, RIGHT);
+    tap(&context, &mut app, SOUTH);
+    assert_eq!(app.filter.search, "AB");
+    tap(&context, &mut app, EAST);
+    assert!(!state(&app).search_open());
+    assert_eq!(app.filter.search, "AB", "Back keeps what was typed");
+    app.filter.search.clear();
+    tap(&context, &mut app, R3);
+    let _ = frame_with_events(
+        &context,
+        &mut app,
+        SIZE,
+        vec![egui::Event::Text("game 000012".into())],
+    );
+    assert_eq!(app.filter.search, "game 000012");
+    let strings = text(&settle(&context, &mut app));
+    assert!(strings.iter().any(|s| s == "Game 000012"), "{strings:?}");
+    assert!(strings.iter().any(|s| s.contains("1 game")));
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Enter));
+    settle(&context, &mut app);
+    assert!(!state(&app).search_open());
+    assert_eq!(
+        state(&app).focused_game(),
+        Some(12),
+        "focus follows the list"
+    );
+}
+
+#[test]
+fn system_filter_uses_the_library_filter_and_cancel_changes_nothing() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 30);
+    tap(&context, &mut app, NORTH);
+    assert!(state(&app).platforms_open());
+    tap(&context, &mut app, DOWN);
+    tap(&context, &mut app, EAST);
+    assert!(!state(&app).platforms_open());
+    assert_eq!(app.filter.platform, "");
+    tap(&context, &mut app, NORTH);
+    tap(&context, &mut app, DOWN);
+    tap(&context, &mut app, DOWN);
+    let strings = text(&tap(&context, &mut app, SOUTH));
+    assert_eq!(app.filter.platform, "SNES");
+    assert!(
+        strings.iter().any(|s| s.contains("15 games")),
+        "{strings:?}"
+    );
+    assert!(strings.iter().all(|s| !s.contains("Game 000001")));
+}
+
+#[test]
+fn a_filter_that_keeps_the_focused_game_keeps_focus_on_it() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 30);
+    tap(&context, &mut app, RIGHT);
+    assert_eq!(state(&app).focused_game(), Some(2));
+    app.filter.select_platform("SNES".into());
+    settle(&context, &mut app);
+    assert_eq!(state(&app).focused_game(), Some(2));
+    assert_eq!(state(&app).focus(), 0);
+}
+
+#[test]
+fn a_game_removed_by_a_rescan_returns_to_the_browser_with_a_reason() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 3);
+    tap(&context, &mut app, SOUTH);
+    app.library = Arc::new(Library::new(vec![archive(9, "Other", Some("SNES"))]));
+    settle(&context, &mut app);
+    assert_eq!(state(&app).step(), Step::Browse);
+    assert!(state(&app).notice_text().unwrap().contains("no longer"));
+}
+
+#[test]
+fn a_133k_library_stays_fast_through_the_existing_filter_worker() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 133_000);
+    // Large catalogues go through the debounced worker, as in the Library.
+    app.indices = (0..133_000).collect();
+    app.filter_dirty = None;
+    app.filter_inflight = false;
+    settle(&context, &mut app);
+    let start = std::time::Instant::now();
+    for _ in 0..200 {
+        tap(&context, &mut app, DOWN);
+    }
+    let per_step = start.elapsed() / 400;
+    assert_eq!(state(&app).focus(), 200 * state(&app).columns());
+    let strings = text(&frame(&context, &mut app, SIZE));
+    assert!(strings.iter().filter(|s| s.starts_with("Game ")).count() <= 24);
+    println!("BIG_PICTURE_FRAME {per_step:?}");
+    assert!(
+        per_step < std::time::Duration::from_millis(100),
+        "a frame took {per_step:?}"
+    );
+}
+
+#[test]
+fn closing_stops_at_a_real_exit_of_full_screen() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 3);
+    app.big_picture.as_mut().unwrap().set_connected();
+    tap(&context, &mut app, EAST);
+    let pad = app.big_picture.as_mut().unwrap();
+    pad.inject(PadEvent::Pressed {
+        device: 1,
+        control: EAST,
+    });
+    let output = frame(&context, &mut app, SIZE);
+    assert!(app.big_picture.is_none());
+    let commands = &output.viewport_output.values().next().unwrap().commands;
+    assert!(
+        commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Fullscreen(false)))
+    );
+}
+
+#[test]
+fn the_grid_fills_a_full_hd_screen_instead_of_leaving_half_of_it_empty() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 100);
+    let strings = text(&settle(&context, &mut app));
+    let columns = state(&app).columns();
+    let tiles = strings.iter().filter(|s| s.starts_with("Game 0")).count();
+    assert!(tiles >= columns * 2, "{tiles} tiles, {columns} columns");
+}
+
+#[test]
+fn nothing_claims_a_game_count_before_the_library_has_loaded() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.loaded = false;
+    app.enter_big_picture(&context);
+    let strings = text(&settle(&context, &mut app));
+    assert!(
+        !strings.iter().any(|s| s.contains("0 games")),
+        "{strings:?}"
+    );
+}
+
+fn key_event(k: egui::Key, pressed: bool, repeat: bool) -> egui::Event {
+    egui::Event::Key {
+        key: k,
+        physical_key: Some(k),
+        pressed,
+        repeat,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+/// A real keyboard sends the letter as text in the same frame as the key.
+#[test]
+fn the_key_that_opens_search_is_not_typed_into_it() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 30);
+    for (k, typed) in [(egui::Key::S, "s"), (egui::Key::Slash, "/")] {
+        let _ = frame_with_events(
+            &context,
+            &mut app,
+            SIZE,
+            vec![
+                key_event(k, true, false),
+                egui::Event::Text(typed.into()),
+                key_event(k, false, false),
+            ],
+        );
+        settle(&context, &mut app);
+        assert!(state(&app).search_open(), "{typed} opens search");
+        assert_eq!(app.filter.search, "", "{typed} is not typed into it");
+        let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Escape));
+        assert!(!state(&app).search_open());
+    }
+    // Typing once search is open still works.
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::S));
+    let _ = frame_with_events(
+        &context,
+        &mut app,
+        SIZE,
+        vec![egui::Event::Text("s".into())],
+    );
+    assert_eq!(app.filter.search, "s");
+}
+
+/// The key that closed the emulator (often Esc) may still be held, and
+/// autorepeating, when EmuWiz gets focus back.
+#[test]
+fn keyboard_input_while_a_game_runs_or_in_the_grace_period_does_nothing() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    tap(&context, &mut app, START);
+    let launch = state(&app).step();
+    assert!(matches!(launch, Step::Launch(_)));
+    app.big_picture.as_mut().unwrap().set_launch_active(true);
+    settle(&context, &mut app);
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Escape));
+    assert_eq!(state(&app).step(), launch, "a running game keeps the page");
+    app.big_picture.as_mut().unwrap().set_launch_active(false);
+    settle(&context, &mut app);
+    assert_eq!(state(&app).step(), Step::Browse);
+    for _ in 0..3 {
+        let _ = frame_with_events(
+            &context,
+            &mut app,
+            SIZE,
+            vec![key_event(egui::Key::Escape, true, true)],
+        );
+    }
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Enter));
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::ArrowRight));
+    assert!(app.big_picture.is_some(), "a held Esc did not leave");
+    assert_eq!(state(&app).step(), Step::Browse, "Enter did not reselect");
+    assert_eq!(state(&app).focus(), 0, "arrows did not move");
+    assert!(
+        !state(&app)
+            .notice_text()
+            .is_some_and(|notice| notice.contains("again")),
+        "leaving was not armed"
+    );
+}
+
+/// A held key autorepeats (egui marks every press after the first as a
+/// repeat). Only movement repeats, as on the controller: holding Esc or Enter
+/// acts once, so it cannot leave Big Picture or walk into the Launch page.
+#[test]
+fn a_held_back_or_select_key_acts_once() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    for _ in 0..3 {
+        let _ = frame_with_events(
+            &context,
+            &mut app,
+            SIZE,
+            vec![key_event(egui::Key::Escape, true, false)],
+        );
+    }
+    assert!(app.big_picture.is_some(), "a held Esc only arms leaving");
+    assert!(state(&app).notice_text().unwrap().contains("again"));
+    let _ = frame_with_events(
+        &context,
+        &mut app,
+        SIZE,
+        vec![key_event(egui::Key::Escape, false, false)],
+    );
+    for _ in 0..3 {
+        let _ = frame_with_events(
+            &context,
+            &mut app,
+            SIZE,
+            vec![key_event(egui::Key::Enter, true, false)],
+        );
+    }
+    assert!(
+        matches!(state(&app).step(), Step::Game(_)),
+        "a held Enter opens the game and stops there"
+    );
+    let _ = frame_with_events(
+        &context,
+        &mut app,
+        SIZE,
+        vec![key_event(egui::Key::Enter, false, false)],
+    );
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Escape));
+    assert_eq!(state(&app).step(), Step::Browse);
+    for _ in 0..3 {
+        let _ = frame_with_events(
+            &context,
+            &mut app,
+            SIZE,
+            vec![key_event(egui::Key::ArrowRight, true, false)],
+        );
+    }
+    assert_eq!(state(&app).focus(), 3, "a held arrow still moves");
+}
+
+/// The owner's test pad, as /proc/bus/input/devices showed it on Saltbox26:
+/// "Sunshine X-Box One (virtual) pad", bus 0003, vendor 045e, product 02ea.
+/// Input starts as the raw evdev codes inputtino writes for Moonlight's A, B,
+/// X and Y flags (BTN_A, BTN_B, BTN_X, BTN_Y).
+const SUNSHINE_XBOX_ONE: u16 = 0x045e;
+
+fn press_raw(context: &egui::Context, app: &mut App, raw: &[(u16, u16, i32)]) {
+    let events = big_picture::decode_raw(SUNSHINE_XBOX_ONE, 3, raw);
+    assert!(!events.is_empty(), "{raw:?} decoded to nothing");
+    let state = app.big_picture.as_mut().expect("Big Picture is open");
+    for event in events {
+        state.inject(event);
+    }
+    settle(context, app);
+}
+
+fn xbox(context: &egui::Context, app: &mut App, code: u16) {
+    use big_picture::codes::EV_KEY;
+    press_raw(context, app, &[(EV_KEY, code, 1), (EV_KEY, code, 0)]);
+}
+
+#[test]
+fn a_sunshine_xbox_one_pad_selects_with_a_and_goes_back_with_b_everywhere() {
+    use big_picture::codes::{ABS_HAT0Y, BTN_A, BTN_B, BTN_X, BTN_Y, EV_ABS};
+    let context = egui::Context::default();
+    let mut app = opened(&context, 30);
+    // Grid and game step.
+    xbox(&context, &mut app, BTN_A);
+    assert_eq!(
+        state(&app).step(),
+        Step::Game(1),
+        "A selects the focused game"
+    );
+    xbox(&context, &mut app, BTN_B);
+    assert_eq!(state(&app).step(), Step::Browse, "B goes back");
+    xbox(&context, &mut app, BTN_B);
+    assert!(
+        state(&app).notice_text().unwrap().contains("again"),
+        "B at the top only arms leaving"
+    );
+    xbox(&context, &mut app, BTN_A);
+    xbox(&context, &mut app, BTN_B);
+    // Search keyboard: R3 opens it as the hint says; X is the double tap.
+    xbox(&context, &mut app, BTN_X);
+    assert!(!state(&app).search_open(), "one X does nothing");
+    tap(&context, &mut app, R3);
+    assert!(state(&app).search_open(), "R3 opens search");
+    xbox(&context, &mut app, BTN_A);
+    assert_eq!(app.filter.search, "A", "A presses the focused key");
+    xbox(&context, &mut app, BTN_B);
+    assert!(!state(&app).search_open(), "B closes search");
+    assert_eq!(app.filter.search, "A");
+    app.filter.search.clear();
+    settle(&context, &mut app);
+    // System picker: Y, the top button.
+    xbox(&context, &mut app, BTN_Y);
+    assert!(state(&app).platforms_open(), "Y opens the systems");
+    xbox(&context, &mut app, BTN_B);
+    assert!(!state(&app).platforms_open(), "B closes it");
+    assert_eq!(app.filter.platform, "", "and changes nothing");
+    xbox(&context, &mut app, BTN_Y);
+    for _ in 0..2 {
+        press_raw(
+            &context,
+            &mut app,
+            &[(EV_ABS, ABS_HAT0Y, 1), (EV_ABS, ABS_HAT0Y, 0)],
+        );
+    }
+    xbox(&context, &mut app, BTN_A);
+    assert_eq!(app.filter.platform, "SNES", "A chooses the focused system");
+    assert!(!state(&app).platforms_open());
+    // X, the left button, twice: Play.
+    xbox(&context, &mut app, BTN_X);
+    xbox(&context, &mut app, BTN_X);
+    assert!(
+        matches!(state(&app).step(), Step::Launch(_)),
+        "X twice plays"
+    );
+}
+
+/// Press and release at a known clock, so a double-tap window can be crossed.
+fn tap_at(context: &egui::Context, app: &mut App, control: Control, time: f64) {
+    let state = app.big_picture.as_mut().expect("Big Picture is open");
+    state.inject(PadEvent::Pressed { device: 1, control });
+    state.inject(PadEvent::Released { device: 1, control });
+    for offset in [0.0, 0.01] {
+        let _ = context.run(
+            egui::RawInput {
+                time: Some(time + offset),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SIZE.into())),
+                ..Default::default()
+            },
+            |context| app.show(context),
+        );
+    }
+}
+
+#[test]
+fn x_twice_plays_an_unready_game_only_as_far_as_its_launch_page() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    app.big_picture.as_mut().unwrap().set_connected();
+    let strings = text(&tap(&context, &mut app, RIGHT));
+    assert!(strings.iter().any(|s| s == "X twice  Play"), "{strings:?}");
+    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Launch(2));
+    assert!(
+        !app.native_workflows
+            .as_ref()
+            .unwrap()
+            .launch_was_requested(2),
+        "this fixture has no ready plan: Play waits on the Launch page, it never launches blind"
+    );
+    // The open game's page works the same way.
+    tap(&context, &mut app, EAST);
+    assert_eq!(state(&app).step(), Step::Game(2));
+    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Launch(2));
+}
+
+#[test]
+fn one_x_or_two_slow_ones_do_nothing_and_start_still_plays() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    tap_at(&context, &mut app, WEST, 10.0);
+    assert_eq!(state(&app).step(), Step::Browse);
+    assert!(!state(&app).search_open(), "Search moved to R3");
+    tap_at(&context, &mut app, WEST, 10.5);
+    assert_eq!(
+        state(&app).step(),
+        Step::Browse,
+        "too slow for a double tap"
+    );
+    tap_at(&context, &mut app, WEST, 10.7);
+    assert_eq!(
+        state(&app).step(),
+        Step::Launch(1),
+        "the slow one armed a new tap"
+    );
+    tap(&context, &mut app, EAST);
+    tap(&context, &mut app, EAST);
+    tap(&context, &mut app, START);
+    assert_eq!(state(&app).step(), Step::Launch(1), "Start is unchanged");
+}
+
+#[test]
+fn a_held_x_is_one_press_not_a_double_tap() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    let state_mut = app.big_picture.as_mut().unwrap();
+    for _ in 0..3 {
+        state_mut.inject(PadEvent::Pressed {
+            device: 1,
+            control: WEST,
+        });
+    }
+    settle(&context, &mut app);
+    settle(&context, &mut app);
+    assert_eq!(state(&app).step(), Step::Browse);
+}
+
+#[test]
+fn any_other_input_or_focus_change_between_the_xs_resets_the_double_tap() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, RIGHT);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Browse, "a move in between");
+    tap(&context, &mut app, EAST);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Browse, "Back in between");
+    assert_eq!(state(&app).notice_text(), None, "X disarms leaving");
+    // That X armed a tap; then focus changes with no command between (a
+    // mouse click on a tile).
+    app.big_picture.as_mut().unwrap().set_focus(3);
+    settle(&context, &mut app);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Browse, "another game focused");
+    // Search open: X is not a double tap there.
+    tap(&context, &mut app, R3);
+    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Browse, "not from an overlay");
+}
+
+#[test]
+fn x_twice_on_a_game_that_cannot_play_is_refused_with_the_start_reason() {
+    let context = egui::Context::default();
+    let mut recording = archive(2, "Recording", Some("ZX Spectrum"));
+    recording.archive_kind = "preservation_recording".into();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "Game", Some("SNES")),
+        recording,
+    ]));
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.loaded = true;
+    app.enter_big_picture(&context);
+    settle(&context, &mut app);
+    tap(&context, &mut app, RIGHT);
+    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Browse);
+    assert!(
+        state(&app)
+            .notice_text()
+            .unwrap()
+            .contains("Play is not offered")
+    );
+    tap(&context, &mut app, SOUTH);
+    assert_eq!(state(&app).step(), Step::Game(2));
+    tap(&context, &mut app, WEST);
+    tap(&context, &mut app, WEST);
+    assert_eq!(state(&app).step(), Step::Game(2), "never past the refusal");
+}
+
+const UP: Control = Control::Direction(Direction::Up);
+
+fn focused(context: &egui::Context) -> Option<egui::Id> {
+    context.memory(|m| m.focused())
+}
+
+/// Job 5: A on a game, A on its Play, and the Launch page opens with its own
+/// Play focused, so a third A is Play: the game card's Play, which asks the
+/// planner and starts nothing it refuses. Directions leave Play for the
+/// page's controls and come back; B goes back to the game.
+#[test]
+fn a_a_lands_on_a_focused_play_that_only_asks_the_launch_planner() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    tap(&context, &mut app, SOUTH);
+    assert_eq!(state(&app).step(), Step::Game(1));
+    tap(&context, &mut app, SOUTH);
+    assert_eq!(state(&app).step(), Step::Launch(1));
+    let strings = after_launch_page_loads(&context, &mut app);
+    let play = state(&app)
+        .play_button()
+        .expect("the Launch step offers Play");
+    assert_eq!(focused(&context), Some(play), "{strings:?}");
+    assert!(
+        strings.iter().any(|s| s == "Play / Launch readiness"),
+        "the unchanged Launch page is still below: {strings:?}"
+    );
+    // This fixture's page may have no control of its own: then Down wraps
+    // back to Play. Either way focus is never lost, and Up returns to Play.
+    tap(&context, &mut app, DOWN);
+    assert!(focused(&context).is_some(), "Down never drops focus");
+    for _ in 0..20 {
+        if focused(&context) == Some(play) {
+            break;
+        }
+        tap(&context, &mut app, UP);
+    }
+    assert_eq!(focused(&context), Some(play), "Up comes back to Play");
+    tap(&context, &mut app, SOUTH);
+    settle(&context, &mut app);
+    let workflows = app.native_workflows.as_ref().unwrap();
+    assert!(
+        !workflows.launch_was_requested(1),
+        "this fixture has no ready plan: Play never launches blind"
+    );
+    assert!(
+        state(&app).notice_text().is_some(),
+        "Play says what happened instead of doing nothing"
+    );
+    tap(&context, &mut app, EAST);
+    assert_eq!(state(&app).step(), Step::Game(1));
+    assert_eq!(
+        focused(&context),
+        None,
+        "the Game step's buttons are Big Picture's own"
+    );
+}
+
+/// The keyboard reaches the same Play, and an Enter held down from the
+/// game's own Play (egui marks every later press of a held key as a repeat)
+/// never runs it.
+#[test]
+fn keyboard_reaches_launch_play_and_a_held_enter_never_runs_it() {
+    let context = egui::Context::default();
+    let mut app = opened(&context, 10);
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Enter));
+    assert_eq!(state(&app).step(), Step::Game(1));
+    settle(&context, &mut app);
+    // Enter on the game's Play, then held: the first press opens Launch.
+    for _ in 0..4 {
+        let _ = frame_with_events(
+            &context,
+            &mut app,
+            SIZE,
+            vec![key_event(egui::Key::Enter, true, false)],
+        );
+    }
+    assert_eq!(state(&app).step(), Step::Launch(1));
+    let play = state(&app).play_button().expect("Play is drawn");
+    assert_eq!(focused(&context), Some(play));
+    let pending = |app: &App| app.native_workflows.as_ref().unwrap().play_pending();
+    assert_eq!(pending(&app), None, "a held Enter is not a press");
+    assert_eq!(state(&app).notice_text(), None);
+    let _ = frame_with_events(
+        &context,
+        &mut app,
+        SIZE,
+        vec![key_event(egui::Key::Enter, false, false)],
+    );
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Enter));
+    settle(&context, &mut app);
+    assert!(state(&app).notice_text().is_some(), "a fresh Enter is Play");
+    assert!(
+        !app.native_workflows
+            .as_ref()
+            .unwrap()
+            .launch_was_requested(1)
+    );
+    let _ = frame_with_events(&context, &mut app, SIZE, key(egui::Key::Escape));
+    assert_eq!(state(&app).step(), Step::Game(1), "Esc goes back");
+}

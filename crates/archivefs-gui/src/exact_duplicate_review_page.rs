@@ -180,9 +180,7 @@ impl Default for ExactDuplicateReviewPageState {
             rollback_error: None,
             recovery: None,
             recovery_error: None,
-            journal_dir: default_rename_transaction_dir().unwrap_or_else(|_| {
-                PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
-            }),
+            journal_dir: resolved_journal_dir(),
             cache: DuplicateHashCache::new(),
             trust_scope_dirs: Vec::new(),
         }
@@ -340,9 +338,14 @@ impl ExactDuplicateReviewPageState {
             Some(PathBuf::from(&elected_trimmed))
         };
 
-        std::fs::create_dir_all(&self.journal_dir).ok();
-        self.recovery = Some(classify_persisted_transactions(&self.journal_dir));
-        self.recovery_error = None;
+        if let Some(refusal) = journal_dir_refusal(&self.journal_dir) {
+            self.recovery = None;
+            self.recovery_error = Some(refusal);
+        } else {
+            std::fs::create_dir_all(&self.journal_dir).ok();
+            self.recovery = Some(classify_persisted_transactions(&self.journal_dir));
+            self.recovery_error = None;
+        }
 
         let mut candidates = collect_regular_files(&source_root);
         for extra_root in trusted_roots.iter().chain(elected_root.iter()) {
@@ -714,6 +717,10 @@ impl ExactDuplicateReviewPageState {
             }
         };
 
+        if let Some(refusal) = journal_dir_refusal(&self.journal_dir) {
+            self.apply_error = Some(refusal);
+            return;
+        }
         if let Err(error) = std::fs::create_dir_all(&self.journal_dir) {
             self.apply_error = Some(format!(
                 "could not create the quarantine journal folder: {error}"
@@ -1435,3 +1442,17 @@ fn show_apply_confirmation_dialog(ui: &mut egui::Ui, state: &mut ExactDuplicateR
 
 #[cfg(test)]
 mod tests;
+
+/// The journal folder, or an empty path when the data folder cannot be
+/// resolved (for example two existing setups). Never a path relative to the
+/// working directory: core refuses to journal into a non-absolute folder, and
+/// this page refuses before creating anything (see `journal_dir_refusal`).
+fn resolved_journal_dir() -> PathBuf {
+    default_rename_transaction_dir().unwrap_or_default()
+}
+
+/// The actionable refusal when no absolute journal folder is available.
+fn journal_dir_refusal(journal_dir: &std::path::Path) -> Option<String> {
+    (!journal_dir.is_absolute())
+        .then(|| archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE.to_string())
+}

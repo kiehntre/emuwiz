@@ -158,6 +158,9 @@ pub(super) fn project(
             estimate.explanation
         )];
         why.push(format!("Round trip: {}", capability.round_trip));
+        if let Some(detail) = &capability.eligibility_detail {
+            why.push(format!("Tool note: {detail}"));
+        }
         if !capability.verification_required.is_empty() {
             why.push(format!("Checked by: {}", capability.verification_required));
         }
@@ -514,7 +517,7 @@ fn file_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use archivefs_core::storage_conversion::ConversionToolRecord;
+    use archivefs_core::storage_conversion::{ChdmanBinding, ConversionToolRecord};
     use std::fs;
     use std::path::PathBuf;
 
@@ -532,6 +535,11 @@ mod tests {
                 capabilities: vec!["createcd".into()],
                 capability_source: "test".into(),
             }],
+            reviewed_chdman: if chdman_found {
+                ChdmanBinding::Usable(PathBuf::from("/usr/bin/chdman"))
+            } else {
+                ChdmanBinding::Absent
+            },
         }
     }
 
@@ -543,13 +551,16 @@ mod tests {
             fs::write(&path, vec![7u8; len]).unwrap();
             path
         };
+        // The one layout the verified converter admits. This fixture was a raw
+        // MODE1/2352 sheet until 2026-11-03; the converter refuses that, so it
+        // could never truthfully be "Can shrink safely".
         let cue = dir.path().join("Disc A.cue");
         fs::write(
             &cue,
-            "FILE \"Disc A.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+            "FILE \"Disc A.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
         )
         .unwrap();
-        write("Disc A.bin", 4704);
+        write("Disc A.bin", 4096);
         let input = |path: PathBuf, platform: &str, hash: Option<&str>| StorageHealthInput {
             logical_size_bytes: fs::metadata(&path).ok().map(|m| m.len()),
             path,
@@ -694,6 +705,136 @@ mod tests {
             assert!(item.savings.is_none());
             assert!(item.why.iter().any(|l| l.starts_with("Round trip")));
         }
+    }
+
+    /// Regression (2026-11-03 optical audit, Priority 1): only a disc the
+    /// verified CUE/BIN converter admits may appear under "Can shrink safely".
+    /// Discs it refuses stay listed, with a reason, under "won't recommend".
+    #[test]
+    fn regression_only_converter_admitted_discs_can_shrink_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            path
+        };
+        let cue = |name: &str, text: &str| write(name, text.as_bytes());
+        write("ok.bin", &[0; 2048 * 4]);
+        write("raw.bin", &[0; 2352 * 4]);
+        write("data.bin", &[0; 2048 * 4]);
+        write("audio.bin", &[0; 2352 * 4]);
+        write("track01.bin", &[0; 2352]);
+        write("track02.raw", &[0; 2352 * 2]);
+        write("track03.bin", &[0; 2352 * 2]);
+        let input = |path: PathBuf, platform: &str| StorageHealthInput {
+            logical_size_bytes: fs::metadata(&path).ok().map(|m| m.len()),
+            path,
+            platform: Some(platform.into()),
+            format_hint: None,
+            content_hash: None,
+        };
+        let inputs = vec![
+            input(
+                cue(
+                    "Admitted.cue",
+                    "FILE \"ok.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+                ),
+                "PlayStation",
+            ),
+            input(
+                cue(
+                    "Raw PS1.cue",
+                    "FILE \"raw.bin\" BINARY\nTRACK 01 MODE2/2352\nINDEX 01 00:00:00\n",
+                ),
+                "PlayStation",
+            ),
+            input(
+                cue(
+                    "With Audio.cue",
+                    "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n\
+                     FILE \"audio.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n",
+                ),
+                "Sega Saturn",
+            ),
+            input(
+                cue(
+                    "Dreamcast.gdi",
+                    "3\n1 0 4 2352 track01.bin 0\n2 150 0 2352 track02.raw 0\n\
+                     3 45000 4 2352 track03.bin 0\n",
+                ),
+                "Sega Dreamcast",
+            ),
+            input(write("Cooked PS1.iso", &[0; 2048 * 4]), "PlayStation"),
+        ];
+        let report = analyze_storage_health(&inputs);
+        for chdman in [true, false] {
+            let review = project(&report, &tools(chdman));
+            let groups = groups(&review);
+            let refused = [
+                "Raw PS1.cue",
+                "With Audio.cue",
+                "Dreamcast.gdi",
+                "Cooked PS1.iso",
+            ];
+            for name in refused {
+                let name = name.to_string();
+                assert!(
+                    groups
+                        .get(&Group::WontRecommend)
+                        .is_some_and(|g| g.contains(&name)),
+                    "chdman={chdman}: {name} must be explained, not offered: {groups:?}"
+                );
+            }
+            let admitted = "Admitted.cue".to_string();
+            let expected = if chdman {
+                Group::CanShrink
+            } else {
+                Group::NeedsTool
+            };
+            assert_eq!(groups[&expected], vec![admitted], "chdman={chdman}");
+            for item in review
+                .items
+                .iter()
+                .filter(|i| i.group == Group::WontRecommend)
+            {
+                assert!(item.savings.is_none());
+                assert!(
+                    item.why.iter().any(|l| l.starts_with("Savings:")
+                        && (l.contains("verified CUE/BIN to CHD converter does not accept")
+                            || l.contains("has no verified GDI to CHD converter")
+                            || l.contains("has no verified ISO to CHD converter"))),
+                    "{}: {:?}",
+                    item.path,
+                    item.why
+                );
+            }
+        }
+    }
+
+    /// The converter cannot use its reviewed chdman (for example a symlink),
+    /// so an admitted disc is not "Can shrink safely" and the reason is shown.
+    #[test]
+    fn regression_an_unusable_reviewed_chdman_is_explained_not_offered() {
+        let (_dir, inputs) = fixture();
+        let report = analyze_storage_health(&inputs);
+        let mut inventory = tools(true);
+        inventory.reviewed_chdman =
+            ChdmanBinding::Unusable("must be a regular non-symlink file".into());
+        let review = project(&report, &inventory);
+        let cue = review
+            .items
+            .iter()
+            .find(|i| i.path.ends_with("Disc A.cue"))
+            .unwrap();
+        assert_eq!(cue.group, Group::WontRecommend);
+        assert!(
+            cue.why
+                .iter()
+                .any(|l| l.starts_with("Tool note:") && l.contains("cannot use /usr/bin/chdman")),
+            "{:?}",
+            cue.why
+        );
+        assert!(!groups(&review).contains_key(&Group::CanShrink));
     }
 
     #[test]

@@ -188,6 +188,7 @@ fn mid_scan_catalogue_change_rolls_back_native_scan_writes_and_preserves_history
     let path = root.join("db");
     let mut db = crate::Database::open_or_create(&path).unwrap();
     let config = crate::Config {
+        configured_source_roots: None,
         source_folders: vec![source.clone()],
         mount_root: root.join("mount"),
         ratarmount_bin: String::new(),

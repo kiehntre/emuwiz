@@ -428,6 +428,8 @@ fn gamer_action_carries_the_same_sealed_plan_with_warnings() {
         cemu: None,
         flycast: None,
         xroar: None,
+        azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         shadps4: Some(snapshot),

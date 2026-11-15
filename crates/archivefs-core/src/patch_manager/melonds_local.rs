@@ -177,6 +177,7 @@ fn executable_candidates(roots: &MelonDsProfileDiscoveryRoots) -> Vec<MelonDsExe
     );
     paths.sort();
     paths.dedup();
+    crate::path_alias::dedup_by_real_path(&mut paths, |entry| &entry.0);
     let mut executables: Vec<MelonDsExecutable> = paths
         .into_iter()
         .filter(|(p, _)| regular(p))

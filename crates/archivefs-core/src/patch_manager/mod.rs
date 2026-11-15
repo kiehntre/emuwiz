@@ -39,6 +39,8 @@ mod cheat_consolidation_tests;
 /// Synthetic WHDLoad slave and inspection fixtures shared with the launch tests.
 #[cfg(test)]
 pub(crate) use whdload_trainer_discovery::tests as whdload_trainer_discovery_fixtures;
+#[cfg(unix)]
+pub mod anchored_fs;
 mod cheat_conversion;
 mod cheat_coverage;
 mod cheat_history;
@@ -99,7 +101,7 @@ mod gamehacking_provider;
 mod gamehacking_shared;
 mod gamehacking_wii_provider;
 mod gecko_document;
-mod hatari_local;
+pub(crate) mod hatari_local;
 mod import_safety;
 mod local_cheat_install;
 mod local_cheat_install_dolphin;
@@ -313,8 +315,10 @@ pub use cheat_catalogue::{
     CheatDefinition, CheatGameMatch, CheatGameRecord, CheatInstalledState, CheatMatchCandidate,
     CheatMatchConfidence, CheatMatchEvidence, CheatStagingAction, CheatStagingPlan,
     JsonManifestSource, MAX_CATALOGUE_EXCLUDED_ENTRIES, MAX_CATALOGUE_EXCLUSION_EXAMPLES,
-    RetroarchChtDirectorySource, build_cheat_availability_report, load_cheat_catalogue_snapshot,
-    match_cheat_game_record, matching_excluded_entry,
+    NO_INSTALLABLE_CHEATS_REASON, NO_USABLE_CHEAT_CODES_LABEL, RetroarchChtDirectorySource,
+    build_cheat_availability_report, cheat_destination_file_name, installable_content_hash,
+    load_cheat_catalogue_snapshot, match_cheat_game_record, matching_excluded_entry,
+    render_installable_cheat_document,
 };
 pub use cheat_compatibility::{
     CheatCompatibilityEntry, CheatCompatibilityOperation, CheatCompatibilityReport, CheatCondition,
@@ -349,14 +353,15 @@ pub use cheat_install_plan::{
     resolve_cheat_destination, stage_generated_cheat_file,
 };
 pub use cheat_install_result::{
-    CHEAT_INSTALL_RUN_SCHEMA_VERSION, CheatInstallEntryResult, CheatInstallOutcome,
-    CheatInstallPath, CheatInstallRun, CheatInstallRunSchemaError, CheatInstallRunStatus,
-    CheatInstallSummary, PreviousDestinationState, parse_cheat_install_run,
+    CHEAT_INSTALL_RUN_SCHEMA_VERSION, CheatInstallEntryResult, CheatInstallEntrySettlement,
+    CheatInstallOutcome, CheatInstallPath, CheatInstallRun, CheatInstallRunSchemaError,
+    CheatInstallRunStatus, CheatInstallSummary, PreviousDestinationState, parse_cheat_install_run,
     plan_cheat_install_entries, plan_cheat_install_entry, plan_cheat_install_run,
 };
 pub use cheat_installer::{
     CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME, CHEAT_INSTALL_RUNS_DIRECTORY_NAME, CheatInstallOptions,
-    CheatInstallRunOutcome, execute_cheat_install_run,
+    CheatInstallRunOutcome, JOURNAL_UNAVAILABLE_REASON, JOURNAL_UPDATE_FAILED_REASON,
+    execute_cheat_install_run,
 };
 pub use cheat_ir::{
     CheatApplicability, CheatConversionPreview, CheatDocument, CheatDuplicateKind,
@@ -569,14 +574,16 @@ pub use dolphin_texture_mod::{
     verified_dolphin_texture_identity,
 };
 pub use dolphin_texture_pack::{
-    DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT, DOLPHIN_TEXTURE_PACK_MAX_MANIFEST_BYTES,
-    DOLPHIN_TEXTURE_PACK_SOURCE_MODE, DolphinTexturePackApplyResult,
-    DolphinTexturePackArchivePreview, DolphinTexturePackBuildPreview,
-    DolphinTexturePackBuildRequest, DolphinTexturePackFile, DolphinTexturePackManifest,
-    DolphinTexturePackPlan, DolphinTexturePackPreviewRequest, DolphinTexturePackRejectedFile,
-    build_dolphin_texture_pack_manifest, build_dolphin_texture_pack_preview,
-    build_dolphin_texture_pack_transaction_plan, execute_dolphin_texture_pack_apply,
-    inspect_dolphin_texture_pack_zip, validate_dolphin_texture_pack_manifest,
+    DOLPHIN_TEXTURE_ARCHIVE_STAGING_PREFIX, DOLPHIN_TEXTURE_PACK_MANIFEST_FORMAT,
+    DOLPHIN_TEXTURE_PACK_MAX_MANIFEST_BYTES, DOLPHIN_TEXTURE_PACK_SOURCE_MODE,
+    DolphinTexturePackApplyResult, DolphinTexturePackArchivePreview,
+    DolphinTexturePackBuildPreview, DolphinTexturePackBuildRequest, DolphinTexturePackFile,
+    DolphinTexturePackManifest, DolphinTexturePackPlan, DolphinTexturePackPreviewRequest,
+    DolphinTexturePackRejectedFile, DolphinTexturePackStaging, build_dolphin_texture_pack_manifest,
+    build_dolphin_texture_pack_preview, build_dolphin_texture_pack_transaction_plan,
+    describe_missing_texture_pack_source, execute_dolphin_texture_pack_apply,
+    inspect_dolphin_texture_pack_zip, inspect_dolphin_texture_pack_zip_in,
+    relocate_dolphin_texture_pack_manifest, validate_dolphin_texture_pack_manifest,
 };
 pub use duckstation_cheat::{
     DUCKSTATION_CHEAT_MAX_BYTES, DUCKSTATION_CHEAT_MAX_LINES, DuckStationCheatApplyPlan,
@@ -623,7 +630,8 @@ pub use duckstation_native::{
     DuckStationNativeWarning, EnableCheatsChange, apply_duckstation_native_plan,
     duckstation_disc_topology_from_media_sets, duckstation_native_batch_from_catalogue,
     duckstation_native_section_digest, plan_duckstation_native, preview_duckstation_native_undo,
-    read_duckstation_native_receipt, resolve_duckstation_folders, undo_duckstation_native,
+    read_duckstation_native_receipt, resolve_duckstation_folders,
+    resolve_duckstation_memory_cards_folder, undo_duckstation_native,
 };
 pub use duckstation_native_history::{
     DUCKSTATION_NATIVE_SOURCE_MODE, GroupedHistoryRow, NativeGroupState, NativeHistoryGroup,
@@ -658,16 +666,18 @@ pub use flycast_cheats::{
     apply_flycast_cheat_preview, build_flycast_cheat_preview, parse_flycast_cheat_file,
 };
 pub use flycast_local::{
-    FLYCAST_MAX_CHEAT_BYTES, FLYCAST_MAX_CONFIG_BYTES, FLYCAST_MAX_DIRECTORY_ENTRIES,
-    FLYCAST_MAX_PROFILES, FLYCAST_MAX_SAVE_CANDIDATES, FLYCAST_MAX_TEXTURE_DEPTH,
-    FLYCAST_MAX_TEXTURE_FILES, FlycastCheatInventory, FlycastConfigInspection, FlycastDiscContext,
-    FlycastDiscoveryError, FlycastExecutable, FlycastGameInspection, FlycastGameKeyMapping,
-    FlycastGameRequest, FlycastHealth, FlycastInstallationType, FlycastLaunchBlocker,
-    FlycastLaunchBlockerKind, FlycastNativeLaunchBinding, FlycastPlatform, FlycastProfile,
-    FlycastProfileDiscovery, FlycastProfileDiscoveryRoots, FlycastSaveStateInventory,
-    FlycastSettings, FlycastSystemFileState, FlycastSystemHealth, FlycastTextureInventory,
-    FlycastVmuInventory, FlycastWarning, FlycastWarningKind, discover_flycast_profiles,
-    inspect_flycast_game, parse_flycast_version, resolve_flycast_native_launch_binding,
+    FLYCAST_APPIMAGE_DIRECTORIES, FLYCAST_MAX_CHEAT_BYTES, FLYCAST_MAX_CONFIG_BYTES,
+    FLYCAST_MAX_DIRECTORY_ENTRIES, FLYCAST_MAX_PROFILES, FLYCAST_MAX_SAVE_CANDIDATES,
+    FLYCAST_MAX_TEXTURE_DEPTH, FLYCAST_MAX_TEXTURE_FILES, FLYCAST_NOT_SET_UP,
+    FlycastCheatInventory, FlycastConfigInspection, FlycastDiscContext, FlycastDiscoveryError,
+    FlycastExecutable, FlycastGameInspection, FlycastGameKeyMapping, FlycastGameRequest,
+    FlycastHealth, FlycastInstallationType, FlycastLaunchBlocker, FlycastLaunchBlockerKind,
+    FlycastNativeLaunchBinding, FlycastPlatform, FlycastProfile, FlycastProfileDiscovery,
+    FlycastProfileDiscoveryRoots, FlycastSaveStateInventory, FlycastSettings,
+    FlycastSystemFileState, FlycastSystemHealth, FlycastTextureInventory, FlycastVmuInventory,
+    FlycastWarning, FlycastWarningKind, discover_flycast_profiles, flycast_profile_dreamcast_bios,
+    flycast_profile_dreamcast_bios_inputs, inspect_flycast_game, is_appimage_executable,
+    parse_flycast_version, resolve_flycast_native_launch_binding,
 };
 pub use fuse_local::{
     FUSE_MAX_PROFILES, FUSE_NATIVE_BINARY_NAMES, FuseExecutable, FuseInstallationType,
@@ -860,7 +870,8 @@ pub use pcsx2::{
 };
 pub use pcsx2_firmware::{
     Pcsx2BiosVerificationOutcome, Pcsx2GameInspectionWithFirmware, Pcsx2VerifiedBios,
-    inspect_pcsx2_game_with_firmware_evidence, resolve_pcsx2_bios,
+    inspect_pcsx2_game_with_firmware_evidence, pcsx2_profile_bios_inputs,
+    pcsx2_profile_bios_verification, resolve_pcsx2_bios,
 };
 pub use pcsx2_identity::{
     Pcsx2GameIdentity, Pcsx2IdentityState, Pcsx2ProfileChoiceError, confirmed_pcsx2_profile,
@@ -882,14 +893,15 @@ pub use pcsx2_local::{
     Pcsx2DirectoryIdentity, Pcsx2DiscoveryError, Pcsx2Executable, Pcsx2GameInspection,
     Pcsx2GameRequest, Pcsx2Health, Pcsx2InspectionError, Pcsx2InspectionWarning,
     Pcsx2InspectionWarningKind, Pcsx2InstallationType, Pcsx2LaunchBlocker, Pcsx2LaunchBlockerKind,
-    Pcsx2MatchResult, Pcsx2MatchState, Pcsx2MemcardInfo, Pcsx2MemcardKind,
-    Pcsx2NativeLaunchBinding, Pcsx2PatchCategory, Pcsx2PatchDirectory, Pcsx2PatchDirectoryState,
-    Pcsx2PnachFile, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileBlocker,
-    Pcsx2ProfileBlockerKind, Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope,
-    Pcsx2SaveStateInventory, Pcsx2SerialMapping, Pcsx2Settings, Pcsx2TextureInventory,
-    Pcsx2UserDirectoryMode, discover_pcsx2_profiles, inspect_pcsx2_game, inspect_pcsx2_profile,
+    Pcsx2MatchResult, Pcsx2MatchState, Pcsx2MemcardInfo, Pcsx2MemcardKind, Pcsx2MemcardSlot,
+    Pcsx2MemcardSlotSource, Pcsx2MemcardSlotState, Pcsx2MemcardSlots, Pcsx2NativeLaunchBinding,
+    Pcsx2PatchCategory, Pcsx2PatchDirectory, Pcsx2PatchDirectoryState, Pcsx2PnachFile,
+    Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileBlocker, Pcsx2ProfileBlockerKind,
+    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, Pcsx2SaveStateInventory,
+    Pcsx2SerialMapping, Pcsx2Settings, Pcsx2TextureInventory, Pcsx2UserDirectoryMode,
+    discover_pcsx2_profiles, inspect_pcsx2_game, inspect_pcsx2_profile,
     inspect_pcsx2_profile_with_activation, match_pcsx2_inventory, parse_pcsx2_version,
-    resolve_pcsx2_native_launch_binding,
+    resolve_pcsx2_memcard_slots, resolve_pcsx2_native_launch_binding,
 };
 pub use pcsx2_pnach::{
     MAX_MANAGED_PNACH_BLOCKS, MAX_MANAGED_PNACH_BYTES, ManagedPnachCheat, PnachDocument,
@@ -1070,6 +1082,12 @@ pub use shared_preview::{
     PreviewWarning, PreviewWarningKind, SharedPreviewEntry, SharedPreviewError,
     SharedPreviewReport, SharedPreviewRequest, build_shared_preview,
 };
+#[cfg(feature = "test-support")]
+pub use shared_transaction::set_test_replaced_checkpoint_fault;
+#[cfg(feature = "test-support")]
+pub use shared_transaction::set_test_rollback_restore_fault;
+#[cfg(feature = "test-support")]
+pub use shared_transaction::set_test_terminal_journal_fault;
 pub use shared_transaction::{
     SHARED_APPLY_SCHEMA_VERSION, SHARED_DURABLE_JOURNAL_SCHEMA_VERSION, SHARED_MAX_BACKUP_BYTES,
     SHARED_MAX_CREATED_DIRECTORIES, SHARED_MAX_ENTRIES, SHARED_MAX_FAILURES,
@@ -1078,18 +1096,21 @@ pub use shared_transaction::{
     SHARED_MAX_TOTAL_WRITTEN_BYTES, SHARED_MAX_WARNINGS, SharedAdapterWriteSupport,
     SharedApplyConfirmation, SharedApplyContext, SharedApplyEntry, SharedApplyFailure,
     SharedApplyFailureKind, SharedApplyJournal, SharedApplyOptions, SharedApplyOutcome,
-    SharedApplyResult, SharedApplyStatus, SharedContentVerification, SharedDurableEntry,
-    SharedDurableJournal, SharedEntryRecoveryState, SharedHistoryReport, SharedJournalWarning,
-    SharedMaterializedOutput, SharedPendingOperation, SharedPendingRecoveryPlan, SharedPlanEntry,
-    SharedRecoveryState, SharedRollbackConfirmation, SharedRollbackEntry, SharedRollbackOptions,
-    SharedRollbackOutcome, SharedRollbackPermissions, SharedRollbackPreview, SharedRollbackResult,
-    SharedTransactionPath, SharedTransactionPlan, SharedTransactionStage, adapter_write_support,
+    SharedApplyResult, SharedApplyStatus, SharedContentVerification, SharedDestinationOutcome,
+    SharedDurableEntry, SharedDurableJournal, SharedEntryDestination, SharedEntryRecoveryState,
+    SharedHistoryReport, SharedInterruptedApplyOutcome, SharedInterruptedApplyRecovery,
+    SharedJournalWarning, SharedMaterializedOutput, SharedPendingOperation,
+    SharedPendingRecoveryPlan, SharedPlanEntry, SharedPublicationState, SharedRecoveryState,
+    SharedRollbackConfirmation, SharedRollbackEntry, SharedRollbackOptions, SharedRollbackOutcome,
+    SharedRollbackPermissions, SharedRollbackPreview, SharedRollbackResult, SharedTransactionPath,
+    SharedTransactionPlan, SharedTransactionStage, adapter_write_support,
     build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
     discover_pending_operations, discover_shared_apply_history, execute_shared_apply,
     execute_shared_materialized_apply, execute_shared_rollback, generate_shared_operation_id,
-    plan_pending_recovery, preview_shared_rollback,
+    plan_pending_recovery, preview_shared_rollback, recover_interrupted_shared_applies,
     require_dolphin_managed_gamehacking_verification, require_local_mod_package_verification,
-    require_retroarch_bezel_verification, seal_shared_transaction_plan,
+    require_retroarch_bezel_verification, seal_shared_transaction_plan, shared_destination_outcome,
+    shared_entry_destination, shared_rollback_can_reverse,
 };
 pub use snes9x_local::{
     SNES9X_MAX_PROFILES, SNES9X_NATIVE_BINARY_NAMES, Snes9xExecutable, Snes9xInstallationType,

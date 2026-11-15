@@ -138,7 +138,18 @@ pub struct LocalCatalogueProvider {
     records: BTreeMap<HomebrewProjectId, LocalHomebrewRecord>,
 }
 
+/// The curated starter catalogue shipped inside the binary so discovery works
+/// offline with no file selection. It is metadata only: the same schema, size
+/// bound and validation as a user-selected file apply when it is loaded.
+pub const BUNDLED_STARTER_CATALOGUE_JSON: &[u8] =
+    include_bytes!("../tests/fixtures/homebrew/starter-catalogue.json");
+
 impl LocalCatalogueProvider {
+    /// Loads [`BUNDLED_STARTER_CATALOGUE_JSON`] through the normal validator.
+    pub fn bundled_starter() -> Result<Self, LocalCatalogueError> {
+        Self::from_json(BUNDLED_STARTER_CATALOGUE_JSON)
+    }
+
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, LocalCatalogueError> {
         let path = path.as_ref();
         let io_error = |source| LocalCatalogueError::Io {

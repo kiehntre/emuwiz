@@ -209,10 +209,12 @@ impl Rpcs3PageState {
                 }
             }
             Ok(Message::Applied(r)) => {
-                self.outcome = Some(format!(
+                let mut outcome = format!(
                     "Recorded Apply: {:?} · receipt {:?}. In-game effectiveness remains unverified.",
                     r.journal.status, r.journal_path
-                ));
+                );
+                crate::shared_apply_warnings::append(&mut outcome, &r);
+                self.outcome = Some(outcome);
                 if r.journal.status != SharedApplyStatus::Success {
                     self.failure = Some(format!(
                         "Apply incomplete/refused: {:?}; receipt issue {:?}. Retain recovery evidence and inspect History.",

@@ -44,7 +44,11 @@ pub enum AmigaMediaKind {
     WhdloadPackage,
     /// CUE/BIN, ISO or CHD disc image.
     CdImage,
-    /// ZIP/7z/RAR container. EmuWiz never extracts it for Amiga play.
+    /// ZIP of one game's IPF floppy disks. Play stages those disks in a
+    /// private temporary folder (`zip_cartridge_stage`); the ZIP is never
+    /// changed.
+    ZipArchive,
+    /// 7z/RAR container. EmuWiz never extracts it for Amiga play.
     Container,
     Unsupported,
 }
@@ -65,7 +69,8 @@ impl AmigaMediaKind {
             "hdf" | "hdfx" | "rdb" => Self::HardDisk,
             "lha" | "lzh" => Self::WhdloadPackage,
             "cue" | "iso" | "chd" => Self::CdImage,
-            "zip" | "7z" | "rar" => Self::Container,
+            "zip" => Self::ZipArchive,
+            "7z" | "rar" => Self::Container,
             _ => Self::Unsupported,
         }
     }
@@ -81,6 +86,8 @@ impl AmigaMediaKind {
             Self::HardDisk => "Hard-disk image (HDF/RDB)",
             Self::WhdloadPackage => "WHDLoad package (LHA)",
             Self::CdImage => "CD image",
+            // The extension alone says nothing about what the ZIP holds.
+            Self::ZipArchive => "ZIP archive",
             Self::Container => "Packed in an archive",
             Self::Unsupported => "Unrecognised file type",
         }
@@ -211,6 +218,11 @@ pub struct AmigaDiskSetFacts {
     pub count: usize,
     pub order_verified: bool,
     pub problems: usize,
+    /// Disk numbers the set's own topology names as absent. A lone disk can
+    /// still belong to a larger, incomplete set.
+    pub missing: usize,
+    /// This entry's own file is one of the unavailable disks.
+    pub this_disk_unavailable: bool,
 }
 
 /// Reads the discovered emulator profiles and, for an LHA/LZH package, the
@@ -488,8 +500,63 @@ pub fn assess_amiga_game(
         }
     }
 
-    if let Some(disks) = disks.filter(|disks| disks.count > 1) {
-        let (state, detail) = if disks.problems > 0 {
+    // A DAT hash match that proves a complete single-disk game outranks disk
+    // numbers read from file names.
+    let dat_single_disk = media == AmigaMediaKind::Adf
+        && !cd_machine
+        && matches!(
+            facts.and_then(|facts| facts.adf_identity.as_ref()),
+            Some(Ok(_))
+        );
+    if let Some(disks) = disks.filter(|disks| disks.count > 1 || disks.missing > 0) {
+        // Grouping, gaps and unavailable siblings are claims about the
+        // proposed set, not about this disk: when the DAT proves this ADF is a
+        // whole game and its own file is still there, say both and let Play
+        // rest on that proof (FS-UAE launches only this disk).
+        let (state, detail) = if dat_single_disk && !disks.this_disk_unavailable {
+            let mut grouping = Vec::new();
+            if disks.count > 1 {
+                grouping.push("puts this disk with other disk files".to_string());
+            }
+            if disks.missing > 0 {
+                grouping.push(if disks.missing == 1 {
+                    "suggests 1 more disk is missing".to_string()
+                } else {
+                    format!("suggests {} more disks are missing", disks.missing)
+                });
+            }
+            if disks.problems > 0 {
+                grouping.push(if disks.problems == 1 {
+                    "names 1 disk file that is not available".to_string()
+                } else {
+                    format!("names {} disk files that are not available", disks.problems)
+                });
+            }
+            let grouping = match grouping.split_last() {
+                Some((last, [])) => last.clone(),
+                Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+                None => String::new(),
+            };
+            (
+                Warning,
+                format!(
+                    "The disk grouping {grouping}, but this disk's DAT hash match is a complete single-disk game. Play uses this disk only."
+                ),
+            )
+        } else if disks.missing > 0 {
+            (
+                Blocked,
+                format!(
+                    "{} of this game's disks {} missing from the disk numbers found; the set is incomplete or unproven (see the disk list).",
+                    disks.missing,
+                    if disks.missing == 1 {
+                        "appears to be"
+                    } else {
+                        "appear to be"
+                    }
+                ),
+            )
+        } else if disks.problems > 0 {
             (
                 Blocked,
                 format!(
@@ -501,7 +568,7 @@ pub fn assess_amiga_game(
             (
                 Ready,
                 format!(
-                    "{} disks, order verified. Change disks from the emulator's own menu (F12 in FS-UAE and Amiberry); EmuWiz does not swap disks for you.",
+                    "{} disks, order verified. Blue does not start multi-disk Amiga games: its FS-UAE launch inserts one disk and gives the emulator no list of the other disks.",
                     disks.count
                 ),
             )
@@ -649,12 +716,18 @@ fn play_noun(machine: AmigaCdMachine, media: AmigaMediaKind) -> String {
         (_, AmigaMediaKind::Ipf) => "IPF images".into(),
         (_, AmigaMediaKind::Hfe) => "HFE images".into(),
         (_, AmigaMediaKind::CdImage) => "CD images".into(),
+        (_, AmigaMediaKind::ZipArchive) => "zipped floppy disks".into(),
         (_, AmigaMediaKind::Container) => "packed archives".into(),
         (_, AmigaMediaKind::WhdloadPackage | AmigaMediaKind::Unsupported) => {
             "files like this".into()
         }
     }
 }
+
+/// Honest explanations of HDF / IPF media, shared with the identity wording.
+pub const HARD_DISK_NOTE: &str = "RetroArch (PUAE) starts it from a private working copy, so the game can save without changing your library file; its contents are not proof of a complete game.";
+pub const ZIP_DISKS_NOTE: &str = "Play copies this game's disks to a private temporary folder for RetroArch (PUAE) and removes them afterwards; the ZIP is never changed. The ZIP must hold only one game's IPF disks, and IPF needs the CAPS/SPS plugin. Games with up to four disks start with every disk in a drive. Games with more than four disks have not been tested.";
+pub const IPF_NOTE: &str = "IPF needs the CAPS/SPS plugin (capsimg.so) in RetroArch's system folder; Play checks for it before starting.";
 
 fn media_check(machine: AmigaCdMachine, media: AmigaMediaKind) -> (AmigaCheckState, String) {
     use AmigaCheckState::{Blocked, Ready, Warning};
@@ -667,6 +740,15 @@ fn media_check(machine: AmigaCdMachine, media: AmigaMediaKind) -> (AmigaCheckSta
         AmigaMediaKind::CdImage => (
             Blocked,
             "A CD image stored as an ordinary Amiga game. CD32 and CDTV discs are not floppies; check the platform.".into(),
+        ),
+        // A ZIP's contents are not read here, so never call them floppies:
+        // real CD32 ZIPs usually hold a CUE/ISO disc image.
+        AmigaMediaKind::ZipArchive if cd_machine => (
+            Blocked,
+            format!(
+                "{} discs are not started from inside a ZIP. Extract the disc image (CUE/BIN, ISO or CHD) from the ZIP, then recheck readiness. The ZIP was not changed.",
+                machine_label(machine)
+            ),
         ),
         _ if cd_machine => (
             Blocked,
@@ -684,7 +766,7 @@ fn media_check(machine: AmigaCdMachine, media: AmigaMediaKind) -> (AmigaCheckSta
         ),
         AmigaMediaKind::Ipf => (
             Warning,
-            "IPF preservation image. Emulators need the CAPS/SPS library for IPF; EmuWiz cannot confirm it is installed.".into(),
+            format!("IPF preservation image. {IPF_NOTE}"),
         ),
         AmigaMediaKind::Hfe => (
             Blocked,
@@ -692,15 +774,19 @@ fn media_check(machine: AmigaCdMachine, media: AmigaMediaKind) -> (AmigaCheckSta
         ),
         AmigaMediaKind::HardDisk => (
             Warning,
-            "Hard-disk image. It needs a hard-drive entry in the emulator's configuration; its contents are not proof of a complete game.".into(),
+            format!("Hard-disk image. {HARD_DISK_NOTE}"),
         ),
         AmigaMediaKind::WhdloadPackage => (
             Ready,
             "WHDLoad package: an installed game run from a virtual hard drive, not a set of floppy images.".into(),
         ),
+        AmigaMediaKind::ZipArchive => (
+            Warning,
+            format!("ZIP of IPF floppy disks. {ZIP_DISKS_NOTE}"),
+        ),
         AmigaMediaKind::Container => (
             Blocked,
-            "Packed inside a ZIP, 7z or RAR archive. EmuWiz does not extract Amiga media for play.".into(),
+            "Packed inside a 7z or RAR archive. EmuWiz does not extract Amiga media from these for play.".into(),
         ),
         AmigaMediaKind::Unsupported => (
             Blocked,

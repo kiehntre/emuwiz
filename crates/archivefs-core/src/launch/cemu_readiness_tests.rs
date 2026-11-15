@@ -574,7 +574,7 @@ fn blue_bridge_rechecks_title_metadata_even_when_stat_is_restored() {
     let (_temp, root, roots) = fixture();
     let selected = root.join("code/game.rpx");
     cafe_rpx(&selected);
-    let inspection = inspect_cemu_readiness(&root, None, &roots);
+    let mut inspection = inspect_cemu_readiness(&root, None, &roots);
     let meta = root.join("meta/meta.xml");
     let modified = fs::metadata(&meta).unwrap().modified().unwrap();
     let old = fs::read_to_string(&meta).unwrap();
@@ -587,10 +587,10 @@ fn blue_bridge_rechecks_title_metadata_even_when_stat_is_restored() {
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(modified))
         .unwrap();
-    assert!(
-        !inspection.stamp.is_stale(),
-        "same inode, length and restored mtime is not a cryptographic stamp"
-    );
+    // The stamp usually sees this through ctime. Re-stamp the edited state
+    // so only the bridge's own title-metadata re-read can refuse it.
+    inspection.stamp = crate::wiiu_content_readiness::WiiUContentStamp::capture(&root);
+    assert!(!inspection.stamp.is_stale());
     assert!(
         launch_bridge::inputs(&selected, &CanonicalIdentityStatus::Unknown, &inspection).is_none()
     );
@@ -615,6 +615,7 @@ fn cemu_scanner_admits_only_the_exact_structured_base_inside_its_source() {
     cafe_rpx(&loose);
     assert!(crate::Archive::from_path_in_root(&loose, &root).is_none());
     let config = crate::Config {
+        configured_source_roots: None,
         source_folders: vec![root.clone()],
         mount_root: root.join("unused-mount"),
         ratarmount_bin: "unused".into(),
@@ -664,6 +665,7 @@ fn cemu_scanner_rechecks_positive_and_negative_cache_when_sibling_evidence_chang
         non_archive_kind: Some("unsupported".into()),
     };
     let config = crate::Config {
+        configured_source_roots: None,
         source_folders: vec![root.clone()],
         mount_root: root.join("unused-mount"),
         ratarmount_bin: "unused".into(),

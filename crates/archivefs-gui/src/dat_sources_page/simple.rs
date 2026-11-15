@@ -6,6 +6,7 @@ use archivefs_core::dat::catalogue_selection::{CatalogueVariant, InstalledCatalo
 use archivefs_core::dat::model::DatEcosystem;
 
 mod catalogue_list;
+mod recognition;
 
 #[derive(Default)]
 pub(crate) struct SimpleCheckUi {
@@ -24,6 +25,7 @@ pub(crate) struct SimpleCheckUi {
     /// A platform chosen by a caller (Check Games) rather than by a click here:
     /// the first render opens setup if, and only if, the platform is not ready.
     open_setup_if_not_ready: bool,
+    recognition: recognition::RecognitionUi,
 }
 
 impl SimpleCheckUi {
@@ -455,6 +457,11 @@ pub(super) fn show_with_inputs(
     }
     if let Some(prompt) = assignment_prompt(ui, view, state) {
         action = Some(prompt);
+    }
+    if state.platform.is_none()
+        && let Some(next) = recognition::card(ui, view, &mut state.recognition)
+    {
+        action = Some(next);
     }
     let Some(platform) = state.platform.clone() else {
         ui.label("Choose a platform to see its setup and next step.");

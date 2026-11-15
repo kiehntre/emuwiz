@@ -619,23 +619,44 @@ fn canonical_id(hint: &str) -> Option<&'static str> {
 
 /// Walks directory components from the file's own folder upward to, and
 /// including, `source_root`. The file's own name is never treated as a folder.
-/// Nearest folder wins.
+/// Nearest folder wins, except as [`nearest_platform_folder`] explains.
 fn folder_alias_evidence(path: &Path, source_root: &Path) -> Option<(&'static Platform, String)> {
     let relative = path.strip_prefix(source_root).ok()?;
     let mut components: Vec<_> = relative.components().collect();
     components.pop();
-
-    components
+    let mut folders: Vec<String> = components
         .iter()
         .rev()
-        .find_map(|component| {
-            let name = component.as_os_str().to_string_lossy();
-            folder_alias_with_suffixes(&name).map(|platform| (platform, name.into_owned()))
-        })
-        .or_else(|| {
-            let name = source_root.file_name()?.to_string_lossy();
-            folder_alias_with_suffixes(&name).map(|platform| (platform, name.into_owned()))
-        })
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if let Some(root) = source_root.file_name() {
+        folders.push(root.to_string_lossy().into_owned());
+    }
+    nearest_platform_folder(&folders)
+}
+
+/// The platform folder among `folders` (nearest first). The nearest match
+/// wins, except that a folder matching only once a parenthesised suffix is
+/// removed - the No-Intro/TOSEC title convention, as in
+/// `pc-8800-series/Enterprise (MIA)/` - never outranks an enclosing folder
+/// that names a platform. Real library 2026-11-12: a PC-8801 game was filed as
+/// the Enterprise 64/128 computer by its title folder. Only which folder is
+/// read changes; the result is still folder evidence, never a verified fact.
+pub fn nearest_platform_folder(folders: &[String]) -> Option<(&'static Platform, String)> {
+    let index = folders
+        .iter()
+        .position(|name| folder_alias_with_suffixes(name).is_some())?;
+    let name = &folders[index];
+    let platform = folder_alias_with_suffixes(name)?;
+    let title_like = platform_for_alias(name).is_none() && name.trim_end().ends_with(')');
+    if title_like
+        && let Some((outer, outer_name)) = folders[index + 1..]
+            .iter()
+            .find_map(|outer| folder_alias_with_suffixes(outer).map(|p| (p, outer)))
+    {
+        return Some((outer, outer_name.clone()));
+    }
+    Some((platform, name.clone()))
 }
 
 /// An exact alias match, also tolerating the two suffix conventions real

@@ -51,6 +51,7 @@ impl F {
         scan_and_persist(
             &mut self.db,
             &Config {
+                configured_source_roots: Some(self.roots.clone()),
                 source_folders: self.roots.clone(),
                 mount_root: self.temp.path().join("mounts"),
                 ratarmount_bin: "ratarmount".into(),

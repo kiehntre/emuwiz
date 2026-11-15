@@ -74,6 +74,8 @@ pub(super) fn input_with_preferences(
         cemu: None,
         flycast: None,
         xroar: None,
+        azahar: None,
+        vita3k: None,
         vice: Some(context),
         amiga_whdload: None,
         #[cfg(target_os = "linux")]

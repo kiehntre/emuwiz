@@ -307,17 +307,30 @@ pub fn hash_firmware_file(
     max_bytes: u64,
     chunk_bytes: usize,
 ) -> Result<ComputedFirmwareDigests, String> {
-    use md5::Md5;
-    use sha1::Sha1;
-    use sha1::digest::Digest;
-
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let mut file = options
+    let file = options
         .open(path)
         .map_err(|error| format!("firmware file could not be opened safely: {error}"))?;
+    hash_open_firmware_file(file, max_bytes, chunk_bytes)
+}
+
+/// [`hash_firmware_file`] for a file the caller already opened safely (for
+/// example through [`crate::safe_read::open_bounded_read`], which may follow
+/// a contained symlink). Type and size come from this descriptor, and the
+/// bytes hashed are exactly the ones read from it, so nothing swapped at the
+/// path after the open can be hashed instead.
+pub fn hash_open_firmware_file(
+    mut file: std::fs::File,
+    max_bytes: u64,
+    chunk_bytes: usize,
+) -> Result<ComputedFirmwareDigests, String> {
+    use md5::Md5;
+    use sha1::Sha1;
+    use sha1::digest::Digest;
+
     let metadata = file
         .metadata()
         .map_err(|error| format!("firmware file could not be inspected: {error}"))?;

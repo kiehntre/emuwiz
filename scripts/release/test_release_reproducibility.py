@@ -72,6 +72,42 @@ class ReproducibilityTests(unittest.TestCase):
                 self.assertFalse(member.issym() or member.islnk())
                 self.assertFalse(set(member.pax_headers) & {"atime", "ctime", "mtime"})
 
+    def test_reproducible_archives_do_not_depend_on_the_build_host_kernel(self):
+        shim = self.root / "kernel-shim"
+        shim.mkdir()
+        (shim / "sitecustomize.py").write_text(
+            "import os, platform\n"
+            "platform.release = lambda: os.environ['FAKE_KERNEL']\n"
+        )
+        archives = []
+        for name, kernel in (("kernel-a", "7.0.0-1017-azure"), ("kernel-b", "7.0.0-1014-aws")):
+            output = self.root / name
+            result = self.fixture._run(
+                "package", "--gui", str(self.fixture.gui), "--cli", str(self.fixture.cli),
+                "--source-root", str(self.fixture.repo), "--output-root", str(output),
+                "--arch", "x86_64", "--fixture-mode", "--reproducible", "--archive",
+                env={"PYTHONPATH": str(shim), "FAKE_KERNEL": kernel},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            archives.append(output / f"{fixtures.BUNDLE}.tar.xz")
+            info = (output / fixtures.BUNDLE / "BUILD_INFO.txt").read_text()
+            self.assertNotIn(kernel, info)
+            self.assertNotIn(kernel, (output / fixtures.BUNDLE / "manifest.json").read_text())
+            self.assertIn("linux_kernel: not recorded (reproducible build)", info)
+        self.assertEqual(archives[0].read_bytes(), archives[1].read_bytes())
+        self.assertEqual(self.compare(*archives).returncode, 0)
+
+    def test_non_reproducible_builds_still_record_the_host_kernel(self):
+        original = fixtures.packager.platform.release
+        fixtures.packager.platform.release = lambda: "6.8.0-test"
+        try:
+            self.assertEqual(fixtures.packager.recorded_host_kernel(False), "6.8.0-test")
+            self.assertEqual(
+                fixtures.packager.recorded_host_kernel(True), fixtures.packager.REPRODUCIBLE_KERNEL_NOTE
+            )
+        finally:
+            fixtures.packager.platform.release = original
+
     def test_input_order_mtime_permissions_and_long_pax_names_normalized(self):
         outputs = []
         for number, order in enumerate((("z", "a", "x" * 120), ("x" * 120, "a", "z"))):

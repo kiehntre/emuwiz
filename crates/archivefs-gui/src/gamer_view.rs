@@ -275,7 +275,7 @@ pub(crate) fn gamer_readiness_short_label(readiness: &GamerReadiness<'_>) -> &'s
         GamerReadiness::ChooseMember { .. } => "Choose game file",
         GamerReadiness::Unmount => "Mounted",
         GamerReadiness::Ready { request } if !request.unverified_warnings().is_empty() => {
-            "Ready, compatibility unverified"
+            request.unverified_status_label()
         }
         GamerReadiness::Ready { .. } => "Ready to play",
         GamerReadiness::NeedsSetup { .. } => "Needs setup",
@@ -293,6 +293,18 @@ pub(crate) fn show_gamer_launch_blocker(
     ui.colored_label(ui.visuals().warn_fg_color, blocker.heading());
     let next = match blocker.kind {
         launch_readiness_page::GamerBlockerKind::CheckingGame => {
+            // mGBA's Bubblewrap probe finishes on a worker thread, so it must
+            // not wait for the next input event. Other checks are unchanged.
+            if blocker.detail == launch_readiness_page::MGBA_CHECKING_BLOCKER {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            // The Atari800 setup check also answers from a worker thread.
+            #[cfg(target_os = "linux")]
+            if blocker.detail == launch_readiness_page::atari800::CHECKING {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+            }
             "EmuWiz is still checking this game."
         }
         launch_readiness_page::GamerBlockerKind::UnknownSystem => {
@@ -726,6 +738,7 @@ fn featured_retroarch_launch_action(
 
     let display = launch_state.display_for(request);
     launch_readiness_page::show_retroarch_launch_feedback(ui, &display);
+    launch_state.show_stop_control(ui);
     // Integration: the executor state machine, polling and running/closed/
     // error presentation are 934c9ec's; the plain beginner label is
     // 1c825e7's (`GAMER_PLAY_LABEL`).
@@ -2060,6 +2073,7 @@ mod game_metadata_enrichment_tests {
     /// planner's `Launch` projection over an already-retained archive member.
     fn ready_retroarch_play_action() -> launch_readiness_page::GamerPlayAction {
         let request = archivefs_core::launch::RetroArchLaunchRequest {
+            launch_choice: None,
             selected_content_path: PathBuf::from("/mnt/archive/disc1.iso"),
             expected_platform_id: "PlayStation 2".to_string(),
             expected_game_key: "retained-member".to_string(),
@@ -2783,6 +2797,7 @@ mod retroarch_one_launch_tests {
 
     fn request(path: &str) -> RetroArchLaunchRequest {
         RetroArchLaunchRequest {
+            launch_choice: None,
             selected_content_path: path.into(),
             expected_platform_id: "PSX".into(),
             expected_game_key: "a".repeat(64),
@@ -2818,5 +2833,22 @@ mod retroarch_one_launch_tests {
         });
         assert!(!clicked);
         assert!(texts(&output).contains(launch_readiness_page::RETROARCH_BUSY_HINT));
+    }
+
+    #[test]
+    fn gamer_view_offers_stop_for_the_running_game_and_keeps_play_disabled() {
+        let mut state = launch_readiness_page::RetroArchLaunchState::default();
+        let game = request("/library/GameA.bin");
+        state.track_running_for_test(&game);
+        let ctx = egui::Context::default();
+        let mut clicked = true;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                clicked = featured_retroarch_launch_action(ui, &mut state, &game, true);
+            });
+        });
+        assert!(!clicked);
+        assert!(texts(&output).contains("Stop RetroArch"));
+        state.stop_for_test();
     }
 }

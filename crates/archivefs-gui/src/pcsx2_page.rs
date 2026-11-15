@@ -34,6 +34,9 @@
 mod background;
 mod restore_recovery;
 
+#[cfg(test)]
+pub(crate) use background::save_fixture_tests::ps2_inventory_fixture;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
@@ -52,7 +55,8 @@ use archivefs_core::memory_card_inventory::{
 };
 use archivefs_core::patch_manager::{
     Pcsx2BiosVerification, Pcsx2GameInspection, Pcsx2GameRequest, Pcsx2InstallationType,
-    Pcsx2MemcardKind, Pcsx2ProfileDiscoveryRoots, Pcsx2SerialMapping, discover_pcsx2_profiles,
+    Pcsx2MemcardKind, Pcsx2MemcardSlot, Pcsx2MemcardSlotSource, Pcsx2MemcardSlotState,
+    Pcsx2MemcardSlots, Pcsx2ProfileDiscoveryRoots, Pcsx2SerialMapping, discover_pcsx2_profiles,
     inspect_pcsx2_game,
 };
 use eframe::egui;
@@ -110,13 +114,18 @@ pub(crate) fn gather_pcsx2_status(
         emulator_serial: None,
     };
     let inspection = inspect_pcsx2_game(&profile, &request);
-    let memory_cards = inspection
-        .memcards
-        .iter()
-        .filter(|card| card.present)
-        .filter_map(|card| {
-            archivefs_core::memory_card_inventory::inspect_memory_card(&card.path).ok()
-        })
+    // Cards PCSX2 actually assigns to a slot come first (they may live in a
+    // custom folder the shared-card scan never sees), then any other card
+    // image found in the default folder. Each path is inspected once.
+    let mut card_paths: Vec<&Path> = inspection.memcard_slots.assigned_card_files().collect();
+    for card in inspection.memcards.iter().filter(|card| card.present) {
+        if !card_paths.contains(&card.path.as_path()) {
+            card_paths.push(&card.path);
+        }
+    }
+    let memory_cards = card_paths
+        .into_iter()
+        .filter_map(|path| archivefs_core::memory_card_inventory::inspect_memory_card(path).ok())
         .collect();
     Pcsx2StatusOutcome::Found {
         profile: Pcsx2FoundProfile {
@@ -372,6 +381,7 @@ fn show_outcome(
         let (bios_headline, bios_tone) = bios_label(inspection.bios.verification);
         ui.label(format!("BIOS: {bios_headline}"));
         let _ = bios_tone;
+        show_memcard_slots(ui, advanced_mode, &inspection.memcard_slots);
 
         if verified_ps2_serial.is_none() {
             ui.label(
@@ -478,6 +488,71 @@ fn show_outcome(
         );
     });
     show_save_vault(ui, advanced_mode, memory_cards, save_vault)
+}
+
+/// One plain-language line for a PCSX2 memory-card slot.
+fn memcard_slot_summary(slot: &Pcsx2MemcardSlot) -> (String, widgets::StatusTone) {
+    let n = slot.slot;
+    let name = slot.filename.as_deref().unwrap_or("");
+    let default = if slot.source == Pcsx2MemcardSlotSource::Default {
+        " (PCSX2 default)"
+    } else {
+        ""
+    };
+    match slot.state {
+        Pcsx2MemcardSlotState::Enabled if slot.folder_card => (
+            format!("Slot {n}: {name} (folder memory card; contents not inspected){default}"),
+            widgets::StatusTone::Success,
+        ),
+        Pcsx2MemcardSlotState::Enabled => (
+            format!("Slot {n}: {name}{default}"),
+            widgets::StatusTone::Success,
+        ),
+        Pcsx2MemcardSlotState::Disabled if name.is_empty() => {
+            (format!("Slot {n}: off"), widgets::StatusTone::Info)
+        }
+        Pcsx2MemcardSlotState::Disabled => (
+            format!("Slot {n}: off ({name} is not inserted)"),
+            widgets::StatusTone::Info,
+        ),
+        Pcsx2MemcardSlotState::Missing => (
+            format!("Slot {n}: {name} - card file not found{default}"),
+            widgets::StatusTone::Warning,
+        ),
+        Pcsx2MemcardSlotState::Unassigned => (
+            format!("Slot {n}: no card assigned"),
+            widgets::StatusTone::Info,
+        ),
+        Pcsx2MemcardSlotState::Unsupported => (
+            format!(
+                "Slot {n}: unknown - {}",
+                slot.detail
+                    .as_deref()
+                    .unwrap_or("EmuWiz could not read this slot's setting.")
+            ),
+            widgets::StatusTone::Warning,
+        ),
+    }
+}
+
+fn show_memcard_slots(ui: &mut egui::Ui, advanced_mode: bool, slots: &Pcsx2MemcardSlots) {
+    if slots.slots.is_empty() {
+        return;
+    }
+    ui.label("Memory cards PCSX2 uses (read from its settings):");
+    for slot in &slots.slots {
+        let (text, tone) = memcard_slot_summary(slot);
+        widgets::status_badge(ui, text, tone);
+        if advanced_mode && let Some(path) = &slot.path {
+            widgets::path_value(ui, &format!("Slot {} path", slot.slot), path);
+        }
+    }
+    if advanced_mode && let Some(folder) = &slots.folder {
+        widgets::path_value(ui, "Memory-card folder", folder);
+    }
+    for note in &slots.notes {
+        ui.add(egui::Label::new(note.as_str()).wrap());
+    }
 }
 
 fn show_save_vault(
@@ -972,7 +1047,12 @@ fn show_export_dialog(ui: &mut egui::Ui) {
     }
 }
 
-fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
+/// Shown when the kernel reports that some program has the card open. Says
+/// nothing about which program: only process evidence says "PCSX2 is running".
+pub(crate) const STORAGE_UNPROTECTED: &str = "This memory card is stored on a merged, FUSE or network folder, where EmuWiz cannot safely protect it from other programs during a restore. Copy the card to a local disk and restore it there.";
+pub(crate) const CARD_IN_USE: &str = "Memory card is in use. Another application may have it open. Close applications accessing this card and try again.";
+
+pub(crate) fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
     match error {
         Ps2PsuRestoreError::ExistingSave(name) => {
             format!("Save already exists on this card: {name}")
@@ -1008,8 +1088,10 @@ fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
         Ps2PsuRestoreError::InvalidPlan(detail) => format!("Restore was refused: {detail}"),
         Ps2PsuRestoreError::Io(detail) => format!("Restore could not be completed: {detail}"),
         Ps2PsuRestoreError::EmulatorRunning => {
-            "A PS2 emulator is running or has this memory card open. Close it completely, then try again. The card was not changed.".into()
+            "A PS2 emulator (PCSX2) is running. Close it completely, then try again. The card was not changed.".into()
         }
+        Ps2PsuRestoreError::CardInUse => format!("{CARD_IN_USE} The card was not changed."),
+        Ps2PsuRestoreError::StorageUnprotected => format!("{STORAGE_UNPROTECTED} The card was not changed."),
         Ps2PsuRestoreError::EmulatorStateUnknown => {
             "EmuWiz could not inspect every live process, so it did not change the card. Close the emulator and inaccessible processes or correct /proc permissions, then retry.".into()
         }
@@ -1445,6 +1527,33 @@ mod tests {
         assert!(running.contains("not changed"));
     }
 
+    #[test]
+    fn card_in_use_never_claims_that_pcsx2_is_running() {
+        let in_use = psu_restore_error_message(&Ps2PsuRestoreError::CardInUse);
+        assert!(in_use.starts_with(CARD_IN_USE), "{in_use}");
+        assert!(in_use.contains("not changed"));
+        assert!(
+            !in_use.contains("PCSX2") && !in_use.contains("emulator"),
+            "{in_use}"
+        );
+        let running = psu_restore_error_message(&Ps2PsuRestoreError::EmulatorRunning);
+        assert!(running.contains("PCSX2") && running.contains("is running"));
+        assert!(!running.contains("in use"), "{running}");
+    }
+
+    #[test]
+    fn unprotectable_storage_explains_the_location_not_an_emulator() {
+        let storage = psu_restore_error_message(&Ps2PsuRestoreError::StorageUnprotected);
+        assert!(storage.starts_with(STORAGE_UNPROTECTED), "{storage}");
+        assert!(storage.contains("not changed") && storage.contains("local disk"));
+        assert!(
+            !storage.contains("PCSX2") && !storage.contains("running"),
+            "{storage}"
+        );
+        let core = Ps2PsuRestoreError::StorageUnprotected.to_string();
+        assert!(core.contains("storage location") && !core.contains("emulator"));
+    }
+
     fn empty_inspection() -> Pcsx2GameInspection {
         Pcsx2GameInspection {
             serial: None,
@@ -1462,6 +1571,7 @@ mod tests {
             patch_match: None,
             textures: None,
             memcards: Vec::new(),
+            memcard_slots: Default::default(),
             savestates: Pcsx2SaveStateInventory::default(),
             controllers: Pcsx2ControllerInfo::default(),
             bios: Pcsx2BiosInfo {
@@ -1519,6 +1629,63 @@ mod tests {
         };
         let _ = ctx.run(egui::RawInput::default(), draw);
         ctx.run(egui::RawInput::default(), draw)
+    }
+
+    #[test]
+    fn memory_card_slot_assignments_are_shown_honestly() {
+        let slot = |n, state, filename: Option<&str>, detail: Option<&str>| Pcsx2MemcardSlot {
+            slot: n,
+            state,
+            source: Pcsx2MemcardSlotSource::Settings,
+            filename: filename.map(str::to_string),
+            path: filename.map(|f| PathBuf::from("/cards").join(f)),
+            folder_card: false,
+            detail: detail.map(str::to_string),
+        };
+        let mut inspection = empty_inspection();
+        inspection.memcard_slots = Pcsx2MemcardSlots {
+            folder: Some(PathBuf::from("/cards")),
+            slots: vec![
+                slot(1, Pcsx2MemcardSlotState::Enabled, Some("RPG.ps2"), None),
+                slot(2, Pcsx2MemcardSlotState::Missing, Some("Racing.ps2"), None),
+            ],
+            notes: Vec::new(),
+        };
+        let state = Pcsx2StatusState::Ready {
+            generation: 1,
+            outcome: found_outcome(inspection),
+        };
+        let output = run_panel(false, None, &state);
+        assert!(rendered_text_contains(&output, "Slot 1: RPG.ps2"));
+        assert!(rendered_text_contains(
+            &output,
+            "Slot 2: Racing.ps2 - card file not found"
+        ));
+
+        let cases = [
+            (
+                slot(1, Pcsx2MemcardSlotState::Disabled, Some("A.ps2"), None),
+                "Slot 1: off (A.ps2 is not inserted)",
+            ),
+            (
+                slot(2, Pcsx2MemcardSlotState::Unassigned, None, None),
+                "Slot 2: no card assigned",
+            ),
+            (
+                slot(1, Pcsx2MemcardSlotState::Unsupported, None, Some("Odd.")),
+                "Slot 1: unknown - Odd.",
+            ),
+        ];
+        for (slot, expected) in cases {
+            assert_eq!(memcard_slot_summary(&slot).0, expected);
+        }
+        let mut folder = slot(1, Pcsx2MemcardSlotState::Enabled, Some("F.ps2"), None);
+        folder.folder_card = true;
+        folder.source = Pcsx2MemcardSlotSource::Default;
+        assert_eq!(
+            memcard_slot_summary(&folder).0,
+            "Slot 1: F.ps2 (folder memory card; contents not inspected) (PCSX2 default)"
+        );
     }
 
     #[test]

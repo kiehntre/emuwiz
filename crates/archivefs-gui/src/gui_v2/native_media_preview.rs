@@ -112,9 +112,14 @@ fn run_at(
     review.validate_saved_at(config_path, &database)?;
     let db = Database::open_read_only(&database).map_err(|e| e.to_string())?;
     let platforms = catalogue_platforms(&root, &sources);
+    // The configured mount root lets the scan skip mount-root content (and
+    // live mounts) when a legacy config overlaps this source.
+    let mount_root =
+        archivefs_core::configured_mount_root_at(config_path).map_err(|e| e.to_string())?;
     let config = archivefs_core::Config {
+        configured_source_roots: None,
         source_folders: vec![root],
-        mount_root: PathBuf::new(),
+        mount_root,
         ratarmount_bin: String::new(),
         master_rom_root: None,
     };

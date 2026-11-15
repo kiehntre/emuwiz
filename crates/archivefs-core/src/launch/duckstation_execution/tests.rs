@@ -776,3 +776,54 @@ fn cue_launch_refuses_changed_replaced_missing_linked_and_ambiguous_companions()
         );
     }
 }
+
+/// The three concepts stay apart on DuckStation's route: the system and the
+/// game are established by the disc's own serial (no DAT needed), and the
+/// file is re-read at Play. An `unverified:` key (a folder guess, a try or a
+/// remembered choice) can never pass that check, so the route fails safe and
+/// Blue blocks it up front instead of offering a Play that is refused.
+#[test]
+fn duckstation_launches_on_the_discs_own_serial_and_never_on_an_unverified_key() {
+    let root = fixture_root("unverified-key");
+    let content_path = root.join("games/game.iso");
+    std::fs::create_dir_all(content_path.parent().unwrap()).unwrap();
+    std::fs::write(&content_path, ps1_iso_bytes()).unwrap();
+    let request = |key: &str| DuckStationLaunchRequest {
+        expected_cue_members: None,
+        selected_content_path: content_path.clone(),
+        expected_platform_id: "PSX".to_string(),
+        expected_game_key: key.to_string(),
+        expected_ps1_serial: "SLUS-12345".to_string(),
+        profile_id: "duckstation:test".to_string(),
+        expected_executable: root.join("duckstation-qt"),
+        expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+        expected_installation: crate::launch::installation::LaunchInstallation::Native,
+    };
+    // Not DAT-recognised, but the disc names itself: accepted.
+    assert!(fresh_identity_status(&content_path, &request("SLUS-12345")).is_ok());
+    // The content-bound key the unverified lane would hand it: refused.
+    let unverified =
+        crate::launch::unverified_media::platform_media_identity_fresh(&content_path, "PSX")
+            .expect("iso is a PSX format")
+            .game_key;
+    assert!(crate::launch::unverified_media::is_unverified_key(
+        &unverified
+    ));
+    assert_eq!(
+        fresh_identity_status(&content_path, &request(&unverified))
+            .unwrap_err()
+            .kind,
+        DuckStationLaunchPreflightErrorKind::IdentityMismatch
+    );
+    // A disc changed to another serial is refused on the serial route too.
+    let mut bytes = ps1_iso_bytes();
+    let mut changed = 0;
+    while let Some(at) = bytes.windows(11).position(|w| w == b"SLUS_123.45") {
+        bytes[at..at + 4].copy_from_slice(b"SLES");
+        changed += 1;
+    }
+    assert!(changed > 0);
+    std::fs::write(&content_path, bytes).unwrap();
+    assert!(fresh_identity_status(&content_path, &request("SLUS-12345")).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}

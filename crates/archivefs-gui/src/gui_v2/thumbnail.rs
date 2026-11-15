@@ -60,6 +60,17 @@ fn fingerprint(path: &Path, metadata: &fs::Metadata) -> String {
 }
 
 pub(super) fn load_local(path: &Path, root: &Path) -> Result<Pixels, String> {
+    load_local_with(path, root, true)
+}
+
+/// Like [`load_local`], but strictly read-only: an existing cached thumbnail
+/// is read, otherwise the source is decoded and resized in memory. Nothing is
+/// created, published or trimmed under `root`.
+pub(super) fn load_local_read_only(path: &Path, root: &Path) -> Result<Pixels, String> {
+    load_local_with(path, root, false)
+}
+
+fn load_local_with(path: &Path, root: &Path, persist: bool) -> Result<Pixels, String> {
     let start = Instant::now();
     if !path.is_absolute()
         || path
@@ -78,7 +89,9 @@ pub(super) fn load_local(path: &Path, root: &Path) -> Result<Pixels, String> {
         lookup: start.elapsed(),
         ..Timings::default()
     };
-    prepare_cache(root)?;
+    if persist {
+        prepare_cache(root)?;
+    }
     let cached = root.join(format!("{key}.png"));
     if fs::symlink_metadata(&cached).is_ok_and(|metadata| metadata.file_type().is_file())
         && let Ok(image) = decode(&cached, true, &mut timings)
@@ -95,7 +108,7 @@ pub(super) fn load_local(path: &Path, root: &Path) -> Result<Pixels, String> {
         return Err("The picture changed while loading. Retry it.".into());
     }
     // Cache failure does not prevent a valid picture being shown.
-    if let Err(error) = publish(root, &cached, &image) {
+    if persist && let Err(error) = publish(root, &cached, &image) {
         log::debug!("gui_v2 thumbnail not cached: {error}");
     }
     Ok(Pixels { image, timings })

@@ -3,7 +3,7 @@
 //! The projector consumes the existing launch input and never performs
 //! discovery, identity resolution, firmware inspection, or launch planning.
 
-use crate::launch_readiness_page::LaunchReadinessInput;
+use crate::launch_readiness_page::{IdentityUnknownReason, LaunchReadinessInput};
 use archivefs_core::launch::{
     CandidatePreference, FirmwareReadiness, LaunchBlockerKind, LaunchCandidate, LaunchPlan,
     LaunchReadiness, LaunchTarget, LaunchWarningKind,
@@ -11,7 +11,10 @@ use archivefs_core::launch::{
 use eframe::egui;
 
 mod diagnosis;
-pub(crate) use diagnosis::{Attempt, AttemptTracker, Finding};
+pub(crate) mod route_truth;
+mod vita3k_package;
+pub(crate) use diagnosis::{Attempt, AttemptTracker, Cause, Finding};
+pub(crate) use vita3k_package::note_vita3k_package;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadinessPresentationState {
@@ -21,6 +24,8 @@ pub(crate) enum ReadinessPresentationState {
     NeedsEmulator,
     NeedsFirmware,
     NeedsIdentityReview,
+    /// No trusted system is on record for this game.
+    NeedsSystem,
     SourceUnavailable,
     MediaUnreadable,
     Blocked,
@@ -33,12 +38,23 @@ pub(crate) enum ReadinessAction {
     SetUpEmulator,
     CheckFirmware,
     ReviewIdentity,
+    /// Identity unresolved though the system is known: open the evidence.
+    VerifyIdentity,
+    /// No trusted system on record: open the existing Choose system flow.
+    ChooseSystem,
+    /// The system came from the folder name only: open the Launch page,
+    /// which offers a one-launch "Try anyway" (nothing saved) beside the
+    /// permanent Change system.
+    TryAnyway,
     CheckGamesFolder,
     ReviewProblem,
     ChooseEmulator,
     RecheckReadiness,
     ReviewDiscSet,
     OpenActivity,
+    /// Game Details only: bring "Look up online" into view. Never reads a
+    /// file or contacts Hasheous by itself.
+    LookUpOnline,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +65,18 @@ pub(crate) enum IdentitySummary {
     /// The saved catalogue holds an exact authoritative match, but launch
     /// still needs the file's own identity evidence.
     CatalogueVerified,
+    /// The game's identity is verified by current, trusted evidence while
+    /// launch readiness is still being checked. Says nothing about launch.
+    Verified,
+    /// A DAT match is on record, but this game's current proof is still
+    /// being checked. Says nothing about launch.
+    VerificationPending,
+    /// The check finished without establishing current proof either way
+    /// (setup gap, unreadable evidence, unavailable file). Not a disproof.
+    VerificationNotConfirmed,
+    /// This game's fresh check established its earlier proof is no longer
+    /// current.
+    RecheckNeeded,
     Mismatch,
 }
 
@@ -97,6 +125,12 @@ pub(crate) struct GameReadinessSummary {
     pub(crate) findings: Vec<Finding>,
     /// What happened the last time Play was pressed for this game.
     pub(crate) attempt: Option<Attempt>,
+    /// Play is ready and at least one other emulator could also be chosen
+    /// for this game (the shared launch-choice gate, so a blocked or
+    /// unavailable one never counts). The card then also offers "Choose
+    /// emulator", which opens the Launch page's per-emulator choice controls;
+    /// without it a planner's sole pick left no way to set a default.
+    pub(crate) other_emulator_choosable: bool,
 }
 
 pub(crate) fn project(
@@ -106,6 +140,14 @@ pub(crate) fn project(
     let mut summary = match input {
         LaunchReadinessInput::EvidenceNotLoaded | LaunchReadinessInput::RetroArchNotScanned => {
             checking_summary()
+        }
+        // One fully preflighted Hatari profile launches through the isolated
+        // disposable session, so it projects like any other ready plan (with
+        // its visible identity-unverified warning and a Play action).
+        LaunchReadinessInput::AtariSt(snapshot) if snapshot.launch_request().is_some() => {
+            let mut summary = project_plan(&snapshot.plan(), true, true);
+            summary.details.extend(snapshot.details());
+            summary
         }
         LaunchReadinessInput::AtariSt(snapshot) => {
             let mut summary = project_plan(&snapshot.plan(), true, true);
@@ -128,7 +170,7 @@ pub(crate) fn project(
             None,
             Some(ReadinessAction::Play),
         ),
-        LaunchReadinessInput::IdentityUnknown => identity_summary(false),
+        LaunchReadinessInput::IdentityUnknown(reason) => identity_unknown_summary(*reason),
         LaunchReadinessInput::DiscFilesUnresolved(detail) => base(
             ReadinessPresentationState::NeedsIdentityReview,
             "The disc's files need attention",
@@ -168,6 +210,21 @@ pub(crate) fn project(
         summary.primary_action = Some(ReadinessAction::RecheckReadiness);
     }
     summary
+}
+
+/// A readiness check that stopped with an error is shown as that error, not
+/// as the generic "changed since this result": rechecking a game whose file
+/// is missing otherwise repeats that sentence forever without saying why.
+/// The answer stays stale, so Play stays unavailable.
+pub(super) fn describe_check_error(summary: &mut GameReadinessSummary, error: &str) {
+    if summary.freshness != ReadinessFreshness::Stale {
+        return;
+    }
+    summary.headline = "EmuWiz couldn't check this game".into();
+    summary.explanation = format!(
+        "The check stopped with this error: {}. Nothing was changed. Fix the cause (for example reconnect the game's drive), then recheck.",
+        error.trim().trim_end_matches('.')
+    );
 }
 
 /// The shared DuckStation resolver's fallback or refusal, shown with the
@@ -215,10 +272,18 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
     let named_disc_refusal = summary
         .explanation
         .starts_with(archivefs_core::launch::evidence_bridge::CUE_BIN_REFUSED_PREFIX);
+    // The zipped-save refusal already offers Recheck (which refreshes
+    // RetroArch, where the answer comes from); the generic safety-refusal
+    // finding must not turn that into "Review problem".
+    let zipped_save_refusal = matches!(input, LaunchReadinessInput::Plan { plan, .. }
+    if plan.candidates.iter().flat_map(|candidate| &candidate.blockers).any(|blocker| {
+        blocker.kind == LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe
+            && blocker.detail == summary.explanation
+    }));
     let mut findings = match input {
-        LaunchReadinessInput::IdentityUnknown | LaunchReadinessInput::IdentityConflicting => {
-            diagnosis::single(Cause::IdentityNotConfirmed)
-        }
+        LaunchReadinessInput::IdentityConflicting => diagnosis::single(Cause::IdentityNotConfirmed),
+        // Each reason already carries its own wording and next action.
+        LaunchReadinessInput::IdentityUnknown(_) => Vec::new(),
         // Carries its own named reason and rescan action.
         LaunchReadinessInput::DosBoxReview | LaunchReadinessInput::DiscFilesUnresolved(_) => {
             Vec::new()
@@ -233,7 +298,19 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
                     Vec::new()
                 }
             } else {
+                // An option blocked only by a core tie can be chosen, so it
+                // speaks for the game before an option that cannot open the
+                // file at all (Stella refusing a zipped 2600 cartridge must
+                // not turn the action into "Check games folder").
                 selected_candidate(plan)
+                    .or_else(|| {
+                        plan.candidates.iter().find(|c| {
+                            !c.blockers.is_empty()
+                                && c.blockers
+                                    .iter()
+                                    .all(|b| b.kind == LaunchBlockerKind::AmbiguousCore)
+                        })
+                    })
                     .or_else(|| plan.candidates.iter().find(|c| !c.blockers.is_empty()))
                     .map(findings_for)
                     .unwrap_or_default()
@@ -255,7 +332,10 @@ fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessIn
     {
         return;
     }
-    if !named_disc_refusal && let Some(fix) = findings[0].fix {
+    if !named_disc_refusal
+        && !zipped_save_refusal
+        && let Some(fix) = findings[0].fix
+    {
         summary.primary_action = Some(fix);
     }
     summary.findings = findings;
@@ -274,14 +354,114 @@ fn checking_summary() -> GameReadinessSummary {
     )
 }
 
+fn identity_unknown_summary(reason: IdentityUnknownReason) -> GameReadinessSummary {
+    match reason {
+        IdentityUnknownReason::SystemNotChosen => base(
+            ReadinessPresentationState::NeedsSystem,
+            "Choose a system for this game",
+            "EmuWiz has no trusted system for this file, so it cannot pick an emulator. Choose system lets you set it after reviewing its confirmation. Optional catalogue (DAT) verification is separate and is not what is stopping Play.",
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::ChooseSystem),
+        ),
+        IdentityUnknownReason::UnsupportedArchive => base(
+            ReadinessPresentationState::Blocked,
+            "This archive format isn't supported for launch identity",
+            "EmuWiz cannot read a game identity from this kind of archive and will not guess one. Extract the game from the archive, or use a supported format, then recheck readiness. Your file is untouched. Optional catalogue (DAT) verification is separate and is not what is stopping Play.",
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::RecheckReadiness),
+        ),
+        // No identity route exists for these, so there is nothing for a
+        // "Verify identity" button to open: only a safe recheck is offered.
+        reason @ (IdentityUnknownReason::NoIdentityCheck(_)
+        | IdentityUnknownReason::UnsupportedFormat(_)
+        | IdentityUnknownReason::AmigaHardDisk
+        | IdentityUnknownReason::AmigaIpf
+        | IdentityUnknownReason::NoLaunchRoute(_)) => base(
+            ReadinessPresentationState::Blocked,
+            &match reason {
+                IdentityUnknownReason::NoIdentityCheck(system) => {
+                    format!("EmuWiz has no identity check for {system} yet")
+                }
+                IdentityUnknownReason::NoLaunchRoute(system) => {
+                    format!("This is a {system} game; no installed emulator starts it")
+                }
+                IdentityUnknownReason::UnsupportedFormat(_) => {
+                    "EmuWiz does not read this file format yet".to_string()
+                }
+                _ => reason.banner_title().to_string(),
+            },
+            &reason.no_action_note().unwrap_or_default(),
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::RecheckReadiness),
+        ),
+        IdentityUnknownReason::FolderOnly(system) => base(
+            ReadinessPresentationState::NeedsSystem,
+            &format!("The {system} system is only a guess from the folder"),
+            &format!(
+                "EmuWiz only knows the system from the folder this file is in, and the file format is shared with other systems, so Play is not offered on that guess alone. Try anyway starts it once as {system} (or another compatible system) with a warning and saves nothing. To make it lasting, change the system permanently on Review identity. Catalogue (DAT) verification is not required."
+            ),
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::TryAnyway),
+        ),
+        IdentityUnknownReason::SystemUnknown => base(
+            ReadinessPresentationState::NeedsSystem,
+            "The system for this game is not known",
+            "No system is recorded for this game and the file does not name one, so Play is not offered on a guess. Try anyway starts it once as a compatible system you pick (only systems that use this file format and have an installed emulator), with a warning, and saves nothing unless you tick Remember this launch choice. Neither sets the game's system; choose it permanently on Review identity. Catalogue (DAT) verification is not required.",
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::TryAnyway),
+        ),
+        IdentityUnknownReason::MediaConflict { recorded, content } => base(
+            ReadinessPresentationState::Blocked,
+            &format!("This file is a {content} game, not {recorded}"),
+            &format!(
+                "The file's own header says {content}, but the game is recorded as {recorded}. EmuWiz will not start it with a {recorded} emulator. Review identity lets you change the system."
+            ),
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::ReviewIdentity),
+        ),
+        IdentityUnknownReason::NotConfirmed => base(
+            ReadinessPresentationState::NeedsIdentityReview,
+            "EmuWiz cannot tell which game this file is yet",
+            "Play needs the file's own identity evidence to choose the right emulator settings. Optional catalogue (DAT) verification is a separate check and is not what is stopping Play. Verify identity shows what EmuWiz found.",
+            IdentitySummary::NeedsReview,
+            SourceSummary::RecheckNeeded,
+            FirmwareSummary::Unknown,
+            None,
+            Some(ReadinessAction::VerifyIdentity),
+        ),
+    }
+}
+
 fn identity_summary(conflicting: bool) -> GameReadinessSummary {
     base(
         ReadinessPresentationState::NeedsIdentityReview,
-        "This exact release is not confirmed",
         if conflicting {
-            "Evidence for this game conflicts and needs review before launch."
+            "This file's evidence points to different games"
         } else {
-            "EmuWiz cannot confirm this exact release yet."
+            "EmuWiz cannot tell which game this file is yet"
+        },
+        if conflicting {
+            "Evidence for this game conflicts, so EmuWiz will not guess which game to start. Review identity to choose the right match."
+        } else {
+            "Play needs the file's own identity evidence to choose the right emulator settings. Optional catalogue (DAT) verification is a separate check and is not what is stopping Play. Review identity shows what EmuWiz thinks it is."
         },
         if conflicting {
             IdentitySummary::Mismatch
@@ -399,23 +579,31 @@ fn project_plan(
         );
     }
 
-    if let Some(candidate) = plan.candidates.iter().find(|candidate| {
-        candidate.blockers.iter().any(|blocker| {
-            matches!(
-                blocker.kind,
-                LaunchBlockerKind::ContentNotResolved | LaunchBlockerKind::NoInstallationCandidate
-            )
-        })
-    }) && candidate
-        .blockers
+    // One option's own content refusal (a zipped cartridge on a standalone
+    // emulator that cannot open ZIPs) says nothing about the game when another
+    // option can start it, or is blocked for its own reason (a core tie): the
+    // card then follows those options, exactly as the Launch page does.
+    let no_usable_option = plan
+        .candidates
         .iter()
-        .any(|blocker| blocker.kind == LaunchBlockerKind::ContentNotResolved)
+        .all(|candidate| candidate.readiness == LaunchReadiness::Blocked);
+    let content_unresolved = |candidate: &LaunchCandidate| {
+        candidate
+            .blockers
+            .iter()
+            .any(|blocker| blocker.kind == LaunchBlockerKind::ContentNotResolved)
+    };
+    if no_usable_option
+        && plan.candidates.iter().all(content_unresolved)
+        && let Some(candidate) = plan.candidates.first()
     {
+        // A file confirmed missing gets its own message (`note_file_missing`);
+        // here only "no route can open it as stored" is known.
         return with_details(
             base(
                 ReadinessPresentationState::SourceUnavailable,
-                "The game file is unavailable",
-                "The library remembers this game, but its current folder cannot be reached.",
+                "No emulator here can open this game file",
+                "None of the installed emulators can start this file as it is stored. A game kept in an archive (such as a ZIP of a disc image) may need extracting, and a moved or disconnected folder must be reconnected.",
                 IdentitySummary::StrongLocal,
                 SourceSummary::Unavailable,
                 firmware_for(candidate),
@@ -426,7 +614,7 @@ fn project_plan(
         );
     }
 
-    if let Some(candidate) = plan.candidates.iter().find(|candidate| {
+    let media_refused = |candidate: &LaunchCandidate| {
         candidate.blockers.iter().any(|blocker| {
             matches!(
                 blocker.kind,
@@ -435,7 +623,13 @@ fn project_plan(
                     | LaunchBlockerKind::ContentNotResolved
             )
         })
-    }) {
+    };
+    // Only when every option refuses the media itself; an option blocked for
+    // its own reason (a core tie) is reported by the branches below.
+    if no_usable_option
+        && plan.candidates.iter().all(media_refused)
+        && let Some(candidate) = plan.candidates.first()
+    {
         return with_details(
             base(
                 ReadinessPresentationState::MediaUnreadable,
@@ -452,6 +646,35 @@ fn project_plan(
     }
 
     let selected = selected_candidate(plan);
+    // A saved emulator choice that can no longer be used never falls back to
+    // another emulator (launch_choice), so say which one is missing and
+    // offer the choice again instead of a generic "choose one".
+    // `hold_for_new_choice` gives every remaining option this warning, so its
+    // presence alone means the choice is held: a sole remaining option must
+    // not fall through to the ready path (re-review of 17615e6c).
+    if let Some(warning) = plan.candidates.iter().find_map(|candidate| {
+        candidate.warnings.iter().find(|warning| {
+            warning.kind
+                == archivefs_core::launch::LaunchWarningKind::PreferredLaunchChoiceUnavailable
+        })
+    }) {
+        return with_details(
+            base(
+                ReadinessPresentationState::NeedsEmulator,
+                "Your saved emulator choice cannot be used",
+                &format!(
+                    "{} Use Choose emulator to pick another one for this launch, or save a new default.",
+                    warning.detail
+                ),
+                IdentitySummary::StrongLocal,
+                SourceSummary::Available,
+                FirmwareSummary::Unknown,
+                None,
+                Some(ReadinessAction::ChooseEmulator),
+            ),
+            details,
+        );
+    }
     let eligible = plan
         .candidates
         .iter()
@@ -504,6 +727,28 @@ fn project_plan(
                 FirmwareSummary::Missing,
                 emulator_for(candidate),
                 Some(ReadinessAction::CheckFirmware),
+            ),
+            details,
+        );
+    }
+
+    if let Some(blocker) = candidate
+        .blockers
+        .iter()
+        .find(|blocker| blocker.kind == LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe)
+    {
+        // Same reason the launch would refuse with; Recheck also refreshes
+        // RetroArch, which is where this answer comes from.
+        return with_details(
+            base(
+                ReadinessPresentationState::Blocked,
+                "RetroArch would lose this zipped game's saves",
+                &blocker.detail,
+                IdentitySummary::StrongLocal,
+                source_for(candidate),
+                firmware_for(candidate),
+                emulator_for(candidate),
+                Some(ReadinessAction::RecheckReadiness),
             ),
             details,
         );
@@ -578,7 +823,13 @@ fn project_plan(
         .iter()
         .map(|warning| warning.detail.clone())
         .collect::<Vec<_>>();
-    if candidate.firmware == FirmwareReadiness::PresentUnverified {
+    // One clear statement: the candidate's own (file-naming) warning wins; the
+    // generic line is only a fallback for candidates that carry none.
+    if candidate.firmware == FirmwareReadiness::PresentUnverified
+        && !candidate.warnings.iter().any(|warning| {
+            warning.kind == archivefs_core::launch::LaunchWarningKind::FirmwarePresentUnverified
+        })
+    {
         warnings.push("Firmware is present but not verified.".into());
     }
     let has_warning = candidate.readiness == LaunchReadiness::ReadyWithWarnings
@@ -612,6 +863,10 @@ fn project_plan(
     );
     summary.warnings = warnings;
     summary.details = details;
+    summary.other_emulator_choosable = plan.candidates.iter().any(|other| {
+        !std::ptr::eq(other, candidate)
+            && archivefs_core::launch::launch_choice::is_choosable(plan, other)
+    });
     if !has_warning && let Some(emulator) = &summary.emulator {
         summary.explanation = format!(
             "EmuWiz can now prepare this game for {}. Checking readiness does not change your game files.",
@@ -619,6 +874,15 @@ fn project_plan(
         );
     }
     summary
+}
+
+/// A save-folder finding comes from the last RetroArch scan; offer the
+/// refresh that re-checks it (owner decision 2026-11-13).
+pub(crate) fn offers_retroarch_refresh(summary: &GameReadinessSummary) -> bool {
+    summary
+        .warnings
+        .iter()
+        .any(|warning| warning.ends_with(archivefs_core::launch::RETROARCH_RECHECK_HINT))
 }
 
 fn base(
@@ -645,6 +909,7 @@ fn base(
         freshness: ReadinessFreshness::Current,
         findings: Vec::new(),
         attempt: None,
+        other_emulator_choosable: false,
     }
 }
 
@@ -761,6 +1026,7 @@ pub(crate) fn status_tone(status: ReadinessPresentationState) -> crate::ui::comp
         ReadinessPresentationState::NeedsEmulator
         | ReadinessPresentationState::NeedsFirmware
         | ReadinessPresentationState::NeedsIdentityReview
+        | ReadinessPresentationState::NeedsSystem
         | ReadinessPresentationState::SourceUnavailable
         | ReadinessPresentationState::MediaUnreadable
         | ReadinessPresentationState::Blocked => crate::ui::components::StatusTone::Blocked,
@@ -776,9 +1042,8 @@ pub(crate) fn blue_status_tone(
     match status {
         ReadinessPresentationState::NeedsEmulator
         | ReadinessPresentationState::NeedsFirmware
-        | ReadinessPresentationState::NeedsIdentityReview => {
-            crate::ui::components::StatusTone::Warning
-        }
+        | ReadinessPresentationState::NeedsIdentityReview
+        | ReadinessPresentationState::NeedsSystem => crate::ui::components::StatusTone::Warning,
         other => status_tone(other),
     }
 }
@@ -790,7 +1055,10 @@ pub(crate) fn status_label(status: ReadinessPresentationState) -> &'static str {
         ReadinessPresentationState::ReadyWithWarnings => "Ready with warning",
         ReadinessPresentationState::NeedsEmulator => "Emulator needed",
         ReadinessPresentationState::NeedsFirmware => "Firmware needed",
-        ReadinessPresentationState::NeedsIdentityReview => "Identity needs review",
+        // Launch needs the file's own evidence; identity confidence is
+        // stated separately, so this never reads as an identity verdict.
+        ReadinessPresentationState::NeedsIdentityReview => "File check needed",
+        ReadinessPresentationState::NeedsSystem => "System needed",
         ReadinessPresentationState::SourceUnavailable => "Game file unavailable",
         ReadinessPresentationState::MediaUnreadable => "Game file unreadable",
         ReadinessPresentationState::Blocked => "Needs attention",
@@ -804,16 +1072,28 @@ pub(crate) fn action_label(action: ReadinessAction) -> &'static str {
         ReadinessAction::SetUpEmulator => "Set up emulator",
         ReadinessAction::CheckFirmware => "Check BIOS / Firmware",
         ReadinessAction::ReviewIdentity => "Review identity",
+        ReadinessAction::VerifyIdentity => "Verify identity",
+        ReadinessAction::ChooseSystem => "Choose system",
+        ReadinessAction::TryAnyway => "Try anyway",
         ReadinessAction::CheckGamesFolder => "Check games folder",
         ReadinessAction::ReviewProblem => "Review problem",
         ReadinessAction::ChooseEmulator => "Choose emulator",
         ReadinessAction::RecheckReadiness => "Recheck readiness",
         ReadinessAction::ReviewDiscSet => "Review multi-disc set",
         ReadinessAction::OpenActivity => "Open Activity",
+        ReadinessAction::LookUpOnline => super::hasheous_check::SHORTCUT_LABEL,
     }
 }
 
-pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<ReadinessAction> {
+/// `identity` is the page's identity wording. The launch projection's own
+/// identity value follows which launch branch ran (a missing BIOS, an
+/// emulator, a check still running), so it is only a fallback.
+pub(crate) fn show(
+    ui: &mut egui::Ui,
+    summary: &GameReadinessSummary,
+    identity: Option<&str>,
+) -> Option<ReadinessAction> {
+    let identity = identity.unwrap_or(identity_label(summary.identity));
     let mut action = None;
     crate::ui::components::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -827,18 +1107,30 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
         });
         // The action sits directly under the state so it stays on screen in a
         // short window; the explanation and evidence chips follow it.
+        let offers_choice = summary.primary_action == Some(ReadinessAction::Play)
+            && summary.other_emulator_choosable;
         let action_count = 1 + usize::from(
-            summary.primary_action.is_some()
-                && summary.primary_action != Some(ReadinessAction::Play),
+            (summary.primary_action.is_some()
+                && summary.primary_action != Some(ReadinessAction::Play))
+                || offers_choice,
         );
         let available = ui.available_width();
         let gap = ui.spacing().item_spacing.x;
-        let slot = if available >= 320.0 && action_count == 2 {
-            (available - gap) / 2.0
+        // Two buttons share the row when each keeps a usable width; otherwise
+        // they stack. `add_sized` does not wrap in a wrapping row, so never
+        // rely on that: a narrow card used to push Play past its edge.
+        let side_by_side = action_count == 2 && available >= 240.0;
+        let slot = if side_by_side {
+            ((available - gap) / 2.0).min(260.0)
         } else {
             available.min(260.0)
         };
-        ui.horizontal_wrapped(|ui| {
+        let button_layout = if action_count == 2 && !side_by_side {
+            egui::Layout::top_down(egui::Align::Min)
+        } else {
+            egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true)
+        };
+        ui.allocate_ui_with_layout(egui::vec2(available, 0.0), button_layout, |ui| {
             if let Some(primary) = summary.primary_action {
                 let fill = crate::ui::theme::primary_action_fill(ui);
                 if ui
@@ -852,6 +1144,17 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
                 {
                     action = Some(primary);
                 }
+            }
+            if offers_choice
+                && ui
+                    .add_sized(
+                        [slot, 64.0],
+                        egui::Button::new(action_label(ReadinessAction::ChooseEmulator)).wrap(),
+                    )
+                    .on_hover_text("Other emulators can also start this game. Choose one for this launch, or save it as the default for this game or system.")
+                    .clicked()
+            {
+                action = Some(ReadinessAction::ChooseEmulator);
             }
             // Play is always on screen so the page never changes shape: when
             // it cannot run, it is disabled and the headline above says why.
@@ -900,7 +1203,14 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
             if let Some(emulator) = &summary.emulator {
                 ui.label(format!("Using: {}", emulator.name));
             }
-            ui.label(format!("Identity: {}", identity_label(summary.identity)));
+            ui.label(format!("Identity: {identity}"));
+            if ui
+                .small_button(action_label(ReadinessAction::LookUpOnline))
+                .on_hover_text(super::hasheous_check::SHORTCUT_HINT)
+                .clicked()
+            {
+                action = Some(ReadinessAction::LookUpOnline);
+            }
             if summary.firmware != FirmwareSummary::Unknown {
                 ui.label(format!("Firmware: {}", firmware_label(summary.firmware)));
             }
@@ -908,6 +1218,9 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
         });
         for warning in summary.warnings.iter().take(2) {
             ui.colored_label(crate::ui::theme::warning(ui), warning);
+        }
+        if offers_retroarch_refresh(summary) && ui.small_button("Refresh RetroArch").clicked() {
+            action = Some(ReadinessAction::RecheckReadiness);
         }
         ui.collapsing("Readiness details", |ui| {
             if let Some(emulator) = &summary.emulator {
@@ -921,10 +1234,7 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
                     ui.monospace(line);
                 }
             }
-            ui.label(format!(
-                "Identity evidence: {}",
-                identity_label(summary.identity)
-            ));
+            ui.label(format!("Identity evidence: {identity}"));
             ui.label(format!("Source state: {}", source_label(summary.source)));
             ui.label(format!(
                 "Firmware state: {}",
@@ -937,7 +1247,7 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
 
 /// Shown while the Library's check has not reached a current answer.
 pub(crate) const PLAY_RUNS_THE_CHECK: &str =
-    "Play runs the full launch check first. Nothing starts unless it passes.";
+    "Play checks that this game can start, then starts it. Nothing starts unless the check passes.";
 
 /// The Library's selected-game readiness, before it is drawn.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1012,6 +1322,14 @@ pub(crate) fn compact(summary: &GameReadinessSummary, checksum_pending: bool) ->
         },
         status => {
             let ready = summary.primary_action == Some(ReadinessAction::Play);
+            // A launchable-with-warning game states the warning itself (for
+            // example which firmware files are unverified), not only a
+            // generic note, while Play stays enabled.
+            let reason = if status == State::ReadyWithWarnings && ready {
+                summary.warnings.first().cloned().unwrap_or(reason)
+            } else {
+                reason
+            };
             CompactReadiness {
                 badge: status_label(status),
                 tone: status,
@@ -1075,16 +1393,27 @@ pub(crate) fn show_compact(
         break_anywhere: false,
         overflow_character: Some('…'),
     };
-    ui.add(egui::Label::new(reason).wrap().selectable(false))
+    let reason_response = ui
+        .add(egui::Label::new(reason).wrap().selectable(false))
         .on_hover_text(view.reason.as_str());
+    // Reserve the full reason block so a longer answer arriving after
+    // "Checking" does not push the buttons down.
+    let row_height = ui.fonts_mut(|fonts| {
+        fonts.row_height(&egui::FontId::proportional(crate::ui::theme::METADATA_SIZE))
+    });
+    let reserved = row_height * reason_rows as f32;
+    if reason_response.rect.height() < reserved {
+        ui.add_space(reserved - reason_response.rect.height());
+    }
     let gap = ui.spacing().item_spacing.x;
     let fill = crate::ui::theme::primary_action_fill(ui);
     let fix_is_primary = view.fix.is_some() && !view.pending;
     let count = 1 + usize::from(view.fix.is_some());
-    let inline_trailing =
-        trailing.is_some() && width >= (count + 1) as f32 * 144.0 + gap * count as f32;
+    let inline_trailing = trailing.is_some() && width >= 3.0 * 144.0 + gap * 2.0;
     let slots = count + usize::from(inline_trailing);
-    let stacked = width < count as f32 * 144.0 + gap * (count - 1) as f32;
+    // Decided for the widest answer (a fix plus Play), so the arrangement does
+    // not change when readiness resolves.
+    let stacked = width < 2.0 * 144.0 + gap;
     let slot = if stacked {
         width
     } else {
@@ -1116,8 +1445,14 @@ pub(crate) fn show_compact(
             egui::Layout::left_to_right(egui::Align::Min)
         },
         |ui| {
-            if fix_is_primary && let Some(clicked) = fix_button(ui, true) {
-                choice = Some(clicked);
+            if fix_is_primary {
+                if let Some(clicked) = fix_button(ui, true) {
+                    choice = Some(clicked);
+                }
+            } else if stacked {
+                // Stacked: keep the fix button's slot so Play and the
+                // trailing button stay put when a fix appears.
+                ui.allocate_space(egui::vec2(slot, 64.0));
             }
             let mut play = egui::Button::new(egui::RichText::new("Play").strong());
             if view.play_enabled && !fix_is_primary {
@@ -1253,13 +1588,50 @@ pub(crate) fn note_retroarch_installation_refusal(
     summary.primary_action = Some(ReadinessAction::SetUpEmulator);
 }
 
+/// A file already found missing is never offered for Play and never left
+/// reading as "Checking". DOS review offers Play without looking at the file.
+pub(crate) fn note_file_missing(summary: &mut GameReadinessSummary) {
+    if summary.primary_action == Some(ReadinessAction::Play)
+        || summary.status == ReadinessPresentationState::Checking
+    {
+        summary.status = ReadinessPresentationState::SourceUnavailable;
+        summary.headline = "The game file is unavailable".into();
+        summary.explanation =
+            "Reconnect its drive or restore the file, then open this game again.".into();
+        summary.source = SourceSummary::Unavailable;
+        summary.primary_action = Some(ReadinessAction::CheckGamesFolder);
+    }
+}
+
+/// Game Details' DAT identity answer, on the identity line only: status,
+/// headline and actions keep their answer. Never upgrades to Verified.
+pub(crate) fn note_dat_identity(summary: &mut GameReadinessSummary, identity: IdentitySummary) {
+    debug_assert!(matches!(
+        identity,
+        IdentitySummary::VerificationPending
+            | IdentitySummary::VerificationNotConfirmed
+            | IdentitySummary::RecheckNeeded
+    ));
+    if summary.identity == IdentitySummary::NeedsReview {
+        summary.identity = identity;
+    }
+}
+
+/// Callers pass only a current, strictly verified identity. While readiness
+/// is still checking, only the identity line changes: the headline, status
+/// and primary action keep saying launch has not been decided.
 pub(crate) fn note_catalogue_verified(summary: &mut GameReadinessSummary) {
+    if summary.status == ReadinessPresentationState::Checking
+        && summary.identity == IdentitySummary::NeedsReview
+    {
+        summary.identity = IdentitySummary::Verified;
+    }
     if summary.status == ReadinessPresentationState::NeedsIdentityReview
         && summary.identity == IdentitySummary::NeedsReview
     {
         summary.identity = IdentitySummary::CatalogueVerified;
         summary.headline = "Verified. Launch also needs the file's own identity".into();
-        summary.explanation = "This game matched trusted identification data exactly. Before it plays, EmuWiz also reads the file's own identity data, and that could not be confirmed yet. The verification itself is fine; Review identity shows what is known.".into();
+        summary.explanation = "This game matched trusted identification data exactly. Before it plays, EmuWiz also reads the file's own identity data, and that could not be confirmed yet. The verification itself is fine; Verify identity shows what is known.".into();
     }
 }
 
@@ -1269,6 +1641,10 @@ fn identity_label(identity: IdentitySummary) -> &'static str {
         IdentitySummary::LaunchableWithWarning => "Launchable with warning",
         IdentitySummary::NeedsReview => "Needs review",
         IdentitySummary::CatalogueVerified => "Verified · file identity still needed to launch",
+        IdentitySummary::Verified => "Verified",
+        IdentitySummary::VerificationPending => "Checking verification",
+        IdentitySummary::VerificationNotConfirmed => "Verification not yet confirmed",
+        IdentitySummary::RecheckNeeded => "Re-check needed",
         IdentitySummary::Mismatch => "Mismatch / blocked",
     }
 }
@@ -1370,6 +1746,8 @@ mod tests {
             cemu: None,
             flycast: None,
             xroar: None,
+            azahar: None,
+            vita3k: None,
             vice: None,
             amiga_whdload: None,
             #[cfg(target_os = "linux")]
@@ -1455,6 +1833,75 @@ mod tests {
         let summary = project(&plan(vec![mame, fbneo]), ReadinessFreshness::Current);
         assert_eq!(summary.status, ReadinessPresentationState::Ready);
         assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+    }
+
+    /// Census 2026-11-10 (NES/Game Gear/... zips): the Launch page offered
+    /// Play through RetroArch while Game Details said "The game file is
+    /// unavailable", taken from the standalone option's own ZIP refusal.
+    #[test]
+    fn a_zipped_cartridge_refused_by_one_option_stays_playable_through_another() {
+        let mesen = candidate(
+            LaunchReadiness::Blocked,
+            FirmwareReadiness::NotRequired,
+            vec![LaunchBlocker::new(
+                LaunchBlockerKind::ContentNotResolved,
+                "a zipped cartridge launches through RetroArch only",
+            )],
+            vec![],
+            CandidatePreference::Undetermined,
+            Some("/mnt/nes/Game.zip"),
+        );
+        let retroarch = candidate(
+            LaunchReadiness::Ready,
+            FirmwareReadiness::NotRequired,
+            vec![],
+            vec![],
+            CandidatePreference::SoleEligible,
+            Some("/mnt/nes/Game.zip"),
+        );
+        let summary = project(
+            &plan(vec![mesen.clone(), retroarch]),
+            ReadinessFreshness::Current,
+        );
+        assert_ne!(
+            summary.status,
+            ReadinessPresentationState::SourceUnavailable
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+        // Atari 2600 zip: the other options are blocked by a core tie, not by
+        // the file, so the card must not say the file cannot be opened.
+        let tied = candidate(
+            LaunchReadiness::Blocked,
+            FirmwareReadiness::NotRequired,
+            vec![LaunchBlocker::new(
+                LaunchBlockerKind::AmbiguousCore,
+                "more than one installed RetroArch core resolves to Atari2600",
+            )],
+            vec![],
+            CandidatePreference::Undetermined,
+            Some("/mnt/a2600/Game.zip"),
+        );
+        let summary = project(
+            &plan(vec![mesen.clone(), tied]),
+            ReadinessFreshness::Current,
+        );
+        assert_ne!(
+            summary.status,
+            ReadinessPresentationState::SourceUnavailable
+        );
+        // Census 2026-11-10: the media branch said "could not be read" here.
+        assert_ne!(summary.status, ReadinessPresentationState::MediaUnreadable);
+        // Census 2026-11-10 (059ae25a): the action followed the option that
+        // cannot open ZIPs ("Check games folder"); the tie can be chosen.
+        assert_eq!(
+            summary.primary_action,
+            Some(ReadinessAction::ChooseEmulator)
+        );
+        // With nothing else, the refusal is still reported - without claiming
+        // the folder is unreachable (the file may simply be an archive).
+        let alone = project(&plan(vec![mesen]), ReadinessFreshness::Current);
+        assert_eq!(alone.status, ReadinessPresentationState::SourceUnavailable);
+        assert!(!alone.explanation.contains("cannot be reached"));
     }
 
     #[test]
@@ -1769,6 +2216,42 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_check_names_its_error_instead_of_a_change() {
+        let ready = || {
+            plan(vec![candidate(
+                LaunchReadiness::Ready,
+                FirmwareReadiness::NotRequired,
+                vec![],
+                vec![],
+                CandidatePreference::SoleEligible,
+                Some("/game.iso"),
+            )])
+        };
+        let mut summary = project(&ready(), ReadinessFreshness::Stale);
+        describe_check_error(
+            &mut summary,
+            "game.chd: No such file or directory (os error 2).",
+        );
+        assert_eq!(summary.status, ReadinessPresentationState::Stale);
+        assert_eq!(summary.headline, "EmuWiz couldn't check this game");
+        assert!(
+            summary
+                .explanation
+                .contains("No such file or directory (os error 2). Nothing")
+        );
+        assert!(!summary.explanation.contains("changed since this result"));
+        assert_eq!(
+            summary.primary_action,
+            Some(ReadinessAction::RecheckReadiness)
+        );
+        // A current answer is never rewritten.
+        let mut current = project(&ready(), ReadinessFreshness::Current);
+        let before = current.headline.clone();
+        describe_check_error(&mut current, "boom");
+        assert_eq!(current.headline, before);
+    }
+
+    #[test]
     fn missing_emulator_projects_to_setup_action() {
         let summary = project(
             &plan(vec![candidate(
@@ -1842,10 +2325,114 @@ mod tests {
         assert_eq!(summary.primary_action, Some(ReadinessAction::SetUpEmulator));
     }
 
+    /// The card's identity line is the page's identity wording. The launch
+    /// projection's own value follows the launch branch (missing firmware,
+    /// an emulator needed, a check still running) and used to read as an
+    /// identity verdict beside the page's Identity line.
+    #[test]
+    fn the_card_states_the_pages_identity_never_a_launch_branch_value() {
+        use ReadinessPresentationState as State;
+        let page = "Name hint only · not verified";
+        let cases = [
+            base(
+                State::NeedsFirmware,
+                "This system needs firmware",
+                "fixture",
+                IdentitySummary::StrongLocal,
+                SourceSummary::Available,
+                FirmwareSummary::Missing,
+                None,
+                Some(ReadinessAction::CheckFirmware),
+            ),
+            base(
+                State::NeedsEmulator,
+                "An emulator is needed",
+                "fixture",
+                IdentitySummary::StrongLocal,
+                SourceSummary::Available,
+                FirmwareSummary::Unknown,
+                None,
+                Some(ReadinessAction::SetUpEmulator),
+            ),
+            base(
+                State::ReadyWithWarnings,
+                "Ready, with a warning",
+                "fixture",
+                IdentitySummary::LaunchableWithWarning,
+                SourceSummary::Available,
+                FirmwareSummary::Ready,
+                None,
+                Some(ReadinessAction::Play),
+            ),
+            checking_summary(),
+            identity_summary(true),
+        ];
+        for summary in cases {
+            let context = egui::Context::default();
+            let output = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    show(ui, &summary, Some(page));
+                });
+            });
+            let strings = super::super::tests::text(&output);
+            let status = summary.status;
+            assert!(
+                strings
+                    .iter()
+                    .any(|line| *line == format!("Identity: {page}")),
+                "{status:?}: {strings:?}"
+            );
+            for launch_value in [
+                "Strong local identity",
+                "Launchable with warning",
+                "Needs review",
+                "Mismatch / blocked",
+                "Identity needs review",
+            ] {
+                assert!(
+                    !strings.iter().any(|line| line.contains(launch_value)),
+                    "{status:?} shows {launch_value}: {strings:?}"
+                );
+            }
+        }
+        assert_eq!(
+            status_label(State::NeedsIdentityReview),
+            "File check needed"
+        );
+    }
+
+    #[test]
+    fn verified_identity_while_checking_changes_only_the_identity_line() {
+        let mut checking = project(
+            &LaunchReadinessInput::EvidenceNotLoaded,
+            ReadinessFreshness::Current,
+        );
+        let before = checking.clone();
+        assert_eq!(before.identity, IdentitySummary::NeedsReview);
+        note_catalogue_verified(&mut checking);
+        assert_eq!(checking.identity, IdentitySummary::Verified);
+        assert_eq!(identity_label(checking.identity), "Verified");
+        // Identity is not launch readiness: still checking, no Play.
+        assert_eq!(checking.status, ReadinessPresentationState::Checking);
+        assert_eq!(checking.headline, before.headline);
+        assert_eq!(checking.explanation, before.explanation);
+        assert_eq!(checking.primary_action, before.primary_action);
+        assert_ne!(checking.primary_action, Some(ReadinessAction::Play));
+        assert_eq!(checking.source, before.source);
+        // Without verified identity nothing changes.
+        let unverified = project(
+            &LaunchReadinessInput::EvidenceNotLoaded,
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(unverified.identity, IdentitySummary::NeedsReview);
+    }
+
     #[test]
     fn identity_inputs_are_never_called_verified_by_the_summary() {
         let unknown = project(
-            &LaunchReadinessInput::IdentityUnknown,
+            &LaunchReadinessInput::IdentityUnknown(
+                crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+            ),
             ReadinessFreshness::Current,
         );
         assert_eq!(unknown.identity, IdentitySummary::NeedsReview);
@@ -1901,7 +2488,7 @@ mod tests {
         summary: &GameReadinessSummary,
         label: &str,
     ) -> (Vec<String>, Option<ReadinessAction>) {
-        click_rendered_button(summary, label, show)
+        click_rendered_button(summary, label, |ui, summary| show(ui, summary, None))
     }
 
     /// The same, for the Library's compact card at a 1024x600-sized column.
@@ -1985,6 +2572,115 @@ mod tests {
         assert_eq!(action, Some(ReadinessAction::Play));
     }
 
+    /// Owner 2026-11-11: PS1 showed one Play for the planner's sole pick
+    /// (a reviewed SwanStation core) while standalone DuckStation was also
+    /// ready, so "Default for PSX" was unreachable. Another choosable
+    /// emulator now adds "Choose emulator" beside Play; a blocked or
+    /// unavailable one never does.
+    #[test]
+    fn a_ready_sole_pick_offers_choose_emulator_only_when_another_is_choosable() {
+        let sole = candidate(
+            LaunchReadiness::Ready,
+            FirmwareReadiness::NotRequired,
+            vec![],
+            vec![],
+            CandidatePreference::SoleEligible,
+            Some("/game.chd"),
+        );
+        let other_ready = candidate(
+            LaunchReadiness::Ready,
+            FirmwareReadiness::Verified,
+            vec![],
+            vec![],
+            CandidatePreference::Undetermined,
+            Some("/game.chd"),
+        );
+        let summary = project(
+            &plan(vec![sole.clone(), other_ready]),
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+        assert!(summary.other_emulator_choosable);
+        let (labels, action) = click_card_button(&summary, "Choose emulator");
+        assert_eq!(action, Some(ReadinessAction::ChooseEmulator), "{labels:?}");
+        let (labels, action) = click_card_button(&summary, "Play");
+        assert_eq!(labels.iter().filter(|label| *label == "Play").count(), 1);
+        assert_eq!(action, Some(ReadinessAction::Play));
+
+        for unavailable in [
+            LaunchBlocker::new(
+                LaunchBlockerKind::NoInstallationCandidate,
+                "the chosen DuckStation is no longer installed",
+            ),
+            LaunchBlocker::new(LaunchBlockerKind::RequiredFirmwareMissing, "no BIOS"),
+        ] {
+            let blocked = candidate(
+                LaunchReadiness::Blocked,
+                FirmwareReadiness::Missing,
+                vec![unavailable],
+                vec![],
+                CandidatePreference::Undetermined,
+                Some("/game.chd"),
+            );
+            let summary = project(
+                &plan(vec![sole.clone(), blocked]),
+                ReadinessFreshness::Current,
+            );
+            assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+            assert!(!summary.other_emulator_choosable);
+            let (labels, action) = click_card_button(&summary, "Choose emulator");
+            assert_eq!(action, None);
+            assert!(!labels.iter().any(|label| label == "Choose emulator"));
+        }
+
+        let alone = project(&plan(vec![sole]), ReadinessFreshness::Current);
+        assert!(!alone.other_emulator_choosable);
+    }
+
+    /// Owner 2026-11-11: a missing saved PSX default showed only "More than
+    /// one safe emulator choice is available". The card now names the
+    /// missing selection, routes to Choose emulator and never offers Play,
+    /// even when just one other emulator remains.
+    #[test]
+    fn a_missing_saved_choice_is_named_and_offers_choose_emulator_not_play() {
+        let held = |preference| {
+            candidate(
+                LaunchReadiness::ReadyWithWarnings,
+                FirmwareReadiness::NotRequired,
+                vec![],
+                vec![LaunchWarning::new(
+                    archivefs_core::launch::LaunchWarningKind::PreferredLaunchChoiceUnavailable,
+                    "The emulator in your saved emulator default for this system (duckstation at /apps/DuckStationRemoved) is no longer available. No other emulator is used instead; choose one to continue.",
+                )],
+                preference,
+                Some("/game.chd"),
+            )
+        };
+        for candidates in [
+            vec![held(CandidatePreference::Undetermined)],
+            vec![
+                held(CandidatePreference::Undetermined),
+                held(CandidatePreference::Undetermined),
+            ],
+        ] {
+            let summary = project(&plan(candidates), ReadinessFreshness::Current);
+            assert_eq!(summary.status, ReadinessPresentationState::NeedsEmulator);
+            assert_eq!(
+                summary.primary_action,
+                Some(ReadinessAction::ChooseEmulator)
+            );
+            assert!(summary.headline.contains("saved emulator choice"));
+            assert!(
+                summary
+                    .explanation
+                    .contains("duckstation at /apps/DuckStationRemoved")
+            );
+            assert!(summary.explanation.contains("Choose emulator"));
+            let (_, action) = click_card_button(&summary, "Play");
+            assert_eq!(action, None, "Play stays inert");
+        }
+    }
+
     #[test]
     fn blocked_card_keeps_play_visible_but_inert_and_routes_the_fix() {
         let summary = project(
@@ -2039,6 +2735,35 @@ mod tests {
         assert_eq!(labels.iter().filter(|label| *label == "Play").count(), 1);
         assert!(labels.iter().any(|label| label.ends_with("Ready to play")));
         assert_eq!(action, Some(ReadinessAction::Play));
+    }
+
+    #[test]
+    fn compact_card_names_the_unverified_firmware_once_and_keeps_play() {
+        let warning = LaunchWarning::new(
+            LaunchWarningKind::FirmwarePresentUnverified,
+            "Firmware found but not verified: kick34005.A500 is present but its contents were not checked.",
+        );
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::ReadyWithWarnings,
+                FirmwareReadiness::PresentUnverified,
+                vec![],
+                vec![warning],
+                CandidatePreference::SoleEligible,
+                Some("/game.adf"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        let unverified = summary
+            .warnings
+            .iter()
+            .filter(|text| text.to_lowercase().contains("not verified"))
+            .count();
+        assert_eq!(unverified, 1, "{:?}", summary.warnings);
+        let view = compact(&summary, false);
+        assert!(view.reason.contains("kick34005.A500"), "{}", view.reason);
+        assert!(view.reason.contains("Firmware found but not verified"));
+        assert!(view.play_enabled);
     }
 
     #[test]
@@ -2114,7 +2839,9 @@ mod tests {
     #[test]
     fn identity_waiting_on_the_checksum_is_not_shown_as_a_refusal() {
         let summary = project(
-            &LaunchReadinessInput::IdentityUnknown,
+            &LaunchReadinessInput::IdentityUnknown(
+                crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+            ),
             ReadinessFreshness::Current,
         );
         assert_eq!(
@@ -2124,11 +2851,11 @@ mod tests {
         let deferred = compact(&summary, true);
         assert_eq!(deferred.badge, "Not fully checked");
         assert!(deferred.play_enabled && deferred.pending);
-        assert_eq!(deferred.fix, Some(ReadinessAction::ReviewIdentity));
+        assert_eq!(deferred.fix, Some(ReadinessAction::VerifyIdentity));
         // Once the checksum has run, the same answer is a current refusal.
         let current = compact(&summary, false);
         assert!(!current.play_enabled && !current.pending);
-        assert_eq!(current.fix, Some(ReadinessAction::ReviewIdentity));
+        assert_eq!(current.fix, Some(ReadinessAction::VerifyIdentity));
     }
 
     #[test]
@@ -2324,6 +3051,67 @@ mod tests {
         );
         assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
     }
+
+    #[test]
+    fn save_folder_warning_keeps_play_and_offers_retroarch_refresh() {
+        let detail = format!(
+            "In-game progress may fail to save. RetroArch's save-file folder /gone does not exist. {}",
+            archivefs_core::launch::RETROARCH_RECHECK_HINT
+        );
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::ReadyWithWarnings,
+                FirmwareReadiness::NotRequired,
+                vec![],
+                vec![LaunchWarning::new(
+                    archivefs_core::launch::LaunchWarningKind::RetroArchSaveDirectoryUnusable,
+                    detail.clone(),
+                )],
+                CandidatePreference::SoleEligible,
+                Some("/game.sfc"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(
+            summary.status,
+            ReadinessPresentationState::ReadyWithWarnings
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+        assert!(summary.warnings.contains(&detail));
+        assert!(offers_retroarch_refresh(&summary));
+        let (_, refresh) = click_card_button(&summary, "Refresh RetroArch");
+        assert_eq!(refresh, Some(ReadinessAction::RecheckReadiness));
+    }
+
+    #[test]
+    fn zipped_save_blocker_states_the_reason_and_offers_recheck_not_play() {
+        let reason = format!(
+            "This game is inside a ZIP ... /gone does not exist ... {}",
+            archivefs_core::launch::RETROARCH_RECHECK_HINT
+        );
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::Blocked,
+                FirmwareReadiness::NotRequired,
+                vec![LaunchBlocker::new(
+                    LaunchBlockerKind::RetroArchZippedSaveLocationUnsafe,
+                    reason.clone(),
+                )],
+                vec![],
+                CandidatePreference::SoleEligible,
+                Some("/game.zip"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(summary.status, ReadinessPresentationState::Blocked);
+        assert_eq!(summary.explanation, reason);
+        assert_eq!(
+            summary.primary_action,
+            Some(ReadinessAction::RecheckReadiness)
+        );
+        let (_, play) = click_card_button(&summary, "Play");
+        assert_eq!(play, None, "a refused zipped game must not launch");
+    }
 }
 
 #[cfg(test)]
@@ -2343,5 +3131,187 @@ mod dosbox_approval_tests {
                 .contains("does not verify a game release")
         );
         assert!(compact(&summary, false).play_enabled);
+    }
+}
+
+#[cfg(test)]
+mod identity_reason_wording_tests {
+    use super::*;
+
+    fn summary(reason: IdentityUnknownReason) -> GameReadinessSummary {
+        project(
+            &LaunchReadinessInput::IdentityUnknown(reason),
+            ReadinessFreshness::Current,
+        )
+    }
+
+    #[test]
+    fn system_not_chosen_offers_choose_system_not_identity_review() {
+        let s = summary(IdentityUnknownReason::SystemNotChosen);
+        assert_eq!(s.status, ReadinessPresentationState::NeedsSystem);
+        assert_eq!(status_label(s.status), "System needed");
+        assert_eq!(s.primary_action, Some(ReadinessAction::ChooseSystem));
+        assert_eq!(action_label(ReadinessAction::ChooseSystem), "Choose system");
+        assert!(s.headline.contains("Choose a system"));
+        assert!(s.explanation.contains("separate"));
+        assert_ne!(status_label(s.status), "Identity needs review");
+    }
+
+    #[test]
+    fn unsupported_archive_says_so_and_never_identity_review() {
+        let s = summary(IdentityUnknownReason::UnsupportedArchive);
+        assert_ne!(status_label(s.status), "Identity needs review");
+        assert!(s.headline.contains("archive format isn't supported"));
+        assert!(s.explanation.contains("Extract"));
+        assert!(s.explanation.contains("not what is stopping Play"));
+        assert_eq!(s.primary_action, Some(ReadinessAction::RecheckReadiness));
+        assert!(s.findings.is_empty());
+        assert!(!s.explanation.contains("Review identity"));
+    }
+
+    #[test]
+    fn unconfirmed_identity_offers_verify_identity() {
+        let s = summary(IdentityUnknownReason::NotConfirmed);
+        assert_eq!(s.status, ReadinessPresentationState::NeedsIdentityReview);
+        assert_eq!(s.primary_action, Some(ReadinessAction::VerifyIdentity));
+        assert_eq!(
+            action_label(ReadinessAction::VerifyIdentity),
+            "Verify identity"
+        );
+        assert!(s.explanation.contains("not what is stopping Play"));
+    }
+
+    #[test]
+    fn conflicting_identity_keeps_review_identity() {
+        let s = project(
+            &LaunchReadinessInput::IdentityConflicting,
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(s.primary_action, Some(ReadinessAction::ReviewIdentity));
+        // The badge names the launch step; the identity verdict is the page's.
+        assert_eq!(status_label(s.status), "File check needed");
+    }
+
+    #[test]
+    fn chooser_and_verify_actions_route_to_the_identity_screen() {
+        use crate::gui_v2::native_workflows::route_for_action;
+        for action in [
+            ReadinessAction::ChooseSystem,
+            ReadinessAction::VerifyIdentity,
+        ] {
+            assert_eq!(
+                route_for_action(action, 7),
+                Some(crate::gui_v2::routes::Route::ReviewIdentity(7))
+            );
+        }
+    }
+
+    #[test]
+    fn launch_page_blockers_differ_per_reason() {
+        use IdentityUnknownReason as R;
+        let texts: Vec<_> = [R::SystemNotChosen, R::UnsupportedArchive, R::NotConfirmed]
+            .iter()
+            .map(|r| (r.blocker_text(), r.banner_title()))
+            .collect();
+        assert_ne!(texts[0], texts[1]);
+        assert_ne!(texts[1], texts[2]);
+        assert!(
+            R::UnsupportedArchive
+                .blocker_text()
+                .contains("not supported")
+        );
+        for r in [R::SystemNotChosen, R::UnsupportedArchive, R::NotConfirmed] {
+            assert!(
+                !r.blocker_text()
+                    .to_lowercase()
+                    .contains("dat verification is required")
+            );
+        }
+    }
+
+    #[test]
+    fn no_route_reasons_offer_only_a_recheck_never_a_dead_end_verify_identity_action() {
+        use IdentityUnknownReason as R;
+        for r in [
+            R::NoIdentityCheck("Sharp X68000"),
+            R::UnsupportedFormat("Atari 2600"),
+            R::AmigaHardDisk,
+            R::AmigaIpf,
+        ] {
+            let s = summary(r);
+            assert_eq!(
+                s.primary_action,
+                Some(ReadinessAction::RecheckReadiness),
+                "{r:?}"
+            );
+            assert!(!r.has_identity_screen());
+            let text = format!("{} {}", s.headline, s.explanation);
+            assert!(!text.contains("cannot tell which game"), "{text}");
+            assert!(!text.contains("Extract the game"), "{text}");
+            assert!(!text.contains("Verify identity"), "{text}");
+            assert!(!text.contains("Nothing about your file"), "{text}");
+            assert!(!text.contains("Choose system"), "{text}");
+            assert!(
+                text.contains("not caused by missing DAT verification"),
+                "{text}"
+            );
+        }
+        let s = summary(R::NoIdentityCheck("Sharp X68000"));
+        assert!(s.headline.contains("no identity check for Sharp X68000"));
+        assert!(
+            s.explanation
+                .contains("not caused by missing DAT verification")
+        );
+    }
+
+    #[test]
+    fn choose_system_and_verify_identity_actions_are_kept() {
+        use IdentityUnknownReason as R;
+        assert_eq!(
+            summary(R::SystemNotChosen).primary_action,
+            Some(ReadinessAction::ChooseSystem)
+        );
+        assert_eq!(
+            summary(R::NotConfirmed).primary_action,
+            Some(ReadinessAction::VerifyIdentity)
+        );
+        assert!(R::SystemNotChosen.has_identity_screen() && R::NotConfirmed.has_identity_screen());
+    }
+
+    #[test]
+    fn amiga_reasons_reuse_the_amiga_readiness_wording() {
+        use IdentityUnknownReason as R;
+        assert!(
+            R::AmigaHardDisk
+                .blocker_text()
+                .contains("private working copy")
+        );
+        assert!(R::AmigaIpf.blocker_text().contains("CAPS/SPS"));
+    }
+
+    #[test]
+    fn new_reasons_never_enable_play_or_report_ready_like_the_old_ones() {
+        use IdentityUnknownReason as R;
+        for r in [
+            R::SystemNotChosen,
+            R::UnsupportedArchive,
+            R::NotConfirmed,
+            R::NoIdentityCheck("MSX"),
+            R::UnsupportedFormat("Atari 2600"),
+            R::AmigaHardDisk,
+            R::AmigaIpf,
+        ] {
+            let s = summary(r);
+            assert!(!compact(&s, false).play_enabled, "{r:?}");
+            assert_ne!(s.primary_action, Some(ReadinessAction::Play), "{r:?}");
+            assert!(
+                !matches!(
+                    s.status,
+                    ReadinessPresentationState::Ready
+                        | ReadinessPresentationState::ReadyWithWarnings
+                ),
+                "{r:?}"
+            );
+        }
     }
 }

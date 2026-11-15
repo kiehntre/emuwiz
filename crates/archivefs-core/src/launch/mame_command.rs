@@ -96,6 +96,19 @@ pub fn build_mame_command_plan(
     executable: Option<&std::path::Path>,
     rom_search_path: Option<&Path>,
 ) -> MameCommandPlan {
+    build_mame_command_plan_with_extra(identity, set_resolutions, executable, rom_search_path, &[])
+}
+
+/// As [`build_mame_command_plan`], plus already validated extra read-only ROM
+/// search paths, passed after the set's own folder as
+/// `-rompath <parent>;<extra>;...`. An unvalidated extra path blocks the plan.
+pub fn build_mame_command_plan_with_extra(
+    identity: &CanonicalIdentityStatus,
+    set_resolutions: &[SetResolution],
+    executable: Option<&std::path::Path>,
+    rom_search_path: Option<&Path>,
+    extra_rompaths: &[PathBuf],
+) -> MameCommandPlan {
     let mut blockers = Vec::new();
     match identity {
         CanonicalIdentityStatus::Resolved(identity)
@@ -224,6 +237,23 @@ pub fn build_mame_command_plan(
             "the selected MAME set is not directly inside the configured ROM/search path",
         ));
     }
+    // MAME reads ';' as a rompath separator, so a collection folder whose path
+    // contains one would silently become two search paths.
+    if rom_search_path.is_some_and(|path| path.to_string_lossy().contains(';')) {
+        blockers.push(blocker(
+            LaunchBlockerKind::MameSearchPathUnconfigured,
+            "the collection folder path contains ';', which MAME reads as a path separator",
+        ));
+    }
+    if extra_rompaths
+        .iter()
+        .any(|path| crate::arcade_mame_routing::validate_extra_rompath(path).as_ref() != Ok(path))
+    {
+        blockers.push(blocker(
+            LaunchBlockerKind::MameSearchPathUnconfigured,
+            "an extra MAME ROM search path is not an existing canonical absolute folder",
+        ));
+    }
     if !blockers.is_empty() {
         return blocked(blockers);
     }
@@ -236,7 +266,7 @@ pub fn build_mame_command_plan(
             executable: executable.to_path_buf(),
             arguments: vec![
                 OsString::from("-rompath"),
-                rom_search_path.as_os_str().to_os_string(),
+                crate::arcade_mame_routing::rompath_argument(rom_search_path, extra_rompaths),
                 OsString::from(set_name.as_str()),
             ],
             working_directory: None,

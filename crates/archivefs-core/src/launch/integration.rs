@@ -250,6 +250,15 @@ pub enum DiscoveredStandaloneProfile<'a> {
         executable: Option<&'a Path>,
         set: Option<&'a FbneoSetEvidence>,
     },
+    /// The user's native Atari800 setup, already resolved by
+    /// `crate::launch::atari800_setup::resolve_setup` (see its
+    /// `Atari800Resolution::standalone_input`). The projection borrows that
+    /// result unchanged: an unbound or changed OS ROM arrives here as
+    /// `FirmwareReadiness::Missing` and becomes a blocker, and bound ROMs are
+    /// only ever `PresentUnverified`.
+    Atari800 {
+        profile: &'a StandaloneProfileInput,
+    },
 }
 
 impl<'a> DiscoveredStandaloneProfile<'a> {
@@ -465,6 +474,19 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
         .standalone_profiles
         .iter()
         .filter_map(|source| match source {
+            // ATR only: other Atari 8-bit formats are not a native candidate.
+            DiscoveredStandaloneProfile::Atari800 { profile }
+                if profile.adapter_id == "atari800"
+                    && matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
+                        if identity.platform_id == "Atari 8-bit")
+                    && input.content.resolved_path.as_deref().is_some_and(|path| {
+                        path.extension()
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("atr"))
+                    }) =>
+            {
+                Some((*profile).clone())
+            }
+            DiscoveredStandaloneProfile::Atari800 { .. } => None,
             DiscoveredStandaloneProfile::DuckStation { profile, bios }
                 if authorized(project_duckstation_launch_input(
                     input.verified_identity_facts,
@@ -966,11 +988,13 @@ mod tests {
         ConfigFileFinding, ConfigReadOutcome, CoreFinding, CoreInfoFinding, DirectoryProbeFinding,
         Evidence, ProfileKind, ProfileScope, RetroArchPlaylistInventory, RetroArchProfile,
     };
+    use crate::emulator_environment::retroarch::{FirmwarePresence, FirmwareRequirement};
     use crate::emulator_environment::{EncodedPath, FsProbe};
+    use crate::launch::planning::{CandidatePreference, LaunchCandidate, RememberedPreference};
     use crate::launch::planning::{
         LaunchContainerKind, LaunchContentKind, LaunchTarget, ResolvedIdentity,
     };
-    use crate::launch::readiness::{LaunchBlockerKind, LaunchReadiness};
+    use crate::launch::readiness::{LaunchBlockerKind, LaunchReadiness, LaunchWarningKind};
     use crate::patch_manager::{
         DuckStationInstallationType, Pcsx2InstallationType, Pcsx2ProfileScope,
         PpssppInstallationType, PpssppProfileScope, XeniaInstallationType, XeniaProfileScope,
@@ -1059,6 +1083,7 @@ mod tests {
                     complete: true,
                 },
                 app_images: Vec::new(),
+                save_directories: Vec::new(),
                 diagnostics: Vec::new(),
             }],
             diagnostics: Vec::new(),
@@ -1113,6 +1138,7 @@ mod tests {
                     complete: true,
                 },
                 app_images: Vec::new(),
+                save_directories: Vec::new(),
                 diagnostics: Vec::new(),
             }],
             diagnostics: Vec::new(),
@@ -2746,6 +2772,7 @@ mod tests {
                         complete: true,
                     },
                     app_images: Vec::new(),
+                    save_directories: Vec::new(),
                     diagnostics: Vec::new(),
                 }],
                 diagnostics: Vec::new(),
@@ -2811,6 +2838,518 @@ mod tests {
             &empty_retroarch(),
         );
         assert_eq!(first, second);
+    }
+
+    // --- Atari800 (Atari 8-bit) ---
+
+    fn atari800_input(eligible: bool, firmware: FirmwareReadiness) -> StandaloneProfileInput {
+        StandaloneProfileInput {
+            adapter_id: "atari800",
+            profile_id: "atari800:/usr/bin/atari800".into(),
+            profile_path: Some("/usr/bin/atari800".into()),
+            eligible,
+            firmware,
+        }
+    }
+
+    #[test]
+    fn atari800_firmware_state_decides_ready_with_warning_or_blocked() {
+        let identity = resolved("Atari 8-bit", "atrsha");
+        for (eligible, firmware, readiness) in [
+            (
+                true,
+                FirmwareReadiness::PresentUnverified,
+                LaunchReadiness::ReadyWithWarnings,
+            ),
+            (false, FirmwareReadiness::Missing, LaunchReadiness::Blocked),
+            (false, FirmwareReadiness::Unknown, LaunchReadiness::Blocked),
+        ] {
+            let input = atari800_input(eligible, firmware);
+            let profiles = [DiscoveredStandaloneProfile::Atari800 { profile: &input }];
+            let plan = plan(
+                &identity,
+                &[],
+                &atr_content(),
+                &profiles,
+                &empty_retroarch(),
+            );
+            assert_eq!(plan.candidates.len(), 1);
+            assert!(matches!(
+                plan.candidates[0].target,
+                LaunchTarget::Standalone {
+                    adapter_id: "atari800",
+                    ..
+                }
+            ));
+            assert_eq!(plan.candidates[0].firmware, firmware);
+            assert_eq!(plan.candidates[0].readiness, readiness, "{firmware:?}");
+        }
+    }
+
+    #[test]
+    fn atari800_is_never_a_candidate_for_the_5200_or_an_unresolved_game() {
+        let input = atari800_input(true, FirmwareReadiness::PresentUnverified);
+        let profiles = [DiscoveredStandaloneProfile::Atari800 { profile: &input }];
+        for identity in [
+            resolved("Atari5200", "a52sha"),
+            resolved("Atari2600", "a26sha"),
+            CanonicalIdentityStatus::Unknown,
+            CanonicalIdentityStatus::Conflicting,
+        ] {
+            let plan = plan(
+                &identity,
+                &[],
+                &atr_content(),
+                &profiles,
+                &empty_retroarch(),
+            );
+            assert!(
+                !plan.candidates.iter().any(|candidate| matches!(
+                    candidate.target,
+                    LaunchTarget::Standalone {
+                        adapter_id: "atari800",
+                        ..
+                    }
+                )),
+                "{identity:?}"
+            );
+        }
+    }
+
+    fn retroarch_with_atari800_core(firmware_missing: bool) -> RetroArchEnvironmentReport {
+        let mut report = retroarch_with_snes9x_core();
+        let core = &mut report.profiles[0].cores[0];
+        core.core_stem = "atari800".to_string();
+        if let CoreInfoFinding::Found {
+            system_name,
+            database,
+            firmware,
+            ..
+        } = &mut core.info
+        {
+            *system_name = Some("Atari 8-bit Family".to_string());
+            *database = Some("Atari - 5200|Atari - 8-bit Family".to_string());
+            if firmware_missing {
+                firmware.push(FirmwareRequirement {
+                    index: 0,
+                    description: Some("ATARIXL.ROM".to_string()),
+                    path: Some("ATARIXL.ROM".to_string()),
+                    optional: false,
+                    presence: FirmwarePresence::Missing,
+                });
+            }
+        }
+        report
+    }
+
+    fn atr_content() -> LaunchContentRef {
+        LaunchContentRef {
+            kind: None,
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(PathBuf::from("/library/a.atr")),
+            requires_mount: false,
+            provenance: "loose disk image".to_string(),
+        }
+    }
+
+    fn is_native_atari800(candidate: &crate::launch::LaunchCandidate) -> bool {
+        matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "atari800",
+                ..
+            }
+        )
+    }
+
+    fn atari_plan(
+        native: Option<FirmwareReadiness>,
+        retroarch: &RetroArchEnvironmentReport,
+    ) -> LaunchPlan {
+        let input = native.map(|firmware| {
+            atari800_input(firmware == FirmwareReadiness::PresentUnverified, firmware)
+        });
+        let profiles: Vec<_> = input
+            .iter()
+            .map(|profile| DiscoveredStandaloneProfile::Atari800 { profile })
+            .collect();
+        plan(
+            &resolved("Atari 8-bit", "atrsha"),
+            &[],
+            &atr_content(),
+            &profiles,
+            retroarch,
+        )
+    }
+
+    #[test]
+    fn a_flatpak_core_keeps_its_existing_place_and_native_atari800_stays_choosable() {
+        let mut retroarch = retroarch_with_atari800_core(false);
+        retroarch.profiles[0].profile_kind = ProfileKind::Flatpak;
+        let before = atari_plan(None, &retroarch);
+        let after = atari_plan(Some(FirmwareReadiness::PresentUnverified), &retroarch);
+        // Whatever Play did with the Flatpak core before, it still does.
+        let other = |plan: &LaunchPlan| {
+            plan.candidates
+                .iter()
+                .find(|candidate| !is_native_atari800(candidate))
+                .map(|candidate| (candidate.preference, candidate.readiness))
+        };
+        assert_eq!(other(&after), other(&before));
+        let native = after
+            .candidates
+            .iter()
+            .find(|candidate| is_native_atari800(candidate))
+            .unwrap();
+        assert_ne!(native.readiness, LaunchReadiness::Blocked);
+        assert!(crate::launch::launch_choice::is_choosable(&after, native));
+    }
+
+    /// Two different installed cores that both play Atari 8-bit.
+    fn retroarch_with_two_atari_cores() -> RetroArchEnvironmentReport {
+        let mut report = retroarch_with_atari800_core(false);
+        let mut other = report.profiles[0].cores[0].clone();
+        other.core_stem = "altirra".to_string();
+        report.profiles[0].cores.push(other);
+        report
+    }
+
+    fn automatic(plan: &LaunchPlan) -> usize {
+        plan.candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.preference,
+                    CandidatePreference::SoleEligible | CandidatePreference::Remembered
+                )
+            })
+            .count()
+    }
+
+    /// What the planner decided for the RetroArch candidates only.
+    fn retroarch_decisions(
+        plan: &LaunchPlan,
+    ) -> Vec<(
+        String,
+        CandidatePreference,
+        LaunchReadiness,
+        Vec<LaunchBlockerKind>,
+    )> {
+        plan.candidates
+            .iter()
+            .filter_map(|candidate| match &candidate.target {
+                LaunchTarget::RetroArchCore { core_stem, .. } => Some((
+                    core_stem.clone(),
+                    candidate.preference,
+                    candidate.readiness,
+                    candidate.blockers.iter().map(|b| b.kind).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The platform row's core hint exists for cheat routing. It must not
+    /// pick between two different installed cores, and a ready native
+    /// Atari800 must not answer that question either: the chooser stays.
+    #[test]
+    fn two_different_ready_cores_without_a_saved_choice_still_ask() {
+        let two = retroarch_with_two_atari_cores();
+        let without_native = atari_plan(None, &two);
+        let decisions = retroarch_decisions(&without_native);
+        assert_eq!(decisions.len(), 2);
+        for (stem, preference, readiness, blockers) in &decisions {
+            assert_eq!(*preference, CandidatePreference::Undetermined, "{stem}");
+            assert_eq!(*readiness, LaunchReadiness::Blocked, "{stem}");
+            assert_eq!(blockers, &[LaunchBlockerKind::AmbiguousCore], "{stem}");
+        }
+        assert_eq!(automatic(&without_native), 0, "nothing is picked");
+
+        let with_native = atari_plan(Some(FirmwareReadiness::PresentUnverified), &two);
+        assert_eq!(
+            retroarch_decisions(&with_native),
+            decisions,
+            "native Atari800 changes nothing about the RetroArch routes"
+        );
+        assert_eq!(automatic(&with_native), 0, "the tie is not answered");
+        // Every route, native included, is there to be chosen.
+        assert_eq!(with_native.candidates.len(), 3);
+        for candidate in &with_native.candidates {
+            assert!(crate::launch::launch_choice::is_choosable(
+                &with_native,
+                candidate
+            ));
+        }
+    }
+
+    #[test]
+    fn a_saved_core_choice_is_honoured_with_or_without_native_atari800() {
+        use crate::launch::launch_choice::{
+            LaunchChoiceInputs, LaunchChoiceOutcome, LaunchPreference, apply, launch_option_id,
+        };
+        let two = retroarch_with_two_atari_cores();
+        for native in [None, Some(FirmwareReadiness::PresentUnverified)] {
+            let mut plan = atari_plan(native, &two);
+            let wanted = plan
+                .candidates
+                .iter()
+                .find(|candidate| {
+                    matches!(&candidate.target,
+                        LaunchTarget::RetroArchCore { core_stem, .. } if core_stem == "altirra")
+                })
+                .map(|candidate| launch_option_id(&candidate.target))
+                .unwrap();
+            let saved = [LaunchPreference::game("Atari 8-bit", "atrsha", &wanted)];
+            let outcome = apply(
+                &mut plan,
+                LaunchChoiceInputs {
+                    once: None,
+                    preferences: Ok(&saved),
+                },
+            );
+            assert!(matches!(outcome, LaunchChoiceOutcome::Applied { .. }));
+            for candidate in &plan.candidates {
+                let chosen = launch_option_id(&candidate.target) == wanted;
+                assert_eq!(
+                    candidate.preference == CandidatePreference::Remembered,
+                    chosen,
+                    "{:?}",
+                    candidate.target
+                );
+                assert_ne!(candidate.preference, CandidatePreference::SoleEligible);
+                if chosen {
+                    assert_ne!(candidate.readiness, LaunchReadiness::Blocked);
+                }
+            }
+        }
+    }
+
+    /// The saved core was uninstalled. Neither the remaining core nor a ready
+    /// native Atari800 is used in its place.
+    #[test]
+    fn a_saved_choice_whose_core_is_gone_substitutes_nothing() {
+        use crate::launch::launch_choice::{
+            LaunchChoiceInputs, LaunchChoiceOutcome, LaunchPreference, apply, launch_option_id,
+        };
+        let two = atari_plan(None, &retroarch_with_two_atari_cores());
+        let gone = two
+            .candidates
+            .iter()
+            .find(|candidate| {
+                matches!(&candidate.target,
+                    LaunchTarget::RetroArchCore { core_stem, .. } if core_stem == "altirra")
+            })
+            .map(|candidate| launch_option_id(&candidate.target))
+            .unwrap();
+        let saved = [LaunchPreference::game("Atari 8-bit", "atrsha", &gone)];
+        // Only the other core is installed now, beside a ready native route.
+        let mut plan = atari_plan(
+            Some(FirmwareReadiness::PresentUnverified),
+            &retroarch_with_atari800_core(false),
+        );
+        let outcome = apply(
+            &mut plan,
+            LaunchChoiceInputs {
+                once: None,
+                preferences: Ok(&saved),
+            },
+        );
+        assert!(matches!(
+            outcome,
+            LaunchChoiceOutcome::PreferredUnavailable { .. }
+        ));
+        assert_eq!(automatic(&plan), 0);
+        assert!(plan.candidates.iter().all(|candidate| {
+            candidate
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == LaunchWarningKind::PreferredLaunchChoiceUnavailable)
+        }));
+    }
+
+    #[test]
+    fn native_atari800_is_not_a_candidate_for_other_atari_8bit_formats() {
+        let input = atari800_input(true, FirmwareReadiness::PresentUnverified);
+        let profiles = [DiscoveredStandaloneProfile::Atari800 { profile: &input }];
+        for name in [
+            "/library/a.xex",
+            "/library/a.xfd",
+            "/library/a.car",
+            "/library/a",
+        ] {
+            let mut content = atr_content();
+            content.resolved_path = Some(PathBuf::from(name));
+            let plan = plan(
+                &resolved("Atari 8-bit", "sha"),
+                &[],
+                &content,
+                &profiles,
+                &empty_retroarch(),
+            );
+            assert!(!plan.candidates.iter().any(is_native_atari800), "{name}");
+            // The same holds for callers that hand the planner the profile
+            // directly, as Blue's own scan does, ready or not.
+            for eligible in [true, false] {
+                let direct = build_launch_plan(
+                    &resolved("Atari 8-bit", "sha"),
+                    &content,
+                    &[atari800_input(
+                        eligible,
+                        FirmwareReadiness::PresentUnverified,
+                    )],
+                    &empty_retroarch(),
+                    &[],
+                );
+                assert!(!direct.candidates.iter().any(is_native_atari800), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_atari800_alone_is_the_automatic_route() {
+        let plan = atari_plan(
+            Some(FirmwareReadiness::PresentUnverified),
+            &empty_retroarch(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(
+            plan.candidates[0].preference,
+            CandidatePreference::SoleEligible
+        );
+    }
+
+    /// The regression this guards: a game that RetroArch already plays must
+    /// keep one-click Play when native Atari800 also becomes ready.
+    #[test]
+    fn a_ready_retroarch_route_keeps_play_when_native_atari800_becomes_ready() {
+        let retroarch = retroarch_with_atari800_core(false);
+        let before = atari_plan(None, &retroarch);
+        let after = atari_plan(Some(FirmwareReadiness::PresentUnverified), &retroarch);
+        let automatic = |plan: &LaunchPlan| -> Vec<LaunchTarget> {
+            plan.candidates
+                .iter()
+                .filter(|candidate| candidate.preference == CandidatePreference::SoleEligible)
+                .map(|candidate| candidate.target.clone())
+                .collect()
+        };
+        assert_eq!(automatic(&before).len(), 1);
+        assert_eq!(
+            automatic(&after),
+            automatic(&before),
+            "Play must not change"
+        );
+        let native = after
+            .candidates
+            .iter()
+            .find(|candidate| is_native_atari800(candidate))
+            .expect("native Atari800 stays offered");
+        assert_eq!(native.preference, CandidatePreference::Undetermined);
+        assert_ne!(native.readiness, LaunchReadiness::Blocked);
+        // Neither route is stalled behind a "more than one" tie.
+        assert!(after.candidates.iter().all(|candidate| {
+            candidate
+                .warnings
+                .iter()
+                .all(|warning| warning.kind != LaunchWarningKind::MultipleEligibleProfiles)
+        }));
+        // And the person can still choose it deliberately.
+        assert!(crate::launch::launch_choice::is_choosable(&after, native));
+    }
+
+    #[test]
+    fn native_atari800_becomes_automatic_only_when_the_other_route_cannot_start() {
+        let plan = atari_plan(
+            Some(FirmwareReadiness::PresentUnverified),
+            &retroarch_with_atari800_core(true),
+        );
+        for candidate in &plan.candidates {
+            if is_native_atari800(candidate) {
+                assert_eq!(candidate.preference, CandidatePreference::SoleEligible);
+            } else {
+                assert_eq!(candidate.readiness, LaunchReadiness::Blocked);
+                assert_eq!(candidate.preference, CandidatePreference::Undetermined);
+            }
+        }
+        // A native route that is itself not ready never becomes automatic.
+        let neither = atari_plan(
+            Some(FirmwareReadiness::Missing),
+            &retroarch_with_atari800_core(true),
+        );
+        assert!(
+            neither
+                .candidates
+                .iter()
+                .all(|candidate| candidate.preference == CandidatePreference::Undetermined)
+        );
+    }
+
+    #[test]
+    fn an_explicit_choice_selects_native_atari800_and_a_stale_choice_selects_nothing() {
+        use crate::launch::launch_choice::{
+            LaunchChoiceInputs, LaunchChoiceOutcome, LaunchPreference, apply, launch_option_id,
+        };
+        let retroarch = retroarch_with_atari800_core(false);
+        let mut plan = atari_plan(Some(FirmwareReadiness::PresentUnverified), &retroarch);
+        let native = plan
+            .candidates
+            .iter()
+            .find(|candidate| is_native_atari800(candidate))
+            .unwrap();
+        let chosen = [LaunchPreference::game(
+            "Atari 8-bit",
+            "atrsha",
+            &launch_option_id(&native.target),
+        )];
+        let outcome = apply(
+            &mut plan,
+            LaunchChoiceInputs {
+                once: None,
+                preferences: Ok(&chosen),
+            },
+        );
+        assert!(matches!(outcome, LaunchChoiceOutcome::Applied { .. }));
+        for candidate in &plan.candidates {
+            assert_eq!(
+                candidate.preference == CandidatePreference::Remembered,
+                is_native_atari800(candidate)
+            );
+            assert_ne!(candidate.preference, CandidatePreference::SoleEligible);
+        }
+        // The chosen native route still carries its firmware caveat: a choice
+        // never upgrades readiness or removes a safety warning.
+        let native = plan
+            .candidates
+            .iter()
+            .find(|candidate| is_native_atari800(candidate))
+            .unwrap();
+        assert_eq!(native.readiness, LaunchReadiness::ReadyWithWarnings);
+        assert!(
+            native
+                .warnings
+                .iter()
+                .any(|warning| { warning.kind == LaunchWarningKind::FirmwarePresentUnverified })
+        );
+
+        // The chosen emulator is gone: nothing is substituted, not even the
+        // route that used to be automatic.
+        let mut gone = atari_plan(None, &retroarch);
+        let outcome = apply(
+            &mut gone,
+            LaunchChoiceInputs {
+                once: None,
+                preferences: Ok(&chosen),
+            },
+        );
+        assert!(matches!(
+            outcome,
+            LaunchChoiceOutcome::PreferredUnavailable { .. }
+        ));
+        assert!(gone.candidates.iter().all(|candidate| {
+            candidate.preference == CandidatePreference::Undetermined
+                && candidate.warnings.iter().any(|warning| {
+                    warning.kind == LaunchWarningKind::PreferredLaunchChoiceUnavailable
+                })
+        }));
     }
 
     // --- Stella (Atari 2600) ---
@@ -2966,6 +3505,7 @@ mod tests {
                         complete: true,
                     },
                     app_images: Vec::new(),
+                    save_directories: Vec::new(),
                     diagnostics: Vec::new(),
                 }],
                 diagnostics: Vec::new(),
@@ -3184,6 +3724,7 @@ mod tests {
                         complete: true,
                     },
                     app_images: Vec::new(),
+                    save_directories: Vec::new(),
                     diagnostics: Vec::new(),
                 }],
                 diagnostics: Vec::new(),
@@ -3316,6 +3857,338 @@ mod tests {
         assert_eq!(
             mame.content.resolved_path,
             Some(PathBuf::from("/mnt/arcade/19xx"))
+        );
+    }
+
+    #[test]
+    fn blocked_hinted_retroarch_core_never_holds_the_preference() {
+        let identity = resolved("Arcade", "19xx");
+        let mame = StandaloneProfileInput {
+            adapter_id: "mame",
+            profile_id: "mame".to_string(),
+            profile_path: Some(PathBuf::from("/usr/bin/mame")),
+            eligible: true,
+            firmware: FirmwareReadiness::NotRequired,
+        };
+        let launch_plan = build_launch_plan(
+            &identity,
+            &extracted_arcade_set_content(),
+            &[mame],
+            &retroarch_with_fbneo_core(),
+            &[],
+        );
+        for candidate in &launch_plan.candidates {
+            match candidate.target {
+                LaunchTarget::RetroArchCore { .. } => assert_eq!(
+                    candidate.preference,
+                    CandidatePreference::Undetermined,
+                    "a blocked core must not hold the preference"
+                ),
+                _ => assert_eq!(candidate.preference, CandidatePreference::SoleEligible),
+            }
+        }
+    }
+
+    fn psx_duckstation_input() -> StandaloneProfileInput {
+        StandaloneProfileInput {
+            adapter_id: "duckstation",
+            profile_id: "duckstation".to_string(),
+            profile_path: Some(PathBuf::from("/usr/bin/duckstation")),
+            eligible: true,
+            firmware: FirmwareReadiness::NotRequired,
+        }
+    }
+
+    fn preference_of(plan: &LaunchPlan, retroarch: bool) -> Vec<CandidatePreference> {
+        plan.candidates
+            .iter()
+            .filter(|c| matches!(c.target, LaunchTarget::RetroArchCore { .. }) == retroarch)
+            .map(|c| c.preference)
+            .collect()
+    }
+
+    #[test]
+    fn psx_chd_prefers_a_ready_duckstation_over_the_unconfirmed_retroarch_core() {
+        let identity = resolved("PSX", "SLUS-12345");
+        let plan = build_launch_plan(
+            &identity,
+            &resolved_content(),
+            &[psx_duckstation_input()],
+            &retroarch_with_psx_core(),
+            &[],
+        );
+        let core = plan
+            .candidates
+            .iter()
+            .find(|c| matches!(c.target, LaunchTarget::RetroArchCore { .. }))
+            .expect("retroarch psx candidate");
+        assert!(
+            core.warnings
+                .iter()
+                .any(|w| w.kind == LaunchWarningKind::RetroArchChdSupportUnconfirmed)
+        );
+        assert_eq!(core.readiness, LaunchReadiness::ReadyWithWarnings);
+        assert_eq!(
+            preference_of(&plan, false),
+            [CandidatePreference::SoleEligible]
+        );
+        assert_eq!(
+            preference_of(&plan, true),
+            [CandidatePreference::Undetermined]
+        );
+    }
+
+    #[test]
+    fn psx_chd_through_retroarch_alone_is_still_offered_but_flagged_unconfirmed() {
+        let identity = resolved("PSX", "SLUS-12345");
+        let plan = build_launch_plan(
+            &identity,
+            &resolved_content(),
+            &[],
+            &retroarch_with_psx_core(),
+            &[],
+        );
+        let core = &plan.candidates[0];
+        assert!(matches!(core.target, LaunchTarget::RetroArchCore { .. }));
+        assert!(core.blockers.is_empty());
+        assert_eq!(core.readiness, LaunchReadiness::ReadyWithWarnings);
+        assert_eq!(core.preference, CandidatePreference::SoleEligible);
+    }
+
+    #[test]
+    fn psx_chd_without_duckstation_prefers_swanstation_over_beetle() {
+        let identity = resolved("PSX", "SLUS-12345");
+        let mut report = retroarch_with_psx_core();
+        let mut swan = report.profiles[0].cores[0].clone();
+        swan.core_stem = "swanstation".to_string();
+        swan.full_path =
+            EncodedPath::from_path(&PathBuf::from("/retroarch/cores/swanstation_libretro.so"));
+        report.profiles[0].cores.push(swan);
+        let plan = build_launch_plan(&identity, &resolved_content(), &[], &report, &[]);
+        for candidate in &plan.candidates {
+            let LaunchTarget::RetroArchCore { core_stem, .. } = &candidate.target else {
+                panic!("only retroarch candidates expected");
+            };
+            let expected = if core_stem == "swanstation" {
+                CandidatePreference::SoleEligible
+            } else {
+                CandidatePreference::Undetermined
+            };
+            assert_eq!(candidate.preference, expected, "{core_stem}");
+        }
+    }
+
+    #[test]
+    fn psx_chd_orders_swanstation_then_duckstation_then_beetle() {
+        let identity = resolved("PSX", "SLUS-12345");
+        let mut report = retroarch_with_psx_core();
+        let mut swan = report.profiles[0].cores[0].clone();
+        swan.core_stem = "swanstation".to_string();
+        report.profiles[0].cores.push(swan);
+        let plan = build_launch_plan(
+            &identity,
+            &resolved_content(),
+            &[psx_duckstation_input()],
+            &report,
+            &[],
+        );
+        for candidate in &plan.candidates {
+            let name = match &candidate.target {
+                LaunchTarget::RetroArchCore { core_stem, .. } => core_stem.as_str(),
+                _ => "duckstation",
+            };
+            let expected = if name == "swanstation" {
+                CandidatePreference::SoleEligible
+            } else {
+                CandidatePreference::Undetermined
+            };
+            assert_eq!(candidate.preference, expected, "{name}");
+        }
+    }
+
+    fn psx_report_with_swanstation(kind: ProfileKind) -> RetroArchEnvironmentReport {
+        let mut report = retroarch_with_psx_core();
+        let mut swan = report.profiles[0].cores[0].clone();
+        swan.core_stem = "swanstation".to_string();
+        report.profiles[0].cores.push(swan);
+        report.profiles[0].profile_kind = kind;
+        report
+    }
+
+    fn find<'a>(plan: &'a LaunchPlan, name: &str) -> &'a LaunchCandidate {
+        plan.candidates
+            .iter()
+            .find(|c| match &c.target {
+                LaunchTarget::RetroArchCore { core_stem, .. } => core_stem == name,
+                LaunchTarget::Standalone { adapter_id, .. } => *adapter_id == name,
+            })
+            .unwrap_or_else(|| panic!("no {name} candidate"))
+    }
+
+    #[test]
+    fn psx_chd_swanstation_is_ready_without_a_warning_and_is_the_sole_choice() {
+        let plan = build_launch_plan(
+            &resolved("PSX", "SLUS-12345"),
+            &resolved_content(),
+            &[psx_duckstation_input()],
+            &psx_report_with_swanstation(ProfileKind::Native),
+            &[],
+        );
+        let swan = find(&plan, "swanstation");
+        assert_eq!(swan.readiness, LaunchReadiness::Ready);
+        assert!(swan.warnings.is_empty() && swan.blockers.is_empty());
+        assert_eq!(swan.preference, CandidatePreference::SoleEligible);
+        let beetle = find(&plan, "mednafen_psx");
+        assert_eq!(beetle.readiness, LaunchReadiness::ReadyWithWarnings);
+        assert_eq!(beetle.preference, CandidatePreference::Undetermined);
+        assert_eq!(
+            find(&plan, "duckstation").preference,
+            CandidatePreference::Undetermined
+        );
+    }
+
+    #[test]
+    fn psx_chd_unlaunchable_flatpak_swanstation_never_hides_a_ready_duckstation() {
+        let plan = build_launch_plan(
+            &resolved("PSX", "SLUS-12345"),
+            &resolved_content(),
+            &[psx_duckstation_input()],
+            &psx_report_with_swanstation(ProfileKind::Flatpak),
+            &[],
+        );
+        let duck = find(&plan, "duckstation");
+        assert_eq!(duck.readiness, LaunchReadiness::Ready);
+        assert_eq!(duck.preference, CandidatePreference::SoleEligible);
+        assert_eq!(
+            find(&plan, "swanstation").preference,
+            CandidatePreference::Undetermined
+        );
+    }
+
+    #[test]
+    fn psx_chd_remembered_duckstation_is_not_changed_by_the_ordering() {
+        let remembered = [RememberedPreference {
+            adapter_id: "duckstation".to_string(),
+            profile_id: "duckstation".to_string(),
+        }];
+        let plan = build_launch_plan(
+            &resolved("PSX", "SLUS-12345"),
+            &resolved_content(),
+            &[psx_duckstation_input()],
+            &psx_report_with_swanstation(ProfileKind::Native),
+            &remembered,
+        );
+        assert_eq!(
+            find(&plan, "duckstation").preference,
+            CandidatePreference::Remembered
+        );
+    }
+
+    #[test]
+    fn non_psx_retroarch_cores_never_get_the_chd_warning() {
+        let mut report = retroarch_with_snes9x_core();
+        report.profiles[0].cores[0].core_stem = "mednafen_psx".to_string();
+        let content = LaunchContentRef {
+            kind: None,
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(PathBuf::from("/library/game.chd")),
+            requires_mount: false,
+            provenance: "loose".to_string(),
+        };
+        let plan = build_launch_plan(&resolved("SNES", "k"), &content, &[], &report, &[]);
+        assert!(plan.candidates.iter().all(|c| c.warnings.is_empty()));
+    }
+
+    #[test]
+    fn psx_cue_disc_through_retroarch_is_not_flagged_for_chd() {
+        let identity = resolved("PSX", "SLUS-12345");
+        let mut content = resolved_content();
+        content.container = Some(LaunchContainerKind::PlainFile);
+        content.resolved_path = Some(PathBuf::from("/library/game.cue"));
+        let plan = build_launch_plan(
+            &identity,
+            &content,
+            &[psx_duckstation_input()],
+            &retroarch_with_psx_core(),
+            &[],
+        );
+        assert!(plan.candidates.iter().all(|c| {
+            !c.warnings
+                .iter()
+                .any(|w| w.kind == LaunchWarningKind::RetroArchChdSupportUnconfirmed)
+        }));
+    }
+
+    #[test]
+    fn atari_8bit_disk_gets_the_installed_atari800_retroarch_core() {
+        let identity = resolved("Atari 8-bit", "A-E");
+        let mut report = retroarch_with_snes9x_core();
+        let core = &mut report.profiles[0].cores[0];
+        core.core_stem = "atari800".to_string();
+        if let CoreInfoFinding::Found {
+            system_name,
+            database,
+            ..
+        } = &mut core.info
+        {
+            *system_name = Some("Atari 8-bit Family".to_string());
+            *database = Some("Atari - 5200|Atari - 8-bit Family".to_string());
+        }
+        let content = LaunchContentRef {
+            kind: None,
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(PathBuf::from("/library/A-E (USA) (Side A).atr")),
+            requires_mount: false,
+            provenance: "loose disk image".to_string(),
+        };
+        let launch_plan = build_launch_plan(&identity, &content, &[], &report, &[]);
+        let candidate = &launch_plan.candidates[0];
+        assert!(
+            matches!(&candidate.target, LaunchTarget::RetroArchCore { core_stem, .. } if core_stem == "atari800"),
+            "{:?}",
+            candidate.target
+        );
+        assert_eq!(candidate.readiness, LaunchReadiness::Ready);
+    }
+
+    #[test]
+    fn atari_8bit_core_with_required_missing_firmware_stays_blocked() {
+        let identity = resolved("Atari 8-bit", "A-E");
+        let mut report = retroarch_with_snes9x_core();
+        let core = &mut report.profiles[0].cores[0];
+        core.core_stem = "atari800".to_string();
+        if let CoreInfoFinding::Found {
+            system_name,
+            firmware,
+            ..
+        } = &mut core.info
+        {
+            *system_name = Some("Atari 8-bit Family".to_string());
+            firmware.push(FirmwareRequirement {
+                index: 0,
+                description: Some("ATARIXL.ROM".to_string()),
+                path: Some("ATARIXL.ROM".to_string()),
+                optional: false,
+                presence: FirmwarePresence::Missing,
+            });
+        }
+        let content = LaunchContentRef {
+            kind: None,
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(PathBuf::from("/library/a.atr")),
+            requires_mount: false,
+            provenance: "loose disk image".to_string(),
+        };
+        let launch_plan = build_launch_plan(&identity, &content, &[], &report, &[]);
+        assert_eq!(
+            launch_plan.candidates[0].readiness,
+            LaunchReadiness::Blocked
+        );
+        assert!(
+            launch_plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|b| b.kind == LaunchBlockerKind::RequiredFirmwareMissing)
         );
     }
 

@@ -2341,3 +2341,69 @@ fn job10_new_duplicate_refusal_information_is_visible_without_selectable_ids() {
     assert!(!state.can_apply());
     assert!(state.actionable_selected_ids().is_empty());
 }
+
+/// #312: Repair Center Apply never falls back to a journal folder relative
+/// to the launch directory: an unresolved data folder is a refusal (with
+/// the resolver's reason); the test override and a resolved folder are used
+/// as given.
+#[test]
+fn an_unresolved_data_folder_is_an_apply_refusal_never_a_relative_journal_folder() {
+    let refusal = repair_journal_dir(None, || Err("EmuWiz found data in two places")).unwrap_err();
+    assert!(
+        refusal.starts_with(archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE),
+        "{refusal}"
+    );
+    assert!(refusal.contains("two places"));
+    let resolved = PathBuf::from("/data/emuwiz/rename-transactions-sealed-v1");
+    assert_eq!(
+        repair_journal_dir::<String>(None, || Ok(resolved.clone())),
+        Ok(resolved.clone())
+    );
+    let override_dir = PathBuf::from("/tmp/test-override");
+    assert_eq!(
+        repair_journal_dir(Some(override_dir.clone()), || Err("ignored")),
+        Ok(override_dir)
+    );
+}
+
+/// #312: the real Apply path (`confirm_apply` -> `spawn_apply`) with an
+/// unresolved data folder refuses before any worker starts: nothing is
+/// renamed and no journal folder is chosen, relative or otherwise.
+#[test]
+fn apply_with_an_unresolved_data_folder_refuses_before_any_worker_starts() {
+    let dir = TestDir::new("apply-unresolved-journal");
+    let (dat, roms) = write_apply_fixture(dir.path());
+    let plan = scan_apply_fixture(&dat, &roms);
+    let alpha_id = proposal_id_for(&plan, "a.bin");
+    let mut state = isolated_state(plan, isolated_journal_dir(dir.path()));
+    state.journal_dir_override = None;
+    state.journal_resolver_for_test = Some(|| Err("EmuWiz found data in two places".into()));
+    let cwd_journal =
+        std::path::Path::new(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY);
+    let cwd_journal_existed = cwd_journal.exists();
+
+    state.toggle_selected(&alpha_id);
+    state.open_apply_confirmation();
+    state.confirm_apply();
+
+    assert!(!state.is_apply_running(), "no worker may start");
+    let failure = state.apply_failure.as_ref().expect("a visible refusal");
+    assert_eq!(failure.label, "Nothing was repaired");
+    assert!(
+        failure
+            .detail
+            .starts_with(archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE)
+            && failure.detail.contains("two places"),
+        "{}",
+        failure.detail
+    );
+    assert!(roms.join("a.bin").exists() && !roms.join("alpha.bin").exists());
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("journal"))
+            .unwrap()
+            .count(),
+        0,
+        "no journal was written"
+    );
+    assert_eq!(cwd_journal.exists(), cwd_journal_existed);
+}

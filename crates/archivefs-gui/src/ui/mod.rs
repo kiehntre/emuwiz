@@ -1,6 +1,7 @@
 pub(crate) mod components;
 pub(crate) mod icons;
 pub(crate) mod layout;
+pub(crate) mod picker;
 pub(crate) mod platform_artwork;
 pub(crate) mod text_edit;
 pub(crate) mod theme;

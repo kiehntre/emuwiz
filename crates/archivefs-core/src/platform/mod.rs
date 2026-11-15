@@ -667,6 +667,8 @@ pub const PLATFORMS: &[Platform] = &[
         display_name: "Atari 8-bit",
         folder_aliases: &[
             "atari8bit",
+            // RetroArch's atari800 core names its system "Atari 8-bit Family".
+            "atari8bitfamily",
             "atari800",
             "atari8",
             "atarixl",
@@ -1655,6 +1657,25 @@ pub const PLATFORMS: &[Platform] = &[
         conflicts_with: &["MegaDrive", "Sega 32X", "PSX", "AmigaCD32"],
         preferred_emulator: None,
         explanation: "The `SEGADISCSYSTEM` boot signature is what separates a Mega-CD image from any other `.bin`/`.iso`. Kept as its own canonical platform, never folded into Mega Drive.",
+    },
+    // Sega Pico (owner approval 2026-11-10, development only: the live
+    // library is not rescanned or reclassified by this entry). The Pico
+    // cartridge header names `PICO` at 0x100..0x110 but begins with `SEGA`
+    // like a Mega Drive's, so no magic rule is registered: the bytes would
+    // only ever corroborate both. Pico-versus-Mega Drive is decided by the
+    // launch-time header check (`launch::unverified_media::is_sega_pico_rom`).
+    Platform {
+        id: "Sega Pico",
+        display_name: "Sega Pico",
+        folder_aliases: &["segapico", "pico", "kidspico", "segatoyspico"],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["md", "bin", "zip"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &["MegaDrive"],
+        preferred_emulator: None,
+        explanation: "A Pico ROM is a Mega Drive-format cartridge whose header names the Pico; only a folder name or that header tells them apart. `.md`, `.bin` and `.zip` are weak and shared with the Mega Drive.",
     },
     Platform {
         id: "Saturn",

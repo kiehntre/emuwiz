@@ -57,10 +57,10 @@ library look empty without deleting anything.
 ## The database
 
 The catalogue database upgrades forward only, in steps. The current schema is
-**27**; the `v0.9.0` tag used schema 16, so upgrading from it applies several
+**28**; the `v0.9.0` tag used schema 16, so upgrading from it applies several
 steps. Later versions may use a higher number.
 
-Starting EmuWiz does not upgrade the database. At schema 27 it can make one small
+Starting EmuWiz does not upgrade the database. At schema 28 it can make one small
 write to a saved Favourites item ([details](FAVOURITES_AND_COLLECTIONS.md)). If the
 database is older than this version, the
 app shows an **Outdated** state and does not change it. Upgrade it in the app
@@ -96,27 +96,27 @@ database. Add `--json PATH` for a machine-readable report, or use
 `--config-root`, `--data-root`, `--legacy-config-root` and `--legacy-data-root`
 to inspect other locations. Run it with `--help` to see every option.
 
-### Schema 27: Favourites and collections
+### Schema 28: Favourites and collections
 
-Schema 27 adds two tables and changes nothing that already exists. It is still
+Schema 28 adds two tables and changes nothing that already exists. It is still
 a one-way step, so choose when to take it:
 
-- It needs the explicit upgrade above. A build at schema 27 will not open a
-  schema 26 library until that has been done, and never does it by itself.
-- After the upgrade, every build made for schema 26 refuses the library. That
+- It needs the explicit upgrade above. A build at schema 28 will not open a
+  schema 27 library until that has been done, and never does it by itself.
+- After the upgrade, every build made for schema 27 refuses the library. That
   includes older installs and any build from a branch without this migration.
 - `emuwiz-cli library-upgrade --confirm` upgrades without scanning.
   **Scan and upgrade library** also scans every game folder, so do not use it
   while a drive, mount or migration is in doubt. The checks to run before and
   after are in
   [Upgrading a live library without a scan](FAVOURITES_AND_COLLECTIONS.md#upgrading-a-live-library-without-a-scan).
-- At schema 27, EmuWiz can make one small background write to a saved
+- At schema 28, EmuWiz can make one small background write to a saved
   Favourites item after the library loads; see that page.
 
 The backup holds the whole library, so going back loses every later change to
 it, not only Favourites: scans, imports, metadata, verification results and more.
 What that involves is in
-[Favourites and collections](FAVOURITES_AND_COLLECTIONS.md#going-back-to-schema-26).
+[Favourites and collections](FAVOURITES_AND_COLLECTIONS.md#going-back-to-schema-27).
 
 ## Upgrade checklist
 

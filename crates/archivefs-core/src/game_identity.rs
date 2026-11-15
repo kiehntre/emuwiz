@@ -400,6 +400,11 @@ pub enum IdentityPlatform {
     ThreeDo,
     Pcfx,
     PcEngineCd,
+    GameGear,
+    MasterSystem,
+    Sega32x,
+    ColecoVision,
+    TurboGrafx16,
     NeoGeoCd,
     Ngp,
     Ngpc,
@@ -480,6 +485,26 @@ impl IdentityPlatform {
             | "super cd-rom2"
             | "turbo duo"
             | "turboduo" => Self::PcEngineCd,
+            "game gear" | "gamegear" | "sega game gear" | "segagamegear" | "sega gg" | "segagg"
+            | "gg" => Self::GameGear,
+            "master system" | "mastersystem" | "sega master system" | "segamastersystem"
+            | "sega mark iii" | "sms" => Self::MasterSystem,
+            "32x" | "sega 32x" | "sega32x" | "sega 32" | "sega32" => Self::Sega32x,
+            "colecovision" | "coleco" | "colecovision cv" => Self::ColecoVision,
+            "turbografx-16"
+            | "turbografx16"
+            | "turbografx 16"
+            | "turbografx"
+            | "tg16"
+            | "tg-16"
+            | "nec turbografx-16"
+            | "nec turbografx16"
+            | "pc engine"
+            | "pcengine"
+            | "pce"
+            | "nec pc engine"
+            | "necpcengine"
+            | "pc engine / turbografx-16" => Self::TurboGrafx16,
             "neo geo cd" | "neogeocd" | "neo-geo cd" | "neo geo cd-rom" | "snk neo geo cd"
             | "ngcd" | "neocd" | "neo cd" | "neocdz" => Self::NeoGeoCd,
             "neo geo pocket" | "neogeopocket" | "ngp" => Self::Ngp,
@@ -539,6 +564,11 @@ impl IdentityPlatform {
             Self::ThreeDo => "3DO",
             Self::Pcfx => "PC-FX",
             Self::PcEngineCd => "PC Engine CD / TurboGrafx-CD",
+            Self::GameGear => "Sega Game Gear",
+            Self::MasterSystem => "Sega Master System",
+            Self::Sega32x => "Sega 32X",
+            Self::ColecoVision => "ColecoVision",
+            Self::TurboGrafx16 => "PC Engine / TurboGrafx-16",
             Self::NeoGeoCd => "Neo Geo CD",
             Self::Ngp => "Neo Geo Pocket",
             Self::Ngpc => "Neo Geo Pocket Color",
@@ -562,6 +592,12 @@ pub enum IdentityImageFormat {
     Iso,
     ZipContainingIso,
     LooseCartridgeRom,
+    /// A ZIP containing exactly one cartridge ROM member. Its
+    /// [`IdentityKind::LooseRomSha256`] covers that member's decompressed
+    /// bytes, never the ZIP container, and is deliberately not
+    /// [`Self::LooseCartridgeRom`] so no loose-file consumer (saves, cheats,
+    /// mod packages) treats the ZIP path as the runnable ROM.
+    ZipContainingCartridgeRom,
     Xex,
     ZipContainingXex,
     /// A direct original-Xbox `.xbe` executable - identity is read from its
@@ -781,7 +817,14 @@ impl GameIdentityReport {
         self.verified_value(IdentityKind::SegaCdProductCode)
     }
 
+    /// The verified hash of a loose ROM file. Deliberately `None` for a
+    /// zipped cartridge: that hash covers a ZIP member, so file-level
+    /// consumers (patching, cheats, saves) must not treat the ZIP path as the
+    /// ROM. Use [`Self::verified_value`] for the member hash.
     pub fn verified_loose_rom_sha256(&self) -> Option<&str> {
+        if self.format == IdentityImageFormat::ZipContainingCartridgeRom {
+            return None;
+        }
         self.verified_value(IdentityKind::LooseRomSha256)
     }
 
@@ -1024,27 +1067,16 @@ fn inspect_game_identity_with_platform_trust_and_budget(
         }
     }
 
-    if matches!(
-        platform,
-        IdentityPlatform::MegaDrive
-            | IdentityPlatform::Snes
-            | IdentityPlatform::Nes
-            | IdentityPlatform::GameBoy
-            | IdentityPlatform::GameBoyColor
-            | IdentityPlatform::GameBoyAdvance
-            | IdentityPlatform::VirtualBoy
-            | IdentityPlatform::PokemonMini
-            | IdentityPlatform::N64
-            | IdentityPlatform::Atari2600
-            | IdentityPlatform::Atari5200
-            | IdentityPlatform::Atari7800
-            | IdentityPlatform::Atari8Bit
-            | IdentityPlatform::AtariLynx
-            | IdentityPlatform::AtariJaguar
-            | IdentityPlatform::Ngp
-            | IdentityPlatform::Ngpc
-    ) {
-        inspect_loose_rom(&mut report, trusted_platform, trusted);
+    if crate::zip_cartridge_select::is_loose_cartridge_platform(platform) {
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("zip"))
+        {
+            inspect_zip_cartridge_rom(&mut report, trusted_platform, trusted);
+        } else {
+            inspect_loose_rom(&mut report, trusted_platform, trusted);
+        }
         return report;
     }
 
@@ -1536,6 +1568,9 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::Nes, "nes") => Some("nes"),
         (IdentityPlatform::Nes, "fds") => Some("fds"),
         (IdentityPlatform::Nes, "unf") => Some("unf"),
+        // No-Intro headerless dump: cores supply the mapper from their own
+        // game database, so it is staged as `.nes` (bytes unchanged).
+        (IdentityPlatform::Nes, "unh") => Some("unh"),
         (IdentityPlatform::GameBoy, "gb") => Some("gb"),
         (IdentityPlatform::GameBoyColor, "gb") => Some("gb"),
         (IdentityPlatform::GameBoyColor, "gbc") => Some("gbc"),
@@ -1547,6 +1582,11 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::N64, "z64") => Some("z64"),
         (IdentityPlatform::N64, "v64") => Some("v64"),
         (IdentityPlatform::N64, "n64") => Some("n64"),
+        (IdentityPlatform::GameGear, "gg") => Some("gg"),
+        (IdentityPlatform::MasterSystem, "sms") => Some("sms"),
+        (IdentityPlatform::Sega32x, "32x") => Some("32x"),
+        (IdentityPlatform::ColecoVision, "col") => Some("col"),
+        (IdentityPlatform::TurboGrafx16, "pce") => Some("pce"),
         (IdentityPlatform::Atari2600, "a26") => Some("a26"),
         (IdentityPlatform::Atari5200, "a52") => Some("a52"),
         (IdentityPlatform::Atari7800, "a78") => Some("a78"),
@@ -1562,6 +1602,43 @@ pub fn supported_loose_rom_format(path: &Path, platform: IdentityPlatform) -> Op
         (IdentityPlatform::Ngpc, "ngp" | "ngc") => Some("ngc"),
         _ => None,
     }
+}
+
+/// Like [`supported_loose_rom_format`], for a member inside a ZIP that sits in
+/// a trusted platform folder. The only addition is a bare `.bin` for Atari
+/// 2600: that is the dominant name for 2600 cartridge dumps, and in a trusted
+/// Atari 2600 container it is not ambiguous. A loose `.bin` stays unsupported
+/// (its extension alone says nothing; many cartridge systems share it).
+pub fn supported_zip_member_rom_format(
+    path: &Path,
+    platform: IdentityPlatform,
+) -> Option<&'static str> {
+    supported_loose_rom_format(path, platform).or_else(|| {
+        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+        (platform == IdentityPlatform::Atari2600 && extension == "bin").then_some("bin")
+    })
+}
+
+/// Structural check for a `.bin` Atari 2600 ROM member, from its declared
+/// size alone. Measured over 613 real zipped `.bin` members: every one is a
+/// multiple of 1 KiB from 2 KiB to 64 KiB, except Starpath Supercharger
+/// images (multiples of 8448 bytes: 1, 3 and 4 loads seen) and the one
+/// Pitfall II (DPC) dump of 10495 bytes. Anything else (empty, tiny, odd,
+/// or far larger than any 2600 cartridge) is not accepted as a 2600 ROM.
+pub fn atari_2600_bin_size_problem(len: u64) -> Option<String> {
+    const KIB: u64 = 1024;
+    const SUPERCHARGER_LOAD: u64 = 8448;
+    const DPC_PITFALL_II: u64 = 10_495;
+    let kib_cartridge = len.is_multiple_of(KIB) && (2 * KIB..=256 * KIB).contains(&len);
+    let supercharger = len.is_multiple_of(SUPERCHARGER_LOAD) && len <= 8 * SUPERCHARGER_LOAD;
+    if len > 0 && (kib_cartridge || supercharger || len == DPC_PITFALL_II) {
+        return None;
+    }
+    Some(format!(
+        "a .bin of {len} bytes is not a recognised Atari 2600 cartridge size \
+         (expected a multiple of 1 KiB from 2 KiB to 256 KiB, a Supercharger \
+         image, or the 10495-byte DPC dump)"
+    ))
 }
 
 /// Parses the existing iNES/NES 2.0 header detector from a loose `.nes`
@@ -1640,6 +1717,112 @@ fn validate_game_boy_header(
     Ok(())
 }
 
+/// Extensions that identify a *different* 8-bit Sega system than the trusted
+/// folder platform. A `.sms` in a Game Gear folder (or `.gg` in a Master
+/// System one) is refused as a cross-platform mismatch rather than silently
+/// verified or reported as a bare "unsupported extension". The extension may
+/// simply be wrong (a real Game Gear dump named `.sms`), so the text asks for
+/// a rename and never claims what the file really is.
+pub(crate) fn cross_platform_extension_mismatch(
+    path: &Path,
+    platform: IdentityPlatform,
+) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match (platform, extension.as_str()) {
+        (IdentityPlatform::GameGear, "sms") => Some(
+            "cross-platform mismatch: the .sms extension does not match Game Gear; rename the \
+             file to .gg (or move it to the Master System folder) - EmuWiz does not guess",
+        ),
+        (IdentityPlatform::MasterSystem, "gg") => Some(
+            "cross-platform mismatch: the .gg extension does not match Master System; rename the \
+             file to .sms (or move it to the Game Gear folder) - EmuWiz does not guess",
+        ),
+        _ => None,
+    }
+}
+
+/// Structural sanity checks for the Sega 8-bit, 32X, ColecoVision and
+/// HuCard cartridge families, which are verified by exact-byte SHA-256 only.
+///
+/// Only size rules gate (they refuse obviously wrong data). Header magics
+/// (`TMR SEGA`, `SEGA 32X`, the ColecoVision `AA55`/`55AA` marker) are
+/// reported as supporting text and never gate: no header is universal, and
+/// where none exists the trust model is exact size + extension + the trusted
+/// folder platform - local identity from exact bytes, not a known-good dump
+/// claim. Returns the supporting note on success.
+fn validate_cartridge_family_structure(
+    file: &mut File,
+    len: u64,
+    platform: IdentityPlatform,
+) -> Result<Option<String>, String> {
+    const KIB: u64 = 1024;
+    let mut read_at = |offset: u64, count: usize| -> Option<Vec<u8>> {
+        if offset.checked_add(count as u64)? > len {
+            return None;
+        }
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut buf = vec![0_u8; count];
+        file.read_exact(&mut buf).ok()?;
+        Some(buf)
+    };
+    let note = match platform {
+        IdentityPlatform::GameGear | IdentityPlatform::MasterSystem => {
+            if !(KIB..=4 * KIB * KIB).contains(&len) || !len.is_multiple_of(512) {
+                return Err(format!(
+                    "{} ROM is {len} bytes; expected 1 KiB to 4 MiB in 512-byte steps \
+                     (1 KiB banks plus an optional 512-byte copier header)",
+                    platform.label()
+                ));
+            }
+            let header = [0x1FF0_u64, 0x3FF0, 0x7FF0]
+                .iter()
+                .any(|offset| read_at(*offset, 8).is_some_and(|b| b == b"TMR SEGA"));
+            if header {
+                "TMR SEGA header present (supporting evidence only; it cannot separate Master System from Game Gear)"
+            } else {
+                "no TMR SEGA header found; trust is size + extension + trusted folder platform"
+            }
+        }
+        IdentityPlatform::Sega32x => {
+            if !(0x200..=4 * KIB * KIB).contains(&len) || !len.is_multiple_of(512) {
+                return Err(format!(
+                    "32X ROM is {len} bytes; expected 512 bytes to 4 MiB in 512-byte steps"
+                ));
+            }
+            if read_at(0x100, 8).is_some_and(|b| b == b"SEGA 32X") {
+                "SEGA 32X header at 0x100 present (supporting evidence only)"
+            } else {
+                "no SEGA 32X header at 0x100; trust is size + extension + trusted folder platform"
+            }
+        }
+        IdentityPlatform::ColecoVision => {
+            if !(KIB..=KIB * KIB).contains(&len) {
+                return Err(format!(
+                    "ColecoVision ROM is {len} bytes; expected 1 KiB to 1 MiB"
+                ));
+            }
+            if read_at(0, 2).is_some_and(|b| b == [0xAA, 0x55] || b == [0x55, 0xAA]) {
+                "ColecoVision AA55/55AA start marker present (supporting evidence only)"
+            } else {
+                "no ColecoVision start marker; trust is size + extension + trusted folder platform"
+            }
+        }
+        IdentityPlatform::TurboGrafx16 => {
+            let body = len % (8 * KIB);
+            if !(8 * KIB..=3 * KIB * KIB + 512).contains(&len) || (body != 0 && body != 512) {
+                return Err(format!(
+                    "HuCard ROM is {len} bytes; expected a multiple of 8 KiB (plus an optional \
+                     512-byte copier header) up to 3 MiB"
+                ));
+            }
+            "HuCard has no header magic; trust is size + extension + trusted folder platform"
+        }
+        _ => return Ok(None),
+    };
+    file.seek(SeekFrom::Start(0)).ok();
+    Ok(Some(note.to_string()))
+}
+
 fn inspect_loose_rom(
     report: &mut GameIdentityReport,
     trusted_platform: bool,
@@ -1647,6 +1830,12 @@ fn inspect_loose_rom(
 ) {
     report.format = IdentityImageFormat::LooseCartridgeRom;
     let Some(format) = supported_loose_rom_format(&report.archive_path, report.platform) else {
+        if let Some(reason) =
+            cross_platform_extension_mismatch(&report.archive_path, report.platform)
+        {
+            add_loose_rom_unavailable(report, IdentityStatus::Invalid, reason);
+            return;
+        }
         add_loose_rom_unavailable(
             report,
             IdentityStatus::Unsupported,
@@ -1662,13 +1851,188 @@ fn inspect_loose_rom(
         );
         return;
     }
-    let mut file = match open_read_only_regular(&report.archive_path, trusted) {
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
         Ok(file) => file,
         Err(message) => {
             add_loose_rom_unavailable(report, IdentityStatus::Invalid, &message);
             return;
         }
     };
+    inspect_loose_rom_file(report, format, file);
+}
+
+fn add_zip_cartridge_unavailable(
+    report: &mut GameIdentityReport,
+    status: IdentityStatus,
+    diagnostic: &str,
+) {
+    add_loose_rom_unavailable(
+        report,
+        status,
+        &format!("zipped cartridge ROM: {diagnostic}"),
+    );
+}
+
+/// Identity for a ZIP holding exactly one cartridge ROM of the trusted
+/// platform. The member's decompressed bytes go through the same checks as a
+/// loose ROM (via an anonymous, bounded temporary copy); the resulting SHA-256
+/// is the member's, never the container's, the report format is
+/// [`IdentityImageFormat::ZipContainingCartridgeRom`], and every evidence item
+/// carries the member name and index. Nothing is extracted next to the
+/// archive, and identity alone never makes the ZIP runnable: launch still
+/// needs the mount/extraction flow and its own preflight.
+fn inspect_zip_cartridge_rom(
+    report: &mut GameIdentityReport,
+    trusted_platform: bool,
+    trusted: &TrustedRoots,
+) {
+    report.format = IdentityImageFormat::ZipContainingCartridgeRom;
+    report.nested_container_depth = 1;
+    if !trusted_platform {
+        add_zip_cartridge_unavailable(
+            report,
+            IdentityStatus::Ambiguous,
+            "identity requires exact scanner or manual platform evidence",
+        );
+        return;
+    }
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
+        Ok(file) => file,
+        Err(message) => {
+            add_zip_cartridge_unavailable(report, IdentityStatus::Invalid, &message);
+            return;
+        }
+    };
+    let before = match StableFileMetadata::from_file(&file) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            add_zip_cartridge_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+            return;
+        }
+    };
+    let mut archive = match ZipArchive::new(file) {
+        Ok(archive) => archive,
+        Err(error) => {
+            add_zip_cartridge_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                &format!("invalid ZIP: {error}"),
+            );
+            return;
+        }
+    };
+    let crate::zip_cartridge_select::ZipCartridgeMember {
+        index,
+        name: member_name,
+        declared,
+        format,
+    } = match crate::zip_cartridge_select::select_zip_cartridge_member(
+        &mut archive,
+        report.platform,
+        &mut report.archive_members_inspected,
+    ) {
+        Ok(member) => member,
+        Err((status, message)) => {
+            add_zip_cartridge_unavailable(report, status, &message);
+            return;
+        }
+    };
+    let mut temp = match tempfile::tempfile() {
+        Ok(temp) => temp,
+        Err(error) => {
+            add_zip_cartridge_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                &format!("could not create the private bounded copy: {error}"),
+            );
+            return;
+        }
+    };
+    {
+        let entry = match archive.by_index(index) {
+            Ok(entry) => entry,
+            Err(error) => {
+                add_zip_cartridge_unavailable(report, IdentityStatus::Invalid, &error.to_string());
+                return;
+            }
+        };
+        if entry.name_raw() != member_name.as_slice() {
+            add_zip_cartridge_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                "ZIP entry changed since it was selected",
+            );
+            return;
+        }
+        // Read one byte past the declared size so an entry that inflates
+        // beyond its header is detected rather than silently truncated.
+        let mut limited = entry.take(declared.saturating_add(1));
+        match io::copy(&mut limited, &mut temp) {
+            Ok(copied) if copied == declared => {}
+            Ok(copied) => {
+                add_zip_cartridge_unavailable(
+                    report,
+                    IdentityStatus::Invalid,
+                    &format!(
+                        "ROM member inflated to {copied} bytes but its header declares {declared}"
+                    ),
+                );
+                return;
+            }
+            Err(error) => {
+                add_zip_cartridge_unavailable(
+                    report,
+                    IdentityStatus::Invalid,
+                    &format!("ROM member is corrupt or truncated: {error}"),
+                );
+                return;
+            }
+        }
+    }
+    if temp.seek(SeekFrom::Start(0)).is_err() {
+        add_zip_cartridge_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "could not rewind the bounded ROM copy",
+        );
+        return;
+    }
+    let first_new = report.evidence.len();
+    inspect_loose_rom_file(report, format, temp);
+    // The ZIP must be byte-for-byte the same file after the member was read.
+    let unchanged = still_same_file(&report.archive_path, trusted, &before);
+    if !unchanged {
+        report.evidence.truncate(first_new);
+        report.complete = false;
+        add_zip_cartridge_unavailable(
+            report,
+            IdentityStatus::Invalid,
+            "ZIP changed while its identity was being read",
+        );
+        return;
+    }
+    let zip_note = format!(
+        "ZIP container {} bytes; ROM is member #{index} ({} decompressed bytes); \
+         the hash is of the member, not the ZIP file",
+        before.len, declared
+    );
+    for item in &mut report.evidence[first_new..] {
+        item.provenance.member_path = Some(member_name.clone());
+        item.provenance.member_index = Some(index);
+        item.provenance.method = format!("zip member: {}", item.provenance.method);
+        if item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Verified {
+            item.diagnostic = format!("{}; {zip_note}", item.diagnostic);
+        }
+    }
+    report.format = IdentityImageFormat::ZipContainingCartridgeRom;
+    report.nested_container_depth = 1;
+}
+
+/// The shared cartridge checks, run on an already-opened regular file whose
+/// exact bytes are the ROM. Used for a loose file and, via an anonymous
+/// bounded copy of one ZIP member, for a zipped cartridge ROM, so both routes
+/// apply identical header/format validation and size bounds.
+fn inspect_loose_rom_file(report: &mut GameIdentityReport, format: &'static str, mut file: File) {
     let before = match StableFileMetadata::from_file(&file) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -1695,6 +2059,14 @@ fn inspect_loose_rom(
         add_loose_rom_unavailable(report, IdentityStatus::Invalid, &reason);
         return;
     }
+    let family_note =
+        match validate_cartridge_family_structure(&mut file, before.len, report.platform) {
+            Ok(note) => note,
+            Err(reason) => {
+                add_loose_rom_unavailable(report, IdentityStatus::Invalid, &reason);
+                return;
+            }
+        };
     let mut nes_header = None;
     let mut atari7800_header = None;
     let mut lynx_header = None;
@@ -1869,7 +2241,13 @@ fn inspect_loose_rom(
         IdentityStatus::Verified,
         Some(digest),
         IdentityConfidence::ExactBytes,
-        "SHA-256 covers the exact on-disk bytes; it is not a known-good dump claim",
+        &match &family_note {
+            Some(note) => format!(
+                "SHA-256 covers the exact on-disk bytes; it is not a known-good dump claim; {note}"
+            ),
+            None => "SHA-256 covers the exact on-disk bytes; it is not a known-good dump claim"
+                .to_string(),
+        },
         "bounded full-file SHA-256",
     ));
     if let Some(fact) = nes_header {
@@ -2229,24 +2607,45 @@ fn hash_bounded_file(file: &mut File, maximum: u64) -> io::Result<(String, u64)>
     ))
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct StableFileMetadata {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StableFileMetadata {
     len: u64,
     modified: Option<std::time::SystemTime>,
+    /// Unix ctime (see `CapturedFileIdentity::changed`): catches a same-size
+    /// rewrite with a reset mtime and a replacement given the freed inode.
+    changed: Option<std::time::SystemTime>,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
 }
 
+/// True when `path` still names exactly the file `before` was taken from.
+///
+/// Reopens only through [`open_read_only_regular`] (the safe-read policy:
+/// regular files only, symlinks only inside `trusted`, non-blocking open), so
+/// a path swapped for a FIFO, device, directory or untrusted symlink is
+/// refused at once instead of blocking the worker.
+pub(crate) fn still_same_file(
+    path: &Path,
+    trusted: &TrustedRoots,
+    before: &StableFileMetadata,
+) -> bool {
+    open_read_only_regular(path, trusted)
+        .ok()
+        .and_then(|file| StableFileMetadata::from_file(&file).ok())
+        .is_some_and(|after| &after == before)
+}
+
 impl StableFileMetadata {
-    fn from_file(file: &File) -> io::Result<Self> {
+    pub(crate) fn from_file(file: &File) -> io::Result<Self> {
         let metadata = file.metadata()?;
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         Ok(Self {
             len: metadata.len(),
             modified: metadata.modified().ok(),
+            changed: crate::launch::process_spawn::status_change_time(&metadata),
             #[cfg(unix)]
             device: metadata.dev(),
             #[cfg(unix)]
@@ -4031,6 +4430,11 @@ fn inspect_iso_source(
         | IdentityPlatform::N64
         | IdentityPlatform::Commodore64
         | IdentityPlatform::Vic20
+        | IdentityPlatform::GameGear
+        | IdentityPlatform::MasterSystem
+        | IdentityPlatform::Sega32x
+        | IdentityPlatform::ColecoVision
+        | IdentityPlatform::TurboGrafx16
         | IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
         | IdentityPlatform::Atari7800
@@ -4388,7 +4792,7 @@ fn inspect_dreamcast_source(
         member_path,
         member_index,
         "Dreamcast IP.BIN product code",
-        "product code read from a recognised Sega Dreamcast IP.BIN boot structure",
+        "product code read from a recognised Sega Dreamcast IP.BIN boot structure; the rest of the disc image was not read, so this identifies the game without proving the image is undamaged",
     );
     report.bytes_read = report.bytes_read.max(source.bytes_read());
     report.complete = true;
@@ -5942,6 +6346,18 @@ fn inspect_disc_chd(
     aggregate_budget: Option<u64>,
 ) {
     report.format = IdentityImageFormat::Chd;
+    // A Dreamcast GD-ROM is recognised from the CHD header and metadata
+    // alone, read straight from the file, so its high-density area can be
+    // inspected sector by sector without first loading a 300-900 MB image.
+    if report.platform == IdentityPlatform::Dreamcast
+        && let Ok(observation) =
+            crate::chd_identity::observe_chd_identity_file(&report.archive_path)
+        && let crate::chd_identity::ChdMetadataOutcome::Observed(metadata) = &observation.metadata
+        && crate::chd_identity::needs_specialist_optical_backend(metadata)
+    {
+        inspect_dreamcast_gdrom_chd(report);
+        return;
+    }
     let bytes = match aggregate_budget.map_or_else(
         || read_bounded_chd_bytes(&report.archive_path),
         |budget| {
@@ -6327,13 +6743,31 @@ fn inspect_dreamcast_gdrom_chd(report: &mut GameIdentityReport) {
 /// filename - the honest answer is that this build cannot read this disc.
 #[cfg(not(feature = "chd-optical-specialist"))]
 fn inspect_dreamcast_gdrom_chd(report: &mut GameIdentityReport) {
-    add_unavailable(
-        report,
-        IdentityStatus::Unsupported,
-        "this CHD is a multi-track Dreamcast GD-ROM; reading its high-density data area \
-         requires the optional chd-optical-specialist build feature, which is not enabled in \
-         this build",
-    );
+    // Pure-Rust high-density reader: places each GD-ROM track exactly as
+    // chdman stores it and fails closed on any layout it cannot prove (see
+    // `crate::chd_logical_media::open_chd_gdrom_high_density_file`). The
+    // product code still comes only from the disc's own IP.BIN through the
+    // shared `inspect_dreamcast_source`.
+    let media =
+        match crate::chd_logical_media::open_chd_gdrom_high_density_file(&report.archive_path) {
+            Ok(media) => media,
+            Err(error) => {
+                push_with_source(
+                    report,
+                    IdentityKind::DreamcastProductCode,
+                    IdentityStatus::Invalid,
+                    None,
+                    IdentityConfidence::Unavailable,
+                    None,
+                    None,
+                    "Dreamcast GD-ROM high-density CHD reader",
+                    &error.to_string(),
+                );
+                return;
+            }
+        };
+    let mut source = MediaSource::new(media);
+    inspect_dreamcast_source(report, &mut source, None, None);
 }
 
 /// Authoritative Dreamcast identity for a DiscJuggler `.cdi` image. Never
@@ -6931,7 +7365,7 @@ impl ByteSource for SliceSource<'_> {
 /// that contains both the link and its canonical target - so passing
 /// [`TrustedRoots::none`] keeps the historical behaviour of refusing every
 /// symlink outright.
-fn open_read_only_regular(path: &Path, trusted: &TrustedRoots) -> Result<File, String> {
+pub(crate) fn open_read_only_regular(path: &Path, trusted: &TrustedRoots) -> Result<File, String> {
     crate::safe_read::open_bounded_read(path, trusted)
         .map(crate::safe_read::SafeFile::into_file)
         .map_err(|refusal| refusal.detail())
@@ -7009,6 +7443,11 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
             &[IdentityKind::LooseRomSha256]
         }
         IdentityPlatform::WataraSupervision => &[IdentityKind::LooseRomSha256],
+        IdentityPlatform::GameGear
+        | IdentityPlatform::MasterSystem
+        | IdentityPlatform::Sega32x
+        | IdentityPlatform::ColecoVision
+        | IdentityPlatform::TurboGrafx16 => &[IdentityKind::LooseRomSha256],
         IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
         | IdentityPlatform::Atari7800
@@ -7245,6 +7684,11 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::Ngp
         | IdentityPlatform::Ngpc
         | IdentityPlatform::ThreeDo
+        | IdentityPlatform::GameGear
+        | IdentityPlatform::MasterSystem
+        | IdentityPlatform::Sega32x
+        | IdentityPlatform::ColecoVision
+        | IdentityPlatform::TurboGrafx16
         | IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
         | IdentityPlatform::Atari7800
@@ -9941,12 +10385,39 @@ mod tests {
                 .iter()
                 .find(|item| item.kind == IdentityKind::DreamcastProductCode)
                 .expect("a DreamcastProductCode evidence item must exist");
+            // The pure-Rust high-density reader now handles this shape; a
+            // metadata-only fixture has no hunk map, so it refuses as
+            // invalid media rather than "feature not built".
+            assert_eq!(evidence.status, IdentityStatus::Invalid);
             assert!(
-                evidence.diagnostic.contains("chd-optical-specialist"),
-                "expected the specialist-backend-unavailable message, got: {}",
+                !evidence.diagnostic.contains("chd-optical-specialist"),
+                "the default build must not claim the specialist backend is required: {}",
                 evidence.diagnostic
             );
         }
+    }
+
+    #[cfg(not(feature = "chd-optical-specialist"))]
+    #[test]
+    fn dreamcast_gdrom_chd_verifies_ip_bin_product_code_from_track_three() {
+        let iso = dreamcast_iso(b"T-8109N");
+        let blocks: Vec<[u8; 2048]> = iso
+            .chunks(ISO_SECTOR_SIZE as usize)
+            .map(|chunk| chunk.try_into().unwrap())
+            .collect();
+        let directory = FixtureDir::new("dreamcast-gdrom-chd-ip-bin");
+        let path = write_fixture(
+            &directory,
+            "renamed.chd",
+            &crate::chd_logical_media::synthetic_gdrom_chd(&blocks),
+        );
+        let report = inspect_game_identity(&path, Some("Dreamcast"));
+        assert_eq!(report.format, IdentityImageFormat::Chd);
+        assert_eq!(report.verified_dreamcast_product_code(), Some("T-8109N"));
+        assert!(report.complete);
+        // A Saturn hint over the same bytes never takes the Dreamcast reader.
+        let saturn = inspect_game_identity(&path, Some("Saturn"));
+        assert_eq!(saturn.verified_dreamcast_product_code(), None);
     }
 
     #[cfg(feature = "chd-optical-specialist")]
@@ -11511,16 +11982,14 @@ mod tests {
 
     #[test]
     fn game_boy_zip_extension_is_unsupported_not_extracted() {
-        // No archive-mount/ZIP-member path exists for any loose-cartridge
-        // platform (Mega Drive/SNES/NES included) - a `.zip` extension
-        // simply fails closed as unsupported, exactly like any other wrong
-        // extension. This crate never adds ZIP extraction for this pass.
+        // A `.zip` that is not a valid ZIP fails closed (Invalid) and is never
+        // extracted; real single-ROM ZIPs are covered by `zip_cartridge_tests`.
         let directory = FixtureDir::new("loose-gb-zip");
         let path = write_fixture(&directory, "Mystery Game.zip", b"bytes");
         let report = inspect_catalogued_game_identity(&path, Some("Game Boy"));
         assert_eq!(report.verified_loose_rom_sha256(), None);
         assert!(report.evidence.iter().any(|item| {
-            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Unsupported
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Invalid
         }));
     }
 
@@ -11868,7 +12337,7 @@ mod tests {
         let report = inspect_catalogued_game_identity(&path, Some("N64"));
         assert_eq!(report.verified_loose_rom_sha256(), None);
         assert!(report.evidence.iter().any(|item| {
-            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Unsupported
+            item.kind == IdentityKind::LooseRomSha256 && item.status == IdentityStatus::Invalid
         }));
     }
 
@@ -12020,6 +12489,28 @@ mod tests {
             item.kind == IdentityKind::LooseRomSha256
                 && item.status == IdentityStatus::ResourceLimitReached
         }));
+    }
+
+    /// ZIP staging and loose-ROM reads re-check the file with
+    /// `still_same_file`. A file equal on device, inode, size and mtime but
+    /// with a different ctime (same-size rewrite with a reset mtime, or a
+    /// replacement given the freed inode) passed the old check; it must not.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_matching_on_inode_size_and_mtime_but_not_ctime_is_not_the_same_file() {
+        let directory = FixtureDir::new("ctime-reuse");
+        let path = write_fixture(&directory, "Replaced.zip", b"replacement bytes");
+        let now = StableFileMetadata::from_file(&File::open(&path).unwrap()).unwrap();
+        assert!(now.changed.is_some(), "ctime must be captured on Unix");
+        let mut before = now.clone();
+        before.changed = now
+            .changed
+            .map(|ctime| ctime - std::time::Duration::from_nanos(1));
+        let old_check = |m: &StableFileMetadata| (m.device, m.inode, m.len, m.modified);
+        assert_eq!(old_check(&before), old_check(&now));
+        assert!(!still_same_file(&path, &TrustedRoots::none(), &before));
+        assert!(!loose_rom_read_was_stable(&before, &now, now.len));
+        assert!(still_same_file(&path, &TrustedRoots::none(), &now));
     }
 
     #[test]
@@ -13665,3 +14156,6 @@ fn a_deferred_identity_status_reads_not_available_yet() {
     assert_eq!(IdentityStatus::Deferred.to_string(), "Not available yet");
     assert_ne!(IdentityStatus::Deferred.to_string(), "Deferred");
 }
+
+#[cfg(test)]
+mod zip_cartridge_tests;

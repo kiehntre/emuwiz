@@ -11,6 +11,7 @@ use crate::{ArchiveKind, Config, Database, archive_kind, media_registry, scan_an
 
 fn config(source: &Path, root: &Path) -> Config {
     Config {
+        configured_source_roots: None,
         source_folders: vec![source.to_path_buf()],
         mount_root: root.join("mount"),
         ratarmount_bin: "ratarmount".to_string(),

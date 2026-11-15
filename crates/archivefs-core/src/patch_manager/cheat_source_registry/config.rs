@@ -24,7 +24,6 @@
 
 #[cfg(test)]
 use std::ffi::OsString;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -96,7 +95,7 @@ pub fn load_cheat_sources_config_from(
     path: impl AsRef<Path>,
 ) -> Result<CheatSourcesConfig, ArchiveFsError> {
     let path = path.as_ref();
-    let text = match fs::read_to_string(path) {
+    let text = match read_config_text(path) {
         Ok(contents) => contents,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             return Ok(CheatSourcesConfig::default());
@@ -111,6 +110,38 @@ pub fn load_cheat_sources_config_from(
     let config: CheatSourcesConfig = toml::from_str(&text)
         .map_err(|e| ArchiveFsError::Config(format!("failed to parse {}: {e}", path.display())))?;
     Ok(config)
+}
+
+/// Longest `cheat_sources.toml` that is read. A real one is a few kilobytes;
+/// a file past this bound is a mistake or a device masquerading as a file,
+/// and is refused rather than read into memory.
+pub const MAX_CHEAT_SOURCES_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Reads the config as UTF-8 text without ever blocking on it or reading it
+/// unbounded: the open is non-blocking and requires a regular file (a FIFO
+/// in the config's place is refused, Night Watch D7-04), and at most
+/// [`MAX_CHEAT_SOURCES_CONFIG_BYTES`] are read. Symlinks are followed: a
+/// config kept in a dotfiles repository is the user's own choice.
+fn read_config_text(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    #[cfg(unix)]
+    let file = crate::safe_read::open_regular_file_nonblocking(path, true)?;
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)?;
+    let mut text = String::new();
+    let read = file
+        .take(MAX_CHEAT_SOURCES_CONFIG_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if read as u64 > MAX_CHEAT_SOURCES_CONFIG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} exceeds the {MAX_CHEAT_SOURCES_CONFIG_BYTES}-byte cheat sources config limit",
+                path.display()
+            ),
+        ));
+    }
+    Ok(text)
 }
 
 pub fn save_cheat_sources_config_default(
@@ -135,6 +166,7 @@ pub fn save_cheat_sources_config_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn test_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -548,5 +580,58 @@ extra_field = "bad"
             "an existing legacy ArchiveFS config dir is reused transparently"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Night Watch D7-04: a FIFO in the config's place is refused promptly
+    /// instead of blocking the loader (and the GUI page behind it) forever.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_config_is_refused_promptly() {
+        let root = test_root("fifo");
+        let path = root.join("cheat_sources.toml");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_cheat_sources_config_from(&thread_path).is_err());
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
+        if outcome.is_err() {
+            let _ = fs::OpenOptions::new().read(true).write(true).open(&path);
+        }
+        assert!(outcome.expect("cheat sources config loader blocked on a FIFO"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_config_is_refused_not_read_whole() {
+        let root = test_root("oversized");
+        let path = root.join("cheat_sources.toml");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_CHEAT_SOURCES_CONFIG_BYTES + 1).unwrap();
+        let error = load_cheat_sources_config_from(&path).unwrap_err();
+        assert!(error.to_string().contains("limit"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_is_still_followed() {
+        let root = test_root("symlinked");
+        let real = root.join("real.toml");
+        fs::write(&real, "").unwrap();
+        let link = root.join("cheat_sources.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            load_cheat_sources_config_from(&link).unwrap(),
+            CheatSourcesConfig::default()
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

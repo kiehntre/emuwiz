@@ -95,6 +95,30 @@ class PartitionTests(unittest.TestCase):
         self.assertEqual(owners["update::f"], {"rest"})
         self.assertEqual(owners["top"], {"rest"})
 
+    def test_gui_tier_shards_split_only_on_gui_v2(self) -> None:
+        self.enumerate("gui")
+        tests = {shard: {name.split(" :: ", 1)[1] for name in ci_test_shards.parse_listing(
+                     (self.lists / f"{shard}.selected").read_text())}
+                 for shard in ci_test_shards.shards("gui")}
+        self.assertEqual(tests["gui-tier-v2"], {"gui_v2::d", "gui_v2::dat::overlap"})
+        # Tests the full tier gives to recovery or dat must not vanish here.
+        self.assertIn("dat::a", tests["gui-tier-other"])
+        self.assertIn("memory_card_inventory::ignored", tests["gui-tier-other"])
+
+    def test_a_shard_that_never_enumerated_is_named_as_a_cascade_and_still_fails(self) -> None:
+        for absent in (["rest"], ["recovery", "dat", "gui-v2", "rest"]):
+            with self.subTest(absent=absent):
+                for path in self.lists.iterdir():
+                    path.unlink()
+                self.enumerate("full")
+                for shard in absent:
+                    for kind in ("all", "selected"):
+                        (self.lists / f"{shard}.{kind}").unlink()
+                result = self.check()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"no enumeration from shard(s) {sorted(absent)}", result.stderr)
+                self.assertIn("not a shard coverage defect", result.stderr)
+
     def test_missing_duplicated_or_inconsistent_enumerations_fail(self) -> None:
         cases = {
             "missing": lambda: (self.lists / "dat.selected").write_text(cargo_listing(self.binaries, ["--skip", ""])),
@@ -184,14 +208,15 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(ci_test_shards.selection(name), [*group, *(a for f in earlier for a in ("--skip", f))])
 
     def test_tiers(self) -> None:
-        self.assertEqual(ci_test_shards.shards("gui"), ["all"])
-        self.assertEqual(ci_test_shards.selection("all"), [])
+        self.assertEqual(ci_test_shards.shards("gui"), ["gui-tier-v2", "gui-tier-other"])
+        self.assertEqual(ci_test_shards.selection("gui-tier-v2"), ["gui_v2::"])
+        self.assertEqual(ci_test_shards.selection("gui-tier-other"), ["--skip", "gui_v2::"])
         for tier in ("core", "full"):
             self.assertEqual(ci_test_shards.shards(tier), [name for name, _ in ci_test_shards.SHARDS])
         self.assertEqual(ci_test_shards.PACKAGES["full"], ["--workspace"])
 
     def test_unknown_tier_or_shard_is_refused(self) -> None:
-        for args in (["shards", "other"], ["packages", "other"], ["selection", "other"]):
+        for args in (["shards", "other"], ["packages", "other"], ["selection", "other"], ["selection", "all"]):
             with self.subTest(args=args):
                 result = subprocess.run([sys.executable, "-I", str(SCRIPT), *args],
                                         capture_output=True, text=True, check=False)

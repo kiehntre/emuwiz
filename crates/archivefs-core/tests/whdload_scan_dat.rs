@@ -69,6 +69,7 @@ fn scan_supplies_registered_dat_context_without_creating_verified_results() {
     let db_path = root.join("library.sqlite3");
     let mut db = Database::open_or_create(&db_path).unwrap();
     let config = Config {
+        configured_source_roots: Some(vec![source.clone()]),
         source_folders: vec![source],
         mount_root: root.join("mount"),
         ratarmount_bin: String::new(),

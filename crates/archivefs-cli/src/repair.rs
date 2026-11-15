@@ -34,7 +34,9 @@
 use std::path::{Path, PathBuf};
 
 use archivefs_core::dat::limits::DatLimits;
-use archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir;
+use archivefs_core::dat::rename_apply::journal::{
+    default_rename_transaction_dir, journal_dir_or_refusal,
+};
 use archivefs_core::dat::rename_apply::model::RollbackStatus;
 use archivefs_core::dat::rename_apply::{
     EntryState, RenameTransaction, RollbackResult, TransactionSummary, journal_path, list_journals,
@@ -211,11 +213,12 @@ fn run_apply(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 
     let plan = read_plan(&plan_path)?;
 
-    let journal_dir = journal_dir.unwrap_or_else(|| {
-        default_rename_transaction_dir().unwrap_or_else(|_| {
-            PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
-        })
-    });
+    // Never a folder relative to the working directory: an unresolved data
+    // folder (for example two existing setups) is a refusal.
+    let journal_dir = match journal_dir {
+        Some(dir) => dir,
+        None => journal_dir_or_refusal(default_rename_transaction_dir())?,
+    };
     // The trusted mutation root comes from the caller's `--root`, never from the
     // saved plan, so an edited plan cannot expand or redefine what may be touched.
     let trusted = TrustedRoots::from_paths([&root]);
@@ -439,11 +442,12 @@ fn classify_transaction_kind(transaction: &RenameTransaction) -> TransactionKind
 /// database or log format.
 fn run_history(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let json = take_flag(&mut args, "--json");
-    let journal_dir = take_path_value(&mut args, "--journal-dir")?.unwrap_or_else(|| {
-        default_rename_transaction_dir().unwrap_or_else(|_| {
-            PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
-        })
-    });
+    // Listing reconciles journals, so an unresolved data folder is a refusal,
+    // never a folder relative to the working directory.
+    let journal_dir = match take_path_value(&mut args, "--journal-dir")? {
+        Some(dir) => dir,
+        None => journal_dir_or_refusal(default_rename_transaction_dir())?,
+    };
     let limit = take_string_value(&mut args, "--limit")?
         .map(|raw| {
             raw.parse::<usize>()

@@ -1,0 +1,22 @@
+[INFO] === Build =======================================
+[INFO] CPU Model Name: Example CPU
+[INFO] Capabilities: MMX MMXEXT SSE SSE2 SSE3 SSSE3 SSE4 SSE42 AES AVX AVX2 
+[INFO] Version: 1.21.0
+[INFO] Built: May 28 2025
+[INFO] =================================================
+[INFO] [Input]: Found input driver: "x".
+[INFO] [Core]: Loading dynamic libretro core from: "/usr/lib/x86_64-linux-gnu/libretro/gambatte_libretro.so"
+[INFO] [Overrides]: Redirecting save file to "/scratch/home/.config/retroarch/saves/Gambatte/garbage.srm".
+[INFO] [Overrides]: Redirecting save state to "/scratch/home/.config/retroarch/states/Gambatte/garbage.state".
+[INFO] [Environ]: SET_VARIABLES.
+[INFO] [Environ]: GET_LOG_INTERFACE.
+[INFO] [Environ]: PERFORMANCE_LEVEL: 4.
+[INFO] [Content]: Loading content file: "/scratch/fix/garbage.gb".
+[INFO] [Environ]: GET_CAN_DUPE: true
+[INFO] [Environ]: SET_INPUT_DESCRIPTORS:
+[INFO] [Environ]: SET_PIXEL_FORMAT: RGB565.
+[ERROR] [Content]: Failed to load content
+[INFO] [Core]: Content ran for a total of: 00 hours, 00 minutes, 00 seconds.
+[INFO] [Core]: Unloading core..
+[INFO] [Core]: Unloading core symbols..
+[INFO] [Core]: Saved core options file to "/scratch/home/.config/retroarch/config/Gambatte/Gambatte.opt".

@@ -1841,6 +1841,7 @@ fn gamer_view_first_scan_message_uses_plain_language() {
         ingestion_skip_reasons: Default::default(),
         ingestion_platform_counts: Default::default(),
         arcade_ingestion: Default::default(),
+        nested_mounts: Vec::new(),
         ingestion_skipped: Vec::new(),
         ingestion_recognised_sample: Vec::new(),
     };
@@ -3690,6 +3691,7 @@ fn a_refused_repair_is_recorded_in_history_and_shown_as_refused() {
     let scratch = std::env::temp_dir().join("archivefs-doctor-repair-refusal-fixture");
     app.confirm_doctor_repair_with(
         Config {
+            configured_source_roots: Some(vec![scratch.join("sources")]),
             source_folders: vec![scratch.join("sources")],
             mount_root: scratch.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),

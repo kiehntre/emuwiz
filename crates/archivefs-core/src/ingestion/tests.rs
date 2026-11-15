@@ -2699,6 +2699,7 @@ fn lha_package_row_retains_its_exact_inspection_refusal() {
     let path = root.join("Ambiguous.lha");
     std::fs::write(&path, &bytes).unwrap();
     let config = crate::Config {
+        configured_source_roots: None,
         source_folders: vec![root],
         mount_root: Default::default(),
         ratarmount_bin: String::new(),

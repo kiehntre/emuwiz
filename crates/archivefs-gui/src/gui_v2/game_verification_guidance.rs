@@ -24,11 +24,27 @@ pub(super) enum Action {
 impl Action {
     pub fn label(self) -> &'static str {
         match self {
-            Self::SelectDat => "Select DAT",
-            Self::Validate => "Validate",
-            Self::Audit => "Audit",
-            Self::Recheck => "Re-check",
-            Self::Review => "View evidence",
+            Self::SelectDat | Self::Validate => "Set up verification",
+            Self::Audit => "Verify this game",
+            Self::Recheck => "Re-check this game",
+            Self::Review => "View verification result",
+        }
+    }
+
+    /// Game Details' always-visible per-game action: "Re-check" once any DAT
+    /// result is saved for this game (or its saved proof was invalidated, or
+    /// this panel's guidance already asks for a re-check), otherwise
+    /// "Verify". The label names the action only; the result shown stays the
+    /// engine's saved state.
+    pub(super) fn one_game_check(game: &Game, guidance: Option<&Guidance>) -> Self {
+        if game.dat_exact.is_some()
+            || game.dat_state.is_some()
+            || game.dat_proof_invalidated
+            || guidance.is_some_and(|guidance| guidance.action == Self::Recheck)
+        {
+            Self::Recheck
+        } else {
+            Self::Audit
         }
     }
 
@@ -37,8 +53,76 @@ impl Action {
         match self {
             Self::Validate => Route::Section(Section::Dat),
             Self::Review => Route::ReviewIdentity(game.archive.id),
-            Self::SelectDat | Self::Audit | Self::Recheck => {
+            // Both read and save only this game; see `game_dat_check`. A
+            // game with no known system must have one chosen first.
+            Self::Audit | Self::Recheck
+                if archivefs_core::canonical_platform_for_alias(&game.platform).is_some() =>
+            {
+                Route::GameCheck(game.archive.id)
+            }
+            Self::Audit | Self::Recheck => {
+                super::identity_review_page::setup_verification_route(None)
+            }
+            Self::SelectDat => {
                 super::identity_review_page::setup_verification_route(Some(&game.platform))
+            }
+        }
+    }
+}
+
+/// The plain-language state a normal user sees first. It is derived only from
+/// the existing guidance reason; it never adds a verification conclusion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Outcome {
+    Verified,
+    NotRecognised,
+    NeedsSetup,
+    /// A compatible catalogue is ready but this game has not been checked yet.
+    NotCheckedYet,
+    NeedsAttention,
+}
+
+impl Outcome {
+    pub(super) fn of(reason: &str) -> Self {
+        match reason {
+            "Verified" => Self::Verified,
+            "No catalogue match" => Self::NotRecognised,
+            "Audit not yet performed" => Self::NotCheckedYet,
+            "No trusted DAT configured"
+            | "Configured DAT unavailable or disabled"
+            | "Catalogue does not cover this system"
+            | "Catalogue system coverage unresolved"
+            | "Catalogue selection required"
+            | "Catalogue not validated or unavailable"
+            | "Catalogue status unavailable" => Self::NeedsSetup,
+            _ => Self::NeedsAttention,
+        }
+    }
+
+    pub(super) fn headline(self) -> &'static str {
+        match self {
+            Self::Verified => "Verified",
+            Self::NotRecognised => "Not recognised",
+            Self::NeedsSetup => "Needs setup",
+            Self::NotCheckedYet => "Not checked yet",
+            Self::NeedsAttention => "Needs attention",
+        }
+    }
+
+    pub(super) fn next_step(self) -> &'static str {
+        match self {
+            Self::Verified => "This game's identity matched a trusted catalogue.",
+            Self::NotRecognised => {
+                "The trusted catalogue for this system did not list this file. That does not mean the file is damaged."
+            }
+            Self::NeedsSetup => {
+                "EmuWiz needs a trusted catalogue for this system before it can check this game."
+            }
+            Self::NotCheckedYet => {
+                "A trusted catalogue is ready. You can preview and then confirm a read-only check."
+            }
+            Self::NeedsAttention => {
+                "Something about this game's saved check needs a second look before it can be relied on."
             }
         }
     }
@@ -73,7 +157,28 @@ impl State {
         *self = Self::default();
     }
 
-    fn poll(&mut self, game: &Game, context: &eframe::egui::Context) {
+    /// Test-only: put the panel in a chosen state without starting the
+    /// worker, which would read the real default database.
+    #[cfg(test)]
+    pub(super) fn set_for_test(
+        &mut self,
+        game: i64,
+        receiver: Option<Receiver<Guidance>>,
+        result: Option<Guidance>,
+    ) {
+        self.game = Some(game);
+        self.receiver = receiver;
+        self.result = result;
+    }
+
+    /// This panel's finished result for `game`, if it has one.
+    pub(super) fn result_for(&self, game: i64) -> Option<&Guidance> {
+        (self.game == Some(game))
+            .then_some(self.result.as_ref())
+            .flatten()
+    }
+
+    pub(super) fn poll(&mut self, game: &Game, context: &eframe::egui::Context) {
         if self.game != Some(game.archive.id) {
             self.invalidate();
             self.game = Some(game.archive.id);
@@ -111,17 +216,23 @@ fn unavailable() -> Guidance {
     )
 }
 
+/// Whether the file is there and still agrees with the scan's size/mtime.
+pub(super) fn file_state(game: &Game) -> (Option<std::fs::Metadata>, bool) {
+    let metadata = std::fs::symlink_metadata(&game.archive.absolute_path).ok();
+    let unchanged = metadata.as_ref().is_some_and(|m| {
+        Some(m.len()) == game.archive.size_bytes
+            && m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|d| i64::try_from(d.as_secs()).ok())
+                == game.archive.modified_time_unix_seconds
+    });
+    (metadata, unchanged)
+}
+
 fn read_game(game: &Game) -> Guidance {
     let result = (|| -> Result<_, String> {
-        let metadata = std::fs::symlink_metadata(&game.archive.absolute_path).ok();
-        let unchanged = metadata.as_ref().is_some_and(|m| {
-            Some(m.len()) == game.archive.size_bytes
-                && m.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .and_then(|d| i64::try_from(d.as_secs()).ok())
-                    == game.archive.modified_time_unix_seconds
-        });
+        let (metadata, unchanged) = file_state(game);
         let database = Database::open_read_only(
             &archivefs_core::default_database_path().map_err(|e| e.to_string())?,
         )
@@ -166,7 +277,8 @@ fn load(
     format_exclusion: Option<&str>,
 ) -> Guidance {
     let result = (|| -> Result<_, String> {
-        let (checks, freshness) = saved_evidence(game, database)?;
+        let (checks, stale) = saved_evidence(game, database)?;
+        let freshness = freshness(game, stale);
         let snapshot =
             crate::dat_catalogue_picker::load_inventory_snapshot().map_err(|e| e.to_string())?;
         Ok((
@@ -197,16 +309,38 @@ fn load(
     }
 }
 
-/// Read stored stale marks and whole-disc metadata through the existing API.
-/// With no current hashes/revision, absence of staleness is Unknown, never Current.
-fn saved_evidence(
-    game: &Game,
-    database: &Database,
-) -> Result<(usize, DatProvenanceFreshness), String> {
+/// Whether Game Details may call this game's DAT match current anywhere on
+/// the page (the Region note included): only the panel's own answer, once
+/// its worker has re-read this game's saved rows. Before that nothing says
+/// Verified, whatever the Library decided at load.
+pub(super) fn dat_verified_now(_game: &Game, panel: Option<&Guidance>) -> bool {
+    panel.is_some_and(|guidance| guidance.reason == "Verified")
+}
+
+/// Current only when the Library's strict current-evidence decision
+/// (`dat_exact`, set only from `current_library_dat_evidence`) holds and no
+/// saved row is stale; Stale when one is; otherwise Unknown. A saved
+/// exact-match row alone never makes evidence current.
+pub(super) fn freshness(game: &Game, stale: bool) -> DatProvenanceFreshness {
+    if stale {
+        DatProvenanceFreshness::Stale
+    } else if game.dat_exact.is_some() {
+        DatProvenanceFreshness::Current
+    } else {
+        DatProvenanceFreshness::Unknown
+    }
+}
+
+/// How many saved checks exist for this game, and whether its evidence is
+/// stale now: a row is marked stale, or the Library loaded current proof
+/// that no saved row still confirms when re-read here (the file changed,
+/// moved or became another file-system object since the Library loaded).
+pub(super) fn saved_evidence(game: &Game, database: &Database) -> Result<(usize, bool), String> {
     let checks = database
         .library_dat_identities_for_item(game.archive.id)
         .map_err(|e| e.to_string())?;
     let mut stale = false;
+    let mut confirmed = false;
     for check in &checks {
         let summary = database
             .library_dat_identity_summary_for_item(
@@ -217,17 +351,15 @@ fn saved_evidence(
                 true,
             )
             .map_err(|e| e.to_string())?;
-        if summary.is_some_and(|s| s.provenance_freshness == DatProvenanceFreshness::Stale) {
-            stale = true;
+        match summary.map(|s| s.provenance_freshness) {
+            Some(DatProvenanceFreshness::Stale) => stale = true,
+            Some(DatProvenanceFreshness::Current) => confirmed = true,
+            _ => (),
         }
     }
     Ok((
         checks.len(),
-        if stale {
-            DatProvenanceFreshness::Stale
-        } else {
-            DatProvenanceFreshness::Unknown
-        },
+        stale || (game.dat_exact.is_some() && !confirmed),
     ))
 }
 
@@ -243,7 +375,12 @@ pub(super) fn explain(
     catalogues: Result<&[InstalledCatalogueSummary], &str>,
     format_exclusion: Option<&str>,
 ) -> Guidance {
-    if !present || !unchanged || freshness == DatProvenanceFreshness::Stale {
+    // Current evidence already proved the audited file object is unchanged,
+    // which is stronger than the scan's size/mtime baseline; a re-checked
+    // file whose scan row is older must not be called changed. A file that
+    // is gone now is reported whatever the evidence said at load.
+    let current = freshness == DatProvenanceFreshness::Current;
+    if !present || (!unchanged && !current) || freshness == DatProvenanceFreshness::Stale {
         return guidance(
             "File evidence stale or changed",
             if !present {
@@ -407,25 +544,57 @@ impl super::App {
             ui.label("Reading saved evidence and catalogue status; no content audit is running.");
             return;
         };
-        if show(ui, &guidance) {
+        let one_game = Action::one_game_check(game, Some(&guidance));
+        if show(ui, &guidance, one_game) {
             if guidance.action == Action::Validate {
                 self.review.dat_context = Some((game.archive.id, game.platform.clone()));
             }
             // Navigation only: the existing workflow owns selection,
             // population preview and explicit audit confirmation.
-            self.go(guidance.action.route(game));
+            self.go_verification(guidance.action.route(game));
         }
+    }
+
+    /// Opens a verification route for a game. Check Games without a system
+    /// (where a game whose system is unknown is sent) opens on its system
+    /// list, never on a system chosen there earlier.
+    pub(super) fn go_verification(&mut self, route: super::routes::Route) {
+        use super::routes::{Route, Section};
+        if route == Route::Section(Section::Check) {
+            self.check_platform = None;
+            self.verification = None;
+        }
+        self.go(route);
     }
 }
 
-fn show(ui: &mut eframe::egui::Ui, guidance: &Guidance) -> bool {
-    ui.strong(format!("DAT: {}", guidance.reason));
-    ui.label(&guidance.explanation);
-    let clicked = ui.button(guidance.action.label()).clicked();
+/// The card states the result and its evidence. Its own button is kept for
+/// setup and for opening a saved result; the one-game check itself has one
+/// button, `one_game`, under "More for this game", so the card points there
+/// instead of repeating it.
+fn show(ui: &mut eframe::egui::Ui, guidance: &Guidance, one_game: Action) -> bool {
+    let outcome = Outcome::of(guidance.reason);
+    ui.strong(format!("Verification: {}", outcome.headline()));
+    ui.label(outcome.next_step());
+    let clicked = if matches!(guidance.action, Action::Audit | Action::Recheck) {
+        ui.label(format!(
+            "To check it, use {} under More for this game.",
+            one_game.label()
+        ));
+        false
+    } else {
+        ui.button(guidance.action.label()).clicked()
+    };
     ui.small(match guidance.action {
-            Action::Validate => "Opens DATs & Verification. Validate the catalogue there.",
-            Action::Review => "Opens this game's saved evidence.",
-            _ => "Opens verification for this system. Choose a DAT and review the preview before starting an audit.",
-        });
+        Action::Review => "Opens this game's saved result.",
+        _ => "You will see a preview first. Nothing is checked until you confirm.",
+    });
+    ui.small(
+        "Verification is about this game's identity. Whether it can launch is shown separately under Launch readiness.",
+    );
+    ui.collapsing("Technical details", |ui| {
+        ui.strong(format!("DAT: {}", guidance.reason));
+        ui.label(&guidance.explanation);
+    });
     clicked
 }

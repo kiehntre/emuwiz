@@ -140,6 +140,7 @@ fn executables(roots: &MgbaProfileDiscoveryRoots) -> Vec<MgbaExecutable> {
     }
     paths.sort();
     paths.dedup();
+    crate::path_alias::dedup_by_real_path(&mut paths, |entry| &entry.0);
     paths
         .into_iter()
         .filter(|(p, _)| executable(p))

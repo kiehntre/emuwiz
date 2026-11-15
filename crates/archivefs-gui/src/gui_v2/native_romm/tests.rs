@@ -1438,3 +1438,30 @@ fn an_authentication_failure_through_the_bridge_is_not_a_reason_to_look_again() 
         "no rediscovery after an authentication failure"
     );
 }
+
+#[test]
+fn related_file_line_shows_reported_size_and_hash_names_only() {
+    use archivefs_core::identity_source::model::{ExternalHash, HashAlgorithm};
+    use archivefs_core::identity_source::romm::browser::RommRelatedFile;
+    let bare = RommRelatedFile {
+        id: 1,
+        filename: None,
+        provider_path: None,
+        size_bytes: None,
+        hashes: vec![],
+        rejected_hashes: vec![],
+    };
+    assert_eq!(related_file_line(&bare), "Unnamed file");
+    let full = RommRelatedFile {
+        filename: Some("game.zip".into()),
+        size_bytes: Some(3 * 1024 * 1024),
+        hashes: vec![ExternalHash {
+            algorithm: HashAlgorithm::Sha1,
+            value: "abc123".into(),
+        }],
+        ..bare
+    };
+    let line = related_file_line(&full);
+    assert!(line.starts_with("game.zip - 3.0 MiB - hashes listed: "));
+    assert!(!line.contains("abc123"));
+}

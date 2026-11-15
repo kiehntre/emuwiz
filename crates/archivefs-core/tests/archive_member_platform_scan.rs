@@ -27,6 +27,7 @@ fn tap() -> Vec<u8> {
 
 fn scan(db: &mut Database, source: &Path) {
     let config = Config {
+        configured_source_roots: Some(vec![source.to_path_buf()]),
         source_folders: vec![source.to_path_buf()],
         mount_root: source.join("mount"),
         ratarmount_bin: "ratarmount".into(),

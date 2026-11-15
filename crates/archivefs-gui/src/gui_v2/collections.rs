@@ -45,6 +45,10 @@ pub(super) enum CollectionSort {
 }
 
 impl CollectionSort {
+    pub(super) fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
     pub const ALL: [Self; 4] = [
         Self::TitleAscending,
         Self::TitleDescending,

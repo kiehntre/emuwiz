@@ -24,7 +24,7 @@ with the PR number/link, full SHA, result and workflow/job links:
   No comment or notification is posted yet; the next completion event evaluates
   again. Missing results never count as success.
 
-Only the six release/installer/reproducibility jobs already conditional in CI
+Only the seven release/installer/maintenance/reproducibility jobs conditional in CI
 may skip on the existing core/gui tiers. The notifier uses the trusted existing
 path classifier and matches skip exceptions to exact check IDs in the CI run.
 All four configured CodeQL languages (Actions, C/C++, Python and Rust) are

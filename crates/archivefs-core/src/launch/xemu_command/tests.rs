@@ -55,6 +55,7 @@ fn loose_xbe_candidate(path: Option<PathBuf>) -> LaunchCandidate {
 
 fn valid_binding(executable: &str) -> Result<XemuNativeLaunchBinding, XemuLaunchBlocker> {
     Ok(XemuNativeLaunchBinding {
+        launcher_arguments: Vec::new(),
         executable: PathBuf::from(executable),
     })
 }

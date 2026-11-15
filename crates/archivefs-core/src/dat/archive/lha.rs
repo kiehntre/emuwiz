@@ -445,7 +445,14 @@ impl LhaArchiveSource {
             })?;
         if !safe_member_name(&member.path) {
             return Err(LhaError::Unsupported {
-                detail: format!("unsafe member path: {}", member.path),
+                detail: format!(
+                    "unsafe member path: {} ({})",
+                    member.path,
+                    super::member_path::check_member_name(&member.path)
+                        .err()
+                        .map(|refusal| refusal.detail())
+                        .unwrap_or("refused")
+                ),
             });
         }
         if let Some(reason) = member.kind.refusal_reason() {
@@ -938,32 +945,18 @@ fn io_error(error: io::Error) -> LhaError {
     }
 }
 
+/// Locates a 7-Zip candidate under the crate-wide rule
+/// ([`crate::external_tools`]): absolute `PATH` directories only, regular
+/// executable only, absolute result only. A `7zz` sitting in the working
+/// directory is never found through an empty, `.` or relative `PATH` entry.
 fn resolve_executable(candidate: &Path) -> Option<PathBuf> {
-    if candidate.components().count() > 1 {
-        return candidate.is_file().then(|| candidate.to_path_buf());
-    }
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|directory| directory.join(candidate))
-            .find(|path| path.is_file())
-    })
+    crate::external_tools::resolve_executable(candidate)
 }
 
+/// The crate-wide member-name rule ([`super::member_path`]): plain
+/// relative components only, no control, wildcard or backslash characters.
 fn safe_member_name(name: &str) -> bool {
-    !name.contains('\\')
-        && !name.contains('*')
-        && !name.contains('?')
-        && !name.contains('\0')
-        // Every `/` component must be a plain, non-empty name: no `.`/`..`,
-        // no empty segment, no Windows drive prefix (`C:`), and no absolute
-        // root.  `Path::components` alone silently drops `.` and empty
-        // segments and accepts `C:` on Unix.
-        && name.split('/').all(|part| {
-            !part.is_empty()
-                && part != "."
-                && part != ".."
-                && !matches!(part.as_bytes(), [letter, b':', ..] if letter.is_ascii_alphabetic())
-        })
+    super::member_path::is_safe_member_name(name)
 }
 
 fn is_nested_name(name: &str) -> bool {

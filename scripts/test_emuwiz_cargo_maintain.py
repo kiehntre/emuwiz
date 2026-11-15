@@ -29,11 +29,27 @@ ISO = os.path.join(HERE, "cargo-iso")
 DAY = 86400
 
 
+# The fixture repository of the running test.  Production inventory enumerates the worktrees of
+# the repository the script lives in (make_args: repo=None), which for this checkout means every
+# real worktree on the machine; tests must see only their own fixture repository.
+FIXTURE_REPO = None
+
+
 def load_maintain():
     loader = importlib.machinery.SourceFileLoader("emuwiz_cargo_maintain_under_test", MAINTAIN)
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
+    production_make_args = module.make_args
+
+    def fixture_make_args(policy, extra=None):
+        ns = production_make_args(policy, extra)
+        if ns.repo is None:
+            if FIXTURE_REPO is None:
+                raise AssertionError("inventory outside a test fixture would enumerate real worktrees")
+            ns.repo = FIXTURE_REPO
+        return ns
+    module.make_args = fixture_make_args
     return module
 
 
@@ -52,7 +68,12 @@ class MaintBase(R.Base):
 
     def setUp(self):
         super().setUp()
+        global FIXTURE_REPO
+        FIXTURE_REPO = self.repo
+        self.addCleanup(globals().__setitem__, "FIXTURE_REPO", None)
         self.m = load_maintain()
+        import test_emuwiz_cargo_signing as S
+        S.install_test_anchor(self.m.executor())
 
     def full_census(self, m=None):
         m = m or self.m
@@ -60,8 +81,11 @@ class MaintBase(R.Base):
         ex = m.executor()
         ex.F.Census = with_full_census(ex.F.Census)
 
-    def call(self, *argv, m=None):
+    def call(self, *argv, m=None, raw=False, signed=False):
         m = m or self.m
+        argv = list(argv)
+        if signed and argv and argv[0] == "run" and "--dry-run" not in argv and "--scoped-run" not in argv:
+            argv = self.signed_run_argv(argv, m)
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             try:
@@ -69,6 +93,29 @@ class MaintBase(R.Base):
             except SystemExit as exit_:
                 rc = exit_.code if isinstance(exit_.code, int) else 1
         return rc, out.getvalue()
+
+    def signed_run_argv(self, argv, m):
+        """The owner-signed form of a `run`: the targets the plan selects (or the given
+        --only names), a scoped-run record from request-retirement, signed with the test
+        owner key.  Unplannable requests are passed through unchanged (and refused)."""
+        import test_emuwiz_cargo_signing as S
+        only = [argv[i + 1] for i, a in enumerate(argv) if a == "--only" and i + 1 < len(argv)]
+        if not only:
+            st, policy, _ = m.load_policy()
+            if st != "ok" or not policy["enabled"]:
+                return argv
+            _, items, census, _, summ = m.snapshot(policy)
+            only = [e["item"]["name"] for e in m.plan_cycle(policy, items, summ, census, None)["selected"]]
+            if not only:
+                return argv
+        req = ["request-retirement"] + [x for n in only for x in ("--only", n)]
+        rc, out = self.call(*req, m=m, raw=True)
+        if rc != 0:
+            return argv if "--only" in argv else argv + [x for n in only for x in ("--only", n)]
+        record = out.splitlines()[0].strip()
+        S.sign(record)
+        rest = [a for i, a in enumerate(argv[1:], 1) if a != "--only" and (i == 0 or argv[i - 1] != "--only")]
+        return ["run"] + [x for n in only for x in ("--only", n)] + rest + ["--scoped-run", record]
 
     def status(self, m=None):
         rc, out = self.call("status", "--json", m=m)
@@ -107,6 +154,18 @@ class MaintBase(R.Base):
                 os.path.join(t, "debug", "emuwiz-test-env", "profile", "journal.jsonl"),
                 os.path.join(t, "debug", "UNKNOWN.txt"),
                 os.path.join(t, "debug", ".cargo-lock")]
+
+    def evidence_paths(self, t):
+        """The preserved paths the gate permits: everything except the stray file."""
+        return [p for p in self.preserved_paths(t) if not p.endswith("UNKNOWN.txt")]
+
+    def review_unrecognised(self, wt, t, m=None):
+        """The fixture leaves a stray debug/UNKNOWN.txt that retirement does not
+        recognise. The gate must HOLD on it (UNRECOGNISED_RESIDUE) until the owner
+        has reviewed and removed it; this is that review."""
+        g = (m or self.m).worktree_gate(wt)
+        self.assertEqual((g["status"], g["code"]), ("HOLD", "UNRECOGNISED_RESIDUE"), g)
+        os.unlink(os.path.join(t, "debug", "UNKNOWN.txt"))
 
 
 class Lifecycle(MaintBase):
@@ -273,6 +332,21 @@ class Policy(MaintBase):
         self.assertTrue(os.path.exists(os.path.join(t, "debug", "deps", "libx.rlib")))
 
 
+class FixtureIsolation(MaintBase):
+    def test_inventory_sees_only_the_fixture(self):
+        wt, t = self.cache("iso")
+        self.finish(wt)
+        self.full_census()
+        rc, out = self.call("status", "--json")
+        targets = json.loads(out)["targets"]
+        self.assertTrue(targets)
+        tmp = os.path.realpath(self.tmp) + os.sep
+        outside = [t for t in targets
+                   if not (os.path.realpath(t.get("worktree") or tmp) + os.sep).startswith(tmp)]
+        self.assertEqual(outside, [], "the test inventory must not include real worktrees or their targets")
+        self.assertLess(json.loads(out)["total_allocated"], 1 << 30)
+
+
 class Holds(MaintBase):
     def setUp(self):
         super().setUp()
@@ -310,6 +384,42 @@ class Holds(MaintBase):
             self.assertFalse(row["auto_eligible"], target)
             self.assertIn(reason, row["reasons"], (target, row))
             self.assertTrue(self.intact(target), target)
+
+    def test_busy_source_checkout_is_held_by_the_planner_and_does_not_block_others(self):
+        # 2026-11-05..07: a language server kept a released target's checkout mapped; the
+        # planner selected it as the oldest candidate every cycle, the executor held it
+        # (LIVE_PROCESS_IN_SOURCE) and nothing else was retired for 573 cycles.
+        busy_wt, busy = self.ready("busy-src")
+        self.age(busy, 20)
+        self.age_record(busy, 20)                                  # oldest: planned first
+        free_wt, free = self.ready("free-src")
+        proc = subprocess.Popen(["sleep", "600"], cwd=busy_wt)    # a process in the checkout only
+        try:
+            time.sleep(0.3)
+            self.approve(extra=("--max-targets", "1"))
+            row = self.state_of(self.status(), busy)
+            self.assertFalse(row["auto_eligible"], row)
+            self.assertIn("LIVE_PROCESS_IN_SOURCE", row["reasons"], row)
+            rc, out = self.call("plan", "--json")
+            self.assertEqual([e["name"] for e in json.loads(out)["selected"]], [os.path.basename(free)])
+            rc, out = self.call("run")
+            self.assertEqual(rc, 0, out)
+            cyc = self.last_cycle()
+            self.assertEqual(cyc["outcome"], "RETIRED", cyc)
+            self.assertEqual([t["name"] for t in cyc["targets"]], [os.path.basename(free)])
+            self.assertFalse(self.intact(free))
+            self.assertTrue(self.intact(busy))                     # the busy one is untouched
+            rc, out = self.call("run", "--only", os.path.basename(busy))
+            self.assertNotEqual(rc, 0, out)                        # and cannot be forced
+            self.assertTrue(self.intact(busy))
+        finally:
+            proc.kill()
+            proc.wait()
+        # once the checkout is no longer in use, the next cycle retires it normally
+        rc, out = self.call("run")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.last_cycle()["outcome"], "RETIRED", self.last_cycle())
+        self.assertFalse(self.intact(busy))
 
     def test_corrupt_records_hold_and_never_block(self):
         wt, t = self.ready("corrupt")
@@ -538,6 +648,274 @@ class Workflow(MaintBase):
             self.assertNotIn(banned, src)
 
 
+class SecondRootInstance(MaintBase):
+    """A second, independent policy instance (EMUWIZ_MAINTENANCE_INSTANCE) for another
+    target root over the same shared lifecycle registry, with the free-space trigger
+    (`--reserve-trigger-free-gib`) the /mnt/nvme2 policy uses.  Both roots are synthetic
+    temp directories; free space is simulated by patching the summary only."""
+    GIB = 1024 ** 3
+
+    def setUp(self):
+        super().setUp()
+        self.home_root = self.targets
+        self.nv_root = os.path.join(self.tmp, "nvme2-targets")
+        os.makedirs(self.nv_root)
+        self.addCleanup(self.restore, "EMUWIZ_MAINTENANCE_INSTANCE", os.environ.get("EMUWIZ_MAINTENANCE_INSTANCE"))
+        self.use(self.home_root, None)
+        self.full_census()
+        self.fake_free = None
+        real = self.m.F.summary
+
+        def summary(*a, **kw):
+            out = real(*a, **kw)
+            if self.fake_free is not None:
+                out["free_bytes"] = self.fake_free
+            return out
+        self.m.F.summary = summary
+
+    def use(self, root, instance):
+        os.environ["EMUWIZ_TARGET_ROOT"] = self.env["EMUWIZ_TARGET_ROOT"] = root
+        if instance is None:
+            os.environ.pop("EMUWIZ_MAINTENANCE_INSTANCE", None)
+            self.env.pop("EMUWIZ_MAINTENANCE_INSTANCE", None)
+        else:
+            os.environ["EMUWIZ_MAINTENANCE_INSTANCE"] = self.env["EMUWIZ_MAINTENANCE_INSTANCE"] = instance
+
+    def nvme(self):
+        self.use(self.nv_root, "nvme2")
+
+    def home_(self):
+        self.use(self.home_root, None)
+
+    def ready(self, name, days=10):
+        wt, t = self.cache(name)
+        self.finish(wt)
+        self.age(t, days)
+        self.age_record(t, days)
+        return wt, t
+
+    def intact(self, t):
+        return os.path.exists(os.path.join(t, "debug", "deps", "libx.rlib"))
+
+    def approve_nvme(self, soft_gb="100000", hard_gb="200000", max_targets="3", max_gb="20", enable=True):
+        """The owner's /mnt/nvme2 free-space numbers.  The soft budget is set far out of reach
+        (the inventory also counts this checkout's in-tree targets on the temp device), so
+        only the free-space trigger decides."""
+        rc, out = self.call("policy", "approve", "--owners", "tester", "--soft-gb", soft_gb, "--hard-gb", hard_gb,
+                            "--reserve-free-gib", "260", "--reserve-trigger-free-gib", "240",
+                            "--max-targets", max_targets, "--max-gb", max_gb)
+        self.assertEqual(rc, 0, out)
+        if enable:
+            rc, out = self.call("policy", "enable")
+            self.assertEqual(rc, 0, out)
+
+    def plan(self):
+        rc, out = self.call("plan", "--json")
+        self.assertEqual(rc, 0, out)
+        return json.loads(out)
+
+    def test_each_instance_only_ever_touches_its_own_root(self):
+        self.home_()
+        h_wt, h = self.ready("home-a")
+        self.nvme()
+        n_wt, n = self.ready("nv-a")
+        self.assertEqual(os.path.dirname(h), os.path.realpath(self.home_root))
+        self.assertEqual(os.path.dirname(n), os.path.realpath(self.nv_root))
+        self.home_()
+        self.approve()                                   # tiny soft budget: wants everything
+        with open(self.m.policy_path(), "rb") as handle:
+            home_policy = handle.read()
+        home_state = self.m.state_dir()
+        self.nvme()
+        self.approve(soft_gb="0.00001", hard_gb="0.0001")
+        self.assertNotEqual(self.m.state_dir(), home_state)
+        self.assertEqual(os.path.basename(self.m.state_dir()), "maintenance-nvme2")
+        with open(os.path.join(home_state, "policy.json"), "rb") as handle:
+            self.assertEqual(handle.read(), home_policy)  # the default policy is untouched
+        # each plan sees the other root as out of scope
+        self.assertEqual([e["name"] for e in self.plan()["selected"]], [os.path.basename(n)])
+        self.assertIn("OUTSIDE_POLICY_ROOT", self.state_of(self.status(), h)["reasons"])
+        self.home_()
+        self.assertEqual([e["name"] for e in self.plan()["selected"]], [os.path.basename(h)])
+        self.assertIn("OUTSIDE_POLICY_ROOT", self.state_of(self.status(), n)["reasons"])
+        # the nvme2 cycle retires only its root ...
+        self.nvme()
+        rc, out = self.call("run")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([t["name"] for t in self.last_cycle()["targets"]], [os.path.basename(n)])
+        self.assertFalse(self.intact(n))
+        self.assertTrue(self.intact(h))
+        # ... and the default cycle only its own, with separate histories
+        self.home_()
+        self.assertFalse(any(c.get("event") == "cycle" for c in self.history()))
+        rc, out = self.call("run")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([t["name"] for t in self.last_cycle()["targets"]], [os.path.basename(h)])
+        self.assertFalse(self.intact(h))
+
+    def test_instance_policy_for_another_root_fails_closed(self):
+        self.nvme()
+        n_wt, n = self.ready("nv-wrong")
+        self.approve(soft_gb="0.00001", hard_gb="0.0001")
+        # same instance, but EMUWIZ_TARGET_ROOT now selects the home root
+        self.use(self.home_root, "nvme2")
+        st, _, why = self.m.load_policy()
+        self.assertEqual(st, "invalid", why)
+        rc, out = self.call("run")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.last_cycle()["outcome"], "REFUSED")
+        self.assertTrue(self.intact(n))
+        os.environ["EMUWIZ_MAINTENANCE_INSTANCE"] = "../maintenance"
+        with self.assertRaises(SystemExit):
+            self.m.state_dir()
+
+    def test_nothing_is_retired_at_or_above_the_free_space_trigger(self):
+        self.nvme()
+        ts = [self.ready(f"nv-free{i}")[1] for i in range(2)]
+        self.approve_nvme()
+        for free in (240 * self.GIB, 250 * self.GIB, 400 * self.GIB):
+            self.fake_free = free
+            plan = self.plan()
+            self.assertEqual((plan["need_bytes"], plan["selected"]), (0, []), free)
+            rc, out = self.call("run")
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(self.last_cycle()["outcome"], "NOTHING_TO_DO", free)
+            self.assertTrue(all(self.intact(t) for t in ts))
+
+    def test_below_the_trigger_selection_stops_at_the_caps_or_the_restore_target(self):
+        self.nvme()
+        ts = [self.ready(f"nv-low{i}", days=10 + i)[1] for i in range(4)]   # nv-low3 oldest
+        self.approve_nvme()
+        self.fake_free = 240 * self.GIB - 1
+        plan = self.plan()
+        self.assertEqual(plan["free_space_need_bytes"], 20 * self.GIB + 1)
+        names = [e["name"] for e in plan["selected"]]
+        self.assertEqual(names, [os.path.basename(t) for t in ts[3:0:-1]])  # 3-target cap, oldest first
+        # the restore target ends selection: exactly enough for the oldest one
+        st, policy, _ = self.m.load_policy()
+        ns, items, census, measured, summ = self.m.snapshot(policy)
+        first = plan["selected"][0]["estimated_recoverable"]
+        limits = dict(policy["limits"], reserve_free_bytes=300 * self.GIB, reserve_trigger_free_bytes=300 * self.GIB)
+        summ["free_bytes"] = 300 * self.GIB - first
+        got = self.m.plan_cycle(dict(policy, limits=limits), items, summ, census)
+        self.assertEqual([e["item"]["name"] for e in got["selected"]], names[:1])
+        # the per-cycle byte cap also bounds it
+        limits = dict(policy["limits"], max_bytes_per_cycle=first)
+        summ["free_bytes"] = 100 * self.GIB
+        got = self.m.plan_cycle(dict(policy, limits=limits), items, summ, census)
+        self.assertEqual([e["item"]["name"] for e in got["selected"]], names[:1])
+        # the real cycle retires exactly the planned three and leaves the fourth
+        rc, out = self.call("run")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(sorted(t["name"] for t in self.last_cycle()["targets"]), sorted(names))
+        self.assertTrue(self.intact(ts[0]))
+        self.assertFalse(any(self.intact(t) for t in ts[1:]))
+
+    def test_trigger_above_the_reserve_is_refused(self):
+        self.nvme()
+        rc, _ = self.call("policy", "approve", "--owners", "tester", "--soft-gb", "100", "--hard-gb", "200",
+                          "--reserve-free-gib", "240", "--reserve-trigger-free-gib", "260")
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(os.path.exists(self.m.policy_path()))
+
+    def test_protected_active_and_changed_targets_stay_held_below_the_trigger(self):
+        self.nvme()
+        pin_wt, pinned = self.ready("nv-pinned", days=40)
+        self.assertEqual(self.ret("pin", pin_wt, "--reason", "release-build").returncode, 0)
+        idle_wt, idle = self.cache("nv-idle", age_days=40)                # never released
+        chg_wt, changed = self.ready("nv-changed", days=40)
+        keyfile = os.path.join(self.reg, "targets", self.key_of(changed) + ".json")
+        rec = T.jload(keyfile)
+        rec["identity"]["ino"] += 12345
+        T.jdump(rec, keyfile)
+        src_wt, busy_src = self.ready("nv-busy-src", days=40)
+        act_wt, active = self.ready("nv-active", days=40)
+        free_wt, free = self.ready("nv-free", days=10)
+        self.approve_nvme()
+        self.fake_free = 200 * self.GIB
+        sleeper = subprocess.Popen(["sleep", "600"], cwd=src_wt)
+        build = subprocess.Popen([ISO, "check"], cwd=act_wt, env=dict(self.env, FAKE_SLEEP="25"))
+        try:
+            time.sleep(1.5)
+            st = self.status()
+            for target, reason in ((pinned, "PINNED"), (idle, "NOT_RELEASED"),
+                                   (changed, "DIRECTORY_IDENTITY_CHANGED"), (busy_src, "LIVE_PROCESS_IN_SOURCE")):
+                row = self.state_of(st, target)
+                self.assertFalse(row["auto_eligible"], row)
+                self.assertIn(reason, row["reasons"], (target, row))
+            self.assertEqual(self.state_of(st, active)["state"], "ACTIVE")
+            self.assertFalse(self.state_of(st, active)["auto_eligible"])
+            self.assertEqual([e["name"] for e in self.plan()["selected"]], [os.path.basename(free)])
+            rc, out = self.call("run")
+            self.assertEqual(rc, 0, out)
+            self.assertEqual([t["name"] for t in self.last_cycle()["targets"]], [os.path.basename(free)])
+        finally:
+            for proc in (sleeper, build):
+                proc.kill()
+                proc.wait()
+        self.assertFalse(self.intact(free))
+        for target in (pinned, idle, changed, busy_src, active):
+            self.assertTrue(self.intact(target), target)
+
+    def test_instance_units_select_the_root_and_its_own_state(self):
+        import pwd
+        self.nvme()
+        service, timer = self.m.unit_texts(pwd.getpwuid(os.getuid()).pw_name, self.m.DEFAULT_INSTALL_DIR)
+        self.assertIn(f"Environment=EMUWIZ_TARGET_ROOT={self.nv_root}\n", service)
+        self.assertIn("Environment=EMUWIZ_MAINTENANCE_INSTANCE=nvme2\n", service)
+        self.assertIn(f"ConditionPathExists={self.reg}/maintenance-nvme2/policy.json\n", service)
+        self.assertIn(f"ReadWritePaths={self.reg} {self.nv_root}\n", service)
+        self.assertIn(f"RequiresMountsFor={self.nv_root}\n", service)   # never runs against an unmounted root
+        self.assertEqual(self.m.unit_basename(), "emuwiz-cargo-maintain-nvme2")
+        os.environ.pop("EMUWIZ_TARGET_ROOT")
+        with self.assertRaises(SystemExit):
+            self.m.unit_texts(pwd.getpwuid(os.getuid()).pw_name, self.m.DEFAULT_INSTALL_DIR)
+        # the default instance's unit is unchanged
+        self.home_()
+        os.environ.pop("EMUWIZ_TARGET_ROOT")
+        service, _ = self.m.unit_texts(pwd.getpwuid(os.getuid()).pw_name, self.m.DEFAULT_INSTALL_DIR)
+        self.assertIn(f"ConditionPathExists={self.reg}/maintenance/policy.json\n", service)
+        self.assertNotIn("EMUWIZ_MAINTENANCE_INSTANCE", service)
+        self.assertEqual(self.m.unit_basename(), "emuwiz-cargo-maintain")
+
+    def test_nvme2_retirement_verifies_from_a_shell_without_the_instance(self):
+        # The owner's shell (cargo-env.sh) sets EMUWIZ_TARGET_ROOT only; worktree-check and
+        # finish-task must still find the nvme2 instance's evidence instead of holding forever.
+        self.nvme()
+        n_wt, n = self.ready("nv-evidence")
+        self.approve(soft_gb="0.00001", hard_gb="0.0001")
+        rc, out = self.call("run")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(self.intact(n))
+        rc, out = self.call("worktree-check", n_wt, "--json")
+        with_instance = json.loads(out)["code"]
+        self.use(self.nv_root, None)
+        rc, out = self.call("worktree-check", n_wt, "--json")
+        without = json.loads(out)
+        self.assertEqual(without["code"], with_instance, without)
+        self.assertNotIn(without["code"], ("RECEIPT_UNVERIFIED", "ARTIFACTS_MISSING_UNVERIFIED"), without)
+        # evidence is only accepted from a maintenance directory whose policy covers the root
+        rec = {"last_retired": {"receipt": os.path.join(self.tmp, "elsewhere", "receipts", "r.json")}}
+        d, why = self.m.evidence_state_dir(rec, n, self.m.trusted_policy_uids())
+        self.assertIsNone(d, why)
+
+    def test_one_policy_per_root(self):
+        self.nvme()
+        self.approve_nvme(enable=False)
+        self.use(self.nv_root, None)        # default instance, shell pointing at nvme2
+        rc, out = self.call("policy", "approve", "--owners", "tester", "--soft-gb", "1", "--hard-gb", "2")
+        self.assertNotEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(self.m.policy_path()), "no second policy over the nvme2 root")
+        self.home_()                        # the default instance may still cover its own root
+        self.approve(enable=False)
+
+    def test_unknown_free_space_requests_nothing(self):
+        limits = {"reserve_free_bytes": 260 * self.GIB, "reserve_trigger_free_bytes": 240 * self.GIB}
+        self.assertEqual(self.m.free_space_need(limits, None), 0)
+        self.assertEqual(self.m.free_space_need(limits, 250 * self.GIB), 0)
+        self.assertEqual(self.m.free_space_need(limits, 230 * self.GIB), 30 * self.GIB)
+
+
 class WorktreeOrdering(MaintBase):
     """Finish-task, waiting out the inactivity rule, retirement, restart and only then
     worktree removal.  The gate never deletes; a release record alone never clears it."""
@@ -571,10 +949,11 @@ class WorktreeOrdering(MaintBase):
         self.assertFalse(os.path.exists(os.path.join(t, "debug", "deps", "libx.rlib")))
         # restart: a fresh process reads the same state and the gate is CLEAR with a verified receipt
         m2 = load_maintain()
+        self.review_unrecognised(wt, t, m2)
         g = self.gate(wt, m2)
         self.assertEqual(g["status"], "CLEAR", g)
         self.assertIn("receipt verified", g["explanation"])
-        for p in self.preserved_paths(t):
+        for p in self.evidence_paths(t):
             self.assertTrue(os.path.exists(p), p)
         r = subprocess.run([sys.executable, MAINTAIN, "worktree-check", wt], env=self.env,
                            capture_output=True, text=True)
@@ -665,6 +1044,7 @@ class WorktreeOrdering(MaintBase):
         self.age_record(t2, 10)
         self.approve()
         self.retire_cycle()
+        self.review_unrecognised(wt2, t2)
         self.assertEqual(self.gate(wt2)["status"], "CLEAR")
         cyc = self.last_cycle()
         os.rename(cyc["journal"], cyc["journal"] + ".moved")
@@ -678,6 +1058,253 @@ class WorktreeOrdering(MaintBase):
         post = open(os.path.join(HERE, "task-postcheck.sh")).read()
         self.assertIn("--finish-task", post)
 
+
+
+class UnrecognisedResidue(MaintBase):
+    """worktree-check is CLEAR only when the cache holds nothing but permitted
+    content. Output the retirement tool cannot recognise (a standalone executable
+    with no sibling .d, a stray file, nested residue, a symlink) would be orphaned
+    once the worktree is gone, so it must HOLD with UNRECOGNISED_RESIDUE. The check
+    is read-only and shared by the plain and --cargo-state-only paths."""
+
+    def retire_cycle(self):
+        self.full_census()
+        self.call("run")
+
+    def retired(self, name):
+        wt, t = self.managed_cache(name, age_days=10)
+        self.finish(wt)
+        self.age(t, 10)
+        self.age_record(t, 10)
+        self.approve()
+        self.retire_cycle()
+        self.assertEqual(self.last_cycle()["outcome"], "RETIRED")
+        # the fixture's stray UNKNOWN.txt is itself residue; start from permitted content only
+        self.review_unrecognised(wt, t)
+        g = self.m.worktree_gate(wt)
+        self.assertEqual((g["status"], g["code"]), ("CLEAR", "CLEAR"), g)
+        return wt, t
+
+    def checks(self, wt):
+        """(plain, cargo-state-only) results through the real CLI entry point."""
+        results = []
+        for extra in ((), ("--cargo-state-only",)):
+            rc, out = self.call("worktree-check", "--json", *extra, wt)
+            data = json.loads(out)
+            self.assertEqual(rc == 0, data["status"] == "CLEAR", (rc, data))
+            if data["status"] != "CLEAR":
+                self.assertEqual(rc, self.m.EXIT_WORKTREE_HOLD)
+            results.append(data)
+        return results
+
+    def assert_residue(self, wt, needle):
+        for data in self.checks(wt) + [self.m.worktree_gate(wt), load_maintain().lifecycle_gate(wt)]:
+            self.assertEqual((data["status"], data["code"]), ("HOLD", "UNRECOGNISED_RESIDUE"), data)
+            self.assertGreaterEqual(data["residue"]["items"], 1)
+            self.assertIn(needle, " ".join(data["residue"]["examples"]), data)
+            self.assertIn("Keep the worktree", data["explanation"])
+
+    def assert_clear(self, wt):
+        for data in self.checks(wt) + [self.m.worktree_gate(wt)]:
+            self.assertEqual((data["status"], data["code"]), ("CLEAR", "CLEAR"), data)
+            self.assertIn("receipt verified", data["explanation"])
+
+    def snapshot(self, root):
+        rows = []
+        for dirpath, dirs, files in os.walk(root):
+            for name in sorted(dirs + files):
+                path = os.path.join(dirpath, name)
+                st = os.lstat(path)
+                rows.append((path, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino))
+        return sorted(rows)
+
+    def test_permitted_content_stays_clear(self):
+        wt, t = self.retired("resid-ok")
+        self.assert_clear(wt)
+        debug = os.path.join(t, "debug")
+        # empty directories at any depth, empty lock files and preserved-evidence directories
+        os.makedirs(os.path.join(debug, "a", "b", "c"))
+        os.makedirs(os.path.join(t, "tmp"))
+        for lock in (".cargo-build-lock", ".cargo-artifact-lock"):
+            open(os.path.join(debug, lock), "wb").close()
+        for evidence in (os.path.join(t, "tmp", "scratch.bin"),
+                         os.path.join(t, "receipts", "r.json"),
+                         os.path.join(debug, "emuwiz-test-env", "profile", "extra.sqlite")):
+            os.makedirs(os.path.dirname(evidence), exist_ok=True)
+            with open(evidence, "wb") as handle:
+                handle.write(b"evidence")
+        self.assert_clear(wt)
+        for p in self.evidence_paths(t):
+            self.assertTrue(os.path.exists(p), p)
+
+    def test_each_kind_of_residue_holds_and_clears_when_removed(self):
+        wt, t = self.retired("resid-kinds")
+        debug = os.path.join(t, "debug")
+        elf = b"\x7fELF\x02\x01\x01" + b"\0" * 4096
+
+        def write(path, data=b"x", mode=0o644):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(data)
+            os.chmod(path, mode)
+            return lambda: os.unlink(path)
+
+        def symlink(target_path, path):
+            os.symlink(target_path, path)
+            return lambda: os.unlink(path)
+
+        def fifo(path):
+            os.mkfifo(path)
+            return lambda: os.unlink(path)
+
+        def hardlinked(path):
+            undo = write(path, elf, 0o755)
+            alias = os.path.join(self.tmp, "installed-" + os.path.basename(path))
+            os.link(path, alias)
+            def both():
+                undo()
+                os.unlink(alias)
+            return both
+
+        def unreadable(path):
+            os.makedirs(path)
+            os.chmod(path, 0)
+            def undo():
+                os.chmod(path, 0o755)
+                os.rmdir(path)
+            return undo
+
+        cases = {
+            # (a bare ELF directly in markerless debug/ is retirable residue since Fix B; see
+            # test_debug_binary_residue_holds_until_retired. These ELF shapes are not.)
+            "standalone ELF in a release profile": (lambda: write(os.path.join(t, "release", "archivefs-gui"), elf, 0o755), "archivefs-gui"),
+            "executable that is not an ELF": (lambda: write(os.path.join(debug, "helper.sh"), b"#!/bin/sh\n", 0o755), "helper.sh"),
+            "hard-linked ELF": (lambda: hardlinked(os.path.join(debug, "emuwiz-v2")), "emuwiz-v2"),
+            "suffixed ELF": (lambda: write(os.path.join(debug, "emuwiz.real"), elf, 0o755), "emuwiz.real"),
+            "unrecognised file at the cache root": (lambda: write(os.path.join(t, "stray.txt")), "stray.txt"),
+            "unrecognised file beside the lock files": (lambda: write(os.path.join(debug, "notes.txt")), "notes.txt"),
+            "nested residue": (lambda: write(os.path.join(debug, "x", "y", "z", "blob.bin")), "blob.bin"),
+            "evidence name too deep to be permitted": (lambda: write(os.path.join(debug, "a", "b", "c", "tmp", "f")), "f"),
+            "dangling symlink": (lambda: symlink("/nonexistent-target", os.path.join(debug, "dangling")), "dangling"),
+            "symlink to a real file": (lambda: symlink("/etc/hostname", os.path.join(debug, "link")), "link"),
+            "non-empty lock file": (lambda: write(os.path.join(debug, ".cargo-artifact-lock"), b"data"), ".cargo-artifact-lock"),
+            "named pipe": (lambda: fifo(os.path.join(debug, "pipe")), "pipe"),
+            "unreadable directory": (lambda: unreadable(os.path.join(debug, "locked")), "locked"),
+        }
+        for label, (plant, needle) in cases.items():
+            with self.subTest(label):
+                undo = plant()
+                try:
+                    self.assert_residue(wt, needle)
+                finally:
+                    undo()
+                    if os.path.isdir(os.path.join(t, "release")):
+                        os.rmdir(os.path.join(t, "release"))
+                self.assert_clear(wt)
+
+    def test_the_standalone_executable_case_the_real_orphans_had(self):
+        # Several 373 MB executables with different names and no .d, as left in real caches,
+        # older than the release. Since Fix B they are retirable residue: the worktree still
+        # HOLDs (never CLEAR) until a maintenance cycle has retired them.
+        wt, t = self.retired("resid-real")
+        names = ("archivefs-gui", "emuwiz", "emuwiz-gui", "emuwiz-v2")
+        for name in names:
+            path = os.path.join(t, "debug", name)
+            with open(path, "wb") as handle:
+                handle.write(b"\x7fELF" + b"\0" * 1_000_000)
+            os.chmod(path, 0o755)
+        self.age(t, 10)
+        selected, _ = self.m.F.select_artifacts(t, None)
+        self.assertEqual(sorted(os.path.basename(s["path"]) for s in selected), sorted(names))
+        for data in self.checks(wt) + [self.m.worktree_gate(wt)]:
+            self.assertEqual((data["status"], data["code"]), ("HOLD", "AWAITING_RETIREMENT"), data)
+
+    def test_debug_binary_residue_holds_until_retired(self):
+        wt, t = self.retired("resid-cycle")
+        path = os.path.join(t, "debug", "archivefs-gui")
+        with open(path, "wb") as handle:
+            handle.write(b"\x7fELF\x02\x01\x01" + b"\0" * 4096)
+        os.chmod(path, 0o755)
+        # written after the release: the gate says so, and holds
+        self.assertEqual(self.m.worktree_gate(wt)["code"], "WRITTEN_AFTER_RELEASE")
+        self.age(t, 10)
+        for data in self.checks(wt):
+            self.assertEqual((data["status"], data["code"]), ("HOLD", "AWAITING_RETIREMENT"), data)
+        self.retire_cycle()
+        self.assertEqual(self.last_cycle()["outcome"], "RETIRED")
+        self.assertFalse(os.path.lexists(path))
+        self.assert_clear(wt)
+        for p in self.evidence_paths(t):
+            self.assertTrue(os.path.exists(p), p)
+
+    def test_c1_policy_approved_before_residue_scope_does_not_retire_residue(self):
+        # PR #301 review C1: Fix B widened what a cycle retires. A policy approved (and enabled)
+        # under the previous schema must not retire residue; a re-approved current policy does.
+        wt, t = self.retired("resid-c1")
+        current = self.m.POLICY_VERSION
+        self.m.POLICY_VERSION = 1  # the code that approved and enabled the old policy
+        try:
+            self.approve()
+        finally:
+            self.m.POLICY_VERSION = current
+        path = os.path.join(t, "debug", "archivefs-gui")
+        with open(path, "wb") as handle:
+            handle.write(b"\x7fELF\x02\x01\x01" + b"\0" * 4096)
+        os.chmod(path, 0o755)
+        self.age(t, 10)
+        state, policy, why = self.m.load_policy()
+        self.assertEqual(state, "invalid", why)
+        self.assertIn("policy approve", why)
+        self.retire_cycle()
+        self.assertEqual(self.last_cycle()["outcome"], "REFUSED", self.last_cycle())
+        self.assertTrue(os.path.lexists(path))
+        for data in self.checks(wt):
+            self.assertEqual(data["status"], "HOLD", data)
+        self.approve()  # re-approved under the current schema, then enabled
+        self.assertEqual(self.m.load_policy()[0], "ok")
+        self.retire_cycle()
+        self.assertEqual(self.last_cycle()["outcome"], "RETIRED", self.last_cycle())
+        self.assertFalse(os.path.lexists(path))
+        self.assert_clear(wt)
+
+    def test_check_is_read_only_and_repeatable_after_restart(self):
+        wt, t = self.retired("resid-ro")
+        path = os.path.join(t, "debug", "helper.sh")  # unrecognised (not an ELF)
+        with open(path, "wb") as handle:
+            handle.write(b"#!/bin/sh\n" + b"\0" * 512)
+        os.chmod(path, 0o755)
+        before = self.snapshot(t)
+        first = self.m.worktree_gate(wt)
+        self.checks(wt)
+        second = load_maintain().worktree_gate(wt)
+        self.assertEqual(self.snapshot(t), before)
+        self.assertEqual((first["code"], first["residue"]), (second["code"], second["residue"]))
+        self.assertTrue(os.path.exists(path))
+
+    def test_earlier_protections_keep_their_own_reasons(self):
+        # unreleased cache with compiler output: residue must not mask the lifecycle reason
+        wt, t = self.managed_cache("resid-unreleased", age_days=10)
+        with open(os.path.join(t, "debug", "archivefs-gui"), "wb") as handle:
+            handle.write(b"\x7fELF")
+        os.chmod(os.path.join(t, "debug", "archivefs-gui"), 0o755)
+        self.assertEqual(self.m.worktree_gate(wt)["code"], "NOT_RELEASED")
+        # a retired cache whose receipt was removed keeps RECEIPT_UNVERIFIED
+        wt2, t2 = self.retired("resid-tamper")
+        with open(os.path.join(t2, "debug", "archivefs-gui"), "wb") as handle:
+            handle.write(b"\x7fELF")
+        cycle = self.last_cycle()
+        os.rename(cycle["journal"], cycle["journal"] + ".moved")
+        self.assertEqual(self.m.worktree_gate(wt2)["code"], "RECEIPT_UNVERIFIED")
+        # no cache, and an empty cache, are still CLEAR
+        self.assertEqual(self.m.worktree_gate(self.worktree("resid-nothing"))["status"], "CLEAR")
+
+    def test_no_new_deletion_capability(self):
+        with open(MAINTAIN) as handle:
+            src = handle.read()
+        start = src.index("def unrecognised_residue")
+        body = src[start:src.index("def lifecycle_gate")]
+        for banned in ("rmtree", "os.remove", "os.unlink", "os.rmdir", "os.rename", "shutil", "unlinkat", "os.open(", "write("):
+            self.assertNotIn(banned, body)
 
 
 class DebugModeAcrossRetirement(MaintBase):
@@ -737,11 +1364,14 @@ class DebugModeAcrossRetirement(MaintBase):
         self.retire_cycle()
         self.assertEqual(self.last_cycle()["outcome"], "RETIRED")
         self.assertTrue(os.listdir(t))                       # evidence remains: not empty
+        # unrecognised residue holds the gate, so the target is not "fresh" yet
+        self.assertEqual((self.build(wt)[0], self.recorded(t)), ("unset", "full"))
+        self.review_unrecognised(wt, t)
         self.assertEqual(self.gate(wt)["status"], "CLEAR")
         mode, err = self.build(wt)
         self.assertEqual((mode, self.recorded(t)), ("0", "low"))
         self.assertIn("changes from full to low", err)
-        for p in self.preserved_paths(t):
+        for p in self.evidence_paths(t):
             self.assertTrue(os.path.exists(p), p)
 
     def test_partially_retired_target_is_not_fresh(self):

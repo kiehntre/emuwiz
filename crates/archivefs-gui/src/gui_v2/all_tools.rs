@@ -76,6 +76,13 @@ pub(super) struct AllToolsState {
     pub filter: ToolFilter,
 }
 
+impl AllToolsState {
+    /// A new visit to All Tools starts from an empty search and the All filter.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Tool {
     pub route: Route,
@@ -174,6 +181,37 @@ pub(super) fn groups() -> Vec<ToolGroup> {
             safety: ToolSafety::LookingOnly,
         },
     );
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::Vita3kTitles),
+        title: ToolPage::Vita3kTitles.title(),
+        purpose: ToolPage::Vita3kTitles.purpose(),
+        safety: ToolSafety::OpensElsewhere,
+    });
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::OpenRct2),
+        title: ToolPage::OpenRct2.title(),
+        purpose: ToolPage::OpenRct2.purpose(),
+        safety: ToolSafety::OpensElsewhere,
+    });
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::FolderCheck),
+        title: ToolPage::FolderCheck.title(),
+        purpose: ToolPage::FolderCheck.purpose(),
+        safety: ToolSafety::AsksFirst,
+    });
+    #[cfg(target_os = "linux")]
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::Relocation),
+        title: ToolPage::Relocation.title(),
+        purpose: ToolPage::Relocation.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    games.tools.push(Tool {
+        route: Route::Tool(ToolPage::ArcadeShelf),
+        title: ToolPage::ArcadeShelf.title(),
+        purpose: ToolPage::ArcadeShelf.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     games.tools.push(Tool {
         route: Route::Tool(ToolPage::MediaSets),
         title: ToolPage::MediaSets.title(),
@@ -351,12 +389,13 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut AllToolsState) -> Option<Route
         }
     });
     ui.add_space(6.0);
-    ui.add(
+    let search = ui.add(
         egui::TextEdit::singleline(&mut state.query)
             .id(egui::Id::new("v2_all_tools_search"))
             .hint_text("Find a tool, for example \u{201c}convert\u{201d}, \u{201c}duplicates\u{201d} or \u{201c}cheats\u{201d}")
             .desired_width(ui.available_width().min(620.0)),
     );
+    crate::gui_v2::shortcuts::register_search(&search);
     ui.add_space(12.0);
     let visible: Vec<(&'static str, Vec<Tool>)> = groups()
         .into_iter()
@@ -548,6 +587,17 @@ mod tests {
     }
 
     #[test]
+    fn reset_clears_search_and_filter_for_a_fresh_visit() {
+        let mut state = AllToolsState {
+            query: "emulator".into(),
+            filter: ToolFilter::LookingOnly,
+        };
+        state.reset();
+        assert!(state.query.is_empty());
+        assert_eq!(state.filter, ToolFilter::default());
+    }
+
+    #[test]
     fn search_matches_titles_purposes_and_groups_and_filters_by_safety() {
         let mut state = AllToolsState::default();
         let all: usize = groups().iter().map(|group| group.tools.len()).sum();
@@ -570,11 +620,13 @@ mod tests {
         assert_eq!(shown(&state), 0);
         state.query.clear();
         state.filter = ToolFilter::OpensElsewhere;
-        assert_eq!(shown(&state), 1);
+        // The specialist-window tool and the Vita3K and OpenRCT2 launchers,
+        // which start an external window.
+        assert_eq!(shown(&state), 3);
         state.filter = ToolFilter::LookingOnly;
         let looking = shown(&state);
         state.filter = ToolFilter::AsksFirst;
-        assert_eq!(looking + shown(&state) + 1, all);
+        assert_eq!(looking + shown(&state) + 3, all);
     }
 
     #[test]

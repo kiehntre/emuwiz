@@ -1271,11 +1271,14 @@ fn show_simple_game_folders(
     if busy {
         ui.label("Working on your library. Your game files are unchanged; you can return Home while this finishes.");
     }
-    if crate::simple_mode::primary_button(ui, "Add a games folder…", !busy).clicked()
-        && let Some(path) = rfd::FileDialog::new()
-            .set_title("Choose a games folder to add")
-            .pick_folder()
-    {
+    if crate::simple_mode::primary_button(ui, "Add a games folder…", !busy).clicked() {
+        crate::ui::picker::request(
+            ui.ctx(),
+            egui::Id::new("sources_add_folder"),
+            crate::ui::picker::PickRequest::folder("Choose a games folder to add"),
+        );
+    }
+    if let Some(path) = crate::ui::picker::take(ui.ctx(), egui::Id::new("sources_add_folder")) {
         action = Some(SourcesPageAction::AddFolder(path));
     }
     ui.label("Next: scan the folder, then open My Games or Check My Games. Adding a folder saves only its location in EmuWiz.");
@@ -1785,10 +1788,15 @@ pub(super) fn show_sources_page_with_mount_root_and_role(
                     // `None` on cancellation or picker failure - never
                     // panics, and a cancelled pick leaves whatever the
                     // user had already typed untouched.
-                    if ui.button("Browse...").clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .set_title("Select Archive Source Folder")
-                            .pick_folder()
+                    if ui.button("Browse...").clicked() {
+                        crate::ui::picker::request(
+                            ui.ctx(),
+                            egui::Id::new("sources_dialog_browse"),
+                            crate::ui::picker::PickRequest::folder("Select Archive Source Folder"),
+                        );
+                    }
+                    if let Some(path) =
+                        crate::ui::picker::take(ui.ctx(), egui::Id::new("sources_dialog_browse"))
                     {
                         dialog.path_text = path.display().to_string();
                         dialog.validation_message = None;

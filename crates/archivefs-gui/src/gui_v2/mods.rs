@@ -32,7 +32,9 @@ enum Tab {
     Stack,
     Conflicts,
     Activation,
+    TexturePacks,
     Cheats,
+    Catalogues,
 }
 
 #[derive(Default)]
@@ -40,6 +42,7 @@ pub(super) struct ModsPageState {
     tab: Tab,
     local: LocalModPackagePageState,
     patch_composition: super::patch_composition::State,
+    discovery: super::mod_discovery::State,
     cheatbase: CheatBasePageState,
     cheatbase_game_id: Option<i64>,
     history: Option<ModHistory>,
@@ -51,7 +54,7 @@ pub(super) struct ModsPageState {
 
 impl ModsPageState {
     pub(super) fn poll(&mut self) -> bool {
-        let local_changed = self.local.poll();
+        let local_changed = self.local.poll() | self.discovery.poll();
         let Some(worker) = &self.history_worker else {
             return local_changed;
         };
@@ -93,6 +96,11 @@ impl ModsPageState {
             let _ = sender.send(result);
             context.request_repaint();
         });
+    }
+
+    #[cfg(test)]
+    pub(super) fn select_texture_packs(&mut self) {
+        self.tab = Tab::TexturePacks;
     }
 
     pub(super) fn select_cheats(&mut self) {
@@ -142,7 +150,9 @@ pub(super) fn show_mods_page(
                 (Tab::Stack, "Recorded changes"),
                 (Tab::Conflicts, "Conflicts"),
                 (Tab::Activation, "Enable / disable"),
+                (Tab::TexturePacks, "Texture packs"),
                 (Tab::Cheats, "Cheats"),
+                (Tab::Catalogues, "Cheat catalogues"),
             ];
             ui.horizontal_wrapped(|ui| {
                 for (tab, label) in tabs {
@@ -184,7 +194,9 @@ pub(super) fn show_mods_page(
             if state.tab == Tab::Cheats && selected_game.is_some() {
                 ui.label("Recognised code syntax does not prove a cheat works in-game. Check the game version, region and emulator before previewing any supported change; installing a file is not proof that a cheat is active.");
             }
-            if state.tab == Tab::Cheats && selected_game.is_none() {
+            if state.tab == Tab::Catalogues {
+                destination = workflows.show_cheat_catalogues(ui).or(destination.take());
+            } else if state.tab == Tab::Cheats && selected_game.is_none() {
                 destination = workflows.show_cheats(ui, selected_game, activity).or(destination.take());
                 show_cheatbase(ui, &mut state.cheatbase, selected_game);
             } else {
@@ -202,6 +214,11 @@ pub(super) fn show_mods_page(
                 match state.tab {
                     Tab::Installed => installed(ui, state.history.as_ref(), selected_game),
                     Tab::Add => {
+                        super::mod_discovery::show(
+                            ui,
+                            &mut state.discovery,
+                            discovery_identity(selected_game),
+                        );
                         add_package(ui, &mut state.local, selected_game);
                         super::patch_composition::show(
                             ui,
@@ -214,10 +231,14 @@ pub(super) fn show_mods_page(
                     Tab::Activation => {
                         destination = workflows.show_mod_activation(ui, selected_game, activity).or(destination.take());
                     }
+                    Tab::TexturePacks => {
+                        destination = workflows.show_texture_packs(ui, selected_game, activity).or(destination.take());
+                    }
                     Tab::Cheats => {
                         destination = workflows.show_cheats(ui, selected_game, activity).or(destination.take());
                         show_cheatbase(ui, &mut state.cheatbase, selected_game);
                     }
+                    Tab::Catalogues => {}
                 }
             }
 
@@ -235,7 +256,7 @@ pub(super) fn show_mods_page(
             });
         });
 
-    let busy = state.local.is_busy();
+    let busy = state.local.is_busy() || workflows.texture_busy();
     if busy {
         ui.label("The mod operation is running. It cannot be cancelled from Activity; wait for the result before starting another change.");
     }
@@ -257,6 +278,16 @@ pub(super) fn show_mods_page(
         state.refresh_history(ui.ctx());
     }
     destination
+}
+
+/// The selected game's identity report, only while its saved evidence is
+/// currently trustworthy; otherwise ModDB claims are not compared at all.
+fn discovery_identity(
+    game: Option<&crate::gui_v2::library::Game>,
+) -> Option<(&archivefs_core::game_identity::GameIdentityReport, &str)> {
+    let game = game?;
+    selected_identity(Some(game))?;
+    Some((game.archive.identity_report.as_ref()?, game.title.as_str()))
 }
 
 fn cheatbase_seed(game: Option<&crate::gui_v2::library::Game>) -> Option<CheatBaseGameSeed> {
@@ -899,6 +930,43 @@ mod tests {
             });
         });
         assert_eq!(state.tab, Tab::Installed);
+    }
+
+    #[test]
+    fn texture_packs_tab_is_listed_and_needs_a_game_first() {
+        let context = egui::Context::default();
+        let mut state = ModsPageState {
+            history_loaded: true,
+            ..Default::default()
+        };
+        state.select_texture_packs();
+        let mut workflows = NativeWorkflows::new(context.clone());
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_mods_page(
+                    ui,
+                    &mut state,
+                    None,
+                    &mut workflows,
+                    &mut Activity::default(),
+                );
+            });
+        });
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Texture packs"), "{text}");
+        assert!(
+            text.contains("Choose a game before looking at texture packs"),
+            "{text}"
+        );
+        assert!(workflows.app.cheat_workflow.is_none());
     }
 
     #[test]

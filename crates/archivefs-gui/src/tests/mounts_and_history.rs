@@ -927,6 +927,7 @@ fn scan_completion_and_activity_use_every_truthful_non_overlapping_count() {
         ingestion_skip_reasons: Default::default(),
         ingestion_platform_counts: Default::default(),
         arcade_ingestion: Default::default(),
+        nested_mounts: Vec::new(),
         ingestion_skipped: Vec::new(),
         ingestion_recognised_sample: Vec::new(),
     };
@@ -1067,6 +1068,7 @@ fn skipped_files_window_redirects_to_collection_discovery_instead_of_duplicating
         ingestion_skip_reasons: Default::default(),
         ingestion_platform_counts: Default::default(),
         arcade_ingestion: Default::default(),
+        nested_mounts: Vec::new(),
         ingestion_skipped: vec![ingestion_item],
         ingestion_recognised_sample: Vec::new(),
     };

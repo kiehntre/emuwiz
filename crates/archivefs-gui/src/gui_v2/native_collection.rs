@@ -24,6 +24,9 @@ pub(super) struct State {
     review: Option<ScanReview>,
     pub(super) refusal: Option<String>,
     scope_job: Option<Receiver<Result<ScanReview, String>>>,
+    /// A scan asked for before Blue had loaded the saved library. The review
+    /// opens once the read-only load it started is ready.
+    pending_scan: Option<SourceAction>,
     route: Option<super::Route>,
 }
 
@@ -48,7 +51,7 @@ impl State {
         }
     }
     pub(super) fn preparing(&self) -> bool {
-        self.scope_job.is_some()
+        self.scope_job.is_some() || self.pending_scan.is_some()
     }
 }
 
@@ -253,12 +256,12 @@ impl NativeWorkflows {
     }
     /// All Blue controls that can trigger a source scan pass through the same
     /// review, including Enable (which the existing backend makes a scan).
-    pub(super) fn review_or_start_source_action(
+    pub(in crate::gui_v2) fn review_or_start_source_action(
         &mut self,
         ctx: egui::Context,
         action: SourceAction,
     ) {
-        if !self.app.source_action_available() || self.collection.preparing() {
+        if !self.source_action_available() || self.collection.preparing() {
             return;
         }
         if !scans(&action) {
@@ -267,6 +270,17 @@ impl NativeWorkflows {
                 self.collection.select_folder(path);
             }
             self.app.start_source_action(ctx, action);
+            return;
+        }
+        // Blue starts without loading the saved library, so `NotCreated` can
+        // just mean "not loaded yet" while the database file exists. The
+        // review needs the saved source state: load it read-only first and
+        // open the review when it is ready, instead of treating the existing
+        // library as a first scan (which then refuses).
+        if self.saved_library_not_loaded() {
+            self.collection.refusal = None;
+            self.collection.pending_scan = Some(action);
+            self.app.start_database_action(ctx, false);
             return;
         }
         if let DatabaseState::NotCreated { database_path } = &self.app.database_state {
@@ -306,7 +320,26 @@ impl NativeWorkflows {
         self.collection.review = Some(review);
     }
 
+    /// The library database exists but Blue has not loaded it yet.
+    fn saved_library_not_loaded(&self) -> bool {
+        matches!(
+            &self.app.database_state,
+            DatabaseState::NotCreated { database_path }
+                if std::fs::symlink_metadata(database_path).is_ok()
+        )
+    }
+
     pub(super) fn show_source_scan_review(&mut self, ctx: &egui::Context) {
+        if self.collection.pending_scan.is_some() && !self.app.database_state.is_loading() {
+            let action = self.collection.pending_scan.take().unwrap();
+            if self.saved_library_not_loaded() {
+                self.collection.refusal = Some(
+                    "The saved library status could not be loaded. Nothing was scanned. Reload saved status and try again.".into(),
+                );
+            } else {
+                self.review_or_start_source_action(ctx.clone(), action);
+            }
+        }
         if let Some(receiver) = &self.collection.scope_job {
             let result = match receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -334,7 +367,7 @@ impl NativeWorkflows {
             return;
         };
         let current = self.review_is_current(review);
-        let available = self.app.source_action_available();
+        let available = self.source_action_available();
         let mut cancel = false;
         let mut confirm = false;
         let response = egui::Modal::new(egui::Id::new("blue_collection_scan_review")).show(ctx, |ui| {
@@ -383,9 +416,14 @@ impl NativeWorkflows {
         if self.collection.preparing() {
             ui.horizontal_wrapped(|ui| {
                 ui.spinner();
-                ui.label("Reading saved scan scope. No collection scan has started.");
+                ui.label(if self.collection.pending_scan.is_some() {
+                    "Loading saved library status for the scan review. No scan has started."
+                } else {
+                    "Reading saved scan scope. No collection scan has started."
+                });
                 if ui.button("Cancel scope review").clicked() {
                     self.collection.scope_job = None;
+                    self.collection.pending_scan = None;
                 }
             });
         }
@@ -410,7 +448,7 @@ impl NativeWorkflows {
             && self.collection.import_history.show(
                 ui,
                 Some(&path),
-                !self.app.source_action_available(),
+                !self.source_action_available(),
                 None,
             )
         {
@@ -443,7 +481,7 @@ impl NativeWorkflows {
                 ui.label("Before importing from this folder, review which storage it is on. This is separate from importing and does not scan or change game files.");
                 if ui
                     .add_enabled(
-                        self.app.source_action_available(),
+                        self.source_action_available(),
                         egui::Button::new("Review folder storage…"),
                     )
                     .clicked()
@@ -452,6 +490,9 @@ impl NativeWorkflows {
                 }
             }
         }
+        // Read before the closure: it borrows `self` whole while the closure
+        // needs `self.collection.media` mutably.
+        let source_actions_busy = !self.source_action_available();
         if let DatabaseState::Ready { snapshot, .. } = &self.app.database_state {
             egui::CollapsingHeader::new("Discover missing games and prepare imports")
                 .default_open(latest_saved_scan(snapshot).is_none())
@@ -461,7 +502,7 @@ impl NativeWorkflows {
                         &snapshot.database_path,
                         self.app.database_generation.0,
                         &snapshot.source_views,
-                        !self.app.source_action_available(),
+                        source_actions_busy,
                     );
                 });
         }

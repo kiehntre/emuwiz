@@ -72,6 +72,7 @@ fn hashes(sha1: &str) -> AuditedFileHashes {
         md5: None,
         sha1: Some(sha1.to_string()),
         sha256: None,
+        header_removal: None,
     }
 }
 

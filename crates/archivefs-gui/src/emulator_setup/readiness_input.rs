@@ -26,6 +26,28 @@ pub(crate) struct ReadinessSources<'a> {
     pub(crate) member_path: &'a dyn Fn(&ArchiveRecord) -> Option<PathBuf>,
     pub(crate) is_scummvm_folder: &'a dyn Fn(&Path) -> bool,
     pub(crate) loose_ref: &'a dyn Fn(&Path) -> Option<archivefs_core::launch::LaunchContentRef>,
+    /// True only for a catalogued `arcade_set_directory` at exactly this path.
+    pub(crate) is_arcade_set_directory: &'a dyn Fn(&Path) -> bool,
+    /// The catalogue's platform for exactly this path. The saved-library
+    /// snapshot is not loaded on the v2 routes, so the live record cannot be
+    /// the only source of the platform.
+    pub(crate) platform_hint: &'a dyn Fn(&Path) -> Option<String>,
+    /// How the catalogue's platform for exactly this path was set
+    /// (`platform_assignments.source`: "manual", "folder_alias", ...).
+    pub(crate) platform_source: &'a dyn Fn(&Path) -> Option<String>,
+    /// A one-launch "Try anyway" system for exactly this path (in memory
+    /// only; see `unverified_media`). Background workers never have one.
+    pub(crate) system_trial: &'a dyn Fn(&Path) -> Option<&'static str>,
+    /// The person's saved "Remember this launch choice" for this unchanged
+    /// file, if any (see `archivefs_core::launch::remembered_launch_system`).
+    pub(crate) remembered_system: &'a dyn Fn(&Path) -> Option<&'static str>,
+    /// The catalogue row for this file is known and records no system at all
+    /// (distinct from "not loaded yet").
+    pub(crate) system_unknown: &'a dyn Fn(&Path) -> bool,
+    /// How fresh the PCSX2 and Flycast BIOS answers must be. Only the drawn
+    /// readiness card may ask for `Shown`; everything that can lead to a
+    /// launch asks for `Fresh` (see `firmware_answers`).
+    pub(crate) firmware_use: super::firmware_answers::FirmwareUse,
 }
 
 impl ReadinessSources<'_> {
@@ -161,6 +183,41 @@ impl ReadinessSources<'_> {
             );
             mame_set_resolutions.push(resolution);
         }
+        // An extracted Arcade set folder is routed by the installed MAME's own
+        // per-set data (driver status, ROM verify incl. extra read-only
+        // rompaths), not by the old DAT join. No category is a gate.
+        let mame_executable = self
+            .readiness
+            .emulator_setup_overrides
+            .executable(crate::emulator_setup_overrides::OverridableEmulator::Mame);
+        // Only a catalogued Arcade set folder is ever handed to MAME here; any
+        // other game (ScummVM, DOS, PS3 ...) never reaches the probe and its
+        // identity is left exactly as the other routes resolved it.
+        let arcade_target =
+            arcade_probe_target(focused, self.is_arcade_set_directory, mame_executable);
+        // Selection moved on: stop foreground probes for any other folder.
+        crate::arcade_mame_probe::cancel_foreground_except(arcade_target.map(|(path, _)| path));
+        let mut arcade_probe = None;
+        if let Some((path, executable)) = arcade_target {
+            match crate::arcade_mame_probe::lookup(executable, path) {
+                Some(crate::arcade_mame_probe::Lookup::Checking) => {
+                    // Neither Ready nor Blocked: shown as "checking" and
+                    // re-polled when the background probe wakes the UI.
+                    return LaunchReadinessInput::EvidenceNotLoaded;
+                }
+                Some(crate::arcade_mame_probe::Lookup::Done(probe)) => arcade_probe = Some(probe),
+                None => {}
+            }
+        }
+        if let Some(probe) = &arcade_probe {
+            identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(
+                archivefs_core::launch::ResolvedIdentity {
+                    platform_id: "Arcade".to_string(),
+                    game_key: probe.set.clone(),
+                },
+            );
+            mame_set_resolutions = vec![probe.resolution.clone()];
+        }
 
         // A loose ADF has no header identity; its only launch identity is a
         // current DAT match that also proves a single-disk game.
@@ -226,6 +283,44 @@ impl ReadinessSources<'_> {
         if let Some((identity, _)) = &vice_inputs {
             identity_status = identity.clone();
         }
+        let azahar_context = self.readiness.azahar_homebrew.context(focused);
+        // Never impose Nintendo 3DS on a file that other evidence places on
+        // another platform.
+        let azahar_inputs = azahar_context
+            .as_ref()
+            .filter(|_| {
+                selected_game_identity_report.is_none_or(|r| {
+                    matches!(
+                        r.platform,
+                        archivefs_core::game_identity::IdentityPlatform::ThreeDS
+                            | archivefs_core::game_identity::IdentityPlatform::Other
+                    )
+                }) && crate::launch_readiness_page::azahar::platform_allows(
+                    focused_record.and_then(|r| r.mount_plan.archive.identity.platform.as_deref()),
+                )
+            })
+            .and_then(|c| c.inputs(&identity_status));
+        if let Some((identity, _)) = &azahar_inputs {
+            identity_status = identity.clone();
+        }
+        let vita3k_context = self.readiness.vita3k_library.context(focused);
+        // Never impose PlayStation Vita on a file other evidence places elsewhere.
+        let vita3k_inputs = vita3k_context
+            .as_ref()
+            .filter(|_| {
+                selected_game_identity_report.is_none_or(|r| {
+                    matches!(
+                        r.platform,
+                        archivefs_core::game_identity::IdentityPlatform::Other
+                    )
+                }) && crate::launch_readiness_page::vita3k::platform_allows(
+                    focused_record.and_then(|r| r.mount_plan.archive.identity.platform.as_deref()),
+                )
+            })
+            .and_then(|c| c.inputs(&identity_status));
+        if let Some((identity, _)) = &vita3k_inputs {
+            identity_status = identity.clone();
+        }
         let xroar_context = self.readiness.xroar_cassette.context(focused);
         let xroar_inputs = xroar_context
             .as_ref()
@@ -269,6 +364,132 @@ impl ReadinessSources<'_> {
         {
             identity_status = evidence.identity();
         }
+        // Owner-approved controlled path (ZX tapes 2026-11-07, every system
+        // 2026-11-09, see `unverified_media`): a single-file game whose system
+        // is established by its own media or the person's choice may launch
+        // with a visible "game not identified" warning instead of requiring
+        // DAT or header identity. A folder-only system must be confirmed
+        // first, and content naming another system is refused.
+        let mut identity_unverified = None;
+        // Reported in place of the generic reason, after the disc-file and
+        // DOS checks below have had their say.
+        let mut lane_reason = None;
+        if matches!(
+            identity_status,
+            archivefs_core::launch::CanonicalIdentityStatus::Unknown
+        ) && !evidence_freshness.is_incomplete()
+            && let Some(path) = focused
+        {
+            let catalogued = (self.platform_hint)(path);
+            let hint = focused_record
+                .and_then(|record| record.mount_plan.archive.identity.platform.clone())
+                .or_else(|| catalogued.clone());
+            // A format EmuWiz explicitly does not start from here (Amiga HDF
+            // and IPF, unsupported archives, cartridge formats the system's
+            // check does not read) stays unsupported: the unverified lane
+            // never manufactures launch support (owner rule 7, 2026-11-09).
+            let format_unsupported = matches!(
+                identity_unknown_reason(
+                    focused,
+                    selected_game_identity_report,
+                    Some(hint.as_deref()),
+                ),
+                launch_readiness_page::IdentityUnknownReason::AmigaHardDisk
+                    | launch_readiness_page::IdentityUnknownReason::AmigaIpf
+                    | launch_readiness_page::IdentityUnknownReason::UnsupportedArchive
+                    | launch_readiness_page::IdentityUnknownReason::UnsupportedFormat(_)
+            );
+            // No system recorded at all (owner decision 2026-11-10): the same
+            // lane, with no recorded system to confirm - the person picks one
+            // for a try or remembers it; nothing is saved as the system.
+            let system_unknown = hint.is_none() && (self.system_unknown)(path);
+            let lane_hint = hint.clone().or_else(|| system_unknown.then(String::new));
+            if let Some(hint) = lane_hint.filter(|_| !format_unsupported) {
+                // The recorded source only describes the catalogue's own value.
+                let source = (catalogued.as_deref() == Some(hint.as_str()))
+                    .then(|| (self.platform_source)(path))
+                    .flatten();
+                use crate::emulator_setup::unverified_media::Outcome;
+                match crate::emulator_setup::unverified_media::resolve(
+                    path,
+                    &hint,
+                    source.as_deref(),
+                    selected_game_identity_report.map(|report| report.platform),
+                    (self.system_trial)(path),
+                    (self.remembered_system)(path),
+                ) {
+                    Outcome::Allowed(resolved, basis) => {
+                        identity_status =
+                            archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved);
+                        identity_unverified = Some(basis);
+                    }
+                    Outcome::NeedsConfirmation(platform) => {
+                        lane_reason =
+                            Some(launch_readiness_page::IdentityUnknownReason::FolderOnly(
+                                archivefs_core::platform::display_name_for(platform),
+                            ));
+                    }
+                    Outcome::Contradicted { recorded, content } => {
+                        lane_reason = Some(
+                            launch_readiness_page::IdentityUnknownReason::MediaConflict {
+                                recorded: archivefs_core::platform::display_name_for(recorded),
+                                content: archivefs_core::platform::display_name_for(content),
+                            },
+                        );
+                    }
+                    Outcome::NotApplicable => {
+                        if system_unknown
+                            && !crate::emulator_setup::unverified_media::trial_systems(
+                                path,
+                                None,
+                                &|system| {
+                                    archivefs_core::launch::planning::retroarch_core_installed_for(
+                                        system,
+                                        retroarch_environment,
+                                    )
+                                },
+                            )
+                            .is_empty()
+                        {
+                            lane_reason =
+                                Some(launch_readiness_page::IdentityUnknownReason::SystemUnknown);
+                        } else if system_unknown
+                            && archivefs_core::launch::unverified_media::is_sega_pico_rom(path)
+                        {
+                            // The header names the Pico and rules out every
+                            // other system: say so instead of a generic
+                            // "choose a system" (owner ruling 2026-11-10).
+                            lane_reason =
+                                Some(launch_readiness_page::IdentityUnknownReason::NoLaunchRoute(
+                                    archivefs_core::launch::unverified_media::SEGA_PICO_PLATFORM,
+                                ));
+                        }
+                    }
+                }
+            }
+        }
+        // Whatever route resolved it, a plain file whose own header names a
+        // different system is refused (owner policy 2026-11-09), e.g. an NES
+        // ROM renamed into the SNES collection.
+        if let archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved) =
+            &identity_status
+            && let Some(path) = focused
+            && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+            && let Some(recorded) =
+                archivefs_core::canonical_platform_for_alias(&resolved.platform_id)
+            && let archivefs_core::launch::unverified_media::MediaSystemEvidence::Contradicts(
+                content,
+            ) = archivefs_core::launch::unverified_media::media_system_evidence_cached(
+                path, recorded,
+            )
+        {
+            return LaunchReadinessInput::IdentityUnknown(
+                launch_readiness_page::IdentityUnknownReason::MediaConflict {
+                    recorded: archivefs_core::platform::display_name_for(recorded),
+                    content: archivefs_core::platform::display_name_for(content),
+                },
+            );
+        }
         match identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
                 // The worker's own report already says which track of a CUE
@@ -286,7 +507,25 @@ impl ReadinessSources<'_> {
                 } else if evidence_freshness.is_incomplete() {
                     LaunchReadinessInput::InspectionIncomplete
                 } else {
-                    LaunchReadinessInput::IdentityUnknown
+                    // Blue has no live record; the catalogue row's system is
+                    // what the lane above used, so the reason uses it too.
+                    let catalogued = focused.and_then(|p| (self.platform_hint)(p));
+                    LaunchReadinessInput::IdentityUnknown(lane_reason.unwrap_or_else(|| {
+                        identity_unknown_reason(
+                            focused,
+                            selected_game_identity_report,
+                            focused_record
+                                .map(|r| r.mount_plan.archive.identity.platform.as_deref())
+                                .or_else(|| catalogued.as_deref().map(Some))
+                                // Blue knows when the catalogue row has no
+                                // system at all.
+                                .or_else(|| {
+                                    focused
+                                        .is_some_and(|p| (self.system_unknown)(p))
+                                        .then_some(None)
+                                }),
+                        )
+                    }))
                 };
             }
             archivefs_core::launch::CanonicalIdentityStatus::Conflicting => {
@@ -340,11 +579,43 @@ impl ReadinessSources<'_> {
             },
         };
         if !mame_set_resolutions.is_empty() {
-            content.resolved_path = focused.map(Path::to_path_buf);
-            content.container = Some(archivefs_core::launch::LaunchContainerKind::PlainFile);
-            content.requires_mount = false;
-            content.provenance =
-                "verified MAME logical-set directory from the persisted DAT join".into();
+            apply_mame_set_content(&mut content, focused);
+        }
+
+        // A ZIP holding exactly one verified cartridge ROM is launchable
+        // through RetroArch by extracting that member at Play time. Blue
+        // loads no live record, so its content is unresolved rather than
+        // "requires mount"; the report for this exact path (complete, exactly
+        // one verified ROM) is what authorises the substitution either way.
+        // Before 2026-11-09 every zipped cartridge in Blue stopped at "No
+        // runnable game file has been resolved".
+        if (content.requires_mount || content.resolved_path.is_none())
+            && let Some(zipped) = selected_game_identity_report
+                .filter(|report| focused.is_some_and(|path| report.archive_path == path))
+                .and_then(archivefs_core::launch::launch_content_ref_for_zipped_cartridge)
+        {
+            content = zipped;
+        } else if (content.requires_mount || content.resolved_path.is_none())
+            && identity_unverified.is_some()
+            && let archivefs_core::launch::CanonicalIdentityStatus::Resolved(resolved) =
+                &identity_status
+            && let Some(path) = focused
+            && archivefs_core::zip_cartridge_stage::zip_cartridge_member_fits(
+                path,
+                &resolved.platform_id,
+            ) == Some(true)
+        {
+            // The same extraction for a zipped cartridge the unverified lane
+            // resolved (a try, a remembered or a saved choice): staging still
+            // demands one complete member this system's check accepts, and
+            // the extracted file passes the click-time header re-check.
+            content = archivefs_core::launch::LaunchContentRef {
+                kind: Some(archivefs_core::launch::LaunchContentKind::Cartridge),
+                container: Some(archivefs_core::launch::LaunchContainerKind::PlainFile),
+                resolved_path: Some(path.to_path_buf()),
+                requires_mount: false,
+                provenance: archivefs_core::launch::ZIPPED_CARTRIDGE_PROVENANCE.to_string(),
+            };
         }
 
         if let Some((_, selected_content)) = flycast_inputs {
@@ -358,6 +629,12 @@ impl ReadinessSources<'_> {
         }
         if let Some((_, selected_content)) = xroar_inputs {
             content = selected_content;
+        }
+        if let Some((_, selected_content)) = azahar_inputs {
+            content = selected_content;
+        }
+        if let Some((_, selected_content)) = vita3k_inputs.as_ref() {
+            content = selected_content.clone();
         }
 
         // WHDLoad is an additive, content-bound launch seam.  The package
@@ -531,23 +808,19 @@ impl ReadinessSources<'_> {
             | DolphinLocalProfilesState::Scanning { .. }
             | DolphinLocalProfilesState::Error(_) => None,
         };
+        // A Dolphin profile is a launch option only when a launch binding can
+        // be proven for it now; otherwise it is blocked with that reason and
+        // never ties with an option that can actually start.
+        let dolphin_launch_profiles = dolphin_context.as_ref().map(|context| {
+            archivefs_core::launch::dolphin_binding_readiness::dolphin_launch_profiles(
+                &context.discovery,
+                &context.roots,
+            )
+        });
         let dolphin_standalone_profiles: Vec<archivefs_core::launch::StandaloneProfileInput> =
-            dolphin_context
+            dolphin_launch_profiles
                 .as_ref()
-                .map(|context| {
-                    context
-                        .discovery
-                        .profiles
-                        .iter()
-                        .map(|profile| archivefs_core::launch::StandaloneProfileInput {
-                            adapter_id: "dolphin",
-                            profile_id: profile.profile_id.clone(),
-                            profile_path: Some(profile.configuration_root.clone()),
-                            eligible: profile.eligible,
-                            firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
-                        })
-                        .collect()
-                })
+                .map(|profiles| profiles.inputs.clone())
                 .unwrap_or_default();
 
         // Real, already-discovered PCSX2 profiles and already-resolved PS2
@@ -586,28 +859,39 @@ impl ReadinessSources<'_> {
             pcsx2_context
                 .as_ref()
                 .map(|context| {
+                    let verifications = self.readiness.pcsx2_bios_cache.answers(
+                        self.firmware_use,
+                        &(&context.discovery.profiles, &context.firmware_evidence),
+                        std::time::Instant::now(),
+                        |index| {
+                            archivefs_core::patch_manager::pcsx2_profile_bios_inputs(
+                                &context.discovery.profiles[index],
+                            )
+                        },
+                        || {
+                            let profiles = context.discovery.profiles.clone();
+                            let evidence = context.firmware_evidence.clone();
+                            move |index: usize| {
+                                archivefs_core::patch_manager::pcsx2_profile_bios_verification(
+                                    &profiles[index],
+                                    &evidence,
+                                )
+                            }
+                        },
+                    );
                     context
                         .discovery
                         .profiles
                         .iter()
-                        .map(|profile| {
-                            let inspection =
-                                archivefs_core::patch_manager::inspect_pcsx2_game_with_firmware_evidence(
-                                    profile,
-                                    &archivefs_core::patch_manager::Pcsx2GameRequest {
-                                        verified_ps2_serial: None,
-                                        verified_executable_crc: None,
-                                        emulator_serial: None,
-                                    },
-                                    &context.firmware_evidence,
-                                );
+                        .zip(verifications)
+                        .map(|(profile, verification)| {
                             archivefs_core::launch::StandaloneProfileInput {
                                 adapter_id: "pcsx2",
                                 profile_id: profile.profile_id.clone(),
                                 profile_path: Some(profile.configuration_path.clone()),
                                 eligible: profile.eligible,
                                 firmware: archivefs_core::launch::pcsx2_firmware_readiness(
-                                    inspection.inspection.bios.verification,
+                                    verification,
                                 ),
                             }
                         })
@@ -621,45 +905,51 @@ impl ReadinessSources<'_> {
         // launch planner. A binding is resolved here solely so a missing,
         // unsafe or ambiguous executable is shown as blocked rather than
         // advertised as launch-ready. Core preflight repeats the same check.
+        // Only the profile's Dreamcast BIOS state is used here; it never
+        // depends on the game, so it is kept like the PCSX2 answers (see
+        // `firmware_answers`) instead of a full game inspection on every build.
         let flycast_standalone_profiles: Vec<archivefs_core::launch::StandaloneProfileInput> =
             match &self.readiness.flycast_profiles {
-                FlycastProfilesState::Ready(ready) => ready
-                    .discovery
-                    .profiles
-                    .iter()
-                    .map(|profile| {
-                        let verified_product_code = verified_facts.iter().find_map(|fact| match fact {
-                            archivefs_core::launch::VerifiedIdentityFact::DreamcastProductCode(code) => {
-                                Some(code.clone())
-                            }
-                            _ => None,
-                        });
-                        let inspection = archivefs_core::patch_manager::inspect_flycast_game(
-                            profile,
-                            &archivefs_core::patch_manager::FlycastGameRequest {
-                                canonical_platform: Some("Dreamcast".to_string()),
-                                flycast_platform: Some(
-                                    archivefs_core::patch_manager::FlycastPlatform::Dreamcast,
-                                ),
-                                verified_dreamcast_product_code: verified_product_code,
-                                ..Default::default()
-                            },
-                        );
-                        archivefs_core::launch::StandaloneProfileInput {
-                            adapter_id: "flycast",
-                            profile_id: profile.profile_id.clone(),
-                            profile_path: Some(profile.configuration_path.clone()),
-                            eligible: profile.eligible
-                                && archivefs_core::patch_manager::resolve_flycast_native_launch_binding(
-                                    profile,
+                FlycastProfilesState::Ready(ready) => {
+                    let profiles = &ready.discovery.profiles;
+                    let bios = self.readiness.flycast_bios_cache.answers(
+                        self.firmware_use,
+                        profiles,
+                        std::time::Instant::now(),
+                        |index| {
+                            archivefs_core::patch_manager::flycast_profile_dreamcast_bios_inputs(
+                                &profiles[index],
+                            )
+                        },
+                        || {
+                            let profiles = profiles.clone();
+                            move |index: usize| {
+                                archivefs_core::patch_manager::flycast_profile_dreamcast_bios(
+                                    &profiles[index],
                                 )
-                                .is_ok(),
-                            firmware: archivefs_core::launch::flycast_firmware_readiness(
-                                inspection.health.system.dreamcast_bios,
-                            ),
-                        }
-                    })
-                    .collect(),
+                            }
+                        },
+                    );
+                    profiles
+                        .iter()
+                        .zip(bios)
+                        .map(|(profile, dreamcast_bios)| {
+                            archivefs_core::launch::StandaloneProfileInput {
+                                adapter_id: "flycast",
+                                profile_id: profile.profile_id.clone(),
+                                profile_path: Some(profile.configuration_path.clone()),
+                                eligible: profile.eligible
+                                    && archivefs_core::patch_manager::resolve_flycast_native_launch_binding(
+                                        profile,
+                                    )
+                                    .is_ok(),
+                                firmware: archivefs_core::launch::flycast_firmware_readiness(
+                                    dreamcast_bios,
+                                ),
+                            }
+                        })
+                        .collect()
+                }
                 FlycastProfilesState::NotScanned
                 | FlycastProfilesState::Scanning { .. }
                 | FlycastProfilesState::Error(_) => Vec::new(),
@@ -931,10 +1221,28 @@ impl ReadinessSources<'_> {
                 }
             }));
         }
+        // Owner-approved default (2026-11-08): the configured xemu Flatpak is
+        // the preferred original-Xbox emulator. Used only when the user has
+        // saved no xemu choice, and only when its launch binding is proven;
+        // nothing is written to any configuration.
+        let mut xemu_default_profile: Option<String> = None;
         if let Ok(roots) =
             archivefs_core::patch_manager::XemuProfileDiscoveryRoots::from_environment()
         {
             let discovery = archivefs_core::patch_manager::discover_xemu_profiles(&roots);
+            xemu_default_profile = discovery
+                .profiles
+                .iter()
+                .find(|profile| {
+                    profile.installation_type
+                        == archivefs_core::patch_manager::XemuInstallationType::FlatpakUser
+                        && profile.eligible
+                        && archivefs_core::patch_manager::resolve_xemu_native_launch_binding(
+                            profile,
+                        )
+                        .is_ok()
+                })
+                .map(|profile| profile.profile_id.clone());
             standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
                 archivefs_core::launch::StandaloneProfileInput {
                     adapter_id: "xemu",
@@ -1048,6 +1356,28 @@ impl ReadinessSources<'_> {
                     firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
                 }),
         );
+        // Native Atari800: a candidate only when the program exists; its
+        // eligibility and firmware state come from the user's own setup.
+        #[cfg(target_os = "linux")]
+        standalone_profiles
+            .extend(crate::launch_readiness_page::atari800::standalone_profile_input());
+        let snes9x_roots =
+            archivefs_core::patch_manager::Snes9xProfileDiscoveryRoots::from_environment();
+        standalone_profiles.extend(
+            archivefs_core::patch_manager::discover_snes9x_profiles(&snes9x_roots)
+                .profiles
+                .iter()
+                .map(|profile| archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "snes9x",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: None,
+                    eligible: archivefs_core::patch_manager::resolve_snes9x_native_launch_binding(
+                        profile,
+                    )
+                    .is_ok(),
+                    firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                }),
+        );
         if let Ok(roots) =
             archivefs_core::patch_manager::SameBoyProfileDiscoveryRoots::from_environment()
         {
@@ -1087,6 +1417,13 @@ impl ReadinessSources<'_> {
                     firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
                 });
             }
+        }
+        // The installation comes from the worker's own scan of Vita3K (the
+        // very entry Play will recheck), only when the identity was supplied.
+        if vita3k_inputs.is_some()
+            && let Some(profile) = vita3k_context.as_ref().and_then(|c| c.profile_input())
+        {
+            standalone_profiles.push(profile);
         }
         if let XeniaProfilesState::Ready(discovery) = &self.readiness.xenia_profiles {
             let (title_id, media_id) = game_identity_report
@@ -1258,7 +1595,7 @@ impl ReadinessSources<'_> {
             | archivefs_core::launch::CanonicalIdentityStatus::Conflicting => false,
         };
 
-        let remembered: Vec<archivefs_core::launch::RememberedPreference> = self
+        let mut remembered: Vec<archivefs_core::launch::RememberedPreference> = self
             .readiness
             .remembered_emulator_profiles
             .iter()
@@ -1267,6 +1604,14 @@ impl ReadinessSources<'_> {
                 profile_id: profile.profile_id.clone(),
             })
             .collect();
+        if let Some(profile_id) = xemu_default_profile
+            && !remembered.iter().any(|entry| entry.adapter_id == "xemu")
+        {
+            remembered.push(archivefs_core::launch::RememberedPreference {
+                adapter_id: "xemu".into(),
+                profile_id,
+            });
+        }
         #[cfg(target_os = "linux")]
         let shadps4_context = if matches!(&identity_status,
             archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity) if identity.platform_id == "PS4")
@@ -1327,8 +1672,39 @@ impl ReadinessSources<'_> {
             retroarch_environment,
             &remembered,
         );
+        // Only RetroArch can launch a zipped cartridge; a standalone emulator
+        // would be handed the ZIP itself, which its preflight refuses.
+        if content.provenance == archivefs_core::launch::ZIPPED_CARTRIDGE_PROVENANCE {
+            for candidate in &mut plan.candidates {
+                if matches!(
+                    candidate.target,
+                    archivefs_core::launch::LaunchTarget::Standalone { .. }
+                ) {
+                    candidate.readiness = archivefs_core::launch::LaunchReadiness::Blocked;
+                    candidate
+                        .blockers
+                        .push(archivefs_core::launch::LaunchBlocker::new(
+                            archivefs_core::launch::LaunchBlockerKind::ContentNotResolved,
+                            "a zipped cartridge launches through RetroArch only",
+                        ));
+                }
+            }
+        }
         launch_readiness_page::saturn_core::apply(&mut plan, retroarch_environment);
+        if let Some(profiles) = &dolphin_launch_profiles {
+            archivefs_core::launch::dolphin_binding_readiness::apply(&mut plan, profiles);
+        }
         archivefs_core::launch::nkit_readiness::inspect_and_apply(&mut plan);
+        // A zipped cartridge's launch is refused when RetroArch's save setup
+        // would lose saves; show that same refusal here, before Play.
+        // The findings were computed once on the RetroArch scan thread; this
+        // is a lookup, never a file read, so it is safe on every frame.
+        if let RetroArchProfilesState::Ready(discovery) = &self.readiness.retroarch_profiles {
+            archivefs_core::launch::apply_zipped_cartridge_save_safety(
+                &mut plan,
+                &discovery.zipped_save_findings,
+            );
+        }
         archivefs_core::launch::cemu_readiness::apply_cemu_readiness(
             &mut plan,
             self.readiness.cemu.inspection_for(focused),
@@ -1346,6 +1722,19 @@ impl ReadinessSources<'_> {
             launch_readiness_page::amiga_boot::apply(&mut plan, context);
         }
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
+        if let Some(basis) = identity_unverified {
+            crate::emulator_setup::unverified_media::apply_warning(&mut plan, basis, focused);
+        }
+        if let Some(probe) = &arcade_probe {
+            crate::arcade_mame_probe::apply_warnings(&mut plan, probe);
+        }
+        refine_arcade_set_blocker(
+            &mut plan,
+            self.readiness
+                .emulator_setup_overrides
+                .executable(crate::emulator_setup_overrides::OverridableEmulator::Mame)
+                .is_some(),
+        );
         if let Some(snapshot) = &mesen_context {
             snapshot.apply(&mut plan);
         }
@@ -1353,6 +1742,36 @@ impl ReadinessSources<'_> {
         if let Some(snapshot) = &shadps4_context {
             snapshot.apply(&mut plan, &content);
         }
+        // Dreamcast: an installed standalone Flycast is the automatic route;
+        // a RetroArch Flycast core needs an explicit emulator choice.
+        let flycast_reasons: Vec<(String, String)> = match &self.readiness.flycast_profiles {
+            FlycastProfilesState::Ready(ready) => ready
+                .discovery
+                .profiles
+                .iter()
+                .filter_map(|profile| {
+                    let reason = match &profile.blocker {
+                        Some(blocker) => blocker.clone(),
+                        None => {
+                            archivefs_core::patch_manager::resolve_flycast_native_launch_binding(
+                                profile,
+                            )
+                            .err()?
+                            .detail
+                        }
+                    };
+                    Some((profile.profile_id.clone(), reason))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        launch_readiness_page::flycast::prefer_standalone(&mut plan, &flycast_reasons);
+        // Last: an explicit emulator choice only resolves what every check
+        // above left usable, and never unblocks anything.
+        archivefs_core::launch::launch_choice::apply(
+            &mut plan,
+            self.readiness.launch_choices.inputs(),
+        );
         #[cfg(target_os = "linux")]
         let standalone_scans_complete = shadps4_context
             .as_ref()
@@ -1383,10 +1802,807 @@ impl ReadinessSources<'_> {
             cemu: cemu_context,
             flycast: flycast_context,
             xroar: xroar_context,
+            azahar: azahar_context,
+            vita3k: vita3k_context,
             vice: vice_context,
             amiga_whdload: amiga_whdload_context,
             #[cfg(target_os = "linux")]
             shadps4: shadps4_context,
         }
+    }
+}
+
+/// Archive container extensions EmuWiz may meet but has no identity route for.
+fn is_archive_container(path: &std::path::Path) -> bool {
+    path.extension().and_then(|x| x.to_str()).is_some_and(|x| {
+        matches!(
+            x.to_ascii_lowercase().as_str(),
+            "zip" | "7z" | "rar" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst"
+        )
+    })
+}
+
+/// Platforms (canonical ids) whose identity is resolved by a route other than
+/// the shared identity inspection, before the "unknown" outcome is reached
+/// (MAME arcade join, DeSmuME, DOSBox, Vita3K, tape/disc adapters and the ZX
+/// `.z80` snapshot adapter). They must never be reported as having no
+/// identity check, even though they have no `IdentityPlatform`. Platforms
+/// that do have an `IdentityPlatform` never reach this check.
+fn has_other_identity_route(id: &str, extension: &str) -> bool {
+    match id {
+        "ZX Spectrum" => extension == "z80",
+        "NeoGeo"
+        | "NeoGeo64"
+        | "Nintendo DS"
+        | "DOS"
+        | "PC"
+        | "PlayStation Vita"
+        | "Dragon / Tandy CoCo"
+        | "FM Towns"
+        | "AmigaCD32"
+        | "Commodore CDTV" => true,
+        _ => false,
+    }
+}
+
+/// True for platforms whose shared identity check reads only loose ROM files
+/// (cartridge families), derived from `supported_loose_rom_format` itself so a
+/// newly supported platform or extension is picked up automatically.
+fn is_loose_rom_platform(platform: archivefs_core::game_identity::IdentityPlatform) -> bool {
+    // Generous list of ROM/cartridge extensions; the test
+    // `loose_rom_probe_covers_every_accepted_extension` brute-forces all
+    // 1-3 character extensions against `supported_loose_rom_format`, so a
+    // platform or extension added there without a probe entry fails loudly.
+    const PROBE: &[&str] = &[
+        "md", "gen", "smd", "bin", "sfc", "smc", "nes", "fds", "unf", "gb", "gbc", "gba", "vb",
+        "vboy", "min", "sv", "z64", "v64", "n64", "a26", "a52", "a78", "atr", "atx", "xex", "xfd",
+        "lnx", "lyx", "j64", "jag", "ngp", "ngc", "pce", "sms", "gg", "32x", "col", "cv", "sg",
+        "rom",
+    ];
+    PROBE.iter().any(|ext| {
+        archivefs_core::game_identity::supported_loose_rom_format(
+            std::path::Path::new(&format!("x.{ext}")),
+            platform,
+        )
+        .is_some()
+    })
+}
+
+/// Why identity is unknown, from existing evidence only.
+///
+/// `recorded_platform` is the live library record's platform hint, if the
+/// record exists at all (`None` outer = no live record, so "no system" cannot
+/// be claimed). "System not chosen" means no platform hint is recorded and
+/// none was identified; it is a reading of that evidence, not a trust grant.
+/// A ZIP is never called unsupported (it is native content on many systems);
+/// a ZIP with no platform is a missing system because choosing one makes it
+/// inspectable, otherwise it stays "not confirmed". Only other containers
+/// (7z, rar, ...) have no identity route.
+pub(crate) fn identity_unknown_reason(
+    focused: Option<&std::path::Path>,
+    report: Option<&archivefs_core::game_identity::GameIdentityReport>,
+    recorded_platform: Option<Option<&str>>,
+) -> crate::launch_readiness_page::IdentityUnknownReason {
+    use crate::launch_readiness_page::IdentityUnknownReason as Reason;
+    use archivefs_core::game_identity::{IdentityImageFormat, IdentityPlatform};
+    let hint = recorded_platform.flatten();
+    let platform = match report.map(|r| r.platform) {
+        Some(p) if p != IdentityPlatform::Other => p,
+        _ => IdentityPlatform::from_catalogue(hint),
+    };
+    let platform_known = platform != IdentityPlatform::Other
+        || hint.is_some_and(|p| archivefs_core::canonical_platform_for_alias(p).is_some());
+    let system_missing = if recorded_platform.is_some() && !platform_known {
+        Reason::SystemNotChosen
+    } else {
+        Reason::NotConfirmed
+    };
+    // Blocker-specific reasons come first and are derived from facts only:
+    // the platform, the file extension and the container kind. When no
+    // identity route exists, extracting an archive or opening Verify identity
+    // cannot help, so the truthful reason must win.
+    let extension = focused
+        .and_then(|p| p.extension())
+        .and_then(|x| x.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let archive = focused.is_some_and(is_archive_container);
+    // Amiga hard-disk images (`.hdf`, started from EmuWiz's private working
+    // copy: launch::amiga_hdf_working_copy) and IPF floppies (started when
+    // the CAPS/SPS plugin is present: launch::amiga_caps_plugin) both take
+    // the ordinary unverified route through RetroArch's PUAE core.
+    // A known system with no IdentityPlatform (so no shared identity check and
+    // no launch platform id) and no other identity route.
+    if platform == IdentityPlatform::Other
+        && let Some(system) = hint.and_then(archivefs_core::canonical_platform_for_alias)
+        && !has_other_identity_route(system, &extension)
+    {
+        return Reason::NoIdentityCheck(system);
+    }
+    // The system has an identity check but it reads only loose ROM files and
+    // this loose file is not one it reads. Archives keep the archive advice.
+    if platform != IdentityPlatform::Other
+        && !archive
+        && is_loose_rom_platform(platform)
+        && report.is_some_and(|r| r.format == IdentityImageFormat::Unsupported)
+        && let Some(path) = focused
+        && archivefs_core::game_identity::supported_loose_rom_format(path, platform).is_none()
+    {
+        return Reason::UnsupportedFormat(platform.label());
+    }
+    if let (Some(path), Some(report)) = (focused, report)
+        && report.format == IdentityImageFormat::Unsupported
+        && is_archive_container(path)
+    {
+        // A ZIP is native content on many systems (arcade sets must stay
+        // zipped), so it is never "unsupported"; it falls through to the
+        // system / not-confirmed reasons below.
+        let is_zip = path
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("zip"));
+        if !is_zip {
+            return Reason::UnsupportedArchive;
+        }
+    }
+    // A recorded system that does not use this file's format at all (a ZIP of
+    // BBC disk images, an Atari 5200 `.a52` filed under Game Gear) cannot be
+    // started as it is stored. Saying "cannot tell which game" would send the
+    // person to identity review for nothing (census 2026-11-10).
+    if let Some(system) = hint.and_then(archivefs_core::canonical_platform_for_alias)
+        && !extension.is_empty()
+        && !archivefs_core::launch::unverified_media::platform_lists_extension(system, &extension)
+        && !has_other_identity_route(system, &extension)
+        && report.is_none_or(|r| r.format == IdentityImageFormat::Unsupported)
+    {
+        return if archive {
+            Reason::UnsupportedArchive
+        } else {
+            Reason::UnsupportedFormat(archivefs_core::platform::display_name_for(system))
+        };
+    }
+    if !platform_known {
+        return system_missing;
+    }
+    Reason::NotConfirmed
+}
+
+/// The only case in which MAME is asked about a folder: a catalogued Arcade
+/// set directory AND a configured MAME. Any other game yields `None`, so the
+/// probe never runs and identity/set resolutions are never overwritten.
+fn arcade_probe_target<'a>(
+    focused: Option<&'a Path>,
+    is_arcade_set_directory: &dyn Fn(&Path) -> bool,
+    executable: Option<&'a Path>,
+) -> Option<(&'a Path, &'a Path)> {
+    let path = focused.filter(|path| is_arcade_set_directory(path))?;
+    Some((path, executable?))
+}
+
+/// Says precisely what is missing for the MAME route when RetroArch refused an
+/// extracted arcade set and no MAME candidate exists. Wording only: nothing is
+/// unblocked and no candidate is added.
+fn refine_arcade_set_blocker(plan: &mut archivefs_core::launch::LaunchPlan, mame_configured: bool) {
+    use archivefs_core::launch::{LaunchBlockerKind, LaunchReadiness, LaunchTarget};
+    let mame = plan.candidates.iter().find(|candidate| {
+        matches!(
+            candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "mame",
+                ..
+            }
+        )
+    });
+    let advice = match mame {
+        Some(mame) if mame.readiness != LaunchReadiness::Blocked => return,
+        Some(mame) => format!(
+            "MAME is set up but cannot start this set yet: {}.",
+            mame.blockers
+                .first()
+                .map_or("see its readiness details", |blocker| blocker.detail.as_str())
+        ),
+        None if !mame_configured => {
+            "Choose the MAME program in Emulator Setup to play this copy.".to_string()
+        }
+        None => "MAME is set up, but this set has no current verified MAME record yet; run the MAME check for this folder first.".to_string(),
+    };
+    for candidate in &mut plan.candidates {
+        if !matches!(candidate.target, LaunchTarget::RetroArchCore { .. }) {
+            continue;
+        }
+        for blocker in &mut candidate.blockers {
+            if blocker.kind == LaunchBlockerKind::RetroArchArcadeSetNeedsArchive {
+                blocker.detail = format!("{} {advice}", blocker.detail);
+            }
+        }
+    }
+}
+
+/// Points `content` at the MAME logical set the persisted DAT join resolved.
+/// The join says which set this is, not what shape it has: an extracted set
+/// directory keeps the `ExtractedArcadeSet` shape, so RetroArch cores (which
+/// cannot load a directory) are refused with the true reason instead of being
+/// shown as Ready.
+fn apply_mame_set_content(
+    content: &mut archivefs_core::launch::LaunchContentRef,
+    focused: Option<&Path>,
+) {
+    content.resolved_path = focused.map(Path::to_path_buf);
+    if focused.is_some_and(|path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())) {
+        content.kind = Some(archivefs_core::launch::LaunchContentKind::ExtractedArcadeSet);
+    }
+    content.container = Some(archivefs_core::launch::LaunchContainerKind::PlainFile);
+    content.requires_mount = false;
+    content.provenance = "verified MAME logical-set directory from the persisted DAT join".into();
+}
+
+#[cfg(test)]
+mod identity_reason_tests {
+    use super::identity_unknown_reason;
+    use crate::launch_readiness_page::IdentityUnknownReason as R;
+    use archivefs_core::game_identity::{
+        GameIdentityReport, IdentityImageFormat, IdentityPlatform,
+    };
+    use std::path::Path;
+
+    fn report(platform: IdentityPlatform, format: IdentityImageFormat) -> GameIdentityReport {
+        GameIdentityReport {
+            archive_path: "x".into(),
+            platform,
+            format,
+            evidence: Vec::new(),
+            warnings: Vec::new(),
+            bytes_read: 0,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete: true,
+        }
+    }
+
+    fn unsupported(platform: IdentityPlatform) -> GameIdentityReport {
+        report(platform, IdentityImageFormat::Unsupported)
+    }
+
+    #[test]
+    fn non_zip_archive_is_unsupported() {
+        let r = unsupported(IdentityPlatform::Other);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.7z")), Some(&r), Some(None)),
+            R::UnsupportedArchive
+        );
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.rar")), Some(&r), Some(Some("GBA"))),
+            R::UnsupportedArchive
+        );
+    }
+
+    #[test]
+    fn failed_or_ambiguous_cartridge_zip_is_never_called_unsupported() {
+        // Platform known via the record hint, report still at Unsupported.
+        let r = unsupported(IdentityPlatform::Other);
+        assert_eq!(
+            identity_unknown_reason(
+                Some(Path::new("/g/a.zip")),
+                Some(&r),
+                Some(Some("Game Boy Advance"))
+            ),
+            R::NotConfirmed
+        );
+        // Platform known via the report.
+        let r = unsupported(IdentityPlatform::GameBoyAdvance);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.zip")), Some(&r), Some(None)),
+            R::NotConfirmed
+        );
+    }
+
+    #[test]
+    fn zip_without_platform_is_choose_system() {
+        let r = unsupported(IdentityPlatform::Other);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.zip")), Some(&r), Some(None)),
+            R::SystemNotChosen
+        );
+    }
+
+    #[test]
+    fn zip_on_a_platform_without_an_identity_variant_is_never_unsupported() {
+        // NeoGeo has its own MAME-join route, so it is never called
+        // "no identity check"; Sharp X68000 has no route at all.
+        let r = unsupported(IdentityPlatform::Other);
+        let reason_for = |hint| {
+            identity_unknown_reason(Some(Path::new("/g/kof98.zip")), Some(&r), Some(Some(hint)))
+        };
+        assert_eq!(reason_for("NeoGeo"), R::NotConfirmed);
+        assert_eq!(
+            reason_for("Sharp X68000"),
+            R::NoIdentityCheck("Sharp X68000")
+        );
+    }
+
+    #[test]
+    fn no_live_record_never_claims_system_not_chosen() {
+        let r = unsupported(IdentityPlatform::Other);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.zip")), Some(&r), None),
+            R::NotConfirmed
+        );
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.bin")), None, None),
+            R::NotConfirmed
+        );
+    }
+
+    #[test]
+    fn no_platform_anywhere_means_choose_system() {
+        let r = unsupported(IdentityPlatform::Other);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.bin")), Some(&r), Some(None)),
+            R::SystemNotChosen
+        );
+        assert_eq!(
+            identity_unknown_reason(
+                Some(Path::new("/g/a.bin")),
+                None,
+                Some(Some("not a platform"))
+            ),
+            R::SystemNotChosen
+        );
+    }
+
+    #[test]
+    fn known_platform_without_confirmation_is_not_confirmed() {
+        let r = report(IdentityPlatform::Other, IdentityImageFormat::Deferred);
+        assert_eq!(
+            identity_unknown_reason(
+                Some(Path::new("/g/a.gba")),
+                Some(&r),
+                Some(Some("Game Boy Advance"))
+            ),
+            R::NotConfirmed
+        );
+        let known = report(IdentityPlatform::PlayStation, IdentityImageFormat::Deferred);
+        assert_eq!(
+            identity_unknown_reason(Some(Path::new("/g/a.bin")), Some(&known), Some(None)),
+            R::NotConfirmed
+        );
+    }
+
+    fn reason(path: &str, platform: IdentityPlatform, hint: Option<&str>) -> R {
+        let r = unsupported(platform);
+        identity_unknown_reason(Some(Path::new(path)), Some(&r), Some(hint))
+    }
+
+    #[test]
+    fn systems_without_an_identity_check_get_the_truthful_reason_first() {
+        let other = IdentityPlatform::Other;
+        for (path, hint, name) in [
+            ("/g/game.zip", "Sharp X68000", "Sharp X68000"),
+            ("/g/game.7z", "Sharp X68000", "Sharp X68000"),
+            ("/g/game.7z", "NEC PC-8801", "NEC PC-8801"),
+            ("/g/game.tap", "ZX Spectrum", "ZX Spectrum"),
+            ("/g/game.zip", "MSX", "MSX"),
+            ("/g/game.rom", "MSX2", "MSX2"),
+            ("/g/game.zip", "NEC PC-9801", "NEC PC-9801"),
+            ("/g/game.ssd", "BBC Micro", "BBC Micro"),
+            ("/g/game.adf", "Acorn Archimedes", "Acorn Archimedes"),
+        ] {
+            assert_eq!(
+                reason(path, other, Some(hint)),
+                R::NoIdentityCheck(name),
+                "{path}"
+            );
+        }
+    }
+
+    /// Systems that are meant to stay unsupported for now. If one gains an
+    /// `IdentityPlatform` this fails loudly: prune it here and add the new
+    /// platform's own format tests (the reason logic itself is derived).
+    #[test]
+    fn systems_meant_to_stay_unsupported_have_no_identity_platform() {
+        for id in [
+            "Sharp X68000",
+            "NEC PC-8801",
+            "PC-98",
+            "NEC PC-9801",
+            "MSX",
+            "MSX2",
+            "BBC Micro",
+            "Acorn Archimedes",
+            "Acorn Electron",
+            "ZX Spectrum",
+        ] {
+            assert_eq!(
+                IdentityPlatform::from_catalogue(Some(id)),
+                IdentityPlatform::Other,
+                "{id} now has an IdentityPlatform: update this list and add format tests"
+            );
+        }
+    }
+
+    /// Merge-order independent: for any system, `NoIdentityCheck` holds exactly
+    /// when the facts say so (no `IdentityPlatform`, no launch platform id, no
+    /// other identity route), and a system with an `IdentityPlatform` never
+    /// gets it - whichever cartridge-family changes have landed.
+    #[test]
+    fn no_identity_check_is_exactly_what_the_platform_facts_say() {
+        use archivefs_core::launch::evidence_bridge::launch_platform_id;
+        for id in [
+            "Sharp X68000",
+            "NEC PC-8801",
+            "NEC PC-9801",
+            "PC-98",
+            "MSX",
+            "MSX2",
+            "BBC Micro",
+            "Acorn Archimedes",
+            "Acorn Electron",
+            "ZX Spectrum",
+            "PC Engine",
+            "TurboGrafx-16",
+            "PC Engine CD",
+            "MasterSystem",
+            "GameGear",
+            "Sega 32X",
+            "ColecoVision",
+            "Atari2600",
+            "Atari5200",
+            "Atari7800",
+            "Atari Lynx",
+            "AtariST",
+            "MegaDrive",
+            "SNES",
+            "NES",
+            "GBA",
+            "Amiga",
+            "NeoGeo",
+            "Nintendo DS",
+            "DOS",
+            "WiiU",
+            "Arcade",
+            "Amstrad CPC",
+            "Oric",
+        ] {
+            let identity = IdentityPlatform::from_catalogue(Some(id));
+            let has_route = archivefs_core::canonical_platform_for_alias(id)
+                .is_some_and(|c| super::has_other_identity_route(c, "xyz"));
+            let expected = identity == IdentityPlatform::Other
+                && launch_platform_id(identity).is_none()
+                && archivefs_core::canonical_platform_for_alias(id).is_some()
+                && !has_route;
+            let got = reason("/g/game.xyz", IdentityPlatform::Other, Some(id));
+            assert_eq!(
+                matches!(got, R::NoIdentityCheck(_)),
+                expected,
+                "{id}: {got:?}"
+            );
+            if identity != IdentityPlatform::Other {
+                assert!(!matches!(got, R::NoIdentityCheck(_)), "{id}");
+            }
+        }
+    }
+
+    #[test]
+    fn archives_of_a_platform_with_an_identity_check_keep_the_extract_advice() {
+        assert_eq!(
+            reason("/g/game.7z", IdentityPlatform::Atari2600, None),
+            R::UnsupportedArchive
+        );
+        assert_eq!(
+            reason("/g/game.7z", IdentityPlatform::GameBoyAdvance, None),
+            R::UnsupportedArchive
+        );
+        assert_eq!(
+            reason("/g/game.7z", IdentityPlatform::Other, Some("NEC PC-8801")),
+            R::NoIdentityCheck("NEC PC-8801")
+        );
+        assert_eq!(
+            reason("/g/game.zip", IdentityPlatform::Atari2600, None),
+            R::NotConfirmed
+        );
+    }
+
+    #[test]
+    fn zx_snapshot_route_other_routes_and_supported_platforms_are_unaffected() {
+        let other = IdentityPlatform::Other;
+        assert_eq!(
+            reason("/g/a.z80", other, Some("ZX Spectrum")),
+            R::NotConfirmed
+        );
+        for hint in ["NeoGeo", "Nintendo DS", "DOS", "WiiU"] {
+            assert_eq!(
+                reason("/g/a.zip", other, Some(hint)),
+                R::NotConfirmed,
+                "{hint}"
+            );
+        }
+        assert_eq!(
+            reason("/g/a.zip", IdentityPlatform::GameBoyAdvance, None),
+            R::NotConfirmed
+        );
+        assert_eq!(reason("/g/a.7z", other, Some("GBA")), R::UnsupportedArchive);
+        assert_eq!(reason("/g/a.zip", other, None), R::SystemNotChosen);
+    }
+
+    #[test]
+    fn a_format_the_recorded_system_never_uses_is_unsupported_not_unconfirmed() {
+        // Census 2026-11-10: zipped BBC/Electron/Archimedes disk images and
+        // an Atari 5200 `.a52` filed under Game Gear read "cannot tell which
+        // game", sending the person to identity review for nothing.
+        let other = IdentityPlatform::Other;
+        // Systems with no identity check say so first.
+        for hint in ["BBC Micro", "Acorn Electron", "Acorn Archimedes"] {
+            assert!(
+                matches!(reason("/g/a.zip", other, Some(hint)), R::NoIdentityCheck(_)),
+                "{hint}"
+            );
+        }
+        // A system with a check that never reads this archive.
+        assert_eq!(
+            reason(
+                "/g/a.zip",
+                IdentityPlatform::Ngpc,
+                Some("Neo Geo Pocket Color")
+            ),
+            R::NotConfirmed
+        );
+        assert_eq!(
+            reason("/g/Ms. Pac-Man (USA).a52", other, Some("GameGear")),
+            R::UnsupportedFormat("Sega Game Gear")
+        );
+        // Formats the system lists, and systems with another identity route,
+        // are unaffected.
+        assert!(matches!(
+            reason("/g/a.ssd", other, Some("BBC Micro")),
+            R::NoIdentityCheck(_)
+        ));
+        assert_eq!(
+            reason("/g/a.zip", other, Some("AmigaCD32")),
+            R::NotConfirmed
+        );
+    }
+
+    #[test]
+    fn amiga_hdf_and_ipf_route_to_the_honest_amiga_reasons() {
+        let amiga = IdentityPlatform::Amiga;
+        // Since 2026-11-11 neither is refused up front: a hard-disk image
+        // starts from a private working copy, an IPF when the CAPS/SPS plugin
+        // is present (checked at launch).
+        assert_eq!(reason("/g/a.hdf", amiga, None), R::NotConfirmed);
+        assert_eq!(reason("/g/a.IPF", amiga, None), R::NotConfirmed);
+        assert_ne!(
+            reason("/g/a.hdf", IdentityPlatform::Other, Some("Amiga")),
+            R::AmigaHardDisk
+        );
+        assert_eq!(reason("/g/a.adf", amiga, None), R::NotConfirmed);
+    }
+
+    #[test]
+    fn loose_files_a_cartridge_identity_check_does_not_read_are_an_unsupported_format() {
+        for (path, platform, name) in [
+            ("/g/a.bin", IdentityPlatform::Atari2600, "Atari 2600"),
+            ("/g/a.bin", IdentityPlatform::Atari5200, "Atari 5200"),
+            ("/g/a.rom", IdentityPlatform::Atari7800, "Atari 7800"),
+            ("/g/a.bin", IdentityPlatform::AtariLynx, "Atari Lynx"),
+        ] {
+            assert_eq!(
+                reason(path, platform, None),
+                R::UnsupportedFormat(name),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            reason("/g/a.a26", IdentityPlatform::Atari2600, None),
+            R::NotConfirmed
+        );
+    }
+
+    #[test]
+    fn vita_and_other_routed_systems_are_never_called_unsupported() {
+        for hint in ["PlayStation Vita", "NeoGeo", "Nintendo DS", "DOS"] {
+            assert_eq!(
+                reason("/g/title.vpk", IdentityPlatform::Other, Some(hint)),
+                R::NotConfirmed,
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn loose_rom_probe_covers_every_accepted_extension() {
+        use archivefs_core::game_identity::supported_loose_rom_format;
+        let mut exts: Vec<String> = ["vboy"].iter().map(|e| e.to_string()).collect();
+        let alnum: Vec<char> = ('a'..='z').chain('0'..='9').collect();
+        for &a in &alnum {
+            exts.push(a.to_string());
+            for &b in &alnum {
+                exts.push(format!("{a}{b}"));
+                for &c in &alnum {
+                    exts.push(format!("{a}{b}{c}"));
+                }
+            }
+        }
+        for alias in [
+            "MegaDrive",
+            "SNES",
+            "NES",
+            "Game Boy",
+            "Game Boy Color",
+            "GBA",
+            "Virtual Boy",
+            "Pokemon Mini",
+            "Watara Supervision",
+            "N64",
+            "Atari2600",
+            "Atari5200",
+            "Atari7800",
+            "Atari 8-bit",
+            "Atari Lynx",
+            "Atari Jaguar",
+            "Neo Geo Pocket",
+            "Neo Geo Pocket Color",
+            "MasterSystem",
+            "GameGear",
+            "Sega 32X",
+            "ColecoVision",
+            "TurboGrafx-16",
+            "PC Engine",
+        ] {
+            let platform = IdentityPlatform::from_catalogue(Some(alias));
+            if platform == IdentityPlatform::Other {
+                continue;
+            }
+            let accepts = exts.iter().any(|e| {
+                supported_loose_rom_format(Path::new(&format!("x.{e}")), platform).is_some()
+            });
+            assert_eq!(super::is_loose_rom_platform(platform), accepts, "{alias}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod arcade_set_shape_tests {
+    use super::*;
+    use archivefs_core::launch::{LaunchContentKind, LaunchContentRef};
+
+    fn unresolved() -> LaunchContentRef {
+        LaunchContentRef {
+            kind: None,
+            container: None,
+            resolved_path: None,
+            requires_mount: false,
+            provenance: "placeholder".into(),
+        }
+    }
+
+    fn arcade_plan(mame_blocker: Option<&str>) -> archivefs_core::launch::LaunchPlan {
+        use archivefs_core::emulator_environment::retroarch::{
+            ProfileKind, ProfileRef, ProfileScope,
+        };
+        use archivefs_core::launch::{
+            CandidatePreference, FirmwareReadiness, LaunchBlocker, LaunchBlockerKind,
+            LaunchCandidate, LaunchPlan, LaunchReadiness, LaunchTarget,
+        };
+        let content = LaunchContentRef {
+            kind: Some(LaunchContentKind::ExtractedArcadeSet),
+            container: None,
+            resolved_path: None,
+            requires_mount: false,
+            provenance: String::new(),
+        };
+        let mut candidates = vec![LaunchCandidate {
+            target: LaunchTarget::RetroArchCore {
+                profile: ProfileRef {
+                    profile_kind: ProfileKind::Native,
+                    scope: ProfileScope::User,
+                },
+                core_stem: "fbneo".into(),
+                platform_id: "Arcade",
+            },
+            content: content.clone(),
+            firmware: FirmwareReadiness::NotRequired,
+            blockers: vec![LaunchBlocker::new(
+                LaunchBlockerKind::RetroArchArcadeSetNeedsArchive,
+                "base.",
+            )],
+            warnings: Vec::new(),
+            readiness: LaunchReadiness::Blocked,
+            preference: CandidatePreference::Undetermined,
+        }];
+        if let Some(detail) = mame_blocker {
+            candidates.push(LaunchCandidate {
+                target: LaunchTarget::Standalone {
+                    adapter_id: "mame",
+                    profile_id: "mame".into(),
+                    profile_path: None,
+                },
+                content,
+                firmware: FirmwareReadiness::NotRequired,
+                blockers: vec![LaunchBlocker::new(
+                    LaunchBlockerKind::MameSetVerdictUnavailable,
+                    detail,
+                )],
+                warnings: Vec::new(),
+                readiness: LaunchReadiness::Blocked,
+                preference: CandidatePreference::Undetermined,
+            });
+        }
+        LaunchPlan {
+            platform_id: Some("Arcade".into()),
+            game_key: Some("19xx".into()),
+            summary: Default::default(),
+            candidates,
+            media_topology: None,
+        }
+    }
+
+    #[test]
+    fn only_a_catalogued_arcade_set_directory_is_ever_probed() {
+        let exe = Path::new("/usr/bin/mame");
+        let arcade = Path::new("/lib/arcade/pacman");
+        let is_arcade = |p: &Path| p == arcade;
+        assert_eq!(
+            arcade_probe_target(Some(arcade), &is_arcade, Some(exe)),
+            Some((arcade, exe))
+        );
+        // ScummVM / DOS / PS3 / any other folder: no probe at all.
+        for other in ["/lib/scummvm/monkey", "/lib/dos/doom", "/lib/ps3/game"] {
+            assert_eq!(
+                arcade_probe_target(Some(Path::new(other)), &is_arcade, Some(exe)),
+                None
+            );
+        }
+        assert_eq!(arcade_probe_target(None, &is_arcade, Some(exe)), None);
+        // No MAME configured: nothing to ask.
+        assert_eq!(arcade_probe_target(Some(arcade), &is_arcade, None), None);
+    }
+
+    #[test]
+    fn arcade_blocker_names_exactly_what_is_missing_for_mame() {
+        let detail = |plan: &archivefs_core::launch::LaunchPlan| {
+            plan.candidates[0].blockers[0].detail.clone()
+        };
+        let mut plan = arcade_plan(None);
+        refine_arcade_set_blocker(&mut plan, false);
+        assert!(detail(&plan).contains("Choose the MAME program in Emulator Setup"));
+        let mut plan = arcade_plan(None);
+        refine_arcade_set_blocker(&mut plan, true);
+        assert!(detail(&plan).contains("no current verified MAME record"));
+        assert!(!detail(&plan).contains("Emulator Setup"));
+        let mut plan = arcade_plan(Some("needs a fresh audit"));
+        refine_arcade_set_blocker(&mut plan, true);
+        assert!(detail(&plan).contains("cannot start this set yet: needs a fresh audit"));
+    }
+
+    #[test]
+    fn joined_set_directory_keeps_the_extracted_arcade_set_shape() {
+        let dir = std::env::temp_dir().join(format!("emuwiz-arcade-shape-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("19xx")).unwrap();
+        std::fs::write(dir.join("19xx.zip"), b"zip").unwrap();
+
+        let mut directory = unresolved();
+        apply_mame_set_content(&mut directory, Some(&dir.join("19xx")));
+        assert_eq!(directory.kind, Some(LaunchContentKind::ExtractedArcadeSet));
+        assert_eq!(directory.resolved_path, Some(dir.join("19xx")));
+
+        let mut archive = unresolved();
+        apply_mame_set_content(&mut archive, Some(&dir.join("19xx.zip")));
+        assert_eq!(archive.kind, None);
+
+        let directory_kind = archivefs_core::ArchiveKind::ArcadeSetDirectory;
+        assert!(crate::emulator_setup::catalogued_content_shape_ok(
+            directory_kind,
+            &dir.join("19xx")
+        ));
+        assert!(!crate::emulator_setup::catalogued_content_shape_ok(
+            archivefs_core::ArchiveKind::DirectGameImage,
+            &dir.join("19xx")
+        ));
+        assert!(crate::emulator_setup::catalogued_content_shape_ok(
+            archivefs_core::ArchiveKind::DirectGameImage,
+            &dir.join("19xx.zip")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -106,6 +106,7 @@ fn retroarch_environment_with_cores(cores: Vec<CoreFinding>) -> RetroArchEnviron
                 complete: true,
             },
             app_images: Vec::new(),
+            save_directories: Vec::new(),
             diagnostics: Vec::new(),
         }],
         diagnostics: Vec::new(),
@@ -528,14 +529,15 @@ fn two_matching_cores_without_a_reviewed_hint_remain_ambiguous() {
         &resolved("NES"),
         &resolved_content(),
         &[],
+        // Neither core is named by the platform's reviewed hint list.
         &retroarch_environment_with_cores(vec![
             core_finding(
-                "fceumm",
+                "fixnes",
                 Some("Nintendo - Nintendo Entertainment System"),
                 None,
             ),
             core_finding(
-                "mesen",
+                "quicknes",
                 Some("Nintendo - Nintendo Entertainment System"),
                 None,
             ),
@@ -1055,4 +1057,577 @@ fn remembering_snes9x_keeps_retroarch_listed_as_a_separate_choice() {
             .any(|candidate| matches!(candidate.target, LaunchTarget::RetroArchCore { .. })),
         "RetroArch remains a separate, still-listed choice after remembering Snes9x"
     );
+}
+
+// ---------------------------------------------------------------------
+// RetroArch-only cartridge family: Game Gear, Master System, 32X,
+// ColecoVision, TurboGrafx-16 (HuCard)
+// ---------------------------------------------------------------------
+
+fn cartridge_content(file: &str) -> LaunchContentRef {
+    LaunchContentRef {
+        kind: Some(LaunchContentKind::Cartridge),
+        container: Some(LaunchContainerKind::PlainFile),
+        resolved_path: Some(format!("/games/{file}").into()),
+        requires_mount: false,
+        provenance: "direct cartridge ROM".to_string(),
+    }
+}
+
+/// `(platform id, preferred core, other installed cores, systemname, database)`
+/// with the real `.info` strings of the cores installed on the host.
+#[allow(clippy::type_complexity)]
+fn cartridge_family_rows() -> Vec<(
+    &'static str,
+    &'static str,
+    Vec<(&'static str, &'static str, &'static str)>,
+    &'static str,
+)> {
+    let gpgx = (
+        "genesis_plus_gx",
+        "Sega 8/16-bit (Various)",
+        "Sega - Game Gear|Sega - Master System - Mark III|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis|Sega - PICO|Sega - SG-1000",
+    );
+    let pico = (
+        "picodrive",
+        "Sega 8/16-bit + 32X (Various)",
+        "Sega - Master System - Mark III|Sega - Game Gear|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis|Sega - PICO|Sega - 32X",
+    );
+    let smsplus = (
+        "smsplus",
+        "Sega 8-bit",
+        "Sega - Game Gear|Sega - Master System - Mark III",
+    );
+    let gpgx_wide = (
+        "genesis_plus_gx_wide",
+        "Sega 8/16-bit (Various)",
+        "Sega - Game Gear|Sega - Master System - Mark III|Sega - Mega-CD - Sega CD|Sega - Mega Drive - Genesis|Sega - PICO|Sega - SG-1000",
+    );
+    let supergrafx = (
+        "mednafen_supergrafx",
+        "PC Engine SuperGrafx",
+        "NEC - PC Engine SuperGrafx|NEC - PC Engine - TurboGrafx 16|NEC - PC Engine CD - TurboGrafx-CD",
+    );
+    let gearsystem = (
+        "gearsystem",
+        "Sega 8-bit (MS/GG/SG-1000)",
+        "Sega - Game Gear|Sega - Master System - Mark III|Sega - SG-1000",
+    );
+    let pce_fast = (
+        "mednafen_pce_fast",
+        "PC Engine/PCE-CD",
+        "NEC - PC Engine - TurboGrafx 16|NEC - PC Engine CD - TurboGrafx-CD",
+    );
+    let pce = (
+        "mednafen_pce",
+        "PC Engine/SuperGrafx/CD",
+        "NEC - PC Engine SuperGrafx|NEC - PC Engine - TurboGrafx 16|NEC - PC Engine CD - TurboGrafx-CD",
+    );
+    let geargrafx = (
+        "geargrafx",
+        "PC Engine/SuperGrafx",
+        "NEC - PC Engine SuperGrafx|NEC - PC Engine - TurboGrafx 16|NEC - PC Engine CD - TurboGrafx-CD",
+    );
+    let gearcoleco = ("gearcoleco", "ColecoVision", "Coleco - ColecoVision");
+    let bluemsx = (
+        "bluemsx",
+        "MSX/SVI/ColecoVision/SG-1000",
+        "Microsoft - MSX|Microsoft - MSX2|Coleco - ColecoVision|Sega - SG-1000|Spectravideo - SVI-318 - SVI-328",
+    );
+    vec![
+        (
+            "GameGear",
+            "genesis_plus_gx",
+            vec![pico, smsplus, gearsystem, gpgx_wide],
+            "x.gg",
+        ),
+        (
+            "MasterSystem",
+            "genesis_plus_gx",
+            vec![pico, smsplus, gearsystem, gpgx_wide],
+            "x.sms",
+        ),
+        ("Sega 32X", "picodrive", vec![], "x.32x"),
+        ("ColecoVision", "gearcoleco", vec![bluemsx], "x.col"),
+        (
+            "TurboGrafx-16",
+            "mednafen_pce_fast",
+            vec![pce, geargrafx, supergrafx],
+            "x.pce",
+        ),
+    ]
+    .into_iter()
+    .map(|(id, preferred, others, file)| {
+        let mut all = vec![match preferred {
+            "genesis_plus_gx" => gpgx,
+            "picodrive" => pico,
+            "gearcoleco" => gearcoleco,
+            _ => pce_fast,
+        }];
+        all.extend(others);
+        (id, preferred, all, file)
+    })
+    .collect()
+}
+
+fn cartridge_family_cores(all: &[(&'static str, &'static str, &'static str)]) -> Vec<CoreFinding> {
+    all.iter()
+        .map(|(stem, system, database)| core_finding(stem, Some(system), Some(database)))
+        .collect()
+}
+
+#[test]
+fn cartridge_family_plans_one_ready_preferred_retroarch_core() {
+    for (platform_id, preferred, all, file) in cartridge_family_rows() {
+        let plan = build_launch_plan(
+            &resolved(platform_id),
+            &cartridge_content(file),
+            &[],
+            &retroarch_environment_with_cores(cartridge_family_cores(&all)),
+            &[],
+        );
+        let ready: Vec<_> = plan
+            .candidates
+            .iter()
+            .filter(|c| c.preference == CandidatePreference::SoleEligible)
+            .collect();
+        assert_eq!(ready.len(), 1, "{platform_id}");
+        assert!(
+            matches!(
+                ready[0].target,
+                LaunchTarget::RetroArchCore { ref core_stem, platform_id: id, .. }
+                    if core_stem == preferred && id == platform_id
+            ),
+            "{platform_id}"
+        );
+        assert_eq!(ready[0].readiness, LaunchReadiness::Ready, "{platform_id}");
+        assert!(
+            !plan.candidates.iter().any(|c| c
+                .blockers
+                .iter()
+                .any(|b| b.kind == LaunchBlockerKind::AmbiguousCore)),
+            "{platform_id} must not be ambiguous"
+        );
+    }
+}
+
+#[test]
+fn cartridge_family_without_any_matching_core_is_blocked() {
+    for (platform_id, _, _, file) in cartridge_family_rows() {
+        // Only an unrelated core is installed (Atari 2600).
+        let plan = build_launch_plan(
+            &resolved(platform_id),
+            &cartridge_content(file),
+            &[],
+            &retroarch_environment_with_cores(vec![core_finding(
+                "stella",
+                Some("Atari - 2600"),
+                None,
+            )]),
+            &[],
+        );
+        assert_eq!(plan.candidates.len(), 1, "{platform_id}");
+        assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Blocked);
+        assert!(
+            plan.candidates[0]
+                .blockers
+                .iter()
+                .any(|b| b.kind == LaunchBlockerKind::NoInstallationCandidate),
+            "{platform_id}"
+        );
+    }
+}
+
+#[test]
+fn colecovision_with_missing_required_bios_still_blocks() {
+    use crate::emulator_environment::retroarch::{FirmwarePresence, FirmwareRequirement};
+    let mut core = core_finding(
+        "gearcoleco",
+        Some("ColecoVision"),
+        Some("Coleco - ColecoVision"),
+    );
+    if let CoreInfoFinding::Found { firmware, .. } = &mut core.info {
+        firmware.push(FirmwareRequirement {
+            index: 0,
+            path: Some("colecovision.rom".to_string()),
+            description: Some("ColecoVision BIOS".to_string()),
+            optional: false,
+            presence: FirmwarePresence::Missing,
+        });
+    }
+    let plan = build_launch_plan(
+        &resolved("ColecoVision"),
+        &cartridge_content("x.col"),
+        &[],
+        &retroarch_environment_with_cores(vec![core]),
+        &[],
+    );
+    assert_eq!(plan.candidates.len(), 1);
+    assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Blocked);
+    assert!(
+        plan.candidates[0]
+            .blockers
+            .iter()
+            .any(|b| b.kind == LaunchBlockerKind::RequiredFirmwareMissing)
+    );
+}
+
+#[test]
+fn turbografx16_and_pc_engine_share_cores_but_pc_engine_cd_stays_separate() {
+    use super::platform_map::{launch_compatibility_for_platform, retroarch_platform_matches};
+    let info = core_finding(
+        "mednafen_pce_fast",
+        Some("PC Engine/PCE-CD"),
+        Some("NEC - PC Engine - TurboGrafx 16|NEC - PC Engine CD - TurboGrafx-CD"),
+    )
+    .info;
+    assert!(retroarch_platform_matches(&info, "TurboGrafx-16"));
+    assert!(retroarch_platform_matches(&info, "PC Engine"));
+    // The existing standalone Mesen route for "PC Engine" is untouched.
+    let pce = launch_compatibility_for_platform("PC Engine").unwrap();
+    assert_eq!(pce.standalone_adapters, &["mesen"]);
+    assert!(pce.retroarch_core_hints.is_empty());
+    let tg16 = launch_compatibility_for_platform("TurboGrafx-16").unwrap();
+    assert!(tg16.standalone_adapters.is_empty());
+    assert_eq!(tg16.retroarch_core_hints, &["mednafen_pce_fast"]);
+    // A cartridge-only core is not a PC Engine CD core.
+    let cd_only = core_finding("x", Some("NEC - PC Engine CD"), None).info;
+    assert!(!retroarch_platform_matches(&cd_only, "TurboGrafx-16"));
+    assert!(!retroarch_platform_matches(&cd_only, "PC Engine"));
+}
+
+#[test]
+fn cartridge_family_platform_map_rows_resolve_installed_core_info() {
+    use super::platform_map::{launch_compatibility_for_platform, retroarch_platform_matches};
+    for (platform_id, preferred, all, _) in cartridge_family_rows() {
+        let row = launch_compatibility_for_platform(platform_id).expect("reviewed row");
+        assert_eq!(row.retroarch_core_hints, &[preferred], "{platform_id}");
+        assert!(row.standalone_adapters.is_empty(), "{platform_id}");
+        for (stem, system, database) in all {
+            let info = core_finding(stem, Some(system), Some(database)).info;
+            assert!(
+                retroarch_platform_matches(&info, platform_id),
+                "{stem} {platform_id}"
+            );
+        }
+    }
+}
+
+fn with_extensions(mut core: CoreFinding, extensions: &[&str]) -> CoreFinding {
+    if let CoreInfoFinding::Found {
+        supported_extensions,
+        ..
+    } = &mut core.info
+    {
+        *supported_extensions = extensions.iter().map(|e| e.to_string()).collect();
+    }
+    core
+}
+
+fn nes_cores() -> Vec<CoreFinding> {
+    let system = Some("Nintendo Entertainment System");
+    vec![
+        with_extensions(core_finding("fixnes", system, None), &["nes"]),
+        with_extensions(core_finding("quicknes", system, None), &["nes"]),
+        with_extensions(
+            core_finding("mesen", system, None),
+            &["nes", "fds", "unf", "unif"],
+        ),
+    ]
+}
+
+fn nes_content(name: &str) -> LaunchContentRef {
+    LaunchContentRef {
+        kind: Some(LaunchContentKind::Cartridge),
+        container: Some(LaunchContainerKind::PlainFile),
+        resolved_path: Some(PathBuf::from(name)),
+        requires_mount: false,
+        provenance: "plain file".into(),
+    }
+}
+
+#[test]
+fn a_disk_image_only_considers_cores_that_can_open_it() {
+    // Distros alias nestopia/fceumm to mesen (not counted as separate cores), so
+    // only fixnes, quicknes and mesen exist; only mesen lists .fds.
+    let plan = build_launch_plan(
+        &resolved("NES"),
+        &nes_content("/g/Disk (Japan).fds"),
+        &[],
+        &retroarch_environment_with_cores(nes_cores()),
+        &[],
+    );
+    assert_eq!(plan.candidates.len(), 1, "{:?}", plan.candidates);
+    let candidate = &plan.candidates[0];
+    assert!(matches!(
+        candidate.target,
+        LaunchTarget::RetroArchCore { ref core_stem, .. } if core_stem == "mesen"
+    ));
+    assert!(candidate.blockers.is_empty(), "{:?}", candidate.blockers);
+    assert_eq!(candidate.preference, CandidatePreference::SoleEligible);
+}
+
+#[test]
+fn nes_cartridges_prefer_a_reviewed_core_that_is_actually_installed() {
+    let plan = build_launch_plan(
+        &resolved("NES"),
+        &nes_content("/g/Game (USA).nes"),
+        &[],
+        &retroarch_environment_with_cores(nes_cores()),
+        &[],
+    );
+    assert_eq!(plan.candidates.len(), 3);
+    assert!(
+        plan.candidates.iter().all(|c| c
+            .blockers
+            .iter()
+            .all(|b| b.kind != LaunchBlockerKind::AmbiguousCore)),
+        "{:?}",
+        plan.candidates
+    );
+    let preferred: Vec<_> = plan
+        .candidates
+        .iter()
+        .filter(|c| c.preference == CandidatePreference::SoleEligible)
+        .collect();
+    assert_eq!(preferred.len(), 1);
+    assert!(matches!(
+        preferred[0].target,
+        LaunchTarget::RetroArchCore { ref core_stem, .. } if core_stem == "mesen"
+    ));
+}
+
+#[test]
+fn an_extension_nothing_lists_does_not_narrow_the_cores() {
+    let plan = build_launch_plan(
+        &resolved("NES"),
+        &nes_content("/g/archive.zip"),
+        &[],
+        &retroarch_environment_with_cores(nes_cores()),
+        &[],
+    );
+    assert_eq!(plan.candidates.len(), 3);
+}
+
+#[test]
+fn a_ranked_core_hint_list_picks_the_first_installed_name() {
+    // With both Nestopia and FCEUmm (and Mesen) installed, Nestopia wins; the
+    // lower-ranked names are not "ties".
+    let system = Some("Nintendo Entertainment System");
+    let cores = vec![
+        with_extensions(core_finding("mesen", system, None), &["nes", "fds"]),
+        with_extensions(core_finding("fceumm", system, None), &["nes", "fds"]),
+        with_extensions(core_finding("nestopia", system, None), &["nes", "fds"]),
+    ];
+    let plan = build_launch_plan(
+        &resolved("NES"),
+        &nes_content("/g/Game.nes"),
+        &[],
+        &retroarch_environment_with_cores(cores),
+        &[],
+    );
+    let preferred: Vec<_> = plan
+        .candidates
+        .iter()
+        .filter(|c| c.preference == CandidatePreference::SoleEligible)
+        .collect();
+    assert_eq!(preferred.len(), 1);
+    assert!(matches!(
+        preferred[0].target,
+        LaunchTarget::RetroArchCore { ref core_stem, .. } if core_stem == "nestopia"
+    ));
+}
+
+// ---------------------------------------------------------------------
+// RetroArch save-folder readiness (owner decision 2026-11-13: warn, keep Play)
+// ---------------------------------------------------------------------
+
+fn save_dir_finding(
+    purpose: crate::emulator_environment::retroarch::PathPurpose,
+    core_name: Option<&str>,
+    directory: &str,
+    status: crate::emulator_environment::retroarch::SaveDirectoryStatus,
+) -> crate::emulator_environment::retroarch::SaveDirectoryFinding {
+    use crate::emulator_environment::retroarch::PathPurpose;
+    crate::emulator_environment::retroarch::SaveDirectoryFinding {
+        purpose,
+        config_key: if purpose == PathPurpose::Saves {
+            "savefile_directory"
+        } else {
+            "savestate_directory"
+        },
+        core_name: core_name.map(str::to_string),
+        settings_file: EncodedPath::from_path(&PathBuf::from(match core_name {
+            Some(core) => format!("/home/user/.config/retroarch/config/{core}/{core}.cfg"),
+            None => "/home/user/.config/retroarch/retroarch.cfg".into(),
+        })),
+        directory: Some(EncodedPath::from_path(&PathBuf::from(directory))),
+        status,
+    }
+}
+
+fn snes_plan_with_save_dirs(
+    findings: Vec<crate::emulator_environment::retroarch::SaveDirectoryFinding>,
+    firmware: Vec<crate::emulator_environment::retroarch::FirmwareRequirement>,
+) -> LaunchPlan {
+    let mut core = core_finding("snes9x", Some("Nintendo - SNES / SFC"), None);
+    if let CoreInfoFinding::Found { firmware: f, .. } = &mut core.info {
+        *f = firmware;
+    }
+    let mut environment = retroarch_environment_with_cores(vec![core]);
+    environment.profiles[0].save_directories = findings;
+    build_launch_plan(
+        &resolved("SNES"),
+        &resolved_content(),
+        &[],
+        &environment,
+        &[],
+    )
+}
+
+#[test]
+fn unusable_save_folders_warn_with_path_and_remedy_but_keep_play() {
+    use crate::emulator_environment::retroarch::{PathPurpose, SaveDirectoryStatus};
+    for (status, reason) in [
+        (SaveDirectoryStatus::Missing, "does not exist"),
+        (SaveDirectoryStatus::NotWritable, "cannot be written"),
+        (SaveDirectoryStatus::Symlink, "symbolic link"),
+        (SaveDirectoryStatus::Uncheckable, "could not check"),
+        (SaveDirectoryStatus::NotADirectory, "is not a folder"),
+    ] {
+        let plan = snes_plan_with_save_dirs(
+            vec![save_dir_finding(
+                PathPurpose::Saves,
+                None,
+                "/gone/saves",
+                status,
+            )],
+            Vec::new(),
+        );
+        let candidate = &plan.candidates[0];
+        assert_eq!(
+            candidate.readiness,
+            LaunchReadiness::ReadyWithWarnings,
+            "{status:?}"
+        );
+        assert!(candidate.blockers.is_empty(), "{status:?}");
+        assert!(
+            candidate.retroarch_play_eligible(),
+            "{status:?}: Play stays available"
+        );
+        let warning = candidate
+            .warnings
+            .iter()
+            .find(|w| w.kind == LaunchWarningKind::RetroArchSaveDirectoryUnusable)
+            .expect("save-folder warning");
+        let text = &warning.detail;
+        assert!(
+            text.starts_with("In-game progress may fail to save."),
+            "{text}"
+        );
+        assert!(
+            text.contains("/gone/saves") && text.contains("savefile_directory"),
+            "{text}"
+        );
+        assert!(text.contains(reason), "{text}");
+        assert!(text.contains("Settings > Directory > Save Files"), "{text}");
+    }
+}
+
+#[test]
+fn per_core_override_wins_over_retroarch_cfg_and_usable_folders_are_silent() {
+    use crate::emulator_environment::retroarch::{PathPurpose, SaveDirectoryStatus};
+    // retroarch.cfg's state folder is fine, but snes9x's override points at a
+    // missing one: the override is what the launch would use.
+    let plan = snes_plan_with_save_dirs(
+        vec![
+            save_dir_finding(
+                PathPurpose::Saves,
+                None,
+                "/ok/saves",
+                SaveDirectoryStatus::Usable,
+            ),
+            save_dir_finding(
+                PathPurpose::SaveStates,
+                None,
+                "/ok/states",
+                SaveDirectoryStatus::Usable,
+            ),
+            save_dir_finding(
+                PathPurpose::SaveStates,
+                Some("snes9x"),
+                "/gone/states",
+                SaveDirectoryStatus::Missing,
+            ),
+            // Another core's broken override never affects snes9x.
+            save_dir_finding(
+                PathPurpose::Saves,
+                Some("mgba"),
+                "/x",
+                SaveDirectoryStatus::Missing,
+            ),
+        ],
+        Vec::new(),
+    );
+    let warnings: Vec<_> = plan.candidates[0]
+        .warnings
+        .iter()
+        .filter(|w| w.kind == LaunchWarningKind::RetroArchSaveDirectoryUnusable)
+        .collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let text = &warnings[0].detail;
+    assert!(text.starts_with("Save states may fail to save."), "{text}");
+    assert!(
+        text.contains("/gone/states") && text.contains("snes9x core override"),
+        "{text}"
+    );
+
+    let fine = snes_plan_with_save_dirs(
+        vec![save_dir_finding(
+            PathPurpose::Saves,
+            None,
+            "/ok",
+            SaveDirectoryStatus::Usable,
+        )],
+        Vec::new(),
+    );
+    assert_eq!(fine.candidates[0].readiness, LaunchReadiness::Ready);
+}
+
+#[test]
+fn save_folder_warning_never_hides_a_real_blocker_or_firmware_rule() {
+    use crate::emulator_environment::retroarch::{
+        FirmwarePresence, FirmwareRequirement, PathPurpose, SaveDirectoryStatus,
+    };
+    let broken = || {
+        vec![save_dir_finding(
+            PathPurpose::Saves,
+            None,
+            "/gone",
+            SaveDirectoryStatus::Missing,
+        )]
+    };
+    let required = |presence| {
+        vec![FirmwareRequirement {
+            index: 0,
+            path: Some("bios.bin".into()),
+            description: None,
+            optional: false,
+            presence,
+        }]
+    };
+    // Missing firmware still blocks.
+    let plan = snes_plan_with_save_dirs(broken(), required(FirmwarePresence::Missing));
+    assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Blocked);
+    assert!(!plan.candidates[0].retroarch_play_eligible());
+    // Unverified firmware keeps its own rule alongside the save warning.
+    let plan = snes_plan_with_save_dirs(broken(), required(FirmwarePresence::PresentUnverified));
+    assert!(plan.candidates[0].retroarch_play_eligible());
+    // A non-allow-listed warning still withdraws Play even with a save warning.
+    let mut candidate = snes_plan_with_save_dirs(broken(), Vec::new()).candidates[0].clone();
+    candidate.warnings.push(LaunchWarning::new(
+        LaunchWarningKind::MultipleEligibleProfiles,
+        "fixture",
+    ));
+    assert!(!candidate.retroarch_play_eligible());
 }

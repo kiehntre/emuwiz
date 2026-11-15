@@ -1915,6 +1915,7 @@ pub(super) fn show_history_logs_page(
     filters: &mut HistoryLogFilters,
     clipboard: &mut dyn ClipboardBackend,
     database_restore_plan: &mut Option<archivefs_core::DatabaseRestorePlan>,
+    database_rollback_receipt: &mut Option<archivefs_core::DatabaseRestoreReceipt>,
     database_restore_confirmation: &mut String,
     database_restore_feedback: &mut Option<String>,
     database_busy: bool,
@@ -2145,6 +2146,7 @@ pub(super) fn show_history_logs_page(
     show_operation_receipts(
         ui,
         database_restore_plan,
+        database_rollback_receipt,
         database_restore_confirmation,
         database_restore_feedback,
         database_busy,
@@ -2398,6 +2400,7 @@ pub(super) fn show_history_logs_page(
 fn show_operation_receipts(
     ui: &mut egui::Ui,
     restore_plan: &mut Option<archivefs_core::DatabaseRestorePlan>,
+    rollback_receipt: &mut Option<archivefs_core::DatabaseRestoreReceipt>,
     confirmation: &mut String,
     feedback: &mut Option<String>,
     database_busy: bool,
@@ -2472,8 +2475,14 @@ fn show_operation_receipts(
                 "Backup schema: {} · Current schema: {}",
                 plan.backup_schema_version, plan.current_live_schema_version
             ));
+            if plan.requires_upgrade() {
+                ui.label(format!(
+                    "This backup is older than the current layout: a staging copy will be upgraded through {} migration(s) and verified before it replaces anything. The backup file itself is only read.",
+                    plan.pending_migrations.len()
+                ));
+            }
             ui.label("A fresh emergency backup of the current database will be mandatory immediately before replacement.");
-            ui.label("Risks: the application must be idle; restart may be required for other processes holding the database.");
+            ui.label("Safety: the restore takes the database lock, refuses if any scan or action is writing, and leaves the original intact on any failure. Other EmuWiz windows must be restarted afterwards.");
             ui.add(egui::TextEdit::singleline(confirmation).hint_text("Type RESTORE DATABASE"));
             if widgets::action_button(
                 ui,
@@ -2493,6 +2502,41 @@ fn show_operation_receipts(
         });
         if cancel_review {
             *restore_plan = None;
+            confirmation.clear();
+        }
+    }
+    if let Some(receipt) = rollback_receipt.as_ref() {
+        let mut cancel_review = false;
+        widgets::card(ui, |ui| {
+            widgets::status_badge(ui, "Review rollback", widgets::StatusTone::Warning);
+            ui.strong("Put the pre-restore database back from its verified emergency backup.");
+            ui.label(format!("Restore: {}", receipt.operation_id));
+            if let Some(path) = receipt.emergency_backup_path.as_ref() {
+                ui.label(format!("Emergency backup: {}", path.display()));
+            }
+            if let Some(sha) = receipt.emergency_backup_sha256.as_deref() {
+                ui.label(format!("Emergency backup SHA-256: {sha}"));
+            }
+            ui.label("The rollback is refused if the restored database has changed since the restore completed, or if any scan or action is writing.");
+            ui.add(egui::TextEdit::singleline(confirmation).hint_text("Type RESTORE DATABASE"));
+            if widgets::action_button(
+                ui,
+                "Roll back restore",
+                widgets::ActionStyle::Destructive,
+                !database_busy && confirmation == "RESTORE DATABASE",
+            )
+            .clicked()
+            {
+                *action = Some(HistoryPageAction::ExecuteDatabaseRollback);
+            }
+            if widgets::action_button(ui, "Cancel review", widgets::ActionStyle::Quiet, true)
+                .clicked()
+            {
+                cancel_review = true;
+            }
+        });
+        if cancel_review {
+            *rollback_receipt = None;
             confirmation.clear();
         }
     }
@@ -2532,6 +2576,41 @@ fn show_operation_receipts(
                 {
                     *action = Some(HistoryPageAction::ReviewDatabaseRestore {
                         backup_path: backup_path.expect("enabled backup path"),
+                    });
+                }
+            }
+            if record.kind == archivefs_core::operation::OperationKind::DatabaseRecovery {
+                let receipt_path = record.output.journal_reference.as_ref().map(PathBuf::from);
+                let rollback_offered = record.recovery.actions.rollback
+                    == archivefs_core::operation::ActionAvailability::Available;
+                let reconcile_offered = record.state
+                    == archivefs_core::operation::OperationState::Interrupted
+                    && record.recovery.actions.review
+                        == archivefs_core::operation::ActionAvailability::Available;
+                if rollback_offered
+                    && widgets::action_button(
+                        ui,
+                        "Review rollback",
+                        widgets::ActionStyle::Secondary,
+                        receipt_path.is_some() && !database_busy,
+                    )
+                    .clicked()
+                {
+                    *action = Some(HistoryPageAction::ReviewDatabaseRollback {
+                        receipt_path: receipt_path.clone().expect("enabled receipt path"),
+                    });
+                }
+                if reconcile_offered
+                    && widgets::action_button(
+                        ui,
+                        "Reconcile interrupted restore",
+                        widgets::ActionStyle::Secondary,
+                        receipt_path.is_some() && !database_busy,
+                    )
+                    .clicked()
+                {
+                    *action = Some(HistoryPageAction::ReconcileInterruptedRestore {
+                        receipt_path: receipt_path.expect("enabled receipt path"),
                     });
                 }
             }

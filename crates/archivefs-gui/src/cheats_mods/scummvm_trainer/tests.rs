@@ -627,3 +627,16 @@ fn scummvm_gui_workers_keep_history_and_backups_in_test_machine() {
     );
     f.assert_game_untouched();
 }
+
+#[test]
+fn apply_result_shows_shared_transaction_warnings() {
+    use crate::shared_apply_warnings::test_support::{assert_shows_warning, warned_result};
+    let (tx, rx) = mpsc::channel();
+    let mut state = State {
+        pending: Some(rx),
+        ..Default::default()
+    };
+    tx.send(Ok(Completed::Applied(warned_result()))).unwrap();
+    state.poll();
+    assert_shows_warning(state.status.as_deref().unwrap());
+}

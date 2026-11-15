@@ -361,6 +361,7 @@ fn stale_unsupported_fingerprints_are_re_evaluated_only_for_newly_stored_extensi
         (1, fingerprint(&still_ambiguous, "ambiguous")),
     ];
     let config = Config {
+        configured_source_roots: None,
         source_folders: vec![root.clone()],
         mount_root: dir.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),
@@ -466,6 +467,7 @@ fn detector_assigned_shared_signature_rows_are_re_evaluated_not_reused() {
         }
     };
     let config = Config {
+        configured_source_roots: None,
         source_folders: vec![root.clone()],
         mount_root: dir.path().join("mount"),
         ratarmount_bin: "ratarmount".into(),

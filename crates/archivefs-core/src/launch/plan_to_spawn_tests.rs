@@ -186,6 +186,7 @@ fn build_wired(label: &str, extra_cores: &[&str]) -> Wired {
     };
     assert_eq!(profile.profile_kind, ProfileKind::Native);
     let request = RetroArchLaunchRequest {
+        launch_choice: None,
         selected_content_path: content.clone(),
         expected_platform_id: plan.platform_id.clone().unwrap(),
         expected_game_key: plan.game_key.clone().unwrap(),

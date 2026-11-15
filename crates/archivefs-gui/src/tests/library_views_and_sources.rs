@@ -959,6 +959,43 @@ fn sources_page_renders_without_panicking_while_a_source_action_is_running() {
 }
 
 #[test]
+fn failed_scan_reloads_saved_status_but_other_failures_do_not() {
+    // A scan can commit part of its work before failing, so its failure must
+    // reload saved status (read-only); a refused non-scan action need not.
+    for (action, reloads) in [
+        (SourceAction::ScanOne(PathBuf::from("/games")), true),
+        (SourceAction::ScanAll, true),
+        (
+            SourceAction::SetEnabled {
+                path: PathBuf::from("/games"),
+                enabled: false,
+            },
+            false,
+        ),
+    ] {
+        let mut app = app_for_operation_tests();
+        assert!(!app.database_state.is_loading());
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Err("config error: parse MAME XML".to_string()))
+            .unwrap();
+        app.sources_ui.source_action = Some(RunningSourceAction {
+            action: action.clone(),
+            receiver,
+            worker: None,
+        });
+        app.poll_source_action(&egui::Context::default());
+        assert!(app.sources_ui.source_action.is_none());
+        assert!(!app.feedback.as_ref().unwrap().succeeded);
+        assert_eq!(
+            app.database_state.is_loading(),
+            reloads,
+            "{action:?} reload after failure"
+        );
+    }
+}
+
+#[test]
 fn source_action_available_requires_no_running_action_or_database_load() {
     let mut app = app_for_operation_tests();
     assert!(app.source_action_available());

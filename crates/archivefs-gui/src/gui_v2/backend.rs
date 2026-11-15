@@ -53,8 +53,12 @@ pub(super) struct Preferences {
     /// Interface scale used with the Simple v1 shell; 1.0 when absent.
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
-    /// How Favourites and collections are listed.
-    #[serde(default)]
+    /// How Favourites and collections are listed. The default is not
+    /// written, so a first-start save is unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "super::collections::CollectionSort::is_default"
+    )]
     pub collection_sort: super::collections::CollectionSort,
 }
 
@@ -179,6 +183,10 @@ pub(super) enum Command {
         library: SharedLibrary,
         key: usize,
     },
+    DiscLookup {
+        library: SharedLibrary,
+        game: i64,
+    },
     MissingPreview,
     MissingApply {
         token: String,
@@ -186,6 +194,8 @@ pub(super) enum Command {
     MissingUndo {
         receipt: PathBuf,
     },
+    /// Read-only: forget-missing receipts on disk that can still be undone.
+    MissingReceipts,
     OpenFolder(PathBuf),
     /// Create the starter configuration the person confirmed, at `expected`.
     CreateStarterConfig {
@@ -206,6 +216,9 @@ pub(super) enum Command {
     PlayingLibraryPreview {
         state: Box<PlayingLibraryPageState>,
         generation: u64,
+        /// The Activity cancel flag: a preview only reads, so it may stop
+        /// between files (Night Watch S11-04).
+        cancel: Arc<AtomicBool>,
     },
     PlayingLibraryApply {
         state: Box<PlayingLibraryPageState>,
@@ -235,6 +248,37 @@ pub(super) enum Command {
         root: std::path::PathBuf,
         target: super::save_snapshots::SnapshotTarget,
     },
+    CardRestore(Box<super::card_restore::Job>),
+    SingleFileRestore(Box<super::single_file_restore::Job>),
+    /// Test only: holds the worker until `gate` is released, so queue order
+    /// can be observed deterministically.
+    #[cfg(test)]
+    Block(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>),
+}
+
+impl Command {
+    /// Undo and recovery commands jump the queue: they run before any other
+    /// command still waiting, though never alongside one (Night Watch S11-04).
+    /// They are all small, and a person asking to put something back should
+    /// not wait behind a long preview queued earlier.
+    pub(super) fn is_recovery(&self) -> bool {
+        matches!(
+            self,
+            Command::UndoDuplicateRepair { .. }
+                | Command::MissingUndo { .. }
+                | Command::CanonicalOrganisation {
+                    kind: super::CanonicalOrganisationJobKind::Rollback,
+                    ..
+                }
+                | Command::PlayingLibrarySpecial {
+                    kind: super::PlayingLibraryJobKind::Rollback
+                        | super::PlayingLibraryJobKind::RollbackRomm
+                        | super::PlayingLibraryJobKind::RollbackRetroDeck
+                        | super::PlayingLibraryJobKind::RecoverEsde,
+                    ..
+                }
+        )
+    }
 }
 
 pub(super) enum Payload {
@@ -288,9 +332,11 @@ pub(super) enum Payload {
     ReconciliationHashes(super::library_reconciliation::HashRun),
     ReconciliationSupportCheck(Box<super::library_reconciliation::SupportCheckRun>),
     MediaSetReview(Box<super::media_sets::MediaSetReview>),
+    DiscLookup(Option<Box<super::game_detail_facts::DiscLookup>>),
     MissingPreview(Box<archivefs_core::catalogue_health::ForgetMissingPlan>),
     MissingApplied(Box<archivefs_core::catalogue_health::ForgetMissingResult>),
     MissingUndone(usize),
+    MissingReceipts(Vec<archivefs_core::catalogue_health::ForgetMissingReceiptSummary>),
     Preferences(Preferences),
     Done,
     PlayingLibraryPreview {
@@ -322,6 +368,8 @@ pub(super) enum Payload {
     SaveSnapshotCreated {
         result: Result<String, String>,
     },
+    CardRestore(Box<super::card_restore::Outcome>),
+    SingleFileRestore(Box<super::single_file_restore::Outcome>),
 }
 
 #[derive(Clone, Debug)]
@@ -363,17 +411,57 @@ pub(super) struct VerificationResult {
     pub statuses: HashMap<i64, String>,
 }
 
+/// The two waiting lines for the one worker: recovery commands first, then
+/// everything else in the order it was asked for. One token per queued
+/// command travels over `wake`, so the worker never spins and exits when the
+/// `Backend` is dropped.
+#[derive(Default)]
+struct Queues {
+    recovery: std::collections::VecDeque<(u64, Command)>,
+    ordinary: std::collections::VecDeque<(u64, Command)>,
+}
+
+impl Queues {
+    fn push(&mut self, id: u64, command: Command) {
+        if command.is_recovery() {
+            self.recovery.push_back((id, command));
+        } else {
+            self.ordinary.push_back((id, command));
+        }
+    }
+    fn pop(&mut self) -> Option<(u64, Command)> {
+        self.recovery
+            .pop_front()
+            .or_else(|| self.ordinary.pop_front())
+    }
+}
+
 pub(super) struct Backend {
-    tx: Sender<(u64, Command)>,
+    queues: Arc<std::sync::Mutex<Queues>>,
+    wake: Sender<()>,
+    /// Test seam: a raw request channel standing in for the worker, so a
+    /// test can read the exact command the App sent. Never set in production.
+    raw: Option<Sender<(u64, Command)>>,
     pub rx: Receiver<Event>,
 }
 
 impl Backend {
     pub fn start(context: eframe::egui::Context) -> Self {
-        let (tx, requests) = mpsc::channel();
+        let (wake, tokens) = mpsc::channel::<()>();
         let (answers, rx) = mpsc::channel();
+        let queues = Arc::new(std::sync::Mutex::new(Queues::default()));
+        let worker_queues = Arc::clone(&queues);
         std::thread::spawn(move || {
-            while let Ok((id, command)) = requests.recv() {
+            while tokens.recv().is_ok() {
+                // One token was sent per queued command, so there is always
+                // something to take; recovery work is taken first.
+                let Some((id, command)) = worker_queues
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .pop()
+                else {
+                    continue;
+                };
                 if answers.send(Event::Started(id)).is_err() {
                     break;
                 }
@@ -389,18 +477,58 @@ impl Backend {
                 context.request_repaint();
             }
         });
-        Self { tx, rx }
+        Self {
+            queues,
+            wake,
+            raw: None,
+            rx,
+        }
+    }
+    /// A backend whose "worker" is the test: every command goes straight to
+    /// `requests`, and the test answers on the paired `Event` sender.
+    #[cfg(test)]
+    pub fn with_channels(requests: Sender<(u64, Command)>, rx: Receiver<Event>) -> Self {
+        let (wake, _) = mpsc::channel();
+        Self {
+            queues: Arc::new(std::sync::Mutex::new(Queues::default())),
+            wake,
+            raw: Some(requests),
+            rx,
+        }
     }
     /// A backend whose worker is gone: every command is refused before it can
     /// run. Tests use it so nothing reaches the real catalogue or sources.
     #[cfg(test)]
     pub fn disconnected() -> Self {
-        let (tx, _) = mpsc::channel();
+        let (wake, _) = mpsc::channel();
         let (_, rx) = mpsc::channel();
-        Self { tx, rx }
+        Self {
+            queues: Arc::new(std::sync::Mutex::new(Queues::default())),
+            wake,
+            raw: None,
+            rx,
+        }
     }
     pub fn send(&self, id: u64, command: Command) -> Result<(), String> {
-        self.tx.send((id, command)).map_err(|_| "The background worker is unavailable. Close and reopen GUI v2; your games have not been changed.".into())
+        const GONE: &str = "The background worker is unavailable. Close and reopen GUI v2; your games have not been changed.";
+        if let Some(raw) = &self.raw {
+            return raw.send((id, command)).map_err(|_| GONE.into());
+        }
+        self.queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(id, command);
+        if self.wake.send(()).is_err() {
+            // Nobody will ever take it; do not leave it waiting forever.
+            let mut queues = self
+                .queues
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queues.recovery.retain(|(queued, _)| *queued != id);
+            queues.ordinary.retain(|(queued, _)| *queued != id);
+            return Err(GONE.into());
+        }
+        Ok(())
     }
 }
 
@@ -419,6 +547,9 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
         Command::MediaSetReview { library, key } => Ok(Payload::MediaSetReview(Box::new(
             super::media_sets::analyse(&library, key),
         ))),
+        Command::DiscLookup { library, game } => Ok(Payload::DiscLookup(
+            super::game_detail_facts::look_up(&library, game).map(Box::new),
+        )),
         Command::ReconcileLibrary {
             library,
             hashes,
@@ -465,6 +596,9 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
         ))),
         Command::MissingUndo { receipt } => Ok(Payload::MissingUndone(
             super::missing_review::undo(&receipt)?,
+        )),
+        Command::MissingReceipts => Ok(Payload::MissingReceipts(
+            super::missing_review::undoable_receipts(),
         )),
         Command::EnvironmentCheck => Ok(Payload::Environment(crate::gui_v2::environment::gather())),
         Command::LoadRommLibrary => Ok(Payload::RommLibrary(
@@ -515,10 +649,12 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             })
         }
         Command::Load { scan } => {
+            let mut scan_note = None;
             let scan_warning = if scan {
                 let summary = archivefs_core::scan_all_enabled_sources_default()
                     .map_err(|error| error.to_string())?;
-                (!summary.folder_errors.is_empty()).then(|| format!("{} game folders could not be read. Their previous entries were kept. Reconnect the drive or review Sources, then scan again.", summary.folder_errors.len()))
+                scan_note = scan_mount_note(&summary);
+                scan_warning_text(&summary)
             } else {
                 None
             };
@@ -529,6 +665,7 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             let mut library = load_library(&path)?;
             library.sources = sources;
             library.scan_warning = scan_warning;
+            library.scan_note = scan_note;
             Ok(Payload::Library(Arc::new(library)))
         }
         Command::Filter {
@@ -769,6 +906,17 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 journal_dir: preview.journal_dir,
             })))
         }
+        #[cfg(test)]
+        Command::Block(gate) => {
+            let (open, signal) = &*gate;
+            let mut open = open.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*open {
+                open = signal
+                    .wait(open)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            Ok(Payload::Done)
+        }
         Command::UndoDuplicateRepair {
             record,
             cancel,
@@ -843,8 +991,13 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
         Command::PlayingLibraryPreview {
             mut state,
             generation,
+            cancel,
         } => {
-            state.preview();
+            // A cancelled preview only read files: drop it and keep the
+            // person's previous plan exactly as it was.
+            if !state.preview_cancellable(&cancel) {
+                return Err(super::activity::CANCELLED.to_string());
+            }
             Ok(Payload::PlayingLibraryPreview { state, generation })
         }
         Command::PlayingLibraryApply {
@@ -908,6 +1061,11 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                     reporter.flush();
                     state.rollback();
                 }
+                super::CanonicalOrganisationJobKind::Rescan => {
+                    reporter.phase("Finding your game files", "folders", None);
+                    reporter.flush();
+                    state.rescan_sources();
+                }
             }
             Ok(Payload::CanonicalOrganisation {
                 state,
@@ -930,9 +1088,19 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 &root,
                 &targets,
                 &archivefs_core::save_snapshots::history::default_closure_observer(),
+                archivefs_core::save_snapshots::default_single_file_restore_roots()
+                    .ok()
+                    .as_ref()
+                    .map(|(backups, receipts)| (receipts.as_path(), backups.as_path())),
             ),
             generation,
         }),
+        Command::SingleFileRestore(job) => Ok(Payload::SingleFileRestore(Box::new(
+            super::single_file_restore::run(*job),
+        ))),
+        Command::CardRestore(job) => Ok(Payload::CardRestore(Box::new(super::card_restore::run(
+            *job,
+        )))),
         Command::CreateSaveSnapshot { root, target } => Ok(Payload::SaveSnapshotCreated {
             result: super::save_snapshots::create(
                 &root,
@@ -940,6 +1108,82 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 &archivefs_core::save_snapshots::history::default_closure_observer(),
             ),
         }),
+    }
+}
+
+/// The Activity/notice text for a scan that saved but left folders, or
+/// archive mounts inside them, partly or wholly unread. Names the first real
+/// reason: "reconnect the drive" is wrong when the drive is present.
+pub(super) fn scan_warning_text(summary: &archivefs_core::ScanPersistSummary) -> Option<String> {
+    let mut parts = Vec::new();
+    let folder_errors = &summary.folder_errors;
+    if let Some((path, reason)) = folder_errors.first() {
+        parts.push(format!(
+            "{} game folder{} not fully scanned. Everything else was saved; entries EmuWiz could not check were kept, not marked missing. {}: {}{}",
+            folder_errors.len(),
+            if folder_errors.len() == 1 { " was" } else { "s were" },
+            path.display(),
+            reason,
+            more_text(folder_errors.len()),
+        ));
+    }
+    let attention: Vec<_> = summary
+        .nested_mounts
+        .iter()
+        .filter(|mount| {
+            use archivefs_core::NestedMountState::*;
+            matches!(mount.state, Incomplete | Unavailable | Unsupported | Failed)
+        })
+        .collect();
+    if let Some(first) = attention.first() {
+        parts.push(format!(
+            "{} mounted folder{} inside your game folders {} not fully read; {} games were kept, not marked missing. {}: {}{}",
+            attention.len(),
+            if attention.len() == 1 { "" } else { "s" },
+            if attention.len() == 1 { "was" } else { "were" },
+            if attention.len() == 1 { "its" } else { "their" },
+            first.path.display(),
+            first.detail.as_deref().unwrap_or("not read"),
+            more_text(attention.len()),
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Informational line for archive mounts that were read: how many games
+/// they hold, and whether missing games there wait for the next scan.
+pub(super) fn scan_mount_note(summary: &archivefs_core::ScanPersistSummary) -> Option<String> {
+    let indexed: Vec<_> = summary
+        .nested_mounts
+        .iter()
+        .filter(|mount| mount.state.indexed())
+        .collect();
+    if indexed.is_empty() {
+        return None;
+    }
+    let games: usize = indexed.iter().map(|mount| mount.archives).sum();
+    let waiting = indexed
+        .iter()
+        .filter(|mount| !mount.state.reconciled())
+        .count();
+    Some(format!(
+        "Read {} mounted archive folder{} ({games} games).{}",
+        indexed.len(),
+        if indexed.len() == 1 { "" } else { "s" },
+        match waiting {
+            0 => String::new(),
+            n => format!(
+                " {n} {} new or changed, so missing games there are checked from the next scan.",
+                if n == 1 { "is" } else { "are" }
+            ),
+        }
+    ))
+}
+
+fn more_text(count: usize) -> String {
+    match count {
+        0 | 1 => String::new(),
+        n => format!(" ({} more in the scan details)", n - 1),
     }
 }
 
@@ -1001,7 +1245,13 @@ pub(super) fn load_library_with_catalogues(
     .filter(|result| !result.stale)
     .filter_map(|result| result.archive_id)
     .collect();
-    let mut library = Library::with_history(archives, &renames, Some(&configured));
+    // An old-location row is retired only when its path is confirmed absent;
+    // any other error (permission, I/O) keeps it listed.
+    let mut library =
+        Library::with_history_retiring(archives, &renames, Some(&configured), |path| {
+            std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        });
     library.identity_context = super::library::IdentityContext {
         inventory: crate::dat_catalogue_picker::reference_inventory(),
         matched,
@@ -1015,6 +1265,11 @@ pub(super) fn load_library_with_catalogues(
             library.games[index].mark_dat_exact(ecosystem);
             library.games[index].dat_exact_hashes =
                 dat_evidence.exact_hashes.get(&archive_id).cloned();
+        }
+    }
+    for (archive_id, hashes) in dat_evidence.current_hashes {
+        if let Some(index) = library.by_id.get(&archive_id).copied() {
+            library.games[index].saved_hashes = Some(hashes);
         }
     }
     // Other saved DAT evidence, shown as such; never a verification.
@@ -1076,12 +1331,24 @@ fn load_detail(game: &Game) -> Result<Detail, String> {
             .collect();
     installed.sort();
     installed.dedup();
+    // Only for the same file the audit saw; a changed file gets no saved region.
+    let dat_region = checks.iter().filter(|_| unchanged).find_map(|check| {
+        matches!(
+            check.verification_state,
+            archivefs_core::dat::library_identity_summary::DatVerificationState::VerifiedSingleMatch { .. }
+        )
+        .then_some(())?;
+        (check.audited_hashes.size_bytes == game.archive.size_bytes).then_some(())?;
+        let region = check.canonical.region.clone()?;
+        Some((region, check.source.source_name.clone()))
+    });
     Ok(Detail {
         game: game.archive.id,
         file_present: metadata.is_some(),
         unchanged,
         saved_checks: checks.len(),
         installed,
+        dat_region,
         technical: format!(
             "Saved health: {}\nSaved checks: {}\n{}",
             game.archive.last_known_health,
@@ -1122,7 +1389,8 @@ pub(super) fn create_mount_root_at(expected: &Path) -> Result<(), String> {
 }
 
 fn preferences_path() -> Result<PathBuf, String> {
-    archivefs_core::app_dirs::config_path("gui-v2.json").map_err(|error| error.to_string())
+    archivefs_core::app_dirs::config_path(archivefs_core::app_dirs::GUI_PREFERENCES_FILE)
+        .map_err(|error| error.to_string())
 }
 
 pub(super) fn save_preferences(path: &Path, preferences: &Preferences) -> Result<(), String> {

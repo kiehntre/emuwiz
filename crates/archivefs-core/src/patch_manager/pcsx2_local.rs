@@ -36,6 +36,12 @@ use super::destination_safety::{
 };
 use super::pcsx2::{normalize_crc, parse_patch_identity};
 
+mod memcard_slots;
+pub use memcard_slots::{
+    Pcsx2MemcardSlot, Pcsx2MemcardSlotSource, Pcsx2MemcardSlotState, Pcsx2MemcardSlots,
+    resolve_pcsx2_memcard_slots,
+};
+
 pub const PCSX2_MAX_PROFILES: usize = 16;
 pub const PCSX2_MAX_PATCH_DIRECTORIES_PER_PROFILE: usize = 4;
 pub const PCSX2_MAX_DIRECTORIES_TRAVERSED: usize = 256;
@@ -715,6 +721,7 @@ fn discover_pcsx2_local_executables(roots: &Pcsx2ProfileDiscoveryRoots) -> Vec<P
     paths.extend(appimages.iter().map(|found| found.path.clone()));
     paths.sort();
     paths.dedup();
+    crate::path_alias::dedup_by_real_path(&mut paths, |entry| entry.as_path());
     let mut executables: Vec<Pcsx2Executable> = paths
         .into_iter()
         .filter(|path| is_regular_file_no_follow(path))
@@ -2071,6 +2078,9 @@ pub struct Pcsx2Settings {
     /// Section names actually observed (bounded), used only to derive
     /// [`Pcsx2ControllerInfo`] - never treated as settings themselves.
     controller_sections: Vec<String>,
+    /// Bounded raw `(section, key, value)` memory-card slot settings, kept
+    /// verbatim (including repeats) for [`resolve_pcsx2_memcard_slots`].
+    memcard_values: Vec<(String, String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2086,7 +2096,7 @@ pub struct Pcsx2Config {
 /// `inis/PCSX2.ini` and falling back to the older `PCSX2.ini` directly at
 /// the profile root (the same two locations `inspect_pcsx2_marker`,
 /// above, already treats as equally valid PCSX2 evidence).
-fn pcsx2_global_config_path(configuration_path: &Path) -> PathBuf {
+pub(super) fn pcsx2_global_config_path(configuration_path: &Path) -> PathBuf {
     let modern = configuration_path.join("inis/PCSX2.ini");
     if is_regular_file_no_follow(&modern) {
         modern
@@ -2095,7 +2105,7 @@ fn pcsx2_global_config_path(configuration_path: &Path) -> PathBuf {
     }
 }
 
-fn inspect_pcsx2_config(path: &Path) -> Pcsx2Config {
+pub(super) fn inspect_pcsx2_config(path: &Path) -> Pcsx2Config {
     let exists = path.exists();
     let mut warnings = Vec::new();
     let text = match read_bounded_text(path, PCSX2_MAX_CONFIG_BYTES) {
@@ -2176,6 +2186,13 @@ fn parse_pcsx2_ini(text: &str, warnings: &mut Vec<String>) -> Pcsx2Settings {
         let value = value.trim();
         if key.is_empty() {
             continue;
+        }
+        if memcard_slots::is_memcard_setting(&section, key)
+            && settings.memcard_values.len() < memcard_slots::MAX_RETAINED_MEMCARD_VALUES
+        {
+            settings
+                .memcard_values
+                .push((section.clone(), key.to_string(), value.to_string()));
         }
         apply_pcsx2_setting(&mut settings, &section, key, value);
     }
@@ -2564,6 +2581,8 @@ pub struct Pcsx2GameInspection {
     pub patch_match: Option<Pcsx2MatchResult>,
     pub textures: Option<Pcsx2TextureInventory>,
     pub memcards: Vec<Pcsx2MemcardInfo>,
+    /// Which cards PCSX2's settings assign to Slot 1 and Slot 2.
+    pub memcard_slots: Pcsx2MemcardSlots,
     pub savestates: Pcsx2SaveStateInventory,
     pub controllers: Pcsx2ControllerInfo,
     pub bios: Pcsx2BiosInfo,
@@ -2629,6 +2648,11 @@ pub fn inspect_pcsx2_game(
         &profile.configuration_path.join("memcards"),
         serial.as_deref(),
     );
+    let memcard_slots = resolve_pcsx2_memcard_slots(
+        &profile.configuration_path,
+        &global_config,
+        per_game_config.as_ref(),
+    );
     let savestates = inspect_pcsx2_savestates(
         &profile.configuration_path.join("sstates"),
         serial.as_deref(),
@@ -2660,6 +2684,7 @@ pub fn inspect_pcsx2_game(
         patch_match,
         textures,
         memcards,
+        memcard_slots,
         savestates,
         controllers,
         bios,

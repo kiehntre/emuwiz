@@ -128,27 +128,27 @@ fn verification_actions_reuse_existing_routes_and_preserve_saved_state() {
     for (existing, label, route) in [
         (
             VerificationAction::SelectDat,
-            "Choose DAT",
+            "Set up verification",
             Route::PlatformCheck("Amiga".into()),
         ),
         (
             VerificationAction::Validate,
-            "Choose DAT",
+            "Set up verification",
             Route::Section(Section::Dat),
         ),
         (
             VerificationAction::Audit,
-            "Verify",
-            Route::PlatformCheck("Amiga".into()),
+            "Verify this game",
+            Route::GameCheck(game.archive.id),
         ),
         (
             VerificationAction::Recheck,
-            "Re-check",
-            Route::PlatformCheck("Amiga".into()),
+            "Re-check this game",
+            Route::GameCheck(game.archive.id),
         ),
         (
             VerificationAction::Review,
-            "Review Identity",
+            "View verification result",
             Route::ReviewIdentity(7),
         ),
     ] {
@@ -308,7 +308,11 @@ fn mr_wiz_buttons_are_clickable_at_small_size_and_same_page_review_is_not_duplic
             }]);
             assert_eq!(clicked, Some(action));
         } else {
-            assert!(!labels.iter().any(|(label, _)| label == "Review Identity"));
+            assert!(
+                !labels
+                    .iter()
+                    .any(|(label, _)| label == "View verification result")
+            );
         }
     }
 }

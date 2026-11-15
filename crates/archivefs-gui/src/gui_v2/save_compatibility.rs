@@ -555,6 +555,7 @@ mod tests {
                 let save = saves.join(name);
                 let command = archivefs_core::launch::RetroArchCommand {
                     saturn_core_selection: None,
+                    unverified_game_key: None,
                     snapshot_evidence: None,
                     executable: exe.clone(),
                     arguments: vec![

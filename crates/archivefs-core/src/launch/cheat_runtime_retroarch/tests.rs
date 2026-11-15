@@ -93,6 +93,7 @@ impl World {
             .expect("verifiable loose rom")
             .to_string();
         let request = RetroArchLaunchRequest {
+            launch_choice: None,
             selected_content_path: content,
             expected_platform_id: "MegaDrive".into(),
             expected_game_key: key,
@@ -392,7 +393,9 @@ fn a_selected_cheat_launches_retroarch_with_a_prepared_scratch_config_and_cleans
     // The canonical argv comes first; the prepared config is appended.
     let args = fs::read_to_string(world.root.join("record/args.txt")).unwrap();
     let lines: Vec<&str> = args.lines().collect();
-    assert_eq!(lines[0], "-L");
+    // Detailed logging is asked for at spawn, directly before the core flag.
+    assert_eq!(lines[0], "--verbose");
+    assert_eq!(lines[1], "-L");
     let at = lines
         .iter()
         .position(|l| *l == "--config")
@@ -548,7 +551,9 @@ fn the_prepared_config_is_the_final_pair_after_the_content_argument() {
         .iter()
         .position(|l| *l == content)
         .expect("content argument");
-    assert_eq!(lines[0], "-L");
+    // Detailed logging is asked for at spawn, directly before the core flag.
+    assert_eq!(lines[0], "--verbose");
+    assert_eq!(lines[1], "-L");
     assert_eq!(lines[content_at + 1], "--config");
     assert_eq!(
         lines.len(),
@@ -1211,5 +1216,59 @@ fn a_different_frontend_than_the_verified_one_refuses_before_materialising() {
         matches!(result, Err(RetroArchCheatLaunchError::Facts(ref why)) if why.contains("executable changed"))
     );
     assert!(!workspace(&id).exists());
+    assert!(!world.root.join("record").exists());
+}
+
+#[test]
+fn a_zipped_cartridge_with_cheats_is_refused_before_anything_starts() {
+    let mut world = World::new("zip-cheats", true);
+    world.request.selected_content_path = world.root.join("content/game.zip");
+    let id = unique("zip-cheats");
+    let error = launch(&world, &selection(), &id).err().expect("refused");
+    match error {
+        RetroArchCheatLaunchError::Preflight(error) => {
+            assert_eq!(
+                error.kind,
+                crate::launch::LaunchPreflightErrorKind::ContentRequiresMount
+            );
+            assert!(
+                error.detail.contains("zipped cartridge"),
+                "{}",
+                error.detail
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!workspace(&id).exists());
+    assert!(!world.root.join("record").exists());
+}
+
+#[test]
+fn the_zipped_cartridge_cheat_guard_does_not_touch_other_zips_or_empty_selections() {
+    let id = unique("zip-others");
+    // An arcade-style ZIP with cheats is not refused by this guard.
+    let mut world = World::new("zip-arcade", true);
+    world.request.selected_content_path = world.root.join("content/game.zip");
+    world.request.expected_platform_id = "Arcade".into();
+    if let Err(RetroArchCheatLaunchError::Preflight(error)) = launch(&world, &selection(), &id) {
+        assert!(
+            !error.detail.contains("zipped cartridge"),
+            "{}",
+            error.detail
+        );
+    }
+    // A zipped cartridge with no cheats selected falls through to the ordinary
+    // preflight, which has its own refusal.
+    let mut world = World::new("zip-empty", true);
+    world.request.selected_content_path = world.root.join("content/game.zip");
+    let mut none = selection();
+    none.selections.clear();
+    if let Err(RetroArchCheatLaunchError::Preflight(error)) = launch(&world, &none, &id) {
+        assert!(
+            !error.detail.contains("zipped cartridge"),
+            "{}",
+            error.detail
+        );
+    }
     assert!(!world.root.join("record").exists());
 }

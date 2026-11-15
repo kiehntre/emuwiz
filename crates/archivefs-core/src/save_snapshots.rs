@@ -13,6 +13,10 @@ pub mod tree_restore;
 /// used by the Blue Saves page.
 pub mod history;
 
+/// Guarded single-file restore and Undo: proves the emulator is closed and
+/// keeps the proof across the write.
+pub mod single_file_guard;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -20,6 +24,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -64,6 +69,8 @@ pub enum SaveProvenance {
 pub enum EmulatorUseStatus {
     NotDetected,
     Running,
+    /// Another program has the save open; not established to be the emulator.
+    CardInUse,
     Unknown,
 }
 
@@ -131,6 +138,7 @@ pub struct SaveSnapshotRequest {
 pub enum SaveSnapshotReadiness {
     Ready,
     EmulatorRunning,
+    CardInUse,
     EmulatorUseUnknown,
     SourceUnavailable,
     InsufficientSpace { available: u64, required: u64 },
@@ -149,6 +157,7 @@ pub enum SaveRestoreConflict {
     SnapshotUnreadable,
     EmulatorUseUnknown,
     EmulatorRunning,
+    CardInUse,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -220,6 +229,8 @@ impl SaveTargetBinding {
 pub enum SaveQuiescenceRequirement {
     ConfirmedClosed,
     Running,
+    /// Some program has the save open; which program is not established.
+    InUse,
     Unknown,
 }
 
@@ -237,6 +248,7 @@ pub enum SaveRestoreRefusal {
     SharedContainerRestoreNotSupported,
     SaveStateRestoreNotSupported,
     EmulatorRunning,
+    SaveInUse,
     EmulatorStateUnknown,
     DestinationChanged,
     BackupFailed,
@@ -272,6 +284,9 @@ impl std::fmt::Display for SaveRestoreRefusal {
                 "save states require emulator-specific compatibility checks"
             }
             Self::EmulatorRunning => "close the emulator before restoring this save",
+            Self::SaveInUse => {
+                "the save is in use; another application may have it open. Close applications using this save and try again"
+            }
             Self::EmulatorStateUnknown => {
                 "EmuWiz cannot prove that the emulator is closed; close it before restoring this save"
             }
@@ -369,11 +384,22 @@ impl From<SaveSnapshotError> for SaveRestoreError {
 
 #[derive(Debug)]
 pub enum SaveSnapshotError {
-    Io { path: PathBuf, detail: String },
-    InvalidPath { path: PathBuf, detail: String },
+    Io {
+        path: PathBuf,
+        detail: String,
+    },
+    InvalidPath {
+        path: PathBuf,
+        detail: String,
+    },
     SourceChanged(PathBuf),
-    InsufficientSpace { available: u64, required: u64 },
+    InsufficientSpace {
+        available: u64,
+        required: u64,
+    },
     EmulatorRunning,
+    /// Another program has the save open (kernel evidence).
+    CardInUse,
     EmulatorUseUnknown,
     TooManyFiles,
     TooLarge,
@@ -405,6 +431,10 @@ impl std::fmt::Display for SaveSnapshotError {
                 f,
                 "close the emulator before snapshotting or restoring this save"
             ),
+            Self::CardInUse => write!(
+                f,
+                "the memory card is open in another program; close programs using this card and try again"
+            ),
             Self::EmulatorUseUnknown => write!(
                 f,
                 "the emulator may still be using this save; close it before continuing"
@@ -421,6 +451,14 @@ pub fn default_snapshot_root() -> crate::Result<PathBuf> {
     Ok(crate::app_dirs::data_dir()?.join("snapshots"))
 }
 
+/// EmuWiz-owned folders for single-file restores: pre-restore backups and the
+/// receipts (journals) that Undo reads. Kept apart from `snapshots` so a
+/// backup never appears in a game's snapshot history.
+pub fn default_single_file_restore_roots() -> crate::Result<(PathBuf, PathBuf)> {
+    let data = crate::app_dirs::data_dir()?;
+    Ok((data.join("restore-backups"), data.join("restore-receipts")))
+}
+
 pub fn assess_snapshot_readiness(
     location: &SaveLocation,
     available_space_bytes: Option<u64>,
@@ -432,6 +470,7 @@ pub fn assess_snapshot_readiness(
     }
     match emulator_use {
         EmulatorUseStatus::Running => SaveSnapshotReadiness::EmulatorRunning,
+        EmulatorUseStatus::CardInUse => SaveSnapshotReadiness::CardInUse,
         EmulatorUseStatus::Unknown => SaveSnapshotReadiness::EmulatorUseUnknown,
         EmulatorUseStatus::NotDetected => {
             available_space_bytes.map_or(SaveSnapshotReadiness::Ready, |available| {
@@ -449,9 +488,20 @@ pub fn assess_snapshot_readiness(
 }
 
 pub fn create_snapshot(request: &SaveSnapshotRequest) -> Result<SaveSnapshot, SaveSnapshotError> {
+    create_snapshot_checked(request, &|| true)
+}
+
+/// As [`create_snapshot`]; `still_consistent` is asked once more after the
+/// copy, immediately before the snapshot is published. If it says no, the
+/// copy is discarded and `SourceChanged` is returned.
+pub fn create_snapshot_checked(
+    request: &SaveSnapshotRequest,
+    still_consistent: &dyn Fn() -> bool,
+) -> Result<SaveSnapshot, SaveSnapshotError> {
     let source = validate_source(&request.location.path)?;
     match request.emulator_use {
         EmulatorUseStatus::Running => return Err(SaveSnapshotError::EmulatorRunning),
+        EmulatorUseStatus::CardInUse => return Err(SaveSnapshotError::CardInUse),
         EmulatorUseStatus::Unknown => return Err(SaveSnapshotError::EmulatorUseUnknown),
         EmulatorUseStatus::NotDetected => {}
     }
@@ -519,7 +569,28 @@ pub fn create_snapshot(request: &SaveSnapshotRequest) -> Result<SaveSnapshot, Sa
             let bytes = serde_json::to_vec_pretty(&manifest)
                 .map_err(|error| SaveSnapshotError::Serialization(error.to_string()))?;
             write_file(&staging.join("manifest.json"), &bytes)?;
+            if !still_consistent() {
+                return Err(SaveSnapshotError::SourceChanged(
+                    request.location.path.clone(),
+                ))
+                .inspect_err(|_| {
+                    let _ = fs::remove_dir_all(&staging);
+                });
+            }
             fs::rename(&staging, &final_path).map_err(|error| io_error(&staging, error))?;
+            // The file data is already durable (write_file). Make the
+            // directory entries durable too, innermost first, so a power loss
+            // after a restore cannot lose the backup the receipt names.
+            for dir in [
+                final_path.join("files"),
+                final_path.clone(),
+                game_dir.clone(),
+            ] {
+                sync_parent(&dir).map_err(|detail| SaveSnapshotError::InvalidPath {
+                    path: dir.clone(),
+                    detail: format!("could not make the snapshot folder durable: {detail}"),
+                })?;
+            }
             Ok(SaveSnapshot {
                 manifest,
                 storage_path: final_path,
@@ -583,6 +654,7 @@ pub fn build_restore_plan(
     }
     match emulator_use {
         EmulatorUseStatus::Running => plan.conflicts.push(SaveRestoreConflict::EmulatorRunning),
+        EmulatorUseStatus::CardInUse => plan.conflicts.push(SaveRestoreConflict::CardInUse),
         EmulatorUseStatus::Unknown => plan.conflicts.push(SaveRestoreConflict::EmulatorUseUnknown),
         EmulatorUseStatus::NotDetected => {}
     }
@@ -700,6 +772,7 @@ pub fn build_single_file_restore_preflight(
     match quiescence {
         SaveQuiescenceRequirement::ConfirmedClosed => {}
         SaveQuiescenceRequirement::Running => refusals.push(SaveRestoreRefusal::EmulatorRunning),
+        SaveQuiescenceRequirement::InUse => refusals.push(SaveRestoreRefusal::SaveInUse),
         SaveQuiescenceRequirement::Unknown => {
             refusals.push(SaveRestoreRefusal::EmulatorStateUnknown)
         }
@@ -728,6 +801,19 @@ pub fn apply_single_file_restore(
     snapshot: &SaveSnapshot,
     preflight: &SaveRestorePreflight,
     options: &SaveRestoreApplyOptions,
+) -> Result<SaveRestoreResult, SaveRestoreError> {
+    apply_single_file_restore_gated(snapshot, preflight, options, &|| true)
+}
+
+/// [`apply_single_file_restore`] with a last-moment gate. `still_safe` is
+/// called after the journal is durable and immediately before the atomic
+/// publication; if it returns false nothing is published, the journal is
+/// discarded and the restore is refused as `SaveInUse`.
+pub fn apply_single_file_restore_gated(
+    snapshot: &SaveSnapshot,
+    preflight: &SaveRestorePreflight,
+    options: &SaveRestoreApplyOptions,
+    still_safe: &dyn Fn() -> bool,
 ) -> Result<SaveRestoreResult, SaveRestoreError> {
     if !preflight.ready() {
         return Err(SaveRestoreError::Refused(
@@ -770,9 +856,9 @@ pub fn apply_single_file_restore(
         .parent()
         .ok_or_else(|| SaveRestoreError::Refused(SaveRestoreRefusal::TargetPathUnsafe))?;
     ensure_directory(parent)?;
-    ensure_directory(&options.backup_root)
+    ensure_directory_durable(&options.backup_root)
         .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
-    ensure_directory(&options.receipt_root)
+    ensure_directory_durable(&options.receipt_root)
         .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::ReceiptWriteFailed))?;
     verify_snapshot(snapshot)?;
 
@@ -801,6 +887,10 @@ pub fn apply_single_file_restore(
         let backup = create_snapshot(&backup_request)
             .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
         verify_snapshot(&backup)
+            .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
+        // The backup's own folders are durable (create_snapshot); its entry in
+        // backup_root must be too before the receipt that names it is.
+        sync_parent(&options.backup_root)
             .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
         Some(backup)
     } else {
@@ -835,8 +925,48 @@ pub fn apply_single_file_restore(
             SaveRestoreRefusal::DestinationChanged,
         ));
     }
+    // Journal first: the receipt is durable before the live save changes, so a
+    // crash after publication still leaves a way to Undo. It names the bytes
+    // the restore is about to publish; Undo re-hashes the target and refuses
+    // unless those exact bytes are there, so a receipt for a restore that
+    // never happened can only be refused, never applied.
+    let receipt_path = options.receipt_root.join(format!("{transaction_id}.json"));
+    let mut receipt = SaveRestoreReceipt {
+        transaction_id,
+        snapshot_id: preflight.snapshot_id.clone(),
+        snapshot_sha256: preflight.snapshot_sha256.clone(),
+        target_binding: preflight.target_binding.clone(),
+        pre_restore_target_sha256: preflight.target_fingerprint.clone(),
+        backup_snapshot_id: backup_snapshot
+            .as_ref()
+            .map(|backup| backup.manifest.snapshot_id.clone()),
+        backup_snapshot_path: backup_snapshot
+            .as_ref()
+            .map(|backup| backup.storage_path.clone()),
+        post_restore_expected_sha256: preflight.snapshot_sha256.clone(),
+        post_restore_actual_sha256: preflight.snapshot_sha256.clone(),
+        quiescence: preflight.quiescence,
+        applied_unix_seconds: options.now_unix_seconds,
+        target_was_missing: !preflight.target_exists,
+        rollback_eligible: true,
+        receipt_path,
+    };
+    if let Err(error) = persist_receipt(&receipt) {
+        let _ = fs::remove_file(&stage);
+        let _ = fs::remove_file(receipt.receipt_path.with_extension("json.partial"));
+        return Err(error);
+    }
+    let discard_journal = |receipt: &SaveRestoreReceipt| {
+        let _ = fs::remove_file(&receipt.receipt_path);
+    };
+    if !still_safe() {
+        let _ = fs::remove_file(&stage);
+        discard_journal(&receipt);
+        return Err(SaveRestoreError::Refused(SaveRestoreRefusal::SaveInUse));
+    }
     if let Err(error) = fs::rename(&stage, target) {
         let _ = fs::remove_file(&stage);
+        discard_journal(&receipt);
         return Err(SaveRestoreError::Io {
             path: target.clone(),
             detail: format!("atomic publication failed: {error}"),
@@ -853,6 +983,7 @@ pub fn apply_single_file_restore(
             let rollback =
                 rollback_after_failed_restore(target, preflight, backup_snapshot.as_ref());
             return Err(if rollback.is_ok() {
+                discard_journal(&receipt);
                 SaveRestoreError::Snapshot(error)
             } else {
                 SaveRestoreError::Refused(SaveRestoreRefusal::RollbackFailed)
@@ -862,36 +993,17 @@ pub fn apply_single_file_restore(
     if actual != preflight.snapshot_sha256 {
         let rollback = rollback_after_failed_restore(target, preflight, backup_snapshot.as_ref());
         return Err(if rollback.is_ok() {
+            discard_journal(&receipt);
             SaveRestoreError::Refused(SaveRestoreRefusal::PostWriteVerificationFailed)
         } else {
             SaveRestoreError::Refused(SaveRestoreRefusal::RollbackFailed)
         });
     }
-
-    let receipt_path = options.receipt_root.join(format!("{transaction_id}.json"));
-    let receipt = SaveRestoreReceipt {
-        transaction_id,
-        snapshot_id: preflight.snapshot_id.clone(),
-        snapshot_sha256: preflight.snapshot_sha256.clone(),
-        target_binding: preflight.target_binding.clone(),
-        pre_restore_target_sha256: preflight.target_fingerprint.clone(),
-        backup_snapshot_id: backup_snapshot
-            .as_ref()
-            .map(|backup| backup.manifest.snapshot_id.clone()),
-        backup_snapshot_path: backup_snapshot
-            .as_ref()
-            .map(|backup| backup.storage_path.clone()),
-        post_restore_expected_sha256: preflight.snapshot_sha256.clone(),
-        post_restore_actual_sha256: actual,
-        quiescence: preflight.quiescence,
-        applied_unix_seconds: options.now_unix_seconds,
-        target_was_missing: !preflight.target_exists,
-        rollback_eligible: true,
-        receipt_path,
-    };
+    receipt.post_restore_actual_sha256 = actual;
     persist_receipt(&receipt).map_err(|error| {
         let rollback = rollback_after_failed_restore(target, preflight, backup_snapshot.as_ref());
         if rollback.is_ok() {
+            discard_journal(&receipt);
             error
         } else {
             SaveRestoreError::Refused(SaveRestoreRefusal::RollbackFailed)
@@ -903,9 +1015,106 @@ pub fn apply_single_file_restore(
     })
 }
 
+/// Receipts of single-file restores under `receipt_root`, newest first.
+/// Unreadable or oversized files are skipped; nothing is repaired or removed.
+///
+/// Only receipts this module could have written are returned: a RetroArch
+/// SRAM target, a file named after its transaction, and a backup that lives
+/// under `backup_root` without links or `..`. Undo trusts a receipt's paths,
+/// so anything else is ignored rather than offered.
+pub fn list_single_file_restore_receipts(
+    receipt_root: &Path,
+    backup_root: &Path,
+) -> Vec<SaveRestoreReceipt> {
+    let Ok(entries) = fs::read_dir(receipt_root) else {
+        return Vec::new();
+    };
+    let mut receipts = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+                && fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 1024 * 1024)
+        })
+        .filter_map(|path| {
+            let mut receipt: SaveRestoreReceipt =
+                serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+            // The file's own location decides where it lives, not its contents.
+            let named_for_itself = path.file_stem().and_then(|stem| stem.to_str())
+                == Some(receipt.transaction_id.as_str());
+            let backup_ok = match (&receipt.backup_snapshot_path, receipt.target_was_missing) {
+                (None, true) => true,
+                (Some(backup), false) => {
+                    backup.is_absolute()
+                        && backup.starts_with(backup_root)
+                        && backup
+                            .components()
+                            .all(|part| !matches!(part, Component::ParentDir))
+                        && fs::symlink_metadata(backup).is_ok_and(|metadata| {
+                            metadata.is_dir() && !metadata.file_type().is_symlink()
+                        })
+                }
+                _ => false,
+            };
+            let binding = &receipt.target_binding;
+            if !named_for_itself
+                || !backup_ok
+                || binding.artifact_type != SaveArtifactType::Sram
+                || !binding
+                    .emulator
+                    .as_deref()
+                    .is_some_and(|emulator| emulator.eq_ignore_ascii_case("retroarch"))
+            {
+                return None;
+            }
+            receipt.receipt_path = path;
+            Some(receipt)
+        })
+        .collect::<Vec<_>>();
+    receipts.sort_by(|a, b| {
+        b.applied_unix_seconds
+            .cmp(&a.applied_unix_seconds)
+            .then_with(|| b.transaction_id.cmp(&a.transaction_id))
+    });
+    receipts
+}
+
 /// Undo a completed generic single-file restore only while the destination
 /// still contains the bytes created by that transaction.
-pub fn undo_single_file_restore(receipt: &SaveRestoreReceipt) -> Result<(), SaveRestoreError> {
+pub fn undo_single_file_restore(
+    receipt: &SaveRestoreReceipt,
+    quiescence: SaveQuiescenceRequirement,
+) -> Result<(), SaveRestoreError> {
+    undo_single_file_restore_gated(receipt, quiescence, &|| true)
+}
+
+/// As [`undo_single_file_restore`]; `still_safe` is asked once more after the
+/// previous save has been staged, immediately before it is published over the
+/// restored file. If it says no, the stage is discarded and `SaveInUse` is
+/// returned with the restored file untouched.
+pub fn undo_single_file_restore_gated(
+    receipt: &SaveRestoreReceipt,
+    quiescence: SaveQuiescenceRequirement,
+    still_safe: &dyn Fn() -> bool,
+) -> Result<(), SaveRestoreError> {
+    match quiescence {
+        SaveQuiescenceRequirement::ConfirmedClosed => {}
+        SaveQuiescenceRequirement::Running => {
+            return Err(SaveRestoreError::Refused(
+                SaveRestoreRefusal::EmulatorRunning,
+            ));
+        }
+        SaveQuiescenceRequirement::InUse => {
+            return Err(SaveRestoreError::Refused(SaveRestoreRefusal::SaveInUse));
+        }
+        SaveQuiescenceRequirement::Unknown => {
+            return Err(SaveRestoreError::Refused(
+                SaveRestoreRefusal::EmulatorStateUnknown,
+            ));
+        }
+    }
     if !receipt.rollback_eligible {
         return Err(SaveRestoreError::Refused(
             SaveRestoreRefusal::DestinationChanged,
@@ -977,19 +1186,23 @@ pub fn undo_single_file_restore(receipt: &SaveRestoreReceipt) -> Result<(), Save
     let parent = target
         .parent()
         .ok_or_else(|| SaveRestoreError::Refused(SaveRestoreRefusal::TargetPathUnsafe))?;
-    let stage = parent.join(format!(
-        ".{}.emuwiz-undo-stage-{}",
-        target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("save"),
-        short_path_token(&receipt.receipt_path)
-    ));
+    // An earlier Undo of this receipt that died mid-copy (kill, ENOSPC, EIO)
+    // leaves its stage behind; it is ours, so it is cleared before copying.
+    let prefix = stage_prefix(target, "undo", &short_path_token(&receipt.receipt_path));
+    remove_owned_stale_stages(parent, &prefix);
+    let stage = parent.join(unique_stage_name(&prefix));
     copy_and_verify(&backup, &stage, &backup_hash)?;
-    fs::rename(&stage, target).map_err(|error| SaveRestoreError::Io {
-        path: target.clone(),
-        detail: format!("atomic undo publication failed: {error}"),
-    })?;
+    if !still_safe() {
+        let _ = fs::remove_file(&stage);
+        return Err(SaveRestoreError::Refused(SaveRestoreRefusal::SaveInUse));
+    }
+    if let Err(error) = fs::rename(&stage, target) {
+        let _ = fs::remove_file(&stage);
+        return Err(SaveRestoreError::Io {
+            path: target.clone(),
+            detail: format!("atomic undo publication failed: {error}"),
+        });
+    }
     sync_parent(parent).map_err(|error| SaveRestoreError::Io {
         path: parent.to_path_buf(),
         detail: error,
@@ -1062,6 +1275,31 @@ fn live_target_matches(preflight: &SaveRestorePreflight) -> bool {
     }
 }
 
+/// As [`ensure_directory`], and makes every folder it had to create durable
+/// (each new folder and the existing parent that now lists the first one).
+fn ensure_directory_durable(path: &Path) -> Result<(), SaveRestoreError> {
+    let mut created = Vec::new();
+    let mut cursor = path;
+    while fs::symlink_metadata(cursor).is_err() {
+        created.push(cursor.to_path_buf());
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => break,
+        }
+    }
+    ensure_directory(path)?;
+    if created.is_empty() {
+        return Ok(());
+    }
+    for dir in created.iter().chain(std::iter::once(&cursor.to_path_buf())) {
+        sync_parent(dir).map_err(|detail| SaveRestoreError::Io {
+            path: dir.clone(),
+            detail,
+        })?;
+    }
+    Ok(())
+}
+
 fn ensure_directory(path: &Path) -> Result<(), SaveRestoreError> {
     fs::create_dir_all(path).map_err(|error| SaveRestoreError::Io {
         path: path.to_path_buf(),
@@ -1079,6 +1317,10 @@ fn ensure_directory(path: &Path) -> Result<(), SaveRestoreError> {
     Ok(())
 }
 
+/// Copies `source` to a new file at `destination` and checks its hash. The
+/// destination is created with `create_new`; on any failure after that (read,
+/// write, sync or hash mismatch) the partial file is removed, so a failed
+/// attempt never blocks the next one.
 fn copy_and_verify(
     source: &Path,
     destination: &Path,
@@ -1096,6 +1338,27 @@ fn copy_and_verify(
             path: destination.to_path_buf(),
             detail: error.to_string(),
         })?;
+    let result = copy_into(
+        &mut input,
+        &mut output,
+        source,
+        destination,
+        expected_sha256,
+    );
+    if result.is_err() {
+        drop(output);
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+fn copy_into(
+    input: &mut File,
+    output: &mut File,
+    source: &Path,
+    destination: &Path,
+    expected_sha256: &str,
+) -> Result<(), SaveRestoreError> {
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -1122,12 +1385,56 @@ fn copy_and_verify(
     })?;
     let actual = hex_digest(digest);
     if actual != expected_sha256 {
-        let _ = fs::remove_file(destination);
         return Err(SaveRestoreError::Refused(
             SaveRestoreRefusal::StagedHashMismatch,
         ));
     }
     Ok(())
+}
+
+/// `.<save>.emuwiz-<kind>-stage-<token>`: the fixed part of a stage name,
+/// so a leftover is attributable to its save and its receipt or target.
+fn stage_prefix(target: &Path, kind: &str, token: &str) -> String {
+    format!(
+        ".{}.emuwiz-{kind}-stage-{token}",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("save")
+    )
+}
+
+/// A stage name unique to this attempt (process id and a per-process
+/// counter), so a leftover from an earlier attempt can never collide with it.
+fn unique_stage_name(prefix: &str) -> String {
+    static ATTEMPT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        ATTEMPT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Removes leftover stage files of our own in `parent`: regular files only
+/// (lstat, never following a symlink) whose name starts with `prefix`. A
+/// name that merely resembles a stage but is a symlink, directory or special
+/// file is left alone.
+fn remove_owned_stale_stages(parent: &Path, prefix: &str) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(prefix) {
+            continue;
+        }
+        let path = entry.path();
+        if fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 fn rollback_after_failed_restore(
@@ -1169,23 +1476,21 @@ fn rollback_after_failed_restore(
     let parent = target
         .parent()
         .ok_or_else(|| SaveRestoreError::Refused(SaveRestoreRefusal::TargetPathUnsafe))?;
-    let stage = parent.join(format!(
-        ".{}.emuwiz-rollback-stage-{}",
-        target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("save"),
-        short_path_token(target)
-    ));
+    let prefix = stage_prefix(target, "rollback", &short_path_token(target));
+    remove_owned_stale_stages(parent, &prefix);
+    let stage = parent.join(unique_stage_name(&prefix));
     copy_and_verify(
         &source,
         &stage,
         preflight.target_fingerprint.as_deref().unwrap_or_default(),
     )?;
-    fs::rename(stage, target).map_err(|error| SaveRestoreError::Io {
-        path: target.to_path_buf(),
-        detail: error.to_string(),
-    })?;
+    if let Err(error) = fs::rename(&stage, target) {
+        let _ = fs::remove_file(&stage);
+        return Err(SaveRestoreError::Io {
+            path: target.to_path_buf(),
+            detail: error.to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -1200,13 +1505,39 @@ fn persist_receipt(receipt: &SaveRestoreReceipt) -> Result<(), SaveRestoreError>
         path: receipt.receipt_path.clone(),
         detail: error.to_string(),
     })?;
+    if let Some(parent) = receipt.receipt_path.parent() {
+        sync_parent(parent).map_err(|detail| SaveRestoreError::Io {
+            path: parent.to_path_buf(),
+            detail,
+        })?;
+    }
     Ok(())
 }
 
+/// fsync of a directory: makes its entries (renames, new files) durable.
 fn sync_parent(path: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    sync_log::record(path);
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| error.to_string())
+}
+
+/// Test-only record of directory fsyncs, in order, for this thread.
+#[cfg(test)]
+pub(crate) mod sync_log {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    thread_local! {
+        static SYNCED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+    pub(super) fn record(path: &Path) {
+        SYNCED.with(|synced| synced.borrow_mut().push(path.to_path_buf()));
+    }
+    /// Directory fsyncs since the last call, oldest first.
+    pub(crate) fn take() -> Vec<PathBuf> {
+        SYNCED.with(|synced| std::mem::take(&mut *synced.borrow_mut()))
+    }
 }
 
 fn validate_source(path: &Path) -> Result<PathBuf, SaveSnapshotError> {
@@ -1608,7 +1939,8 @@ mod tests {
         assert!(result.receipt.rollback_eligible);
         assert!(result.receipt.backup_snapshot_path.is_some());
         assert!(result.receipt.receipt_path.is_file());
-        undo_single_file_restore(&result.receipt).unwrap();
+        undo_single_file_restore(&result.receipt, SaveQuiescenceRequirement::ConfirmedClosed)
+            .unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"changed");
     }
 
@@ -1627,7 +1959,8 @@ mod tests {
         let result =
             apply_single_file_restore(&snapshot, &preflight, &restore_options(dir.path())).unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"save");
-        undo_single_file_restore(&result.receipt).unwrap();
+        undo_single_file_restore(&result.receipt, SaveQuiescenceRequirement::ConfirmedClosed)
+            .unwrap();
         assert!(!source.exists());
     }
 
@@ -1660,7 +1993,7 @@ mod tests {
             apply_single_file_restore(&snapshot, &fresh, &restore_options(dir.path())).unwrap();
         fs::write(&source, b"external-change").unwrap();
         assert!(matches!(
-            undo_single_file_restore(&result.receipt),
+            undo_single_file_restore(&result.receipt, SaveQuiescenceRequirement::ConfirmedClosed),
             Err(SaveRestoreError::Refused(
                 SaveRestoreRefusal::DestinationChanged
             ))

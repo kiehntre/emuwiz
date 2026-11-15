@@ -8,6 +8,7 @@ pub(super) fn summary(index: usize) -> InstalledCatalogueSummary {
         store: CatalogueStore::LocalRegistry,
         display_name: format!("Catalogue {index:05}"),
         platform: EvidenceValue::Confirmed("Amiga".into()),
+        platform_origin: archivefs_core::dat::sources::PlatformProvenance::NotSet,
         ecosystem: EvidenceValue::Unknown,
         variant: EvidenceValue::Unknown,
         revision: None,

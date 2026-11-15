@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use super::CatalogueGameEvidence;
 use super::cheat_catalogue::{
-    CatalogueEntryExclusionKind, CatalogueIndexState, CheatMatchConfidence,
+    CatalogueEntryExclusionKind, CatalogueIndexState, CheatCatalogueFormat, CheatMatchConfidence,
     build_cheat_availability_report, load_cheat_catalogue_snapshot, matching_excluded_entry,
 };
 use super::cheat_sources::inspect_retroarch_cheat_source_snapshot;
@@ -219,6 +219,17 @@ pub fn materialize_retroarch_shared_preview(
                 RetroArchMaterializationErrorKind::ResourceLimitReached,
                 Some(&catalogue_root),
                 "materialized source-entry limit reached",
+            ));
+        }
+        if entry.game.format == CheatCatalogueFormat::JsonManifest {
+            // A manifest's bytes are never the installable document (one
+            // JSON file describes many games); the shared executor copies
+            // a snapshot file verbatim, so a manifest record must be
+            // refused here rather than installed as `<game>.cht`.
+            return Err(error(
+                RetroArchMaterializationErrorKind::NoEligibleMatch,
+                Some(Path::new(&entry.game.source_file_path.display)),
+                "catalogue manifest records are rendered per game by the cheat installer and cannot be copied from the snapshot verbatim",
             ));
         }
         if entry.game.source_file_path.lossy {

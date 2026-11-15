@@ -332,7 +332,7 @@ fn index_machine_inputs(
     index
 }
 
-fn verified_machine(identity: Option<&GameIdentityReport>) -> Option<String> {
+pub(super) fn verified_machine(identity: Option<&GameIdentityReport>) -> Option<String> {
     let identity = identity.filter(|identity| identity.platform == IdentityPlatform::Arcade)?;
     let names: Vec<_> = identity
         .evidence

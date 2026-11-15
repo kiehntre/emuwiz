@@ -955,6 +955,39 @@ fn a_thumbnail_whose_file_has_been_corrupted_is_dropped_and_refetched() {
     assert!(cache.lookup(SERVER, &wanted).is_some());
 }
 
+#[test]
+fn peek_reads_a_cached_thumbnail_and_never_changes_the_cache() {
+    let tree = Tree::new("peek-read-only");
+    let cache = tree.cache();
+    let wanted = request("1", Some("/assets/cover.png"), None);
+    let stored = cache
+        .fetch(
+            &source(),
+            &FakeArtworkServer::serving(synthetic_png(40, 56)),
+            &wanted,
+            1_000,
+            None,
+        )
+        .expect("stored");
+    assert_eq!(
+        cache.peek(SERVER, &wanted).map(|hit| hit.path),
+        Some(stored.path.clone())
+    );
+    let missing = request("2", Some("/assets/other.png"), None);
+    assert!(cache.peek(SERVER, &missing).is_none());
+
+    // A damaged file is reported absent but left exactly as found, and the
+    // index still lists it: peek never repairs, deletes or rewrites.
+    fs::write(&stored.path, b"not a png any more").expect("fixture");
+    let keys = cache.keys(SERVER);
+    assert!(cache.peek(SERVER, &wanted).is_none());
+    assert_eq!(
+        fs::read(&stored.path).expect("still there"),
+        b"not a png any more"
+    );
+    assert_eq!(cache.keys(SERVER), keys);
+}
+
 // --- Bounded cache: accounting, eviction, clearing -----------------------
 
 #[test]

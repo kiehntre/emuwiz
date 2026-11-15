@@ -30,6 +30,7 @@ impl World {
         bytes[30 + 16384] = 0x76;
         std::fs::write(&path, &bytes).unwrap();
         let config = Config {
+            configured_source_roots: None,
             source_folders: vec![root.join("games")],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
@@ -101,6 +102,7 @@ impl World {
         std::fs::write(&core, b"original fixture core").unwrap();
         RetroArchCommand {
             saturn_core_selection: None,
+            unverified_game_key: None,
             snapshot_evidence: Some(self.load().unwrap()),
             executable,
             arguments: vec![],

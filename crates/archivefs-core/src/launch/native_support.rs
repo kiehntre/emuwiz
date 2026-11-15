@@ -556,8 +556,13 @@ exit 1 # changed
             .unwrap()
             .set_modified(modified)
             .unwrap();
-        // Metadata identity is unchanged by construction; only content moved.
-        assert_eq!(executable_identity(&exe).unwrap(), binding.identity);
+        // Device, inode, size and mtime are unchanged by construction (ctime
+        // moves whenever the kernel's timestamp tick did); only content moved.
+        let four = |i: CapturedFileIdentity| (i.device, i.inode, i.size, i.modified);
+        assert_eq!(
+            four(executable_identity(&exe).unwrap()),
+            four(binding.identity)
+        );
         assert!(!binding.is_unchanged(&exe));
         // Replaced by a symlink: refused outright.
         let target = dir.path().join("target");

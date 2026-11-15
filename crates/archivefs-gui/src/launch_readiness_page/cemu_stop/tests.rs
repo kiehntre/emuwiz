@@ -198,12 +198,15 @@ fn cemu_stop_is_visible_at_small_size_without_a_current_readiness_plan() {
             egui::CentralPanel::default().show(ctx, |ui| {
                 super::super::show_launch_readiness_panel(
                     ui,
-                    &super::super::LaunchReadinessInput::IdentityUnknown,
+                    &super::super::LaunchReadinessInput::IdentityUnknown(
+                        crate::launch_readiness_page::IdentityUnknownReason::NotConfirmed,
+                    ),
                     &mut Default::default(),
                     &mut Default::default(),
                     &mut Default::default(),
                     &mut state,
                     &mut Default::default(),
+                    &Default::default(),
                 );
             });
         },

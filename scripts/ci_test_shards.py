@@ -36,6 +36,15 @@ SHARDS: list[tuple[str, list[str]]] = [
     ("rest", []),
 ]
 
+# The gui tier tests one crate, so it needs less compilation and has no
+# recovery or dat group to balance: its own partition splits that crate's two
+# large halves. These names are distinct from SHARDS so a shard name alone still
+# determines its selection, and a tier cannot run the other's skip list.
+GUI_TIER_SHARDS: list[tuple[str, list[str]]] = [
+    ("gui-tier-v2", ["gui_v2::"]),
+    ("gui-tier-other", []),
+]
+
 PACKAGES = {
     "gui": ["-p", "archivefs-gui"],
     "core": ["-p", "archivefs-core"],
@@ -50,21 +59,22 @@ LISTED = re.compile(r"^(.*): (test|bench)$")
 def shards(tier: str) -> list[str]:
     if tier not in PACKAGES:
         raise SystemExit(f"unknown CI tier: {tier}")
-    return ["all"] if tier == "gui" else [name for name, _ in SHARDS]
+    return [name for name, _ in (GUI_TIER_SHARDS if tier == "gui" else SHARDS)]
 
 
 def selection(shard: str) -> list[str]:
-    if shard == "all":
-        return []
-    names = [name for name, _ in SHARDS]
-    if shard not in names:
+    for partition in (SHARDS, GUI_TIER_SHARDS):
+        names = [name for name, _ in partition]
+        if shard in names:
+            break
+    else:
         raise SystemExit(f"unknown test shard: {shard}")
     index = names.index(shard)
-    own = SHARDS[index][1]
-    if (index == len(SHARDS) - 1) != (not own):
+    own = partition[index][1]
+    if (index == len(partition) - 1) != (not own):
         raise SystemExit("only the last shard may (and must) have no filters")
     # The last shard has no filters of its own, so it skips every group.
-    skips = [arg for _, group in SHARDS[:index] for f in group for arg in ("--skip", f)]
+    skips = [arg for _, group in partition[:index] for f in group for arg in ("--skip", f)]
     return [*own, *skips]
 
 
@@ -88,13 +98,18 @@ def parse_listing(text: str) -> collections.Counter[str]:
 
 def check(directory: pathlib.Path) -> None:
     alls = sorted(directory.glob("*.all"))
-    if not alls:
-        raise SystemExit(f"no shard enumerations in {directory}")
+    expected = set(json.loads((directory / "shards.json").read_text()))
     names = {path.stem for path in alls}
+    absent = sorted(expected - names)
+    if absent:
+        # Still a failure: without a shard's list the partition is unproven. Its
+        # own job holds the cause, usually a build or runner failure, not a gap.
+        raise SystemExit(f"no enumeration from shard(s) {absent}: this is a consequence of that shard "
+                         "failing before it finished building, not a shard coverage defect; "
+                         "fix or rerun that shard")
     selected_paths = {path.stem for path in directory.glob("*.selected")}
     if names != selected_paths:
         raise SystemExit(f"shards without both enumerations: {sorted(names ^ selected_paths)}")
-    expected = set(json.loads((directory / "shards.json").read_text()))
     if names != expected:
         raise SystemExit(f"enumerated shards {sorted(names)} differ from planned {sorted(expected)}")
     reference = None

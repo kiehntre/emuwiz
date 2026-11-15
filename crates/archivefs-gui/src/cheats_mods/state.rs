@@ -814,6 +814,9 @@ pub(crate) enum CheatStepResource<T> {
 pub(crate) struct LoadedHistory {
     pub(crate) report: SharedHistoryReport,
     pub(crate) rows: Vec<archivefs_core::patch_manager::GroupedHistoryRow>,
+    /// Installs interrupted before their receipt (a crash or kill) that
+    /// this refresh settled into History so they can be undone.
+    pub(crate) recovered: Vec<archivefs_core::patch_manager::SharedInterruptedApplyRecovery>,
 }
 
 impl LoadedHistory {
@@ -825,8 +828,35 @@ impl LoadedHistory {
     ) -> Self {
         let rows =
             archivefs_core::patch_manager::group_shared_history(&report, receipts, backup_root);
-        Self { report, rows }
+        Self {
+            report,
+            rows,
+            recovered: Vec::new(),
+        }
     }
+
+    pub(crate) fn with_recovered(
+        mut self,
+        recovered: Vec<archivefs_core::patch_manager::SharedInterruptedApplyRecovery>,
+    ) -> Self {
+        self.recovered = recovered;
+        self
+    }
+}
+
+/// Startup settlement of installs EmuWiz was interrupted in (crash, kill,
+/// power cut), run once per launch on a background worker. It never
+/// performs Undo; it turns a pending record into a reviewable History
+/// entry with Undo available. See
+/// `archivefs_core::patch_manager::recover_interrupted_shared_applies`.
+pub(crate) enum StartupSharedRecoveryState {
+    NotStarted,
+    Running {
+        receiver: Receiver<Vec<archivefs_core::patch_manager::SharedInterruptedApplyRecovery>>,
+    },
+    Done(Vec<archivefs_core::patch_manager::SharedInterruptedApplyRecovery>),
+    /// The managed history folder was unavailable; nothing was examined.
+    Unavailable,
 }
 
 pub(crate) enum SharedHistoryState {
@@ -883,6 +913,17 @@ pub(crate) enum HistoryPageAction {
         backup_path: PathBuf,
     },
     ExecuteDatabaseRestore,
+    /// Read-only review of a completed restore's rollback inputs.
+    ReviewDatabaseRollback {
+        receipt_path: PathBuf,
+    },
+    /// Puts the pre-restore database back from the verified emergency backup.
+    ExecuteDatabaseRollback,
+    /// Records the truthful outcome of a restore that was interrupted; it
+    /// never changes a database file.
+    ReconcileInterruptedRestore {
+        receipt_path: PathBuf,
+    },
 }
 
 /// The Details "Game ID" row's three-way state - distinct from

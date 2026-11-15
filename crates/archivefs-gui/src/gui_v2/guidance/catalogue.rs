@@ -1440,7 +1440,7 @@ pub(crate) static CATALOGUE: &[GuidanceScript] = &[
         topics: &[T::IdentityDat],
         pages: &[P::CheckGames],
         mascot: M::Helpful,
-        quick: "Choose a platform to see which of its games are verified, unknown or need attention. Checking never renames anything.",
+        quick: "Check games against a trusted catalogue to see which are verified, unknown or need attention. Nothing is checked until you confirm, and checking never renames anything.",
         ..BASE
     },
     GuidanceScript {
@@ -1544,7 +1544,7 @@ pub(crate) static CATALOGUE: &[GuidanceScript] = &[
         category: C::Explain,
         pages: &[P::Settings],
         mascot: M::Helpful,
-        quick: "You can turn these hints off below; no control or page is ever hidden by them.",
+        quick: "You can turn these hints off under Beginner guidance; no control or page is ever hidden by them.",
         ..BASE
     },
     GuidanceScript {

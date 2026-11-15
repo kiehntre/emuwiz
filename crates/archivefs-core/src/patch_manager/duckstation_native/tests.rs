@@ -1802,3 +1802,81 @@ fn undo_refuses_when_either_output_was_changed_and_overwrites_nothing() {
     }
     undo_duckstation_native(&receipt, &world.options("op-guard-final")).unwrap();
 }
+
+#[test]
+fn memory_card_folder_follows_memory_cards_directory_not_folders() {
+    let world = World::new();
+    // No settings.ini, then an empty value: DuckStation's default.
+    let (path, custom) = resolve_duckstation_memory_cards_folder(&world.profile).unwrap();
+    assert_eq!(path, world.profile.join("memcards"));
+    assert!(!custom);
+    World::write(
+        &world.profile.join("settings.ini"),
+        "[MemoryCards]\nDirectory =\n",
+    );
+    assert_eq!(
+        resolve_duckstation_memory_cards_folder(&world.profile).unwrap(),
+        (world.profile.join("memcards"), false)
+    );
+
+    // DuckStation keeps this folder under [MemoryCards], so a [Folders]
+    // MemoryCards key is not the setting and must not move it.
+    World::write(
+        &world.profile.join("settings.ini"),
+        "[Folders]\nMemoryCards = wrong\n",
+    );
+    assert_eq!(
+        resolve_duckstation_memory_cards_folder(&world.profile).unwrap(),
+        (world.profile.join("memcards"), false)
+    );
+
+    // Relative values resolve against the data root; absolute ones stand.
+    World::write(
+        &world.profile.join("settings.ini"),
+        "[MemoryCards]\nDirectory = my cards\nCard1Type = PerGameTitle\n",
+    );
+    assert_eq!(
+        resolve_duckstation_memory_cards_folder(&world.profile).unwrap(),
+        (world.profile.join("my cards"), true)
+    );
+    let elsewhere = world.dir.path().join("elsewhere").join("cards");
+    World::write(
+        &world.profile.join("settings.ini"),
+        &format!("[MemoryCards]\nDirectory = {}\n", elsewhere.display()),
+    );
+    assert_eq!(
+        resolve_duckstation_memory_cards_folder(&world.profile).unwrap(),
+        (elsewhere, true)
+    );
+    // Resolving is read-only: nothing was created.
+    assert!(!world.profile.join("memcards").exists());
+    assert!(!world.profile.join("my cards").exists());
+}
+
+#[test]
+fn unsafe_or_ambiguous_memory_card_folders_are_refused() {
+    let world = World::new();
+    for case in [
+        "Directory = ../outside",
+        "Directory = /",
+        "Directory = /home",
+    ] {
+        World::write(
+            &world.profile.join("settings.ini"),
+            &format!("[MemoryCards]\n{case}\n"),
+        );
+        let error = resolve_duckstation_memory_cards_folder(&world.profile).unwrap_err();
+        assert!(
+            matches!(error, DuckStationNativeRefusal::UnsafeCustomFolder { .. }),
+            "{case}: {error:?}"
+        );
+    }
+    World::write(
+        &world.profile.join("settings.ini"),
+        "[MemoryCards]\nDirectory = a\nDirectory = b\n",
+    );
+    assert!(matches!(
+        resolve_duckstation_memory_cards_folder(&world.profile).unwrap_err(),
+        DuckStationNativeRefusal::InvalidDuckStationProfile { .. }
+    ));
+}

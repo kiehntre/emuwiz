@@ -259,9 +259,7 @@ impl Default for PlayingLibraryPageState {
             applied_plan: None,
             apply_error: None,
             apply_error_is_undo: false,
-            journal_dir: default_rename_transaction_dir().unwrap_or_else(|_| {
-                PathBuf::from(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
-            }),
+            journal_dir: resolved_journal_dir(),
             async_busy: false,
             apply_stage: Arc::new(AtomicU8::new(0)),
             esde_platform_id: None,
@@ -633,6 +631,28 @@ impl PlayingLibraryPageState {
     /// filesystem beyond reading the DAT and hashing candidate files -
     /// nothing is written, moved, or created.
     pub(crate) fn preview(&mut self) {
+        self.preview_cancellable(&AtomicBool::new(false));
+    }
+
+    /// `preview`, stopping between candidate files when `cancel` is set.
+    /// Returns `false` when it stopped: no plan is kept, nothing was written,
+    /// and the caller should present the stop rather than a partial preview.
+    pub(crate) fn preview_cancellable(&mut self, cancel: &AtomicBool) -> bool {
+        self.preview_inner(cancel);
+        if cancel.load(Ordering::Relaxed) {
+            // The matcher skips the remaining files once asked to stop, so a
+            // plan built from it would silently cover only part of the folder.
+            self.plan = None;
+            self.preview_transaction = None;
+            self.verified_matches.clear();
+            self.output_projection = None;
+            self.error = None;
+            return false;
+        }
+        true
+    }
+
+    fn preview_inner(&mut self, cancel: &AtomicBool) {
         self.plan = None;
         self.preview_transaction = None;
         self.verified_dat = None;
@@ -687,6 +707,11 @@ impl PlayingLibraryPageState {
         };
         self.dat_platform_identity = Some(resolved.dat_platform_identity());
 
+        // A cancel raised while this job was still queued must not pay for
+        // the source walk first.
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let scan = collect_source_files_reported(std::slice::from_ref(&source_root), 20_000, 16);
         if !scan.incomplete.is_empty() {
             self.error = Some(format!(
@@ -697,12 +722,11 @@ impl PlayingLibraryPageState {
         }
         let candidates = scan.files;
         let trusted = TrustedRoots::from_paths([&source_root]);
-        let outcome_matches = match_loose_files_against_dat(
-            &resolved.parsed,
-            &candidates,
-            &trusted,
-            &AtomicBool::new(false),
-        );
+        let outcome_matches =
+            match_loose_files_against_dat(&resolved.parsed, &candidates, &trusted, cancel);
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
 
         self.source_files_examined = candidates.len();
         self.review_paths = presentation::unrepresented_paths(&candidates, &outcome_matches);
@@ -1156,6 +1180,11 @@ impl PlayingLibraryPageState {
                 return;
             }
         };
+        if let Some(refusal) = journal_dir_refusal(&self.journal_dir) {
+            self.romm_error = Some(refusal);
+            self.romm_pending_apply = false;
+            return;
+        }
         if let Err(error) = std::fs::create_dir_all(&projection.romm_root) {
             self.romm_error = Some(format!("could not create the RomM destination: {error}"));
             return;
@@ -1289,6 +1318,11 @@ impl PlayingLibraryPageState {
                 "playing_library_profile".into(),
                 serde_json::Value::String("generic".into()),
             );
+        }
+        if let Some(refusal) = journal_dir_refusal(&self.journal_dir) {
+            self.apply_error = Some(refusal);
+            self.pending_apply = None;
+            return;
         }
         if let Err(error) = prepare_destination_root(&plan.destination_root) {
             self.apply_error = Some(format!("could not create the destination folder: {error}"));
@@ -3177,3 +3211,17 @@ fn show_esde_publish_section(
 
 #[cfg(test)]
 mod tests;
+
+/// The journal folder, or an empty path when the data folder cannot be
+/// resolved (for example two existing setups). Never a path relative to the
+/// working directory: core refuses to journal into a non-absolute folder, and
+/// this page refuses before creating anything (see `journal_dir_refusal`).
+fn resolved_journal_dir() -> PathBuf {
+    default_rename_transaction_dir().unwrap_or_default()
+}
+
+/// The actionable refusal when no absolute journal folder is available.
+fn journal_dir_refusal(journal_dir: &std::path::Path) -> Option<String> {
+    (!journal_dir.is_absolute())
+        .then(|| archivefs_core::dat::rename_apply::journal::JOURNAL_DIR_UNAVAILABLE.to_string())
+}

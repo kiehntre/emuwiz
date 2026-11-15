@@ -5,10 +5,86 @@ use archivefs_core::game_identity::{GameIdentityReport, IdentityConfidence};
 use eframe::egui;
 use std::path::Path;
 
+/// Read-only extras shown when nothing is saved: the evidence the existing
+/// bounded live inspection already computed, and the blocker-specific reason
+/// the system has no identity check. Neither is persisted or re-read here.
+#[derive(Default)]
+pub(crate) struct Extras {
+    pub live_lines: Vec<String>,
+    pub blocker_note: Option<String>,
+}
+
+/// One bounded line per fact the live inspection found or could not read.
+/// Pure presentation over the already-computed report; sanitises every
+/// untrusted string and states plainly that nothing is saved from it.
+pub(super) fn live_evidence_lines(
+    identity: &GameIdentityReport,
+    structural_facts: &[archivefs_core::content_evidence::ContentEvidence],
+) -> Vec<String> {
+    const MAX_LINES: usize = 12;
+    let mut lines = Vec::new();
+    for fact in &identity.evidence {
+        let mut line = format!(
+            "{}: {} ({})",
+            fact.kind,
+            saved_text(fact.value.as_deref().unwrap_or("could not be read")),
+            fact.status
+        );
+        if !fact.diagnostic.is_empty() {
+            line.push_str(&format!(" - {}", saved_text(&fact.diagnostic)));
+        }
+        lines.push(line);
+    }
+    for fact in structural_facts {
+        lines.push(format!(
+            "{}: {} - {}",
+            fact.kind.label(),
+            saved_text(&fact.value),
+            saved_text(&fact.detail)
+        ));
+    }
+    for warning in &identity.warnings {
+        lines.push(format!("Could not read: {}", saved_text(warning)));
+    }
+    let total = lines.len();
+    lines.truncate(MAX_LINES);
+    if total > MAX_LINES {
+        lines.push(format!("… and {} more not shown here.", total - MAX_LINES));
+    }
+    if lines.is_empty() {
+        lines.push("EmuWiz read this file and found no identity facts it can use.".into());
+    }
+    lines
+}
+
+#[cfg(test)]
 pub(super) fn show(ui: &mut egui::Ui, path: &Path, report: Option<&GameIdentityReport>) {
+    show_with(ui, path, report, &Extras::default());
+}
+
+pub(super) fn show_with(
+    ui: &mut egui::Ui,
+    path: &Path,
+    report: Option<&GameIdentityReport>,
+    extras: &Extras,
+) {
     ui.label("Saved file inspection. Recorded facts explain identification; they do not establish current DAT verification or whole-file integrity. This view does not recheck file freshness.");
+    if let Some(note) = &extras.blocker_note {
+        ui.strong(note);
+    }
     let Some(report) = report.filter(|report| report.archive_path == path) else {
-        ui.label("No saved identity evidence is available for this file. A filename or an unavailable report cannot establish a verified identity.");
+        if extras.live_lines.is_empty() && extras.blocker_note.is_none() {
+            ui.label("No saved identity evidence is available for this file. A filename or an unavailable report cannot establish a verified identity.");
+            return;
+        }
+        ui.label("No identity evidence is saved for this file.");
+        if !extras.live_lines.is_empty() {
+            ui.label("What follows was read just now, read-only, and is not saved.");
+            ui.strong("What EmuWiz found in the file");
+            for line in &extras.live_lines {
+                ui.label(line);
+            }
+        }
         return;
     };
     if !report.complete {

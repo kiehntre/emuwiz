@@ -56,6 +56,11 @@ fn proposal(source: &str, current: &str, proposed: &str, state: ProposalState) -
         sanitisation_notes: Vec::new(),
         actionable: state == ProposalState::Suggested,
         audited_identity: None,
+        // Bound like a planner-built proposal: observed when the proposal is
+        // made, i.e. after the file exists and before any test mutates it.
+        audited_fingerprint: crate::identity_source::hashing::FileFingerprint::observe(Path::new(
+            source,
+        )),
         is_outer_archive: false,
     }
 }
@@ -689,8 +694,10 @@ fn source_replaced_with_a_symlink_after_approval_is_rejected() {
     // Hostile change: replace the source with a symlink after approval.
     std::fs::remove_file(&source).unwrap();
     std::os::unix::fs::symlink(dir.path().join("elsewhere.bin"), &source).unwrap();
+    // Fail closed before any mutation: the symlink is no longer the file the
+    // audit fingerprinted, so the batch is refused by name.
     let cancel = no_cancel();
-    let outcome = apply(
+    let error = apply(
         &plan,
         approved_of(&[&source]),
         TrustedRoots::from_paths([&roms]),
@@ -698,22 +705,12 @@ fn source_replaced_with_a_symlink_after_approval_is_rejected() {
         HardConflictMode::SkipUnsafeSubset,
         &cancel,
     )
-    .unwrap();
-    assert_eq!(outcome.summary.applied, 0);
-    assert_eq!(
-        outcome.summary.skipped, 1,
-        "the symlink substitution is a hard conflict"
-    );
-    let entry = &outcome.transaction.entries[0];
+    .unwrap_err();
     assert!(
-        entry
-            .preflight_failures
-            .iter()
-            .any(|f| f.contains("symlink")),
-        "{:?}",
-        entry.preflight_failures
+        matches!(error, ApplyError::SourceChangedSinceAudit(ref changed)
+            if changed.len() == 1 && changed[0].reason == SourceChangeReason::Missing),
+        "{error:?}"
     );
-    // The symlink is still there; the target was never touched.
     assert!(
         std::fs::symlink_metadata(&source)
             .unwrap()
@@ -2569,7 +2566,15 @@ fn a_completed_transaction_cannot_be_applied_twice() {
         &cancel,
     )
     .unwrap_err();
-    assert_eq!(error, ApplyError::NothingApproved);
+    // Identity Lock: the renamed-away source is named with its reason rather
+    // than collapsing into an empty batch.
+    assert_eq!(
+        error,
+        ApplyError::SourceChangedSinceAudit(vec![ChangedSource {
+            path: source.clone(),
+            reason: SourceChangeReason::Missing,
+        }])
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3072,8 +3077,10 @@ fn broken_symlink_substitution_is_rejected() {
     // Hostile change: replace the source with a broken symlink.
     std::fs::remove_file(&source).unwrap();
     std::os::unix::fs::symlink(dir.path().join("nowhere.bin"), &source).unwrap();
+    // Fail closed before any mutation: the broken symlink is no longer the file the
+    // audit fingerprinted, so the batch is refused by name.
     let cancel = no_cancel();
-    let outcome = apply(
+    let error = apply(
         &plan,
         approved_of(&[&source]),
         TrustedRoots::from_paths([&roms]),
@@ -3081,8 +3088,18 @@ fn broken_symlink_substitution_is_rejected() {
         HardConflictMode::SkipUnsafeSubset,
         &cancel,
     )
-    .unwrap();
-    assert_eq!(outcome.summary.applied, 0);
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplyError::SourceChangedSinceAudit(ref changed)
+            if changed.len() == 1 && changed[0].reason == SourceChangeReason::Missing),
+        "{error:?}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&source)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]
@@ -3685,6 +3702,8 @@ fn outer_archive_proposal(source: &str, current: &str, proposed: &str) -> Rename
     proposal.verdict_label = "Set complete".to_string();
     proposal.audited_identity = capture_identity(Path::new(source)).ok();
     proposal.is_outer_archive = true;
+    // Archives are bound by `audited_identity`, not a loose-file fingerprint.
+    proposal.audited_fingerprint = None;
     proposal
 }
 
@@ -3701,7 +3720,15 @@ fn outer_transaction_construction_refuses_an_object_replaced_after_planning() {
     std::fs::write(&source, b"replacement archive").unwrap();
 
     let error = build_transaction(&plan, &approved_of(&[&source]), 1).unwrap_err();
-    assert_eq!(error, ApplyError::NothingApproved);
+    // Identity Lock: the replaced archive is named with its reason rather
+    // than silently dropped into an empty batch.
+    assert_eq!(
+        error,
+        ApplyError::SourceChangedSinceAudit(vec![ChangedSource {
+            path: source.clone(),
+            reason: SourceChangeReason::IdentityChanged,
+        }])
+    );
 }
 
 #[test]

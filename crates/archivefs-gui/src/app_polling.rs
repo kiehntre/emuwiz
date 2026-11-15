@@ -15,6 +15,12 @@ use crate::{
 };
 
 pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context) {
+    // First in every frame of both GUIs and before any launch state is
+    // polled, so a launch started from any page (Details, Gamer View, Big
+    // Picture, cheats) is seen as starting and uses up a one-time choice.
+    app.emulator_readiness
+        .launch_choices
+        .observe_launches(app.launch_retroarch.is_active() || app.launch_dolphin.is_active());
     crate::emulator_setup::zx_snapshot::poll(context);
     #[cfg(target_os = "linux")]
     app.emulator_readiness
@@ -35,6 +41,7 @@ pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context
     app.reconcile_archive_preparation();
     app.poll_needs_attention(context);
     app.artwork_media.platform_artwork.poll(context);
+    app.poll_startup_shared_recovery();
     app.poll_shared_history();
     // Gamer View's "Undo last change" (docs/GUI_NAVIGATION_RESET_DESIGN.md
     // mandatory risk #2) drives this exact same `shared_rollback` state
@@ -106,6 +113,9 @@ pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context
     app.poll_duckstation_resolution();
     app.poll_ppsspp_resolution();
     app.poll_pcsx2_firmware_evidence();
+    // BIOS answers verified again off this thread wake the interface.
+    app.emulator_readiness.pcsx2_bios_cache.wake_with(context);
+    app.emulator_readiness.flycast_bios_cache.wake_with(context);
     app.poll_cheat_workflow(context);
     app.cheatbase_page.poll(context);
     app.emulator_download_page.poll(context);

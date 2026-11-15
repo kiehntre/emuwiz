@@ -142,10 +142,12 @@ impl MelonDsPageState {
                 self.outcome = Some("Preview only — no emulator or game files changed".into());
             }
             Ok(Message::Applied(r)) => {
-                self.outcome = Some(format!(
+                let mut outcome = format!(
                     "Install result: {:?}. Runtime cheat effectiveness remains unverified. Journal: {:?}",
                     r.journal.status, r.journal_path
-                ));
+                );
+                crate::shared_apply_warnings::append(&mut outcome, &r);
+                self.outcome = Some(outcome);
                 if r.journal.status != SharedApplyStatus::Success {
                     self.failure = Some(format!(
                         "Install incomplete or refused: {:?}; journal evidence: {:?}. Refresh History and inspect retained recovery guidance",

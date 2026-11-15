@@ -8,11 +8,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use sha2::{Digest, Sha256};
 
 use super::catalogue_selection::ResolvedCatalogue;
+use super::header_match::extension_fits_kind;
 use super::identity::{DatPlatformIdentity, identify_dat_source};
 use super::library_identity_projection::project_dat_audit_for_library_identity;
 use super::library_identity_summary::DatVerificationState;
 use super::limits::DatLimits;
-use super::model::{DatEcosystem, DatPackingPolicy};
+use super::model::{DatEcosystem, DatPackingPolicy, ParsedDat};
 use super::parsers::parse_dat_file;
 use super::sources::DatSourceKind;
 use super::sources::audit_cache::AuditCacheConfig;
@@ -118,6 +119,27 @@ pub struct VerificationPreview {
     targets: CatalogueAuditTargets,
     // Private catalogue bytes live through the run and are never a user write target.
     _snapshot: tempfile::TempDir,
+    /// One selected game: its save touches only that game's evidence, so the
+    /// library-wide disc-order rebuild is not run.
+    single_game: bool,
+    /// A bounded set of rows chosen by a re-check (see `execute`).
+    rows_population: bool,
+}
+
+/// Which library rows a verification may hash and save.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerificationPopulation {
+    /// Every row assigned to the platform, optionally under one folder.
+    Platform { collection: Option<PathBuf> },
+    /// Exactly one library row, bound to the path the person was shown. Any
+    /// other row is never examined, and the preview fails rather than widen.
+    Game { archive_id: i64, path: PathBuf },
+    /// A bounded set of library rows, each bound to the path it had when the
+    /// set was chosen. Rows outside the set are never examined. A row that
+    /// has moved, left the library or changed system is excluded with its
+    /// reason; the rest are still checked. Used by the saved-evidence
+    /// re-audit, which commits one such set at a time.
+    Rows { rows: BTreeMap<i64, PathBuf> },
 }
 
 fn ext(path: &Path) -> String {
@@ -157,6 +179,59 @@ fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
         && a.ctime_nsec() == b.ctime_nsec()
 }
 
+/// Whether the frozen catalogue is for `platform`, from its own header.
+///
+/// An ordinary game list must name `platform`. Extras (downloadable
+/// content, e-Reader cards and so on) and Non-Redump discs are only
+/// accepted when the person set that system for the catalogue themselves
+/// (`chosen`; a system applied from a recognised header is not a choice),
+/// and so is a header naming more than one system when the person chose
+/// one of them. A header with no name is read from its description by the
+/// same rules. One with neither is accepted only for the system the person
+/// chose, and only when the older evidence agrees. Any other header
+/// (several systems, not games, ambiguous, unsupported) is refused.
+fn catalogue_is_for(parsed: &ParsedDat, platform: &str, chosen: Option<&str>) -> bool {
+    use super::catalogue_recognition::{CatalogueRecognition, recognise_catalogue, same_platform};
+    let ecosystem = Some(parsed.source.ecosystem);
+    let chosen_here = || {
+        chosen
+            .and_then(crate::canonical_platform_for_alias)
+            .is_some_and(|assigned| same_platform(assigned, platform))
+    };
+    let mut recognition = recognise_catalogue(parsed.source.name.as_deref(), ecosystem);
+    if recognition == CatalogueRecognition::NoName {
+        // The description never gets looser rules than a name would: a
+        // "Non-Redump - ..." or extras description still needs the choice.
+        recognition = recognise_catalogue(parsed.source.description.as_deref(), ecosystem);
+    }
+    match &recognition {
+        CatalogueRecognition::Games { .. } => recognition.is_for(platform),
+        // Extras and Non-Redump discs count only for a system the person
+        // chose themselves.
+        CatalogueRecognition::Extras { .. } | CatalogueRecognition::NeedsReview { .. } => {
+            recognition.is_for(platform) && chosen_here()
+        }
+        // The person resolved the ambiguity by choosing one of the systems
+        // the header names.
+        CatalogueRecognition::Ambiguous { platforms } => {
+            platforms
+                .iter()
+                .any(|candidate| same_platform(candidate, platform))
+                && chosen_here()
+        }
+        // Nothing in the header names a system. File names, folders and game
+        // names alone never back a system: only the person's own choice does.
+        CatalogueRecognition::NoName => {
+            chosen_here()
+                && matches!(
+                    identify_dat_source(parsed),
+                    DatPlatformIdentity::Resolved { platform: p, .. } if p == platform
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Metadata-only ROM population preview; DAT bytes are frozen and parsed on the worker.
 pub fn preview_library_verification(
     resolved: ResolvedCatalogue,
@@ -164,6 +239,67 @@ pub fn preview_library_verification(
     platform: String,
     collection: Option<PathBuf>,
 ) -> Result<VerificationPreview, String> {
+    preview_verification(
+        resolved,
+        database_path,
+        platform,
+        VerificationPopulation::Platform { collection },
+    )
+}
+
+/// The same preview for a bounded set of library rows (see
+/// [`VerificationPopulation::Rows`]). The library-wide disc-order rebuild is
+/// left to the caller, once, after its last set.
+pub fn preview_rows_verification(
+    resolved: ResolvedCatalogue,
+    database_path: PathBuf,
+    platform: String,
+    rows: BTreeMap<i64, PathBuf>,
+) -> Result<VerificationPreview, String> {
+    preview_verification(
+        resolved,
+        database_path,
+        platform,
+        VerificationPopulation::Rows { rows },
+    )
+}
+
+/// The same preview for exactly one library game. Fails, and checks nothing,
+/// when that game is gone, moved, on another system, shared by several rows
+/// or not eligible; it never falls back to the platform population.
+pub fn preview_game_verification(
+    resolved: ResolvedCatalogue,
+    database_path: PathBuf,
+    platform: String,
+    archive_id: i64,
+    path: PathBuf,
+) -> Result<VerificationPreview, String> {
+    preview_verification(
+        resolved,
+        database_path,
+        platform,
+        VerificationPopulation::Game { archive_id, path },
+    )
+}
+
+fn preview_verification(
+    resolved: ResolvedCatalogue,
+    database_path: PathBuf,
+    platform: String,
+    population: VerificationPopulation,
+) -> Result<VerificationPreview, String> {
+    let collection = match &population {
+        VerificationPopulation::Platform { collection } => collection.clone(),
+        VerificationPopulation::Game { .. } | VerificationPopulation::Rows { .. } => None,
+    };
+    let single = match &population {
+        VerificationPopulation::Game { archive_id, path } => Some((*archive_id, path.clone())),
+        VerificationPopulation::Platform { .. } | VerificationPopulation::Rows { .. } => None,
+    };
+    let mut chosen_rows = match &population {
+        VerificationPopulation::Rows { rows } => Some(rows.clone()),
+        _ => None,
+    };
     if resolved.kind != DatSourceKind::File {
         return Err("Choose one installed DAT file, not an aggregate folder.".into());
     }
@@ -203,12 +339,11 @@ pub fn preview_library_verification(
     {
         return Err("Managed catalogue snapshot changed.".into());
     }
-    match identify_dat_source(&parsed) {
-        DatPlatformIdentity::Resolved { platform: p, .. } if p == platform => {}
-        _ => return Err(
+    if !catalogue_is_for(&parsed, &platform, resolved.chosen_platform()) {
+        return Err(
             "Catalogue platform is unknown, ambiguous or incompatible with the selected system."
                 .into(),
-        ),
+        );
     }
     if resolved
         .assigned_platform
@@ -246,6 +381,7 @@ pub fn preview_library_verification(
     if formats.is_empty() {
         return Err("This catalogue has no supported ROM content hashes. Names, CRC-only, SHA-256-only and disk-only catalogues cannot provide this verification.".into());
     }
+    let header_kind = super::header_match::header_kind_for_platform(&platform);
     let db = Database::open_read_only(&database_path).map_err(|e| e.to_string())?;
     let rows = db.load_archives().map_err(|e| e.to_string())?;
     let mut path_counts = BTreeMap::new();
@@ -314,15 +450,59 @@ pub fn preview_library_verification(
         fingerprints: BTreeMap::new(),
         targets: CatalogueAuditTargets::default(),
         _snapshot: snapshot,
+        single_game: single.is_some() || chosen_rows.is_some(),
+        rows_population: chosen_rows.is_some(),
     };
     preview.request.dat_path = frozen;
     preview.request.platform = Some(platform);
     for row in rows {
+        if let Some((id, path)) = &single {
+            if row.id != *id {
+                continue;
+            }
+            if &row.absolute_path != path {
+                return Err(
+                    "This game's library location changed. Open it again. Nothing was checked."
+                        .into(),
+                );
+            }
+        }
+        let chosen_path = match chosen_rows.as_mut() {
+            Some(chosen) => match chosen.remove(&row.id) {
+                Some(path) => Some(path),
+                None => continue,
+            },
+            None => None,
+        };
+        if let Some(expected) = &chosen_path
+            && expected != &row.absolute_path
+        {
+            preview.selected_games += 1;
+            preview.exclusions.push(VerificationExclusion {
+                path: expected.clone(),
+                reason: "Library location changed since this check was planned".into(),
+            });
+            continue;
+        }
         let assigned = row
             .platform
             .as_deref()
             .and_then(crate::canonical_platform_for_alias);
         if assigned != Some(preview.platform.as_str()) {
+            if chosen_path.is_some() {
+                preview.selected_games += 1;
+                preview.exclusions.push(VerificationExclusion {
+                    path: row.absolute_path,
+                    reason: format!("No longer assigned to {}", preview.platform),
+                });
+                continue;
+            }
+            if single.is_some() {
+                return Err(format!(
+                    "This game is not assigned to {}. Nothing was checked.",
+                    preview.platform
+                ));
+            }
             if assigned.is_none() {
                 preview.unknown_system += 1;
             } else {
@@ -358,6 +538,12 @@ pub fn preview_library_verification(
         } else if !preview.formats.contains(&ext(&path))
             && !(parsed.source.packing_policy != DatPackingPolicy::FileOnly
                 && matches!(ext(&path).as_str(), "zip" | "7z"))
+            // A headered NES/Lynx/7800 file (".nes", ".lnx", ".a78") is
+            // compared with a headerless catalogue (".unh", ".lyx", ".bin")
+            // after its verified header is ignored. Its extension is never in
+            // that catalogue's formats, so it can only be verified, never
+            // recorded as a definitive negative.
+            && !header_kind.is_some_and(|kind| extension_fits_kind(&path, kind))
         {
             Some("Format not represented by this catalogue or unsupported container")
         } else {
@@ -375,6 +561,27 @@ pub fn preview_library_verification(
         preview.eligible_games += 1;
         preview.fingerprints.insert(path.clone(), metadata);
         preview.scope.eligible.insert(path, row.id);
+    }
+    for path in chosen_rows.into_iter().flatten().map(|(_, path)| path) {
+        preview.selected_games += 1;
+        preview.exclusions.push(VerificationExclusion {
+            path,
+            reason: "No longer in the library".into(),
+        });
+    }
+    if single.is_some() {
+        if preview.selected_games == 0 {
+            return Err("This game is no longer in the library. Nothing was checked.".into());
+        }
+        if let Some(exclusion) = preview.exclusions.first() {
+            return Err(format!(
+                "This game cannot be checked: {}. Nothing was checked or saved.",
+                exclusion.reason
+            ));
+        }
+        if preview.eligible_games != 1 {
+            return Err("This game could not be resolved to one file. Nothing was checked.".into());
+        }
     }
     preview.targets =
         catalogue_audit_targets(preview.scope.eligible.keys().cloned(), Path::new("/"));
@@ -404,12 +611,58 @@ pub struct VerificationTotals {
     pub errors: usize,
     pub saved: usize,
     pub protected_prior: usize,
+    /// The definitive result reached for each library row in this run.
+    pub findings: Vec<VerificationFinding>,
+    /// Set only for a bounded row set: the save committed, but some results
+    /// in it were withheld (their rows are simply still not current).
+    pub save_withheld: Option<String>,
     /// The disc-order refresh that follows a successful save. An error here
     /// never undoes the saved evidence.
     pub disc_order: Option<Result<crate::DatDiscOrderOutcome, String>>,
 }
 
+/// A definitive per-row result of one verification run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerificationFindingKind {
+    Verified,
+    NoMatch,
+    Ambiguous,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerificationFinding {
+    pub path: PathBuf,
+    pub kind: VerificationFindingKind,
+}
+
+/// The files one preview confirmed, as they were then. Lets a caller name
+/// which of them changed after a run refused to save.
+#[derive(Clone, Debug)]
+pub struct VerificationInputWatch {
+    fingerprints: BTreeMap<PathBuf, std::fs::Metadata>,
+}
+
+impl VerificationInputWatch {
+    /// Confirmed files that are no longer the same object. Metadata only.
+    pub fn changed(&self) -> Vec<PathBuf> {
+        self.fingerprints
+            .iter()
+            .filter(|(path, before)| {
+                !std::fs::symlink_metadata(path).is_ok_and(|after| same_file(before, &after))
+            })
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+}
+
 impl VerificationPreview {
+    /// The confirmed files as previewed (see [`VerificationInputWatch`]).
+    pub fn input_watch(&self) -> VerificationInputWatch {
+        VerificationInputWatch {
+            fingerprints: self.fingerprints.clone(),
+        }
+    }
+
     /// Exact physical paths in this confirmed library population (no folder walk).
     pub fn eligible_paths(&self) -> impl Iterator<Item = &Path> {
         self.scope.eligible.keys().map(PathBuf::as_path)
@@ -530,17 +783,29 @@ impl VerificationPreview {
             match &item.identity.verification_state {
                 DatVerificationState::VerifiedSingleMatch { .. } => {
                     totals.verified += 1;
+                    totals.findings.push(VerificationFinding {
+                        path: PathBuf::from(&item.local_path),
+                        kind: VerificationFindingKind::Verified,
+                    });
                     totals.not_checked -= 1;
                     definitive.insert(item.local_path.as_str());
                 }
                 DatVerificationState::NoMatch => {
                     totals.no_match += 1;
+                    totals.findings.push(VerificationFinding {
+                        path: PathBuf::from(&item.local_path),
+                        kind: VerificationFindingKind::NoMatch,
+                    });
                     totals.not_checked -= 1;
                     definitive.insert(item.local_path.as_str());
                 }
                 DatVerificationState::AmbiguousMultipleCandidates { .. }
                 | DatVerificationState::Conflicting { .. } => {
                     totals.ambiguous += 1;
+                    totals.findings.push(VerificationFinding {
+                        path: PathBuf::from(&item.local_path),
+                        kind: VerificationFindingKind::Ambiguous,
+                    });
                     totals.not_checked -= 1;
                     definitive.insert(item.local_path.as_str());
                 }
@@ -604,14 +869,33 @@ impl VerificationPreview {
             || saved.ambiguous != 0
             || saved.negative_platform_unproven_skipped != 0
         {
-            return Err(format!("Verification save was incomplete: {saved:?}"));
+            // The transaction has committed. A whole-system or one-game
+            // check reports that as an error, as it always has. A bounded
+            // row set must not: its caller would take "error" to mean
+            // nothing was saved, read the set again and stop at it forever.
+            if !self.rows_population {
+                return Err(format!("Verification save was incomplete: {saved:?}"));
+            }
+            totals.save_withheld = Some(format!(
+                "Some results in this set were not saved ({} refused, {} not tied to one library row, {} negative results that do not apply to the game's system)",
+                usize::from(saved.refused.is_some()),
+                saved.unassociated + saved.ambiguous,
+                saved.negative_platform_unproven_skipped
+            ));
         }
         totals.saved = saved.inserted + saved.updated;
         totals.protected_prior = saved.skipped_protected_prior_result;
-        totals.disc_order = Some(db.refresh_dat_disc_order(0).map_err(|e| e.to_string()));
+        // The disc-order rebuild reads and rewrites every release in the
+        // library, so a one-game check leaves it to the next platform check.
+        totals.disc_order =
+            (!self.single_game).then(|| db.refresh_dat_disc_order(0).map_err(|e| e.to_string()));
         Ok(totals)
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "library_verification/recognition_tests.rs"]
+mod recognition_tests;

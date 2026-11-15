@@ -118,6 +118,15 @@ pub(super) fn rollback(run: &mut Run<'_>, hook: Hook<'_>) -> Result<(), String> 
             .map_err(|error| error.to_string())?;
     }
     run.renamed = false;
-    remove_owned_temp(&run.journal);
+    // The restored card is now at the staging path. A program that opened
+    // the card before the reversal holds it: keep it (`unwind` parks the
+    // record). Removed only while its lease shows nobody did.
+    if run
+        .leases
+        .as_ref()
+        .is_none_or(|leases| leases.incoming.intact())
+    {
+        remove_owned_temp(&run.journal);
+    }
     Ok(())
 }

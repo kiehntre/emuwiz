@@ -150,7 +150,7 @@ fn find_value(resolved: &[(IdentityKind, String)], kind: IdentityKind) -> Option
 
 /// Matches [`crate::platform::Platform::id`]'s existing values for exactly
 /// the platforms [`GameIdentityReport`] can identify - never invented here.
-fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
+pub fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
     match platform {
         IdentityPlatform::PlayStation => Some("PSX"),
         IdentityPlatform::Amiga => Some("Amiga"),
@@ -181,6 +181,13 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::NeoGeoCd => Some("Neo Geo CD"),
         IdentityPlatform::Ngp => Some("Neo Geo Pocket"),
         IdentityPlatform::Ngpc => Some("Neo Geo Pocket Color"),
+        IdentityPlatform::GameGear => Some("GameGear"),
+        IdentityPlatform::MasterSystem => Some("MasterSystem"),
+        IdentityPlatform::Sega32x => Some("Sega 32X"),
+        IdentityPlatform::ColecoVision => Some("ColecoVision"),
+        // Stored libraries use `TurboGrafx-16` for HuCards; `PC Engine` is an
+        // equivalent registry id (EQUIVALENT_PLATFORM_IDS) and CD stays separate.
+        IdentityPlatform::TurboGrafx16 => Some("TurboGrafx-16"),
         IdentityPlatform::Atari2600 => Some("Atari2600"),
         IdentityPlatform::Atari5200 => Some("Atari5200"),
         IdentityPlatform::Atari7800 => Some("Atari7800"),
@@ -393,7 +400,12 @@ fn resolved_identity_for_platform(
                 vec![VerifiedIdentityFact::PcfxDiscHash(disc_hash.to_string())],
             ))
         }
-        IdentityPlatform::Atari2600
+        IdentityPlatform::GameGear
+        | IdentityPlatform::MasterSystem
+        | IdentityPlatform::Sega32x
+        | IdentityPlatform::ColecoVision
+        | IdentityPlatform::TurboGrafx16
+        | IdentityPlatform::Atari2600
         | IdentityPlatform::Atari5200
         | IdentityPlatform::Atari7800
         | IdentityPlatform::Atari8Bit
@@ -672,6 +684,36 @@ pub fn launch_content_ref_for_unmounted(
         })
     }
 }
+
+/// The launch content for a ZIP whose identity report proves exactly one
+/// verified cartridge ROM member. The plan treats it as a direct file so
+/// readiness can be Ready, but the ZIP is never handed to an emulator:
+/// RetroArch launch extracts the member to a private temporary file after
+/// re-verifying identity (see `stage_zip_cartridge_for_launch`). `None` for
+/// anything else, which keeps the ordinary mount-required route.
+pub fn launch_content_ref_for_zipped_cartridge(
+    report: &GameIdentityReport,
+) -> Option<LaunchContentRef> {
+    use crate::game_identity::IdentityImageFormat;
+    if report.format != IdentityImageFormat::ZipContainingCartridgeRom
+        || !report.complete
+        || report
+            .verified_value(IdentityKind::LooseRomSha256)
+            .is_none()
+    {
+        return None;
+    }
+    Some(LaunchContentRef {
+        kind: Some(LaunchContentKind::Cartridge),
+        container: Some(LaunchContainerKind::PlainFile),
+        resolved_path: Some(report.archive_path.clone()),
+        requires_mount: false,
+        provenance: ZIPPED_CARTRIDGE_PROVENANCE.to_string(),
+    })
+}
+
+/// Provenance text marking content that must be extracted before launch.
+pub const ZIPPED_CARTRIDGE_PROVENANCE: &str = "zipped cartridge: its single verified ROM member is extracted to a private temporary file when you press Play";
 
 pub fn launch_content_ref_from_archive_record(
     record: &ArchiveRecord,

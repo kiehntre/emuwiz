@@ -249,7 +249,11 @@ impl Controller {
                     }
                 });
                 ui.label("Path or address (re-enter a remote address to edit; query values stay hidden)");
-                edited |= ui.add(egui::TextEdit::singleline(&mut self.address).password(self.kind != 0)).changed();
+                let response = ui.add(egui::TextEdit::singleline(&mut self.address).password(self.kind != 0));
+                if self.kind != 0 {
+                    crate::gui_v2::mark_secret(&response);
+                }
+                edited |= response.changed();
                 if edited { self.candidate = None; self.rollback = None; self.approved = false; }
                 if ui.button("Save registration only").clicked() {
                     let source = match self.kind {

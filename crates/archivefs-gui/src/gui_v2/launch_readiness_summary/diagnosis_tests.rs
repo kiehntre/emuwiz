@@ -66,6 +66,8 @@ fn plan(candidates: Vec<LaunchCandidate>) -> LaunchReadinessInput {
         cemu: None,
         flycast: None,
         xroar: None,
+        azahar: None,
+        vita3k: None,
         vice: None,
         amiga_whdload: None,
         #[cfg(target_os = "linux")]
@@ -98,7 +100,7 @@ fn render(
         },
         |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, summary);
+                show(ui, summary, None);
             });
         },
     );

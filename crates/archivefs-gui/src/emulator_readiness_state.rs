@@ -19,6 +19,8 @@ pub(crate) struct EmulatorReadinessState {
     pub(crate) flycast_gdi: crate::emulator_setup::flycast_gdi::Controller,
     pub(crate) vice: crate::launch_readiness_page::vice::Controller,
     pub(crate) xroar_cassette: crate::emulator_setup::xroar_cassette::Controller,
+    pub(crate) azahar_homebrew: crate::emulator_setup::azahar_homebrew::Controller,
+    pub(crate) vita3k_library: crate::emulator_setup::vita3k_library::Controller,
     pub(crate) cemu: crate::emulator_setup::cemu::Controller,
     #[cfg(target_os = "linux")]
     pub(crate) shadps4:
@@ -59,12 +61,23 @@ pub(crate) struct EmulatorReadinessState {
     pub(crate) pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState,
     pub(crate) xenia_profiles: XeniaProfilesState,
     pub(crate) remembered_emulator_profiles: Vec<RememberedEmulatorProfile>,
+    /// The user's explicit emulator choices for launch (shared facility).
+    pub(crate) launch_choices: crate::launch_readiness_page::launch_choice::LaunchChoiceState,
     pub(crate) rpcs3_status: rpcs3_page::Rpcs3State,
     pub(crate) rpcs3_status_generation: u64,
     pub(crate) pcsx2_status: pcsx2_page::Pcsx2StatusState,
     pub(crate) pcsx2_save_vault: pcsx2_page::Pcsx2SaveVaultState,
     pub(crate) pcsx2_status_generation: u64,
     pub(crate) pcsx2_status_archive_path: Option<PathBuf>,
+    /// Each PCSX2 / Flycast profile's BIOS answer for the launch planner,
+    /// reused while its files are unchanged and verified again off the
+    /// interface thread; see `firmware_answers::FirmwareAnswerCache`.
+    pub(crate) pcsx2_bios_cache: crate::emulator_setup::firmware_answers::FirmwareAnswerCache<
+        archivefs_core::patch_manager::Pcsx2BiosVerification,
+    >,
+    pub(crate) flycast_bios_cache: crate::emulator_setup::firmware_answers::FirmwareAnswerCache<
+        archivefs_core::patch_manager::FlycastSystemFileState,
+    >,
 }
 
 impl Default for EmulatorReadinessState {
@@ -75,6 +88,8 @@ impl Default for EmulatorReadinessState {
             hatari: Default::default(),
             flycast_gdi: Default::default(),
             xroar_cassette: Default::default(),
+            azahar_homebrew: Default::default(),
+            vita3k_library: Default::default(),
             vice: Default::default(),
             #[cfg(target_os = "linux")]
             shadps4: Default::default(),
@@ -82,6 +97,8 @@ impl Default for EmulatorReadinessState {
             retroarch_profiles: RetroArchProfilesState::NotScanned,
             retroarch_installation_fingerprint: None,
             retroarch_revalidated_at: None,
+            pcsx2_bios_cache: Default::default(),
+            flycast_bios_cache: Default::default(),
             retroarch_core_directory_override: None,
             retroarch_core_folder_rejected_pick: None,
             retroarch_core_folder_preview: None,
@@ -107,6 +124,7 @@ impl Default for EmulatorReadinessState {
             pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState::NotLoaded,
             xenia_profiles: XeniaProfilesState::NotScanned,
             remembered_emulator_profiles: Vec::new(),
+            launch_choices: Default::default(),
             rpcs3_status: rpcs3_page::Rpcs3State::Idle,
             rpcs3_status_generation: 0,
             pcsx2_status: pcsx2_page::Pcsx2StatusState::Idle,
@@ -128,6 +146,8 @@ impl EmulatorReadinessState {
             ),
             remembered_emulator_profiles: crate::load_remembered_emulator_profiles_default()
                 .unwrap_or_default(),
+            launch_choices:
+                crate::launch_readiness_page::launch_choice::LaunchChoiceState::load_default(),
             ..Self::default()
         }
     }

@@ -12,7 +12,10 @@
 //! This module owns no shared state with `crate::patch_manager` and is not
 //! imported by it.
 
+pub mod content_history;
 pub mod installation_selection;
+mod save_directories;
+pub use save_directories::{SaveDirectoryFinding, SaveDirectoryStatus};
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -715,6 +718,9 @@ pub struct RetroArchProfile {
     /// evidence never merges with a Flatpak sandbox's own path roots.
     /// Sorted by encoded AppImage path bytes.
     pub app_images: Vec<AppImageCandidate>,
+    /// Health of the configured save-file/save-state folders, from
+    /// `retroarch.cfg` and each installed core's per-core override.
+    pub save_directories: Vec<SaveDirectoryFinding>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -1133,11 +1139,13 @@ fn discover_profile(
     let config_directory_found = config_directory_probe == FsProbe::PresentDirectory;
 
     let config_file_path = config_dir.join("retroarch.cfg");
+    let mut config_keys = path_purpose_keys().to_vec();
+    config_keys.push(save_directories::OVERRIDE_DIRECTORY_KEY);
     let (config_probe, config_outcome, parsed) = read_config_file(
         filesystem,
         &config_file_path,
         MAX_CONFIG_BYTES,
-        &path_purpose_keys(),
+        &config_keys,
     );
     record_config_diagnostics(
         &config_probe,
@@ -1185,6 +1193,22 @@ fn discover_profile(
     // finding appears twice in JSON for no benefit.
     let playlists = discover_playlists(filesystem, &path_results.resolved_dirs, profile_ref);
 
+    let save_directories = save_directories::discover_save_directories(
+        filesystem,
+        &config_file_path,
+        |key| {
+            parsed
+                .as_ref()
+                .and_then(|parsed| parsed.values.get(key))
+                .map(String::as_str)
+        },
+        tilde_home,
+        cores.iter().filter_map(|core| match &core.info {
+            CoreInfoFinding::Found { core_name, .. } => core_name.as_deref(),
+            _ => None,
+        }),
+    );
+
     let evidence = Evidence {
         executables: executables.clone(),
         flatpak_metadata_found: flatpak_metadata_found.unwrap_or(false),
@@ -1209,6 +1233,7 @@ fn discover_profile(
         cores,
         playlists,
         app_images: Vec::new(), // filled in by discover_retroarch_environment, native/AppImage profiles only
+        save_directories,
         diagnostics: Vec::new(), // filled in by the caller after global sort
     };
 
@@ -1481,6 +1506,44 @@ fn parse_config(text: &str, recognized_keys: &[&'static str]) -> ParsedConfig {
     }
 }
 
+/// Every occurrence of the requested keys in one settings file, in file
+/// order, for callers that must point at the exact line a value came from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ConfigKeyOccurrences {
+    /// `(one-based line number, key, value)`.
+    pub(crate) occurrences: Vec<(u32, String, String)>,
+    /// Lines holding an `#include` directive. Included files are not read.
+    pub(crate) include_lines: Vec<u32>,
+    pub(crate) malformed_lines: Vec<u32>,
+}
+
+/// Lists every occurrence of `keys` using the same grammar as
+/// [`parse_config`], without collapsing repeats. RetroArch honours the
+/// *first* occurrence of a repeated key (checked against RetroArch 1.21.0),
+/// which is also what [`parse_config`] keeps.
+pub(crate) fn config_key_occurrences(text: &str, keys: &[&str]) -> ConfigKeyOccurrences {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut found = ConfigKeyOccurrences::default();
+    for (index, raw_line) in text.split('\n').enumerate() {
+        let line_number = (index + 1) as u32;
+        match classify_line(raw_line) {
+            LineKind::Blank | LineKind::WholeLineComment => {}
+            LineKind::Include => found.include_lines.push(line_number),
+            LineKind::Malformed => found.malformed_lines.push(line_number),
+            LineKind::KeyValue { key, value_region } => {
+                if keys.contains(&key) {
+                    found.occurrences.push((
+                        line_number,
+                        key.to_string(),
+                        extract_value(value_region),
+                    ));
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Which sub-field a `firmwareN_*` key names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirmwareField {
@@ -1605,7 +1668,7 @@ fn parse_firmware_requirements(
 /// EmuWiz declines to resolve it (colon alias, or a plain relative
 /// value with no config-relative anchor RetroArch itself would use -
 /// confirmed via `fill_pathname_expand_special` in the primary source).
-fn resolve_configured_value(raw: &str, tilde_home: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_configured_value(raw: &str, tilde_home: &Path) -> Option<PathBuf> {
     if raw.starts_with('/') {
         Some(PathBuf::from(raw))
     } else if raw == "~" {
@@ -1931,14 +1994,21 @@ pub fn firmware_evidence_paths(report: &RetroArchEnvironmentReport) -> Vec<PathB
     paths
 }
 
-/// Read-only, no-follow presence check for one declared firmware file.
+/// Read-only presence check for one declared firmware file.
 ///
-/// Every component is probed with the final-component no-follow `probe`,
-/// starting from the already-validated system directory; a symlink at any
-/// level is `Unknown` (never followed, never trusted). Declared paths come
-/// from user-editable `.info` files, so anything but plain relative
-/// `Normal` components (absolute, `..`, empty, NUL) is `Unknown`. Flatpak
-/// system directories are sandbox-mapped, so no host-side claim is made.
+/// Every component is probed with `probe_firmware_candidate`, starting from
+/// the already-validated system directory. A symlink is resolved and
+/// verified (canonicalized; final target must be a readable regular file,
+/// or a directory for a parent component) and then treated EXACTLY like the
+/// real file/directory it resolves to: a link to a regular file is
+/// `PresentUnverified` (never `Verified` - no content is read, so no
+/// authenticity is claimed; the same level a real unhashed file gets), a
+/// dangling or looping link is `Missing`, and a link to a non-regular target
+/// is `Unknown`, as a non-regular real file is. Real-file outcomes are
+/// unchanged. Declared paths come from user-editable `.info` files, so
+/// anything but plain relative `Normal` components (absolute, `..`, empty,
+/// NUL) is `Unknown`. Flatpak system directories are sandbox-mapped, so no
+/// host-side claim is made.
 fn probe_firmware_presence(
     filesystem: &dyn ReadOnlyHostFilesystem,
     profile: ProfileRef,
@@ -1960,14 +2030,14 @@ fn probe_firmware_presence(
     let mut current = system_dir.clone();
     for parent in parents {
         current.push(parent);
-        match filesystem.probe(&current) {
+        match filesystem.probe_firmware_candidate(&current) {
             FsProbe::PresentDirectory => {}
             FsProbe::Missing => return FirmwarePresence::Missing,
             _ => return FirmwarePresence::Unknown,
         }
     }
     current.push(last);
-    match filesystem.probe(&current) {
+    match filesystem.probe_firmware_candidate(&current) {
         FsProbe::PresentFile => FirmwarePresence::PresentUnverified,
         FsProbe::Missing => FirmwarePresence::Missing,
         _ => FirmwarePresence::Unknown,
@@ -3810,6 +3880,45 @@ mod tests {
     }
 
     #[test]
+    fn aliased_symlink_cores_are_not_offered_as_separate_cores() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("core-alias");
+        fixture.write(
+            ".config/retroarch/retroarch.cfg",
+            &format!(
+                "libretro_directory = \"{}\"\n",
+                fixture.path("cores").display()
+            ),
+        );
+        fixture.mkdir("cores");
+        fixture.write("cores/mednafen_psx_libretro.so", "stub");
+        for alias in ["pcsx_rearmed", "mednafen_psx_hw"] {
+            symlink(
+                fixture.path("cores/mednafen_psx_libretro.so"),
+                fixture.path(&format!("cores/{alias}_libretro.so")),
+            )
+            .unwrap();
+        }
+
+        let filesystem = HostReadOnlyFilesystem;
+        let report = discover_retroarch_environment(&filesystem, &fixture.env()).unwrap();
+        let stems: Vec<&str> = report.profiles[0]
+            .cores
+            .iter()
+            .map(|core| core.core_stem.as_str())
+            .collect();
+        assert_eq!(stems, ["mednafen_psx"]);
+        assert_eq!(
+            report.profiles[0]
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == "core_symlink_skipped")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn matching_info_file_is_parsed() {
         let fixture = Fixture::new("core-info");
         fixture.write(
@@ -4317,11 +4426,11 @@ mod tests {
     /// Builds a native profile with one core whose `.info` is `info_bytes`
     /// and a configured system directory `system/`, then returns the
     /// per-entry presences plus the projected readiness.
-    fn firmware_probe_fixture(
+    fn firmware_report_fixture(
         name: &str,
         info_bytes: &[u8],
         setup: impl FnOnce(&Fixture),
-    ) -> (Fixture, CoreInfoFinding) {
+    ) -> (Fixture, RetroArchEnvironmentReport) {
         let fixture = Fixture::new(name);
         fixture.write(
             ".config/retroarch/retroarch.cfg",
@@ -4346,6 +4455,15 @@ mod tests {
             fixture.snapshot(),
             "discovery must not write anything"
         );
+        (fixture, report)
+    }
+
+    fn firmware_probe_fixture(
+        name: &str,
+        info_bytes: &[u8],
+        setup: impl FnOnce(&Fixture),
+    ) -> (Fixture, CoreInfoFinding) {
+        let (fixture, report) = firmware_report_fixture(name, info_bytes, setup);
         let info = report.profiles[0].cores[0].info.clone();
         (fixture, info)
     }
@@ -4372,7 +4490,11 @@ mod tests {
     impl Fixture {
         fn snapshot(&self) -> Vec<(PathBuf, bool)> {
             fn walk(dir: &Path, out: &mut Vec<(PathBuf, bool)>) {
-                let mut entries: Vec<_> = fs::read_dir(dir).unwrap().flatten().collect();
+                // An unreadable directory (permission tests) is a leaf.
+                let Ok(read_dir) = fs::read_dir(dir) else {
+                    return;
+                };
+                let mut entries: Vec<_> = read_dir.flatten().collect();
                 entries.sort_by_key(|e| e.path());
                 for entry in entries {
                     let meta = fs::symlink_metadata(entry.path()).unwrap();
@@ -4424,27 +4546,208 @@ mod tests {
         );
     }
 
+    // Symlinked firmware is resolved and then judged exactly like the real
+    // file it resolves to (see `probe_firmware_candidate`). This replaces the
+    // old "never follow symlinks" rule, which made any link `Unknown` (no
+    // block, no warning) while a plain unhashed file was `PresentUnverified`
+    // (warning, Play removed): a link to a good file was treated as LESS
+    // scrutinised than the file itself, and a dangling link never blocked.
     #[test]
-    fn firmware_presence_never_follows_symlinks() {
+    fn firmware_presence_symlinks_are_judged_like_the_resolved_file() {
+        use std::os::unix::fs::symlink;
         let info = fw_info(&[
+            ("real.bin", false),
             ("link.bin", false),
-            ("linkdir/real.bin", false),
+            ("rel.bin", false),
+            ("chain.bin", false),
+            ("dangling.bin", false),
+            ("loop.bin", false),
+            ("dirlink.bin", false),
+            ("linkdir/inner.bin", false),
             ("dirname", false),
         ]);
         let (_f, found) = firmware_probe_fixture("fw-symlink", info.as_bytes(), |f| {
-            f.write("elsewhere/real.bin", "x");
-            std::os::unix::fs::symlink(f.path("elsewhere/real.bin"), f.path("system/link.bin"))
-                .unwrap();
-            std::os::unix::fs::symlink(f.path("elsewhere"), f.path("system/linkdir")).unwrap();
+            f.write("system/real.bin", "x");
+            f.write("elsewhere/target.bin", "x");
+            f.mkdir("elsewhere/adir");
+            symlink(f.path("elsewhere/target.bin"), f.path("system/link.bin")).unwrap();
+            symlink("../elsewhere/target.bin", f.path("system/rel.bin")).unwrap();
+            symlink(f.path("system/link.bin"), f.path("elsewhere/hop.bin")).unwrap();
+            symlink(f.path("elsewhere/hop.bin"), f.path("system/chain.bin")).unwrap();
+            symlink(f.path("elsewhere/nope.bin"), f.path("system/dangling.bin")).unwrap();
+            symlink("loop.bin", f.path("system/loop.bin")).unwrap();
+            symlink(f.path("elsewhere/adir"), f.path("system/dirlink.bin")).unwrap();
+            symlink(f.path("elsewhere"), f.path("system/linkdir")).unwrap();
+            f.write("elsewhere/inner.bin", "x");
             f.mkdir("system/dirname");
         });
         assert_eq!(
             presences(&found),
             vec![
-                FirmwarePresence::Unknown,
-                FirmwarePresence::Unknown,
-                FirmwarePresence::Unknown
+                FirmwarePresence::PresentUnverified, // real file (unchanged)
+                FirmwarePresence::PresentUnverified, // absolute link
+                FirmwarePresence::PresentUnverified, // relative link
+                FirmwarePresence::PresentUnverified, // chain of links
+                FirmwarePresence::Missing,           // dangling
+                FirmwarePresence::Missing,           // loop
+                FirmwarePresence::Unknown,           // link to dir == real dir
+                FirmwarePresence::PresentUnverified, // symlinked parent dir
+                FirmwarePresence::Unknown,           // real dir
             ]
+        );
+    }
+
+    #[test]
+    fn firmware_presence_symlink_to_fifo_is_not_present_and_does_not_hang() {
+        let info = fw_info(&[("fifo.bin", false), ("realfifo.bin", false)]);
+        let (_f, found) = firmware_probe_fixture("fw-symlink-fifo", info.as_bytes(), |f| {
+            f.mkdir("elsewhere");
+            let fifo = f.path("elsewhere/fifo");
+            let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            std::os::unix::fs::symlink(&fifo, f.path("system/fifo.bin")).unwrap();
+            let c2 = std::ffi::CString::new(f.path("system/realfifo.bin").as_os_str().as_bytes())
+                .unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c2.as_ptr(), 0o600) }, 0);
+        });
+        // Same (non-claiming) outcome as a real FIFO; never PresentUnverified.
+        assert_eq!(
+            presences(&found),
+            vec![FirmwarePresence::Unknown, FirmwarePresence::Unknown]
+        );
+    }
+
+    // ---- planner-level pins (real filesystem probe -> build_launch_plan) ----
+
+    fn planner_outcome(
+        name: &str,
+        setup: impl FnOnce(&Fixture),
+    ) -> (
+        crate::launch::readiness::LaunchReadiness,
+        Vec<crate::launch::readiness::LaunchBlockerKind>,
+        Vec<crate::launch::readiness::LaunchWarningKind>,
+    ) {
+        use crate::launch::planning::*;
+        let info = "systemname = \"PlayStation 2\"\nfirmware_count = \"1\"\nfirmware0_path = \"bios.bin\"\nfirmware0_opt = \"false\"\n";
+        let (_f, report) = firmware_report_fixture(name, info.as_bytes(), setup);
+        let identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "PS2".to_string(),
+            game_key: "TEST-00001".to_string(),
+        });
+        let content = LaunchContentRef {
+            kind: Some(LaunchContentKind::OpticalDisc),
+            container: Some(LaunchContainerKind::Chd),
+            resolved_path: Some(PathBuf::from("/library/ps2/Game.chd")),
+            requires_mount: false,
+            provenance: "test".to_string(),
+        };
+        let plan = build_launch_plan(&identity, &content, &[], &report, &[]);
+        let candidate = plan
+            .candidates
+            .iter()
+            .find(|c| matches!(c.target, LaunchTarget::RetroArchCore { .. }))
+            .expect("retroarch candidate");
+        (
+            candidate.readiness,
+            candidate.blockers.iter().map(|b| b.kind).collect(),
+            candidate.warnings.iter().map(|w| w.kind).collect(),
+        )
+    }
+
+    #[test]
+    fn planner_blocks_required_firmware_behind_a_dangling_link() {
+        use crate::launch::readiness::*;
+        let (readiness, blockers, _) = planner_outcome("fw-plan-dangling", |f| {
+            std::os::unix::fs::symlink(f.path("elsewhere/gone.bin"), f.path("system/bios.bin"))
+                .unwrap();
+        });
+        assert_eq!(readiness, LaunchReadiness::Blocked);
+        assert!(blockers.contains(&LaunchBlockerKind::RequiredFirmwareMissing));
+    }
+
+    /// PINS today's policy: an unhashed present firmware (real file OR a link
+    /// to one) is `FirmwarePresentUnverified` => `ReadyWithWarnings`, which the
+    /// GUI turns into "no Play". Changing that is the owner's separate
+    /// decision; when it happens this test must change in the same diff.
+    #[test]
+    fn planner_pins_present_unverified_for_real_file_and_readable_link_alike() {
+        use crate::launch::readiness::*;
+        let real = planner_outcome("fw-plan-real", |f| f.write("system/bios.bin", "x"));
+        let linked = planner_outcome("fw-plan-link", |f| {
+            f.write("elsewhere/bios.bin", "x");
+            std::os::unix::fs::symlink(f.path("elsewhere/bios.bin"), f.path("system/bios.bin"))
+                .unwrap();
+        });
+        assert_eq!(real, linked);
+        assert_eq!(real.0, LaunchReadiness::ReadyWithWarnings);
+        assert!(real.1.is_empty());
+        assert_eq!(real.2, vec![LaunchWarningKind::FirmwarePresentUnverified]);
+    }
+
+    #[test]
+    fn unreadable_link_target_is_inaccessible_never_a_pass() {
+        use std::os::unix::fs::PermissionsExt;
+        let info = fw_info(&[("a.bin", false)]);
+        let (_f, found) = firmware_probe_fixture("fw-eacces-open", info.as_bytes(), |f| {
+            f.write("elsewhere/a.bin", "x");
+            fs::set_permissions(f.path("elsewhere/a.bin"), fs::Permissions::from_mode(0o000))
+                .unwrap();
+            std::os::unix::fs::symlink(f.path("elsewhere/a.bin"), f.path("system/a.bin")).unwrap();
+        });
+        let readable_anyway = fs::File::open(
+            std::env::temp_dir()
+                .join(format!(
+                    "archivefs-retroarch-env-fw-eacces-open-{}",
+                    std::process::id()
+                ))
+                .join("elsewhere/a.bin"),
+        )
+        .is_ok(); // running as root ignores mode bits
+        if readable_anyway {
+            return;
+        }
+        assert_eq!(presences(&found), vec![FirmwarePresence::Unknown]);
+
+        // EACCES on canonicalize: a directory component without search permission.
+        let (f2, found2) = firmware_probe_fixture("fw-eacces-canon", info.as_bytes(), |f| {
+            f.write("locked/a.bin", "x");
+            std::os::unix::fs::symlink(f.path("locked/a.bin"), f.path("system/a.bin")).unwrap();
+            fs::set_permissions(f.path("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        });
+        let _ = fs::set_permissions(f2.path("locked"), fs::Permissions::from_mode(0o755));
+        assert_eq!(presences(&found2), vec![FirmwarePresence::Unknown]);
+    }
+
+    #[test]
+    fn firmware_symlink_gate_equivalence_with_real_file() {
+        use crate::launch::readiness::retroarch_core_firmware_readiness;
+        use std::os::unix::fs::symlink;
+        // Required firmware: real file vs link to that same content, present
+        // vs absent. The readiness (which feeds blocker/warning mapping) of
+        // the link must equal that of the real file / missing file.
+        let info = fw_info(&[("a.bin", false)]);
+        let (_f, real) = firmware_probe_fixture("fw-eq-real", info.as_bytes(), |f| {
+            f.write("system/a.bin", "x");
+        });
+        let (_f2, linked) = firmware_probe_fixture("fw-eq-link", info.as_bytes(), |f| {
+            f.write("elsewhere/a.bin", "x");
+            symlink(f.path("elsewhere/a.bin"), f.path("system/a.bin")).unwrap();
+        });
+        assert_eq!(
+            retroarch_core_firmware_readiness(&real),
+            retroarch_core_firmware_readiness(&linked)
+        );
+        let (_f3, absent) = firmware_probe_fixture("fw-eq-absent", info.as_bytes(), |_| {});
+        let (_f4, dangling) = firmware_probe_fixture("fw-eq-dangling", info.as_bytes(), |f| {
+            symlink(f.path("elsewhere/gone.bin"), f.path("system/a.bin")).unwrap();
+        });
+        assert_eq!(
+            retroarch_core_firmware_readiness(&absent),
+            crate::launch::readiness::FirmwareReadiness::Missing
+        );
+        assert_eq!(
+            retroarch_core_firmware_readiness(&absent),
+            retroarch_core_firmware_readiness(&dangling)
         );
     }
 
@@ -5136,6 +5439,7 @@ mod tests {
                 "paths",
                 "playlists",
                 "profile_kind",
+                "save_directories",
                 "scope",
             ]
         );

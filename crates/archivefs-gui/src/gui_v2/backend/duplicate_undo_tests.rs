@@ -111,7 +111,7 @@ fn deliver_payload(
     let mut app = super::super::tests::fixture(&context);
     let (requests, _rx) = mpsc::channel();
     let (answers, rx) = mpsc::channel();
-    app.backend = Backend { tx: requests, rx };
+    app.backend = Backend::with_channels(requests, rx);
     app.repair_history.push(record.clone());
     let id = app.activity.queue(
         "Undoing the duplicate quarantine",
@@ -707,7 +707,7 @@ fn reordered_history_dispatches_immutable_transaction_id() {
     let mut app = super::super::tests::fixture(&ctx);
     let (tx, rx) = mpsc::channel();
     let (_answers, answers) = mpsc::channel();
-    app.backend = Backend { tx, rx: answers };
+    app.backend = Backend::with_channels(tx, answers);
     app.equivalent_applied(fx.record.clone());
     let target = app.equiv.result.as_ref().unwrap().1.clone();
     app.repair_history.insert(0, other.record.clone());
@@ -826,7 +826,7 @@ fn dispatch_does_not_finish_current_activity_for_obsolete_generation() {
     let mut app = super::super::tests::fixture(&ctx);
     let (tx, _requests) = mpsc::channel();
     let (answers, rx) = mpsc::channel();
-    app.backend = Backend { tx, rx };
+    app.backend = Backend::with_channels(tx, rx);
     app.repair_history.push(fx.record.clone());
     let id = pending(&mut app, &fx.record, 2);
     answers
@@ -1121,10 +1121,7 @@ fn dispatch_history_undo(
     let mut app = super::super::tests::fixture(&ctx);
     let (requests, rx) = mpsc::channel();
     let (answers, events) = mpsc::channel();
-    app.backend = Backend {
-        tx: requests,
-        rx: events,
-    };
+    app.backend = Backend::with_channels(requests, events);
     let transaction_id = record.transaction.transaction_id.clone();
     app.repair_history.push(record);
     if disconnected {
@@ -1233,10 +1230,7 @@ fn history_page_shows_pending_undo_only_on_the_matching_receipt() {
     let mut app = super::super::tests::fixture(&ctx);
     let (requests, rx) = mpsc::channel();
     let (_answers, events) = mpsc::channel();
-    app.backend = Backend {
-        tx: requests,
-        rx: events,
-    };
+    app.backend = Backend::with_channels(requests, events);
     app.repair_history = vec![other.record.clone(), fx.record.clone()];
     app.undo_history_entry(&fx.record.transaction.transaction_id);
     let (id, _) = rx.recv().unwrap();

@@ -114,14 +114,213 @@ pub struct DolphinTexturePackBuildPreview {
     pub complete: bool,
 }
 
-/// Read-only result of inspecting a ZIP texture pack.  `staging_root` is a
-/// private, EmuWiz-owned temporary directory containing only validated ZIP
-/// members; callers must retain it until the manifest is installed and then
-/// remove it.  It is never the emulator destination.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The private, EmuWiz-owned temporary directory a ZIP texture pack was
+/// decoded into. It owns that directory: dropping the value removes it, so
+/// an abandoned preview (a new selection, a cancel, an error on the way)
+/// never leaves hundreds of megabytes behind in `$TMPDIR` (Night Watch
+/// NW2-A-01). The one way to keep the files is [`Self::retain_into`], which
+/// moves them to a caller-chosen, EmuWiz-owned retained location and hands
+/// back that path. It is never the emulator destination.
+#[derive(Debug)]
+pub struct DolphinTexturePackStaging {
+    root: PathBuf,
+    retained: bool,
+}
+
+impl DolphinTexturePackStaging {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            retained: false,
+        }
+    }
+
+    /// The staging directory, valid while this value is alive.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Moves the staged files to `retained_root` (which must not exist yet;
+    /// its parent is created) and returns that path. A plain rename is
+    /// tried first; when the retained location is on another file system
+    /// the tree is copied and the staging directory removed. On failure the
+    /// staging directory is removed and nothing is left at `retained_root`.
+    pub fn retain_into(mut self, retained_root: &Path) -> Result<PathBuf, DolphinTextureModError> {
+        let result = (|| {
+            if !retained_root.is_absolute() {
+                return Err(pack_error(
+                    DolphinTextureModErrorKind::PreviewFailed,
+                    "retained texture-pack location must be absolute",
+                ));
+            }
+            if fs::symlink_metadata(retained_root).is_ok() {
+                return Err(pack_error(
+                    DolphinTextureModErrorKind::PreviewFailed,
+                    format!(
+                        "retained texture-pack location already exists: {}",
+                        retained_root.display()
+                    ),
+                ));
+            }
+            let parent = retained_root.parent().ok_or_else(|| {
+                pack_error(
+                    DolphinTextureModErrorKind::PreviewFailed,
+                    "retained texture-pack location has no parent",
+                )
+            })?;
+            fs::create_dir_all(parent).map_err(|error| {
+                pack_error(
+                    DolphinTextureModErrorKind::PreviewFailed,
+                    format!("could not create {}: {error}", parent.display()),
+                )
+            })?;
+            match fs::rename(&self.root, retained_root) {
+                Ok(()) => Ok(()),
+                Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+                    // Only a directory this copy created is removed on failure;
+                    // if `create_dir` itself failed nothing of ours exists there.
+                    copy_tree(&self.root, retained_root).map_err(|(created, detail)| {
+                        if created {
+                            let _ = fs::remove_dir_all(retained_root);
+                        }
+                        pack_error(DolphinTextureModErrorKind::PreviewFailed, detail)
+                    })
+                }
+                Err(error) => Err(pack_error(
+                    DolphinTextureModErrorKind::PreviewFailed,
+                    format!("could not retain texture-pack files: {error}"),
+                )),
+            }
+        })();
+        // Whatever happened, the staging directory is finished with: either
+        // it was renamed away (removal is a no-op) or it must not linger.
+        let _ = fs::remove_dir_all(&self.root);
+        self.retained = true;
+        result.map(|()| retained_root.to_path_buf())
+    }
+}
+
+impl Drop for DolphinTexturePackStaging {
+    fn drop(&mut self) {
+        if !self.retained {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+}
+
+/// Copies the regular files and directories of `from` into the new
+/// directory `to`. Symlinks and special files cannot occur here (the ZIP
+/// extractor writes only regular files) and are refused if met.
+fn copy_tree(from: &Path, to: &Path) -> Result<(), (bool, String)> {
+    fs::create_dir(to).map_err(|error| (false, format!("{}: {error}", to.display())))?;
+    copy_tree_contents(from, to).map_err(|detail| (true, detail))
+}
+
+fn copy_tree_contents(from: &Path, to: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(from).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source).map_err(|error| error.to_string())?;
+        if metadata.is_dir() {
+            fs::create_dir(&target).map_err(|error| format!("{}: {error}", target.display()))?;
+            copy_tree_contents(&source, &target)?;
+        } else if metadata.is_file() {
+            fs::copy(&source, &target).map_err(|error| format!("{}: {error}", source.display()))?;
+        } else {
+            return Err(format!(
+                "unexpected non-regular file in staging: {}",
+                source.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The name prefix of every temporary ZIP staging directory this module
+/// creates under the system temporary directory.
+pub const DOLPHIN_TEXTURE_ARCHIVE_STAGING_PREFIX: &str = "archivefs-dolphin-texture-archive-";
+
+/// Rewrites a manifest built against one source root so every file path
+/// points under `new_root` instead, keeping each file's path relative to the
+/// root. Used after a ZIP preview's staging was retained elsewhere: both
+/// `source_root` *and* every `files[].source_path` move, so the saved
+/// manifest never refers to the temporary copy (reviewer finding F1). The
+/// result is validated against `new_root` before it is returned, so a
+/// manifest that would not load is never handed back.
+pub fn relocate_dolphin_texture_pack_manifest(
+    manifest: &DolphinTexturePackManifest,
+    identity: &DolphinTextureModIdentity,
+    new_root: &Path,
+) -> Result<DolphinTexturePackManifest, DolphinTextureModError> {
+    if !new_root.is_absolute() {
+        return Err(pack_error(
+            DolphinTextureModErrorKind::SourceOutsideApprovedScope,
+            "relocated texture-pack root must be absolute",
+        ));
+    }
+    let mut relocated = manifest.clone();
+    relocated.source_root = new_root.to_path_buf();
+    for file in &mut relocated.files {
+        let relative = if file.source_relative_path.as_os_str().is_empty() {
+            file.source_path
+                .strip_prefix(&manifest.source_root)
+                .map(Path::to_path_buf)
+                .map_err(|_| {
+                    pack_error(
+                        DolphinTextureModErrorKind::SourceOutsideApprovedScope,
+                        format!(
+                            "{} is not under the manifest's source root",
+                            file.source_path.display()
+                        ),
+                    )
+                })?
+        } else {
+            file.source_relative_path.clone()
+        };
+        file.source_path = new_root.join(&relative);
+        file.source_relative_path = relative;
+    }
+    validate_dolphin_texture_pack_manifest(&relocated, identity, new_root)?;
+    Ok(relocated)
+}
+
+/// Why a manifest's source folder is unusable, in words a person can act on.
+/// A root under the temporary directory with this module's staging prefix is
+/// a manifest saved from a ZIP preview before EmuWiz kept the extracted
+/// files (they were lost at reboot or temp cleanup); any other missing root
+/// is simply gone. `None` when the root is present.
+pub fn describe_missing_texture_pack_source(source_root: &Path) -> Option<String> {
+    if fs::symlink_metadata(source_root).is_ok_and(|metadata| metadata.is_dir()) {
+        return None;
+    }
+    let legacy_staging = source_root.starts_with(std::env::temp_dir())
+        && source_root.components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| name.starts_with(DOLPHIN_TEXTURE_ARCHIVE_STAGING_PREFIX))
+        });
+    Some(if legacy_staging {
+        format!(
+            "This manifest was saved from a ZIP preview before EmuWiz kept the extracted files; its temporary folder {} no longer exists (temporary folders are lost at reboot). Nothing was installed. Choose the original texture-pack ZIP again with Choose texture-pack ZIP, preview it and save a new manifest; EmuWiz now keeps the files in its data folder.",
+            source_root.display()
+        )
+    } else {
+        format!(
+            "The manifest's source folder {} is missing, so its texture files cannot be read. Nothing was installed. Restore the folder or supply the texture pack again and save a new manifest.",
+            source_root.display()
+        )
+    })
+}
+
+/// Read-only result of inspecting a ZIP texture pack. `staging` owns the
+/// decoded members (see [`DolphinTexturePackStaging`]); `build.manifest.
+/// source_root` points inside it until the staging is retained elsewhere.
+#[derive(Debug)]
 pub struct DolphinTexturePackArchivePreview {
     pub archive_path: PathBuf,
-    pub staging_root: PathBuf,
+    pub staging: DolphinTexturePackStaging,
     pub build: DolphinTexturePackBuildPreview,
 }
 
@@ -551,6 +750,26 @@ pub fn inspect_dolphin_texture_pack_zip(
     name: String,
     version: Option<String>,
 ) -> Result<DolphinTexturePackArchivePreview, DolphinTextureModError> {
+    inspect_dolphin_texture_pack_zip_in(
+        archive_path,
+        identity,
+        name,
+        version,
+        &std::env::temp_dir(),
+    )
+}
+
+/// [`inspect_dolphin_texture_pack_zip`] with an explicit parent directory for
+/// the temporary staging (the system temporary directory in production; a
+/// private directory in tests, so lifecycle assertions are deterministic
+/// while other tests create and drop their own stagings).
+pub fn inspect_dolphin_texture_pack_zip_in(
+    archive_path: &Path,
+    identity: &DolphinTextureModIdentity,
+    name: String,
+    version: Option<String>,
+    staging_parent: &Path,
+) -> Result<DolphinTexturePackArchivePreview, DolphinTextureModError> {
     if !archive_path.is_absolute() {
         return Err(pack_error(
             DolphinTextureModErrorKind::SourceOutsideApprovedScope,
@@ -586,8 +805,8 @@ pub fn inspect_dolphin_texture_pack_zip(
         ));
     }
 
-    let staging_root = std::env::temp_dir().join(format!(
-        "archivefs-dolphin-texture-archive-{}-{}",
+    let staging_root = staging_parent.join(format!(
+        "{DOLPHIN_TEXTURE_ARCHIVE_STAGING_PREFIX}{}-{}",
         std::process::id(),
         next_archive_stage_id()
     ));
@@ -597,6 +816,9 @@ pub fn inspect_dolphin_texture_pack_zip(
             format!("could not create archive staging directory: {error}"),
         )
     })?;
+    // From here on the directory is owned: every `?` below drops `staging`
+    // and removes it. Only a returned preview keeps it alive.
+    let staging = DolphinTexturePackStaging::new(staging_root.clone());
     let trusted = crate::safe_read::TrustedRoots::from_paths(archive_path.parent());
     let limits = crate::dat::archive::limits::ArchiveLimits {
         max_members: DOLPHIN_TEXTURE_ARCHIVE_MAX_MEMBERS,
@@ -622,7 +844,6 @@ pub fn inspect_dolphin_texture_pack_zip(
     ) {
         Ok(extracted) => extracted,
         Err(error) => {
-            let _ = fs::remove_dir_all(&staging_root);
             return Err(pack_error(
                 DolphinTextureModErrorKind::PreviewFailed,
                 format!("texture-pack ZIP refused: {error:?}"),
@@ -649,7 +870,6 @@ pub fn inspect_dolphin_texture_pack_zip(
     {
         staging_root.clone()
     } else {
-        let _ = fs::remove_dir_all(&staging_root);
         return Err(pack_error(
             DolphinTextureModErrorKind::PreviewFailed,
             if roots.is_empty() {
@@ -665,13 +885,12 @@ pub fn inspect_dolphin_texture_pack_zip(
         name,
         version,
     })?;
-    if !build.complete {
-        // Keep the staging directory available for preview diagnostics; no
-        // install path can be constructed from an incomplete build.
-    }
+    // An incomplete build still returns its staging for preview diagnostics;
+    // no install path can be constructed from it, and dropping the preview
+    // removes the files.
     Ok(DolphinTexturePackArchivePreview {
         archive_path: archive_path.to_path_buf(),
-        staging_root,
+        staging,
         build,
     })
 }

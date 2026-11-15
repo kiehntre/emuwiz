@@ -535,6 +535,49 @@ fn first_scan_of_configured_roots_can_request_a_read_only_scope_review() {
 }
 
 #[test]
+fn scan_before_blue_loaded_an_existing_library_loads_it_then_opens_the_review() {
+    // Blue starts with `NotCreated` as a "not loaded yet" placeholder while the
+    // library file exists. A scan must not be treated as a first scan (which
+    // refuses because the database "appeared"); it waits for a read-only load.
+    let fixture = Fixture::new();
+    let before = std::fs::read(&fixture.database).unwrap();
+    let ctx = egui::Context::default();
+    let mut loaded = fixture.workflows(&ctx, false);
+    let ready = std::mem::replace(
+        &mut loaded.app.database_state,
+        DatabaseState::NotCreated {
+            database_path: fixture.database.clone(),
+        },
+    );
+    let mut workflows = fixture.workflows(&ctx, false);
+    workflows.app.database_state = DatabaseState::NotCreated {
+        database_path: fixture.database.clone(),
+    };
+    workflows.review_or_start_source_action(
+        ctx.clone(),
+        SourceAction::ScanOne(fixture.sources[0].path.clone()),
+    );
+    assert!(workflows.collection.refusal.is_none());
+    assert!(workflows.collection.preparing());
+    assert!(workflows.app.database_state.is_loading());
+    assert!(workflows.collection.review.is_none());
+    // Nothing happens while the load is still running.
+    frame(&ctx, vec![], |ctx| workflows.show_source_scan_review(ctx));
+    assert!(workflows.collection.review.is_none());
+    // The load finishes: the normal review opens; still no scan.
+    workflows.app.database_state = ready;
+    workflows.app.database_generation = crate::DatabaseGeneration(7);
+    frame(&ctx, vec![], |ctx| workflows.show_source_scan_review(ctx));
+    assert!(workflows.collection.refusal.is_none());
+    assert!(!workflows.collection.preparing());
+    let review = workflows.collection.review.as_ref().expect("review opens");
+    assert!(review.database_existed);
+    assert!(review.selected(&review.sources[0]));
+    assert!(workflows.app.sources_ui.source_action.is_none());
+    assert_eq!(before, std::fs::read(&fixture.database).unwrap());
+}
+
+#[test]
 fn initial_scope_preserves_exclusions_and_refuses_a_database_that_appears_later() {
     let fixture = Fixture::new();
     std::fs::remove_file(&fixture.database).unwrap();

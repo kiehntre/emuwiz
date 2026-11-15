@@ -48,11 +48,13 @@ use crate::media_set::{
 };
 use crate::platform::identity::{PlatformIdentityResolution, PlatformIdentitySource};
 
+#[cfg(test)]
+use crate::revalidate_archive_for_catalogue;
 use crate::{
     ARCHIVE_PARSER_VERSION, Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config,
     IngestionFingerprint, PlatformProvenance, Result, SCAN_CACHE_VERSION, SCANNER_VERSION,
     ScanFingerprint, canonical_platform_names, detect_platform_with_details, nested_source_roots,
-    normalize_path_segment, revalidate_archive_for_catalogue, validate_configured_source_roots,
+    normalize_path_segment, validate_configured_source_roots,
 };
 
 mod attention;
@@ -82,6 +84,8 @@ pub use discovery_import::{
     DiscoveryImportUndoPreview, DiscoveryImportUndoResult,
 };
 mod catalogue_health;
+mod nested_scan;
+pub use nested_scan::{NestedMountOutcome, NestedMountState};
 mod cue_revalidation;
 pub(crate) mod organisation_paths;
 pub use cue_revalidation::{CueDiscCatalogue, CueDiscRevalidation};
@@ -94,10 +98,15 @@ mod amiga_adf_identity_tests;
 mod cue_bin_tests;
 mod dat_current;
 mod dat_inventory;
+#[cfg(test)]
+#[path = "database/gdi_disc_tests.rs"]
+mod gdi_disc_tests;
 mod preservation_fingerprint;
 pub use preservation_fingerprint::PreservationFreshness;
 mod disc_order;
-pub use dat_current::CurrentLibraryDatEvidence;
+pub use dat_current::{
+    CurrentLibraryDatEvidence, DatRecheckAttempt, SavedDatEvidenceRow, SavedDatEvidenceStatus,
+};
 pub use disc_order::DatDiscOrderOutcome;
 #[cfg(test)]
 #[path = "database/catalogue_health_tests.rs"]
@@ -108,7 +117,18 @@ mod disc_order_tests;
 pub(crate) mod forget_missing;
 mod missing_cleanup;
 pub use missing_cleanup::MissingCleanupTarget;
+#[cfg(test)]
+#[path = "database/dat_evidence_history_tests.rs"]
+mod dat_evidence_history_tests;
+mod journal_recovery;
+#[cfg(test)]
+#[path = "database/journal_recovery_tests.rs"]
+mod journal_recovery_tests;
 mod journal_state;
+pub use journal_recovery::{
+    JournalRecoveryReceipt, JournalRecoveryState, PreservedFile, apply_journal_recovery,
+    prepare_journal_recovery, read_journal_recovery_receipt,
+};
 #[cfg(test)]
 #[path = "database/migration_protection_tests.rs"]
 mod migration_protection_tests;
@@ -117,12 +137,20 @@ mod migration_protection_tests;
 mod negative_dat_platform_tests;
 pub(crate) mod reconciliation;
 mod restore;
+mod scan_history;
+pub use scan_history::{MAX_SCAN_HISTORY_RUNS, RecordedScanCounts, ScanRunCoverage, ScanRunRecord};
 #[cfg(test)]
 #[path = "database/topology_evidence_tests.rs"]
 mod topology_evidence_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub use restore::fault_injection as database_restore_fault_injection;
 pub use restore::{
     DatabaseRestorePlan, DatabaseRestoreReceipt, DatabaseRestoreResult, DatabaseRestoreState,
-    prepare_database_restore, restore_database, rollback_database_restore,
+    FileIdentity, InterruptedRestoreAssessment, InterruptedRestoreOutcome,
+    assess_interrupted_restore, finalise_interrupted_restore, interrupted_restore_receipts,
+    prepare_database_restore, preview_interrupted_restore,
+    read_receipt as read_database_restore_receipt, receipt_path as database_restore_receipt_path,
+    restore_database, review_database_rollback, rollback_database_restore,
 };
 
 /// The join evidence for `logical_set_name` with its member observations replaced
@@ -241,10 +269,7 @@ pub fn default_database_path() -> Result<PathBuf> {
 #[cfg(test)]
 fn resolve_database_path(home: Option<OsString>) -> Result<PathBuf> {
     let home = home.ok_or_else(|| ArchiveFsError::Database("HOME is not set".to_string()))?;
-    Ok(crate::app_dirs::data_path_in(
-        Path::new(&home),
-        "library.sqlite3",
-    ))
+    Ok(crate::app_dirs::data_dir_in(Path::new(&home))?.join("library.sqlite3"))
 }
 
 /// One forward-only schema migration. Applied in ascending `version` order;
@@ -401,10 +426,63 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 27,
+        description: "keep replaced DAT evidence and unfinished re-check reasons",
+        sql: include_str!("migrations/0027_dat_evidence_history.sql"),
+    },
+    Migration {
+        version: 28,
         description: "game collections: Favourites and user-created collections",
-        sql: include_str!("migrations/0027_game_collections.sql"),
+        sql: include_str!("migrations/0028_game_collections.sql"),
     },
 ];
+
+/// From this version on, a migration's description is part of its identity
+/// and must never be edited: [`verify_migration_lineage`] compares it with
+/// what the database recorded when that version was applied.
+const LINEAGE_CHECKED_FROM_VERSION: i64 = 27;
+
+/// Refuses a database whose recorded migrations are not this build's.
+///
+/// `user_version` alone cannot tell two different migrations that were both
+/// numbered N apart (two branches each adding "the next" migration). Such a
+/// database has the right number and the wrong tables. Every applied version
+/// from [`LINEAGE_CHECKED_FROM_VERSION`] on must therefore be recorded, with
+/// the description this build has for it. Read-only.
+fn verify_migration_lineage(connection: &Connection, migrations: &[Migration]) -> Result<()> {
+    let current = schema_version(connection)?;
+    if current < LINEAGE_CHECKED_FROM_VERSION {
+        return Ok(());
+    }
+    let mut statement = connection
+        .prepare("SELECT version, description FROM schema_migrations WHERE version >= ?1")
+        .map_err(|error| db_error("failed to read the applied migrations", error))?;
+    let recorded: HashMap<i64, String> = statement
+        .query_map([LINEAGE_CHECKED_FROM_VERSION], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .and_then(|rows| rows.collect())
+        .map_err(|error| db_error("failed to read the applied migrations", error))?;
+    for migration in migrations.iter().filter(|migration| {
+        migration.version >= LINEAGE_CHECKED_FROM_VERSION && migration.version <= current
+    }) {
+        match recorded.get(&migration.version) {
+            Some(description) if description == migration.description => {}
+            Some(description) => {
+                return Err(ArchiveFsError::Database(format!(
+                    "this library database was taken to schema {} by a different EmuWiz build (it recorded \"{description}\"; this build's schema {} is \"{}\"). The two are not compatible. Refusing to use or migrate it. Nothing was changed.",
+                    migration.version, migration.version, migration.description
+                )));
+            }
+            None => {
+                return Err(ArchiveFsError::Database(format!(
+                    "this library database reports schema {current} but has no record of schema {} being applied. Refusing to use or migrate it. Nothing was changed.",
+                    migration.version
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
     migrations
@@ -534,8 +612,12 @@ fn topology_source_fingerprint(
 /// What one topology persistence call wrote and what it refused to replace.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TopologyPersistOutcome {
+    /// Sets accepted as the saved evidence, including the unchanged ones.
     pub written: usize,
     pub conflicts_kept: usize,
+    /// Accepted sets whose saved row was already byte-identical, so no row
+    /// was written for them at all.
+    pub unchanged: usize,
 }
 
 /// Two claims about one release agree when no source moves to another
@@ -1406,6 +1488,7 @@ impl Database {
                 "library database schema version {current_version} is not the required current version {expected_version}; refusing to migrate or repair it during a read-only operation"
             )));
         }
+        verify_migration_lineage(&connection, MIGRATIONS)?;
 
         Ok(Self {
             connection,
@@ -1491,8 +1574,8 @@ impl Database {
                 )
                 .optional()
                 .map_err(|e| db_error("failed to read saved topology evidence", e))?;
-            if let Some((saved_fingerprint, saved_json)) = saved
-                && let Ok(saved_set) = serde_json::from_slice::<MediaSet>(&saved_json)
+            if let Some((saved_fingerprint, saved_json)) = &saved
+                && let Ok(saved_set) = serde_json::from_slice::<MediaSet>(saved_json)
                 && !topology_claims_agree(&saved_set, &set)
                 && topology_source_fingerprint(&saved_set, None).as_deref()
                     == Some(saved_fingerprint.as_str())
@@ -1503,6 +1586,22 @@ impl Database {
             let json = serde_json::to_vec(&set).map_err(|e| {
                 ArchiveFsError::Database(format!("failed to serialize topology evidence: {e}"))
             })?;
+            // A refresh that would store the very same evidence writes
+            // nothing. Rewriting an identical row is still a row change: it
+            // fires the Discovery import triggers, which then mark every
+            // untouched import in the library as modified and refuse its
+            // Undo, although nothing about any game changed. A new or
+            // different row is still written, and still marks them.
+            if saved
+                .as_ref()
+                .is_some_and(|(saved_fingerprint, saved_json)| {
+                    *saved_fingerprint == fingerprint && *saved_json == json
+                })
+            {
+                outcome.written += 1;
+                outcome.unchanged += 1;
+                continue;
+            }
             tx.execute(
                 "INSERT INTO media_topology_evidence
                  (set_namespace,set_value,producer,producer_version,producer_schema,source_fingerprint,generation,created_at,refreshed_at,evidence_json)
@@ -1843,6 +1942,9 @@ fn classify_existing_database(path: &Path, migrations: &[Migration]) -> Result<E
     let connection = open_read_only_connection(path)?;
     let version = schema_version(&connection)?;
     let latest = latest_known_version(migrations);
+    if version <= latest {
+        verify_migration_lineage(&connection, migrations)?;
+    }
     if version == latest {
         return Ok(ExistingDatabase::Current);
     }
@@ -1893,6 +1995,7 @@ fn open_existing_current(path: &Path, migrations: &[Migration]) -> Result<Databa
             path.display()
         )));
     }
+    verify_migration_lineage(&connection, migrations)?;
     Ok(Database {
         connection,
         path: path.to_path_buf(),
@@ -2068,7 +2171,11 @@ fn upgrade_library_database_with_migrations(
         &source_identity,
     )?;
     let backup_path = reservation.backup_path.clone();
-    if let Err(error) = source.backup(MAIN_DB, &backup_path, None) {
+    if let Err(error) = source.backup(
+        MAIN_DB,
+        &backup_path,
+        None::<fn(rusqlite::backup::Progress)>,
+    ) {
         reservation.discard();
         return Err(ArchiveFsError::Database(format!(
             "Could not create a safe pre-upgrade database backup. The library database was not \
@@ -2874,6 +2981,8 @@ fn apply_migrations_checked(
         )));
     }
 
+    verify_migration_lineage(connection, migrations)?;
+
     for migration in migrations {
         if migration.version <= current_version {
             continue;
@@ -3388,7 +3497,7 @@ pub struct ScummVmScanReport {
 }
 
 /// The outcome of one [`scan_and_persist`] call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanPersistSummary {
     pub scummvm: ScummVmScanReport,
     pub scan_run_id: i64,
@@ -3442,6 +3551,10 @@ pub struct ScanPersistSummary {
     pub ingestion_recognised_sample: Vec<crate::ingestion::GameDiscovery>,
     /// Role-aware arcade aggregation and support-material diagnostics.
     pub arcade_ingestion: crate::ingestion::ArcadeIngestionDiagnostics,
+    /// One entry per nested mount met (or remembered) inside a scanned
+    /// source: whether its games were indexed and whether missing games
+    /// were reconciled there this run, with the reason when not.
+    pub nested_mounts: Vec<NestedMountOutcome>,
 }
 
 impl ScanPersistSummary {
@@ -4138,6 +4251,35 @@ fn persist_library_dat_identity_row(
         LibraryDatIdentityPersistOutcome::Inserted
     };
 
+    // Evidence about to be replaced is kept, in this same transaction, unless
+    // this check re-confirmed the same proof-bearing conclusion (same verdict,
+    // catalogue bytes and content hashes): only then is nothing lost.
+    let reconfirmed = existing.as_ref().is_some_and(|prior| {
+        (prior.audit_file.is_some() || !prior.disc_members.is_empty())
+            && prior.source.catalogue_sha256.is_some()
+            && prior.source.catalogue_sha256 == persisted.source.catalogue_sha256
+            && prior.verification_state == persisted.verification_state
+            && prior.audited_hashes == persisted.audited_hashes
+    });
+    if existing.is_some() && !reconfirmed {
+        conn.execute(
+            "INSERT INTO library_dat_identity_history \
+             (archive_id, archive_path, dat_source_id, verification_state, completeness, audited_at, \
+              revision_marked_stale, facts_json, row_created_at, row_updated_at, replaced_at, replaced_by_state) \
+             SELECT d.archive_id, (SELECT absolute_path_cached FROM archives WHERE id = d.archive_id), \
+                    d.dat_source_id, d.verification_state, d.completeness, d.audited_at, \
+                    d.revision_marked_stale, d.facts_json, d.created_at, d.updated_at, ?3, ?4 \
+             FROM library_dat_identities d WHERE d.archive_id = ?1 AND d.dat_source_id = ?2",
+            params![archive_id, source_id, now, state],
+        )
+        .map_err(|error| db_error("failed to keep replaced library DAT identity", error))?;
+    }
+    conn.execute(
+        "DELETE FROM dat_recheck_attempts WHERE archive_id = ?1 AND dat_source_id = ?2",
+        params![archive_id, source_id],
+    )
+    .map_err(|error| db_error("failed to clear a finished DAT re-check note", error))?;
+
     conn.execute(
         "INSERT INTO library_dat_identities \
          (archive_id, dat_source_id, dat_ecosystem, source_revision, verification_state, \
@@ -4775,12 +4917,42 @@ impl Database {
             None => {
                 // Discovery ownership rows retain deleted IDs permanently. This
                 // keeps delayed verification/metadata workers from targeting a
-                // different record after selective Undo. Legacy schemas have
-                // no import tombstones and retain their former allocation.
-                let has_import_history: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='discovery_import_records')", [], |r|r.get(0)).map_err(|e|db_error("check retained import identities",e))?;
-                let max_id: i64 = if has_import_history {
-                    tx.query_row("SELECT max(value) FROM (SELECT coalesce(max(id),0) AS value FROM archives UNION ALL SELECT coalesce(max(archive_id),0) AS value FROM discovery_import_records)",[],|r|r.get(0))
-                } else { tx.query_row("SELECT coalesce(max(id),0) FROM archives",[],|r|r.get(0)) }.map_err(|e|db_error("reserve new archive identity",e))?;
+                // different record after selective Undo. Kept DAT evidence and
+                // re-check notes (schema 27) also outlive their game and are
+                // keyed by its id, so those ids are never handed out again
+                // either: a new game must not inherit another game's records
+                // (which would, among other things, refuse its import's Undo
+                // for good). Favourites and collection memberships (schema 28)
+                // outlive their game in the same way. Legacy schemas without
+                // these tables keep their former allocation.
+                let mut sources =
+                    vec!["SELECT coalesce(max(id),0) AS value FROM archives".to_string()];
+                for table in [
+                    "discovery_import_records",
+                    "library_dat_identity_history",
+                    "dat_recheck_attempts",
+                    "game_collection_items",
+                ] {
+                    let exists: bool = tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                            [table],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| db_error("check retained archive identities", e))?;
+                    if exists {
+                        sources.push(format!(
+                            "SELECT coalesce(max(archive_id),0) AS value FROM {table}"
+                        ));
+                    }
+                }
+                let max_id: i64 = tx
+                    .query_row(
+                        &format!("SELECT max(value) FROM ({})", sources.join(" UNION ALL ")),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| db_error("reserve new archive identity", e))?;
                 let new_id = max_id.checked_add(1).ok_or_else(|| {
                     ArchiveFsError::Database(
                         "Archive identity space exhausted; insertion refused".into(),
@@ -5790,6 +5962,37 @@ impl Database {
             .map_err(|error| db_error("failed to look up current platform assignment", error))
     }
 
+    /// Present games of exactly `size` bytes whose current platform is not a
+    /// manual choice, with their absolute paths. Used to restore remembered
+    /// manual choices after a rebuild without reading unrelated files.
+    pub fn archives_without_manual_platform_of_size(
+        &self,
+        size: u64,
+    ) -> Result<Vec<(i64, PathBuf)>> {
+        let size = i64::try_from(size).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT a.id, a.absolute_path_cached FROM archives a \
+                 WHERE a.size_bytes = ?1 AND a.last_verified_missing_at IS NULL \
+                 AND a.absolute_path_cached IS NOT NULL \
+                 AND NOT EXISTS (SELECT 1 FROM platform_assignments p WHERE p.archive_id = a.id \
+                 AND p.is_current = 1 AND p.source = ?2) ORDER BY a.id",
+            )
+            .map_err(|error| db_error("failed to prepare manual-choice lookup", error))?;
+        let rows = statement
+            .query_map(params![size, MANUAL_PLATFORM_SOURCE], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|error| db_error("failed to look up games by size", error))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, path) = row.map_err(|error| db_error("failed to read game path", error))?;
+            out.push((id, PathBuf::from(std::ffi::OsString::from_vec(path))));
+        }
+        Ok(out)
+    }
+
     /// Looks up the current `archives.id` for the archive whose
     /// `absolute_path_cached` exactly matches `path` (exact bytes - never
     /// a lossy display string; see `Path::as_os_str`/`OsStrExt::as_bytes`).
@@ -6623,8 +6826,13 @@ impl Database {
                 "source changed while opening missing authority".into(),
             ));
         }
+        // A remembered nested mount the coverage proof did not exclude must
+        // still be proven; one it excluded keeps its rows untouched.
         let unproven = self.unproven_nested_boundaries(source_folder_id, &source_guard)?;
-        if let Some((path, reason)) = unproven.first() {
+        if let Some((path, reason)) = unproven
+            .iter()
+            .find(|(path, _)| !coverage.excluded_roots.iter().any(|r| path.starts_with(r)))
+        {
             return Err(ArchiveFsError::Database(format!(
                 "nested filesystem boundary {} is not proven continuous ({reason}); missing reconciliation withheld",
                 path.display()
@@ -6640,7 +6848,20 @@ impl Database {
             })
             .map(|s| s.root.clone())
             .collect();
-        let mut recorded = coverage.excluded_roots.clone();
+        let areas = catalogue_health::missing_areas(
+            &self.connection,
+            source_folder_id,
+            &source_guard,
+            &coverage.excluded_roots,
+        )?;
+        // Nested mounts may be excluded too; every other exclusion must be
+        // exactly the configured child sources.
+        let mut recorded: Vec<_> = coverage
+            .excluded_roots
+            .iter()
+            .filter(|root| delegated.contains(root) || !areas.boundaries.contains(root))
+            .cloned()
+            .collect();
         delegated.sort();
         recorded.sort();
         if delegated != recorded {
@@ -6701,8 +6922,12 @@ impl Database {
                 {
                     return None;
                 }
-                let probe = source_guard
-                    .probe(&path, crate::archive_kind_is_directory_item(&kind))
+                let probe = areas
+                    .probe(
+                        &source_guard,
+                        &path,
+                        crate::archive_kind_is_directory_item(&kind),
+                    )
                     .probe;
                 if matches!(
                     probe,
@@ -6729,7 +6954,7 @@ impl Database {
                 "owned candidate could not be probed; missing reconciliation withheld".into(),
             ));
         }
-        if !source_guard.current() {
+        if !source_guard.current() || !areas.current(&source_guard) {
             return Err(ArchiveFsError::Database(
                 "source changed while probing missing candidates".into(),
             ));
@@ -6753,7 +6978,8 @@ impl Database {
                 source_folder_id,
                 &source_guard,
             )?
-            .first()
+            .iter()
+            .find(|(path, _)| !coverage.excluded_roots.iter().any(|r| path.starts_with(r)))
             {
                 return Err(ArchiveFsError::Database(format!(
                     "nested filesystem boundary {} is not proven continuous ({reason}); no missing evidence written",
@@ -6763,6 +6989,13 @@ impl Database {
             Ok(())
         };
         ensure_boundaries_hold(&tx)?;
+        // Nested mounts re-proven under the writer reservation.
+        let areas = catalogue_health::missing_areas(
+            &tx,
+            source_folder_id,
+            &source_guard,
+            &coverage.excluded_roots,
+        )?;
         // Re-checked inside the write transaction, not just before it.
         catalogue_health::assert_missing_authority(
             &tx,
@@ -6774,8 +7007,12 @@ impl Database {
         for archive_id in &missing {
             let (bytes,kind):(Vec<u8>,String)=tx.query_row("SELECT absolute_path_cached,archive_kind FROM archives WHERE id=?1 AND source_folder_id=?2",params![archive_id,source_folder_id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|db_error("revalidate missing row",e))?;
             let path = PathBuf::from(OsString::from_vec(bytes));
-            if source_guard
-                .probe(&path, crate::archive_kind_is_directory_item(&kind))
+            if areas
+                .probe(
+                    &source_guard,
+                    &path,
+                    crate::archive_kind_is_directory_item(&kind),
+                )
                 .probe
                 != crate::emulator_environment::FsProbe::Missing
             {
@@ -6803,8 +7040,12 @@ impl Database {
         }
         for (archive_id, path, kind) in &unseen_headers {
             if !matches!(
-                source_guard
-                    .probe(path, crate::archive_kind_is_directory_item(kind))
+                areas
+                    .probe(
+                        &source_guard,
+                        path,
+                        crate::archive_kind_is_directory_item(kind)
+                    )
                     .probe,
                 crate::emulator_environment::FsProbe::PresentFile
                     | crate::emulator_environment::FsProbe::PresentDirectory
@@ -6822,7 +7063,7 @@ impl Database {
             )
             .map_err(|error| db_error("failed to retire unseen header platform", error))?;
         }
-        if !source_guard.current() {
+        if !source_guard.current() || !areas.current(&source_guard) {
             return Err(ArchiveFsError::Database(
                 "source changed before missing commit".into(),
             ));
@@ -7347,7 +7588,17 @@ impl Database {
         persisted: &crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
     ) -> Result<LibraryDatIdentityPersistOutcome> {
         let now = now_utc_string();
-        persist_library_dat_identity_row(&self.connection, archive_id, persisted, &now)
+        // Keeping the replaced row, clearing its note and writing the new
+        // row are one change.
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
+        let outcome = persist_library_dat_identity_row(&tx, archive_id, persisted, &now)?;
+        tx.commit().map_err(|error| {
+            db_error("failed to commit library DAT identity transaction", error)
+        })?;
+        Ok(outcome)
     }
 
     /// The stored DAT identity for one library item and one DAT source, if
@@ -7516,12 +7767,15 @@ impl Database {
         outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
         scope: Option<&crate::dat::library_verification::VerificationScope>,
     ) -> Result<LibraryDatIdentityAuditPersistOutcome> {
-        // Reads and writes share one SQLite snapshot. Concurrent membership
-        // changes either precede validation or prevent upgrading this transaction.
-        let tx = self
-            .connection
-            .unchecked_transaction()
-            .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
+        // Reads and writes share one SQLite snapshot. The write lock is taken
+        // at the start (waiting out another writer for the busy timeout), so
+        // a membership change either precedes validation or waits for this
+        // save; a save is never refused only because it had read first.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| db_error("failed to start library DAT identity transaction", error))?;
         if let Some(scope) = scope {
             scope
                 .validate(&self.load_archives()?, outcome)
@@ -9450,7 +9704,12 @@ pub fn scan_and_persist(
 ) -> Result<ScanPersistSummary> {
     validate_configured_source_roots(&config.source_folders)?;
     let registered_folders = database.register_source_folders(&config.source_folders)?;
-    let summary = scan_and_persist_folders(database, &registered_folders, triggered_by)?;
+    let summary = scan_and_persist_folders_excluding_mount_root(
+        database,
+        &registered_folders,
+        triggered_by,
+        &config.mount_root,
+    )?;
     // The source scanner owns logical Arcade ingestion; the version-bound DAT
     // join is persisted immediately after that transaction so nested SQLite
     // transactions cannot make the catalogue refresh fragile.
@@ -9473,12 +9732,24 @@ pub fn scan_and_persist(
 /// (`Config::source_folders`), while multi-source management must also
 /// register disabled ones (to keep them "configured" rather than
 /// "removed") without asking this function to scan them.
+#[cfg(test)]
 pub(crate) fn scan_and_persist_folders(
     database: &mut Database,
     folders: &[RegisteredSourceFolder],
     triggered_by: &str,
 ) -> Result<ScanPersistSummary> {
-    scan_and_persist_folders_with_skipped(database, folders, triggered_by, &[])
+    scan_and_persist_folders_with_skipped(database, folders, triggered_by, &[], Path::new(""))
+}
+
+/// [`scan_and_persist_folders`] that never walks `mount_root` content when a
+/// legacy configuration places the mount root on, inside or around a source.
+pub(crate) fn scan_and_persist_folders_excluding_mount_root(
+    database: &mut Database,
+    folders: &[RegisteredSourceFolder],
+    triggered_by: &str,
+    mount_root: &Path,
+) -> Result<ScanPersistSummary> {
+    scan_and_persist_folders_with_skipped(database, folders, triggered_by, &[], mount_root)
 }
 
 pub(crate) fn scan_and_persist_folders_with_skipped(
@@ -9486,9 +9757,11 @@ pub(crate) fn scan_and_persist_folders_with_skipped(
     folders: &[RegisteredSourceFolder],
     triggered_by: &str,
     skipped: &[PathBuf],
+    mount_root: &Path,
 ) -> Result<ScanPersistSummary> {
     database.begin_catalogue_refresh()?;
-    let result = scan_and_persist_folders_transaction(database, folders, triggered_by, skipped);
+    let result =
+        scan_and_persist_folders_transaction(database, folders, triggered_by, skipped, mount_root);
     match result {
         Ok(summary) => {
             if let Err(error) = database.validate_scan_source_commit(summary.scan_run_id) {
@@ -9498,6 +9771,15 @@ pub(crate) fn scan_and_persist_folders_with_skipped(
             if let Err(error) = database.commit_catalogue_refresh() {
                 database.rollback_catalogue_refresh();
                 return Err(error);
+            }
+            // Manual system choices outlive the database: restore any the
+            // catalogue lost (rebuild, restore, re-added folder). Best effort;
+            // only same-size files are read.
+            let store = crate::manual_platform_choices::store_path(database.path());
+            if store.exists()
+                && let Err(error) = crate::manual_platform_choices::restore(database, &store)
+            {
+                eprintln!("emuwiz: remembered system choices not restored: {error}");
             }
             Ok(summary)
         }
@@ -9513,6 +9795,7 @@ fn scan_and_persist_folders_transaction(
     folders: &[RegisteredSourceFolder],
     triggered_by: &str,
     skipped: &[PathBuf],
+    mount_root: &Path,
 ) -> Result<ScanPersistSummary> {
     database.mark_interrupted_scan_runs()?;
     let scan_run_id = database.start_scan_run(triggered_by, None)?;
@@ -9535,6 +9818,7 @@ fn scan_and_persist_folders_transaction(
     let mut folder_errors = Vec::new();
     let mut platform_assignment_warnings = Vec::new();
     let mut preservation_fingerprint_warnings = Vec::new();
+    let mut nested_mounts = Vec::new();
     let mut scummvm_report = ScummVmScanReport::default();
     let mut skipped_files: Vec<crate::SkippedFile> = Vec::new();
     let mut ingestion_stats = crate::ingestion::DiscoveryStats::default();
@@ -9583,11 +9867,16 @@ fn scan_and_persist_folders_transaction(
             continue;
         }
         let folder_config = Config {
+            configured_source_roots: None,
             source_folders: vec![folder.path.clone()],
             mount_root: PathBuf::new(),
             ratarmount_bin: String::new(),
             master_rom_root: None,
         };
+        // A legacy config may put the mount root on, inside or around this
+        // source: never walk its content (or live mounts) as library content.
+        let mut source_exclusions = folder.excluded_source_roots.clone();
+        source_exclusions.extend(crate::mount_root_scan_exclusions(&folder.path, mount_root));
 
         let db_read_started = std::time::Instant::now();
         let fingerprints = database.load_scan_fingerprints(folder.id)?;
@@ -9620,30 +9909,35 @@ fn scan_and_persist_folders_transaction(
         let arcade_sets = arcade_root
             .as_ref()
             .filter(|root| {
-                !folder
-                    .excluded_source_roots
+                !source_exclusions
                     .iter()
                     .any(|excluded| root.starts_with(excluded))
             })
             .map(|root| {
-                crate::ingestion::discover_extracted_sets_excluding(
-                    root,
-                    &folder.excluded_source_roots,
-                )
+                crate::ingestion::discover_extracted_sets_excluding(root, &source_exclusions)
             });
         let arcade_complete = arcade_sets.as_ref().is_none_or(|result| {
             result
                 .as_ref()
                 .is_ok_and(|sets| sets.scan_errors_total == 0)
         });
-        let mut excluded_roots = folder.excluded_source_roots.clone();
+        let mut excluded_roots = source_exclusions.clone();
         if let Some(Ok(sets)) = &arcade_sets {
             // Exclude only already-aggregated logical set directories, never
             // the other systems sharing a mixed source root.
             excluded_roots.extend(sets.sets.iter().map(|set| set.path.clone()));
         }
+        // Remembered nested mounts: which are the same trusted mount as last
+        // time (only those may reuse cached observations).
+        let area_plans = match crate::catalogue_health::BoundRoot::open(&folder.path)
+            .filter(|root| Some(root.identity) == covered.root_identity)
+        {
+            Some(root) => nested_scan::plan_areas(database, folder.id, &root)?,
+            None => Vec::new(),
+        };
         let discovery_started = std::time::Instant::now();
         let discovery = match ArchiveScanner::new(&folder_config)
+            .with_trusted_nested_areas(nested_scan::trusted_paths(&area_plans))
             .scan_archives_with_cache_excluding(&fingerprint_refs, &excluded_roots)
         {
             Ok(discovery) => discovery,
@@ -9668,47 +9962,48 @@ fn scan_and_persist_folders_transaction(
                 continue;
             }
         };
-        // A nested filesystem seen on an earlier scan that has vanished or been
-        // replaced makes everything beneath it unprovable, not deleted.
-        let mut boundary_diagnostic = None;
+        #[cfg(test)]
+        nested_scan::test_hook::run();
+        // Every nested mount is its own ownership boundary, settled against
+        // the live filesystem: indexed through its own pinned root when it is
+        // still the mount discovery read, reconciled only when it is also the
+        // same trusted mount as last time. Anything else is excluded from
+        // Missing, so its existing entries are kept exactly as they were.
+        let mut settled_areas = nested_scan::SettledAreas::default();
         if let Some(root) = crate::catalogue_health::BoundRoot::open(&folder.path)
             && Some(root.identity) == covered.root_identity
         {
-            let mut unproven = database.unproven_nested_boundaries(folder.id, &root)?;
-            unproven.extend(database.record_nested_boundaries(
+            database.record_nested_boundaries(folder.id, &root, &discovery.nested_boundaries)?;
+            settled_areas = nested_scan::settle_areas(
+                database,
                 folder.id,
                 &root,
-                &discovery.nested_boundaries,
-            )?);
-            unproven.sort();
-            unproven.dedup_by(|a, b| a.0 == b.0);
-            if !unproven.is_empty() {
-                boundary_diagnostic = Some(
-                    unproven
-                        .iter()
-                        .map(|(path, reason)| {
-                            format!("nested filesystem boundary {} ({reason})", path.display())
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; "),
+                &area_plans,
+                &discovery.nested_areas,
+            )?;
+        } else {
+            for area in &discovery.nested_areas {
+                settled_areas.dropped.push(area.path.clone());
+                settled_areas.excluded.push(area.path.clone());
+            }
+        }
+        for outcome in &settled_areas.outcomes {
+            if !outcome.state.reconciled() {
+                log::warn!(
+                    "nested mount {} {:?}: {}; its existing entries are not reconciled this scan",
+                    outcome.path.display(),
+                    outcome.state,
+                    outcome.detail.as_deref().unwrap_or("")
                 );
             }
         }
-        if let Some(detail) = &boundary_diagnostic {
-            log::warn!(
-                "{detail}; catalogue evidence preserved and missing reconciliation withheld"
-            );
-            counts.errors_count += 1;
-            folder_errors.push((
-                folder.path.clone(),
-                format!(
-                    "{detail} is not proven continuous; catalogue evidence preserved and missing reconciliation withheld"
-                ),
-            ));
-            covered.diagnostic = Some(detail.clone());
-        }
-        let discovery_complete =
-            discovery.is_complete() && arcade_complete && boundary_diagnostic.is_none();
+        nested_mounts.extend(settled_areas.outcomes.iter().cloned());
+        covered
+            .excluded_roots
+            .extend(settled_areas.excluded.iter().cloned());
+        covered.excluded_roots.sort();
+        covered.excluded_roots.dedup();
+        let discovery_complete = discovery.is_complete() && arcade_complete;
         covered.state = if discovery_complete {
             ScanCoverageState::Complete
         } else {
@@ -9877,9 +10172,14 @@ fn scan_and_persist_folders_transaction(
             }
         }
         let mut archives = discovery.archives;
+        archives.retain(|archive| !settled_areas.is_dropped(&archive.path));
+        ingestion_evidence.retain(|evidence| !settled_areas.is_dropped(&evidence.path));
         if let Some(Ok(arcade_sets)) = arcade_sets {
             arcade_ingestion.merge(&arcade_sets.diagnostics);
             for set in arcade_sets.sets {
+                if settled_areas.is_dropped(&set.path) {
+                    continue;
+                }
                 if let Some(archive) = Archive::from_arcade_set_directory(&set.path, &folder.path) {
                     archives.retain(|candidate| !candidate.path.starts_with(&set.path));
                     archives.push(archive);
@@ -10006,7 +10306,10 @@ fn scan_and_persist_folders_transaction(
         }
         archives.sort_by(|left, right| left.path.cmp(&right.path));
         archives.dedup_by(|left, right| left.path == right.path);
-        let non_archive_fingerprints = discovery.non_archive_fingerprints;
+        let mut non_archive_fingerprints = discovery.non_archive_fingerprints;
+        non_archive_fingerprints.retain(|fingerprint| {
+            !settled_areas.is_dropped(&folder.path.join(&fingerprint.relative_path))
+        });
         // An inspection the detector reports as incomplete keeps whatever
         // the row already says, is shown as needing a retry, and keeps no
         // fingerprint, so the next scan looks at the file again.
@@ -10050,24 +10353,51 @@ fn scan_and_persist_folders_transaction(
         }
         database.record_scan_coverage(scan_run_id, covered)?;
         database.begin_folder_refresh()?;
+        let identities_recorded = match crate::catalogue_health::BoundRoot::open(&folder.path)
+            .filter(|root| Some(root.identity) == covered.root_identity)
+        {
+            Some(root) => {
+                nested_scan::record_identities(database, folder.id, &root, &settled_areas)
+            }
+            None => Err(ArchiveFsError::Database(
+                "source changed before nested mount identities were saved".into(),
+            )),
+        };
+        #[cfg(test)]
+        nested_scan::test_hook::run_before_persist();
         let db_write_started = std::time::Instant::now();
         let persist_complete = discovery_complete && !scummvm_incomplete;
         let fully_reused = !arcade_specialist
             && persist_complete
             && discovery.timings.re_inspected == 0
             && non_archive_fingerprints.is_empty();
-        let persisted = if fully_reused {
-            database
+        let persisted = match identities_recorded {
+            Err(error) => Err(error),
+            Ok(()) if fully_reused => database
                 .reconcile_fully_reused_source(scan_run_id, folder, &archives)?
                 .map(Ok)
                 .unwrap_or_else(|| {
-                    persist_one_folder(database, scan_run_id, folder, &archives, persist_complete)
-                })
-        } else {
-            persist_one_folder(database, scan_run_id, folder, &archives, persist_complete)
+                    persist_one_folder(
+                        database,
+                        scan_run_id,
+                        folder,
+                        &archives,
+                        persist_complete,
+                        &settled_areas,
+                    )
+                }),
+            Ok(()) => persist_one_folder(
+                database,
+                scan_run_id,
+                folder,
+                &archives,
+                persist_complete,
+                &settled_areas,
+            ),
         };
         let persisted = persisted.and_then(|result| {
             if crate::catalogue_health::source_root_identity(&folder.path) != covered.root_identity
+                || !settled_areas.owners_current()
                 || !database.source_binding_current(folder.id, &folder.path)?
             {
                 Err(ArchiveFsError::Database(
@@ -10235,6 +10565,7 @@ fn scan_and_persist_folders_transaction(
         ingestion_skipped,
         ingestion_recognised_sample,
         arcade_ingestion,
+        nested_mounts,
     })
 }
 
@@ -10313,19 +10644,29 @@ fn persist_one_folder(
     folder: &RegisteredSourceFolder,
     archives: &[Archive],
     complete: bool,
+    areas: &nested_scan::SettledAreas,
 ) -> Result<ScanRunCounts> {
     let mut counts = ScanRunCounts::default();
     let mut seen_archive_ids = Vec::with_capacity(archives.len());
 
     let identity = crate::catalogue_health::source_root_identity(&folder.path);
     for archive in archives {
+        // Inside a nested mount, ownership is proven from that mount's own
+        // pinned root (still no crossing of any further mount); elsewhere
+        // from the source root. A game in an unsaved mount never gets here.
+        let owner = areas.owner_of(&archive.path);
+        let (owner_root, owner_identity) = match owner {
+            Some(owner) => (owner.root.as_path(), Some(owner.identity)),
+            None => (folder.path.as_path(), identity),
+        };
         if folder
             .excluded_source_roots
             .iter()
             .any(|root| archive.path.starts_with(root))
+            || areas.is_dropped(&archive.path)
             || !crate::catalogue_health::observe_owned(
-                &folder.path,
-                identity,
+                owner_root,
+                owner_identity,
                 &archive.path,
                 matches!(
                     archive.kind,
@@ -10338,7 +10679,10 @@ fn persist_one_folder(
                 "positive observation outside safe source ownership".into(),
             ));
         }
-        revalidate_archive_for_catalogue(archive)?;
+        crate::revalidate_archive_within(
+            archive,
+            owner.map(|owner| (owner.root.as_path(), owner.identity, owner.mount_id)),
+        )?;
         let outcome = database.upsert_archive(folder.id, &folder.path, archive)?;
         let incomplete = !archive.identity.inspection_problems.is_empty();
         database.set_inspection_retry_mark(outcome.archive_id, incomplete)?;
@@ -10886,6 +11230,7 @@ mod tests {
 
     fn config_for(source_dir: &Path, mount_dir: &Path) -> Config {
         Config {
+            configured_source_roots: Some(vec![source_dir.to_path_buf()]),
             source_folders: vec![source_dir.to_path_buf()],
             mount_root: mount_dir.to_path_buf(),
             ratarmount_bin: "ratarmount".to_string(),
@@ -11096,21 +11441,21 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 27);
+        assert_eq!(report.to_version, 28);
         assert_eq!(
             report.applied_versions,
-            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
         );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 27);
+        assert_eq!(upgraded.schema_version().unwrap(), 28);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         assert_eq!(
             pending_schema_migration_versions(19).unwrap(),
-            vec![20, 21, 22, 23, 24, 25, 26, 27]
+            vec![20, 21, 22, 23, 24, 25, 26, 27, 28]
         );
 
         let quick_check: String = upgraded
@@ -11130,11 +11475,14 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 20);
-        assert_eq!(report.to_version, 27);
-        assert_eq!(report.applied_versions, vec![21, 22, 23, 24, 25, 26, 27]);
+        assert_eq!(report.to_version, 28);
+        assert_eq!(
+            report.applied_versions,
+            vec![21, 22, 23, 24, 25, 26, 27, 28]
+        );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 27);
+        assert_eq!(upgraded.schema_version().unwrap(), 28);
         assert_eq!(upgraded.list_source_folders().unwrap().len(), 1);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         let table_count: i64 = upgraded
@@ -11149,7 +11497,7 @@ mod tests {
         upgraded.close().unwrap();
 
         let reopened = Database::open_read_only(&database_path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 27);
+        assert_eq!(reopened.schema_version().unwrap(), 28);
         reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -11372,8 +11720,19 @@ mod tests {
         std::fs::create_dir_all(&emuwiz).unwrap();
         std::fs::create_dir_all(&legacy).unwrap();
 
+        // Two empty directories: an empty EmuWiz folder never displaces the
+        // legacy install.
+        let path = resolve_database_path(Some(home.clone().into_os_string())).unwrap();
+        assert_eq!(path, legacy.join("library.sqlite3"));
+
+        // EmuWiz holding the library is preferred over an empty legacy folder.
+        std::fs::write(emuwiz.join("library.sqlite3"), b"db").unwrap();
         let path = resolve_database_path(Some(home.clone().into_os_string())).unwrap();
         assert_eq!(path, emuwiz.join("library.sqlite3"));
+
+        // Both holding a library: no path is chosen.
+        std::fs::write(legacy.join("library.sqlite3"), b"db").unwrap();
+        assert!(resolve_database_path(Some(home.clone().into_os_string())).is_err());
 
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -11636,6 +11995,7 @@ mod tests {
 
     fn captured(device: u64, inode: u64, size: u64, mtime: u64) -> CapturedFileIdentity {
         CapturedFileIdentity {
+            changed: None,
             device,
             inode,
             size,
@@ -11997,6 +12357,7 @@ mod tests {
                 "catalogue_health_epoch",
                 "dat_expected_entries",
                 "dat_expected_inventory_meta",
+                "dat_recheck_attempts",
                 "dat_set_audit_dependencies",
                 "dat_set_audit_results",
                 "discovery_details",
@@ -12005,6 +12366,7 @@ mod tests {
                 "game_collection_items",
                 "game_collections",
                 "library_dat_identities",
+                "library_dat_identity_history",
                 "mame_member_evidence",
                 "media_topology_evidence",
                 "mod_catalogue_records",
@@ -13622,6 +13984,7 @@ mod tests {
         write_archive_file(&source_a, "a.zip", b"a");
         write_archive_file(&source_b, "b.zip", b"b");
         let config = Config {
+            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
@@ -13680,6 +14043,7 @@ mod tests {
         write_archive_file(&source_a, "a.zip", b"a");
         write_archive_file(&source_b, "b.zip", b"b");
         let config = Config {
+            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
@@ -13734,6 +14098,7 @@ mod tests {
         write_archive_file(&source_a, "game.zip", b"from a");
         write_archive_file(&source_b, "game.zip", b"from b, different size");
         let config = Config {
+            configured_source_roots: Some(vec![source_a.clone(), source_b.clone()]),
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
@@ -17482,6 +17847,11 @@ echo "$out"
         write_archive_file(&source_b, "b.zip", b"b");
         write_archive_file(&source_c, "c.zip", b"c");
         let config = Config {
+            configured_source_roots: Some(vec![
+                source_a.clone(),
+                source_b.clone(),
+                source_c.clone(),
+            ]),
             source_folders: vec![source_a.clone(), source_b.clone(), source_c.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
@@ -22107,7 +22477,7 @@ echo "$out"
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 27);
+            assert_eq!(latest_known_version(MIGRATIONS), 28);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")

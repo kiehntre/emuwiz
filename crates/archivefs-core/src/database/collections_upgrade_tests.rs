@@ -1,4 +1,4 @@
-//! Schema 26 to 27, on disposable libraries only: what the upgrade keeps, the
+//! Schema 27 to 28, on disposable libraries only: what the upgrade keeps, the
 //! backup it makes, what an interruption leaves, and how to go back.
 
 use std::collections::BTreeMap;
@@ -14,9 +14,9 @@ use super::{
 };
 use crate::UpgradeBackupState;
 
-const SCHEMA_26: usize = 26;
+const SCHEMA_27: usize = 27;
 
-/// Every row of every table, as text, leaving out what schema 27 adds.
+/// Every row of every table, as text, leaving out what schema 28 adds.
 fn all_rows(path: &Path) -> BTreeMap<String, Vec<String>> {
     let c = Connection::open(path).unwrap();
     let tables: Vec<String> = c
@@ -43,7 +43,7 @@ fn all_rows(path: &Path) -> BTreeMap<String, Vec<String>> {
             .map(|column| format!("quote(\"{column}\")"))
             .collect();
         let filter = if table == "schema_migrations" {
-            " WHERE version <= 26"
+            " WHERE version <= 27"
         } else {
             ""
         };
@@ -83,9 +83,10 @@ struct Library {
     path: PathBuf,
 }
 
-/// A real scanned catalogue, with history and metadata rows, taken back to
-/// schema 26 by removing exactly what migration 27 added.
-fn schema_26_library() -> Library {
+/// A real scanned catalogue, with history, metadata and schema 27 DAT
+/// evidence (current, replaced and re-check notes) rows, taken back to
+/// schema 27 by removing exactly what migration 28 added.
+fn schema_27_library() -> Library {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     let source = root.join("source");
@@ -99,6 +100,7 @@ fn schema_26_library() -> Library {
         mount_root: root.join("mount"),
         ratarmount_bin: "ratarmount".to_string(),
         master_rom_root: None,
+        configured_source_roots: None,
     };
     let mut database = Database::open_or_create(&path).unwrap();
     scan_and_persist(&mut database, &config, "fixture").unwrap();
@@ -114,9 +116,15 @@ fn schema_26_library() -> Library {
          INSERT INTO platform_assignments (archive_id, platform, source, assigned_at)
            SELECT id, 'SNES', 'user', 'old' FROM archives;
          UPDATE archives SET last_known_health='Healthy';
+         INSERT INTO library_dat_identities(archive_id,dat_source_id,dat_ecosystem,source_revision,verification_state,completeness,audited_at,facts_json,created_at,updated_at)
+           SELECT id,'158','no_intro','1','verified_single_match','exhaustive','then',x'7b7d','then','then' FROM archives;
+         INSERT INTO library_dat_identity_history(archive_id,archive_path,dat_source_id,verification_state,completeness,audited_at,revision_marked_stale,facts_json,row_created_at,row_updated_at,replaced_at,replaced_by_state)
+           SELECT id,absolute_path_cached,'158','verified_single_match','exhaustive','then',0,x'7b7d','then','then','now','no_match' FROM archives;
+         INSERT INTO dat_recheck_attempts(archive_id,dat_source_id,archive_path,attempted_at,reason,catalogue_sha256)
+           SELECT id,'158',absolute_path_cached,'now','The file changed while it was being checked',NULL FROM archives;
          DROP TABLE game_collection_items; DROP TABLE game_collections;
-         DELETE FROM schema_migrations WHERE version=27;
-         PRAGMA user_version=26;",
+         DELETE FROM schema_migrations WHERE version=28;
+         PRAGMA user_version=27;",
     )
     .unwrap();
     drop(c);
@@ -158,7 +166,7 @@ impl Drop for StageGuard {
 
 #[test]
 fn the_fixture_really_holds_the_records_being_protected() {
-    let library = schema_26_library();
+    let library = schema_27_library();
     let rows = all_rows(&library.path);
     for table in [
         "archives",
@@ -168,6 +176,9 @@ fn the_fixture_really_holds_the_records_being_protected() {
         "platform_aliases",
         "discovery_import_operations",
         "discovery_import_records",
+        "library_dat_identities",
+        "library_dat_identity_history",
+        "dat_recheck_attempts",
     ] {
         assert!(!rows[table].is_empty(), "{table} is empty");
     }
@@ -176,12 +187,12 @@ fn the_fixture_really_holds_the_records_being_protected() {
 
 #[test]
 fn upgrading_keeps_every_row_of_every_table_and_the_history_beside_it() {
-    let library = schema_26_library();
+    let library = schema_27_library();
     let before = all_rows(&library.path);
     let journal = journal_bytes(&library.root);
     let report = upgrade_library_database(&library.path).unwrap();
-    assert_eq!((report.from_version, report.to_version), (26, 27));
-    assert_eq!(report.applied_versions, vec![27]);
+    assert_eq!((report.from_version, report.to_version), (27, 28));
+    assert_eq!(report.applied_versions, vec![28]);
     assert_eq!(all_rows(&library.path), before);
     assert_eq!(journal_bytes(&library.root), journal);
     let database = Database::open_read_only(&library.path).unwrap();
@@ -193,7 +204,7 @@ fn upgrading_keeps_every_row_of_every_table_and_the_history_beside_it() {
 
 #[test]
 fn the_backup_is_complete_verified_and_made_before_the_schema_changes() {
-    let library = schema_26_library();
+    let library = schema_27_library();
     let before = all_rows(&library.path);
     let database_at_backup = std::rc::Rc::new(std::cell::Cell::new(0));
     let seen = database_at_backup.clone();
@@ -212,8 +223,8 @@ fn the_backup_is_complete_verified_and_made_before_the_schema_changes() {
     let report = upgrade_library_database(&library.path);
     UPGRADE_STAGE_HOOK.with(|slot| *slot.borrow_mut() = None);
     let report = report.unwrap();
-    assert_eq!(database_at_backup.get(), 26);
-    assert_eq!(user_version(&report.backup_path), 26);
+    assert_eq!(database_at_backup.get(), 27);
+    assert_eq!(user_version(&report.backup_path), 27);
     assert!(!has_collection_tables(&report.backup_path));
     assert_eq!(all_rows(&report.backup_path), before);
     let integrity: String = Connection::open(&report.backup_path)
@@ -224,8 +235,8 @@ fn the_backup_is_complete_verified_and_made_before_the_schema_changes() {
     assert!(matches!(
         inspect_upgrade_backups(&library.path).unwrap()[0].state,
         UpgradeBackupState::Verified {
-            from_version: 26,
-            to_version: 27,
+            from_version: 27,
+            to_version: 28,
             ..
         }
     ));
@@ -234,27 +245,27 @@ fn the_backup_is_complete_verified_and_made_before_the_schema_changes() {
 #[test]
 fn an_upgrade_interrupted_before_writing_changes_nothing_and_can_be_repeated() {
     for stage in ["after-lock", "after-backup"] {
-        let library = schema_26_library();
+        let library = schema_27_library();
         let original = fs::read(&library.path).unwrap();
         {
             let _guard = StageGuard::fail_at(stage);
             assert!(upgrade_library_database(&library.path).is_err(), "{stage}");
         }
         assert_eq!(fs::read(&library.path).unwrap(), original, "{stage}");
-        assert_eq!(user_version(&library.path), 26);
+        assert_eq!(user_version(&library.path), 27);
         assert!(Database::open_read_only(&library.path).is_err());
         let retried = upgrade_library_database(&library.path);
         assert!(retried.is_ok(), "{stage}: {:?}", retried.err());
-        assert_eq!(user_version(&library.path), 27);
+        assert_eq!(user_version(&library.path), 28);
     }
 }
 
 #[test]
 fn a_failure_inside_the_migration_rolls_back_whole_and_can_be_repeated() {
-    let library = schema_26_library();
+    let library = schema_27_library();
     let c = Connection::open(&library.path).unwrap();
     c.execute_batch(
-        "CREATE TRIGGER reject_27 BEFORE INSERT ON schema_migrations WHEN NEW.version=27 \
+        "CREATE TRIGGER reject_28 BEFORE INSERT ON schema_migrations WHEN NEW.version=28 \
          BEGIN SELECT RAISE(ABORT,'simulated failure'); END;",
     )
     .unwrap();
@@ -264,7 +275,7 @@ fn a_failure_inside_the_migration_rolls_back_whole_and_can_be_repeated() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("recoverable from"), "{error}");
-    assert_eq!(user_version(&library.path), 26);
+    assert_eq!(user_version(&library.path), 27);
     assert!(!has_collection_tables(&library.path));
     assert_eq!(all_rows(&library.path), before);
     let found = inspect_upgrade_backups(&library.path).unwrap();
@@ -274,16 +285,16 @@ fn a_failure_inside_the_migration_rolls_back_whole_and_can_be_repeated() {
     ));
     Connection::open(&library.path)
         .unwrap()
-        .execute_batch("DROP TRIGGER reject_27;")
+        .execute_batch("DROP TRIGGER reject_28;")
         .unwrap();
     upgrade_library_database(&library.path).unwrap();
-    assert_eq!(user_version(&library.path), 27);
+    assert_eq!(user_version(&library.path), 28);
     assert_eq!(all_rows(&library.path), before);
 }
 
 #[test]
-fn a_new_build_never_upgrades_a_schema_26_library_by_itself() {
-    let library = schema_26_library();
+fn a_new_build_never_upgrades_a_schema_27_library_by_itself() {
+    let library = schema_27_library();
     let original = fs::read(&library.path).unwrap();
     assert!(Database::open_read_only(&library.path).is_err());
     assert!(Database::open_existing(&library.path).is_err());
@@ -292,22 +303,22 @@ fn a_new_build_never_upgrades_a_schema_26_library_by_itself() {
 }
 
 #[test]
-fn a_schema_26_build_refuses_an_upgraded_library() {
-    let library = schema_26_library();
+fn a_schema_27_build_refuses_an_upgraded_library() {
+    let library = schema_27_library();
     upgrade_library_database(&library.path).unwrap();
-    let error = open_or_create_with_migrations(&library.path, &MIGRATIONS[..SCHEMA_26])
+    let error = open_or_create_with_migrations(&library.path, &MIGRATIONS[..SCHEMA_27])
         .err()
         .unwrap()
         .to_string();
     assert!(!error.is_empty());
-    assert_eq!(user_version(&library.path), 27);
+    assert_eq!(user_version(&library.path), 28);
 }
 
 /// The documented way back: close EmuWiz and put the backup in place. It
-/// returns the exact schema 26 library, so favourites made since are gone.
+/// returns the exact schema 27 library, so favourites made since are gone.
 #[test]
-fn rolling_back_to_the_backup_restores_schema_26_and_loses_later_favourites() {
-    let library = schema_26_library();
+fn rolling_back_to_the_backup_restores_schema_27_and_loses_later_favourites() {
+    let library = schema_27_library();
     let before = all_rows(&library.path);
     let report = upgrade_library_database(&library.path).unwrap();
     let mut database = Database::open_existing(&library.path).unwrap();
@@ -316,17 +327,21 @@ fn rolling_back_to_the_backup_restores_schema_26_and_loses_later_favourites() {
     database.add_game_to_collection(favourites, game).unwrap();
     database.close().unwrap();
 
-    // The built-in Restore only accepts a backup at the build's own schema.
-    assert!(prepare_database_restore(&library.path, &report.backup_path).is_err());
+    // The built-in Restore never goes back to schema 27: it would upgrade the
+    // backup to this build's schema (see the test below). Going back to 27 is
+    // by hand.
+    let plan = prepare_database_restore(&library.path, &report.backup_path).unwrap();
+    assert_eq!(plan.backup_schema_version, 27);
+    assert_eq!(plan.pending_migrations, vec![28]);
 
-    let kept = library.root.join("library.schema-27-favourites.sqlite3");
+    let kept = library.root.join("library.schema-28-favourites.sqlite3");
     fs::copy(&library.path, &kept).unwrap();
     fs::copy(&report.backup_path, &library.path).unwrap();
 
-    assert_eq!(user_version(&library.path), 26);
+    assert_eq!(user_version(&library.path), 27);
     assert!(!has_collection_tables(&library.path));
     assert_eq!(all_rows(&library.path), before);
-    open_or_create_with_migrations(&library.path, &MIGRATIONS[..SCHEMA_26]).unwrap();
+    open_or_create_with_migrations(&library.path, &MIGRATIONS[..SCHEMA_27]).unwrap();
 
     // Upgrading again starts with empty Favourites; the set-aside copy is the
     // only remaining record of them.
@@ -335,4 +350,35 @@ fn rolling_back_to_the_backup_restores_schema_26_and_loses_later_favourites() {
     assert!(again.load_game_collections().unwrap()[0].items.is_empty());
     let saved = Database::open_read_only(&kept).unwrap();
     assert_eq!(saved.load_game_collections().unwrap()[0].items.len(), 1);
+}
+
+/// History's own Restore, run by a schema 28 build on the schema 27 backup:
+/// the whole library goes back to its state before the upgrade (every row,
+/// including saved DAT evidence) and is upgraded again in a staging copy, so
+/// it stays at schema 28 and Favourites start empty.
+#[test]
+fn the_in_app_restore_of_the_schema_27_backup_keeps_schema_28_and_empties_favourites() {
+    let library = schema_27_library();
+    let before = all_rows(&library.path);
+    let report = upgrade_library_database(&library.path).unwrap();
+    let mut database = Database::open_existing(&library.path).unwrap();
+    let favourites = database.favourites_collection_id().unwrap();
+    let game = database.load_archives().unwrap()[0].id;
+    database.add_game_to_collection(favourites, game).unwrap();
+    database.close().unwrap();
+
+    let plan = prepare_database_restore(&library.path, &report.backup_path).unwrap();
+    super::restore_database(&plan, "RESTORE DATABASE").unwrap();
+
+    assert_eq!(user_version(&library.path), 28);
+    assert_eq!(all_rows(&library.path), before);
+    let restored = Database::open_read_only(&library.path).unwrap();
+    let collections = restored.load_game_collections().unwrap();
+    assert_eq!(collections.len(), 1);
+    assert!(
+        collections[0].items.is_empty(),
+        "favourites made since are gone"
+    );
+    // The backup itself is untouched.
+    assert_eq!(user_version(&report.backup_path), 27);
 }

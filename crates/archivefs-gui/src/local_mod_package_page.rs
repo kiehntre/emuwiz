@@ -289,19 +289,11 @@ fn poll_standalone(state: &mut StandalonePatchPageState) -> bool {
     changed
 }
 
+/// CRC-32 (IEEE) of a buffer, through the core's table-driven implementation.
 fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xedb8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
+    let mut crc = archivefs_core::identity_source::hashing::Crc32::new();
+    crc.update(bytes);
+    crc.finish()
 }
 
 fn patch_candidate_rank(candidate: &StandalonePatchCandidate) -> u8 {
@@ -1229,6 +1221,13 @@ fn candidate_state_label(plan: &LocalModPackagePlan) -> &'static str {
 /// with no written journal. This is what gates the Undo control for every
 /// status: on `Failed` no entry ever qualifies, on `PartialFailure` only the
 /// subset that genuinely changed does.
+fn show_applied_summary(ui: &mut egui::Ui, result: &SharedApplyResult) {
+    let presentation = apply_presentation(result.journal.status);
+    widgets::status_badge(ui, presentation.headline, presentation.tone);
+    ui.label(presentation.detail);
+    crate::shared_apply_warnings::show(ui, &crate::shared_apply_warnings::lines(result));
+}
+
 fn has_restorable_changes(result: &SharedApplyResult) -> bool {
     result.journal_path.is_some()
         && result.journal.entries.iter().any(|entry| {
@@ -1651,11 +1650,9 @@ pub(crate) fn show_local_mod_package_panel_with_evidence(
             state.stage = Some(Stage::Applying(receiver, plan));
         }
         Stage::Applied(result) => {
-            let presentation = apply_presentation(result.journal.status);
             let can_undo = has_restorable_changes(&result);
             widgets::card(ui, |ui| {
-                widgets::status_badge(ui, presentation.headline, presentation.tone);
-                ui.label(presentation.detail);
+                show_applied_summary(ui, &result);
                 if can_undo
                     && let Some(journal) = result.journal_path.as_ref()
                     && widgets::action_button(
@@ -2037,6 +2034,15 @@ mod tests {
             },
             rom_hack: None,
         }
+    }
+
+    #[test]
+    fn apply_result_shows_shared_transaction_warnings() {
+        use crate::shared_apply_warnings::test_support::{
+            assert_shows_warning, render, warned_result,
+        };
+        let result = warned_result();
+        assert_shows_warning(&render(|ui| show_applied_summary(ui, &result)));
     }
 
     #[test]
@@ -2591,3 +2597,47 @@ mod tests {
 #[cfg(test)]
 #[path = "local_mod_package_page/representation_guidance_tests.rs"]
 mod representation_guidance_tests;
+
+#[cfg(test)]
+mod crc32_vector_tests {
+    /// The definition, one bit at a time: the code this file used before it
+    /// switched to the shared table-driven implementation.
+    fn bitwise(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffff_u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn crc32_gives_the_published_answers() {
+        assert_eq!(super::crc32(b""), 0);
+        assert_eq!(super::crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(
+            super::crc32(b"The quick brown fox jumps over the lazy dog"),
+            0x414f_a339
+        );
+    }
+
+    #[test]
+    fn crc32_agrees_with_the_bit_at_a_time_definition_at_every_length() {
+        let data: Vec<u8> = (0..4099_u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        for length in (0..=40).chain([255, 256, 257, 4095, 4096, 4097, 4099]) {
+            assert_eq!(
+                super::crc32(&data[..length]),
+                bitwise(&data[..length]),
+                "length {length}"
+            );
+        }
+    }
+}

@@ -25,7 +25,9 @@ use crate::patch_manager::duckstation_local::{
     discover_duckstation_executables, discover_duckstation_profiles,
     expected_duckstation_native_root,
 };
-use crate::patch_manager::duckstation_native::{ini_value, resolve_duckstation_folders};
+use crate::patch_manager::duckstation_native::{
+    ini_value, resolve_duckstation_folders, resolve_duckstation_memory_cards_folder,
+};
 
 const FLATPAK_APP_ID: &str = "org.duckstation.DuckStation";
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
@@ -236,10 +238,46 @@ impl DuckStationAdapter {
                 }),
             }
         }
+        // Memory cards: `[MemoryCards] Directory` (DuckStation does not keep
+        // this one under `[Folders]`).
+        if directory_present {
+            match resolve_duckstation_memory_cards_folder(&root) {
+                Ok((path, custom)) => {
+                    let exists = is_directory(&path);
+                    if custom && !exists {
+                        warnings.push(ConfigurationWarning::CustomFolderMissing {
+                            folder: ProfileFolder::MemoryCards,
+                            path: path.clone(),
+                        });
+                    }
+                    folders.insert(
+                        ProfileFolder::MemoryCards,
+                        ResolvedFolder {
+                            path,
+                            exists,
+                            custom,
+                        },
+                    );
+                }
+                Err(refusal) => warnings.push(ConfigurationWarning::FolderUnsafe {
+                    folder: ProfileFolder::MemoryCards,
+                    reason: format!("{refusal:?}"),
+                }),
+            }
+        } else {
+            let path = root.join("memcards");
+            folders.insert(
+                ProfileFolder::MemoryCards,
+                ResolvedFolder {
+                    exists: is_directory(&path),
+                    path,
+                    custom: false,
+                },
+            );
+        }
         for (folder, name) in [
             (ProfileFolder::Patches, "patches"),
             (ProfileFolder::Textures, "textures"),
-            (ProfileFolder::MemoryCards, "memcards"),
             (ProfileFolder::SaveStates, "savestates"),
         ] {
             let path = root.join(name);
