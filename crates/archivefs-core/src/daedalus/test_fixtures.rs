@@ -31,6 +31,11 @@ fixture!(
     "retroarch-1.21.0/save-dir-read-only.log"
 );
 fixture!(
+    RA_SAVE_DIR_READ_ONLY_QUIET,
+    "retroarch-1.21.0/save-dir-read-only-quiet.stderr"
+);
+fixture!(RA_SAVE_OK, "retroarch-1.21.0/save-ok.log");
+fixture!(
     RA_SILENT_CORE_AUDIO,
     "retroarch-1.21.0/silent-core-audio.log"
 );

@@ -18,6 +18,8 @@ disposable settings and the bundled `2048` and `gambatte` cores:
 | `content-unreadable.log` | game file exists with mode 000 | status 1 |
 | `content-garbage.log` | game file is random bytes | status 1 |
 | `save-dir-read-only.log` | save folder not writable | status 0 |
+| `save-dir-read-only-quiet.stderr` | the same without `--verbose`: nothing is printed about the failed save | status 0 |
+| `save-ok.log` | save folder writable; the save is written (captured 2026-11-14) | status 0 |
 | `silent-core-audio.log` | core that produces no sound | status 0 |
 | `no-display.stderr` | `DISPLAY` unset | SIGABRT |
 

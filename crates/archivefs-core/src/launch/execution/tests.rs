@@ -2439,3 +2439,128 @@ fn zipped_save_readiness_is_pure_across_repeated_frames_and_launch_rechecks() {
         .expect_err("launch re-checks and refuses");
     assert!(!launch.contains(&missing.display().to_string()), "{launch}");
 }
+
+// --- detailed logging is asked for at spawn, and both streams are kept ---------------------
+
+#[test]
+fn a_launch_asks_retroarch_for_detailed_logging_without_changing_the_planned_command() {
+    let ready = build_ready_fixture_with_content(
+        "diagnostic-logging",
+        b"synthetic mega drive rom bytes",
+        "game.md",
+    );
+    // A stand-in that prints its arguments on standard output and one line
+    // on standard error, then fails.
+    crate::verified_game_fixture::compile_native_test_executable(
+        &ready.fixture.path("bin/retroarch"),
+        "#!/bin/sh\nfor a in \"$@\"; do echo \"arg:$a\"; done\necho 'to stderr' 1>&2\nexit 3\n",
+    )
+    .unwrap();
+
+    let command = preflight(&ready).unwrap();
+    let planned: Vec<String> = command
+        .arguments
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    assert!(!planned.iter().any(|argument| argument == "--verbose"));
+
+    let mut process = spawn_retroarch(command).unwrap();
+    // What EmuWiz reports about the launch is still the planned command.
+    let reported: Vec<String> = process
+        .command_facts
+        .arguments
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(reported, planned);
+    wait_for_exit(&mut process);
+    let report = process.poll().unwrap();
+    assert_eq!(report.status.as_ref().unwrap().code(), Some(3));
+    let output = String::from_utf8_lossy(&report.stderr).into_owned();
+    // Standard output (the arguments) and standard error are both kept.
+    assert!(output.contains("to stderr"), "{output}");
+    let received: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("arg:"))
+        .collect();
+    // Exactly the planned arguments plus `--verbose` directly before `-L`.
+    let core_flag = received
+        .iter()
+        .position(|argument| *argument == "-L")
+        .unwrap();
+    assert_eq!(received[core_flag - 1], "--verbose");
+    let mut without = received.clone();
+    without.remove(core_flag - 1);
+    assert_eq!(without, planned);
+}
+
+/// Opt-in check against a real RetroArch, for the behaviour the diagnostic
+/// launch relies on: `--verbose` leaves the settings file exactly as a
+/// normal launch leaves it. Skipped unless
+/// `EMUWIZ_TEST_REAL_RETROARCH=<path to retroarch>` and
+/// `EMUWIZ_TEST_REAL_RETROARCH_CORE=<path to a core that needs no game>`
+/// are set, because automated test machines have no emulator and no
+/// display. Run it inside a private display; it uses only a temporary
+/// profile and never the real one.
+#[test]
+#[ignore = "needs a real RetroArch, a contentless core and a display"]
+fn retroarch_verbose_leaves_settings_untouched() {
+    let (Some(retroarch), Some(core)) = (
+        std::env::var_os("EMUWIZ_TEST_REAL_RETROARCH"),
+        std::env::var_os("EMUWIZ_TEST_REAL_RETROARCH_CORE"),
+    ) else {
+        panic!("set EMUWIZ_TEST_REAL_RETROARCH and EMUWIZ_TEST_REAL_RETROARCH_CORE");
+    };
+    let run = |home: &Path, extra: &[&str]| {
+        let status = std::process::Command::new(&retroarch)
+            .args(extra)
+            .arg("-L")
+            .arg(&core)
+            .arg("--max-frames=120")
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env_remove("XDG_DATA_HOME")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("RetroArch must start");
+        assert!(status.success(), "RetroArch exited with {status}");
+    };
+    let settings = |home: &Path| home.join(".config/retroarch/retroarch.cfg");
+
+    // RetroArch writes its own complete settings file on a first run.
+    let template = tempfile::tempdir().unwrap();
+    run(template.path(), &[]);
+    let generated = fs::read(settings(template.path())).expect("RetroArch wrote its settings");
+    let generated_text = String::from_utf8_lossy(&generated);
+    assert!(generated_text.contains("log_verbosity = \"false\""));
+
+    // An unrelated setting passed with --appendconfig makes RetroArch rewrite
+    // its settings file, so there is a saved file to compare.
+    let appended = template.path().join("unrelated.cfg");
+    fs::write(&appended, "menu_swap_ok_cancel_buttons = \"true\"\n").unwrap();
+    let append = format!("--appendconfig={}", appended.display());
+
+    let saved_after = |extra: &[&str]| {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(settings(home.path()).parent().unwrap()).unwrap();
+        fs::write(settings(home.path()), &generated).unwrap();
+        run(home.path(), extra);
+        fs::read(settings(home.path())).unwrap()
+    };
+    // A plain launch and a verbose launch leave the file as it was.
+    assert_eq!(saved_after(&[]), generated);
+    assert_eq!(saved_after(&["--verbose"]), generated);
+    // Where RetroArch does save, it saves the same bytes with and without
+    // --verbose, and detailed logging is not switched on in them.
+    let normal = saved_after(&[append.as_str()]);
+    let verbose = saved_after(&["--verbose", append.as_str()]);
+    assert_ne!(
+        normal, generated,
+        "the control launch did not rewrite the settings"
+    );
+    assert_eq!(verbose, normal);
+    assert!(String::from_utf8_lossy(&verbose).contains("log_verbosity = \"false\""));
+}

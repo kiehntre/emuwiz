@@ -191,7 +191,17 @@ RetroArch 1.21.0 facts that shaped the rules:
   produce no sound;
 - the first occurrence of a repeated settings key wins;
 - `--appendconfig` overrides `video_driver` for that launch, but appended
-  values leak into the base settings file (see Repair below).
+  values leak into the base settings file (see Repair below);
+- `--verbose` is not written back to the settings file, on a clean exit, a
+  SIGTERM or a SIGKILL (checked run by run; a regression test repeats it
+  against the real program when one is available);
+- a battery save that cannot be written is reported
+  (`[ERROR] [SRAM]: Failed to save SRAM.`) **only with `--verbose`**; without
+  it nothing at all is printed, and the process exits with status 0 either
+  way. RetroArch then keeps a recovery copy of the save data in its settings
+  folder and says so. A successful save is reported as `Saved successfully`;
+- the content-free cores used for these captures do not support save states,
+  so no real save-state failure has been captured.
 
 ## Command line
 
@@ -228,6 +238,166 @@ given, and prints a report. It opens no database and starts no emulator.
 `diagnose-launch --rules --json` prints `engine_version`, `digest` and `rules`
 (`id`, `version`, `category`, `summary`). New keys may be added without a
 version change. Text fields are for people and are not stable.
+
+## Capture in Blue launches (`launch::retroarch_launch_diagnostics`)
+
+A RetroArch launch from Blue asks for detailed logging (`--verbose`, placed
+before `-L`) and keeps a bounded capture of what RetroArch prints, standard
+output and standard error through one pipe: the first 64 KiB and the last
+64 KiB, with one marker line where output was left out. Lines are kept in the
+order RetroArch wrote them to the pipe, which for a program that buffers its
+standard output can be later than it produced them. The capture lives in
+memory. It is best-effort: if the pipe cannot be set up the launch still asks
+for detailed logging, and keeps what every other launch keeps (the first
+64 KiB of standard error; standard output is discarded).
+`EMUWIZ_RETROARCH_QUIET_LAUNCH=1` switches both the flag and the wider capture
+off. No settings file is changed and no retry with other settings is made.
+
+A managed RetroArch started this way ignores a broken output pipe, so it
+finishes writing its saves even if EmuWiz ends while the game is running.
+
+The capture is for diagnosis and is never shown whole. Where Blue shows the
+output of a failed RetroArch launch (the technical-details box), it shows the
+last 40 lines only, with recognised private details removed and every
+character made visible (`redact::output_tail_for_display`). A launch that did
+not fail shows no output at all, and its capture is dropped as soon as Blue
+has seen that it ended well. When Blue starts calling
+`session::diagnose_finished_launch`, that call must come before the capture is
+dropped, or the capture must be kept until the save check has run: a launch
+that ended well can still carry RetroArch's report of a failed save, and that
+output is the only evidence of it.
+
+## After a launch (`daedalus::session`, `daedalus::notice`)
+
+`session::diagnose_finished_launch` is the one call a launcher makes, from a
+worker thread, once the process has ended: it collects evidence (recorded as
+observed by EmuWiz, not supplied), diagnoses, assesses saves, records the
+launch when it is one to keep, and returns a `LaunchNotice`. It starts
+nothing and changes no emulator setting or game file; a history that is
+missing, unusable or switched off changes nothing else about the result.
+
+`notice::launch_notice` decides how loud the result is, as plain values the
+interface only draws:
+
+| Level | When | Shown as |
+|---|---|---|
+| `LaunchFailed` | the process failed, or a program reported an error that stops a game from starting | prominent; the headline says which of the two. A save problem found beside it is a separate part of the notice (`save_warning`), with its own next step |
+| `SaveWriteFailed` | the launch did not fail and the emulator said a save could not be written | prominent |
+| `SavesAtRisk` | nothing reported; the save folder is missing or not writable | a warning |
+| `Quiet` | nothing to report | no banner; at most one quiet line about what save checking covered |
+
+A problem that only degrades a game that ran (sound that could not start) is
+not shown on Play; it is in Game Doctor. Nothing says that saves were written.
+When the evidence disagrees or does not show why a launch failed, a cause that
+is listed says how it stands ("One possible cause: ...") and is not the
+headline.
+The text is built from a redacted copy of the report.
+
+Blue does not call these yet: the Play notice, the Game Doctor history and its
+controls are the next slice. Until then the history is reachable through
+`emuwiz-cli launch-history`.
+
+## Saves (`archivefs_core::daedalus::saves`)
+
+Whether a save was written is assessed apart from what happened to the
+launch. A game can run, exit with status 0 and still lose a save.
+
+| Status | Meaning |
+|---|---|
+| `write_failed` | The emulator stated that a save could not be written. `confirmed_by_check` when EmuWiz's own look at the save folder agrees, `reported_by_emulator` when nothing measured says why. Shown prominently; kept in history. |
+| `at_risk` | Nothing was reported, but EmuWiz found the save folder missing or not writable. Shown; not kept on its own. |
+| `no_failure_detected` | The monitoring that was available saw no failed write. Only the mechanisms listed as monitored were watched. |
+| `monitoring_unavailable` | Nothing was watching: no provider for this emulator, no output, output without detailed logging, or output that was cut. |
+
+Coverage is a table, not an inference. `saves::PROVIDERS` lists, per
+emulator, the save mechanisms whose failed writes are recognised from a real
+captured message. Today: RetroArch, in-game (battery) saves, which is also how
+most of its cores keep memory cards. A mechanism counts as monitored for a
+launch only when its provider's output was detailed and complete. That an
+emulator is RetroArch does not make its save states monitored, and a clean
+exit is never evidence that a save was written. No wording says saves were
+written; the most that is said is that the emulator reported writing one.
+
+Not monitored yet, tracked as later slices: save states, files a core or
+emulator writes by itself (memory-card files), and every standalone emulator
+(PCSX2, DuckStation, Flycast, Atari800 and the rest). For those Play shows a
+quiet line ("Save check: not available for this emulator") and Game Doctor
+says what that means. Adding a row needs a real capture of that emulator
+failing to write that kind of save.
+
+Nothing here changes a save path, a permission or a file. Next steps are
+things for a person to check.
+
+## History (`archivefs_core::daedalus::history`)
+
+A private, bounded record so that Game Doctor still has something to show
+after Blue restarts. Two kinds of launch are kept and no other: one that
+failed, and one that did not fail but whose emulator stated that a save could
+not be written. Ordinary launches are never recorded.
+
+**What a record holds** is built field by field from fixed lists: when; the
+game's library id and platform (not its title: a title is free text, so a
+record names the game by its id and whatever shows the record looks the title
+up in the library); the emulator, core and version as short
+names of a fixed shape; how the process ended, as numbers; what happened to
+the launch; the verdict and, per finding, the rule, category, confidence and
+effect; kinds of reported error with counts; driver settings whose value is
+on a fixed list; graphics-check results; missing libraries whose name is on a
+fixed list; the save status and which mechanisms were monitored; sizes and
+counts of the output examined.
+
+**What a record never holds**: emulator output in whole or in part, file or
+folder paths, user names, network or web addresses, environment values, or
+any free text from a log, a settings file or a diagnosis. This is not
+redaction. Redaction cannot be shown to catch every secret, so text that
+could carry one is not filtered on the way in; it is not copied at all, and a
+value that is not on a list is stored as "not kept". The wording shown for a
+record is regenerated from the built-in tables.
+
+**Limits**: the newest 20 records, none older than 14 days, at most 16 KiB
+each and 512 KiB in total. What is past a limit is removed, oldest first,
+each time a finished launch is offered to the store (recorded or not,
+recording on or off), before a record is added, and when Blue lists the
+history. The read-only views, including `emuwiz-cli launch-history list` and
+`show`, remove nothing and leave out what is past a limit. So a record past
+14 days can stay on disk until the next launch, and is not shown in the
+meantime. Repeats of the same save warning for the same game are one record
+with a count.
+
+**The files**: one folder (`launch-diagnostics`, mode 0700) in EmuWiz's data
+directory, refused unless it is a real directory owned by this user with no
+access for others; one file per record (mode 0600) under a name this module
+generates; written to a temporary name, flushed, and renamed without
+replacing anything. A file that is too large, does not parse, holds a field or
+a value a record never holds, or does not match its own name is never shown
+and is removed at the next clean-up. Something under a record's name that is
+not a regular file (a link, a folder) is never shown and never removed: only
+plain files are ever removed. Saving is best-effort and returns its failures
+as values; it cannot affect a launch.
+
+**Controls**: list, show, delete one, clear all, and switch recording off
+(a marker file, so the switch survives clearing). On the command line:
+`emuwiz-cli launch-history [list|show <id>|status]` only read (a store that
+does not exist yet is left absent), `delete <id>`, `clear`, `off` and `on`
+change only the history folder; `--json` on `list` and `show` prints the
+records as stored.
+
+## Detailed export (`archivefs_core::daedalus::export`)
+
+The detail of a launch, what the emulator printed and the evidence behind
+each finding, exists only in memory after the launch. It leaves the program
+only when a person asks: `ExportPreview::prepare` builds the exact text,
+which opens with a privacy warning; nothing can be written without
+`confirmed_by_person`; the only thing that can then happen is one new file
+(mode 0600) in a folder the caller names, never replacing anything. Nothing
+is sent anywhere.
+
+The text has recognised private details removed (`daedalus::redact`: the home
+folder, the user name in paths, values labelled as secrets, logins in web
+addresses). That is a short list of literal rules and **not** a guarantee: an
+unlabelled token, an unusual credential, another person's name or a network
+address passes through. The warning says so, a test holds the claim to that
+scope, and this is why redacted text is shown and exported but never stored.
 
 ## Repair (next slice; owner policy of 2026-11-14)
 

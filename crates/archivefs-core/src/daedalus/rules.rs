@@ -2178,6 +2178,29 @@ pub fn rule_set() -> RuleSetInfo {
     }
 }
 
+/// One built-in rule by its id, as shown to people.
+pub fn rule_info(id: &str) -> Option<RuleInfo> {
+    RULES
+        .iter()
+        .find(|rule| rule.id == id)
+        .map(|rule| RuleInfo {
+            id: rule.id,
+            version: rule.version,
+            category: rule.category,
+            summary: rule.summary,
+        })
+}
+
+/// The built-in wording for a kind of error a program states outright, as
+/// the rest of the sentence "it was reported that ...". `None` for a kind
+/// of message that is not an error report.
+pub fn reported_error_phrase(meaning: LogMeaning) -> Option<&'static str> {
+    REPORTED_ERRORS
+        .iter()
+        .find(|(reported, ..)| *reported == meaning)
+        .map(|(.., phrase)| *phrase)
+}
+
 /// Diagnose with the built-in rules.
 pub fn diagnose(evidence: &EvidenceSet) -> DiagnosisReport {
     diagnose_with(RULES, evidence)

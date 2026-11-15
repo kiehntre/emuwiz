@@ -393,7 +393,9 @@ fn a_selected_cheat_launches_retroarch_with_a_prepared_scratch_config_and_cleans
     // The canonical argv comes first; the prepared config is appended.
     let args = fs::read_to_string(world.root.join("record/args.txt")).unwrap();
     let lines: Vec<&str> = args.lines().collect();
-    assert_eq!(lines[0], "-L");
+    // Detailed logging is asked for at spawn, directly before the core flag.
+    assert_eq!(lines[0], "--verbose");
+    assert_eq!(lines[1], "-L");
     let at = lines
         .iter()
         .position(|l| *l == "--config")
@@ -549,7 +551,9 @@ fn the_prepared_config_is_the_final_pair_after_the_content_argument() {
         .iter()
         .position(|l| *l == content)
         .expect("content argument");
-    assert_eq!(lines[0], "-L");
+    // Detailed logging is asked for at spawn, directly before the core flag.
+    assert_eq!(lines[0], "--verbose");
+    assert_eq!(lines[1], "-L");
     assert_eq!(lines[content_at + 1], "--config");
     assert_eq!(
         lines.len(),

@@ -270,10 +270,19 @@ fn what_the_caller_states_is_recorded_as_supplied_and_a_saved_log_is_complete() 
             .any(|note| note.contains("EmuWiz did not observe it"))
     );
 
-    // The same bytes as a launcher capture are known to be cut at 64 KiB.
+    // As a launcher capture, the same 80 KiB is a start-and-end capture
+    // that kept every byte: no marker line says output was left out.
     let observed = collect(&base);
     assert_eq!(trusts(&observed), [Trust::Measured, Trust::Measured]);
-    assert!(cut(&observed));
+    assert!(!cut(&observed));
+
+    // A plain capture that is exactly full was cut off.
+    let limit = crate::launch::process_spawn::PROCESS_STDERR_CAPTURE_LIMIT;
+    let full = collect(&LaunchArtefacts {
+        stderr: base.stderr.as_ref().map(|bytes| bytes[..limit].to_vec()),
+        ..base.clone()
+    });
+    assert!(cut(&full));
 }
 
 #[test]

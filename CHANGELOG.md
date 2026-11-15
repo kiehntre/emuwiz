@@ -45,6 +45,32 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   before this version it can also leave some of that install's own files
   out of an Undo, and have that install's genuine original put back over a
   file it replaced that has changed since.
+- Launching with RetroArch: EmuWiz now asks RetroArch for detailed output and
+  keeps a bounded copy in memory (the first and last 64 KiB) to explain a
+  launch that goes wrong. No RetroArch setting is changed. When a launch
+  fails, the technical details show the last 40 lines only, with your home
+  folder, your user name in paths, and the values next to a short list of
+  labels (such as `password`, `token` and `api_key`) removed. The list is not
+  complete: read the details before you share them.
+  `EMUWIZ_RETROARCH_QUIET_LAUNCH=1` turns the detailed output off.
+- Command line: `emuwiz-cli launch-history` lists, shows, deletes and clears
+  the record EmuWiz keeps of launches that went wrong, and switches recording
+  off or on. A record is kept for a failed launch and for a launch whose
+  emulator said a save could not be written; it holds structured facts only
+  (no emulator output, paths or addresses), at most 20 records for 14 days.
+  Nothing writes to this history yet: Blue starts recording in a later
+  change.
+- Command line: `emuwiz-cli diagnose-launch` explains a failed emulator launch
+  from what it left behind: how the process ended, what the emulator printed,
+  its settings and a look at the files involved. It reports what happened
+  separately from why, names the evidence behind every conclusion, lists what
+  was not observed, and leaves a failure unexplained when the evidence does not
+  explain it. What happened to the launch is stated apart from the verdict, and
+  what you type about the launch (how it ended, its environment) is taken as
+  supplied: it can suggest a cause, never establish one. Read-only: it starts
+  nothing and changes nothing. RetroArch is the
+  only emulator with log and settings support so far; for others it covers the
+  process exit, missing libraries and sandbox refusals. Not yet in Blue.
 - Check Games: a "Saved results that need checking again" card lists saved
   catalogue results that no longer count (and why), and can check those games
   again with progress and Stop. Finished sets stay saved; Continue checks the
