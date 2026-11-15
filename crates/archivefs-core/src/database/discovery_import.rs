@@ -563,9 +563,9 @@ impl Database {
                 }
             }
             // An item counts if it is saved against this row, or if its own row
-            // is gone and Blue shows it on this row because the source, path
-            // and size match (the same rule as `load_game_collections`), so
-            // Undo never deletes a game the user sees starred.
+            // is gone and Blue proposes this row for it because the source,
+            // path and size match (the same rule as `load_game_collections`),
+            // so Undo never deletes a game the user may still confirm.
             let collections: i64 = self
                 .connection
                 .query_row(
@@ -583,7 +583,7 @@ impl Database {
                 )
                 .map_err(string_error)?;
             if collections != 0 {
-                blockers.push(format!("{label}: this game is in Favourites or a collection. Remove it there first; none will be deleted."));
+                blockers.push(format!("{label}: this game is in Favourites or a collection, or is proposed there for a saved game. Remove it there first; none will be deleted."));
             }
         }
         Ok(blockers)

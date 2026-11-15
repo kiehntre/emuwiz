@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
 use archivefs_core::{
-    CollectionItemKey, CollectionReanchor, Database, GameCollection, GameCollectionItem,
-    GameCollectionKind, MAX_COLLECTION_NAME_CHARS,
+    CollectionItemKey, CollectionReanchor, Database, GameCollection, GameCollectionKind,
+    MAX_COLLECTION_NAME_CHARS,
 };
 use eframe::egui::{self, Color32, RichText};
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,8 @@ const STAR: &str = "★";
 const STAR_ON: Color32 = Color32::from_rgb(245, 197, 66);
 const STAR_OFF: Color32 = Color32::from_rgb(150, 156, 170);
 const GONE_ROW_HEIGHT: f32 = 44.0;
+/// A gone row that also shows a proposed match and its confirm button.
+const GONE_PROPOSAL_ROW_HEIGHT: f32 = 92.0;
 
 /// How a collection is listed. Library-wide browsing stays in title order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +82,9 @@ pub(super) struct GoneGame {
     title: String,
     platform: String,
     file_name: String,
+    /// A listed game at the item's own source, path and size: shown as a
+    /// possible match, saved only when the user confirms it.
+    proposed: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,14 +98,12 @@ pub(super) struct View {
     pub platforms: Vec<(String, usize)>,
 }
 
-/// Saved collections as this library shows them, and the items whose saved row
-/// should move to the row that now stands for the game.
-pub(super) fn build_views(
-    collections: &[GameCollection],
-    library: &Library,
-) -> (Vec<View>, Vec<CollectionReanchor>) {
-    let mut moves = Vec::new();
-    let views = collections
+/// Saved collections as this library shows them. Read-only: a game is a member
+/// only through its own saved row (followed to the row that now stands for it);
+/// a match by place and size is only proposed, on the item's gone entry.
+pub(super) fn build_views(collections: &[GameCollection], library: &Library) -> Vec<View> {
+    let listed = |id: i64| Some(library.resolve(id)).filter(|id| library.by_id.contains_key(id));
+    collections
         .iter()
         .map(|collection| {
             let mut members: HashMap<i64, Member> = HashMap::new();
@@ -110,19 +113,8 @@ pub(super) fn build_views(
                     archive_id: item.stored_archive_id,
                     created_at: item.stored_created_at.clone(),
                 };
-                let current = item
-                    .resolved_archive_id
-                    .map(|id| library.resolve(id))
-                    .filter(|id| library.by_id.contains_key(id));
-                match current {
+                match item.resolved_archive_id.and_then(listed) {
                     Some(id) => {
-                        if let Some(target) = durable_target(item, id, library) {
-                            moves.push(CollectionReanchor {
-                                stored_archive_id: item.stored_archive_id,
-                                stored_created_at: item.stored_created_at.clone(),
-                                current_archive_id: target,
-                            });
-                        }
                         let member = members.entry(id).or_insert_with(|| Member {
                             stored: Vec::new(),
                             added_at: item.added_at.clone(),
@@ -146,6 +138,7 @@ pub(super) fn build_views(
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default(),
+                        proposed: item.proposed_archive_id.and_then(listed),
                     }),
                 }
             }
@@ -159,26 +152,7 @@ pub(super) fn build_views(
                 platforms,
             }
         })
-        .collect();
-    moves.sort_by_key(|item| (item.stored_archive_id, item.current_archive_id));
-    moves.dedup();
-    (views, moves)
-}
-
-/// Where an item should be saved from now on, when that is a fact and not just
-/// how it is shown today. Most supersession links are derived on each load and
-/// can stop applying (a folder moved aside and put back), so those only steer
-/// the display. A recorded rename, or a row found at the item's own place and
-/// size after its old row went, is lasting.
-fn durable_target(item: &GameCollectionItem, current: i64, library: &Library) -> Option<i64> {
-    let resolved = item.resolved_archive_id?;
-    let journalled = library.historical_links.get(&resolved).is_some_and(|link| {
-        link.evidence == archivefs_core::catalogue_supersession::SupersessionEvidence::JournalRename
-    });
-    let target = if journalled { current } else { resolved };
-    let same_row = target == item.stored_archive_id
-        && item.resolved_created_at.as_deref() == Some(item.stored_created_at.as_str());
-    (!same_row).then_some(target)
+        .collect()
 }
 
 fn platform_counts(members: &HashMap<i64, Member>, library: &Library) -> Vec<(String, usize)> {
@@ -255,7 +229,8 @@ pub(super) enum Change {
         collection: i64,
         seen: String,
     },
-    Reanchor(Vec<CollectionReanchor>),
+    /// The user confirmed a proposed match: save the item against that row.
+    Confirm(CollectionReanchor),
 }
 
 enum Job {
@@ -297,20 +272,34 @@ fn apply(path: &Path, change: Change) -> Result<Option<i64>, String> {
             name,
         } => database.rename_game_collection(collection, &seen, &name),
         Change::Delete { collection, seen } => database.delete_game_collection(collection, &seen),
-        Change::Reanchor(moves) => database.reanchor_collection_items(&moves),
+        Change::Confirm(step) => database.reanchor_collection_items(std::slice::from_ref(&step)),
     };
     result.map(|()| created).map_err(|error| error.to_string())
 }
 
+/// The one save that loading may make: items EmuWiz's own completed rename
+/// record proves moved (see `save_journalled_collection_moves`). Guesses by
+/// name, path or size are never saved here. It is retried at the next load if
+/// it fails, and items still show through the rename record meanwhile.
+fn save_journalled_moves(path: &Path) {
+    let Some(journals) = path
+        .parent()
+        .map(|dir| dir.join(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY))
+        .filter(|dir| dir.is_dir())
+    else {
+        return;
+    };
+    if let Err(error) = Database::open_existing(path)
+        .and_then(|mut database| database.save_journalled_collection_moves(&journals))
+    {
+        log::warn!("collections: renamed games were not saved to their new entry: {error}");
+    }
+}
+
 fn answer(path: &Path, job: Job) -> Answer {
     let (error, created) = match job {
-        Job::Reload => (None, None),
-        // Nobody asked for this one: it is retried at the next library load,
-        // and items resolve correctly in the meantime.
-        Job::Change(change @ Change::Reanchor(_)) => {
-            if let Err(error) = apply(path, change) {
-                log::warn!("collections: saved games were not re-anchored: {error}");
-            }
+        Job::Reload => {
+            save_journalled_moves(path);
             (None, None)
         }
         Job::Change(change) => match apply(path, change) {
@@ -384,9 +373,7 @@ pub(super) struct State {
     views: Vec<View>,
     /// Bumped whenever a list on screen may change.
     version: u64,
-    /// The library that last asked for items to be moved; asked once for each.
-    reanchored: usize,
-    /// Moves sent and not yet read back; a removal must follow them.
+    /// Confirmed moves sent and not yet read back; a removal must follow them.
     reanchoring: Vec<CollectionReanchor>,
     message: Option<String>,
     dialog: Dialog,
@@ -443,14 +430,12 @@ impl State {
         self.send(Job::Reload);
     }
 
-    fn rebuild(&mut self, library: &Library) -> Vec<CollectionReanchor> {
-        let (views, moves) = build_views(&self.saved, library);
-        self.views = views;
+    fn rebuild(&mut self, library: &Library) {
+        self.views = build_views(&self.saved, library);
         if self.scoped().is_none() {
             self.scope = None;
         }
         self.version += 1;
-        moves
     }
 
     /// Collect finished work. Called every frame; does nothing when idle.
@@ -495,13 +480,8 @@ impl State {
             return;
         }
         self.reanchoring.clear();
-        let moves = self.rebuild(library);
-        let token = Arc::as_ptr(library) as usize;
-        if !moves.is_empty() && self.reanchored != token {
-            self.reanchored = token;
-            self.reanchoring.clone_from(&moves);
-            self.send(Job::Change(Change::Reanchor(moves)));
-        }
+        // Loading or reloading only reads: nothing is moved or saved here.
+        self.rebuild(library);
     }
 
     fn change(&mut self, change: Change) {
@@ -594,7 +574,9 @@ impl App {
 
     /// Star, plain words, and the collections menu, for one selected game.
     pub(super) fn game_collection_actions(&mut self, ui: &mut egui::Ui, game: i64, title: &str) {
-        if !self.collections.ready() {
+        // Owner decision 2026-11-15: selecting for artwork never offers a
+        // Favourites or Collections change, anywhere.
+        if !self.collections.ready() || self.batch_selecting {
             return;
         }
         ui.horizontal_wrapped(|ui| {
@@ -654,6 +636,8 @@ impl App {
         let mut chosen = None;
         let mut dialog = None;
         let scope = self.collections.scope;
+        // Selecting for artwork shows the lists but none of their editing.
+        let editing = !self.batch_selecting;
         ui.horizontal_wrapped(|ui| {
             if scope_button(ui, "All games".into(), scope.is_none()) {
                 chosen = Some(None);
@@ -688,7 +672,7 @@ impl App {
                             chosen = Some(Some(view.id));
                         }
                     }
-                    if ui.button("New collection…").clicked() {
+                    if editing && ui.button("New collection…").clicked() {
                         dialog = Some(Dialog::Create {
                             name: String::new(),
                             game: None,
@@ -709,7 +693,7 @@ impl App {
                             ui.selectable_value(&mut sort, choice, choice.label());
                         }
                     });
-                if !favourites {
+                if editing && !favourites {
                     // Until the last change is answered the list may already be out of date.
                     let settled = self.collections.pending == 0;
                     if ui
@@ -729,7 +713,8 @@ impl App {
                         dialog = Some(Dialog::Delete { collection: id });
                     }
                 }
-                if gone > 0
+                if editing
+                    && gone > 0
                     && ui
                         .small_button(format!("{} no longer in the library", thousands(gone)))
                         .clicked()
@@ -796,7 +781,8 @@ impl App {
         let mut change = None;
         let mut open_new = false;
         // Drawn every frame on these pages, so nothing is copied when idle.
-        if matches!(self.collections.dialog, Dialog::None) {
+        // Selecting for artwork keeps any open dialog for afterwards.
+        if matches!(self.collections.dialog, Dialog::None) || self.batch_selecting {
             return;
         }
         // The dialog's own target, not whatever is listed now: the page behind
@@ -817,6 +803,7 @@ impl App {
             return;
         }
         let settled = self.collections.pending == 0;
+        let library = self.library.clone();
         match &mut self.collections.dialog {
             Dialog::None => {}
             Dialog::Create { name, game } => {
@@ -905,9 +892,14 @@ impl App {
                     .default_width(460.0)
                     .show(context, |ui| {
                         ui.label(format!("Saved in {name}, but with no catalogue entry now. A game comes back on its own if a scan finds the same file in the same place. A game that moved stays here until you remove it. Nothing is removed unless you remove it."));
+                        let height = if rows.iter().any(|game| game.proposed.is_some()) {
+                            GONE_PROPOSAL_ROW_HEIGHT
+                        } else {
+                            GONE_ROW_HEIGHT
+                        };
                         egui::ScrollArea::vertical().max_height(320.0).show_rows(
                             ui,
-                            GONE_ROW_HEIGHT,
+                            height,
                             rows.len(),
                             |ui, range| {
                                 for game in &rows[range] {
@@ -918,14 +910,30 @@ impl App {
                                                 "{} · {}",
                                                 game.platform, game.file_name
                                             ));
+                                            if let Some(proposed) = game.proposed {
+                                                let title = library
+                                                    .game(proposed)
+                                                    .map_or_else(String::new, |found| found.title.clone());
+                                                ui.small(format!("Possible match: {title}. Same folder, file name and size, but that does not prove it is the same game. Nothing is saved unless you confirm."));
+                                                if ui
+                                                    .add_enabled(settled, egui::Button::new("Keep as this game").small())
+                                                    .clicked()
+                                                {
+                                                    change = Some(Change::Confirm(CollectionReanchor {
+                                                        stored_archive_id: game.stored.archive_id,
+                                                        stored_created_at: game.stored.created_at.clone(),
+                                                        current_archive_id: proposed,
+                                                    }));
+                                                }
+                                            }
                                         });
                                         if ui.small_button("Remove").clicked() {
                                             change = Some(Change::Remove {
                                                 collection,
- game: None,
- moved_to: Vec::new(),
- stored: vec![game.stored.clone()],
- });
+                                                game: None,
+                                                moved_to: Vec::new(),
+                                                stored: vec![game.stored.clone()],
+                                            });
                                         }
                                     });
                                 }
@@ -949,6 +957,17 @@ impl App {
                     .find(|view| view.id == *collection)
             {
                 view.gone.retain(|game| !stored.contains(&game.stored));
+            }
+            if let Change::Confirm(step) = &change {
+                // The row is already shown; a removal before the read-back
+                // must also reach the item's new row.
+                self.collections.reanchoring.push(step.clone());
+                for view in &mut self.collections.views {
+                    view.gone.retain(|game| {
+                        game.stored.archive_id != step.stored_archive_id
+                            || game.stored.created_at != step.stored_created_at
+                    });
+                }
             }
             self.collections.open_after_create = open_new;
             self.collections.change(change);

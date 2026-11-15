@@ -2,20 +2,25 @@
 //! together. Membership is user data over catalogue rows. It never changes a
 //! row, a file, or any identity evidence.
 //!
-//! An item is resolved to a catalogue row, strongest first:
+//! An item belongs to its own row: same id and same `created_at`, whatever its
+//! path is now (organisation moves update a row in place). When that row is
+//! gone, the row now at the saved source and relative path, with the same size
+//! when both are known, is only *proposed*: the user confirms it or not.
 //!
-//! 1. the same row: same id and same `created_at`, whatever its path is now
-//!    (organisation moves update a row in place);
-//! 2. the row now at the saved source and relative path, with the same size
-//!    when both are known (a forgotten row that a later scan found again).
+//! The one automatic save is [`Database::save_journalled_collection_moves`]:
+//! EmuWiz's own completed rename record proves where the file went.
 //!
 //! Anything else is reported as no longer in the library, with its saved title
 //! and platform. It is kept until the person removes it: an unavailable drive
 //! or a Forget must not silently lose a choice, and a recycled id or a matching
 //! title must not attach it to a different game.
 
-use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+
+use crate::dat::rename_apply::journal::list_journals;
+use crate::dat::rename_apply::model::{EntryState, TransactionOperation, TransactionState};
 
 use rusqlite::{OptionalExtension, params};
 
@@ -35,11 +40,16 @@ pub struct GameCollectionItem {
     /// The catalogue id this item was saved against.
     pub stored_archive_id: i64,
     pub stored_created_at: String,
-    /// The catalogue row it resolves to now; `None`: no longer in the library.
+    /// The saved row itself, when it is still in the catalogue (same id and
+    /// creation time); `None`: the saved row is no longer in the library.
     pub resolved_archive_id: Option<i64>,
-    /// That row's creation time. Differs from `stored_created_at` for a row
-    /// that took over the saved id, which the id alone cannot show.
+    /// That row's creation time: always `stored_created_at` when present.
     pub resolved_created_at: Option<String>,
+    /// Only when the saved row is gone: a current row at the item's source and
+    /// relative path, with the same size when both sizes are known. This is a
+    /// proposal, never identity: it is shown for the user to confirm and is
+    /// never saved, or treated as membership, without that confirmation.
+    pub proposed_archive_id: Option<i64>,
     pub title: String,
     pub platform: Option<String>,
     pub absolute_path: PathBuf,
@@ -180,11 +190,6 @@ impl Database {
                          WHERE a.source_folder_id = i.source_folder_id \
                            AND a.relative_path = i.relative_path \
                            AND (a.size_bytes IS NULL OR i.size_bytes IS NULL \
-                                OR a.size_bytes = i.size_bytes)), \
-                        (SELECT a.created_at FROM archives a \
-                         WHERE a.source_folder_id = i.source_folder_id \
-                           AND a.relative_path = i.relative_path \
-                           AND (a.size_bytes IS NULL OR i.size_bytes IS NULL \
                                 OR a.size_bytes = i.size_bytes)) \
                  FROM game_collection_items i ORDER BY i.collection_id, i.added_at, i.archive_id",
             )
@@ -193,19 +198,15 @@ impl Database {
             .query_map([], |row| {
                 let same: Option<i64> = row.get(7)?;
                 let located: Option<i64> = row.get(8)?;
-                let located_created_at: Option<String> = row.get(9)?;
                 let path: Vec<u8> = row.get(5)?;
                 let stored_created_at: String = row.get(2)?;
                 Ok((
                     row.get::<_, i64>(0)?,
                     GameCollectionItem {
                         stored_archive_id: row.get(1)?,
-                        resolved_archive_id: same.or(located),
-                        resolved_created_at: if same.is_some() {
-                            Some(stored_created_at.clone())
-                        } else {
-                            located_created_at
-                        },
+                        resolved_archive_id: same,
+                        resolved_created_at: same.map(|_| stored_created_at.clone()),
+                        proposed_archive_id: if same.is_none() { located } else { None },
                         stored_created_at,
                         title: row.get(3)?,
                         platform: row.get(4)?,
@@ -367,15 +368,191 @@ impl Database {
     }
 
     /// Saves each item against the row that replaced its old one, so the
-    /// membership keeps working after the old row is forgotten. An item that
+    /// membership keeps working after the old row is forgotten. Call it only
+    /// for a move the user confirmed: a match by place and size is a proposal,
+    /// never identity, and loading the library writes nothing. An item that
     /// no longer has the expected anchor is left alone, and an item whose
     /// target is already in the same collection merges into it. The whole
     /// change is one transaction.
     pub fn reanchor_collection_items(&mut self, moves: &[CollectionReanchor]) -> Result<()> {
         let error = |error| db_error("failed to update saved games", error);
         let tx = self.connection.transaction().map_err(error)?;
+        reanchor_in(&tx, moves)?;
+        tx.commit().map_err(error)
+    }
+
+    /// Saves, without asking, only the items that EmuWiz's own *completed*
+    /// rename record proves were moved: the item's saved file path is the
+    /// start of a chain of applied rename-moves in finished transactions,
+    /// exactly one current row stands at its end, its size agrees, and the
+    /// item's own row (when it still exists) is at the saved path and marked
+    /// missing. A path with two destinations, two sources moving onto one
+    /// destination, or a part in a transaction that did not finish cleanly is
+    /// never followed. File names, paths or sizes alone never move an item.
+    /// Nothing is written when nothing qualifies; running it again changes
+    /// nothing. Returns how many items were moved.
+    pub fn save_journalled_collection_moves(&mut self, journals: &Path) -> Result<usize> {
+        let renames = completed_rename_ends(journals);
+        if renames.is_empty() || journalled_moves(&self.connection, &renames)?.is_empty() {
+            return Ok(0);
+        }
+        let error = |error| db_error("failed to update saved games", error);
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(error)?;
+        // Checked again under the write lock.
+        let moves = journalled_moves(&tx, &renames)?;
+        reanchor_in(&tx, &moves)?;
+        tx.commit().map_err(error)?;
+        Ok(moves.len())
+    }
+}
+
+/// Start path -> final path for every chain of rename-moves that EmuWiz's own
+/// journals record as applied in a finished transaction (Applied or
+/// Finalised). Undone, failed, interrupted and planned transactions add no
+/// link, and a path any unfinished transaction touched is never followed.
+fn completed_rename_ends(dir: &Path) -> HashMap<PathBuf, PathBuf> {
+    const MAX_HOPS: usize = 16;
+    let (transactions, _problems) = list_journals(dir);
+    let mut next: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
+    let mut into: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
+    let mut unsettled: HashSet<PathBuf> = HashSet::new();
+    for transaction in transactions {
+        let finished = matches!(
+            transaction.state,
+            TransactionState::Applied | TransactionState::Finalised
+        );
+        let settled = finished
+            || matches!(
+                transaction.state,
+                TransactionState::Planned | TransactionState::RolledBack
+            );
+        for entry in transaction.entries {
+            if !matches!(entry.operation, TransactionOperation::RenameMove) {
+                continue;
+            }
+            if finished && entry.state == EntryState::Applied {
+                next.entry(entry.source_path.clone())
+                    .or_default()
+                    .insert(entry.destination_path.clone());
+                into.entry(entry.destination_path)
+                    .or_default()
+                    .insert(entry.source_path);
+            } else if !settled {
+                unsettled.insert(entry.source_path);
+                unsettled.insert(entry.destination_path);
+            }
+        }
+    }
+    let step = |at: &Path| -> Option<PathBuf> {
+        let ends = next.get(at)?;
+        let end = (ends.len() == 1).then(|| ends.iter().next())??;
+        let sources = into.get(end)?;
+        (sources.len() == 1 && !unsettled.contains(at) && !unsettled.contains(end))
+            .then(|| end.clone())
+    };
+    let mut ends = HashMap::new();
+    for start in next.keys() {
+        let mut seen = HashSet::from([start.clone()]);
+        let mut at = start.clone();
+        let mut ok = true;
+        let mut hops = 0;
+        while next.contains_key(&at) {
+            hops += 1;
+            match step(&at) {
+                Some(end) if hops <= MAX_HOPS && seen.insert(end.clone()) => at = end,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && at != *start {
+            ends.insert(start.clone(), at);
+        }
+    }
+    ends
+}
+
+/// The items `renames` proves moved, each onto the one current row at the end
+/// of its chain. Read-only.
+fn journalled_moves(
+    connection: &rusqlite::Connection,
+    renames: &HashMap<PathBuf, PathBuf>,
+) -> Result<Vec<CollectionReanchor>> {
+    let error = |error| db_error("failed to read collection games", error);
+    let mut items = connection
+        .prepare(
+            "SELECT DISTINCT archive_id, archive_created_at, absolute_path, size_bytes \
+             FROM game_collection_items",
+        )
+        .map_err(error)?;
+    let rows = items
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .and_then(|rows| rows.collect::<std::result::Result<Vec<_>, _>>())
+        .map_err(error)?;
+    let mut moves = Vec::new();
+    for (id, created_at, path, size) in rows {
+        let saved = PathBuf::from(std::ffi::OsString::from_vec(path.clone()));
+        let Some(end) = renames.get(&saved) else {
+            continue;
+        };
+        // The item's own row, if it still exists, must agree that the file left.
+        let own: Option<(Vec<u8>, Option<String>)> = connection
+            .query_row(
+                "SELECT absolute_path_cached, last_verified_missing_at FROM archives \
+                 WHERE id = ?1 AND created_at = ?2",
+                params![id, created_at],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(error)?;
+        if own.is_some_and(|(own_path, missing)| own_path != path || missing.is_none()) {
+            continue;
+        }
+        let mut found = connection
+            .prepare(
+                "SELECT id, size_bytes FROM archives \
+                 WHERE absolute_path_cached = ?1 AND last_verified_missing_at IS NULL",
+            )
+            .map_err(error)?;
+        let targets = found
+            .query_map([end.as_os_str().as_bytes()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            })
+            .and_then(|rows| rows.collect::<std::result::Result<Vec<_>, _>>())
+            .map_err(error)?;
+        let [(target, target_size)] = targets.as_slice() else {
+            continue;
+        };
+        if matches!((size, target_size), (Some(a), Some(b)) if a != *b) || *target == id {
+            continue;
+        }
+        moves.push(CollectionReanchor {
+            stored_archive_id: id,
+            stored_created_at: created_at,
+            current_archive_id: *target,
+        });
+    }
+    Ok(moves)
+}
+
+/// Moves each item onto its target row inside `tx`; see
+/// [`Database::reanchor_collection_items`].
+fn reanchor_in(tx: &rusqlite::Transaction<'_>, moves: &[CollectionReanchor]) -> Result<()> {
+    let error = |error| db_error("failed to update saved games", error);
+    {
         for item in moves {
-            let Some(anchor) = archive_anchor(&tx, item.current_archive_id)? else {
+            let Some(anchor) = archive_anchor(tx, item.current_archive_id)? else {
                 continue;
             };
             // Merge first: the same target row already being in a collection
@@ -415,6 +592,6 @@ impl Database {
             )
             .map_err(error)?;
         }
-        tx.commit().map_err(error)
     }
+    Ok(())
 }

@@ -36,10 +36,19 @@ fn item(stored: i64, resolved: Option<i64>, added: &str) -> GameCollectionItem {
         stored_created_at: "created".into(),
         resolved_archive_id: resolved,
         resolved_created_at: resolved.map(|_| "created".into()),
+        proposed_archive_id: None,
         title: format!("Saved {stored}"),
         platform: Some("SNES".into()),
         absolute_path: PathBuf::from(format!("/old/saved-{stored}.zip")),
         added_at: added.into(),
+    }
+}
+
+/// An item whose own row is gone, with a row at its place and size.
+fn proposed_item(stored: i64, proposed: i64) -> GameCollectionItem {
+    GameCollectionItem {
+        proposed_archive_id: Some(proposed),
+        ..item(stored, None, "a")
     }
 }
 
@@ -66,7 +75,7 @@ fn view_of(library: &Library, ids: &[(i64, &str)]) -> View {
         .iter()
         .map(|(id, added)| item(*id, Some(*id), added))
         .collect();
-    build_views(&favourites(items), library).0.remove(0)
+    build_views(&favourites(items), library).remove(0)
 }
 
 fn titles(library: &Library, indices: &[usize]) -> Vec<(String, i64)> {
@@ -81,16 +90,16 @@ fn titles(library: &Library, indices: &[usize]) -> Vec<(String, i64)> {
 
 #[test]
 fn a_saved_game_with_no_row_is_listed_as_gone_and_not_as_a_member() {
-    let (views, moves) = build_views(&favourites(vec![item(99, None, "a")]), &library());
+    let views = build_views(&favourites(vec![item(99, None, "a")]), &library());
     assert!(views[0].members.is_empty());
     assert_eq!(views[0].gone[0].title, "Saved 99");
     assert_eq!(views[0].gone[0].file_name, "saved-99.zip");
-    assert!(moves.is_empty());
+    assert_eq!(views[0].gone[0].proposed, None);
 }
 
 #[test]
 fn a_row_this_library_does_not_list_is_gone_until_it_does() {
-    let (views, _) = build_views(&favourites(vec![item(50, Some(50), "a")]), &library());
+    let views = build_views(&favourites(vec![item(50, Some(50), "a")]), &library());
     assert!(views[0].members.is_empty());
     assert_eq!(views[0].gone.len(), 1);
 }
@@ -108,10 +117,9 @@ fn a_superseded_row_shows_its_current_game_once() {
     let library = Library::new(vec![old, new]);
     assert_eq!(library.resolve(10), 11);
     let items = vec![item(10, Some(10), "a"), item(11, Some(11), "b")];
-    let (views, moves) = build_views(&favourites(items), &library);
+    let views = build_views(&favourites(items), &library);
     assert_eq!(views[0].members.len(), 1);
     assert_eq!(views[0].members[&11].stored.len(), 2);
-    assert!(moves.is_empty(), "derived links only steer the display");
 }
 
 #[test]
@@ -535,26 +543,25 @@ fn superseded(evidence_journal: bool) -> (Library, GameCollectionItem) {
 }
 
 #[test]
-fn a_derived_link_steers_the_display_but_never_moves_the_item() {
-    let (library, item) = superseded(false);
-    assert_eq!(library.resolve(10), 11);
-    let (views, moves) = build_views(&favourites(vec![item]), &library);
-    assert!(views[0].members.contains_key(&11));
-    assert!(moves.is_empty());
+fn a_derived_link_or_a_recorded_rename_steers_the_display_only() {
+    for journal in [false, true] {
+        let (library, item) = superseded(journal);
+        assert_eq!(library.resolve(10), 11);
+        let views = build_views(&favourites(vec![item]), &library);
+        assert!(views[0].members.contains_key(&11), "{journal}");
+        assert!(views[0].gone.is_empty(), "{journal}");
+    }
 }
 
+/// Owner decision 2026-11-15: a match by place, name and size is proposed,
+/// never treated as the saved game, until the user confirms it.
 #[test]
-fn a_recorded_rename_moves_the_item() {
-    let (library, item) = superseded(true);
-    let (_, moves) = build_views(&favourites(vec![item]), &library);
-    assert_eq!(moves.len(), 1);
-    assert_eq!(moves[0].current_archive_id, 11);
-}
-
-#[test]
-fn a_row_found_at_the_items_own_place_moves_the_item() {
-    let (_, moves) = build_views(&favourites(vec![item(99, Some(2), "a")]), &library());
-    assert_eq!(moves[0].current_archive_id, 2);
+fn a_row_found_at_the_items_own_place_is_only_proposed() {
+    let views = build_views(&favourites(vec![proposed_item(99, 2)]), &library());
+    assert!(views[0].members.is_empty(), "not starred on a guess");
+    assert_eq!(views[0].gone.len(), 1, "the saved item stays listed");
+    assert_eq!(views[0].gone[0].title, "Saved 99");
+    assert_eq!(views[0].gone[0].proposed, Some(2));
 }
 
 #[test]
@@ -605,12 +612,98 @@ fn removing_a_star_before_its_add_was_read_back_still_removes_it() {
 }
 
 #[test]
-fn a_new_row_on_the_items_own_id_and_place_moves_the_item() {
-    let mut saved = item(2, Some(2), "a");
-    saved.resolved_created_at = Some("rescanned".into());
-    let (_, moves) = build_views(&favourites(vec![saved]), &library());
-    assert_eq!(moves.len(), 1);
-    assert_eq!(moves[0].current_archive_id, 2);
+fn a_new_row_on_the_items_own_id_and_place_is_only_proposed() {
+    // The loader gives a row that took the saved id (another creation time)
+    // only as a proposal.
+    let views = build_views(&favourites(vec![proposed_item(2, 2)]), &library());
+    assert!(views[0].members.is_empty());
+    assert_eq!(views[0].gone[0].proposed, Some(2));
+}
+
+/// Owner decision 2026-11-15: loading the library never saves an inferred
+/// match; the user's confirmation does, and only for that item.
+#[test]
+fn loading_writes_nothing_and_a_confirmed_match_is_saved() {
+    let mut f = fixture();
+    let favourites = f.favourites_id();
+    let game = f.ids[0];
+    let library = f.library.clone();
+    f.state.toggle(favourites, game, &library);
+    f.settle();
+    // Its own row went and the same file came back as this row.
+    rusqlite::Connection::open(&f.path)
+        .unwrap()
+        .execute_batch(&format!(
+            "UPDATE game_collection_items SET archive_id = 990000, archive_created_at = 'gone' WHERE archive_id = {game}"
+        ))
+        .unwrap();
+    let before = std::fs::read(&f.path).unwrap();
+    for _ in 0..3 {
+        let mut restarted = State::with_database(Some(f.path.clone()), Default::default());
+        restarted.library_changed(&library);
+        f.state = restarted;
+        f.settle();
+        f.state.poll(&library);
+    }
+    assert_eq!(
+        std::fs::read(&f.path).unwrap(),
+        before,
+        "loading wrote nothing"
+    );
+    assert!(!f.state.is_favourite(game), "not starred on a guess");
+    let gone = &f.state.favourites().unwrap().gone;
+    assert_eq!(gone.len(), 1);
+    assert_eq!(gone[0].proposed, Some(game));
+    let step = archivefs_core::CollectionReanchor {
+        stored_archive_id: 990000,
+        stored_created_at: "gone".into(),
+        current_archive_id: game,
+    };
+    f.state.change(super::Change::Confirm(step));
+    f.settle();
+    assert!(f.state.is_favourite(game));
+    assert!(f.state.favourites().unwrap().gone.is_empty());
+    let saved = Database::open_read_only(&f.path)
+        .unwrap()
+        .load_game_collections()
+        .unwrap();
+    assert_eq!(saved[0].items[0].stored_archive_id, game);
+    assert_eq!(saved[0].items[0].resolved_archive_id, Some(game));
+}
+
+#[test]
+fn the_gone_list_shows_a_proposed_match_and_confirming_sends_only_that_item() {
+    let context = eframe::egui::Context::default();
+    let (mut app, sent) = recording_app(&context, &[]);
+    app.collections.saved = favourites(vec![proposed_item(99, 2), item(98, None, "b")]);
+    let library = app.library.clone();
+    app.collections.library_changed(&library);
+    while sent.try_recv().is_ok() {}
+    app.collections.pending = 0;
+    app.collections.scope = Some(1);
+    app.collections.dialog = super::Dialog::Gone { collection: 1 };
+    frame(&context, &mut app, vec![]);
+    let strings = super::super::tests::text(&frame(&context, &mut app, vec![]));
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.starts_with("Possible match: Beta.")),
+        "{strings:?}"
+    );
+    assert_eq!(
+        strings.iter().filter(|s| *s == "Keep as this game").count(),
+        1,
+        "only the item with a match offers it"
+    );
+    assert!(sent.try_recv().is_err(), "showing it sent nothing");
+    click_text(&context, &mut app, "Keep as this game");
+    match sent.try_recv().unwrap() {
+        super::Job::Change(super::Change::Confirm(step)) => {
+            assert_eq!((step.stored_archive_id, step.current_archive_id), (99, 2));
+        }
+        _ => panic!("expected a confirmed match"),
+    }
+    assert!(sent.try_recv().is_err());
 }
 
 #[test]
@@ -1119,4 +1212,168 @@ fn controller_up_and_down_from_a_cards_star_step_one_grid_row() {
             "and landed on the card itself"
         );
     }
+}
+
+/// Owner decision 2026-11-15: while selecting for artwork no star and no
+/// Collections editing is offered anywhere (list, selected-game panel, Game
+/// Details); everything returns when artwork mode ends.
+#[test]
+fn artwork_mode_hides_every_favourites_and_collections_control_until_it_ends() {
+    let context = eframe::egui::Context::default();
+    let editing = [
+        "Favourite",
+        "In Favourites",
+        "Collections",
+        "Rename",
+        "Delete",
+        "1 no longer in the library",
+    ];
+    for route in [
+        super::super::routes::Route::BrowsePlayGame(2),
+        super::super::routes::Route::Game(2),
+    ] {
+        let (mut app, sent) = recording_app(&context, &[(5, "Kids")]);
+        app.collections.saved[1].items = vec![item(77, None, "a")];
+        let library = app.library.clone();
+        app.collections.library_changed(&library);
+        app.collections.pending = 0;
+        app.collections.scope = Some(5);
+        app.router.current = route.clone();
+        let shown = |app: &mut super::super::App| {
+            frame(&context, app, vec![]);
+            let drawn = frame(&context, app, vec![]);
+            (super::super::tests::text(&drawn), stars(&drawn).len())
+        };
+        let (normal, _) = shown(&mut app);
+        let saved_before = app.collections.saved.clone();
+        app.batch_selecting = true;
+        app.collections.dialog = super::Dialog::Gone { collection: 5 };
+        let (artwork, star_count) = shown(&mut app);
+        for label in editing {
+            assert!(
+                !artwork.iter().any(|s| s == label),
+                "{route:?}: {label} offered while selecting for artwork: {artwork:?}"
+            );
+        }
+        assert_eq!(
+            star_count, 0,
+            "{route:?}: no star while selecting for artwork"
+        );
+        assert!(
+            !artwork.iter().any(|s| s == "No longer in the library"),
+            "{route:?}: dialogs wait until artwork mode ends"
+        );
+        assert_eq!(app.collections.saved, saved_before);
+        app.batch_selecting = false;
+        let (after, after_stars) = shown(&mut app);
+        assert!(after_stars > 0, "{route:?}: stars return");
+        assert!(
+            after
+                .iter()
+                .any(|s| s == "Favourite" || s == "In Favourites"),
+            "{route:?}: the panel star returns: {after:?}"
+        );
+        assert!(after.iter().any(|s| s == "Collections"), "{route:?}");
+        assert!(
+            after.iter().any(|s| s == "No longer in the library"),
+            "{route:?}: the kept dialog returns"
+        );
+        let _ = normal;
+        let _ = sent;
+    }
+}
+
+/// Owner clarification 2026-11-15: a completed EmuWiz rename is saved when the
+/// library loads (restart), so the favourite keeps its star once the old entry
+/// is cleaned up; a mere name/size guess elsewhere is still not saved.
+#[test]
+fn a_completed_rename_is_saved_on_load_and_a_guess_is_not() {
+    let mut f = fixture();
+    let favourites = f.favourites_id();
+    let library = f.library.clone();
+    let alpha = f.ids[0];
+    let beta = f.ids[1];
+    f.state.toggle(favourites, alpha, &library);
+    f.state.toggle(favourites, beta, &library);
+    f.settle();
+    let source = f.path.parent().unwrap().join("source");
+    // Alpha: renamed by EmuWiz, recorded as a finished transaction.
+    std::fs::rename(source.join("Alpha.zip"), source.join("Alpha (Renamed).zip")).unwrap();
+    let transaction: archivefs_core::dat::rename_apply::model::RenameTransaction =
+        serde_json::from_value(serde_json::json!({
+            "transaction_id": "1-0", "plan_generation": 0, "created_at_unix": 1,
+            "source_scan_root": source, "state": "applied",
+            "entries": [{
+                "source_path": source.join("Alpha.zip"),
+                "destination_path": source.join("Alpha (Renamed).zip"),
+                "original_basename": "Alpha.zip", "proposed_basename": "Alpha (Renamed).zip",
+                "identity": {"size_bytes": 9, "modified_unix": 1, "kind": "regular_file"},
+                "state": "applied"
+            }]
+        }))
+        .unwrap();
+    archivefs_core::dat::rename_apply::journal::write_journal(
+        &f.path
+            .parent()
+            .unwrap()
+            .join(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY),
+        &transaction,
+    )
+    .unwrap();
+    // Beta: moved by hand, no record.
+    std::fs::create_dir_all(source.join("moved")).unwrap();
+    std::fs::rename(
+        source.join("Beta.zip"),
+        source.join("moved").join("Beta.zip"),
+    )
+    .unwrap();
+    let mut database = Database::open_existing(&f.path).unwrap();
+    archivefs_core::scan_and_persist(
+        &mut database,
+        &archivefs_core::Config {
+            source_folders: vec![source.clone()],
+            mount_root: f.path.parent().unwrap().join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+            configured_source_roots: None,
+        },
+        "after rename",
+    )
+    .unwrap();
+    let archives = database.load_archives().unwrap();
+    database.close().unwrap();
+    let current = |name: &str| {
+        archives
+            .iter()
+            .find(|a| a.relative_path.ends_with(name) && a.last_verified_missing_at.is_none())
+            .unwrap()
+            .id
+    };
+    let (renamed, moved) = (current("Alpha (Renamed).zip"), current("moved/Beta.zip"));
+    // Restart: a new state loads the rescanned library.
+    f.library = Arc::new(Library::new(archives));
+    let library = f.library.clone();
+    f.state = State::with_database(Some(f.path.clone()), Default::default());
+    f.state.library_changed(&library);
+    f.settle();
+    let saved = Database::open_read_only(&f.path)
+        .unwrap()
+        .load_game_collections()
+        .unwrap();
+    let mut stored: Vec<i64> = saved[0].items.iter().map(|i| i.stored_archive_id).collect();
+    stored.sort();
+    let mut expected = vec![renamed, beta];
+    expected.sort();
+    assert_eq!(stored, expected, "the rename was saved, the guess was not");
+    assert!(f.state.is_favourite(renamed));
+    // The hand-moved file is shown through the library's own display link
+    // (same name and size), as the whole library shows it, but the saved item
+    // still names Beta's old entry: nothing was written for it.
+    assert_eq!(library.resolve(beta), moved);
+    assert!(stored.contains(&beta) && !stored.contains(&moved));
+    // A second load changes nothing.
+    let before = std::fs::read(&f.path).unwrap();
+    f.state.library_changed(&library);
+    f.settle();
+    assert_eq!(std::fs::read(&f.path).unwrap(), before);
 }

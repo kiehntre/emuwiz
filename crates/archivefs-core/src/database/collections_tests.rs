@@ -48,11 +48,33 @@ fn id_of(database: &Database, name: &str) -> i64 {
         .id
 }
 
+/// Each item and the row it points at: its own row, or else the row proposed
+/// for it (see `proposed_rows` for which).
 fn favourites(database: &Database) -> Vec<(i64, Option<i64>)> {
     database.load_game_collections().unwrap()[0]
         .items
         .iter()
-        .map(|item| (item.stored_archive_id, item.resolved_archive_id))
+        .map(|item| {
+            (
+                item.stored_archive_id,
+                item.resolved_archive_id.or(item.proposed_archive_id),
+            )
+        })
+        .collect()
+}
+
+/// Items whose row is only proposed: their own row is gone.
+fn proposed_rows(database: &Database) -> Vec<(i64, Option<i64>, Option<i64>)> {
+    database.load_game_collections().unwrap()[0]
+        .items
+        .iter()
+        .map(|item| {
+            (
+                item.stored_archive_id,
+                item.resolved_archive_id,
+                item.proposed_archive_id,
+            )
+        })
         .collect()
 }
 
@@ -225,7 +247,7 @@ fn a_recycled_id_never_adopts_a_membership_and_the_saved_title_remains() {
 }
 
 #[test]
-fn a_forgotten_row_found_again_at_the_same_place_and_size_reattaches() {
+fn a_forgotten_row_found_again_at_the_same_place_and_size_is_proposed() {
     let mut f = fixture(&["a.zip", "z.zip"]);
     let favourites_id = f.database.favourites_collection_id().unwrap();
     let id = id_of(&f.database, "a.zip");
@@ -246,6 +268,8 @@ fn a_forgotten_row_found_again_at_the_same_place_and_size_reattaches() {
         .unwrap();
     let new_id = id_of(&f.database, "a.zip");
     assert_eq!(favourites(&f.database), vec![(id, Some(new_id))]);
+    // Proposed only: the saved row itself is gone, and nothing was written.
+    assert_eq!(proposed_rows(&f.database), vec![(id, None, Some(new_id))]);
     // A different file at that path is a different game.
     f.database
         .connection
@@ -354,7 +378,7 @@ fn reanchoring_onto_a_recycled_id_keeps_both_items() {
 }
 
 #[test]
-fn a_row_that_took_the_same_id_at_the_same_place_is_saved_against() {
+fn a_row_that_took_the_same_id_at_the_same_place_is_proposed_then_saved_on_confirmation() {
     let mut f = fixture(&["a.zip"]);
     let favourites_id = f.database.favourites_collection_id().unwrap();
     let id = id_of(&f.database, "a.zip");
@@ -369,8 +393,9 @@ fn a_row_that_took_the_same_id_at_the_same_place_is_saved_against() {
         )
         .unwrap();
     let item = f.database.load_game_collections().unwrap()[0].items[0].clone();
-    assert_eq!(item.resolved_archive_id, Some(id));
-    assert_eq!(item.resolved_created_at.as_deref(), Some("rescanned"));
+    assert_eq!(item.resolved_archive_id, None, "another creation time");
+    assert_eq!(item.proposed_archive_id, Some(id));
+    // What the user's confirmation sends.
     f.database
         .reanchor_collection_items(&[CollectionReanchor {
             stored_archive_id: id,
@@ -452,4 +477,275 @@ fn the_scanner_never_reuses_an_id_a_membership_still_names() {
         "id {highest} named by a favourite was given to another game"
     );
     assert_eq!(favourites(&f.database), vec![(highest, None)]);
+}
+
+// ---- Owner clarification 2026-11-15: a completed EmuWiz rename is saved ----
+//
+// Only EmuWiz's own finished rename record moves an item without asking;
+// guesses, failed, undone, ambiguous or stale records change nothing.
+
+fn journals(f: &Fixture) -> PathBuf {
+    f.db_path
+        .parent()
+        .unwrap()
+        .join(crate::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY)
+}
+
+/// Records one rename transaction in `state`, each entry in `entry_state`.
+fn record(f: &Fixture, id: u32, state: &str, entry_state: &str, moves: &[(&str, &str)]) {
+    let entries: Vec<serde_json::Value> = moves
+        .iter()
+        .map(|(from, to)| {
+            serde_json::json!({
+                "source_path": f.source.join(from), "destination_path": f.source.join(to),
+                "original_basename": "x", "proposed_basename": "y",
+                "identity": {"size_bytes": 1, "modified_unix": 1, "kind": "regular_file"},
+                "state": entry_state
+            })
+        })
+        .collect();
+    let transaction: crate::dat::rename_apply::model::RenameTransaction =
+        serde_json::from_value(serde_json::json!({
+            "transaction_id": format!("{id}-0"), "plan_generation": 0, "created_at_unix": id,
+            "source_scan_root": f.source, "state": state, "entries": entries
+        }))
+        .unwrap();
+    crate::dat::rename_apply::journal::write_journal(&journals(f), &transaction).unwrap();
+}
+
+/// Moves the file on disk and rescans: the old row is marked missing and a
+/// new row stands at the destination, as after a real Organise rename.
+fn rename_on_disk(f: &mut Fixture, from: &str, to: &str) -> i64 {
+    if let Some(parent) = f.source.join(to).parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::rename(f.source.join(from), f.source.join(to)).unwrap();
+    scan_and_persist(&mut f.database, &f.config, "after rename").unwrap();
+    id_by_path(&f.database, to)
+}
+
+fn id_by_path(database: &Database, relative: &str) -> i64 {
+    database
+        .load_archives()
+        .unwrap()
+        .iter()
+        .find(|archive| {
+            archive.relative_path == std::path::Path::new(relative)
+                && archive.last_verified_missing_at.is_none()
+        })
+        .unwrap()
+        .id
+}
+
+fn stored_ids(database: &Database) -> Vec<Vec<i64>> {
+    database
+        .load_game_collections()
+        .unwrap()
+        .iter()
+        .map(|collection| {
+            let mut ids: Vec<i64> = collection
+                .items
+                .iter()
+                .map(|item| item.stored_archive_id)
+                .collect();
+            ids.sort();
+            ids
+        })
+        .collect()
+}
+
+#[test]
+fn a_completed_rename_saves_favourites_and_collections_once_and_survives_a_restart() {
+    let mut f = fixture(&["a.zip", "z.zip"]);
+    let favourites = f.database.favourites_collection_id().unwrap();
+    let mine = f.database.create_game_collection("Mine").unwrap();
+    let old = id_of(&f.database, "a.zip");
+    f.database.add_game_to_collection(favourites, old).unwrap();
+    f.database.add_game_to_collection(mine, old).unwrap();
+    let new = rename_on_disk(&mut f, "a.zip", "a (Renamed).zip");
+    record(&f, 1, "applied", "applied", &[("a.zip", "a (Renamed).zip")]);
+    assert_eq!(stored_ids(&f.database), vec![vec![old], vec![old]]);
+
+    let dir = journals(&f);
+    assert_eq!(
+        f.database.save_journalled_collection_moves(&dir).unwrap(),
+        1
+    );
+    assert_eq!(stored_ids(&f.database), vec![vec![new], vec![new]]);
+    let items = f.database.load_game_collections().unwrap();
+    assert!(
+        items
+            .iter()
+            .all(|c| c.items[0].resolved_archive_id == Some(new))
+    );
+
+    // Idempotent: nothing left to do, and the file is not even written.
+    let before = fs::read(&f.db_path).unwrap();
+    assert_eq!(
+        f.database.save_journalled_collection_moves(&dir).unwrap(),
+        0
+    );
+    assert_eq!(fs::read(&f.db_path).unwrap(), before);
+    // A restart reads the saved move.
+    let reopened = Database::open_existing(&f.db_path).unwrap();
+    assert_eq!(stored_ids(&reopened), vec![vec![new], vec![new]]);
+}
+
+#[test]
+fn a_completed_rename_still_applies_after_the_old_entry_was_cleaned_up() {
+    let mut f = fixture(&["a.zip"]);
+    let favourites = f.database.favourites_collection_id().unwrap();
+    let old = id_of(&f.database, "a.zip");
+    f.database.add_game_to_collection(favourites, old).unwrap();
+    let new = rename_on_disk(&mut f, "a.zip", "moved/a.zip");
+    record(&f, 1, "applied", "applied", &[("a.zip", "moved/a.zip")]);
+    f.database
+        .connection
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys=OFF; DELETE FROM archives WHERE id={old};"
+        ))
+        .unwrap();
+    assert_eq!(
+        f.database
+            .save_journalled_collection_moves(&journals(&f))
+            .unwrap(),
+        1
+    );
+    assert_eq!(stored_ids(&f.database), vec![vec![new]]);
+}
+
+#[test]
+fn only_the_renamed_one_of_two_same_named_games_moves() {
+    let mut f = fixture(&[]);
+    for folder in ["x", "y"] {
+        fs::create_dir_all(f.source.join(folder)).unwrap();
+        fs::write(f.source.join(folder).join("a.zip"), folder).unwrap();
+    }
+    scan_and_persist(&mut f.database, &f.config, "two").unwrap();
+    let favourites = f.database.favourites_collection_id().unwrap();
+    let x = id_by_path(&f.database, "x/a.zip");
+    let y = id_by_path(&f.database, "y/a.zip");
+    f.database.add_game_to_collection(favourites, x).unwrap();
+    f.database.add_game_to_collection(favourites, y).unwrap();
+    let new = rename_on_disk(&mut f, "x/a.zip", "x/b.zip");
+    record(&f, 1, "applied", "applied", &[("x/a.zip", "x/b.zip")]);
+    f.database
+        .save_journalled_collection_moves(&journals(&f))
+        .unwrap();
+    let mut expected = vec![new, y];
+    expected.sort();
+    assert_eq!(stored_ids(&f.database), vec![expected]);
+}
+
+#[test]
+fn failed_undone_unfinished_ambiguous_or_stale_records_change_nothing() {
+    type Setup = fn(&Fixture);
+    let cases: [(&str, Setup); 8] = [
+        ("undone", |f| {
+            record(f, 1, "rolled_back", "rolled_back", &[("a.zip", "b.zip")])
+        }),
+        ("failed", |f| {
+            record(f, 1, "apply_failed", "applied", &[("a.zip", "b.zip")])
+        }),
+        ("interrupted", |f| {
+            record(f, 1, "applying", "applied", &[("a.zip", "b.zip")])
+        }),
+        ("rollback failed", |f| {
+            record(f, 1, "rollback_failed", "applied", &[("a.zip", "b.zip")])
+        }),
+        ("planned only", |f| {
+            record(f, 1, "planned", "planned", &[("a.zip", "b.zip")])
+        }),
+        ("two destinations", |f| {
+            record(f, 1, "applied", "applied", &[("a.zip", "b.zip")]);
+            record(f, 2, "applied", "applied", &[("a.zip", "c.zip")]);
+        }),
+        ("a later unfinished move of the destination", |f| {
+            record(f, 1, "applied", "applied", &[("a.zip", "b.zip")]);
+            record(f, 2, "applying", "applied", &[("b.zip", "d.zip")]);
+        }),
+        ("two sources onto one file", |f| {
+            record(f, 1, "applied", "applied", &[("a.zip", "b.zip")]);
+            record(f, 2, "applied", "applied", &[("z.zip", "b.zip")]);
+        }),
+    ];
+    for (name, setup) in cases {
+        let mut f = fixture(&["a.zip", "z.zip"]);
+        let favourites = f.database.favourites_collection_id().unwrap();
+        let old = id_of(&f.database, "a.zip");
+        f.database.add_game_to_collection(favourites, old).unwrap();
+        rename_on_disk(&mut f, "a.zip", "b.zip");
+        setup(&f);
+        let before = fs::read(&f.db_path).unwrap();
+        assert_eq!(
+            f.database
+                .save_journalled_collection_moves(&journals(&f))
+                .unwrap(),
+            0,
+            "{name}"
+        );
+        assert_eq!(
+            fs::read(&f.db_path).unwrap(),
+            before,
+            "{name}: nothing written"
+        );
+        assert_eq!(stored_ids(&f.database), vec![vec![old]], "{name}");
+    }
+}
+
+#[test]
+fn a_record_that_disagrees_with_the_catalogue_changes_nothing() {
+    // The old row is still present and not missing: the file did not leave.
+    let mut f = fixture(&["a.zip", "b.zip"]);
+    let favourites = f.database.favourites_collection_id().unwrap();
+    let old = id_of(&f.database, "a.zip");
+    f.database.add_game_to_collection(favourites, old).unwrap();
+    record(&f, 1, "applied", "applied", &[("a.zip", "b.zip")]);
+    let dir = journals(&f);
+    assert_eq!(
+        f.database.save_journalled_collection_moves(&dir).unwrap(),
+        0
+    );
+    assert_eq!(stored_ids(&f.database), vec![vec![old]]);
+
+    // A different size at the destination is a different file.
+    let mut g = fixture(&["a.zip"]);
+    let favourites = g.database.favourites_collection_id().unwrap();
+    let old = id_of(&g.database, "a.zip");
+    g.database.add_game_to_collection(favourites, old).unwrap();
+    rename_on_disk(&mut g, "a.zip", "b.zip");
+    fs::write(g.source.join("b.zip"), "a different, longer file").unwrap();
+    scan_and_persist(&mut g.database, &g.config, "changed").unwrap();
+    record(&g, 1, "applied", "applied", &[("a.zip", "b.zip")]);
+    assert_eq!(
+        g.database
+            .save_journalled_collection_moves(&journals(&g))
+            .unwrap(),
+        0
+    );
+    assert_eq!(stored_ids(&g.database), vec![vec![old]]);
+}
+
+#[test]
+fn a_guess_by_name_path_or_size_alone_is_never_saved() {
+    // Same name and size elsewhere, no rename record: nothing moves.
+    let mut f = fixture(&["a.zip"]);
+    let favourites = f.database.favourites_collection_id().unwrap();
+    let old = id_of(&f.database, "a.zip");
+    f.database.add_game_to_collection(favourites, old).unwrap();
+    rename_on_disk(&mut f, "a.zip", "elsewhere/a.zip");
+    record(
+        &f,
+        1,
+        "applied",
+        "applied",
+        &[("unrelated.zip", "other.zip")],
+    );
+    assert_eq!(
+        f.database
+            .save_journalled_collection_moves(&journals(&f))
+            .unwrap(),
+        0
+    );
+    assert_eq!(stored_ids(&f.database), vec![vec![old]]);
 }

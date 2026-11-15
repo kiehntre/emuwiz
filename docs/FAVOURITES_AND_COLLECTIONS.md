@@ -14,6 +14,10 @@ is not evidence of what a game is.
   sort control appears: title, system or recently added.
 - A collection can be renamed or deleted. Deleting one cannot be undone, but its
   games stay in the library. Favourites cannot be renamed or deleted.
+- While **Select for artwork** is on, stars and Collections editing are hidden
+  everywhere, including the selected-game panel and Game Details, so choosing
+  artwork cannot change Favourites. They return when artwork selection ends.
+  Ordinary multi-select keeps both the star and the selection tick.
 
 ## What is saved
 
@@ -24,35 +28,37 @@ existing table, row or index.
 A favourite belongs to one catalogue entry, not to a title, so two copies with
 the same title are separate. Hover over a card to see which copy it is.
 
-An item finds its game in this order:
+An item belongs to the catalogue row it was saved against (same id and creation
+time), wherever that row now lives. If that row has been replaced by another,
+for example by a recorded rename, the page shows the replacement. A title match
+is never enough, and a reused id is never accepted: a saved game and a current
+game can even hold the same id and stay separate items. A game whose row remains
+but whose file is missing stays in the list, marked as needing attention.
 
-1. the same catalogue row (same id and creation time), wherever it now lives;
-2. the row at the same source and relative path, with the same size when both
-   sizes are known.
+When the saved row is gone, the item stays saved and appears under
+**no longer in the library** with its saved title, system and file name. If a
+current game sits in the same folder with the same file name and size, it is
+shown there as a **possible match**. That is not proof that it is the same game,
+so the item is not starred on it and nothing is saved. Choose
+**Keep as this game** to save the item against that game, or **Remove** to drop
+the item. Until you choose, the item stays as it is.
 
-If the row found has been replaced by another, the page shows the replacement.
-A title match is never enough, and a reused id is never accepted: a saved game
-and a current game can even hold the same id and stay separate items. An item
-with no match stays saved and appears under **no longer in the library** with
-its saved title, system and file name. It stays there until a scan finds the
-file again or you remove it. A game whose row remains but whose file is missing
-stays in the list, marked as needing attention.
+Loading the library makes one kind of change to saved Favourites and
+collections, and only when EmuWiz's own rename record proves it. When Organise
+renamed or moved a game in a transaction that finished (not undone, failed or
+interrupted), the item is saved against the game's new entry once a scan has
+found it there, so it keeps its star after the old entry is cleaned up. The
+record must lead to exactly one destination, with exactly one current entry
+there of the same size, and the item's old entry, if it is still listed, must be
+marked missing. Anything less certain changes nothing. Running it again changes
+nothing, and it never uses file names, paths or sizes alone.
 
-Most replacement links are worked out afresh each time the library loads and
-can stop applying, so they only change what is shown. An item is saved against a
-different row only when that is a fact: EmuWiz's own rename journal records the
-move, or a new row sits at the item's own place and size. That small write
-happens in the background after the library loads, and only when such an item
-exists. It touches only the item. A rename you later Undo does not move the item
-back: it stays on the renamed row, which then shows as missing or under
-**no longer in the library**. Forgetting the old row of a game you moved by hand
-also ends a derived link, so its star goes off and the item waits in the same list
-until you remove it. Neither deletes the item.
+Every other change comes from you: a star, the Collections menu, create,
+rename, delete, Remove and Keep as this game.
 
-Discovery import Undo refuses a game that Blue shows in Favourites or a
-collection, and says so: an item saved against the imported row, or one whose own
-row is gone and which matches the imported row by source, path and size. Remove
-it there first, then Undo. Undo never deletes an item. Forget and missing cleanup
+Discovery import Undo refuses a game that is in Favourites or a collection, or is
+offered there as a possible match for a saved item, and says so. Remove the item
+there first, then Undo. Undo never deletes an item. Forget and missing cleanup
 remove the row and leave the item showing as no longer in the library.
 
 ## Upgrade and compatibility

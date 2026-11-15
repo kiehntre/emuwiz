@@ -1874,9 +1874,9 @@ fn an_undone_games_id_is_never_given_out_while_a_membership_names_it() {
 #[test]
 fn a_saved_item_blue_shows_on_the_imported_row_by_its_path_blocks_undo() {
     // Review finding 2026-11-15: a favourite whose own row was forgotten is
-    // shown on a re-imported row at the same source, path and size before any
-    // background re-save. Undo must refuse that row too, as Blue shows it
-    // starred.
+    // proposed for a re-imported row at the same source, path and size, for
+    // the user to confirm. Undo refuses that row too, so a proposal is never
+    // left pointing at a deleted game.
     let f = Fixture::new();
     f.write("new.z80", 2);
     let r = f.import();
@@ -1892,9 +1892,9 @@ fn a_saved_item_blue_shows_on_the_imported_row_by_its_path_blocks_undo() {
         f.mutate(&saved(size));
         let shown = f.db().load_game_collections().unwrap();
         assert_eq!(
-            shown[0].items[0].resolved_archive_id,
+            shown[0].items[0].proposed_archive_id,
             Some(id),
-            "{size}: Blue shows the item on the imported row"
+            "{size}: Blue proposes the imported row for the item"
         );
         assert_eq!(touched(&f, id), 0, "{size}");
         let p = f.preview(&op);
@@ -1908,7 +1908,7 @@ fn a_saved_item_blue_shows_on_the_imported_row_by_its_path_blocks_undo() {
     // A different size is a different file: not shown there, not blocking.
     f.mutate(&saved("size_bytes + 1"));
     assert_eq!(
-        f.db().load_game_collections().unwrap()[0].items[0].resolved_archive_id,
+        f.db().load_game_collections().unwrap()[0].items[0].proposed_archive_id,
         None
     );
     let p = f.preview(&op);
