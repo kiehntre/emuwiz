@@ -499,9 +499,9 @@ fn old_no_match_results_from_another_systems_catalogue_are_not_applicable_and_le
         (6, 3, 3, 0, 0)
     );
     assert!(
-        plan.blocked
-            .iter()
-            .all(|b| b.block == ReauditBlock::DoesNotApply && b.status == Status::DoesNotApply)
+        plan.blocked.iter().all(
+            |b| b.block == ReauditBlock::DoesNotApply && b.status == Some(Status::DoesNotApply)
+        )
     );
     let report = f
         .reaudit_with(&plan, 10, &AtomicBool::new(false), &|_| {})
@@ -1292,4 +1292,311 @@ fn f2_a_stale_plan_never_marks_or_annotates_a_newer_game_that_was_given_the_same
         0,
         "the run marked an import it never read or wrote"
     );
+}
+
+/// S3: first-time matching of games that have no saved DAT result, planned
+/// per system with the Check Games catalogue rule and run by `run_reaudit`.
+mod first_matching {
+    use super::*;
+    use crate::dat::reaudit::{FirstMatchPlan, FirstMatchWait, plan_first_matching};
+
+    const GB_DAT: &str = "<datafile><header><name>Nintendo - Game Boy</name><description>Nintendo - Game Boy</description><version>1</version><author>No-Intro</author><homepage>No-Intro</homepage><url>https://www.no-intro.org</url></header><game name=\"X\"><rom name=\"x.gb\" size=\"1\" sha1=\"0000000000000000000000000000000000000001\"/></game></datafile>";
+
+    /// Checked as the DAT page does: single-catalogue use needs it.
+    fn validated(entry: &mut DatSourceEntry) {
+        let (report, _) =
+            crate::dat::sources::validation::validate_dat_source(entry, DatLimits::default());
+        entry.health = report.to_health(&entry.path, entry.kind);
+    }
+
+    impl Fixture {
+        /// The person's catalogues: the Spectrum list (system chosen), two
+        /// Game Boy lists, nothing for the NES.
+        fn registry(&self) -> DatSourceRegistry {
+            let mut registry = DatSourceRegistry::default();
+            let mut spectrum = DatSourceEntry::new(
+                "synthetic".into(),
+                "Synthetic TOSEC".into(),
+                self.dat.clone(),
+                DatSourceKind::File,
+            );
+            spectrum.set_platform_by_person(Some("ZX Spectrum".into()));
+            validated(&mut spectrum);
+            registry.add(spectrum).unwrap();
+            for id in ["gb-one", "gb-two"] {
+                let path = self.dir.path().join(format!("{id}.dat"));
+                std::fs::write(
+                    &path,
+                    GB_DAT.replace("<version>1", &format!("<version>{id}")),
+                )
+                .unwrap();
+                let mut entry =
+                    DatSourceEntry::new(id.into(), id.into(), path, DatSourceKind::File);
+                entry.set_platform_by_person(Some("Game Boy".into()));
+                validated(&mut entry);
+                registry.add(entry).unwrap();
+            }
+            registry
+        }
+
+        /// The configured digest of the Spectrum catalogue.
+        fn spectrum_sha(&self) -> String {
+            let registry = self.registry();
+            let inputs = CatalogueInventoryInputs {
+                local_registry: &registry,
+                managed_sources: &Default::default(),
+                managed_root: self.dir.path(),
+                limits: DatLimits::default(),
+            };
+            crate::dat::configured_catalogues::configured_catalogues(inputs)["synthetic"]
+                .sha256
+                .clone()
+                .unwrap()
+        }
+
+        /// A note that an earlier run tried `archive_id` against the Spectrum
+        /// catalogue with these bytes and saved nothing.
+        fn tried_before(&self, archive_id: i64, sha: &str) {
+            let conn = rusqlite::Connection::open(&self.db).unwrap();
+            let written = conn
+                .execute(
+                    "INSERT INTO dat_recheck_attempts \
+                     (archive_id, dat_source_id, archive_path, attempted_at, reason, catalogue_sha256) \
+                     SELECT id, 'synthetic', absolute_path_cached, '2026-11-16T00:00:00Z', \
+                            'format not represented', ?2 FROM archives WHERE id = ?1",
+                    rusqlite::params![archive_id, sha],
+                )
+                .unwrap();
+            assert_eq!(written, 1);
+        }
+
+        fn first_plan(&self) -> FirstMatchPlan {
+            self.sized();
+            let registry = self.registry();
+            let inputs = CatalogueInventoryInputs {
+                local_registry: &registry,
+                managed_sources: &Default::default(),
+                managed_root: self.dir.path(),
+                limits: DatLimits::default(),
+            };
+            let configured = crate::dat::configured_catalogues::configured_catalogues(inputs);
+            plan_first_matching(&self.db, &configured, &|platform| {
+                crate::dat::catalogue_selection::resolve_catalogue_for_platform(platform, inputs)
+            })
+            .unwrap()
+        }
+
+        fn saved_rows(&self) -> Vec<(i64, String, String)> {
+            let conn = rusqlite::Connection::open(&self.db).unwrap();
+            conn.prepare("SELECT archive_id, dat_source_id, verification_state FROM library_dat_identities ORDER BY archive_id, dat_source_id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+    }
+
+    /// Spectrum games 1-3 (two match the catalogue), a Game Boy game, an NES
+    /// game, a game with no system, a missing Spectrum file, and game 9,
+    /// which already has a saved result.
+    fn library() -> Fixture {
+        let f = Fixture::new();
+        f.write_games_dat(4, "v1");
+        f.add(9, "g0003.tap", Some(&body(3)), Some("ZX Spectrum"));
+        let t = f.run();
+        assert_eq!(t.saved, 1);
+        f.add(1, "g0000.tap", Some(&body(0)), Some("ZX Spectrum"));
+        f.add(2, "g0001.tap", Some(&body(1)), Some("ZX Spectrum"));
+        f.add(
+            3,
+            "other.tap",
+            Some(b"not in the catalogue"),
+            Some("ZX Spectrum"),
+        );
+        f.add(4, "game.gb", Some(b"gb"), Some("Game Boy"));
+        f.add(5, "game.nes", Some(b"nes"), Some("NES"));
+        f.add(6, "mystery.bin", Some(b"?"), None);
+        f.add(7, "gone.tap", None, Some("ZX Spectrum"));
+        f
+    }
+
+    #[test]
+    fn plans_only_unchecked_games_on_a_system_with_exactly_one_catalogue() {
+        let f = library();
+        let before = f.saved_rows();
+        let plan = f.first_plan();
+        assert_eq!(plan.already_checked, 1);
+        assert_eq!(plan.plan.groups.len(), 1, "{:#?}", plan.waiting);
+        let group = &plan.plan.groups[0];
+        assert_eq!(
+            (group.source_id.as_str(), group.platform.as_str()),
+            ("synthetic", "ZX Spectrum")
+        );
+        let ids: Vec<i64> = group.items.iter().map(|item| item.archive_id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert!(
+            group
+                .items
+                .iter()
+                .all(|item| item.status.is_none() && item.saved_verdict.is_empty())
+        );
+        let waits: Vec<(Option<&str>, &FirstMatchWait, usize)> = plan
+            .waiting
+            .iter()
+            .map(|w| (w.platform.as_deref(), &w.wait, w.games))
+            .collect();
+        assert_eq!(
+            waits,
+            vec![
+                (None, &FirstMatchWait::SystemUnknown, 1),
+                (
+                    Some("Game Boy"),
+                    &FirstMatchWait::NeedsChoice {
+                        catalogues: vec!["gb-one".into(), "gb-two".into()]
+                    },
+                    1
+                ),
+                (Some("NES"), &FirstMatchWait::NoCatalogue, 1),
+                (Some("ZX Spectrum"), &FirstMatchWait::FileUnavailable, 1),
+            ]
+        );
+        assert_eq!(
+            plan.plan.games() + plan.waiting_games() + plan.already_checked,
+            8
+        );
+        // Planning reads nothing and writes nothing.
+        assert_eq!(f.saved_rows(), before);
+    }
+
+    #[test]
+    fn a_run_saves_results_for_the_planned_games_only_and_then_has_nothing_left() {
+        let f = library();
+        let plan = f.first_plan();
+        let report = f
+            .reaudit_with(&plan.plan, 2, &AtomicBool::new(false), &|_| {})
+            .unwrap();
+        assert_eq!((report.verified, report.no_match, report.saved), (2, 1, 3));
+        assert!(report.contradictions.is_empty());
+        let rows = f.saved_rows();
+        let ids: Vec<i64> = rows.iter().map(|row| row.0).collect();
+        assert_eq!(ids, vec![1, 2, 3, 9], "nothing outside the plan is written");
+        assert!(
+            rows.iter().all(|row| row.1 == "synthetic"),
+            "saved against the resolved catalogue: {rows:?}"
+        );
+        assert_eq!(rows[0].2, "verified_single_match");
+        assert_eq!(rows[2].2, "no_match");
+        // Saved results are current proof, so the re-check leaves them alone.
+        assert!(f.statuses().values().all(|s| *s == Status::Current));
+        let again = f.first_plan();
+        assert_eq!(again.plan.games(), 0);
+        assert_eq!(again.already_checked, 4);
+        assert_eq!(again.waiting_games(), 4);
+    }
+
+    #[test]
+    fn a_stopped_run_keeps_finished_sets_and_the_next_plan_lists_the_rest() {
+        let f = library();
+        let plan = f.first_plan();
+        let cancel = AtomicBool::new(false);
+        let sets = Cell::new(0);
+        let report = f
+            .reaudit_with(&plan.plan, 1, &cancel, &|progress| {
+                if let ReauditProgress::SetSaved { .. } = progress {
+                    sets.set(sets.get() + 1);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            })
+            .unwrap();
+        assert_eq!(report.saved, 1);
+        assert!(matches!(report.stopped, Some(ReauditStop::Cancelled)));
+        let next = f.first_plan();
+        let ids: Vec<i64> = next.plan.groups[0]
+            .items
+            .iter()
+            .map(|i| i.archive_id)
+            .collect();
+        assert_eq!(ids, vec![2, 3]);
+        assert_eq!(next.already_checked, 2);
+    }
+
+    #[test]
+    fn a_limit_leaves_the_rest_for_a_later_run() {
+        let f = library();
+        let plan = f.first_plan().truncated(2);
+        assert_eq!(plan.plan.games(), 2);
+        assert_eq!(plan.plan.blocked.len(), 1);
+        assert_eq!(plan.plan.blocked[0].block, ReauditBlock::LeftOutOfThisRun);
+        assert_eq!(plan.plan.blocked[0].status, None);
+    }
+
+    /// A game whose only saved result is from another catalogue (another
+    /// system's, or one since removed) is neither re-checked (that result
+    /// does not apply) nor left as "already checked": it is matched against
+    /// its own system's catalogue, and the other result is kept as it is.
+    #[test]
+    fn a_result_from_another_catalogue_does_not_count_as_checked_and_is_kept() {
+        let f = library();
+        let conn = rusqlite::Connection::open(&f.db).unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE other AS SELECT * FROM library_dat_identities WHERE archive_id = 9;
+             UPDATE other SET id = NULL, archive_id = 1, dat_source_id = 'removed-catalogue';
+             INSERT INTO library_dat_identities SELECT * FROM other;",
+        )
+        .unwrap();
+        drop(conn);
+        let before: Vec<_> = f.saved_rows().into_iter().filter(|r| r.0 == 1).collect();
+        assert_eq!(before.len(), 1);
+        let plan = f.first_plan();
+        assert_eq!((plan.already_checked, plan.checked_elsewhere), (1, 1));
+        let ids: Vec<i64> = plan.plan.groups[0]
+            .items
+            .iter()
+            .map(|item| item.archive_id)
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        f.reaudit_with(&plan.plan, 10, &AtomicBool::new(false), &|_| {})
+            .unwrap();
+        let after: Vec<_> = f.saved_rows().into_iter().filter(|r| r.0 == 1).collect();
+        assert_eq!(
+            after,
+            vec![
+                before[0].clone(),
+                (1, "synthetic".into(), "verified_single_match".into())
+            ],
+            "the other catalogue's result is kept; the new one is added beside it"
+        );
+        // A result from the catalogue that would be used is the re-check's job.
+        assert_eq!(f.first_plan().plan.games(), 0);
+    }
+
+    /// Games an earlier run tried against the same catalogue bytes without
+    /// saving anything go last under a limit, so repeating a limited run
+    /// moves on; with new catalogue bytes they count as never tried.
+    #[test]
+    fn a_limited_run_reaches_games_never_tried_before_retrying() {
+        let f = library();
+        let sha = f.spectrum_sha();
+        f.tried_before(1, &sha);
+        let plan = f.first_plan();
+        assert_eq!(plan.retry.iter().copied().collect::<Vec<_>>(), vec![1]);
+        let limited = plan.clone().truncated(2);
+        let ids: Vec<i64> = limited.plan.groups[0]
+            .items
+            .iter()
+            .map(|item| item.archive_id)
+            .collect();
+        assert_eq!(ids, vec![2, 3], "never-tried games first");
+        assert_eq!(limited.left_out(), 1);
+        assert!(limited.retry.is_empty());
+        // With room, the tried game is still checked, in plan order.
+        let all = plan.truncated(3);
+        assert_eq!(all.plan.games(), 3);
+        assert_eq!(all.plan.groups[0].items[0].archive_id, 1);
+        // A note against other catalogue bytes is not a retry.
+        let g = library();
+        g.tried_before(1, "0".repeat(64).as_str());
+        assert!(g.first_plan().retry.is_empty());
+    }
 }
