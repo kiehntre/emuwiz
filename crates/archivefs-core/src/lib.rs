@@ -188,7 +188,7 @@ pub use database::{
     SOURCE_PLATFORM_ASSIGNMENT_SOURCE, SavedDatEvidenceRow, SavedDatEvidenceStatus,
     ScanPersistSummary, ScanRunCounts, ScummVmScanReport, SourceFolderRecord, SourceRole,
     SourceScanStatus, TopologyPersistOutcome, UpgradeBackupInspection, UpgradeBackupState,
-    VERIFIED_DAT_PLATFORM_SOURCE, apply_journal_recovery, check_database_health,
+    VERIFIED_DAT_PLATFORM_SOURCE, VerifiedDatName, apply_journal_recovery, check_database_health,
     default_database_path, diagnose_database, format_unix_timestamp_utc,
     inspect_upgrade_backup_evidence, inspect_upgrade_backups, latest_schema_version,
     pending_schema_migration_versions, persisted_archive_has_unknown_platform,

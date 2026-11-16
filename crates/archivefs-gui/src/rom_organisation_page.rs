@@ -120,6 +120,9 @@ pub(crate) struct RomOrganisationPageState {
     /// page otherwise offers. Deliberately not a new sidebar destination.
     pub(crate) showing_playing_library: bool,
     pub(crate) playing_library: crate::playing_library_page::PlayingLibraryPageState,
+    /// Where each previewed file's proposed name came from, and why another
+    /// source was not used. Display only: Apply re-derives every name.
+    name_choices: std::collections::BTreeMap<PathBuf, NameChoice>,
 }
 
 /// Batches larger than this require typing the exact confirmation phrase
@@ -253,6 +256,7 @@ impl RomOrganisationPageState {
             approvals_file: None,
             showing_playing_library: false,
             playing_library: crate::playing_library_page::PlayingLibraryPageState::load(),
+            name_choices: Default::default(),
         }
     }
 }
@@ -625,9 +629,9 @@ impl RomOrganisationPageState {
             return true;
         };
         progress.phase("Reading your game list", "steps", None);
-        let cache = load_romm_cache();
-        let Some(candidates) =
-            build_candidates(&self.sources, self.plan_generation, cache.as_ref())
+        let names = NameResolver::load();
+        let Some((candidates, name_choices)) =
+            build_candidates(&self.sources, self.plan_generation, &names)
         else {
             self.error = Some("could not read the platform identity database".to_string());
             self.plan = None;
@@ -672,6 +676,7 @@ impl RomOrganisationPageState {
             .suggested()
             .map(|entry| entry.source_path.to_string_lossy().into_owned())
             .collect();
+        self.name_choices = name_choices;
         self.plan = Some(plan);
         self.error = None;
         // The plan rebuild just rewrote the approval set to "all Suggested".
@@ -732,9 +737,12 @@ impl RomOrganisationPageState {
         // transaction: a platform/canonical name changed by another process
         // since the plan was generated must reject the apply with zero
         // mutation. Destinations are re-derived from the same neutral EmuWiz
-        // layout identity as the preview - no RomM lookup happens here.
-        let cache = load_romm_cache();
-        let canonical_name_for = |source: &Path| canonical_name_for(source, cache.as_ref());
+        // layout identity as the preview. Every proposed name is chosen again
+        // from live evidence (verified catalogue name, then RomM): a check
+        // that went stale or a file that changed since the preview changes the
+        // name, and the apply is refused.
+        let names = NameResolver::load();
+        let canonical_name_for = |source: &Path| names.choose(source).name;
         let database_path = default_database_path();
         let database = match database_path.and_then(archivefs_core::Database::open_read_only) {
             Ok(database) => database,
@@ -1425,20 +1433,24 @@ pub(crate) fn collect_source_files_reported(
 }
 
 /// Builds organisation candidates by resolving each source file's platform
-/// identity from the database, and attaching the canonical game name (with the
-/// source's extension) from the authoritative RomM identity cache record when
-/// one exists. Returns `None` when the database is unreadable.
+/// identity from the database, and attaching the proposed name chosen by
+/// [`NameResolver`] (verified catalogue name, then RomM, else unchanged).
+/// Returns `None` when the database is unreadable.
 fn build_candidates(
     sources: &[PathBuf],
     generation: u64,
-    cache: Option<&archivefs_core::identity_source::cache::IdentityCache>,
-) -> Option<Vec<OrganisationCandidate>> {
+    names: &NameResolver,
+) -> Option<(
+    Vec<OrganisationCandidate>,
+    std::collections::BTreeMap<PathBuf, NameChoice>,
+)> {
     // No identity lookup is needed for an empty selection.  In particular,
     // regenerating an empty preview must be able to clear a stale approved
     // set even when this machine has not created its local database yet.
     if sources.is_empty() {
-        return Some(Vec::new());
+        return Some(Default::default());
     }
+    let mut choices = std::collections::BTreeMap::new();
 
     let database_path = default_database_path().ok()?;
     let database = Database::open_read_only(&database_path).ok()?;
@@ -1458,15 +1470,17 @@ fn build_candidates(
             }
             None => PlatformIdentityResolution::Unknown { generation },
         };
+        let choice = names.choose(source);
         candidates.push(OrganisationCandidate {
             source_path: source.clone(),
             resolution,
-            canonical_name: canonical_name_for(source, cache),
+            canonical_name: choice.name.clone(),
             content_classification: None,
             original_metadata: Default::default(),
         });
+        choices.insert(source.clone(), choice);
     }
-    Some(candidates)
+    Some((candidates, choices))
 }
 
 /// Uses exactly the existing organisation freshness/planning checks, on a worker.
@@ -1480,9 +1494,9 @@ pub(crate) fn validate_r2_selection(
     }) {
         return Err("Catalogue-backed organisation requires Standard Apply so filesystem and catalogue Undo remain coordinated.".into());
     }
-    let cache = load_romm_cache();
+    let names = NameResolver::load();
     let database = default_database_path().map_err(|e| e.to_string())?;
-    revalidate_organisation_plan(plan, &database, &|p| canonical_name_for(p, cache.as_ref()))?;
+    revalidate_organisation_plan(plan, &database, &|p| names.choose(p).name)?;
     let tx = build_organisation_transaction(plan, approved, plan.generation)?;
     let expected = plan
         .suggested()
@@ -1496,12 +1510,11 @@ pub(crate) fn validate_r2_selection(
     }
     Ok(tx)
 }
-/// The authoritative canonical game name for a source, when the RomM identity
-/// cache records one: the record's title with the source's extension appended,
+/// The RomM name for a source, when the RomM identity cache records one: the record's title with the source's extension appended,
 /// so `derive_proposed_basename` preserves extension semantics. Returns `None`
 /// when there is no record (the planner then falls back to the source
 /// basename). Never derived from a display label.
-fn canonical_name_for(
+fn romm_name_for(
     source: &Path,
     cache: Option<&archivefs_core::identity_source::cache::IdentityCache>,
 ) -> Option<String> {
@@ -1523,6 +1536,203 @@ fn canonical_name_for(
         return Some(title);
     }
     Some(format!("{title}.{extension}"))
+}
+
+/// Where a proposed name came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NameSource {
+    /// A current, unique, single-match catalogue check (its source id).
+    VerifiedDat { catalogue: String },
+    /// The imported RomM record title.
+    Romm,
+    /// Neither qualified: the file keeps its own name.
+    Original,
+}
+
+/// One file's proposed name, its source, and why another source was not used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NameChoice {
+    /// `None` keeps the file's current name.
+    pub(crate) name: Option<String>,
+    pub(crate) source: NameSource,
+    pub(crate) note: Option<String>,
+    /// The catalogue named a file inside this archive, so its name was not
+    /// used (archives are never renamed with an inner file's name).
+    pub(crate) skipped_archive: bool,
+}
+
+/// Preview totals that separate "has a verified catalogue name" from "needs
+/// a new file name".
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NameCounts {
+    /// Verified catalogue name that differs from the current file name.
+    pub(crate) dat_changes: usize,
+    /// Verified catalogue name the file already has.
+    pub(crate) dat_already_correct: usize,
+    /// RomM name used because no catalogue name qualified.
+    pub(crate) romm_fallbacks: usize,
+    /// Archives whose catalogue match names an inner file, left unnamed.
+    pub(crate) archives_skipped: usize,
+}
+
+pub(crate) fn name_counts(
+    plan: &OrganisationPlan,
+    choices: &std::collections::BTreeMap<PathBuf, NameChoice>,
+) -> NameCounts {
+    let mut counts = NameCounts::default();
+    for entry in &plan.entries {
+        // Blocked, unsupported or colliding entries have no usable destination.
+        if !matches!(
+            entry.status,
+            OrganisationStatus::Suggested | OrganisationStatus::AlreadyOrganised
+        ) {
+            continue;
+        }
+        let Some(choice) = choices.get(&entry.source_path) else {
+            continue;
+        };
+        if choice.skipped_archive {
+            counts.archives_skipped += 1;
+        }
+        match choice.source {
+            NameSource::VerifiedDat { .. } => {
+                if entry.destination_path.file_name() == entry.source_path.file_name() {
+                    counts.dat_already_correct += 1;
+                } else {
+                    counts.dat_changes += 1;
+                }
+            }
+            NameSource::Romm => counts.romm_fallbacks += 1,
+            NameSource::Original => {}
+        }
+    }
+    counts
+}
+
+impl NameChoice {
+    pub(crate) fn source_label(&self) -> String {
+        match &self.source {
+            NameSource::VerifiedDat { catalogue } => {
+                format!("verified catalogue name ({catalogue})")
+            }
+            NameSource::Romm => "RomM".to_string(),
+            NameSource::Original => "current file name (no verified name)".to_string(),
+        }
+    }
+}
+
+/// The owner's rule (S1, 2026-11-16): a verified catalogue name wins; RomM is
+/// the fallback; otherwise the file keeps its name. A catalogue name is used
+/// only when it names a file of the same kind (same extension): a match made
+/// through an archive member never renames the archive here.
+pub(crate) fn choose_name(
+    dat: archivefs_core::VerifiedDatName,
+    romm: Option<String>,
+    source: &Path,
+) -> NameChoice {
+    use archivefs_core::VerifiedDatName as V;
+    let extension = |p: &Path| {
+        p.extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    };
+    let mut skipped_archive = false;
+    let dat_refusal = match dat {
+        // Recorded provenance, not an extension guess: a member's name never
+        // renames its archive, even when the member is itself a .zip.
+        V::Usable {
+            through_archive_member: true,
+            rom_name,
+            ..
+        } => {
+            skipped_archive = true;
+            Some(format!(
+                "the catalogue matched '{rom_name}', a file inside this archive; archives are not renamed with an inner file's name"
+            ))
+        }
+        V::Usable {
+            rom_name,
+            dat_source_id,
+            ..
+        } => {
+            if extension(Path::new(&rom_name)) == extension(source) {
+                let note = romm.as_ref().filter(|romm| **romm != rom_name).map(|romm| {
+                    format!("RomM suggests '{romm}'; the verified catalogue name is used instead")
+                });
+                return NameChoice {
+                    name: Some(rom_name),
+                    source: NameSource::VerifiedDat {
+                        catalogue: dat_source_id,
+                    },
+                    note,
+                    skipped_archive: false,
+                };
+            }
+            Some(format!(
+                "the catalogue names '{rom_name}', a file of another kind; the file's own extension is kept, so the name is not used"
+            ))
+        }
+        V::NotUsable(reason) => Some(reason),
+        V::None => None,
+    };
+    let note = dat_refusal.map(|reason| format!("Catalogue name not used: {reason}"));
+    match romm {
+        Some(name) => NameChoice {
+            name: Some(name),
+            source: NameSource::Romm,
+            note,
+            skipped_archive,
+        },
+        None => NameChoice {
+            name: None,
+            source: NameSource::Original,
+            note,
+            skipped_archive,
+        },
+    }
+}
+
+/// Chooses proposed names from live evidence. Loaded once per preview and
+/// again at apply, so both use the same rule on the then-current state.
+pub(crate) struct NameResolver {
+    romm: Option<archivefs_core::identity_source::cache::IdentityCache>,
+    database: Option<Database>,
+    catalogues: std::collections::HashMap<
+        String,
+        archivefs_core::dat::configured_catalogues::ConfiguredCatalogue,
+    >,
+}
+
+impl NameResolver {
+    pub(crate) fn load() -> Self {
+        Self {
+            romm: load_romm_cache(),
+            database: default_database_path()
+                .and_then(Database::open_read_only)
+                .ok(),
+            catalogues: archivefs_core::dat::sources::default_dat_sources_config_path()
+                .map(|path| {
+                    archivefs_core::dat::configured_catalogues::load_configured_catalogues(&path)
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn choose(&self, source: &Path) -> NameChoice {
+        use archivefs_core::VerifiedDatName as V;
+        let dat = match &self.database {
+            None => V::NotUsable("the library could not be read".into()),
+            Some(database) => match database.find_archive_id_by_absolute_path(source) {
+                Ok(None) => V::None,
+                Ok(Some(id)) => database
+                    .verified_dat_name_for_archive(id, &self.catalogues)
+                    .unwrap_or_else(|error| {
+                        V::NotUsable(format!("the saved check could not be read ({error})"))
+                    }),
+                Err(error) => V::NotUsable(format!("the library could not be read ({error})")),
+            },
+        };
+        choose_name(dat, romm_name_for(source, self.romm.as_ref()), source)
+    }
 }
 
 /// Loads the imported RomM identity cache, if any.
@@ -2284,6 +2494,16 @@ fn show_library_destination_cards(ui: &mut egui::Ui, state: &mut RomOrganisation
     }
 }
 
+/// One row's name provenance: the source of the proposed name and, when
+/// another source was set aside, why.
+fn show_name_choice(ui: &mut egui::Ui, choice: Option<&NameChoice>) {
+    let Some(choice) = choice else { return };
+    ui.label(format!("Name from: {}", choice.source_label()));
+    if let Some(note) = &choice.note {
+        ui.label(egui::RichText::new(note).color(theme::muted(ui)).small());
+    }
+}
+
 fn show_plan(
     ui: &mut egui::Ui,
     plan: &OrganisationPlan,
@@ -2292,6 +2512,15 @@ fn show_plan(
     page_action: &mut Option<RomOrganisationPageAction>,
     quick_only: bool,
 ) {
+    // Cloned like the plan itself: rows below borrow `state` mutably.
+    let name_choices = state.name_choices.clone();
+    if !name_choices.is_empty() {
+        let c = name_counts(plan, &name_choices);
+        ui.label(format!(
+            "Names: {} verified catalogue names to apply · {} already correct · {} RomM names (no verified catalogue name) · {} archives skipped (catalogue names a file inside)",
+            c.dat_changes, c.dat_already_correct, c.romm_fallbacks, c.archives_skipped
+        ));
+    }
     let suggested_count = plan
         .entries
         .iter()
@@ -2498,6 +2727,7 @@ fn show_plan(
                             ui.label("MAME collections use the dedicated MAME tools.");
                         } else {
                             ui.label(format!("Rename to: {}", entry.destination_path.display()));
+                            show_name_choice(ui, name_choices.get(&entry.source_path));
                             ui.label(format!("Identity: Verified by {}", entry.platform_source));
                         }
                         ui.label(format!("Status: {}", entry.status.label()));
@@ -2539,6 +2769,7 @@ fn show_plan(
                     ui.vertical(|ui| {
                         ui.label(format!("Current: {}", entry.source_path.display()));
                         ui.label(format!("Will become: {}", entry.destination_path.display()));
+                        show_name_choice(ui, name_choices.get(&entry.source_path));
                         if !entry.platform_display_name.is_empty() {
                             ui.label(format!(
                                 "Reason: Verified for {}",
@@ -3138,7 +3369,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn canonical_name_for_uses_the_romm_record_title_with_the_source_extension() {
+    fn romm_name_for_uses_the_romm_record_title_with_the_source_extension() {
         use archivefs_core::identity_source::cache::{CACHE_FORMAT_VERSION, IdentityCache};
         use archivefs_core::identity_source::model::{
             ExternalIdentityRecord, ExternalVerification, IdentityProvider,
@@ -3190,17 +3421,233 @@ mod tests {
             server_reported_total: Some(1),
         };
         assert_eq!(
-            canonical_name_for(&source, Some(&cache)).as_deref(),
+            romm_name_for(&source, Some(&cache)).as_deref(),
             Some("Game (Europe).iso"),
             "the title must be combined with the source extension"
         );
         // A source with no cache record falls back to None.
         assert_eq!(
-            canonical_name_for(&PathBuf::from("/roms/library/Other.iso"), Some(&cache)),
+            romm_name_for(&PathBuf::from("/roms/library/Other.iso"), Some(&cache)),
             None
         );
         // No cache at all falls back to None.
-        assert_eq!(canonical_name_for(&source, None), None);
+        assert_eq!(romm_name_for(&source, None), None);
+    }
+
+    #[test]
+    fn a_verified_catalogue_name_wins_over_romm_and_says_so() {
+        use archivefs_core::VerifiedDatName as V;
+        let source = Path::new("/roms/gba/pokemon_e.gba");
+        let dat = || V::Usable {
+            rom_name: "Pokemon - Emerald Version (USA, Europe).gba".into(),
+            game_name: "Pokemon - Emerald Version (USA, Europe)".into(),
+            dat_source_id: "no-intro-gba".into(),
+            through_archive_member: false,
+        };
+        let choice = choose_name(dat(), Some("Pokemon Emerald.gba".into()), source);
+        assert_eq!(
+            choice.name.as_deref(),
+            Some("Pokemon - Emerald Version (USA, Europe).gba")
+        );
+        assert_eq!(
+            choice.source,
+            NameSource::VerifiedDat {
+                catalogue: "no-intro-gba".into()
+            }
+        );
+        assert!(
+            choice
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("RomM suggests 'Pokemon Emerald.gba'"))
+        );
+        // Agreement is not a conflict.
+        let same = choose_name(
+            dat(),
+            Some("Pokemon - Emerald Version (USA, Europe).gba".into()),
+            source,
+        );
+        assert_eq!(same.note, None);
+        // Extension case alone is the same kind of file.
+        let upper = choose_name(dat(), None, Path::new("/roms/gba/POKEMON.GBA"));
+        assert!(matches!(upper.source, NameSource::VerifiedDat { .. }));
+    }
+
+    #[test]
+    fn romm_is_the_fallback_and_the_original_name_is_kept_when_nothing_qualifies() {
+        use archivefs_core::VerifiedDatName as V;
+        let source = Path::new("/roms/gba/game.gba");
+        let romm = || Some("Game (Europe).gba".to_string());
+        // No saved check: RomM, nothing to explain.
+        let choice = choose_name(V::None, romm(), source);
+        assert_eq!(
+            (choice.name.as_deref(), &choice.source, &choice.note),
+            (Some("Game (Europe).gba"), &NameSource::Romm, &None)
+        );
+        // A stale check is explained, and RomM is used.
+        let stale = choose_name(
+            V::NotUsable("the file has changed since it was checked".into()),
+            romm(),
+            source,
+        );
+        assert_eq!(stale.source, NameSource::Romm);
+        assert!(
+            stale
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("Catalogue name not used: the file has changed"))
+        );
+        // Neither: the file keeps its name (None), with the reason shown.
+        let neither = choose_name(
+            V::NotUsable("catalogues disagree on the name".into()),
+            None,
+            source,
+        );
+        assert_eq!((neither.name, neither.source), (None, NameSource::Original));
+        assert!(neither.note.is_some());
+        assert_eq!(choose_name(V::None, None, source).note, None);
+    }
+
+    #[test]
+    fn preview_counts_separate_verified_names_from_names_that_change() {
+        use archivefs_core::VerifiedDatName as V;
+        let root = PathBuf::from("/master");
+        let dat = |rom: &str| V::Usable {
+            rom_name: rom.into(),
+            game_name: rom.into(),
+            dat_source_id: "no-intro".into(),
+            through_archive_member: false,
+        };
+        let files = [
+            ("/src/ugly.gba", dat("Nice (USA).gba"), None),
+            ("/src/Right (USA).gba", dat("Right (USA).gba"), None),
+            (
+                "/src/disk.zip",
+                V::Usable {
+                    rom_name: "Disk (1990).adf".into(),
+                    game_name: "Disk (1990)".into(),
+                    dat_source_id: "tosec".into(),
+                    through_archive_member: true,
+                },
+                Some("Disk.zip".to_string()),
+            ),
+            ("/src/blocked.gba", dat("Blocked (USA).gba"), None),
+            (
+                "/src/other.gbc",
+                V::None,
+                Some("Other (Europe).gbc".to_string()),
+            ),
+            ("/src/plain.gbc", V::None, None),
+        ];
+        let mut choices = std::collections::BTreeMap::new();
+        let mut entries = Vec::new();
+        for (path, dat, romm) in files {
+            let source = PathBuf::from(path);
+            let choice = choose_name(dat, romm, &source);
+            let name = choice
+                .name
+                .clone()
+                .unwrap_or_else(|| source.file_name().unwrap().to_string_lossy().into_owned());
+            entries.push(OrganisationPlanEntry {
+                source_identity: None,
+                catalogue_binding: None,
+                source_path: source.clone(),
+                destination_path: source.with_file_name(name),
+                platform: None,
+                platform_display_name: String::new(),
+                platform_source: String::new(),
+                slug: None,
+                layout_folder: None,
+                mode: OrganisationMode::RenameInPlace,
+                content_classification: None,
+                original_metadata: Default::default(),
+                status: OrganisationStatus::Suggested,
+                reason: None,
+            });
+            choices.insert(source, choice);
+        }
+        // A blocked entry has no destination and is never counted.
+        let blocked = entries
+            .iter_mut()
+            .find(|e| e.source_path.ends_with("blocked.gba"))
+            .unwrap();
+        blocked.status = OrganisationStatus::Blocked;
+        blocked.destination_path = PathBuf::new();
+        let plan = OrganisationPlan {
+            master_root: root,
+            mode: OrganisationMode::RenameInPlace,
+            content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+            classifier_version: String::new(),
+            generation: 1,
+            entries,
+        };
+        assert_eq!(
+            name_counts(&plan, &choices),
+            NameCounts {
+                dat_changes: 1,
+                dat_already_correct: 1,
+                romm_fallbacks: 2,
+                archives_skipped: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_match_through_an_archive_member_never_renames_the_archive() {
+        use archivefs_core::VerifiedDatName as V;
+        let member = || V::Usable {
+            rom_name: "Lemmings (1991).adf".into(),
+            game_name: "Lemmings (1991)".into(),
+            dat_source_id: "tosec-amiga".into(),
+            through_archive_member: true,
+        };
+        let zip = Path::new("/roms/amiga/lemmings.zip");
+        let choice = choose_name(member(), None, zip);
+        assert_eq!((choice.name, choice.source), (None, NameSource::Original));
+        assert!(
+            choice
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("file inside this archive"))
+        );
+        assert!(choice.skipped_archive);
+        let with_romm = choose_name(member(), Some("Lemmings.zip".into()), zip);
+        assert_eq!(
+            (with_romm.name.as_deref(), with_romm.source),
+            (Some("Lemmings.zip"), NameSource::Romm)
+        );
+        // Even an inner .zip never renames the outer .zip.
+        let inner_zip = V::Usable {
+            rom_name: "Inner.zip".into(),
+            game_name: "Inner".into(),
+            dat_source_id: "x".into(),
+            through_archive_member: true,
+        };
+        assert_eq!(
+            choose_name(inner_zip, None, zip).source,
+            NameSource::Original
+        );
+        // A loose file of another kind is refused but is not an archive.
+        let other_kind = V::Usable {
+            rom_name: "Game.smc".into(),
+            game_name: "Game".into(),
+            dat_source_id: "x".into(),
+            through_archive_member: false,
+        };
+        let refused = choose_name(other_kind.clone(), None, Path::new("/roms/snes/game.sfc"));
+        assert_eq!(
+            (refused.source, refused.skipped_archive),
+            (NameSource::Original, false)
+        );
+        assert!(
+            refused
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("another kind"))
+        );
+        // A file with no extension never takes a name that adds one.
+        let bare = choose_name(other_kind, None, Path::new("/roms/amiga/lemmings"));
+        assert_eq!(bare.source, NameSource::Original);
     }
 
     // ------------------------------------------------------------------
