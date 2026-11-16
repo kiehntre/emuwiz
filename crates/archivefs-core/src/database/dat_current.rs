@@ -421,3 +421,176 @@ impl Database {
             .map_err(|error| db_error("failed to count replaced DAT evidence", error))
     }
 }
+
+/// One saved row reduced to what the rename name rule needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedDatNameRow {
+    pub dat_source_id: String,
+    pub status: SavedDatEvidenceStatus,
+    /// The saved verdict column (`verified_single_match`, `no_match`, ...).
+    pub saved_verdict: String,
+    pub canonical_rom_name: Option<String>,
+    pub canonical_dat_name: Option<String>,
+}
+
+/// Whether a library item has one verified catalogue name that a rename may
+/// use. Only current, unique, single-match evidence qualifies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedDatName {
+    /// No saved check names this item.
+    None,
+    /// A trustworthy name: the DAT `<rom>` name (with its own extension).
+    Usable {
+        rom_name: String,
+        game_name: String,
+        dat_source_id: String,
+    },
+    /// Saved evidence exists but must not be used; the text says why.
+    NotUsable(String),
+}
+
+fn status_reason(status: SavedDatEvidenceStatus) -> &'static str {
+    use SavedDatEvidenceStatus as S;
+    match status {
+        S::Current => "the saved check is current",
+        S::MissingProof => {
+            "the saved check is from before checks were recorded in full; check the game again"
+        }
+        S::FileChanged => "the file has changed since it was checked; check the game again",
+        S::FileUnavailable => "the file is missing or unreadable",
+        S::CatalogueChanged => {
+            "the catalogue has changed since the game was checked; check the game again"
+        }
+        S::CatalogueUnavailable => "the catalogue that checked this game is not available now",
+        S::DoesNotApply => "the saved check does not apply to this game",
+    }
+}
+
+/// The single rule for a verified rename name, on already-judged rows.
+pub fn decide_verified_dat_name(rows: &[SavedDatNameRow]) -> VerifiedDatName {
+    use SavedDatEvidenceStatus as S;
+    let current: Vec<&SavedDatNameRow> = rows.iter().filter(|r| r.status == S::Current).collect();
+    if current
+        .iter()
+        .any(|r| r.saved_verdict == "conflicting" || r.saved_verdict == "ambiguous")
+    {
+        return VerifiedDatName::NotUsable(
+            "a catalogue check found more than one possible match".into(),
+        );
+    }
+    let verified: Vec<&&SavedDatNameRow> = current
+        .iter()
+        .filter(|r| r.saved_verdict == "verified_single_match")
+        .collect();
+    if verified.is_empty() {
+        return match rows
+            .iter()
+            .find(|r| r.saved_verdict == "verified_single_match")
+        {
+            Some(stale) => VerifiedDatName::NotUsable(status_reason(stale.status).into()),
+            None => VerifiedDatName::None,
+        };
+    }
+    let mut names: Vec<(&str, &str, &str)> = Vec::new();
+    for row in &verified {
+        let (Some(rom), Some(game)) = (
+            row.canonical_rom_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty()),
+            row.canonical_dat_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty()),
+        ) else {
+            return VerifiedDatName::NotUsable(
+                "the saved match does not record a single catalogue file name".into(),
+            );
+        };
+        if !names.iter().any(|(r, _, _)| *r == rom) {
+            names.push((rom, game, row.dat_source_id.as_str()));
+        }
+    }
+    if names.len() > 1 {
+        return VerifiedDatName::NotUsable(format!(
+            "catalogues disagree on the name: {}",
+            names
+                .iter()
+                .map(|(rom, _, source)| format!("'{rom}' ({source})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let (rom, game, source) = names[0];
+    VerifiedDatName::Usable {
+        rom_name: rom.to_string(),
+        game_name: game.to_string(),
+        dat_source_id: source.to_string(),
+    }
+}
+
+impl Database {
+    /// The verified catalogue name for one library item, judged by the same
+    /// currency rule as every other consumer (live file state, catalogue
+    /// digest, revision marks). Read-only; no matching or hashing of ROMs.
+    pub fn verified_dat_name_for_archive(
+        &self,
+        archive_id: i64,
+        catalogues: &HashMap<String, ConfiguredCatalogue>,
+    ) -> Result<VerifiedDatName> {
+        let mut statement = self.connection.prepare(
+            "SELECT d.dat_source_id, d.facts_json, a.size_bytes, p.platform, a.absolute_path_cached, \
+                    d.revision_marked_stale, a.last_verified_missing_at IS NOT NULL, d.verification_state \
+             FROM library_dat_identities d JOIN archives a ON a.id = d.archive_id \
+             LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1 \
+             WHERE d.archive_id = ?1 ORDER BY d.dat_source_id",
+        ).map_err(|error| db_error("failed to prepare verified DAT name query", error))?;
+        let mut rows = statement
+            .query(params![archive_id])
+            .map_err(|error| db_error("failed to query verified DAT name", error))?;
+        let mut judged = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| db_error("failed to read verified DAT name", error))?
+        {
+            let read = |error| db_error("failed to read verified DAT name", error);
+            let dat_source_id: String = row.get(0).map_err(read)?;
+            let bytes: Vec<u8> = row.get(1).map_err(read)?;
+            let size_bytes: Option<i64> = row.get(2).map_err(read)?;
+            let platform: Option<String> = row.get(3).map_err(read)?;
+            let path_bytes: Vec<u8> = row.get(4).map_err(read)?;
+            let marked_stale: bool = row.get(5).map_err(read)?;
+            let library_missing: bool = row.get(6).map_err(read)?;
+            let saved_verdict: String = row.get(7).map_err(read)?;
+            // Unreadable saved evidence is never a name; it is reported.
+            let Ok(saved) = serde_json::from_slice::<
+                crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
+            >(&bytes) else {
+                return Ok(VerifiedDatName::NotUsable(
+                    "the saved check for this game is unreadable".into(),
+                ));
+            };
+            let path = PathBuf::from(std::ffi::OsString::from_vec(path_bytes));
+            let (status, _) = judge_saved_row(
+                &saved,
+                &SavedRowInputs {
+                    source_id: &dat_source_id,
+                    source: catalogues.get(&dat_source_id),
+                    path: &path,
+                    size_bytes,
+                    platform: platform.as_deref(),
+                    marked_stale,
+                    library_missing,
+                },
+            );
+            judged.push(SavedDatNameRow {
+                dat_source_id,
+                status,
+                saved_verdict,
+                canonical_rom_name: saved.canonical.canonical_rom_name.clone(),
+                canonical_dat_name: saved.canonical.canonical_dat_name.clone(),
+            });
+        }
+        Ok(decide_verified_dat_name(&judged))
+    }
+}

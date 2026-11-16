@@ -1693,3 +1693,6 @@ fn headered_zip_member_of_an_incomplete_multi_rom_set_is_not_verified() {
 
 // Issue #279: the bounded, resumable re-check of saved evidence.
 mod reaudit;
+
+// S1: the verified catalogue name Organise may propose.
+mod dat_names;

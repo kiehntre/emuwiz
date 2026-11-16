@@ -106,7 +106,10 @@ pub use preservation_fingerprint::PreservationFreshness;
 mod disc_order;
 pub use dat_current::{
     CurrentLibraryDatEvidence, DatRecheckAttempt, SavedDatEvidenceRow, SavedDatEvidenceStatus,
+    VerifiedDatName,
 };
+#[cfg(test)]
+pub(crate) use dat_current::{SavedDatNameRow, decide_verified_dat_name};
 pub use disc_order::DatDiscOrderOutcome;
 #[cfg(test)]
 #[path = "database/catalogue_health_tests.rs"]
