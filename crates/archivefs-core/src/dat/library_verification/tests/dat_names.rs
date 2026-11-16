@@ -35,6 +35,7 @@ fn a_current_single_match_gives_the_catalogue_file_name() {
             rom_name: "Synthetic.tap".into(),
             game_name: "Synthetic".into(),
             dat_source_id: "synthetic".into(),
+            through_archive_member: false,
         }
     );
     // A genuine "not in this catalogue" and an unchecked game give no name.
@@ -84,6 +85,7 @@ fn row(source: &str, status: Status, verdict: &str, rom: Option<&str>) -> SavedD
         saved_verdict: verdict.into(),
         canonical_rom_name: rom.map(Into::into),
         canonical_dat_name: rom.map(|r| r.trim_end_matches(".gba").into()),
+        through_archive_member: false,
     }
 }
 
@@ -122,6 +124,21 @@ fn the_rule_refuses_ambiguity_disagreement_and_missing_names() {
         matches!(decide_verified_dat_name(&[ok.clone(), other]), V::NotUsable(r) if r.contains("disagree"))
     );
     // A current "more than one possible match" beside a match: refuse.
+    // The persisted "several candidates" verdict refuses like "conflicting".
+    let ambiguous = row("b", Status::Current, "ambiguous_multiple_candidates", None);
+    assert!(
+        matches!(decide_verified_dat_name(&[ok.clone(), ambiguous]), V::NotUsable(r) if r.contains("more than one"))
+    );
+    // A match through an archive member is reported as such.
+    let mut member = ok.clone();
+    member.through_archive_member = true;
+    assert!(matches!(
+        decide_verified_dat_name(&[member]),
+        V::Usable {
+            through_archive_member: true,
+            ..
+        }
+    ));
     let conflict = row("b", Status::Current, "conflicting", None);
     assert!(matches!(
         decide_verified_dat_name(&[ok.clone(), conflict]),

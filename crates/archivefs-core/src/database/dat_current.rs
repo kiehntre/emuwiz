@@ -431,6 +431,8 @@ pub struct SavedDatNameRow {
     pub saved_verdict: String,
     pub canonical_rom_name: Option<String>,
     pub canonical_dat_name: Option<String>,
+    /// The match was made through one member of an outer archive.
+    pub through_archive_member: bool,
 }
 
 /// Whether a library item has one verified catalogue name that a rename may
@@ -444,6 +446,8 @@ pub enum VerifiedDatName {
         rom_name: String,
         game_name: String,
         dat_source_id: String,
+        /// The name belongs to a file inside this archive, not the archive.
+        through_archive_member: bool,
     },
     /// Saved evidence exists but must not be used; the text says why.
     NotUsable(String),
@@ -470,10 +474,12 @@ fn status_reason(status: SavedDatEvidenceStatus) -> &'static str {
 pub fn decide_verified_dat_name(rows: &[SavedDatNameRow]) -> VerifiedDatName {
     use SavedDatEvidenceStatus as S;
     let current: Vec<&SavedDatNameRow> = rows.iter().filter(|r| r.status == S::Current).collect();
-    if current
-        .iter()
-        .any(|r| r.saved_verdict == "conflicting" || r.saved_verdict == "ambiguous")
-    {
+    if current.iter().any(|r| {
+        matches!(
+            r.saved_verdict.as_str(),
+            "conflicting" | "ambiguous_multiple_candidates"
+        )
+    }) {
         return VerifiedDatName::NotUsable(
             "a catalogue check found more than one possible match".into(),
         );
@@ -491,7 +497,7 @@ pub fn decide_verified_dat_name(rows: &[SavedDatNameRow]) -> VerifiedDatName {
             None => VerifiedDatName::None,
         };
     }
-    let mut names: Vec<(&str, &str, &str)> = Vec::new();
+    let mut names: Vec<(&str, &str, &str, bool)> = Vec::new();
     for row in &verified {
         let (Some(rom), Some(game)) = (
             row.canonical_rom_name
@@ -507,8 +513,14 @@ pub fn decide_verified_dat_name(rows: &[SavedDatNameRow]) -> VerifiedDatName {
                 "the saved match does not record a single catalogue file name".into(),
             );
         };
-        if !names.iter().any(|(r, _, _)| *r == rom) {
-            names.push((rom, game, row.dat_source_id.as_str()));
+        match names.iter_mut().find(|(r, ..)| *r == rom) {
+            Some(existing) => existing.3 |= row.through_archive_member,
+            None => names.push((
+                rom,
+                game,
+                row.dat_source_id.as_str(),
+                row.through_archive_member,
+            )),
         }
     }
     if names.len() > 1 {
@@ -516,16 +528,17 @@ pub fn decide_verified_dat_name(rows: &[SavedDatNameRow]) -> VerifiedDatName {
             "catalogues disagree on the name: {}",
             names
                 .iter()
-                .map(|(rom, _, source)| format!("'{rom}' ({source})"))
+                .map(|(rom, _, source, _)| format!("'{rom}' ({source})"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
     }
-    let (rom, game, source) = names[0];
+    let (rom, game, source, member) = names[0];
     VerifiedDatName::Usable {
         rom_name: rom.to_string(),
         game_name: game.to_string(),
         dat_source_id: source.to_string(),
+        through_archive_member: member,
     }
 }
 
@@ -589,6 +602,7 @@ impl Database {
                 saved_verdict,
                 canonical_rom_name: saved.canonical.canonical_rom_name.clone(),
                 canonical_dat_name: saved.canonical.canonical_dat_name.clone(),
+                through_archive_member: saved.archive_member.is_some(),
             });
         }
         Ok(decide_verified_dat_name(&judged))

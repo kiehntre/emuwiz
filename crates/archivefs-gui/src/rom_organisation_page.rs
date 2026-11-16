@@ -1581,6 +1581,13 @@ pub(crate) fn name_counts(
 ) -> NameCounts {
     let mut counts = NameCounts::default();
     for entry in &plan.entries {
+        // Blocked, unsupported or colliding entries have no usable destination.
+        if !matches!(
+            entry.status,
+            OrganisationStatus::Suggested | OrganisationStatus::AlreadyOrganised
+        ) {
+            continue;
+        }
         let Some(choice) = choices.get(&entry.source_path) else {
             continue;
         };
@@ -1630,6 +1637,18 @@ pub(crate) fn choose_name(
     };
     let mut skipped_archive = false;
     let dat_refusal = match dat {
+        // Recorded provenance, not an extension guess: a member's name never
+        // renames its archive, even when the member is itself a .zip.
+        V::Usable {
+            through_archive_member: true,
+            rom_name,
+            ..
+        } => {
+            skipped_archive = true;
+            Some(format!(
+                "the catalogue matched '{rom_name}', a file inside this archive; archives are not renamed with an inner file's name"
+            ))
+        }
         V::Usable {
             rom_name,
             dat_source_id,
@@ -1648,9 +1667,8 @@ pub(crate) fn choose_name(
                     skipped_archive: false,
                 };
             }
-            skipped_archive = true;
             Some(format!(
-                "the catalogue names '{rom_name}', a file of another kind (probably inside this archive); renaming archives by catalogue name is not part of this step"
+                "the catalogue names '{rom_name}', a file of another kind; the file's own extension is kept, so the name is not used"
             ))
         }
         V::NotUsable(reason) => Some(reason),
@@ -3424,6 +3442,7 @@ mod tests {
             rom_name: "Pokemon - Emerald Version (USA, Europe).gba".into(),
             game_name: "Pokemon - Emerald Version (USA, Europe)".into(),
             dat_source_id: "no-intro-gba".into(),
+            through_archive_member: false,
         };
         let choice = choose_name(dat(), Some("Pokemon Emerald.gba".into()), source);
         assert_eq!(
@@ -3497,15 +3516,22 @@ mod tests {
             rom_name: rom.into(),
             game_name: rom.into(),
             dat_source_id: "no-intro".into(),
+            through_archive_member: false,
         };
         let files = [
             ("/src/ugly.gba", dat("Nice (USA).gba"), None),
             ("/src/Right (USA).gba", dat("Right (USA).gba"), None),
             (
                 "/src/disk.zip",
-                dat("Disk (1990).adf"),
+                V::Usable {
+                    rom_name: "Disk (1990).adf".into(),
+                    game_name: "Disk (1990)".into(),
+                    dat_source_id: "tosec".into(),
+                    through_archive_member: true,
+                },
                 Some("Disk.zip".to_string()),
             ),
+            ("/src/blocked.gba", dat("Blocked (USA).gba"), None),
             (
                 "/src/other.gbc",
                 V::None,
@@ -3540,6 +3566,13 @@ mod tests {
             });
             choices.insert(source, choice);
         }
+        // A blocked entry has no destination and is never counted.
+        let blocked = entries
+            .iter_mut()
+            .find(|e| e.source_path.ends_with("blocked.gba"))
+            .unwrap();
+        blocked.status = OrganisationStatus::Blocked;
+        blocked.destination_path = PathBuf::new();
         let plan = OrganisationPlan {
             master_root: root,
             mode: OrganisationMode::RenameInPlace,
@@ -3566,6 +3599,7 @@ mod tests {
             rom_name: "Lemmings (1991).adf".into(),
             game_name: "Lemmings (1991)".into(),
             dat_source_id: "tosec-amiga".into(),
+            through_archive_member: true,
         };
         let zip = Path::new("/roms/amiga/lemmings.zip");
         let choice = choose_name(member(), None, zip);
@@ -3574,15 +3608,45 @@ mod tests {
             choice
                 .note
                 .as_deref()
-                .is_some_and(|n| n.contains("another kind"))
+                .is_some_and(|n| n.contains("file inside this archive"))
         );
+        assert!(choice.skipped_archive);
         let with_romm = choose_name(member(), Some("Lemmings.zip".into()), zip);
         assert_eq!(
             (with_romm.name.as_deref(), with_romm.source),
             (Some("Lemmings.zip"), NameSource::Romm)
         );
+        // Even an inner .zip never renames the outer .zip.
+        let inner_zip = V::Usable {
+            rom_name: "Inner.zip".into(),
+            game_name: "Inner".into(),
+            dat_source_id: "x".into(),
+            through_archive_member: true,
+        };
+        assert_eq!(
+            choose_name(inner_zip, None, zip).source,
+            NameSource::Original
+        );
+        // A loose file of another kind is refused but is not an archive.
+        let other_kind = V::Usable {
+            rom_name: "Game.smc".into(),
+            game_name: "Game".into(),
+            dat_source_id: "x".into(),
+            through_archive_member: false,
+        };
+        let refused = choose_name(other_kind.clone(), None, Path::new("/roms/snes/game.sfc"));
+        assert_eq!(
+            (refused.source, refused.skipped_archive),
+            (NameSource::Original, false)
+        );
+        assert!(
+            refused
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("another kind"))
+        );
         // A file with no extension never takes a name that adds one.
-        let bare = choose_name(member(), None, Path::new("/roms/amiga/lemmings"));
+        let bare = choose_name(other_kind, None, Path::new("/roms/amiga/lemmings"));
         assert_eq!(bare.source, NameSource::Original);
     }
 
