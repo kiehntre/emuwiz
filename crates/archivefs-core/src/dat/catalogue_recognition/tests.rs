@@ -313,6 +313,101 @@ fn tosec_game_lists_are_recognised() {
 }
 
 #[test]
+fn tosec_game_lists_split_by_a_reviewed_genre_are_ordinary_game_lists() {
+    for (name, platform) in [
+        ("Commodore C64 - Games - Sports - [D64]", "Commodore 64"),
+        (
+            "Commodore C64 - Games - Shoot'em Up - [T64]",
+            "Commodore 64",
+        ),
+        ("Commodore C64 - Games - Misc - [CRT]", "Commodore 64"),
+        ("Commodore C64 - Games - Arcade", "Commodore 64"),
+        (
+            "Sinclair ZX Spectrum - Games - Adventure - [TZX]",
+            "ZX Spectrum",
+        ),
+        ("Commodore VIC20 - Games - [PRG] - Singlepart", "VIC-20"),
+        ("Commodore Amiga - Games - [ADF] - Multipart", "Amiga"),
+    ] {
+        assert_eq!(tosec(name), games(platform), "{name}");
+    }
+}
+
+#[test]
+fn tosec_headings_outside_the_reviewed_genres_stay_extras() {
+    for (name, platform, what) in [
+        (
+            "Commodore C64 - Games - Boulder Dash - [D64]",
+            "Commodore 64",
+            "Boulder Dash",
+        ),
+        (
+            "Commodore Amiga - Games - Emerald Mine",
+            "Amiga",
+            "Emerald Mine",
+        ),
+        (
+            "Atari ST - Games - Save Disks - [ST]",
+            "AtariST",
+            "Save Disks",
+        ),
+        (
+            "Commodore Amiga - Games - Public Domain - [EXE]",
+            "Amiga",
+            "Public Domain",
+        ),
+        (
+            "Commodore C128 - Games - CPM - [D71]",
+            "Commodore 128",
+            "CPM",
+        ),
+        // A genre followed by another heading narrows the list further.
+        (
+            "Commodore C64 - Games - Sports - Unreleased - [D64]",
+            "Commodore 64",
+            "Sports",
+        ),
+        // Exact text only: a differently written heading is not reviewed.
+        (
+            "Commodore C64 - Games - sports - [D64]",
+            "Commodore 64",
+            "sports",
+        ),
+        (
+            "Commodore C64 - Games - Shoot-em Up - [D64]",
+            "Commodore 64",
+            "Shoot-em Up",
+        ),
+    ] {
+        assert_eq!(
+            extras(&tosec(name), platform),
+            format!("\u{201c}{what}\u{201d}"),
+            "{name}"
+        );
+    }
+    // Compilations stay compilations even when split by genre.
+    assert_eq!(
+        extras(
+            &tosec("Commodore C64 - Compilations - Games - Sports - [D64]"),
+            "Commodore 64"
+        ),
+        "compilations"
+    );
+}
+
+#[test]
+fn a_reviewed_genre_never_makes_an_unsupported_system_usable() {
+    for name in [
+        "Commodore C64DTV - Games - Sports",
+        "Tandy Radio Shack TRS-80 Model 4 - Games - Arcade",
+        "Acorn Atom - Games - Adventure - [UEF]",
+    ] {
+        let recognition = tosec(name);
+        assert_eq!(recognition.safe_platform(), None, "{name}: {recognition:?}");
+    }
+}
+
+#[test]
 fn tosec_non_game_collections_are_extras_or_not_games() {
     assert_eq!(extras(&tosec("Commodore Amiga - Demos"), "Amiga"), "demos");
     assert_eq!(

@@ -318,15 +318,21 @@ fn recognise_tosec(name: &str) -> Option<CatalogueRecognition> {
     let what: Option<String> = match classification.category {
         TosecFriendlyCategory::Games => {
             // Anything after "Games" other than media tags in brackets
-            // ("Games - [ADF]") is a different collection.
+            // ("Games - [ADF]"), how the release is split into files, or one
+            // reviewed genre heading is a different collection.
             let segments: Vec<&str> = name.split(" - ").map(str::trim).collect();
             let after: &[&str] = segments
                 .iter()
                 .rposition(|segment| matches!(*segment, "Games" | "Game"))
                 .map_or(&[], |index| &segments[index + 1..]);
-            let extra = after
-                .iter()
-                .find(|segment| !(segment.starts_with('[') && segment.ends_with(']')));
+            let mut extras = after.iter().filter(|segment| {
+                !(segment.starts_with('[') && segment.ends_with(']'))
+                    && !TOSEC_FILE_SPLITS.contains(segment)
+            });
+            let extra = match (extras.next(), extras.next()) {
+                (Some(genre), None) if TOSEC_GAME_GENRES.contains(genre) => None,
+                (first, _) => first,
+            };
             match (classification.qualifier.as_deref(), extra) {
                 (Some(_), _) => Some("compilations".to_string()),
                 (None, Some(extra)) => Some(format!("\u{201c}{extra}\u{201d}")),
@@ -358,6 +364,32 @@ fn recognise_tosec(name: &str) -> Option<CatalogueRecognition> {
         Some(what) => CatalogueRecognition::Extras { platform, what },
     })
 }
+
+/// Genre headings TOSEC uses to split one system's ordinary game list
+/// ("Commodore C64 - Games - Sports - [D64]"). Reviewed by hand against the
+/// 2025-03-13 release: each still holds ordinary, released games for exactly
+/// the system the name leads with, so the list is as safe as an unsplit one.
+/// Exact text only. Headings for other kinds of collection (compilations,
+/// save disks, public domain, fan-made level series such as "Boulder Dash",
+/// add-ons and patches, CP/M software) are deliberately absent and stay
+/// extras that only a person may choose.
+const TOSEC_GAME_GENRES: &[&str] = &[
+    "Adventure",
+    "Arcade",
+    "Board",
+    "Cards",
+    "Gambling",
+    "Misc",
+    "Racing",
+    "Shoot'em Up",
+    "Simulation",
+    "Sports",
+    "Strategy",
+];
+
+/// How TOSEC splits one release into files ("Games - [PRG] - Singlepart").
+/// Says nothing about what the list holds.
+const TOSEC_FILE_SPLITS: &[&str] = &["Singlepart", "Multipart"];
 
 /// The platform of a TOSEC system name such as `Sega Mark III & Master System`.
 fn tosec_system_platform(system: &str) -> Result<&'static str, CatalogueRecognition> {
