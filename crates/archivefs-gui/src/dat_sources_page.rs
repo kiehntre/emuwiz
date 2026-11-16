@@ -5582,6 +5582,18 @@ impl DatSourcesPageState {
                 return;
             }
         };
+        // A partial inventory must never be saved: staging later treats the
+        // saved list as the whole pack, so the DATs the walk stopped before
+        // would silently vanish from every selection.
+        if !inventory.scan_complete {
+            self.tosec_action_error = Some(format!(
+                "Nothing imported: EmuWiz could not list every DAT in this folder \
+                 (it stopped after {} DATs, or the folder is nested too deeply). \
+                 Choose a smaller folder, such as the TOSEC folder inside the release.",
+                inventory.dats.len()
+            ));
+            return;
+        }
         if self
             .tosec_packs
             .iter()
@@ -5799,6 +5811,16 @@ impl DatSourcesPageState {
         if pack.selections.is_empty() {
             // Expected state, not a failure: the screen disables the button and
             // says "Select at least one DAT group first."
+            return;
+        }
+        // The saved list is only trusted once a fresh, complete listing of the
+        // folder matches it; that is what makes `scan_complete: true` true.
+        if let Err(error) =
+            archivefs_core::dat::tosec_release_pack::verify_persisted_pack_is_complete(pack)
+        {
+            self.tosec_managed_error = Some(error);
+            self.tosec_action_error = self.tosec_managed_error.clone();
+            self.refresh_tosec_managed_view();
             return;
         }
         let now = std::time::SystemTime::now()

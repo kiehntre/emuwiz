@@ -62,7 +62,10 @@ const MAX_PACK_WALK_DEPTH: usize = 6;
 /// Total directory entries examined before the scan declares itself partial.
 const MAX_PACK_ENTRIES_EXAMINED: usize = 100_000;
 /// Maximum inventoried DAT candidates; beyond this the scan is partial.
-const MAX_PACK_DATS: usize = 2_000;
+/// A complete official TOSEC release holds about 4,700 DATs (TOSEC, TOSEC-ISO
+/// and TOSEC-PIX together), so the bound must sit above that or a real,
+/// extracted release can never be inventoried in full.
+pub const MAX_PACK_DATS: usize = 8_192;
 /// Largest single DAT hashed during inventory. Keep this aligned with the
 /// existing default parser ceiling: a candidate too large to parse must not be
 /// hashed here and then fail later through an unbounded import hash.
@@ -744,6 +747,40 @@ pub fn inventory_release_pack(root: &Path) -> Result<TosecPackInventory, TosecPa
         skipped: state.skipped,
         scan_complete: state.complete,
     })
+}
+
+/// Re-lists a saved pack's folder and confirms the saved DAT list is the whole
+/// pack. A pack saved before partial inventories were refused (or whose
+/// folder has since changed) must be removed and imported again, never staged
+/// from a list that may silently miss DATs.
+pub fn verify_persisted_pack_is_complete(pack: &PersistedTosecPack) -> Result<(), String> {
+    let fresh = inventory_release_pack(&pack.root_path).map_err(|error| error.to_string())?;
+    if !fresh.scan_complete {
+        return Err(format!(
+            "Not staged: EmuWiz cannot list every DAT in {} (more than {MAX_PACK_DATS} DATs, \
+             more than {MAX_PACK_ENTRIES_EXAMINED} entries, or nested too deeply).",
+            pack.root_path.display()
+        ));
+    }
+    let saved: BTreeSet<&Path> = pack
+        .dats
+        .iter()
+        .map(|dat| dat.relative_path.as_path())
+        .collect();
+    let found: BTreeSet<&Path> = fresh
+        .dats
+        .iter()
+        .map(|dat| dat.relative_path.as_path())
+        .collect();
+    if saved != found {
+        return Err(format!(
+            "Not staged: this pack's saved list ({} DATs) does not match its folder ({} DATs). \
+             It may have been saved incompletely. Remove the pack and import it again.",
+            saved.len(),
+            found.len()
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1770,6 +1807,45 @@ fn resolve_selected_dat_path(
     Ok(canonical_dat)
 }
 
+/// The id of an enabled, user-local FILE source that the verifier will really
+/// read and that holds exactly the bytes of `dat` (same file name, equal
+/// SHA-256). Only same-named files are hashed, so the check stays bounded.
+///
+/// Deliberately narrow, because a false match leaves the selected DAT
+/// registered nowhere:
+/// - only entries the registry actually loads (valid, unique IDs) count;
+/// - only file sources: a folder source is read with its own caps and order,
+///   so a same-named file inside one is not proof the verifier uses it;
+/// - the path must pass the verifier's own path policy (no symlink in any
+///   component, a regular file);
+/// - entries owned by a TOSEC release pack or any other EmuWiz workflow never
+///   count: they can be removed by that workflow, and a DAT skipped here would
+///   then silently lose its only registration.
+fn user_file_source_with_same_bytes(sources: &DatSourcesConfig, dat: &Path) -> Option<String> {
+    let name = dat.file_name()?;
+    let digest = sha256_file_bounded(dat).ok().flatten()?;
+    let (registry, _) = crate::dat::sources::DatSourceRegistry::from_config(sources);
+    for entry in registry.sorted_all() {
+        if !entry.enabled
+            || entry.kind != DatSourceKind::File
+            || entry.ownership != DatSourceOwnership::UserLocal
+            || entry.path.file_name() != Some(name)
+            || entry.path == dat
+        {
+            continue;
+        }
+        if crate::dat::sources::validation::validate_dat_path(&entry.path, DatSourceKind::File)
+            .is_err()
+        {
+            continue;
+        }
+        if sha256_file_bounded(&entry.path).ok().flatten().as_deref() == Some(digest.as_str()) {
+            return Some(entry.id.clone());
+        }
+    }
+    None
+}
+
 /// Registers every selected DAT of one pack into `sources`, validating each
 /// through the existing classic-TOSEC import path (bounded parser, internal
 /// ecosystem gate, artifact digest, collision-preserving index). Re-registering
@@ -1824,6 +1900,17 @@ pub fn register_selected_tosec_dats(
                     .iter()
                     .flatten()
                     .find(|existing| existing.path == absolute_text || existing.id == id);
+                // The user may already have registered these exact bytes as
+                // their own DAT file under another path. A second registration
+                // of identical content would double every match, so it is
+                // satisfied, not added (see user_file_source_with_same_bytes
+                // for what deliberately does not count).
+                if existing.is_none()
+                    && user_file_source_with_same_bytes(sources, &absolute).is_some()
+                {
+                    outcome.already_registered.push(dat.relative_path.clone());
+                    continue;
+                }
                 if let Some(existing) = existing {
                     if existing.path == absolute_text {
                         if existing.ownership.is_user_local() {
