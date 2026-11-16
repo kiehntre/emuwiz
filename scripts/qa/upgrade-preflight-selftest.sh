@@ -103,6 +103,51 @@ make_db "$ROOT/mount/data/library.sqlite3" "$CURRENT"
 run_case missing-mount 2 --config-root "$ROOT/mount/config" --data-root "$ROOT/mount/data" \
     --legacy-config-root "$ROOT/mount/legacy-config" --legacy-data-root "$ROOT/mount/legacy-data"
 
+# DAT sources: a missing path named only by a disabled source is an inactive
+# warning; enabled sources (explicitly, or by default) and a path shared with an
+# enabled source still block.
+dat_case() {
+    local name="$1" expected="$2" body="$3"
+    mkdir -p "$ROOT/$name/config" "$ROOT/$name/data"
+    printf '%s' "$body" > "$ROOT/$name/config/dat_sources.toml"
+    make_db "$ROOT/$name/data/library.sqlite3" "$CURRENT"
+    run_case "$name" "$expected" --config-root "$ROOT/$name/config" --data-root "$ROOT/$name/data" \
+        --legacy-config-root "$ROOT/$name/legacy-config" --legacy-data-root "$ROOT/$name/legacy-data"
+}
+dat_case dat-disabled-missing 1 '[[sources]]
+id = "old"
+path = "/mnt/not-mounted/old.dat"
+kind = "file"
+enabled = false
+'
+grep -q 'inactive: disabled DAT source path is missing' "$ROOT/dat-disabled-missing.out" || {
+    echo "self-test failed: dat-disabled-missing did not report the inactive warning" >&2; exit 1; }
+grep -q 'MOUNT MAY BE UNAVAILABLE' "$ROOT/dat-disabled-missing.out" && {
+    echo "self-test failed: dat-disabled-missing reported a blocker" >&2; exit 1; }
+dat_case dat-enabled-missing 2 '[[sources]]
+id = "old"
+path = "/mnt/not-mounted/old.dat"
+kind = "file"
+enabled = true
+'
+dat_case dat-default-enabled-missing 2 '[[sources]]
+id = "old"
+path = "/mnt/not-mounted/old.dat"
+kind = "file"
+'
+dat_case dat-shared-path-missing 2 '[[sources]]
+id = "off"
+path = "/mnt/not-mounted/shared.dat"
+kind = "file"
+enabled = false
+
+[[sources]]
+id = "on"
+path = "/mnt/not-mounted/shared.dat"
+kind = "file"
+enabled = true
+'
+
 mkdir -p "$ROOT/secret/config" "$ROOT/secret/data" "$ROOT/secret/mount"
 printf 'mount_root = "%s"\nromm_token = "DO_NOT_PRINT"\n' "$ROOT/secret/mount" > "$ROOT/secret/config/config.toml"
 make_db "$ROOT/secret/data/library.sqlite3" "$CURRENT"
