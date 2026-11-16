@@ -447,6 +447,36 @@ fn managed_snapshot_rejects_excessive_selected_member_count() {
 }
 
 #[test]
+fn a_complete_official_size_release_is_inventoried_in_full() {
+    // The 2025 complete release ships 4,743 DATs; a flat 3,111-file TOSEC
+    // folder was once cut at 2,000 without the user being told.
+    assert!(MAX_PACK_DATS >= 4_743);
+    let fixture = PackFixture::new();
+    for index in 0..3_111 {
+        fixture.write_dat(
+            &[&format!(
+                "System {index:04} - Games (TOSEC-v2025-01-01_CM).dat"
+            )],
+            "x",
+        );
+    }
+    let inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    assert!(inventory.scan_complete);
+    assert_eq!(inventory.dats.len(), 3_111);
+}
+
+#[test]
+fn a_release_beyond_the_dat_bound_is_reported_partial() {
+    let fixture = PackFixture::new();
+    for index in 0..=MAX_PACK_DATS {
+        fixture.write_dat(&[&format!("D{index:05} - Games (TOSEC).dat")], "x");
+    }
+    let inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    assert!(!inventory.scan_complete);
+    assert_eq!(inventory.dats.len(), MAX_PACK_DATS);
+}
+
+#[test]
 fn a_small_synthetic_release_directory_is_inventoried() {
     let fixture = PackFixture::standard();
     let inventory = inventory_release_pack(&fixture.pack_root).unwrap();
@@ -709,6 +739,143 @@ fn selected_release_pack_dat_gets_typed_ownership_that_survives_registry_reload(
     let reloaded = load_dat_sources_config_from(&registry).unwrap();
     let entry = &reloaded.sources.unwrap()[0];
     assert_eq!(entry.ownership, outcome.registered[0].entry.ownership);
+}
+
+const AMIGA_LEAF: &str = "Amiga - Games - Floppy (TOSEC-v2021-01-09).dat";
+
+/// Writes a one-entry registry naming `path` (a file or folder) and returns it.
+fn registry_with(fixture: &PackFixture, kind: &str, path: &Path, enabled: bool) -> PathBuf {
+    let registry = fixture._root.path().join("dat_sources.toml");
+    std::fs::write(
+        &registry,
+        format!(
+            "[[sources]]\nid = \"mine\"\ndisplay_name = \"Mine\"\npath = \"{}\"\nkind = \"{kind}\"\nenabled = {enabled}\n",
+            path.display()
+        ),
+    )
+    .unwrap();
+    registry
+}
+
+fn amiga_pack(fixture: &PackFixture) -> PersistedTosecPack {
+    let inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    let mut pack = persisted_from_inventory(&inventory);
+    select_amiga_floppy(&mut pack);
+    pack
+}
+
+fn registered_ids(registry: &Path) -> Vec<String> {
+    load_dat_sources_config_from(registry)
+        .unwrap()
+        .sources
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect()
+}
+
+#[test]
+fn identical_bytes_already_registered_elsewhere_are_not_registered_twice() {
+    let fixture = PackFixture::standard();
+    let own = fixture._root.path().join("own");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(own.join(AMIGA_LEAF), AMIGA_GAMES_FLOPPY_DAT).unwrap();
+    let registry = registry_with(&fixture, "file", &own.join(AMIGA_LEAF), true);
+
+    let outcome = apply_selection_to_registry(&amiga_pack(&fixture), &registry, 42).unwrap();
+    assert!(outcome.registered.is_empty());
+    assert_eq!(outcome.already_registered.len(), 1);
+    assert_eq!(registered_ids(&registry), vec!["mine".to_string()]);
+}
+
+#[test]
+fn identical_bytes_inside_a_registered_folder_are_not_registered_twice() {
+    let fixture = PackFixture::standard();
+    let own = fixture._root.path().join("own-folder");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(own.join(AMIGA_LEAF), AMIGA_GAMES_FLOPPY_DAT).unwrap();
+    let registry = registry_with(&fixture, "folder", &own, true);
+
+    let outcome = apply_selection_to_registry(&amiga_pack(&fixture), &registry, 42).unwrap();
+    assert!(outcome.registered.is_empty());
+    assert_eq!(outcome.already_registered.len(), 1);
+}
+
+#[test]
+fn a_disabled_or_different_same_named_dat_does_not_block_registration() {
+    for (bytes, enabled) in [
+        (AMIGA_GAMES_FLOPPY_DAT.to_string(), false),
+        (
+            AMIGA_GAMES_FLOPPY_DAT.replace("Another Game", "Other Game"),
+            true,
+        ),
+    ] {
+        let fixture = PackFixture::standard();
+        let own = fixture._root.path().join("own");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join(AMIGA_LEAF), bytes).unwrap();
+        let registry = registry_with(&fixture, "file", &own.join(AMIGA_LEAF), enabled);
+
+        let outcome = apply_selection_to_registry(&amiga_pack(&fixture), &registry, 42).unwrap();
+        assert_eq!(outcome.registered.len(), 1, "enabled={enabled}");
+        assert_eq!(registered_ids(&registry).len(), 2);
+    }
+}
+
+#[test]
+fn activating_another_pack_keeps_the_previous_release_entries_files_and_rollback() {
+    let (store_root, store) = managed_store();
+    let registry = store_root.path().join("dat-sources.toml");
+
+    // Release A: a ZX Spectrum pack, active and registered first.
+    let spectrum = PackFixture::standard();
+    let spectrum_inventory = inventory_release_pack(&spectrum.pack_root).unwrap();
+    let spectrum_key = find_dat(&spectrum_inventory, "ZX Spectrum - Games - Tape").selection_key();
+    let a = store
+        .stage_release_pack(&spectrum_inventory, &BTreeSet::from([spectrum_key]), 1)
+        .unwrap();
+    let a_hash = store.activate(&a, None).unwrap().active.sha256;
+    let a_outcome = store
+        .register_active_snapshot_to_registry(&registry, 2)
+        .unwrap();
+    assert_eq!(a_outcome.registered.len(), 1);
+    let a_entry = a_outcome.registered[0].entry.clone();
+    let a_bytes = std::fs::read(&a_entry.path).unwrap();
+
+    // Release B: a different pack folder; its Amiga DAT duplicates a user DAT.
+    let amiga = PackFixture::standard();
+    let own = amiga._root.path().join(AMIGA_LEAF);
+    std::fs::write(&own, AMIGA_GAMES_FLOPPY_DAT).unwrap();
+    let mut config = load_dat_sources_config_from(&registry).unwrap();
+    let mut mine = local_source("mine", &own.to_string_lossy());
+    mine.enabled = Some(true);
+    config.sources.get_or_insert_with(Vec::new).push(mine);
+    crate::dat::sources::save_dat_sources_config_to(&registry, &config).unwrap();
+
+    let amiga_inventory = inventory_release_pack(&amiga.pack_root).unwrap();
+    let amiga_key = find_dat(&amiga_inventory, "Amiga - Games - Floppy").selection_key();
+    let b = store
+        .stage_release_pack(&amiga_inventory, &BTreeSet::from([amiga_key]), 3)
+        .unwrap();
+    store.activate(&b, Some(&a_hash)).unwrap();
+    let b_outcome = store
+        .register_active_snapshot_to_registry(&registry, 4)
+        .unwrap();
+
+    assert!(
+        b_outcome.registered.is_empty(),
+        "B duplicates the user's DAT"
+    );
+    assert_eq!(b_outcome.already_registered.len(), 1);
+    assert!(
+        b_outcome.removed.is_empty(),
+        "release A entries are never removed"
+    );
+    let ids = registered_ids(&registry);
+    assert!(ids.contains(&a_entry.id) && ids.contains(&"mine".to_string()));
+    assert_eq!(ids.len(), 2);
+    assert_eq!(std::fs::read(&a_entry.path).unwrap(), a_bytes);
+    assert_eq!(store.rollback(&a_hash).unwrap().active.sha256, a_hash);
 }
 
 #[test]

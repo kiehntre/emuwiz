@@ -62,7 +62,10 @@ const MAX_PACK_WALK_DEPTH: usize = 6;
 /// Total directory entries examined before the scan declares itself partial.
 const MAX_PACK_ENTRIES_EXAMINED: usize = 100_000;
 /// Maximum inventoried DAT candidates; beyond this the scan is partial.
-const MAX_PACK_DATS: usize = 2_000;
+/// A complete official TOSEC release holds about 4,700 DATs (TOSEC, TOSEC-ISO
+/// and TOSEC-PIX together), so the bound must sit above that or a real,
+/// extracted release can never be inventoried in full.
+pub const MAX_PACK_DATS: usize = 8_192;
 /// Largest single DAT hashed during inventory. Keep this aligned with the
 /// existing default parser ceiling: a candidate too large to parse must not be
 /// hashed here and then fail later through an unbounded import hash.
@@ -1770,6 +1773,43 @@ fn resolve_selected_dat_path(
     Ok(canonical_dat)
 }
 
+/// The id of an enabled registered source that already holds a DAT with the
+/// exact bytes of `dat` (same file name, equal SHA-256). Only same-named files
+/// are hashed, so the check stays bounded; a folder source is looked up one
+/// level deep, as the verifier reads it. Symlinks never match.
+///
+/// Entries owned by a TOSEC release pack never count: deselecting a group in
+/// that pack removes its entry, and a DAT skipped here because of it would
+/// then silently lose its only registration.
+fn enabled_source_with_same_bytes(sources: &DatSourcesConfig, dat: &Path) -> Option<String> {
+    let name = dat.file_name()?;
+    let digest = sha256_file_bounded(dat).ok().flatten()?;
+    for entry in sources.sources.iter().flatten() {
+        if entry.enabled == Some(false) || entry.ownership.imported_tosec_release_pack().is_some() {
+            continue;
+        }
+        let root = Path::new(&entry.path);
+        let candidate = match entry.kind {
+            DatSourceKind::File if root.file_name() == Some(name) => root.to_path_buf(),
+            DatSourceKind::Folder => root.join(name),
+            _ => continue,
+        };
+        if candidate == dat {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        if sha256_file_bounded(&candidate).ok().flatten().as_deref() == Some(digest.as_str()) {
+            return Some(entry.id.clone());
+        }
+    }
+    None
+}
+
 /// Registers every selected DAT of one pack into `sources`, validating each
 /// through the existing classic-TOSEC import path (bounded parser, internal
 /// ecosystem gate, artifact digest, collision-preserving index). Re-registering
@@ -1824,6 +1864,16 @@ pub fn register_selected_tosec_dats(
                     .iter()
                     .flatten()
                     .find(|existing| existing.path == absolute_text || existing.id == id);
+                // The same bytes may already be registered under another path
+                // (the user's own folder, another pack, or a different
+                // snapshot copy). A second registration of identical content
+                // would double every match, so it is satisfied, not added.
+                if existing.is_none()
+                    && enabled_source_with_same_bytes(sources, &absolute).is_some()
+                {
+                    outcome.already_registered.push(dat.relative_path.clone());
+                    continue;
+                }
                 if let Some(existing) = existing {
                     if existing.path == absolute_text {
                         if existing.ownership.is_user_local() {
