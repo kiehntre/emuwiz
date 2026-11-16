@@ -552,6 +552,29 @@ def managed_installs_report(config_root: Path, data_root: Path) -> tuple[list[di
     return results, warnings
 
 
+# Label for a path that only a DAT source with `enabled = false` names. EmuWiz
+# does not read a disabled source, so a missing path there is reported as an
+# inactive warning, never as a blocker. A path also named by an enabled source
+# or anything else keeps the ordinary (blocking) treatment.
+INACTIVE_DAT_LABEL = "disabled DAT source path"
+
+
+def dat_registry_paths(document: Any) -> list[tuple[str, str]]:
+    if not isinstance(document, dict) or not isinstance(document.get("sources"), list):
+        return absolute_strings(document)
+    disabled = [s for s in document["sources"] if isinstance(s, dict) and s.get("enabled") is False]
+    rest = dict(document)
+    rest["sources"] = [s for s in document["sources"] if not (isinstance(s, dict) and s.get("enabled") is False)]
+    active = absolute_strings(rest)
+    active_values = {value for _, value in active}
+    inactive = [
+        (INACTIVE_DAT_LABEL, value)
+        for _, value in absolute_strings(disabled)
+        if value not in active_values
+    ]
+    return active + inactive
+
+
 def dat_provider_report(config_root: Path, data_root: Path) -> tuple[dict[str, Any], list[tuple[str, str]], list[str]]:
     files = []
     absolute: list[tuple[str, str]] = []
@@ -563,7 +586,10 @@ def dat_provider_report(config_root: Path, data_root: Path) -> tuple[dict[str, A
         item: dict[str, Any] = {"path": str(path), "status": "readable"}
         try:
             document = tomllib.loads(path.read_text(encoding="utf-8"))
-            paths = absolute_strings(document)
+            if relative == "dat_sources.toml":
+                paths = dat_registry_paths(document)
+            else:
+                paths = absolute_strings(document)
             absolute.extend(paths)
             item["absolute_path_count"] = len(paths)
             item["configured_entries"] = len(document) if isinstance(document, dict) else 0
@@ -646,6 +672,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         if install.get("install_root"):
             path_items.append(path_health("managed emulator install root", install["install_root"]))
     for item in path_items:
+        if item["label"] == INACTIVE_DAT_LABEL and item["status"] in {"Missing", "Unavailable"}:
+            warnings.append(f"inactive: disabled DAT source path is {item['status'].lower()} (not used while disabled): {item['path']}")
+            continue
         warning = mount_warning(item)
         if warning:
             mount_warnings.append(warning)
