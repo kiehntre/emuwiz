@@ -1456,10 +1456,8 @@ fn build_candidates(
     let database = Database::open_read_only(&database_path).ok()?;
     let mut candidates = Vec::new();
     for source in sources {
-        let archive_id = database
-            .find_archive_id_by_absolute_path(source)
-            .ok()
-            .flatten();
+        let lookup = database.find_archive_id_by_absolute_path(source);
+        let archive_id = lookup.as_ref().ok().copied().flatten();
         let resolution = match archive_id {
             Some(archive_id) => {
                 let evidence = database
@@ -1470,7 +1468,7 @@ fn build_candidates(
             }
             None => PlatformIdentityResolution::Unknown { generation },
         };
-        let choice = names.choose_known(source, archive_id);
+        let choice = names.choose_looked_up(source, lookup);
         candidates.push(OrganisationCandidate {
             source_path: source.clone(),
             resolution,
@@ -1744,13 +1742,26 @@ impl NameResolver {
         use archivefs_core::VerifiedDatName as V;
         match &self.database {
             None => self.finish(V::NotUsable("the library could not be read".into()), source),
-            Some(database) => match database.find_archive_id_by_absolute_path(source) {
-                Ok(id) => self.choose_known(source, id),
-                Err(error) => self.finish(
-                    V::NotUsable(format!("the library could not be read ({error})")),
-                    source,
-                ),
-            },
+            Some(database) => {
+                self.choose_looked_up(source, database.find_archive_id_by_absolute_path(source))
+            }
+        }
+    }
+
+    /// [`Self::choose`] for a file whose library lookup the caller already
+    /// made. A failed lookup is explained, exactly as [`Self::choose`] does.
+    pub(crate) fn choose_looked_up<E: std::fmt::Display>(
+        &self,
+        source: &Path,
+        lookup: Result<Option<i64>, E>,
+    ) -> NameChoice {
+        use archivefs_core::VerifiedDatName as V;
+        match lookup {
+            Ok(id) => self.choose_known(source, id),
+            Err(error) => self.finish(
+                V::NotUsable(format!("the library could not be read ({error})")),
+                source,
+            ),
         }
     }
 
@@ -3680,6 +3691,35 @@ mod tests {
         assert_eq!((neither.name, neither.source), (None, NameSource::Original));
         assert!(neither.note.is_some());
         assert_eq!(choose_name(V::None, None, source).note, None);
+    }
+
+    #[test]
+    fn a_failed_library_lookup_is_explained_in_the_preview_as_at_apply() {
+        let names = NameResolver {
+            romm: RommTitles::default(),
+            database: None,
+            saved_archives: None,
+            catalogues: Default::default(),
+        };
+        let source = Path::new("/roms/gba/game.gba");
+        let failed = names.choose_looked_up(source, Err::<Option<i64>, _>("disk I/O error"));
+        assert_eq!(
+            (&failed.name, &failed.source),
+            (&None, &NameSource::Original)
+        );
+        assert!(
+            failed
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("the library could not be read (disk I/O error)")),
+            "{:?}",
+            failed.note
+        );
+        // A successful lookup is exactly the already-looked-up path.
+        assert_eq!(
+            names.choose_looked_up(source, Ok::<_, String>(Some(7))),
+            names.choose_known(source, Some(7))
+        );
     }
 
     #[test]
