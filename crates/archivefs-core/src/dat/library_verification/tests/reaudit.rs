@@ -1692,8 +1692,10 @@ mod first_matching {
         struct C64Library {
             f: Fixture,
             /// (source id, header, [(game name, content)]), as registered.
-            dats: Vec<(String, String, Vec<(String, Vec<u8>)>)>,
+            dats: Vec<SyntheticDat>,
         }
+
+        type SyntheticDat = (String, String, Vec<(String, Vec<u8>)>);
 
         fn tape(name: &str) -> Vec<u8> {
             format!("synthetic C64 tape: {name}").into_bytes()
@@ -1940,7 +1942,7 @@ mod first_matching {
                 notes[&3].contains("disagree") && notes[&3].contains("Clash"),
                 "{notes:?}"
             );
-            assert!(notes[&4].contains("more than one entry"), "{notes:?}");
+            assert!(notes[&4].contains("more than once"), "{notes:?}");
             assert!(notes[&6].contains("definitive"), "{notes:?}");
             // Listed in none: one record, not one per catalogue.
             assert_eq!(c.not_listed_rows(), vec![(5, C64.to_string(), 4)]);
@@ -2053,6 +2055,96 @@ mod first_matching {
                 "{report:#?}"
             );
             assert!(c.identity_rows().is_empty() && c.not_listed_rows().is_empty());
+        }
+
+        /// Review B1: an archive whose member one list matches twice (or
+        /// in part) is evidence about the game: it is never "not listed",
+        /// and another list's verified match for it is not saved.
+        #[test]
+        fn an_archive_member_matched_by_a_list_is_never_read_as_not_listed() {
+            let mut c = c64();
+            c.dats[2].2.push(("ZT A".into(), tape("ZipTwice")));
+            c.dats[2].2.push(("ZT B".into(), tape("ZipTwice")));
+            c.dats[1].2.push(("ZT".into(), tape("ZipTwice")));
+            c.dats[2]
+                .2
+                .push(("Only Twice A".into(), tape("Only Twice")));
+            c.dats[2]
+                .2
+                .push(("Only Twice B".into(), tape("Only Twice")));
+            c.write();
+            c.f.zip("zt.zip", "zt.tap", &tape("ZipTwice"));
+            c.f.add(7, "zt.zip", None, Some(C64));
+            c.f.zip("only-twice.zip", "ot.tap", &tape("Only Twice"));
+            c.f.add(8, "only-twice.zip", None, Some(C64));
+            let plan = c.plan();
+            assert_eq!(
+                ids(group(&plan, "catalogue-set:Commodore 64")),
+                vec![1, 2, 3, 4, 5, 6, 7, 8]
+            );
+            c.run(&plan.plan, &AtomicBool::new(false), &|_| {});
+            assert!(
+                c.identity_rows().iter().all(|row| row.0 != 7 && row.0 != 8),
+                "{:#?}",
+                c.identity_rows()
+            );
+            assert_eq!(c.not_listed_rows(), vec![(5, C64.to_string(), 4)]);
+            let notes: BTreeMap<i64, String> =
+                c.f.notes()
+                    .into_iter()
+                    .map(|n| (n.archive_id, n.reason))
+                    .collect();
+            assert!(notes[&7].contains("c64-misc"), "{notes:?}");
+            assert!(notes[&8].contains("c64-misc"), "{notes:?}");
+        }
+
+        /// Review B2: a save reads the game again. If it reads differently
+        /// from the screen (the file was replaced in between), nothing is
+        /// saved from that catalogue.
+        #[test]
+        fn a_file_replaced_before_the_save_saves_nothing_that_was_not_screened() {
+            let c = c64();
+            let plan = c.plan();
+            let replaced = Cell::new(false);
+            c.run(&plan.plan, &AtomicBool::new(false), &|p| {
+                if let ReauditProgress::Audit(_) = p
+                    && !replaced.get()
+                {
+                    replaced.set(true);
+                    // Another game, listed by the corroborating list.
+                    std::fs::write(c.f.root.join("shared.tap"), tape("Arcade Only")).unwrap();
+                }
+            });
+            assert!(replaced.get(), "the save phase was reached");
+            assert!(
+                c.identity_rows().iter().all(|row| row.0 != 2),
+                "{:#?}",
+                c.identity_rows()
+            );
+            assert!(c.not_listed_rows().iter().all(|row| row.0 != 2));
+        }
+
+        /// Review B3: a stop during the saves records no "listed in none".
+        #[test]
+        fn a_stop_during_the_saves_records_no_not_listed() {
+            let c = c64();
+            let plan = c.plan();
+            let cancel = AtomicBool::new(false);
+            let report = c.run(&plan.plan, &cancel, &|p| {
+                if let ReauditProgress::Audit(_) = p {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            });
+            assert!(
+                matches!(report.stopped, Some(ReauditStop::Cancelled)),
+                "{report:#?}"
+            );
+            assert!(c.not_listed_rows().is_empty());
+            assert_eq!(c.sets(), 0);
+            // Nothing is mistaken for done: the next plan has every unsaved game.
+            let next = c.plan();
+            assert_eq!(next.not_listed, 0);
+            assert_eq!(next.plan.games() + next.already_checked, 6);
         }
 
         #[test]

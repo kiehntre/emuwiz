@@ -105,8 +105,8 @@ mod preservation_fingerprint;
 pub use preservation_fingerprint::PreservationFreshness;
 mod disc_order;
 pub use dat_current::{
-    CatalogueSet, CatalogueSetNoMatch, CurrentLibraryDatEvidence, DatRecheckAttempt,
-    SavedDatEvidenceRow, SavedDatEvidenceStatus, VerifiedDatName,
+    CatalogueSet, CurrentLibraryDatEvidence, DatRecheckAttempt, SavedDatEvidenceRow,
+    SavedDatEvidenceStatus, VerifiedDatName,
 };
 #[cfg(test)]
 pub(crate) use dat_current::{SavedDatNameRow, decide_verified_dat_name};

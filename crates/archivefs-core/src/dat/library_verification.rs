@@ -706,12 +706,16 @@ pub struct ScreenFinding {
 pub struct Screened {
     pub findings: Vec<ScreenFinding>,
     pub unchecked: Vec<VerificationExclusion>,
+    /// Archives at least one of whose members matched this catalogue (one
+    /// or several entries), whatever the archive as a whole came to.
+    pub member_hits: BTreeSet<PathBuf>,
 }
 
 struct Evaluated {
     outcome: DatAuditOutcome,
     projection: super::library_identity_projection::LibraryDatIdentityProjection,
     totals: VerificationTotals,
+    member_hits: BTreeSet<PathBuf>,
 }
 
 /// A definitive per-row result of one verification run.
@@ -787,11 +791,49 @@ impl VerificationPreview {
         cancel: &AtomicBool,
         progress: &dyn Fn(DatAuditProgress),
     ) -> Result<VerificationTotals, String> {
+        let evaluated =
+            self.evaluate(trusted, cancel, progress, AuditCacheConfig::Disabled, true)?;
+        self.persist(evaluated)
+    }
+
+    /// [`Self::execute`], but saves nothing unless every confirmed row reads
+    /// exactly as `expected` says (the same result, from the same file
+    /// object and content, as an earlier [`Self::screen`]). A row without a
+    /// result, or with another one, refuses the whole save.
+    pub fn execute_expecting(
+        self,
+        trusted: &TrustedRoots,
+        cancel: &AtomicBool,
+        progress: &dyn Fn(DatAuditProgress),
+        expected: &dyn Fn(
+            &Path,
+            &super::library_identity_summary::PersistedLibraryDatIdentity,
+        ) -> bool,
+    ) -> Result<VerificationTotals, String> {
+        let evaluated =
+            self.evaluate(trusted, cancel, progress, AuditCacheConfig::Disabled, true)?;
+        for path in self.scope.eligible.keys() {
+            let read = evaluated
+                .projection
+                .items
+                .iter()
+                .find(|item| Path::new(&item.local_path) == path);
+            if !read.is_some_and(|item| expected(path, &item.identity)) {
+                return Err(format!(
+                    "{} read differently when saved than when it was checked. Nothing was saved from this catalogue.",
+                    path.display()
+                ));
+            }
+        }
+        self.persist(evaluated)
+    }
+
+    fn persist(&self, evaluated: Evaluated) -> Result<VerificationTotals, String> {
         let Evaluated {
             outcome,
             mut totals,
             ..
-        } = self.evaluate(trusted, cancel, progress, AuditCacheConfig::Disabled, true)?;
+        } = evaluated;
         let mut db = Database::open_or_create(&self.database_path).map_err(|e| e.to_string())?;
         let saved = db
             .persist_scoped_library_dat_verification(&outcome, &self.scope)
@@ -859,6 +901,7 @@ impl VerificationPreview {
                 })
                 .collect(),
             unchecked: evaluated.totals.unchecked,
+            member_hits: evaluated.member_hits,
         })
     }
 
@@ -1031,10 +1074,27 @@ impl VerificationPreview {
             }
         }
         totals.errors = error_paths.len();
+        let member_hits = outcome
+            .archives
+            .iter()
+            .filter(|a| {
+                a.members.iter().any(|m| {
+                    m.verdict.as_ref().is_some_and(|v| {
+                        !matches!(
+                            v,
+                            super::audit::AuditVerdict::NotInDat
+                                | super::audit::AuditVerdict::NoUsableEvidence
+                        )
+                    })
+                })
+            })
+            .map(|a| a.archive_path.clone())
+            .collect();
         Ok(Evaluated {
             outcome,
             projection,
             totals,
+            member_hits,
         })
     }
 }

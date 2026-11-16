@@ -447,6 +447,9 @@ impl FirstMatchPlan {
     }
 }
 
+/// A planned group: catalogue name, catalogue set (if any) and games.
+type PlannedGroup = (String, Vec<PoolCatalogue>, Vec<ReauditItem>);
+
 /// Lists the library games that have no saved DAT result at all and groups
 /// the ones a check can cover: a known system with usable installed
 /// catalogues. `for_platform` is the catalogue rule Check Games uses
@@ -481,10 +484,7 @@ pub fn plan_first_matching(
     archives.sort_by_key(|archive| archive.id);
     let mut first = FirstMatchPlan::default();
     let mut choice: BTreeMap<&'static str, Result<Choice, FirstMatchWait>> = BTreeMap::new();
-    let mut groups: BTreeMap<
-        (String, &'static str),
-        (String, Vec<PoolCatalogue>, Vec<ReauditItem>),
-    > = BTreeMap::new();
+    let mut groups: BTreeMap<(String, &'static str), PlannedGroup> = BTreeMap::new();
     let mut waiting: BTreeMap<(Option<String>, FirstMatchWait), usize> = BTreeMap::new();
     for archive in archives {
         let saved_here = saved.get(&archive.id);
@@ -1093,8 +1093,8 @@ fn run_set(
 /// What one catalogue of a set said about one game.
 #[derive(Clone, Debug)]
 enum Seen {
-    /// A cryptographic match with exactly one entry, of this game name.
-    Verified(Option<String>),
+    /// A cryptographic match with exactly one entry, with its proof.
+    Verified(Box<PersistedLibraryDatIdentity>),
     /// A CRC-only match: probable, never proof, but it names a game.
     Probable(Option<String>),
     /// Several entries fit, or the evidence conflicts.
@@ -1112,7 +1112,7 @@ impl Seen {
     fn of(identity: PersistedLibraryDatIdentity) -> Self {
         let name = identity.canonical.canonical_dat_name.clone();
         match identity.verification_state {
-            DatVerificationState::VerifiedSingleMatch { .. } => Self::Verified(name),
+            DatVerificationState::VerifiedSingleMatch { .. } => Self::Verified(Box::new(identity)),
             DatVerificationState::Probable => Self::Probable(name),
             DatVerificationState::AmbiguousMultipleCandidates { .. }
             | DatVerificationState::Conflicting { .. } => Self::Ambiguous,
@@ -1165,13 +1165,17 @@ fn settle(seen: &[Seen], names: &[String]) -> Settled {
         return Settled::Unsettled(format!("Not settled by {}: {why}", names[index]));
     }
     if let Some(index) = seen.iter().position(|s| matches!(s, Seen::Ambiguous)) {
-        return Settled::Ambiguous(format!("{} lists more than one entry for it", names[index]));
+        return Settled::Ambiguous(format!(
+            "{} lists it more than once, or only in part",
+            names[index]
+        ));
     }
     let named: Vec<(usize, &Option<String>)> = seen
         .iter()
         .enumerate()
         .filter_map(|(index, s)| match s {
-            Seen::Verified(name) | Seen::Probable(name) => Some((index, name)),
+            Seen::Verified(identity) => Some((index, &identity.canonical.canonical_dat_name)),
+            Seen::Probable(name) => Some((index, name)),
             _ => None,
         })
         .collect();
@@ -1197,11 +1201,22 @@ fn settle(seen: &[Seen], names: &[String]) -> Settled {
             .filter(|(_, s)| matches!(s, Seen::Verified(_)))
             .map(|(index, _)| index)
             .collect();
-        return if verified.is_empty() {
-            Settled::Unsettled("Only a CRC match; not verified".into())
-        } else {
-            Settled::Match(verified)
-        };
+        if verified.is_empty() {
+            return Settled::Unsettled("Only a CRC match; not verified".into());
+        }
+        // Every verifying catalogue must have read the same content from the
+        // same file object.
+        let proofs: Vec<&PersistedLibraryDatIdentity> = verified
+            .iter()
+            .filter_map(|index| match &seen[*index] {
+                Seen::Verified(identity) => Some(identity.as_ref()),
+                _ => None,
+            })
+            .collect();
+        if proofs.iter().any(|p| !same_read(p, proofs[0])) {
+            return Settled::Unsettled("The file changed while it was being checked".into());
+        }
+        return Settled::Match(verified);
     }
     // No catalogue matched. A definitive "listed in none" needs at least one
     // proof-bearing negative, and every negative must be about the same
@@ -1221,14 +1236,34 @@ fn settle(seen: &[Seen], names: &[String]) -> Settled {
     if first.audit_file.is_none() && first.disc_members.is_empty() {
         return Settled::Unsettled("The file read was not recorded; check it again".into());
     }
-    if negatives.iter().any(|n| {
-        n.audited_hashes != first.audited_hashes
-            || n.audit_file != first.audit_file
-            || n.disc_members != first.disc_members
-    }) {
+    if negatives.iter().any(|n| !same_read(n, first)) {
         return Settled::Unsettled("The file changed while it was being checked".into());
     }
     Settled::NotListed(Box::new((*first).clone()))
+}
+
+/// Whether two results were read from the same content of the same file
+/// object (hashes compared, outer-file and disc-file fingerprints).
+fn same_read(a: &PersistedLibraryDatIdentity, b: &PersistedLibraryDatIdentity) -> bool {
+    a.audited_hashes == b.audited_hashes
+        && a.audit_file == b.audit_file
+        && a.disc_members == b.disc_members
+        && a.archive_member == b.archive_member
+}
+
+/// Whether a save read the game exactly as the screen did: the same
+/// verified entry, from the same content and file object.
+fn same_result(
+    saved: &PersistedLibraryDatIdentity,
+    screened: &PersistedLibraryDatIdentity,
+) -> bool {
+    matches!(
+        saved.verification_state,
+        DatVerificationState::VerifiedSingleMatch { .. }
+    ) && saved.verification_state == screened.verification_state
+        && saved.canonical == screened.canonical
+        && saved.matched_entries == screened.matched_entries
+        && same_read(saved, screened)
 }
 
 struct PoolScreen {
@@ -1316,7 +1351,16 @@ fn screen_pool(
         let mut this: BTreeMap<i64, Seen> = BTreeMap::new();
         for exclusion in &screened.unchecked {
             if let Some(id) = by_path.get(exclusion.path.as_path()) {
-                this.insert(*id, Seen::of_reason(&exclusion.reason));
+                // A member of an archive matched this catalogue, but the
+                // archive as a whole got no result (a member listed twice,
+                // one disk of several, say): that is evidence about the game,
+                // never "not listed".
+                let seen = if screened.member_hits.contains(&exclusion.path) {
+                    Seen::Ambiguous
+                } else {
+                    Seen::of_reason(&exclusion.reason)
+                };
+                this.insert(*id, seen);
             }
         }
         for finding in screened.findings {
@@ -1477,12 +1521,27 @@ fn run_pool_set(
                 .push(VerificationExclusion { path, reason: why }),
         }
     }
-    // Each catalogue's own verification, run and saved as usual. Its bytes
-    // must be the ones just read; a save that fails leaves the others saved.
+    // Each catalogue's own verification, run and saved as usual, but only
+    // when it reads every one of its games exactly as the screen did: the
+    // same catalogue bytes, the same entry, the same content from the same
+    // file object. Anything else saves nothing from that catalogue. A save
+    // that fails leaves the others saved.
     let mut verified: BTreeSet<i64> = BTreeSet::new();
     let mut save_failed: BTreeMap<i64, String> = BTreeMap::new();
     for (index, chosen) in &to_save {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let catalogue = &group.pool[*index];
+        let expected: HashMap<&Path, &PersistedLibraryDatIdentity> = chosen
+            .iter()
+            .filter_map(
+                |(id, path)| match screen.seen.get(id).and_then(|s| s.get(*index)) {
+                    Some(Seen::Verified(identity)) => Some((path.as_path(), identity.as_ref())),
+                    _ => None,
+                },
+            )
+            .collect();
         let saved = resolve(&catalogue.source_id)
             .and_then(|resolved| {
                 preview_rows_verification(
@@ -1499,7 +1558,16 @@ fn run_pool_set(
                         catalogue.display_name
                     ));
                 }
-                preview.execute(trusted, cancel, &|p| progress(ReauditProgress::Audit(p)))
+                preview.execute_expecting(
+                    trusted,
+                    cancel,
+                    &|p| progress(ReauditProgress::Audit(p)),
+                    &|path, read| {
+                        expected
+                            .get(path)
+                            .is_some_and(|screened| same_result(read, screened))
+                    },
+                )
             });
         match saved {
             Ok(result) => {
@@ -1524,19 +1592,25 @@ fn run_pool_set(
             }
         }
     }
+    // A stop during the saves: what was saved stays saved; nothing else is
+    // recorded, and the rest is simply not reached.
+    let stopped = cancel.load(Ordering::Relaxed);
     let matched: BTreeSet<i64> = to_save.values().flat_map(|c| c.keys().copied()).collect();
-    for id in &matched {
-        if !verified.contains(id) {
-            totals.unchecked.push(VerificationExclusion {
-                path: rows[id].clone(),
-                reason: save_failed.get(id).cloned().unwrap_or_else(|| {
-                    "The result changed between the check and the save; check it again".into()
-                }),
-            });
+    if !stopped {
+        for id in &matched {
+            if !verified.contains(id) {
+                totals.unchecked.push(VerificationExclusion {
+                    path: rows[id].clone(),
+                    reason: save_failed.get(id).cloned().unwrap_or_else(|| {
+                        "The result changed between the check and the save; check it again".into()
+                    }),
+                });
+            }
         }
     }
     totals.verified = verified.len();
     let verified_ids: Vec<i64> = verified.iter().copied().collect();
+    let not_listed = if stopped { Vec::new() } else { not_listed };
     if !not_listed.is_empty() || !verified_ids.is_empty() {
         match Database::open_existing(database_path).and_then(|mut db| {
             db.record_catalogue_set_no_matches(&catalogue_set, &not_listed, &verified_ids)
@@ -1564,6 +1638,12 @@ fn run_pool_set(
                 }
             }
         }
+    }
+    if stopped {
+        // Settled-but-unsaved reasons are only kept for a finished set.
+        outcome.settled_notes.clear();
+        totals.ambiguous = 0;
+        totals.unchecked.clear();
     }
     outcome.totals = Some(totals);
     outcome
@@ -1748,6 +1828,11 @@ pub fn run_reaudit(
             }
             if let Some(stop) = stop {
                 report.stopped = Some(stop);
+                break 'groups;
+            }
+            // Stopped while this set was being saved: what it saved stays.
+            if cancel.load(Ordering::Relaxed) {
+                report.stopped = Some(ReauditStop::Cancelled);
                 break 'groups;
             }
         }
