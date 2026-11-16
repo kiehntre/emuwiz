@@ -608,3 +608,34 @@ impl Database {
         Ok(decide_verified_dat_name(&judged))
     }
 }
+
+impl Database {
+    /// Which archives have any saved DAT row, and every catalogue ID those
+    /// rows name. Lets a caller skip items with nothing saved and read only
+    /// the catalogues saved rows can refer to. Metadata only.
+    pub fn saved_dat_row_index(
+        &self,
+    ) -> Result<(
+        std::collections::HashSet<i64>,
+        std::collections::HashSet<String>,
+    )> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT archive_id, dat_source_id FROM library_dat_identities")
+            .map_err(|error| db_error("failed to prepare saved DAT row index", error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| db_error("failed to query saved DAT row index", error))?;
+        let mut archives = std::collections::HashSet::new();
+        let mut sources = std::collections::HashSet::new();
+        for row in rows {
+            let (archive, source) =
+                row.map_err(|error| db_error("failed to read saved DAT row index", error))?;
+            archives.insert(archive);
+            sources.insert(source);
+        }
+        Ok((archives, sources))
+    }
+}

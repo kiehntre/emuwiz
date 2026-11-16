@@ -166,3 +166,51 @@ fn the_rule_refuses_ambiguity_disagreement_and_missing_names() {
     assert_eq!(decide_verified_dat_name(&[negative]), V::None);
     assert_eq!(decide_verified_dat_name(&[]), V::None);
 }
+
+#[test]
+fn reading_only_referenced_catalogues_gives_the_same_rows() {
+    use crate::dat::configured_catalogues::configured_catalogues_among;
+    let f = verified_fixture();
+    let mut registry = DatSourceRegistry::default();
+    registry
+        .add(DatSourceEntry::new(
+            "synthetic".into(),
+            "Synthetic TOSEC".into(),
+            f.dat.clone(),
+            DatSourceKind::File,
+        ))
+        .unwrap();
+    let among = |wanted: Option<&std::collections::HashSet<String>>| {
+        configured_catalogues_among(
+            CatalogueInventoryInputs {
+                local_registry: &registry,
+                managed_sources: &Default::default(),
+                managed_root: f.dir.path(),
+                limits: DatLimits::default(),
+            },
+            wanted,
+        )
+    };
+    let full = f.configured();
+    let index = Database::open_read_only(&f.db)
+        .unwrap()
+        .saved_dat_row_index()
+        .unwrap();
+    // Two checked games have rows; the unchecked one has none.
+    assert_eq!(index.0, [1, 2].into_iter().collect());
+    assert_eq!(index.1, ["synthetic".to_string()].into_iter().collect());
+    let restricted = among(Some(&index.1));
+    assert_eq!(
+        restricted.keys().collect::<Vec<_>>(),
+        full.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(restricted["synthetic"].sha256, full["synthetic"].sha256);
+    assert!(among(Some(&Default::default())).is_empty());
+    assert!(among(Some(&["other".to_string()].into_iter().collect())).is_empty());
+    // The name decision is identical with the restricted map.
+    let db = Database::open_read_only(&f.db).unwrap();
+    assert_eq!(
+        db.verified_dat_name_for_archive(1, &restricted).unwrap(),
+        db.verified_dat_name_for_archive(1, &full).unwrap()
+    );
+}
