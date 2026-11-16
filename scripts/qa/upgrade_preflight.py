@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 TOOL_VERSION = "1"
-CURRENT_SCHEMA = 28
+CURRENT_SCHEMA = 29
 KNOWN_HISTORICAL_SCHEMAS = {3, 6, 12, 16, 19, 20, 21, 22, 23, 24, 25, 26, 27}
 SECRET_KEY = re.compile(r"(token|secret|password|passwd|api[_-]?key|credential|bearer)", re.I)
 ACTIONABLE_STATES = {

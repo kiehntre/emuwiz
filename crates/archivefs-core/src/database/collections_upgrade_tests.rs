@@ -22,7 +22,8 @@ fn all_rows(path: &Path) -> BTreeMap<String, Vec<String>> {
     let tables: Vec<String> = c
         .prepare(
             "SELECT name FROM sqlite_schema WHERE type='table' \
-             AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'game_collection%'",
+             AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'game_collection%' \
+             AND name NOT LIKE 'dat_catalogue_set%'",
         )
         .unwrap()
         .query_map([], |r| r.get(0))
@@ -122,6 +123,8 @@ fn schema_27_library() -> Library {
            SELECT id,absolute_path_cached,'158','verified_single_match','exhaustive','then',0,x'7b7d','then','then','now','no_match' FROM archives;
          INSERT INTO dat_recheck_attempts(archive_id,dat_source_id,archive_path,attempted_at,reason,catalogue_sha256)
            SELECT id,'158',absolute_path_cached,'now','The file changed while it was being checked',NULL FROM archives;
+         DROP TABLE dat_catalogue_set_no_matches; DROP TABLE dat_catalogue_sets;
+         DELETE FROM schema_migrations WHERE version=29;
          DROP TABLE game_collection_items; DROP TABLE game_collections;
          DELETE FROM schema_migrations WHERE version=28;
          PRAGMA user_version=27;",
@@ -191,8 +194,8 @@ fn upgrading_keeps_every_row_of_every_table_and_the_history_beside_it() {
     let before = all_rows(&library.path);
     let journal = journal_bytes(&library.root);
     let report = upgrade_library_database(&library.path).unwrap();
-    assert_eq!((report.from_version, report.to_version), (27, 28));
-    assert_eq!(report.applied_versions, vec![28]);
+    assert_eq!((report.from_version, report.to_version), (27, 29));
+    assert_eq!(report.applied_versions, vec![28, 29]);
     assert_eq!(all_rows(&library.path), before);
     assert_eq!(journal_bytes(&library.root), journal);
     let database = Database::open_read_only(&library.path).unwrap();
@@ -236,7 +239,7 @@ fn the_backup_is_complete_verified_and_made_before_the_schema_changes() {
         inspect_upgrade_backups(&library.path).unwrap()[0].state,
         UpgradeBackupState::Verified {
             from_version: 27,
-            to_version: 28,
+            to_version: 29,
             ..
         }
     ));
@@ -256,7 +259,7 @@ fn an_upgrade_interrupted_before_writing_changes_nothing_and_can_be_repeated() {
         assert!(Database::open_read_only(&library.path).is_err());
         let retried = upgrade_library_database(&library.path);
         assert!(retried.is_ok(), "{stage}: {:?}", retried.err());
-        assert_eq!(user_version(&library.path), 28);
+        assert_eq!(user_version(&library.path), 29);
     }
 }
 
@@ -288,7 +291,7 @@ fn a_failure_inside_the_migration_rolls_back_whole_and_can_be_repeated() {
         .execute_batch("DROP TRIGGER reject_28;")
         .unwrap();
     upgrade_library_database(&library.path).unwrap();
-    assert_eq!(user_version(&library.path), 28);
+    assert_eq!(user_version(&library.path), 29);
     assert_eq!(all_rows(&library.path), before);
 }
 
@@ -311,7 +314,7 @@ fn a_schema_27_build_refuses_an_upgraded_library() {
         .unwrap()
         .to_string();
     assert!(!error.is_empty());
-    assert_eq!(user_version(&library.path), 28);
+    assert_eq!(user_version(&library.path), 29);
 }
 
 /// The documented way back: close EmuWiz and put the backup in place. It
@@ -332,7 +335,7 @@ fn rolling_back_to_the_backup_restores_schema_27_and_loses_later_favourites() {
     // by hand.
     let plan = prepare_database_restore(&library.path, &report.backup_path).unwrap();
     assert_eq!(plan.backup_schema_version, 27);
-    assert_eq!(plan.pending_migrations, vec![28]);
+    assert_eq!(plan.pending_migrations, vec![28, 29]);
 
     let kept = library.root.join("library.schema-28-favourites.sqlite3");
     fs::copy(&library.path, &kept).unwrap();
@@ -370,7 +373,7 @@ fn the_in_app_restore_of_the_schema_27_backup_keeps_schema_28_and_empties_favour
     let plan = prepare_database_restore(&library.path, &report.backup_path).unwrap();
     super::restore_database(&plan, "RESTORE DATABASE").unwrap();
 
-    assert_eq!(user_version(&library.path), 28);
+    assert_eq!(user_version(&library.path), 29);
     assert_eq!(all_rows(&library.path), before);
     let restored = Database::open_read_only(&library.path).unwrap();
     let collections = restored.load_game_collections().unwrap();

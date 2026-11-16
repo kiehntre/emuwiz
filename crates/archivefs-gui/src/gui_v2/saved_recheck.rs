@@ -313,6 +313,13 @@ impl State {
                                 format!("A set was not saved: {reason}")
                             };
                         }
+                        ReauditProgress::CatalogueOfSet {
+                            index,
+                            of,
+                            catalogue,
+                        } => {
+                            running.line = format!("Catalogue {index} of {of}: {catalogue}");
+                        }
                     }
                 }
                 Message::Done(result, plan) => {

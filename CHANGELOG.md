@@ -15,6 +15,19 @@ guessing at intent, dates, or scope.
 
 Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
+- `emuwiz-cli dat recheck --unchecked` no longer waits for a choice when
+  several trusted catalogues describe one system (TOSEC's Commodore 64 genre
+  lists, say). Each game is read against every catalogue for its system that
+  the check can use, and a result is saved only when they agree on one game:
+  under each catalogue that verified it, with that catalogue's own id and
+  bytes. Catalogues that disagree on the name, or a catalogue that lists the
+  game more than once, save nothing and keep the reason. A catalogue that
+  cannot be used for the system (another system's list, say) is left out and
+  named; one that could be used but cannot be read now makes the system wait.
+  A game that none of them lists is recorded once, with the file it read and
+  the exact catalogue set, and is not read again until the file, its system
+  or any catalogue in the set changes. Library schema 29 adds that record.
+
 - Undo for mods, cheats and texture packs no longer takes its saved record's
   word for what it may touch. What ties a record, its destination folder and
   each file to an install is what EmuWiz itself kept in its backup store

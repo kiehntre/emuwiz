@@ -105,8 +105,8 @@ mod preservation_fingerprint;
 pub use preservation_fingerprint::PreservationFreshness;
 mod disc_order;
 pub use dat_current::{
-    CurrentLibraryDatEvidence, DatRecheckAttempt, SavedDatEvidenceRow, SavedDatEvidenceStatus,
-    VerifiedDatName,
+    CatalogueSet, CatalogueSetNoMatch, CurrentLibraryDatEvidence, DatRecheckAttempt,
+    SavedDatEvidenceRow, SavedDatEvidenceStatus, VerifiedDatName,
 };
 #[cfg(test)]
 pub(crate) use dat_current::{SavedDatNameRow, decide_verified_dat_name};
@@ -436,6 +436,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 28,
         description: "game collections: Favourites and user-created collections",
         sql: include_str!("migrations/0028_game_collections.sql"),
+    },
+    Migration {
+        version: 29,
+        description: "remember games no catalogue in their system's catalogue set lists",
+        sql: include_str!("migrations/0029_dat_catalogue_set_no_match.sql"),
     },
 ];
 
@@ -4935,6 +4940,7 @@ impl Database {
                     "library_dat_identity_history",
                     "dat_recheck_attempts",
                     "game_collection_items",
+                    "dat_catalogue_set_no_matches",
                 ] {
                     let exists: bool = tx
                         .query_row(
@@ -11444,21 +11450,21 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 28);
+        assert_eq!(report.to_version, 29);
         assert_eq!(
             report.applied_versions,
-            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
         );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 28);
+        assert_eq!(upgraded.schema_version().unwrap(), 29);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         assert_eq!(
             pending_schema_migration_versions(19).unwrap(),
-            vec![20, 21, 22, 23, 24, 25, 26, 27, 28]
+            vec![20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
         );
 
         let quick_check: String = upgraded
@@ -11478,14 +11484,14 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 20);
-        assert_eq!(report.to_version, 28);
+        assert_eq!(report.to_version, 29);
         assert_eq!(
             report.applied_versions,
-            vec![21, 22, 23, 24, 25, 26, 27, 28]
+            vec![21, 22, 23, 24, 25, 26, 27, 28, 29]
         );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 28);
+        assert_eq!(upgraded.schema_version().unwrap(), 29);
         assert_eq!(upgraded.list_source_folders().unwrap().len(), 1);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         let table_count: i64 = upgraded
@@ -11500,7 +11506,7 @@ mod tests {
         upgraded.close().unwrap();
 
         let reopened = Database::open_read_only(&database_path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 28);
+        assert_eq!(reopened.schema_version().unwrap(), 29);
         reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -12358,6 +12364,8 @@ mod tests {
                 "archive_scan_observations",
                 "archives",
                 "catalogue_health_epoch",
+                "dat_catalogue_set_no_matches",
+                "dat_catalogue_sets",
                 "dat_expected_entries",
                 "dat_expected_inventory_meta",
                 "dat_recheck_attempts",
@@ -22480,7 +22488,7 @@ echo "$out"
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 28);
+            assert_eq!(latest_known_version(MIGRATIONS), 29);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")

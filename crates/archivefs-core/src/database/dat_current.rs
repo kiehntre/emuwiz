@@ -663,3 +663,227 @@ impl Database {
         Ok((archives, sources))
     }
 }
+
+/// The exact catalogue set a game was checked against (schema 29): the
+/// system, and each catalogue's source id with the content digest it had.
+/// `set_sha256` is the SHA-256 of [`CatalogueSet::canonical_bytes`], so the
+/// same set always has the same digest and any change (a catalogue added,
+/// removed, rewritten, or no longer eligible) gives another one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogueSet {
+    pub platform: String,
+    /// `(source id, catalogue SHA-256)`, sorted by source id, no duplicates.
+    pub catalogues: Vec<(String, String)>,
+}
+
+impl CatalogueSet {
+    pub fn new(platform: &str, mut catalogues: Vec<(String, String)>) -> Self {
+        catalogues.sort();
+        catalogues.dedup();
+        Self {
+            platform: platform.to_string(),
+            catalogues,
+        }
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "platform": self.platform,
+            "catalogues": self.catalogues,
+        }))
+        .unwrap_or_default()
+    }
+
+    pub fn sha256(&self) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(self.canonical_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
+/// "Checked against every catalogue in one set; listed in none." Saved per
+/// game; never a catalogue result, never evidence of identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogueSetNoMatch {
+    pub archive_id: i64,
+    pub path: PathBuf,
+    pub platform: String,
+    pub set_sha256: String,
+    pub catalogue_count: usize,
+    pub checked_at: String,
+    /// One catalogue's own "not in this catalogue" result for the game, as a
+    /// save would have recorded it: the hashes compared and the fingerprint
+    /// of the file object read.
+    pub facts: crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
+}
+
+impl CatalogueSetNoMatch {
+    /// Whether the record still says something about the game: the same
+    /// path, system and catalogue set, the very file object that was hashed
+    /// (same size, times, device and inode), and the game not marked missing.
+    /// Metadata only. Anything else means the game must be read again.
+    pub fn holds(
+        &self,
+        path: &std::path::Path,
+        size_bytes: Option<u64>,
+        platform: &str,
+        set_sha256: &str,
+        marked_missing: bool,
+    ) -> bool {
+        !marked_missing
+            && self.path == path
+            && self.platform == platform
+            && self.set_sha256 == set_sha256
+            && self.facts.verification_state == DatVerificationState::NoMatch
+            && (self.facts.audit_file.is_some() || !self.facts.disc_members.is_empty())
+            && self.facts.file_state_for_path(path) == DiscFileState::Unchanged
+            && size_bytes.is_some()
+            && size_bytes == self.facts.audited_hashes.size_bytes
+    }
+}
+
+impl Database {
+    /// Every saved "listed in no catalogue of the set" record whose game is
+    /// still at the path it had then (schema 29).
+    pub fn catalogue_set_no_matches(&self) -> Result<HashMap<i64, CatalogueSetNoMatch>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT n.archive_id, n.archive_path, n.platform, n.set_sha256, n.catalogue_count, \
+                        n.checked_at, n.facts_json \
+                 FROM dat_catalogue_set_no_matches n JOIN archives a \
+                   ON a.id = n.archive_id AND a.absolute_path_cached = n.archive_path",
+            )
+            .map_err(|error| db_error("failed to prepare catalogue-set results", error))?;
+        let mut rows = statement
+            .query([])
+            .map_err(|error| db_error("failed to query catalogue-set results", error))?;
+        let mut out = HashMap::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| db_error("failed to read catalogue-set results", error))?
+        {
+            let read = |error| db_error("failed to read catalogue-set results", error);
+            let archive_id: i64 = row.get(0).map_err(read)?;
+            let path: Vec<u8> = row.get(1).map_err(read)?;
+            let count: i64 = row.get(4).map_err(read)?;
+            let facts: Vec<u8> = row.get(6).map_err(read)?;
+            // An unreadable record is no record: the game is simply read again.
+            let Ok(facts) = serde_json::from_slice(&facts) else {
+                continue;
+            };
+            out.insert(
+                archive_id,
+                CatalogueSetNoMatch {
+                    archive_id,
+                    path: PathBuf::from(std::ffi::OsString::from_vec(path)),
+                    platform: row.get(2).map_err(read)?,
+                    set_sha256: row.get(3).map_err(read)?,
+                    catalogue_count: usize::try_from(count).unwrap_or(0),
+                    checked_at: row.get(5).map_err(read)?,
+                    facts,
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    /// Saves, in one transaction, that each game in `no_match` was checked
+    /// against every catalogue in `set` and is listed in none, replacing the
+    /// game's earlier record. A game is skipped (and not counted) when it is
+    /// no longer at that path, or when any catalogue of the set now has a
+    /// saved result for it. Records of games in `matched` are removed: those
+    /// games now have a result. Sets no record names any more are removed.
+    /// Returns the games whose record was written.
+    pub fn record_catalogue_set_no_matches(
+        &mut self,
+        set: &CatalogueSet,
+        no_match: &[(
+            i64,
+            PathBuf,
+            crate::dat::library_identity_summary::PersistedLibraryDatIdentity,
+        )],
+        matched: &[i64],
+    ) -> Result<Vec<i64>> {
+        let now = now_utc_string();
+        let set_sha256 = set.sha256();
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| db_error("failed to start catalogue-set result transaction", error))?;
+        for archive_id in matched {
+            tx.execute(
+                "DELETE FROM dat_catalogue_set_no_matches WHERE archive_id = ?1",
+                [archive_id],
+            )
+            .map_err(|error| db_error("failed to clear a catalogue-set result", error))?;
+        }
+        let mut written = Vec::new();
+        if !no_match.is_empty() {
+            tx.execute(
+                "INSERT OR IGNORE INTO dat_catalogue_sets (set_sha256, platform, catalogues_json, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![set_sha256, set.platform, set.canonical_bytes(), now],
+            )
+            .map_err(|error| db_error("failed to record a catalogue set", error))?;
+        }
+        for (archive_id, path, facts) in no_match {
+            if facts.verification_state != DatVerificationState::NoMatch {
+                continue;
+            }
+            let mut has_result = false;
+            for (source_id, _) in &set.catalogues {
+                has_result |= tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM library_dat_identities \
+                         WHERE archive_id = ?1 AND dat_source_id = ?2)",
+                        params![archive_id, source_id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(|error| db_error("failed to check saved DAT results", error))?;
+            }
+            if has_result {
+                continue;
+            }
+            let facts_json = serde_json::to_vec(facts).map_err(|error| {
+                ArchiveFsError::Database(format!("catalogue-set result not encodable: {error}"))
+            })?;
+            let inserted = tx
+                .execute(
+                    "INSERT INTO dat_catalogue_set_no_matches \
+                     (archive_id, archive_path, platform, set_sha256, catalogue_count, checked_at, facts_json) \
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 \
+                     WHERE EXISTS (SELECT 1 FROM archives a \
+                                   WHERE a.id = ?1 AND a.absolute_path_cached = ?2) \
+                     ON CONFLICT(archive_id) DO UPDATE SET \
+                      archive_path = excluded.archive_path, platform = excluded.platform, \
+                      set_sha256 = excluded.set_sha256, catalogue_count = excluded.catalogue_count, \
+                      checked_at = excluded.checked_at, facts_json = excluded.facts_json",
+                    params![
+                        archive_id,
+                        path.as_os_str().as_bytes(),
+                        set.platform,
+                        set_sha256,
+                        i64::try_from(set.catalogues.len()).unwrap_or(i64::MAX),
+                        now,
+                        facts_json
+                    ],
+                )
+                .map_err(|error| db_error("failed to record a catalogue-set result", error))?;
+            if inserted == 1 {
+                written.push(*archive_id);
+            }
+        }
+        tx.execute(
+            "DELETE FROM dat_catalogue_sets WHERE set_sha256 NOT IN \
+             (SELECT set_sha256 FROM dat_catalogue_set_no_matches)",
+            [],
+        )
+        .map_err(|error| db_error("failed to remove unused catalogue sets", error))?;
+        tx.commit()
+            .map_err(|error| db_error("failed to commit catalogue-set results", error))?;
+        Ok(written)
+    }
+}

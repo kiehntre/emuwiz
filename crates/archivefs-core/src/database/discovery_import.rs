@@ -21,7 +21,11 @@ use std::sync::OnceLock;
 // that record and never deletes the membership. The id allocator in
 // `upsert_archive` also never reuses an id a membership still names. No touch
 // trigger: the blocker is re-read under the Undo transaction itself.
-const REVIEWED_SCHEMA: i64 = 28;
+// Schema 29 reviewed: dat_catalogue_set_no_matches is a per-game record like
+// the schema-27 notes (no foreign key or cascade, touch triggers, protected
+// dependent in `check_import_undo`, id never reused); dat_catalogue_sets
+// names catalogues only, no game.
+const REVIEWED_SCHEMA: i64 = 29;
 const MAX_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BATCH: usize = crate::ingestion::saved_discovery::MAX_SELECTED;
 
@@ -546,6 +550,7 @@ impl Database {
                 "library_dat_identities",
                 "library_dat_identity_history",
                 "dat_recheck_attempts",
+                "dat_catalogue_set_no_matches",
                 "verified_identity_facts",
                 "screenscraper_enrichments",
                 "dat_set_audit_results",

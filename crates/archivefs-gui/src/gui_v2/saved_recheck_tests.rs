@@ -39,6 +39,7 @@ fn plan(games: usize, blocked: usize, current: usize) -> ReauditPlan {
                         )
                     })
                     .collect(),
+                pool: Vec::new(),
             }]
         },
         blocked: (0..blocked)

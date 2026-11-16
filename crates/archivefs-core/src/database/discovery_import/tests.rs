@@ -713,8 +713,8 @@ fn gate_topology_report(path: &Path) -> crate::media_set::TopologyReport {
 #[test]
 fn gate_schema_27_untouched_import_undoes_and_leaves_the_new_tables_empty() {
     let f = Fixture::new();
-    assert_eq!(f.db().schema_version().unwrap(), 28);
-    assert_eq!(REVIEWED_SCHEMA, 28);
+    assert_eq!(f.db().schema_version().unwrap(), 29);
+    assert_eq!(REVIEWED_SCHEMA, 29);
     f.write("new.z80", 2);
     let r = f.import();
     let id = r.inserted[0].1;
@@ -1272,7 +1272,7 @@ fn gate_migration_26_to_27_keeps_discovery_records_and_protections_and_matches_f
     let before = dump(&c);
     assert_eq!(before.len(), 4);
     apply_migrations(&mut c, MIGRATIONS).unwrap();
-    assert_eq!(schema_version(&c).unwrap(), 28);
+    assert_eq!(schema_version(&c).unwrap(), 29);
     assert_eq!(dump(&c), before, "the upgrade changed Discovery evidence");
 
     // Identical to a fresh schema 27 for the gate: digest and history.
@@ -1357,14 +1357,14 @@ fn gate_an_import_made_before_schema_27_undoes_after_the_upgrade_unless_it_was_m
         // Take the library back to exactly what a schema-26 build leaves: the
         // real receipt and ownership rows, none of schema 27's or 28's objects.
         f.mutate(
-            "DROP TABLE game_collection_items; DROP TABLE game_collections; DELETE FROM sqlite_sequence WHERE name='game_collections'; DELETE FROM schema_migrations WHERE version=28; DROP TABLE library_dat_identity_history; DROP TABLE dat_recheck_attempts; DELETE FROM schema_migrations WHERE version=27; PRAGMA user_version=26;",
+            "DROP TABLE dat_catalogue_set_no_matches; DROP TABLE dat_catalogue_sets; DELETE FROM schema_migrations WHERE version=29; DROP TABLE game_collection_items; DROP TABLE game_collections; DELETE FROM sqlite_sequence WHERE name='game_collections'; DELETE FROM schema_migrations WHERE version=28; DROP TABLE library_dat_identity_history; DROP TABLE dat_recheck_attempts; DELETE FROM schema_migrations WHERE version=27; PRAGMA user_version=26;",
         );
         assert!(
             Database::open_read_only(&f.db).is_err(),
             "a schema-26 library must not be read as current"
         );
         let report = crate::upgrade_library_database(&f.db).unwrap();
-        assert_eq!((report.from_version, report.to_version), (26, 28));
+        assert_eq!((report.from_version, report.to_version), (26, 29));
         assert_eq!((gate_rows(&f, records), gate_rows(&f, receipts)), before);
         let c = Connection::open(&f.db).unwrap();
         require_reviewed_schema(&c).unwrap();
@@ -1477,6 +1477,7 @@ fn gate_every_table_naming_an_archive_id_is_on_the_reviewed_list_with_touch_trig
         naming,
         [
             "archive_scan_observations",
+            "dat_catalogue_set_no_matches",
             "dat_recheck_attempts",
             "dat_set_audit_results",
             "discovery_import_records",
@@ -1494,6 +1495,7 @@ fn gate_every_table_naming_an_archive_id_is_on_the_reviewed_list_with_touch_trig
     assert_eq!(
         without_foreign_key,
         [
+            "dat_catalogue_set_no_matches",
             "dat_recheck_attempts",
             "discovery_import_records",
             "game_collection_items",
