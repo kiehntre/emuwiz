@@ -749,6 +749,40 @@ pub fn inventory_release_pack(root: &Path) -> Result<TosecPackInventory, TosecPa
     })
 }
 
+/// Re-lists a saved pack's folder and confirms the saved DAT list is the whole
+/// pack. A pack saved before partial inventories were refused (or whose
+/// folder has since changed) must be removed and imported again, never staged
+/// from a list that may silently miss DATs.
+pub fn verify_persisted_pack_is_complete(pack: &PersistedTosecPack) -> Result<(), String> {
+    let fresh = inventory_release_pack(&pack.root_path).map_err(|error| error.to_string())?;
+    if !fresh.scan_complete {
+        return Err(format!(
+            "Not staged: EmuWiz cannot list every DAT in {} (more than {MAX_PACK_DATS} DATs, \
+             more than {MAX_PACK_ENTRIES_EXAMINED} entries, or nested too deeply).",
+            pack.root_path.display()
+        ));
+    }
+    let saved: BTreeSet<&Path> = pack
+        .dats
+        .iter()
+        .map(|dat| dat.relative_path.as_path())
+        .collect();
+    let found: BTreeSet<&Path> = fresh
+        .dats
+        .iter()
+        .map(|dat| dat.relative_path.as_path())
+        .collect();
+    if saved != found {
+        return Err(format!(
+            "Not staged: this pack's saved list ({} DATs) does not match its folder ({} DATs). \
+             It may have been saved incompletely. Remove the pack and import it again.",
+            saved.len(),
+            found.len()
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Persistence: imported packs, inventory projection and user selections
 // ---------------------------------------------------------------------------
@@ -1773,37 +1807,39 @@ fn resolve_selected_dat_path(
     Ok(canonical_dat)
 }
 
-/// The id of an enabled registered source that already holds a DAT with the
-/// exact bytes of `dat` (same file name, equal SHA-256). Only same-named files
-/// are hashed, so the check stays bounded; a folder source is looked up one
-/// level deep, as the verifier reads it. Symlinks never match.
+/// The id of an enabled, user-local FILE source that the verifier will really
+/// read and that holds exactly the bytes of `dat` (same file name, equal
+/// SHA-256). Only same-named files are hashed, so the check stays bounded.
 ///
-/// Entries owned by a TOSEC release pack never count: deselecting a group in
-/// that pack removes its entry, and a DAT skipped here because of it would
-/// then silently lose its only registration.
-fn enabled_source_with_same_bytes(sources: &DatSourcesConfig, dat: &Path) -> Option<String> {
+/// Deliberately narrow, because a false match leaves the selected DAT
+/// registered nowhere:
+/// - only entries the registry actually loads (valid, unique IDs) count;
+/// - only file sources: a folder source is read with its own caps and order,
+///   so a same-named file inside one is not proof the verifier uses it;
+/// - the path must pass the verifier's own path policy (no symlink in any
+///   component, a regular file);
+/// - entries owned by a TOSEC release pack or any other EmuWiz workflow never
+///   count: they can be removed by that workflow, and a DAT skipped here would
+///   then silently lose its only registration.
+fn user_file_source_with_same_bytes(sources: &DatSourcesConfig, dat: &Path) -> Option<String> {
     let name = dat.file_name()?;
     let digest = sha256_file_bounded(dat).ok().flatten()?;
-    for entry in sources.sources.iter().flatten() {
-        if entry.enabled == Some(false) || entry.ownership.imported_tosec_release_pack().is_some() {
+    let (registry, _) = crate::dat::sources::DatSourceRegistry::from_config(sources);
+    for entry in registry.sorted_all() {
+        if !entry.enabled
+            || entry.kind != DatSourceKind::File
+            || entry.ownership != DatSourceOwnership::UserLocal
+            || entry.path.file_name() != Some(name)
+            || entry.path == dat
+        {
             continue;
         }
-        let root = Path::new(&entry.path);
-        let candidate = match entry.kind {
-            DatSourceKind::File if root.file_name() == Some(name) => root.to_path_buf(),
-            DatSourceKind::Folder => root.join(name),
-            _ => continue,
-        };
-        if candidate == dat {
+        if crate::dat::sources::validation::validate_dat_path(&entry.path, DatSourceKind::File)
+            .is_err()
+        {
             continue;
         }
-        let Ok(metadata) = std::fs::symlink_metadata(&candidate) else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        if sha256_file_bounded(&candidate).ok().flatten().as_deref() == Some(digest.as_str()) {
+        if sha256_file_bounded(&entry.path).ok().flatten().as_deref() == Some(digest.as_str()) {
             return Some(entry.id.clone());
         }
     }
@@ -1864,12 +1900,13 @@ pub fn register_selected_tosec_dats(
                     .iter()
                     .flatten()
                     .find(|existing| existing.path == absolute_text || existing.id == id);
-                // The same bytes may already be registered under another path
-                // (the user's own folder, another pack, or a different
-                // snapshot copy). A second registration of identical content
-                // would double every match, so it is satisfied, not added.
+                // The user may already have registered these exact bytes as
+                // their own DAT file under another path. A second registration
+                // of identical content would double every match, so it is
+                // satisfied, not added (see user_file_source_with_same_bytes
+                // for what deliberately does not count).
                 if existing.is_none()
-                    && enabled_source_with_same_bytes(sources, &absolute).is_some()
+                    && user_file_source_with_same_bytes(sources, &absolute).is_some()
                 {
                     outcome.already_registered.push(dat.relative_path.clone());
                     continue;

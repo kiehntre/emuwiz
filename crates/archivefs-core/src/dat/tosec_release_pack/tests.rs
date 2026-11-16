@@ -789,16 +789,72 @@ fn identical_bytes_already_registered_elsewhere_are_not_registered_twice() {
 }
 
 #[test]
-fn identical_bytes_inside_a_registered_folder_are_not_registered_twice() {
+fn a_copy_the_verifier_may_not_read_never_satisfies_a_selected_dat() {
+    // A folder source is read with its own caps and order, so a same-named
+    // copy inside one is not proof of coverage: register the pack DAT.
     let fixture = PackFixture::standard();
     let own = fixture._root.path().join("own-folder");
     std::fs::create_dir_all(&own).unwrap();
     std::fs::write(own.join(AMIGA_LEAF), AMIGA_GAMES_FLOPPY_DAT).unwrap();
     let registry = registry_with(&fixture, "folder", &own, true);
-
     let outcome = apply_selection_to_registry(&amiga_pack(&fixture), &registry, 42).unwrap();
-    assert!(outcome.registered.is_empty());
-    assert_eq!(outcome.already_registered.len(), 1);
+    assert_eq!(outcome.registered.len(), 1, "folder copy must not count");
+
+    // A file source behind a symlinked parent is refused by the verifier.
+    #[cfg(unix)]
+    {
+        let fixture = PackFixture::standard();
+        let real = fixture._root.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join(AMIGA_LEAF), AMIGA_GAMES_FLOPPY_DAT).unwrap();
+        let link = fixture._root.path().join("linked");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let registry = registry_with(&fixture, "file", &link.join(AMIGA_LEAF), true);
+        let outcome = apply_selection_to_registry(&amiga_pack(&fixture), &registry, 42).unwrap();
+        assert_eq!(outcome.registered.len(), 1, "symlinked copy must not count");
+    }
+
+    // A file source with an invalid ID is dropped by the registry loader.
+    let fixture = PackFixture::standard();
+    let own = fixture._root.path().join("own");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(own.join(AMIGA_LEAF), AMIGA_GAMES_FLOPPY_DAT).unwrap();
+    let registry = fixture._root.path().join("dat_sources.toml");
+    std::fs::write(
+        &registry,
+        format!(
+            "[[sources]]\nid = \"has space\"\ndisplay_name = \"Mine\"\npath = \"{}\"\nkind = \"file\"\n",
+            own.join(AMIGA_LEAF).display()
+        ),
+    )
+    .unwrap();
+    let outcome = apply_selection_to_registry(&amiga_pack(&fixture), &registry, 42).unwrap();
+    assert_eq!(
+        outcome.registered.len(),
+        1,
+        "an ignored entry must not count"
+    );
+}
+
+#[test]
+fn a_pack_saved_with_an_incomplete_list_cannot_be_staged() {
+    let fixture = PackFixture::standard();
+    let inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    let complete = persisted_from_inventory(&inventory);
+    assert!(verify_persisted_pack_is_complete(&complete).is_ok());
+
+    // As saved by the old importer: the walk stopped before the last DATs.
+    let mut truncated = complete.clone();
+    truncated.dats.pop();
+    let error = verify_persisted_pack_is_complete(&truncated).unwrap_err();
+    assert!(
+        error.contains("Remove the pack and import it again"),
+        "{error}"
+    );
+
+    // A DAT added to the folder after import also invalidates the saved list.
+    fixture.write_dat(&["Extra - Games (TOSEC-v2021-01-09).dat"], "x");
+    assert!(verify_persisted_pack_is_complete(&complete).is_err());
 }
 
 #[test]
@@ -875,7 +931,24 @@ fn activating_another_pack_keeps_the_previous_release_entries_files_and_rollback
     assert!(ids.contains(&a_entry.id) && ids.contains(&"mine".to_string()));
     assert_eq!(ids.len(), 2);
     assert_eq!(std::fs::read(&a_entry.path).unwrap(), a_bytes);
+
+    // Rolling back to release A and registering it again restores exactly A's
+    // entry (same path, same bytes) and removes nothing.
     assert_eq!(store.rollback(&a_hash).unwrap().active.sha256, a_hash);
+    let again = store
+        .register_active_snapshot_to_registry(&registry, 5)
+        .unwrap();
+    assert!(again.removed.is_empty());
+    assert_eq!(again.already_registered.len(), 1);
+    let after = load_dat_sources_config_from(&registry).unwrap();
+    let a_after = after
+        .sources
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.id == a_entry.id)
+        .unwrap();
+    assert_eq!(a_after.path, a_entry.path);
+    assert_eq!(std::fs::read(&a_after.path).unwrap(), a_bytes);
 }
 
 #[test]

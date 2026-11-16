@@ -5813,6 +5813,16 @@ impl DatSourcesPageState {
             // says "Select at least one DAT group first."
             return;
         }
+        // The saved list is only trusted once a fresh, complete listing of the
+        // folder matches it; that is what makes `scan_complete: true` true.
+        if let Err(error) =
+            archivefs_core::dat::tosec_release_pack::verify_persisted_pack_is_complete(pack)
+        {
+            self.tosec_managed_error = Some(error);
+            self.tosec_action_error = self.tosec_managed_error.clone();
+            self.refresh_tosec_managed_view();
+            return;
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs())
