@@ -1456,11 +1456,11 @@ fn build_candidates(
     let database = Database::open_read_only(&database_path).ok()?;
     let mut candidates = Vec::new();
     for source in sources {
-        let resolution = match database
+        let archive_id = database
             .find_archive_id_by_absolute_path(source)
             .ok()
-            .flatten()
-        {
+            .flatten();
+        let resolution = match archive_id {
             Some(archive_id) => {
                 let evidence = database
                     .current_platform_identity_evidence(archive_id, generation)
@@ -1470,7 +1470,7 @@ fn build_candidates(
             }
             None => PlatformIdentityResolution::Unknown { generation },
         };
-        let choice = names.choose(source);
+        let choice = names.choose_known(source, archive_id);
         candidates.push(OrganisationCandidate {
             source_path: source.clone(),
             resolution,
@@ -1514,6 +1514,7 @@ pub(crate) fn validate_r2_selection(
 /// so `derive_proposed_basename` preserves extension semantics. Returns `None`
 /// when there is no record (the planner then falls back to the source
 /// basename). Never derived from a display label.
+#[cfg(test)]
 fn romm_name_for(
     source: &Path,
     cache: Option<&archivefs_core::identity_source::cache::IdentityCache>,
@@ -1525,6 +1526,10 @@ fn romm_name_for(
         .then(|| record.title.clone())
         .flatten()
     })?;
+    romm_title_with_extension(&title, source)
+}
+
+fn romm_title_with_extension(title: &str, source: &Path) -> Option<String> {
     let title = title.trim().to_string();
     if title.is_empty() {
         return None;
@@ -1694,8 +1699,11 @@ pub(crate) fn choose_name(
 /// Chooses proposed names from live evidence. Loaded once per preview and
 /// again at apply, so both use the same rule on the then-current state.
 pub(crate) struct NameResolver {
-    romm: Option<archivefs_core::identity_source::cache::IdentityCache>,
+    romm: RommTitles,
     database: Option<Database>,
+    /// Archives with any saved DAT row; `None` when the index could not be
+    /// read (every item is then looked up, as before).
+    saved_archives: Option<std::collections::HashSet<i64>>,
     catalogues: std::collections::HashMap<
         String,
         archivefs_core::dat::configured_catalogues::ConfiguredCatalogue,
@@ -1704,34 +1712,124 @@ pub(crate) struct NameResolver {
 
 impl NameResolver {
     pub(crate) fn load() -> Self {
-        Self {
-            romm: load_romm_cache(),
-            database: default_database_path()
-                .and_then(Database::open_read_only)
-                .ok(),
-            catalogues: archivefs_core::dat::sources::default_dat_sources_config_path()
+        let database = default_database_path()
+            .and_then(Database::open_read_only)
+            .ok();
+        let index = database
+            .as_ref()
+            .and_then(|database| database.saved_dat_row_index().ok());
+        // Only catalogues that saved rows name are read (hashed). Without an
+        // index every configured catalogue is read, as before.
+        let wanted = index.as_ref().map(|(_, sources)| sources);
+        let catalogues = if wanted.is_some_and(|wanted| wanted.is_empty()) {
+            Default::default()
+        } else {
+            archivefs_core::dat::sources::default_dat_sources_config_path()
                 .map(|path| {
-                    archivefs_core::dat::configured_catalogues::load_configured_catalogues(&path)
+                    archivefs_core::dat::configured_catalogues::load_configured_catalogues_among(
+                        &path, wanted,
+                    )
                 })
-                .unwrap_or_default(),
+                .unwrap_or_default()
+        };
+        Self {
+            romm: RommTitles::new(load_romm_cache().as_ref()),
+            database,
+            saved_archives: index.map(|(archives, _)| archives),
+            catalogues,
         }
     }
 
     pub(crate) fn choose(&self, source: &Path) -> NameChoice {
         use archivefs_core::VerifiedDatName as V;
-        let dat = match &self.database {
-            None => V::NotUsable("the library could not be read".into()),
+        match &self.database {
+            None => self.finish(V::NotUsable("the library could not be read".into()), source),
             Some(database) => match database.find_archive_id_by_absolute_path(source) {
-                Ok(None) => V::None,
-                Ok(Some(id)) => database
-                    .verified_dat_name_for_archive(id, &self.catalogues)
-                    .unwrap_or_else(|error| {
-                        V::NotUsable(format!("the saved check could not be read ({error})"))
-                    }),
-                Err(error) => V::NotUsable(format!("the library could not be read ({error})")),
+                Ok(id) => self.choose_known(source, id),
+                Err(error) => self.finish(
+                    V::NotUsable(format!("the library could not be read ({error})")),
+                    source,
+                ),
             },
+        }
+    }
+
+    /// [`Self::choose`] for a file whose library id the caller already looked up.
+    pub(crate) fn choose_known(&self, source: &Path, archive_id: Option<i64>) -> NameChoice {
+        use archivefs_core::VerifiedDatName as V;
+        let dat = match (&self.database, archive_id) {
+            (None, _) => V::NotUsable("the library could not be read".into()),
+            (Some(_), None) => V::None,
+            // Nothing saved for this item: no query, no name.
+            (Some(_), Some(id))
+                if self
+                    .saved_archives
+                    .as_ref()
+                    .is_some_and(|saved| !saved.contains(&id)) =>
+            {
+                V::None
+            }
+            (Some(database), Some(id)) => database
+                .verified_dat_name_for_archive(id, &self.catalogues)
+                .unwrap_or_else(|error| {
+                    V::NotUsable(format!("the saved check could not be read ({error})"))
+                }),
         };
-        choose_name(dat, romm_name_for(source, self.romm.as_ref()), source)
+        self.finish(dat, source)
+    }
+
+    fn finish(&self, dat: archivefs_core::VerifiedDatName, source: &Path) -> NameChoice {
+        choose_name(dat, self.romm.name_for(source), source)
+    }
+}
+
+/// RomM record titles indexed once, with the same first-record-wins rule as
+/// [`romm_name_for`] (a record matches by EmuWiz path or provider path; a
+/// record without a title never matches).
+#[derive(Default)]
+pub(crate) struct RommTitles {
+    by_path: std::collections::HashMap<PathBuf, (usize, String)>,
+    by_provider: std::collections::HashMap<String, (usize, String)>,
+}
+
+impl RommTitles {
+    pub(crate) fn new(
+        cache: Option<&archivefs_core::identity_source::cache::IdentityCache>,
+    ) -> Self {
+        let mut titles = Self::default();
+        for (index, record) in cache.into_iter().flat_map(|c| c.records.iter()).enumerate() {
+            let Some(title) = record.title.clone() else {
+                continue;
+            };
+            if let Some(path) = &record.archivefs_path {
+                titles
+                    .by_path
+                    .entry(path.clone())
+                    .or_insert((index, title.clone()));
+            }
+            titles
+                .by_provider
+                .entry(record.provider_path.clone())
+                .or_insert((index, title));
+        }
+        titles
+    }
+
+    pub(crate) fn name_for(&self, source: &Path) -> Option<String> {
+        let by_path = self.by_path.get(source);
+        let by_provider = self.by_provider.get(source.to_string_lossy().as_ref());
+        let title = match (by_path, by_provider) {
+            (Some(a), Some(b)) => {
+                if a.0 <= b.0 {
+                    a
+                } else {
+                    b
+                }
+            }
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => return None,
+        };
+        romm_title_with_extension(&title.1, source)
     }
 }
 
@@ -3432,6 +3530,82 @@ mod tests {
         );
         // No cache at all falls back to None.
         assert_eq!(romm_name_for(&source, None), None);
+    }
+
+    #[test]
+    fn indexed_romm_titles_match_the_linear_lookup() {
+        use archivefs_core::identity_source::cache::{CACHE_FORMAT_VERSION, IdentityCache};
+        use archivefs_core::identity_source::model::{
+            ExternalIdentityRecord, ExternalVerification, IdentityProvider,
+        };
+        let record =
+            |path: Option<&str>, provider: &str, title: Option<&str>| ExternalIdentityRecord {
+                provider: IdentityProvider::Romm,
+                server_id: "t".into(),
+                provider_platform_id: None,
+                provider_game_id: provider.into(),
+                provider_file_id: None,
+                provider_path: provider.into(),
+                archivefs_path: path.map(PathBuf::from),
+                title: title.map(Into::into),
+                platform_candidate: None,
+                provider_platform_name: None,
+                regions: Vec::new(),
+                revision: None,
+                hashes: Vec::new(),
+                file_size_bytes: None,
+                metadata_provider_ids: Vec::new(),
+                artwork: None,
+                related_files: Vec::new(),
+                sibling_game_ids: Vec::new(),
+                imported_at_unix_seconds: 1,
+                provider_updated_at: None,
+                verification: ExternalVerification::StrongExternal,
+                conflicts: Vec::new(),
+                evidence: Vec::new(),
+                synopsis: None,
+                genres: Vec::new(),
+                players: None,
+                rating: None,
+                release_year: None,
+                howlongtobeat: None,
+            };
+        let cache = IdentityCache {
+            format_version: CACHE_FORMAT_VERSION,
+            provider: IdentityProvider::Romm,
+            server_id: "t".into(),
+            server_version: None,
+            source_fingerprint: "f".into(),
+            imported_at_unix_seconds: 1,
+            platforms: Vec::new(),
+            records: vec![
+                // Matches /r/a.gba by provider path first, then by EmuWiz path.
+                record(None, "/r/a.gba", Some("First")),
+                record(Some("/r/a.gba"), "x/a.gba", Some("Second")),
+                // A titleless record never matches; the later one does.
+                record(Some("/r/b.gba"), "x/b.gba", None),
+                record(Some("/r/b.gba"), "y/b.gba", Some("Bee")),
+                record(Some("/r/c.gba"), "z/c.gba", Some("  ")),
+            ],
+            rejected_hashes: Vec::new(),
+            unknown_platforms: Vec::new(),
+            server_reported_total: Some(5),
+        };
+        let index = RommTitles::new(Some(&cache));
+        for path in ["/r/a.gba", "/r/b.gba", "/r/c.gba", "/r/none.gba", "x/a.gba"] {
+            let path = Path::new(path);
+            assert_eq!(
+                index.name_for(path),
+                romm_name_for(path, Some(&cache)),
+                "{}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            index.name_for(Path::new("/r/a.gba")).as_deref(),
+            Some("First.gba")
+        );
+        assert_eq!(RommTitles::new(None).name_for(Path::new("/r/a.gba")), None);
     }
 
     #[test]
