@@ -6,13 +6,19 @@
 //! one bounded set at a time. Ctrl-C stops the run: the set being read is
 //! given up, every finished set stays saved, and running the command again
 //! continues with the rest.
+//!
+//! With `--unchecked` the same steps cover games that have no saved DAT
+//! result yet (first-time matching): a game is checked only when its system
+//! is known and exactly one usable catalogue is installed for it. Several
+//! fitting catalogues are never ranked; those games wait for a choice in
+//! Check Games.
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use archivefs_core::dat::reaudit::{
-    ReauditBlock, ReauditCatalogues, ReauditLimits, ReauditPlan, ReauditProgress, ReauditReport,
-    ReauditStop, plan_reaudit, run_reaudit,
+    FirstMatchPlan, FirstMatchWait, ReauditBlock, ReauditCatalogues, ReauditLimits, ReauditPlan,
+    ReauditProgress, ReauditReport, ReauditStop, plan_first_matching, plan_reaudit, run_reaudit,
 };
 use archivefs_core::dat::sources::audit_run::DatAuditProgress;
 use archivefs_core::safe_read::TrustedRoots;
@@ -264,8 +270,94 @@ fn report_json(report: &ReauditReport, plan: &ReauditPlan, seconds: f64) -> Repo
     }
 }
 
+fn wait_text(wait: &FirstMatchWait) -> String {
+    match wait {
+        FirstMatchWait::SystemUnknown => "the game has no known system".into(),
+        FirstMatchWait::NoCatalogue => "no usable catalogue for the system (none installed, disabled, not validated, or changed since it was validated)".into(),
+        FirstMatchWait::NeedsChoice { catalogues } => format!(
+            "several catalogues fit ({}); choose one in Check Games",
+            catalogues.join(", ")
+        ),
+        FirstMatchWait::CatalogueUnusable(why) => format!("the catalogue cannot be used: {why}"),
+        FirstMatchWait::FileUnavailable => "file missing or storage not connected".into(),
+    }
+}
+
+#[derive(Serialize)]
+struct FirstPlanJson {
+    already_checked: usize,
+    to_check: usize,
+    bytes: u64,
+    groups: Vec<GroupJson>,
+    waiting: Vec<WaitingJson>,
+}
+
+#[derive(Serialize)]
+struct WaitingJson {
+    system: Option<String>,
+    reason: String,
+    games: usize,
+}
+
+fn first_plan_json(first: &FirstMatchPlan) -> FirstPlanJson {
+    FirstPlanJson {
+        already_checked: first.already_checked,
+        to_check: first.plan.games(),
+        bytes: first.plan.bytes(),
+        groups: first
+            .plan
+            .groups
+            .iter()
+            .map(|group| GroupJson {
+                source_id: group.source_id.clone(),
+                catalogue: group.catalogue_name.clone(),
+                system: group.platform.clone(),
+                games: group.items.len(),
+            })
+            .collect(),
+        waiting: first
+            .waiting
+            .iter()
+            .map(|waiting| WaitingJson {
+                system: waiting.platform.clone(),
+                reason: wait_text(&waiting.wait),
+                games: waiting.games,
+            })
+            .collect(),
+    }
+}
+
+fn print_first_plan(plan: &FirstPlanJson) {
+    println!(
+        "Games with a saved DAT result (left alone; plain `dat recheck` covers them): {}",
+        plan.already_checked
+    );
+    println!(
+        "Games to match for the first time: {} ({:.1} GiB by recorded size)",
+        plan.to_check,
+        plan.bytes as f64 / (1u64 << 30) as f64
+    );
+    for group in &plan.groups {
+        println!(
+            "    {:>7}  {} against {} ({})",
+            group.games, group.system, group.catalogue, group.source_id
+        );
+    }
+    let waiting: usize = plan.waiting.iter().map(|w| w.games).sum();
+    println!("Waiting, not matched now ({waiting}):");
+    for w in &plan.waiting {
+        println!(
+            "    {:>7}  {}: {}",
+            w.games,
+            w.system.as_deref().unwrap_or("unknown system"),
+            w.reason
+        );
+    }
+}
+
 pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut confirm = false;
+    let mut unchecked = false;
     let mut json = false;
     let mut limit = None;
     let mut database = None;
@@ -274,6 +366,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--confirm" => confirm = true,
+            "--unchecked" => unchecked = true,
             "--json" => json = true,
             "--limit" => {
                 limit = Some(
@@ -298,9 +391,10 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "dat recheck: unknown argument {other}. Nothing was checked.\n\
-                     usage: dat recheck [--confirm] [--limit <n>] [--games-per-set <n>] \
-                     [--database <path>] [--json]\n\
-                     Without --confirm this only lists what would be checked."
+                     usage: dat recheck [--unchecked] [--confirm] [--limit <n>] \
+                     [--games-per-set <n>] [--database <path>] [--json]\n\
+                     Without --confirm this only lists what would be checked. \
+                     --unchecked matches games that have no saved result yet."
                 )
                 .into());
             }
@@ -311,6 +405,9 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         None => archivefs_core::default_database_path()?,
     };
     let catalogues = ReauditCatalogues::load_default()?;
+    if unchecked {
+        return run_first_time(&database, &catalogues, confirm, json, limit, games_per_set);
+    }
     let mut plan = plan_reaudit(&database, &catalogues.configured())?;
     if let Some(limit) = limit {
         plan = plan.truncated(limit);
@@ -331,6 +428,80 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if !json {
         print_plan(&summary);
     }
+    let (report, seconds) = execute(&database, &plan, &catalogues, games_per_set)?;
+    let output = report_json(&report, &plan, seconds);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+    println!(
+        "Checked again in {seconds:.1} s; {} rows saved in {} sets.",
+        output.saved, output.sets_saved
+    );
+    print_tally(&output.tally, true);
+    print_outcome(&output);
+    Ok(())
+}
+
+/// `dat recheck --unchecked`: first-time matching for games with no saved
+/// DAT result, through the same bounded, resumable run as a re-check.
+fn run_first_time(
+    database: &std::path::Path,
+    catalogues: &ReauditCatalogues,
+    confirm: bool,
+    json: bool,
+    limit: Option<usize>,
+    games_per_set: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut first = plan_first_matching(database, &catalogues.configured(), &|platform| {
+        catalogues.for_platform(platform)
+    })?;
+    if let Some(limit) = limit {
+        first = first.truncated(limit);
+    }
+    let summary = first_plan_json(&first);
+    if !confirm {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        } else {
+            print_first_plan(&summary);
+            println!(
+                "Nothing was read or changed. Add --confirm to match these games; \
+                 that reads the game files and saves the results in the library database."
+            );
+        }
+        return Ok(());
+    }
+    if !json {
+        print_first_plan(&summary);
+    }
+    let (report, seconds) = execute(database, &first.plan, catalogues, games_per_set)?;
+    let output = report_json(&report, &first.plan, seconds);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "plan": summary,
+                "run": output,
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "Matched in {seconds:.1} s; {} rows saved in {} sets: {} verified, {} no match, {} need a choice.",
+        output.saved, output.sets_saved, output.verified, output.no_match, output.ambiguous
+    );
+    print_outcome(&output);
+    Ok(())
+}
+
+/// Runs a planned check with Ctrl-C handling and the configured trusted roots.
+fn execute(
+    database: &std::path::Path,
+    plan: &ReauditPlan,
+    catalogues: &ReauditCatalogues,
+    games_per_set: Option<usize>,
+) -> Result<(ReauditReport, f64), Box<dyn std::error::Error>> {
     // SAFETY: the handler only stores to an atomic.
     unsafe {
         libc::signal(
@@ -349,8 +520,8 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     }
     let started = std::time::Instant::now();
     let report = run_reaudit(
-        &database,
-        &plan,
+        database,
+        plan,
         &|source_id| catalogues.resolve(source_id),
         &trusted,
         &STOP,
@@ -379,17 +550,10 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             | ReauditProgress::Audit(_) => {}
         },
     )?;
-    let seconds = started.elapsed().as_secs_f64();
-    let output = report_json(&report, &plan, seconds);
-    if json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
-        return Ok(());
-    }
-    println!(
-        "Checked again in {seconds:.1} s; {} rows saved in {} sets.",
-        output.saved, output.sets_saved
-    );
-    print_tally(&output.tally, true);
+    Ok((report, started.elapsed().as_secs_f64()))
+}
+
+fn print_outcome(output: &ReportJson) {
     if !output.no_longer_matching.is_empty() {
         println!(
             "{} saved matches no longer match their file (the earlier results are kept for the record):",
@@ -424,5 +588,4 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "A verified file matches its catalogue entry. That says nothing about whether an emulator will run it."
     );
-    Ok(())
 }

@@ -19,7 +19,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::catalogue_selection::ResolvedCatalogue;
+use super::catalogue_selection::{CatalogueResolveError, ResolvedCatalogue};
 use super::configured_catalogues::ConfiguredCatalogue;
 use super::library_verification::{
     VerificationFindingKind, VerificationTotals, preview_rows_verification,
@@ -38,8 +38,11 @@ pub struct ReauditItem {
     /// The size the library last recorded; used only to bound a set.
     pub size_bytes: Option<u64>,
     /// The saved verdict column. A hint about what to expect, never a result.
+    /// Empty for a game with no saved result.
     pub saved_verdict: String,
-    pub status: SavedDatEvidenceStatus,
+    /// Why the saved result is not current; `None` for a game with no saved
+    /// result yet (first-time matching, [`plan_first_matching`]).
+    pub status: Option<SavedDatEvidenceStatus>,
 }
 
 /// Rows that can be checked together: one catalogue, one system.
@@ -74,7 +77,7 @@ pub struct ReauditBlocked {
     pub source_id: String,
     pub path: PathBuf,
     pub saved_verdict: String,
-    pub status: SavedDatEvidenceStatus,
+    pub status: Option<SavedDatEvidenceStatus>,
     pub block: ReauditBlock,
 }
 
@@ -177,8 +180,13 @@ impl ReauditPlan {
     /// Games to check for each reason they are not current.
     pub fn by_status(&self) -> BTreeMap<SavedDatEvidenceStatus, usize> {
         let mut counts = BTreeMap::new();
-        for item in self.groups.iter().flat_map(|group| &group.items) {
-            *counts.entry(item.status).or_insert(0) += 1;
+        for status in self
+            .groups
+            .iter()
+            .flat_map(|group| &group.items)
+            .filter_map(|item| item.status)
+        {
+            *counts.entry(status).or_insert(0) += 1;
         }
         counts
     }
@@ -256,7 +264,7 @@ pub fn plan_reaudit(
                 source_id: row.dat_source_id,
                 path: row.path,
                 saved_verdict: row.saved_verdict,
-                status: row.status,
+                status: Some(row.status),
                 block,
             });
             continue;
@@ -269,7 +277,7 @@ pub fn plan_reaudit(
                 path: row.path,
                 size_bytes: row.size_bytes,
                 saved_verdict: row.saved_verdict,
-                status: row.status,
+                status: Some(row.status),
             });
     }
     plan.groups = groups
@@ -285,6 +293,196 @@ pub fn plan_reaudit(
         })
         .collect();
     Ok(plan)
+}
+
+/// Why games with no saved DAT result are not matched for the first time now.
+/// Nothing is guessed: each of these waits for the person or for storage.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FirstMatchWait {
+    /// The game has no known system, so no catalogue can be chosen for it.
+    SystemUnknown,
+    /// No usable catalogue is installed for the system.
+    NoCatalogue,
+    /// More than one usable catalogue fits the system. The person chooses
+    /// one (Check Games); none is ranked or picked here.
+    NeedsChoice { catalogues: Vec<String> },
+    /// The system's one catalogue cannot be used for this now (why).
+    CatalogueUnusable(String),
+    /// The file is missing or its storage is not connected.
+    FileUnavailable,
+}
+
+/// Games that wait for the same reason on the same system.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FirstMatchWaiting {
+    pub platform: Option<String>,
+    pub wait: FirstMatchWait,
+    pub games: usize,
+}
+
+/// What first-time matching would do. Built from library rows, saved-row
+/// ids and file metadata only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FirstMatchPlan {
+    /// The games to check, one group per system and its one catalogue. Run
+    /// it with [`run_reaudit`], exactly like a re-check.
+    pub plan: ReauditPlan,
+    /// Library games that already have a saved DAT result. Left alone here;
+    /// [`plan_reaudit`] is what checks those again.
+    pub already_checked: usize,
+    /// Games without a saved result that cannot be matched now, by system
+    /// and reason, in a stable order.
+    pub waiting: Vec<FirstMatchWaiting>,
+}
+
+impl FirstMatchPlan {
+    pub fn waiting_games(&self) -> usize {
+        self.waiting.iter().map(|waiting| waiting.games).sum()
+    }
+
+    /// Keeps at most `limit` games to check; the rest wait for a later run.
+    pub fn truncated(mut self, limit: usize) -> Self {
+        self.plan = self.plan.truncated(limit);
+        self
+    }
+}
+
+/// Lists the library games that have no saved DAT result at all and groups
+/// the ones a check can cover: a known system with exactly one usable
+/// installed catalogue. `for_platform` is the catalogue rule Check Games uses
+/// ([`ReauditCatalogues::for_platform`]); several candidates are never
+/// ranked, they wait for the person's choice.
+///
+/// Opens the library read-only; reads no game content and writes nothing.
+pub fn plan_first_matching(
+    database_path: &Path,
+    catalogues: &HashMap<String, ConfiguredCatalogue>,
+    for_platform: &dyn Fn(&str) -> Result<ResolvedCatalogue, CatalogueResolveError>,
+) -> Result<FirstMatchPlan, String> {
+    let db = Database::open_read_only(database_path).map_err(|e| e.to_string())?;
+    let checked = db
+        .archives_with_saved_dat_results()
+        .map_err(|e| e.to_string())?;
+    let mut archives = db.load_archives().map_err(|e| e.to_string())?;
+    archives.sort_by_key(|archive| archive.id);
+    let mut first = FirstMatchPlan::default();
+    let mut choice: BTreeMap<&'static str, Result<(String, String), FirstMatchWait>> =
+        BTreeMap::new();
+    let mut groups: BTreeMap<(String, &'static str), (String, Vec<ReauditItem>)> = BTreeMap::new();
+    let mut waiting: BTreeMap<(Option<String>, FirstMatchWait), usize> = BTreeMap::new();
+    for archive in archives {
+        if checked.contains(&archive.id) {
+            first.already_checked += 1;
+            continue;
+        }
+        let platform = archive
+            .platform
+            .as_deref()
+            .and_then(crate::canonical_platform_for_alias);
+        let Some(platform) = platform else {
+            *waiting
+                .entry((None, FirstMatchWait::SystemUnknown))
+                .or_insert(0) += 1;
+            continue;
+        };
+        let catalogue = choice
+            .entry(platform)
+            .or_insert_with(|| one_catalogue_for(platform, catalogues, for_platform));
+        let (source_id, catalogue_name) = match catalogue {
+            Ok(found) => found.clone(),
+            Err(wait) => {
+                *waiting
+                    .entry((Some(platform.to_string()), wait.clone()))
+                    .or_insert(0) += 1;
+                continue;
+            }
+        };
+        // Disconnected storage, a deleted file, or a row the last scan found
+        // missing: nothing can be read now.
+        if archive.last_verified_missing_at.is_some()
+            || std::fs::symlink_metadata(&archive.absolute_path).is_err()
+        {
+            *waiting
+                .entry((Some(platform.to_string()), FirstMatchWait::FileUnavailable))
+                .or_insert(0) += 1;
+            continue;
+        }
+        groups
+            .entry((source_id, platform))
+            .or_insert_with(|| (catalogue_name, Vec::new()))
+            .1
+            .push(ReauditItem {
+                archive_id: archive.id,
+                path: archive.absolute_path,
+                size_bytes: archive.size_bytes,
+                saved_verdict: String::new(),
+                status: None,
+            });
+    }
+    first.plan.groups = groups
+        .into_iter()
+        .map(
+            |((source_id, platform), (catalogue_name, items))| ReauditGroup {
+                catalogue_name,
+                source_id,
+                platform: platform.to_string(),
+                items,
+            },
+        )
+        .collect();
+    first.waiting = waiting
+        .into_iter()
+        .map(|((platform, wait), games)| FirstMatchWaiting {
+            platform,
+            wait,
+            games,
+        })
+        .collect();
+    Ok(first)
+}
+
+/// The one catalogue first-time matching may use for `platform`, as its
+/// configured id and display name, or why there is none.
+fn one_catalogue_for(
+    platform: &str,
+    catalogues: &HashMap<String, ConfiguredCatalogue>,
+    for_platform: &dyn Fn(&str) -> Result<ResolvedCatalogue, CatalogueResolveError>,
+) -> Result<(String, String), FirstMatchWait> {
+    let resolved = match for_platform(platform) {
+        Ok(resolved) => resolved,
+        Err(CatalogueResolveError::NoCatalogueForPlatform { .. }) => {
+            return Err(FirstMatchWait::NoCatalogue);
+        }
+        Err(CatalogueResolveError::MultipleCandidates { candidates, .. }) => {
+            return Err(FirstMatchWait::NeedsChoice {
+                catalogues: candidates.into_iter().map(|c| c.display_name).collect(),
+            });
+        }
+        Err(CatalogueResolveError::PlatformAmbiguity { candidates }) => {
+            return Err(FirstMatchWait::CatalogueUnusable(format!(
+                "the catalogue names several systems ({}); choose its system first",
+                candidates.join(", ")
+            )));
+        }
+        Err(other) => return Err(FirstMatchWait::CatalogueUnusable(other.to_string())),
+    };
+    if resolved.ecosystem == super::model::DatEcosystem::MAMEArcade {
+        return Err(FirstMatchWait::CatalogueUnusable(
+            "arcade sets are checked with the MAME collection tools".into(),
+        ));
+    }
+    // Only a catalogue a re-check can resolve again by id, with a content
+    // digest to bind the results to, can record proof.
+    match catalogues.get(&resolved.source_id) {
+        Some(configured)
+            if configured.kind == DatSourceKind::File && configured.sha256.is_some() =>
+        {
+            Ok((resolved.source_id, configured.display_name.clone()))
+        }
+        _ => Err(FirstMatchWait::CatalogueUnusable(
+            "the catalogue is not a single readable file with a content digest".into(),
+        )),
+    }
 }
 
 /// The configured catalogue stores, loaded once for a plan and its run.
@@ -327,6 +525,12 @@ impl ReauditCatalogues {
     /// The catalogue saved rows name by `source_id`, as it is right now.
     pub fn resolve(&self, source_id: &str) -> Result<ResolvedCatalogue, String> {
         super::configured_catalogues::resolve_configured_catalogue(source_id, self.inputs())
+    }
+
+    /// The one usable game catalogue for a system, by the rule Check Games
+    /// uses: none, exactly one, or several for the person to choose from.
+    pub fn for_platform(&self, platform: &str) -> Result<ResolvedCatalogue, CatalogueResolveError> {
+        super::catalogue_selection::resolve_catalogue_for_platform(platform, self.inputs())
     }
 }
 

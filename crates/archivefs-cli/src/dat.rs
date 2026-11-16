@@ -217,8 +217,8 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let Some(command) = args.first().cloned() else {
         return Err(
             "dat requires a sub-command: inspect <path> | validate <path> | audit <path> [--json] \
-             [--file <path> ...] | duel <DAT-A> <DAT-B> [--json] | recheck [--confirm] [--limit <n>] \
-             [--database <path>] [--json]\n\
+             [--file <path> ...] | duel <DAT-A> <DAT-B> [--json] | recheck [--unchecked] [--confirm] \
+             [--limit <n>] [--database <path>] [--json]\n\
              \x20 --file compares the given name against the DAT. It does not open,\n\
              \x20 read or hash the file."
                 .into(),

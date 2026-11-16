@@ -14,7 +14,7 @@ fn item(id: i64, status: SavedDatEvidenceStatus) -> ReauditItem {
         path: PathBuf::from(format!("/games/gba/game-{id}.gba")),
         size_bytes: Some(8 * 1024 * 1024),
         saved_verdict: "verified_single_match".into(),
-        status,
+        status: Some(status),
     }
 }
 
@@ -47,7 +47,7 @@ fn plan(games: usize, blocked: usize, current: usize) -> ReauditPlan {
                 source_id: "165".into(),
                 path: PathBuf::from(format!("/games/gbc/game-{n}.gbc")),
                 saved_verdict: "verified_single_match".into(),
-                status: SavedDatEvidenceStatus::CatalogueUnavailable,
+                status: Some(SavedDatEvidenceStatus::CatalogueUnavailable),
                 block: ReauditBlock::CatalogueUnavailable,
             })
             .collect(),
@@ -64,7 +64,7 @@ fn plan_with_not_applicable(games: usize, blocked: usize, current: usize, n: usi
         source_id: "158".into(),
         path: PathBuf::from(format!("/games/pc88/disk-{i}.d88")),
         saved_verdict: "no_match".into(),
-        status: SavedDatEvidenceStatus::DoesNotApply,
+        status: Some(SavedDatEvidenceStatus::DoesNotApply),
         block: ReauditBlock::DoesNotApply,
     }));
     plan.saved_rows += n;

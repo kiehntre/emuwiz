@@ -134,6 +134,21 @@ fn judge_saved_row(
 }
 
 impl Database {
+    /// Library games that have at least one saved DAT result, from any
+    /// catalogue and whether or not it is current. Reads saved rows only.
+    pub fn archives_with_saved_dat_results(&self) -> Result<std::collections::HashSet<i64>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT archive_id FROM library_dat_identities")
+            .map_err(|error| db_error("failed to prepare saved DAT result list", error))?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|error| db_error("failed to list saved DAT results", error))?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|error| db_error("failed to read saved DAT result list", error))?;
+        Ok(ids)
+    }
+
     /// Every saved DAT row with why it is or is not current. Reads saved rows
     /// and file metadata only: no audit, matching or content hashing.
     pub fn saved_dat_evidence_status(
