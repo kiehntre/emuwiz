@@ -1339,6 +1339,37 @@ mod first_matching {
             registry
         }
 
+        /// The configured digest of the Spectrum catalogue.
+        fn spectrum_sha(&self) -> String {
+            let registry = self.registry();
+            let inputs = CatalogueInventoryInputs {
+                local_registry: &registry,
+                managed_sources: &Default::default(),
+                managed_root: self.dir.path(),
+                limits: DatLimits::default(),
+            };
+            crate::dat::configured_catalogues::configured_catalogues(inputs)["synthetic"]
+                .sha256
+                .clone()
+                .unwrap()
+        }
+
+        /// A note that an earlier run tried `archive_id` against the Spectrum
+        /// catalogue with these bytes and saved nothing.
+        fn tried_before(&self, archive_id: i64, sha: &str) {
+            let conn = rusqlite::Connection::open(&self.db).unwrap();
+            let written = conn
+                .execute(
+                    "INSERT INTO dat_recheck_attempts \
+                     (archive_id, dat_source_id, archive_path, attempted_at, reason, catalogue_sha256) \
+                     SELECT id, 'synthetic', absolute_path_cached, '2026-11-16T00:00:00Z', \
+                            'format not represented', ?2 FROM archives WHERE id = ?1",
+                    rusqlite::params![archive_id, sha],
+                )
+                .unwrap();
+            assert_eq!(written, 1);
+        }
+
         fn first_plan(&self) -> FirstMatchPlan {
             self.sized();
             let registry = self.registry();
@@ -1450,6 +1481,10 @@ mod first_matching {
         let rows = f.saved_rows();
         let ids: Vec<i64> = rows.iter().map(|row| row.0).collect();
         assert_eq!(ids, vec![1, 2, 3, 9], "nothing outside the plan is written");
+        assert!(
+            rows.iter().all(|row| row.1 == "synthetic"),
+            "saved against the resolved catalogue: {rows:?}"
+        );
         assert_eq!(rows[0].2, "verified_single_match");
         assert_eq!(rows[2].2, "no_match");
         // Saved results are current proof, so the re-check leaves them alone.
@@ -1494,5 +1529,74 @@ mod first_matching {
         assert_eq!(plan.plan.blocked.len(), 1);
         assert_eq!(plan.plan.blocked[0].block, ReauditBlock::LeftOutOfThisRun);
         assert_eq!(plan.plan.blocked[0].status, None);
+    }
+
+    /// A game whose only saved result is from another catalogue (another
+    /// system's, or one since removed) is neither re-checked (that result
+    /// does not apply) nor left as "already checked": it is matched against
+    /// its own system's catalogue, and the other result is kept as it is.
+    #[test]
+    fn a_result_from_another_catalogue_does_not_count_as_checked_and_is_kept() {
+        let f = library();
+        let conn = rusqlite::Connection::open(&f.db).unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE other AS SELECT * FROM library_dat_identities WHERE archive_id = 9;
+             UPDATE other SET id = NULL, archive_id = 1, dat_source_id = 'removed-catalogue';
+             INSERT INTO library_dat_identities SELECT * FROM other;",
+        )
+        .unwrap();
+        drop(conn);
+        let before: Vec<_> = f.saved_rows().into_iter().filter(|r| r.0 == 1).collect();
+        assert_eq!(before.len(), 1);
+        let plan = f.first_plan();
+        assert_eq!((plan.already_checked, plan.checked_elsewhere), (1, 1));
+        let ids: Vec<i64> = plan.plan.groups[0]
+            .items
+            .iter()
+            .map(|item| item.archive_id)
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        f.reaudit_with(&plan.plan, 10, &AtomicBool::new(false), &|_| {})
+            .unwrap();
+        let after: Vec<_> = f.saved_rows().into_iter().filter(|r| r.0 == 1).collect();
+        assert_eq!(
+            after,
+            vec![
+                before[0].clone(),
+                (1, "synthetic".into(), "verified_single_match".into())
+            ],
+            "the other catalogue's result is kept; the new one is added beside it"
+        );
+        // A result from the catalogue that would be used is the re-check's job.
+        assert_eq!(f.first_plan().plan.games(), 0);
+    }
+
+    /// Games an earlier run tried against the same catalogue bytes without
+    /// saving anything go last under a limit, so repeating a limited run
+    /// moves on; with new catalogue bytes they count as never tried.
+    #[test]
+    fn a_limited_run_reaches_games_never_tried_before_retrying() {
+        let f = library();
+        let sha = f.spectrum_sha();
+        f.tried_before(1, &sha);
+        let plan = f.first_plan();
+        assert_eq!(plan.retry.iter().copied().collect::<Vec<_>>(), vec![1]);
+        let limited = plan.clone().truncated(2);
+        let ids: Vec<i64> = limited.plan.groups[0]
+            .items
+            .iter()
+            .map(|item| item.archive_id)
+            .collect();
+        assert_eq!(ids, vec![2, 3], "never-tried games first");
+        assert_eq!(limited.left_out(), 1);
+        assert!(limited.retry.is_empty());
+        // With room, the tried game is still checked, in plan order.
+        let all = plan.truncated(3);
+        assert_eq!(all.plan.games(), 3);
+        assert_eq!(all.plan.groups[0].items[0].archive_id, 1);
+        // A note against other catalogue bytes is not a retry.
+        let g = library();
+        g.tried_before(1, "0".repeat(64).as_str());
+        assert!(g.first_plan().retry.is_empty());
     }
 }

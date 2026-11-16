@@ -134,19 +134,28 @@ fn judge_saved_row(
 }
 
 impl Database {
-    /// Library games that have at least one saved DAT result, from any
-    /// catalogue and whether or not it is current. Reads saved rows only.
-    pub fn archives_with_saved_dat_results(&self) -> Result<std::collections::HashSet<i64>> {
+    /// For each library game with saved DAT results, the catalogues they
+    /// came from.
+    pub fn saved_dat_result_sources(
+        &self,
+    ) -> Result<std::collections::HashMap<i64, std::collections::BTreeSet<String>>> {
         let mut statement = self
             .connection
-            .prepare("SELECT DISTINCT archive_id FROM library_dat_identities")
+            .prepare("SELECT DISTINCT archive_id, dat_source_id FROM library_dat_identities")
             .map_err(|error| db_error("failed to prepare saved DAT result list", error))?;
-        let ids = statement
-            .query_map([], |row| row.get::<_, i64>(0))
+        let pairs = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|error| db_error("failed to list saved DAT results", error))?
-            .collect::<std::result::Result<_, _>>()
+            .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| db_error("failed to read saved DAT result list", error))?;
-        Ok(ids)
+        let mut sources: std::collections::HashMap<i64, std::collections::BTreeSet<String>> =
+            Default::default();
+        for (archive_id, source_id) in pairs {
+            sources.entry(archive_id).or_default().insert(source_id);
+        }
+        Ok(sources)
     }
 
     /// Every saved DAT row with why it is or is not current. Reads saved rows

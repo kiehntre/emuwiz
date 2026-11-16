@@ -287,6 +287,9 @@ fn wait_text(wait: &FirstMatchWait) -> String {
 struct FirstPlanJson {
     already_checked: usize,
     to_check: usize,
+    checked_elsewhere: usize,
+    tried_before: usize,
+    left_out_by_limit: usize,
     bytes: u64,
     groups: Vec<GroupJson>,
     waiting: Vec<WaitingJson>,
@@ -303,6 +306,9 @@ fn first_plan_json(first: &FirstMatchPlan) -> FirstPlanJson {
     FirstPlanJson {
         already_checked: first.already_checked,
         to_check: first.plan.games(),
+        checked_elsewhere: first.checked_elsewhere,
+        tried_before: first.retry.len(),
+        left_out_by_limit: first.left_out(),
         bytes: first.plan.bytes(),
         groups: first
             .plan
@@ -341,6 +347,24 @@ fn print_first_plan(plan: &FirstPlanJson) {
         println!(
             "    {:>7}  {} against {} ({})",
             group.games, group.system, group.catalogue, group.source_id
+        );
+    }
+    if plan.checked_elsewhere > 0 {
+        println!(
+            "    {:>7}  of these have results only from other catalogues (kept as they are)",
+            plan.checked_elsewhere
+        );
+    }
+    if plan.tried_before > 0 {
+        println!(
+            "    {:>7}  of these were tried before against the same catalogue without a result",
+            plan.tried_before
+        );
+    }
+    if plan.left_out_by_limit > 0 {
+        println!(
+            "Left out of this run by --limit: {} (games never tried go first)",
+            plan.left_out_by_limit
         );
     }
     let waiting: usize = plan.waiting.iter().map(|w| w.games).sum();
@@ -482,7 +506,9 @@ fn run_first_time(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "plan": summary,
-                "run": output,
+                // The re-check tally describes saved results; a first-time
+                // run has none, so it is left out rather than shown at zero.
+                "run": without_tally(&output)?,
             }))?
         );
         return Ok(());
@@ -493,6 +519,14 @@ fn run_first_time(
     );
     print_outcome(&output);
     Ok(())
+}
+
+fn without_tally(output: &ReportJson) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(output)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("tally");
+    }
+    Ok(value)
 }
 
 /// Runs a planned check with Ctrl-C handling and the configured trusted roots.

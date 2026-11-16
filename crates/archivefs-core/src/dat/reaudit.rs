@@ -12,7 +12,7 @@
 //! after a stop, a crash or a restart, a new plan lists exactly the rows
 //! that still lack current evidence. No "in progress" marker is ever read
 //! as a result.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
@@ -327,9 +327,18 @@ pub struct FirstMatchPlan {
     /// The games to check, one group per system and its one catalogue. Run
     /// it with [`run_reaudit`], exactly like a re-check.
     pub plan: ReauditPlan,
-    /// Library games that already have a saved DAT result. Left alone here;
-    /// [`plan_reaudit`] is what checks those again.
+    /// Library games that already have a saved DAT result for the catalogue
+    /// that would be used (or that cannot be planned now and have any saved
+    /// result). Left alone here; [`plan_reaudit`] is what checks those again.
     pub already_checked: usize,
+    /// Planned games whose only saved results are from other catalogues
+    /// (another system's, or one since removed). Those rows are kept as they
+    /// are; the game is matched against its own system's catalogue.
+    pub checked_elsewhere: usize,
+    /// Planned games a previous run already tried against these same
+    /// catalogue bytes without saving a result. A limited run takes them
+    /// last, so it always reaches games never tried.
+    pub retry: BTreeSet<i64>,
     /// Games without a saved result that cannot be matched now, by system
     /// and reason, in a stable order.
     pub waiting: Vec<FirstMatchWaiting>,
@@ -340,10 +349,63 @@ impl FirstMatchPlan {
         self.waiting.iter().map(|waiting| waiting.games).sum()
     }
 
-    /// Keeps at most `limit` games to check; the rest wait for a later run.
+    /// Keeps at most `limit` games to check; the rest wait for a later run
+    /// (counted as left out of this run). Games never tried come first, in
+    /// plan order, then games tried before without a result; so repeating a
+    /// limited run always moves on instead of retrying the same games.
     pub fn truncated(mut self, limit: usize) -> Self {
-        self.plan = self.plan.truncated(limit);
+        let mut budget = limit;
+        let mut keep: Vec<Vec<bool>> = self
+            .plan
+            .groups
+            .iter()
+            .map(|group| vec![false; group.items.len()])
+            .collect();
+        for retried in [false, true] {
+            for (group, kept) in self.plan.groups.iter().zip(keep.iter_mut()) {
+                for (item, kept) in group.items.iter().zip(kept.iter_mut()) {
+                    if budget > 0 && self.retry.contains(&item.archive_id) == retried {
+                        *kept = true;
+                        budget -= 1;
+                    }
+                }
+            }
+        }
+        for (group, kept) in self.plan.groups.iter_mut().zip(keep) {
+            let items = std::mem::take(&mut group.items);
+            for (item, kept) in items.into_iter().zip(kept) {
+                if kept {
+                    group.items.push(item);
+                } else {
+                    self.plan.blocked.push(ReauditBlocked {
+                        archive_id: item.archive_id,
+                        source_id: group.source_id.clone(),
+                        path: item.path,
+                        saved_verdict: item.saved_verdict,
+                        status: item.status,
+                        block: ReauditBlock::LeftOutOfThisRun,
+                    });
+                }
+            }
+        }
+        self.plan.groups.retain(|group| !group.items.is_empty());
+        let planned: BTreeSet<i64> = self
+            .plan
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter().map(|item| item.archive_id))
+            .collect();
+        self.retry.retain(|id| planned.contains(id));
         self
+    }
+
+    /// Games left out of this run by a limit.
+    pub fn left_out(&self) -> usize {
+        self.plan
+            .blocked
+            .iter()
+            .filter(|blocked| blocked.block == ReauditBlock::LeftOutOfThisRun)
+            .count()
     }
 }
 
@@ -360,52 +422,72 @@ pub fn plan_first_matching(
     for_platform: &dyn Fn(&str) -> Result<ResolvedCatalogue, CatalogueResolveError>,
 ) -> Result<FirstMatchPlan, String> {
     let db = Database::open_read_only(database_path).map_err(|e| e.to_string())?;
-    let checked = db
-        .archives_with_saved_dat_results()
-        .map_err(|e| e.to_string())?;
+    let saved = db.saved_dat_result_sources().map_err(|e| e.to_string())?;
+    // (game, catalogue, catalogue digest) a previous run tried and saved
+    // nothing for.
+    let tried: BTreeSet<(i64, String, String)> = db
+        .dat_recheck_attempts()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter_map(|note| {
+            note.catalogue_sha256
+                .map(|sha| (note.archive_id, note.dat_source_id, sha))
+        })
+        .collect();
     let mut archives = db.load_archives().map_err(|e| e.to_string())?;
     archives.sort_by_key(|archive| archive.id);
     let mut first = FirstMatchPlan::default();
-    let mut choice: BTreeMap<&'static str, Result<(String, String), FirstMatchWait>> =
+    let mut choice: BTreeMap<&'static str, Result<(String, String, String), FirstMatchWait>> =
         BTreeMap::new();
     let mut groups: BTreeMap<(String, &'static str), (String, Vec<ReauditItem>)> = BTreeMap::new();
     let mut waiting: BTreeMap<(Option<String>, FirstMatchWait), usize> = BTreeMap::new();
     for archive in archives {
-        if checked.contains(&archive.id) {
-            first.already_checked += 1;
-            continue;
-        }
+        let saved_here = saved.get(&archive.id);
+        // A game with any saved result that cannot be planned now is left to
+        // the re-check; it is not "waiting" for a first match.
+        let mut wait = |key: (Option<String>, FirstMatchWait)| {
+            if saved_here.is_some() {
+                first.already_checked += 1;
+            } else {
+                *waiting.entry(key).or_insert(0) += 1;
+            }
+        };
         let platform = archive
             .platform
             .as_deref()
             .and_then(crate::canonical_platform_for_alias);
         let Some(platform) = platform else {
-            *waiting
-                .entry((None, FirstMatchWait::SystemUnknown))
-                .or_insert(0) += 1;
+            wait((None, FirstMatchWait::SystemUnknown));
             continue;
         };
         let catalogue = choice
             .entry(platform)
             .or_insert_with(|| one_catalogue_for(platform, catalogues, for_platform));
-        let (source_id, catalogue_name) = match catalogue {
+        let (source_id, catalogue_name, catalogue_sha) = match catalogue {
             Ok(found) => found.clone(),
-            Err(wait) => {
-                *waiting
-                    .entry((Some(platform.to_string()), wait.clone()))
-                    .or_insert(0) += 1;
+            Err(why) => {
+                wait((Some(platform.to_string()), why.clone()));
                 continue;
             }
         };
+        // Already has a result from this very catalogue: the re-check's job.
+        if saved_here.is_some_and(|sources| sources.contains(&source_id)) {
+            first.already_checked += 1;
+            continue;
+        }
         // Disconnected storage, a deleted file, or a row the last scan found
         // missing: nothing can be read now.
         if archive.last_verified_missing_at.is_some()
             || std::fs::symlink_metadata(&archive.absolute_path).is_err()
         {
-            *waiting
-                .entry((Some(platform.to_string()), FirstMatchWait::FileUnavailable))
-                .or_insert(0) += 1;
+            wait((Some(platform.to_string()), FirstMatchWait::FileUnavailable));
             continue;
+        }
+        if saved_here.is_some() {
+            first.checked_elsewhere += 1;
+        }
+        if tried.contains(&(archive.id, source_id.clone(), catalogue_sha)) {
+            first.retry.insert(archive.id);
         }
         groups
             .entry((source_id, platform))
@@ -442,12 +524,12 @@ pub fn plan_first_matching(
 }
 
 /// The one catalogue first-time matching may use for `platform`, as its
-/// configured id and display name, or why there is none.
+/// configured id, display name and content digest, or why there is none.
 fn one_catalogue_for(
     platform: &str,
     catalogues: &HashMap<String, ConfiguredCatalogue>,
     for_platform: &dyn Fn(&str) -> Result<ResolvedCatalogue, CatalogueResolveError>,
-) -> Result<(String, String), FirstMatchWait> {
+) -> Result<(String, String, String), FirstMatchWait> {
     let resolved = match for_platform(platform) {
         Ok(resolved) => resolved,
         Err(CatalogueResolveError::NoCatalogueForPlatform { .. }) => {
@@ -477,7 +559,11 @@ fn one_catalogue_for(
         Some(configured)
             if configured.kind == DatSourceKind::File && configured.sha256.is_some() =>
         {
-            Ok((resolved.source_id, configured.display_name.clone()))
+            Ok((
+                resolved.source_id,
+                configured.display_name.clone(),
+                configured.sha256.clone().unwrap_or_default(),
+            ))
         }
         _ => Err(FirstMatchWait::CatalogueUnusable(
             "the catalogue is not a single readable file with a content digest".into(),
