@@ -1271,3 +1271,217 @@ mod non_redump {
         assert_eq!(group_of(&registry, "nr"), RecognitionGroup::Conflict);
     }
 }
+
+/// A TOSEC release pack, registered, checked and given its systems in one
+/// bulk step, exactly as the DAT page does after an import.
+mod tosec_release_pack_bulk {
+    use super::*;
+    use crate::dat::tosec_release_pack::{apply_selection_to_registry, inventory_release_pack};
+
+    fn tosec_dat(header: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+<datafile>
+  <header>
+    <name>{header}</name>
+    <description>{header} (TOSEC-v2025-01-15_CM)</description>
+    <version>2025-01-15</version>
+    <author>TOSEC</author>
+    <homepage>TOSEC</homepage>
+    <url>https://www.tosecdev.org/</url>
+  </header>
+  <game name="Example (1985)(Maker)">
+    <rom name="Example (1985)(Maker).bin" size="4" crc="0c7e7fd8" md5="098f6bcd4621d373cade4e832627b4f6" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+  </game>
+</datafile>
+"#
+        )
+    }
+
+    /// Header text as written in the file (XML-escaped) and as it reads.
+    const SPORTS: (&str, &str) = (
+        "Commodore C64 - Games - Sports - [D64]",
+        "Commodore C64 - Games - Sports - [D64]",
+    );
+    const SHOOT: (&str, &str) = (
+        "Commodore C64 - Games - Shoot&apos;em Up - [D64]",
+        "Commodore C64 - Games - Shoot'em Up - [D64]",
+    );
+    const PLAIN: (&str, &str) = (
+        "Commodore C64 - Games - [T64]",
+        "Commodore C64 - Games - [T64]",
+    );
+    const BOULDER: (&str, &str) = (
+        "Commodore C64 - Games - Boulder Dash - [D64]",
+        "Commodore C64 - Games - Boulder Dash - [D64]",
+    );
+    const RACING: (&str, &str) = (
+        "Commodore C64 - Games - Racing - [D64]",
+        "Commodore C64 - Games - Racing - [D64]",
+    );
+    const TRS80: (&str, &str) = (
+        "Tandy Radio Shack TRS-80 Model 4 - Games - Arcade",
+        "Tandy Radio Shack TRS-80 Model 4 - Games - Arcade",
+    );
+
+    struct Pack {
+        _dir: tempfile::TempDir,
+        config: PathBuf,
+    }
+
+    impl Pack {
+        /// Registers every DAT of a synthetic pack (nothing enabled until
+        /// selected, as on the DAT page), then checks each catalogue once and
+        /// saves, which is what "Check catalogues" then "Save setup" do.
+        fn registered_and_checked() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("TOSEC - DAT Pack (TOSEC-v2025-01-15)");
+            std::fs::create_dir_all(&root).unwrap();
+            for (written, read) in [SPORTS, SHOOT, PLAIN, BOULDER, RACING, TRS80] {
+                let file = format!("{} (TOSEC-v2025-01-15_CM).dat", read.replace('\'', ""));
+                std::fs::write(root.join(file), tosec_dat(written)).unwrap();
+            }
+            let inventory = inventory_release_pack(&root).unwrap();
+            let mut pack = crate::dat::tosec_release_pack::PersistedTosecPack {
+                pack_id: inventory.pack_id.clone(),
+                root_path: inventory.pack_root.clone(),
+                imported_unix_seconds: 1_700_000_000,
+                selections: Default::default(),
+                dats: inventory.dats.clone(),
+            };
+            pack.selections = pack.dats.iter().map(|dat| dat.selection_key()).collect();
+            let config = dir.path().join("dat_sources.toml");
+            let outcome = apply_selection_to_registry(&pack, &config, 42).unwrap();
+            assert_eq!(outcome.registered.len(), 6, "{outcome:?}");
+            let mut registry =
+                DatSourceRegistry::from_config(&load_dat_sources_config_from(&config).unwrap()).0;
+            assert!(
+                registry
+                    .entries()
+                    .iter()
+                    .all(|entry| entry.platform.is_none())
+            );
+            let ids: Vec<String> = registry.entries().iter().map(|e| e.id.clone()).collect();
+            for id in ids {
+                validate_into(registry.get_mut(&id).unwrap());
+            }
+            save_dat_sources_config_to(&config, &registry.to_config()).unwrap();
+            Self { _dir: dir, config }
+        }
+
+        fn registry(&self) -> DatSourceRegistry {
+            DatSourceRegistry::from_config(&load_dat_sources_config_from(&self.config).unwrap()).0
+        }
+
+        fn revision(&self) -> DatSourcesRevision {
+            load_dat_sources_config_with_revision(&self.config)
+                .unwrap()
+                .1
+        }
+
+        fn id(&self, header: (&str, &str)) -> String {
+            self.registry()
+                .entries()
+                .iter()
+                .find(|entry| {
+                    entry
+                        .display_name
+                        .starts_with(header.1.replace('\'', "").as_str())
+                })
+                .unwrap_or_else(|| panic!("{} not registered", header.1))
+                .id
+                .clone()
+        }
+
+        fn platform(&self, header: (&str, &str)) -> Option<String> {
+            self.registry()
+                .get(&self.id(header))
+                .unwrap()
+                .platform
+                .clone()
+        }
+
+        fn edit(&self, change: impl FnOnce(&mut DatSourceRegistry)) {
+            let mut registry = self.registry();
+            change(&mut registry);
+            save_dat_sources_config_to(&self.config, &registry.to_config()).unwrap();
+        }
+    }
+
+    #[test]
+    fn genre_split_game_lists_become_safe_matches_and_nothing_else_does() {
+        let pack = Pack::registered_and_checked();
+        let registry = pack.registry();
+        let mut safe: Vec<(String, &str)> = safe_matches(&registry)
+            .into_iter()
+            .map(|item| (item.header_name, item.platform))
+            .collect();
+        safe.sort();
+        assert_eq!(
+            safe,
+            vec![
+                (RACING.1.to_string(), "Commodore 64"),
+                (SHOOT.1.to_string(), "Commodore 64"),
+                (SPORTS.1.to_string(), "Commodore 64"),
+                (PLAIN.1.to_string(), "Commodore 64"),
+            ]
+        );
+        assert_eq!(
+            group_of(&registry, &pack.id(BOULDER)),
+            RecognitionGroup::Extras
+        );
+        assert_eq!(
+            group_of(&registry, &pack.id(TRS80)),
+            RecognitionGroup::CannotUse
+        );
+    }
+
+    #[test]
+    fn one_bulk_apply_sets_them_all_never_overwrites_a_choice_and_undo_reverses_it() {
+        let pack = Pack::registered_and_checked();
+        // The person already chose systems by hand: one agrees with the
+        // header, one is a different machine. Neither may be changed.
+        let (agrees, differs) = (pack.id(SPORTS), pack.id(RACING));
+        pack.edit(|registry| {
+            registry
+                .get_mut(&agrees)
+                .unwrap()
+                .set_platform_by_person(Some("Commodore 64".into()));
+            registry
+                .get_mut(&differs)
+                .unwrap()
+                .set_platform_by_person(Some("Commodore 128".into()));
+        });
+        let registry = pack.registry();
+        assert_eq!(group_of(&registry, &agrees), RecognitionGroup::AlreadySet);
+        assert_eq!(group_of(&registry, &differs), RecognitionGroup::Conflict);
+        let preview = safe_matches(&registry);
+        assert_eq!(preview.len(), 2, "{preview:?}");
+        let applied =
+            apply_safe_matches(&pack.config, &pack.revision(), &registry, &preview).unwrap();
+
+        assert_eq!(pack.platform(PLAIN).as_deref(), Some("Commodore 64"));
+        assert_eq!(pack.platform(SHOOT).as_deref(), Some("Commodore 64"));
+        assert_eq!(pack.platform(SPORTS).as_deref(), Some("Commodore 64"));
+        assert_eq!(pack.platform(RACING).as_deref(), Some("Commodore 128"));
+        assert_eq!(pack.platform(BOULDER), None);
+        assert_eq!(pack.platform(TRS80), None);
+        for header in [SPORTS, RACING] {
+            assert_eq!(
+                pack.registry()
+                    .get(&pack.id(header))
+                    .unwrap()
+                    .platform_provenance(),
+                PlatformProvenance::ChosenByPerson
+            );
+        }
+
+        let undo = last_undoable_apply(&pack.registry()).unwrap();
+        assert_eq!(undo.batch, applied.batch);
+        undo_apply(&pack.config, &pack.revision(), &undo.batch).unwrap();
+        assert_eq!(pack.platform(PLAIN), None);
+        assert_eq!(pack.platform(SHOOT), None);
+        assert_eq!(pack.platform(SPORTS).as_deref(), Some("Commodore 64"));
+        assert_eq!(pack.platform(RACING).as_deref(), Some("Commodore 128"));
+    }
+}
