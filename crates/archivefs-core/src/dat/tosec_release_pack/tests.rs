@@ -450,7 +450,7 @@ fn managed_snapshot_rejects_excessive_selected_member_count() {
 fn a_complete_official_size_release_is_inventoried_in_full() {
     // The 2025 complete release ships 4,743 DATs; a flat 3,111-file TOSEC
     // folder was once cut at 2,000 without the user being told.
-    assert!(MAX_PACK_DATS >= 4_743);
+    const _: () = assert!(MAX_PACK_DATS >= 4_743);
     let fixture = PackFixture::new();
     for index in 0..3_111 {
         fixture.write_dat(
