@@ -186,6 +186,11 @@ pub const MAX_MAGIC_OFFSET: u64 = 0x8008;
 pub const SHARED_EXTENSIONS: &[&str] = &[
     "bin", "cue", "iso", "img", "rom", "zip", "7z", "rar", "dsk", "tap", "cas", "adf", "chd",
     "mdf", "ccd", "sna", "ipf",
+    // A Commodore program file: a two-byte load address and the program.
+    // C64, C128, VIC-20, C16 and Plus/4 all use it, and the load address does
+    // not separate them (`$1001` is both an unexpanded VIC-20 and a C16/Plus/4),
+    // so it never names a system by itself.
+    "prg",
 ];
 
 /// Whether `extension` (lowercased, no dot) is one of the shared extensions
@@ -814,7 +819,7 @@ pub const PLATFORMS: &[Platform] = &[
         ],
         filename_aliases: &[],
         strong_extensions: &["t64", "crt", "g64", "d81ns"],
-        weak_extensions: &["tap", "cas", "bin", "zip"],
+        weak_extensions: &["tap", "cas", "bin", "zip", "prg"],
         magic: &[],
         layout: &[],
         conflicts_with: &["Commodore 128", "VIC-20"],

@@ -3342,3 +3342,38 @@ fn a_sega_pico_folder_is_sega_pico_and_mega_drive_folders_are_unchanged() {
     assert!(pico.conflicts_with.contains(&"MegaDrive"));
     assert!(pico.accepts_extension("zip") && !pico.accepts_extension("pco"));
 }
+
+#[test]
+fn a_prg_alone_never_names_a_commodore_machine() {
+    let report = detect(&format!("{ROOT}/unsorted/game.prg"));
+    assert_eq!(report.platform, None);
+    assert!(report.requires_confirmation);
+    let names: Vec<_> = report.candidates.iter().map(|c| c.platform).collect();
+    for expected in ["Commodore 64", "Commodore 128", "VIC-20"] {
+        assert!(
+            names.contains(&expected),
+            "{expected} missing from {names:?}"
+        );
+    }
+}
+
+#[test]
+fn a_prg_follows_folder_evidence_and_c16_plus4_folders_are_never_c64() {
+    assert_eq!(
+        detect(&format!("{ROOT}/c64/game.prg")).platform,
+        Some("Commodore 64")
+    );
+    assert_eq!(
+        detect(&format!("{ROOT}/vic20/game.prg")).platform,
+        Some("VIC-20")
+    );
+    assert_eq!(
+        detect(&format!("{ROOT}/c128/game.prg")).platform,
+        Some("Commodore 128")
+    );
+    for folder in ["plus4", "c16", "commodore16", "plus-4"] {
+        let report = detect(&format!("{ROOT}/{folder}/game.prg"));
+        assert_eq!(report.platform, None, "{folder} must not become a system");
+        assert!(report.requires_confirmation, "{folder}");
+    }
+}

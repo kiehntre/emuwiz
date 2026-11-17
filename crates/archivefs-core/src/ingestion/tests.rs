@@ -2899,3 +2899,55 @@ fn archive_listings_with_no_recognised_member_are_relisted_under_a_wider_registr
         .unwrap();
     assert_eq!(mario.content, Some(ContentKind::RomCartridge));
 }
+
+/// A Commodore program file: load address `$0801` (C64 BASIC start) and a body.
+fn minimal_prg(load: u16) -> Vec<u8> {
+    let mut bytes = load.to_le_bytes().to_vec();
+    bytes.extend_from_slice(b"\x0b\x08\x0a\x00\x9e2061\x00\x00\x00");
+    bytes
+}
+
+#[test]
+fn commodore_prg_files_are_discovered_as_programs_never_as_disks() {
+    let root = source_dir("commodore-prg");
+    for (folder, load) in [
+        ("c64", 0x0801),
+        ("plus4", 0x1001),
+        ("c16", 0x1001),
+        ("unsorted", 0x0801),
+    ] {
+        let dir = root.path().join(folder);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("game.prg"), minimal_prg(load)).unwrap();
+    }
+    let report = discover_source(root.path()).unwrap();
+    let item = |folder: &str| {
+        report
+            .items
+            .iter()
+            .find(|item| item.path.ends_with(format!("{folder}/game.prg")))
+            .unwrap_or_else(|| panic!("{folder}/game.prg was not discovered: {report:?}"))
+    };
+    for folder in ["c64", "plus4", "c16", "unsorted"] {
+        assert_eq!(
+            item(folder).content,
+            Some(ContentKind::Executable),
+            "{folder}"
+        );
+        assert_ne!(
+            item(folder).content,
+            Some(ContentKind::ComputerDisk),
+            "{folder}"
+        );
+    }
+    // Folder evidence names C64; nothing names C16 or Plus/4 as C64, and a
+    // loose `.prg` with no folder evidence stays without a system.
+    assert_eq!(item("c64").platform_hint.as_deref(), Some("Commodore 64"));
+    for folder in ["plus4", "c16", "unsorted"] {
+        assert_eq!(
+            item(folder).platform_hint,
+            None,
+            "{folder} must not be guessed"
+        );
+    }
+}

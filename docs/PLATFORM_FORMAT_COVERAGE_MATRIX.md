@@ -16,7 +16,7 @@ GENERATED from the live registries by `archivefs_core::format_coverage_matrix` -
 | Measure | Count |
 |---|---:|
 | Registered platforms | 84 |
-| PLATFORM × EXTENSION rows | 437 |
+| PLATFORM × EXTENSION rows | 438 |
 | Strong claims | 108 |
 | Strong claims the plain scan does not store | 5 |
 | Platforms with no Library route at all | 0 |
@@ -158,7 +158,7 @@ None.
 | Commodore 128 | `.d81` | strong | stored (extension) | Computer disk image | - | Commodore 128 (probable) | - | - | - | none reviewed | none |
 | Commodore 128 | `.d64` | weak | stored (extension) | Computer disk image | content | ambiguous | - | - | VIC-20 | none reviewed | none |
 | Commodore 128 | `.g64` | weak | stored (extension) | Computer disk image | - | Commodore 64 (probable) | - | Commodore 64 | - | none reviewed | none |
-| Commodore 128 | `.prg` | weak | NOT STORED | - | - | ambiguous | - | - | VIC-20 | none reviewed | none |
+| Commodore 128 | `.prg` | weak (shared) | stored (extension) | Game executable | content | ambiguous | - | - | Commodore 64, VIC-20 | none reviewed | none |
 | Commodore 128 | `.tap` | weak (shared) | stored (extension) | Cassette/tape image | content | ambiguous | - | - | Amstrad CPC, Commodore 64, Enterprise, Oric, VIC-20, ZX Spectrum | none reviewed | none |
 | Commodore 64 | `.t64` | strong | stored (extension) | Cassette/tape image | content | Commodore 64 (probable) | - | - | - | standalone (exact) | none |
 | Commodore 64 | `.crt` | strong | stored (extension) | Computer disk image | content | Commodore 64 (probable) | - | - | - | standalone (exact) | none |
@@ -168,6 +168,7 @@ None.
 | Commodore 64 | `.cas` | weak (shared) | stored (extension) | Cassette/tape image | - | ambiguous | - | - | Atari 8-bit, MSX, MSX2, VIC-20 | standalone (exact) | none |
 | Commodore 64 | `.bin` | weak (shared) | stored (needs corroboration) | - | content | ambiguous | - | - | 3DO, AmigaCD32, Atari 8-bit, Atari Jaguar, Atari Lynx, Atari2600, Atari5200, Atari7800, ColecoVision, Commodore CDTV, Dreamcast, FM Towns, Game Boy, Game Boy Advance, Game Boy Color, GameGear, Intellivision, MasterSystem, MegaDrive, N64, NES, Neo Geo CD, Neo Geo Pocket, Neo Geo Pocket Color, NeoGeo64, Nintendo DS, PC Engine, PC Engine CD, PC-FX, PS2, PSX, Philips CD-i, SNES, Saturn, Sega 32X, Sega CD, Sega Pico, TurboGrafx-16, Vectrex, Virtual Boy, Watara Supervision, WonderSwan, WonderSwan Color | standalone (exact) | none |
 | Commodore 64 | `.zip` | weak (shared) | stored (extension) | - | - | ambiguous | - | - | Amiga, Apple II, Arcade, Atari2600, Atari5200, Atari7800, AtariST, ColecoVision, DOS, Game Boy, Game Boy Advance, Game Boy Color, GameCube, GameGear, Intellivision, MSX, MSX2, Macintosh, MasterSystem, MegaDrive, N64, NES, NGage, Neo Geo Pocket, Neo Geo Pocket Color, NeoGeo, NeoGeo64, Nintendo 3DS, Nintendo DS, PC, PC Engine, PC-98, PS2, PS3, PSP, PSX, PlayStation Vita, SNES, ScummVM, Sega 32X, Sega Pico, Sharp X68000, Switch, TurboGrafx-16, Vectrex, Virtual Boy, Watara Supervision, Wii, WiiU, WonderSwan, WonderSwan Color, Xbox, Xbox360, ZX Spectrum | standalone (exact) | none |
+| Commodore 64 | `.prg` | weak (shared) | stored (extension) | Game executable | content | ambiguous | - | - | Commodore 128, VIC-20 | standalone (exact) | none |
 | Commodore Amiga | `.adz` | strong | stored (extension) | Amiga image | content | Amiga (probable) | - | - | - | standalone (exact) | none |
 | Commodore Amiga | `.dms` | strong | stored (extension) | Amiga image | content | Amiga (probable) | - | - | - | standalone (exact) | none |
 | Commodore Amiga | `.lha` | strong | stored (extension) | Amiga image | - | Amiga (probable) | - | - | - | standalone (exact) | none |
@@ -181,7 +182,7 @@ None.
 | Commodore CDTV | `.cue` | weak (shared) | stored (structural gate) | - | - | ambiguous | - | - | 3DO, AmigaCD32, Dreamcast, FM Towns, Neo Geo CD, PC Engine CD, PC-FX, PS2, PSX, Philips CD-i, Saturn, Sega CD | standalone (exact) | none |
 | Commodore CDTV | `.bin` | weak (shared) | stored (needs corroboration) | - | content | ambiguous | - | - | 3DO, AmigaCD32, Atari 8-bit, Atari Jaguar, Atari Lynx, Atari2600, Atari5200, Atari7800, ColecoVision, Commodore 64, Dreamcast, FM Towns, Game Boy, Game Boy Advance, Game Boy Color, GameGear, Intellivision, MasterSystem, MegaDrive, N64, NES, Neo Geo CD, Neo Geo Pocket, Neo Geo Pocket Color, NeoGeo64, Nintendo DS, PC Engine, PC Engine CD, PC-FX, PS2, PSX, Philips CD-i, SNES, Saturn, Sega 32X, Sega CD, Sega Pico, TurboGrafx-16, Vectrex, Virtual Boy, Watara Supervision, WonderSwan, WonderSwan Color | standalone (exact) | none |
 | Commodore CDTV | `.chd` | weak (shared) | stored (extension) | Disc image | content | ambiguous | - | - | 3DO, AmigaCD32, Arcade, Dreamcast, FM Towns, MegaDrive, Neo Geo CD, NeoGeo, PC Engine, PC Engine CD, PC-FX, PS2, PSP, PSX, Philips CD-i, Saturn, Sega CD | standalone (exact) | none |
-| Commodore VIC-20 | `.prg` | weak | NOT STORED | - | - | ambiguous | - | - | Commodore 128 | none reviewed | none |
+| Commodore VIC-20 | `.prg` | weak (shared) | stored (extension) | Game executable | content | ambiguous | - | - | Commodore 128, Commodore 64 | none reviewed | none |
 | Commodore VIC-20 | `.tap` | weak (shared) | stored (extension) | Cassette/tape image | content | ambiguous | - | - | Amstrad CPC, Commodore 128, Commodore 64, Enterprise, Oric, ZX Spectrum | none reviewed | none |
 | Commodore VIC-20 | `.cas` | weak (shared) | stored (extension) | Cassette/tape image | - | ambiguous | - | - | Atari 8-bit, Commodore 64, MSX, MSX2 | none reviewed | none |
 | Commodore VIC-20 | `.d64` | weak | stored (extension) | Computer disk image | content | ambiguous | - | - | Commodore 128 | none reviewed | none |

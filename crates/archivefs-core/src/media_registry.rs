@@ -280,6 +280,14 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "t64",
         kind: ArchiveKind::DirectGameImage,
     },
+    // A loose Commodore program file (`.prg`): not a disk or tape image and
+    // never unwrapped as one. Catalogued so it can be identified and matched
+    // like any other file; which Commodore machine it is for comes only from
+    // folder, catalogue or person evidence (`prg` is a shared extension).
+    MediaFormat {
+        extension: "prg",
+        kind: ArchiveKind::DirectGameImage,
+    },
     MediaFormat {
         extension: "tzx",
         kind: ArchiveKind::DirectGameImage,
@@ -851,6 +859,18 @@ mod tests {
         for extension in ["wua", "rpx", "key", "wup"] {
             assert_eq!(kind_for_extension(extension), None, ".{extension}");
         }
+    }
+
+    #[test]
+    fn commodore_program_files_are_direct_media_but_never_platform_proof() {
+        assert_eq!(
+            kind_for_extension("prg"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert!(is_watch_relevant_extension("prg"));
+        assert!(!requires_structural_gate("prg"));
+        assert!(crate::platform::is_shared_extension("prg"));
+        assert!(crate::platform::platforms_with_strong_extension("prg").is_empty());
     }
 
     #[test]
