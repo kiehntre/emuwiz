@@ -3349,7 +3349,13 @@ fn a_prg_alone_never_names_a_commodore_machine() {
     assert_eq!(report.platform, None);
     assert!(report.requires_confirmation);
     let names: Vec<_> = report.candidates.iter().map(|c| c.platform).collect();
-    for expected in ["Commodore 64", "Commodore 128", "VIC-20"] {
+    for expected in [
+        "Commodore 64",
+        "Commodore 128",
+        "VIC-20",
+        "Commodore 16",
+        "Commodore Plus-4",
+    ] {
         assert!(
             names.contains(&expected),
             "{expected} missing from {names:?}"
@@ -3371,9 +3377,75 @@ fn a_prg_follows_folder_evidence_and_c16_plus4_folders_are_never_c64() {
         detect(&format!("{ROOT}/c128/game.prg")).platform,
         Some("Commodore 128")
     );
-    for folder in ["plus4", "c16", "commodore16", "plus-4"] {
+    for (folder, platform) in [
+        ("c16", "Commodore 16"),
+        ("commodore16", "Commodore 16"),
+        ("c116", "Commodore 16"),
+        ("plus4", "Commodore Plus-4"),
+        ("plus-4", "Commodore Plus-4"),
+        ("commodore-plus-4", "Commodore Plus-4"),
+    ] {
         let report = detect(&format!("{ROOT}/{folder}/game.prg"));
-        assert_eq!(report.platform, None, "{folder} must not become a system");
-        assert!(report.requires_confirmation, "{folder}");
+        assert_eq!(report.platform, Some(platform), "{folder}");
+        assert_ne!(report.platform, Some("Commodore 64"), "{folder}");
     }
+}
+
+#[test]
+fn c16_and_plus4_are_distinct_but_equivalent_ted_machines() {
+    assert_eq!(
+        platform_for_alias("c16").map(|p| p.id),
+        Some("Commodore 16")
+    );
+    assert_eq!(
+        platform_for_alias("plus4").map(|p| p.id),
+        Some("Commodore Plus-4")
+    );
+    assert_eq!(
+        equivalent_platform_ids("Commodore 16"),
+        vec!["Commodore Plus-4"]
+    );
+    assert_eq!(
+        equivalent_platform_ids("Commodore Plus-4"),
+        vec!["Commodore 16"]
+    );
+    for id in ["Commodore 16", "Commodore Plus-4"] {
+        assert!(
+            equivalent_platform_ids("Commodore 64")
+                .iter()
+                .all(|e| *e != id)
+        );
+        assert!(equivalent_platform_ids("VIC-20").iter().all(|e| *e != id));
+    }
+}
+
+#[test]
+fn a_c16_tape_header_names_the_c16_and_contradicts_a_c64_folder() {
+    let tree = TempTree::new("commodore-tap-c16");
+    let mut tap = Vec::from(&b"C64-TAPE-RAW"[..]);
+    tap.extend([2, 2, 0, 0]);
+    tap.extend(1_u32.to_le_bytes());
+    tap.push(0xaa);
+    let loose = tree.file("unsorted/c16.tap", &tap);
+    let report =
+        detect_platform_report(&DetectionRequest::new(&loose, tree.path()).inspecting_content());
+    assert_eq!(report.platform, Some("Commodore 16"));
+    assert_eq!(report.confidence, DetectionConfidence::Confirmed);
+
+    // Filed under c64/ by mistake: the folder still answers, but only as
+    // Probable with the C16 on show, so the wrong assignment is visible and
+    // waits for a person instead of being confirmed as a C64 tape.
+    let misfiled = tree.file("c64/c16.tap", &tap);
+    let report =
+        detect_platform_report(&DetectionRequest::new(&misfiled, tree.path()).inspecting_content());
+    assert_ne!(report.confidence, DetectionConfidence::Confirmed);
+    assert!(report.requires_confirmation);
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|c| c.platform == "Commodore 16"),
+        "{:?}",
+        report.candidates
+    );
 }

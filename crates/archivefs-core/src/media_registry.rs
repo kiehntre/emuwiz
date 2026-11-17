@@ -874,6 +874,40 @@ mod tests {
     }
 
     #[test]
+    fn a_prg_in_an_arcade_or_console_folder_is_a_rom_chip_not_a_commodore_program() {
+        use std::path::Path;
+        let root = Path::new("/roms");
+        for refused in [
+            "/roms/arcade/intrepidb2/1intrepid.prg",
+            "/roms/arcade/famibox/0.prg",
+            "/roms/nes/game.prg",
+        ] {
+            assert_eq!(
+                crate::archive_kind_in_root(Path::new(refused), root),
+                None,
+                "{refused}"
+            );
+        }
+        assert_eq!(
+            crate::archive_kind_in_root(Path::new("/arcade/set/1game.prg"), Path::new("/arcade")),
+            None
+        );
+        for stored in [
+            "/roms/c64/game.prg",
+            "/roms/c16/game.prg",
+            "/roms/plus4/game.prg",
+            "/roms/vic20/game.prg",
+            "/roms/unsorted/game.prg",
+        ] {
+            assert_eq!(
+                crate::archive_kind_in_root(Path::new(stored), root),
+                Some(ArchiveKind::DirectGameImage),
+                "{stored}"
+            );
+        }
+    }
+
+    #[test]
     fn commodore_disk_extensions_are_recognized_as_direct_game_images() {
         for extension in ["d64", "g64", "d71", "d81"] {
             assert_eq!(

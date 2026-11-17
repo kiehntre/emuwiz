@@ -212,6 +212,9 @@ pub const EQUIVALENT_PLATFORM_IDS: &[(&str, &str)] = &[
     // The same computer family. `NEC PC-9801` is the identifier this build
     // shipped first; `PC-98` is the spelling real folder names use.
     ("PC-98", "NEC PC-9801"),
+    // The C16/C116 and the Plus/4 share the TED chip and their software, and
+    // TOSEC catalogues them together ("Commodore C16, C116 & Plus-4").
+    ("Commodore 16", "Commodore Plus-4"),
 ];
 
 /// Every canonical identifier equivalent to `id`, excluding `id` itself.
@@ -822,7 +825,12 @@ pub const PLATFORMS: &[Platform] = &[
         weak_extensions: &["tap", "cas", "bin", "zip", "prg"],
         magic: &[],
         layout: &[],
-        conflicts_with: &["Commodore 128", "VIC-20"],
+        conflicts_with: &[
+            "Commodore 128",
+            "VIC-20",
+            "Commodore 16",
+            "Commodore Plus-4",
+        ],
         preferred_emulator: None,
         explanation: "`.d64`/`.t64`/`.crt` are Commodore-specific but shared across the 8-bit Commodore range, so folder evidence is what separates C64 from C128 and VIC-20.",
     },
@@ -874,9 +882,48 @@ pub const PLATFORMS: &[Platform] = &[
         weak_extensions: &["prg", "tap", "cas", "d64"],
         magic: &[],
         layout: &[],
-        conflicts_with: &["Commodore 64"],
+        conflicts_with: &["Commodore 64", "Commodore 16", "Commodore Plus-4"],
         preferred_emulator: None,
         explanation: "The VIC-20 shares `.prg`/`.crt`/`.tap` with the rest of the Commodore range and has no extension of its own, so it is recognised from folder evidence.",
+    },
+    // The TED machines. The C16, C116 and Plus/4 run the same software and
+    // TOSEC keeps them in one list, so the two identifiers are separate (a
+    // person's folder says which machine they mean) but declared equivalent
+    // in `EQUIVALENT_PLATFORM_IDS`. Neither is ever a C64 or a VIC-20: a `$1001`
+    // load address is shared with the unexpanded VIC-20, so files need folder,
+    // TAP-header or catalogue evidence.
+    Platform {
+        id: "Commodore 16",
+        display_name: "Commodore 16",
+        folder_aliases: &[
+            "commodore16",
+            "c16",
+            "commodorec16",
+            "c116",
+            "commodore116",
+            "commodorec116",
+        ],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["prg", "tap", "d64"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &["Commodore 64", "VIC-20"],
+        preferred_emulator: None,
+        explanation: "The C16 and C116 share `.prg`/`.tap`/`.d64` with the rest of the Commodore range, so they are recognised from folder evidence, a TAP header's machine byte or a C16/Plus-4 catalogue. Plus/4 software is treated as the same family.",
+    },
+    Platform {
+        id: "Commodore Plus-4",
+        display_name: "Commodore Plus/4",
+        folder_aliases: &["plus4", "commodoreplus4", "cplus4", "commodorecplus4"],
+        filename_aliases: &[],
+        strong_extensions: &[],
+        weak_extensions: &["prg", "tap", "d64"],
+        magic: &[],
+        layout: &[],
+        conflicts_with: &["Commodore 64", "VIC-20"],
+        preferred_emulator: None,
+        explanation: "The Plus/4 shares `.prg`/`.tap`/`.d64` with the rest of the Commodore range, so it is recognised from folder evidence, a TAP header's machine byte or a C16/Plus-4 catalogue. C16 software is treated as the same family.",
     },
     Platform {
         id: "Dragon / Tandy CoCo",

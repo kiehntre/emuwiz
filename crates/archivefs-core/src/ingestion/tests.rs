@@ -2940,14 +2940,13 @@ fn commodore_prg_files_are_discovered_as_programs_never_as_disks() {
             "{folder}"
         );
     }
-    // Folder evidence names C64; nothing names C16 or Plus/4 as C64, and a
-    // loose `.prg` with no folder evidence stays without a system.
+    // Folder evidence names the machine; C16 and Plus/4 programs keep their
+    // own systems (never C64), and a loose `.prg` stays without a system.
     assert_eq!(item("c64").platform_hint.as_deref(), Some("Commodore 64"));
-    for folder in ["plus4", "c16", "unsorted"] {
-        assert_eq!(
-            item(folder).platform_hint,
-            None,
-            "{folder} must not be guessed"
-        );
-    }
+    assert_eq!(item("c16").platform_hint.as_deref(), Some("Commodore 16"));
+    assert_eq!(
+        item("plus4").platform_hint.as_deref(),
+        Some("Commodore Plus-4")
+    );
+    assert_eq!(item("unsorted").platform_hint, None, "must not be guessed");
 }
