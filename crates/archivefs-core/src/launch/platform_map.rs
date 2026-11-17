@@ -98,6 +98,21 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         retroarch_core_hints: &["vice_x64sc"],
         confidence: MappingConfidence::Exact,
     },
+    // The TED machines run through RetroArch's VICE xplus4 core, whose own
+    // `.info` names `PLUS/4` / `Commodore - Plus-4`. The native VICE adapter
+    // stays C64-only.
+    LaunchCompatibility {
+        platform_id: "Commodore 16",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["vice_xplus4"],
+        confidence: MappingConfidence::Exact,
+    },
+    LaunchCompatibility {
+        platform_id: "Commodore Plus-4",
+        standalone_adapters: &[],
+        retroarch_core_hints: &["vice_xplus4"],
+        confidence: MappingConfidence::Exact,
+    },
     LaunchCompatibility {
         platform_id: "PSX",
         standalone_adapters: &["duckstation"],
@@ -779,6 +794,31 @@ mod tests {
                 assert_eq!(row.retroarch_core_hints.len(), 1, "{platform_id}");
             }
             assert_eq!(row.confidence, MappingConfidence::StronglyKnown);
+        }
+    }
+
+    #[test]
+    fn vice_xplus4_runs_the_ted_machines_and_never_the_c64() {
+        // The installed core's own `.info` text (vice_xplus4_libretro.info).
+        let xplus4 = found(Some("PLUS/4"), Some("Commodore - Plus-4"));
+        assert_eq!(
+            retroarch_platform_candidate(&xplus4),
+            Some("Commodore Plus-4")
+        );
+        assert!(retroarch_platform_matches(&xplus4, "Commodore Plus-4"));
+        assert!(retroarch_platform_matches(&xplus4, "Commodore 16"));
+        assert!(!retroarch_platform_matches(&xplus4, "Commodore 64"));
+        assert!(!retroarch_platform_matches(&xplus4, "VIC-20"));
+        // vice_x64sc_libretro.info stays C64-only.
+        let x64sc = found(Some("C64"), Some("Commodore - 64"));
+        assert_eq!(retroarch_platform_candidate(&x64sc), Some("Commodore 64"));
+        assert!(!retroarch_platform_matches(&x64sc, "Commodore Plus-4"));
+        assert!(!retroarch_platform_matches(&x64sc, "Commodore 16"));
+        for platform in ["Commodore 16", "Commodore Plus-4"] {
+            let row = launch_compatibility_for_platform(platform).expect("reviewed row");
+            assert_eq!(row.retroarch_core_hints, &["vice_xplus4"], "{platform}");
+            assert!(row.standalone_adapters.is_empty(), "{platform}");
+            assert!(extension_narrows_candidate("prg", platform), "{platform}");
         }
     }
 
