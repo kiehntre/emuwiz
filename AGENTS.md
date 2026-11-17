@@ -453,17 +453,22 @@ rules; efficiency never overrides those guarantees.
 14. Do not start a new development campaign while assigned work is unfinished
     unless explicitly authorised.
 15. After focused local tests and required source checks, push only when authorised,
-    open/update the PR, verify CI targets the exact reviewed head, and check once
-    for immediate failures. If checks remain running, report the PR, full head SHA,
-    run links and PENDING, then end the development session. Never use
-    `gh run watch`, `gh pr checks --watch`, `sleep`+`gh` loops, background polling
-    watchers, repeated status/log polling or artifact downloads to wait for CI; this
-    applies equally to subagents.
-    GitHub's completion notifier handles the final notification; see
-    `docs/ci-notifications.md`. After completion, perform a separate short
-    merge-readiness check using completed results for that exact head. Collect
-    detailed logs only for failures or a specific evidence requirement. Never
-    claim green CI early or merge without approval; all security, preservation,
+    open/update the PR, and verify CI targets the exact reviewed head. Then
+    (owner policy 2026-11-17):
+    - Prefer GitHub's completion notification (`docs/ci-notifications.md`).
+    - For an authorised long-running job, monitor with sensible cadence: first check
+      after about 10 minutes, then every 5 minutes, until it finishes or a defined
+      timeout. On the maintainer's machine this is exactly one
+      `~/.claude/bin/ci-wait pr <N> --repo OWNER/NAME --sha <full head>` run in the
+      background, which enforces that cadence, the timeout and one monitor per PR.
+    - Never use `gh run watch`, `gh pr checks --watch`, hand-rolled `sleep`+`gh`
+      loops, a loop around the monitor, duplicate monitors, repeated log polling or
+      artifact downloads; a guard hook denies them. This applies equally to subagents.
+    - When CI passes, complete an already-authorised merge only after verifying the
+      exact head SHA, the required checks and the merge state on GitHub.
+    - When CI fails, report the actual failure (failing job and log excerpt) instead
+      of checking again.
+    Never claim green CI early or merge without approval; all security, preservation,
     reproducibility and exact-head merge protections remain mandatory.
 
 ### Completion standard
