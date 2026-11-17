@@ -1379,11 +1379,26 @@ mod first_matching {
                 managed_root: self.dir.path(),
                 limits: DatLimits::default(),
             };
-            let configured = crate::dat::configured_catalogues::configured_catalogues(inputs);
-            plan_first_matching(&self.db, &configured, &|platform| {
-                crate::dat::catalogue_selection::resolve_catalogue_for_platform(platform, inputs)
-            })
-            .unwrap()
+            plan_with(&self.db, inputs)
+        }
+
+        /// A first-time run with the real resolver over this registry.
+        fn first_run(
+            &self,
+            plan: &ReauditPlan,
+            per_set: usize,
+            cancel: &AtomicBool,
+            progress: &dyn Fn(ReauditProgress),
+        ) -> ReauditReport {
+            let registry = self.registry();
+            run_with(
+                &self.db,
+                inputs_for(&registry, self),
+                plan,
+                per_set,
+                cancel,
+                progress,
+            )
         }
 
         fn saved_rows(&self) -> Vec<(i64, String, String)> {
@@ -1395,6 +1410,75 @@ mod first_matching {
                 .map(Result::unwrap)
                 .collect()
         }
+    }
+
+    fn inputs_for<'a>(
+        registry: &'a DatSourceRegistry,
+        f: &'a Fixture,
+    ) -> CatalogueInventoryInputs<'a> {
+        CatalogueInventoryInputs {
+            local_registry: registry,
+            managed_sources: no_managed(),
+            managed_root: f.dir.path(),
+            limits: DatLimits::default(),
+        }
+    }
+
+    pub(super) fn no_managed() -> &'static crate::dat::managed_sources::ManagedDatSources {
+        static NONE: std::sync::OnceLock<crate::dat::managed_sources::ManagedDatSources> =
+            std::sync::OnceLock::new();
+        NONE.get_or_init(Default::default)
+    }
+
+    pub(super) fn plan_with(db: &Path, inputs: CatalogueInventoryInputs<'_>) -> FirstMatchPlan {
+        let configured = crate::dat::configured_catalogues::configured_catalogues(inputs);
+        plan_first_matching(
+            db,
+            &configured,
+            &|platform| {
+                crate::dat::catalogue_selection::resolve_catalogue_for_platform(platform, inputs)
+            },
+            &|id| crate::dat::configured_catalogues::resolve_configured_catalogue(id, inputs),
+        )
+        .unwrap()
+    }
+
+    pub(super) fn run_with(
+        db: &Path,
+        inputs: CatalogueInventoryInputs<'_>,
+        plan: &ReauditPlan,
+        per_set: usize,
+        cancel: &AtomicBool,
+        progress: &dyn Fn(ReauditProgress),
+    ) -> ReauditReport {
+        run_reaudit(
+            db,
+            plan,
+            &|id| crate::dat::configured_catalogues::resolve_configured_catalogue(id, inputs),
+            &TrustedRoots::none(),
+            cancel,
+            ReauditLimits {
+                max_games_per_set: per_set,
+                max_bytes_per_set: u64::MAX,
+            },
+            progress,
+        )
+        .unwrap()
+    }
+
+    fn group<'a>(
+        plan: &'a FirstMatchPlan,
+        source_id: &str,
+    ) -> &'a crate::dat::reaudit::ReauditGroup {
+        plan.plan
+            .groups
+            .iter()
+            .find(|g| g.source_id == source_id)
+            .unwrap_or_else(|| panic!("no group {source_id}: {:#?}", plan.plan.groups))
+    }
+
+    fn ids(group: &crate::dat::reaudit::ReauditGroup) -> Vec<i64> {
+        group.items.iter().map(|item| item.archive_id).collect()
     }
 
     /// Spectrum games 1-3 (two match the catalogue), a Game Boy game, an NES
@@ -1427,8 +1511,14 @@ mod first_matching {
         let before = f.saved_rows();
         let plan = f.first_plan();
         assert_eq!(plan.already_checked, 1);
-        assert_eq!(plan.plan.groups.len(), 1, "{:#?}", plan.waiting);
-        let group = &plan.plan.groups[0];
+        assert_eq!(plan.plan.groups.len(), 2, "{:#?}", plan.waiting);
+        // Two Game Boy lists: the game is matched against both, never one
+        // picked.
+        let set = group(&plan, "catalogue-set:Game Boy");
+        assert_eq!(ids(set), vec![4]);
+        let pool: Vec<&str> = set.pool.iter().map(|c| c.source_id.as_str()).collect();
+        assert_eq!(pool, vec!["gb-one", "gb-two"]);
+        let group = group(&plan, "synthetic");
         assert_eq!(
             (group.source_id.as_str(), group.platform.as_str()),
             ("synthetic", "ZX Spectrum")
@@ -1450,13 +1540,6 @@ mod first_matching {
             waits,
             vec![
                 (None, &FirstMatchWait::SystemUnknown, 1),
-                (
-                    Some("Game Boy"),
-                    &FirstMatchWait::NeedsChoice {
-                        catalogues: vec!["gb-one".into(), "gb-two".into()]
-                    },
-                    1
-                ),
                 (Some("NES"), &FirstMatchWait::NoCatalogue, 1),
                 (Some("ZX Spectrum"), &FirstMatchWait::FileUnavailable, 1),
             ]
@@ -1473,10 +1556,10 @@ mod first_matching {
     fn a_run_saves_results_for_the_planned_games_only_and_then_has_nothing_left() {
         let f = library();
         let plan = f.first_plan();
-        let report = f
-            .reaudit_with(&plan.plan, 2, &AtomicBool::new(false), &|_| {})
-            .unwrap();
-        assert_eq!((report.verified, report.no_match, report.saved), (2, 1, 3));
+        let report = f.first_run(&plan.plan, 2, &AtomicBool::new(false), &|_| {});
+        // Spectrum: two verified, one not in the catalogue. Game Boy: listed in
+        // neither list, saved once as such (not as a catalogue result).
+        assert_eq!((report.verified, report.no_match, report.saved), (2, 2, 4));
         assert!(report.contradictions.is_empty());
         let rows = f.saved_rows();
         let ids: Vec<i64> = rows.iter().map(|row| row.0).collect();
@@ -1492,7 +1575,8 @@ mod first_matching {
         let again = f.first_plan();
         assert_eq!(again.plan.games(), 0);
         assert_eq!(again.already_checked, 4);
-        assert_eq!(again.waiting_games(), 4);
+        assert_eq!(again.not_listed, 1);
+        assert_eq!(again.waiting_games(), 3);
     }
 
     #[test]
@@ -1501,31 +1585,27 @@ mod first_matching {
         let plan = f.first_plan();
         let cancel = AtomicBool::new(false);
         let sets = Cell::new(0);
-        let report = f
-            .reaudit_with(&plan.plan, 1, &cancel, &|progress| {
-                if let ReauditProgress::SetSaved { .. } = progress {
-                    sets.set(sets.get() + 1);
+        // The Game Boy set goes first; stop after the first Spectrum set.
+        let report = f.first_run(&plan.plan, 1, &cancel, &|progress| {
+            if let ReauditProgress::SetSaved { .. } = progress {
+                sets.set(sets.get() + 1);
+                if sets.get() == 2 {
                     cancel.store(true, Ordering::Relaxed);
                 }
-            })
-            .unwrap();
-        assert_eq!(report.saved, 1);
+            }
+        });
+        assert_eq!(report.saved, 2);
         assert!(matches!(report.stopped, Some(ReauditStop::Cancelled)));
         let next = f.first_plan();
-        let ids: Vec<i64> = next.plan.groups[0]
-            .items
-            .iter()
-            .map(|i| i.archive_id)
-            .collect();
-        assert_eq!(ids, vec![2, 3]);
-        assert_eq!(next.already_checked, 2);
+        assert_eq!(ids(group(&next, "synthetic")), vec![2, 3]);
+        assert_eq!((next.already_checked, next.not_listed), (2, 1));
     }
 
     #[test]
     fn a_limit_leaves_the_rest_for_a_later_run() {
         let f = library();
-        let plan = f.first_plan().truncated(2);
-        assert_eq!(plan.plan.games(), 2);
+        let plan = f.first_plan().truncated(3);
+        assert_eq!(plan.plan.games(), 3);
         assert_eq!(plan.plan.blocked.len(), 1);
         assert_eq!(plan.plan.blocked[0].block, ReauditBlock::LeftOutOfThisRun);
         assert_eq!(plan.plan.blocked[0].status, None);
@@ -1550,14 +1630,8 @@ mod first_matching {
         assert_eq!(before.len(), 1);
         let plan = f.first_plan();
         assert_eq!((plan.already_checked, plan.checked_elsewhere), (1, 1));
-        let ids: Vec<i64> = plan.plan.groups[0]
-            .items
-            .iter()
-            .map(|item| item.archive_id)
-            .collect();
-        assert_eq!(ids, vec![1, 2, 3]);
-        f.reaudit_with(&plan.plan, 10, &AtomicBool::new(false), &|_| {})
-            .unwrap();
+        assert_eq!(ids(group(&plan, "synthetic")), vec![1, 2, 3]);
+        f.first_run(&plan.plan, 10, &AtomicBool::new(false), &|_| {});
         let after: Vec<_> = f.saved_rows().into_iter().filter(|r| r.0 == 1).collect();
         assert_eq!(
             after,
@@ -1581,22 +1655,512 @@ mod first_matching {
         f.tried_before(1, &sha);
         let plan = f.first_plan();
         assert_eq!(plan.retry.iter().copied().collect::<Vec<_>>(), vec![1]);
-        let limited = plan.clone().truncated(2);
-        let ids: Vec<i64> = limited.plan.groups[0]
-            .items
-            .iter()
-            .map(|item| item.archive_id)
-            .collect();
-        assert_eq!(ids, vec![2, 3], "never-tried games first");
+        let limited = plan.clone().truncated(3);
+        assert_eq!(
+            ids(group(&limited, "synthetic")),
+            vec![2, 3],
+            "never-tried games first"
+        );
         assert_eq!(limited.left_out(), 1);
         assert!(limited.retry.is_empty());
         // With room, the tried game is still checked, in plan order.
-        let all = plan.truncated(3);
-        assert_eq!(all.plan.games(), 3);
-        assert_eq!(all.plan.groups[0].items[0].archive_id, 1);
+        let all = plan.truncated(4);
+        assert_eq!(all.plan.games(), 4);
+        assert_eq!(group(&all, "synthetic").items[0].archive_id, 1);
         // A note against other catalogue bytes is not a retry.
         let g = library();
         g.tried_before(1, "0".repeat(64).as_str());
         assert!(g.first_plan().retry.is_empty());
+    }
+
+    /// Several trusted TOSEC lists for one system (synthetic Commodore 64
+    /// genre lists): every game is read against all of them, and only one
+    /// identity they agree on is saved.
+    mod catalogue_sets {
+        use super::*;
+
+        const C64: &str = "Commodore 64";
+
+        fn sha1(bytes: &[u8]) -> String {
+            Sha1::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        }
+
+        /// The synthetic C64 library and its catalogues.
+        struct C64Library {
+            f: Fixture,
+            /// (source id, header, [(game name, content)]), as registered.
+            dats: Vec<SyntheticDat>,
+        }
+
+        type SyntheticDat = (String, String, Vec<(String, Vec<u8>)>);
+
+        fn tape(name: &str) -> Vec<u8> {
+            format!("synthetic C64 tape: {name}").into_bytes()
+        }
+
+        impl C64Library {
+            fn write(&self) {
+                for (id, header, games) in &self.dats {
+                    let mut xml = format!(
+                        "<datafile><header><name>{header}</name><description>{header}</description><version>2025-03-13</version><author>TOSEC</author></header>"
+                    );
+                    for (game, content) in games {
+                        xml.push_str(&format!(
+                            "<game name=\"{game}\"><rom name=\"{game}.tap\" size=\"{}\" sha1=\"{}\"/></game>",
+                            content.len(),
+                            sha1(content)
+                        ));
+                    }
+                    xml.push_str("</datafile>");
+                    std::fs::write(self.f.dir.path().join(format!("{id}.dat")), xml).unwrap();
+                }
+            }
+
+            fn registry(&self) -> DatSourceRegistry {
+                let mut registry = DatSourceRegistry::default();
+                for (id, _, _) in &self.dats {
+                    let mut entry = DatSourceEntry::new(
+                        id.clone(),
+                        id.clone(),
+                        self.f.dir.path().join(format!("{id}.dat")),
+                        DatSourceKind::File,
+                    );
+                    entry.set_platform_by_person(Some(C64.into()));
+                    validated(&mut entry);
+                    registry.add(entry).unwrap();
+                }
+                registry
+            }
+
+            fn plan(&self) -> FirstMatchPlan {
+                self.f.sized();
+                let registry = self.registry();
+                plan_with(&self.f.db, inputs_for(&registry, &self.f))
+            }
+
+            fn run(
+                &self,
+                plan: &ReauditPlan,
+                cancel: &AtomicBool,
+                progress: &dyn Fn(ReauditProgress),
+            ) -> ReauditReport {
+                let registry = self.registry();
+                run_with(
+                    &self.f.db,
+                    inputs_for(&registry, &self.f),
+                    plan,
+                    10,
+                    cancel,
+                    progress,
+                )
+            }
+
+            fn not_listed_rows(&self) -> Vec<(i64, String, i64)> {
+                let conn = rusqlite::Connection::open(&self.f.db).unwrap();
+                conn.prepare("SELECT archive_id, platform, catalogue_count FROM dat_catalogue_set_no_matches ORDER BY archive_id")
+                    .unwrap()
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect()
+            }
+
+            fn sets(&self) -> usize {
+                let conn = rusqlite::Connection::open(&self.f.db).unwrap();
+                conn.query_row("SELECT count(*) FROM dat_catalogue_sets", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .map(|n| n as usize)
+                .unwrap()
+            }
+
+            /// (archive, source, state, catalogue digest saved in the row).
+            fn identity_rows(&self) -> Vec<(i64, String, String, String)> {
+                let conn = rusqlite::Connection::open(&self.f.db).unwrap();
+                conn.prepare("SELECT archive_id, dat_source_id, verification_state, facts_json FROM library_dat_identities ORDER BY archive_id, dat_source_id")
+                    .unwrap()
+                    .query_map([], |r| {
+                        let facts: serde_json::Value =
+                            serde_json::from_slice(&r.get::<_, Vec<u8>>(3)?).unwrap();
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            facts["source"]["catalogue_sha256"].as_str().unwrap_or("").to_string(),
+                        ))
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect()
+            }
+
+            fn digest(&self, id: &str) -> String {
+                hex(&Sha256::digest(
+                    std::fs::read(self.f.dir.path().join(format!("{id}.dat"))).unwrap(),
+                ))
+            }
+        }
+
+        /// Four C64 genre lists plus one mislabelled list (a Spectrum list
+        /// the person assigned to the C64), and these games:
+        /// 1 only in Adventure; 2 in Adventure and Arcade under the same
+        /// name; 3 in Sports and Misc under different names; 4 listed twice
+        /// in Misc; 5 in none; 6 a disk image no list covers.
+        fn c64() -> C64Library {
+            let f = Fixture::new();
+            let entries = |games: &[&str]| -> Vec<(String, Vec<u8>)> {
+                games.iter().map(|g| (g.to_string(), tape(g))).collect()
+            };
+            let mut misc = entries(&["Clash (Misc name)"]);
+            misc[0].1 = tape("Clash");
+            misc.push(("Twice A".into(), tape("Twice")));
+            misc.push(("Twice B".into(), tape("Twice")));
+            let mut sports = entries(&["Clash"]);
+            sports.push(("Sports Only".into(), tape("Sports Only")));
+            let library = C64Library {
+                f,
+                dats: vec![
+                    (
+                        "c64-adventure".into(),
+                        "Commodore C64 - Games - Adventure - [TAP]".into(),
+                        entries(&["Only Here", "Shared"]),
+                    ),
+                    (
+                        "c64-arcade".into(),
+                        "Commodore C64 - Games - Arcade - [TAP]".into(),
+                        entries(&["Shared", "Arcade Only"]),
+                    ),
+                    (
+                        "c64-misc".into(),
+                        "Commodore C64 - Games - Misc - [TAP]".into(),
+                        misc,
+                    ),
+                    (
+                        "c64-sports".into(),
+                        "Commodore C64 - Games - Sports - [TAP]".into(),
+                        sports,
+                    ),
+                    (
+                        "mislabelled".into(),
+                        "Sinclair ZX Spectrum - Games - [TAP]".into(),
+                        entries(&["Spectrum Game"]),
+                    ),
+                ],
+            };
+            library.write();
+            let f = &library.f;
+            f.add(1, "only.tap", Some(&tape("Only Here")), Some(C64));
+            f.add(2, "shared.tap", Some(&tape("Shared")), Some(C64));
+            f.add(3, "clash.tap", Some(&tape("Clash")), Some(C64));
+            f.add(4, "twice.tap", Some(&tape("Twice")), Some(C64));
+            f.add(5, "unlisted.tap", Some(&tape("Nobody lists me")), Some(C64));
+            f.add(6, "disk.d64", Some(b"a disk image"), Some(C64));
+            library
+        }
+
+        #[test]
+        fn a_system_with_several_catalogues_is_planned_against_all_eligible_ones() {
+            let c = c64();
+            let plan = c.plan();
+            assert!(
+                plan.waiting.is_empty(),
+                "nothing waits for a choice: {:#?}",
+                plan.waiting
+            );
+            let set = group(&plan, "catalogue-set:Commodore 64");
+            assert_eq!(ids(set), vec![1, 2, 3, 4, 5, 6]);
+            let pool: Vec<(&str, String)> = set
+                .pool
+                .iter()
+                .map(|p| (p.source_id.as_str(), p.sha256.clone()))
+                .collect();
+            assert_eq!(
+                pool,
+                ["c64-adventure", "c64-arcade", "c64-misc", "c64-sports"]
+                    .map(|id| (id, c.digest(id)))
+                    .to_vec(),
+                "every eligible list, with its exact bytes"
+            );
+            assert_eq!(plan.not_eligible.len(), 1);
+            assert_eq!(plan.not_eligible[0].1, "mislabelled");
+            // Planning writes nothing.
+            assert!(c.identity_rows().is_empty() && c.not_listed_rows().is_empty());
+        }
+
+        #[test]
+        fn only_a_single_agreed_identity_is_saved_with_each_catalogues_provenance() {
+            let c = c64();
+            let plan = c.plan();
+            let report = c.run(&plan.plan, &AtomicBool::new(false), &|_| {});
+            assert_eq!(
+                (
+                    report.verified,
+                    report.ambiguous,
+                    report.no_match,
+                    report.not_checked.len()
+                ),
+                (2, 2, 1, 1),
+                "{report:#?}"
+            );
+            assert!(report.stopped.is_none());
+            // Game 1 from Adventure only; game 2 corroborated, saved for each
+            // list that verified it, under its own id and bytes.
+            assert_eq!(
+                c.identity_rows(),
+                vec![
+                    (
+                        1,
+                        "c64-adventure".into(),
+                        "verified_single_match".into(),
+                        c.digest("c64-adventure")
+                    ),
+                    (
+                        2,
+                        "c64-adventure".into(),
+                        "verified_single_match".into(),
+                        c.digest("c64-adventure")
+                    ),
+                    (
+                        2,
+                        "c64-arcade".into(),
+                        "verified_single_match".into(),
+                        c.digest("c64-arcade")
+                    ),
+                ]
+            );
+            // Conflicting names (3) and a list with two entries (4): nothing
+            // saved, the reason kept.
+            let notes: BTreeMap<i64, String> =
+                c.f.notes()
+                    .into_iter()
+                    .map(|n| (n.archive_id, n.reason))
+                    .collect();
+            assert!(
+                notes[&3].contains("disagree") && notes[&3].contains("Clash"),
+                "{notes:?}"
+            );
+            assert!(notes[&4].contains("more than once"), "{notes:?}");
+            assert!(notes[&6].contains("definitive"), "{notes:?}");
+            // Listed in none: one record, not one per catalogue.
+            assert_eq!(c.not_listed_rows(), vec![(5, C64.to_string(), 4)]);
+            assert_eq!(c.sets(), 1);
+            // Saved rows are current evidence; nothing replaced.
+            assert!(c.f.history().is_empty());
+            let registry = c.registry();
+            let configured = crate::dat::configured_catalogues::configured_catalogues(inputs_for(
+                &registry, &c.f,
+            ));
+            let statuses = Database::open_read_only(&c.f.db)
+                .unwrap()
+                .saved_dat_evidence_status(&configured)
+                .unwrap();
+            assert_eq!(statuses.len(), 3);
+            assert!(
+                statuses.iter().all(|row| row.status == Status::Current),
+                "{statuses:#?}"
+            );
+            // The person's verified names: only the agreed ones.
+            let names = Database::open_read_only(&c.f.db)
+                .unwrap()
+                .current_library_dat_evidence(&configured)
+                .unwrap();
+            assert!(names.exact.contains_key(&1) && names.exact.contains_key(&2));
+            assert!(!names.exact.contains_key(&3) && !names.exact.contains_key(&4));
+
+            // Next plan: matched games are done, 5 is not read again; the
+            // unsettled ones are tried again, after never-tried games.
+            let next = c.plan();
+            assert_eq!((next.already_checked, next.not_listed), (2, 1));
+            assert_eq!(
+                ids(group(&next, "catalogue-set:Commodore 64")),
+                vec![3, 4, 6]
+            );
+            assert_eq!(
+                next.retry.iter().copied().collect::<Vec<_>>(),
+                vec![3, 4, 6]
+            );
+        }
+
+        #[test]
+        fn a_not_listed_result_stops_holding_when_the_game_or_catalogues_change() {
+            let c = c64();
+            c.run(&c.plan().plan, &AtomicBool::new(false), &|_| {});
+            assert_eq!(c.plan().not_listed, 1);
+            let planned =
+                |c: &C64Library| ids(group(&c.plan(), "catalogue-set:Commodore 64")).contains(&5);
+            assert!(!planned(&c));
+
+            // The game's file is rewritten.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::write(c.f.root.join("unlisted.tap"), tape("Nobody lists me")).unwrap();
+            assert!(planned(&c), "a rewritten file is read again");
+
+            // A list's bytes change.
+            let mut c = c64();
+            c.run(&c.plan().plan, &AtomicBool::new(false), &|_| {});
+            assert!(!planned(&c));
+            c.dats[1].2.push(("New Arcade Game".into(), tape("New")));
+            c.write();
+            assert!(planned(&c), "new catalogue bytes: read again");
+
+            // A list is removed (or no longer usable).
+            let mut c = c64();
+            c.run(&c.plan().plan, &AtomicBool::new(false), &|_| {});
+            c.dats.remove(3);
+            assert!(planned(&c), "another catalogue set: read again");
+
+            // The game is moved to another system.
+            let c = c64();
+            c.run(&c.plan().plan, &AtomicBool::new(false), &|_| {});
+            let conn = rusqlite::Connection::open(&c.f.db).unwrap();
+            conn.execute(
+                "UPDATE platform_assignments SET platform = 'ZX Spectrum' WHERE archive_id = 5",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+            let plan = c.plan();
+            assert_eq!(plan.not_listed, 0, "the record is for another system");
+        }
+
+        #[test]
+        fn a_stopped_or_failed_run_never_records_not_listed() {
+            // Stopped while reading the second list.
+            let c = c64();
+            let cancel = AtomicBool::new(false);
+            let report = c.run(&c.plan().plan, &cancel, &|p| {
+                if let ReauditProgress::CatalogueOfSet { index: 2, .. } = p {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            });
+            assert!(
+                matches!(report.stopped, Some(ReauditStop::Cancelled)),
+                "{report:#?}"
+            );
+            assert!(c.identity_rows().is_empty() && c.not_listed_rows().is_empty());
+            assert_eq!(c.plan().plan.games(), 6, "everything is still to do");
+
+            // A list becomes unreadable after planning: the set is refused
+            // whole; nothing is saved from the other lists.
+            let c = c64();
+            let plan = c.plan();
+            std::fs::write(c.f.dir.path().join("c64-misc.dat"), "not a catalogue").unwrap();
+            let report = c.run(&plan.plan, &AtomicBool::new(false), &|_| {});
+            assert_eq!(
+                report.verified + report.no_match + report.ambiguous,
+                0,
+                "{report:#?}"
+            );
+            assert!(c.identity_rows().is_empty() && c.not_listed_rows().is_empty());
+        }
+
+        /// Review B1: an archive whose member one list matches twice (or
+        /// in part) is evidence about the game: it is never "not listed",
+        /// and another list's verified match for it is not saved.
+        #[test]
+        fn an_archive_member_matched_by_a_list_is_never_read_as_not_listed() {
+            let mut c = c64();
+            c.dats[2].2.push(("ZT A".into(), tape("ZipTwice")));
+            c.dats[2].2.push(("ZT B".into(), tape("ZipTwice")));
+            c.dats[1].2.push(("ZT".into(), tape("ZipTwice")));
+            c.dats[2]
+                .2
+                .push(("Only Twice A".into(), tape("Only Twice")));
+            c.dats[2]
+                .2
+                .push(("Only Twice B".into(), tape("Only Twice")));
+            c.write();
+            c.f.zip("zt.zip", "zt.tap", &tape("ZipTwice"));
+            c.f.add(7, "zt.zip", None, Some(C64));
+            c.f.zip("only-twice.zip", "ot.tap", &tape("Only Twice"));
+            c.f.add(8, "only-twice.zip", None, Some(C64));
+            let plan = c.plan();
+            assert_eq!(
+                ids(group(&plan, "catalogue-set:Commodore 64")),
+                vec![1, 2, 3, 4, 5, 6, 7, 8]
+            );
+            c.run(&plan.plan, &AtomicBool::new(false), &|_| {});
+            assert!(
+                c.identity_rows().iter().all(|row| row.0 != 7 && row.0 != 8),
+                "{:#?}",
+                c.identity_rows()
+            );
+            assert_eq!(c.not_listed_rows(), vec![(5, C64.to_string(), 4)]);
+            let notes: BTreeMap<i64, String> =
+                c.f.notes()
+                    .into_iter()
+                    .map(|n| (n.archive_id, n.reason))
+                    .collect();
+            assert!(notes[&7].contains("c64-misc"), "{notes:?}");
+            assert!(notes[&8].contains("c64-misc"), "{notes:?}");
+        }
+
+        /// Review B2: a save reads the game again. If it reads differently
+        /// from the screen (the file was replaced in between), nothing is
+        /// saved from that catalogue.
+        #[test]
+        fn a_file_replaced_before_the_save_saves_nothing_that_was_not_screened() {
+            let c = c64();
+            let plan = c.plan();
+            let replaced = Cell::new(false);
+            c.run(&plan.plan, &AtomicBool::new(false), &|p| {
+                if let ReauditProgress::Audit(_) = p
+                    && !replaced.get()
+                {
+                    replaced.set(true);
+                    // Another game, listed by the corroborating list.
+                    std::fs::write(c.f.root.join("shared.tap"), tape("Arcade Only")).unwrap();
+                }
+            });
+            assert!(replaced.get(), "the save phase was reached");
+            assert!(
+                c.identity_rows().iter().all(|row| row.0 != 2),
+                "{:#?}",
+                c.identity_rows()
+            );
+            assert!(c.not_listed_rows().iter().all(|row| row.0 != 2));
+        }
+
+        /// Review B3: a stop during the saves records no "listed in none".
+        #[test]
+        fn a_stop_during_the_saves_records_no_not_listed() {
+            let c = c64();
+            let plan = c.plan();
+            let cancel = AtomicBool::new(false);
+            let report = c.run(&plan.plan, &cancel, &|p| {
+                if let ReauditProgress::Audit(_) = p {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            });
+            assert!(
+                matches!(report.stopped, Some(ReauditStop::Cancelled)),
+                "{report:#?}"
+            );
+            assert!(c.not_listed_rows().is_empty());
+            assert_eq!(c.sets(), 0);
+            // Nothing is mistaken for done: the next plan has every unsaved game.
+            let next = c.plan();
+            assert_eq!(next.not_listed, 0);
+            assert_eq!(next.plan.games() + next.already_checked, 6);
+        }
+
+        #[test]
+        fn a_limit_and_a_restart_work_across_a_catalogue_set() {
+            let c = c64();
+            let first = c.plan().truncated(2);
+            assert_eq!((first.plan.games(), first.left_out()), (2, 4));
+            let report = c.run(&first.plan, &AtomicBool::new(false), &|_| {});
+            assert_eq!(report.verified, 2);
+            let next = c.plan().truncated(2);
+            assert_eq!(ids(group(&next, "catalogue-set:Commodore 64")), vec![3, 4]);
+            c.run(&next.plan, &AtomicBool::new(false), &|_| {});
+            // 3 and 4 were settled as needing review: the next limited run
+            // moves on to 5 and 6 instead of trying them again.
+            let last = c.plan().truncated(2);
+            assert_eq!(ids(group(&last, "catalogue-set:Commodore 64")), vec![5, 6]);
+        }
     }
 }

@@ -94,7 +94,7 @@ fn a_fresh_library_has_the_new_tables_and_they_are_empty() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("library.sqlite3");
     let db = Database::open_or_create(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 28);
+    assert_eq!(db.schema_version().unwrap(), 29);
     assert_eq!(db.replaced_dat_evidence_count().unwrap(), 0);
     assert!(db.dat_recheck_attempts().unwrap().is_empty());
     drop(db);
@@ -111,25 +111,26 @@ fn upgrading_26_to_27_changes_no_existing_row_and_verifies_nothing() {
     make_schema_26(&path, 25);
     let before = contents(&path);
     let report = super::upgrade_library_database(&path).unwrap();
-    // A schema-26 library takes 27 and then 28 (Favourites) in one upgrade.
-    assert_eq!((report.from_version, report.to_version), (26, 28));
-    assert_eq!(report.applied_versions, vec![27, 28]);
+    // A schema-26 library takes 27, 28 (Favourites) and 29 in one upgrade.
+    assert_eq!((report.from_version, report.to_version), (26, 29));
+    assert_eq!(report.applied_versions, vec![27, 28, 29]);
     assert_eq!(integrity(&path), "ok");
     let after = contents(&path);
     for (table, rows) in &before {
         if table == "schema_migrations" {
-            assert_eq!(after[table].len(), rows.len() + 2);
+            assert_eq!(after[table].len(), rows.len() + 3);
             continue;
         }
         assert_eq!(&after[table], rows, "{table} changed");
     }
     let added: Vec<_> = after
         .keys()
-        // Schema 28's tables (and SQLite's AUTOINCREMENT counter) are not
-        // migration 27's.
+        // Schema 28's and 29's tables (and SQLite's AUTOINCREMENT counter)
+        // are not migration 27's.
         .filter(|t| {
             !before.contains_key(*t)
                 && !t.starts_with("game_collection")
+                && !t.starts_with("dat_catalogue_set")
                 && t.as_str() != "sqlite_sequence"
         })
         .collect();
@@ -207,7 +208,7 @@ fn a_library_taken_to_27_by_another_build_line_is_refused_and_untouched() {
         // read-only open refuses it before looking at its history.
         let error = Database::open_read_only(&path).err().unwrap().to_string();
         assert!(
-            error.contains(expected) || error.contains("is not the required current version 28"),
+            error.contains(expected) || error.contains("is not the required current version 29"),
             "{error}"
         );
         // Nor can a later build migrate past the foreign step.
@@ -246,6 +247,10 @@ fn shipped_migration_descriptions_from_27_on_are_pinned() {
         (
             28,
             "game collections: Favourites and user-created collections",
+        ),
+        (
+            29,
+            "remember games no catalogue in their system's catalogue set lists",
         ),
     ];
     for (version, description) in shipped {
@@ -363,22 +368,23 @@ fn killing_the_upgrade_at_any_moment_leaves_schema_26_or_a_whole_schema_27() {
                 );
                 // The interrupted upgrade can simply be run again.
                 let report = super::upgrade_library_database(&path).unwrap();
-                assert_eq!((report.from_version, report.to_version), (26, 28));
+                assert_eq!((report.from_version, report.to_version), (26, 29));
             }
-            // Each migration commits on its own: a kill between 27 and 28
-            // leaves a whole schema 27, and running the upgrade again ends it.
-            27 => {
+            // Each migration commits on its own: a kill between two of them
+            // leaves a whole earlier schema, and running the upgrade again
+            // ends it.
+            from @ (27 | 28) => {
                 at_27 += 1;
                 assert!(
                     Database::open_or_create(&path).is_err(),
-                    "27 is not current"
+                    "{from} is not current"
                 );
                 let report = super::upgrade_library_database(&path).unwrap();
-                assert_eq!((report.from_version, report.to_version), (27, 28));
+                assert_eq!((report.from_version, report.to_version), (from, 29));
             }
-            28 => {
+            29 => {
                 at_27 += 1;
-                Database::open_or_create(&path).expect("a whole schema 28 opens");
+                Database::open_or_create(&path).expect("a whole schema 29 opens");
             }
             other => panic!("schema {other} after a killed upgrade"),
         }
@@ -391,7 +397,7 @@ fn killing_the_upgrade_at_any_moment_leaves_schema_26_or_a_whole_schema_27() {
         for table in NEW_TABLES {
             assert!(done[table].is_empty());
         }
-        assert_eq!(version(&path), 28);
+        assert_eq!(version(&path), 29);
     }
     eprintln!(
         "upgrade kill test: {at_26} left schema 26, {at_27} reached 27 or 28, {journals} rollback journals"

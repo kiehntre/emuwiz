@@ -17,8 +17,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use archivefs_core::dat::reaudit::{
-    FirstMatchPlan, FirstMatchWait, ReauditBlock, ReauditCatalogues, ReauditLimits, ReauditPlan,
-    ReauditProgress, ReauditReport, ReauditStop, plan_first_matching, plan_reaudit, run_reaudit,
+    FirstMatchPlan, FirstMatchWait, ReauditBlock, ReauditCatalogues, ReauditGroup, ReauditLimits,
+    ReauditPlan, ReauditProgress, ReauditReport, ReauditStop, plan_first_matching, plan_reaudit,
+    run_reaudit,
 };
 use archivefs_core::dat::sources::audit_run::DatAuditProgress;
 use archivefs_core::safe_read::TrustedRoots;
@@ -151,6 +152,34 @@ struct GroupJson {
     catalogue: String,
     system: String,
     games: usize,
+    /// For a system's catalogue set: every catalogue each game is read
+    /// against, by source id.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    catalogue_set: Vec<String>,
+}
+
+fn group_json(group: &ReauditGroup) -> GroupJson {
+    GroupJson {
+        source_id: group.source_id.clone(),
+        catalogue: group.catalogue_name.clone(),
+        system: group.platform.clone(),
+        games: group.items.len(),
+        catalogue_set: group.pool.iter().map(|c| c.source_id.clone()).collect(),
+    }
+}
+
+fn print_group(group: &GroupJson) {
+    if group.catalogue_set.is_empty() {
+        println!(
+            "    {:>7}  {} against {} ({})",
+            group.games, group.system, group.catalogue, group.source_id
+        );
+    } else {
+        println!(
+            "    {:>7}  {} against all {} (only one identity they agree on is saved)",
+            group.games, group.system, group.catalogue
+        );
+    }
 }
 
 #[derive(Serialize)]
@@ -194,16 +223,7 @@ fn plan_json(plan: &ReauditPlan) -> PlanJson {
             .into_iter()
             .map(|(status, count)| (status_text(status), count))
             .collect(),
-        groups: plan
-            .groups
-            .iter()
-            .map(|group| GroupJson {
-                source_id: group.source_id.clone(),
-                catalogue: group.catalogue_name.clone(),
-                system: group.platform.clone(),
-                games: group.items.len(),
-            })
-            .collect(),
+        groups: plan.groups.iter().map(group_json).collect(),
         cannot_check,
     }
 }
@@ -219,10 +239,7 @@ fn print_plan(plan: &PlanJson) {
         println!("    {count:>7}  {reason}");
     }
     for group in &plan.groups {
-        println!(
-            "    {:>7}  {} against {} ({})",
-            group.games, group.system, group.catalogue, group.source_id
-        );
+        print_group(group);
     }
     let cannot: usize = plan.cannot_check.values().sum();
     println!("Not eligible ({cannot}), by reason:");
@@ -293,6 +310,15 @@ struct FirstPlanJson {
     bytes: u64,
     groups: Vec<GroupJson>,
     waiting: Vec<WaitingJson>,
+    not_listed: usize,
+    not_eligible: Vec<NotEligibleJson>,
+}
+
+#[derive(Serialize)]
+struct NotEligibleJson {
+    system: String,
+    catalogue: String,
+    reason: String,
 }
 
 #[derive(Serialize)]
@@ -310,15 +336,15 @@ fn first_plan_json(first: &FirstMatchPlan) -> FirstPlanJson {
         tried_before: first.retry.len(),
         left_out_by_limit: first.left_out(),
         bytes: first.plan.bytes(),
-        groups: first
-            .plan
-            .groups
+        groups: first.plan.groups.iter().map(group_json).collect(),
+        not_listed: first.not_listed,
+        not_eligible: first
+            .not_eligible
             .iter()
-            .map(|group| GroupJson {
-                source_id: group.source_id.clone(),
-                catalogue: group.catalogue_name.clone(),
-                system: group.platform.clone(),
-                games: group.items.len(),
+            .map(|(system, catalogue, reason)| NotEligibleJson {
+                system: system.clone(),
+                catalogue: catalogue.clone(),
+                reason: reason.clone(),
             })
             .collect(),
         waiting: first
@@ -344,10 +370,7 @@ fn print_first_plan(plan: &FirstPlanJson) {
         plan.bytes as f64 / (1u64 << 30) as f64
     );
     for group in &plan.groups {
-        println!(
-            "    {:>7}  {} against {} ({})",
-            group.games, group.system, group.catalogue, group.source_id
-        );
+        print_group(group);
     }
     if plan.checked_elsewhere > 0 {
         println!(
@@ -366,6 +389,21 @@ fn print_first_plan(plan: &FirstPlanJson) {
             "Left out of this run by --limit: {} (games never tried go first)",
             plan.left_out_by_limit
         );
+    }
+    if plan.not_listed > 0 {
+        println!(
+            "Checked before against every catalogue of their system and listed in none, unchanged since (not read again): {}",
+            plan.not_listed
+        );
+    }
+    if !plan.not_eligible.is_empty() {
+        println!(
+            "Catalogues left out because this check cannot use them for their system ({}):",
+            plan.not_eligible.len()
+        );
+        for n in &plan.not_eligible {
+            println!("    {}: {}: {}", n.system, n.catalogue, n.reason);
+        }
     }
     let waiting: usize = plan.waiting.iter().map(|w| w.games).sum();
     println!("Waiting, not matched now ({waiting}):");
@@ -477,9 +515,12 @@ fn run_first_time(
     limit: Option<usize>,
     games_per_set: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut first = plan_first_matching(database, &catalogues.configured(), &|platform| {
-        catalogues.for_platform(platform)
-    })?;
+    let mut first = plan_first_matching(
+        database,
+        &catalogues.configured(),
+        &|platform| catalogues.for_platform(platform),
+        &|source_id| catalogues.resolve(source_id),
+    )?;
     if let Some(limit) = limit {
         first = first.truncated(limit);
     }
@@ -580,6 +621,15 @@ fn execute(
                 "  not saved{}: {reason}",
                 if retrying { " (trying again)" } else { "" }
             ),
+            ReauditProgress::CatalogueOfSet {
+                index,
+                of,
+                catalogue,
+            } => {
+                if index == 1 || index == of || index % 25 == 0 {
+                    eprintln!("  catalogue {index}/{of}: {catalogue}");
+                }
+            }
             ReauditProgress::Audit(DatAuditProgress::Hashing { .. })
             | ReauditProgress::Audit(_) => {}
         },
