@@ -72,8 +72,8 @@ fn unknown_neighbouring_and_decorated_system_text_fails_closed() {
         "Acorn",
         "Commodore",
         "Commodore C64DTV",
-        "commodore c64", // exact, case-sensitive
-        "Commodore C16         "commodore c64", // exact, case-sensitive Plus-4", // only the exact TOSEC spelling is reviewed
+        "commodore c64",          // exact, case-sensitive
+        "Commodore C16 & Plus-4", // only the exact TOSEC spelling is reviewed
         "Sinclair ZX81",
         "Sinclair ZX80",
         "Acorn Atom",
