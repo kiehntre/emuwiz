@@ -2098,6 +2098,113 @@ mod first_matching {
             assert!(notes[&8].contains("c64-misc"), "{notes:?}");
         }
 
+        /// Adds a hand-written `<game>` to a written list.
+        fn append_game(c: &C64Library, dat: usize, game: &str) {
+            let path = c.f.dir.path().join(format!("{}.dat", c.dats[dat].0));
+            let xml = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(
+                &path,
+                xml.replace("</datafile>", &format!("{game}</datafile>")),
+            )
+            .unwrap();
+        }
+
+        /// #501 (D1/P1): a list whose only answer about a zip as a whole is
+        /// a CRC match, while it lists the zip's member twice, stays
+        /// ambiguous. The weaker whole-archive result never replaces the
+        /// member evidence, so another list's verified match under the same
+        /// name is not saved. (A filename-only answer takes the same path;
+        /// it cannot arise for an archive that was hashed.)
+        #[test]
+        fn a_crc_only_archive_result_never_replaces_ambiguous_member_evidence() {
+            let mut c = c64();
+            c.dats[2].2.push(("Same A".into(), tape("P1 member")));
+            c.dats[2].2.push(("Same B".into(), tape("P1 member")));
+            c.dats[1].2.push(("Same".into(), tape("P1 member")));
+            c.write();
+            c.f.zip("p1.zip", "p1.tap", &tape("P1 member"));
+            let zip = std::fs::read(c.f.root.join("p1.zip")).unwrap();
+            let mut crc = crate::identity_source::hashing::Crc32::new();
+            crc.update(&zip);
+            append_game(
+                &c,
+                2,
+                &format!(
+                    "<game name=\"Same\"><rom name=\"p1.zip\" size=\"{}\" crc=\"{:08x}\"/></game>",
+                    zip.len(),
+                    crc.finish()
+                ),
+            );
+            c.f.add(7, "p1.zip", None, Some(C64));
+            let plan = c.plan();
+            assert_eq!(
+                ids(group(&plan, "catalogue-set:Commodore 64")),
+                vec![1, 2, 3, 4, 5, 6, 7]
+            );
+            c.run(&plan.plan, &AtomicBool::new(false), &|_| {});
+            assert!(
+                c.identity_rows().iter().all(|row| row.0 != 7),
+                "{:#?}",
+                c.identity_rows()
+            );
+            assert_eq!(c.not_listed_rows(), vec![(5, C64.to_string(), 4)]);
+            let notes: BTreeMap<i64, String> =
+                c.f.notes()
+                    .into_iter()
+                    .map(|n| (n.archive_id, n.reason))
+                    .collect();
+            assert!(notes[&7].contains("c64-misc"), "{notes:?}");
+        }
+
+        /// #501 (P2): two lists that prove the same zip member, one by MD5
+        /// and one by SHA-1, read the same file. The agreed identity is
+        /// saved for both, never refused as "the file changed".
+        #[test]
+        fn one_member_proved_by_md5_and_by_sha1_is_one_read_and_saved_for_both() {
+            let mut c = c64();
+            c.dats[1].2.push(("Both Ways".into(), tape("Both Ways")));
+            c.write();
+            let body = tape("Both Ways");
+            let md5: String = md5::Md5::digest(&body)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            append_game(
+                &c,
+                0,
+                &format!(
+                    "<game name=\"Both Ways\"><rom name=\"Both Ways.tap\" size=\"{}\" md5=\"{md5}\"/></game>",
+                    body.len()
+                ),
+            );
+            c.f.zip("both.zip", "both.tap", &body);
+            c.f.add(7, "both.zip", None, Some(C64));
+            let plan = c.plan();
+            c.run(&plan.plan, &AtomicBool::new(false), &|_| {});
+            let rows: Vec<_> = c
+                .identity_rows()
+                .into_iter()
+                .filter(|row| row.0 == 7)
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    (
+                        7,
+                        "c64-adventure".into(),
+                        "verified_single_match".into(),
+                        c.digest("c64-adventure")
+                    ),
+                    (
+                        7,
+                        "c64-arcade".into(),
+                        "verified_single_match".into(),
+                        c.digest("c64-arcade")
+                    ),
+                ]
+            );
+        }
+
         /// Review B2: a save reads the game again. If it reads differently
         /// from the screen (the file was replaced in between), nothing is
         /// saved from that catalogue.

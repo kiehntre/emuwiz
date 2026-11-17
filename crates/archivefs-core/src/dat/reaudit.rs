@@ -1243,12 +1243,24 @@ fn settle(seen: &[Seen], names: &[String]) -> Settled {
 }
 
 /// Whether two results were read from the same content of the same file
-/// object (hashes compared, outer-file and disc-file fingerprints).
+/// object (hashes compared, outer-file and disc-file fingerprints, and the
+/// same archive member). Catalogues may prove one member with different
+/// algorithms (MD5 in one list, SHA-1 in another): that is still one read,
+/// so the member's matching algorithm is not compared here (#501).
 fn same_read(a: &PersistedLibraryDatIdentity, b: &PersistedLibraryDatIdentity) -> bool {
+    let member = |identity: &PersistedLibraryDatIdentity| {
+        identity.archive_member.as_ref().map(|m| {
+            (
+                m.member_name.clone(),
+                m.member_index,
+                m.archive_format.clone(),
+            )
+        })
+    };
     a.audited_hashes == b.audited_hashes
         && a.audit_file == b.audit_file
         && a.disc_members == b.disc_members
-        && a.archive_member == b.archive_member
+        && member(a) == member(b)
 }
 
 /// Whether a save read the game exactly as the screen did: the same
@@ -1263,7 +1275,22 @@ fn same_result(
     ) && saved.verification_state == screened.verification_state
         && saved.canonical == screened.canonical
         && saved.matched_entries == screened.matched_entries
+        && saved.archive_member == screened.archive_member
         && same_read(saved, screened)
+}
+
+/// What one catalogue said about a game, from its projected result.
+/// `member_hit`: a member of the archive matched this catalogue. That is
+/// content evidence about the game, so a weaker answer about the archive as
+/// a whole (CRC only, filename only, no match, no usable evidence) never
+/// replaces it: the answer stays ambiguous unless the archive itself is
+/// verified or ambiguous (#501).
+fn seen_for_finding(identity: PersistedLibraryDatIdentity, member_hit: bool) -> Seen {
+    match Seen::of(identity) {
+        seen @ (Seen::Verified(_) | Seen::Ambiguous) => seen,
+        _ if member_hit => Seen::Ambiguous,
+        seen => seen,
+    }
 }
 
 struct PoolScreen {
@@ -1365,7 +1392,8 @@ fn screen_pool(
         }
         for finding in screened.findings {
             if let Some(id) = by_path.get(finding.path.as_path()) {
-                this.insert(*id, Seen::of(finding.identity));
+                let member_hit = screened.member_hits.contains(&finding.path);
+                this.insert(*id, seen_for_finding(finding.identity, member_hit));
             }
         }
         for (id, seen) in &mut screen.seen {
