@@ -2909,44 +2909,25 @@ fn minimal_prg(load: u16) -> Vec<u8> {
 
 #[test]
 fn commodore_prg_files_are_discovered_as_programs_never_as_disks() {
+    // Loose files at the source root: a folder holding recognised content is
+    // a game folder in discovery, whatever the extension. The machine for a
+    // `.prg` comes from folder evidence, tested in `platform::tests` and
+    // `media_registry::tests`.
     let root = source_dir("commodore-prg");
-    for (folder, load) in [
-        ("c64", 0x0801),
-        ("plus4", 0x1001),
-        ("c16", 0x1001),
-        ("unsorted", 0x0801),
-    ] {
-        let dir = root.path().join(folder);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("game.prg"), minimal_prg(load)).unwrap();
-    }
+    std::fs::write(root.path().join("c64_game.prg"), minimal_prg(0x0801)).unwrap();
+    std::fs::write(root.path().join("ted_game.prg"), minimal_prg(0x1001)).unwrap();
     let report = discover_source(root.path()).unwrap();
-    let item = |folder: &str| {
-        report
+    for name in ["c64_game.prg", "ted_game.prg"] {
+        let item = report
             .items
             .iter()
-            .find(|item| item.path.ends_with(format!("{folder}/game.prg")))
-            .unwrap_or_else(|| panic!("{folder}/game.prg was not discovered: {report:?}"))
-    };
-    for folder in ["c64", "plus4", "c16", "unsorted"] {
+            .find(|item| item.path.ends_with(name))
+            .unwrap_or_else(|| panic!("{name} was not discovered: {report:?}"));
+        assert_eq!(item.content, Some(ContentKind::Executable), "{name}");
+        assert_ne!(item.content, Some(ContentKind::ComputerDisk), "{name}");
         assert_eq!(
-            item(folder).content,
-            Some(ContentKind::Executable),
-            "{folder}"
-        );
-        assert_ne!(
-            item(folder).content,
-            Some(ContentKind::ComputerDisk),
-            "{folder}"
+            item.platform_hint, None,
+            "{name}: a .prg alone names no machine"
         );
     }
-    // Folder evidence names the machine; C16 and Plus/4 programs keep their
-    // own systems (never C64), and a loose `.prg` stays without a system.
-    assert_eq!(item("c64").platform_hint.as_deref(), Some("Commodore 64"));
-    assert_eq!(item("c16").platform_hint.as_deref(), Some("Commodore 16"));
-    assert_eq!(
-        item("plus4").platform_hint.as_deref(),
-        Some("Commodore Plus-4")
-    );
-    assert_eq!(item("unsorted").platform_hint, None, "must not be guessed");
 }
