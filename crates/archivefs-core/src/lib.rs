@@ -4952,6 +4952,13 @@ pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<Ar
             }),
         };
     }
+    // A Commodore `.prg` is stored on its extension, but arcade and console
+    // dumps use the same name for program-ROM chips (`arcade/<set>/1game.prg`,
+    // `famibox/0.prg`). A folder naming a system that has no `.prg` media is a
+    // positive refusal, exactly like the `.gen` rule below.
+    if extension == "prg" && folder_refuses_commodore_program(path, source_root) {
+        return None;
+    }
     if let Some(kind) = archive_kind(path) {
         return Some(kind);
     }
@@ -4979,6 +4986,21 @@ pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<Ar
     }
     let header_match = !nested_match && !source_root_match && has_mega_drive_cartridge_header(path);
     (nested_match || source_root_match || header_match).then_some(ArchiveKind::MegaDriveRom)
+}
+
+/// Whether the nearest folder (or the source root) names a platform whose
+/// media never includes `.prg`.
+fn folder_refuses_commodore_program(path: &Path, source_root: &Path) -> bool {
+    let refuses = |platform: &str| {
+        !platform::platform_by_id(platform).is_some_and(|entry| entry.accepts_extension("prg"))
+    };
+    detect_platform_from_folder_alias_with_match(path, source_root)
+        .is_some_and(|(platform, _)| refuses(platform))
+        || source_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(folder_platform_alias)
+            .is_some_and(refuses)
 }
 
 pub fn is_supported_archive(path: impl AsRef<Path>) -> bool {

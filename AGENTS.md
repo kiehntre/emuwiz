@@ -268,6 +268,32 @@ scripts/check-working-tree-scope.sh --baseline-file /tmp/emuwiz-task.txt \
 If a required file is already dirty, do not work around the ownership boundary
 by overwriting it. Stop and report the exact path and overlap.
 
+## Proportionate risk policy (owner directive 2026-11-17)
+
+This section takes precedence over any older process rule in this file that asks
+for more review, testing or approval than it does. The owner explicitly accepts
+reasonable, recoverable risk so that development is fast. A working application
+matters more than process and paperwork.
+
+| Risk | Examples | How to work |
+|---|---|---|
+| **Low** | UI work, ordinary fixes, tests, docs, inactive build caches, recoverable development artefacts (scratch fixtures, sandboxes, your own targets) | Implement, run focused tests, push, open a PR and merge it (head pinned) when CI passes. No separate approval, review or full local test run. |
+| **Medium** | Recoverable application installs, database migrations with a backup, service changes | Take a backup or rollback point, then act on an existing owner approval for that kind of work. Don't ask again for every step. Report the rollback path. |
+| **High** | Irreplaceable data, unique source, other people's collections, genuinely destructive operations | Keep the full safeguards: read-only by default, journal, backup, rollback and explicit owner approval. |
+
+Stop doing:
+- Independent reviews of low-risk changes. Keep them for high-risk preservation,
+  filesystem, transaction and recovery code.
+- Repeated full test runs. Run focused tests locally and let CI run the rest.
+- Speculative investigations, research phases and plans that nobody asked for.
+- Approval loops for steps the owner already approved, and handoffs that leave work
+  half-finished.
+
+These protections stay non-negotiable: game files and source archives are
+read-only, real user data is never used for destructive tests, the HOLD lists and
+guard hooks are never weakened or bypassed, no virtual input devices, stop only your
+own processes, no `gh pr merge --auto`, and hints never become verified identity.
+
 ## Automatic repair and security policy
 
 This policy applies equally to Claude Code and Codex. Automatic production
@@ -384,8 +410,10 @@ blockers, including an unresolved defect requiring architectural reconsideration
 after the attempt limit. Explain the blocker and the evidence or decision needed
 to proceed. Read-only assignments retain their own review/report completion path.
 
-Never push, merge, release or enable dangerous operations without explicit
-permission. A local candidate commit is not permission to promote or publish it.
+Low-risk work (see "Proportionate risk policy") is pushed, opened as a PR and
+merged with its head pinned once CI passes, without separate permission. Releases,
+installs and dangerous operations still need owner approval, and an existing
+approval for that kind of work covers every step of it.
 
 ### Reporting
 
@@ -413,8 +441,8 @@ rules; efficiency never overrides those guarantees.
 2. Default to one active implementation agent per task. Use additional active
    implementers only for explicitly authorised parallel work with disjoint file
    sets. Do not launch subagents automatically for routine work. Reserve
-   independent review for high-risk preservation, filesystem, transaction,
-   recovery and other safety-critical changes, or an explicit review requirement.
+   independent review for high-risk preservation, filesystem, transaction and
+   recovery changes, or an explicit review requirement. Low-risk changes get none.
 3. Never repeatedly poll builds, process lists, logs or Cargo locks using AI
    model turns. Use bounded shell waiters that write completion status and
    results to disk; inspect the result after completion or the bounded timeout.
@@ -424,8 +452,8 @@ rules; efficiency never overrides those guarantees.
    with `scripts/qa/gui_wait.py` (`--window NAME --stable 2`, `--window-gone`,
    `--log FILE --pattern RE --new-only`, `--pid-exit PID`, bounded `--timeout`),
    or `xdotool search --sync`.
-4. Run focused tests during implementation. Freeze the candidate before running
-   the full relevant final gate.
+4. Run focused tests during implementation. For low-risk changes, CI is the final
+   gate; don't repeat the full suite locally.
 5. Reuse successful test and review evidence. Repeat it only when subsequent
    changes invalidate that evidence; safety-sensitive changes still require
    independent review of the exact final commit.
@@ -452,8 +480,8 @@ rules; efficiency never overrides those guarantees.
     validation or preservation guarantees to save usage.
 14. Do not start a new development campaign while assigned work is unfinished
     unless explicitly authorised.
-15. After focused local tests and required source checks, push only when authorised,
-    open/update the PR, and verify CI targets the exact reviewed head. Then
+15. After focused local tests and required source checks, push (low-risk work is
+    pre-authorised; see "Proportionate risk policy"), open/update the PR, and verify CI targets the exact reviewed head. Then
     (owner policy 2026-11-17):
     - Prefer GitHub's completion notification (`docs/ci-notifications.md`).
     - For an authorised long-running job, monitor with sensible cadence: first check

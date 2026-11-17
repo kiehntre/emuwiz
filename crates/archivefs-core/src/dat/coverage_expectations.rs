@@ -153,6 +153,8 @@ pub(crate) const TOSEC_PRIMARY_PLATFORMS: &[&str] = &[
     "BBC Micro",
     "Commodore 128",
     "Commodore 64",
+    "Commodore 16",
+    "Commodore Plus-4",
     "VIC-20",
     "ZX Spectrum",
 ];

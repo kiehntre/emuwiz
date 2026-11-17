@@ -280,6 +280,14 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "t64",
         kind: ArchiveKind::DirectGameImage,
     },
+    // A loose Commodore program file (`.prg`): not a disk or tape image and
+    // never unwrapped as one. Catalogued so it can be identified and matched
+    // like any other file; which Commodore machine it is for comes only from
+    // folder, catalogue or person evidence (`prg` is a shared extension).
+    MediaFormat {
+        extension: "prg",
+        kind: ArchiveKind::DirectGameImage,
+    },
     MediaFormat {
         extension: "tzx",
         kind: ArchiveKind::DirectGameImage,
@@ -850,6 +858,52 @@ mod tests {
         // Registration is per extension: companions and other Wii U files are not swept in.
         for extension in ["wua", "rpx", "key", "wup"] {
             assert_eq!(kind_for_extension(extension), None, ".{extension}");
+        }
+    }
+
+    #[test]
+    fn commodore_program_files_are_direct_media_but_never_platform_proof() {
+        assert_eq!(
+            kind_for_extension("prg"),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert!(is_watch_relevant_extension("prg"));
+        assert!(!requires_structural_gate("prg"));
+        assert!(crate::platform::is_shared_extension("prg"));
+        assert!(crate::platform::platforms_with_strong_extension("prg").is_empty());
+    }
+
+    #[test]
+    fn a_prg_in_an_arcade_or_console_folder_is_a_rom_chip_not_a_commodore_program() {
+        use std::path::Path;
+        let root = Path::new("/roms");
+        for refused in [
+            "/roms/arcade/intrepidb2/1intrepid.prg",
+            "/roms/arcade/famibox/0.prg",
+            "/roms/nes/game.prg",
+        ] {
+            assert_eq!(
+                crate::archive_kind_in_root(Path::new(refused), root),
+                None,
+                "{refused}"
+            );
+        }
+        assert_eq!(
+            crate::archive_kind_in_root(Path::new("/arcade/set/1game.prg"), Path::new("/arcade")),
+            None
+        );
+        for stored in [
+            "/roms/c64/game.prg",
+            "/roms/c16/game.prg",
+            "/roms/plus4/game.prg",
+            "/roms/vic20/game.prg",
+            "/roms/unsorted/game.prg",
+        ] {
+            assert_eq!(
+                crate::archive_kind_in_root(Path::new(stored), root),
+                Some(ArchiveKind::DirectGameImage),
+                "{stored}"
+            );
         }
     }
 

@@ -244,6 +244,8 @@ fn short_label(id: &str) -> Option<&'static str> {
         "ColecoVision" => "Coleco",
         "Commodore 128" => "C128",
         "Commodore 64" => "C64",
+        "Commodore 16" => "C16",
+        "Commodore Plus-4" => "Plus/4",
         "Amiga" => "Amiga",
         "Commodore CDTV" => "CDTV",
         "VIC-20" => "VIC-20",

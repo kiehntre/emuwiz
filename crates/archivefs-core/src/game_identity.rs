@@ -1482,12 +1482,6 @@ fn inspect_commodore_tap_identity(report: &mut GameIdentityReport, trusted: &Tru
                     "commodore_tape::parse_commodore_tap machine field",
                 ));
             }
-            if observation.machine.platform_id().is_none() {
-                retain_warning(
-                    report,
-                    "the TAP header identifies C16/Plus4 media, which has no canonical EmuWiz platform entry yet",
-                );
-            }
         }
         Err(error) => add_tape_unavailable(report, tape_error_status(&error), &error.to_string()),
     }

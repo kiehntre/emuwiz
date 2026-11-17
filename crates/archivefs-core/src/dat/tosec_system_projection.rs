@@ -65,6 +65,12 @@ const ROWS: &[Row] = &[
         platform: "Commodore 64",
         systems: &["Commodore C64"],
     },
+    // One TOSEC list covers both TED machines; `Commodore Plus-4` reaches it
+    // through its declared equivalent (see `tosec_systems_for_platform`).
+    Row {
+        platform: "Commodore 16",
+        systems: &["Commodore C16, C116 & Plus-4"],
+    },
     Row {
         platform: "VIC-20",
         systems: &["Commodore VIC20"],
@@ -108,7 +114,12 @@ pub fn tosec_systems_for_platform(platform_hint: Option<&str>) -> TosecSystemsFo
     let Some(platform) = platform_hint.and_then(crate::canonical_platform_for_alias) else {
         return TosecSystemsForPlatform::NotMapped;
     };
-    match ROWS.iter().find(|row| row.platform == platform) {
+    let equivalents = crate::platform::equivalent_platform_ids(platform);
+    let row = ROWS
+        .iter()
+        .find(|row| row.platform == platform)
+        .or_else(|| ROWS.iter().find(|row| equivalents.contains(&row.platform)));
+    match row {
         Some(row) if expects_tosec => TosecSystemsForPlatform::Systems(row.systems),
         _ => TosecSystemsForPlatform::NotMapped,
     }
