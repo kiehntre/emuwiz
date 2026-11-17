@@ -418,7 +418,8 @@ fn tosec_pack_probe() {
 
 #[test]
 fn the_c16_plus4_list_belongs_to_both_ted_machines_and_never_to_the_c64() {
-    let system = "Commodore C16, C116 & Plus-4";
+    const SYSTEMS: &[&str] = &["Commodore C16, C116 & Plus-4"];
+    let system = SYSTEMS[0];
     assert_eq!(
         platform_for_tosec_system(system),
         PlatformForTosecSystem::Platform("Commodore 16")
@@ -426,14 +427,14 @@ fn the_c16_plus4_list_belongs_to_both_ted_machines_and_never_to_the_c64() {
     for platform in ["Commodore 16", "Commodore Plus-4", "c16", "plus4"] {
         assert_eq!(
             tosec_systems_for_platform(Some(platform)),
-            TosecSystemsForPlatform::Systems(&[system]),
+            TosecSystemsForPlatform::Systems(SYSTEMS),
             "{platform}"
         );
     }
     for platform in ["Commodore 64", "VIC-20", "Commodore 128"] {
         assert_ne!(
             tosec_systems_for_platform(Some(platform)),
-            TosecSystemsForPlatform::Systems(&[system]),
+            TosecSystemsForPlatform::Systems(SYSTEMS),
             "{platform}"
         );
     }

@@ -100,11 +100,12 @@ pub(crate) fn platform_asset_category(platform: &str) -> PlatformAssetCategory {
         | "Psion EPOC32"
         | "Psion SIBO" => PlatformAssetCategory::Handheld,
         "Acorn Archimedes" | "Acorn Electron" | "Amiga" | "Amstrad CPC" | "Apple II"
-        | "Atari 8-bit" | "AtariST" | "BBC Micro" | "Commodore 128" | "Commodore 64" | "Commodore 16"
-        | "Commodore Plus-4" | "DOS"
-        | "Enterprise" | "FM Towns" | "Macintosh" | "MSX" | "MSX2" | "NEC PC-8801"
-        | "NEC PC-9801" | "Oric" | "PC" | "PC-98" | "ScummVM" | "Sharp X68000" | "VIC-20"
-        | "Thomson MO" | "Thomson TO" | "ZX Spectrum" => PlatformAssetCategory::Computer,
+        | "Atari 8-bit" | "AtariST" | "BBC Micro" | "Commodore 128" | "Commodore 64"
+        | "Commodore 16" | "Commodore Plus-4" | "DOS" | "Enterprise" | "FM Towns" | "Macintosh"
+        | "MSX" | "MSX2" | "NEC PC-8801" | "NEC PC-9801" | "Oric" | "PC" | "PC-98" | "ScummVM"
+        | "Sharp X68000" | "VIC-20" | "Thomson MO" | "Thomson TO" | "ZX Spectrum" => {
+            PlatformAssetCategory::Computer
+        }
         "Arcade" => PlatformAssetCategory::Arcade,
         "AmigaCD32" | "Commodore CDTV" | "Neo Geo CD" | "PC Engine CD" | "PC-FX"
         | "Philips CD-i" | "Sega CD" => PlatformAssetCategory::OpticalDisc,
