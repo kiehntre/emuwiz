@@ -61,3 +61,121 @@ fn mame_join_persistence_is_bound_to_dat_digest() {
             .is_empty()
     );
 }
+
+fn evidence(name: &str, class: ArcadeJoinClass) -> ArcadeJoinEvidence {
+    let found = class != ArcadeJoinClass::NotFound;
+    ArcadeJoinEvidence {
+        logical_set_name: name.into(),
+        dat_set_name: found.then(|| name.into()),
+        class,
+        description: None,
+        manufacturer: None,
+        year: None,
+        clone_of: None,
+        rom_of: None,
+        parent_description: None,
+        runnable: None,
+        mechanical: false,
+        is_bios: false,
+        is_device: false,
+        disk_declarations: Some(Vec::new()),
+        expected_member_count: 0,
+        members: Vec::new(),
+        dependencies: Vec::new(),
+        launchable_normal_game: found,
+        dat_version: "0.174".into(),
+        dat_sha256: "digest-0174".into(),
+        dat_path: "mame-0.174.dat".into(),
+        audited_at: "test".into(),
+    }
+}
+
+/// Run 210: `arcade/covers`, `arcade/manuals` and `arcade/screenshots` are
+/// artwork folders the MAME 0.174 DAT does not describe (class NotFound).
+/// They were stored as complete, satisfied DAT sets. A folder the DAT does
+/// not describe must never be recorded as a DAT set, and rows an earlier
+/// scan wrote that way are removed by the next join.
+#[test]
+fn artwork_folders_absent_from_the_dat_are_never_recorded_as_sets() {
+    let root = tempfile::tempdir().unwrap();
+    let report = ArcadeJoinReport {
+        dat_path: PathBuf::from("mame-0.174.dat"),
+        dat_sha256: "digest-0174".into(),
+        dat_version: "0.174".into(),
+        dat_machine_count: 1,
+        scan_root: PathBuf::from("/games/arcade"),
+        evidence: vec![
+            evidence("covers", ArcadeJoinClass::NotFound),
+            evidence("manuals", ArcadeJoinClass::NotFound),
+            evidence("pacman", ArcadeJoinClass::ExactSetMatch),
+            evidence("screenshots", ArcadeJoinClass::NotFound),
+        ],
+        summary: ArcadeJoinSummary::default(),
+        layout_estimate: "split".into(),
+    };
+    let db_path = root.path().join("library.sqlite3");
+    let source_id = "mame-arcade:0.174:digest-0174";
+    {
+        let _db = Database::open_or_create(&db_path).unwrap();
+    }
+    // The six rows run 210 left behind, written by the earlier behaviour.
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    for name in ["covers", "manuals", "screenshots"] {
+        connection
+            .execute(
+                "INSERT INTO dat_set_audit_results (archive_id, archive_path, source_id, game_name, platform, set_state_json, dependency_state_json, ecosystem, dat_revision, audited_at, stale, exhaustive) VALUES (NULL, ?1, ?2, ?3, 'arcade', '\"complete\"', '\"satisfied\"', '\"m_a_m_e_arcade\"', 'digest-0174', 'run-210', 0, 1)",
+                rusqlite::params![format!("/games/arcade/{name}").into_bytes(), source_id, name],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO dat_expected_entries (dat_source_id, canonical_identity, display_name, source_revision, ecosystem, metadata_json, created_at, updated_at) VALUES (?1, ?2, ?2, 'digest-0174', 'mame', '{\"class\":\"NotFound\"}', 'run-210', 'run-210')",
+                rusqlite::params![source_id, name],
+            )
+            .unwrap();
+    }
+    // A catalogued "covers" folder carrying an identity from an earlier
+    // join: the current DAT does not describe it, so the identity is cleared.
+    connection
+        .execute(
+            "INSERT INTO source_folders (id, path, first_seen_at, last_seen_in_config_at) VALUES (1, CAST('/games' AS BLOB), 'x', 'x')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO archives (source_folder_id, relative_path, absolute_path_cached, file_name_cached, archive_kind, display_name, normalized_name, size_bytes, modified_time_unix_seconds, first_seen_at, last_seen_at, created_at, updated_at, identity_report_json, identity_report_size_bytes, identity_report_modified_time_unix_seconds) VALUES (1, CAST('arcade/covers' AS BLOB), CAST('/games/arcade/covers' AS BLOB), CAST('covers' AS BLOB), 'arcade_set_directory', 'covers', 'covers', 1, 1, 'x', 'x', 'x', 'x', CAST('{}' AS BLOB), 1, 1)",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut db = Database::open_or_create(&db_path).unwrap();
+    assert_eq!(db.persist_mame_arcade_join(&report).unwrap(), 1);
+    let stored = db.set_audit_results_for_source(source_id).unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .map(|row| row.game_name.as_str())
+            .collect::<Vec<_>>(),
+        ["pacman"]
+    );
+    drop(db);
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    let expected: Vec<String> = connection
+        .prepare("SELECT canonical_identity FROM dat_expected_entries WHERE dat_source_id = ?1 ORDER BY 1")
+        .unwrap()
+        .query_map([source_id], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(expected, ["pacman"]);
+    let identity: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT identity_report_json FROM archives WHERE display_name = 'covers'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(identity, None);
+}
