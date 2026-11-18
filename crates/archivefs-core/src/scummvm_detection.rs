@@ -1156,7 +1156,7 @@ fn discovery_cache_key(root: &Path, executable: &Path) -> Option<String> {
 /// search keeps being refreshed. Symbolic links are never followed; a folder
 /// that cannot be read is skipped and logged rather than widening the search.
 pub fn discovery_roots(source: &Path, catalogued: &[PathBuf]) -> Vec<PathBuf> {
-    discovery_roots_reporting(source, catalogued).0
+    discovery_roots_reporting(source, catalogued, None).0
 }
 
 /// As [`discovery_roots`], plus a note when the PC/DOS nomination stopped at
@@ -1164,6 +1164,7 @@ pub fn discovery_roots(source: &Path, catalogued: &[PathBuf]) -> Vec<PathBuf> {
 pub fn discovery_roots_reporting(
     source: &Path,
     catalogued: &[PathBuf],
+    deadline: Option<Instant>,
 ) -> (Vec<PathBuf>, Option<String>) {
     let mut truncated: Option<String> = None;
     let is_scummvm_folder = |path: &Path| {
@@ -1243,6 +1244,12 @@ pub fn discovery_roots_reporting(
                     .any(|root| game.starts_with(root))
             {
                 continue;
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                truncated = Some(
+                    "the ScummVM search time budget ran out while choosing PC/DOS folders; the rest were not looked at".into(),
+                );
+                break 'pc;
             }
             folders_looked_at += 1;
             if folders_looked_at > MAX_NOMINATION_FOLDERS {
@@ -1491,7 +1498,7 @@ mod tests {
             fs::create_dir_all(library.join(dir)).unwrap();
             fs::write(library.join(dir).join(file), b"x").unwrap();
         }
-        let (roots, truncated) = discovery_roots_reporting(&library, &[]);
+        let (roots, truncated) = discovery_roots_reporting(&library, &[], None);
         assert_eq!(
             roots,
             vec![
@@ -1500,6 +1507,17 @@ mod tests {
             ]
         );
         assert_eq!(truncated, None);
+    }
+
+    #[test]
+    fn an_expired_deadline_stops_nomination_and_says_so() {
+        let root = tempfile::tempdir().unwrap();
+        let library = root.path().join("games");
+        fs::create_dir_all(library.join("dos/Monkey Island")).unwrap();
+        fs::write(library.join("dos/Monkey Island/monkey.000"), b"x").unwrap();
+        let (roots, truncated) = discovery_roots_reporting(&library, &[], Some(Instant::now()));
+        assert!(roots.is_empty(), "{roots:?}");
+        assert!(truncated.is_some_and(|note| note.contains("time budget")));
     }
 
     #[test]

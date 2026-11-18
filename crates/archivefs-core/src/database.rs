@@ -10248,6 +10248,7 @@ fn scan_and_persist_folders_transaction(
             let (roots, truncated) = crate::scummvm_detection::discovery_roots_reporting(
                 &folder.path,
                 &catalogued_games,
+                Some(budget_started + budget),
             );
             if let Some(note) = truncated {
                 // Games past the bound were not searched: never evidence
