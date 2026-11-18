@@ -10205,8 +10205,9 @@ fn scan_and_persist_folders_transaction(
         // recognises; a failure leaves the rest of the scan untouched.
         scummvm_report.sources_considered += 1;
         // A discovery that could not run or be trusted is not evidence that
-        // ScummVM folders are gone: the source is then incomplete for the
-        // purpose of marking anything missing.
+        // ScummVM folders are gone: their rows (`scummvm_directory`) are then
+        // withheld from missing reconciliation. Every other row is still
+        // reconciled.
         let mut scummvm_incomplete = false;
         let scummvm_executable = crate::scummvm_detection::resolve_scummvm_executable();
         if scummvm_executable.is_some()
@@ -10224,7 +10225,10 @@ fn scan_and_persist_folders_transaction(
             scummvm_report.detector_available = true;
             let cache_path = scummvm_discovery_cache_path(database.path());
             let mut cache = load_scummvm_discovery_cache(&cache_path);
-            for detection_root in crate::scummvm_detection::discovery_roots(&folder.path) {
+            let catalogued_games = catalogued_scummvm_game_folders(database, &folder.path);
+            for detection_root in
+                crate::scummvm_detection::discovery_roots(&folder.path, &catalogued_games)
+            {
                 let cache_key = detection_root.display().to_string();
                 let started = std::time::Instant::now();
                 match crate::scummvm_detection::discover_scummvm_game_directories_cached(
@@ -10600,6 +10604,29 @@ fn scan_and_persist_folders_transaction(
 /// The regenerable discovery cache lives beside the library database rather than
 /// in it, so it needs no schema migration and an older build that shares the
 /// database never meets an unknown table.
+/// Present `scummvm_directory` rows of the source at `source_path`, so
+/// narrowed ScummVM discovery keeps covering games an earlier search found.
+/// A read failure yields none: discovery then covers the ScummVM folders only,
+/// and nothing is marked missing because of it.
+fn catalogued_scummvm_game_folders(database: &Database, source_path: &Path) -> Vec<PathBuf> {
+    let Ok(mut statement) = database.connection.prepare(
+        "SELECT a.absolute_path_cached FROM archives a
+           JOIN source_folders s ON s.id = a.source_folder_id
+          WHERE s.path = ?1 AND a.archive_kind = 'scummvm_directory'
+            AND a.last_verified_missing_at IS NULL",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([source_path.as_os_str().as_bytes()], |row| {
+        row.get::<_, Vec<u8>>(0)
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(|row| row.ok())
+        .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+        .collect()
+}
+
 fn scummvm_discovery_cache_path(database: &Path) -> PathBuf {
     let mut name = database.as_os_str().to_os_string();
     name.push(".scummvm-discovery.json");
