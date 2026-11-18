@@ -352,13 +352,19 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
     let safe =
         match crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none()) {
             Ok(safe) => safe,
-            // A refusal (symlink, FIFO, device, directory) is "not a
-            // cartridge" while the path itself can be stat'ed; a path that
-            // cannot be stat'ed at all is an error to report.
+            // A structural refusal (symlink, FIFO, device, directory, odd
+            // path) means "not a cartridge"; a failed or racing read of a
+            // file that exists is an error to report.
             Err(refusal) => {
-                return match fs::symlink_metadata(path) {
-                    Ok(_) => Ok(None),
-                    Err(error) => Err(std::io::Error::other(format!("{refusal:?}: {error}"))),
+                use crate::safe_read::SafeReadRefusal as Refusal;
+                return match refusal {
+                    Refusal::Unreadable(detail)
+                    | Refusal::OpenFailed(detail)
+                    | Refusal::UnresolvableTarget(detail) => Err(std::io::Error::other(detail)),
+                    Refusal::ChangedWhileOpening => Err(std::io::Error::other(
+                        "the file changed while it was being opened",
+                    )),
+                    _ => Ok(None),
                 };
             }
         };

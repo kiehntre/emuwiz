@@ -256,3 +256,24 @@ fn a_fifo_named_like_a_cartridge_is_not_read_and_never_blocks() {
         LooseCartridge::Unreadable { .. }
     ));
 }
+
+#[cfg(unix)]
+#[test]
+fn an_existing_cartridge_that_cannot_be_opened_is_reported_not_skipped() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let folder = root.path().join("videopac");
+    fs::create_dir_all(&folder).unwrap();
+    let locked = folder.join("Locked.bin");
+    fs::write(&locked, rom(12, 2048)).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let readable_anyway = File::open(&locked).is_ok(); // e.g. running as root
+    let verdict = classify(&locked);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+    if !readable_anyway {
+        assert!(
+            matches!(verdict, LooseCartridge::Unreadable { .. }),
+            "{verdict:?}"
+        );
+    }
+}
