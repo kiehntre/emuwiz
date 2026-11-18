@@ -145,7 +145,7 @@ fn the_summary_groups_every_kind_of_catalogue() {
         ("extra", "b.dat", "Nintendo - Game Boy Advance (e-Reader)"),
         ("ambiguous", "c.dat", "IBM - PC and Compatibles"),
         ("source", "d.dat", "Source Code - Nintendo - Game Boy Color"),
-        ("unsupported", "e.dat", "Casio - Loopy"),
+        ("unsupported", "e.dat", "Epoch - Super Cassette Vision"),
         ("chosen", "f.dat", "Nintendo - Game Boy"),
         ("conflict", "g.dat", "Sega - Game Gear"),
         ("off", "h.dat", "Nintendo - Virtual Boy"),
@@ -377,7 +377,7 @@ fn a_check_of_a_different_file_is_refused() {
 
 #[test]
 fn an_empty_preview_applies_nothing() {
-    let setup = Setup::new(&[("x", "x.dat", "Casio - Loopy")]);
+    let setup = Setup::new(&[("x", "x.dat", "Epoch - Super Cassette Vision")]);
     let saved = std::fs::read(&setup.config).unwrap();
     assert!(matches!(
         apply_safe_matches(&setup.config, &setup.revision(), &setup.registry(), &[]).unwrap_err(),

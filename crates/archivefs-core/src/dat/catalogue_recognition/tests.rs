@@ -282,11 +282,34 @@ fn equivalent_names_for_one_machine_are_not_ambiguous() {
     );
 }
 
+/// Casio Loopy, Amstrad GX4000 and Philips Videopac joined the registry with
+/// loose `.bin` cartridge support (owner-approved): their own catalogues map
+/// to them, and their neighbours keep their existing mappings.
+#[test]
+fn newly_supported_cartridge_systems_map_to_themselves_only() {
+    assert_eq!(no_intro("Casio - Loopy"), games("CasioLoopy"));
+    assert_eq!(no_intro("Magnavox - Odyssey 2"), games("Videopac"));
+    assert_eq!(no_intro("Philips - Videopac"), games("Videopac"));
+    assert_eq!(tosec("Amstrad GX4000 - Games"), games("AmstradGX4000"));
+    // Neighbours are unchanged, never pulled onto the new systems.
+    assert_eq!(no_intro("Amstrad - CPC"), games("Amstrad CPC"));
+    for name in ["Magnavox - Odyssey", "Casio - PV-1000", "Philips - CD-i"] {
+        let recognition = no_intro(name);
+        assert!(
+            !matches!(
+                recognition.platform(),
+                Some("CasioLoopy" | "Videopac" | "AmstradGX4000")
+            ),
+            "{name}: {recognition:?}"
+        );
+    }
+}
+
 #[test]
 fn unsupported_systems_are_not_mapped_to_a_neighbour() {
     for name in [
         "Sony - PlayStation Mobile (PSN)",
-        "Casio - Loopy",
+        "Epoch - Super Cassette Vision",
         "Sega - SG-1000 - SC-3000",
         "Microsoft - Xbox One (Digital) (CDN)",
         "Totally Unknown Maker - Imaginary Console",

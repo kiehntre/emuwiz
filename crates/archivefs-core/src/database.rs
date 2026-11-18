@@ -13543,6 +13543,53 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Review C2 on #510: a loose cartridge already catalogued keeps its row
+    /// (identity and history) when an identical ZIP appears beside it later,
+    /// even after the loose file is touched and re-inspected.
+    #[test]
+    fn a_catalogued_loose_cartridge_keeps_its_row_when_an_identical_zip_appears() {
+        use std::io::Write;
+        let root = temp_dir("loose-bin-kept");
+        let source = root.join("games");
+        let folder = source.join("videopac");
+        fs::create_dir_all(&folder).unwrap();
+        let bytes: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        let loose = folder.join("Chess (Europe).bin");
+        fs::write(&loose, &bytes).unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let before = database.load_archives().unwrap();
+        assert_eq!(before.len(), 1);
+        let id = before[0].id;
+
+        let mut writer = zip::ZipWriter::new(fs::File::create(folder.join("Chess.zip")).unwrap());
+        writer
+            .start_file(
+                "Chess (Europe).bin",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        // Touch the loose file so its fingerprint no longer matches.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        fs::File::options()
+            .write(true)
+            .open(&loose)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let second = scan_and_persist(&mut database, &config, "test").unwrap();
+
+        let rows = database.load_archives().unwrap();
+        let kept = rows.iter().find(|row| row.absolute_path == loose).unwrap();
+        assert_eq!(kept.id, id);
+        assert!(kept.last_verified_missing_at.is_none());
+        assert_eq!(second.counts.archives_seen, 2, "{second:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn successful_scan_marks_disappeared_archive_missing() {
         let root = temp_dir("disappeared-archive");

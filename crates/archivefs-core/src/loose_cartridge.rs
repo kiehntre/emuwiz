@@ -59,6 +59,11 @@ pub enum LooseCartridge {
         platform: &'static str,
         zip: PathBuf,
     },
+    /// The file could not be read: an error to report, never a verdict.
+    Unreadable {
+        platform: &'static str,
+        error: String,
+    },
 }
 
 impl LooseCartridge {
@@ -68,7 +73,8 @@ impl LooseCartridge {
             Self::NotCartridge => None,
             Self::New { platform }
             | Self::PossibleVariant { platform, .. }
-            | Self::IdenticalCopy { platform, .. } => Some(platform),
+            | Self::IdenticalCopy { platform, .. }
+            | Self::Unreadable { platform, .. } => Some(platform),
         }
     }
 
@@ -97,20 +103,21 @@ pub fn plausible_dump(platform: &str, size: u64, header: &[u8]) -> bool {
     match platform {
         // 2 KiB banks, or Supercharger 8448-byte loads.
         "Atari2600" => {
-            (2 * KIB..=512 * KIB).contains(&size) && (size % (2 * KIB) == 0 || size % 8448 == 0)
+            (2 * KIB..=512 * KIB).contains(&size)
+                && (size.is_multiple_of(2 * KIB) || size.is_multiple_of(8448))
         }
         // A `CART` header (16 bytes) over 4 KiB multiples, or a raw 8 KiB
         // multiple.
         "Atari 8-bit" => {
             if header.starts_with(b"CART") {
-                size > 16 && (size - 16) % (4 * KIB) == 0 && size - 16 <= 1024 * KIB
+                size > 16 && (size - 16).is_multiple_of(4 * KIB) && size - 16 <= 1024 * KIB
             } else {
-                (8 * KIB..=1024 * KIB).contains(&size) && size % (8 * KIB) == 0
+                (8 * KIB..=1024 * KIB).contains(&size) && size.is_multiple_of(8 * KIB)
             }
         }
-        "AmstradGX4000" => (16 * KIB..=512 * KIB).contains(&size) && size % (16 * KIB) == 0,
+        "AmstradGX4000" => (16 * KIB..=512 * KIB).contains(&size) && size.is_multiple_of(16 * KIB),
         "CasioLoopy" => {
-            (512 * KIB..=MAX_CARTRIDGE_BYTES).contains(&size) && size % (512 * KIB) == 0
+            (512 * KIB..=MAX_CARTRIDGE_BYTES).contains(&size) && size.is_multiple_of(512 * KIB)
         }
         "Videopac" => matches!(size, 2048 | 4096 | 8192 | 12288 | 16384),
         _ => false,
@@ -123,14 +130,19 @@ pub fn classify(path: &Path) -> LooseCartridge {
     let Some(platform) = candidate_platform(path) else {
         return LooseCartridge::NotCartridge;
     };
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return LooseCartridge::NotCartridge;
-    };
-    if !metadata.is_file() || metadata.len() > MAX_CARTRIDGE_BYTES {
-        return LooseCartridge::NotCartridge;
-    }
-    let Ok(bytes) = read_bounded(path, MAX_CARTRIDGE_BYTES) else {
-        return LooseCartridge::NotCartridge;
+    let bytes = match read_bounded(path, MAX_CARTRIDGE_BYTES) {
+        Ok(Some(bytes)) => bytes,
+        // Not a regular file, or larger than any cartridge.
+        Ok(None) => return LooseCartridge::NotCartridge,
+        Err(error) => {
+            return LooseCartridge::Unreadable {
+                platform,
+                error: format!(
+                    "cartridge inspection unavailable for {}: {error}",
+                    path.display()
+                ),
+            };
+        }
     };
     if !plausible_dump(platform, bytes.len() as u64, &bytes) {
         return LooseCartridge::NotCartridge;
@@ -212,10 +224,10 @@ struct ZipMember {
 }
 
 type ZipIndex = Arc<Vec<ZipMember>>;
+type ZipCache = Mutex<HashMap<PathBuf, (Option<SystemTime>, ZipIndex)>>;
 
-fn zip_cache() -> &'static Mutex<HashMap<PathBuf, (Option<SystemTime>, ZipIndex)>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (Option<SystemTime>, ZipIndex)>>> =
-        OnceLock::new();
+fn zip_cache() -> &'static ZipCache {
+    static CACHE: OnceLock<ZipCache> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
@@ -305,11 +317,18 @@ fn member_bytes_equal(zip: &Path, expected: &[u8]) -> bool {
     let Ok(mut archive) = ZipArchive::new(file) else {
         return false;
     };
-    let Some(index) = (0..archive.len()).find(|&index| {
-        archive
-            .by_index_raw(index)
-            .is_ok_and(|member| !member.is_dir())
-    }) else {
+    if archive.len() > MAX_ZIP_MEMBERS {
+        return false;
+    }
+    let files: Vec<usize> = (0..archive.len())
+        .filter(|&index| {
+            archive
+                .by_index_raw(index)
+                .is_ok_and(|member| !member.is_dir())
+        })
+        .collect();
+    // Still exactly one file now, not just when the index was read.
+    let [index] = files[..] else {
         return false;
     };
     let Ok(member) = archive.by_index(index) else {
@@ -326,13 +345,34 @@ fn member_bytes_equal(zip: &Path, expected: &[u8]) -> bool {
     actual == expected
 }
 
-fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(std::io::Error::other("too large for a cartridge"));
+/// The whole file when it is a regular file of at most `limit` bytes, opened
+/// without following symbolic links and without blocking on a FIFO.
+/// `Ok(None)`: not a regular file, or too large.
+fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let safe =
+        match crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none()) {
+            Ok(safe) => safe,
+            // A refusal (symlink, FIFO, device, directory) is "not a
+            // cartridge" while the path itself can be stat'ed; a path that
+            // cannot be stat'ed at all is an error to report.
+            Err(refusal) => {
+                return match fs::symlink_metadata(path) {
+                    Ok(_) => Ok(None),
+                    Err(error) => Err(std::io::Error::other(format!("{refusal:?}: {error}"))),
+                };
+            }
+        };
+    if safe.len() > limit {
+        return Ok(None);
     }
-    Ok(bytes)
+    let mut bytes = Vec::new();
+    (&safe.into_file())
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 #[cfg(test)]

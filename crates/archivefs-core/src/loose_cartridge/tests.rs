@@ -236,3 +236,23 @@ fn a_region_tagged_name_with_other_bytes_is_a_possible_variant() {
         }
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_named_like_a_cartridge_is_not_read_and_never_blocks() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = root.path().join("atari2600");
+    fs::create_dir_all(&folder).unwrap();
+    let fifo = folder.join("Pipe.bin");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(classify(&fifo), LooseCartridge::NotCartridge);
+    // A path that vanished is an error to report, not a verdict.
+    assert!(matches!(
+        classify(&folder.join("Gone.bin")),
+        LooseCartridge::Unreadable { .. }
+    ));
+}
