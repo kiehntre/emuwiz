@@ -10242,9 +10242,19 @@ fn scan_and_persist_folders_transaction(
             let cache_path = scummvm_discovery_cache_path(database.path());
             let mut cache = load_scummvm_discovery_cache(&cache_path);
             let catalogued_games = catalogued_scummvm_game_folders(database, &folder.path);
-            let roots = crate::scummvm_detection::discovery_roots(&folder.path, &catalogued_games);
+            // The budget covers choosing the roots too.
             let budget = crate::scummvm_detection::source_discovery_budget();
             let budget_started = std::time::Instant::now();
+            let (roots, truncated) = crate::scummvm_detection::discovery_roots_reporting(
+                &folder.path,
+                &catalogued_games,
+            );
+            if let Some(note) = truncated {
+                // Games past the bound were not searched: never evidence
+                // that ScummVM folders are gone.
+                scummvm_report.errors.push((folder.path.clone(), note));
+                scummvm_incomplete = true;
+            }
             for (searched, detection_root) in roots.iter().cloned().enumerate() {
                 // Bounded per source: past the budget the remaining roots are
                 // not searched, so only ScummVM rows are withheld from
