@@ -13538,6 +13538,28 @@ mod tests {
         let again = scan_and_persist(&mut database, &config, "test").unwrap();
         assert_eq!(again.counts.archives_added, 0, "{again:?}");
         assert_eq!(again.counts.archives_missing, 0, "{again:?}");
+        // Attention: the identical copy is a recognised duplicate, not an
+        // unsupported format (the nested data file stays "ambiguous").
+        let attention = database.attention_snapshot().unwrap();
+        let discovery = |category: crate::attention::AttentionCategory| {
+            attention
+                .items()
+                .filter(|item| item.category == category && item.id.starts_with("discovery:"))
+                .map(|item| item.affected_count)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            discovery(crate::attention::AttentionCategory::Unsupported),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            discovery(crate::attention::AttentionCategory::Duplicates),
+            [1]
+        );
+        assert_eq!(
+            discovery(crate::attention::AttentionCategory::Identity),
+            [1]
+        );
         assert_eq!(fs::read(folder.join("Amidar (USA).bin")).unwrap(), amidar);
         assert!(folder.join("extras/data.bin").is_file());
         let _ = fs::remove_dir_all(&root);

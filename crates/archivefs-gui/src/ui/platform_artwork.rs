@@ -110,7 +110,9 @@ pub(crate) fn platform_asset_category(platform: &str) -> PlatformAssetCategory {
         "AmigaCD32" | "Commodore CDTV" | "Neo Geo CD" | "PC Engine CD" | "PC-FX"
         | "Philips CD-i" | "Sega CD" => PlatformAssetCategory::OpticalDisc,
         "Atari2600" | "Atari5200" | "Atari7800" | "Atari Jaguar" | "PC Engine"
-        | "TurboGrafx-16" => PlatformAssetCategory::Cartridge,
+        | "TurboGrafx-16" | "AmstradGX4000" | "CasioLoopy" | "Videopac" => {
+            PlatformAssetCategory::Cartridge
+        }
         _ => PlatformAssetCategory::Unknown,
     }
 }

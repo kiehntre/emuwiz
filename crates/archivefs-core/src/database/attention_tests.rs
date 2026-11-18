@@ -139,3 +139,84 @@ fn attention_dat_set_and_identity_share_one_review_and_refresh_staleness() {
             .any(|i| i.category == AttentionCategory::Dat)
     );
 }
+
+/// #510: identical copies of catalogued ZIPs sit in the historical
+/// unsupported counter, but Attention reports them as recognised duplicates,
+/// never as unsupported formats; genuinely unsupported and ambiguous files
+/// keep their own counts. Only this run's verdicts count.
+#[test]
+fn attention_reports_identical_copies_as_duplicates_not_unsupported() {
+    let (_directory, db) = fixture(1);
+    db.connection.execute_batch("INSERT INTO scan_runs(started_at,finished_at,triggered_by,status,skipped_unsupported_extension,skipped_ambiguous_platform) VALUES('2026-02-01T10:00:00Z','2026-02-01T11:00:00Z','test','completed',12,3);").unwrap();
+    let fingerprint = |path: &str, verdict: &str, at: &str| {
+        db.connection
+            .execute(
+                "INSERT INTO scan_fingerprints(source_folder_id,relative_path,size_bytes,modified_time_ns,archive_kind,display_name,normalized_name,scanner_version,parser_version,cache_version,non_archive_kind,updated_at) VALUES(1,CAST(?1 AS BLOB),1,1,'direct_game_image','','','v','p',1,?2,?3)",
+                rusqlite::params![path, verdict, at],
+            )
+            .unwrap();
+    };
+    for index in 0..5 {
+        fingerprint(
+            &format!("atari2600/copy{index}.bin"),
+            "identical_copy",
+            "2026-02-01T10:30:00Z",
+        );
+    }
+    // A verdict left by an earlier scan, and other verdicts, do not count.
+    fingerprint(
+        "atari2600/old.bin",
+        "identical_copy",
+        "2026-01-15T09:00:00Z",
+    );
+    fingerprint("atari2600/odd.bin", "unsupported", "2026-02-01T10:30:00Z");
+    let snapshot = db.attention_snapshot().unwrap();
+    let count_of = |category: AttentionCategory| {
+        snapshot
+            .items()
+            .filter(|item| item.category == category && item.id.starts_with("discovery:"))
+            .map(|item| (item.severity, item.affected_count))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        count_of(AttentionCategory::Unsupported),
+        [(AttentionSeverity::Warning, 7)]
+    );
+    assert_eq!(
+        count_of(AttentionCategory::Duplicates),
+        [(AttentionSeverity::Info, 5)]
+    );
+    assert_eq!(
+        count_of(AttentionCategory::Identity),
+        [(AttentionSeverity::Warning, 3)]
+    );
+    assert!(snapshot.items().any(
+        |item| item.title.contains("identical copies of catalogued ZIPs")
+            && !item.title.contains("unsupported")
+    ));
+}
+
+#[test]
+fn attention_identical_copies_never_exceed_the_counter() {
+    let (_directory, db) = fixture(1);
+    db.connection.execute_batch("INSERT INTO scan_runs(started_at,finished_at,triggered_by,status,skipped_unsupported_extension,skipped_ambiguous_platform) VALUES('2026-02-01T10:00:00Z','2026-02-01T11:00:00Z','test','completed',2,0);").unwrap();
+    for index in 0..4 {
+        db.connection
+            .execute(
+                "INSERT INTO scan_fingerprints(source_folder_id,relative_path,size_bytes,modified_time_ns,archive_kind,display_name,normalized_name,scanner_version,parser_version,cache_version,non_archive_kind,updated_at) VALUES(1,CAST(?1 AS BLOB),1,1,'direct_game_image','','','v','p',1,'identical_copy','2026-02-01T10:30:00Z')",
+                [format!("c{index}.bin")],
+            )
+            .unwrap();
+    }
+    let snapshot = db.attention_snapshot().unwrap();
+    assert!(
+        !snapshot
+            .items()
+            .any(|item| item.category == AttentionCategory::Unsupported)
+    );
+    assert!(
+        snapshot
+            .items()
+            .any(|item| item.category == AttentionCategory::Duplicates && item.affected_count == 2)
+    );
+}
