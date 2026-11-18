@@ -1083,7 +1083,7 @@ pub fn discovery_roots(source: &Path, catalogued: &[PathBuf]) -> Vec<PathBuf> {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(error) => {
-                eprintln!(
+                log::warn!(
                     "scummvm discovery: {} could not be read, so it was not searched: {error}",
                     dir.display()
                 );
@@ -1119,7 +1119,14 @@ pub fn discovery_roots(source: &Path, catalogued: &[PathBuf]) -> Vec<PathBuf> {
     let mut extra: Vec<PathBuf> = catalogued
         .iter()
         .filter(|game| game.starts_with(source) && !roots.iter().any(|root| game.starts_with(root)))
-        .filter(|game| fs::symlink_metadata(game).is_ok_and(|meta| meta.is_dir()))
+        // Only a real directory whose canonical path is itself and lies
+        // inside the (already canonical) source: a stored path through a
+        // since-symlinked parent, or holding `..`, never widens detection.
+        .filter(|game| {
+            game.canonicalize()
+                .is_ok_and(|real| &real == *game && real.starts_with(source))
+                && fs::metadata(game).is_ok_and(|meta| meta.is_dir())
+        })
         .cloned()
         .collect();
     extra.sort();
@@ -1344,6 +1351,21 @@ mod tests {
                 library.join("scummvm"),
                 library.join("amiga/Monkey Island"),
             ]
+        );
+        // A catalogued game reached through a since-symlinked parent folder
+        // never takes detection outside the source.
+        let elsewhere = root.path().join("elsewhere/MI");
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(root.path().join("elsewhere"), library.join("linkedparent"))
+            .unwrap();
+        assert!(
+            !discovery_roots(&library, &[library.join("linkedparent/MI")])
+                .contains(&library.join("linkedparent/MI"))
+        );
+        assert!(
+            !discovery_roots(&library, &[library.join("../elsewhere/MI")])
+                .iter()
+                .any(|root| root.ends_with("MI"))
         );
         // An unreadable folder is skipped, not a reason to search everything.
         #[cfg(unix)]

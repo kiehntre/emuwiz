@@ -10604,6 +10604,12 @@ fn scan_and_persist_folders_transaction(
 /// The regenerable discovery cache lives beside the library database rather than
 /// in it, so it needs no schema migration and an older build that shares the
 /// database never meets an unknown table.
+fn scummvm_discovery_cache_path(database: &Path) -> PathBuf {
+    let mut name = database.as_os_str().to_os_string();
+    name.push(".scummvm-discovery.json");
+    PathBuf::from(name)
+}
+
 /// Present `scummvm_directory` rows of the source at `source_path`, so
 /// narrowed ScummVM discovery keeps covering games an earlier search found.
 /// A read failure yields none: discovery then covers the ScummVM folders only,
@@ -10625,12 +10631,6 @@ fn catalogued_scummvm_game_folders(database: &Database, source_path: &Path) -> V
     rows.filter_map(|row| row.ok())
         .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
         .collect()
-}
-
-fn scummvm_discovery_cache_path(database: &Path) -> PathBuf {
-    let mut name = database.as_os_str().to_os_string();
-    name.push(".scummvm-discovery.json");
-    PathBuf::from(name)
 }
 
 const MAX_SCUMMVM_DISCOVERY_CACHE_BYTES: u64 = 16 * 1024 * 1024;
