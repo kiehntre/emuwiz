@@ -286,14 +286,21 @@ fn lifecycle_projections() -> Vec<EmulatorLifecycleProjection> {
 }
 
 /// RetroArch's own saved installation choice (the same sidecar launch
-/// discovery honours). Only native programs can be saved there, and discovery
-/// lists them by their resolved path, so the choice is a native binding.
+/// discovery honours), as a lifecycle selection. Only a saved native program
+/// that the lifecycle view itself lists (by resolved path on PATH) is used:
+/// a saved AppImage is not inventoried here, and treating it as a native
+/// selection would wrongly report the choice as missing.
 fn saved_retroarch_selection() -> Option<PathBuf> {
+    use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
     use archivefs_core::emulator_environment::retroarch::installation_selection::{
         EXECUTABLE_OVERRIDE_FILE, load_executable_override_at,
     };
+    use archivefs_core::emulator_environment::retroarch::native_retroarch_executables_on_path;
     let file = archivefs_core::app_dirs::config_path(EXECUTABLE_OVERRIDE_FILE).ok()?;
-    load_executable_override_at(&file).ok().flatten()
+    let saved = load_executable_override_at(&file).ok().flatten()?;
+    native_retroarch_executables_on_path(&HostReadOnlyFilesystem, env::var_os("PATH").as_deref())
+        .contains(&saved)
+        .then_some(saved)
 }
 
 /// Executable overrides persist only an exact path, not package/ownership
