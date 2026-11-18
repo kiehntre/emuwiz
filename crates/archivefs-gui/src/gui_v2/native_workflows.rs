@@ -5235,6 +5235,25 @@ fn lifecycle_setup_panel(
                             .set_executable(emulator, Some(path.to_path_buf()));
                         ui.label("Selection saved through the existing emulator setup backend. Refresh to inspect it again.");
                     }
+                    // RetroArch keeps its own installation choice (the sidecar
+                    // launch discovery honours); only native programs qualify.
+                    if !installation.selected
+                        && projection.emulator_id == "RetroArch"
+                        && let archivefs_core::emulator_lifecycle::ExactBinding::NativeExecutable {
+                            path,
+                        } = &installation.exact_binding
+                        && ui
+                            .add_enabled(launchable, egui::Button::new("Use this installation"))
+                            .on_disabled_hover_text(
+                                "EmuWiz cannot launch this installation, so it cannot be chosen.",
+                            )
+                            .clicked()
+                    {
+                        app.emulator_readiness
+                            .retroarch_installation_picker
+                            .start(Some(path.clone()), ui.ctx().clone());
+                        ui.label("Saving this RetroArch choice. Launches use only this program with its own settings; RetroArch settings are not changed. Refresh to inspect it again.");
+                    }
                     ui.collapsing("Advanced details", |ui| {
                         ui.label(format!("Ownership: {}", ownership_label(installation.ownership_category)));
                         ui.label(format!("Channel: {:?} · Version source: {:?}", installation.channel, installation.version.source));
