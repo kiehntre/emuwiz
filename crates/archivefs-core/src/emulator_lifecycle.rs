@@ -221,6 +221,10 @@ pub struct LifecycleContext {
     /// the AppImages found in known locations. Empty in tests that do not
     /// need it (every installation is then `NotAssessed`).
     pub launch_assessment: LaunchAssessment,
+    /// Native RetroArch executables found on `PATH` by the RetroArch
+    /// environment discovery. RetroArch is not part of the older inventory
+    /// enum, so without this the Setup view never listed a native install.
+    pub native_retroarch: Vec<PathBuf>,
 }
 
 impl LifecycleContext {
@@ -500,6 +504,65 @@ fn flatpak_record(
     })
 }
 
+/// A native RetroArch found on `PATH`. Its version is not probed here, so it is
+/// reported with an unknown version. Package ownership, when the caller found
+/// it, marks it as system-package managed.
+fn native_retroarch_record(
+    path: &Path,
+    context: &LifecycleContext,
+    selected: bool,
+) -> EmulatorLifecycleInstallation {
+    let binding = ExactBinding::NativeExecutable {
+        path: path.to_path_buf(),
+    };
+    let package = context.package_evidence.get(path).cloned();
+    let package_manager = package.as_ref().map(|item| item.manager.clone());
+    let (installation_type, ownership_category, update_authority) = if package.is_some() {
+        (
+            InstallationType::SystemPackage,
+            OwnershipCategory::SystemPackageManaged,
+            UpdateAuthority::SystemPackageManager,
+        )
+    } else {
+        (
+            InstallationType::Manual,
+            OwnershipCategory::PortableUserManaged,
+            UpdateAuthority::UserManaged,
+        )
+    };
+    EmulatorLifecycleInstallation {
+        emulator_id: "RetroArch".to_string(),
+        launch_support: context.launch_assessment.support_for("RetroArch", &binding),
+        exact_binding: binding,
+        installation_type,
+        ownership_category,
+        version: VersionEvidence {
+            version: None,
+            raw_output: None,
+            source: VersionSource::Unknown,
+            confidence: VersionConfidence::Unknown,
+        },
+        channel: LifecycleChannel::Unknown,
+        local_health: local_health(path, installation_type),
+        launch_readiness: context.launch_readiness.get("RetroArch").copied(),
+        package,
+        update_authority,
+        update_status: update_for(path, &context.updates),
+        selected,
+        provenance: LifecycleProvenance {
+            discovered_by: vec!["retroarch_environment_path".into()],
+            selected_by: if selected {
+                vec!["profile_or_user_selection".into()]
+            } else {
+                Vec::new()
+            },
+            package_manager,
+            flatpak_scope: None,
+            metadata_timestamp_unix: None,
+        },
+    }
+}
+
 /// An AppImage found in a known location. Its version is not probed (that
 /// would run it), so it is reported with an unknown version rather than a
 /// guessed one.
@@ -695,6 +758,29 @@ pub fn inspect_all_emulator_lifecycles(
             .entry(app.emulator_id.to_string())
             .or_default()
             .push(appimage_record(app, context, selected));
+    }
+    for path in &context.native_retroarch {
+        let binding = ExactBinding::NativeExecutable { path: path.clone() };
+        let already = grouped.get("RetroArch").is_some_and(|items| {
+            items.iter().any(|item| {
+                matches!(&item.exact_binding,
+                    ExactBinding::NativeExecutable { path: known }
+                    | ExactBinding::PortableExecutable { path: known }
+                    | ExactBinding::UnknownExternal { path: known } if known == path)
+            })
+        });
+        if already {
+            continue;
+        }
+        let selected = context
+            .selected_bindings
+            .get("RetroArch")
+            .map(|chosen| chosen == &binding)
+            .unwrap_or(false);
+        grouped
+            .entry("RetroArch".to_string())
+            .or_default()
+            .push(native_retroarch_record(path, context, selected));
     }
     let mut result = Vec::new();
     for (id, mut installations) in grouped {
@@ -918,12 +1004,18 @@ pub fn inspect_discovered_emulator_lifecycles_with_selections(
     selected_bindings: BTreeMap<EmulatorId, ExactBinding>,
 ) -> Vec<EmulatorLifecycleProjection> {
     let inventory = crate::emulator_inventory::discover_installed_emulators();
+    let native_retroarch =
+        crate::emulator_environment::retroarch::native_retroarch_executables_on_path(
+            &crate::emulator_environment::HostReadOnlyFilesystem,
+            std::env::var_os("PATH").as_deref(),
+        );
     let package_evidence = inventory
         .installations
         .iter()
-        .filter_map(|installation| {
-            discover_package_ownership(&installation.executable_path)
-                .map(|evidence| (installation.executable_path.clone(), evidence))
+        .map(|installation| &installation.executable_path)
+        .chain(native_retroarch.iter())
+        .filter_map(|path| {
+            discover_package_ownership(path).map(|evidence| (path.clone(), evidence))
         })
         .collect();
     let raw_version_output = inventory
@@ -945,6 +1037,7 @@ pub fn inspect_discovered_emulator_lifecycles_with_selections(
         package_evidence,
         raw_version_output,
         selected_bindings,
+        native_retroarch,
         ..Default::default()
     })
 }
@@ -1046,6 +1139,54 @@ mod tests {
         let projection = inspect_all_emulator_lifecycles(&context);
         assert_eq!(projection[0].state, LifecycleState::InstalledCurrent);
         assert!(projection[0].selected.is_some());
+    }
+
+    #[test]
+    fn native_retroarch_on_path_is_listed() {
+        let dir = tempdir().unwrap();
+        let path = executable(dir.path(), "retroarch");
+        let context = LifecycleContext {
+            native_retroarch: vec![path.clone()],
+            ..Default::default()
+        };
+        let projection = inspect_emulator_lifecycle(&context, "RetroArch");
+        assert_eq!(projection.state, LifecycleState::InstalledUnknownVersion);
+        assert_eq!(projection.installations.len(), 1);
+        let install = &projection.installations[0];
+        assert_eq!(
+            install.exact_binding,
+            ExactBinding::NativeExecutable { path: path.clone() }
+        );
+        assert_eq!(install.installation_type, InstallationType::Manual);
+        assert_eq!(install.local_health, LocalHealth::Healthy);
+        assert!(!install.selected);
+    }
+
+    #[test]
+    fn native_retroarch_with_package_evidence_is_system_managed() {
+        let dir = tempdir().unwrap();
+        let path = executable(dir.path(), "retroarch");
+        let mut context = LifecycleContext {
+            native_retroarch: vec![path.clone()],
+            ..Default::default()
+        };
+        context.package_evidence.insert(
+            path.clone(),
+            PackageEvidence {
+                manager: "dpkg".into(),
+                package_name: "retroarch".into(),
+                package_version: None,
+                executable_path: path.clone(),
+            },
+        );
+        let projection = inspect_emulator_lifecycle(&context, "RetroArch");
+        let install = &projection.installations[0];
+        assert_eq!(install.installation_type, InstallationType::SystemPackage);
+        assert_eq!(
+            install.ownership_category,
+            OwnershipCategory::SystemPackageManaged
+        );
+        assert_eq!(projection.state, LifecycleState::InstalledUnknownVersion);
     }
 
     #[test]

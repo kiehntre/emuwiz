@@ -1324,13 +1324,25 @@ fn discover_native_executables(
     filesystem: &dyn ReadOnlyHostFilesystem,
     path_value: &OsStr,
 ) -> Vec<EncodedPath> {
-    discover_path_executables(filesystem, Some(path_value))
+    native_retroarch_executables_on_path(filesystem, Some(path_value))
         .iter()
+        .map(|path| EncodedPath::from_path(path))
+        .collect()
+}
+
+/// Native RetroArch executables on `PATH`, resolved and de-duplicated the same
+/// way launch discovery does. Flatpak launchers and unresolved wrapper scripts
+/// are excluded. Read-only; nothing is executed.
+pub fn native_retroarch_executables_on_path(
+    filesystem: &dyn ReadOnlyHostFilesystem,
+    path_value: Option<&OsStr>,
+) -> Vec<PathBuf> {
+    discover_path_executables(filesystem, path_value)
+        .into_iter()
         .filter(|path| {
             installation_selection::classify_installation_executable(filesystem, path)
                 == installation_selection::InstallationExecutable::Native
         })
-        .map(|path| EncodedPath::from_path(path))
         .collect()
 }
 
@@ -5342,6 +5354,26 @@ mod tests {
             report.profiles[0].evidence.executables,
             vec![EncodedPath::from_path(&fixture.path("games/retroarch"))]
         );
+    }
+
+    #[test]
+    fn native_executables_on_path_exclude_flatpak_wrapper() {
+        let fixture = Fixture::new("native-on-path");
+        fixture.mkdir("wrap");
+        fixture.mkdir("games");
+        fixture.write(
+            "wrap/retroarch",
+            "#!/bin/sh\nexec flatpak run org.libretro.RetroArch \"$@\"\n",
+        );
+        make_executable(&fixture.path("wrap/retroarch"));
+        fixture.write("games/retroarch", "\x7fELF");
+        make_executable(&fixture.path("games/retroarch"));
+        let path = std::env::join_paths([fixture.path("wrap"), fixture.path("games")]).unwrap();
+
+        let found =
+            native_retroarch_executables_on_path(&HostReadOnlyFilesystem, Some(path.as_os_str()));
+        assert_eq!(found, vec![fixture.path("games/retroarch")]);
+        assert!(native_retroarch_executables_on_path(&HostReadOnlyFilesystem, None).is_empty());
     }
 
     #[test]
