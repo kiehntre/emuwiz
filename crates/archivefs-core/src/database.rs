@@ -1030,10 +1030,11 @@ impl Database {
                 // A folder the DAT does not describe (artwork, manuals,
                 // screenshots, or a set from another MAME release) has no
                 // expected members, so it would read as a complete,
-                // satisfied set. It is not a DAT set: record nothing.
-                if evidence.class == crate::dat::mame_arcade_join::ArcadeJoinClass::NotFound {
-                    continue;
-                }
+                // satisfied set. It is not a DAT set: no audit or expected
+                // rows. Its catalogue row still has any earlier identity
+                // cleared below, since this DAT no longer supports one.
+                let not_in_dat =
+                    evidence.class == crate::dat::mame_arcade_join::ArcadeJoinClass::NotFound;
                 let encoded = serde_json::to_string(evidence).map_err(|error| {
                     ArchiveFsError::Database(format!(
                         "failed to encode MAME Arcade join evidence for {} in batch {batch_start}..{batch_end}; {committed} rows already committed: {error}",
@@ -1060,7 +1061,8 @@ impl Database {
                                 evidence.logical_set_name
                             ))
                         })?;
-                tx.execute(
+                if !not_in_dat {
+                    tx.execute(
                     "INSERT INTO dat_expected_entries
                  (dat_source_id, canonical_identity, display_name, source_revision,
                   ecosystem, metadata_json, created_at, updated_at)
@@ -1092,7 +1094,7 @@ impl Database {
                         error,
                     )
                 })?;
-                tx.execute(
+                    tx.execute(
                     "INSERT INTO dat_set_audit_results
                  (archive_id, archive_path, source_id, game_name, platform,
                   set_state_json, dependency_state_json, ecosystem, dat_revision,
@@ -1142,6 +1144,7 @@ impl Database {
                         error,
                     )
                 })?;
+                }
                 if let Some(archive_id) = archive_id {
                     tx.execute(
                         "UPDATE archives SET identity_report_json = ?2,

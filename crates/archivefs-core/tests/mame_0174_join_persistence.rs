@@ -134,6 +134,20 @@ fn artwork_folders_absent_from_the_dat_are_never_recorded_as_sets() {
             )
             .unwrap();
     }
+    // A catalogued "covers" folder carrying an identity from an earlier
+    // join: the current DAT does not describe it, so the identity is cleared.
+    connection
+        .execute(
+            "INSERT INTO source_folders (id, path, first_seen_at, last_seen_in_config_at) VALUES (1, CAST('/games' AS BLOB), 'x', 'x')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO archives (source_folder_id, relative_path, absolute_path_cached, file_name_cached, archive_kind, display_name, normalized_name, size_bytes, modified_time_unix_seconds, first_seen_at, last_seen_at, created_at, updated_at, identity_report_json, identity_report_size_bytes, identity_report_modified_time_unix_seconds) VALUES (1, CAST('arcade/covers' AS BLOB), CAST('/games/arcade/covers' AS BLOB), CAST('covers' AS BLOB), 'arcade_set_directory', 'covers', 'covers', 1, 1, 'x', 'x', 'x', 'x', CAST('{}' AS BLOB), 1, 1)",
+            [],
+        )
+        .unwrap();
     drop(connection);
 
     let mut db = Database::open_or_create(&db_path).unwrap();
@@ -156,4 +170,12 @@ fn artwork_folders_absent_from_the_dat_are_never_recorded_as_sets() {
         .map(Result::unwrap)
         .collect();
     assert_eq!(expected, ["pacman"]);
+    let identity: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT identity_report_json FROM archives WHERE display_name = 'covers'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(identity, None);
 }
