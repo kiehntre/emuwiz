@@ -13460,6 +13460,89 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Loose `.bin` cartridges (run 210: 1,592 ambiguous `.bin`) in a system's
+    /// own folder: an identical copy of a catalogued ZIP is reported, not
+    /// catalogued twice; a same-name different-content file and a new ROM
+    /// are catalogued; nested data is left alone; no file is touched, and a
+    /// rescan neither adds nor marks anything missing.
+    #[test]
+    fn loose_bin_cartridges_are_catalogued_without_duplicating_zipped_copies() {
+        use std::io::Write;
+        let root = temp_dir("loose-bin-cartridges");
+        let source = root.join("games");
+        let folder = source.join("atari2600");
+        fs::create_dir_all(folder.join("extras")).unwrap();
+        let rom = |seed: u8, size: usize| -> Vec<u8> {
+            (0..size)
+                .map(|i| (i as u8).wrapping_mul(13).wrapping_add(seed))
+                .collect()
+        };
+        let zip_with = |path: &Path, name: &str, bytes: &[u8]| {
+            let mut writer = zip::ZipWriter::new(fs::File::create(path).unwrap());
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+            writer.finish().unwrap();
+        };
+        let amidar = rom(1, 4096);
+        zip_with(&folder.join("Amidar.zip"), "Amidar (USA).bin", &amidar);
+        zip_with(
+            &folder.join("Combat.zip"),
+            "Combat (USA).bin",
+            &rom(2, 2048),
+        );
+        fs::write(folder.join("Amidar (USA).bin"), &amidar).unwrap();
+        fs::write(folder.join("Combat (USA).bin"), rom(3, 2048)).unwrap();
+        fs::write(folder.join("Homebrew.bin"), rom(4, 8192)).unwrap();
+        fs::write(folder.join("extras/data.bin"), rom(5, 4096)).unwrap();
+
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        let mut catalogued: Vec<String> = database
+            .load_archives()
+            .unwrap()
+            .iter()
+            .map(|row| row.relative_path.display().to_string())
+            .collect();
+        catalogued.sort();
+        assert_eq!(
+            catalogued,
+            [
+                "atari2600/Amidar.zip",
+                "atari2600/Combat (USA).bin",
+                "atari2600/Combat.zip",
+                "atari2600/Homebrew.bin",
+            ]
+        );
+        assert!(
+            summary.skipped_files.iter().any(|skipped| {
+                skipped.path == folder.join("Amidar (USA).bin")
+                    && skipped.reason == crate::SkipReason::IdenticalCopy
+            }),
+            "{:?}",
+            summary.skipped_files
+        );
+        let platform: String = database
+            .connection
+            .query_row(
+                "SELECT p.platform FROM platform_assignments p JOIN archives a ON a.id = p.archive_id
+                  WHERE p.is_current = 1 AND CAST(a.relative_path AS TEXT) = 'atari2600/Homebrew.bin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(platform, "Atari2600");
+
+        let again = scan_and_persist(&mut database, &config, "test").unwrap();
+        assert_eq!(again.counts.archives_added, 0, "{again:?}");
+        assert_eq!(again.counts.archives_missing, 0, "{again:?}");
+        assert_eq!(fs::read(folder.join("Amidar (USA).bin")).unwrap(), amidar);
+        assert!(folder.join("extras/data.bin").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn successful_scan_marks_disappeared_archive_missing() {
         let root = temp_dir("disappeared-archive");

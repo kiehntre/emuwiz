@@ -89,6 +89,7 @@ pub(super) fn show_skipped_files_window(
                     archivefs_core::SkipReason::InvalidContent,
                     archivefs_core::SkipReason::UnsupportedVariant,
                     archivefs_core::SkipReason::AmbiguousPlatform,
+                    archivefs_core::SkipReason::IdenticalCopy,
                 ] {
                     if ui
                         .selectable_label(*filter == Some(reason), reason.label())

@@ -404,7 +404,6 @@ fn an_alias_never_matches_a_substring_of_a_longer_folder_name() {
         "segacd32",
         "amiga-cd",
         "atari-jaguar-cd",
-        "amstrad-gx4000",
         "amstrad-pcw",
         "neo-geo-x",
         "intellivision-amico",

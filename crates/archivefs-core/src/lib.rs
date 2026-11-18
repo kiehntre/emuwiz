@@ -280,6 +280,7 @@ pub use library_views::{
 /// Read-only external identity providers - RomM in Stage 1, with room for local
 /// DAT catalogues and Hasheous later.
 pub mod identity_source;
+pub mod loose_cartridge;
 /// Explicit, user-approved descriptive metadata enrichment. This is kept
 /// separate from identity/platform evidence by construction.
 pub mod screenscraper_enrichment;
@@ -4963,6 +4964,24 @@ pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<Ar
         return Some(kind);
     }
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    // A `.bin` directly in a folder naming a cartridge system with raw `.bin`
+    // dumps: catalogued when its size/header fits, unless it is a proven
+    // identical copy of a sibling ZIP (see `loose_cartridge`).
+    if extension == "bin" && loose_cartridge::candidate_platform(path).is_some() {
+        let verdict = loose_cartridge::classify(path);
+        // Both files are kept and catalogued separately; the pairing is
+        // re-derived from disk by `loose_cartridge::classify` on demand.
+        if let loose_cartridge::LooseCartridge::PossibleVariant { counterpart, .. } = &verdict {
+            log::info!(
+                "possible variant: {} has the same title as {} but different contents",
+                path.display(),
+                counterpart.display()
+            );
+        }
+        return verdict
+            .is_catalogued()
+            .then_some(ArchiveKind::DirectGameImage);
+    }
     if !media_registry::is_corroboration_candidate(&extension) {
         return None;
     }
@@ -6232,6 +6251,10 @@ pub enum SkipReason {
     /// that merely shares one of these three extensions (for example a
     /// ScummVM `RESOURCE.GEN`) is reported this way, not as unsupported.
     AmbiguousPlatform,
+    /// A loose cartridge byte-identical to the only file of a sibling ZIP the
+    /// library already catalogues: an alternate copy, reported rather than
+    /// catalogued twice. Neither file is changed.
+    IdenticalCopy,
 }
 
 impl SkipReason {
@@ -6242,6 +6265,7 @@ impl SkipReason {
             Self::InvalidContent => "Unsupported or invalid media structure",
             Self::UnsupportedVariant => "Recognised, unsupported variant",
             Self::AmbiguousPlatform => "Ambiguous platform",
+            Self::IdenticalCopy => "Identical copy of a catalogued ZIP",
         }
     }
 }
@@ -6776,6 +6800,17 @@ impl<'a> ArchiveScanner<'a> {
                     {
                         discovery.skipped_unsupported_extension += 1;
                         SkipReason::InvalidContent
+                    } else if extension.as_deref() == Some("bin")
+                        && matches!(
+                            loose_cartridge::classify(&path),
+                            loose_cartridge::LooseCartridge::IdenticalCopy { .. }
+                        )
+                    {
+                        // Kept in the historical unsupported counter for schema
+                        // compatibility, like `UnsupportedVariant`; the
+                        // per-item reason stays distinct.
+                        discovery.skipped_unsupported_extension += 1;
+                        SkipReason::IdenticalCopy
                     } else if extension
                         .as_deref()
                         .is_some_and(|value| matches!(value, "md" | "bin" | "gen"))
@@ -6843,6 +6878,7 @@ impl<'a> ArchiveScanner<'a> {
                                         SkipReason::InvalidContent => "invalid_content",
                                         SkipReason::UnsupportedVariant => "unsupported_variant",
                                         SkipReason::AmbiguousPlatform => "ambiguous",
+                                        SkipReason::IdenticalCopy => "identical_copy",
                                     }
                                     .to_string(),
                                 ),
@@ -7123,7 +7159,13 @@ fn non_archive_verdict_is_still_current(path: &Path, verdict: &str) -> bool {
             !media_registry::is_recognized_extension(&extension)
                 && !media_registry::is_corroboration_candidate(&extension)
         }
-        "ambiguous" => media_registry::is_corroboration_candidate(&extension),
+        // A loose cartridge candidate is always re-classified: its verdict
+        // depends on the size/header rules and on sibling ZIPs, which the
+        // file's own stat cannot show.
+        "ambiguous" => {
+            media_registry::is_corroboration_candidate(&extension)
+                && loose_cartridge::candidate_platform(path).is_none()
+        }
         _ => false,
     }
 }
