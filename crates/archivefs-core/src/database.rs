@@ -6810,6 +6810,7 @@ impl Database {
         scan_run_id: i64,
         source_folder_id: i64,
         seen_archive_ids: &[i64],
+        withheld_kinds: &[&str],
     ) -> Result<i64> {
         let status: Option<String> = self
             .connection
@@ -6938,7 +6939,11 @@ impl Database {
             .into_iter()
             .filter_map(|(id, bytes, kind, current_source)| {
                 let path = PathBuf::from(OsString::from_vec(bytes));
+                // A kind this run could not enumerate (for example ScummVM
+                // folders when the detector failed) keeps its rows untouched;
+                // every other row of the source is still reconciled.
                 if seen.contains(&id)
+                    || withheld_kinds.contains(&kind.as_str())
                     || !path.starts_with(&coverage.root)
                     || coverage
                         .excluded_roots
@@ -7199,7 +7204,7 @@ impl Database {
             .count();
         if missing > 0 {
             let marked =
-                self.mark_unseen_archives_missing(scan_run_id, source_folder_id, &seen_ids)?;
+                self.mark_unseen_archives_missing(scan_run_id, source_folder_id, &seen_ids, &[])?;
             let counts = ScanRunCounts {
                 archives_seen: archives.len() as i64,
                 archives_unchanged: archives.len() as i64,
@@ -10216,8 +10221,9 @@ fn scan_and_persist_folders_transaction(
         // recognises; a failure leaves the rest of the scan untouched.
         scummvm_report.sources_considered += 1;
         // A discovery that could not run or be trusted is not evidence that
-        // ScummVM folders are gone: the source is then incomplete for the
-        // purpose of marking anything missing.
+        // ScummVM folders are gone: their rows (`scummvm_directory`) are then
+        // withheld from missing reconciliation. Every other row is still
+        // reconciled.
         let mut scummvm_incomplete = false;
         let scummvm_executable = crate::scummvm_detection::resolve_scummvm_executable();
         if scummvm_executable.is_some()
@@ -10235,84 +10241,90 @@ fn scan_and_persist_folders_transaction(
             scummvm_report.detector_available = true;
             let cache_path = scummvm_discovery_cache_path(database.path());
             let mut cache = load_scummvm_discovery_cache(&cache_path);
-            let cache_key = folder.path.display().to_string();
-            let started = std::time::Instant::now();
-            match crate::scummvm_detection::discover_scummvm_game_directories_cached(
-                &folder.path,
-                &executable,
-                cache.get(&cache_key),
-            ) {
-                Ok((found, entry)) => {
-                    let hit = entry
-                        .as_ref()
-                        .is_some_and(|e| cache.get(&cache_key) == Some(e));
-                    if hit {
-                        scummvm_report.cache_hits += 1;
-                    } else {
-                        scummvm_report.detector_runs += 1;
-                    }
-                    info!(
-                        "scummvm discovery for {} took {} ms (cache {})",
-                        folder.path.display(),
-                        started.elapsed().as_millis(),
-                        if hit { "hit" } else { "miss" }
-                    );
-                    match entry {
-                        Some(entry) => {
-                            cache.insert(cache_key, entry);
+            let catalogued_games = catalogued_scummvm_game_folders(database, &folder.path);
+            for detection_root in
+                crate::scummvm_detection::discovery_roots(&folder.path, &catalogued_games)
+            {
+                let cache_key = detection_root.display().to_string();
+                let started = std::time::Instant::now();
+                match crate::scummvm_detection::discover_scummvm_game_directories_cached(
+                    &detection_root,
+                    &executable,
+                    cache.get(&cache_key),
+                ) {
+                    Ok((found, entry)) => {
+                        let hit = entry
+                            .as_ref()
+                            .is_some_and(|e| cache.get(&cache_key) == Some(e));
+                        if hit {
+                            scummvm_report.cache_hits += 1;
+                        } else {
+                            scummvm_report.detector_runs += 1;
                         }
-                        None => {
-                            cache.remove(&cache_key);
+                        info!(
+                            "scummvm discovery for {} took {} ms (cache {})",
+                            detection_root.display(),
+                            started.elapsed().as_millis(),
+                            if hit { "hit" } else { "miss" }
+                        );
+                        match entry {
+                            Some(entry) => {
+                                cache.insert(cache_key, entry);
+                            }
+                            None => {
+                                cache.remove(&cache_key);
+                            }
                         }
-                    }
-                    save_scummvm_discovery_cache(&cache_path, &cache);
-                    scummvm_report.ambiguous.extend(found.ambiguous);
-                    scummvm_report.rejected.extend(found.rejected);
-                    scummvm_report
-                        .unknown_variants
-                        .extend(found.unknown_variants.into_iter().map(|game| game.path));
-                    for game in found.games {
-                        if let Some(archive) = Archive::from_scummvm_directory(
-                            &game.path,
-                            &folder.path,
-                            game.game.description.as_deref(),
-                        ) {
-                            scummvm_report.games_found += 1;
-                            // The folder is one game; media the file scanner
-                            // recognised inside it is part of that game, not
-                            // separate rows - said so, never silently dropped.
-                            scummvm_report.contained_media.extend(
+                        save_scummvm_discovery_cache(&cache_path, &cache);
+                        scummvm_report.ambiguous.extend(found.ambiguous);
+                        scummvm_report.rejected.extend(found.rejected);
+                        scummvm_report
+                            .unknown_variants
+                            .extend(found.unknown_variants.into_iter().map(|game| game.path));
+                        for game in found.games {
+                            if let Some(archive) = Archive::from_scummvm_directory(
+                                &game.path,
+                                &folder.path,
+                                game.game.description.as_deref(),
+                            ) {
+                                scummvm_report.games_found += 1;
+                                // The folder is one game; media the file scanner
+                                // recognised inside it is part of that game, not
+                                // separate rows - said so, never silently dropped.
+                                scummvm_report.contained_media.extend(
+                                    archives
+                                        .iter()
+                                        .filter(|candidate| candidate.path.starts_with(&game.path))
+                                        .filter(|candidate| {
+                                            crate::ingestion::support_material_kind(
+                                                &candidate.path,
+                                                &folder.path,
+                                                folder.role,
+                                            )
+                                            .is_none()
+                                        })
+                                        .map(|candidate| candidate.path.clone()),
+                                );
                                 archives
-                                    .iter()
-                                    .filter(|candidate| candidate.path.starts_with(&game.path))
-                                    .filter(|candidate| {
-                                        crate::ingestion::support_material_kind(
-                                            &candidate.path,
-                                            &folder.path,
-                                            folder.role,
-                                        )
-                                        .is_none()
-                                    })
-                                    .map(|candidate| candidate.path.clone()),
-                            );
-                            archives.retain(|candidate| !candidate.path.starts_with(&game.path));
-                            archives.push(archive);
+                                    .retain(|candidate| !candidate.path.starts_with(&game.path));
+                                archives.push(archive);
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    info!(
-                        "scummvm discovery skipped for {}: {error}",
-                        folder.path.display()
-                    );
-                    scummvm_report
-                        .errors
-                        .push((folder.path.clone(), error.to_string()));
-                    scummvm_incomplete = true;
-                    // A cached entry that was rejected (or any entry for a run
-                    // that failed) must not be consumed again: the next scan
-                    // asks ScummVM afresh. Other sources' entries are kept.
-                    evict_scummvm_discovery_entry(&cache_path, &mut cache, &cache_key);
+                    Err(error) => {
+                        info!(
+                            "scummvm discovery skipped for {}: {error}",
+                            detection_root.display()
+                        );
+                        scummvm_report
+                            .errors
+                            .push((detection_root.clone(), error.to_string()));
+                        scummvm_incomplete = true;
+                        // A cached entry that was rejected (or any entry for a run
+                        // that failed) must not be consumed again: the next scan
+                        // asks ScummVM afresh. Other sources' entries are kept.
+                        evict_scummvm_discovery_entry(&cache_path, &mut cache, &cache_key);
+                    }
                 }
             }
         }
@@ -10391,9 +10403,18 @@ fn scan_and_persist_folders_transaction(
         #[cfg(test)]
         nested_scan::test_hook::run_before_persist();
         let db_write_started = std::time::Instant::now();
-        let persist_complete = discovery_complete && !scummvm_incomplete;
+        // A ScummVM detector failure says nothing about the files the archive
+        // scanner enumerated: only ScummVM folder rows are withheld from
+        // missing reconciliation (run 210 lost all of it to one timeout).
+        let persist_complete = discovery_complete;
+        let withheld_missing_kinds: &[&str] = if scummvm_incomplete {
+            &["scummvm_directory"]
+        } else {
+            &[]
+        };
         let fully_reused = !arcade_specialist
             && persist_complete
+            && !scummvm_incomplete
             && discovery.timings.re_inspected == 0
             && non_archive_fingerprints.is_empty();
         let persisted = match identities_recorded {
@@ -10408,6 +10429,7 @@ fn scan_and_persist_folders_transaction(
                         folder,
                         &archives,
                         persist_complete,
+                        withheld_missing_kinds,
                         &settled_areas,
                     )
                 }),
@@ -10417,6 +10439,7 @@ fn scan_and_persist_folders_transaction(
                 folder,
                 &archives,
                 persist_complete,
+                withheld_missing_kinds,
                 &settled_areas,
             ),
         };
@@ -10603,6 +10626,29 @@ fn scummvm_discovery_cache_path(database: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Present `scummvm_directory` rows of the source at `source_path`, so
+/// narrowed ScummVM discovery keeps covering games an earlier search found.
+/// A read failure yields none: discovery then covers the ScummVM folders only,
+/// and nothing is marked missing because of it.
+fn catalogued_scummvm_game_folders(database: &Database, source_path: &Path) -> Vec<PathBuf> {
+    let Ok(mut statement) = database.connection.prepare(
+        "SELECT a.absolute_path_cached FROM archives a
+           JOIN source_folders s ON s.id = a.source_folder_id
+          WHERE s.path = ?1 AND a.archive_kind = 'scummvm_directory'
+            AND a.last_verified_missing_at IS NULL",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([source_path.as_os_str().as_bytes()], |row| {
+        row.get::<_, Vec<u8>>(0)
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(|row| row.ok())
+        .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+        .collect()
+}
+
 const MAX_SCUMMVM_DISCOVERY_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Reads the cache, treating anything unreadable, oversized or malformed as
@@ -10669,6 +10715,7 @@ fn persist_one_folder(
     folder: &RegisteredSourceFolder,
     archives: &[Archive],
     complete: bool,
+    withheld_missing_kinds: &[&str],
     areas: &nested_scan::SettledAreas,
 ) -> Result<ScanRunCounts> {
     let mut counts = ScanRunCounts::default();
@@ -10782,8 +10829,12 @@ fn persist_one_folder(
     }
 
     if complete {
-        counts.archives_missing =
-            database.mark_unseen_archives_missing(scan_run_id, folder.id, &seen_archive_ids)?;
+        counts.archives_missing = database.mark_unseen_archives_missing(
+            scan_run_id,
+            folder.id,
+            &seen_archive_ids,
+            withheld_missing_kinds,
+        )?;
     }
 
     Ok(counts)
@@ -16072,6 +16123,89 @@ echo "$out"
         exe
     }
 
+    /// Production run 210: ScummVM detection over a whole mixed library timed
+    /// out, which used to withhold missing reconciliation for the entire
+    /// source, so 40 renamed/removed ROM rows stayed "present". Detection is
+    /// now limited to ScummVM-named folders, and a detector failure withholds
+    /// only ScummVM folder rows.
+    #[cfg(unix)]
+    #[test]
+    fn scummvm_detector_failure_withholds_only_scummvm_rows_from_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir("scummvm-failure-missing");
+        let source = root.join("games");
+        let mount = root.join("mount");
+        let renamed = write_archive_file(&source, "atari2600/Amidar (USA).zip", b"amidar");
+        write_archive_file(&source, "atari2600/Basic Programming.zip", b"basic");
+        let beena = write_archive_file(&source, "beena/S/Soreike.zip", b"beena");
+        let game = source.join("scummvm/queen");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("queen.1c"), b"synthetic game data").unwrap();
+        let log = root.join("detector-paths.log");
+        let real = fake_scummvm(&root);
+        let logging = root.join("scummvm-logging");
+        fs::write(
+            &logging,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --path=*) echo \"${{a#--path=}}\" >> '{}';; esac; done\nexec '{}' \"$@\"\n",
+                log.display(),
+                real.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&logging, fs::Permissions::from_mode(0o755)).unwrap();
+        let failing = root.join("scummvm-failing");
+        fs::write(&failing, "#!/bin/sh\necho 'detector crashed' >&2\nexit 3\n").unwrap();
+        fs::set_permissions(&failing, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(logging));
+        let first = scan_and_persist(&mut database, &config, "test").unwrap();
+        assert!(first.folder_errors.is_empty(), "{:?}", first.folder_errors);
+        assert_eq!(database.load_archives().unwrap().len(), 4);
+        // The detector is only ever pointed inside the ScummVM folder (the
+        // folder itself, then each detected game), never at the library.
+        let asked = fs::read_to_string(&log).unwrap();
+        let canonical_scummvm = source.join("scummvm").canonicalize().unwrap();
+        assert!(
+            asked
+                .lines()
+                .any(|line| Path::new(line) == canonical_scummvm)
+                && asked
+                    .lines()
+                    .all(|line| Path::new(line).starts_with(&canonical_scummvm)),
+            "{asked}"
+        );
+
+        // The Atari ROM is renamed, a Beena ROM removed, the ScummVM folder
+        // removed, and the detector now fails.
+        fs::rename(&renamed, source.join("atari2600/Amidar.zip")).unwrap();
+        fs::remove_file(&beena).unwrap();
+        fs::remove_dir_all(source.join("scummvm/queen")).unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(failing));
+        let second = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+
+        assert_eq!(second.counts.archives_missing, 2, "{second:?}");
+        let archives = database.load_archives().unwrap();
+        let missing = |name: &str| {
+            archives
+                .iter()
+                .find(|row| row.absolute_path.ends_with(name))
+                .unwrap_or_else(|| panic!("{name} row kept"))
+                .last_verified_missing_at
+                .is_some()
+        };
+        assert!(missing("atari2600/Amidar (USA).zip"));
+        assert!(missing("beena/S/Soreike.zip"));
+        assert!(!missing("atari2600/Basic Programming.zip"));
+        assert!(!missing("atari2600/Amidar.zip"));
+        // The ScummVM row could not be re-enumerated: kept, not called missing.
+        assert!(!missing("scummvm/queen"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn scanning_a_scummvm_game_folder_catalogues_it_without_manual_rows() {
@@ -19506,6 +19640,65 @@ echo "$out"
         assert_eq!(archives.len(), 1);
         assert_eq!(archives[0].archive_kind, "arcade_set_directory");
         assert_eq!(archives[0].relative_path, Path::new("pacman"));
+    }
+
+    /// Run 210: 30 legacy one-row-per-file records (chip images such as
+    /// `bnzabros/ds3-5000-07d.img`) sit inside arcade set folders that are
+    /// catalogued as one game each. A scan keeps the folder as the one game,
+    /// never rediscovers a component file as a separate game, and leaves the
+    /// legacy row as it is (missing), neither restored nor deleted.
+    #[test]
+    fn legacy_arcade_component_rows_stay_missing_and_are_not_rediscovered() {
+        let root = temp_dir("arcade-legacy-component");
+        let source = root.join("games");
+        let set = source.join("arcade/bnzabros");
+        fs::create_dir_all(&set).unwrap();
+        fs::write(set.join("ds3-5000-07d.img"), vec![0u8; 4096]).unwrap();
+        fs::write(set.join("bnzabros.u1"), b"chip").unwrap();
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        let source_id: i64 = database
+            .connection
+            .query_row("SELECT id FROM source_folders", [], |row| row.get(0))
+            .unwrap();
+        let component = set.join("ds3-5000-07d.img");
+        database
+            .connection
+            .execute(
+                "INSERT INTO archives (source_folder_id, relative_path, absolute_path_cached, file_name_cached, archive_kind, display_name, normalized_name, size_bytes, first_seen_at, last_seen_at, last_verified_missing_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'direct_game_image', 'ds3-5000-07d', 'ds3-5000-07d', 4096, '2026-09-18T00:51:59Z', '2026-09-20T11:03:25Z', '2026-09-22T16:18:04Z', '2026-09-18T00:51:59Z', '2026-09-22T16:18:04Z')",
+                params![
+                    source_id,
+                    b"arcade/bnzabros/ds3-5000-07d.img".to_vec(),
+                    component.as_os_str().as_bytes().to_vec(),
+                    b"ds3-5000-07d.img".to_vec(),
+                ],
+            )
+            .unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+
+        assert_eq!(summary.counts.archives_added, 0, "{summary:?}");
+        assert_eq!(summary.counts.archives_restored, 0, "{summary:?}");
+        let archives = database.load_archives().unwrap();
+        let present: Vec<_> = archives
+            .iter()
+            .filter(|row| row.last_verified_missing_at.is_none())
+            .map(|row| (row.archive_kind.as_str(), row.relative_path.clone()))
+            .collect();
+        assert_eq!(
+            present,
+            [("arcade_set_directory", PathBuf::from("arcade/bnzabros"))]
+        );
+        let legacy = archives
+            .iter()
+            .find(|row| row.absolute_path == component)
+            .expect("legacy row is kept");
+        assert_eq!(
+            legacy.last_verified_missing_at.as_deref(),
+            Some("2026-09-22T16:18:04Z")
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

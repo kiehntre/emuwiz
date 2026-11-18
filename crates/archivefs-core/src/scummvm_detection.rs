@@ -1058,6 +1058,83 @@ fn discovery_cache_key(root: &Path, executable: &Path) -> Option<String> {
     Some(crate::launch::scummvm_execution::trainer_profile::sha256_hex(&hasher.finalize()))
 }
 
+/// Directories one ScummVM discovery run should cover for `source`.
+///
+/// Recursive detection over a whole mixed library (hundreds of thousands of
+/// files) cannot finish inside [`DISCOVERY_TIMEOUT`]; production run 210 timed
+/// out on every scan. When the source itself is a ScummVM folder, or contains
+/// none, the source is searched as before. Otherwise only folders named for
+/// ScummVM (by the platform registry's folder aliases) within two levels of
+/// the source are searched, plus each already catalogued ScummVM game folder
+/// (`catalogued`) outside them, so a game found by an earlier whole-source
+/// search keeps being refreshed. Symbolic links are never followed; a folder
+/// that cannot be read is skipped and logged rather than widening the search.
+pub fn discovery_roots(source: &Path, catalogued: &[PathBuf]) -> Vec<PathBuf> {
+    let is_scummvm_folder = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(crate::folder_platform_alias)
+            == Some("ScummVM")
+    };
+    if is_scummvm_folder(source) {
+        return vec![source.to_path_buf()];
+    }
+    let child_directories = |dir: &Path| -> Vec<PathBuf> {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                log::warn!(
+                    "scummvm discovery: {} could not be read, so it was not searched: {error}",
+                    dir.display()
+                );
+                return Vec::new();
+            }
+        };
+        let mut found: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.path())
+            .collect();
+        found.sort();
+        found
+    };
+    if fs::read_dir(source).is_err() {
+        return vec![source.to_path_buf()];
+    }
+    let mut roots = Vec::new();
+    for child in child_directories(source) {
+        if is_scummvm_folder(&child) {
+            roots.push(child);
+            continue;
+        }
+        roots.extend(
+            child_directories(&child)
+                .into_iter()
+                .filter(|dir| is_scummvm_folder(dir)),
+        );
+    }
+    if roots.is_empty() {
+        return vec![source.to_path_buf()];
+    }
+    let mut extra: Vec<PathBuf> = catalogued
+        .iter()
+        .filter(|game| game.starts_with(source) && !roots.iter().any(|root| game.starts_with(root)))
+        // Only a real directory whose canonical path is itself and lies
+        // inside the (already canonical) source: a stored path through a
+        // since-symlinked parent, or holding `..`, never widens detection.
+        .filter(|game| {
+            game.canonicalize()
+                .is_ok_and(|real| &real == *game && real.starts_with(source))
+                && fs::metadata(game).is_ok_and(|meta| meta.is_dir())
+        })
+        .cloned()
+        .collect();
+    extra.sort();
+    extra.dedup();
+    roots.extend(extra);
+    roots
+}
+
 /// As [`discover_scummvm_game_directories`], but reuses the recursive detector
 /// run in `cached` when its key still matches. Only the raw detector output is
 /// reused: ownership, symlink, ambiguity and per-folder re-detection checks
@@ -1225,6 +1302,87 @@ impl OsStringAppend for OsString {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discovery_roots_cover_only_scummvm_folders_of_a_mixed_library() {
+        let root = tempfile::tempdir().unwrap();
+        let library = root.path().join("games");
+        for dir in [
+            "atari2600",
+            "scummvm/queen",
+            "pc/sci/kq4",
+            "pc/doom",
+            "snes",
+        ] {
+            fs::create_dir_all(library.join(dir)).unwrap();
+        }
+        assert_eq!(
+            discovery_roots(&library, &[]),
+            vec![library.join("pc/sci"), library.join("scummvm")]
+        );
+        // A ScummVM source itself is searched whole.
+        assert_eq!(
+            discovery_roots(&library.join("scummvm"), &[]),
+            vec![library.join("scummvm")]
+        );
+        // A source with no ScummVM folder keeps the previous whole-source search.
+        let plain = root.path().join("plain");
+        fs::create_dir_all(plain.join("Flight of the Amazon Queen")).unwrap();
+        assert_eq!(discovery_roots(&plain, &[]), vec![plain.clone()]);
+        // Symbolic links are never followed.
+        let linked = root.path().join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(library.join("scummvm"), linked.join("scummvm")).unwrap();
+        assert_eq!(discovery_roots(&linked, &[]), vec![linked.clone()]);
+        // A game catalogued by an earlier whole-source search outside every
+        // ScummVM folder stays a detection root; one inside a root, or gone,
+        // adds nothing.
+        fs::create_dir_all(library.join("amiga/Monkey Island")).unwrap();
+        assert_eq!(
+            discovery_roots(
+                &library,
+                &[
+                    library.join("amiga/Monkey Island"),
+                    library.join("scummvm/queen"),
+                    library.join("pc/gone"),
+                ]
+            ),
+            vec![
+                library.join("pc/sci"),
+                library.join("scummvm"),
+                library.join("amiga/Monkey Island"),
+            ]
+        );
+        // A catalogued game reached through a since-symlinked parent folder
+        // never takes detection outside the source.
+        let elsewhere = root.path().join("elsewhere/MI");
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(root.path().join("elsewhere"), library.join("linkedparent"))
+            .unwrap();
+        assert!(
+            !discovery_roots(&library, &[library.join("linkedparent/MI")])
+                .contains(&library.join("linkedparent/MI"))
+        );
+        assert!(
+            !discovery_roots(&library, &[library.join("../elsewhere/MI")])
+                .iter()
+                .any(|root| root.ends_with("MI"))
+        );
+        // An unreadable folder is skipped, not a reason to search everything.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = library.join("locked");
+            fs::create_dir_all(&locked).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let readable_anyway = fs::read_dir(&locked).is_ok();
+            let roots = discovery_roots(&library, &[]);
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            if !readable_anyway {
+                assert_eq!(roots, vec![library.join("pc/sci"), library.join("scummvm")]);
+            }
+        }
+    }
+
     /// A "user's" ScummVM configuration with comments, odd spacing, CRLF-free
     /// but unusual ordering and a trailing blank line: exactly what ScummVM's
     /// own re-save would normalise.

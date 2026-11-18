@@ -185,7 +185,7 @@ fn partial_platform_proof_cannot_authorize_missing() {
     )
     .unwrap();
     assert_eq!(
-        db.mark_unseen_archives_missing(run, source.id, &[])
+        db.mark_unseen_archives_missing(run, source.id, &[], &[])
             .unwrap(),
         0
     );
@@ -234,7 +234,7 @@ fn complete_scan_does_not_call_an_existing_unseen_file_missing() {
     )
     .unwrap();
     assert_eq!(
-        db.mark_unseen_archives_missing(run, source.id, &[])
+        db.mark_unseen_archives_missing(run, source.id, &[], &[])
             .unwrap(),
         0
     );
@@ -326,7 +326,7 @@ fn replaced_source_root_invalidates_coverage_proof() {
     fs::rename(&root, temp.path().join("previous-root")).unwrap();
     fs::create_dir(&root).unwrap();
     assert!(
-        db.mark_unseen_archives_missing(run, source.id, &[])
+        db.mark_unseen_archives_missing(run, source.id, &[], &[])
             .is_err()
     );
     assert!(
@@ -366,7 +366,7 @@ fn failed_run_cannot_use_a_prior_complete_coverage_proof() {
     fs::remove_file(path).unwrap();
     db.fail_scan_run(run, "failed before completion").unwrap();
     assert_eq!(
-        db.mark_unseen_archives_missing(run, source.id, &[])
+        db.mark_unseen_archives_missing(run, source.id, &[], &[])
             .unwrap(),
         0
     );
