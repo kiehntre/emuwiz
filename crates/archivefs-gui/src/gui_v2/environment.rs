@@ -239,7 +239,7 @@ fn path_present(path: &std::path::Path) -> bool {
 
 fn lifecycle_projections() -> Vec<EmulatorLifecycleProjection> {
     let overrides = crate::emulator_setup_overrides::EmulatorPathOverrides::load();
-    let selected_bindings = crate::emulator_setup_overrides::OverridableEmulator::ALL
+    let mut selected_bindings = crate::emulator_setup_overrides::OverridableEmulator::ALL
         .into_iter()
         .filter_map(|emulator| {
             let id = match emulator.adapter_id() {
@@ -259,6 +259,12 @@ fn lifecycle_projections() -> Vec<EmulatorLifecycleProjection> {
             })
         })
         .collect::<BTreeMap<_, _>>();
+    if let Some(path) = saved_retroarch_selection() {
+        selected_bindings.insert(
+            "RetroArch".to_string(),
+            ExactBinding::NativeExecutable { path },
+        );
+    }
     let mut projections = inspect_discovered_emulator_lifecycles_with_selections(selected_bindings)
         .into_iter()
         .filter(|projection| LIFECYCLE_DISPLAY_IDS.contains(&projection.emulator_id.as_str()))
@@ -277,6 +283,17 @@ fn lifecycle_projections() -> Vec<EmulatorLifecycleProjection> {
     }
     projections.sort_by(|left, right| left.emulator_id.cmp(&right.emulator_id));
     projections
+}
+
+/// RetroArch's own saved installation choice (the same sidecar launch
+/// discovery honours). Only native programs can be saved there, and discovery
+/// lists them by their resolved path, so the choice is a native binding.
+fn saved_retroarch_selection() -> Option<PathBuf> {
+    use archivefs_core::emulator_environment::retroarch::installation_selection::{
+        EXECUTABLE_OVERRIDE_FILE, load_executable_override_at,
+    };
+    let file = archivefs_core::app_dirs::config_path(EXECUTABLE_OVERRIDE_FILE).ok()?;
+    load_executable_override_at(&file).ok().flatten()
 }
 
 /// Executable overrides persist only an exact path, not package/ownership
