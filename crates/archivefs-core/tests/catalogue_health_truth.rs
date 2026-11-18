@@ -204,7 +204,10 @@ fn unproven_scan_cannot_call_missing_mutation() {
     let (id, path) = f.add(0, "game.zip");
     fs::remove_file(path).unwrap();
     let run = f.db.start_scan_run("unproven", None).unwrap();
-    assert_eq!(f.db.mark_unseen_archives_missing(run, 1, &[]).unwrap(), 0);
+    assert_eq!(
+        f.db.mark_unseen_archives_missing(run, 1, &[], &[]).unwrap(),
+        0
+    );
     assert_eq!(f.flag(id), None);
 }
 
@@ -635,7 +638,7 @@ fn known_root_replacement_requires_reviewed_generation_and_new_scan() {
     let review = f.db.review_source_rebind(source).unwrap();
     f.db.rebind_source_after_review(&review).unwrap();
     assert!(
-        f.db.mark_unseen_archives_missing(scan.scan_run_id, source, &[])
+        f.db.mark_unseen_archives_missing(scan.scan_run_id, source, &[], &[])
             .is_err()
     );
     assert_eq!(f.flag(id), None);
@@ -902,7 +905,7 @@ fn mount_disappearing_at_candidate_probe_preserves_missing_evidence() {
         std::env::set_var("EMUWIZ_FAULT_UNMOUNT", "1");
     }
     assert!(
-        f.db.mark_unseen_archives_missing(scan.scan_run_id, source, &[])
+        f.db.mark_unseen_archives_missing(scan.scan_run_id, source, &[], &[])
             .is_err()
     );
     assert_ne!(
@@ -931,7 +934,7 @@ fn filesystem_id_collision_with_same_device_inode_is_not_accepted() {
         .unwrap();
     assert_eq!(f.preview().counts.rows_would_change, 0);
     assert!(
-        f.db.mark_unseen_archives_missing(scan.scan_run_id, source, &[])
+        f.db.mark_unseen_archives_missing(scan.scan_run_id, source, &[], &[])
             .is_err()
     );
     assert_eq!(f.scan().counts.archives_missing, 0);
@@ -1040,7 +1043,10 @@ fn root_replaced_between_preflight_and_descriptor_binding_is_refused() {
         std::env::set_var("EMUWIZ_FAULT_ROOT", &f.roots[0]);
         std::env::set_var("EMUWIZ_FAULT_PROBE_NUMBER", "3");
     }
-    assert!(f.db.mark_unseen_archives_missing(run, source, &[]).is_err());
+    assert!(
+        f.db.mark_unseen_archives_missing(run, source, &[], &[])
+            .is_err()
+    );
     assert_ne!(
         fs::metadata(&f.roots[0]).unwrap().ino(),
         old.ino(),
@@ -1152,7 +1158,8 @@ mod nested_mounts {
         let run = f.scan().scan_run_id;
         // Partial coverage is non-authoritative, so the write boundary refuses.
         assert_eq!(
-            f.db.mark_unseen_archives_missing(run, source, &[]).ok(),
+            f.db.mark_unseen_archives_missing(run, source, &[], &[])
+                .ok(),
             Some(0)
         );
         assert_eq!(f.flag(id), None);
@@ -1266,7 +1273,7 @@ mod nested_mounts {
         let source = f.db.load_archives().unwrap()[0].source_folder_id;
         inject_unmount(&inner, &sub, None);
         let result =
-            f.db.mark_unseen_archives_missing(scan.scan_run_id, source, &[]);
+            f.db.mark_unseen_archives_missing(scan.scan_run_id, source, &[], &[]);
         assert!(
             !sub.join("inner.zip").exists(),
             "fault must detach the mount"

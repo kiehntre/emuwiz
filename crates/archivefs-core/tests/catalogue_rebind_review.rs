@@ -791,7 +791,7 @@ fn independent_old_complete_run_cannot_override_new_partial_attempt() {
     fs::remove_file(path).unwrap();
     assert_eq!(f.health(0).state, SourceHealthState::PartialScan);
     let source = f.source_id(0);
-    let result = f.db.mark_unseen_archives_missing(old, source, &[]);
+    let result = f.db.mark_unseen_archives_missing(old, source, &[], &[]);
     eprintln!(
         "old complete run result={result:?}, missing={:?}",
         f.flag(id)
@@ -813,7 +813,7 @@ fn independent_old_rebind_api_cannot_resurrect_old_generation() {
     let review = f.db.review_source_rebind(source).unwrap();
     f.db.rebind_source_after_review(&review).unwrap();
     fs::remove_file(path).unwrap();
-    let result = f.db.mark_unseen_archives_missing(old, source, &[]);
+    let result = f.db.mark_unseen_archives_missing(old, source, &[], &[]);
     eprintln!(
         "legacy rebind generation={}, result={result:?}, missing={:?}",
         f.health(0).generation,
@@ -966,7 +966,10 @@ fn independent_new_confirm_rejects_old_coverage_at_write_boundary() {
     f.db.confirm_source_rebind(&review).unwrap();
     fs::remove_file(path).unwrap();
     assert_eq!(f.health(0).generation, 2);
-    assert!(f.db.mark_unseen_archives_missing(old, source, &[]).is_err());
+    assert!(
+        f.db.mark_unseen_archives_missing(old, source, &[], &[])
+            .is_err()
+    );
     assert!(f.flag(id).is_none());
 }
 #[test]
@@ -1174,7 +1177,7 @@ fn old_complete_coverage_loses_authority_to_any_later_actual_attempt() {
         record_attempt(&mut f, 0, later);
         fs::remove_file(path).unwrap();
         let source = f.source_id(0);
-        let result = f.db.mark_unseen_archives_missing(old, source, &[]);
+        let result = f.db.mark_unseen_archives_missing(old, source, &[], &[]);
         assert!(
             result.is_err(),
             "{later}: superseded coverage was accepted: {result:?}"
@@ -1195,7 +1198,8 @@ fn a_later_not_attempted_record_does_not_supersede_the_latest_actual_attempt() {
     assert_eq!(f.health(0).state, SourceHealthState::Healthy);
     let source = f.source_id(0);
     assert_eq!(
-        f.db.mark_unseen_archives_missing(old, source, &[]).unwrap(),
+        f.db.mark_unseen_archives_missing(old, source, &[], &[])
+            .unwrap(),
         1
     );
     assert!(f.flag(id).is_some());
@@ -1210,12 +1214,12 @@ fn only_the_latest_actual_attempt_may_write_even_when_both_are_complete() {
     fs::remove_file(path).unwrap();
     let source = f.source_id(0);
     assert!(
-        f.db.mark_unseen_archives_missing(first, source, &[])
+        f.db.mark_unseen_archives_missing(first, source, &[], &[])
             .is_err()
     );
     assert_eq!(f.flag(id), None);
     assert_eq!(
-        f.db.mark_unseen_archives_missing(second, source, &[])
+        f.db.mark_unseen_archives_missing(second, source, &[], &[])
             .unwrap(),
         1
     );
@@ -1231,7 +1235,10 @@ fn missing_evidence_requires_an_accepted_binding_at_the_write_boundary() {
         .unwrap();
     fs::remove_file(path).unwrap();
     let source = f.source_id(0);
-    assert!(f.db.mark_unseen_archives_missing(run, source, &[]).is_err());
+    assert!(
+        f.db.mark_unseen_archives_missing(run, source, &[], &[])
+            .is_err()
+    );
     assert_eq!(f.flag(id), None);
 }
 
@@ -1267,7 +1274,8 @@ fn missing_write_rechecks_current_source_configuration_and_binding() {
         let source = f.source_id(0);
         change(&mut f, source);
         assert!(
-            f.db.mark_unseen_archives_missing(run, source, &[]).is_err(),
+            f.db.mark_unseen_archives_missing(run, source, &[], &[])
+                .is_err(),
             "{label} must refuse Missing"
         );
         assert_eq!(f.flag(id), None, "{label} wrote Missing evidence");
@@ -1290,7 +1298,8 @@ fn enabled_source_with_current_authority_still_writes_missing() {
     fs::remove_file(path).unwrap();
     let source = f.source_id(0);
     assert_eq!(
-        f.db.mark_unseen_archives_missing(run, source, &[]).unwrap(),
+        f.db.mark_unseen_archives_missing(run, source, &[], &[])
+            .unwrap(),
         1
     );
     assert!(f.flag(id).is_some());
@@ -1304,7 +1313,10 @@ fn disabled_source_cannot_write_missing() {
     set_enabled(&mut f, 0, false);
     fs::remove_file(path).unwrap();
     let source = f.source_id(0);
-    assert!(f.db.mark_unseen_archives_missing(run, source, &[]).is_err());
+    assert!(
+        f.db.mark_unseen_archives_missing(run, source, &[], &[])
+            .is_err()
+    );
     assert_eq!(f.flag(id), None);
 }
 
@@ -1317,7 +1329,10 @@ fn enabled_complete_scan_then_disable_refuses_missing() {
     set_enabled(&mut f, 0, false);
     fs::remove_file(path).unwrap();
     let source = f.source_id(0);
-    assert!(f.db.mark_unseen_archives_missing(run, source, &[]).is_err());
+    assert!(
+        f.db.mark_unseen_archives_missing(run, source, &[], &[])
+            .is_err()
+    );
     assert_eq!(f.flag(id), None);
 }
 
@@ -1332,7 +1347,10 @@ fn reenabling_needs_a_fresh_scan_before_missing_is_allowed_again() {
     let source = f.source_id(0);
     // The old complete attempt is still the latest actual attempt, but it began
     // before the disable, so re-enabling must not revive its authority.
-    assert!(f.db.mark_unseen_archives_missing(old, source, &[]).is_err());
+    assert!(
+        f.db.mark_unseen_archives_missing(old, source, &[], &[])
+            .is_err()
+    );
     assert_eq!(f.flag(id), None);
     // A new complete scan after re-enable is a fresh authority and is honoured by
     // the ordinary scan path (the missing file is reconciled by that scan itself).
@@ -1398,7 +1416,7 @@ fn source_disabled_during_missing_write_refuses() {
         std::env::set_var("EMUWIZ_FAULT_SQL_DATABASE", f.db.path());
         std::env::set_var("EMUWIZ_FAULT_SQL_STATEMENT", &statement);
     }
-    let result = f.db.mark_unseen_archives_missing(run, source, &[]);
+    let result = f.db.mark_unseen_archives_missing(run, source, &[], &[]);
     for key in [
         "EMUWIZ_FAULT_PATH",
         "EMUWIZ_FAULT_ROOT",
@@ -1471,7 +1489,8 @@ fn a_rebind_takes_a_generation_above_every_historical_generation_by_either_path(
         let source = f.source_id(0);
         for old in [first, second] {
             assert!(
-                f.db.mark_unseen_archives_missing(old, source, &[]).is_err(),
+                f.db.mark_unseen_archives_missing(old, source, &[], &[])
+                    .is_err(),
                 "via_review={via_review}: coverage from a historical generation regained authority"
             );
         }
@@ -1494,7 +1513,10 @@ fn rebinding_an_existing_binding_also_clears_every_historical_generation() {
         assert_eq!(f.health(0).generation, 10, "via_review={via_review}");
         fs::remove_file(path).ok();
         let source = f.source_id(0);
-        assert!(f.db.mark_unseen_archives_missing(old, source, &[]).is_err());
+        assert!(
+            f.db.mark_unseen_archives_missing(old, source, &[], &[])
+                .is_err()
+        );
         assert_eq!(f.flag(id), None);
     }
 }
@@ -1511,7 +1533,10 @@ fn a_removed_and_readded_source_cannot_reuse_old_coverage_after_rebind() {
         rebind_every_way(&mut f, 0, via_review);
         fs::remove_file(path).ok();
         let source = f.source_id(0);
-        assert!(f.db.mark_unseen_archives_missing(old, source, &[]).is_err());
+        assert!(
+            f.db.mark_unseen_archives_missing(old, source, &[], &[])
+                .is_err()
+        );
         assert_eq!(f.flag(id), None);
         assert!(f.health(0).generation > 1);
     }
@@ -1535,7 +1560,7 @@ fn rebind_after_a_partial_or_complete_old_scan_never_revives_either() {
         let source = f.source_id(0);
         for run in [complete, latest] {
             // Refused outright, or nothing written (a non-complete run never could).
-            let result = f.db.mark_unseen_archives_missing(run, source, &[]);
+            let result = f.db.mark_unseen_archives_missing(run, source, &[], &[]);
             assert!(
                 !matches!(result, Ok(written) if written > 0),
                 "{later}/{via_review}: run {run} kept its authority after the rebind"
@@ -1700,7 +1725,7 @@ fn missing_write_refuses_source_removed_after_preflight_authority_check() {
         std::env::set_var("EMUWIZ_FAULT_ROOT", &f.roots[0]);
         std::env::set_var("EMUWIZ_FAULT_SQL_DATABASE", f.db.path());
     }
-    let result = f.db.mark_unseen_archives_missing(run, source, &[]);
+    let result = f.db.mark_unseen_archives_missing(run, source, &[], &[]);
     for key in [
         "EMUWIZ_FAULT_PATH",
         "EMUWIZ_FAULT_ROOT",
@@ -1825,7 +1850,8 @@ fn self_audit_every_old_generation_is_dead_after_a_rebind() {
     let source = f.source_id(0);
     for run in runs {
         assert!(
-            f.db.mark_unseen_archives_missing(run, source, &[]).is_err(),
+            f.db.mark_unseen_archives_missing(run, source, &[], &[])
+                .is_err(),
             "run {run}"
         );
     }

@@ -1058,6 +1058,60 @@ fn discovery_cache_key(root: &Path, executable: &Path) -> Option<String> {
     Some(crate::launch::scummvm_execution::trainer_profile::sha256_hex(&hasher.finalize()))
 }
 
+/// Directories one ScummVM discovery run should cover for `source`.
+///
+/// Recursive detection over a whole mixed library (hundreds of thousands of
+/// files) cannot finish inside [`DISCOVERY_TIMEOUT`]; production run 210 timed
+/// out on every scan. When the source itself is a ScummVM folder, or contains
+/// none, the source is searched as before. Otherwise only folders named for
+/// ScummVM (by the platform registry's folder aliases) within two levels of
+/// the source are searched. Symbolic links are never followed.
+pub fn discovery_roots(source: &Path) -> Vec<PathBuf> {
+    let is_scummvm_folder = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(crate::folder_platform_alias)
+            == Some("ScummVM")
+    };
+    if is_scummvm_folder(source) {
+        return vec![source.to_path_buf()];
+    }
+    let child_directories = |dir: &Path| -> Option<Vec<PathBuf>> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(dir).ok()? {
+            let entry = entry.ok()?;
+            if entry.file_type().ok()?.is_dir() {
+                found.push(entry.path());
+            }
+        }
+        found.sort();
+        Some(found)
+    };
+    let Some(children) = child_directories(source) else {
+        return vec![source.to_path_buf()];
+    };
+    let mut roots = Vec::new();
+    for child in children {
+        if is_scummvm_folder(&child) {
+            roots.push(child);
+            continue;
+        }
+        let Some(grandchildren) = child_directories(&child) else {
+            return vec![source.to_path_buf()];
+        };
+        roots.extend(
+            grandchildren
+                .into_iter()
+                .filter(|dir| is_scummvm_folder(dir)),
+        );
+    }
+    if roots.is_empty() {
+        vec![source.to_path_buf()]
+    } else {
+        roots
+    }
+}
+
 /// As [`discover_scummvm_game_directories`], but reuses the recursive detector
 /// run in `cached` when its key still matches. Only the raw detector output is
 /// reused: ownership, symlink, ambiguity and per-folder re-detection checks
@@ -1225,6 +1279,39 @@ impl OsStringAppend for OsString {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discovery_roots_cover_only_scummvm_folders_of_a_mixed_library() {
+        let root = tempfile::tempdir().unwrap();
+        let library = root.path().join("games");
+        for dir in [
+            "atari2600",
+            "scummvm/queen",
+            "pc/sci/kq4",
+            "pc/doom",
+            "snes",
+        ] {
+            fs::create_dir_all(library.join(dir)).unwrap();
+        }
+        assert_eq!(
+            discovery_roots(&library),
+            vec![library.join("pc/sci"), library.join("scummvm")]
+        );
+        // A ScummVM source itself is searched whole.
+        assert_eq!(
+            discovery_roots(&library.join("scummvm")),
+            vec![library.join("scummvm")]
+        );
+        // A source with no ScummVM folder keeps the previous whole-source search.
+        let plain = root.path().join("plain");
+        fs::create_dir_all(plain.join("Flight of the Amazon Queen")).unwrap();
+        assert_eq!(discovery_roots(&plain), vec![plain.clone()]);
+        // Symbolic links are never followed.
+        let linked = root.path().join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(library.join("scummvm"), linked.join("scummvm")).unwrap();
+        assert_eq!(discovery_roots(&linked), vec![linked.clone()]);
+    }
+
     /// A "user's" ScummVM configuration with comments, odd spacing, CRLF-free
     /// but unusual ordering and a trailing blank line: exactly what ScummVM's
     /// own re-save would normalise.
