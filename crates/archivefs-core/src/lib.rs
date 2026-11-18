@@ -6935,6 +6935,7 @@ impl<'a> ArchiveScanner<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn archive_from_fingerprint_or_path(
         &self,
         path: &Path,
