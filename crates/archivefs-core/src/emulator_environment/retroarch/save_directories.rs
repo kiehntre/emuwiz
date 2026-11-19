@@ -132,19 +132,30 @@ pub(super) fn discover_save_directories<'a>(
             ));
         }
     }
+    let names: BTreeSet<&str> = core_names
+        .into_iter()
+        .filter(|n| safe_component(n))
+        .collect();
     let override_root: Option<PathBuf> = match global(OVERRIDE_DIRECTORY_KEY) {
-        Some(raw) if !raw.is_empty() => {
+        Some(raw) if !unset(raw) => {
             resolve_configured_value(raw, tilde_home).filter(|path| path.is_absolute())
         }
         _ => config_file.parent().map(|parent| parent.join("config")),
     };
     let Some(override_root) = override_root else {
+        // The override folder is set but cannot be resolved: each core's
+        // override (and any save folder it names) is unknown, not absent.
+        for name in &names {
+            findings.extend(uncheckable(name, config_file));
+        }
         return findings;
     };
-    let names: BTreeSet<&str> = core_names
-        .into_iter()
-        .filter(|n| safe_component(n))
-        .collect();
+    if names.len() > MAX_CORE_OVERRIDES {
+        // Overrides past the bound are not examined: say so, never skip.
+        for name in names.iter().skip(MAX_CORE_OVERRIDES) {
+            findings.extend(uncheckable(name, config_file));
+        }
+    }
     for name in names.into_iter().take(MAX_CORE_OVERRIDES) {
         let file = override_root.join(name).join(format!("{name}.cfg"));
         let keys: Vec<&'static str> = SAVE_DIRECTORY_KEYS.iter().map(|(_, key)| *key).collect();
