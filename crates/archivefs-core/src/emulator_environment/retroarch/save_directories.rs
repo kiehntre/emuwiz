@@ -94,6 +94,12 @@ fn finding(
     }
 }
 
+/// RetroArch writes `default` (or nothing) for a folder that is not set:
+/// saves then go beside the game, not into a folder called "default".
+fn unset(raw: &str) -> bool {
+    raw.is_empty() || raw == "default"
+}
+
 /// A `corename` that is safe to use as one path component.
 fn safe_component(name: &str) -> bool {
     !name.is_empty()
@@ -114,7 +120,7 @@ pub(super) fn discover_save_directories<'a>(
 ) -> Vec<SaveDirectoryFinding> {
     let mut findings = Vec::new();
     for (purpose, key) in SAVE_DIRECTORY_KEYS {
-        if let Some(raw) = global(key).filter(|raw| !raw.is_empty()) {
+        if let Some(raw) = global(key).filter(|raw| !unset(raw)) {
             findings.push(finding(
                 filesystem,
                 purpose,
@@ -151,7 +157,7 @@ pub(super) fn discover_save_directories<'a>(
                 };
                 let parsed = super::parse_config(&text, &keys);
                 for (purpose, key) in SAVE_DIRECTORY_KEYS {
-                    if let Some(raw) = parsed.values.get(key).filter(|raw| !raw.is_empty()) {
+                    if let Some(raw) = parsed.values.get(key).filter(|raw| !unset(raw)) {
                         findings.push(finding(
                             filesystem,
                             purpose,

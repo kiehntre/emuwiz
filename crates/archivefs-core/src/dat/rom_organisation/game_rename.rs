@@ -70,14 +70,21 @@ impl RetroArchSaveLocations {
     /// profile means no configured folders; the game's own folder is still
     /// searched.
     pub fn discover() -> Self {
+        Self::discover_in(
+            &crate::emulator_environment::retroarch::DiscoveryEnvironment::from_process_environment(
+            ),
+        )
+    }
+
+    /// [`Self::discover`] for a given environment (tests use a scratch home).
+    pub fn discover_in(
+        environment: &crate::emulator_environment::retroarch::DiscoveryEnvironment,
+    ) -> Self {
         use crate::emulator_environment::HostReadOnlyFilesystem;
         use crate::emulator_environment::retroarch::{
-            DiscoveryEnvironment, SaveDirectoryStatus, discover_retroarch_environment,
+            SaveDirectoryStatus, discover_retroarch_environment,
         };
-        let report = match discover_retroarch_environment(
-            &HostReadOnlyFilesystem,
-            &DiscoveryEnvironment::from_process_environment(),
-        ) {
+        let report = match discover_retroarch_environment(&HostReadOnlyFilesystem, environment) {
             Ok(report) => report,
             Err(error) => {
                 return Self {
@@ -87,28 +94,51 @@ impl RetroArchSaveLocations {
             }
         };
         let mut locations = Self::default();
+        for profile in &report.profiles {
+            // A settings file that exists but was not read completely could
+            // name a save folder this check never sees.
+            use crate::emulator_environment::FsProbe;
+            use crate::emulator_environment::retroarch::ConfigReadOutcome;
+            let read_fully = matches!(
+                profile.config_file.read,
+                ConfigReadOutcome::Parsed { complete: true, .. }
+            );
+            if !read_fully && profile.config_file.probe != FsProbe::Missing {
+                locations.uncheckable.push(format!(
+                    "{} (RetroArch settings not fully readable)",
+                    profile.config_file.path.display
+                ));
+            }
+        }
         for finding in report
             .profiles
             .iter()
             .flat_map(|profile| &profile.save_directories)
         {
-            let Some(directory) = &finding.directory else {
-                continue;
-            };
-            match finding.status {
+            match (&finding.directory, finding.status) {
                 // Nothing there: RetroArch writes beside the game instead.
-                SaveDirectoryStatus::Missing | SaveDirectoryStatus::NotADirectory => {}
-                SaveDirectoryStatus::Usable | SaveDirectoryStatus::NotWritable
-                    if !directory.lossy =>
-                {
+                (Some(_), SaveDirectoryStatus::Missing | SaveDirectoryStatus::NotADirectory) => {}
+                (
+                    Some(directory),
+                    SaveDirectoryStatus::Usable | SaveDirectoryStatus::NotWritable,
+                ) if !directory.lossy => {
                     let path = PathBuf::from(&directory.display);
                     if !locations.directories.contains(&path) {
                         locations.directories.push(path);
                     }
                 }
-                _ => locations
-                    .uncheckable
-                    .push(format!("{} ({})", directory.display, finding.config_key)),
+                // Unresolvable values, unreadable per-core settings, links and
+                // anything else: saves there cannot be ruled out.
+                (directory, _) => locations.uncheckable.push(format!(
+                    "{} ({} in {})",
+                    directory
+                        .as_ref()
+                        .map_or("an unresolved folder", |directory| directory
+                            .display
+                            .as_str()),
+                    finding.config_key,
+                    finding.settings_file.display
+                )),
             }
         }
         locations
@@ -243,8 +273,8 @@ pub fn preview_game_rename(
         "The game keeps its EmuWiz library entry: favourites, collections, play history and EmuWiz artwork stay with it.".into(),
         "RetroArch playlists and ES-DE gamelists that list the old file name are not updated yet.".into(),
         "Undo is available in History.".into(),
-        "No RetroArch saves or save states were found for this game, so none can be cut off by the new name.".into(),
-        "RomM (5.3 or later, with hashing on) moves its existing entry to the new file name at its next scan of this platform, matching by file hash. RomM's displayed title is not changed for games RomM never identified.".into(),
+        "No RetroArch saves or save states were found for this game. Saves kept by standalone emulators are not checked.".into(),
+        "RomM is not told about the rename. It catches up at its next scan of this system (its scheduled scan, or Scan in RomM), where RomM 5.3 matches the renamed file to its existing entry by file hash if hashing is on. For games RomM never identified, its displayed title stays the old one.".into(),
     ];
     Ok(GameRenamePreview {
         plan,
@@ -261,11 +291,14 @@ pub fn preview_game_rename(
 /// Applies a confirmed preview with the journalled executor. Everything is
 /// re-checked against the live library and disk first; any change since the
 /// preview refuses with nothing renamed.
+/// `save_locations` is read again just before confirming: RetroArch may
+/// have run, or its settings changed, since the preview.
 pub fn apply_game_rename(
     preview: &GameRenamePreview,
     database: &crate::Database,
     journal_dir: &Path,
     cancel: &AtomicBool,
+    save_locations: &RetroArchSaveLocations,
 ) -> Result<ApplyOutcome, String> {
     if let Some(referrer) = referencing_sidecar(&preview.source, &preview.source_root)? {
         return Err(format!(
@@ -287,6 +320,7 @@ pub fn apply_game_rename(
     )?;
     // A save made since the preview (the game was played) also refuses.
     refuse_if_retroarch_saves(&preview.source, &preview.save_locations)?;
+    refuse_if_retroarch_saves(&preview.source, save_locations)?;
     let wanted = preview.new_file_name.clone();
     let source = preview.source.clone();
     let name_for = move |path: &Path| (path == source).then(|| wanted.clone());
@@ -331,21 +365,27 @@ pub fn apply_game_rename(
     Ok(outcome)
 }
 
-/// RetroArch save and save-state names: `<file stem>.<one of these>`, with
-/// numbered and auto states (`.state1`, `.state.auto`) and their thumbnails.
-const RETROARCH_SAVE_SUFFIXES: [&str; 9] = [
-    "srm", "sav", "rtc", "ram", "eep", "fla", "mpk", "ldci", "state",
+/// RetroArch save and save-state names beside the game: `<file stem>.<one
+/// of these>`, with numbered and auto states (`.state1`, `.state.auto`),
+/// their thumbnails, and numbered memory cards (`.1.mcr`).
+const RETROARCH_SAVE_SUFFIXES: [&str; 15] = [
+    "srm", "sav", "rtc", "ram", "eep", "fla", "mpk", "ldci", "state", "bsv", "dsv", "bkr", "bcr",
+    "smpc", "mcr",
 ];
+/// Bound on folders examined in one save folder; more refuses.
+const MAX_SAVE_SUBFOLDERS: usize = 4096;
 
-/// Refuses when any RetroArch save or state for `source` exists: beside the
-/// game, in a configured folder, or in its by-core / by-folder subfolders.
+/// Refuses when any RetroArch save or state for `source` may exist: beside
+/// the game or one folder below it (sorted by core), or anything named after
+/// the game in a configured save folder and its by-core / by-folder
+/// subfolders.
 fn refuse_if_retroarch_saves(
     source: &Path,
     locations: &RetroArchSaveLocations,
 ) -> Result<(), String> {
     if let Some(folder) = locations.uncheckable.first() {
         return Err(format!(
-            "RetroArch's save folder {folder} could not be checked, so saves for this game cannot be ruled out. Nothing was changed."
+            "RetroArch's save setting {folder} could not be checked, so saves for this game cannot be ruled out. Nothing was changed."
         ));
     }
     let Some(stem) = source
@@ -354,58 +394,89 @@ fn refuse_if_retroarch_saves(
     else {
         return Ok(());
     };
-    let mut folders: Vec<PathBuf> = source.parent().map(Path::to_path_buf).into_iter().collect();
-    for root in &locations.directories {
-        folders.push(root.clone());
-        for child in subdirectories(root)? {
-            folders.extend(subdirectories(&child)?);
-            folders.push(child);
-        }
-    }
-    for folder in folders {
-        if let Some(found) = save_named_after(&folder, &stem, source)? {
-            return Err(format!(
+    let found = |folder: &Path, any_suffix: bool| -> Result<(), String> {
+        match save_named_after(folder, &stem, source, any_suffix)? {
+            Some(found) => Err(format!(
                 "RetroArch keeps a save for this game at {}. Renaming the game would disconnect it, so this rename is refused. Nothing was changed.",
                 found.display()
-            ));
+            )),
+            None => Ok(()),
+        }
+    };
+    if let Some(game_folder) = source.parent() {
+        found(game_folder, false)?;
+        for child in subdirectories(game_folder)? {
+            found(&child, false)?;
+        }
+    }
+    for root in &locations.directories {
+        found(root, true)?;
+        for child in subdirectories(root)? {
+            found(&child, true)?;
+            for grandchild in subdirectories(&child)? {
+                found(&grandchild, true)?;
+            }
         }
     }
     Ok(())
 }
 
-/// Real sub-folders of `folder` (never following links), at most 4096.
+fn unreadable(folder: &Path, error: impl std::fmt::Display) -> String {
+    format!(
+        "{} could not be read ({error}), so saves for this game cannot be ruled out. Nothing was changed.",
+        folder.display()
+    )
+}
+
+/// Real sub-folders of `folder`. A linked sub-folder, an unreadable entry or
+/// more than [`MAX_SAVE_SUBFOLDERS`] refuses rather than being skipped.
 fn subdirectories(folder: &Path) -> Result<Vec<PathBuf>, String> {
     let entries = match std::fs::read_dir(folder) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
+        Err(error) => return Err(unreadable(folder, error)),
+    };
+    let mut folders = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| unreadable(folder, error))?;
+        let kind = entry
+            .file_type()
+            .map_err(|error| unreadable(&entry.path(), error))?;
+        if kind.is_symlink() && entry.path().is_dir() {
             return Err(format!(
-                "RetroArch's save folder {} could not be read ({error}), so saves cannot be ruled out. Nothing was changed.",
-                folder.display()
+                "{} is a linked folder, so saves inside it cannot be ruled out. Nothing was changed.",
+                entry.path().display()
             ));
         }
-    };
-    Ok(entries
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .map(|entry| entry.path())
-        .take(4096)
-        .collect())
+        if kind.is_dir() {
+            folders.push(entry.path());
+            if folders.len() > MAX_SAVE_SUBFOLDERS {
+                return Err(format!(
+                    "{} holds too many folders to check for saves. Nothing was changed.",
+                    folder.display()
+                ));
+            }
+        }
+    }
+    Ok(folders)
 }
 
-fn save_named_after(folder: &Path, stem: &str, source: &Path) -> Result<Option<PathBuf>, String> {
+/// A file in `folder` named `<stem>.` plus a save suffix (or, in a
+/// configured save folder, any suffix: nothing else lives there).
+fn save_named_after(
+    folder: &Path,
+    stem: &str,
+    source: &Path,
+    any_suffix: bool,
+) -> Result<Option<PathBuf>, String> {
     let entries = match std::fs::read_dir(folder) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "{} could not be read ({error}), so saves cannot be ruled out. Nothing was changed.",
-                folder.display()
-            ));
-        }
+        Err(error) => return Err(unreadable(folder, error)),
     };
     let prefix = format!("{stem}.");
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|error| unreadable(folder, error))?;
         let path = entry.path();
         if path == source {
             continue;
@@ -414,19 +485,30 @@ fn save_named_after(folder: &Path, stem: &str, source: &Path) -> Result<Option<P
         let Some(rest) = name.strip_prefix(&prefix) else {
             continue;
         };
-        let rest = rest.to_ascii_lowercase();
-        if RETROARCH_SAVE_SUFFIXES
-            .iter()
-            .any(|suffix| match rest.strip_prefix(suffix) {
-                Some("") => true,
-                Some(more) => more.starts_with(|c: char| c.is_ascii_digit() || c == '.'),
-                None => false,
-            })
-        {
+        if any_suffix || is_save_suffix(&rest.to_ascii_lowercase()) {
             return Ok(Some(path));
         }
     }
     Ok(None)
+}
+
+fn is_save_suffix(rest: &str) -> bool {
+    // `.1.mcr`: a numbered memory card.
+    let rest = match rest.split_once('.') {
+        Some((number, more))
+            if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            more
+        }
+        _ => rest,
+    };
+    RETROARCH_SAVE_SUFFIXES
+        .iter()
+        .any(|suffix| match rest.strip_prefix(suffix) {
+            Some("") => true,
+            Some(more) => more.starts_with(|c: char| c.is_ascii_digit() || c == '.'),
+            None => false,
+        })
 }
 
 /// Arcade romsets must keep their set names: MAME and FBNeo find a game by
@@ -505,10 +587,15 @@ fn sidecar_in(folder: &Path, source: &Path, name: &str) -> Result<Option<PathBuf
         if entry.metadata().is_ok_and(|meta| meta.len() > 1 << 20) {
             continue;
         }
-        if let Ok(bytes) = std::fs::read(&path)
-            && String::from_utf8_lossy(&bytes)
-                .to_lowercase()
-                .contains(name)
+        let bytes = std::fs::read(&path).map_err(|error| {
+            format!(
+                "{} could not be read ({error}), so it may name this file. Nothing was changed.",
+                path.display()
+            )
+        })?;
+        if String::from_utf8_lossy(&bytes)
+            .to_lowercase()
+            .contains(name)
         {
             return Ok(Some(path));
         }

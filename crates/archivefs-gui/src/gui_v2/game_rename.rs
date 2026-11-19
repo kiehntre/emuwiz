@@ -104,17 +104,23 @@ impl State {
                 archivefs_core::Database::open_existing(path)
                     .map_err(|error| format!("Could not open the library: {error}"))
             })?;
+            // Read RetroArch's save folders again: it may have run since.
+            let saves = self
+                .saves
+                .clone()
+                .unwrap_or_else(RetroArchSaveLocations::discover);
             apply_game_rename(
                 &preview,
                 &database,
                 &journal,
                 &std::sync::atomic::AtomicBool::new(false),
+                &saves,
             )
         });
         let renamed = result.is_ok();
         self.outcome = Some(result.map(|_| {
             format!(
-                "Renamed to {}. Undo is in History. RomM keeps this game's entry at its next scan of this platform.",
+                "Renamed to {}. Undo is in History. RomM refresh pending: RomM shows the new name after its next scan of this system.",
                 preview.new_file_name
             )
         }));

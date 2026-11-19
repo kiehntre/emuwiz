@@ -89,7 +89,8 @@ fn rename_applies_rebinds_the_same_game_and_undoes() {
     let wanted = lib.root.join("nes").join("New Name (USA).nes");
     assert_eq!(preview.destination, wanted);
     assert!(lib.game.exists(), "a preview changes nothing");
-    let outcome = apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel()).unwrap();
+    let outcome =
+        apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel(), &none()).unwrap();
     assert_eq!(outcome.transaction.state, TransactionState::Applied);
     assert!(!lib.game.exists());
     assert_eq!(std::fs::read(&wanted).unwrap(), b"NES\x1a synthetic rom");
@@ -127,7 +128,7 @@ fn existing_destination_is_refused_at_preview_and_at_apply() {
     let preview = preview_game_rename(&lib.db, &lib.game, "Later", 1, &none()).unwrap();
     let later = lib.root.join("nes").join("Later.nes");
     std::fs::write(&later, b"arrived late").unwrap();
-    assert!(apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel()).is_err());
+    assert!(apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel(), &none()).is_err());
     assert!(lib.game.exists());
     assert_eq!(std::fs::read(&later).unwrap(), b"arrived late");
     assert_eq!(std::fs::read(&taken).unwrap(), b"someone else");
@@ -139,7 +140,7 @@ fn a_file_changed_after_preview_is_not_renamed() {
     let lib = Lib::new("Old.nes", Some("nes"));
     let preview = preview_game_rename(&lib.db, &lib.game, "New", 1, &none()).unwrap();
     std::fs::write(&lib.game, b"different content, different size").unwrap();
-    assert!(apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel()).is_err());
+    assert!(apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel(), &none()).is_err());
     assert!(lib.game.exists());
     assert!(!lib.root.join("nes").join("New.nes").exists());
 }
@@ -235,7 +236,7 @@ fn a_library_folder_removed_after_preview_refuses_the_apply() {
             [],
         )
         .unwrap();
-    assert!(apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel()).is_err());
+    assert!(apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel(), &none()).is_err());
     assert!(lib.game.exists());
 }
 
@@ -243,7 +244,8 @@ fn a_library_folder_removed_after_preview_refuses_the_apply() {
 fn history_can_open_the_rename_for_undo() {
     let lib = Lib::new("Old.nes", Some("nes"));
     let preview = preview_game_rename(&lib.db, &lib.game, "New", 1, &none()).unwrap();
-    let outcome = apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel()).unwrap();
+    let outcome =
+        apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel(), &none()).unwrap();
     assert!(super::is_organisation_transaction(&outcome.transaction));
     let mut reopened =
         super::open_history_transaction_for_undo(&lib.journal(), &outcome.transaction).unwrap();
@@ -313,7 +315,14 @@ fn other_games_saves_do_not_block_and_a_late_save_refuses_the_apply() {
         preview_game_rename(&lib.db, &lib.game, "Zelda (USA) [!]", 1, &saves_in(&saves)).unwrap();
     // A save appears between preview and confirm: the apply refuses.
     std::fs::write(saves.join("Zelda.srm"), b"new save").unwrap();
-    let error = apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel()).unwrap_err();
+    let error = apply_game_rename(
+        &preview,
+        &lib.db,
+        &lib.journal(),
+        &no_cancel(),
+        &saves_in(&saves),
+    )
+    .unwrap_err();
     assert!(error.contains("Zelda.srm"), "{error}");
     assert!(lib.game.exists());
     assert_eq!(std::fs::read(saves.join("Zelda.srm")).unwrap(), b"new save");
@@ -374,7 +383,7 @@ fn a_rename_the_filesystem_refuses_is_reported_as_failed() {
     let preview = preview_game_rename(&lib.db, &lib.game, "New", 1, &none()).unwrap();
     let folder = lib.root.join("nes");
     std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let result = apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel());
+    let result = apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel(), &none());
     std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
     if nix_is_root() {
         return; // root ignores directory permissions
@@ -395,4 +404,93 @@ fn nix_is_root() -> bool {
                 .map(|l| l.split_whitespace().nth(1) == Some("0"))
         })
         .unwrap_or(false)
+}
+
+fn retroarch_home(
+    cfg: &str,
+) -> (
+    tempfile::TempDir,
+    crate::emulator_environment::retroarch::DiscoveryEnvironment,
+) {
+    let home = tempfile::tempdir().unwrap();
+    let xdg = home.path().join("xdg");
+    std::fs::create_dir_all(xdg.join("retroarch")).unwrap();
+    std::fs::write(xdg.join("retroarch/retroarch.cfg"), cfg).unwrap();
+    let environment = crate::emulator_environment::retroarch::DiscoveryEnvironment {
+        home: Some(home.path().as_os_str().to_owned()),
+        xdg_config_home: Some(xdg.into_os_string()),
+        path: None,
+        explicit_executables: Vec::new(),
+        user_flatpak_root: PathBuf::from("/nonexistent"),
+        system_flatpak_root: PathBuf::from("/nonexistent"),
+        app_image_search_roots: Vec::new(),
+        desktop_file_roots: Vec::new(),
+    };
+    (home, environment)
+}
+
+#[test]
+fn discovered_save_settings_that_cannot_be_resolved_refuse() {
+    // A real configured folder is searched.
+    let (home, env) = retroarch_home("savefile_directory = \"~/saves\"\n");
+    std::fs::create_dir_all(home.path().join("saves")).unwrap();
+    let found = RetroArchSaveLocations::discover_in(&env);
+    assert_eq!(found.directories, vec![home.path().join("saves")]);
+    assert!(found.uncheckable.is_empty(), "{found:?}");
+
+    // "default" means beside the game: nothing extra to search, no refusal.
+    let (_home, env) =
+        retroarch_home("savefile_directory = \"default\"\nsavestate_directory = \"\"\n");
+    let found = RetroArchSaveLocations::discover_in(&env);
+    assert!(
+        found.directories.is_empty() && found.uncheckable.is_empty(),
+        "{found:?}"
+    );
+
+    // A portable `:` alias or a relative value cannot be resolved: refuse.
+    for value in [":/saves", "saves"] {
+        let (_home, env) = retroarch_home(&format!("savefile_directory = \"{value}\"\n"));
+        let found = RetroArchSaveLocations::discover_in(&env);
+        assert!(!found.uncheckable.is_empty(), "{value}: {found:?}");
+    }
+
+    // Settings that are not valid text cannot be read fully: refuse.
+    let (_home, env) = retroarch_home("");
+    let cfg = PathBuf::from(env.xdg_config_home.clone().unwrap()).join("retroarch/retroarch.cfg");
+    std::fs::write(&cfg, b"savefile_directory = \"\xff\xfe\"\n").unwrap();
+    let found = RetroArchSaveLocations::discover_in(&env);
+    assert!(!found.uncheckable.is_empty(), "{found:?}");
+}
+
+#[test]
+fn saves_sorted_beside_the_game_and_any_file_in_a_save_folder_refuse() {
+    // savefiles_in_content_dir + sort by core: <game folder>/<core>/<stem>.srm
+    let lib = Lib::new("Zelda.nes", Some("nes"));
+    let sorted = lib.root.join("nes").join("Mesen");
+    std::fs::create_dir_all(&sorted).unwrap();
+    std::fs::write(sorted.join("Zelda.srm"), b"save").unwrap();
+    assert!(
+        preview_game_rename(&lib.db, &lib.game, "Renamed", 1, &none())
+            .unwrap_err()
+            .contains("Zelda.srm")
+    );
+
+    // A core-specific save name in a configured save folder.
+    let lib = Lib::new("Zelda.nes", Some("nes"));
+    let saves = lib.temp.path().join("ra-saves");
+    std::fs::create_dir_all(&saves).unwrap();
+    std::fs::write(saves.join("Zelda.1.mcr"), b"card").unwrap();
+    assert!(preview_game_rename(&lib.db, &lib.game, "Renamed", 1, &saves_in(&saves)).is_err());
+
+    // A linked by-core folder cannot be checked without following it.
+    let lib = Lib::new("Zelda.nes", Some("nes"));
+    let saves = lib.temp.path().join("ra-saves");
+    let elsewhere = lib.temp.path().join("elsewhere");
+    std::fs::create_dir_all(&saves).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, saves.join("Mesen")).unwrap();
+    let error =
+        preview_game_rename(&lib.db, &lib.game, "Renamed", 1, &saves_in(&saves)).unwrap_err();
+    assert!(error.contains("linked folder"), "{error}");
+    assert!(lib.game.exists());
 }
