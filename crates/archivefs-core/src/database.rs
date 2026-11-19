@@ -3527,6 +3527,9 @@ pub struct ScummVmScanReport {
     /// Recognised library media that sat inside a confirmed ScummVM game
     /// folder and so became part of that game instead of separate rows.
     pub contained_media: Vec<PathBuf>,
+    /// One ScummVM game recognised in several folders: all kept and
+    /// catalogued, listed so a person can decide about spare copies.
+    pub same_game: Vec<(String, Vec<PathBuf>)>,
     /// `(source, error)` where the detector could not be run or read.
     pub errors: Vec<(PathBuf, String)>,
     pub cache_hits: usize,
@@ -10320,6 +10323,20 @@ fn scan_and_persist_folders_transaction(
                         save_scummvm_discovery_cache(&cache_path, &cache);
                         scummvm_report.ambiguous.extend(found.ambiguous);
                         scummvm_report.rejected.extend(found.rejected);
+                        scummvm_report.same_game.extend(found.same_game);
+                        // A row EmuWiz cannot read may be a game: said so, and
+                        // ScummVM rows of this source are kept from Missing.
+                        if !found.unreadable.is_empty() {
+                            scummvm_incomplete = true;
+                            for line in found.unreadable {
+                                scummvm_report.errors.push((
+                                    detection_root.clone(),
+                                    format!(
+                                        "ScummVM printed a result EmuWiz could not read: {line}"
+                                    ),
+                                ));
+                            }
+                        }
                         scummvm_report
                             .unknown_variants
                             .extend(found.unknown_variants.into_iter().map(|game| game.path));

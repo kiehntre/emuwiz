@@ -235,7 +235,7 @@ fn detect_candidates(
     );
     let _ = fs::remove_file(&config);
     let output = result?;
-    let games = parse_detection_output(&output)?;
+    let games = parse_detection_output_for(&output, Some(path))?;
     Ok(dedupe_candidates(games))
 }
 
@@ -802,11 +802,27 @@ fn read_bounded(mut reader: impl Read, max: usize) -> Vec<u8> {
 pub fn parse_detection_output(
     output: &[u8],
 ) -> Result<Vec<ScummVmDetectedGame>, ScummVmDetectionError> {
+    parse_detection_output_for(output, None)
+}
+
+/// [`parse_detection_output`] for one searched folder: table paths are
+/// located by that folder, and any row that cannot be read fails the whole
+/// detection (the folder is then reported, not guessed at).
+fn parse_detection_output_for(
+    output: &[u8],
+    folder: Option<&Path>,
+) -> Result<Vec<ScummVmDetectedGame>, ScummVmDetectionError> {
     let text = std::str::from_utf8(output)
         .map_err(|_| ScummVmDetectionError::MalformedOutput("output is not UTF-8".into()))?;
     let unknown_variant = text.contains(UNKNOWN_VARIANT_MARKER);
-    if let Some(rows) = parse_detection_table(text)? {
-        return Ok(rows
+    if let Some(table) = parse_detection_table(text, folder)? {
+        if let Some(line) = table.unreadable.first() {
+            return Err(ScummVmDetectionError::MalformedOutput(format!(
+                "unreadable detection row: {line}"
+            )));
+        }
+        return Ok(table
+            .rows
             .into_iter()
             .map(|(mut game, _)| {
                 game.unknown_variant = unknown_variant;
@@ -872,15 +888,31 @@ pub fn parse_detection_output(
     Ok(games)
 }
 
+/// One parsed `--detect` table: the rows read, and every row that could not
+/// be read, kept verbatim so a caller reports it instead of losing a game.
+#[derive(Debug, Default)]
+struct DetectionTable {
+    rows: Vec<(ScummVmDetectedGame, PathBuf)>,
+    unreadable: Vec<String>,
+}
+
 /// Parses the table real ScummVM (2.x) prints for `--detect`: a
-/// `GameID  Description  Full Path` header, a dashed rule that fixes the column
-/// widths, then one row per detected game. Returns `Ok(None)` when the output
-/// has no such header, so the older `Game:` record shape is still handled by the
-/// caller. Only the first column becomes identity; the path column is returned
-/// so a recursive scan can say where each game was found.
+/// `GameID  Description  Full Path` header, a dashed rule, then one row per
+/// detected game. Returns `Ok(None)` when the output has no such header, so
+/// the older `Game:` record shape is still handled by the caller.
+///
+/// The rule's column widths are NOT trusted for the path: ScummVM pads with
+/// `printf("%-30s %-58s %s")`, so a longer description (or id) pushes the
+/// path right, and slicing at the header column silently mangled 25 real
+/// games' paths (follow-up 9, 2026-11-19). A row is instead read as
+/// `<engine:game> <description> <path>`: the id is the first word (ids never
+/// contain spaces), and the path is found as the first ` <anchor>` - the
+/// folder that was searched when known, otherwise any absolute path. A row
+/// that does not fit is returned in `unreadable`, never dropped.
 fn parse_detection_table(
     text: &str,
-) -> Result<Option<Vec<(ScummVmDetectedGame, PathBuf)>>, ScummVmDetectionError> {
+    anchor: Option<&Path>,
+) -> Result<Option<DetectionTable>, ScummVmDetectionError> {
     let mut lines = text.lines();
     let Some(_) = lines.find(|line| {
         let trimmed = line.trim_start();
@@ -888,62 +920,72 @@ fn parse_detection_table(
     }) else {
         return Ok(None);
     };
-    let rule: Vec<char> = lines.next().unwrap_or_default().chars().collect();
-    let mut starts = Vec::new();
-    for (index, character) in rule.iter().enumerate() {
-        if *character == '-' && (index == 0 || rule[index - 1] == ' ') {
-            starts.push(index);
-        }
-    }
-    if starts.len() != 3 || starts[0] != 0 {
+    let rule = lines.next().unwrap_or_default();
+    if !rule.starts_with('-') || rule.split_whitespace().count() != 3 {
         return Err(ScummVmDetectionError::MalformedOutput(
             "detection table has an unexpected column layout".into(),
         ));
     }
-    let mut rows = Vec::new();
+    let anchor = match anchor {
+        Some(path) => Some(
+            path.to_str()
+                .map(|text| text.trim_end_matches('/').to_string())
+                .ok_or_else(|| {
+                    ScummVmDetectionError::MalformedOutput(
+                        "searched folder is not valid UTF-8".into(),
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    let mut table = DetectionTable::default();
     for raw in lines {
-        let chars: Vec<char> = raw.chars().collect();
-        if chars.iter().all(|c| c.is_whitespace()) {
+        let line = raw.trim_end_matches('\r');
+        if line.trim().is_empty() {
             continue;
         }
-        if chars.len() <= starts[2] {
-            return Err(ScummVmDetectionError::MalformedOutput(
-                "detection table row is shorter than its columns".into(),
-            ));
+        match parse_detection_row(line, anchor.as_deref()) {
+            Some(row) => table.rows.push(row),
+            None => table.unreadable.push(line.to_string()),
         }
-        let column = |from: usize, to: usize| {
-            chars[from..to.min(chars.len())]
-                .iter()
-                .collect::<String>()
-                .trim()
-                .to_string()
-        };
-        let id = column(starts[0], starts[1]);
-        let description = column(starts[1], starts[2]);
-        let path = column(starts[2], chars.len());
-        let (engine_id, game_id) = id.split_once(':').ok_or_else(|| {
-            ScummVmDetectionError::MalformedOutput("game record lacks engine:game id".into())
-        })?;
-        if !valid_id(engine_id) || !valid_id(game_id) || path.is_empty() {
-            return Err(ScummVmDetectionError::MalformedOutput(
-                "invalid game record".into(),
-            ));
-        }
-        rows.push((
-            ScummVmDetectedGame {
-                game_id: game_id.into(),
-                engine_id: engine_id.into(),
-                description: Some(description).filter(|value| !value.is_empty()),
-                platform: None,
-                language: None,
-                variant: None,
-                demo: None,
-                unknown_variant: false,
-            },
-            PathBuf::from(path),
-        ));
     }
-    Ok(Some(rows))
+    Ok(Some(table))
+}
+
+fn parse_detection_row(line: &str, anchor: Option<&str>) -> Option<(ScummVmDetectedGame, PathBuf)> {
+    let id_end = line.find(char::is_whitespace)?;
+    let (id, rest) = line.split_at(id_end);
+    let (engine_id, game_id) = id.split_once(':')?;
+    if !valid_id(engine_id) || !valid_id(game_id) {
+        return None;
+    }
+    let path_at = match anchor {
+        Some(anchor) => {
+            let needle = format!(" {anchor}");
+            rest.match_indices(&needle)
+                .map(|(at, _)| at)
+                .find(|at| matches!(rest[at + needle.len()..].chars().next(), None | Some('/')))?
+        }
+        None => rest.find(" /")?,
+    };
+    let description = rest[..path_at].trim();
+    let path = &rest[path_at + 1..];
+    if description.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((
+        ScummVmDetectedGame {
+            game_id: game_id.into(),
+            engine_id: engine_id.into(),
+            description: Some(description.to_string()),
+            platform: None,
+            language: None,
+            variant: None,
+            demo: None,
+            unknown_variant: false,
+        },
+        PathBuf::from(path),
+    ))
 }
 
 /// One game folder found by [`discover_scummvm_game_directories`].
@@ -965,8 +1007,30 @@ pub struct ScummVmDiscovery {
     /// folder with one `.cas` file is not a Glk text adventure.
     pub unknown_variants: Vec<DiscoveredScummVmGame>,
     /// Folders whose per-folder detection disagreed with the recursive result
-    /// or was refused (symlink, unsafe entry): not offered as games.
+    /// or was refused (symlink, unsafe entry, outside the searched folder):
+    /// not offered as games.
     pub rejected: Vec<PathBuf>,
+    /// Detector rows EmuWiz could not read, verbatim. Never guessed at; the
+    /// caller reports them and treats the search as incomplete.
+    pub unreadable: Vec<String>,
+    /// One ScummVM game (`engine:game`) recognised in more than one folder.
+    /// Every folder is kept and catalogued as found; this only says so, so a
+    /// person can decide whether one is a spare copy.
+    pub same_game: Vec<(String, Vec<PathBuf>)>,
+}
+
+fn same_game_folders(games: &[DiscoveredScummVmGame]) -> Vec<(String, Vec<PathBuf>)> {
+    let mut by_id: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
+    for found in games {
+        by_id
+            .entry(format!("{}:{}", found.game.engine_id, found.game.game_id))
+            .or_default()
+            .push(found.path.clone());
+    }
+    by_id
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .collect()
 }
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1320,6 +1384,7 @@ pub fn discover_scummvm_game_directories_cached(
         && &entry.key == key
         && let Ok(found) = analyse_detection_output(&root, executable, &entry.output)
         && found.rejected.is_empty()
+        && found.unreadable.is_empty()
         && entry_is_young_enough(entry, !found.games.is_empty(), unix_now())
     {
         return Ok((found, Some(entry.clone())));
@@ -1359,8 +1424,12 @@ fn analyse_detection_output(
     executable: &Path,
     text: &str,
 ) -> Result<ScummVmDiscovery, ScummVmDetectionError> {
-    let rows = match parse_detection_table(text)? {
-        Some(rows) => rows,
+    let mut discovery = ScummVmDiscovery::default();
+    let rows = match parse_detection_table(text, Some(root))? {
+        Some(table) => {
+            discovery.unreadable = table.unreadable;
+            table.rows
+        }
         // Real ScummVM prints this warning on stdout when it finds nothing.
         // Output that is neither a table nor that explicit statement is not
         // treated as "no games": a broken wrapper must not look like an empty
@@ -1377,12 +1446,13 @@ fn analyse_detection_output(
     for (game, path) in rows {
         // Lexical containment is not enough: a symlinked ancestor or `..` can
         // make a path that starts with the root resolve elsewhere.
+        // Reported as rejected, never dropped without a word.
         if !path.starts_with(root) || path.canonicalize().ok().as_deref() != Some(path.as_path()) {
+            discovery.rejected.push(path);
             continue;
         }
         by_path.entry(path).or_default().push(game);
     }
-    let mut discovery = ScummVmDiscovery::default();
     let mut unique: Vec<(PathBuf, ScummVmDetectedGame)> = Vec::new();
     for (path, games) in by_path {
         let games = dedupe_candidates(games);
@@ -1420,6 +1490,7 @@ fn analyse_detection_output(
             _ => discovery.rejected.push(path),
         }
     }
+    discovery.same_game = same_game_folders(&discovery.games);
     Ok(discovery)
 }
 
@@ -1795,6 +1866,178 @@ mod tests {
         );
     }
 
+    /// Real ScummVM 2.8.0 rows (follow-up 9 evidence): a description longer
+    /// than its 58-character column pushes the path right. Slicing at the
+    /// header column turned the path into `... English) /mnt/...` and the game
+    /// was silently dropped.
+    const LONG_TITLE_TABLE: &str = "GameID                         Description                                                Full Path\n\
+------------------------------ ---------------------------------------------------------- ---------------------------------------------------------\n\
+sci:lsl2                       Leisure Suit Larry 2: Goes Looking for Love (in Several Wrong Places) (DOS/English) /mnt/usbdrive/games/scummvm/lsl2\n\
+gob:woodruff                   The Bizarre Adventures of Woodruff and the Schnibble (v1.00/DOS/English (GB)) /mnt/usbdrive/games/scummvm/woodruff\n\
+queen:queen                    Flight of the Amazon Queen (CD/DOS/English)                /mnt/usbdrive/games/scummvm/Queen / Disc (CD)\n";
+
+    #[test]
+    fn long_titles_never_shift_the_path_into_the_description() {
+        let root = Path::new("/mnt/usbdrive/games/scummvm");
+        for anchor in [None, Some(root)] {
+            let table = parse_detection_table(LONG_TITLE_TABLE, anchor)
+                .unwrap()
+                .unwrap();
+            assert!(table.unreadable.is_empty(), "{:?}", table.unreadable);
+            let rows: Vec<_> = table
+                .rows
+                .iter()
+                .map(|(game, path)| {
+                    (
+                        format!("{}:{}", game.engine_id, game.game_id),
+                        game.description.clone().unwrap(),
+                        path.clone(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                rows[0],
+                (
+                    "sci:lsl2".to_string(),
+                    "Leisure Suit Larry 2: Goes Looking for Love (in Several Wrong Places) (DOS/English)".to_string(),
+                    root.join("lsl2")
+                )
+            );
+            assert_eq!(rows[1].2, root.join("woodruff"));
+            assert_eq!(
+                rows[1].1,
+                "The Bizarre Adventures of Woodruff and the Schnibble (v1.00/DOS/English (GB))"
+            );
+            // Spaces, slashes and parentheses inside the folder name.
+            assert_eq!(rows[2].2, root.join("Queen / Disc (CD)"));
+        }
+        // Anchored on the searched folder, a " /" inside a description is not
+        // mistaken for the path.
+        let tricky = LONG_TITLE_TABLE.replace("(DOS/English) /mnt", "(DOS / English) /mnt");
+        let table = parse_detection_table(&tricky, Some(root)).unwrap().unwrap();
+        assert_eq!(table.rows[0].1, root.join("lsl2"));
+        assert!(
+            table.rows[0]
+                .0
+                .description
+                .as_deref()
+                .unwrap()
+                .ends_with("(DOS / English)")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_row_is_reported_never_dropped() {
+        let root = Path::new("/mnt/usbdrive/games/scummvm");
+        let output = format!(
+            "{LONG_TITLE_TABLE}no-id-here   Some Game    /mnt/usbdrive/games/scummvm/x\nsci:sq4   Space Quest IV    /elsewhere/sq4\n"
+        );
+        let table = parse_detection_table(&output, Some(root)).unwrap().unwrap();
+        assert_eq!(table.rows.len(), 3);
+        assert_eq!(table.unreadable.len(), 2, "{:?}", table.unreadable);
+        assert!(table.unreadable[0].starts_with("no-id-here"));
+        // One searched folder: any unreadable row fails that detection.
+        let folder = root.join("lsl2");
+        let single = LONG_TITLE_TABLE
+            .lines()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            parse_detection_output_for(single.as_bytes(), Some(&folder)).unwrap()[0].game_id,
+            "lsl2"
+        );
+        let broken = format!("{single}\ngarbage\n");
+        assert!(matches!(
+            parse_detection_output_for(broken.as_bytes(), Some(&folder)),
+            Err(ScummVmDetectionError::MalformedOutput(_))
+        ));
+        // A different folder than the one searched is not read as this one.
+        assert!(parse_detection_output_for(single.as_bytes(), Some(&root.join("lsl"))).is_err());
+    }
+
+    /// A fake ScummVM printing rows with ScummVM's own `%-30s %-58s %s`
+    /// padding, chosen by a marker file in each folder.
+    #[cfg(unix)]
+    fn padded_fake(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join("scummvm");
+        fs::write(
+            &exe,
+            r#"#!/bin/sh
+for a in "$@"; do case "$a" in --path=*) p="${a#--path=}";; --recursive) rec=1;; esac; done
+echo 'GameID                         Description                                                Full Path'
+echo '------------------------------ ---------------------------------------------------------- ---------'
+if [ -n "$rec" ]; then list=$(find "$p" -type d | sort); else list="$p"; fi
+printf '%s\n' "$list" | while read -r d; do
+  [ -e "$d/long" ] && printf '%-30s %-58s %s\n' 'sci:lsl2' 'Leisure Suit Larry 2: Goes Looking for Love (in Several Wrong Places) (DOS/English)' "$d"
+  if [ -e "$d/languages" ]; then
+    printf '%-30s %-58s %s\n' 'gob:woodruff' 'The Bizarre Adventures of Woodruff and the Schnibble (v1.00/DOS/English (GB))' "$d"
+    printf '%-30s %-58s %s\n' 'gob:woodruff' 'The Bizarre Adventures of Woodruff and the Schnibble (v1.00/DOS/German)' "$d"
+  fi
+  if [ -e "$d/two" ]; then
+    printf '%-30s %-58s %s\n' 'agi:winnie' 'Winnie the Pooh in the Hundred Acre Wood (DOS/English)' "$d"
+    printf '%-30s %-58s %s\n' 'director:winniewitch' 'Winnie the Witch (Demo/Windows/English)' "$d"
+  fi
+  [ -e "$d/garbled.marker" ] && echo "this is not a row"
+done
+exit 0
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        exe
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_discovery_keeps_long_titles_multiple_detections_and_copies_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = padded_fake(dir.path());
+        let root = dir.path().join("games");
+        let folder = |name: &str, marker: &str| {
+            let path = root.join(name);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join(marker), b"x").unwrap();
+            fs::write(path.join("RESOURCE.000"), b"data").unwrap();
+            path
+        };
+        let short = folder("lsl2", "long");
+        let long_name = folder("Leisure Suit Larry 2 (Floppy DOS) [copy]", "long");
+        let languages = folder("woodruff", "languages");
+        let two = folder("winnie", "two");
+        let _bad = folder("bad", "garbled.marker");
+        let root = root.canonicalize().unwrap();
+        let found = discover_scummvm_game_directories(&root, &exe).unwrap();
+        let mut games: Vec<_> = found
+            .games
+            .iter()
+            .map(|game| (game.path.clone(), game.game.game_id.clone()))
+            .collect();
+        games.sort();
+        let at = |path: &Path| root.join(path.file_name().unwrap());
+        // Long titles are recognised; one game listed once per language is
+        // one candidate, as before.
+        assert_eq!(
+            games,
+            [
+                (at(&long_name), "lsl2".to_string()),
+                (at(&short), "lsl2".to_string()),
+                (at(&languages), "woodruff".to_string()),
+            ]
+        );
+        // Two different games: never guessed between.
+        assert_eq!(found.ambiguous, [at(&two)]);
+        // The same game in two folders: both kept, and said so.
+        assert_eq!(
+            found.same_game,
+            [("sci:lsl2".to_string(), vec![at(&long_name), at(&short)])]
+        );
+        // An unreadable line is reported verbatim.
+        assert_eq!(found.unreadable, ["this is not a row"]);
+        assert!(found.rejected.is_empty(), "{:?}", found.rejected);
+    }
+
     /// A fake ScummVM that prints the real table, reports a version from
     /// `<exe>.ver`, and counts its recursive runs in `<exe>.count`.
     #[cfg(unix)]
@@ -2069,8 +2312,9 @@ queen:queen                    Flight of the Amazon Queen (CD/DOS/English)      
             (games[0].engine_id.as_str(), games[0].game_id.as_str()),
             ("queen", "queen")
         );
-        let rows = parse_detection_table(REAL_TABLE).unwrap().unwrap();
-        assert_eq!(rows[0].1, PathBuf::from("/games/Queen Folder"));
+        let table = parse_detection_table(REAL_TABLE, None).unwrap().unwrap();
+        assert_eq!(table.rows[0].1, PathBuf::from("/games/Queen Folder"));
+        assert!(table.unreadable.is_empty());
     }
 
     #[test]

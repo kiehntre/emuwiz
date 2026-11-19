@@ -63,6 +63,14 @@ pub(crate) fn scummvm_scan_lines(report: &ScummVmScanReport) -> Vec<String> {
             folder_names(&report.unknown_variants)
         ));
     }
+    for (game, folders) in &report.same_game {
+        lines.push(format!(
+            "The same ScummVM game ({game}) was found in {} folders; each is kept and listed, \
+             check whether one is a spare copy: {}.",
+            folders.len(),
+            folder_names(folders)
+        ));
+    }
     if !report.contained_media.is_empty() {
         lines.push(format!(
             "{} recognised game file(s) sit inside confirmed ScummVM game folders and were kept \
@@ -233,6 +241,13 @@ mod scummvm_wording_tests {
             rejected: vec![PathBuf::from("/g/Odd")],
             unknown_variants: vec![PathBuf::from("/g/Tapes")],
             contained_media: vec![PathBuf::from("/g/Queen/bonus.gba")],
+            same_game: vec![(
+                "sci:qfg1vga".into(),
+                vec![
+                    PathBuf::from("/g/qfg1"),
+                    PathBuf::from("/g/Quest for Glory 1"),
+                ],
+            )],
             errors: vec![(PathBuf::from("/g"), "timed out".into())],
             cache_hits: 1,
             detector_runs: 0,
@@ -244,6 +259,11 @@ mod scummvm_wording_tests {
         assert!(text.contains("own folder check") && text.contains("Odd"));
         assert!(text.contains("only guessed these folders") && text.contains("Tapes"));
         assert!(text.contains("1 recognised game file(s) sit inside"));
+        assert!(
+            text.contains("same ScummVM game (sci:qfg1vga) was found in 2 folders")
+                && text.contains("Quest for Glory 1"),
+            "{text}"
+        );
         assert!(text.contains("could not check /g: timed out"));
     }
 }
