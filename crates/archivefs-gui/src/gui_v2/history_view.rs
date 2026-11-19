@@ -414,9 +414,11 @@ fn handoff_of(transaction: &RenameTransaction, source: Source, family: Family) -
     if source == Source::CanonicalOrganisation
         && archivefs_core::dat::rom_organisation::is_organisation_transaction(transaction)
     {
+        // Quick Rename draws the selected transaction with its Undo button;
+        // the Organisation landing page does not.
         return Handoff {
-            label: "Open Organisation",
-            route: Route::Section(Section::Build),
+            label: "Open Undo in Quick Rename",
+            route: Route::QuickRename,
             selects_organisation: true,
         };
     }
@@ -1603,7 +1605,7 @@ impl super::App {
         }
     }
 
-    /// History's "Open Organisation": select exactly this transaction on the
+    /// History's "Open Undo in Quick Rename": select exactly this transaction on the
     /// page, from its sealed journal. A running organisation job owns the page
     /// and its copy, so nothing is selected under it.
     pub(super) fn select_organisation_transaction(&mut self, id: &str) {

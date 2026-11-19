@@ -955,8 +955,8 @@ fn a_bound_organisation_is_selected_by_its_history_row_after_a_restart_and_undon
     );
     let row = rows.iter().find(|row| row.transaction_id == id).unwrap();
     assert!(row.handoff.selects_organisation);
-    assert_eq!(row.handoff.label, "Open Organisation");
-    assert_eq!(row.handoff.route, Route::Section(Section::Build));
+    assert_eq!(row.handoff.label, "Open Undo in Quick Rename");
+    assert_eq!(row.handoff.route, Route::QuickRename);
 
     // The History click selects exactly that row's transaction.
     app.select_organisation_transaction(&row.transaction_id);

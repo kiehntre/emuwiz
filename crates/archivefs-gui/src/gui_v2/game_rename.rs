@@ -188,6 +188,8 @@ impl App {
             }
             if renamed {
                 self.load(false);
+                // History lists the new rename (and its Undo) without a restart.
+                self.send(0, super::Command::LoadRepairHistory);
             }
         });
     }
