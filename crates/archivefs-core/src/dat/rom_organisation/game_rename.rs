@@ -273,6 +273,7 @@ pub fn preview_game_rename(
         "The game keeps its EmuWiz library entry: favourites, collections, play history and EmuWiz artwork stay with it.".into(),
         "RetroArch playlists and ES-DE gamelists that list the old file name are not updated yet.".into(),
         "Undo is available in History.".into(),
+        "A catalogue verification is tied to the file's name, so a verified game shows as not verified after the rename until you re-check it (Re-check this game).".into(),
         "No RetroArch saves or save states were found for this game. Saves kept by standalone emulators are not checked.".into(),
         "RomM is not told about the rename. It catches up at its next scan of this system (its scheduled scan, or Scan in RomM), where RomM 5.3 matches the renamed file to its existing entry by file hash if hashing is on. For games RomM never identified, its displayed title stays the old one.".into(),
     ];
@@ -321,6 +322,16 @@ pub fn apply_game_rename(
     // A save made since the preview (the game was played) also refuses.
     refuse_if_retroarch_saves(&preview.source, &preview.save_locations)?;
     refuse_if_retroarch_saves(&preview.source, save_locations)?;
+    // A file that took the new name since the preview is named plainly here;
+    // the plan check below would refuse too, with a less direct reason.
+    if preview.destination != preview.source
+        && std::fs::symlink_metadata(&preview.destination).is_ok()
+    {
+        return Err(format!(
+            "{} appeared after the preview, so this rename was refused: nothing is overwritten. Nothing was changed.",
+            preview.destination.display()
+        ));
+    }
     let wanted = preview.new_file_name.clone();
     let source = preview.source.clone();
     let name_for = move |path: &Path| (path == source).then(|| wanted.clone());
