@@ -684,7 +684,8 @@ fn cemu_scanner_rechecks_positive_and_negative_cache_when_sibling_evidence_chang
                 Some(1),
                 &cache,
                 &mut timings,
-                &mut error
+                &mut error,
+                &mut None,
             )
             .is_some(),
         "previous negative RPX cache cannot hide a newly complete title"
@@ -702,7 +703,8 @@ fn cemu_scanner_rechecks_positive_and_negative_cache_when_sibling_evidence_chang
                 Some(1),
                 &cache,
                 &mut timings,
-                &mut error
+                &mut error,
+                &mut None,
             )
             .is_none(),
         "cached RPX stat cannot authorize missing sibling metadata"

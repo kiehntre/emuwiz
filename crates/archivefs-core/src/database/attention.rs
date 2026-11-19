@@ -169,7 +169,7 @@ impl Database {
         }
         // Scan-owned counters are current for this completed scan, unlike an
         // old fingerprint row that can survive removal of an unsupported file.
-        let mut statement = transaction.prepare("SELECT id, skipped_unsupported_extension, skipped_ambiguous_platform, CAST(strftime('%s', finished_at) AS INTEGER) FROM scan_runs WHERE status = 'completed' ORDER BY id DESC LIMIT 1")
+        let mut statement = transaction.prepare("SELECT id, skipped_unsupported_extension, skipped_ambiguous_platform, CAST(strftime('%s', finished_at) AS INTEGER), started_at, finished_at FROM scan_runs WHERE status = 'completed' ORDER BY id DESC LIMIT 1")
             .map_err(|e| db_error("prepare attention discovery summary", e))?;
         let mut rows = statement
             .query([])
@@ -182,21 +182,69 @@ impl Database {
             let id: i64 = row
                 .get(0)
                 .map_err(|e| db_error("read attention scan id", e))?;
-            for (column, category, label) in [
-                (1, C::Unsupported, "files have unsupported formats"),
-                (2, C::Identity, "files have ambiguous platform identity"),
+            let started: Option<String> = row
+                .get(4)
+                .map_err(|e| db_error("read attention scan start", e))?;
+            let finished: Option<String> = row
+                .get(5)
+                .map_err(|e| db_error("read attention scan finish", e))?;
+            let unsupported_counter = row
+                .get::<_, i64>(1)
+                .map_err(|e| db_error("read attention discovery count", e))?
+                .max(0) as u64;
+            // Loose cartridges proven identical to a catalogued ZIP are kept
+            // in the historical unsupported counter (no schema change), but
+            // they are recognised ROMs deliberately not catalogued twice. The
+            // run's own fingerprint verdicts (rewritten every scan) say how
+            // many there were, so they are shown apart, never as unsupported.
+            let identical_copies = match (&started, &finished) {
+                (Some(started), Some(finished)) => transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM scan_fingerprints WHERE non_archive_kind = 'identical_copy' AND updated_at >= ?1 AND updated_at <= ?2",
+                        [started, finished],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|e| db_error("count attention identical copies", e))?
+                    .max(0) as u64,
+                _ => 0,
+            }
+            .min(unsupported_counter);
+            snapshot.query_count += 1;
+            for (column, category, severity, label) in [
+                (
+                    1,
+                    C::Unsupported,
+                    S::Warning,
+                    "files have unsupported formats",
+                ),
+                (
+                    2,
+                    C::Identity,
+                    S::Warning,
+                    "files have ambiguous platform identity",
+                ),
+                (
+                    3,
+                    C::Duplicates,
+                    S::Info,
+                    "recognised ROMs are identical copies of catalogued ZIPs",
+                ),
             ] {
-                let count = row
-                    .get::<_, i64>(column)
-                    .map_err(|e| db_error("read attention discovery count", e))?
-                    .max(0) as u64;
+                let count = match column {
+                    1 => unsupported_counter - identical_copies,
+                    3 => identical_copies,
+                    _ => row
+                        .get::<_, i64>(column)
+                        .map_err(|e| db_error("read attention discovery count", e))?
+                        .max(0) as u64,
+                };
                 if count == 0 {
                     continue;
                 }
                 let mut item = AttentionItem::new(
                     format!("discovery:{column}"),
                     category,
-                    S::Warning,
+                    severity,
                     format!("{count} {label}"),
                     D::Discovery,
                 );
@@ -205,8 +253,16 @@ impl Database {
                     .get(3)
                     .map_err(|e| db_error("read attention scan time", e))?;
                 item.source_records.push(format!("scan_runs:{id}"));
-                item.summary = "Recorded by the latest completed scan. Review its discovery details for paths and reasons; other source roots may not have been scanned in that run.".into();
-                item.provenance = "Completed scan counters (not inferred from error text)".into();
+                item.summary = if column == 3 {
+                    "Loose cartridge files byte-identical to the only file of a ZIP the library already catalogues. They are alternate copies, not catalogued twice; no file was changed. Filter the scan's skipped files by \"Identical copy of a catalogued ZIP\" for paths.".into()
+                } else {
+                    "Recorded by the latest completed scan. Review its discovery details for paths and reasons; other source roots may not have been scanned in that run.".into()
+                };
+                item.provenance = if column == 3 {
+                    "This scan's identical-copy verdicts (scan fingerprints)".into()
+                } else {
+                    "Completed scan counters (not inferred from error text)".into()
+                };
                 snapshot.insert(item);
             }
         } else {

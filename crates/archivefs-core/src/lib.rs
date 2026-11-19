@@ -280,6 +280,7 @@ pub use library_views::{
 /// Read-only external identity providers - RomM in Stage 1, with room for local
 /// DAT catalogues and Hasheous later.
 pub mod identity_source;
+pub mod loose_cartridge;
 /// Explicit, user-approved descriptive metadata enrichment. This is kept
 /// separate from identity/platform evidence by construction.
 pub mod screenscraper_enrichment;
@@ -4792,9 +4793,31 @@ impl Archive {
         path: impl AsRef<Path>,
         source_root: impl Into<PathBuf>,
     ) -> Option<Self> {
+        Self::from_path_in_root_with_loose(path, source_root, None, false)
+    }
+
+    /// As [`Self::from_path_in_root`], with a loose-cartridge verdict the
+    /// scanner already computed. `keep_catalogued_copy`: the file is already
+    /// a library row, so a ZIP added beside it later never hides that row
+    /// (its identity and history stay attached).
+    pub(crate) fn from_path_in_root_with_loose(
+        path: impl AsRef<Path>,
+        source_root: impl Into<PathBuf>,
+        loose: Option<&loose_cartridge::LooseCartridge>,
+        keep_catalogued_copy: bool,
+    ) -> Option<Self> {
         let path = path.as_ref();
         let source_root = source_root.into();
-        let kind = archive_kind_in_root(path, &source_root)?;
+        let kind = match loose {
+            Some(verdict) => (verdict.is_catalogued()
+                || (keep_catalogued_copy
+                    && matches!(
+                        verdict,
+                        loose_cartridge::LooseCartridge::IdenticalCopy { .. }
+                    )))
+            .then_some(ArchiveKind::DirectGameImage)?,
+            None => archive_kind_in_root(path, &source_root)?,
+        };
         let metadata = fs::symlink_metadata(path)
             .ok()
             .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
@@ -4963,6 +4986,14 @@ pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<Ar
         return Some(kind);
     }
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    // A `.bin` directly in a folder naming a cartridge system with raw `.bin`
+    // dumps: catalogued when its size/header fits, unless it is a proven
+    // identical copy of a sibling ZIP (see `loose_cartridge`).
+    if extension == "bin" && loose_cartridge::candidate_platform(path).is_some() {
+        return loose_cartridge::classify(path)
+            .is_catalogued()
+            .then_some(ArchiveKind::DirectGameImage);
+    }
     if !media_registry::is_corroboration_candidate(&extension) {
         return None;
     }
@@ -6232,6 +6263,10 @@ pub enum SkipReason {
     /// that merely shares one of these three extensions (for example a
     /// ScummVM `RESOURCE.GEN`) is reported this way, not as unsupported.
     AmbiguousPlatform,
+    /// A loose cartridge byte-identical to the only file of a sibling ZIP the
+    /// library already catalogues: an alternate copy, reported rather than
+    /// catalogued twice. Neither file is changed.
+    IdenticalCopy,
 }
 
 impl SkipReason {
@@ -6242,6 +6277,7 @@ impl SkipReason {
             Self::InvalidContent => "Unsupported or invalid media structure",
             Self::UnsupportedVariant => "Recognised, unsupported variant",
             Self::AmbiguousPlatform => "Ambiguous platform",
+            Self::IdenticalCopy => "Identical copy of a catalogued ZIP",
         }
     }
 }
@@ -6658,6 +6694,7 @@ impl<'a> ArchiveScanner<'a> {
                     continue;
                 }
                 let mut metadata_error = None;
+                let mut loose_verdict = None;
                 let candidate = if file_type.is_file() {
                     self.archive_from_fingerprint_or_path(
                         &path,
@@ -6666,6 +6703,7 @@ impl<'a> ArchiveScanner<'a> {
                         fingerprints,
                         &mut discovery.timings,
                         &mut metadata_error,
+                        &mut loose_verdict,
                     )
                 } else {
                     None
@@ -6776,6 +6814,15 @@ impl<'a> ArchiveScanner<'a> {
                     {
                         discovery.skipped_unsupported_extension += 1;
                         SkipReason::InvalidContent
+                    } else if matches!(
+                        loose_verdict,
+                        Some(loose_cartridge::LooseCartridge::IdenticalCopy { .. })
+                    ) {
+                        // Kept in the historical unsupported counter for schema
+                        // compatibility, like `UnsupportedVariant`; the
+                        // per-item reason stays distinct.
+                        discovery.skipped_unsupported_extension += 1;
+                        SkipReason::IdenticalCopy
                     } else if extension
                         .as_deref()
                         .is_some_and(|value| matches!(value, "md" | "bin" | "gen"))
@@ -6843,6 +6890,7 @@ impl<'a> ArchiveScanner<'a> {
                                         SkipReason::InvalidContent => "invalid_content",
                                         SkipReason::UnsupportedVariant => "unsupported_variant",
                                         SkipReason::AmbiguousPlatform => "ambiguous",
+                                        SkipReason::IdenticalCopy => "identical_copy",
                                     }
                                     .to_string(),
                                 ),
@@ -6887,6 +6935,7 @@ impl<'a> ArchiveScanner<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn archive_from_fingerprint_or_path(
         &self,
         path: &Path,
@@ -6895,6 +6944,7 @@ impl<'a> ArchiveScanner<'a> {
         fingerprints: &HashMap<(i64, PathBuf), &ScanFingerprint>,
         timings: &mut ScanPhaseTimings,
         metadata_error: &mut Option<String>,
+        loose_verdict: &mut Option<loose_cartridge::LooseCartridge>,
     ) -> Option<Archive> {
         timings.candidates += 1;
         let metadata_started = Instant::now();
@@ -6989,7 +7039,39 @@ impl<'a> ArchiveScanner<'a> {
             timings.re_inspected_plain_files += 1;
         }
         let classification_started = Instant::now();
-        let archive = Archive::from_path_in_root(path, source_root);
+        // A loose `.bin` cartridge is classified once here; the skip reason
+        // below reuses the verdict.
+        let loose =
+            loose_cartridge::candidate_platform(path).map(|_| loose_cartridge::classify(path));
+        let archive = match &loose {
+            Some(verdict) => {
+                match verdict {
+                    loose_cartridge::LooseCartridge::Unreadable { error, .. } => {
+                        *metadata_error = Some(error.clone());
+                    }
+                    // Both files are kept and catalogued separately; the
+                    // pairing is re-derived from disk by `classify`.
+                    loose_cartridge::LooseCartridge::PossibleVariant { counterpart, .. } => {
+                        log::info!(
+                            "possible variant: {} has the same title as {} but different contents",
+                            path.display(),
+                            counterpart.display()
+                        );
+                    }
+                    _ => {}
+                }
+                let already_catalogued =
+                    cached.is_some_and(|fingerprint| fingerprint.non_archive_kind.is_none());
+                Archive::from_path_in_root_with_loose(
+                    path,
+                    source_root,
+                    Some(verdict),
+                    already_catalogued,
+                )
+            }
+            None => Archive::from_path_in_root(path, source_root),
+        };
+        *loose_verdict = loose;
         if archive.is_none()
             && let Some(item) = ingestion::discovery::inspect_spectrum_media(path, source_root)
             && matches!(
@@ -7123,7 +7205,13 @@ fn non_archive_verdict_is_still_current(path: &Path, verdict: &str) -> bool {
             !media_registry::is_recognized_extension(&extension)
                 && !media_registry::is_corroboration_candidate(&extension)
         }
-        "ambiguous" => media_registry::is_corroboration_candidate(&extension),
+        // A loose cartridge candidate is always re-classified: its verdict
+        // depends on the size/header rules and on sibling ZIPs, which the
+        // file's own stat cannot show.
+        "ambiguous" => {
+            media_registry::is_corroboration_candidate(&extension)
+                && loose_cartridge::candidate_platform(path).is_none()
+        }
         _ => false,
     }
 }
