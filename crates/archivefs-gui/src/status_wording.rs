@@ -63,6 +63,22 @@ pub(crate) fn scummvm_scan_lines(report: &ScummVmScanReport) -> Vec<String> {
             folder_names(&report.unknown_variants)
         ));
     }
+    if !report.identical_copies.is_empty() {
+        lines.push(format!(
+            "Not added as separate games because each is a byte-for-byte copy of another folder \
+             of the same ScummVM game (both folders are left untouched): {}.",
+            report
+                .identical_copies
+                .iter()
+                .map(|(copy, kept)| format!(
+                    "{} (same as {})",
+                    folder_names(std::slice::from_ref(copy)),
+                    folder_names(std::slice::from_ref(kept))
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
     for (game, folders) in &report.same_game {
         lines.push(format!(
             "The same ScummVM game ({game}) was found in {} folders; each is kept and listed, \
@@ -241,6 +257,7 @@ mod scummvm_wording_tests {
             rejected: vec![PathBuf::from("/g/Odd")],
             unknown_variants: vec![PathBuf::from("/g/Tapes")],
             contained_media: vec![PathBuf::from("/g/Queen/bonus.gba")],
+            identical_copies: vec![(PathBuf::from("/g/sq4"), PathBuf::from("/g/Space Quest 4"))],
             same_game: vec![(
                 "sci:qfg1vga".into(),
                 vec![
@@ -259,6 +276,10 @@ mod scummvm_wording_tests {
         assert!(text.contains("own folder check") && text.contains("Odd"));
         assert!(text.contains("only guessed these folders") && text.contains("Tapes"));
         assert!(text.contains("1 recognised game file(s) sit inside"));
+        assert!(
+            text.contains("byte-for-byte copy") && text.contains("sq4 (same as Space Quest 4)"),
+            "{text}"
+        );
         assert!(
             text.contains("same ScummVM game (sci:qfg1vga) was found in 2 folders")
                 && text.contains("Quest for Glory 1"),

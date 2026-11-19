@@ -1021,9 +1021,105 @@ pub struct ScummVmDiscovery {
     /// caller reports them and treats the search as incomplete.
     pub unreadable: Vec<String>,
     /// One ScummVM game (`engine:game`) recognised in more than one folder.
-    /// Every folder is kept and catalogued as found; this only says so, so a
-    /// person can decide whether one is a spare copy.
+    /// This only says so; the scan then holds back new byte-identical copies
+    /// ([`identical_new_copies`]) and catalogues every other folder.
     pub same_game: Vec<(String, Vec<PathBuf>)>,
+}
+
+/// True only when both folders hold exactly the same files: the same relative
+/// names, sizes and bytes, ignoring ScummVM's per-folder `.scummvm` marker
+/// files (they name the folder, not the game). A symlink, special file or
+/// anything unreadable makes the answer `false`: unproven is "different", so a
+/// folder is catalogued rather than hidden.
+pub fn identical_game_folders(left: &Path, right: &Path) -> bool {
+    fn files(root: &Path) -> Option<std::collections::BTreeMap<PathBuf, u64>> {
+        let mut found = std::collections::BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir).ok()? {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).ok()?;
+                if metadata.is_dir() {
+                    pending.push(path);
+                } else if metadata.is_file() {
+                    let marker = path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("scummvm"));
+                    if !marker {
+                        found.insert(path.strip_prefix(root).ok()?.to_path_buf(), metadata.len());
+                    }
+                } else {
+                    return None;
+                }
+            }
+        }
+        Some(found)
+    }
+    fn same_bytes(left: &Path, right: &Path) -> Option<bool> {
+        use std::io::Read;
+        let (mut a, mut b) = (fs::File::open(left).ok()?, fs::File::open(right).ok()?);
+        let (mut x, mut y) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+        loop {
+            let n = a.read(&mut x).ok()?;
+            if n == 0 {
+                return Some(b.read(&mut y[..1]).ok()? == 0);
+            }
+            b.read_exact(&mut y[..n]).ok()?;
+            if x[..n] != y[..n] {
+                return Some(false);
+            }
+        }
+    }
+    if left == right {
+        return false;
+    }
+    let (Some(a), Some(b)) = (files(left), files(right)) else {
+        return false;
+    };
+    !a.is_empty()
+        && a == b
+        && a
+            .keys()
+            .all(|name| same_bytes(&left.join(name), &right.join(name)) == Some(true))
+}
+
+/// New game folders that are byte-identical copies of another folder with the
+/// same verified ScummVM identity, as `(copy, kept)` pairs. Folders that
+/// already have a row are never in the result (their identities stay as
+/// recorded); among new copies the first path in sort order is kept, so repeat
+/// scans choose the same one. Different editions are not identical, so they
+/// stay separate games.
+pub fn identical_new_copies(
+    games: &[DiscoveredScummVmGame],
+    has_row: impl Fn(&Path) -> bool,
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut by_id: std::collections::BTreeMap<(&str, &str), Vec<&Path>> = Default::default();
+    for found in games {
+        by_id
+            .entry((found.game.engine_id.as_str(), found.game.game_id.as_str()))
+            .or_default()
+            .push(&found.path);
+    }
+    let mut copies = Vec::new();
+    for (_, mut paths) in by_id {
+        if paths.len() < 2 {
+            continue;
+        }
+        paths.sort();
+        let (mut kept, new): (Vec<&Path>, Vec<&Path>) =
+            paths.into_iter().partition(|path| has_row(path));
+        for candidate in new {
+            match kept
+                .iter()
+                .find(|reference| identical_game_folders(reference, candidate))
+            {
+                Some(reference) => copies.push((candidate.to_path_buf(), reference.to_path_buf())),
+                None => kept.push(candidate),
+            }
+        }
+    }
+    copies
 }
 
 fn same_game_folders(games: &[DiscoveredScummVmGame]) -> Vec<(String, Vec<PathBuf>)> {
@@ -2021,6 +2117,80 @@ queen:queen                    Flight of the Amazon Queen (CD/DOS/English)      
         );
         assert!(found.unreadable.is_empty());
         assert_eq!(found.games.len(), 1);
+    }
+
+    #[test]
+    fn identical_folders_ignore_only_the_scummvm_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name: &str, extra: &[(&str, &[u8])]| {
+            let path = dir.path().join(name);
+            fs::create_dir_all(path.join("sub")).unwrap();
+            fs::write(path.join("RESOURCE.000"), b"data").unwrap();
+            fs::write(path.join("sub/SPEECH.BIN"), vec![7u8; 200_000]).unwrap();
+            fs::write(path.join(format!("{name}.scummvm")), name).unwrap();
+            for (file, bytes) in extra {
+                fs::write(path.join(file), bytes).unwrap();
+            }
+            path
+        };
+        let a = make("qfg1", &[]);
+        let b = make("Quest for Glory 1 (Floppy)", &[]);
+        assert!(identical_game_folders(&a, &b));
+        assert!(!identical_game_folders(&a, &a), "a folder is not its own copy");
+        let extra = make("with-extra", &[("PATCH.000", b"p")]);
+        assert!(!identical_game_folders(&a, &extra));
+        let edited = make("edited", &[]);
+        let mut bytes = vec![7u8; 200_000];
+        bytes[150_000] = 8;
+        fs::write(edited.join("sub/SPEECH.BIN"), bytes).unwrap();
+        assert!(!identical_game_folders(&a, &edited), "one byte differs");
+        #[cfg(unix)]
+        {
+            let linked = make("linked", &[]);
+            fs::remove_file(linked.join("RESOURCE.000")).unwrap();
+            std::os::unix::fs::symlink(a.join("RESOURCE.000"), linked.join("RESOURCE.000")).unwrap();
+            assert!(!identical_game_folders(&a, &linked), "unproven is different");
+        }
+    }
+
+    #[test]
+    fn only_new_identical_copies_are_held_back_and_the_choice_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = |name: &str, data: &[u8]| {
+            let path = dir.path().join(name);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("RESOURCE.000"), data).unwrap();
+            path
+        };
+        let game = |path: &Path, id: &str| DiscoveredScummVmGame {
+            path: path.to_path_buf(),
+            game: ScummVmDetectedGame {
+                game_id: id.into(),
+                engine_id: "sci".into(),
+                description: None,
+                platform: None,
+                language: None,
+                variant: None,
+                demo: None,
+                unknown_variant: false,
+            },
+        };
+        let long = folder("Quest for Glory 1 (Floppy)", b"qfg");
+        let short = folder("qfg1", b"qfg");
+        let edition = folder("qfg1 (German)", b"qfg-de");
+        let games = [game(&short, "qfg1vga"), game(&long, "qfg1vga"), game(&edition, "qfg1vga")];
+        // Both new: the first path in sort order is kept; the other edition stays.
+        assert_eq!(identical_new_copies(&games, |_| false), [(short.clone(), long.clone())]);
+        // An already-catalogued folder is the one kept, wherever it sorts.
+        assert_eq!(
+            identical_new_copies(&games, |path| path == short),
+            [(long.clone(), short.clone())]
+        );
+        // Folders that already have rows are left exactly as recorded.
+        assert!(identical_new_copies(&games, |path| path != edition).is_empty());
+        // A different game id is never compared.
+        let other = [game(&short, "qfg1vga"), game(&long, "qfg2")];
+        assert!(identical_new_copies(&other, |_| false).is_empty());
     }
 
     /// A fake ScummVM printing rows with ScummVM's own `%-30s %-58s %s`
