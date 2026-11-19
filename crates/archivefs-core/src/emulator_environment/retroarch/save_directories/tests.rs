@@ -200,3 +200,42 @@ fn unreadable_override_is_uncheckable_not_ignored() {
             .all(|x| x.status == SaveDirectoryStatus::Uncheckable && x.directory.is_none())
     );
 }
+
+#[test]
+fn default_values_are_unset_and_an_unresolvable_override_folder_is_reported() {
+    let f = Fixture::new();
+    let core_dir = f.root.join("ra/config/Mesen");
+    fs::create_dir_all(&core_dir).unwrap();
+    fs::create_dir_all(f.root.join("elsewhere")).unwrap();
+    fs::write(
+        core_dir.join("Mesen.cfg"),
+        format!(
+            "savefile_directory = \"{}\"\n",
+            f.root.join("elsewhere").display()
+        ),
+    )
+    .unwrap();
+    // "default" save folders are unset; a "default" override folder is the
+    // normal <config dir>/config, so the Mesen override is still read.
+    let found = f.discover(
+        &[
+            ("savefile_directory", "default".into()),
+            ("rgui_config_directory", "default".into()),
+        ],
+        &["Mesen"],
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(
+        status_of(&found, "savefile_directory", Some("Mesen")),
+        SaveDirectoryStatus::Usable
+    );
+    // An override folder that cannot be resolved makes every core's
+    // override uncheckable instead of silently skipping it.
+    let found = f.discover(&[("rgui_config_directory", ":/config".into())], &["Mesen"]);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(
+        found
+            .iter()
+            .all(|x| x.status == SaveDirectoryStatus::Uncheckable)
+    );
+}

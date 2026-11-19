@@ -65,6 +65,7 @@ pub(super) fn fixture(context: &egui::Context) -> App {
         indices: Vec::new(),
         filter: Filter::default(),
         collections: Default::default(),
+        game_rename: Default::default(),
         filter_generation: 0,
         filter_inflight: false,
         big_picture: None,

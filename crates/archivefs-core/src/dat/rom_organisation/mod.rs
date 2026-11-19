@@ -31,10 +31,13 @@
 //! organise an existing symlink object only, or build a linked library from
 //! untouched regular sources.
 
+pub mod game_rename;
 pub mod model;
 pub mod plan;
 pub mod transaction;
 
+#[cfg(test)]
+mod game_rename_tests;
 #[cfg(test)]
 mod linked_library_tests;
 #[cfg(test)]

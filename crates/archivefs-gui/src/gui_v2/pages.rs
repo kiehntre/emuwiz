@@ -3408,7 +3408,20 @@ impl App {
     /// "More for this game": the existing per-game pages, and Open Folder.
     fn detail_more(&mut self, ui: &mut egui::Ui, game: &Game) {
         let id = game.archive.id;
-        ui.label(RichText::new("More for this game").color(theme::muted(ui)));
+        // Rename sits on the heading line so the action grid keeps its
+        // rows (and the facts stay on a short window's first screen).
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("More for this game").color(theme::muted(ui)));
+            if ui
+                .small_button("Rename…")
+                .on_hover_text(
+                    "Rename this game's file. You see exactly what changes first; Undo is in History.",
+                )
+                .clicked()
+            {
+                self.game_rename.open(game);
+            }
+        });
         let button_width = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0)
             .clamp(140.0, 240.0)
             .min(ui.available_width());
@@ -3465,6 +3478,7 @@ impl App {
                 self.send(job, Command::OpenFolder(game.archive.absolute_path.clone()));
             }
         });
+        self.game_rename_card(ui, game);
     }
 
     /// Picture retry, description, screenshots, saves, documents and the
