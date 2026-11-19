@@ -4,11 +4,15 @@
 -- one row per reason (zeros included) for every source it walked; a run or
 -- source without rows did not record a breakdown (older runs, sources that
 -- could not be walked), which readers report as "not recorded", never as 0.
+-- The reason list is closed: a new reason needs a new migration, which an
+-- older build refuses, so an older build never meets a reason it cannot name.
 -- Additive: no existing table or row changes.
 CREATE TABLE scan_run_skip_counts (
     scan_run_id      INTEGER NOT NULL REFERENCES scan_runs(id),
     source_folder_id INTEGER NOT NULL REFERENCES source_folders(id),
-    reason           TEXT NOT NULL,
+    reason           TEXT NOT NULL CHECK (reason IN ('unsupported_extension',
+                         'unsupported_variant', 'invalid_content',
+                         'ambiguous_platform', 'identical_copy')),
     file_count       INTEGER NOT NULL CHECK (file_count >= 0),
     PRIMARY KEY (scan_run_id, source_folder_id, reason)
 ) WITHOUT ROWID;

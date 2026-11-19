@@ -3698,7 +3698,9 @@ struct LibraryScanReport {
     archives_missing: i64,
     /// Exact skipped-file totals per reason, as the scan stored them
     /// (schema 30). `null` only when the run recorded no breakdown.
-    skipped_unsupported_extension: Option<u64>,
+    /// Unsupported formats only (not the coarse database column of the
+    /// historical name, which also held variants, invalid content and copies).
+    skipped_unsupported_format: Option<u64>,
     skipped_unsupported_variant: Option<u64>,
     skipped_invalid_content: Option<u64>,
     skipped_ambiguous_platform: Option<u64>,
@@ -3729,7 +3731,7 @@ impl From<&ScanPersistSummary> for LibraryScanReport {
             archives_restored: summary.counts.archives_restored,
             archives_unchanged: summary.counts.archives_unchanged,
             archives_missing: summary.counts.archives_missing,
-            skipped_unsupported_extension: skip.map(|c| c.unsupported_extension),
+            skipped_unsupported_format: skip.map(|c| c.unsupported_extension),
             skipped_unsupported_variant: skip.map(|c| c.unsupported_variant),
             skipped_invalid_content: skip.map(|c| c.invalid_content),
             skipped_ambiguous_platform: skip.map(|c| c.ambiguous_platform),
@@ -3798,7 +3800,7 @@ fn format_library_scan(report: &LibraryScanReport) -> String {
     output.push_str("\nSkipped files:\n");
     let shown = |value: Option<u64>| value.map_or_else(|| "not recorded".into(), |v| v.to_string());
     for (label, value) in [
-        ("Unsupported format", report.skipped_unsupported_extension),
+        ("Unsupported format", report.skipped_unsupported_format),
         ("Unsupported variant", report.skipped_unsupported_variant),
         ("Invalid content", report.skipped_invalid_content),
         ("Ambiguous platform", report.skipped_ambiguous_platform),
@@ -8164,7 +8166,7 @@ mod tests {
         }
         // Per-reason skip totals (follow-up 8), added without renaming any field.
         for field in [
-            "skipped_unsupported_extension",
+            "skipped_unsupported_format",
             "skipped_unsupported_variant",
             "skipped_invalid_content",
             "skipped_ambiguous_platform",
@@ -8224,7 +8226,7 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&format_library_scan_json(&report).unwrap()).unwrap();
         assert_eq!(json["skipped_identical_copies"], 356);
-        assert_eq!(json["skipped_unsupported_extension"], 277_000);
+        assert_eq!(json["skipped_unsupported_format"], 277_000);
         // A run without a stored breakdown says so instead of inventing zeros.
         let mut legacy = summary;
         legacy.counts.skip_reasons = None;

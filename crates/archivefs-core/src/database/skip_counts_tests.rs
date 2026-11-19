@@ -346,6 +346,15 @@ fn attention_uses_the_latest_completed_runs_stored_totals_for_every_reason() {
             ("discovery:5".to_string(), C::Unsupported, S::Warning, 1),
         ]
     );
+    // A catalogue presence reconciliation is recorded as a completed run with
+    // no scan counters; it must not stand in for the scan with zeros.
+    database
+        .connection
+        .execute_batch(
+            "INSERT INTO scan_runs(id,started_at,finished_at,triggered_by,status) VALUES(5,'2026-02-02T00:00:00Z','2026-02-02T00:00:00Z','catalogue-presence-reconciliation','completed');",
+        )
+        .unwrap();
+    assert_eq!(discovery_items(&database).len(), 5);
     let snapshot = database.attention_snapshot().unwrap();
     let duplicates = snapshot
         .items()
@@ -361,6 +370,102 @@ fn attention_uses_the_latest_completed_runs_stored_totals_for_every_reason() {
         !snapshot
             .items()
             .any(|item| item.title.contains("breakdown not recorded"))
+    );
+    // The reason list is closed in the schema: nothing can store a reason
+    // this version cannot name.
+    let refused = database.connection.execute(
+        "INSERT INTO scan_run_skip_counts(scan_run_id,source_folder_id,reason,file_count) VALUES(2,1,'something_new',1)",
+        [],
+    );
+    assert!(refused.is_err(), "{refused:?}");
+}
+
+fn recorded_rows(database: &Database) -> i64 {
+    database
+        .connection
+        .query_row("SELECT COUNT(*) FROM scan_run_skip_counts", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+/// A real scan that fails at commit rolls its totals back with it, and a run
+/// in which one source cannot be walked records only the walked source.
+#[test]
+fn a_rolled_back_scan_leaves_no_totals_and_a_missing_source_records_none() {
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("games-a");
+    let second = root.path().join("games-b");
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&second).unwrap();
+    fs::write(first.join("a.xyz"), b"a").unwrap();
+    identical_copies(&first.join("atari2600"), 1);
+    fs::write(second.join("b.xyz"), b"b").unwrap();
+    let config = config(&[first.clone(), second.clone()], root.path());
+    let mut database = Database::open_or_create(root.path().join("library.sqlite3")).unwrap();
+    let baseline = scan_and_persist(&mut database, &config, "test").unwrap();
+    let rows_after_baseline = recorded_rows(&database);
+    assert!(rows_after_baseline > 0);
+
+    // Replace the first source's folder after it was saved, while the second
+    // source is being scanned: the commit check sees a different folder and
+    // rolls the whole scan back, totals included.
+    let parked = root.path().join("games-a.parked");
+    {
+        let (first, parked) = (first.clone(), parked.clone());
+        super::nested_scan::test_hook::after_discovery(move || {
+            // Fires for the first source; arms the swap for the second.
+            super::nested_scan::test_hook::after_discovery(move || {
+                fs::rename(&first, &parked).unwrap();
+                fs::create_dir(&first).unwrap();
+            });
+        });
+    }
+    let failed = scan_and_persist(&mut database, &config, "test");
+    assert!(failed.is_err(), "{:?}", failed.map(|s| s.scan_run_id));
+    assert_eq!(
+        recorded_rows(&database),
+        rows_after_baseline,
+        "rolled back with the scan"
+    );
+    let completed: i64 = database
+        .connection
+        .query_row(
+            "SELECT MAX(id) FROM scan_runs WHERE status='completed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(completed, baseline.scan_run_id);
+    assert!(
+        discovery_items(&database)
+            .iter()
+            .any(|(id, _, _, count)| id == "discovery:3" && *count == 1),
+        "Attention keeps the last completed scan's figures"
+    );
+    fs::remove_dir(&first).unwrap();
+    fs::rename(&parked, &first).unwrap();
+
+    // One source gone: it records nothing, the other keeps exact totals.
+    fs::rename(&second, root.path().join("games-b.away")).unwrap();
+    let partial = scan_and_persist(&mut database, &config, "test").unwrap();
+    assert_eq!(
+        partial.folder_errors.len(),
+        1,
+        "{:?}",
+        partial.folder_errors
+    );
+    let by_source = database
+        .scan_run_skip_counts_by_source(partial.scan_run_id)
+        .unwrap();
+    assert_eq!(by_source.len(), 1, "{by_source:?}");
+    assert_eq!(
+        by_source[&source_id(&database, &first)],
+        SkipReasonCounts {
+            unsupported_extension: 1,
+            identical_copy: 1,
+            ..Default::default()
+        }
     );
 }
 

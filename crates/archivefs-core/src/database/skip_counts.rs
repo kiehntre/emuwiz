@@ -22,14 +22,14 @@ impl Database {
         counts: &SkipReasonCounts,
     ) -> Result<()> {
         // Plain statements: a scan calls this inside its own open transaction,
-        // so these rows commit or roll back together with the scan.
+        // so these rows commit or roll back together with the scan. A plain
+        // INSERT: a source recorded twice in one run is an error, never a
+        // silent overwrite that would part the totals from the coarse columns.
         let mut statement = self
             .connection
             .prepare(
                 "INSERT INTO scan_run_skip_counts(scan_run_id, source_folder_id, reason, file_count)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(scan_run_id, source_folder_id, reason)
-                 DO UPDATE SET file_count = excluded.file_count",
+                 VALUES (?1, ?2, ?3, ?4)",
             )
             .map_err(|e| db_error("prepare skip counts", e))?;
         for (reason, count) in counts.entries() {
@@ -87,8 +87,8 @@ pub(super) fn read_skip_counts_by_source(
     for row in rows {
         let (source, reason, count) = row.map_err(|e| db_error("read skip count", e))?;
         let entry = by_source.entry(source).or_default();
-        // A reason a later version added is not dropped silently: it is not
-        // one this version can name, so it is refused rather than miscounted.
+        // The table's CHECK admits only these five reasons, so an unknown key
+        // means a damaged file: refused rather than miscounted.
         let reason = SkipReason::from_storage_key(&reason).ok_or_else(|| {
             crate::ArchiveFsError::Database(format!(
                 "scan run {scan_run_id} recorded an unknown skip reason {reason:?}"

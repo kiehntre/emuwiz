@@ -169,7 +169,7 @@ impl Database {
         }
         // Scan-owned counters are current for this completed scan, unlike an
         // old fingerprint row that can survive removal of an unsupported file.
-        let mut statement = transaction.prepare("SELECT id, skipped_unsupported_extension, skipped_ambiguous_platform, CAST(strftime('%s', finished_at) AS INTEGER) FROM scan_runs WHERE status = 'completed' ORDER BY id DESC LIMIT 1")
+        let mut statement = transaction.prepare("SELECT id, skipped_unsupported_extension, skipped_ambiguous_platform, CAST(strftime('%s', finished_at) AS INTEGER) FROM scan_runs WHERE status = 'completed' AND triggered_by <> 'catalogue-presence-reconciliation' ORDER BY id DESC LIMIT 1")
             .map_err(|e| db_error("prepare attention discovery summary", e))?;
         let mut rows = statement
             .query([])
