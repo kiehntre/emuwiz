@@ -128,7 +128,10 @@ fn existing_destination_is_refused_at_preview_and_at_apply() {
     let preview = preview_game_rename(&lib.db, &lib.game, "Later", 1, &none()).unwrap();
     let later = lib.root.join("nes").join("Later.nes");
     std::fs::write(&later, b"arrived late").unwrap();
-    assert!(apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel(), &none()).is_err());
+    let refused =
+        apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel(), &none()).unwrap_err();
+    assert!(refused.contains("appeared after the preview"), "{refused}");
+    assert!(refused.contains("nothing is overwritten"), "{refused}");
     assert!(lib.game.exists());
     assert_eq!(std::fs::read(&later).unwrap(), b"arrived late");
     assert_eq!(std::fs::read(&taken).unwrap(), b"someone else");
