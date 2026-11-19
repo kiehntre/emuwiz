@@ -16546,7 +16546,7 @@ echo "$out"
         // Recognised media inside both copies: the kept folder absorbs its
         // own, and the copy's must not turn up as loose rows either.
         for dir in ["scummvm/Queen", "scummvm/queen-copy"] {
-            write_archive_file(&source, &format!("{dir}/bonus.gba"), b"bonus");
+            write_archive_file(&source, format!("{dir}/bonus.gba"), b"bonus");
         }
         let config = config_for(&source, &mount);
         let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
