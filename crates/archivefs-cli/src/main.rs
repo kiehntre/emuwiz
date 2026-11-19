@@ -3696,6 +3696,17 @@ struct LibraryScanReport {
     archives_restored: i64,
     archives_unchanged: i64,
     archives_missing: i64,
+    /// Exact skipped-file totals per reason, as the scan stored them
+    /// (schema 30). `null` only when the run recorded no breakdown.
+    /// Unsupported formats only (not the coarse database column of the
+    /// historical name, which also held variants, invalid content and copies).
+    skipped_unsupported_format: Option<u64>,
+    skipped_unsupported_variant: Option<u64>,
+    skipped_invalid_content: Option<u64>,
+    skipped_ambiguous_platform: Option<u64>,
+    /// Identical copies of catalogued ZIPs: recognised ROMs deliberately not
+    /// catalogued twice, never counted as unsupported.
+    skipped_identical_copies: Option<u64>,
     folder_errors: Vec<FolderErrorView>,
 }
 
@@ -3709,6 +3720,7 @@ impl From<&ScanPersistSummary> for LibraryScanReport {
     fn from(summary: &ScanPersistSummary) -> Self {
         let succeeded = summary.counts.source_folders_scanned;
         let failed = summary.folder_errors.len() as i64;
+        let skip = summary.counts.skip_reasons;
         Self {
             scan_run_id: summary.scan_run_id,
             source_folders_attempted: succeeded + failed,
@@ -3719,6 +3731,11 @@ impl From<&ScanPersistSummary> for LibraryScanReport {
             archives_restored: summary.counts.archives_restored,
             archives_unchanged: summary.counts.archives_unchanged,
             archives_missing: summary.counts.archives_missing,
+            skipped_unsupported_format: skip.map(|c| c.unsupported_extension),
+            skipped_unsupported_variant: skip.map(|c| c.unsupported_variant),
+            skipped_invalid_content: skip.map(|c| c.invalid_content),
+            skipped_ambiguous_platform: skip.map(|c| c.ambiguous_platform),
+            skipped_identical_copies: skip.map(|c| c.identical_copy),
             folder_errors: summary
                 .folder_errors
                 .iter()
@@ -3780,6 +3797,20 @@ fn format_library_scan(report: &LibraryScanReport) -> String {
     output.push_str(&format!("  Restored: {}\n", report.archives_restored));
     output.push_str(&format!("  Unchanged: {}\n", report.archives_unchanged));
     output.push_str(&format!("  Missing: {}\n", report.archives_missing));
+    output.push_str("\nSkipped files:\n");
+    let shown = |value: Option<u64>| value.map_or_else(|| "not recorded".into(), |v| v.to_string());
+    for (label, value) in [
+        ("Unsupported format", report.skipped_unsupported_format),
+        ("Unsupported variant", report.skipped_unsupported_variant),
+        ("Invalid content", report.skipped_invalid_content),
+        ("Ambiguous platform", report.skipped_ambiguous_platform),
+        (
+            "Recognised duplicates (identical copies, not added twice)",
+            report.skipped_identical_copies,
+        ),
+    ] {
+        output.push_str(&format!("  {label}: {}\n", shown(value)));
+    }
     output.push_str("\nErrors:\n");
     if report.folder_errors.is_empty() {
         output.push_str("  none\n");
@@ -8133,9 +8164,79 @@ mod tests {
                 "existing JSON field {field} must remain"
             );
         }
-        assert_eq!(object.len(), 10, "scan JSON compatibility surface changed");
+        // Per-reason skip totals (follow-up 8), added without renaming any field.
+        for field in [
+            "skipped_unsupported_format",
+            "skipped_unsupported_variant",
+            "skipped_invalid_content",
+            "skipped_ambiguous_platform",
+            "skipped_identical_copies",
+        ] {
+            // Recorded by every scan this version makes: exact numbers, never null.
+            assert!(json[field].is_u64(), "skip total {field}: {}", json[field]);
+        }
+        assert_eq!(object.len(), 15, "scan JSON compatibility surface changed");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every skip reason is reported apart from the stored totals; identical
+    /// copies are never shown as unsupported formats.
+    #[test]
+    fn library_scan_report_shows_each_stored_skip_reason_apart() {
+        let summary = ScanPersistSummary {
+            scummvm: Default::default(),
+            scan_run_id: 211,
+            counts: archivefs_core::ScanRunCounts {
+                source_folders_scanned: 1,
+                skipped_unsupported_extension: 277_617,
+                skipped_ambiguous_platform: 996,
+                skip_reasons: Some(archivefs_core::SkipReasonCounts {
+                    unsupported_extension: 277_000,
+                    unsupported_variant: 200,
+                    invalid_content: 61,
+                    ambiguous_platform: 996,
+                    identical_copy: 356,
+                }),
+                ..Default::default()
+            },
+            folder_errors: Vec::new(),
+            platform_assignment_warnings: Vec::new(),
+            preservation_fingerprint_warnings: Vec::new(),
+            skipped_files: Vec::new(),
+            ingestion_stats: Default::default(),
+            ingestion_skip_reasons: Default::default(),
+            ingestion_platform_counts: Default::default(),
+            arcade_ingestion: Default::default(),
+            nested_mounts: Vec::new(),
+            ingestion_skipped: Vec::new(),
+            ingestion_recognised_sample: Vec::new(),
+        };
+        let report = LibraryScanReport::from(&summary);
+        let text = format_library_scan(&report);
+        for line in [
+            "  Unsupported format: 277000\n",
+            "  Unsupported variant: 200\n",
+            "  Invalid content: 61\n",
+            "  Ambiguous platform: 996\n",
+            "  Recognised duplicates (identical copies, not added twice): 356\n",
+        ] {
+            assert!(text.contains(line), "{line:?} in {text}");
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(&format_library_scan_json(&report).unwrap()).unwrap();
+        assert_eq!(json["skipped_identical_copies"], 356);
+        assert_eq!(json["skipped_unsupported_format"], 277_000);
+        // A run without a stored breakdown says so instead of inventing zeros.
+        let mut legacy = summary;
+        legacy.counts.skip_reasons = None;
+        let report = LibraryScanReport::from(&legacy);
+        assert!(format_library_scan(&report).contains(
+            "  Recognised duplicates (identical copies, not added twice): not recorded\n"
+        ));
+        let json: serde_json::Value =
+            serde_json::from_str(&format_library_scan_json(&report).unwrap()).unwrap();
+        assert!(json["skipped_identical_copies"].is_null());
     }
 
     #[test]

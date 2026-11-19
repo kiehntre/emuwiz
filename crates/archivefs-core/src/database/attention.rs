@@ -169,7 +169,7 @@ impl Database {
         }
         // Scan-owned counters are current for this completed scan, unlike an
         // old fingerprint row that can survive removal of an unsupported file.
-        let mut statement = transaction.prepare("SELECT id, skipped_unsupported_extension, skipped_ambiguous_platform, CAST(strftime('%s', finished_at) AS INTEGER), started_at, finished_at FROM scan_runs WHERE status = 'completed' ORDER BY id DESC LIMIT 1")
+        let mut statement = transaction.prepare("SELECT id, skipped_unsupported_extension, skipped_ambiguous_platform, CAST(strftime('%s', finished_at) AS INTEGER) FROM scan_runs WHERE status = 'completed' AND triggered_by <> 'catalogue-presence-reconciliation' ORDER BY id DESC LIMIT 1")
             .map_err(|e| db_error("prepare attention discovery summary", e))?;
         let mut rows = statement
             .query([])
@@ -182,84 +182,60 @@ impl Database {
             let id: i64 = row
                 .get(0)
                 .map_err(|e| db_error("read attention scan id", e))?;
-            let started: Option<String> = row
-                .get(4)
-                .map_err(|e| db_error("read attention scan start", e))?;
-            let finished: Option<String> = row
-                .get(5)
-                .map_err(|e| db_error("read attention scan finish", e))?;
-            let unsupported_counter = row
-                .get::<_, i64>(1)
-                .map_err(|e| db_error("read attention discovery count", e))?
-                .max(0) as u64;
-            // Loose cartridges proven identical to a catalogued ZIP are kept
-            // in the historical unsupported counter (no schema change), but
-            // they are recognised ROMs deliberately not catalogued twice. The
-            // run's own fingerprint verdicts (rewritten every scan) say how
-            // many there were, so they are shown apart, never as unsupported.
-            let identical_copies = match (&started, &finished) {
-                (Some(started), Some(finished)) => transaction
-                    .query_row(
-                        "SELECT COUNT(*) FROM scan_fingerprints WHERE non_archive_kind = 'identical_copy' AND updated_at >= ?1 AND updated_at <= ?2",
-                        [started, finished],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map_err(|e| db_error("count attention identical copies", e))?
-                    .max(0) as u64,
-                _ => 0,
-            }
-            .min(unsupported_counter);
+            let observed: Option<i64> = row
+                .get(3)
+                .map_err(|e| db_error("read attention scan time", e))?;
+            let column = |index: usize| -> crate::Result<u64> {
+                Ok(row
+                    .get::<_, i64>(index)
+                    .map_err(|e| db_error("read attention discovery count", e))?
+                    .max(0) as u64)
+            };
+            // Exact per-reason totals stored by the scan itself (schema 30).
+            let stored = super::skip_counts::read_skip_counts(&transaction, id)?;
             snapshot.query_count += 1;
-            for (column, category, severity, label) in [
-                (
-                    1,
-                    C::Unsupported,
-                    S::Warning,
-                    "files have unsupported formats",
-                ),
-                (
-                    2,
-                    C::Identity,
-                    S::Warning,
-                    "files have ambiguous platform identity",
-                ),
-                (
-                    3,
-                    C::Duplicates,
-                    S::Info,
-                    "recognised ROMs are identical copies of catalogued ZIPs",
-                ),
-            ] {
-                let count = match column {
-                    1 => unsupported_counter - identical_copies,
-                    3 => identical_copies,
-                    _ => row
-                        .get::<_, i64>(column)
-                        .map_err(|e| db_error("read attention discovery count", e))?
-                        .max(0) as u64,
-                };
+            let entries: Vec<DiscoveryItem> = match stored {
+                Some(counts) => discovery_items(&counts),
+                // A scan made before schema 30 kept only two coarse counters:
+                // its "unsupported" figure also holds unsupported variants,
+                // invalid content and identical copies, so it is labelled as
+                // such rather than presented as unsupported formats.
+                None => vec![
+                    (
+                        "1",
+                        C::Unsupported,
+                        S::Warning,
+                        column(1)?,
+                        "files were skipped as unsupported, invalid or alternate copies (breakdown not recorded for this scan)",
+                        "This scan predates per-reason totals, so the reasons inside this figure are not available. A new scan records them.",
+                    ),
+                    (
+                        "2",
+                        C::Identity,
+                        S::Warning,
+                        column(2)?,
+                        "files have ambiguous platform identity",
+                        RECORDED_SUMMARY,
+                    ),
+                ],
+            };
+            for (key, category, severity, count, label, summary) in entries {
                 if count == 0 {
                     continue;
                 }
                 let mut item = AttentionItem::new(
-                    format!("discovery:{column}"),
+                    format!("discovery:{key}"),
                     category,
                     severity,
                     format!("{count} {label}"),
                     D::Discovery,
                 );
                 item.affected_count = count;
-                item.last_observed = row
-                    .get(3)
-                    .map_err(|e| db_error("read attention scan time", e))?;
+                item.last_observed = observed;
                 item.source_records.push(format!("scan_runs:{id}"));
-                item.summary = if column == 3 {
-                    "Loose cartridge files byte-identical to the only file of a ZIP the library already catalogues. They are alternate copies, not catalogued twice; no file was changed. Filter the scan's skipped files by \"Identical copy of a catalogued ZIP\" for paths.".into()
-                } else {
-                    "Recorded by the latest completed scan. Review its discovery details for paths and reasons; other source roots may not have been scanned in that run.".into()
-                };
-                item.provenance = if column == 3 {
-                    "This scan's identical-copy verdicts (scan fingerprints)".into()
+                item.summary = summary.into();
+                item.provenance = if stored.is_some() {
+                    "Exact per-reason totals stored by the completed scan".into()
                 } else {
                     "Completed scan counters (not inferred from error text)".into()
                 };
@@ -283,4 +259,56 @@ impl Database {
         snapshot.coverage_notes.push("DAT coverage here is saved identity/audit evidence, not collection completeness. Expected/missing sets remain in DAT coverage review.".into());
         Ok(snapshot)
     }
+}
+
+/// (id key, category, severity, count, title after the count, summary)
+type DiscoveryItem = (&'static str, C, S, u64, &'static str, &'static str);
+
+const RECORDED_SUMMARY: &str = "Recorded by the latest completed scan. Review its discovery details for paths and reasons; other source roots may not have been scanned in that run.";
+
+/// One Attention item per skip reason, from a scan's exact stored totals.
+/// The keys `1` and `2` keep the ids the coarse counters always used.
+fn discovery_items(counts: &crate::SkipReasonCounts) -> Vec<DiscoveryItem> {
+    vec![
+        (
+            "1",
+            C::Unsupported,
+            S::Warning,
+            counts.unsupported_extension,
+            "files have unsupported formats",
+            RECORDED_SUMMARY,
+        ),
+        (
+            "4",
+            C::Unsupported,
+            S::Warning,
+            counts.unsupported_variant,
+            "files are recognised formats in a variant EmuWiz does not read",
+            "Not damage: the format was recognised, but this version or variant of it is outside what EmuWiz reads. Review the scan's skipped files for paths.",
+        ),
+        (
+            "5",
+            C::Unsupported,
+            S::Warning,
+            counts.invalid_content,
+            "files failed their format's structure check",
+            "The extension names a format these files do not hold, or the file is damaged. Review the scan's skipped files for paths.",
+        ),
+        (
+            "2",
+            C::Identity,
+            S::Warning,
+            counts.ambiguous_platform,
+            "files have ambiguous platform identity",
+            RECORDED_SUMMARY,
+        ),
+        (
+            "3",
+            C::Duplicates,
+            S::Info,
+            counts.identical_copy,
+            "recognised ROMs are identical copies of catalogued ZIPs",
+            "Loose cartridge files byte-identical to the only file of a ZIP the library already catalogues. They are alternate copies, not catalogued twice; no file was changed. Filter the scan's skipped files by \"Identical copy of a catalogued ZIP\" for paths.",
+        ),
+    ]
 }

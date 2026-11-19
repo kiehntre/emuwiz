@@ -81,15 +81,14 @@ pub(crate) fn scummvm_scan_lines(report: &ScummVmScanReport) -> Vec<String> {
 
 pub(crate) fn format_scan_completion(summary: &ScanPersistSummary) -> String {
     format!(
-        "Scan completed\nSeen: {}\nAdded: {}\nUpdated: {} (including {} restored)\nNewly missing: {}\nUnchanged: {}\nSkipped unsupported: {}\nSkipped ambiguous: {}\nErrors: {}",
+        "Scan completed\nSeen: {}\nAdded: {}\nUpdated: {} (including {} restored)\nNewly missing: {}\nUnchanged: {}\n{}\nErrors: {}",
         summary.counts.archives_seen,
         summary.counts.archives_added,
         summary.counts.archives_updated,
         summary.counts.archives_restored,
         summary.counts.archives_missing,
         summary.counts.archives_unchanged,
-        summary.counts.skipped_unsupported_extension,
-        summary.counts.skipped_ambiguous_platform,
+        skipped_lines(&summary.counts),
         summary.counts.errors_count,
     ) + &scummvm_scan_lines(&summary.scummvm)
         .into_iter()
@@ -97,9 +96,52 @@ pub(crate) fn format_scan_completion(summary: &ScanPersistSummary) -> String {
         .collect::<String>()
 }
 
+/// Skipped-file lines of the scan report, one per reason, from the totals the
+/// scan stored. A run without a stored breakdown says so, never inventing one.
+fn skipped_lines(counts: &archivefs_core::ScanRunCounts) -> String {
+    match counts.skip_reasons {
+        Some(c) => format!(
+            "Skipped unsupported format: {}\nSkipped unsupported variant: {}\nSkipped invalid content: {}\nSkipped ambiguous: {}\nRecognised duplicates (identical copies of catalogued ZIPs, not added twice): {}",
+            c.unsupported_extension,
+            c.unsupported_variant,
+            c.invalid_content,
+            c.ambiguous_platform,
+            c.identical_copy,
+        ),
+        None => format!(
+            "Skipped unsupported, invalid or alternate copies (breakdown not recorded): {}\nSkipped ambiguous: {}",
+            counts.skipped_unsupported_extension, counts.skipped_ambiguous_platform,
+        ),
+    }
+}
+
+/// " (5 unsupported format, 3 recognised duplicates)" for the reasons that
+/// occurred, or nothing when no breakdown was stored or nothing was skipped.
+fn skipped_breakdown(counts: &archivefs_core::ScanRunCounts) -> String {
+    let Some(c) = counts.skip_reasons else {
+        return String::new();
+    };
+    let parts: Vec<String> = [
+        (c.unsupported_extension, "unsupported format"),
+        (c.unsupported_variant, "unsupported variant"),
+        (c.invalid_content, "invalid content"),
+        (c.ambiguous_platform, "ambiguous"),
+        (c.identical_copy, "recognised duplicates"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, label)| format!("{count} {label}"))
+    .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
 pub(crate) fn format_scan_activity(summary: &ScanPersistSummary) -> String {
     format!(
-        "Scan completed: seen {}, added {}, updated {} (including {} restored), newly missing {}, unchanged {}, skipped {}, errors {}.",
+        "Scan completed: seen {}, added {}, updated {} (including {} restored), newly missing {}, unchanged {}, skipped {}{}, errors {}.",
         summary.counts.archives_seen,
         summary.counts.archives_added,
         summary.counts.archives_updated,
@@ -107,6 +149,7 @@ pub(crate) fn format_scan_activity(summary: &ScanPersistSummary) -> String {
         summary.counts.archives_missing,
         summary.counts.archives_unchanged,
         summary.counts.skipped_unsupported_extension + summary.counts.skipped_ambiguous_platform,
+        skipped_breakdown(&summary.counts),
         summary.counts.errors_count,
     ) + &if summary.scummvm.detector_available {
         format!(

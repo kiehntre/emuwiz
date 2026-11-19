@@ -28,6 +28,7 @@ fn counts(errors: i64) -> RecordedScanCounts {
         archives_unchanged: Some(100_690),
         skipped_unsupported_extension: Some(277_261),
         skipped_ambiguous_platform: Some(1_592),
+        skip_reasons: None,
     }
 }
 
@@ -384,4 +385,32 @@ fn an_upgrade_scan_is_shown_and_the_history_waits_for_it() {
     // Once it ends, the history loads.
     rendered(&mut state, None, false);
     assert!(state.loading());
+}
+
+#[test]
+fn a_stored_breakdown_names_recognised_duplicates_in_the_skipped_total() {
+    let recorded = RecordedScanCounts {
+        skipped_unsupported_extension: Some(277_617),
+        skipped_ambiguous_platform: Some(996),
+        skip_reasons: Some(archivefs_core::SkipReasonCounts {
+            unsupported_extension: 277_000,
+            unsupported_variant: 200,
+            invalid_content: 61,
+            ambiguous_platform: 996,
+            identical_copy: 356,
+        }),
+        ..counts(0)
+    };
+    let text = counts_text(Some(&recorded));
+    assert!(
+        text.contains("278,613 (including 356 recognised duplicates) skipped"),
+        "{text}"
+    );
+    // Without a stored breakdown the coarse total stays, with no invented split.
+    let older = RecordedScanCounts {
+        skip_reasons: None,
+        ..recorded
+    };
+    let text = counts_text(Some(&older));
+    assert!(!text.contains("recognised duplicates"), "{text}");
 }

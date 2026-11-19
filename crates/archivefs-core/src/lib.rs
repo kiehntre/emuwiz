@@ -6270,6 +6270,33 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
+    /// Every reason, in the order reports list them.
+    pub const ALL: [SkipReason; 5] = [
+        Self::UnsupportedExtension,
+        Self::UnsupportedVariant,
+        Self::InvalidContent,
+        Self::AmbiguousPlatform,
+        Self::IdenticalCopy,
+    ];
+
+    /// The stable key stored in `scan_run_skip_counts.reason` (schema 30).
+    /// Never rename one: stored rows outlive the binary that wrote them.
+    pub fn storage_key(self) -> &'static str {
+        match self {
+            Self::UnsupportedExtension => "unsupported_extension",
+            Self::InvalidContent => "invalid_content",
+            Self::UnsupportedVariant => "unsupported_variant",
+            Self::AmbiguousPlatform => "ambiguous_platform",
+            Self::IdenticalCopy => "identical_copy",
+        }
+    }
+
+    pub fn from_storage_key(key: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|reason| reason.storage_key() == key)
+    }
+
     /// A short, human-readable label - what a GUI shows for this reason.
     pub fn label(self) -> &'static str {
         match self {
@@ -6279,6 +6306,66 @@ impl SkipReason {
             Self::AmbiguousPlatform => "Ambiguous platform",
             Self::IdenticalCopy => "Identical copy of a catalogued ZIP",
         }
+    }
+}
+
+/// Exact skipped-file totals per [`SkipReason`]. Counted for every skipped
+/// file, so unlike the bounded samples they are never truncated; schema 30
+/// stores them per scan run and source (`scan_run_skip_counts`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkipReasonCounts {
+    pub unsupported_extension: u64,
+    pub unsupported_variant: u64,
+    pub invalid_content: u64,
+    pub ambiguous_platform: u64,
+    pub identical_copy: u64,
+}
+
+impl SkipReasonCounts {
+    pub fn get(&self, reason: SkipReason) -> u64 {
+        match reason {
+            SkipReason::UnsupportedExtension => self.unsupported_extension,
+            SkipReason::UnsupportedVariant => self.unsupported_variant,
+            SkipReason::InvalidContent => self.invalid_content,
+            SkipReason::AmbiguousPlatform => self.ambiguous_platform,
+            SkipReason::IdenticalCopy => self.identical_copy,
+        }
+    }
+
+    fn slot(&mut self, reason: SkipReason) -> &mut u64 {
+        match reason {
+            SkipReason::UnsupportedExtension => &mut self.unsupported_extension,
+            SkipReason::UnsupportedVariant => &mut self.unsupported_variant,
+            SkipReason::InvalidContent => &mut self.invalid_content,
+            SkipReason::AmbiguousPlatform => &mut self.ambiguous_platform,
+            SkipReason::IdenticalCopy => &mut self.identical_copy,
+        }
+    }
+
+    pub fn record(&mut self, reason: SkipReason) {
+        *self.slot(reason) += 1;
+    }
+
+    pub fn set(&mut self, reason: SkipReason, count: u64) {
+        *self.slot(reason) = count;
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        for reason in SkipReason::ALL {
+            *self.slot(reason) += other.get(reason);
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        SkipReason::ALL
+            .into_iter()
+            .map(|reason| self.get(reason))
+            .sum()
+    }
+
+    /// `(reason, count)` for every reason, in [`SkipReason::ALL`] order.
+    pub fn entries(&self) -> [(SkipReason, u64); 5] {
+        SkipReason::ALL.map(|reason| (reason, self.get(reason)))
     }
 }
 
@@ -6298,6 +6385,10 @@ pub struct ArchiveScanDiscovery {
     pub archives: Vec<Archive>,
     pub skipped_unsupported_extension: usize,
     pub skipped_ambiguous_platform: usize,
+    /// Exact totals per [`SkipReason`] for the whole walk, independent of
+    /// every bounded sample (`skipped_files`, `non_archive_fingerprints`).
+    /// The two historical counters above are coarser projections of these.
+    pub skip_reason_counts: SkipReasonCounts,
     /// A bounded (see [`MAX_RETAINED_SKIPPED_FILES`]) sample of individual
     /// skipped files, for GUI drill-down. The exact totals always live in
     /// `skipped_unsupported_extension`/`skipped_ambiguous_platform` - this
@@ -6833,6 +6924,7 @@ impl<'a> ArchiveScanner<'a> {
                         discovery.skipped_unsupported_extension += 1;
                         SkipReason::UnsupportedExtension
                     };
+                    discovery.skip_reason_counts.record(reason);
                     // Bounded: the counters above always stay exact for the
                     // whole scan, but the retained detail list never grows
                     // past `MAX_RETAINED_SKIPPED_FILES` - see
