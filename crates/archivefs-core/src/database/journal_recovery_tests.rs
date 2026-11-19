@@ -129,7 +129,7 @@ fn prepare_changes_nothing_in_the_library_and_the_guard_still_refuses() {
     assert_eq!(receipt.state, JournalRecoveryState::Prepared);
     assert!(receipt.journal_restored_content);
     assert!(receipt.opens_as_current_library);
-    assert_eq!(receipt.schema_version, 29);
+    assert_eq!(receipt.schema_version, 30);
     // The live database and journal are byte for byte what they were, and
     // EmuWiz still will not open them.
     assert_eq!(library_files(temp.path()), before);

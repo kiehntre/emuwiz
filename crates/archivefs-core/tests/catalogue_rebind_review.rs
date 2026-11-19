@@ -638,7 +638,7 @@ fn downgrade_to_21(connection: &Connection) {
     }
     connection
         .execute_batch(
-            "DROP TABLE IF EXISTS dat_catalogue_set_no_matches; DROP TABLE IF EXISTS dat_catalogue_sets; \
+            "DROP TABLE IF EXISTS scan_run_skip_counts; DROP TABLE IF EXISTS dat_catalogue_set_no_matches; DROP TABLE IF EXISTS dat_catalogue_sets; \
              DROP TABLE IF EXISTS game_collection_items; DROP TABLE IF EXISTS game_collections; \
              DROP TABLE IF EXISTS library_dat_identity_history; DROP TABLE IF EXISTS dat_recheck_attempts; \
              DROP TABLE discovery_import_records; DROP TABLE discovery_import_operations; \
@@ -664,7 +664,7 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
 
     archivefs_core::upgrade_library_database(&path).unwrap();
     let db = Database::open_or_create(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 29);
+    assert_eq!(db.schema_version().unwrap(), 30);
     let sql = Connection::open(&path).unwrap();
     // Historical tables are preserved row for row; the new ones start empty.
     let after = everything_but_bindings(&sql);
@@ -681,7 +681,7 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(versions(&sql), (1..=29).collect::<Vec<_>>());
+    assert_eq!(versions(&sql), (1..=30).collect::<Vec<_>>());
     assert_eq!(binding_rows(&sql), 0, "migration must not bind any source");
     assert_eq!(
         sql.query_row("SELECT COUNT(*) FROM source_nested_boundaries", [], |r| r
@@ -735,7 +735,7 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
     drop(db);
     let reopened = everything_but_bindings(&Connection::open(&path).unwrap());
     let db = Database::open_or_create(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 29);
+    assert_eq!(db.schema_version().unwrap(), 30);
     assert_eq!(
         everything_but_bindings(&Connection::open(&path).unwrap()),
         reopened

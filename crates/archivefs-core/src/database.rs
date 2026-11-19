@@ -75,6 +75,10 @@ mod collections_tests;
 #[path = "database/collections_upgrade_tests.rs"]
 mod collections_upgrade_tests;
 mod discovery_import;
+mod skip_counts;
+#[cfg(test)]
+#[path = "database/skip_counts_tests.rs"]
+mod skip_counts_tests;
 pub use collections::{
     CollectionItemKey, CollectionReanchor, GameCollection, GameCollectionItem, GameCollectionKind,
     JournalledMoves, MAX_COLLECTION_NAME_CHARS, validate_collection_name,
@@ -441,6 +445,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 29,
         description: "remember games no catalogue in their system's catalogue set lists",
         sql: include_str!("migrations/0029_dat_catalogue_set_no_match.sql"),
+    },
+    Migration {
+        version: 30,
+        description: "exact skipped-file totals per scan run, source and reason",
+        sql: include_str!("migrations/0030_scan_run_skip_counts.sql"),
     },
 ];
 
@@ -3489,6 +3498,10 @@ pub struct ScanRunCounts {
     pub skipped_unsupported_extension: i64,
     pub skipped_ambiguous_platform: i64,
     pub errors_count: i64,
+    /// Exact totals per skip reason, as stored for this run (schema 30) and
+    /// read back after the scan; `None` when the run recorded no breakdown.
+    /// Reports use these, never the coarse columns above, whenever present.
+    pub skip_reasons: Option<crate::SkipReasonCounts>,
 }
 
 /// What the ScummVM folder discovery did during one scan, so a person can be
@@ -10093,6 +10106,7 @@ fn scan_and_persist_folders_transaction(
         );
         counts.skipped_unsupported_extension += discovery.skipped_unsupported_extension as i64;
         counts.skipped_ambiguous_platform += discovery.skipped_ambiguous_platform as i64;
+        database.record_scan_skip_counts(scan_run_id, folder.id, &discovery.skip_reason_counts)?;
         // Re-bounded across the whole multi-folder run, not just within one
         // folder's own `ArchiveScanDiscovery::skipped_files` (each of which
         // is already independently capped at `MAX_RETAINED_SKIPPED_FILES` -
@@ -10626,6 +10640,9 @@ fn scan_and_persist_folders_transaction(
             )
             .map_err(|e| db_error("record incomplete scan", e))?;
     }
+    // Reports read the stored totals back, so the CLI, the scan report and
+    // Attention all show the same persisted figures.
+    counts.skip_reasons = database.scan_run_skip_counts(scan_run_id)?;
 
     Ok(ScanPersistSummary {
         scummvm: scummvm_report,
@@ -11545,21 +11562,21 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 29);
+        assert_eq!(report.to_version, 30);
         assert_eq!(
             report.applied_versions,
-            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+            vec![17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
         );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 29);
+        assert_eq!(upgraded.schema_version().unwrap(), 30);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         assert_eq!(
             pending_schema_migration_versions(19).unwrap(),
-            vec![20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+            vec![20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
         );
 
         let quick_check: String = upgraded
@@ -11579,14 +11596,14 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 20);
-        assert_eq!(report.to_version, 29);
+        assert_eq!(report.to_version, 30);
         assert_eq!(
             report.applied_versions,
-            vec![21, 22, 23, 24, 25, 26, 27, 28, 29]
+            vec![21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
         );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 29);
+        assert_eq!(upgraded.schema_version().unwrap(), 30);
         assert_eq!(upgraded.list_source_folders().unwrap().len(), 1);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         let table_count: i64 = upgraded
@@ -11601,7 +11618,7 @@ mod tests {
         upgraded.close().unwrap();
 
         let reopened = Database::open_read_only(&database_path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 29);
+        assert_eq!(reopened.schema_version().unwrap(), 30);
         reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -12479,6 +12496,7 @@ mod tests {
                 "platform_aliases",
                 "platform_assignments",
                 "scan_fingerprints",
+                "scan_run_skip_counts",
                 "scan_runs",
                 "scan_source_coverage",
                 "schema_migrations",
@@ -23014,7 +23032,7 @@ echo "$out"
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 29);
+            assert_eq!(latest_known_version(MIGRATIONS), 30);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")

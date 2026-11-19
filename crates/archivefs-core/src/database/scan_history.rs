@@ -25,6 +25,9 @@ pub struct RecordedScanCounts {
     pub archives_unchanged: Option<i64>,
     pub skipped_unsupported_extension: Option<i64>,
     pub skipped_ambiguous_platform: Option<i64>,
+    /// Exact totals per skip reason the run stored (schema 30); `None` for a
+    /// run that recorded no breakdown, never zeros standing in for one.
+    pub skip_reasons: Option<crate::SkipReasonCounts>,
 }
 
 /// What a run recorded about the sources it covered.
@@ -119,6 +122,7 @@ impl Database {
                         archives_unchanged: later(row.get(12)?),
                         skipped_unsupported_extension: later(row.get(13)?),
                         skipped_ambiguous_platform: later(row.get(14)?),
+                        skip_reasons: None,
                     })
                 } else {
                     None
@@ -140,6 +144,12 @@ impl Database {
             .map_err(|e| db_error("decode scan history", e))?;
         drop(statement);
         let mut runs = rows;
+        for run in &mut runs {
+            if let Some(counts) = run.counts.as_mut() {
+                counts.skip_reasons =
+                    super::skip_counts::read_skip_counts(&transaction, run.scan_run_id)?;
+            }
+        }
         if has_coverage {
             for run in &mut runs {
                 run.coverage = match self.scan_coverage(run.scan_run_id) {

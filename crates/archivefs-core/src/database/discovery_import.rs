@@ -25,7 +25,10 @@ use std::sync::OnceLock;
 // the schema-27 notes (no foreign key or cascade, touch triggers, protected
 // dependent in `check_import_undo`, id never reused); dat_catalogue_sets
 // names catalogues only, no game.
-const REVIEWED_SCHEMA: i64 = 29;
+// Schema 30 reviewed: scan_run_skip_counts holds per-run, per-source totals
+// keyed by scan run and source only; it names no game, so an import's Undo
+// neither checks nor touches it.
+const REVIEWED_SCHEMA: i64 = 30;
 const MAX_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BATCH: usize = crate::ingestion::saved_discovery::MAX_SELECTED;
 

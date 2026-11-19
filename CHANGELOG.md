@@ -15,6 +15,16 @@ guessing at intent, dates, or scope.
 
 Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
+- Scans now keep exact totals of skipped files for every reason, per scan and
+  per source: unsupported format, unsupported variant, invalid content,
+  ambiguous platform and recognised duplicates (identical copies of a
+  catalogued ZIP). The totals no longer depend on the bounded sample of
+  skipped files, so a scan skipping hundreds of thousands of files reports
+  them exactly. `emuwiz-cli source scan`, the scan report, scan history and
+  Attention all show these stored totals; recognised duplicates are never
+  counted as unsupported formats. Scans made before this release show their
+  breakdown as "not recorded". Library schema 30 (one new table, additive);
+  the upgrade keeps a verified schema-29 backup.
 - `emuwiz-cli dat recheck --unchecked` no longer waits for a choice when
   several trusted catalogues describe one system (TOSEC's Commodore 64 genre
   lists, say). Each game is read against every catalogue for its system that

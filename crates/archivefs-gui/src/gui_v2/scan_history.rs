@@ -273,10 +273,21 @@ pub(super) fn counts_text(counts: Option<&RecordedScanCounts>) -> String {
     };
     let optional = |value: Option<i64>| value.map_or_else(|| "not recorded".into(), number);
     let skipped = match (
+        c.skip_reasons,
         c.skipped_unsupported_extension,
         c.skipped_ambiguous_platform,
     ) {
-        (Some(unsupported), Some(ambiguous)) => number(unsupported + ambiguous),
+        // The run's stored per-reason totals: identical copies are named, not
+        // folded into an unsupported figure.
+        (Some(reasons), _, _) => match reasons.identical_copy {
+            0 => number(reasons.total() as i64),
+            copies => format!(
+                "{} (including {} recognised duplicates)",
+                number(reasons.total() as i64),
+                number(copies as i64)
+            ),
+        },
+        (None, Some(unsupported), Some(ambiguous)) => number(unsupported + ambiguous),
         _ => "not recorded".into(),
     };
     format!(
