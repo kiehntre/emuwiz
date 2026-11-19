@@ -33,6 +33,7 @@ mod environment;
 mod equivalent_duplicates;
 mod folder_check;
 mod game_dat_check;
+mod game_rename;
 mod game_detail_blue;
 mod game_detail_facts;
 mod game_doctor;
@@ -386,6 +387,7 @@ pub(super) struct App {
     indices: Vec<usize>,
     filter: Filter,
     collections: collections::State,
+    game_rename: game_rename::State,
     filter_generation: u64,
     filter_inflight: bool,
     big_picture: Option<Box<big_picture::BigPicture>>,
@@ -544,6 +546,7 @@ impl App {
                 archivefs_core::default_database_path().ok(),
                 context.clone(),
             ),
+            game_rename: game_rename::State::default(),
             filter_generation: 0,
             filter_inflight: false,
             big_picture: None,

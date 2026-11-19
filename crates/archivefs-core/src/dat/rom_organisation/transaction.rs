@@ -437,7 +437,7 @@ pub fn revalidate_organisation_plan(
     Ok(())
 }
 
-fn live_resolution_for(
+pub(super) fn live_resolution_for(
     database: &crate::Database,
     source: &Path,
     generation: u64,

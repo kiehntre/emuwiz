@@ -3464,7 +3464,15 @@ impl App {
                     .queue("Opening the game folder", Route::Game(id), false);
                 self.send(job, Command::OpenFolder(game.archive.absolute_path.clone()));
             }
+            if ui
+                .add_sized([button_width, button_height], egui::Button::new("Rename…"))
+                .on_hover_text("Rename this game's file. You see exactly what changes first; Undo is in History.")
+                .clicked()
+            {
+                self.game_rename.open(game);
+            }
         });
+        self.game_rename_card(ui, game);
     }
 
     /// Picture retry, description, screenshots, saves, documents and the
