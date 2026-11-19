@@ -9,9 +9,11 @@
 //!
 //! What this module adds is only what a typed name needs:
 //! - the typed name is normalised and kept to the file's own extension;
-//! - files that reference the game by name (`.cue`/`.m3u`/`.gdi` beside it)
-//!   would break, so such a rename is refused rather than silently breaking
-//!   launch;
+//! - files that reference the game by name (`.cue`/`.m3u`/`.m3u8`/`.gdi` in
+//!   its folder or any folder above it inside the library folder) would
+//!   break, so such a rename is refused rather than silently breaking launch;
+//! - RetroArch finds saves and save states by the game's file name, so a game
+//!   that has any is refused (they are never renamed, moved or guessed at);
 //! - the preview lists the consequences it cannot carry out yet.
 
 use std::collections::BTreeSet;
@@ -25,14 +27,14 @@ use super::transaction::{
     prepare_organisation_catalogue, revalidate_organisation_plan,
 };
 use crate::dat::classification::ContentSelectionPolicy;
-use crate::dat::rename_apply::{ApplyOutcome, RenameTransaction};
+use crate::dat::rename_apply::{ApplyOutcome, RenameTransaction, TransactionState};
 use crate::safe_read::TrustedRoots;
 
 /// Longest file name accepted (bytes), well under common filesystem limits.
 const MAX_NAME_BYTES: usize = 200;
 
 /// Sidecar types whose text names other game files.
-const REFERENCING_EXTENSIONS: [&str; 3] = ["cue", "m3u", "gdi"];
+const REFERENCING_EXTENSIONS: [&str; 4] = ["cue", "m3u", "m3u8", "gdi"];
 
 /// A reviewed one-game rename, ready to be confirmed.
 #[derive(Debug, Clone)]
@@ -47,6 +49,70 @@ pub struct GameRenamePreview {
     pub new_file_name: String,
     /// Plain-language consequences shown before confirming.
     pub notes: Vec<String>,
+    /// Where RetroArch saves were looked for (re-checked at apply).
+    pub save_locations: RetroArchSaveLocations,
+}
+
+/// Folders where RetroArch may keep this game's saves and save states, from
+/// RetroArch's own configuration (`savefile_directory`, `savestate_directory`
+/// and per-core overrides). RetroArch also writes beside the game file when a
+/// configured folder is unset or missing; that folder is always searched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetroArchSaveLocations {
+    pub directories: Vec<PathBuf>,
+    /// Configured folders that could not be examined reliably. Any entry
+    /// refuses the rename: saves there could not be ruled out.
+    pub uncheckable: Vec<String>,
+}
+
+impl RetroArchSaveLocations {
+    /// Reads the installed RetroArch configuration (read-only). No RetroArch
+    /// profile means no configured folders; the game's own folder is still
+    /// searched.
+    pub fn discover() -> Self {
+        use crate::emulator_environment::HostReadOnlyFilesystem;
+        use crate::emulator_environment::retroarch::{
+            DiscoveryEnvironment, SaveDirectoryStatus, discover_retroarch_environment,
+        };
+        let report = match discover_retroarch_environment(
+            &HostReadOnlyFilesystem,
+            &DiscoveryEnvironment::from_process_environment(),
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                return Self {
+                    directories: Vec::new(),
+                    uncheckable: vec![format!("RetroArch settings could not be read ({error})")],
+                };
+            }
+        };
+        let mut locations = Self::default();
+        for finding in report
+            .profiles
+            .iter()
+            .flat_map(|profile| &profile.save_directories)
+        {
+            let Some(directory) = &finding.directory else {
+                continue;
+            };
+            match finding.status {
+                // Nothing there: RetroArch writes beside the game instead.
+                SaveDirectoryStatus::Missing | SaveDirectoryStatus::NotADirectory => {}
+                SaveDirectoryStatus::Usable | SaveDirectoryStatus::NotWritable
+                    if !directory.lossy =>
+                {
+                    let path = PathBuf::from(&directory.display);
+                    if !locations.directories.contains(&path) {
+                        locations.directories.push(path);
+                    }
+                }
+                _ => locations
+                    .uncheckable
+                    .push(format!("{} ({})", directory.display, finding.config_key)),
+            }
+        }
+        locations
+    }
 }
 
 /// Turns what the person typed into the full new file name. The file keeps its
@@ -115,6 +181,7 @@ pub fn preview_game_rename(
     source: &Path,
     typed: &str,
     generation: u64,
+    save_locations: &RetroArchSaveLocations,
 ) -> Result<GameRenamePreview, String> {
     let new_file_name = normalise_new_file_name(source, typed)?;
     let current = source
@@ -130,12 +197,13 @@ pub fn preview_game_rename(
         .ok_or("This file is not in the library any more. Rescan, then try again.")?;
     let source_root = owning_source_root(database, source)?;
     refuse_arcade_set(database, source, &source_root, generation)?;
-    if let Some(referrer) = referencing_sidecar(source)? {
+    if let Some(referrer) = referencing_sidecar(source, &source_root)? {
         return Err(format!(
             "{} names this file, so renaming it alone would stop the game launching. Nothing was changed.",
             referrer.display()
         ));
     }
+    refuse_if_retroarch_saves(source, save_locations)?;
     let candidate = OrganisationCandidate {
         source_path: source.to_path_buf(),
         resolution: live_resolution_for(database, source, generation),
@@ -171,11 +239,11 @@ pub fn preview_game_rename(
     prepare_organisation_catalogue(&mut plan, database)?;
     let approved: BTreeSet<String> = [source.to_string_lossy().into_owned()].into();
     let notes = vec![
-        format!("The file is renamed in place: {} → {}", current, new_file_name),
+        format!("The file is renamed in place: {} to {}", current, new_file_name),
         "The game keeps its EmuWiz library entry: favourites, collections, play history and EmuWiz artwork stay with it.".into(),
         "RetroArch playlists and ES-DE gamelists that list the old file name are not updated yet.".into(),
         "Undo is available in History.".into(),
-        "Emulator saves named after the old file (for example RetroArch .srm and save states) are not renamed yet.".into(),
+        "No RetroArch saves or save states were found for this game, so none can be cut off by the new name.".into(),
         "RomM (5.3 or later, with hashing on) moves its existing entry to the new file name at its next scan of this platform, matching by file hash. RomM's displayed title is not changed for games RomM never identified.".into(),
     ];
     Ok(GameRenamePreview {
@@ -186,6 +254,7 @@ pub fn preview_game_rename(
         source_root,
         new_file_name,
         notes,
+        save_locations: save_locations.clone(),
     })
 }
 
@@ -198,7 +267,7 @@ pub fn apply_game_rename(
     journal_dir: &Path,
     cancel: &AtomicBool,
 ) -> Result<ApplyOutcome, String> {
-    if let Some(referrer) = referencing_sidecar(&preview.source)? {
+    if let Some(referrer) = referencing_sidecar(&preview.source, &preview.source_root)? {
         return Err(format!(
             "{} now names this file, so the rename was refused. Nothing was changed.",
             referrer.display()
@@ -216,6 +285,8 @@ pub fn apply_game_rename(
         &preview.source_root,
         preview.plan.generation,
     )?;
+    // A save made since the preview (the game was played) also refuses.
+    refuse_if_retroarch_saves(&preview.source, &preview.save_locations)?;
     let wanted = preview.new_file_name.clone();
     let source = preview.source.clone();
     let name_for = move |path: &Path| (path == source).then(|| wanted.clone());
@@ -227,7 +298,7 @@ pub fn apply_game_rename(
     }
     std::fs::create_dir_all(journal_dir)
         .map_err(|error| format!("could not create the History folder: {error}"))?;
-    apply_organisation_transaction(
+    let outcome = apply_organisation_transaction(
         &mut transaction,
         &preview.approved,
         preview.plan.generation,
@@ -238,7 +309,124 @@ pub fn apply_game_rename(
         &preview.source_root,
         database,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    // The executor records a failed rename in the journal and still returns
+    // Ok: success is only the Applied state.
+    if outcome.transaction.state != TransactionState::Applied {
+        let reason = outcome
+            .transaction
+            .entries
+            .iter()
+            .find_map(|entry| {
+                entry
+                    .failure_reason
+                    .clone()
+                    .or_else(|| entry.preflight_failures.first().cloned())
+            })
+            .unwrap_or_else(|| format!("{:?}", outcome.transaction.state));
+        return Err(format!(
+            "The rename did not complete ({reason}). Check History before trying again."
+        ));
+    }
+    Ok(outcome)
+}
+
+/// RetroArch save and save-state names: `<file stem>.<one of these>`, with
+/// numbered and auto states (`.state1`, `.state.auto`) and their thumbnails.
+const RETROARCH_SAVE_SUFFIXES: [&str; 9] = [
+    "srm", "sav", "rtc", "ram", "eep", "fla", "mpk", "ldci", "state",
+];
+
+/// Refuses when any RetroArch save or state for `source` exists: beside the
+/// game, in a configured folder, or in its by-core / by-folder subfolders.
+fn refuse_if_retroarch_saves(
+    source: &Path,
+    locations: &RetroArchSaveLocations,
+) -> Result<(), String> {
+    if let Some(folder) = locations.uncheckable.first() {
+        return Err(format!(
+            "RetroArch's save folder {folder} could not be checked, so saves for this game cannot be ruled out. Nothing was changed."
+        ));
+    }
+    let Some(stem) = source
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+    else {
+        return Ok(());
+    };
+    let mut folders: Vec<PathBuf> = source.parent().map(Path::to_path_buf).into_iter().collect();
+    for root in &locations.directories {
+        folders.push(root.clone());
+        for child in subdirectories(root)? {
+            folders.extend(subdirectories(&child)?);
+            folders.push(child);
+        }
+    }
+    for folder in folders {
+        if let Some(found) = save_named_after(&folder, &stem, source)? {
+            return Err(format!(
+                "RetroArch keeps a save for this game at {}. Renaming the game would disconnect it, so this rename is refused. Nothing was changed.",
+                found.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Real sub-folders of `folder` (never following links), at most 4096.
+fn subdirectories(folder: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = match std::fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "RetroArch's save folder {} could not be read ({error}), so saves cannot be ruled out. Nothing was changed.",
+                folder.display()
+            ));
+        }
+    };
+    Ok(entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .take(4096)
+        .collect())
+}
+
+fn save_named_after(folder: &Path, stem: &str, source: &Path) -> Result<Option<PathBuf>, String> {
+    let entries = match std::fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "{} could not be read ({error}), so saves cannot be ruled out. Nothing was changed.",
+                folder.display()
+            ));
+        }
+    };
+    let prefix = format!("{stem}.");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == source {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let rest = rest.to_ascii_lowercase();
+        if RETROARCH_SAVE_SUFFIXES
+            .iter()
+            .any(|suffix| match rest.strip_prefix(suffix) {
+                Some("") => true,
+                Some(more) => more.starts_with(|c: char| c.is_ascii_digit() || c == '.'),
+                None => false,
+            })
+        {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 /// Arcade romsets must keep their set names: MAME and FBNeo find a game by
@@ -278,14 +466,29 @@ fn owning_source_root(database: &crate::Database, source: &Path) -> Result<PathB
         .ok_or_else(|| "This game is not inside a library folder. Nothing was changed.".into())
 }
 
-/// A `.cue`/`.m3u`/`.gdi` beside `source` whose text mentions its file name.
-fn referencing_sidecar(source: &Path) -> Result<Option<PathBuf>, String> {
-    let (Some(parent), Some(name)) = (source.parent(), source.file_name()) else {
+/// A `.cue`/`.m3u`/`.m3u8`/`.gdi` in the game's folder, or in any folder
+/// above it up to and including the library folder, whose text names it.
+fn referencing_sidecar(source: &Path, source_root: &Path) -> Result<Option<PathBuf>, String> {
+    let Some(name) = source.file_name() else {
         return Ok(None);
     };
     let name = name.to_string_lossy().to_lowercase();
-    let entries = std::fs::read_dir(parent)
-        .map_err(|error| format!("could not read {}: {error}", parent.display()))?;
+    let mut folder = source.parent();
+    while let Some(dir) = folder {
+        if let Some(found) = sidecar_in(dir, source, &name)? {
+            return Ok(Some(found));
+        }
+        if dir == source_root || !dir.starts_with(source_root) {
+            break;
+        }
+        folder = dir.parent();
+    }
+    Ok(None)
+}
+
+fn sidecar_in(folder: &Path, source: &Path, name: &str) -> Result<Option<PathBuf>, String> {
+    let entries = std::fs::read_dir(folder)
+        .map_err(|error| format!("could not read {}: {error}", folder.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path == source {
@@ -305,7 +508,7 @@ fn referencing_sidecar(source: &Path) -> Result<Option<PathBuf>, String> {
         if let Ok(bytes) = std::fs::read(&path)
             && String::from_utf8_lossy(&bytes)
                 .to_lowercase()
-                .contains(&name)
+                .contains(name)
         {
             return Ok(Some(path));
         }

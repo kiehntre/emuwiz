@@ -24,6 +24,7 @@ fn library(temp: &Path) -> (PathBuf, PathBuf, i64) {
 fn state(temp: &Path, database: PathBuf) -> State {
     State {
         paths: Some((database, temp.join("journal"))),
+        saves: Some(Default::default()),
         ..State::default()
     }
 }

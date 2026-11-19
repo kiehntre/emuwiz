@@ -6,7 +6,7 @@
 //! and History Undo. Nothing is changed until the person confirms a preview.
 
 use archivefs_core::dat::rom_organisation::game_rename::{
-    GameRenamePreview, apply_game_rename, preview_game_rename,
+    GameRenamePreview, RetroArchSaveLocations, apply_game_rename, preview_game_rename,
 };
 use eframe::egui::{self, RichText};
 
@@ -23,6 +23,9 @@ pub(super) struct State {
     generation: u64,
     /// Test seam: library database and History folder (default: the user's).
     paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    /// Test seam: where RetroArch saves are looked for (default: discovered
+    /// from the installed RetroArch configuration).
+    saves: Option<RetroArchSaveLocations>,
 }
 
 impl State {
@@ -46,6 +49,7 @@ impl State {
         *self = Self {
             generation: self.generation,
             paths: self.paths.take(),
+            saves: self.saves.take(),
             ..Self::default()
         };
     }
@@ -80,7 +84,11 @@ impl State {
             })
             .map_err(|error| format!("Could not open the library: {error}"))
             .and_then(|database| {
-                preview_game_rename(&database, source, &self.typed, self.generation)
+                let saves = self
+                    .saves
+                    .clone()
+                    .unwrap_or_else(RetroArchSaveLocations::discover);
+                preview_game_rename(&database, source, &self.typed, self.generation, &saves)
             });
         self.preview = Some(result);
     }
