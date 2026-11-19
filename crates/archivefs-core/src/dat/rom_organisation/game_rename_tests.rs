@@ -173,3 +173,84 @@ fn same_name_unknown_platform_and_missing_rows_are_refused() {
             .contains("not in the library")
     );
 }
+
+#[test]
+fn version_numbers_and_unicode_are_handled() {
+    let source = Path::new("/g/nes/Old.nes");
+    assert_eq!(
+        normalise_new_file_name(source, "Game v1.2").unwrap(),
+        "Game v1.2.nes"
+    );
+    assert_eq!(
+        normalise_new_file_name(source, "Vol.2").unwrap(),
+        "Vol.2.nes"
+    );
+    assert_eq!(
+        normalise_new_file_name(source, "Dr. Mario").unwrap(),
+        "Dr. Mario.nes"
+    );
+    // A multi-byte letter where the extension would be must not panic or
+    // produce a mangled name (U+212A KELVIN SIGN lowercases to ASCII 'k').
+    let k7 = Path::new("/g/to7/Old.k7");
+    assert_eq!(
+        normalise_new_file_name(k7, "Game\u{212A}7").unwrap(),
+        "Game\u{212A}7.k7"
+    );
+    assert_eq!(
+        normalise_new_file_name(Path::new("/g/cpc/Old.dsk"), "Ga.\u{212A}").unwrap(),
+        "Ga.\u{212A}.dsk"
+    );
+    assert_eq!(
+        normalise_new_file_name(source, "Jeux é").unwrap(),
+        "Jeux é.nes"
+    );
+}
+
+#[test]
+fn arcade_sets_keep_their_names() {
+    let lib = Lib::new("pacman.nes", Some("Arcade"));
+    let error = preview_game_rename(&lib.db, &lib.game, "Pac-Man", 1).unwrap_err();
+    assert!(error.contains("Arcade"), "{error}");
+    let mut by_role = Lib::new("galaga.nes", Some("nes"));
+    by_role
+        .db
+        .set_source_role(&by_role.root, crate::SourceRole::ArcadeRomset)
+        .unwrap();
+    assert!(preview_game_rename(&by_role.db, &by_role.game, "Galaga", 1).is_err());
+    assert!(lib.game.exists() && by_role.game.exists());
+}
+
+#[test]
+fn a_library_folder_removed_after_preview_refuses_the_apply() {
+    let lib = Lib::new("Old.nes", Some("nes"));
+    let preview = preview_game_rename(&lib.db, &lib.game, "New", 1).unwrap();
+    rusqlite::Connection::open(lib.db.path())
+        .unwrap()
+        .execute(
+            "UPDATE source_folders SET removed_from_config_at = '2026-11-19T00:00:00Z'",
+            [],
+        )
+        .unwrap();
+    assert!(apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel()).is_err());
+    assert!(lib.game.exists());
+}
+
+#[test]
+fn history_can_open_the_rename_for_undo() {
+    let lib = Lib::new("Old.nes", Some("nes"));
+    let preview = preview_game_rename(&lib.db, &lib.game, "New", 1).unwrap();
+    let outcome = apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel()).unwrap();
+    assert!(super::is_organisation_transaction(&outcome.transaction));
+    let mut reopened =
+        super::open_history_transaction_for_undo(&lib.journal(), &outcome.transaction).unwrap();
+    let undo = rollback_organisation_transaction(
+        &mut reopened,
+        &lib.journal(),
+        &no_cancel(),
+        &preview.source_root,
+    )
+    .unwrap();
+    assert_eq!(undo.rollback.result, RollbackResult::FullyRolledBack);
+    assert!(lib.game.exists());
+    assert_eq!(lib.id_at(&lib.game), Some(lib.id));
+}

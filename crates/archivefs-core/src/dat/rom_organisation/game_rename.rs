@@ -72,17 +72,23 @@ pub fn normalise_new_file_name(source: &Path, typed: &str) -> Result<String, Str
     let name = match &extension {
         Some(ext) => {
             let suffix = format!(".{ext}");
-            if typed.len() > suffix.len() && typed.to_lowercase().ends_with(&suffix.to_lowercase())
-            {
-                format!("{}{}", &typed[..typed.len() - suffix.len()], suffix)
-            } else if let Some((_, other)) = typed.rsplit_once('.')
-                && is_known_game_extension(other)
-            {
-                return Err(format!(
-                    "The file must keep its .{ext} extension (you typed .{other})."
-                ));
-            } else {
-                format!("{typed}{suffix}")
+            let tail = typed
+                .len()
+                .checked_sub(suffix.len())
+                .filter(|&start| start > 0)
+                .and_then(|start| typed.get(start..).map(|tail| (start, tail)));
+            match tail {
+                Some((start, tail)) if tail.eq_ignore_ascii_case(&suffix) => {
+                    format!("{}{suffix}", &typed[..start])
+                }
+                _ => match typed.rsplit_once('.') {
+                    Some((_, other)) if looks_like_extension(other) => {
+                        return Err(format!(
+                            "The file must keep its .{ext} extension (you typed .{other})."
+                        ));
+                    }
+                    _ => format!("{typed}{suffix}"),
+                },
             }
         }
         None => typed.to_string(),
@@ -95,9 +101,12 @@ pub fn normalise_new_file_name(source: &Path, typed: &str) -> Result<String, Str
     Ok(name)
 }
 
-fn is_known_game_extension(extension: &str) -> bool {
-    let ext = extension.to_ascii_lowercase();
-    ext.len() <= 4 && ext.chars().all(|c| c.is_ascii_alphanumeric()) && ext != "1"
+/// "zip", "iso", "nes": 2-4 ASCII letters/digits with at least one letter.
+/// "Game v1.2" or "Vol.2" end in a number, not an extension.
+fn looks_like_extension(text: &str) -> bool {
+    (2..=4).contains(&text.len())
+        && text.chars().all(|c| c.is_ascii_alphanumeric())
+        && text.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 /// Builds the read-only preview for renaming `source` to `typed`.
@@ -120,6 +129,7 @@ pub fn preview_game_rename(
         .map_err(|error| format!("could not read the library: {error}"))?
         .ok_or("This file is not in the library any more. Rescan, then try again.")?;
     let source_root = owning_source_root(database, source)?;
+    refuse_arcade_set(database, source, &source_root, generation)?;
     if let Some(referrer) = referencing_sidecar(source)? {
         return Err(format!(
             "{} names this file, so renaming it alone would stop the game launching. Nothing was changed.",
@@ -162,10 +172,11 @@ pub fn preview_game_rename(
     let approved: BTreeSet<String> = [source.to_string_lossy().into_owned()].into();
     let notes = vec![
         format!("The file is renamed in place: {} → {}", current, new_file_name),
-        "The game keeps its library entry: favourites, collections, play history and artwork stay with it.".into(),
+        "The game keeps its EmuWiz library entry: favourites, collections, play history and EmuWiz artwork stay with it.".into(),
+        "RetroArch playlists and ES-DE gamelists that list the old file name are not updated yet.".into(),
         "Undo is available in History.".into(),
         "Emulator saves named after the old file (for example RetroArch .srm and save states) are not renamed yet.".into(),
-        "RomM keeps its entry for this game when it next scans this platform (it matches the file by hash).".into(),
+        "RomM (5.3 or later, with hashing on) moves its existing entry to the new file name at its next scan of this platform, matching by file hash. RomM's displayed title is not changed for games RomM never identified.".into(),
     ];
     Ok(GameRenamePreview {
         plan,
@@ -193,6 +204,18 @@ pub fn apply_game_rename(
             referrer.display()
         ));
     }
+    // The library folder must still be the same one the preview trusted.
+    if owning_source_root(database, &preview.source)? != preview.source_root {
+        return Err(
+            "This game's library folder changed since the preview. Nothing was changed.".into(),
+        );
+    }
+    refuse_arcade_set(
+        database,
+        &preview.source,
+        &preview.source_root,
+        preview.plan.generation,
+    )?;
     let wanted = preview.new_file_name.clone();
     let source = preview.source.clone();
     let name_for = move |path: &Path| (path == source).then(|| wanted.clone());
@@ -216,6 +239,30 @@ pub fn apply_game_rename(
         database,
     )
     .map_err(|error| error.to_string())
+}
+
+/// Arcade romsets must keep their set names: MAME and FBNeo find a game by
+/// its zip name, so renaming one stops it launching.
+fn refuse_arcade_set(
+    database: &crate::Database,
+    source: &Path,
+    source_root: &Path,
+    generation: u64,
+) -> Result<(), String> {
+    let arcade_folder = database
+        .list_source_folders()
+        .map_err(|error| format!("could not read the library folders: {error}"))?
+        .iter()
+        .any(|folder| folder.path == source_root && folder.role == crate::SourceRole::ArcadeRomset);
+    let arcade_platform = matches!(
+        live_resolution_for(database, source, generation),
+        crate::platform::identity::PlatformIdentityResolution::Resolved { ref platform, .. }
+            if platform.eq_ignore_ascii_case("arcade")
+    );
+    if arcade_folder || arcade_platform {
+        return Err("Arcade games must keep their set name (MAME and FBNeo find them by it), so this one cannot be renamed. Nothing was changed.".into());
+    }
+    Ok(())
 }
 
 /// The enabled library source folder that holds `source` (longest match).
