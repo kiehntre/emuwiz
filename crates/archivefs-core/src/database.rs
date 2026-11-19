@@ -10333,23 +10333,70 @@ fn scan_and_persist_folders_transaction(
                         // folder with the same verified identity is reported,
                         // not catalogued twice (owner decision 2026-11-19).
                         // Folders that already have rows keep them.
+                        // The comparison stays inside this source's time budget;
+                        // a folder it could not finish is left undecided (not
+                        // catalogued, not called a copy) and the search is
+                        // incomplete, so no ScummVM row is called missing.
                         let with_rows = scummvm_folders_with_rows(database, &folder.path);
-                        let copies = crate::scummvm_detection::identical_new_copies(
+                        let verdicts = crate::scummvm_detection::identical_new_copies(
                             &found.games,
                             |path| with_rows.iter().any(|row| row == path),
+                            Some(budget_started + budget),
                         );
-                        let is_copy = |path: &Path| copies.iter().any(|(copy, _)| copy == path);
+                        if !verdicts.undecided.is_empty() {
+                            scummvm_incomplete = true;
+                            scummvm_report.errors.push((
+                                detection_root.clone(),
+                                format!(
+                                    "the ScummVM search time budget ran out while comparing {} possible duplicate folder(s); they were not added and are checked again next scan",
+                                    verdicts.undecided.len()
+                                ),
+                            ));
+                        }
+                        let copies = verdicts.copies;
+                        let is_copy = |path: &Path| {
+                            copies.iter().any(|(copy, _)| copy == path)
+                                || verdicts.undecided.iter().any(|held| held == path)
+                        };
+                        // A copy is part of its game like any game folder:
+                        // recognised files inside it are not loose rows.
+                        for (copy, _) in &copies {
+                            scummvm_report.contained_media.extend(
+                                archives
+                                    .iter()
+                                    .filter(|candidate| candidate.path.starts_with(copy))
+                                    .filter(|candidate| {
+                                        crate::ingestion::support_material_kind(
+                                            &candidate.path,
+                                            &folder.path,
+                                            folder.role,
+                                        )
+                                        .is_none()
+                                    })
+                                    .map(|candidate| candidate.path.clone()),
+                            );
+                            archives.retain(|candidate| !candidate.path.starts_with(copy));
+                        }
                         scummvm_report.same_game.extend(
                             found
                                 .same_game
                                 .into_iter()
                                 .map(|(id, paths)| {
-                                    (id, paths.into_iter().filter(|p| !is_copy(p)).collect::<Vec<_>>())
+                                    (
+                                        id,
+                                        paths
+                                            .into_iter()
+                                            .filter(|p| !is_copy(p))
+                                            .collect::<Vec<_>>(),
+                                    )
                                 })
                                 .filter(|(_, paths)| paths.len() > 1),
                         );
-                        let found_games: Vec<_> =
-                            found.games.into_iter().filter(|game| !is_copy(&game.path)).collect();
+                        let found_games: Vec<_> = found
+                            .games
+                            .into_iter()
+                            .filter(|game| !is_copy(&game.path))
+                            .collect();
                         scummvm_report.identical_copies.extend(copies);
                         // A row EmuWiz cannot read may be a game: said so, and
                         // ScummVM rows of this source are kept from Missing.
@@ -16491,7 +16538,16 @@ echo "$out"
             fs::create_dir_all(source.join(dir)).unwrap();
             fs::write(source.join(dir).join("queen.1c"), data).unwrap();
         }
-        fs::write(source.join("scummvm/queen-copy/queen-copy.scummvm"), b"marker").unwrap();
+        fs::write(
+            source.join("scummvm/queen-copy/queen-copy.scummvm"),
+            b"marker",
+        )
+        .unwrap();
+        // Recognised media inside both copies: the kept folder absorbs its
+        // own, and the copy's must not turn up as loose rows either.
+        for dir in ["scummvm/Queen", "scummvm/queen-copy"] {
+            write_archive_file(&source, &format!("{dir}/bonus.gba"), b"bonus");
+        }
         let config = config_for(&source, &mount);
         let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
         crate::scummvm_detection::TEST_EXECUTABLE
@@ -16523,12 +16579,27 @@ echo "$out"
             assert_eq!(rows.len(), 2, "{pass}: {rows:?}");
             assert!(rows.iter().any(|row| row.ends_with("scummvm/Queen")));
             assert!(rows.iter().any(|row| row.ends_with("scummvm/Queen German")));
+            assert!(
+                report
+                    .contained_media
+                    .iter()
+                    .any(|path| path.ends_with("scummvm/queen-copy/bonus.gba")),
+                "{pass}: {:?}",
+                report.contained_media
+            );
             assert_eq!(summary.counts.archives_missing, 0, "{pass}");
         }
         crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
         // Nothing on disk was changed.
-        assert_eq!(fs::read(source.join("scummvm/queen-copy/queen.1c")).unwrap(), b"same game data");
-        assert!(source.join("scummvm/queen-copy/queen-copy.scummvm").is_file());
+        assert_eq!(
+            fs::read(source.join("scummvm/queen-copy/queen.1c")).unwrap(),
+            b"same game data"
+        );
+        assert!(
+            source
+                .join("scummvm/queen-copy/queen-copy.scummvm")
+                .is_file()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

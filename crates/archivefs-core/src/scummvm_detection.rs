@@ -1032,6 +1032,17 @@ pub struct ScummVmDiscovery {
 /// anything unreadable makes the answer `false`: unproven is "different", so a
 /// folder is catalogued rather than hidden.
 pub fn identical_game_folders(left: &Path, right: &Path) -> bool {
+    compare_game_folders(left, right, None) == Ok(true)
+}
+
+/// [`identical_game_folders`] that stops at `deadline`: `Err(())` means the
+/// comparison did not finish, which is neither "identical" nor "different".
+fn compare_game_folders(
+    left: &Path,
+    right: &Path,
+    deadline: Option<std::time::Instant>,
+) -> Result<bool, ()> {
+    let late = || deadline.is_some_and(|at| std::time::Instant::now() >= at);
     fn files(root: &Path) -> Option<std::collections::BTreeMap<PathBuf, u64>> {
         let mut found = std::collections::BTreeMap::new();
         let mut pending = vec![root.to_path_buf()];
@@ -1072,16 +1083,36 @@ pub fn identical_game_folders(left: &Path, right: &Path) -> bool {
         }
     }
     if left == right {
-        return false;
+        return Ok(false);
+    }
+    if late() {
+        return Err(());
     }
     let (Some(a), Some(b)) = (files(left), files(right)) else {
-        return false;
+        return Ok(false);
     };
-    !a.is_empty()
-        && a == b
-        && a
-            .keys()
-            .all(|name| same_bytes(&left.join(name), &right.join(name)) == Some(true))
+    if a.is_empty() || a != b {
+        return Ok(false);
+    }
+    for name in a.keys() {
+        if late() {
+            return Err(());
+        }
+        if same_bytes(&left.join(name), &right.join(name)) != Some(true) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// What [`identical_new_copies`] decided.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct NewCopies {
+    /// `(copy, kept)`: byte-identical new copies, not to be catalogued.
+    pub copies: Vec<(PathBuf, PathBuf)>,
+    /// New folders whose comparison the deadline cut short: neither
+    /// catalogued nor called a copy this time; the search is incomplete.
+    pub undecided: Vec<PathBuf>,
 }
 
 /// New game folders that are byte-identical copies of another folder with the
@@ -1093,7 +1124,8 @@ pub fn identical_game_folders(left: &Path, right: &Path) -> bool {
 pub fn identical_new_copies(
     games: &[DiscoveredScummVmGame],
     has_row: impl Fn(&Path) -> bool,
-) -> Vec<(PathBuf, PathBuf)> {
+    deadline: Option<std::time::Instant>,
+) -> NewCopies {
     let mut by_id: std::collections::BTreeMap<(&str, &str), Vec<&Path>> = Default::default();
     for found in games {
         by_id
@@ -1101,7 +1133,7 @@ pub fn identical_new_copies(
             .or_default()
             .push(&found.path);
     }
-    let mut copies = Vec::new();
+    let mut result = NewCopies::default();
     for (_, mut paths) in by_id {
         if paths.len() < 2 {
             continue;
@@ -1109,17 +1141,26 @@ pub fn identical_new_copies(
         paths.sort();
         let (mut kept, new): (Vec<&Path>, Vec<&Path>) =
             paths.into_iter().partition(|path| has_row(path));
-        for candidate in new {
-            match kept
-                .iter()
-                .find(|reference| identical_game_folders(reference, candidate))
-            {
-                Some(reference) => copies.push((candidate.to_path_buf(), reference.to_path_buf())),
-                None => kept.push(candidate),
+        'candidates: for candidate in new {
+            for reference in &kept {
+                match compare_game_folders(reference, candidate, deadline) {
+                    Ok(true) => {
+                        result
+                            .copies
+                            .push((candidate.to_path_buf(), reference.to_path_buf()));
+                        continue 'candidates;
+                    }
+                    Ok(false) => {}
+                    Err(()) => {
+                        result.undecided.push(candidate.to_path_buf());
+                        continue 'candidates;
+                    }
+                }
             }
+            kept.push(candidate);
         }
     }
-    copies
+    result
 }
 
 fn same_game_folders(games: &[DiscoveredScummVmGame]) -> Vec<(String, Vec<PathBuf>)> {
@@ -2136,7 +2177,10 @@ queen:queen                    Flight of the Amazon Queen (CD/DOS/English)      
         let a = make("qfg1", &[]);
         let b = make("Quest for Glory 1 (Floppy)", &[]);
         assert!(identical_game_folders(&a, &b));
-        assert!(!identical_game_folders(&a, &a), "a folder is not its own copy");
+        assert!(
+            !identical_game_folders(&a, &a),
+            "a folder is not its own copy"
+        );
         let extra = make("with-extra", &[("PATCH.000", b"p")]);
         assert!(!identical_game_folders(&a, &extra));
         let edited = make("edited", &[]);
@@ -2148,8 +2192,12 @@ queen:queen                    Flight of the Amazon Queen (CD/DOS/English)      
         {
             let linked = make("linked", &[]);
             fs::remove_file(linked.join("RESOURCE.000")).unwrap();
-            std::os::unix::fs::symlink(a.join("RESOURCE.000"), linked.join("RESOURCE.000")).unwrap();
-            assert!(!identical_game_folders(&a, &linked), "unproven is different");
+            std::os::unix::fs::symlink(a.join("RESOURCE.000"), linked.join("RESOURCE.000"))
+                .unwrap();
+            assert!(
+                !identical_game_folders(&a, &linked),
+                "unproven is different"
+            );
         }
     }
 
@@ -2178,19 +2226,33 @@ queen:queen                    Flight of the Amazon Queen (CD/DOS/English)      
         let long = folder("Quest for Glory 1 (Floppy)", b"qfg");
         let short = folder("qfg1", b"qfg");
         let edition = folder("qfg1 (German)", b"qfg-de");
-        let games = [game(&short, "qfg1vga"), game(&long, "qfg1vga"), game(&edition, "qfg1vga")];
+        let games = [
+            game(&short, "qfg1vga"),
+            game(&long, "qfg1vga"),
+            game(&edition, "qfg1vga"),
+        ];
+        let copies = |games: &[DiscoveredScummVmGame], has_row: &dyn Fn(&Path) -> bool| {
+            let found = identical_new_copies(games, has_row, None);
+            assert!(found.undecided.is_empty());
+            found.copies
+        };
         // Both new: the first path in sort order is kept; the other edition stays.
-        assert_eq!(identical_new_copies(&games, |_| false), [(short.clone(), long.clone())]);
+        assert_eq!(copies(&games, &|_| false), [(short.clone(), long.clone())]);
         // An already-catalogued folder is the one kept, wherever it sorts.
         assert_eq!(
-            identical_new_copies(&games, |path| path == short),
+            copies(&games, &|path| path == short),
             [(long.clone(), short.clone())]
         );
         // Folders that already have rows are left exactly as recorded.
-        assert!(identical_new_copies(&games, |path| path != edition).is_empty());
+        assert!(copies(&games, &|path| path != edition).is_empty());
         // A different game id is never compared.
         let other = [game(&short, "qfg1vga"), game(&long, "qfg2")];
-        assert!(identical_new_copies(&other, |_| false).is_empty());
+        assert!(copies(&other, &|_| false).is_empty());
+        // Out of time: the candidates are undecided, never called copies or
+        // added; a lone first member needs no comparison and stays.
+        let late = identical_new_copies(&games, |_| false, Some(std::time::Instant::now()));
+        assert!(late.copies.is_empty());
+        assert_eq!(late.undecided, [short.clone(), edition.clone()]);
     }
 
     /// A fake ScummVM printing rows with ScummVM's own `%-30s %-58s %s`
