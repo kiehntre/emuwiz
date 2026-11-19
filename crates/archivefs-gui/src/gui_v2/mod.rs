@@ -33,11 +33,11 @@ mod environment;
 mod equivalent_duplicates;
 mod folder_check;
 mod game_dat_check;
-mod game_rename;
 mod game_detail_blue;
 mod game_detail_facts;
 mod game_doctor;
 mod game_documents;
+mod game_rename;
 mod game_verification_guidance;
 #[cfg(test)]
 mod glyph_coverage_tests;
