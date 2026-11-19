@@ -70,3 +70,61 @@ fn a_clash_is_shown_and_nothing_changes() {
         b"other"
     );
 }
+
+/// After a rename, the one-game re-check's answer reaches Activity and the
+/// card, and a saved result reloads the library so Game Details shows it.
+#[test]
+fn a_finished_recheck_is_reported_and_reloads_the_library() {
+    use archivefs_core::dat::reaudit::{GameRecheck, ReauditPlan, ReauditReport};
+    let context = eframe::egui::Context::default();
+    let mut app = super::super::tests::fixture(&context);
+    app.game_rename.open_for = Some(7);
+    let job = app
+        .activity
+        .queue("Re-checking the renamed game", super::super::Route::Game(7), false);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.game_rename.recheck = Some(super::Recheck {
+        job,
+        archive_id: Some(7),
+        receiver,
+    });
+    app.poll_rename_recheck();
+    assert!(app.game_rename.recheck.is_some(), "still running");
+    sender
+        .send(Ok(GameRecheck {
+            plan: ReauditPlan {
+                saved_rows: 1,
+                ..Default::default()
+            },
+            report: Some(ReauditReport {
+                planned: 1,
+                verified: 1,
+                saved: 1,
+                ..Default::default()
+            }),
+        }))
+        .unwrap();
+    app.poll_rename_recheck();
+    assert!(app.game_rename.recheck.is_none());
+    let line = app.game_rename.recheck_line.clone().unwrap();
+    assert!(line.contains("still verified"), "{line}");
+    assert_eq!(app.activity.jobs[&job].summary, line);
+    assert!(app.game_rename.reload_pending);
+
+    // A failed re-check never claims verification and saves nothing.
+    let job = app
+        .activity
+        .queue("Re-checking the renamed game", super::super::Route::Game(7), false);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.game_rename.reload_pending = false;
+    app.game_rename.recheck = Some(super::Recheck {
+        job,
+        archive_id: Some(7),
+        receiver,
+    });
+    sender.send(Err("database is busy".into())).unwrap();
+    app.poll_rename_recheck();
+    let line = app.game_rename.recheck_line.clone().unwrap();
+    assert!(line.contains("not verified until you re-check it"), "{line}");
+    assert!(!app.game_rename.reload_pending);
+}

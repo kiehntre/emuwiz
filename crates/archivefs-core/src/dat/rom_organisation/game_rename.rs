@@ -273,7 +273,7 @@ pub fn preview_game_rename(
         "The game keeps its EmuWiz library entry: favourites, collections, play history and EmuWiz artwork stay with it.".into(),
         "RetroArch playlists and ES-DE gamelists that list the old file name are not updated yet.".into(),
         "Undo is available in History.".into(),
-        "A catalogue verification is tied to the file's name, so a verified game shows as not verified after the rename until you re-check it (Re-check this game).".into(),
+        "A catalogue verification is tied to the file's name, so the game is re-checked against its catalogue straight after the rename (and after an Undo). It stays verified only if the file still matches.".into(),
         "No RetroArch saves or save states were found for this game. Saves kept by standalone emulators are not checked.".into(),
         "RomM is not told about the rename. It catches up at its next scan of this system (its scheduled scan, or Scan in RomM), where RomM 5.3 matches the renamed file to its existing entry by file hash if hashing is on. For games RomM never identified, its displayed title stays the old one.".into(),
     ];

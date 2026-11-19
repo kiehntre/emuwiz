@@ -2271,3 +2271,86 @@ mod first_matching {
         }
     }
 }
+
+/// Blue Rename: a verified game's saved result is tied to its file name, so
+/// after a rename (and after its Undo) the one-game re-check reads the file
+/// again and keeps it verified only when it still matches.
+#[test]
+fn one_game_recheck_after_a_rename_and_its_undo_keeps_only_matching_proof() {
+    use crate::dat::reaudit::recheck_game;
+    let f = Fixture::new();
+    f.write_games_dat(2, "v1");
+    f.add(1, "g0000.tap", Some(&body(0)), Some("ZX Spectrum"));
+    f.add(2, "g0001.tap", Some(&body(1)), Some("ZX Spectrum"));
+    assert_eq!(f.run().verified, 2);
+    let current = |f: &Fixture| f.statuses();
+    assert!(current(&f).values().all(|s| *s == Status::Current));
+    let other_before = f.facts(2);
+    let move_row = |from: &str, to: &str| {
+        std::fs::rename(f.root.join(from), f.root.join(to)).unwrap();
+        let conn = rusqlite::Connection::open(&f.db).unwrap();
+        conn.execute(
+            "UPDATE archives SET relative_path=?1, file_name_cached=?1, absolute_path_cached=?2 WHERE id=1",
+            rusqlite::params![to.as_bytes(), f.root.join(to).as_os_str().as_bytes()],
+        )
+        .unwrap();
+    };
+    let recheck = |f: &Fixture| {
+        recheck_game(
+            &f.db,
+            1,
+            &f.configured(),
+            &|_| Ok(f.resolved()),
+            &TrustedRoots::none(),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+    };
+
+    // Renamed: the saved proof stops counting until the file is read again.
+    move_row("g0000.tap", "Renamed Game.tap");
+    assert_ne!(current(&f)[&1], Status::Current);
+    let summary = recheck(&f).summary().unwrap();
+    assert!(summary.contains("still verified"), "{summary}");
+    assert_eq!(current(&f)[&1], Status::Current);
+    assert_eq!(f.saved_state(1).unwrap().0, "verified_single_match");
+    // Only that game was read and saved.
+    assert_eq!(f.facts(2), other_before);
+    // Nothing more to do once current.
+    let again = recheck(&f);
+    assert!(again.report.is_none());
+    assert_eq!(again.summary().unwrap(), "Its catalogue result is still current.");
+
+    // Undo puts the old name back: checked again, verified again.
+    move_row("Renamed Game.tap", "g0000.tap");
+    assert!(recheck(&f).summary().unwrap().contains("still verified"));
+    assert_eq!(current(&f)[&1], Status::Current);
+
+    // A file that no longer matches is never kept verified; the replaced
+    // verified result is kept in history.
+    std::fs::write(f.root.join("g0000.tap"), b"different content now").unwrap();
+    let summary = recheck(&f).summary().unwrap();
+    assert!(summary.contains("no longer matches"), "{summary}");
+    assert_ne!(f.saved_state(1).unwrap().0, "verified_single_match");
+    assert!(
+        f.history()
+            .iter()
+            .any(|(id, state, _, _)| *id == 1 && state == "verified_single_match")
+    );
+
+    // A game with no saved result has nothing to keep verified.
+    f.add(3, "g0002.tap", Some(&body(2)), Some("ZX Spectrum"));
+    assert!(
+        recheck_game(
+            &f.db,
+            3,
+            &f.configured(),
+            &|_| Ok(f.resolved()),
+            &TrustedRoots::none(),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .summary()
+        .is_none()
+    );
+}

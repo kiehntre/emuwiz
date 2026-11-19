@@ -164,11 +164,28 @@ impl Database {
         &self,
         catalogues: &HashMap<String, ConfiguredCatalogue>,
     ) -> Result<Vec<SavedDatEvidenceRow>> {
+        self.saved_dat_evidence_status_where(catalogues, None)
+    }
+
+    /// [`Self::saved_dat_evidence_status`] for one library game only.
+    pub fn saved_dat_evidence_status_for(
+        &self,
+        catalogues: &HashMap<String, ConfiguredCatalogue>,
+        archive_id: i64,
+    ) -> Result<Vec<SavedDatEvidenceRow>> {
+        self.saved_dat_evidence_status_where(catalogues, Some(archive_id))
+    }
+
+    fn saved_dat_evidence_status_where(
+        &self,
+        catalogues: &HashMap<String, ConfiguredCatalogue>,
+        archive_id: Option<i64>,
+    ) -> Result<Vec<SavedDatEvidenceRow>> {
         let mut statement = self.connection.prepare(
-            "SELECT d.archive_id, d.dat_source_id, d.facts_json, a.size_bytes, p.platform, a.absolute_path_cached,                     d.revision_marked_stale, a.last_verified_missing_at IS NOT NULL, d.verification_state, d.audited_at              FROM library_dat_identities d JOIN archives a ON a.id = d.archive_id              LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1              ORDER BY d.dat_source_id, d.archive_id",
+            "SELECT d.archive_id, d.dat_source_id, d.facts_json, a.size_bytes, p.platform, a.absolute_path_cached,                     d.revision_marked_stale, a.last_verified_missing_at IS NOT NULL, d.verification_state, d.audited_at              FROM library_dat_identities d JOIN archives a ON a.id = d.archive_id              LEFT JOIN platform_assignments p ON p.archive_id = a.id AND p.is_current = 1              WHERE ?1 IS NULL OR d.archive_id = ?1              ORDER BY d.dat_source_id, d.archive_id",
         ).map_err(|error| db_error("failed to prepare saved DAT evidence status", error))?;
         let mut rows = statement
-            .query([])
+            .query([archive_id])
             .map_err(|error| db_error("failed to query saved DAT evidence status", error))?;
         let mut result = Vec::new();
         while let Some(row) = rows

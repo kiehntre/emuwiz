@@ -8,6 +8,7 @@
 use archivefs_core::dat::rom_organisation::game_rename::{
     GameRenamePreview, RetroArchSaveLocations, apply_game_rename, preview_game_rename,
 };
+use archivefs_core::dat::reaudit::{GameRecheck, ReauditCatalogues, recheck_game};
 use eframe::egui::{self, RichText};
 
 use super::{App, library::Game};
@@ -26,6 +27,53 @@ pub(super) struct State {
     /// Test seam: where RetroArch saves are looked for (default: discovered
     /// from the installed RetroArch configuration).
     saves: Option<RetroArchSaveLocations>,
+    /// The one-game catalogue re-check started after a rename or its Undo.
+    recheck: Option<Recheck>,
+    /// Its result, shown under the rename outcome.
+    recheck_line: Option<String>,
+    /// A finished re-check saved a result: reload once no load is running.
+    pub(super) reload_pending: bool,
+}
+
+/// A running re-check: its Activity job and the worker's answer.
+struct Recheck {
+    job: u64,
+    /// The game when known up front (a rename); an Undo finds it by path.
+    archive_id: Option<i64>,
+    receiver: std::sync::mpsc::Receiver<Result<GameRecheck, String>>,
+}
+
+/// Which game to re-check.
+pub(super) enum RecheckTarget {
+    Id(i64),
+    /// The library game at this path (after an Undo put the old name back).
+    Path(std::path::PathBuf),
+}
+
+/// Re-checks `archive_id`'s saved catalogue results against the configured
+/// catalogues, on the worker. Read again from the person's settings.
+fn recheck_now(database: &std::path::Path, game: RecheckTarget) -> Result<GameRecheck, String> {
+    let archive_id = match game {
+        RecheckTarget::Id(id) => id,
+        RecheckTarget::Path(path) => archivefs_core::Database::open_read_only(database)
+            .and_then(|db| db.find_archive_id_by_absolute_path(&path))
+            .map_err(|error| error.to_string())?
+            .ok_or("the game is not in the library at its restored name")?,
+    };
+    let catalogues = ReauditCatalogues::load_default()?;
+    let trusted = archivefs_core::Config::load_default()
+        .ok()
+        .as_ref()
+        .map(archivefs_core::safe_read::TrustedRoots::from_config)
+        .unwrap_or_else(archivefs_core::safe_read::TrustedRoots::none);
+    recheck_game(
+        database,
+        archive_id,
+        &catalogues.configured(),
+        &|source| catalogues.resolve(source),
+        &trusted,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
 }
 
 impl State {
@@ -43,6 +91,7 @@ impl State {
             .unwrap_or_default();
         self.preview = None;
         self.outcome = None;
+        self.recheck_line = None;
     }
 
     fn close(&mut self) {
@@ -50,6 +99,7 @@ impl State {
             generation: self.generation,
             paths: self.paths.take(),
             saves: self.saves.take(),
+            recheck: self.recheck.take(),
             ..Self::default()
         };
     }
@@ -76,6 +126,7 @@ impl State {
     pub(super) fn preview_now(&mut self, source: &std::path::Path) {
         self.generation += 1;
         self.outcome = None;
+        self.recheck_line = None;
         let result = self
             .database_path()
             .and_then(|path| {
@@ -120,7 +171,7 @@ impl State {
         let renamed = result.is_ok();
         self.outcome = Some(result.map(|_| {
             format!(
-                "Renamed to {}. Undo is in History. RomM refresh pending: RomM shows the new name after its next scan of this system.",
+                "Renamed to {}. Undo is in History. RomM shows the new name after its next scan of this system.",
                 preview.new_file_name
             )
         }));
@@ -129,6 +180,75 @@ impl State {
 }
 
 impl App {
+    /// Starts the one-game re-check for `archive_id` (after a rename or its
+    /// Undo). A catalogue result is tied to the file's name, so it is read
+    /// again now rather than carried over. At most one runs at a time.
+    pub(super) fn start_rename_recheck(&mut self, game: RecheckTarget) {
+        // Tests never reach the person's own library or catalogues.
+        if self.game_rename.recheck.is_some() || (cfg!(test) && self.game_rename.paths.is_none()) {
+            return;
+        }
+        let archive_id = match &game {
+            RecheckTarget::Id(id) => Some(*id),
+            RecheckTarget::Path(_) => None,
+        };
+        let Ok(database) = self.game_rename.database_path() else {
+            return;
+        };
+        let job = self.activity.queue(
+            "Re-checking the renamed game",
+            match archive_id {
+                Some(id) => super::Route::Game(id),
+                None => super::Route::Section(super::Section::Games),
+            },
+            false,
+        );
+        self.activity.start(job);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(recheck_now(&database, game));
+        });
+        self.game_rename.recheck = Some(Recheck {
+            job,
+            archive_id,
+            receiver,
+        });
+    }
+
+    /// Collects a finished re-check; a saved result sets `reload_pending` so
+    /// Game Details shows it.
+    pub(super) fn poll_rename_recheck(&mut self) {
+        let Some(running) = &self.game_rename.recheck else {
+            return;
+        };
+        let result = match running.receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("the re-check stopped unexpectedly".into())
+            }
+        };
+        let Recheck {
+            job, archive_id, ..
+        } = self.game_rename.recheck.take().expect("checked above");
+        let (line, error) = match &result {
+            Ok(recheck) => match recheck.summary() {
+                Some(line) => (line, None),
+                None => ("This game had no catalogue result to re-check.".into(), None),
+            },
+            Err(error) => (
+                "The game could not be re-checked. It shows as not verified until you re-check it (Re-check this game).".into(),
+                Some(error.clone()),
+            ),
+        };
+        self.activity.finish(job, line.clone(), error);
+        if archive_id.is_some() && self.game_rename.open_for == archive_id {
+            self.game_rename.recheck_line = Some(line);
+        }
+        self.game_rename.reload_pending |=
+            result.is_ok_and(|recheck| recheck.report.is_some_and(|report| report.saved > 0));
+    }
+
     /// The inline rename card under "More for this game".
     pub(super) fn game_rename_card(&mut self, ui: &mut egui::Ui, game: &Game) {
         if !self.game_rename.is_open_for(game.archive.id) {
@@ -180,6 +300,18 @@ impl App {
             match &self.game_rename.outcome {
                 Some(Ok(message)) => {
                     ui.label(RichText::new(message).strong());
+                    match &self.game_rename.recheck_line {
+                        Some(line) => {
+                            ui.label(line);
+                        }
+                        None if self.game_rename.recheck.is_some() => {
+                            ui.label(
+                                RichText::new("Re-checking its catalogue result…")
+                                    .color(theme::muted(ui)),
+                            );
+                        }
+                        None => {}
+                    }
                 }
                 Some(Err(reason)) => {
                     ui.colored_label(theme::warning(ui), reason);
@@ -187,6 +319,10 @@ impl App {
                 None => {}
             }
             if renamed {
+                // The library row keeps its id; only real settings run it.
+                if self.game_rename.paths.is_none() {
+                    self.start_rename_recheck(RecheckTarget::Id(game.archive.id));
+                }
                 self.load(false);
                 // History lists the new rename (and its Undo) without a restart.
                 self.send(0, super::Command::LoadRepairHistory);

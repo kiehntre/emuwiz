@@ -1613,6 +1613,19 @@ impl App {
                 );
             }
         } else if complete {
+            // Undoing one game's rename puts its old name back: its catalogue
+            // result is tied to the name, so that game is checked again.
+            if kind == CanonicalOrganisationJobKind::Rollback
+                && let Some(undone) = previous_transaction_id.as_deref().and_then(|id| {
+                    self.canonical_organisation_history
+                        .iter()
+                        .find(|item| item.transaction_id == id)
+                })
+                && let [entry] = undone.entries.as_slice()
+            {
+                let restored = entry.source_path.clone();
+                self.start_rename_recheck(game_rename::RecheckTarget::Path(restored));
+            }
             self.activity.finish(
                 job.id,
                 match kind {
@@ -2637,6 +2650,7 @@ impl eframe::App for App {
         // A finished one-game check saves new evidence even when its page is
         // no longer showing; reload so Game Details reads it.
         self.game_dat_check.poll();
+        self.poll_rename_recheck();
         self.saved_recheck.poll();
         self.folder_check.poll();
         self.folder_check.organise.poll();
@@ -2657,6 +2671,9 @@ impl eframe::App for App {
             reload_library = true;
         }
         if self.load_job.is_none() && self.saved_recheck.take_saved() {
+            reload_library = true;
+        }
+        if self.load_job.is_none() && std::mem::take(&mut self.game_rename.reload_pending) {
             reload_library = true;
         }
         if reload_library {
