@@ -10242,9 +10242,37 @@ fn scan_and_persist_folders_transaction(
             let cache_path = scummvm_discovery_cache_path(database.path());
             let mut cache = load_scummvm_discovery_cache(&cache_path);
             let catalogued_games = catalogued_scummvm_game_folders(database, &folder.path);
-            for detection_root in
-                crate::scummvm_detection::discovery_roots(&folder.path, &catalogued_games)
-            {
+            // The budget covers choosing the roots too.
+            let budget = crate::scummvm_detection::source_discovery_budget();
+            let budget_started = std::time::Instant::now();
+            let (roots, truncated) = crate::scummvm_detection::discovery_roots_reporting(
+                &folder.path,
+                &catalogued_games,
+                Some(budget_started + budget),
+            );
+            if let Some(note) = truncated {
+                // Games past the bound were not searched: never evidence
+                // that ScummVM folders are gone.
+                scummvm_report.errors.push((folder.path.clone(), note));
+                scummvm_incomplete = true;
+            }
+            for (searched, detection_root) in roots.iter().cloned().enumerate() {
+                // Bounded per source: past the budget the remaining roots are
+                // not searched, so only ScummVM rows are withheld from
+                // missing reconciliation; nothing else waits on ScummVM.
+                if budget_started.elapsed() >= budget {
+                    scummvm_report.errors.push((
+                        detection_root.clone(),
+                        format!(
+                            "the ScummVM search time budget ({} s) was used up; {} of {} folders were not searched",
+                            budget.as_secs(),
+                            roots.len() - searched,
+                            roots.len()
+                        ),
+                    ));
+                    scummvm_incomplete = true;
+                    break;
+                }
                 let cache_key = detection_root.display().to_string();
                 let started = std::time::Instant::now();
                 match crate::scummvm_detection::discover_scummvm_game_directories_cached(
@@ -16355,6 +16383,143 @@ echo "$out"
         assert!(!missing("atari2600/Amidar.zip"));
         // The ScummVM row could not be re-enumerated: kept, not called missing.
         assert!(!missing("scummvm/queen"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Follow-up to #509: ScummVM games in PC/DOS collections are found when
+    /// their folder carries a ScummVM data-file signature and the detector
+    /// confirms them; unsigned PC folders and folders of other systems are
+    /// never handed to the detector; an ambiguous folder is not catalogued;
+    /// one game folder is one row however many files it holds.
+    #[cfg(unix)]
+    #[test]
+    fn scummvm_games_are_found_inside_and_outside_scummvm_folders_without_duplicates() {
+        let root = temp_dir("scummvm-coverage");
+        let source = root.join("games");
+        let mount = root.join("mount");
+        for (dir, files) in [
+            ("scummvm/Queen Inside", &["queen.1c"][..]),
+            ("dos/Queen Outside", &["queen.1c", "readme.txt"]),
+            ("dos/Two Games", &["queen.1c", "hypno.dat"]),
+            ("dos/Doom", &["doom.wad"]),
+            ("snes/Not ScummVM", &["queen.1c"]),
+        ] {
+            fs::create_dir_all(source.join(dir)).unwrap();
+            for file in files {
+                fs::write(source.join(dir).join(file), b"synthetic").unwrap();
+            }
+        }
+        // Media the file scanner would catalogue on its own, inside the game.
+        write_archive_file(&source, "dos/Queen Outside/extras/music.zip", b"music");
+        let exe = fake_scummvm(&root);
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(exe));
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        let again = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+
+        let mut rows: Vec<(String, String)> = database
+            .load_archives()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row.archive_kind.clone(),
+                    row.relative_path.display().to_string(),
+                )
+            })
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "scummvm_directory".to_string(),
+                    "dos/Queen Outside".to_string()
+                ),
+                (
+                    "scummvm_directory".to_string(),
+                    "scummvm/Queen Inside".to_string()
+                ),
+            ],
+            "{:?}",
+            summary.scummvm
+        );
+        assert!(
+            summary
+                .scummvm
+                .contained_media
+                .iter()
+                .any(|path| path.ends_with("extras/music.zip")),
+            "{:?}",
+            summary.scummvm
+        );
+        assert!(
+            summary
+                .scummvm
+                .ambiguous
+                .iter()
+                .any(|item| format!("{item:?}").contains("Two Games")),
+            "{:?}",
+            summary.scummvm
+        );
+        assert_eq!(again.counts.archives_added, 0);
+        assert_eq!(again.counts.archives_missing, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The per-source ScummVM time budget: once used up, the remaining
+    /// folders are not searched, ScummVM rows are withheld, and every other
+    /// row is still reconciled.
+    #[cfg(unix)]
+    #[test]
+    fn scummvm_time_budget_never_blocks_missing_reconciliation() {
+        let root = temp_dir("scummvm-budget");
+        let source = root.join("games");
+        let mount = root.join("mount");
+        let game = source.join("scummvm/queen");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("queen.1c"), b"synthetic").unwrap();
+        let doomed = write_archive_file(&source, "atari2600/Gone.zip", b"gone");
+        write_archive_file(&source, "atari2600/Kept.zip", b"kept");
+        let exe = fake_scummvm(&root);
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(exe));
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        assert_eq!(database.load_archives().unwrap().len(), 3);
+
+        fs::remove_file(&doomed).unwrap();
+        fs::remove_dir_all(&game).unwrap();
+        crate::scummvm_detection::TEST_SOURCE_BUDGET
+            .with(|budget| budget.set(Some(std::time::Duration::ZERO)));
+        let second = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::scummvm_detection::TEST_SOURCE_BUDGET.with(|budget| budget.set(None));
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+
+        assert!(
+            second
+                .scummvm
+                .errors
+                .iter()
+                .any(|(_, error)| error.contains("time budget")),
+            "{:?}",
+            second.scummvm
+        );
+        assert_eq!(second.counts.archives_missing, 1, "{second:?}");
+        let archives = database.load_archives().unwrap();
+        let missing = |name: &str| {
+            archives
+                .iter()
+                .find(|row| row.absolute_path.ends_with(name))
+                .unwrap()
+                .last_verified_missing_at
+                .is_some()
+        };
+        assert!(missing("atari2600/Gone.zip"));
+        assert!(!missing("atari2600/Kept.zip"));
+        assert!(!missing("scummvm/queen"), "withheld, not called missing");
         let _ = fs::remove_dir_all(&root);
     }
 

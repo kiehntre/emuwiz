@@ -21,6 +21,92 @@ thread_local! {
     /// Lets a test route resolution to a fixture executable on its own thread.
     pub(crate) static TEST_EXECUTABLE: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
+    /// Lets a test shrink [`SOURCE_DISCOVERY_BUDGET`] on its own thread.
+    pub(crate) static TEST_SOURCE_BUDGET: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Total wall-clock time one source's ScummVM discovery may take across all
+/// its detection roots. Past it the remaining roots are not searched and only
+/// ScummVM rows are withheld from missing reconciliation; every other row is
+/// still reconciled (production run 210).
+pub const SOURCE_DISCOVERY_BUDGET: Duration = Duration::from_secs(300);
+
+/// The budget in force (a test may shrink it).
+pub fn source_discovery_budget() -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = TEST_SOURCE_BUDGET.with(std::cell::Cell::get) {
+        return budget;
+    }
+    SOURCE_DISCOVERY_BUDGET
+}
+
+/// PC/DOS collection folders (registry ids) whose game folders are searched
+/// when they carry a ScummVM data-file signature.
+const PC_FAMILY_PLATFORMS: [&str; 2] = ["DOS", "PC"];
+/// Signature-matched game folders added per source, at most.
+pub const MAX_SIGNATURE_CANDIDATES: usize = 256;
+/// PC/DOS game folders looked at per source while nominating, at most.
+pub const MAX_NOMINATION_FOLDERS: usize = 4_096;
+/// Entries read from one folder while looking for a signature.
+const MAX_SIGNATURE_LISTING: usize = 512;
+
+/// Whether `dir` directly holds a file only a ScummVM-supported engine uses
+/// (SCUMM, SCI, AGI, Queen, Sky, Sword, SAGA, Gob, Tinsel and others). It
+/// only nominates the folder: ScummVM's own detector still has to confirm a
+/// game there before anything is catalogued.
+pub fn has_scummvm_signature(dir: &Path) -> bool {
+    const EXACT: &[&str] = &[
+        "000.lfl",
+        "index.lfl",
+        "resource.map",
+        "resource.000",
+        "resource.001",
+        "resmap.000",
+        "resmap.001",
+        "ressci.000",
+        "logdir",
+        "vol.0",
+        "queen.1",
+        "queen.1c",
+        "sky.dnr",
+        "sky.dsk",
+        "swordres.rif",
+        "swrd.res",
+        "ite.rsc",
+        "ihnm.res",
+        "intro.stk",
+        "dw.scn",
+        "dw2.scn",
+        "packet.001",
+        "touche.dat",
+        "disk1.vga",
+        "lure.dat",
+        "atlantis.000",
+        "monkey.000",
+        "monkey1.000",
+        "monkey2.000",
+        "tentacle.000",
+        "samnmax.000",
+        "dig.la0",
+        "comi.la0",
+        "ft.la0",
+        "loom.000",
+        "zak.000",
+    ];
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.take(MAX_SIGNATURE_LISTING).filter_map(Result::ok) {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if EXACT.contains(&name.as_str()) || name.ends_with(".lfl") || name.ends_with(".la0") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Test builds only (`cfg(test)` or the `test-support` feature, which
@@ -1070,6 +1156,17 @@ fn discovery_cache_key(root: &Path, executable: &Path) -> Option<String> {
 /// search keeps being refreshed. Symbolic links are never followed; a folder
 /// that cannot be read is skipped and logged rather than widening the search.
 pub fn discovery_roots(source: &Path, catalogued: &[PathBuf]) -> Vec<PathBuf> {
+    discovery_roots_reporting(source, catalogued, None).0
+}
+
+/// As [`discovery_roots`], plus a note when the PC/DOS nomination stopped at
+/// one of its bounds (games past it are not searched this scan).
+pub fn discovery_roots_reporting(
+    source: &Path,
+    catalogued: &[PathBuf],
+    deadline: Option<Instant>,
+) -> (Vec<PathBuf>, Option<String>) {
+    let mut truncated: Option<String> = None;
     let is_scummvm_folder = |path: &Path| {
         path.file_name()
             .and_then(|name| name.to_str())
@@ -1077,7 +1174,7 @@ pub fn discovery_roots(source: &Path, catalogued: &[PathBuf]) -> Vec<PathBuf> {
             == Some("ScummVM")
     };
     if is_scummvm_folder(source) {
-        return vec![source.to_path_buf()];
+        return (vec![source.to_path_buf()], None);
     }
     let child_directories = |dir: &Path| -> Vec<PathBuf> {
         let entries = match fs::read_dir(dir) {
@@ -1099,23 +1196,88 @@ pub fn discovery_roots(source: &Path, catalogued: &[PathBuf]) -> Vec<PathBuf> {
         found
     };
     if fs::read_dir(source).is_err() {
-        return vec![source.to_path_buf()];
+        return (vec![source.to_path_buf()], None);
     }
+    let is_pc_family_folder = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(crate::folder_platform_alias)
+            .is_some_and(|platform| PC_FAMILY_PLATFORMS.contains(&platform))
+    };
     let mut roots = Vec::new();
+    let mut pc_folders = Vec::new();
     for child in child_directories(source) {
         if is_scummvm_folder(&child) {
             roots.push(child);
             continue;
         }
-        roots.extend(
-            child_directories(&child)
-                .into_iter()
-                .filter(|dir| is_scummvm_folder(dir)),
-        );
+        if is_pc_family_folder(&child) {
+            pc_folders.push(child.clone());
+        }
+        for grandchild in child_directories(&child) {
+            if is_scummvm_folder(&grandchild) {
+                roots.push(grandchild);
+            } else if is_pc_family_folder(&grandchild) {
+                pc_folders.push(grandchild);
+            }
+        }
     }
-    if roots.is_empty() {
-        return vec![source.to_path_buf()];
+    if roots.is_empty() && pc_folders.is_empty() {
+        return (vec![source.to_path_buf()], None);
     }
+    // Game folders inside PC/DOS collections that carry a ScummVM data-file
+    // signature (the folder itself or one level down), bounded per source.
+    let mut signed: Vec<PathBuf> = Vec::new();
+    let mut folders_looked_at = 0usize;
+    'pc: for pc in &pc_folders {
+        // A PC folder inside another (`pc/dos`) is listed on its own; it is
+        // never itself a game of its parent.
+        if roots.iter().chain(&signed).any(|root| pc.starts_with(root)) {
+            continue;
+        }
+        for game in child_directories(pc) {
+            if is_scummvm_folder(&game)
+                || is_pc_family_folder(&game)
+                || roots
+                    .iter()
+                    .chain(&signed)
+                    .any(|root| game.starts_with(root))
+            {
+                continue;
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                truncated = Some(
+                    "the ScummVM search time budget ran out while choosing PC/DOS folders; the rest were not looked at".into(),
+                );
+                break 'pc;
+            }
+            folders_looked_at += 1;
+            if folders_looked_at > MAX_NOMINATION_FOLDERS {
+                truncated = Some(format!(
+                    "more than {MAX_NOMINATION_FOLDERS} PC/DOS game folders; the rest were not looked at for ScummVM games"
+                ));
+                break 'pc;
+            }
+            let nominated = if has_scummvm_signature(&game) {
+                Some(game.clone())
+            } else {
+                child_directories(&game)
+                    .into_iter()
+                    .find(|inner| has_scummvm_signature(inner))
+                    .map(|_| game.clone())
+            };
+            if let Some(game) = nominated {
+                if signed.len() >= MAX_SIGNATURE_CANDIDATES {
+                    truncated = Some(format!(
+                        "more than {MAX_SIGNATURE_CANDIDATES} PC/DOS folders look like ScummVM games; the rest were not searched"
+                    ));
+                    break 'pc;
+                }
+                signed.push(game);
+            }
+        }
+    }
+    roots.extend(signed);
     let mut extra: Vec<PathBuf> = catalogued
         .iter()
         .filter(|game| game.starts_with(source) && !roots.iter().any(|root| game.starts_with(root)))
@@ -1132,7 +1294,7 @@ pub fn discovery_roots(source: &Path, catalogued: &[PathBuf]) -> Vec<PathBuf> {
     extra.sort();
     extra.dedup();
     roots.extend(extra);
-    roots
+    (roots, truncated)
 }
 
 /// As [`discover_scummvm_game_directories`], but reuses the recursive detector
@@ -1302,6 +1464,83 @@ impl OsStringAppend for OsString {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_scummvm_signature_only_nominates_folders_holding_engine_data_files() {
+        let root = tempfile::tempdir().unwrap();
+        for (dir, file, expected) in [
+            ("monkey", "MONKEY.000", true),
+            ("kq5", "RESOURCE.MAP", true),
+            ("indy", "01.LFL", true),
+            ("dig", "DIG.LA0", true),
+            ("doom", "DOOM.WAD", false),
+            ("empty", "readme.txt", false),
+        ] {
+            let path = root.path().join(dir);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join(file), b"x").unwrap();
+            assert_eq!(has_scummvm_signature(&path), expected, "{dir}");
+        }
+        // A directory named like a signature file is not a file.
+        let tricky = root.path().join("tricky");
+        fs::create_dir_all(tricky.join("resource.map")).unwrap();
+        assert!(!has_scummvm_signature(&tricky));
+    }
+
+    #[test]
+    fn a_pc_folder_inside_another_is_never_nominated_as_one_game() {
+        let root = tempfile::tempdir().unwrap();
+        let library = root.path().join("games");
+        for (dir, file) in [
+            ("pc/dos/Monkey Island", "monkey.000"),
+            ("pc/dos/Doom", "doom.wad"),
+            ("pc/Loom", "loom.000"),
+        ] {
+            fs::create_dir_all(library.join(dir)).unwrap();
+            fs::write(library.join(dir).join(file), b"x").unwrap();
+        }
+        let (roots, truncated) = discovery_roots_reporting(&library, &[], None);
+        assert_eq!(
+            roots,
+            vec![
+                library.join("pc/Loom"),
+                library.join("pc/dos/Monkey Island")
+            ]
+        );
+        assert_eq!(truncated, None);
+    }
+
+    #[test]
+    fn an_expired_deadline_stops_nomination_and_says_so() {
+        let root = tempfile::tempdir().unwrap();
+        let library = root.path().join("games");
+        fs::create_dir_all(library.join("dos/Monkey Island")).unwrap();
+        fs::write(library.join("dos/Monkey Island/monkey.000"), b"x").unwrap();
+        let (roots, truncated) = discovery_roots_reporting(&library, &[], Some(Instant::now()));
+        assert!(roots.is_empty(), "{roots:?}");
+        assert!(truncated.is_some_and(|note| note.contains("time budget")));
+    }
+
+    #[test]
+    fn pc_family_folders_contribute_only_signed_game_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let library = root.path().join("games");
+        for (dir, file) in [
+            ("dos/Monkey Island", "monkey.000"),
+            ("dos/Doom", "doom.wad"),
+            ("pc/KQ5/disk1", "resource.map"),
+            ("snes/Queen", "queen.1c"),
+        ] {
+            fs::create_dir_all(library.join(dir)).unwrap();
+            fs::write(library.join(dir).join(file), b"x").unwrap();
+        }
+        // No ScummVM-named folder: PC/DOS signed folders alone, never the
+        // whole library.
+        assert_eq!(
+            discovery_roots(&library, &[]),
+            vec![library.join("dos/Monkey Island"), library.join("pc/KQ5")]
+        );
+    }
+
     #[test]
     fn discovery_roots_cover_only_scummvm_folders_of_a_mixed_library() {
         let root = tempfile::tempdir().unwrap();
