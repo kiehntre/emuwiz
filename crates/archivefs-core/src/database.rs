@@ -10323,6 +10323,7 @@ fn scan_and_persist_folders_transaction(
                         save_scummvm_discovery_cache(&cache_path, &cache);
                         scummvm_report.ambiguous.extend(found.ambiguous);
                         scummvm_report.rejected.extend(found.rejected);
+                        scummvm_report.rejected.extend(found.outside_root);
                         scummvm_report.same_game.extend(found.same_game);
                         // A row EmuWiz cannot read may be a game: said so, and
                         // ScummVM rows of this source are kept from Missing.
@@ -16418,6 +16419,70 @@ echo "$out"
         assert!(!missing("atari2600/Amidar.zip"));
         // The ScummVM row could not be re-enumerated: kept, not called missing.
         assert!(!missing("scummvm/queen"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A detector row EmuWiz cannot read may be a game: the scan says so and
+    /// keeps every ScummVM row of the source from being called missing.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_scummvm_row_is_reported_and_withholds_scummvm_rows_from_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir("scummvm-unreadable-row");
+        let source = root.join("games");
+        let mount = root.join("mount");
+        let gone = write_archive_file(&source, "atari2600/Gone.zip", b"gone");
+        let game = source.join("scummvm/queen");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("queen.1c"), b"synthetic game data").unwrap();
+        let real = fake_scummvm(&root);
+        let garbled = root.join("scummvm-garbled");
+        fs::write(
+            &garbled,
+            "#!/bin/sh\nprintf '%-30s %-58s %s\\n' GameID Description 'Full Path'\n\
+             printf '%-30s %-58s %s\\n' '------------------------------' '----------------------------------------------------------' '---------'\n\
+             echo 'a row EmuWiz cannot read'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&garbled, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(real));
+        let first = scan_and_persist(&mut database, &config, "test").unwrap();
+        assert_eq!(first.scummvm.games_found, 1, "{:?}", first.scummvm);
+
+        fs::remove_file(&gone).unwrap();
+        fs::remove_dir_all(&game).unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = Some(garbled));
+        let second = scan_and_persist(&mut database, &config, "test").unwrap();
+        crate::scummvm_detection::TEST_EXECUTABLE.with(|c| *c.borrow_mut() = None);
+
+        assert!(
+            second
+                .scummvm
+                .errors
+                .iter()
+                .any(|(_, error)| error.contains("could not read: a row EmuWiz cannot read")),
+            "{:?}",
+            second.scummvm.errors
+        );
+        let archives = database.load_archives().unwrap();
+        let missing = |name: &str| {
+            archives
+                .iter()
+                .find(|row| row.absolute_path.ends_with(name))
+                .unwrap_or_else(|| panic!("{name} row kept"))
+                .last_verified_missing_at
+                .is_some()
+        };
+        assert!(
+            missing("atari2600/Gone.zip"),
+            "other rows reconcile as usual"
+        );
+        assert!(
+            !missing("scummvm/queen"),
+            "the ScummVM row is kept, not called missing"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

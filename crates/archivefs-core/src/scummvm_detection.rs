@@ -235,7 +235,11 @@ fn detect_candidates(
     );
     let _ = fs::remove_file(&config);
     let output = result?;
-    let games = parse_detection_output_for(&output, Some(path))?;
+    // ScummVM prints the folder made absolute and lexically normalised (no
+    // `.` or doubled separators, symlinks kept), so the anchor is spelled
+    // the same way.
+    let anchor = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let games = parse_detection_output_for(&output, Some(&anchor))?;
     Ok(dedupe_candidates(games))
 }
 
@@ -1010,6 +1014,9 @@ pub struct ScummVmDiscovery {
     /// or was refused (symlink, unsafe entry, outside the searched folder):
     /// not offered as games.
     pub rejected: Vec<PathBuf>,
+    /// Rows whose folder is outside the searched root or reached through a
+    /// symlink: never offered as games, reported with `rejected`.
+    pub outside_root: Vec<PathBuf>,
     /// Detector rows EmuWiz could not read, verbatim. Never guessed at; the
     /// caller reports them and treats the search as incomplete.
     pub unreadable: Vec<String>,
@@ -1446,9 +1453,10 @@ fn analyse_detection_output(
     for (game, path) in rows {
         // Lexical containment is not enough: a symlinked ancestor or `..` can
         // make a path that starts with the root resolve elsewhere.
-        // Reported as rejected, never dropped without a word.
+        // Reported, never dropped without a word; kept apart from `rejected`
+        // so a symlinked subfolder does not stop the cache from being reused.
         if !path.starts_with(root) || path.canonicalize().ok().as_deref() != Some(path.as_path()) {
-            discovery.rejected.push(path);
+            discovery.outside_root.push(path);
             continue;
         }
         by_path.entry(path).or_default().push(game);
@@ -1954,6 +1962,65 @@ queen:queen                    Flight of the Amazon Queen (CD/DOS/English)      
         ));
         // A different folder than the one searched is not read as this one.
         assert!(parse_detection_output_for(single.as_bytes(), Some(&root.join("lsl"))).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_single_check_matches_scummvms_normalised_spelling_of_the_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        fs::create_dir(&game).unwrap();
+        fs::write(game.join("queen.1c"), b"x").unwrap();
+        // Prints the path normalised like ScummVM's POSIX node (realpath -s:
+        // absolute, no `.` or `//`, symlinks kept), with CRLF line ends.
+        let exe = dir.path().join("scummvm");
+        fs::write(
+            &exe,
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --path=*) p=\"${a#--path=}\";; esac; done\n\
+             n=$(realpath -s \"$p\")\nprintf 'GameID                         Description                                                Full Path\\r\\n'\n\
+             printf '%s\\r\\n' '------------------------------ ---------------------------------------------------------- ---------'\n\
+             printf '%-30s %-58s %s\\r\\n' queen:queen 'Flight of the Amazon Queen (CD/DOS/English)' \"$n\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        for spelling in [
+            game.clone(),
+            dir.path().join(".").join("game"),
+            PathBuf::from(format!("{}//game/", dir.path().display())),
+        ] {
+            let found = detect_scummvm_directory_with_executable(&spelling, &exe)
+                .unwrap_or_else(|error| panic!("{}: {error:?}", spelling.display()));
+            assert_eq!(found.game_id, "queen", "{}", spelling.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cached_output_with_an_unreadable_row_is_never_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = caching_fake(dir.path());
+        let root = dir.path().join("lib");
+        let game = root.join("Queen");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join("queen.1c"), b"x").unwrap();
+        let (_, entry) = discover_scummvm_game_directories_cached(&root, &exe, None).unwrap();
+        let mut entry = entry.expect("cache entry");
+        assert_eq!(runs(&exe), 1);
+        let (_, again) =
+            discover_scummvm_game_directories_cached(&root, &exe, Some(&entry)).unwrap();
+        assert_eq!(runs(&exe), 1, "an intact entry is reused");
+        assert_eq!(again.as_ref(), Some(&entry));
+        entry.output.push_str("this is not a row\n");
+        let (found, _) =
+            discover_scummvm_game_directories_cached(&root, &exe, Some(&entry)).unwrap();
+        assert_eq!(
+            runs(&exe),
+            2,
+            "an entry with an unreadable row is run afresh"
+        );
+        assert!(found.unreadable.is_empty());
+        assert_eq!(found.games.len(), 1);
     }
 
     /// A fake ScummVM printing rows with ScummVM's own `%-30s %-58s %s`
