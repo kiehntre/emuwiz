@@ -578,11 +578,12 @@ fn find_retroarch_saves(
 
 /// Where each found save goes: `<old stem>.<rest>` becomes `<new stem>.<rest>`
 /// in the same folder. Refuses (nothing guessed) when RetroArch is running,
-/// when another library file's name starts with this game's (`Bros.` /
-/// `Bros. 3`: a save could be its), when a found file is not a recognised
-/// save name, when
-/// a save is not a plain file or is itself a library file, or when a new save
-/// name is already taken.
+/// when another library game could own a save under the old or the new name
+/// (the same name, or `Gradius Vol.2` beside `Gradius Vol`), when a save's
+/// name could be another game's, when a save is not a plain file or is itself
+/// a library file, or when a new save name is already taken. A longer name
+/// that only starts the same way (`Super Mario Bros. 3` beside
+/// `Super Mario Bros`) is a different game and does not refuse.
 fn plan_save_renames(
     database: &crate::Database,
     source: &Path,
@@ -604,31 +605,11 @@ fn plan_save_renames(
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .ok_or("The new name has no file name.")?;
-    if let Some(other) = database
-        .present_archive_paths_named_after(&old_stem)
-        .map_err(|error| format!("could not read the library: {error}"))?
-        .into_iter()
-        .find(|path| path != source)
-    {
-        return Err(format!(
-            "{} has the same name, so RetroArch's saves for the two games cannot be told apart. Rename refused. Nothing was changed.",
-            other.display()
-        ));
-    }
+    let old_others = other_library_stems(database, source, &old_stem)?;
     // The new name must not be another game's either: its saves would then
     // share RetroArch's save names, and either game could load or overwrite
     // the other's progress.
-    if let Some(other) = database
-        .present_archive_paths_named_after(&new_stem)
-        .map_err(|error| format!("could not read the library: {error}"))?
-        .into_iter()
-        .find(|path| path != source)
-    {
-        return Err(format!(
-            "{} already has the name {new_stem}, so the renamed saves would be shared with it. Rename refused. Nothing was changed.",
-            other.display()
-        ));
-    }
+    let new_others = other_library_stems(database, source, &new_stem)?;
     let mut renames = Vec::new();
     for save in found {
         let metadata = std::fs::symlink_metadata(save).map_err(|error| unreadable(save, error))?;
@@ -652,16 +633,34 @@ fn plan_save_renames(
             .strip_prefix(&format!("{old_stem}."))
             .map(str::to_owned)
             .ok_or_else(|| format!("{} is not named after the game.", save.display()))?;
-        // "Super Mario Bros. 3.srm" also starts with "Super Mario Bros.": only
-        // a recognised RetroArch save name is this game's; anything else
-        // could be another game's, so nothing is guessed.
-        if !is_save_suffix(&rest.to_ascii_lowercase()) {
+        // A save named for this game that another library game's saves
+        // could also be called: whose it is cannot be told.
+        if let Some(other) = claimed_by_another_game(&old_others, &old_stem, &file_name_of(save)) {
+            return Err(format!(
+                "{} could be the save of {} as well, so RetroArch's saves for the two games cannot be told apart. Rename refused. Nothing was changed.",
+                save.display(),
+                other.display()
+            ));
+        }
+        // `Zelda.foo.srm` in a save folder: a recognised save type behind
+        // another name part, so it may be the save of a game called
+        // `Zelda.foo` that is not in the library. Nothing is guessed.
+        if rest.contains('.') && !is_save_suffix(&rest.to_ascii_lowercase()) {
             return Err(format!(
                 "{} could belong to another game, so this game's saves cannot be told apart. Rename refused. Nothing was changed.",
                 save.display()
             ));
         }
         let destination = save.with_file_name(format!("{new_stem}.{rest}"));
+        if let Some(other) =
+            claimed_by_another_game(&new_others, &new_stem, &file_name_of(&destination))
+        {
+            return Err(format!(
+                "{} is a name {} would use for its saves too, so the renamed save would be shared with it. Rename refused. Nothing was changed.",
+                destination.display(),
+                other.display()
+            ));
+        }
         if std::fs::symlink_metadata(&destination).is_ok() {
             return Err(format!(
                 "{} already exists, so renaming the save {} would overwrite it. Rename refused. Nothing was changed.",
@@ -776,11 +775,63 @@ fn saves_named_after(
         let Some(rest) = name.strip_prefix(&prefix) else {
             continue;
         };
-        if any_suffix || is_save_suffix(&rest.to_ascii_lowercase()) {
+        // "Super Mario Bros. 3.srm" starts with "Super Mario Bros." too, but
+        // its remainder (" 3.srm") is not a plain extension: it is named
+        // after another game and is left alone.
+        if is_extension_chain(rest) && (any_suffix || is_save_suffix(&rest.to_ascii_lowercase())) {
             found.push(path);
         }
     }
     Ok(found)
+}
+
+/// `srm`, `state1.png`, `1.mcr`: dot-separated parts of letters, digits,
+/// `_` or `-`. A space or bracket means the file is named after a longer name.
+fn is_extension_chain(rest: &str) -> bool {
+    rest.split('.').all(|part| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    })
+}
+
+/// The stems of the other library files whose names start with `<stem>.`:
+/// the only games whose RetroArch saves could share this game's names.
+fn other_library_stems(
+    database: &crate::Database,
+    source: &Path,
+    stem: &str,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    Ok(database
+        .present_archive_paths_named_after(stem)
+        .map_err(|error| format!("could not read the library: {error}"))?
+        .into_iter()
+        .filter(|path| path != source)
+        .filter_map(|path| {
+            let other = path.file_stem()?.to_string_lossy().into_owned();
+            Some((path, other))
+        })
+        .collect())
+}
+
+/// The other library game that could also own the save named `save_name`:
+/// one with exactly this stem, or a longer one (`Gradius Vol.2` beside
+/// `Gradius Vol`) whose own save names include it.
+fn claimed_by_another_game<'a>(
+    others: &'a [(PathBuf, String)],
+    stem: &str,
+    save_name: &str,
+) -> Option<&'a Path> {
+    others
+        .iter()
+        .find(|(_, other)| {
+            other == stem
+                || save_name
+                    .strip_prefix(&format!("{other}."))
+                    .is_some_and(is_extension_chain)
+        })
+        .map(|(path, _)| path.as_path())
 }
 
 fn is_save_suffix(rest: &str) -> bool {
