@@ -5,6 +5,7 @@ mod device;
 mod discover;
 mod observer;
 mod session;
+mod status;
 mod store;
 
 use super::model::InUse;
@@ -53,6 +54,10 @@ pub(super) fn request(device: &str, files: &[&Path], time: i64) -> CaptureReques
         session_id: None,
         allow_unproven_closure: false,
         captured_unix: Some(time),
+        structure: super::status::StructureCheck::NotChecked {
+            why: "synthetic test file".to_string(),
+        },
+        preceding_session: super::status::PrecedingSession::unknown("no session in this test"),
     }
 }
 

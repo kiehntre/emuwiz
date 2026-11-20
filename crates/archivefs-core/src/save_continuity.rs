@@ -24,6 +24,7 @@
 //! | [`discover`] | Read-only, bounded, cancellable discovery (reuses `memory_card_manager`) |
 //! | [`compat`] | Five-level compatibility verdicts and conversion plans |
 //! | [`store`] | Content-addressed snapshot store: capture, verify, recover, pruning proposals |
+//! | [`status`] | Capture safety, structure, game integrity and last-exit context, kept separate |
 //! | [`session`] | Play-session journal: attempt, started, ended, what changed |
 //! | [`workflow`] | The steps the CLI and Blue share |
 //! | [`device`] | Offline two-device comparison and resumable transfer (no network code) |
@@ -36,6 +37,7 @@ pub mod device;
 pub mod discover;
 pub mod model;
 pub mod session;
+pub mod status;
 pub mod store;
 pub mod workflow;
 

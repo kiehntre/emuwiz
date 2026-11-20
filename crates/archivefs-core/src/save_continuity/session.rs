@@ -17,6 +17,7 @@
 //! what was observed: how long the process ran, and whether a save's content
 //! changed. Nothing here watches the emulator or scans the disk on a timer.
 
+use super::status::{PrecedingSession, is_crash_signal};
 use super::{ContinuityError, now_unix};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -178,6 +179,10 @@ pub struct SessionRecord {
     pub end: Option<SessionEnd>,
     pub play_evidence: PlayEvidence,
     pub saves_before: Vec<SaveMark>,
+    /// The saves as they were once the session had ended, when they were
+    /// compared. `None`: not compared (a crash, an exit EmuWiz did not see).
+    #[serde(default)]
+    pub saves_after: Option<Vec<SaveMark>>,
     pub save_changes: Vec<SaveChange>,
     /// Snapshots taken for this session (ids).
     pub snapshots: Vec<String>,
@@ -506,6 +511,7 @@ impl SessionJournal {
             end: None,
             play_evidence: PlayEvidence::None,
             saves_before,
+            saves_after: None,
             save_changes: Vec::new(),
             snapshots: Vec::new(),
             notes: Vec::new(),
@@ -646,6 +652,7 @@ impl SessionJournal {
         let seconds = record.duration_seconds().unwrap_or(0);
         match saves_after {
             Some(after) => {
+                record.saves_after = Some(after.to_vec());
                 record.save_changes = diff_saves(&record.saves_before, after);
                 let wrote = record.save_changes.iter().any(|change| {
                     matches!(
@@ -767,5 +774,120 @@ impl SessionJournal {
             })
             .take(limit)
             .collect()
+    }
+}
+
+/// Decides how the emulator ended the last time it could have written the
+/// saves in `current`, from recorded sessions (`sessions`, newest first).
+///
+/// A session speaks for a save only when all of this holds; anything else is
+/// [`PrecedingSession::Unknown`], with the reason:
+///
+/// - it is the **most recent** session of the same emulator and install on
+///   this device that actually started (an older one says nothing once a
+///   newer one has run);
+/// - it **recorded this save** (by the save's id) before or after;
+/// - when the saves were compared after the session, each save's content is
+///   **still what it was then** (otherwise something has written it since,
+///   outside any recorded session);
+/// - a normal exit only counts if the saves were compared afterwards.
+///
+/// What this cannot see: an emulator started outside EmuWiz leaves no
+/// session at all, so the answer after one is "unknown", never "clean".
+pub fn preceding_session(
+    sessions: &[SessionRecord],
+    device_id: &str,
+    emulator: &str,
+    profile: &str,
+    current: &[SaveMark],
+) -> PrecedingSession {
+    let Some(latest) = sessions.iter().find(|session| {
+        session.device_id == device_id
+            && session.launch.emulator.eq_ignore_ascii_case(emulator)
+            && session.launch.profile.eq_ignore_ascii_case(profile)
+            && session.state != SessionState::NeverStarted
+    }) else {
+        return PrecedingSession::unknown(&format!(
+            "EmuWiz has no recorded session of {emulator} ({profile}) on this device"
+        ));
+    };
+    if current.is_empty() {
+        return PrecedingSession::unknown("this save has no identity to match against a session");
+    }
+    let id = latest.session_id.clone();
+    if matches!(
+        latest.state,
+        SessionState::Requested | SessionState::Started
+    ) {
+        return PrecedingSession::unknown(
+            "the most recent session of this emulator is still recorded as open",
+        );
+    }
+    let listed = |marks: &[SaveMark]| {
+        current
+            .iter()
+            .all(|now| marks.iter().any(|mark| mark.save_id == now.save_id))
+    };
+    let recorded =
+        listed(&latest.saves_before) || latest.saves_after.as_deref().is_some_and(listed);
+    if !recorded {
+        return PrecedingSession::unknown(&format!(
+            "the most recent {emulator} session did not record this save, so what happened to it then was not seen"
+        ));
+    }
+    if let Some(after) = &latest.saves_after {
+        let unchanged_since = current.iter().all(|now| {
+            after.iter().any(|mark| {
+                mark.save_id == now.save_id && mark.content_sha256 == now.content_sha256
+            })
+        });
+        if !unchanged_since {
+            return PrecedingSession::unknown(
+                "the save has changed since the last recorded session ended, outside any session EmuWiz saw",
+            );
+        }
+    }
+    match (&latest.state, &latest.end) {
+        (SessionState::EndNotSeen, _) => PrecedingSession::ExitNotSeen {
+            session_id: id,
+            detail: "EmuWiz was not watching when the emulator stopped".to_string(),
+        },
+        (_, Some(SessionEnd::Clean)) if latest.saves_after.is_some() => {
+            PrecedingSession::CleanExit { session_id: id }
+        }
+        (_, Some(SessionEnd::Clean)) => PrecedingSession::unknown(
+            "the last session ended normally, but the saves were not compared afterwards",
+        ),
+        (_, Some(SessionEnd::LauncherExitedOk)) => PrecedingSession::ExitNotSeen {
+            session_id: id,
+            detail: "only the launcher's exit was seen, not the emulator's own".to_string(),
+        },
+        (_, Some(SessionEnd::ExitCode { code })) => PrecedingSession::ErrorExit {
+            session_id: id,
+            code: *code,
+        },
+        (
+            _,
+            Some(SessionEnd::Signal {
+                signal,
+                core_dumped,
+            }),
+        ) => {
+            if is_crash_signal(*signal, *core_dumped) {
+                PrecedingSession::Crashed {
+                    session_id: id,
+                    signal: *signal,
+                }
+            } else {
+                PrecedingSession::ForcedStop {
+                    session_id: id,
+                    signal: *signal,
+                }
+            }
+        }
+        (_, Some(SessionEnd::StatusUnavailable)) | (_, None) => PrecedingSession::ExitNotSeen {
+            session_id: id,
+            detail: "the emulator's exit status could not be read".to_string(),
+        },
     }
 }

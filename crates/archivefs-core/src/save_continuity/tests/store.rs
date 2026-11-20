@@ -364,43 +364,63 @@ fn a_writer_that_appears_during_the_copy_means_nothing_is_kept() {
     assert_eq!(bench.store.usage().objects, 0);
 }
 
+/// A writer rewrites the file in place, in pieces, over and over. Reading
+/// the file twice is not enough on its own: a writer that pauses half-way
+/// leaves a file that reads the same twice and is still torn (this test
+/// caught exactly that when it trusted the double read alone). What makes a
+/// snapshot "verified" is the kernel lease: it is only granted while no
+/// program has the file open, and it is broken the moment one opens it to
+/// write. So a verified snapshot here is always one whole version.
 #[test]
-fn a_file_being_rewritten_is_never_kept_torn() {
+fn a_file_being_rewritten_is_never_kept_torn_at_a_verified_safe_point() {
+    use super::super::discover::ProcessObserver;
     let bench = Bench::new();
-    let size = 4 * 1024 * 1024;
+    let size = 2 * 1024 * 1024;
     let (all_a, all_b) = (vec![0xAAu8; size], vec![0xBBu8; size]);
     let path = bench.file("card.ps2", &all_a);
+    let empty_proc = tempfile::tempdir().unwrap();
+    let observer = ProcessObserver::with_proc_root(empty_proc.path().to_path_buf());
     let stop = Arc::new(AtomicBool::new(false));
     let writer = {
         let (path, stop, a, b) = (path.clone(), stop.clone(), all_a.clone(), all_b.clone());
         std::thread::spawn(move || {
+            use std::io::Write;
             let mut flip = false;
             while !stop.load(Ordering::Relaxed) {
-                // In place, in pieces: exactly how a torn copy happens.
-                use std::io::{Seek, SeekFrom, Write};
-                let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+                let Ok(mut file) = fs::OpenOptions::new().write(true).open(&path) else {
+                    continue;
+                };
                 let source = if flip { &a } else { &b };
                 for chunk in source.chunks(64 * 1024) {
                     file.write_all(chunk).unwrap();
+                    std::thread::yield_now(); // pause mid-rewrite, as a busy emulator does
                 }
-                file.seek(SeekFrom::Start(0)).unwrap();
                 flip = !flip;
             }
         })
     };
     let (mut kept, mut refused) = (0, 0);
-    for round in 0..40 {
-        match bench
-            .store
-            .capture(&request("dev", &[&path], round), &CLOSED)
-        {
+    for round in 0..60 {
+        let mut ask = request("dev", &[&path], round);
+        ask.provenance.emulator = "PCSX2".into();
+        match bench.store.capture(&ask, &observer) {
             Ok(outcome) => {
                 kept += 1;
-                let sha = &outcome.manifest().body.files[0].sha256;
-                let bytes = bench.store.read_object(sha).unwrap();
-                assert!(bytes == all_a || bytes == all_b, "a torn copy was kept");
+                let manifest = outcome.manifest();
+                assert_eq!(
+                    manifest.body.boundary,
+                    CaptureBoundary::EmulatorClosedObserved
+                );
+                let bytes = bench
+                    .store
+                    .read_object(&manifest.body.files[0].sha256)
+                    .unwrap();
+                assert!(
+                    bytes == all_a || bytes == all_b,
+                    "a torn copy was kept as verified"
+                );
             }
-            Err(ContinuityError::Unstable(_)) => refused += 1,
+            Err(ContinuityError::InUse(_) | ContinuityError::Unstable(_)) => refused += 1,
             Err(other) => panic!("{other}"),
         }
     }

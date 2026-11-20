@@ -3,6 +3,11 @@
 use super::ContinuityError;
 use super::discover::contained_saves;
 use super::model::{DiscoveredSave, SaveFormat};
+use super::session::SaveMark;
+use super::status::{
+    Advisory, GameIntegrity, PrecedingSession, StructureCheck, describe_integrity,
+    describe_preceding, describe_structure,
+};
 use super::store::{
     CaptureBoundary, CaptureFile, CaptureReason, CaptureRequest, ContainedSave, Provenance,
     SnapshotManifest, SnapshotStore,
@@ -22,6 +27,7 @@ pub fn capture_request(
     reason: CaptureReason,
     session_id: Option<String>,
     allow_unproven_closure: bool,
+    preceding_session: PrecedingSession,
 ) -> Result<CaptureRequest, ContinuityError> {
     let source = &save.source_path;
     let meta =
@@ -102,6 +108,8 @@ pub fn capture_request(
         session_id,
         allow_unproven_closure,
         captured_unix: None,
+        structure: structure_of(save),
+        preceding_session,
     })
 }
 
@@ -122,6 +130,16 @@ pub struct TimelineEntry {
     pub saves: Vec<ContainedSave>,
     /// What differs from the snapshot before, by content.
     pub changes: Vec<String>,
+    /// Three separate statuses; none of them implies another.
+    pub structure: Option<StructureCheck>,
+    pub game_integrity: Option<GameIntegrity>,
+    pub preceding_session: Option<PrecedingSession>,
+    pub advisory: Advisory,
+    /// Shown prominently when the emulator did not end normally (or that is
+    /// not known) before this snapshot.
+    pub warning: Option<String>,
+    /// The same three statuses as sentences, for display.
+    pub status_lines: Vec<String>,
 }
 
 /// One save location's snapshots, oldest first.
@@ -203,6 +221,12 @@ pub fn timelines(store: &SnapshotStore) -> Vec<Timeline> {
                 total_bytes: manifest.total_bytes(),
                 saves: manifest.body.contained_saves.clone(),
                 changes: changes(before, manifest),
+                structure: manifest.body.structure.clone(),
+                game_integrity: manifest.body.game_integrity.clone(),
+                preceding_session: manifest.body.preceding_session.clone(),
+                advisory: advisory_of(manifest),
+                warning: warning_of(manifest),
+                status_lines: status_lines(manifest),
             });
         }
         if let Some(first) = chain.first() {
@@ -215,4 +239,105 @@ pub fn timelines(store: &SnapshotStore) -> Vec<Timeline> {
         }
     }
     out
+}
+
+/// The structural result for one discovered save, worded so that it claims
+/// exactly what discovery checked and nothing more.
+pub fn structure_of(save: &DiscoveredSave) -> StructureCheck {
+    match save.format {
+        SaveFormat::Ps1CardSave | SaveFormat::Ps2CardSave => {
+            let disagree = save
+                .integrity
+                .iter()
+                .any(|line| line.contains("DISAGREE"));
+            let warnings = save
+                .unsupported
+                .iter()
+                .any(|line| line == super::discover::CARD_HAS_WARNINGS);
+            if disagree || warnings {
+                StructureCheck::Problems {
+                    what: "the memory card does not read cleanly (its two readers disagree or it has warnings)".to_string(),
+                }
+            } else {
+                StructureCheck::Passed {
+                    what: "the memory card's directory and allocation were walked by two independent readers, which list the same saves; the game's own data inside each save was not checked".to_string(),
+                }
+            }
+        }
+        SaveFormat::GameCubeGci => StructureCheck::Passed {
+            what: "the file's length matches the block count in its header; nothing inside the save (including its checksums) was checked".to_string(),
+        },
+        SaveFormat::Ps3Savedata | SaveFormat::PspSavedata => StructureCheck::NotChecked {
+            why: "only PARAM.SFO was read; the save's signature (PARAM.PFD) and data files were not checked".to_string(),
+        },
+        SaveFormat::CartridgeBattery => StructureCheck::NotChecked {
+            why: "a cartridge save is raw memory with no structure EmuWiz can check".to_string(),
+        },
+        SaveFormat::SaveState => StructureCheck::NotChecked {
+            why: "a save state's layout belongs to one emulator build".to_string(),
+        },
+    }
+}
+
+/// The current content of every save sharing `save`'s file, for matching
+/// against a session's record.
+pub fn marks_of(save: &DiscoveredSave, all: &[DiscoveredSave]) -> Vec<SaveMark> {
+    all.iter()
+        .filter(|other| other.source_path == save.source_path)
+        .filter_map(|other| {
+            Some(SaveMark {
+                save_id: other.id.clone(),
+                label: other
+                    .entry_name
+                    .clone()
+                    .unwrap_or_else(|| other.source_path.display().to_string()),
+                content_sha256: other.content_sha256.clone()?,
+            })
+        })
+        .collect()
+}
+
+pub fn advisory_of(manifest: &SnapshotManifest) -> Advisory {
+    let from_session = manifest
+        .body
+        .preceding_session
+        .as_ref()
+        .map_or(Advisory::Caution, PrecedingSession::advisory);
+    let structural = if matches!(
+        manifest.body.structure,
+        Some(StructureCheck::Problems { .. })
+    ) {
+        Advisory::Warning
+    } else {
+        Advisory::None
+    };
+    from_session.max(structural)
+}
+
+pub fn warning_of(manifest: &SnapshotManifest) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(StructureCheck::Problems { what }) = &manifest.body.structure {
+        parts.push(format!("WARNING: {what}"));
+    }
+    match &manifest.body.preceding_session {
+        Some(preceding) => parts.extend(preceding.warning()),
+        None => {
+            parts.push("How the emulator last ended was not recorded for this snapshot".to_string())
+        }
+    }
+    if manifest.body.boundary != CaptureBoundary::EmulatorClosedObserved {
+        parts.push(manifest.body.boundary.label().to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(". "))
+}
+
+/// Capture safety, structure, game data and last-exit context, one line
+/// each, in that order. Never merged into one word.
+pub fn status_lines(manifest: &SnapshotManifest) -> Vec<String> {
+    vec![
+        format!("Copy: {}", manifest.body.boundary.label()),
+        describe_structure(manifest.body.structure.as_ref()),
+        describe_integrity(manifest.body.game_integrity.as_ref()),
+        describe_preceding(manifest.body.preceding_session.as_ref()),
+    ]
 }

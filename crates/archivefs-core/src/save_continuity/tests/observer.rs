@@ -29,8 +29,21 @@ impl Proc {
     fn observer(&self) -> ProcessObserver {
         ProcessObserver::with_proc_root(self.0.path().to_path_buf())
     }
+
+    /// Also answers for Dolphin, whose rules are synthetic-only.
+    fn synthetic(&self) -> ProcessObserver {
+        ProcessObserver::synthetic_including_not_verified(self.0.path().to_path_buf())
+    }
 }
 
+const ALL_SIX: [&str; 6] = [
+    "PCSX2",
+    "RetroArch",
+    "DuckStation",
+    "Dolphin",
+    "RPCS3",
+    "PPSSPP",
+];
 const USER: &str = "0::/user.slice/user-1000.slice/session-2.scope\n";
 
 fn save_file(dir: &tempfile::TempDir) -> PathBuf {
@@ -161,17 +174,17 @@ fn every_supported_emulator_is_seen_in_each_form_it_runs_in() {
         let proc = Proc::new();
         proc.add(4242, comm, cmdline, cgroup);
         assert_eq!(
-            proc.observer().observe(emulator, &save),
+            proc.synthetic().observe(emulator, &save),
             InUse::EmulatorRunning,
             "{emulator} as `{cmdline}` must count as running"
         );
         // And no other emulator's saves are blocked by it.
-        for other in SAFE_POINT_EMULATORS
+        for other in ALL_SIX
             .iter()
             .filter(|other| !other.eq_ignore_ascii_case(emulator))
         {
             assert_ne!(
-                proc.observer().observe(other, &save),
+                proc.synthetic().observe(other, &save),
                 InUse::EmulatorRunning,
                 "{cmdline} is not {other}"
             );
@@ -202,7 +215,12 @@ fn an_emulator_with_no_reviewed_identity_is_unknown_not_safe() {
     let dir = tempfile::tempdir().unwrap();
     let save = save_file(&dir);
     let proc = Proc::new();
-    for emulator in ["mGBA", "melonDS", "xemu", "Flycast", ""] {
+    // Dolphin is here on purpose: its rules pass synthetic tests but were
+    // never checked against a real installation, so production says unknown.
+    proc.add(50, "dolphin-emu", "/usr/bin/dolphin-emu", USER);
+    for emulator in [
+        "Dolphin", "dolphin", "mGBA", "melonDS", "xemu", "Flycast", "",
+    ] {
         assert!(!safe_point_supported(emulator));
         assert_eq!(
             proc.observer().observe(emulator, &save),
@@ -241,9 +259,51 @@ fn a_program_holding_the_save_open_is_active_whatever_its_name() {
     let pid = proc.add(77, "syncthing", "/usr/bin/syncthing", USER);
     std::os::unix::fs::symlink(&save, pid.join("fd/9")).unwrap();
     assert_eq!(
-        proc.observer().observe("Dolphin", &save),
+        proc.observer().observe("RPCS3", &save),
         InUse::OpenByAProgram
     );
+}
+
+#[test]
+fn standalone_dolphin_is_never_a_verified_safe_point_until_checked_for_real() {
+    use super::super::discover::SAFE_POINT_NOT_VERIFIED;
+    assert!(
+        SAFE_POINT_NOT_VERIFIED
+            .iter()
+            .any(|(name, _)| *name == "Dolphin")
+    );
+    assert!(!safe_point_supported("Dolphin"));
+    let bench = Bench::new();
+    let save = bench.file("01-GEDE-Eternal Darkness.gci", b"gamecube save");
+    let proc = Proc::new(); // nothing is running at all
+    let mut ask = request("dev", &[&save], 1);
+    ask.provenance.emulator = "Dolphin".to_string();
+
+    // By default: refused, nothing kept.
+    let refused = bench.store.capture(&ask, &proc.observer()).unwrap_err();
+    assert!(
+        matches!(refused, ContinuityError::ClosureUnproven(_)),
+        "{refused}"
+    );
+    assert!(bench.store.list().is_empty());
+
+    // Asked for explicitly: a copy exists, and can never pass for verified.
+    ask.allow_unproven_closure = true;
+    let copy = bench
+        .store
+        .capture(&ask, &proc.observer())
+        .unwrap()
+        .manifest()
+        .clone();
+    assert_eq!(copy.body.boundary, CaptureBoundary::StableReadOnly);
+    assert_ne!(copy.body.boundary, CaptureBoundary::EmulatorClosedObserved);
+    assert!(
+        copy.body
+            .checks
+            .iter()
+            .any(|check| check.starts_with("UNVERIFIED"))
+    );
+    assert_eq!(fs::read(&save).unwrap(), b"gamecube save");
 }
 
 #[test]

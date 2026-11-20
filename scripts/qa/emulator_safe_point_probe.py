@@ -43,7 +43,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gui_sandbox  # noqa: E402
 
 REAL_HOME = Path.home()
-EMULATORS = ["PCSX2", "RetroArch", "DuckStation", "Dolphin", "RPCS3", "PPSSPP"]
+# Emulators the product answers for. Standalone Dolphin is deliberately not
+# here: it is not installed, so its routes report "not_installed" and the
+# product keeps it at "unknown".
+EMULATORS = ["PCSX2", "RetroArch", "DuckStation", "RPCS3", "PPSSPP"]
 
 # name -> (emulator, kind, program or app id, arguments, real folders to watch)
 ROUTES = {

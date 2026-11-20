@@ -18,6 +18,7 @@
 //! a person could remove and what that would free.
 
 use super::model::InUse;
+use super::status::{GameIntegrity, PrecedingSession, StructureCheck};
 use super::{ContinuityError, io, now_unix, sha256_hex};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -124,6 +125,30 @@ pub struct SnapshotBody {
     pub contained_saves: Vec<ContainedSave>,
     /// What was checked when the snapshot was taken.
     pub checks: Vec<String>,
+    /// Whether the file has the shape its format requires. Separate from
+    /// `boundary` (was the copy safe) on purpose; see [`super::status`].
+    /// Absent on records written before this was tracked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure: Option<StructureCheck>,
+    /// Whether the save's own data is valid as the game sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_integrity: Option<GameIntegrity>,
+    /// How the emulator ended the last time it could have written this save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preceding_session: Option<PrecedingSession>,
+}
+
+impl SnapshotBody {
+    /// Taken at a verified safe point, after a session that is known to
+    /// have ended normally. Says nothing about the game's own data.
+    pub fn clean_recovery_point(&self) -> bool {
+        self.boundary == CaptureBoundary::EmulatorClosedObserved
+            && self
+                .preceding_session
+                .as_ref()
+                .is_some_and(PrecedingSession::clean)
+            && !matches!(self.structure, Some(StructureCheck::Problems { .. }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +238,10 @@ pub struct CaptureRequest {
     pub allow_unproven_closure: bool,
     /// For repeatable tests; `None` is now.
     pub captured_unix: Option<i64>,
+    /// Result of the format's structural check, if one was run.
+    pub structure: StructureCheck,
+    /// How the emulator last ended, when a session can be tied to this save.
+    pub preceding_session: PrecedingSession,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -872,8 +901,12 @@ impl SnapshotStore {
             };
             // An unverified copy never stands in for, or is hidden behind,
             // a verified one: only the same kind counts as "unchanged".
+            // Nor does a snapshot taken after a crash hide behind an earlier
+            // one taken after a clean exit (or the reverse): the bytes may be
+            // the same, what is known about them is not.
             if same(&newest.body.files, &files)
                 && newest.body.boundary == boundary
+                && newest.body.preceding_session.as_ref() == Some(&request.preceding_session)
                 && self.verify(&newest.snapshot_id)?.intact()
             {
                 return Ok(CaptureOutcome::Unchanged {
@@ -932,6 +965,9 @@ impl SnapshotStore {
             files,
             contained_saves: request.contained_saves.clone(),
             checks,
+            structure: Some(request.structure.clone()),
+            game_integrity: Some(GameIntegrity::not_checked()),
+            preceding_session: Some(request.preceding_session.clone()),
         };
         let manifest = SnapshotManifest {
             format_version: MANIFEST_FORMAT_VERSION,
@@ -1071,6 +1107,10 @@ impl SnapshotStore {
                 "The original save is not touched.".to_string(),
                 "To use the recovered save, close the emulator and copy it into place yourself; EmuWiz does not replace a live save.".to_string(),
                 manifest.body.boundary.label().to_string(),
+                super::status::describe_structure(manifest.body.structure.as_ref()),
+                super::status::describe_integrity(manifest.body.game_integrity.as_ref()),
+                super::status::describe_preceding(manifest.body.preceding_session.as_ref()),
+                "Recovering a snapshot does not make it a good save: only the game can show that.".to_string(),
             ],
         })
     }
@@ -1180,8 +1220,18 @@ impl SnapshotStore {
                 (manifest.body.captured_unix, manifest.snapshot_id.clone())
             });
             let cut = snapshots.len().saturating_sub(keep);
-            removable.extend(&snapshots[..cut]);
-            kept.extend(&snapshots[cut..]);
+            // The newest snapshot taken safely after a normal exit is never
+            // proposed, even when newer (suspect) snapshots fill the quota.
+            let last_clean = snapshots
+                .iter()
+                .rposition(|manifest| manifest.body.clean_recovery_point());
+            for (index, manifest) in snapshots.iter().enumerate() {
+                if index >= cut || Some(index) == last_clean {
+                    kept.push(manifest);
+                } else {
+                    removable.push(manifest);
+                }
+            }
         }
         let kept_objects: BTreeSet<&str> = kept
             .iter()

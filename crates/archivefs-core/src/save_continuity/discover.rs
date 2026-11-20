@@ -160,16 +160,20 @@ pub struct DiscoveryReport {
     pub not_covered: Vec<&'static str>,
 }
 
-/// Emulators whose "closed" state EmuWiz can establish: the reviewed process
-/// scan knows each one's native, AppImage, Flatpak and launcher forms.
-pub const SAFE_POINT_EMULATORS: [&str; 6] = [
-    "PCSX2",
-    "RetroArch",
-    "DuckStation",
+/// Emulators for which EmuWiz reports a verified safe point. Each one's
+/// process rules were checked against a real launch of the installed
+/// emulator (`scripts/qa/emulator_safe_point_probe.py`), not only against
+/// synthetic process lists.
+pub const SAFE_POINT_EMULATORS: [&str; 5] =
+    ["PCSX2", "RetroArch", "DuckStation", "RPCS3", "PPSSPP"];
+
+/// Emulators whose process rules exist and pass synthetic tests, but have
+/// never been checked against a real installation. They are treated exactly
+/// like an unknown emulator: never a verified safe point.
+pub const SAFE_POINT_NOT_VERIFIED: [(&str, &str); 1] = [(
     "Dolphin",
-    "RPCS3",
-    "PPSSPP",
-];
+    "standalone Dolphin was not installed when this was written, so how its processes and save writes really behave has not been observed",
+)];
 
 pub fn safe_point_supported(emulator: &str) -> bool {
     SAFE_POINT_EMULATORS
@@ -192,18 +196,41 @@ pub fn safe_point_supported(emulator: &str) -> bool {
 ///   identity for.
 pub struct ProcessObserver {
     proc_root: PathBuf,
+    /// Tests only: also answer for emulators in [`SAFE_POINT_NOT_VERIFIED`].
+    include_not_verified: bool,
 }
 
 impl ProcessObserver {
     pub fn new() -> Self {
         Self {
             proc_root: PathBuf::from("/proc"),
+            include_not_verified: false,
         }
     }
 
     /// For tests: read processes from a stand-in for `/proc`.
     pub fn with_proc_root(proc_root: PathBuf) -> Self {
-        Self { proc_root }
+        Self {
+            proc_root,
+            include_not_verified: false,
+        }
+    }
+
+    /// Synthetic tests of process rules that production does not yet trust.
+    #[cfg(test)]
+    pub(crate) fn synthetic_including_not_verified(proc_root: PathBuf) -> Self {
+        Self {
+            proc_root,
+            include_not_verified: true,
+        }
+    }
+
+    fn answers_for(&self, emulator: &str) -> bool {
+        safe_point_supported(emulator)
+            || (self.include_not_verified
+                && SAFE_POINT_NOT_VERIFIED
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(emulator)))
     }
 
     fn scan(&self) -> crate::memory_card_inventory::restore_guard::ProcScanQuiescence {
@@ -251,7 +278,7 @@ fn from_quiescence(
 impl InUseObserver for ProcessObserver {
     fn observe(&self, emulator: &str, path: &Path) -> InUse {
         use crate::memory_card_inventory::restore_guard::observe_card_now;
-        if !safe_point_supported(emulator) {
+        if !self.answers_for(emulator) {
             return InUse::Unknown;
         }
         from_quiescence(observe_card_now(
@@ -267,7 +294,7 @@ impl InUseObserver for ProcessObserver {
         path: &'a Path,
     ) -> Box<dyn super::store::CopyGuard + 'a> {
         use crate::memory_card_inventory::restore_guard::{CardLeaseAttempt, CardWriteLease};
-        let (lease, writers) = if safe_point_supported(emulator) {
+        let (lease, writers) = if self.answers_for(emulator) {
             match CardWriteLease::acquire(path, None) {
                 CardLeaseAttempt::Held(lease) => (Some(lease), false),
                 CardLeaseAttempt::Writers => (None, true),
@@ -299,7 +326,7 @@ struct LeaseGuard<'a> {
 impl super::store::CopyGuard for LeaseGuard<'_> {
     fn state(&self) -> InUse {
         use crate::save_snapshots::tree_restore::safety::QuiescenceProvider;
-        if !safe_point_supported(self.emulator) {
+        if !self.observer.answers_for(self.emulator) {
             return InUse::Unknown;
         }
         let binding = binding_for(self.emulator, self.path);

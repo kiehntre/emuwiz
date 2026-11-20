@@ -19,12 +19,12 @@ use archivefs_core::save_continuity::{
     },
     discover::{
         DiscoveryOptions, DiscoveryReport, DiscoveryRoots, ProcessObserver, SAFE_POINT_EMULATORS,
-        discover,
+        SAFE_POINT_NOT_VERIFIED, discover,
     },
     model::{DiscoveredSave, InUse},
-    session::{ProcFs, SessionJournal},
+    session::{ProcFs, SessionJournal, preceding_session},
     store::{CaptureOutcome, CaptureReason, SnapshotStore},
-    workflow::{capture_request, timelines},
+    workflow::{capture_request, marks_of, status_lines, timelines, warning_of},
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -491,12 +491,33 @@ pub fn run(args: Vec<String>) -> Outcome {
                     })
                 })
                 .collect();
+            // Emulators with process rules that were never checked against a
+            // real installation: listed, and always "unknown".
+            let not_verified: Vec<Value> = SAFE_POINT_NOT_VERIFIED
+                .iter()
+                .map(|(emulator, reason)| {
+                    let saves_found = report
+                        .saves
+                        .iter()
+                        .filter(|save| save.emulator.eq_ignore_ascii_case(emulator))
+                        .count();
+                    json!({ "emulator": emulator, "saves_found": saves_found, "reason": reason })
+                })
+                .collect();
             emit(
                 &options,
                 "safe-points",
                 true,
-                json!({ "emulators": rows }),
+                json!({ "emulators": rows, "not_verified": not_verified }),
                 || {
+                    for row in &not_verified {
+                        println!(
+                            "{}: {} save(s) found. Always \"unknown\", never a verified safe point: {}.",
+                            row["emulator"].as_str().unwrap_or(""),
+                            row["saves_found"].as_u64().unwrap_or(0),
+                            row["reason"].as_str().unwrap_or("")
+                        );
+                    }
                     println!("emulator      saves  verified-safe  active  unknown   (right now)");
                     for row in &rows {
                         let n = |key: &str| row[key].as_u64().unwrap_or(0);
@@ -520,6 +541,17 @@ pub fn run(args: Vec<String>) -> Outcome {
             let save = pick(&report, need(0, "a save id")?)?;
             let store = store(&options)?;
             let device = device(&options, &store)?;
+            // How the emulator last ended, if a recorded session can be tied
+            // to this exact save; otherwise "unknown".
+            let journal = SessionJournal::open(store.root(), &device.identity.device_id)?;
+            journal.reconcile(&ProcFs, continuity_now());
+            let preceding = preceding_session(
+                &journal.recent(500),
+                &device.identity.device_id,
+                &save.emulator,
+                &save.profile,
+                &marks_of(save, &report.saves),
+            );
             let request = capture_request(
                 save,
                 &report.saves,
@@ -527,6 +559,7 @@ pub fn run(args: Vec<String>) -> Outcome {
                 CaptureReason::Manual,
                 None,
                 options.best_effort,
+                preceding,
             )?;
             let outcome = store.capture(&request, &ProcessObserver::new())?;
             let manifest = outcome.manifest().clone();
@@ -545,7 +578,12 @@ pub fn run(args: Vec<String>) -> Outcome {
                             &manifest.snapshot_id[..12]
                         );
                     }
-                    println!("  {}", manifest.body.boundary.label());
+                    if let Some(warning) = warning_of(&manifest) {
+                        println!("  >>> {warning}");
+                    }
+                    for line in status_lines(&manifest) {
+                        println!("  {line}");
+                    }
                     for line in &manifest.body.checks {
                         println!("  checked: {line}");
                     }
@@ -579,8 +617,14 @@ pub fn run(args: Vec<String>) -> Outcome {
                                     .map(|id| format!("  (session {id})"))
                                     .unwrap_or_default()
                             );
+                            if let Some(warning) = &entry.warning {
+                                println!("      >>> {warning}");
+                            }
+                            for line in &entry.status_lines {
+                                println!("      {line}");
+                            }
                             for change in &entry.changes {
-                                println!("      {change}");
+                                println!("      change: {change}");
                             }
                         }
                     }
