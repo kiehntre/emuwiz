@@ -266,18 +266,32 @@ pub fn resolve_platform_identity(
         return settle_tier(generation, manual);
     }
 
-    // DAT and RomM are considered together specifically so contradictory
-    // authoritative providers cannot be resolved by whichever arrived first.
-    let authoritative: Vec<_> = evidence
+    // A current, exact DAT verification is EmuWiz's own evidence and outranks
+    // RomM, which is external metadata: RomM agreeing is kept beside it (as
+    // agreement), RomM disagreeing is left out of the answer and never turns
+    // the verified platform into a conflict. Callers that want to show the
+    // disagreement compare the RomM evidence they passed with the result.
+    // Without such a DAT verification, RomM stands in this tier on its own.
+    let dat: Vec<_> = evidence
         .iter()
-        .filter(|item| {
-            matches!(
-                item.source,
-                PlatformIdentitySource::VerifiedDat | PlatformIdentitySource::Romm
-            )
-        })
+        .filter(|item| item.source == PlatformIdentitySource::VerifiedDat)
         .cloned()
         .collect();
+    let authoritative: Vec<_> = if dat.is_empty() {
+        evidence
+            .iter()
+            .filter(|item| item.source == PlatformIdentitySource::Romm)
+            .cloned()
+            .collect()
+    } else {
+        let dat_platforms: BTreeSet<&str> = dat.iter().map(|item| item.platform.as_str()).collect();
+        let agreeing_romm = evidence.iter().filter(|item| {
+            item.source == PlatformIdentitySource::Romm
+                && dat_platforms.len() == 1
+                && dat_platforms.contains(item.platform.as_str())
+        });
+        dat.iter().chain(agreeing_romm).cloned().collect()
+    };
     if !authoritative.is_empty() {
         let authoritative_resolution = settle_tier(generation, authoritative);
         let authoritative_platform = match &authoritative_resolution {

@@ -1547,11 +1547,12 @@ fn import(
                     });
                 match enrichment {
                     Ok(enrichment) => context.progress(&format!(
-                        "Platform identity enrichment: {} applied, {} already current, {} manual assignment(s) preserved, {} conflict(s) require review.",
+                        "Platform identity enrichment: {} applied, {} already current, {} manual assignment(s) preserved, {} conflict(s) require review, {} RomM platform(s) disagree with a verified catalogue (verified platform kept).",
                         enrichment.applied,
                         enrichment.unchanged,
                         enrichment.manual_preserved,
                         enrichment.conflicts,
+                        enrichment.romm_disagreements,
                     )),
                     Err(error) => context.progress(&format!(
                         "RomM identity was published, but platform metadata could not be updated: {error}"
