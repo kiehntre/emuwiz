@@ -97,6 +97,7 @@ mod mame_evidence;
 mod mame_normalise;
 mod mame_staging;
 mod media_set;
+mod memory_cards;
 mod platform_artwork;
 mod read_only_status;
 mod repair;
@@ -171,6 +172,9 @@ fn startup_registration(cli: &CliArgs) -> StartupRegistration {
 /// asked to do: deleting, clearing and switching change only its own
 /// `launch-diagnostics` folder, so starting it never opens the Undo seal
 /// store, the writer registry in the data directory or the library database.
+/// `memory-cards` likewise: it reads memory cards and creates only new files
+/// (backups, exported saves, new cards); it never opens the library database
+/// and never writes a rename journal or seal.
 fn is_read_only_invocation(cli: &CliArgs) -> bool {
     matches!(
         cli.command.as_str(),
@@ -183,6 +187,7 @@ fn is_read_only_invocation(cli: &CliArgs) -> bool {
             | "diagnose-launch"
             | "launch-history"
             | "saves"
+            | "memory-cards"
             | "emulators"
             | "activity"
             | "history"
@@ -335,6 +340,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "launch-history" => launch_history::run(args.collect())?,
         "discovery" => discovery::run(args)?,
         "saves" => saves::run(args.collect())?,
+        "memory-cards" => memory_cards::run(args.collect())?,
         "media-set" => media_set::run(args)?,
         "scan" => {
             let config = load_config()?;
@@ -7553,6 +7559,7 @@ mod tests {
             &["help"],
             &["inspect", "/x"],
             &["saves", "list"],
+            &["memory-cards", "import", "/card", "/save", "/new"],
             &["history", "--json"],
             &["emulators"],
             &["activity", "--json"],

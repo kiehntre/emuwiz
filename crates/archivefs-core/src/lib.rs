@@ -221,6 +221,7 @@ pub mod archive_member_resolver;
 pub mod archive_workflow;
 pub mod folder_platform_check;
 pub mod memory_card_inventory;
+pub mod memory_card_manager;
 pub mod persistent_state_inventory;
 pub mod save_state_compatibility;
 pub mod save_state_orchestration;

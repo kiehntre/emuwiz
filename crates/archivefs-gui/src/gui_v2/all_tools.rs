@@ -324,6 +324,15 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         purpose: ToolPage::Mounts.purpose(),
         safety: ToolSafety::AsksFirst,
     });
+    // Reads cards and writes only new files in EmuWiz's own folders; no
+    // card, save or game file is ever changed from this page.
+    let mut saves = group("Saves", &[S::SavesStates, S::Saves]);
+    saves.tools.push(Tool {
+        route: Route::Tool(ToolPage::MemoryCards),
+        title: ToolPage::MemoryCards.title(),
+        purpose: ToolPage::MemoryCards.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     vec![
         games,
         verification,
@@ -334,7 +343,7 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         cheats,
         group("Media conversion", &[S::Conversion, S::Converter, S::Tape]),
         storage,
-        group("Saves", &[S::SavesStates, S::Saves]),
+        saves,
         organise,
         group(
             "Emulator utilities",

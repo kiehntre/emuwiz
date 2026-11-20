@@ -180,6 +180,8 @@ dependencies = [
  "nod",
  "notify",
  "opticaldiscs",
+ "ps1-memcard",
+ "ps2-memcard",
  "quick-xml",
  "rars",
  "ring",
@@ -3180,6 +3182,18 @@ name = "profiling"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
+
+[[package]]
+name = "ps1-memcard"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd28dcf1bccb9f2590dde83f28dd012bbfafeec34e54e2fecc8d494f3b1e37cd"
+
+[[package]]
+name = "ps2-memcard"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7101073abafc82f78d4f88ffaf682cc2795ee9292e9ff7f8bbdc963d38e8b742"
 
 [[package]]
 name = "pxfm"

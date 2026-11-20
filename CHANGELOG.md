@@ -15,6 +15,29 @@ guessing at intent, dates, or scope.
 
 Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
+- New Blue page "PlayStation memory cards" (All Tools, Saves) and
+  `emuwiz-cli memory-cards`: finds PS1 and PS2 memory cards in the save
+  folders of PCSX2, DuckStation, RetroArch and RPCS3, and shows each save's
+  title, game code, region and size. Cards are recognised by content: plain
+  128 KB PS1 images (`.mcd`, `.mcr`, `.srm`), DexDrive `.gme`, VGS
+  `.vgs`/`.mem`, PSP/PS3 `.vmp`, PS2 cards with and without ECC (PCSX2
+  `.ps2`), and PCSX2 folder cards (listed only). A card can be backed up to a
+  separate, verified copy. One save can be exported (`.mcs` for PS1, `.psu`
+  for PS2), and a `.mcs`, PS1 `.psv` or `.psu` save can be added to a new
+  copy of a card. A card that is opened is never changed: every result is a
+  new file. Not supported and said so on the page: writing `.gme`, `.vgs` or
+  signed `.vmp` cards, other single-save formats (`.psx`, `.mcb`, `.max`,
+  `.cbs`, PS2 `.psv`), and anything but listing for folder cards. myMCpp and
+  PSMemoryManager, if installed separately, can be started from the page;
+  EmuWiz does not include them.
+- PS2 save export on the PCSX2 page now writes standard `.psu` files that
+  uLaunchELF, mymc and PCSX2's own tools read. Earlier releases wrote every
+  file record first and then every file's contents, which only matched the
+  standard for a save with a single file, so those exports could not be opened
+  elsewhere and `.psu` files from other tools were refused. Restore now reads
+  standard `.psu` files and still reads the older EmuWiz exports. A `.psu` with
+  more than one file exported by this release cannot be restored by an older
+  EmuWiz (it is refused, nothing is written).
 - Scans now keep exact totals of skipped files for every reason, per scan and
   per source: unsupported format, unsupported variant, invalid content,
   ambiguous platform and recognised duplicates (identical copies of a
