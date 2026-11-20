@@ -110,6 +110,7 @@ fn snapshot(state: ProviderState, enabled: bool, configured: bool) -> RommSnapsh
             page_size: Some(100),
             import_timeout_seconds: None,
             rename_updates_title: false,
+            title_token_path: None,
         },
         status,
         artwork: artwork_stats(39, 2_434_474),

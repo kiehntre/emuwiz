@@ -40,7 +40,10 @@ pub(super) struct RommTitleJob {
 
 /// The setting's label and explanation, shown on the RomM card.
 pub(super) const SETTING_LABEL: &str = "Rename also updates RomM's title";
-pub(super) const SETTING_EXPLANATION: &str = "Off: EmuWiz only reads from RomM. On: after you rename a game, EmuWiz changes that one game's title in RomM, only if RomM never identified it and nobody edited its title, and History Undo puts it back unless the title was edited since. Nothing else in RomM is changed. This needs a RomM client token with the roms.write permission, which RomM also allows for other edits to games, so give EmuWiz a token made only for this and keep its file private.";
+pub(super) const SETTING_EXPLANATION: &str = "Off: EmuWiz only reads from RomM. On: after you rename a game, EmuWiz changes that one game's title in RomM, only if RomM never identified it and nobody edited its title, and History Undo puts it back unless the title was edited since. Nothing else in RomM is changed. It uses its own RomM client token with the roms.write permission, which RomM also allows for other edits to games: make a token only for this, keep its file private, and keep a separate read-only token for everything else. Browsing and import keep using the read-only token, and work without this one.";
+
+/// The label of the title-update token field.
+pub(super) const TOKEN_LABEL: &str = "Title-update token file (roms.write, used only for this)";
 
 fn settings_location() -> Result<SettingsLocation, String> {
     let root = default_identity_root()?;
@@ -66,12 +69,38 @@ pub(super) fn set_title_updates(on: bool) -> Result<(), String> {
         .map_err(|error| error.detail())
 }
 
+/// The configured title-update token file, for the card.
+pub(super) fn title_token_path() -> String {
+    settings_location()
+        .and_then(|location| location.load().map_err(|error| error.detail()))
+        .ok()
+        .and_then(|settings| settings.title_token_path)
+        .map(|path| path.display().to_string())
+        .unwrap_or_default()
+}
+
+/// Saves the title-update token file (only that field). Empty clears it. The
+/// file is checked the same way as the read-only token's, and must not be it.
+pub(super) fn set_title_token_path(path: &str) -> Result<(), String> {
+    let location = settings_location()?;
+    let mut settings = location.load().map_err(|error| error.detail())?;
+    let trimmed = path.trim();
+    settings.title_token_path = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed));
+    if settings.title_token_path.is_some() {
+        archivefs_core::identity_source::settings::title_token_file(&settings)?;
+    }
+    location
+        .save(&settings)
+        .map(|_| ())
+        .map_err(|error| error.detail())
+}
+
 /// Runs `action` against the configured RomM. `Ok(None)`: nothing to do.
 fn run(action: RommTitleAction) -> Result<Option<TitleSyncOutcome>, String> {
     use archivefs_core::identity_source::cache::{IdentityCacheLocation, load_cache};
     use archivefs_core::identity_source::romm::client::UreqTransport;
     use archivefs_core::identity_source::romm::config::ValidatedRommSource;
-    use archivefs_core::identity_source::settings::load_token_file;
+    use archivefs_core::identity_source::settings::title_token_file;
 
     let location = settings_location()?;
     let settings = location.load().map_err(|error| error.detail())?;
@@ -84,8 +113,8 @@ fn run(action: RommTitleAction) -> Result<Option<TitleSyncOutcome>, String> {
                 .map(|_| TitleSyncOutcome::LeftAlone(format!("\"{SETTING_LABEL}\" is off, so EmuWiz did not write to RomM. Change the title back in RomM if you want to."))),
         });
     }
-    let token = load_token_file(settings.source.token_path.as_deref())
-        .map_err(|refusal| refusal.detail())?;
+    // Only the separate title-update token, never the read-only one.
+    let token = title_token_file(&settings)?;
     let trusted: Vec<PathBuf> = archivefs_core::Config::load_default()
         .map(|config| config.source_folders)
         .map_err(|error| format!("EmuWiz's settings could not be read: {error}"))?;
@@ -264,6 +293,8 @@ mod tests {
             "History Undo",
             "Nothing else in RomM is changed",
             "keep its file private",
+            "its own RomM client token",
+            "separate read-only token",
         ] {
             assert!(SETTING_EXPLANATION.contains(needed), "{needed}");
         }

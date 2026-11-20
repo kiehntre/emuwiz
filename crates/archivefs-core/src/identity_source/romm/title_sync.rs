@@ -3,7 +3,9 @@
 //!
 //! Everything else in this adapter only reads. This module is used only when
 //! the person turned on "Rename also updates RomM's title" and gave EmuWiz a
-//! RomM client token that may edit ROMs (`roms.write`); otherwise RomM is
+//! separate RomM client token that may edit ROMs (`roms.write`), loaded by
+//! [`crate::identity_source::settings::title_token_file`] and used for nothing
+//! else; browsing and import keep the read-only token. Otherwise RomM is
 //! never written to.
 //!
 //! # What it changes, and when it refuses
@@ -323,7 +325,7 @@ fn put_title<T: RommTitleTransport>(
     match response.status {
         200 => {}
         401 | 403 => {
-            return Err("RomM refused the change: the RomM token EmuWiz uses may not edit games (it needs the roms.write permission).".into());
+            return Err("RomM refused the change: the title-update token may not edit games (it needs the roms.write permission).".into());
         }
         404 => return Err("RomM no longer has this game's entry.".into()),
         status => return Err(format!("RomM refused the change (HTTP {status}).")),
