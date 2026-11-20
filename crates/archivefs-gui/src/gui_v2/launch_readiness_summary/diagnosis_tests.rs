@@ -558,11 +558,6 @@ fn amiga_ipf_and_missing_settings_point_at_the_emulator_setup() {
             "The Amiga emulator has no settings EmuWiz can use",
             "Open the emulator once",
         ),
-        (
-            LaunchBlockerKind::WhdloadProfileMissing,
-            "The Amiga emulator has no settings EmuWiz can use",
-            "then check again",
-        ),
     ] {
         let summary = blocked_on("fsuae", &[kind]);
         assert_eq!(
@@ -579,6 +574,15 @@ fn amiga_ipf_and_missing_settings_point_at_the_emulator_setup() {
         );
         assert_eq!(summary.primary_action, Some(ReadinessAction::SetUpEmulator));
     }
+}
+
+/// `WhdloadProfileMissing` also stands for a refused WHDLoad boot preparation,
+/// so it must not tell the person to save emulator settings.
+#[test]
+fn a_whdload_profile_refusal_keeps_the_general_words() {
+    let summary = blocked_on("amiga_whdload", &[LaunchBlockerKind::WhdloadProfileMissing]);
+    assert_eq!(summary.findings[0].cause, Cause::SafetyRefusal);
+    assert!(!text_of(&summary).contains("has no settings EmuWiz can use"));
 }
 
 #[test]

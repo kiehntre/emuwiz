@@ -231,7 +231,9 @@ fn specific(kind: LaunchBlockerKind, adapter: Option<&str>) -> Option<Wording> {
             AMIGA_KICKSTART
         }
         FsUaeIpfBackendUnavailable | AmiberryIpfBackendUnavailable => AMIGA_IPF_PLUGIN,
-        FsUaeProfileRequired | AmiberryProfileRequired | WhdloadProfileMissing => AMIGA_SETTINGS,
+        // Not `WhdloadProfileMissing`: it also carries every refused WHDLoad boot
+        // preparation, which saving emulator settings cannot fix.
+        FsUaeProfileRequired | AmiberryProfileRequired => AMIGA_SETTINGS,
         _ => return None,
     })
 }

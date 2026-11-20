@@ -45,10 +45,10 @@ supported for launching yet". None of those named a fix.
 | `Rpcs3FirmwareUnavailable` | install the PS3 system software (PS3UPDAT.PUP) in RPCS3 | BIOS / Firmware Setup |
 | `FsUaeKickstartUnavailable`, `AmiberryKickstartUnavailable`, `WhdloadKickstartUnavailable` | the Amiga emulator has no Kickstart ROM it can use; where to set it | BIOS / Firmware Setup |
 | `FsUaeIpfBackendUnavailable`, `AmiberryIpfBackendUnavailable` | the `.ipf` image needs the emulator's CAPS (capsimg) plug-in | Emulator Setup |
-| `FsUaeProfileRequired`, `AmiberryProfileRequired`, `WhdloadProfileMissing` | the Amiga emulator has no settings EmuWiz can use | Emulator Setup |
+| `FsUaeProfileRequired`, `AmiberryProfileRequired` (not `WhdloadProfileMissing`, which also carries refused WHDLoad boot preparation) | the Amiga emulator has no settings EmuWiz can use | Emulator Setup |
 
 Several blockers of one cause still share one finding; the first one with exact
-words speaks for it and the rest stay under Technical details. The other 78
+words speaks for it and the rest stay under Technical details. The other 79
 kinds that fall through to the safety-refusal text are unchanged and are the
 next candidates (arcade set problems, Hatari TOS, DOSBox configuration, the
 `...CandidateRequired` internal refusals).
