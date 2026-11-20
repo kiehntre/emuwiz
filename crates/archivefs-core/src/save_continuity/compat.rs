@@ -118,11 +118,16 @@ fn card_conversion(platform: &str, single: &str, save: &DiscoveredSave) -> Conve
 pub fn assess(save: &DiscoveredSave, target: &ContinuationTarget) -> Assessment {
     let mut reasons = Vec::new();
     let mut unchecked = Vec::new();
-    let done = |verdict, summary: &str, reasons, unchecked, conversion| Assessment {
+    let done = |verdict, summary: &str, reasons, unchecked: Vec<String>, conversion| Assessment {
         verdict,
         summary: summary.to_string(),
         reasons,
-        unchecked_conditions: unchecked,
+        // Nothing to confirm about a destination that cannot work.
+        unchecked_conditions: if verdict == Compatibility::Incompatible {
+            Vec::new()
+        } else {
+            unchecked
+        },
         conversion,
     };
 
@@ -595,4 +600,78 @@ pub fn prepare_card_continuation(
         let _ = fs::remove_dir_all(work_dir);
     }
     result
+}
+
+/// Whether a game file is the game a save was written by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "result")]
+pub enum GameFileMatch {
+    /// The identifier EmuWiz verified inside the game file equals the one
+    /// written inside the save.
+    Confirmed { product_code: String, how: String },
+    /// Both identifiers were read and they differ.
+    Different {
+        save_code: String,
+        game_code: String,
+    },
+    /// One side has no identifier EmuWiz could verify. Not a match.
+    NotEstablished { why: String },
+}
+
+fn plain_code(code: &str) -> String {
+    code.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// Compares the product code written inside `save` with the identifier
+/// EmuWiz's own identity inspection verifies inside `game_file` (for a PS2
+/// disc, the boot file named by `SYSTEM.CNF`). The game file is only read.
+/// File names play no part.
+pub fn match_game_file(save: &DiscoveredSave, game_file: &Path) -> GameFileMatch {
+    use crate::game_identity::{IdentityKind, IdentityStatus, inspect_game_identity};
+    let Some(save_code) = save.identity.product_code.clone() else {
+        return GameFileMatch::NotEstablished {
+            why: "the save does not carry a product code".into(),
+        };
+    };
+    let (hint, kind) = match save.format {
+        SaveFormat::Ps1CardSave => ("PSX", IdentityKind::Ps1Serial),
+        SaveFormat::Ps2CardSave => ("PS2", IdentityKind::Ps2Serial),
+        SaveFormat::GameCubeGci => ("GameCube", IdentityKind::DolphinGameId),
+        SaveFormat::Ps3Savedata => ("PS3", IdentityKind::Ps3TitleId),
+        SaveFormat::PspSavedata => ("PSP", IdentityKind::PspDiscId),
+        SaveFormat::CartridgeBattery | SaveFormat::SaveState => {
+            return GameFileMatch::NotEstablished {
+                why: "this kind of save has no identifier to compare".into(),
+            };
+        }
+    };
+    let report = inspect_game_identity(game_file, Some(hint));
+    let verified = report
+        .evidence
+        .iter()
+        .find(|evidence| evidence.kind == kind && evidence.status == IdentityStatus::Verified);
+    let Some(game_code) = verified.and_then(|evidence| evidence.value.clone()) else {
+        return GameFileMatch::NotEstablished {
+            why: format!(
+                "EmuWiz could not verify a {hint} identifier inside {}",
+                game_file.display()
+            ),
+        };
+    };
+    if plain_code(&game_code) == plain_code(&save_code) {
+        GameFileMatch::Confirmed {
+            product_code: game_code,
+            how: verified
+                .map(|evidence| evidence.provenance.method.clone())
+                .unwrap_or_default(),
+        }
+    } else {
+        GameFileMatch::Different {
+            save_code,
+            game_code,
+        }
+    }
 }

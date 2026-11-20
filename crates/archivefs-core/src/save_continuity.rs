@@ -25,6 +25,7 @@
 //! | [`compat`] | Five-level compatibility verdicts and conversion plans |
 //! | [`store`] | Content-addressed snapshot store: capture, verify, recover, pruning proposals |
 //! | [`session`] | Play-session journal: attempt, started, ended, what changed |
+//! | [`workflow`] | The steps the CLI and Blue share |
 //! | [`device`] | Offline two-device comparison and resumable transfer (no network code) |
 //!
 //! PlayStation memory cards are read, exported and imported only through
@@ -36,6 +37,7 @@ pub mod discover;
 pub mod model;
 pub mod session;
 pub mod store;
+pub mod workflow;
 
 #[cfg(test)]
 mod tests;

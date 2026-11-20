@@ -179,7 +179,13 @@ impl LocalDevice {
 
     /// The counter of the newest list this device has signed.
     pub fn sequence(&self) -> u64 {
-        fs::read(self.root.join("device.json"))
+        Self::recorded_sequence(&self.root)
+    }
+
+    /// The counter recorded in a device folder, read without creating or
+    /// changing anything there.
+    pub fn recorded_sequence(root: &Path) -> u64 {
+        fs::read(root.join("device.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<DeviceFile>(&bytes).ok())
             .map_or(0, |file| file.sequence)
