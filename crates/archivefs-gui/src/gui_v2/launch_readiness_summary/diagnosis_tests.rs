@@ -535,6 +535,52 @@ fn a_missing_amiga_kickstart_is_firmware_with_its_own_fix_not_a_safety_refusal()
     }
 }
 
+/// Seen in Blue on a copy of the maintainer's library with the Kickstart
+/// folder hidden: the WHDLoad route reports plain missing firmware.
+#[test]
+fn missing_firmware_on_an_amiga_emulator_is_explained_as_a_kickstart() {
+    for adapter in ["amiga_whdload", "fsuae", "amiberry"] {
+        let summary = blocked_on(adapter, &[LaunchBlockerKind::RequiredFirmwareMissing]);
+        assert_eq!(
+            summary.findings[0].title, "The Amiga emulator has no Kickstart ROM it can use",
+            "{adapter}"
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::CheckFirmware));
+    }
+}
+
+#[test]
+fn missing_firmware_on_retroarchs_amiga_core_names_its_system_folder() {
+    use archivefs_core::emulator_environment::retroarch::{ProfileKind, ProfileRef, ProfileScope};
+    let core = |platform_id| {
+        let mut candidate = blocked(
+            &[LaunchBlockerKind::RequiredFirmwareMissing],
+            Some("/g/game.lha"),
+            FirmwareReadiness::Missing,
+        );
+        candidate.target = LaunchTarget::RetroArchCore {
+            profile: ProfileRef {
+                profile_kind: ProfileKind::Native,
+                scope: ProfileScope::User,
+            },
+            core_stem: "puae".into(),
+            platform_id,
+        };
+        project(&plan(vec![candidate]), ReadinessFreshness::Current)
+    };
+    let amiga = core("Amiga");
+    assert_eq!(
+        amiga.findings[0].title,
+        "RetroArch's Amiga core has no Kickstart ROM it can use"
+    );
+    assert!(text_of(&amiga).contains("RetroArch's system folder"));
+    let other = core("PSX");
+    assert_eq!(
+        other.findings[0].title,
+        "Console startup software (BIOS / firmware) is needed"
+    );
+}
+
 #[test]
 fn amiga_ipf_and_missing_settings_point_at_the_emulator_setup() {
     for (kind, title, phrase) in [

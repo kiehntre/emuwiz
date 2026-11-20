@@ -203,6 +203,16 @@ const AMIGA_KICKSTART: Wording = Wording {
     fix: Some(ReadinessAction::CheckFirmware),
 };
 
+/// Stands in for an adapter name when the candidate is RetroArch's Amiga core.
+const RETROARCH_AMIGA: &str = "retroarch-amiga";
+
+const RETROARCH_AMIGA_KICKSTART: Wording = Wording {
+    cause: Cause::FirmwareMissing,
+    title: "RetroArch's Amiga core has no Kickstart ROM it can use",
+    why: "Amiga games need a Kickstart ROM, the Amiga's own startup software, and none was found where RetroArch's Amiga core (PUAE) looks. Put your own legally obtained Kickstart in RetroArch's system folder under the name the core expects, for example kick34005.A500 or kick40068.A1200, then check again. EmuWiz never supplies one.",
+    fix: Some(ReadinessAction::CheckFirmware),
+};
+
 const AMIGA_IPF_PLUGIN: Wording = Wording {
     cause: Cause::EmulatorSetupIncomplete,
     title: "This disk image (.ipf) needs the emulator's IPF plug-in",
@@ -225,11 +235,18 @@ fn specific(kind: LaunchBlockerKind, adapter: Option<&str>) -> Option<Wording> {
     Some(match kind {
         XemuContentFormatUnsupported => XEMU_NEEDS_DISC_IMAGE,
         RequiredFirmwareMissing if adapter == Some("xemu") => XEMU_SYSTEM_FILES,
+        // The Amiga adapters report a missing Kickstart as missing firmware too.
+        RequiredFirmwareMissing
+            if matches!(adapter, Some("amiga_whdload" | "fsuae" | "amiberry")) =>
+        {
+            AMIGA_KICKSTART
+        }
         Rpcs3ContentFormatUnsupported => RPCS3_NEEDS_DISC_OR_FOLDER,
         Rpcs3FirmwareUnavailable => RPCS3_SYSTEM_SOFTWARE,
         FsUaeKickstartUnavailable | AmiberryKickstartUnavailable | WhdloadKickstartUnavailable => {
             AMIGA_KICKSTART
         }
+        RequiredFirmwareMissing if adapter == Some(RETROARCH_AMIGA) => RETROARCH_AMIGA_KICKSTART,
         FsUaeIpfBackendUnavailable | AmiberryIpfBackendUnavailable => AMIGA_IPF_PLUGIN,
         // Not `WhdloadProfileMissing`: it also carries every refused WHDLoad boot
         // preparation, which saving emulator settings cannot fix.
@@ -260,6 +277,10 @@ fn blocker_line(blocker: &LaunchBlocker) -> String {
 pub(crate) fn findings_for(candidate: &LaunchCandidate) -> Vec<Finding> {
     let adapter = match &candidate.target {
         LaunchTarget::Standalone { adapter_id, .. } => Some(*adapter_id),
+        // RetroArch's Amiga core needs a Kickstart in RetroArch's own system folder.
+        LaunchTarget::RetroArchCore { platform_id, .. } if platform_id.starts_with("Amiga") => {
+            Some(RETROARCH_AMIGA)
+        }
         LaunchTarget::RetroArchCore { .. } => None,
     };
     // One finding per cause. The first blocker with exact words speaks for
