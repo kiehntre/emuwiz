@@ -242,7 +242,11 @@ pub(super) fn report(path: &Path, bytes: &[u8], sha256: String) -> CardReport {
                 notes.push(format!(
                     "EmuWiz's reader and the ps2-memcard reader list different saves or files \
                      on this card, so nothing is exported from or imported into it. {}",
-                    listing_difference(&ours, &theirs)
+                    if ours == theirs {
+                        "Two save folders on the card have the same name.".to_string()
+                    } else {
+                        listing_difference(&ours, &theirs)
+                    }
                 ));
             }
             Some(agree)
@@ -805,8 +809,11 @@ pub(super) fn import_into_copy(
             && pcsx2_marker_present(
                 &card_bytes[PCSX2_MARKER_PAGE * RAW_PAGE..(PCSX2_MARKER_PAGE + 1) * RAW_PAGE],
             );
+        let at = PCSX2_MARKER_PAGE * RAW_PAGE;
+        // Never over a second page the import itself changed.
+        marker_updated =
+            marker_updated && image[at..at + RAW_PAGE] == card_bytes[at..at + RAW_PAGE];
         if marker_updated {
-            let at = PCSX2_MARKER_PAGE * RAW_PAGE;
             image[at..at + PCSX2_MARKER_BYTES].copy_from_slice(&marker.to_le_bytes());
         }
         image

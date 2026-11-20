@@ -180,9 +180,26 @@ pub(super) fn export_mcs(card_bytes: &[u8], save_name: &str) -> Result<Vec<u8>, 
         .iter()
         .find(|save| save.name == save_name)
         .ok_or_else(|| CardError::SaveNotFound(save_name.to_string()))?;
-    // The save's first block must be where EmuWiz's own reader says it is.
+    // Walk the save's block chain a second time, straight from the directory
+    // frames, and require the same bytes the library returned.
     let inner = ps1_memcard::strip_container(card_bytes).unwrap_or(card_bytes);
-    if inner.get(save.slot * BLOCK..(save.slot + 1) * BLOCK) != save.data.get(..BLOCK) {
+    let mut walked = Vec::with_capacity(save.data.len());
+    let mut slot = save.slot;
+    for _ in 0..SLOTS {
+        let (Some(block), Some(frame)) = (
+            inner.get(slot * BLOCK..(slot + 1) * BLOCK),
+            inner.get(slot * FRAME..(slot + 1) * FRAME),
+        ) else {
+            break;
+        };
+        walked.extend_from_slice(block);
+        let link = u16::from_le_bytes([frame[8], frame[9]]);
+        if link == 0xFFFF || usize::from(link) >= SLOTS {
+            break;
+        }
+        slot = usize::from(link) + 1;
+    }
+    if walked != save.data {
         return Err(CardError::Refused(
             "the two card readers do not return the same bytes for this save".into(),
         ));
