@@ -170,7 +170,7 @@ fn romm_entry(file: &str) -> Value {
         "igdb_id": null, "ss_id": null,
         "has_simple_single_file": true,
         "files": [{"file_name": file}],
-        "sha1_hash": "aabbccddeeff00112233445566778899aabbccdd",
+        "sha1_hash": "ae0d6b471f819f4993edbf261664962afbaa579a",
         "path_cover_large": "roms/3/4/cover/big.png", "summary": "kept",
     })
 }
@@ -436,10 +436,33 @@ fn only_the_entry_linked_to_this_exact_file_is_changed() {
     left_alone(update(&setup, &romm, &cache, "tx", &paths), "hash");
     romm.edit(
         "sha1_hash",
-        json!("aabbccddeeff00112233445566778899aabbccdd"),
+        json!("ae0d6b471f819f4993edbf261664962afbaa579a"),
     );
     romm.edit("fs_size_bytes", json!(999));
     left_alone(update(&setup, &romm, &cache, "tx", &paths), "size");
+    romm.edit("fs_size_bytes", json!(12));
+
+    // The local file replaced since the import by other content of the same
+    // size: RomM and the import still agree, but neither is this file.
+    std::fs::write(&paths.1, b"other gamexx").unwrap();
+    left_alone(
+        update(&setup, &romm, &cache, "tx", &paths),
+        "content is not what RomM's entry has",
+    );
+    // With the right content again, but RomM without hashes: cannot confirm.
+    std::fs::write(&paths.1, b"GBA rom data").unwrap();
+    romm.edit("sha1_hash", json!(null));
+    left_alone(
+        update(&setup, &romm, &cache, "tx", &paths),
+        "no SHA-1 or MD5",
+    );
+    // MD5 alone is enough when it matches.
+    romm.edit("md5_hash", json!("35d3cfa9d3ba1277294dd19912d09bcc"));
+    assert!(matches!(
+        update(&setup, &romm, &cache, "tx", &paths),
+        Ok(TitleSyncOutcome::Changed { .. })
+    ));
+    assert!(romm.puts().len() == 1);
 
     // Two imported entries for the same file: cannot tell which.
     let setup = self::setup();

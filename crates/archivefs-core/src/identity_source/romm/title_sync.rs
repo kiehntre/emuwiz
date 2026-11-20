@@ -185,6 +185,50 @@ fn record_path(folder: &Path, transaction_id: &str) -> Option<PathBuf> {
     safe.then(|| folder.join(format!("{transaction_id}.json")))
 }
 
+/// Whether the file at `path` has the hash RomM reports for the entry
+/// (SHA-1, or MD5 when RomM has only that). `Err` when there is nothing to
+/// compare or the file cannot be read.
+fn local_file_matches_romm(path: &Path, live: &Value, cancel: &AtomicBool) -> Result<bool, String> {
+    let reported = |field| text(live, field).filter(|value| !value.is_empty());
+    let (expected, actual) = if let Some(sha1) = reported("sha1_hash") {
+        (sha1, digest_file::<sha1::Sha1>(path, cancel)?)
+    } else if let Some(md5) = reported("md5_hash") {
+        (md5, digest_file::<md5::Md5>(path, cancel)?)
+    } else {
+        return Err("RomM has no SHA-1 or MD5 for this entry (its hashing may be off), so EmuWiz cannot confirm it is this file.".into());
+    };
+    Ok(actual.eq_ignore_ascii_case(expected))
+}
+
+/// The file's digest as lower-case hex, read in 1 MiB pieces.
+fn digest_file<D: sha1::Digest>(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
+    use std::io::Read as _;
+    let unreadable = |error: std::io::Error| {
+        format!(
+            "this file could not be read to check it ({}).",
+            error.kind()
+        )
+    };
+    let mut file = std::fs::File::open(path).map_err(unreadable)?;
+    let mut digest = D::new();
+    let mut buffer = vec![0_u8; 1 << 20];
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("the check was cancelled.".into());
+        }
+        let read = file.read(&mut buffer).map_err(unreadable)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 fn save_record(folder: &Path, record: &TitleSyncRecord) -> Result<(), String> {
     let path = record_path(folder, &record.transaction_id)
         .ok_or("the rename's History id is not usable as a record name")?;
@@ -408,6 +452,13 @@ pub fn update_title_after_rename<T: RommTitleTransport>(
         {
             return left("RomM's entry no longer has this file's hash.");
         }
+    }
+    // The renamed file itself must be what RomM hashed: two RomM snapshots
+    // agreeing says nothing about a local file replaced since the import.
+    match local_file_matches_romm(new_path, &live, cancel) {
+        Ok(true) => {}
+        Ok(false) => return left("this file's content is not what RomM's entry has."),
+        Err(why) => return left(&why),
     }
     let Some(fs_name) = text(&live, "fs_name") else {
         return left("RomM did not report the entry's file name.");
