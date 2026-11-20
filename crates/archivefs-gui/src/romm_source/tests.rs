@@ -1069,6 +1069,61 @@ fn romm_import_result_surfaces_platform_conflict_for_review() {
 }
 
 #[test]
+fn romm_import_result_shows_romm_disagreeing_with_a_verified_dat_platform() {
+    use archivefs_core::platform::identity::{
+        PlatformIdentityConfidence, PlatformIdentityEvidence, PlatformIdentitySource,
+    };
+
+    let mut summary = import_summary(true, 1);
+    summary.platform_enrichment = Some(Box::new(
+        archivefs_core::PlatformIdentityEnrichmentSummary {
+            romm_disagreements: 1,
+            romm_disagreement_details: vec![archivefs_core::PlatformIdentityConflictDetail {
+                archive_id: 1,
+                evidence: vec![
+                    PlatformIdentityEvidence::canonical(
+                        "PSX",
+                        PlatformIdentitySource::VerifiedDat,
+                        PlatformIdentityConfidence::Verified,
+                        1,
+                        "DAT fixture",
+                    )
+                    .unwrap(),
+                    PlatformIdentityEvidence::canonical(
+                        "PSP",
+                        PlatformIdentitySource::Romm,
+                        PlatformIdentityConfidence::High,
+                        1,
+                        "RomM fixture",
+                    )
+                    .unwrap(),
+                ],
+            }],
+            ..Default::default()
+        },
+    ));
+    let view = build_result_view(
+        &RommOperation::FullImport,
+        Ok(&RommOperationOutcome::Import(Box::new(summary))),
+        false,
+    );
+    assert!(view.rows.iter().any(
+        |row| row.label == "RomM disagrees with a verified catalogue"
+            && row.value.contains("verified platform kept")
+    ));
+    assert!(view.notes.iter().any(|note| {
+        note.contains("Verified DAT: Sony PlayStation")
+            && note.contains("RomM: Sony PlayStation Portable")
+    }));
+    assert!(
+        !view
+            .rows
+            .iter()
+            .any(|row| row.label == "Platform conflicts")
+    );
+}
+
+#[test]
 fn a_published_import_states_atomic_publication_and_the_cache_path() {
     let view = build_result_view(
         &RommOperation::FullImport,

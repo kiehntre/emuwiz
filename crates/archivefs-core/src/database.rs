@@ -4479,6 +4479,10 @@ pub struct PlatformIdentityEnrichmentSummary {
     pub stale_ignored: usize,
     pub unknown_ignored: usize,
     pub conflict_details: Vec<PlatformIdentityConflictDetail>,
+    /// RomM records whose platform differs from a current, exact DAT
+    /// verification. Shown for review; the verified platform stays current.
+    pub romm_disagreements: usize,
+    pub romm_disagreement_details: Vec<PlatformIdentityConflictDetail>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -5482,7 +5486,7 @@ impl Database {
             };
             summary.archives_matched += 1;
             let mut evidence = self.current_platform_identity_evidence(archive_id, generation)?;
-            evidence.push(provider);
+            evidence.push(provider.clone());
             let resolution =
                 crate::platform::identity::resolve_platform_identity(generation, evidence);
             if let PlatformIdentityResolution::Conflict { evidence, .. } = &resolution {
@@ -5491,6 +5495,25 @@ impl Database {
                     .push(PlatformIdentityConflictDetail {
                         archive_id,
                         evidence: evidence.clone(),
+                    });
+            }
+            // A verified DAT platform RomM disagrees with: kept, and reported.
+            if let PlatformIdentityResolution::Resolved {
+                platform, evidence, ..
+            } = &resolution
+                && *platform != provider.platform
+                && evidence
+                    .iter()
+                    .any(|item| item.source == PlatformIdentitySource::VerifiedDat)
+            {
+                summary.romm_disagreements += 1;
+                let mut shown = evidence.clone();
+                shown.push(provider);
+                summary
+                    .romm_disagreement_details
+                    .push(PlatformIdentityConflictDetail {
+                        archive_id,
+                        evidence: shown,
                     });
             }
             summary.note(self.apply_platform_identity_resolution(
@@ -19315,7 +19338,7 @@ echo "$out"
     }
 
     #[test]
-    fn conflict_retires_an_earlier_provider_winner_instead_of_choosing_it() {
+    fn a_dat_verification_replaces_a_romm_winner_and_a_real_conflict_retires_it() {
         let (root, mut database, archive_id) =
             unknown_archive_database("conflicting-platform-enrichment");
         let generation = 6;
@@ -19330,10 +19353,38 @@ echo "$out"
         database
             .apply_platform_identity_resolution(archive_id, &romm_only, generation)
             .unwrap();
-        let conflict = crate::platform::identity::resolve_platform_identity(
+        // A DAT verification disagreeing with that RomM-only platform is not
+        // a conflict: EmuWiz's own exact evidence replaces the RomM winner.
+        let dat_over_romm = crate::platform::identity::resolve_platform_identity(
             generation,
             [
                 provider_evidence("PSP", PlatformIdentitySource::Romm, generation),
+                provider_evidence("PSX", PlatformIdentitySource::VerifiedDat, generation),
+            ],
+        );
+        assert_eq!(
+            database
+                .apply_platform_identity_resolution(archive_id, &dat_over_romm, generation)
+                .unwrap(),
+            PlatformIdentityApplyOutcome::Applied
+        );
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        assert_eq!(archive.platform.as_deref(), Some("PSX"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(VERIFIED_DAT_PLATFORM_SOURCE)
+        );
+        // A genuine conflict (two DAT verifications disagreeing) still
+        // retires the earlier provider winner rather than choosing one.
+        let conflict = crate::platform::identity::resolve_platform_identity(
+            generation,
+            [
+                provider_evidence("PSP", PlatformIdentitySource::VerifiedDat, generation),
                 provider_evidence("PSX", PlatformIdentitySource::VerifiedDat, generation),
             ],
         );
@@ -19383,23 +19434,17 @@ echo "$out"
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn published_romm_cache_enriches_matching_unknown_archive_without_reading_it() {
+    /// A published RomM cache with one StrongExternal record for `archive`
+    /// on `platform`.
+    fn romm_cache_for(
+        archive: &PersistedArchive,
+        platform: &str,
+    ) -> crate::identity_source::cache::IdentityCache {
         use crate::identity_source::cache::{CACHE_FORMAT_VERSION, IdentityCache};
         use crate::identity_source::model::{
             ExternalIdentityRecord, ExternalVerification, IdentityProvider,
         };
-
-        let (root, mut database, archive_id) =
-            unknown_archive_database("romm-cache-platform-enrichment");
-        let archive = database
-            .load_archives()
-            .unwrap()
-            .into_iter()
-            .find(|archive| archive.id == archive_id)
-            .unwrap();
-        let before = fs::read(&archive.absolute_path).unwrap();
-        let cache = IdentityCache {
+        IdentityCache {
             format_version: CACHE_FORMAT_VERSION,
             provider: IdentityProvider::Romm,
             server_id: "https://romm.example".to_string(),
@@ -19416,7 +19461,7 @@ echo "$out"
                 provider_path: "roms/psp/Mystery.zip".to_string(),
                 archivefs_path: Some(archive.absolute_path.clone()),
                 title: Some("Mystery".to_string()),
-                platform_candidate: Some("PSP".to_string()),
+                platform_candidate: Some(platform.to_string()),
                 provider_platform_name: Some("psp".to_string()),
                 regions: Vec::new(),
                 revision: None,
@@ -19441,7 +19486,21 @@ echo "$out"
             rejected_hashes: Vec::new(),
             unknown_platforms: Vec::new(),
             server_reported_total: Some(1),
-        };
+        }
+    }
+
+    #[test]
+    fn published_romm_cache_enriches_matching_unknown_archive_without_reading_it() {
+        let (root, mut database, archive_id) =
+            unknown_archive_database("romm-cache-platform-enrichment");
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        let before = fs::read(&archive.absolute_path).unwrap();
+        let cache = romm_cache_for(&archive, "PSP");
 
         let summary = database
             .enrich_platforms_from_romm_cache(&cache, 10)
@@ -19460,6 +19519,60 @@ echo "$out"
             Some(ROMM_PLATFORM_SOURCE)
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_conflicting_romm_import_leaves_the_dat_verified_platform_current() {
+        // Both a DAT-only verification and a persisted DAT/RomM agreement:
+        // RomM now saying another platform never retires the verified one.
+        for (case, source) in [
+            ("dat-only", VERIFIED_DAT_PLATFORM_SOURCE),
+            ("agreement", DAT_ROMM_AGREEMENT_SOURCE),
+        ] {
+            let (root, mut database, archive_id) =
+                unknown_archive_database(&format!("romm-vs-dat-{case}"));
+            database
+                .assign_platform(archive_id, Some("PSX"), source)
+                .unwrap();
+            let archive = database
+                .load_archives()
+                .unwrap()
+                .into_iter()
+                .find(|archive| archive.id == archive_id)
+                .unwrap();
+
+            let summary = database
+                .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSP"), 10)
+                .unwrap();
+
+            assert_eq!(summary.conflicts, 0, "{case}");
+            assert!(summary.conflict_details.is_empty(), "{case}");
+            assert_eq!(summary.applied, 0, "{case}");
+            // Recorded for review, with both sides.
+            assert_eq!(summary.romm_disagreements, 1, "{case}");
+            let shown = &summary.romm_disagreement_details[0].evidence;
+            assert!(
+                shown
+                    .iter()
+                    .any(|item| item.source == PlatformIdentitySource::VerifiedDat
+                        && item.platform == "PSX")
+            );
+            assert!(
+                shown
+                    .iter()
+                    .any(|item| item.source == PlatformIdentitySource::Romm
+                        && item.platform == "PSP")
+            );
+            let after = database
+                .load_archives()
+                .unwrap()
+                .into_iter()
+                .find(|archive| archive.id == archive_id)
+                .unwrap();
+            assert_eq!(after.platform.as_deref(), Some("PSX"), "{case}");
+            assert_eq!(after.platform_source.as_deref(), Some(source), "{case}");
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

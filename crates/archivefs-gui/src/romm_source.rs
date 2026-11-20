@@ -1434,6 +1434,28 @@ fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultV
                 );
             }
         }
+        if enrichment.romm_disagreements > 0 {
+            rows.push(row(
+                "RomM disagrees with a verified catalogue",
+                format!("{} — verified platform kept", enrichment.romm_disagreements),
+            ));
+            for disagreement in enrichment.romm_disagreement_details.iter().take(3) {
+                notes.push(
+                    disagreement
+                        .evidence
+                        .iter()
+                        .map(|item| {
+                            format!(
+                                "{}: {}",
+                                item.source.label(),
+                                archivefs_core::platform::display_name_for(&item.platform)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                );
+            }
+        }
         if enrichment.applied > 0 {
             notes.push(
                 "Platform identity metadata was updated; no ROM files or links were changed."
