@@ -1621,7 +1621,13 @@ impl App {
                         .iter()
                         .find(|item| item.transaction_id == id)
                 })
-                && let [entry] = undone.entries.as_slice()
+                // The one library game (saves renamed with it have no row).
+                && let [entry] = undone
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.unknown.contains_key("organisation_catalogue_v1"))
+                    .collect::<Vec<_>>()
+                    .as_slice()
             {
                 let restored = entry.source_path.clone();
                 self.start_rename_recheck(game_rename::RecheckTarget::Path(restored));

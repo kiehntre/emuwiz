@@ -6039,6 +6039,32 @@ impl Database {
         Ok(out)
     }
 
+    /// Present library files whose name starts with `<stem>.`: games whose
+    /// RetroArch save names could be confused with this stem's (the same
+    /// stem, or a longer one such as `Bros. 3` for `Bros`). Read-only.
+    pub fn present_archive_paths_named_after(&self, stem: &str) -> Result<Vec<PathBuf>> {
+        let prefix = format!("{stem}.");
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT absolute_path_cached FROM archives \
+                 WHERE last_verified_missing_at IS NULL \
+                 AND substr(CAST(file_name_cached AS BLOB), 1, ?2) = CAST(?1 AS BLOB)",
+            )
+            .map_err(|error| db_error("failed to prepare same-name lookup", error))?;
+        let paths: Vec<Vec<u8>> = stmt
+            .query_map(params![prefix.as_bytes(), prefix.len() as i64], |row| {
+                row.get(0)
+            })
+            .map_err(|error| db_error("failed to look up games with the same name", error))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|error| db_error("failed to read games with the same name", error))?;
+        Ok(paths
+            .into_iter()
+            .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+            .collect())
+    }
+
     /// Looks up the current `archives.id` for the archive whose
     /// `absolute_path_cached` exactly matches `path` (exact bytes - never
     /// a lossy display string; see `Path::as_os_str`/`OsStrExt::as_bytes`).

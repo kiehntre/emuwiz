@@ -53,7 +53,10 @@ pub fn is_organisation_transaction(transaction: &RenameTransaction) -> bool {
                         .contains_key(crate::database::organisation_paths::COMPANION_KEY)
                     || entry
                         .unknown
-                        .contains_key(crate::database::organisation_paths::UNCATALOGUED_KEY))
+                        .contains_key(crate::database::organisation_paths::UNCATALOGUED_KEY)
+                    || entry
+                        .unknown
+                        .contains_key(crate::database::organisation_paths::SAVE_KEY))
         })
 }
 
@@ -651,6 +654,7 @@ pub fn rollback_organisation_transaction(
         journal_dir,
         &transaction.transaction_id,
     );
+    refuse_to_separate_a_game_from_its_saves(transaction)?;
     let rollback = rollback_transaction(transaction, journal_dir, cancel)?;
 
     let mut directories_removed = Vec::new();
@@ -686,6 +690,39 @@ pub fn rollback_organisation_transaction(
         directories_removed,
         directories_remaining,
     })
+}
+
+/// A game renamed with its RetroArch saves is undone as one group. The shared
+/// rollback refuses an entry whose file changed and reverses the rest, which
+/// would put the game back under its old name and leave a save (changed by
+/// playing) under the new one, so the game would no longer find it. Every
+/// renamed file is therefore checked first, with the same identity check the
+/// rollback uses, and nothing is moved unless all of them can go back.
+fn refuse_to_separate_a_game_from_its_saves(transaction: &RenameTransaction) -> Result<(), String> {
+    use crate::dat::rename_apply::identity::identity_matches;
+    use crate::dat::rename_apply::model::EntryState;
+    let has_saves = transaction.entries.iter().any(|entry| {
+        entry
+            .unknown
+            .contains_key(crate::database::organisation_paths::SAVE_KEY)
+    });
+    if !has_saves {
+        return Ok(());
+    }
+    for entry in &transaction.entries {
+        if entry.state != EntryState::Applied {
+            continue;
+        }
+        let unchanged = capture_identity(&entry.destination_path)
+            .is_ok_and(|current| identity_matches(&entry.identity, &current));
+        if !unchanged {
+            return Err(format!(
+                "{} has changed since the rename (a save changes when the game is played), so Undo would separate the game from its saves. Nothing was undone: the game and its saves keep the new name together. To go back to the old name, rename the game again.",
+                entry.destination_path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A directory EmuWiz may remove on rollback (only when it created it and it
