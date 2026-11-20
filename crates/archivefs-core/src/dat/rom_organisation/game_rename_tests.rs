@@ -371,44 +371,44 @@ fn saves_that_cannot_be_renamed_safely_refuse_and_nothing_changes() {
     let error = preview_game_rename(&lib.db, &lib.game, "Zelda (USA)", 1, &none()).unwrap_err();
     assert!(error.contains("cannot be told apart"), "{error}");
 
-    // "Super Mario Bros. 3" saves start with "Super Mario Bros.": never
-    // swept into a rename of "Super Mario Bros", in a save folder or by name.
-    let lib = Lib::new("Super Mario Bros.nes", Some("nes"));
-    let ra = lib.temp.path().join("ra-saves");
-    let saves = ra.join("Nestopia");
-    std::fs::create_dir_all(&saves).unwrap();
-    std::fs::write(saves.join("Super Mario Bros.srm"), b"smb1").unwrap();
-    std::fs::write(saves.join("Super Mario Bros. 3.srm"), b"smb3").unwrap();
-    let error = preview_game_rename(
-        &lib.db,
-        &lib.game,
-        "Super Mario Bros (USA)",
-        1,
-        &saves_in(&ra),
-    )
-    .unwrap_err();
-    assert!(error.contains("could belong to another game"), "{error}");
-    std::fs::remove_file(saves.join("Super Mario Bros. 3.srm")).unwrap();
-    let smb3 = lib.root.join("nes").join("Super Mario Bros. 3.nes");
-    std::fs::write(&smb3, b"NES synthetic smb3").unwrap();
+    // Genuinely ambiguous: "Gradius Vol.2.srm" is both Gradius Vol's second
+    // memory card name and Gradius Vol.2's save.
+    let lib = Lib::new("Gradius Vol.nes", Some("nes"));
+    let folder = lib.root.join("nes");
+    std::fs::write(folder.join("Gradius Vol.2.srm"), b"whose?").unwrap();
+    let vol2 = folder.join("Gradius Vol.2.nes");
+    std::fs::write(&vol2, b"NES synthetic vol2").unwrap();
     let mut db = crate::Database::open_or_create(lib.temp.path().join("library.sqlite3")).unwrap();
     let folder_id = db.list_source_folders().unwrap()[0].id;
-    let archive = crate::Archive::from_path_in_root(&smb3, &lib.root).unwrap();
+    let archive = crate::Archive::from_path_in_root(&vol2, &lib.root).unwrap();
     db.upsert_archive(folder_id, &lib.root, &archive).unwrap();
-    let error = preview_game_rename(
-        &lib.db,
-        &lib.game,
-        "Super Mario Bros (USA)",
-        1,
-        &saves_in(&ra),
-    )
-    .unwrap_err();
+    let error =
+        preview_game_rename(&lib.db, &lib.game, "Gradius Vol (USA)", 1, &none()).unwrap_err();
     assert!(error.contains("cannot be told apart"), "{error}");
     assert_eq!(
-        std::fs::read(saves.join("Super Mario Bros.srm")).unwrap(),
-        b"smb1"
+        std::fs::read(folder.join("Gradius Vol.2.srm")).unwrap(),
+        b"whose?"
     );
+
+    // A save folder file with another name part before a save type.
+    let lib = Lib::new("Zelda.nes", Some("nes"));
+    let ra = lib.temp.path().join("ra-saves");
+    std::fs::create_dir_all(&ra).unwrap();
+    std::fs::write(ra.join("Zelda.Quest.srm"), b"whose?").unwrap();
+    let error =
+        preview_game_rename(&lib.db, &lib.game, "Zelda (USA)", 1, &saves_in(&ra)).unwrap_err();
+    assert!(error.contains("could belong to another game"), "{error}");
     assert!(lib.game.exists());
+    // An unindexed game file in a save folder is not a save either.
+    std::fs::remove_file(ra.join("Zelda.Quest.srm")).unwrap();
+    std::fs::write(ra.join("Zelda.zip"), b"PK synthetic").unwrap();
+    let error =
+        preview_game_rename(&lib.db, &lib.game, "Zelda (USA)", 1, &saves_in(&ra)).unwrap_err();
+    assert!(error.contains("could belong to another game"), "{error}");
+    assert_eq!(
+        std::fs::read(ra.join("Zelda.zip")).unwrap(),
+        b"PK synthetic"
+    );
 
     // The new name is another game's: the renamed save would be shared.
     let lib = Lib::new("Zelda.nes", Some("nes"));
@@ -448,6 +448,135 @@ fn saves_that_cannot_be_renamed_safely_refuse_and_nothing_changes() {
     let error = preview_game_rename(&lib.db, &lib.game, "Zelda (USA)", 1, &none()).unwrap_err();
     assert!(error.contains("not a plain file"), "{error}");
     assert!(lib.game.exists());
+}
+
+#[test]
+fn a_longer_name_that_starts_the_same_is_another_game_and_is_left_alone() {
+    // (game, the other game whose name starts the same, new name)
+    for (game, other, new_name) in [
+        (
+            "Super Mario Bros",
+            "Super Mario Bros. 3",
+            "Super Mario Bros (USA)",
+        ),
+        (
+            "Donkey Kong Jr",
+            "Donkey Kong Jr. Math",
+            "Donkey Kong Jr (USA)",
+        ),
+        ("Dr", "Dr. Mario", "Dr (USA)"),
+        ("Gradius Vol", "Gradius Vol. 2", "Gradius Vol (Japan)"),
+        // Names that themselves end in "Dr.", "Jr." and "Vol.".
+        ("Mario Jr.", "Mario Jr. Deluxe", "Mario Jr. (USA)"),
+        ("Doctor Dr.", "Doctor Dr. 2", "Doctor Dr. (USA)"),
+        ("Pac-Man Vol.", "Pac-Man Vol. 2", "Pac-Man Vol. (USA)"),
+    ] {
+        let lib = Lib::new(&format!("{game}.nes"), Some("nes"));
+        let folder = lib.root.join("nes");
+        let ra = lib.temp.path().join("ra-saves");
+        let core = ra.join("Nestopia");
+        std::fs::create_dir_all(&core).unwrap();
+        // The other game is in the library, with saves of its own beside it
+        // and in the save folder.
+        let other_game = folder.join(format!("{other}.nes"));
+        std::fs::write(&other_game, b"NES synthetic other").unwrap();
+        let mut db =
+            crate::Database::open_or_create(lib.temp.path().join("library.sqlite3")).unwrap();
+        let folder_id = db.list_source_folders().unwrap()[0].id;
+        let archive = crate::Archive::from_path_in_root(&other_game, &lib.root).unwrap();
+        db.upsert_archive(folder_id, &lib.root, &archive).unwrap();
+        let theirs = [
+            folder.join(format!("{other}.srm")),
+            core.join(format!("{other}.srm")),
+            core.join(format!("{other}.state1")),
+            core.join(format!("{other}.state.auto")),
+        ];
+        // This game's saves: battery save, numbered and automatic states,
+        // their thumbnails and a numbered memory card.
+        let mine = [
+            (folder.join(format!("{game}.srm")), "srm"),
+            (core.join(format!("{game}.state")), "state"),
+            (core.join(format!("{game}.state1")), "state1"),
+            (core.join(format!("{game}.state12")), "state12"),
+            (core.join(format!("{game}.state.auto")), "state.auto"),
+            (core.join(format!("{game}.state1.png")), "state1.png"),
+            (core.join(format!("{game}.1.mcr")), "1.mcr"),
+        ];
+        for (index, file) in theirs.iter().enumerate() {
+            std::fs::write(file, format!("theirs {index}")).unwrap();
+        }
+        for (index, (file, _)) in mine.iter().enumerate() {
+            std::fs::write(file, format!("mine {index}")).unwrap();
+        }
+
+        let preview = preview_game_rename(&lib.db, &lib.game, new_name, 1, &saves_in(&ra)).unwrap();
+        assert_eq!(
+            preview.saves.len(),
+            mine.len(),
+            "{game}: {:?}",
+            preview.saves
+        );
+        let outcome = apply_game_rename(
+            &preview,
+            &lib.db,
+            &lib.journal(),
+            &no_cancel(),
+            &saves_in(&ra),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.transaction.state,
+            TransactionState::Applied,
+            "{game}"
+        );
+        for (index, (file, rest)) in mine.iter().enumerate() {
+            let moved = file.with_file_name(format!("{new_name}.{rest}"));
+            assert!(!file.exists(), "{}", file.display());
+            assert_eq!(
+                std::fs::read(&moved).unwrap(),
+                format!("mine {index}").as_bytes()
+            );
+        }
+        for (index, file) in theirs.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(file).unwrap(),
+                format!("theirs {index}").as_bytes(),
+                "{}",
+                file.display()
+            );
+        }
+
+        // Undo puts exactly this game's files back; the other game's stay.
+        let mut reopened =
+            super::open_history_transaction_for_undo(&lib.journal(), &outcome.transaction).unwrap();
+        let undo = rollback_organisation_transaction(
+            &mut reopened,
+            &lib.journal(),
+            &no_cancel(),
+            &preview.source_root,
+        )
+        .unwrap();
+        assert_eq!(
+            undo.rollback.result,
+            RollbackResult::FullyRolledBack,
+            "{game}"
+        );
+        assert_eq!(lib.id_at(&lib.game), Some(lib.id));
+        assert!(other_game.exists());
+        for (index, (file, rest)) in mine.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(file).unwrap(),
+                format!("mine {index}").as_bytes()
+            );
+            assert!(!file.with_file_name(format!("{new_name}.{rest}")).exists());
+        }
+        for (index, file) in theirs.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(file).unwrap(),
+                format!("theirs {index}").as_bytes()
+            );
+        }
+    }
 }
 
 #[test]
