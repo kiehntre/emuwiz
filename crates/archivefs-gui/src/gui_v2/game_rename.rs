@@ -5,10 +5,10 @@
 //! organiser's identity checks, collision refusal, journal, library rebinding
 //! and History Undo. Nothing is changed until the person confirms a preview.
 
+use archivefs_core::dat::reaudit::{GameRecheck, ReauditCatalogues, recheck_game};
 use archivefs_core::dat::rom_organisation::game_rename::{
     GameRenamePreview, RetroArchSaveLocations, apply_game_rename, preview_game_rename,
 };
-use archivefs_core::dat::reaudit::{GameRecheck, ReauditCatalogues, recheck_game};
 use eframe::egui::{self, RichText};
 
 use super::{App, library::Game};

@@ -2319,7 +2319,10 @@ fn one_game_recheck_after_a_rename_and_its_undo_keeps_only_matching_proof() {
     // Nothing more to do once current.
     let again = recheck(&f);
     assert!(again.report.is_none());
-    assert_eq!(again.summary().unwrap(), "Its catalogue result is still current.");
+    assert_eq!(
+        again.summary().unwrap(),
+        "Its catalogue result is still current."
+    );
 
     // Undo puts the old name back: checked again, verified again.
     move_row("Renamed Game.tap", "g0000.tap");

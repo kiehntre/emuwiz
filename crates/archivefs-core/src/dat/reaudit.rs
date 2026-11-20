@@ -1912,8 +1912,7 @@ impl GameRecheck {
     /// One plain sentence for the person; `None` when the game has no saved
     /// catalogue result at all (so there was nothing to keep verified).
     pub fn summary(&self) -> Option<String> {
-        const LATER: &str =
-            "It shows as not verified until you re-check it (Re-check this game).";
+        const LATER: &str = "It shows as not verified until you re-check it (Re-check this game).";
         if self.plan.saved_rows == 0 {
             return None;
         }
@@ -1924,9 +1923,9 @@ impl GameRecheck {
             .find(|b| b.block != ReauditBlock::DoesNotApply);
         let Some(report) = &self.report else {
             return Some(match blocked.map(|b| &b.block) {
-                Some(ReauditBlock::CatalogueUnavailable) => format!(
-                    "Its catalogue is not available now, so it was not re-checked. {LATER}"
-                ),
+                Some(ReauditBlock::CatalogueUnavailable) => {
+                    format!("Its catalogue is not available now, so it was not re-checked. {LATER}")
+                }
                 Some(ReauditBlock::FileUnavailable) => {
                     format!("Its file could not be reached, so it was not re-checked. {LATER}")
                 }
