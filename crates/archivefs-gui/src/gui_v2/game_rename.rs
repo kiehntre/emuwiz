@@ -172,9 +172,14 @@ impl State {
             )
         });
         let renamed = result.is_ok();
+        let saves = match preview.saves.len() {
+            0 => String::new(),
+            1 => " with its RetroArch save".into(),
+            n => format!(" with its {n} RetroArch saves"),
+        };
         self.outcome = Some(result.map(|_| {
             format!(
-                "Renamed to {}. Undo is in History. RomM shows the new name after its next scan of this system.",
+                "Renamed to {}{saves}. Undo is in History. RomM shows the new name after its next scan of this system.",
                 preview.new_file_name
             )
         }));

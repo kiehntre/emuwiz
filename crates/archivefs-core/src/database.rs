@@ -6050,6 +6050,36 @@ impl Database {
     /// one row somehow matches, instead of silently acting on the wrong
     /// archive. `Ok(None)` means no persisted archive has this path -
     /// not yet scanned into the library database, for example.
+    /// Present library files whose file stem (name without its last
+    /// extension) is exactly `stem`: games that RetroArch would give the same
+    /// save names. Read-only.
+    pub fn present_archive_paths_with_file_stem(&self, stem: &str) -> Result<Vec<PathBuf>> {
+        let prefix = format!("{stem}.");
+        let mut stmt = self
+            .connection
+            .prepare(
+                "SELECT absolute_path_cached FROM archives \
+                 WHERE last_verified_missing_at IS NULL \
+                 AND substr(CAST(file_name_cached AS BLOB), 1, ?2) = CAST(?1 AS BLOB)",
+            )
+            .map_err(|error| db_error("failed to prepare same-name lookup", error))?;
+        let paths: Vec<Vec<u8>> = stmt
+            .query_map(params![prefix.as_bytes(), prefix.len() as i64], |row| {
+                row.get(0)
+            })
+            .map_err(|error| db_error("failed to look up games with the same name", error))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|error| db_error("failed to read games with the same name", error))?;
+        Ok(paths
+            .into_iter()
+            .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+            .filter(|path| {
+                path.file_stem()
+                    .is_some_and(|s| s.as_bytes() == stem.as_bytes())
+            })
+            .collect())
+    }
+
     pub fn find_archive_id_by_absolute_path(&self, path: &Path) -> Result<Option<i64>> {
         let path_bytes = path.as_os_str().as_bytes();
         let mut stmt = self

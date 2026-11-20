@@ -53,7 +53,10 @@ pub fn is_organisation_transaction(transaction: &RenameTransaction) -> bool {
                         .contains_key(crate::database::organisation_paths::COMPANION_KEY)
                     || entry
                         .unknown
-                        .contains_key(crate::database::organisation_paths::UNCATALOGUED_KEY))
+                        .contains_key(crate::database::organisation_paths::UNCATALOGUED_KEY)
+                    || entry
+                        .unknown
+                        .contains_key(crate::database::organisation_paths::SAVE_KEY))
         })
 }
 

@@ -19,6 +19,9 @@ pub const COMPANION_KEY: &str = "organisation_companion_v1";
 /// example a disc set outside a PlayStation folder): it moves with no
 /// catalogue path to change.
 pub const UNCATALOGUED_KEY: &str = "organisation_uncatalogued_v1";
+/// A RetroArch save or save state renamed with its game (Blue Rename): a
+/// plain file outside the library, with no row or catalogue binding.
+pub const SAVE_KEY: &str = "organisation_retroarch_save_v1";
 /// Optional request, set by the platform-correction workflow before binding:
 /// `{"platform": "<canonical id>", "source": "verified_dat" | "header_identity"}`.
 /// The new assignment commits in the same SQLite transaction as the path
@@ -764,7 +767,8 @@ pub(crate) fn validate_bound(
             continue;
         }
         if (entry.unknown.contains_key(COMPANION_KEY)
-            || entry.unknown.contains_key(UNCATALOGUED_KEY))
+            || entry.unknown.contains_key(UNCATALOGUED_KEY)
+            || entry.unknown.contains_key(SAVE_KEY))
             && !entry.unknown.contains_key(KEY)
         {
             continue;
