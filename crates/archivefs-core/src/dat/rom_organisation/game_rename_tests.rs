@@ -399,6 +399,16 @@ fn saves_that_cannot_be_renamed_safely_refuse_and_nothing_changes() {
         preview_game_rename(&lib.db, &lib.game, "Zelda (USA)", 1, &saves_in(&ra)).unwrap_err();
     assert!(error.contains("could belong to another game"), "{error}");
     assert!(lib.game.exists());
+    // An unindexed game file in a save folder is not a save either.
+    std::fs::remove_file(ra.join("Zelda.Quest.srm")).unwrap();
+    std::fs::write(ra.join("Zelda.zip"), b"PK synthetic").unwrap();
+    let error =
+        preview_game_rename(&lib.db, &lib.game, "Zelda (USA)", 1, &saves_in(&ra)).unwrap_err();
+    assert!(error.contains("could belong to another game"), "{error}");
+    assert_eq!(
+        std::fs::read(ra.join("Zelda.zip")).unwrap(),
+        b"PK synthetic"
+    );
 
     // The new name is another game's: the renamed save would be shared.
     let lib = Lib::new("Zelda.nes", Some("nes"));

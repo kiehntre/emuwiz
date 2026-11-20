@@ -642,10 +642,11 @@ fn plan_save_renames(
                 other.display()
             ));
         }
-        // `Zelda.foo.srm` in a save folder: a recognised save type behind
-        // another name part, so it may be the save of a game called
-        // `Zelda.foo` that is not in the library. Nothing is guessed.
-        if rest.contains('.') && !is_save_suffix(&rest.to_ascii_lowercase()) {
+        // Only a recognised RetroArch save name is this game's. Anything else
+        // named after it in a save folder (`Zelda.zip`, or `Zelda.Quest.srm`,
+        // which may be a game called `Zelda.Quest`) is not proof of a save,
+        // so nothing is guessed.
+        if !is_save_suffix(&rest.to_ascii_lowercase()) {
             return Err(format!(
                 "{} could belong to another game, so this game's saves cannot be told apart. Rename refused. Nothing was changed.",
                 save.display()
