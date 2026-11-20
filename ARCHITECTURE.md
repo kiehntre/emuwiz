@@ -55,7 +55,17 @@ uniform across platforms or emulators.
 Playing Library and Library Views are plans over the evidence-backed library.
 RomM and ES-DE are projections/exports, not alternate identity authorities.
 The RomM client is local-path-aware and read-only toward RomM; publishing an
-ES-DE projection is a separate local operation.
+ES-DE projection is a separate local operation. The one exception is optional
+and off by default: with "Rename also updates RomM's title" turned on (and a
+RomM client token carrying `roms.write`), a Rename changes the displayed title
+of that game's RomM entry, and History Undo puts it back
+(`identity_source::romm::title_sync`). It writes only when the entry is the one
+EmuWiz's RomM import links to that exact file (by mapped path, with size and
+hashes re-checked live), RomM never identified the game, and its title is still
+the one RomM derived from one of the file's names (the current one or one
+Rename History proves). It sends only the title; Undo restores the recorded
+original only while RomM still shows exactly the title EmuWiz wrote. Nothing
+else in RomM is ever written, and no RomM failure undoes the local rename.
 
 The patch-manager subsystem contains provider/source validation, local
 inspection, mod-package planning, adapter-specific materialization, and the

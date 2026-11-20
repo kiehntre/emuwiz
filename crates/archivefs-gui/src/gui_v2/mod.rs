@@ -88,6 +88,7 @@ mod pad_mouse;
 mod pad_shell;
 #[cfg(target_os = "linux")]
 mod relocation_page;
+mod romm_title;
 mod saved_recheck;
 mod suggest;
 pub(crate) use pad_shell::mark_secret;
@@ -1630,7 +1631,10 @@ impl App {
                     .as_slice()
             {
                 let restored = entry.source_path.clone();
+                let transaction_id = undone.transaction_id.clone();
                 self.start_rename_recheck(game_rename::RecheckTarget::Path(restored));
+                // The RomM title, if EmuWiz changed it for this rename.
+                self.start_romm_title(romm_title::RommTitleAction::AfterUndo { transaction_id });
             }
             self.activity.finish(
                 job.id,
@@ -2657,6 +2661,7 @@ impl eframe::App for App {
         // no longer showing; reload so Game Details reads it.
         self.game_dat_check.poll();
         self.poll_rename_recheck();
+        self.poll_romm_title();
         self.saved_recheck.poll();
         self.folder_check.poll();
         self.folder_check.organise.poll();

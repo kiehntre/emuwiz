@@ -950,3 +950,70 @@ fn a_crash_after_the_game_was_renamed_is_found_after_restart_and_undone() {
     apply_game_rename(&fresh, &db, &journal, &no_cancel(), &none()).unwrap();
     assert!(folder.join("Zelda (USA).srm").exists());
 }
+
+#[test]
+fn history_proves_a_games_earlier_names_and_refuses_when_it_cannot() {
+    let lib = Lib::new("Zelda (USA).nes", Some("nes"));
+    let folder = lib.root.join("nes");
+    let rename_to = |from: &std::path::Path, name: &str| {
+        let preview = preview_game_rename(&lib.db, from, name, 1, &none()).unwrap();
+        apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel(), &none()).unwrap()
+    };
+    // An older rename, then a newer one.
+    let first = rename_to(&lib.game, "Zelda Classic (USA)");
+    let classic = folder.join("Zelda Classic (USA).nes");
+    rename_to(&classic, "Legend of Zelda (USA)");
+    let legend = folder.join("Legend of Zelda (USA).nes");
+    assert_eq!(
+        super::game_rename::earlier_paths_from_history(&lib.journal(), &legend).unwrap(),
+        vec![classic.clone(), lib.game.clone()]
+    );
+    // From the middle of the chain, only what came before it.
+    assert_eq!(
+        super::game_rename::earlier_paths_from_history(&lib.journal(), &classic).unwrap(),
+        vec![lib.game.clone()]
+    );
+    // An undone rename proves nothing: undo the newer one through History.
+    let (transactions, _) = crate::dat::rename_apply::journal::list_journals(&lib.journal());
+    let newer = transactions
+        .iter()
+        .find(|transaction| {
+            transaction
+                .entries
+                .iter()
+                .any(|entry| entry.destination_path == legend)
+        })
+        .unwrap();
+    let mut reopened = super::open_history_transaction_for_undo(&lib.journal(), newer).unwrap();
+    let undo =
+        rollback_organisation_transaction(&mut reopened, &lib.journal(), &no_cancel(), &lib.root)
+            .unwrap();
+    assert_eq!(undo.rollback.result, RollbackResult::FullyRolledBack);
+    assert!(
+        super::game_rename::earlier_paths_from_history(&lib.journal(), &legend)
+            .unwrap()
+            .is_empty()
+    );
+    let _ = first;
+
+    // Two History entries that both produced the same path: not settled.
+    let other = tempfile::tempdir().unwrap();
+    let journal = other.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let (transactions, _) = crate::dat::rename_apply::journal::list_journals(&lib.journal());
+    let mut twin = transactions
+        .into_iter()
+        .find(|transaction| {
+            transaction
+                .entries
+                .iter()
+                .any(|entry| entry.destination_path == classic)
+        })
+        .unwrap();
+    crate::dat::rename_apply::journal::write_journal(&journal, &twin).unwrap();
+    twin.transaction_id = format!("{}-twin", twin.transaction_id);
+    twin.entries[0].source_path = folder.join("Zelda Remix (USA).nes");
+    crate::dat::rename_apply::journal::write_journal(&journal, &twin).unwrap();
+    let error = super::game_rename::earlier_paths_from_history(&journal, &classic).unwrap_err();
+    assert!(error.contains("more than one rename"), "{error}");
+}

@@ -487,7 +487,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             card: HomeCard::RomM,
             icon: crate::ui::icons::ROMM,
             title: "Connect RomM",
-            explanation: "Connect EmuWiz to your RomM server and browse its records. RomM is treated as a read-only source: nothing in your RomM library is ever changed.",
+            explanation: "Connect EmuWiz to your RomM server and browse its records. RomM is only read, never changed, unless you turn on \"Rename also updates RomM's title\": then renaming a game in EmuWiz also updates that one game's title in RomM (and Undo puts it back).",
             technical_detail: None,
             tier: HomeCardTier::Secondary,
             accent: None,

@@ -55,6 +55,10 @@ pub(super) struct NativeWorkflows {
     pub(super) app: ArchiveFsApp,
     /// Set by the readiness card's Hasheous shortcut; Game Details takes it.
     lookup_online_requested: bool,
+    /// "Rename also updates RomM's title", read when the RomM card is first
+    /// drawn and after each change (and why saving it failed, if it did).
+    romm_title_setting: Option<bool>,
+    romm_title_setting_error: Option<String>,
     native_romm: native_romm::State,
     selected: Option<PathBuf>,
     catalogue_identity_report: Option<archivefs_core::game_identity::GameIdentityReport>,
@@ -514,6 +518,8 @@ impl NativeWorkflows {
         Self {
             app,
             lookup_online_requested: false,
+            romm_title_setting: None,
+            romm_title_setting_error: None,
             native_romm: native_romm::State::default(),
             selected: None,
             catalogue_identity_report: None,
@@ -3608,7 +3614,7 @@ impl NativeWorkflows {
         );
         crate::ui::components::card(ui, |ui| {
             ui.strong("RomM");
-            ui.label("Optional metadata/artwork provider · token file required when configured · read-only towards RomM.");
+            ui.label("Optional metadata/artwork provider · token file required when configured · read-only towards RomM, except the optional Rename title update below.");
             ui.label(format!("Status: {}", view.state_label));
             if let Some(detail) = &view.state_detail {
                 ui.weak(detail);
@@ -3625,7 +3631,31 @@ impl NativeWorkflows {
             if ui.button("Refresh RomM status").clicked() {
                 self.app.start_romm_status_load(context.clone());
             }
+            // Hidden while the setup form is open, so the two never save over
+            // each other.
+            if self.app.romm_ui.config_draft.is_none() {
+                ui.separator();
+                let mut on = *self
+                    .romm_title_setting
+                    .get_or_insert_with(super::romm_title::title_updates_enabled);
+                if ui
+                    .checkbox(&mut on, super::romm_title::SETTING_LABEL)
+                    .changed()
+                {
+                    self.romm_title_setting_error = super::romm_title::set_title_updates(on).err();
+                    self.romm_title_setting = Some(super::romm_title::title_updates_enabled());
+                }
+                ui.weak(super::romm_title::SETTING_EXPLANATION);
+                if let Some(error) = &self.romm_title_setting_error {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("The setting was not saved: {error}"),
+                    );
+                }
+            }
             if self.app.romm_ui.config_draft.is_some() {
+                // Read again once the form closes.
+                self.romm_title_setting = None;
                 ui.separator();
                 ui.strong("RomM setup");
                 let mut request = self.app.show_romm_configuration(ui);
