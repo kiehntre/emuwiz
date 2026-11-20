@@ -615,6 +615,20 @@ fn plan_save_renames(
             other.display()
         ));
     }
+    // The new name must not be another game's either: its saves would then
+    // share RetroArch's save names, and either game could load or overwrite
+    // the other's progress.
+    if let Some(other) = database
+        .present_archive_paths_named_after(&new_stem)
+        .map_err(|error| format!("could not read the library: {error}"))?
+        .into_iter()
+        .find(|path| path != source)
+    {
+        return Err(format!(
+            "{} already has the name {new_stem}, so the renamed saves would be shared with it. Rename refused. Nothing was changed.",
+            other.display()
+        ));
+    }
     let mut renames = Vec::new();
     for save in found {
         let metadata = std::fs::symlink_metadata(save).map_err(|error| unreadable(save, error))?;

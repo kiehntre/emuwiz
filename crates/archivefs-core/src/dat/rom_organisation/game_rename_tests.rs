@@ -410,6 +410,23 @@ fn saves_that_cannot_be_renamed_safely_refuse_and_nothing_changes() {
     );
     assert!(lib.game.exists());
 
+    // The new name is another game's: the renamed save would be shared.
+    let lib = Lib::new("Zelda.nes", Some("nes"));
+    std::fs::write(lib.root.join("nes").join("Zelda.srm"), b"save").unwrap();
+    let other = lib.root.join("nes").join("Other.zip");
+    std::fs::write(&other, b"another game").unwrap();
+    let mut db = crate::Database::open_or_create(lib.temp.path().join("library.sqlite3")).unwrap();
+    let folder_id = db.list_source_folders().unwrap()[0].id;
+    let archive = crate::Archive::from_path_in_root(&other, &lib.root).unwrap();
+    db.upsert_archive(folder_id, &lib.root, &archive).unwrap();
+    let error = preview_game_rename(&lib.db, &lib.game, "Other", 1, &none()).unwrap_err();
+    assert!(error.contains("would be shared"), "{error}");
+    assert!(!lib.root.join("nes").join("Other.srm").exists());
+    assert_eq!(
+        std::fs::read(lib.root.join("nes").join("Zelda.srm")).unwrap(),
+        b"save"
+    );
+
     // RetroArch is running: it could write the save under the old name.
     let lib = Lib::new("Zelda.nes", Some("nes"));
     std::fs::write(lib.root.join("nes").join("Zelda.srm"), b"save").unwrap();
@@ -431,6 +448,57 @@ fn saves_that_cannot_be_renamed_safely_refuse_and_nothing_changes() {
     let error = preview_game_rename(&lib.db, &lib.game, "Zelda (USA)", 1, &none()).unwrap_err();
     assert!(error.contains("not a plain file"), "{error}");
     assert!(lib.game.exists());
+}
+
+#[test]
+fn a_save_played_after_the_rename_keeps_the_game_and_saves_together_on_undo() {
+    let lib = Lib::new("Zelda.nes", Some("nes"));
+    let folder = lib.root.join("nes");
+    std::fs::write(folder.join("Zelda.srm"), b"before").unwrap();
+    std::fs::write(folder.join("Zelda.state"), b"state").unwrap();
+    let preview = preview_game_rename(&lib.db, &lib.game, "Zelda (USA)", 1, &none()).unwrap();
+    let outcome =
+        apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel(), &none()).unwrap();
+    let renamed_game = folder.join("Zelda (USA).nes");
+    // Played under the new name: RetroArch rewrote the save.
+    let played = folder.join("Zelda (USA).srm");
+    std::fs::remove_file(&played).unwrap();
+    std::fs::write(&played, b"after playing, longer").unwrap();
+
+    let mut reopened =
+        super::open_history_transaction_for_undo(&lib.journal(), &outcome.transaction).unwrap();
+    let error = rollback_organisation_transaction(
+        &mut reopened,
+        &lib.journal(),
+        &no_cancel(),
+        &preview.source_root,
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("separate the game from its saves"),
+        "{error}"
+    );
+    assert!(error.contains("rename the game again"), "{error}");
+    // Nothing moved: the game and both saves still share the new name.
+    assert!(renamed_game.exists());
+    assert_eq!(lib.id_at(&renamed_game), Some(lib.id));
+    assert_eq!(std::fs::read(&played).unwrap(), b"after playing, longer");
+    assert_eq!(
+        std::fs::read(folder.join("Zelda (USA).state")).unwrap(),
+        b"state"
+    );
+    assert!(!lib.game.exists());
+    assert!(!folder.join("Zelda.srm").exists());
+
+    // The offered way back: rename it again, and the played save goes with it.
+    let back = preview_game_rename(&lib.db, &renamed_game, "Zelda", 1, &none()).unwrap();
+    apply_game_rename(&back, &lib.db, &lib.journal(), &no_cancel(), &none()).unwrap();
+    assert_eq!(lib.id_at(&lib.game), Some(lib.id));
+    assert_eq!(
+        std::fs::read(folder.join("Zelda.srm")).unwrap(),
+        b"after playing, longer"
+    );
+    assert_eq!(std::fs::read(folder.join("Zelda.state")).unwrap(), b"state");
 }
 
 #[test]
