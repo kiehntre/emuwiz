@@ -92,6 +92,9 @@ fn a_finished_recheck_is_reported_and_reloads_the_library() {
     });
     app.poll_rename_recheck();
     assert!(app.game_rename.recheck.is_some(), "still running");
+    // Another rename meanwhile: its re-check waits, it is not dropped.
+    app.start_rename_recheck(super::RecheckTarget::Id(8));
+    assert_eq!(app.game_rename.queued.len(), 1);
     sender
         .send(Ok(GameRecheck {
             plan: ReauditPlan {
@@ -107,6 +110,8 @@ fn a_finished_recheck_is_reported_and_reloads_the_library() {
         }))
         .unwrap();
     app.poll_rename_recheck();
+    // The waiting request was taken up once the first finished.
+    assert!(app.game_rename.queued.is_empty());
     assert!(app.game_rename.recheck.is_none());
     let line = app.game_rename.recheck_line.clone().unwrap();
     assert!(line.contains("still verified"), "{line}");

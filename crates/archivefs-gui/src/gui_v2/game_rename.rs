@@ -31,6 +31,8 @@ pub(super) struct State {
     recheck: Option<Recheck>,
     /// Its result, shown under the rename outcome.
     recheck_line: Option<String>,
+    /// Re-checks asked for while one was running; started in turn.
+    queued: std::collections::VecDeque<RecheckTarget>,
     /// A finished re-check saved a result: reload once no load is running.
     pub(super) reload_pending: bool,
 }
@@ -100,6 +102,7 @@ impl State {
             paths: self.paths.take(),
             saves: self.saves.take(),
             recheck: self.recheck.take(),
+            queued: std::mem::take(&mut self.queued),
             ..Self::default()
         };
     }
@@ -182,10 +185,15 @@ impl State {
 impl App {
     /// Starts the one-game re-check for `archive_id` (after a rename or its
     /// Undo). A catalogue result is tied to the file's name, so it is read
-    /// again now rather than carried over. At most one runs at a time.
+    /// again now rather than carried over. One runs at a time; a request
+    /// made meanwhile waits its turn and is never dropped.
     pub(super) fn start_rename_recheck(&mut self, game: RecheckTarget) {
+        if self.game_rename.recheck.is_some() {
+            self.game_rename.queued.push_back(game);
+            return;
+        }
         // Tests never reach the person's own library or catalogues.
-        if self.game_rename.recheck.is_some() || (cfg!(test) && self.game_rename.paths.is_none()) {
+        if cfg!(test) && self.game_rename.paths.is_none() {
             return;
         }
         let archive_id = match &game {
@@ -244,6 +252,9 @@ impl App {
         self.activity.finish(job, line.clone(), error);
         if archive_id.is_some() && self.game_rename.open_for == archive_id {
             self.game_rename.recheck_line = Some(line);
+        }
+        if let Some(next) = self.game_rename.queued.pop_front() {
+            self.start_rename_recheck(next);
         }
         self.game_rename.reload_pending |=
             result.is_ok_and(|recheck| recheck.report.is_some_and(|report| report.saved > 0));
