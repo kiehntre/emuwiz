@@ -146,6 +146,7 @@ pub mod rom_representation_diagnostics;
 pub mod save_migration_planner;
 pub mod save_migration_readiness;
 /// Local immutable emulator-save snapshots and conservative restore previews.
+pub mod save_continuity;
 pub mod save_snapshots;
 pub mod self_update;
 pub mod sram_provenance;

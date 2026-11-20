@@ -267,8 +267,9 @@ impl QuiescenceProvider for ProcScanQuiescence {
 }
 
 /// What counts as "the emulator is running" for one binding. Names are only
-/// ever used to refuse. Any binding that does not name RetroArch keeps the
-/// PS2 identity the card restore was reviewed with.
+/// ever used to refuse. A binding that names RetroArch, DuckStation, Dolphin,
+/// RPCS3 or PPSSPP gets that emulator's identity; every other binding keeps
+/// the PS2 identity the card restore was reviewed with.
 struct EmulatorIdentity {
     names: &'static [&'static str],
     flatpak_id: &'static str,
@@ -303,6 +304,8 @@ impl EmulatorIdentity {
                 loose_suffix: true,
                 markers: &["retroarch", "libretro", "retrodeck"],
             }
+        } else if let Some(identity) = Self::other_emulator(&binding.emulator) {
+            identity
         } else {
             Self {
                 names: PS2_EMULATOR_PROCESS_NAMES,
@@ -312,6 +315,51 @@ impl EmulatorIdentity {
                 markers: &[],
             }
         }
+    }
+
+    /// Emulators added for save-continuity snapshots. Each is matched by its
+    /// own executable names (native, AppImage and the binary an AppImage
+    /// mounts), its Flatpak app id and scope, and, for processes that cannot
+    /// be inspected, a marker anywhere in the name, command line or cgroup.
+    ///
+    /// The names are deliberately the emulator's own: plain `dolphin` is
+    /// KDE's file manager and is not listed. A name that is missing here
+    /// cannot clear anything: an unlisted emulator build that keeps the save
+    /// open is still caught by the kernel lease, and without a lease an
+    /// uninspectable process keeps the answer `Unknown`.
+    fn other_emulator(emulator: &str) -> Option<Self> {
+        let (names, flatpak_id, markers): (&'static [&'static str], _, &'static [&'static str]) =
+            match emulator.to_ascii_lowercase().as_str() {
+                "duckstation" => (
+                    &["duckstation"],
+                    "org.duckstation.DuckStation",
+                    &["duckstation"],
+                ),
+                "dolphin" => (
+                    &[
+                        "dolphin-emu",
+                        "dolphin-emu-nogui",
+                        "dolphin-emu-qt",
+                        "primehack",
+                    ],
+                    "org.DolphinEmu.dolphin-emu",
+                    &["dolphin-emu", "dolphinemu", "dolphin_emu"],
+                ),
+                "rpcs3" => (&["rpcs3"], "net.rpcs3.RPCS3", &["rpcs3"]),
+                "ppsspp" => (
+                    &["ppsspp", "ppssppsdl", "ppssppqt", "ppssppheadless"],
+                    "org.ppsspp.PPSSPP",
+                    &["ppsspp"],
+                ),
+                _ => return None,
+            };
+        Some(Self {
+            names,
+            flatpak_id,
+            lease_waives_uninspectable: true,
+            loose_suffix: true,
+            markers,
+        })
     }
 
     fn marker(&self, text: &str) -> bool {

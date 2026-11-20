@@ -9,7 +9,7 @@ use ps1_memcard::{BLOCK, CAPACITY, CardBuilder, FRAME, MemoryCard, Save};
 use std::os::unix::fs::PermissionsExt;
 
 /// Full-width Shift-JIS, the way games write save titles.
-fn sjis_fullwidth(text: &str) -> Vec<u8> {
+pub(crate) fn sjis_fullwidth(text: &str) -> Vec<u8> {
     let mut out = Vec::new();
     for character in text.chars() {
         let code: u16 = match character {
@@ -24,7 +24,7 @@ fn sjis_fullwidth(text: &str) -> Vec<u8> {
     out
 }
 
-fn ps1_save(name: &str, blocks: usize, title: &str) -> Save {
+pub(crate) fn ps1_save(name: &str, blocks: usize, title: &str) -> Save {
     let mut data = vec![0u8; blocks * BLOCK];
     for (index, byte) in data.iter_mut().enumerate() {
         *byte = ((index * 31 + name.len() * 7) & 0xff) as u8;
@@ -41,7 +41,7 @@ fn ps1_save(name: &str, blocks: usize, title: &str) -> Save {
     }
 }
 
-fn ps1_card(saves: &[Save]) -> Vec<u8> {
+pub(crate) fn ps1_card(saves: &[Save]) -> Vec<u8> {
     let mut builder = CardBuilder::new();
     for save in saves {
         builder.add(save.clone());
@@ -434,7 +434,7 @@ fn damaged_ps1_card_is_shown_with_a_warning_and_never_written() {
     assert!(!dir.path().join("out.mcs").exists());
 }
 
-fn icon_sys(title: &str, second_line_at: usize) -> Vec<u8> {
+pub(crate) fn icon_sys(title: &str, second_line_at: usize) -> Vec<u8> {
     let mut icon = vec![0u8; 964];
     icon[..4].copy_from_slice(b"PS2D");
     icon[6..8].copy_from_slice(&(second_line_at as u16 * 2).to_le_bytes());
@@ -443,7 +443,7 @@ fn icon_sys(title: &str, second_line_at: usize) -> Vec<u8> {
     icon
 }
 
-fn add_ecc(data_only: &[u8]) -> Vec<u8> {
+pub(crate) fn add_ecc(data_only: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data_only.len() / 512 * 528);
     for page in data_only.chunks_exact(512) {
         let mut spare = [0u8; 16];
@@ -455,7 +455,7 @@ fn add_ecc(data_only: &[u8]) -> Vec<u8> {
 }
 
 /// A `.psu` holding `icon.sys` and one data file, as uLaunchELF writes it.
-fn psu(save_name: &str, title: &str, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn psu(save_name: &str, title: &str, payload: &[u8]) -> Vec<u8> {
     const STAMP: [u8; 8] = [0, 6, 5, 4, 3, 2, 0xD1, 0x07];
     fn entry(mode: u32, length: u32, name: &str) -> Vec<u8> {
         let mut entry = vec![0u8; 512];
