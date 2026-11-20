@@ -417,8 +417,23 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut State) {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // Two installs of one emulator often hold cards with the same
+            // file name, so the folder is part of the line.
+            let folder = found
+                .path
+                .parent()
+                .map(|parent| {
+                    let text = parent.display().to_string();
+                    match std::env::var("HOME") {
+                        Ok(home) if !home.is_empty() && text.starts_with(&home) => {
+                            format!("~{}", &text[home.len()..])
+                        }
+                        _ => text,
+                    }
+                })
+                .unwrap_or_default();
             let line = format!(
-                "{name}  ·  {}  ·  {}",
+                "{name}  ·  {}  ·  {}  ·  {folder}",
                 found.emulator.as_deref().unwrap_or("Folder"),
                 found.format.label()
             );

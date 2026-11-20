@@ -132,6 +132,21 @@ pub fn find_rpcs3_cards(dev_hdd0: &Path) -> Vec<FoundCard> {
     cards
 }
 
+/// One entry per card file: the same file reached twice (reported by two
+/// sources, or through two installs that share a card folder by a link) is
+/// listed once, under the path found first. Sorted by path.
+pub fn without_duplicates(cards: Vec<FoundCard>) -> Vec<FoundCard> {
+    let mut seen = std::collections::HashSet::new();
+    let mut unique: Vec<FoundCard> = cards
+        .into_iter()
+        .filter(|card| {
+            seen.insert(fs::canonicalize(&card.path).unwrap_or_else(|_| card.path.clone()))
+        })
+        .collect();
+    unique.sort_by(|left, right| left.path.cmp(&right.path));
+    unique
+}
+
 /// Cards in the standard save folders of PCSX2, DuckStation, RetroArch and
 /// RPCS3, for a native install and for the Flatpak of each. Only these
 /// folders are listed; nothing is read beyond each file's header.
@@ -157,6 +172,23 @@ pub fn find_cards_in_standard_folders(home: &Path, config: &Path, data: &Path) -
         flatpak("org.libretro.RetroArch", "config/retroarch/saves"),
     ] {
         cards.extend(find_cards_in(&folder, Some("RetroArch")));
+        // RetroArch can sort saves into one sub-folder per core or per game
+        // folder: look one level down as well, never deeper.
+        let mut sub_folders: Vec<PathBuf> = fs::read_dir(&folder)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.path())
+            .collect();
+        sub_folders.sort();
+        for sub_folder in sub_folders.into_iter().take(1024) {
+            cards.extend(
+                find_cards_in(&sub_folder, Some("RetroArch"))
+                    .into_iter()
+                    .filter(|card| card.format != CardFormat::Pcsx2Folder),
+            );
+        }
     }
     for folder in [
         config.join("rpcs3/dev_hdd0"),
@@ -189,21 +221,35 @@ pub fn find_configured_cards() -> CardSearch {
     // profile for it (for example not when PCSX2 is installed both natively
     // and as a Flatpak). A card browser wants every card, so the emulators'
     // standard folders are also looked in directly.
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    // A custom DuckStation card folder that was refused must not be quietly
+    // replaced by the default one.
+    let duckstation_refused = configured
+        .unavailable
+        .iter()
+        .any(|root| root.emulator == crate::persistent_state_inventory::StateEmulator::DuckStation);
+    if let Some(home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+    {
         let from_env = |name: &str, fallback: &str| {
             std::env::var_os(name)
                 .map(PathBuf::from)
                 .filter(|path| path.is_absolute())
                 .unwrap_or_else(|| home.join(fallback))
         };
-        cards.extend(find_cards_in_standard_folders(
-            &home,
-            &from_env("XDG_CONFIG_HOME", ".config"),
-            &from_env("XDG_DATA_HOME", ".local/share"),
-        ));
+        cards.extend(
+            find_cards_in_standard_folders(
+                &home,
+                &from_env("XDG_CONFIG_HOME", ".config"),
+                &from_env("XDG_DATA_HOME", ".local/share"),
+            )
+            .into_iter()
+            .filter(|card| {
+                !(duckstation_refused && card.emulator.as_deref() == Some("DuckStation"))
+            }),
+        );
     }
-    cards.sort_by(|left, right| left.path.cmp(&right.path));
-    cards.dedup_by(|left, right| left.path == right.path);
+    let cards = without_duplicates(cards);
     CardSearch {
         cards,
         unavailable: configured

@@ -200,7 +200,7 @@ fn standard_folders_of_native_and_flatpak_installs_are_both_searched() {
     let mut vmp = vec![0u8; 128];
     vmp[1..4].copy_from_slice(b"PMV");
     vmp.extend_from_slice(&ps1);
-    let files: [(&str, &[u8]); 9] = [
+    let files: [(&str, &[u8]); 11] = [
         (".config/PCSX2/memcards/Mcd001.ps2", &ps2),
         (
             ".var/app/net.pcsx2.PCSX2/config/PCSX2/memcards/Mcd001.ps2",
@@ -220,6 +220,10 @@ fn standard_folders_of_native_and_flatpak_installs_are_both_searched() {
         (".config/retroarch/saves/GBA Game.srm", &[0xFF; 131_072]),
         (".config/PCSX2/inis/PCSX2.ini", b"[UI]"),
         (".config/other/elsewhere.mcd", &ps1),
+        // RetroArch sorting saves by core: one level down is searched...
+        (".config/retroarch/saves/PCSX-ReARMed/Other (USA).srm", &ps1),
+        // ...and no deeper.
+        (".config/retroarch/saves/a/b/Deep (USA).srm", &ps1),
     ];
     for (path, bytes) in files {
         let path = home.join(path);
@@ -253,6 +257,7 @@ fn standard_folders_of_native_and_flatpak_installs_are_both_searched() {
         ("PCSX2", files[1].0),
         ("RPCS3", files[5].0),
         ("RetroArch", files[4].0),
+        ("RetroArch", files[9].0),
     ]
     .iter()
     .map(|(emulator, path)| (emulator.to_string(), path.to_string()))
@@ -263,6 +268,23 @@ fn standard_folders_of_native_and_flatpak_installs_are_both_searched() {
         .map(|(path, _)| fs::read(home.join(path)).unwrap())
         .collect();
     assert_eq!(before, after, "searching only reads");
+
+    // Two installs sharing one card folder through a link: each card once.
+    let shared = home.join(".var/app/org.libretro.RetroArch/config/retroarch");
+    fs::create_dir_all(&shared).unwrap();
+    std::os::unix::fs::symlink(home.join(".config/retroarch/saves"), shared.join("saves")).unwrap();
+    let all = super::discovery::find_cards_in_standard_folders(home, &config, &data);
+    let unique = super::discovery::without_duplicates(all.clone());
+    assert_eq!(
+        all.len(),
+        9,
+        "the linked folder is seen twice before de-duplication"
+    );
+    assert_eq!(unique.len(), 7);
+    assert!(
+        unique.iter().all(|card| !card.path.starts_with(&shared)),
+        "first path wins"
+    );
 }
 
 #[test]
