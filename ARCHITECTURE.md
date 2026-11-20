@@ -57,7 +57,9 @@ RomM and ES-DE are projections/exports, not alternate identity authorities.
 The RomM client is local-path-aware and read-only toward RomM; publishing an
 ES-DE projection is a separate local operation. The one exception is optional
 and off by default: with "Rename also updates RomM's title" turned on (and a
-RomM client token carrying `roms.write`), a Rename changes the displayed title
+separate title-update token carrying `roms.write`, used for nothing else; the
+read-only token stays the one for browsing and import, and may not be the same
+file), a Rename changes the displayed title
 of that game's RomM entry, and History Undo puts it back
 (`identity_source::romm::title_sync`). It writes only when the entry is the one
 EmuWiz's RomM import links to that exact file (by mapped path, with size and

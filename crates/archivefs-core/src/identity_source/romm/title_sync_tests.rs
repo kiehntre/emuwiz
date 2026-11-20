@@ -657,6 +657,80 @@ fn title_updates_are_off_unless_turned_on() {
     assert!(read.rename_updates_title);
 }
 
+#[test]
+fn title_updates_use_their_own_token_and_never_the_read_only_one() {
+    use crate::identity_source::settings::{ProviderSettings, title_token_file};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let write_token = |name: &str, text: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    };
+    let read_only = write_token("read-token", "read-only-token-for-tests");
+    let title = write_token("title-token", "title-token-for-tests");
+    let mut settings = ProviderSettings {
+        rename_updates_title: true,
+        ..ProviderSettings::default()
+    };
+    settings.source.token_path = Some(read_only.clone());
+
+    // Not set: refused, and the read-only token is not used instead.
+    let refused = title_token_file(&settings).unwrap_err();
+    assert!(
+        refused.contains("no title-update token is set"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("read-only token is never used"),
+        "{refused}"
+    );
+
+    // The read-only token's file, directly or through another spelling or a
+    // link: refused.
+    for same in [
+        read_only.clone(),
+        dir.path().join(".").join("read-token"),
+        {
+            let link = dir.path().join("link-to-read-token");
+            std::os::unix::fs::symlink(&read_only, &link).unwrap();
+            link
+        },
+    ] {
+        settings.title_token_path = Some(same.clone());
+        let refused = title_token_file(&settings).unwrap_err();
+        assert!(
+            refused.contains("same file as EmuWiz's read-only RomM token"),
+            "{}: {refused}",
+            same.display()
+        );
+    }
+
+    // Its own file: loaded with the usual checks.
+    settings.title_token_path = Some(title.clone());
+    let token = title_token_file(&settings).expect("the title-update token");
+    assert_eq!(
+        token.with_header_value(|value| value.to_string()),
+        "Bearer title-token-for-tests"
+    );
+    std::fs::set_permissions(&title, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        title_token_file(&settings).is_err(),
+        "a readable-by-others file is refused"
+    );
+
+    // Saved beside the read-only path, never in place of it; absent when unset.
+    let saved = serde_json::to_string(&settings).unwrap();
+    assert!(saved.contains("\"title_token_path\""), "{saved}");
+    assert!(saved.contains("read-token"), "{saved}");
+    assert!(
+        !serde_json::to_string(&ProviderSettings::default())
+            .unwrap()
+            .contains("title_token_path")
+    );
+}
+
 /// End to end against a disposable RomM sandbox, through EmuWiz's real HTTP
 /// transport. Run by hand only:
 /// `EMUWIZ_ROMM_SANDBOX_URL=http://<private address>:8080
@@ -672,7 +746,7 @@ fn title_updates_are_off_unless_turned_on() {
 fn against_the_romm_sandbox() {
     use crate::identity_source::net_policy::SystemResolver;
     use crate::identity_source::romm::client::{RommClient, UreqTransport};
-    use crate::identity_source::settings::load_token_file;
+    use crate::identity_source::settings::{ProviderSettings, load_token_file, title_token_file};
     let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
     let url = env("EMUWIZ_ROMM_SANDBOX_URL");
     let games = PathBuf::from(env("EMUWIZ_ROMM_SANDBOX_GAMES"));
@@ -690,7 +764,16 @@ fn against_the_romm_sandbox() {
             provider_path_kind: ProviderPathKind::ProviderRelative,
             token_path: None,
         };
-        let token = load_token_file(Some(Path::new(&env(token_file)))).expect("token file");
+        // The write token only ever comes through the title-update setting,
+        // beside a separate read-only token, as Blue loads it.
+        let token = if token_file == "EMUWIZ_ROMM_SANDBOX_RW_TOKEN" {
+            let mut settings = ProviderSettings::default();
+            settings.source.token_path = Some(env("EMUWIZ_ROMM_SANDBOX_RO_TOKEN").into());
+            settings.title_token_path = Some(env(token_file).into());
+            title_token_file(&settings).expect("the separate title-update token")
+        } else {
+            load_token_file(Some(Path::new(&env(token_file)))).expect("token file")
+        };
         ValidatedRommSource::validate(
             &config,
             &token,

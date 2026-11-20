@@ -59,6 +59,7 @@ pub(super) struct NativeWorkflows {
     /// drawn and after each change (and why saving it failed, if it did).
     romm_title_setting: Option<bool>,
     romm_title_setting_error: Option<String>,
+    romm_title_token_draft: Option<String>,
     native_romm: native_romm::State,
     selected: Option<PathBuf>,
     catalogue_identity_report: Option<archivefs_core::game_identity::GameIdentityReport>,
@@ -520,6 +521,7 @@ impl NativeWorkflows {
             lookup_online_requested: false,
             romm_title_setting: None,
             romm_title_setting_error: None,
+            romm_title_token_draft: None,
             native_romm: native_romm::State::default(),
             selected: None,
             catalogue_identity_report: None,
@@ -3646,6 +3648,27 @@ impl NativeWorkflows {
                     self.romm_title_setting = Some(super::romm_title::title_updates_enabled());
                 }
                 ui.weak(super::romm_title::SETTING_EXPLANATION);
+                if on {
+                    let draft = self
+                        .romm_title_token_draft
+                        .get_or_insert_with(super::romm_title::title_token_path);
+                    ui.horizontal(|ui| {
+                        ui.label(super::romm_title::TOKEN_LABEL);
+                        ui.add(
+                            egui::TextEdit::singleline(draft)
+                                .hint_text("~/.config/emuwiz/romm-title-token"),
+                        );
+                    });
+                    if ui.button("Save title-update token").clicked() {
+                        let path = self.romm_title_token_draft.clone().unwrap_or_default();
+                        self.romm_title_setting_error =
+                            super::romm_title::set_title_token_path(&path).err();
+                        if self.romm_title_setting_error.is_none() {
+                            // Read back what was saved.
+                            self.romm_title_token_draft = None;
+                        }
+                    }
+                }
                 if let Some(error) = &self.romm_title_setting_error {
                     ui.colored_label(
                         ui.visuals().warn_fg_color,
@@ -3656,6 +3679,7 @@ impl NativeWorkflows {
             if self.app.romm_ui.config_draft.is_some() {
                 // Read again once the form closes.
                 self.romm_title_setting = None;
+                self.romm_title_token_draft = None;
                 ui.separator();
                 ui.strong("RomM setup");
                 let mut request = self.app.show_romm_configuration(ui);

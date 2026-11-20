@@ -53,8 +53,8 @@ pub const REQUIRED_READ_SCOPES: &[&str] = &["platforms.read", "roms.read"];
 
 /// Scopes that would let EmuWiz change something in RomM. Never requested for
 /// browsing or import. `roms.write` is needed only by the optional Rename
-/// title update ([`super::title_sync`]); a person who turns that on gives
-/// EmuWiz a token made for it.
+/// title update ([`super::title_sync`]), through its own separate token file;
+/// the read-only token never needs it.
 pub const UNWANTED_WRITE_SCOPES: &[&str] = &[
     "roms.write",
     "platforms.write",
