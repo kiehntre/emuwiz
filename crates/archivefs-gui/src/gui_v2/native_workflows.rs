@@ -1281,6 +1281,11 @@ impl NativeWorkflows {
             launch_readiness_summary::note_retroarch_installation_refusal(&mut summary, &refusal);
         }
         self.note_launch_route(&mut summary, game_id, path, &input, Some(context));
+        launch_readiness_summary::note_flatpak_graphics(
+            &mut summary,
+            &input,
+            &launch_readiness_summary::host_flatpak_graphics(),
+        );
         if catalogue_verified {
             launch_readiness_summary::note_catalogue_verified(&mut summary);
         }
@@ -1408,6 +1413,11 @@ impl NativeWorkflows {
             launch_readiness_summary::describe_check_error(&mut summary, error);
         }
         self.note_launch_route(&mut summary, game_id, path, &input, None);
+        launch_readiness_summary::note_flatpak_graphics(
+            &mut summary,
+            &input,
+            &launch_readiness_summary::host_flatpak_graphics(),
+        );
         Some(summary)
     }
 

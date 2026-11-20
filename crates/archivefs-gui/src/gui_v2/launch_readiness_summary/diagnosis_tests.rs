@@ -446,3 +446,197 @@ fn an_unrecognised_start_error_gets_no_guessed_cause() {
     assert!(attempt.why().contains("did not start"));
     assert_eq!(attempt.technical(), "something unexpected");
 }
+
+// ---- exact words for blockers whose meaning is known precisely ----
+
+fn blocked_on(adapter_id: &'static str, kinds: &[LaunchBlockerKind]) -> GameReadinessSummary {
+    let mut candidate = blocked(kinds, Some("/g/game"), FirmwareReadiness::NotRequired);
+    candidate.target = LaunchTarget::Standalone {
+        adapter_id,
+        profile_id: "default".into(),
+        profile_path: None,
+    };
+    project(&plan(vec![candidate]), ReadinessFreshness::Current)
+}
+
+#[test]
+fn an_xbox_game_that_is_not_a_disc_image_is_told_what_xemu_needs() {
+    let summary = blocked_on("xemu", &[LaunchBlockerKind::XemuContentFormatUnsupported]);
+    let finding = &summary.findings[0];
+    assert_eq!(finding.cause, Cause::FormatUnsupported);
+    assert_eq!(
+        finding.title,
+        "xemu can only start an Xbox disc image (.iso)"
+    );
+    let text = text_of(&summary);
+    assert!(text.contains("ZIP archive"));
+    assert!(text.contains("Your file is fine and nothing was changed"));
+    assert!(text.contains("Extract or convert it to an .iso disc image"));
+    assert!(!text.contains("isn't supported for launching yet"));
+    assert_eq!(
+        summary.primary_action,
+        Some(ReadinessAction::CheckGamesFolder)
+    );
+}
+
+#[test]
+fn a_ps3_install_package_is_told_to_install_it_in_rpcs3() {
+    let summary = blocked_on("rpcs3", &[LaunchBlockerKind::Rpcs3ContentFormatUnsupported]);
+    assert_eq!(summary.findings[0].cause, Cause::FormatUnsupported);
+    assert_eq!(
+        summary.findings[0].title,
+        "RPCS3 can't start this PS3 file directly"
+    );
+    let text = text_of(&summary);
+    assert!(text.contains("A .pkg file is an installer, not the game itself"));
+    assert!(text.contains("File > Install Packages/Raps/Edats"));
+    assert!(!text.contains("isn't supported for launching yet"));
+}
+
+#[test]
+fn rpcs3_without_confirmed_system_software_names_the_file_and_the_menu() {
+    let summary = blocked_on("rpcs3", &[LaunchBlockerKind::Rpcs3FirmwareUnavailable]);
+    assert_eq!(summary.findings[0].cause, Cause::FirmwareMissing);
+    let text = text_of(&summary);
+    assert!(text.contains("RPCS3 needs the PlayStation 3 system software"));
+    assert!(text.contains("PS3UPDAT.PUP"));
+    assert!(text.contains("File > Install Firmware"));
+    assert_eq!(summary.primary_action, Some(ReadinessAction::CheckFirmware));
+}
+
+/// These three were grouped by name as "EmuWiz can't safely prepare this
+/// launch": a missing Kickstart was reported as an unexplained refusal.
+#[test]
+fn a_missing_amiga_kickstart_is_firmware_with_its_own_fix_not_a_safety_refusal() {
+    for kind in [
+        LaunchBlockerKind::FsUaeKickstartUnavailable,
+        LaunchBlockerKind::AmiberryKickstartUnavailable,
+        LaunchBlockerKind::WhdloadKickstartUnavailable,
+    ] {
+        let summary = blocked_on("fsuae", &[kind]);
+        assert_eq!(summary.findings.len(), 1, "{kind:?}");
+        assert_eq!(
+            summary.findings[0].cause,
+            Cause::FirmwareMissing,
+            "{kind:?}"
+        );
+        assert_eq!(
+            summary.findings[0].title,
+            "The Amiga emulator has no Kickstart ROM it can use"
+        );
+        let text = text_of(&summary);
+        assert!(text.contains("the kickstart_file setting or its Kickstarts folder"));
+        assert!(text.contains("EmuWiz never supplies one"));
+        assert!(
+            !text.contains("can't safely prepare this launch"),
+            "{kind:?}"
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::CheckFirmware));
+    }
+}
+
+#[test]
+fn amiga_ipf_and_missing_settings_point_at_the_emulator_setup() {
+    for (kind, title, phrase) in [
+        (
+            LaunchBlockerKind::FsUaeIpfBackendUnavailable,
+            "This disk image (.ipf) needs the emulator's IPF plug-in",
+            "CAPS, also called capsimg",
+        ),
+        (
+            LaunchBlockerKind::AmiberryIpfBackendUnavailable,
+            "This disk image (.ipf) needs the emulator's IPF plug-in",
+            "Your file is fine and nothing was changed",
+        ),
+        (
+            LaunchBlockerKind::FsUaeProfileRequired,
+            "The Amiga emulator has no settings EmuWiz can use",
+            "save a configuration with your Amiga model and Kickstart",
+        ),
+        (
+            LaunchBlockerKind::AmiberryProfileRequired,
+            "The Amiga emulator has no settings EmuWiz can use",
+            "Open the emulator once",
+        ),
+    ] {
+        let summary = blocked_on("fsuae", &[kind]);
+        assert_eq!(
+            summary.findings[0].cause,
+            Cause::EmulatorSetupIncomplete,
+            "{kind:?}"
+        );
+        assert_eq!(summary.findings[0].title, title, "{kind:?}");
+        let text = text_of(&summary);
+        assert!(text.contains(phrase), "{kind:?}");
+        assert!(
+            !text.contains("can't safely prepare this launch"),
+            "{kind:?}"
+        );
+        assert_eq!(summary.primary_action, Some(ReadinessAction::SetUpEmulator));
+    }
+}
+
+/// `WhdloadProfileMissing` also stands for a refused WHDLoad boot preparation,
+/// so it must not tell the person to save emulator settings.
+#[test]
+fn a_whdload_profile_refusal_keeps_the_general_words() {
+    let summary = blocked_on("amiga_whdload", &[LaunchBlockerKind::WhdloadProfileMissing]);
+    assert_eq!(summary.findings[0].cause, Cause::SafetyRefusal);
+    assert!(!text_of(&summary).contains("has no settings EmuWiz can use"));
+}
+
+#[test]
+fn xemu_system_files_are_named_and_other_emulators_keep_the_general_words() {
+    let xemu = blocked_on("xemu", &[LaunchBlockerKind::RequiredFirmwareMissing]);
+    assert_eq!(xemu.findings[0].title, "xemu needs its Xbox system files");
+    let text = text_of(&xemu);
+    assert!(text.contains("the MCPX boot ROM, a flash BIOS, an EEPROM and a hard disk image"));
+    assert_eq!(xemu.primary_action, Some(ReadinessAction::CheckFirmware));
+
+    let other = summary_for(&[LaunchBlockerKind::RequiredFirmwareMissing]);
+    assert_eq!(
+        other.findings[0].title,
+        "Console startup software (BIOS / firmware) is needed"
+    );
+
+    // The firmware state alone (no named blocker) reads the same way for xemu.
+    let mut candidate = blocked(
+        &[LaunchBlockerKind::XemuBindingUnavailable],
+        Some("/g/game.iso"),
+        FirmwareReadiness::Missing,
+    );
+    candidate.target = LaunchTarget::Standalone {
+        adapter_id: "xemu",
+        profile_id: "default".into(),
+        profile_path: None,
+    };
+    let state_only = project(&plan(vec![candidate]), ReadinessFreshness::Current);
+    assert!(
+        state_only
+            .findings
+            .iter()
+            .any(|finding| finding.title == "xemu needs its Xbox system files")
+    );
+}
+
+#[test]
+fn blockers_of_one_cause_share_one_finding_and_the_exact_words_win_in_either_order() {
+    for kinds in [
+        [
+            LaunchBlockerKind::FsUaeKickstartUnavailable,
+            LaunchBlockerKind::RequiredFirmwareMissing,
+        ],
+        [
+            LaunchBlockerKind::RequiredFirmwareMissing,
+            LaunchBlockerKind::FsUaeKickstartUnavailable,
+        ],
+    ] {
+        let summary = blocked_on("fsuae", &kinds);
+        assert_eq!(summary.findings.len(), 1, "{kinds:?}");
+        assert_eq!(
+            summary.findings[0].title,
+            "The Amiga emulator has no Kickstart ROM it can use"
+        );
+        assert_eq!(summary.findings[0].technical.len(), 2);
+    }
+}

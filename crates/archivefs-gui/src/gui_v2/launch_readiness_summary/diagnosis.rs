@@ -11,6 +11,7 @@
 use super::ReadinessAction;
 use archivefs_core::launch::{
     FirmwareReadiness, LaunchBlocker, LaunchBlockerKind, LaunchCandidate, LaunchReadiness,
+    LaunchTarget,
 };
 use std::time::{Duration, Instant};
 
@@ -154,6 +155,89 @@ fn describe(cause: Cause) -> (&'static str, &'static str, Option<ReadinessAction
     }
 }
 
+/// Exact words for a blocker whose meaning is known precisely, used instead of
+/// its group's general text. Each says what is wrong, that the person's file
+/// is untouched where that matters, and the next step in the emulator's own
+/// terms. Grouping by name alone left these on "can't safely prepare this
+/// launch" or "this kind of file isn't supported yet", which named no fix.
+#[derive(Clone, Copy)]
+struct Wording {
+    cause: Cause,
+    title: &'static str,
+    why: &'static str,
+    fix: Option<ReadinessAction>,
+}
+
+const XEMU_NEEDS_DISC_IMAGE: Wording = Wording {
+    cause: Cause::FormatUnsupported,
+    title: "xemu can only start an Xbox disc image (.iso)",
+    why: "This game is stored another way, for example inside a ZIP archive or as a single .xbe program file, and xemu cannot start those. Your file is fine and nothing was changed. Extract or convert it to an .iso disc image in your games folder, then scan the folder again.",
+    fix: Some(ReadinessAction::CheckGamesFolder),
+};
+
+const XEMU_SYSTEM_FILES: Wording = Wording {
+    cause: Cause::FirmwareMissing,
+    title: "xemu needs its Xbox system files",
+    why: "xemu starts every game through the Xbox's own startup files: the MCPX boot ROM, a flash BIOS, an EEPROM and a hard disk image. At least one is missing; the technical details name it. Choose your own legally obtained files in xemu's own settings (System), then check again.",
+    fix: Some(ReadinessAction::CheckFirmware),
+};
+
+const RPCS3_NEEDS_DISC_OR_FOLDER: Wording = Wording {
+    cause: Cause::FormatUnsupported,
+    title: "RPCS3 can't start this PS3 file directly",
+    why: "EmuWiz starts PS3 games from a disc image (.iso) or an extracted game folder. A .pkg file is an installer, not the game itself: install it once inside RPCS3 (File > Install Packages/Raps/Edats) and start the game from RPCS3's own list. Your file is fine and nothing was changed.",
+    fix: Some(ReadinessAction::ReviewProblem),
+};
+
+const RPCS3_SYSTEM_SOFTWARE: Wording = Wording {
+    cause: Cause::FirmwareMissing,
+    title: "RPCS3 needs the PlayStation 3 system software",
+    why: "EmuWiz could not confirm that the PS3 system software is installed in RPCS3, and RPCS3 cannot start any game without it. Download the official update file (PS3UPDAT.PUP) from PlayStation's own website, choose File > Install Firmware in RPCS3, then check again. EmuWiz never supplies it.",
+    fix: Some(ReadinessAction::CheckFirmware),
+};
+
+const AMIGA_KICKSTART: Wording = Wording {
+    cause: Cause::FirmwareMissing,
+    title: "The Amiga emulator has no Kickstart ROM it can use",
+    why: "Amiga games need a Kickstart ROM, the Amiga's own startup software, and EmuWiz could not confirm one: the emulator's settings name none, or the file they name is missing or cannot be read. Point the emulator at your own legally obtained Kickstart (in FS-UAE: the kickstart_file setting or its Kickstarts folder), then check again. EmuWiz never supplies one.",
+    fix: Some(ReadinessAction::CheckFirmware),
+};
+
+const AMIGA_IPF_PLUGIN: Wording = Wording {
+    cause: Cause::EmulatorSetupIncomplete,
+    title: "This disk image (.ipf) needs the emulator's IPF plug-in",
+    why: "IPF disk images are read through a separate decoder library (CAPS, also called capsimg), and EmuWiz found no proof that this emulator has it. Install the plug-in named in the emulator's own documentation, then check again. Your file is fine and nothing was changed.",
+    fix: Some(ReadinessAction::SetUpEmulator),
+};
+
+const AMIGA_SETTINGS: Wording = Wording {
+    cause: Cause::EmulatorSetupIncomplete,
+    title: "The Amiga emulator has no settings EmuWiz can use",
+    why: "EmuWiz starts Amiga games with the machine set up in the emulator itself, and found no readable settings for it. Open the emulator once, save a configuration with your Amiga model and Kickstart, then check again.",
+    fix: Some(ReadinessAction::SetUpEmulator),
+};
+
+/// `adapter` is the standalone emulator the candidate targets, when it has one:
+/// a shared blocker such as a missing firmware file reads differently for xemu,
+/// whose system files are chosen in xemu and not in BIOS Setup.
+fn specific(kind: LaunchBlockerKind, adapter: Option<&str>) -> Option<Wording> {
+    use LaunchBlockerKind::*;
+    Some(match kind {
+        XemuContentFormatUnsupported => XEMU_NEEDS_DISC_IMAGE,
+        RequiredFirmwareMissing if adapter == Some("xemu") => XEMU_SYSTEM_FILES,
+        Rpcs3ContentFormatUnsupported => RPCS3_NEEDS_DISC_OR_FOLDER,
+        Rpcs3FirmwareUnavailable => RPCS3_SYSTEM_SOFTWARE,
+        FsUaeKickstartUnavailable | AmiberryKickstartUnavailable | WhdloadKickstartUnavailable => {
+            AMIGA_KICKSTART
+        }
+        FsUaeIpfBackendUnavailable | AmiberryIpfBackendUnavailable => AMIGA_IPF_PLUGIN,
+        // Not `WhdloadProfileMissing`: it also carries every refused WHDLoad boot
+        // preparation, which saving emulator settings cannot fix.
+        FsUaeProfileRequired | AmiberryProfileRequired => AMIGA_SETTINGS,
+        _ => return None,
+    })
+}
+
 /// One finding for a cause that is known without a candidate (no emulator
 /// at all, or an identity that is not confirmed).
 pub(crate) fn single(cause: Cause) -> Vec<Finding> {
@@ -174,30 +258,48 @@ fn blocker_line(blocker: &LaunchBlocker) -> String {
 /// Every distinct thing blocking this candidate, most actionable first.
 /// Empty when nothing blocks it.
 pub(crate) fn findings_for(candidate: &LaunchCandidate) -> Vec<Finding> {
-    let mut by_cause: Vec<(Cause, Vec<String>)> = Vec::new();
-    let mut push = |cause: Cause, line: String| {
-        if let Some((_, lines)) = by_cause.iter_mut().find(|(c, _)| *c == cause) {
+    let adapter = match &candidate.target {
+        LaunchTarget::Standalone { adapter_id, .. } => Some(*adapter_id),
+        LaunchTarget::RetroArchCore { .. } => None,
+    };
+    // One finding per cause. The first blocker with exact words speaks for
+    // its cause; the others stay listed under it as technical lines.
+    let mut by_cause: Vec<(Cause, Option<Wording>, Vec<String>)> = Vec::new();
+    let mut push = |cause: Cause, wording: Option<Wording>, line: String| {
+        if let Some((_, known, lines)) = by_cause.iter_mut().find(|(c, _, _)| *c == cause) {
+            if known.is_none() {
+                *known = wording;
+            }
             lines.push(line);
         } else {
-            by_cause.push((cause, vec![line]));
+            by_cause.push((cause, wording, vec![line]));
         }
     };
     for blocker in &candidate.blockers {
-        push(classify(blocker.kind), blocker_line(blocker));
+        let wording = specific(blocker.kind, adapter);
+        push(
+            wording.map_or_else(|| classify(blocker.kind), |wording| wording.cause),
+            wording,
+            blocker_line(blocker),
+        );
     }
     if candidate.firmware == FirmwareReadiness::Missing
         && candidate.readiness == LaunchReadiness::Blocked
     {
         push(
             Cause::FirmwareMissing,
+            specific(LaunchBlockerKind::RequiredFirmwareMissing, adapter),
             "Firmware state: missing".to_string(),
         );
     }
-    by_cause.sort_by_key(|(cause, _)| *cause);
+    by_cause.sort_by_key(|(cause, _, _)| *cause);
     by_cause
         .into_iter()
-        .map(|(cause, technical)| {
-            let (title, why, fix) = describe(cause);
+        .map(|(cause, wording, technical)| {
+            let (title, why, fix) = match wording {
+                Some(wording) => (wording.title, wording.why, wording.fix),
+                None => describe(cause),
+            };
             Finding {
                 cause,
                 title,

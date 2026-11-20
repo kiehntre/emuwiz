@@ -11,9 +11,11 @@ use archivefs_core::launch::{
 use eframe::egui;
 
 mod diagnosis;
+mod flatpak_graphics;
 pub(crate) mod route_truth;
 mod vita3k_package;
 pub(crate) use diagnosis::{Attempt, AttemptTracker, Cause, Finding};
+pub(crate) use flatpak_graphics::{host_flatpak_graphics, note_flatpak_graphics};
 pub(crate) use vita3k_package::note_vita3k_package;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
