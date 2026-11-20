@@ -12,10 +12,12 @@ use eframe::egui;
 
 mod diagnosis;
 mod flatpak_graphics;
+mod known_unplayable;
 pub(crate) mod route_truth;
 mod vita3k_package;
 pub(crate) use diagnosis::{Attempt, AttemptTracker, Cause, Finding};
 pub(crate) use flatpak_graphics::{host_flatpak_graphics, note_flatpak_graphics};
+pub(crate) use known_unplayable::note_known_unplayable;
 pub(crate) use vita3k_package::note_vita3k_package;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

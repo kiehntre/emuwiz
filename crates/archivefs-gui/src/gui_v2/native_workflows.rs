@@ -1286,6 +1286,7 @@ impl NativeWorkflows {
             &input,
             &launch_readiness_summary::host_flatpak_graphics(),
         );
+        launch_readiness_summary::note_known_unplayable(&mut summary, path);
         if catalogue_verified {
             launch_readiness_summary::note_catalogue_verified(&mut summary);
         }
@@ -1418,6 +1419,7 @@ impl NativeWorkflows {
             &input,
             &launch_readiness_summary::host_flatpak_graphics(),
         );
+        launch_readiness_summary::note_known_unplayable(&mut summary, path);
         Some(summary)
     }
 
