@@ -171,6 +171,13 @@ def probe(name, cli, work):
     time.sleep(0.05)
     steps = result.setdefault("steps", {})
 
+    # Other emulators that are already active before anything is started
+    # (someone else's session): not this route's doing, so not held against it.
+    already_active = {
+        other for other in EMULATORS
+        if other != emulator and verdict(cli, scratch, other, save)["verdict"] == "active"
+    }
+    result["others_already_active"] = sorted(already_active)
     before = verdict(cli, scratch, emulator, save)
     steps["before"] = before["verdict"]
     if before["verdict"] != "verified_safe":
@@ -198,11 +205,17 @@ def probe(name, cli, work):
         steps["during"] = during["verdict"]
         steps["during_state"] = during.get("state")
         time.sleep(2)  # let helpers and children appear before listing them
-        result["processes"] = [info for info in map(describe, sandbox.owned()) if info and info["name"] != "Xvfb"]
+        helpers = ("Xvfb", "dbus-launch", "dbus-daemon", "xdg-", "at-spi", "p11-kit")
+        result["processes"] = [
+            info for info in map(describe, sandbox.owned())
+            if info and not info["name"].startswith(helpers)
+        ]
         # Another emulator's saves must not be blocked by this one.
         result["others_blocked"] = [
             other for other in EMULATORS
-            if other != emulator and verdict(cli, scratch, other, save)["verdict"] == "active"
+            if other != emulator
+            and other not in already_active
+            and verdict(cli, scratch, other, save)["verdict"] == "active"
         ]
         sandbox.stop()
         log.close()
