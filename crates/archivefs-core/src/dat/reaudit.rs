@@ -253,6 +253,26 @@ pub fn plan_reaudit(
     let rows = db
         .saved_dat_evidence_status(catalogues)
         .map_err(|e| e.to_string())?;
+    Ok(plan_from_rows(rows, catalogues))
+}
+
+/// [`plan_reaudit`] for one library game: its own saved rows only.
+pub fn plan_reaudit_for_game(
+    database_path: &Path,
+    catalogues: &HashMap<String, ConfiguredCatalogue>,
+    archive_id: i64,
+) -> Result<ReauditPlan, String> {
+    let db = Database::open_read_only(database_path).map_err(|e| e.to_string())?;
+    let rows = db
+        .saved_dat_evidence_status_for(catalogues, archive_id)
+        .map_err(|e| e.to_string())?;
+    Ok(plan_from_rows(rows, catalogues))
+}
+
+fn plan_from_rows(
+    rows: Vec<crate::database::SavedDatEvidenceRow>,
+    catalogues: &HashMap<String, ConfiguredCatalogue>,
+) -> ReauditPlan {
     let mut plan = ReauditPlan {
         saved_rows: rows.len(),
         ..Default::default()
@@ -323,7 +343,7 @@ pub fn plan_reaudit(
             pool: Vec::new(),
         })
         .collect();
-    Ok(plan)
+    plan
 }
 
 /// Why games with no saved DAT result are not matched for the first time now.
@@ -1876,4 +1896,86 @@ pub fn run_reaudit(
         );
     }
     Ok(report)
+}
+
+/// Re-checking one game's saved catalogue results, run after Blue renames a
+/// game (and after that rename is undone): a saved result is tied to the
+/// file's name, so it stops counting until the file is read again.
+#[derive(Clone, Debug)]
+pub struct GameRecheck {
+    pub plan: ReauditPlan,
+    /// `None` when nothing needed reading.
+    pub report: Option<ReauditReport>,
+}
+
+impl GameRecheck {
+    /// One plain sentence for the person; `None` when the game has no saved
+    /// catalogue result at all (so there was nothing to keep verified).
+    pub fn summary(&self) -> Option<String> {
+        const LATER: &str = "It shows as not verified until you re-check it (Re-check this game).";
+        if self.plan.saved_rows == 0 {
+            return None;
+        }
+        let blocked = self
+            .plan
+            .blocked
+            .iter()
+            .find(|b| b.block != ReauditBlock::DoesNotApply);
+        let Some(report) = &self.report else {
+            return Some(match blocked.map(|b| &b.block) {
+                Some(ReauditBlock::CatalogueUnavailable) => {
+                    format!("Its catalogue is not available now, so it was not re-checked. {LATER}")
+                }
+                Some(ReauditBlock::FileUnavailable) => {
+                    format!("Its file could not be reached, so it was not re-checked. {LATER}")
+                }
+                Some(ReauditBlock::SystemUnknown) => {
+                    format!("Its system is not known, so it was not re-checked. {LATER}")
+                }
+                _ => "Its catalogue result is still current.".into(),
+            });
+        };
+        Some(if report.verified > 0 {
+            "Re-checked against its catalogue: still verified.".into()
+        } else if report.no_match > 0 {
+            "Re-checked: the file no longer matches its catalogue entry, so it is not verified. The earlier result is kept in its history.".into()
+        } else if report.ambiguous > 0 {
+            "Re-checked: more than one catalogue entry fits, so it is not verified until you choose one (Re-check this game).".into()
+        } else if let Some(note) = report.not_checked.first() {
+            format!("The re-check could not finish: {}. {LATER}", note.reason)
+        } else if let Some(ReauditStop::Interrupted(why)) = &report.stopped {
+            format!("The re-check could not finish: {why}. {LATER}")
+        } else {
+            format!("The re-check produced no result. {LATER}")
+        })
+    }
+}
+
+/// Re-checks only `archive_id`'s saved results that are no longer current,
+/// through the ordinary re-check engine ([`run_reaudit`]): the file is read
+/// again against the catalogue's bytes now, and nothing is carried over
+/// without that. Replaced results are kept in history by the engine's rules.
+pub fn recheck_game(
+    database_path: &Path,
+    archive_id: i64,
+    catalogues: &HashMap<String, ConfiguredCatalogue>,
+    resolve: &dyn Fn(&str) -> Result<ResolvedCatalogue, String>,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+) -> Result<GameRecheck, String> {
+    let plan = plan_reaudit_for_game(database_path, catalogues, archive_id)?;
+    let report = if plan.games() == 0 {
+        None
+    } else {
+        Some(run_reaudit(
+            database_path,
+            &plan,
+            resolve,
+            trusted,
+            cancel,
+            ReauditLimits::default(),
+            &|_| {},
+        )?)
+    };
+    Ok(GameRecheck { plan, report })
 }
