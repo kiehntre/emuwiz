@@ -5346,7 +5346,17 @@ impl Database {
                 return Ok(());
             }
         }
+        self.replace_current_platform(archive_id, platform, source)
+    }
 
+    /// Makes `platform` from `source` the current assignment, keeping the
+    /// previous one as history. No precedence checks: callers decide.
+    fn replace_current_platform(
+        &mut self,
+        archive_id: i64,
+        platform: &str,
+        source: &str,
+    ) -> Result<()> {
         let tx = self
             .connection
             .savepoint()
@@ -5456,6 +5466,24 @@ impl Database {
                 {
                     return Ok(PlatformIdentityApplyOutcome::Unchanged);
                 }
+                // Same platform, but the DAT/RomM provenance changed (RomM
+                // started or stopped agreeing with the DAT verification):
+                // store the new provenance so the label is never stale.
+                if current
+                    .as_ref()
+                    .is_some_and(|(current_platform, current_source)| {
+                        current_platform == platform
+                            && matches!(
+                                current_source.as_str(),
+                                ROMM_PLATFORM_SOURCE
+                                    | VERIFIED_DAT_PLATFORM_SOURCE
+                                    | DAT_ROMM_AGREEMENT_SOURCE
+                            )
+                    })
+                {
+                    self.replace_current_platform(archive_id, platform, source)?;
+                    return Ok(PlatformIdentityApplyOutcome::Applied);
+                }
                 self.assign_platform(archive_id, Some(platform), source)?;
                 Ok(PlatformIdentityApplyOutcome::Applied)
             }
@@ -5486,6 +5514,16 @@ impl Database {
             };
             summary.archives_matched += 1;
             let mut evidence = self.current_platform_identity_evidence(archive_id, generation)?;
+            // Beside a DAT verification, this import is RomM's current word:
+            // it replaces the RomM half of a stored DAT/RomM agreement, so a
+            // RomM that now disagrees no longer reads as "Verified by DAT and
+            // RomM" (and one that agrees again restores it).
+            if evidence
+                .iter()
+                .any(|item| item.source == PlatformIdentitySource::VerifiedDat)
+            {
+                evidence.retain(|item| item.source != PlatformIdentitySource::Romm);
+            }
             evidence.push(provider.clone());
             let resolution =
                 crate::platform::identity::resolve_platform_identity(generation, evidence);
@@ -19523,8 +19561,9 @@ echo "$out"
 
     #[test]
     fn a_conflicting_romm_import_leaves_the_dat_verified_platform_current() {
-        // Both a DAT-only verification and a persisted DAT/RomM agreement:
-        // RomM now saying another platform never retires the verified one.
+        // Starting from a DAT-only verification and from a stored DAT/RomM
+        // agreement: RomM saying another platform never retires the verified
+        // one, and never leaves an "agree" label behind.
         for (case, source) in [
             ("dat-only", VERIFIED_DAT_PLATFORM_SOURCE),
             ("agreement", DAT_ROMM_AGREEMENT_SOURCE),
@@ -19534,12 +19573,7 @@ echo "$out"
             database
                 .assign_platform(archive_id, Some("PSX"), source)
                 .unwrap();
-            let archive = database
-                .load_archives()
-                .unwrap()
-                .into_iter()
-                .find(|archive| archive.id == archive_id)
-                .unwrap();
+            let archive = load_archive(&database, archive_id);
 
             let summary = database
                 .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSP"), 10)
@@ -19547,7 +19581,6 @@ echo "$out"
 
             assert_eq!(summary.conflicts, 0, "{case}");
             assert!(summary.conflict_details.is_empty(), "{case}");
-            assert_eq!(summary.applied, 0, "{case}");
             // Recorded for review, with both sides.
             assert_eq!(summary.romm_disagreements, 1, "{case}");
             let shown = &summary.romm_disagreement_details[0].evidence;
@@ -19563,16 +19596,87 @@ echo "$out"
                     .any(|item| item.source == PlatformIdentitySource::Romm
                         && item.platform == "PSP")
             );
-            let after = database
-                .load_archives()
-                .unwrap()
-                .into_iter()
-                .find(|archive| archive.id == archive_id)
-                .unwrap();
+            let after = load_archive(&database, archive_id);
             assert_eq!(after.platform.as_deref(), Some("PSX"), "{case}");
-            assert_eq!(after.platform_source.as_deref(), Some(source), "{case}");
+            assert_eq!(
+                after.platform_source.as_deref(),
+                Some(VERIFIED_DAT_PLATFORM_SOURCE),
+                "{case}: the DAT verification stays, any agreement is gone"
+            );
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn romm_agreement_then_disagreement_then_agreement_again_updates_the_label() {
+        let (root, mut database, archive_id) =
+            unknown_archive_database("romm-agree-disagree-agree");
+        database
+            .assign_platform(archive_id, Some("PSX"), VERIFIED_DAT_PLATFORM_SOURCE)
+            .unwrap();
+        let archive = load_archive(&database, archive_id);
+        let stored = |database: &Database| {
+            let archive = load_archive(database, archive_id);
+            (archive.platform, archive.platform_source)
+        };
+        let import = |database: &mut Database, romm: &str, generation: u64| {
+            database
+                .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, romm), generation)
+                .unwrap()
+        };
+
+        // 1. RomM agrees: "Verified by DAT and RomM".
+        let summary = import(&mut database, "PSX", 10);
+        assert_eq!((summary.applied, summary.romm_disagreements), (1, 0));
+        assert_eq!(
+            stored(&database),
+            (Some("PSX".into()), Some(DAT_ROMM_AGREEMENT_SOURCE.into()))
+        );
+        // 2. RomM now disagrees: the DAT platform stays, agreement is dropped.
+        let summary = import(&mut database, "PSP", 11);
+        assert_eq!(
+            (
+                summary.applied,
+                summary.conflicts,
+                summary.romm_disagreements
+            ),
+            (1, 0, 1)
+        );
+        assert_eq!(
+            stored(&database),
+            (
+                Some("PSX".into()),
+                Some(VERIFIED_DAT_PLATFORM_SOURCE.into())
+            )
+        );
+        // The same disagreement again changes nothing further.
+        let summary = import(&mut database, "PSP", 12);
+        assert_eq!((summary.unchanged, summary.romm_disagreements), (1, 1));
+        // 3. RomM agrees again: the agreement label returns.
+        let summary = import(&mut database, "PSX", 13);
+        assert_eq!((summary.applied, summary.romm_disagreements), (1, 0));
+        assert_eq!(
+            stored(&database),
+            (Some("PSX".into()), Some(DAT_ROMM_AGREEMENT_SOURCE.into()))
+        );
+        // A manual choice outranks all of it.
+        database.set_manual_platform(archive_id, "PSP").unwrap();
+        let summary = import(&mut database, "PSX", 14);
+        assert_eq!(summary.manual_preserved, 1);
+        assert_eq!(
+            stored(&database),
+            (Some("PSP".into()), Some(MANUAL_PLATFORM_SOURCE.into()))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn load_archive(database: &Database, archive_id: i64) -> PersistedArchive {
+        database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap()
     }
 
     #[test]
