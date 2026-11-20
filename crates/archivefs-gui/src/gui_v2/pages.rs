@@ -3231,12 +3231,41 @@ impl App {
 
     /// Everything else "Can I play it?" holds: saves, discs, verification and
     /// identity notes. Long enough that small windows place it after the facts.
+    /// The recovery engine's card, for games it has a validated preparation
+    /// for (decided by two string checks; nothing is read here). The diagnosis
+    /// itself runs once on the Game recovery page's worker thread.
+    fn detail_recovery(&mut self, ui: &mut egui::Ui, game: &Game) {
+        let path = &game.archive.absolute_path;
+        let platform = archivefs_core::canonical_platform_for_alias(&game.platform);
+        if !archivefs_core::recovery::preparation_may_apply(path, platform) {
+            return;
+        }
+        let recovery = &mut self.tools.game_recovery;
+        recovery.poll();
+        if recovery.report_for(path).is_none() && !recovery.is_working_on(path) {
+            recovery.open_for(
+                ui.ctx(),
+                super::game_recovery::Target {
+                    game_id: game.archive.id,
+                    title: game.title.clone(),
+                    path: path.clone(),
+                    platform: platform.map(str::to_string),
+                    platform_source: game.archive.platform_source.clone(),
+                },
+            );
+        }
+        if super::game_recovery::show_game_card(ui, &self.tools.game_recovery, path) {
+            self.go(Route::Tool(super::routes::ToolPage::GameRecovery));
+        }
+    }
+
     fn detail_readiness_notes(
         &mut self,
         ui: &mut egui::Ui,
         game: &Game,
         latest_verification: Option<&str>,
     ) {
+        self.detail_recovery(ui, game);
         let id = game.archive.id;
         let state_target = self
             .native_workflows

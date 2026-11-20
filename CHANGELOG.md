@@ -15,6 +15,21 @@ guessing at intent, dates, or scope.
 
 Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
 
+- New Blue page "Game recovery" (All Tools, Health & recovery; also a card on
+  the game's own page) and `emuwiz-cli recovery`: for a game that cannot
+  start, shows what is wrong with the evidence behind each finding, what
+  would fix it, and what cannot be fixed. First supported case: an Amiga CD32
+  disc stored as a ZIP (cue sheet, data track and WAV audio tracks), which no
+  emulator opens. After a confirmation EmuWiz extracts the disc files as new
+  files in its own prepared-media folder, checks each against the ZIP's
+  checksum, reads them back and checks again; the game then starts from that
+  copy through RetroArch's PUAE core. The ZIP is only read and never changed;
+  nothing is downloaded; the copy can be removed again. The system is still
+  known only from the folder, so the Launch page still asks for "Try anyway"
+  or a remembered choice. Not supported and said so: ZIPs whose cue sheet
+  does not match their files, `MODE2/2336` tracks, a bare ISO in a ZIP, 7z
+  and RAR, CDTV, CHD, and every other system (see
+  `docs/GAME_RECOVERY_ENGINE.md`).
 - New Blue page "PlayStation memory cards" (All Tools, Saves) and
   `emuwiz-cli memory-cards`: finds PS1 and PS2 memory cards in the save
   folders of PCSX2, DuckStation, RetroArch and RPCS3, and shows each save's

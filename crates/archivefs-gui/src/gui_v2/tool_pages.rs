@@ -36,6 +36,7 @@ pub(super) struct ToolPagesState {
     #[cfg(target_os = "linux")]
     pub relocation: super::relocation_page::State,
     pub memory_cards: super::memory_cards::State,
+    pub game_recovery: super::game_recovery::State,
 }
 
 impl ToolPagesState {
@@ -58,6 +59,7 @@ impl ToolPagesState {
             #[cfg(target_os = "linux")]
             relocation: Default::default(),
             memory_cards: Default::default(),
+            game_recovery: Default::default(),
             host_diagnostics: Default::default(),
             homebrew_browser: Default::default(),
             patch_package_preview: Default::default(),
@@ -157,6 +159,17 @@ impl App {
             }
             ToolPage::OpenRct2 => self.openrct2_page(ui),
             ToolPage::MemoryCards => super::memory_cards::show(ui, &mut self.tools.memory_cards),
+            ToolPage::GameRecovery => {
+                use super::game_recovery::{Request, show};
+                match show(ui, &mut self.tools.game_recovery) {
+                    Some(Request::OpenLaunch(game)) => self.go(super::routes::Route::Task {
+                        section: super::routes::Section::Launch,
+                        game,
+                    }),
+                    Some(Request::OpenGame(game)) => self.go(super::routes::Route::Game(game)),
+                    None => {}
+                }
+            }
             ToolPage::ViewHistory => {
                 use super::view_history_page::{Request, show};
                 match show(ui, &mut self.tools.view_history) {

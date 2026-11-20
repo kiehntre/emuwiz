@@ -100,6 +100,7 @@ mod media_set;
 mod memory_cards;
 mod platform_artwork;
 mod read_only_status;
+mod recovery;
 mod repair;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
@@ -174,7 +175,8 @@ fn startup_registration(cli: &CliArgs) -> StartupRegistration {
 /// store, the writer registry in the data directory or the library database.
 /// `memory-cards` likewise: it reads memory cards and creates only new files
 /// (backups, exported saves, new cards); it never opens the library database
-/// and never writes a rename journal or seal.
+/// and never writes a rename journal or seal. `recovery` likewise: it reads a
+/// game file and creates or removes only its own prepared copies.
 fn is_read_only_invocation(cli: &CliArgs) -> bool {
     matches!(
         cli.command.as_str(),
@@ -188,6 +190,7 @@ fn is_read_only_invocation(cli: &CliArgs) -> bool {
             | "launch-history"
             | "saves"
             | "memory-cards"
+            | "recovery"
             | "emulators"
             | "activity"
             | "history"
@@ -341,6 +344,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "discovery" => discovery::run(args)?,
         "saves" => saves::run(args.collect())?,
         "memory-cards" => memory_cards::run(args.collect())?,
+        "recovery" => recovery::run(args.collect())?,
         "media-set" => media_set::run(args)?,
         "scan" => {
             let config = load_config()?;
@@ -6160,6 +6164,9 @@ fn print_help() {
     println!("{}", read_only_status::HELP);
     println!("{}", diagnose_launch::HELP);
     println!("{}", launch_history::HELP);
+    println!(
+        "  recovery <capabilities|diagnose|prepare|list|verify|remove|clean>  Why a game cannot start, and verified preparation of a playable copy (new files only; the game file is only read). See `emuwiz-cli recovery help`."
+    );
     println!("  media-set <inspect|explain|plan>  Read-only optical/floppy/tape topology (JSON)");
     println!(
         "  inspect <path>  Read-only view of what EmuWiz believes one file is, the evidence and provenance, launch topology readiness and why an operation would be blocked. Views: --identity --evidence --readiness --media --provenance (default: all); --json, --platform <name>, --root <dir>. Never opens the database or writes anything."
@@ -7560,6 +7567,7 @@ mod tests {
             &["inspect", "/x"],
             &["saves", "list"],
             &["memory-cards", "import", "/card", "/save", "/new"],
+            &["recovery", "prepare", "/game.zip", "--system", "AmigaCD32"],
             &["history", "--json"],
             &["emulators"],
             &["activity", "--json"],

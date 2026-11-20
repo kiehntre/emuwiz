@@ -980,6 +980,7 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
 
 mod cartridge_cue;
 mod installation_save;
+mod prepared_disc;
 mod readiness_memo;
 mod selection_truth;
 
