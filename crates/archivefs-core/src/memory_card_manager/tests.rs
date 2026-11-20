@@ -526,22 +526,43 @@ fn ps2_import_also_reads_emuwiz_older_psu_layout_and_refuses_other_formats() {
     assert!(!dir.path().join("max.ps2").exists() && !dir.path().join("twice.ps2").exists());
 }
 
+/// `(existing save bytes, imported payload)` as the second reader sees a card.
+fn ps2_contents(card: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let saves = ps2_memcard::MemoryCard::parse(card)
+        .unwrap()
+        .saves()
+        .unwrap();
+    let file = |save: &str, file: &str| {
+        saves
+            .iter()
+            .find(|candidate| candidate.name == save)
+            .and_then(|save| save.files.iter().find(|candidate| candidate.name == file))
+            .map(|file| file.data.clone())
+            .unwrap_or_default()
+    };
+    (
+        file("BASLUS-00001TEST", "icon.sys"),
+        file("BESLES-50009GAME", "data.bin"),
+    )
+}
+
 #[test]
-fn pcsx2_change_marker_is_accepted_and_updated_on_the_new_card() {
+fn pcsx2_change_marker_is_updated_only_on_a_confirmed_pcsx2_card() {
     let dir = tempfile::tempdir().unwrap();
-    // As PCSX2 leaves a card: the second page was erased (0xFF) when its ECC
-    // was written, and PCSX2 later put its own 8-byte marker at 0x210.
-    let mut plain = ps2_inventory_fixture();
-    plain[512..520].fill(0xFF);
-    let mut bytes = add_ecc(&plain);
-    let marker = 0x2781_286F_1BC0_C994u64;
-    bytes[0x210..0x218].copy_from_slice(&marker.to_le_bytes());
-    let card = write(&dir, "Mcd001.ps2", &bytes);
     let save_file = write(
         &dir,
         "save.psu",
         &psu("BESLES-50009GAME", "Marked", b"payload"),
     );
+    // As PCSX2 leaves a card: the console wrote the second page blank (so its
+    // ECC is the blank-page code), and PCSX2 later put its 8-byte marker at
+    // 0x210 without touching that code.
+    let mut plain = ps2_inventory_fixture();
+    plain[512..1024].fill(0xFF);
+    let mut bytes = add_ecc(&plain);
+    let marker = 0x2781_286F_1BC0_C994u64;
+    bytes[0x210..0x218].copy_from_slice(&marker.to_le_bytes());
+    let card = write(&dir, "Mcd001.ps2", &bytes);
 
     let report = read_card(&card).unwrap();
     assert_eq!(report.health, CardHealth::Healthy, "{:?}", report.notes);
@@ -553,7 +574,7 @@ fn pcsx2_change_marker_is_accepted_and_updated_on_the_new_card() {
         import
             .checks
             .iter()
-            .any(|check| check.contains("change marker"))
+            .any(|check| check.contains("plus PCSX2's 8-byte"))
     );
     let new_bytes = fs::read(&new_card).unwrap();
     let new_marker = u64::from_le_bytes(new_bytes[0x210..0x218].try_into().unwrap());
@@ -564,7 +585,87 @@ fn pcsx2_change_marker_is_accepted_and_updated_on_the_new_card() {
         "rest of that page and its ECC"
     );
     assert_eq!(read_card(&new_card).unwrap().health, CardHealth::Healthy);
+    assert_eq!(
+        ps2_contents(&new_bytes),
+        (vec![0x5a; 100], b"payload".to_vec())
+    );
     assert_eq!(fs::read(&card).unwrap(), bytes);
+}
+
+#[test]
+fn bytes_at_the_marker_offset_are_kept_when_a_pcsx2_marker_is_not_proven() {
+    let dir = tempfile::tempdir().unwrap();
+    let save_file = write(
+        &dir,
+        "save.psu",
+        &psu("BESLES-50009GAME", "Kept", b"payload"),
+    );
+    let blank_second_page = {
+        let mut plain = ps2_inventory_fixture();
+        plain[512..1024].fill(0xFF);
+        plain
+    };
+    // Real data in the second page, written by the console with its own ECC.
+    let mut real_data = ps2_inventory_fixture();
+    for (index, byte) in real_data[512..1024].iter_mut().enumerate() {
+        *byte = (index * 7 + 3) as u8;
+    }
+    // Real data whose ECC happens to equal the blank-page code (eight equal
+    // bytes cancel out): the ECC alone must not be taken as proof.
+    let mut ecc_blind = blank_second_page.clone();
+    ecc_blind[512..520].fill(0x3C);
+    let mut ecc_blind = add_ecc(&ecc_blind);
+    let mut blank_code = [0u8; 16];
+    ps2_memcard::ecc::fill_spare(&[0xFF; 512], &mut blank_code);
+    assert_eq!(
+        ecc_blind[1040..1052],
+        blank_code[..12],
+        "the code cannot tell them apart"
+    );
+    ecc_blind[1052..1056].fill(0);
+    // A second page that was never written at all.
+    let mut never_written = add_ecc(&blank_second_page);
+    never_written[528..1056].fill(0xFF);
+
+    for (name, bytes) in [
+        ("console-data.ps2", add_ecc(&real_data)),
+        ("ecc-blind.ps2", ecc_blind),
+        ("never-written.ps2", never_written),
+    ] {
+        let card = write(&dir, name, &bytes);
+        let new_card = dir.path().join(format!("new-{name}"));
+        let import = import_save_into_copy(&card, &save_file, &new_card)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let new_bytes = fs::read(&new_card).unwrap();
+        assert_eq!(
+            new_bytes[528..1056],
+            bytes[528..1056],
+            "{name}: second page kept"
+        );
+        assert!(
+            import
+                .checks
+                .iter()
+                .any(|check| check.contains("No PCSX2 change marker was found")),
+            "{name}: {:?}",
+            import.checks
+        );
+        assert_eq!(
+            read_card(&new_card).unwrap().health,
+            CardHealth::Healthy,
+            "{name}"
+        );
+        assert_eq!(
+            ps2_contents(&new_bytes),
+            (vec![0x5a; 100], b"payload".to_vec()),
+            "{name}"
+        );
+        assert_eq!(
+            fs::read(&card).unwrap(),
+            bytes,
+            "{name}: the card is untouched"
+        );
+    }
 }
 
 #[test]

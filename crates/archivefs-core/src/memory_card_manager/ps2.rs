@@ -133,6 +133,26 @@ pub(super) fn icon_sys_title(icon_sys: &[u8]) -> Option<String> {
 const PCSX2_MARKER_PAGE: usize = 1;
 const PCSX2_MARKER_BYTES: usize = 8;
 
+/// Whether this second page provably carries a PCSX2 marker: the page is
+/// blank apart from its first 8 bytes, and its stored code is the code of a
+/// completely blank page, which those 8 bytes contradict. Only a program that
+/// writes without updating the ECC leaves that behind, and PCSX2 does exactly
+/// that at this offset. The ECC alone is never taken as proof: when the
+/// 8 bytes happen to agree with the blank code, the answer is no.
+fn pcsx2_marker_present(page: &[u8]) -> bool {
+    let (data, spare) = page.split_at(PAGE);
+    if data[..PCSX2_MARKER_BYTES].iter().all(|byte| *byte == 0xFF)
+        || data[PCSX2_MARKER_BYTES..].iter().any(|byte| *byte != 0xFF)
+    {
+        return false;
+    }
+    let mut blank_code = [0u8; SPARE];
+    ps2_memcard::ecc::fill_spare(&[0xFF; PAGE], &mut blank_code);
+    let mut actual_code = [0u8; SPARE];
+    ps2_memcard::ecc::fill_spare(data, &mut actual_code);
+    spare[..12] == blank_code[..12] && actual_code[..12] != blank_code[..12]
+}
+
 /// How the `ps2-memcard` ECC compares with the ECC already on the card:
 /// (pages whose stored code matches, written pages checked). The page that
 /// holds PCSX2's marker is checked as the console wrote it, without the marker.
@@ -141,18 +161,22 @@ pub(crate) fn ecc_agreement(bytes: &[u8]) -> (usize, usize) {
     let mut written = 0;
     let mut expected = [0u8; SPARE];
     for (index, page) in bytes.chunks_exact(RAW_PAGE).enumerate() {
-        // An erased page (never written since the last format) carries no code.
-        if page.iter().all(|byte| *byte == 0xFF) {
+        // An erased page (never written since the last format) carries no
+        // code. So does the marker page of a card the console never wrote
+        // there: erased apart from PCSX2's marker.
+        let skip = if index == PCSX2_MARKER_PAGE {
+            PCSX2_MARKER_BYTES
+        } else {
+            0
+        };
+        if page[skip..].iter().all(|byte| *byte == 0xFF) {
             continue;
         }
         written += 1;
         ps2_memcard::ecc::fill_spare(&page[..PAGE], &mut expected);
         let mut agrees = page[PAGE..PAGE + 12] == expected[..12];
         if !agrees && index == PCSX2_MARKER_PAGE {
-            let mut without_marker = page[..PAGE].to_vec();
-            without_marker[..PCSX2_MARKER_BYTES].fill(0xFF);
-            ps2_memcard::ecc::fill_spare(&without_marker, &mut expected);
-            agrees = page[PAGE..PAGE + 12] == expected[..12];
+            agrees = pcsx2_marker_present(page);
         }
         if agrees {
             matching += 1;
@@ -201,7 +225,18 @@ pub(super) fn report(path: &Path, bytes: &[u8], sha256: String) -> CardReport {
                 }
             }
             let (ours, theirs) = (own_listing(&own), library_listing(saves, &unopened));
-            let agree = ours == theirs;
+            // Two folders with one name cannot be told apart by name; such a
+            // card is never treated as agreed.
+            let duplicates = own
+                .ps2_inventory
+                .as_ref()
+                .is_some_and(|inventory| inventory.save_directories.len() != ours.len())
+                || saves
+                    .iter()
+                    .filter(|save| !unopened.contains(&save.name))
+                    .count()
+                    != theirs.len();
+            let agree = ours == theirs && !duplicates;
             if !agree && health != CardHealth::Unreadable {
                 health = CardHealth::Warnings;
                 notes.push(format!(
@@ -582,6 +617,13 @@ fn read_save(
     let _ = fs::remove_file(&staged);
     let plan = plan_ps2_psu_export(&own, save, &staged)
         .map_err(|error| CardError::Refused(error.to_string()))?;
+    // The exporter re-reads the card from disk. It must be reading exactly
+    // the bytes both readers were shown, not a card written in between.
+    if plan.source_card_sha256 != super::sha256_hex(card_bytes) {
+        return Err(CardError::Refused(
+            "the card changed while it was being read (is its emulator running?)".into(),
+        ));
+    }
     apply_ps2_psu_export(&plan).map_err(|error| CardError::Refused(error.to_string()))?;
     let bytes = fs::read(&staged).map_err(|error| io_error("cannot read", &staged, error))?;
     let _ = fs::remove_file(&staged);
@@ -603,6 +645,25 @@ pub(super) fn export_psu(
     }
     let work = working_folder(destination)?;
     let psu = read_save(card, card_bytes, save_name, work.path())?;
+    // The second reader must find the same files with the same bytes.
+    let mut second: Vec<(Vec<u8>, Vec<u8>)> = ps2_memcard::MemoryCard::parse(card_bytes)
+        .and_then(|card| card.saves())
+        .map_err(|error| CardError::Refused(error.to_string()))?
+        .into_iter()
+        .find(|save| save.name == save_name)
+        .map(|save| {
+            save.files
+                .into_iter()
+                .map(|file| (file.name.into_bytes(), file.data))
+                .collect()
+        })
+        .unwrap_or_default();
+    second.sort();
+    if second != psu_contents(&psu) {
+        return Err(CardError::Refused(
+            "the two card readers do not return the same bytes for this save".into(),
+        ));
+    }
     let bytes = write_psu_standard(&psu);
     // What is written must read back as the same files in the standard layout.
     if parse_psu_standard(&bytes).map(|back| psu_contents(&back)) != Some(psu_contents(&psu)) {
@@ -648,15 +709,25 @@ pub(super) fn import_into_copy(
     new_card: &Path,
 ) -> Result<ImportOutcome, CardError> {
     let save_bytes = super::read_card_bytes(save_file)?;
-    let incoming = parse_psu_standard(&save_bytes)
-        .or_else(|| parse_psu_records_first(&save_bytes))
-        .ok_or_else(|| {
-            CardError::Unsupported(
-                "this is not a .psu save. Other PS2 save formats (.max, .cbs, .sps, .xps, \
+    let (standard, older) = (
+        parse_psu_standard(&save_bytes),
+        parse_psu_records_first(&save_bytes),
+    );
+    if let (Some(standard), Some(older)) = (&standard, &older)
+        && psu_contents(standard) != psu_contents(older)
+    {
+        return Err(CardError::Refused(
+            "this .psu reads as two different saves (standard layout and older EmuWiz layout)"
+                .into(),
+        ));
+    }
+    let incoming = standard.or(older).ok_or_else(|| {
+        CardError::Unsupported(
+            "this is not a .psu save. Other PS2 save formats (.max, .cbs, .sps, .xps, \
                  .psv) are not supported"
-                    .into(),
-            )
-        })?;
+                .into(),
+        )
+    })?;
     let before = inspect_memory_card_bytes(card, card_bytes);
     let with_ecc = before
         .ps2_geometry
@@ -702,6 +773,7 @@ pub(super) fn import_into_copy(
     }
 
     let mut changed_pages = 0usize;
+    let mut marker_updated = false;
     let mut marker = card_bytes
         .get(PCSX2_MARKER_PAGE * RAW_PAGE..PCSX2_MARKER_PAGE * RAW_PAGE + PCSX2_MARKER_BYTES)
         .and_then(|bytes| bytes.try_into().ok())
@@ -727,7 +799,13 @@ pub(super) fn import_into_copy(
                 }
             }
         }
-        if changed_pages > 0 {
+        // The marker is rewritten only where one is provably there. Anything
+        // else at that offset is kept as it is.
+        marker_updated = changed_pages > 0
+            && pcsx2_marker_present(
+                &card_bytes[PCSX2_MARKER_PAGE * RAW_PAGE..(PCSX2_MARKER_PAGE + 1) * RAW_PAGE],
+            );
+        if marker_updated {
             let at = PCSX2_MARKER_PAGE * RAW_PAGE;
             image[at..at + PCSX2_MARKER_BYTES].copy_from_slice(&marker.to_le_bytes());
         }
@@ -805,10 +883,16 @@ pub(super) fn import_into_copy(
         ));
     }
     let mut checks = vec![
-        if with_ecc {
+        if marker_updated {
             format!(
                 "{changed_pages} page(s) of the card changed, plus PCSX2's 8-byte change \
                  marker; every other page is identical"
+            )
+        } else if with_ecc {
+            format!(
+                "{changed_pages} page(s) of the card changed; every other page is identical. \
+                 No PCSX2 change marker was found on this card, so none was written: do not \
+                 load a save state made with the old card while the new one is inserted"
             )
         } else {
             format!("{changed_pages} page(s) of the card changed; every other page is identical")

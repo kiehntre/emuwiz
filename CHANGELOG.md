@@ -35,7 +35,9 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   file record first and then every file's contents, which only matched the
   standard for a save with a single file, so those exports could not be opened
   elsewhere and `.psu` files from other tools were refused. Restore now reads
-  standard `.psu` files and still reads the older EmuWiz exports.
+  standard `.psu` files and still reads the older EmuWiz exports. A `.psu` with
+  more than one file exported by this release cannot be restored by an older
+  EmuWiz (it is refused, nothing is written).
 - Scans now keep exact totals of skipped files for every reason, per scan and
   per source: unsupported format, unsupported variant, invalid content,
   ambiguous platform and recognised duplicates (identical copies of a

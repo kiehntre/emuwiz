@@ -888,9 +888,17 @@ fn parse_ps2_psu(path: &Path) -> Result<(Ps2PsuRestoreInput, String), Ps2PsuRest
         }
         Ok(files)
     };
-    let files = match read_files(true) {
-        Ok(files) => files,
-        Err(standard_error) => read_files(false).map_err(|_| standard_error)?,
+    let files = match (read_files(true), read_files(false)) {
+        // A file that reads as two different saves is never guessed at.
+        (Ok(standard), Ok(older)) if standard != older => {
+            return Err(Ps2PsuRestoreError::InvalidPlan(
+                "PSU reads as two different saves (standard layout and older EmuWiz layout); \
+                 it is not restored"
+                    .into(),
+            ));
+        }
+        (Ok(files), _) | (Err(_), Ok(files)) => files,
+        (Err(standard_error), Err(_)) => return Err(standard_error),
     };
     Ok((
         Ps2PsuRestoreInput {
