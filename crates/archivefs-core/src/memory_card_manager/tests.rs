@@ -604,6 +604,85 @@ fn console_settings_folder_is_shown_but_not_exported() {
 }
 
 #[test]
+fn pcsx2_page_export_of_a_multi_file_save_is_standard_and_restores_both_layouts() {
+    use crate::memory_card_inventory::{
+        apply_ps2_psu_export, inspect_memory_card, plan_ps2_psu_export, plan_ps2_psu_restore,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    // A card holding a two-file save (icon.sys + data.bin).
+    let base = write(&dir, "base.ps2", &ps2_inventory_fixture());
+    let payload: Vec<u8> = (0..3000u32).map(|value| (value % 199) as u8).collect();
+    let incoming = psu("BESLES-50009GAME", "Two Files", &payload);
+    let source = write(&dir, "in.psu", &incoming);
+    let card = root.join("card.ps2");
+    import_save_into_copy(&base, &source, &card).unwrap();
+
+    // The export the PCSX2 page uses: standard layout, each record followed
+    // by its bytes, exactly what an established tool writes for these files.
+    let inventory = inspect_memory_card(&card).unwrap();
+    let save = inventory
+        .ps2_inventory
+        .as_ref()
+        .unwrap()
+        .save_directories
+        .iter()
+        .find(|save| save.entry.display_name == "BESLES-50009GAME")
+        .unwrap();
+    let exported = root.join("exported.psu");
+    apply_ps2_psu_export(&plan_ps2_psu_export(&inventory, save, &exported).unwrap()).unwrap();
+    let bytes = fs::read(&exported).unwrap();
+    let standard = ps2::parse_psu_standard(&bytes).expect("standard layout");
+    assert!(ps2::parse_psu_records_first(&bytes).is_none());
+    let original = ps2::parse_psu_standard(&incoming).unwrap();
+    let files = |psu: &ps2::Psu| -> Vec<Vec<u8>> {
+        let mut files: Vec<Vec<u8>> = psu.files.iter().map(|(_, data)| data.clone()).collect();
+        files.sort();
+        files
+    };
+    assert_eq!(files(&standard), files(&original));
+    assert_eq!(bytes.len(), incoming.len());
+    // An existing export is never overwritten.
+    assert!(plan_ps2_psu_export(&inventory, save, &exported).is_err());
+    assert_eq!(fs::read(&exported).unwrap(), bytes);
+
+    // Its restore reads the standard file, a file from another tool, and an
+    // export made by an earlier EmuWiz (every record first).
+    let target = inspect_memory_card(&base).unwrap();
+    let older = root.join("older.psu");
+    fs::write(&older, ps2::write_psu_records_first(&standard)).unwrap();
+    assert_ne!(fs::read(&older).unwrap(), bytes);
+    for file in [&exported, &fs::canonicalize(&source).unwrap(), &older] {
+        let plan = plan_ps2_psu_restore(&target, file, &root.join("backup.ps2"), false)
+            .unwrap_or_else(|error| panic!("{}: {error}", file.display()));
+        assert_eq!(plan.file_count, 2);
+        let restored =
+            crate::memory_card_inventory::build_restored_card(&plan, &fs::read(&base).unwrap())
+                .unwrap();
+        let library = ps2_memcard::MemoryCard::parse(&restored)
+            .unwrap()
+            .saves()
+            .unwrap();
+        let landed = library
+            .iter()
+            .find(|save| save.name == "BESLES-50009GAME")
+            .unwrap();
+        let data = landed
+            .files
+            .iter()
+            .find(|file| file.name == "data.bin")
+            .unwrap();
+        assert_eq!(data.data, payload, "{}", file.display());
+    }
+    assert_eq!(
+        fs::read(&base).unwrap(),
+        ps2_inventory_fixture(),
+        "no card was written"
+    );
+    assert!(!root.join("backup.ps2").exists());
+}
+
+#[test]
 fn ps2_card_whose_ecc_emuwiz_cannot_reproduce_is_read_but_not_written() {
     let dir = tempfile::tempdir().unwrap();
     let mut bytes = add_ecc(&ps2_inventory_fixture());

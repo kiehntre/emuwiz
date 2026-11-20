@@ -480,7 +480,7 @@ pub(super) fn parse_psu_standard(bytes: &[u8]) -> Option<Psu> {
     (offset == bytes.len()).then_some(psu)
 }
 
-/// The layout EmuWiz's own PS2 export has written so far: every record
+/// The layout EmuWiz's PS2 export wrote in earlier releases: every record
 /// first, then every file's bytes. Identical to the standard layout for a
 /// save with one file, and not readable by other tools otherwise.
 pub(super) fn parse_psu_records_first(bytes: &[u8]) -> Option<Psu> {
@@ -517,6 +517,7 @@ pub(super) fn write_psu_standard(psu: &Psu) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 pub(super) fn write_psu_records_first(psu: &Psu) -> Vec<u8> {
     let mut out = [&psu.root[..], &psu.dot[..], &psu.dotdot[..]].concat();
     for (entry, _) in &psu.files {
@@ -584,7 +585,7 @@ fn read_save(
     apply_ps2_psu_export(&plan).map_err(|error| CardError::Refused(error.to_string()))?;
     let bytes = fs::read(&staged).map_err(|error| io_error("cannot read", &staged, error))?;
     let _ = fs::remove_file(&staged);
-    parse_psu_records_first(&bytes).ok_or_else(|| {
+    parse_psu_standard(&bytes).ok_or_else(|| {
         CardError::VerificationFailed("the save read from the card is not a complete .psu".into())
     })
 }
@@ -683,7 +684,7 @@ pub(super) fn import_into_copy(
     let working_card = work.path().join("card.ps2");
     write_new_file(&working_card, &data_only)?;
     let working_save = work.path().join("save.psu");
-    write_new_file(&working_save, &write_psu_records_first(&incoming))?;
+    write_new_file(&working_save, &write_psu_standard(&incoming))?;
     let working = inspect_memory_card(&working_card).map_err(CardError::Io)?;
     let plan = plan_ps2_psu_restore(
         &working,

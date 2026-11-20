@@ -30,6 +30,12 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   `.cbs`, PS2 `.psv`), and anything but listing for folder cards. myMCpp and
   PSMemoryManager, if installed separately, can be started from the page;
   EmuWiz does not include them.
+- PS2 save export on the PCSX2 page now writes standard `.psu` files that
+  uLaunchELF, mymc and PCSX2's own tools read. Earlier releases wrote every
+  file record first and then every file's contents, which only matched the
+  standard for a save with a single file, so those exports could not be opened
+  elsewhere and `.psu` files from other tools were refused. Restore now reads
+  standard `.psu` files and still reads the older EmuWiz exports.
 - Scans now keep exact totals of skipped files for every reason, per scan and
   per source: unsupported format, unsupported variant, invalid content,
   ambiguous platform and recognised duplicates (identical copies of a

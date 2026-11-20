@@ -476,8 +476,8 @@ pub fn apply_ps2_psu_export(
                 &file.entry,
                 false,
             )?;
-        }
-        for file in &plan.files {
+            // Standard EMS/uLaunchELF layout: the file's bytes follow its
+            // record directly, padded to a multiple of 1024.
             let mut remaining = file.declared_size_bytes;
             for &cluster in &file.chain_health.clusters {
                 if remaining == 0 {
@@ -826,48 +826,72 @@ fn parse_ps2_psu(path: &Path) -> Result<(Ps2PsuRestoreInput, String), Ps2PsuRest
             )));
         }
     }
-    let mut files = Vec::new();
-    let mut names = HashSet::new();
-    let mut data_offset = (count + 1)
-        .checked_mul(PS2_DIRECTORY_ENTRY_BYTES)
-        .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("PSU data offset overflowed".into()))?;
-    for index in 3..=count {
-        let raw = entry(index)?;
-        let parsed = ps2_entry(&raw, 0);
-        if parsed.kind != Ps2DirectoryEntryKind::RegularFile || !parsed.warnings.is_empty() {
+    // The standard layout (EMS adapter, uLaunchELF, mymc, PCSX2's tools) puts
+    // each file's bytes directly after its record. EmuWiz releases before
+    // this one wrote every record first and then every file's bytes; those
+    // exports are still read. The two are identical for a one-file save.
+    type PsuFiles = Vec<(Vec<u8>, Vec<u8>)>;
+    let read_files = |standard: bool| -> Result<PsuFiles, Ps2PsuRestoreError> {
+        let mut files = Vec::new();
+        let mut names = HashSet::new();
+        let mut data_offset = if standard {
+            3 * PS2_DIRECTORY_ENTRY_BYTES
+        } else {
+            (count + 1)
+                .checked_mul(PS2_DIRECTORY_ENTRY_BYTES)
+                .ok_or_else(|| {
+                    Ps2PsuRestoreError::InvalidPlan("PSU data offset overflowed".into())
+                })?
+        };
+        for index in 3..=count {
+            let raw = if standard {
+                let raw = entry(data_offset / PS2_DIRECTORY_ENTRY_BYTES)?;
+                data_offset += PS2_DIRECTORY_ENTRY_BYTES;
+                raw
+            } else {
+                entry(index)?
+            };
+            let parsed = ps2_entry(&raw, 0);
+            if parsed.kind != Ps2DirectoryEntryKind::RegularFile || !parsed.warnings.is_empty() {
+                return Err(Ps2PsuRestoreError::InvalidPlan(
+                    "PSU contains an invalid or unsupported file entry".into(),
+                ));
+            }
+            let name = psu_name_bytes(&parsed.raw_name)
+                .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
+            if !names.insert(name.to_vec()) {
+                return Err(Ps2PsuRestoreError::InvalidPlan(
+                    "PSU contains duplicate file names".into(),
+                ));
+            }
+            let length = parsed.length as usize;
+            let padded =
+                length.div_ceil(PS2_PSU_CLUSTER_BYTES as usize) * PS2_PSU_CLUSTER_BYTES as usize;
+            let end = data_offset.checked_add(padded).ok_or_else(|| {
+                Ps2PsuRestoreError::InvalidPlan("PSU data range overflowed".into())
+            })?;
+            let data_end = data_offset.checked_add(length).ok_or_else(|| {
+                Ps2PsuRestoreError::InvalidPlan("PSU file range overflowed".into())
+            })?;
+            if end > bytes.len() {
+                return Err(Ps2PsuRestoreError::InvalidPlan(
+                    "PSU file data is truncated".into(),
+                ));
+            }
+            files.push((raw, bytes[data_offset..data_end].to_vec()));
+            data_offset = end;
+        }
+        if data_offset != bytes.len() {
             return Err(Ps2PsuRestoreError::InvalidPlan(
-                "PSU contains an invalid or unsupported file entry".into(),
+                "PSU contains unexpected trailing bytes".into(),
             ));
         }
-        let name = psu_name_bytes(&parsed.raw_name)
-            .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
-        if !names.insert(name.to_vec()) {
-            return Err(Ps2PsuRestoreError::InvalidPlan(
-                "PSU contains duplicate file names".into(),
-            ));
-        }
-        let length = parsed.length as usize;
-        let padded =
-            length.div_ceil(PS2_PSU_CLUSTER_BYTES as usize) * PS2_PSU_CLUSTER_BYTES as usize;
-        let end = data_offset
-            .checked_add(padded)
-            .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("PSU data range overflowed".into()))?;
-        let data_end = data_offset
-            .checked_add(length)
-            .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("PSU file range overflowed".into()))?;
-        if end > bytes.len() {
-            return Err(Ps2PsuRestoreError::InvalidPlan(
-                "PSU file data is truncated".into(),
-            ));
-        }
-        files.push((raw, bytes[data_offset..data_end].to_vec()));
-        data_offset = end;
-    }
-    if data_offset != bytes.len() {
-        return Err(Ps2PsuRestoreError::InvalidPlan(
-            "PSU contains unexpected trailing bytes".into(),
-        ));
-    }
+        Ok(files)
+    };
+    let files = match read_files(true) {
+        Ok(files) => files,
+        Err(standard_error) => read_files(false).map_err(|_| standard_error)?,
+    };
     Ok((
         Ps2PsuRestoreInput {
             root,
@@ -3252,8 +3276,8 @@ pub(crate) mod tests {
         assert_eq!(result.output_bytes, 5 * 512 + 2048);
         let output = fs::read(destination).unwrap();
         assert_eq!(output.len(), 5 * 512 + 2048);
-        // Every directory entry precedes every payload: the entry table is
-        // root + "." + ".." + one entry per file, and only then the data pages.
+        // Standard EMS/uLaunchELF layout: root + "." + "..", then each file's
+        // entry followed directly by its payload, padded to 1024 bytes.
         assert_eq!(&output[0x40..0x40 + 16], b"BASLUS-00001TEST");
         assert_eq!(&output[512 + 0x40..512 + 0x40 + 1], b".");
         assert_eq!(&output[1024 + 0x40..1024 + 0x40 + 2], b"..");
@@ -3262,16 +3286,17 @@ pub(crate) mod tests {
             u32::from_le_bytes(output[1536 + 4..1536 + 8].try_into().unwrap()),
             1500
         );
-        assert_eq!(&output[2048 + 0x40..2048 + 0x40 + 9], b"empty.bin");
+        assert_eq!(&output[4096 + 0x40..4096 + 0x40 + 9], b"empty.bin");
         assert_eq!(
-            u32::from_le_bytes(output[2048 + 4..2048 + 8].try_into().unwrap()),
+            u32::from_le_bytes(output[4096 + 4..4096 + 8].try_into().unwrap()),
             0
         );
         // The fragmented file spans clusters 3 and 5 and is padded to a whole
         // 1024-byte logical page; the zero-length file contributes no payload.
-        assert_eq!(&output[2560..2560 + 1024], &[0x5a; 1024]);
-        assert_eq!(&output[2560 + 1024..2560 + 1500], &[0x6b; 476]);
-        assert_eq!(&output[2560 + 1500..], &[0; 548]);
+        assert_eq!(&output[2048..2048 + 1024], &[0x5a; 1024]);
+        assert_eq!(&output[2048 + 1024..2048 + 1500], &[0x6b; 476]);
+        assert_eq!(&output[2048 + 1500..4096], &[0; 548]);
+        assert_eq!(output.len(), 4096 + 512);
     }
 
     #[test]
