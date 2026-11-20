@@ -788,10 +788,11 @@ pub(super) enum ToolPage {
     OpenRct2,
     FolderCheck,
     Relocation,
+    MemoryCards,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
@@ -814,6 +815,7 @@ impl ToolPage {
         Self::OpenRct2,
         Self::FolderCheck,
         Self::Relocation,
+        Self::MemoryCards,
     ];
 
     pub fn title(self) -> &'static str {
@@ -840,6 +842,7 @@ impl ToolPage {
             Self::OpenRct2 => "RollerCoaster Tycoon 2 via OpenRCT2 (alternative)",
             Self::FolderCheck => "Organise my games",
             Self::Relocation => "Move a game between library folders",
+            Self::MemoryCards => "PlayStation memory cards",
         }
     }
 
@@ -899,6 +902,9 @@ impl ToolPage {
             Self::Relocation => {
                 "Preview moving one game file to another library folder or drive, and see every recorded move with its true recovery state. Moving is disabled in this build."
             }
+            Self::MemoryCards => {
+                "See the saves on PS1 and PS2 memory cards, back a card up, and copy single saves in and out. A card is never changed: every result is a separate file."
+            }
         }
     }
 
@@ -926,6 +932,7 @@ impl ToolPage {
             Self::OpenRct2 => Section::Games,
             Self::FolderCheck => Section::Games,
             Self::Relocation => Section::Games,
+            Self::MemoryCards => Section::Saves,
         }
     }
 
@@ -952,6 +959,7 @@ impl ToolPage {
             Self::OpenRct2 => "Games & collection",
             Self::FolderCheck => "Games & collection",
             Self::Relocation => "Games & collection",
+            Self::MemoryCards => "Saves & States",
         }
     }
 }

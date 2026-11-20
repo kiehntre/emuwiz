@@ -911,7 +911,7 @@ fn restore_occupied_clusters(
     occupied
 }
 
-fn restore_free_clusters(
+pub(crate) fn restore_free_clusters(
     bytes: &[u8],
     geometry: &Ps2Geometry,
     inventory: &Ps2MemoryCardInventory,
@@ -2611,11 +2611,17 @@ pub fn inspect_memory_card(path: &Path) -> Result<MemoryCardInventory, String> {
         return Err("memory card exceeds inspection bound".into());
     }
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    Ok(inspect_memory_card_bytes(path, &bytes))
+}
+
+/// As [`inspect_memory_card`], for bytes the caller has already read from
+/// `path` (so one read can feed several checks). Read-only and pure.
+pub(crate) fn inspect_memory_card_bytes(path: &Path, bytes: &[u8]) -> MemoryCardInventory {
     if bytes.len() == PS1_CARD_BYTES {
-        return Ok(inspect_ps1(path, &bytes));
+        return inspect_ps1(path, bytes);
     }
-    if looks_like_ps2(&bytes) {
-        let geometry = ps2_geometry(&bytes);
+    if looks_like_ps2(bytes) {
+        let geometry = ps2_geometry(bytes);
         let (mut health, warning, geometry) = match geometry {
             Ok(geometry) => (
                 MemoryCardHealth::Healthy,
@@ -2627,7 +2633,7 @@ pub fn inspect_memory_card(path: &Path) -> Result<MemoryCardInventory, String> {
         };
         let ps2_inventory = geometry
             .as_ref()
-            .map(|geometry| inspect_ps2_filesystem(&bytes, geometry));
+            .map(|geometry| inspect_ps2_filesystem(bytes, geometry));
         if let Some(inventory) = &ps2_inventory {
             let entry_warning = inventory
                 .root_entries
@@ -2648,7 +2654,7 @@ pub fn inspect_memory_card(path: &Path) -> Result<MemoryCardInventory, String> {
                 health = MemoryCardHealth::StructuralWarning;
             }
         }
-        return Ok(MemoryCardInventory {
+        return MemoryCardInventory {
             path: path.into(),
             format: MemoryCardFormat::Ps2,
             format_confidence: MemoryCardFormatConfidence::ConfirmedFormat,
@@ -2672,9 +2678,9 @@ pub fn inspect_memory_card(path: &Path) -> Result<MemoryCardInventory, String> {
             shared_container: true,
             ps2_geometry: geometry,
             ps2_inventory,
-        });
+        };
     }
-    Ok(MemoryCardInventory {
+    MemoryCardInventory {
         path: path.into(),
         format: MemoryCardFormat::Unknown,
         format_confidence: if bytes.len() < PS1_CARD_BYTES {
@@ -2695,7 +2701,7 @@ pub fn inspect_memory_card(path: &Path) -> Result<MemoryCardInventory, String> {
         shared_container: true,
         ps2_geometry: None,
         ps2_inventory: None,
-    })
+    }
 }
 
 #[cfg(test)]

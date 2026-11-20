@@ -35,6 +35,7 @@ pub(super) struct ToolPagesState {
     pub openrct2: openrct2::State,
     #[cfg(target_os = "linux")]
     pub relocation: super::relocation_page::State,
+    pub memory_cards: super::memory_cards::State,
 }
 
 impl ToolPagesState {
@@ -56,6 +57,7 @@ impl ToolPagesState {
             openrct2: Default::default(),
             #[cfg(target_os = "linux")]
             relocation: Default::default(),
+            memory_cards: Default::default(),
             host_diagnostics: Default::default(),
             homebrew_browser: Default::default(),
             patch_package_preview: Default::default(),
@@ -154,6 +156,7 @@ impl App {
                 ui.label("Moving games between library folders is available on Linux only.");
             }
             ToolPage::OpenRct2 => self.openrct2_page(ui),
+            ToolPage::MemoryCards => super::memory_cards::show(ui, &mut self.tools.memory_cards),
             ToolPage::ViewHistory => {
                 use super::view_history_page::{Request, show};
                 match show(ui, &mut self.tools.view_history) {

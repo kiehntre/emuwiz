@@ -69,6 +69,7 @@ mod manual_viewer;
 mod media_sets;
 mod media_sets_tool;
 mod media_sources;
+mod memory_cards;
 mod missing_review;
 mod mod_discovery;
 mod mods;
