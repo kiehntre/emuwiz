@@ -6039,21 +6039,10 @@ impl Database {
         Ok(out)
     }
 
-    /// Looks up the current `archives.id` for the archive whose
-    /// `absolute_path_cached` exactly matches `path` (exact bytes - never
-    /// a lossy display string; see `Path::as_os_str`/`OsStrExt::as_bytes`).
-    /// `absolute_path_cached` is not itself the identity SQLite enforces
-    /// uniqueness on (that is `(source_folder_id, relative_path)` - see
-    /// the migration), but is derived from it and kept in sync by every
-    /// [`Self::upsert_archive`] call, so in practice it is unique too;
-    /// this still defensively errors rather than guessing if more than
-    /// one row somehow matches, instead of silently acting on the wrong
-    /// archive. `Ok(None)` means no persisted archive has this path -
-    /// not yet scanned into the library database, for example.
-    /// Present library files whose file stem (name without its last
-    /// extension) is exactly `stem`: games that RetroArch would give the same
-    /// save names. Read-only.
-    pub fn present_archive_paths_with_file_stem(&self, stem: &str) -> Result<Vec<PathBuf>> {
+    /// Present library files whose name starts with `<stem>.`: games whose
+    /// RetroArch save names could be confused with this stem's (the same
+    /// stem, or a longer one such as `Bros. 3` for `Bros`). Read-only.
+    pub fn present_archive_paths_named_after(&self, stem: &str) -> Result<Vec<PathBuf>> {
         let prefix = format!("{stem}.");
         let mut stmt = self
             .connection
@@ -6073,13 +6062,20 @@ impl Database {
         Ok(paths
             .into_iter()
             .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
-            .filter(|path| {
-                path.file_stem()
-                    .is_some_and(|s| s.as_bytes() == stem.as_bytes())
-            })
             .collect())
     }
 
+    /// Looks up the current `archives.id` for the archive whose
+    /// `absolute_path_cached` exactly matches `path` (exact bytes - never
+    /// a lossy display string; see `Path::as_os_str`/`OsStrExt::as_bytes`).
+    /// `absolute_path_cached` is not itself the identity SQLite enforces
+    /// uniqueness on (that is `(source_folder_id, relative_path)` - see
+    /// the migration), but is derived from it and kept in sync by every
+    /// [`Self::upsert_archive`] call, so in practice it is unique too;
+    /// this still defensively errors rather than guessing if more than
+    /// one row somehow matches, instead of silently acting on the wrong
+    /// archive. `Ok(None)` means no persisted archive has this path -
+    /// not yet scanned into the library database, for example.
     pub fn find_archive_id_by_absolute_path(&self, path: &Path) -> Result<Option<i64>> {
         let path_bytes = path.as_os_str().as_bytes();
         let mut stmt = self

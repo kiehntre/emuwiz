@@ -8,6 +8,7 @@
 use archivefs_core::dat::reaudit::{GameRecheck, ReauditCatalogues, recheck_game};
 use archivefs_core::dat::rom_organisation::game_rename::{
     GameRenamePreview, RetroArchSaveLocations, apply_game_rename, preview_game_rename,
+    refuse_if_unfinished_rename,
 };
 use eframe::egui::{self, RichText};
 
@@ -143,6 +144,12 @@ impl State {
                     .clone()
                     .unwrap_or_else(RetroArchSaveLocations::discover);
                 preview_game_rename(&database, source, &self.typed, self.generation, &saves)
+            })
+            .and_then(|preview| {
+                // An unfinished earlier rename of this game shows now, with
+                // the History entry to Undo, not only at confirm.
+                refuse_if_unfinished_rename(&preview, &self.journal_dir()?)?;
+                Ok(preview)
             });
         self.preview = Some(result);
     }

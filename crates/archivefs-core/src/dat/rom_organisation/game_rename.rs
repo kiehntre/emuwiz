@@ -343,6 +343,7 @@ pub fn apply_game_rename(
     cancel: &AtomicBool,
     save_locations: &RetroArchSaveLocations,
 ) -> Result<ApplyOutcome, String> {
+    refuse_if_unfinished_rename(preview, journal_dir)?;
     if let Some(referrer) = referencing_sidecar(&preview.source, &preview.source_root)? {
         return Err(format!(
             "{} now names this file, so the rename was refused. Nothing was changed.",
@@ -476,6 +477,63 @@ const RETROARCH_SAVE_SUFFIXES: [&str; 15] = [
 /// Bound on folders examined in one save folder; more refuses.
 const MAX_SAVE_SUBFOLDERS: usize = 4096;
 
+/// Whether `transaction` is a rename that stopped part-way: interrupted
+/// (a crash, a failure), or settled by recovery with the game renamed but
+/// one of its saves not (recovery proved that save's rename never ran).
+/// Undo of that History entry puts the game and its saves back.
+pub fn is_unfinished_rename(transaction: &RenameTransaction) -> bool {
+    use crate::dat::rename_apply::model::EntryState;
+    if transaction.state.needs_recovery() {
+        return true;
+    }
+    let has_saves = transaction.entries.iter().any(|entry| {
+        entry
+            .unknown
+            .contains_key(crate::database::organisation_paths::SAVE_KEY)
+    });
+    let applied = transaction
+        .entries
+        .iter()
+        .filter(|entry| entry.state == EntryState::Applied)
+        .count();
+    has_saves && applied > 0 && applied < transaction.entries.len()
+}
+
+/// Refuses while an earlier rename of this game (or of one of its saves)
+/// is unfinished: renaming again on top of it could split the game from its
+/// saves for good. The message names the History entry whose Undo fixes it.
+/// Read-only. Blue also runs it for the preview, so this shows before
+/// anything is confirmed.
+pub fn refuse_if_unfinished_rename(
+    preview: &GameRenamePreview,
+    journal_dir: &Path,
+) -> Result<(), String> {
+    let mut paths = vec![preview.source.as_path(), preview.destination.as_path()];
+    for save in &preview.saves {
+        paths.push(&save.source);
+        paths.push(&save.destination);
+    }
+    let (journals, problems) = crate::dat::rename_apply::journal::list_journals(journal_dir);
+    if let Some(transaction) = journals.iter().find(|transaction| {
+        is_unfinished_rename(transaction)
+            && transaction.entries.iter().any(|entry| {
+                paths.contains(&entry.source_path.as_path())
+                    || paths.contains(&entry.destination_path.as_path())
+            })
+    }) {
+        return Err(format!(
+            "An earlier rename of this game did not finish (History: {}). Open History and Undo it first; it puts the game and its saves back. Nothing was changed.",
+            transaction.transaction_id
+        ));
+    }
+    if let Some(problem) = problems.first() {
+        return Err(format!(
+            "History could not be read completely ({problem}), so an unfinished rename of this game cannot be ruled out. Nothing was changed."
+        ));
+    }
+    Ok(())
+}
+
 const RETROARCH_RUNNING: &str = "RetroArch is running, so this game's saves cannot be renamed safely (it could write a save under the old name). Close RetroArch, then preview again. Nothing was changed.";
 
 /// Every RetroArch save or state for `source`: beside the game or one folder
@@ -520,7 +578,9 @@ fn find_retroarch_saves(
 
 /// Where each found save goes: `<old stem>.<rest>` becomes `<new stem>.<rest>`
 /// in the same folder. Refuses (nothing guessed) when RetroArch is running,
-/// when another library game has the same name (the save could be its), when
+/// when another library file's name starts with this game's (`Bros.` /
+/// `Bros. 3`: a save could be its), when a found file is not a recognised
+/// save name, when
 /// a save is not a plain file or is itself a library file, or when a new save
 /// name is already taken.
 fn plan_save_renames(
@@ -545,7 +605,7 @@ fn plan_save_renames(
         .map(|stem| stem.to_string_lossy().into_owned())
         .ok_or("The new name has no file name.")?;
     if let Some(other) = database
-        .present_archive_paths_with_file_stem(&old_stem)
+        .present_archive_paths_named_after(&old_stem)
         .map_err(|error| format!("could not read the library: {error}"))?
         .into_iter()
         .find(|path| path != source)
@@ -578,6 +638,15 @@ fn plan_save_renames(
             .strip_prefix(&format!("{old_stem}."))
             .map(str::to_owned)
             .ok_or_else(|| format!("{} is not named after the game.", save.display()))?;
+        // "Super Mario Bros. 3.srm" also starts with "Super Mario Bros.": only
+        // a recognised RetroArch save name is this game's; anything else
+        // could be another game's, so nothing is guessed.
+        if !is_save_suffix(&rest.to_ascii_lowercase()) {
+            return Err(format!(
+                "{} could belong to another game, so this game's saves cannot be told apart. Rename refused. Nothing was changed.",
+                save.display()
+            ));
+        }
         let destination = save.with_file_name(format!("{new_stem}.{rest}"));
         if std::fs::symlink_metadata(&destination).is_ok() {
             return Err(format!(

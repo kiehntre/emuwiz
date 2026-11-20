@@ -371,6 +371,45 @@ fn saves_that_cannot_be_renamed_safely_refuse_and_nothing_changes() {
     let error = preview_game_rename(&lib.db, &lib.game, "Zelda (USA)", 1, &none()).unwrap_err();
     assert!(error.contains("cannot be told apart"), "{error}");
 
+    // "Super Mario Bros. 3" saves start with "Super Mario Bros.": never
+    // swept into a rename of "Super Mario Bros", in a save folder or by name.
+    let lib = Lib::new("Super Mario Bros.nes", Some("nes"));
+    let ra = lib.temp.path().join("ra-saves");
+    let saves = ra.join("Nestopia");
+    std::fs::create_dir_all(&saves).unwrap();
+    std::fs::write(saves.join("Super Mario Bros.srm"), b"smb1").unwrap();
+    std::fs::write(saves.join("Super Mario Bros. 3.srm"), b"smb3").unwrap();
+    let error = preview_game_rename(
+        &lib.db,
+        &lib.game,
+        "Super Mario Bros (USA)",
+        1,
+        &saves_in(&ra),
+    )
+    .unwrap_err();
+    assert!(error.contains("could belong to another game"), "{error}");
+    std::fs::remove_file(saves.join("Super Mario Bros. 3.srm")).unwrap();
+    let smb3 = lib.root.join("nes").join("Super Mario Bros. 3.nes");
+    std::fs::write(&smb3, b"NES synthetic smb3").unwrap();
+    let mut db = crate::Database::open_or_create(lib.temp.path().join("library.sqlite3")).unwrap();
+    let folder_id = db.list_source_folders().unwrap()[0].id;
+    let archive = crate::Archive::from_path_in_root(&smb3, &lib.root).unwrap();
+    db.upsert_archive(folder_id, &lib.root, &archive).unwrap();
+    let error = preview_game_rename(
+        &lib.db,
+        &lib.game,
+        "Super Mario Bros (USA)",
+        1,
+        &saves_in(&ra),
+    )
+    .unwrap_err();
+    assert!(error.contains("cannot be told apart"), "{error}");
+    assert_eq!(
+        std::fs::read(saves.join("Super Mario Bros.srm")).unwrap(),
+        b"smb1"
+    );
+    assert!(lib.game.exists());
+
     // RetroArch is running: it could write the save under the old name.
     let lib = Lib::new("Zelda.nes", Some("nes"));
     std::fs::write(lib.root.join("nes").join("Zelda.srm"), b"save").unwrap();
@@ -608,4 +647,109 @@ fn saves_sorted_beside_the_game_and_any_file_in_a_save_folder_are_found() {
         preview_game_rename(&lib.db, &lib.game, "Renamed", 1, &saves_in(&saves)).unwrap_err();
     assert!(error.contains("linked folder"), "{error}");
     assert!(lib.game.exists());
+}
+
+/// Before the game's rename the hook rewrites its save, so the save's own
+/// identity re-check fails after the game was renamed: everything this run
+/// renamed is put back.
+fn rewrite_the_save(game: &Path) {
+    std::fs::write(game.with_extension("srm"), b"changed while renaming").unwrap();
+}
+
+#[test]
+fn a_save_that_fails_after_the_game_was_renamed_puts_the_game_back() {
+    let lib = Lib::new("Zelda.nes", Some("nes"));
+    let save = lib.root.join("nes").join("Zelda.srm");
+    std::fs::write(&save, b"battery").unwrap();
+    let preview = preview_game_rename(&lib.db, &lib.game, "Zelda (USA)", 1, &none()).unwrap();
+    crate::dat::rename_apply::executor::set_test_before_rename_hook(Some(rewrite_the_save));
+    let error =
+        apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel(), &none()).unwrap_err();
+    crate::dat::rename_apply::executor::set_test_before_rename_hook(None);
+    assert!(error.contains("did not complete"), "{error}");
+    // The game is back under its old name with its library row; the save was
+    // never renamed and nothing was overwritten or deleted.
+    assert!(lib.game.exists());
+    assert_eq!(lib.id_at(&lib.game), Some(lib.id));
+    assert!(!lib.root.join("nes").join("Zelda (USA).nes").exists());
+    assert_eq!(std::fs::read(&save).unwrap(), b"changed while renaming");
+    assert!(!lib.root.join("nes").join("Zelda (USA).srm").exists());
+    let (journals, _) = crate::dat::rename_apply::journal::list_journals(&lib.journal());
+    assert_eq!(journals.len(), 1);
+    assert_eq!(journals[0].applied_count(), 0, "{:?}", journals[0].state);
+}
+
+/// The process dies after the game was renamed and before its save was:
+/// the first rename arms a second hook that panics, as a crash would.
+fn arm_crash_before_the_save(_game: &Path) {
+    crate::dat::rename_apply::executor::set_test_before_rename_hook(Some(crash));
+}
+fn crash(_save: &Path) {
+    panic!("simulated crash between the game and its save");
+}
+
+#[test]
+fn a_crash_after_the_game_was_renamed_is_found_after_restart_and_undone() {
+    let lib = Lib::new("Zelda.nes", Some("nes"));
+    let folder = lib.root.join("nes");
+    let save = folder.join("Zelda.srm");
+    std::fs::write(&save, b"battery").unwrap();
+    let preview = preview_game_rename(&lib.db, &lib.game, "Zelda (USA)", 1, &none()).unwrap();
+    crate::dat::rename_apply::executor::set_test_before_rename_hook(Some(
+        arm_crash_before_the_save,
+    ));
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        apply_game_rename(&preview, &lib.db, &lib.journal(), &no_cancel(), &none())
+    }));
+    crate::dat::rename_apply::executor::set_test_before_rename_hook(None);
+    assert!(crashed.is_err(), "the simulated crash happened");
+    // The split state a crash leaves: game renamed, save not.
+    let renamed = folder.join("Zelda (USA).nes");
+    assert!(renamed.exists() && !lib.game.exists());
+    assert!(save.exists() && !folder.join("Zelda (USA).srm").exists());
+
+    // "Restart": only what is on disk. The durable journal names the
+    // unfinished rename with every entry (game and save) Undo needs.
+    let journal = lib.journal();
+    let (mut interrupted, problems) =
+        crate::dat::rename_apply::journal::find_recovery_transactions(&journal);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(interrupted.len(), 1);
+    let mut found = interrupted.remove(0);
+    assert_eq!(found.entries.len(), 2);
+    assert_eq!(found.entries[0].source_path, lib.game);
+    assert_eq!(found.entries[1].source_path, save);
+    // History reconciles it from the filesystem (the game proved renamed).
+    crate::dat::rename_apply::reconcile::reconcile_recovery(&mut found, &journal).unwrap();
+    assert_eq!(found.applied_count(), 1);
+    // The save's rename never ran: the game is renamed, the save is not.
+    assert!(is_unfinished_rename(&found));
+
+    // Renaming that game again is refused until it is undone.
+    let db = crate::Database::open_existing(lib.temp.path().join("library.sqlite3")).unwrap();
+    let again = preview_game_rename(&db, &renamed, "Zelda (Europe)", 2, &none()).unwrap();
+    let error = apply_game_rename(&again, &db, &journal, &no_cancel(), &none()).unwrap_err();
+    assert!(error.contains("did not finish"), "{error}");
+    assert!(renamed.exists());
+
+    // Undo, opened the way History opens it, puts everything back; nothing is
+    // overwritten or deleted.
+    assert!(super::is_organisation_transaction(&found));
+    let mut reopened = super::open_history_transaction_for_undo(&journal, &found).unwrap();
+    let undo = rollback_organisation_transaction(
+        &mut reopened,
+        &journal,
+        &no_cancel(),
+        &preview.source_root,
+    )
+    .unwrap();
+    assert_eq!(undo.rollback.result, RollbackResult::FullyRolledBack);
+    assert!(lib.game.exists() && !renamed.exists());
+    assert_eq!(lib.id_at(&lib.game), Some(lib.id));
+    assert_eq!(std::fs::read(&save).unwrap(), b"battery");
+    assert!(!folder.join("Zelda (USA).srm").exists());
+    // Settled: the game can be renamed again.
+    let fresh = preview_game_rename(&db, &lib.game, "Zelda (USA)", 3, &none()).unwrap();
+    apply_game_rename(&fresh, &db, &journal, &no_cancel(), &none()).unwrap();
+    assert!(folder.join("Zelda (USA).srm").exists());
 }
