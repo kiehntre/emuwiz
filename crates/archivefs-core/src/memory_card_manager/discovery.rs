@@ -113,6 +113,60 @@ fn found(path: &Path, emulator: Option<&str>) -> Option<FoundCard> {
     })
 }
 
+/// PS1 cards inside an RPCS3 storage folder (`dev_hdd0`): each PS1 Classic
+/// keeps its cards in `game/<title id>/USRDIR/SAVEDATA`, and `savedata/vmc`
+/// holds shared ones. Looks only in those folders; a folder that is not
+/// there is simply skipped.
+pub fn find_rpcs3_cards(dev_hdd0: &Path) -> Vec<FoundCard> {
+    let mut cards = find_cards_in(&dev_hdd0.join("savedata/vmc"), Some("RPCS3"));
+    let mut titles: Vec<PathBuf> = fs::read_dir(dev_hdd0.join("game"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    titles.sort();
+    for title in titles.into_iter().take(4096) {
+        cards.extend(find_cards_in(&title.join("USRDIR/SAVEDATA"), Some("RPCS3")));
+    }
+    cards
+}
+
+/// Cards in the standard save folders of PCSX2, DuckStation, RetroArch and
+/// RPCS3, for a native install and for the Flatpak of each. Only these
+/// folders are listed; nothing is read beyond each file's header.
+pub fn find_cards_in_standard_folders(home: &Path, config: &Path, data: &Path) -> Vec<FoundCard> {
+    let flatpak = |app: &str, rest: &str| home.join(".var/app").join(app).join(rest);
+    let mut cards = Vec::new();
+    for folder in [
+        config.join("PCSX2/memcards"),
+        flatpak("net.pcsx2.PCSX2", "config/PCSX2/memcards"),
+    ] {
+        cards.extend(find_cards_in(&folder, Some("PCSX2")));
+    }
+    for folder in [
+        data.join("duckstation/memcards"),
+        config.join("duckstation/memcards"),
+        flatpak("org.duckstation.DuckStation", "data/duckstation/memcards"),
+        flatpak("org.duckstation.DuckStation", "config/duckstation/memcards"),
+    ] {
+        cards.extend(find_cards_in(&folder, Some("DuckStation")));
+    }
+    for folder in [
+        config.join("retroarch/saves"),
+        flatpak("org.libretro.RetroArch", "config/retroarch/saves"),
+    ] {
+        cards.extend(find_cards_in(&folder, Some("RetroArch")));
+    }
+    for folder in [
+        config.join("rpcs3/dev_hdd0"),
+        flatpak("net.rpcs3.RPCS3", "config/rpcs3/dev_hdd0"),
+    ] {
+        cards.extend(find_rpcs3_cards(&folder));
+    }
+    cards
+}
+
 /// The cards in the save folders of the emulators EmuWiz already knows
 /// (the same read-only inventory the Saves page uses): PCSX2 and DuckStation
 /// memory-card folders, RetroArch saves, RPCS3 PS1 Classics.
@@ -124,6 +178,30 @@ pub fn find_configured_cards() -> CardSearch {
         .iter()
         .filter_map(|record| found(&record.path, Some(record.emulator.as_str())))
         .collect();
+    // The inventory records RPCS3's storage folder (`dev_hdd0`) as one opaque
+    // item, so the PS1 cards inside it are looked for here.
+    for record in &configured.inventory.records {
+        if record.emulator == crate::persistent_state_inventory::StateEmulator::Rpcs3 {
+            cards.extend(find_rpcs3_cards(&record.path));
+        }
+    }
+    // The inventory reports an emulator only when it finds exactly one
+    // profile for it (for example not when PCSX2 is installed both natively
+    // and as a Flatpak). A card browser wants every card, so the emulators'
+    // standard folders are also looked in directly.
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let from_env = |name: &str, fallback: &str| {
+            std::env::var_os(name)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| home.join(fallback))
+        };
+        cards.extend(find_cards_in_standard_folders(
+            &home,
+            &from_env("XDG_CONFIG_HOME", ".config"),
+            &from_env("XDG_DATA_HOME", ".local/share"),
+        ));
+    }
     cards.sort_by(|left, right| left.path.cmp(&right.path));
     cards.dedup_by(|left, right| left.path == right.path);
     CardSearch {

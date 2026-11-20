@@ -169,6 +169,103 @@ fn cards_are_recognised_by_content_not_by_extension() {
 }
 
 #[test]
+fn rpcs3_ps1_classic_cards_are_found_inside_its_storage_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let saves = dir.path().join("dev_hdd0/game/NPEF00036/USRDIR/SAVEDATA");
+    fs::create_dir_all(&saves).unwrap();
+    let mut vmp = vec![0u8; 128];
+    vmp[1..4].copy_from_slice(b"PMV");
+    vmp.extend_from_slice(&ps1_card(&[ps1_save("BESCES-01237DATA", 1, "Classic")]));
+    fs::write(saves.join("SCEVMC0.VMP"), &vmp).unwrap();
+    fs::write(saves.join("ICON0.PNG"), b"not a card").unwrap();
+    // Elsewhere in the storage folder: not looked at.
+    fs::create_dir_all(dir.path().join("dev_hdd0/home/00000001")).unwrap();
+    fs::write(dir.path().join("dev_hdd0/home/00000001/stray.VMP"), &vmp).unwrap();
+
+    let found = super::discovery::find_rpcs3_cards(&dir.path().join("dev_hdd0"));
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path, saves.join("SCEVMC0.VMP"));
+    assert_eq!(found[0].format, CardFormat::Ps1Vmp);
+    assert_eq!(found[0].emulator.as_deref(), Some("RPCS3"));
+    assert!(super::discovery::find_rpcs3_cards(&dir.path().join("missing")).is_empty());
+}
+
+#[test]
+fn standard_folders_of_native_and_flatpak_installs_are_both_searched() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (config, data) = (home.join(".config"), home.join(".local/share"));
+    let ps1 = ps1_card(&[ps1_save("BASLUS-00594GAME", 1, "Save")]);
+    let ps2 = ps2_inventory_fixture();
+    let mut vmp = vec![0u8; 128];
+    vmp[1..4].copy_from_slice(b"PMV");
+    vmp.extend_from_slice(&ps1);
+    let files: [(&str, &[u8]); 9] = [
+        (".config/PCSX2/memcards/Mcd001.ps2", &ps2),
+        (
+            ".var/app/net.pcsx2.PCSX2/config/PCSX2/memcards/Mcd001.ps2",
+            &ps2,
+        ),
+        (".local/share/duckstation/memcards/shared_card_1.mcd", &ps1),
+        (
+            ".var/app/org.duckstation.DuckStation/config/duckstation/memcards/a.mcd",
+            &ps1,
+        ),
+        (".config/retroarch/saves/Game (USA).srm", &ps1),
+        (
+            ".config/rpcs3/dev_hdd0/game/NPEF00036/USRDIR/SAVEDATA/SCEVMC0.VMP",
+            &vmp,
+        ),
+        // Not cards, or not in a card folder: never listed.
+        (".config/retroarch/saves/GBA Game.srm", &[0xFF; 131_072]),
+        (".config/PCSX2/inis/PCSX2.ini", b"[UI]"),
+        (".config/other/elsewhere.mcd", &ps1),
+    ];
+    for (path, bytes) in files {
+        let path = home.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+    let before: Vec<_> = files
+        .iter()
+        .map(|(path, _)| fs::read(home.join(path)).unwrap())
+        .collect();
+
+    let mut found: Vec<(String, String)> =
+        super::discovery::find_cards_in_standard_folders(home, &config, &data)
+            .into_iter()
+            .map(|card| {
+                (
+                    card.emulator.unwrap_or_default(),
+                    card.path
+                        .strip_prefix(home)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            })
+            .collect();
+    found.sort();
+    let expected: Vec<(String, String)> = [
+        ("DuckStation", files[2].0),
+        ("DuckStation", files[3].0),
+        ("PCSX2", files[0].0),
+        ("PCSX2", files[1].0),
+        ("RPCS3", files[5].0),
+        ("RetroArch", files[4].0),
+    ]
+    .iter()
+    .map(|(emulator, path)| (emulator.to_string(), path.to_string()))
+    .collect();
+    assert_eq!(found, expected);
+    let after: Vec<_> = files
+        .iter()
+        .map(|(path, _)| fs::read(home.join(path)).unwrap())
+        .collect();
+    assert_eq!(before, after, "searching only reads");
+}
+
+#[test]
 fn ps1_save_round_trips_between_cards_and_no_card_is_modified() {
     let dir = tempfile::tempdir().unwrap();
     let wanted = ps1_save("BASLUS-00594GAME", 2, "Two Blocks");
