@@ -423,12 +423,10 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut State) {
                 .path
                 .parent()
                 .map(|parent| {
-                    let text = parent.display().to_string();
-                    match std::env::var("HOME") {
-                        Ok(home) if !home.is_empty() && text.starts_with(&home) => {
-                            format!("~{}", &text[home.len()..])
-                        }
-                        _ => text,
+                    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+                    match home.and_then(|home| parent.strip_prefix(home).ok()) {
+                        Some(rest) => format!("~/{}", rest.display()),
+                        None => parent.display().to_string(),
                     }
                 })
                 .unwrap_or_default();

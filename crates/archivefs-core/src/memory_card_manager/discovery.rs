@@ -223,10 +223,10 @@ pub fn find_configured_cards() -> CardSearch {
     // standard folders are also looked in directly.
     // A custom DuckStation card folder that was refused must not be quietly
     // replaced by the default one.
-    let duckstation_refused = configured
-        .unavailable
-        .iter()
-        .any(|root| root.emulator == crate::persistent_state_inventory::StateEmulator::DuckStation);
+    let duckstation_refused = configured.unavailable.iter().any(|root| {
+        root.emulator == crate::persistent_state_inventory::StateEmulator::DuckStation
+            && root.reason.contains("memory-card folder was refused")
+    });
     if let Some(home) = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|home| home.is_absolute())
