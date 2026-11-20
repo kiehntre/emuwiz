@@ -27,6 +27,56 @@ Presentation only: nothing here plans, probes or launches. Code:
 | Stale readiness | Recheck (in place, no duplicate, generation-guarded) |
 | Last Play: could not start / closed shortly after starting | Emulator Setup / Activity |
 
+## Exact words for blockers whose meaning is known
+
+Most adapter blockers are grouped by name (`classify_adapter_blocker`), and a name
+that matches no group becomes "EmuWiz can't safely prepare this launch". On
+2026-11-20 that was 86 of the 202 blocker kinds, including a missing Amiga
+Kickstart, and an Xbox ZIP or a PS3 `.pkg` read only "this kind of game file isn't
+supported for launching yet". None of those named a fix.
+
+`diagnosis::specific` now gives these blockers their own title, reason and action:
+
+| Blocker | Says | Action |
+| --- | --- | --- |
+| `XemuContentFormatUnsupported` | xemu can only start an Xbox disc image (.iso); extract or convert, then rescan | Check games folder |
+| `RequiredFirmwareMissing` on xemu (and its missing firmware state) | xemu needs its four Xbox system files, chosen in xemu's own settings | BIOS / Firmware Setup |
+| `Rpcs3ContentFormatUnsupported` | a `.pkg` is an installer: install it in RPCS3 | Problems |
+| `Rpcs3FirmwareUnavailable` | install the PS3 system software (PS3UPDAT.PUP) in RPCS3 | BIOS / Firmware Setup |
+| `FsUaeKickstartUnavailable`, `AmiberryKickstartUnavailable`, `WhdloadKickstartUnavailable` | the Amiga emulator has no Kickstart ROM it can use; where to set it | BIOS / Firmware Setup |
+| `FsUaeIpfBackendUnavailable`, `AmiberryIpfBackendUnavailable` | the `.ipf` image needs the emulator's CAPS (capsimg) plug-in | Emulator Setup |
+| `FsUaeProfileRequired`, `AmiberryProfileRequired`, `WhdloadProfileMissing` | the Amiga emulator has no settings EmuWiz can use | Emulator Setup |
+
+Several blockers of one cause still share one finding; the first one with exact
+words speaks for it and the rest stay under Technical details. The other 78
+kinds that fall through to the safety-refusal text are unchanged and are the
+next candidates (arcade set problems, Hatari TOS, DOSBox configuration, the
+`...CandidateRequired` internal refusals).
+
+## Flatpak emulators and the NVIDIA driver
+
+A Flatpak emulator draws with the driver package Flatpak mounts for it
+(`org.freedesktop.Platform.GL.nvidia-<version>`), chosen by the exact version of
+the loaded NVIDIA kernel module. When the system driver is updated and Flatpak is
+not, the package no longer matches and the emulator silently gets Mesa only:
+OpenGL is drawn by the processor and no NVIDIA Vulkan driver exists. Every launch
+check passes, the game starts, and it runs slowly with stuttering sound (xemu) or
+its Vulkan renderer cannot start while OpenGL "works" (RPCS3).
+
+`archivefs_core::launch::flatpak_graphics` reads `/sys/module/nvidia/version`
+and the two standard Flatpak installations (no process is started). When the
+package for the loaded driver is missing and the game's chosen emulator is a
+Flatpak (xemu, RPCS3 or RetroArch, by their existing installation evidence),
+`note_flatpak_graphics` puts a warning first on the readiness card, and so in
+Setup & Doctor's selected-game check: which emulator, which driver version, which
+versions Flatpak has, what to expect, and the fix (`flatpak update`). Play stays
+available. EmuWiz never runs the update itself.
+
+Limits: other Flatpak emulators (Dolphin, PCSX2, DuckStation) are not yet
+covered; Library tiles do not show the warning; a `FLATPAK_GL_DRIVERS` override
+and non-standard Flatpak installations are not read; only the NVIDIA proprietary
+driver has a version to match.
+
 ## Backend evidence gaps (recorded, not invented)
 
 1. The plan has no adapter support level (ready / readiness-only / unproven /
