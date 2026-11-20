@@ -74,6 +74,7 @@ mod romm_dispatch_tests {
                 },
                 page_size: Some(100),
                 import_timeout_seconds: None,
+                rename_updates_title: false,
             },
             status,
             artwork: ArtworkCacheStats {

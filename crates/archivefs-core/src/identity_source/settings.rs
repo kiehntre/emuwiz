@@ -70,6 +70,11 @@ pub struct ProviderSettings {
     /// [`DEFAULT_IMPORT_TIMEOUT_SECONDS`]'s own reasoning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import_timeout_seconds: Option<u32>,
+    /// "Rename also updates RomM's title": the one RomM write EmuWiz makes,
+    /// described in [`super::romm::title_sync`]. Off unless the person turns
+    /// it on; absent in older settings, which keeps them read-only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rename_updates_title: bool,
 }
 
 impl ProviderSettings {

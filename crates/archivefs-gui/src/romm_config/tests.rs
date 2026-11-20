@@ -80,6 +80,7 @@ fn snapshot(configured: bool, kind: ProviderPathKind, mappings: Vec<PathMapping>
             },
             page_size: Some(100),
             import_timeout_seconds: None,
+            rename_updates_title: false,
         },
         status: ProviderStatus::not_configured(IdentityProvider::Romm),
         artwork: ArtworkCacheStats {
@@ -338,6 +339,7 @@ fn an_import_timeout_that_was_never_set_stays_unset_when_it_is_not_changed() {
         },
         page_size: None,
         import_timeout_seconds: None,
+        rename_updates_title: false,
     };
     let draft = RommConfigDraft {
         url: "http://172.19.0.20:8080".to_string(),
@@ -384,6 +386,7 @@ fn clearing_both_media_mapping_fields_disables_local_reuse() {
         },
         page_size: None,
         import_timeout_seconds: None,
+        rename_updates_title: false,
     };
     let draft = RommConfigDraft {
         media_provider_prefix: String::new(),
@@ -599,6 +602,7 @@ fn a_page_size_that_was_never_set_stays_unset_when_it_is_not_changed() {
         },
         page_size: None,
         import_timeout_seconds: None,
+        rename_updates_title: false,
     };
     let draft = RommConfigDraft {
         url: "http://172.19.0.20:8080".to_string(),
@@ -638,6 +642,7 @@ fn to_settings_keeps_fields_the_dialog_does_not_edit() {
         },
         page_size: Some(50),
         import_timeout_seconds: None,
+        rename_updates_title: false,
     };
     let draft = RommConfigDraft {
         url: "http://172.19.0.20:8080".to_string(),

@@ -562,7 +562,7 @@ pub(crate) fn build_card_view(
         ("Not configured".to_string(), widgets::StatusTone::Warning)
     });
     badges.push((
-        "Read-only towards RomM".to_string(),
+        "Read-only towards RomM, unless Rename title updates are on".to_string(),
         widgets::StatusTone::Info,
     ));
     if status.state.can_browse() {
@@ -1563,7 +1563,9 @@ pub(crate) fn show_romm_source_card(
     widgets::section_header(
         ui,
         "RomM",
-        Some("Optional local identity source. Read-only towards RomM."),
+        Some(
+            "Optional local identity source. Read-only towards RomM, except the optional Rename title update (off unless you turn it on).",
+        ),
     );
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {

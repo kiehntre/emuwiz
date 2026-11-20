@@ -477,6 +477,59 @@ const RETROARCH_SAVE_SUFFIXES: [&str; 15] = [
 /// Bound on folders examined in one save folder; more refuses.
 const MAX_SAVE_SUBFOLDERS: usize = 4096;
 
+/// The earlier paths Rename History proves the game now at `path` had,
+/// newest first: each step is one applied, not undone, rename or move of a
+/// game (never a save) whose destination was the previous path. `Err` (with
+/// why) when History cannot settle it: an unreadable journal, or two entries
+/// that both produced the same path.
+pub fn earlier_paths_from_history(journal_dir: &Path, path: &Path) -> Result<Vec<PathBuf>, String> {
+    use crate::dat::rename_apply::model::{EntryState, TransactionOperation};
+    let (transactions, problems) = crate::dat::rename_apply::journal::list_journals(journal_dir);
+    if !problems.is_empty() {
+        return Err("part of Rename History could not be read".into());
+    }
+    let mut earlier: Vec<PathBuf> = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        let mut sources: Vec<&Path> = transactions
+            .iter()
+            .filter(|transaction| {
+                transaction.state == TransactionState::Applied
+                    && super::transaction::is_organisation_transaction(transaction)
+            })
+            .flat_map(|transaction| &transaction.entries)
+            .filter(|entry| {
+                entry.state == EntryState::Applied
+                    && entry.operation == TransactionOperation::RenameMove
+                    && !entry
+                        .unknown
+                        .contains_key(crate::database::organisation_paths::SAVE_KEY)
+                    && entry.destination_path == current
+            })
+            .map(|entry| entry.source_path.as_path())
+            .collect();
+        sources.sort();
+        sources.dedup();
+        let source = match sources.as_slice() {
+            [] => break,
+            [source] => source.to_path_buf(),
+            _ => {
+                return Err(format!(
+                    "Rename History has more than one rename that produced {}",
+                    current.display()
+                ));
+            }
+        };
+        // Renamed back and forth: every name is already known.
+        if source == path || earlier.contains(&source) {
+            break;
+        }
+        earlier.push(source.clone());
+        current = source;
+    }
+    Ok(earlier)
+}
+
 /// Whether `transaction` is a rename that stopped part-way: interrupted
 /// (a crash, a failure), or settled by recovery with the game renamed but
 /// one of its saves not (recovery proved that save's rename never ran).

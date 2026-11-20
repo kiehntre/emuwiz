@@ -36,6 +36,14 @@ pub(super) struct State {
     queued: std::collections::VecDeque<RecheckTarget>,
     /// A finished re-check saved a result: reload once no load is running.
     pub(super) reload_pending: bool,
+    /// The optional RomM title update (or its restore after Undo) running.
+    pub(super) romm: Option<super::romm_title::RommTitleJob>,
+    /// Its result, shown under the rename outcome.
+    pub(super) romm_line: Option<String>,
+    /// RomM requests asked for while one was running.
+    pub(super) romm_queued: std::collections::VecDeque<super::romm_title::RommTitleAction>,
+    /// The rename just applied, for the RomM title update.
+    renamed: Option<super::romm_title::RommTitleAction>,
 }
 
 /// A running re-check: its Activity job and the worker's answer.
@@ -95,6 +103,7 @@ impl State {
         self.preview = None;
         self.outcome = None;
         self.recheck_line = None;
+        self.romm_line = None;
     }
 
     fn close(&mut self) {
@@ -104,6 +113,8 @@ impl State {
             saves: self.saves.take(),
             recheck: self.recheck.take(),
             queued: std::mem::take(&mut self.queued),
+            romm: self.romm.take(),
+            romm_queued: std::mem::take(&mut self.romm_queued),
             ..Self::default()
         };
     }
@@ -179,14 +190,29 @@ impl State {
             )
         });
         let renamed = result.is_ok();
+        self.romm_line = None;
+        self.renamed =
+            result
+                .as_ref()
+                .ok()
+                .map(|outcome| super::romm_title::RommTitleAction::AfterRename {
+                    transaction_id: outcome.transaction.transaction_id.clone(),
+                    old: preview.source.clone(),
+                    new: preview.destination.clone(),
+                });
         let saves = match preview.saves.len() {
             0 => String::new(),
             1 => " with its RetroArch save".into(),
             n => format!(" with its {n} RetroArch saves"),
         };
+        let romm = if super::romm_title::title_updates_enabled() {
+            "RomM picks up the new file at its next scan of this system; its title is updated below."
+        } else {
+            "RomM picks up the new file at its next scan of this system; it keeps its current title (RomM is only read)."
+        };
         self.outcome = Some(result.map(|_| {
             format!(
-                "Renamed to {}{saves}. Undo is in History. RomM shows the new name after its next scan of this system.",
+                "Renamed to {}{saves}. Undo is in History. {romm}",
                 preview.new_file_name
             )
         }));
@@ -335,6 +361,18 @@ impl App {
                         }
                         None => {}
                     }
+                    match &self.game_rename.romm_line {
+                        Some(line) => {
+                            ui.label(line);
+                        }
+                        None if self.game_rename.romm.is_some() => {
+                            ui.label(
+                                RichText::new("Updating its title in RomM…")
+                                    .color(theme::muted(ui)),
+                            );
+                        }
+                        None => {}
+                    }
                 }
                 Some(Err(reason)) => {
                     ui.colored_label(theme::warning(ui), reason);
@@ -345,6 +383,9 @@ impl App {
                 // The library row keeps its id; only real settings run it.
                 if self.game_rename.paths.is_none() {
                     self.start_rename_recheck(RecheckTarget::Id(game.archive.id));
+                    if let Some(action) = self.game_rename.renamed.take() {
+                        self.start_romm_title(action);
+                    }
                 }
                 self.load(false);
                 // History lists the new rename (and its Undo) without a restart.

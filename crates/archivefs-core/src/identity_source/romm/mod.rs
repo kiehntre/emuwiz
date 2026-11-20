@@ -1,9 +1,11 @@
 //! The RomM adapter.
 //!
 //! RomM is a self-hosted library manager that has usually already scanned and
-//! matched a collection. Stage 1 reads that work and nothing else: there is no
-//! code path here that writes to RomM, triggers a scan, edits metadata or
-//! touches a ROM.
+//! matched a collection. Stage 1 reads that work and nothing else: no code path
+//! here triggers a scan, edits metadata or touches a ROM. The single exception
+//! is [`title_sync`]: optional, off by default, it changes one entry's displayed
+//! title after a Rename (and puts it back on Undo). It lives outside the
+//! read-only [`client`], which still has no write verb.
 //!
 //! # Where the adapter boundary is
 //!
@@ -35,6 +37,7 @@ pub mod mapping_plan;
 pub mod media_mapping;
 pub mod normalise;
 pub mod stale_report;
+pub mod title_sync;
 
 #[cfg(test)]
 mod tests;
