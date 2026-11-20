@@ -18,16 +18,20 @@
 //!
 //! See `docs/GAME_RECOVERY_ENGINE.md`.
 
+pub mod bulk;
 pub mod capability;
 pub mod cue_sheet;
 pub mod diagnose;
 pub mod disc_zip;
 pub mod model;
+pub mod moves;
 pub mod prepared_media;
+pub mod storage;
 
 #[cfg(test)]
 mod tests;
 
+pub use bulk::{BulkCandidate, BulkItemPlan, BulkPlan, Queue, QueueState};
 pub use capability::{
     CAPABILITY_MATRIX, CapabilityRow, CapabilityStatus, capability_matrix_markdown, capability_rows,
 };
@@ -41,5 +45,5 @@ pub use model::{
 };
 pub use prepared_media::{
     LaunchPathCheck, PreparationPlan, PrepareError, PrepareOutcome, PrepareProgress,
-    PreparedMediaStore, PreparedSetSummary, RemovalReport, RemoveError,
+    PreparedMediaStore, PreparedSetSummary, RelinkOutcome, RemovalReport, RemoveError,
 };

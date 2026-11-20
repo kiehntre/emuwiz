@@ -205,6 +205,33 @@ pub struct PrepareOutcome {
     pub link_warning: Option<String>,
 }
 
+/// A prepared copy's link to its ZIP, captured while it was valid, so it can
+/// follow that same file through a rename EmuWiz itself is about to perform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveCandidate {
+    pub old_path: PathBuf,
+    pub new_path: PathBuf,
+    pub set_id: String,
+    pub platform_id: String,
+    identity: SourceIdentity,
+}
+
+/// What looking for an existing prepared copy of a ZIP's contents found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelinkOutcome {
+    /// No prepared copy holds this disc. Nothing was written.
+    NoMatchingCopy,
+    /// The ZIP was read in full, every file matches the prepared copy's
+    /// recorded SHA-256, and the ZIP is now linked to it.
+    Linked {
+        summary: Box<PreparedSetSummary>,
+        /// The one path this copy was linked from that no longer exists: the
+        /// ZIP was renamed or moved from there. `None` when there is no such
+        /// path or more than one (then nothing is assumed).
+        moved_from: Option<PathBuf>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrepareError {
     /// The store's own folder is unusable (named).
@@ -368,8 +395,19 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
     serde_json::from_str(&text).map_err(|error| error.to_string())
 }
 
-fn available_bytes(directory: &Path) -> Result<u64, String> {
+#[cfg(test)]
+thread_local! {
+    /// Test-only: pretend the disk has this many bytes free.
+    pub(crate) static FREE_SPACE_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn available_bytes(directory: &Path) -> Result<u64, String> {
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(test)]
+    if let Some(pretend) = FREE_SPACE_OVERRIDE.with(std::cell::Cell::get) {
+        return Ok(pretend);
+    }
     let name = std::ffi::CString::new(directory.as_os_str().as_bytes())
         .map_err(|_| "path contains NUL".to_string())?;
     // SAFETY: zeroed is a valid initial value for this plain C struct.
@@ -443,9 +481,28 @@ impl PreparedMediaStore {
             }
             return Ok(Self::at(path));
         }
+        if let Some(folder) = super::storage::configured_folder()? {
+            return Ok(Self::at(folder));
+        }
+        Self::default_location()
+    }
+
+    /// `<data>/prepared-media`, where copies go unless a folder was chosen.
+    pub fn default_location() -> Result<Self, String> {
         crate::app_dirs::data_path(DEFAULT_LEAF)
             .map(Self::at)
             .map_err(|error| error.to_string())
+    }
+
+    /// Bytes free for new copies where this store is (or would be created).
+    pub fn available_bytes(&self) -> Result<u64, String> {
+        let mut probe = self.root.as_path();
+        while fs::symlink_metadata(probe).is_err() {
+            probe = probe
+                .parent()
+                .ok_or_else(|| "no existing folder above the store".to_string())?;
+        }
+        available_bytes(probe)
     }
 
     pub fn root(&self) -> &Path {
@@ -524,6 +581,163 @@ impl PreparedMediaStore {
         sync_directory(&self.sources_dir());
     }
 
+    /// Link records of `set_id` whose ZIP is no longer at the recorded path.
+    /// They are removed; the paths are returned.
+    fn retire_stale_links(&self, set_id: &str) -> Vec<PathBuf> {
+        let mut gone = Vec::new();
+        let Ok(entries) = fs::read_dir(self.sources_dir()) else {
+            return gone;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(link) = read_json::<SourceLink>(&path) else {
+                continue;
+            };
+            if link.set_id == set_id
+                && fs::symlink_metadata(&link.source_path).is_err()
+                && fs::remove_file(&path).is_ok()
+            {
+                gone.push(link.source_path);
+            }
+        }
+        if !gone.is_empty() {
+            sync_directory(&self.sources_dir());
+        }
+        gone
+    }
+
+    /// Captures the link of `old_path` if, right now, it is fully valid (the
+    /// same check a launch uses). Called before EmuWiz renames or moves that
+    /// file to `new_path`. Cheap; reads no game data.
+    pub fn movable_link(&self, old_path: &Path, new_path: &Path) -> Option<MoveCandidate> {
+        let summary = self.prepared_for_source(old_path)?;
+        let store = self.existing()?;
+        let link: SourceLink = read_json(&store.source_link_path(old_path)).ok()?;
+        Some(MoveCandidate {
+            old_path: old_path.to_path_buf(),
+            new_path: new_path.to_path_buf(),
+            set_id: summary.set_id,
+            platform_id: summary.platform_id,
+            identity: link.source,
+        })
+    }
+
+    /// Moves a captured link to the file's new path after EmuWiz renamed it.
+    /// The file at the new path must be the very same file object (device and
+    /// inode) with the same size and modification time, and the old path must
+    /// be gone; a name, a size or a timestamp alone is never enough. A move to
+    /// another filesystem creates a new file and is not followed here: the
+    /// content check in [`Self::relink`] covers it.
+    pub fn carry_link(&self, candidate: &MoveCandidate) -> Result<PreparedSetSummary, String> {
+        let store = self
+            .existing()
+            .ok_or_else(|| "the prepared-media folder is unavailable".to_string())?;
+        let never = AtomicBool::new(false);
+        let _lock = store
+            .lock(&never, false)
+            .map_err(|_| "the prepared-media folder is busy".to_string())?;
+        let metadata =
+            fs::symlink_metadata(&candidate.new_path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() {
+            return Err("the renamed game file is not a regular file".into());
+        }
+        let now = SourceIdentity::of(&metadata);
+        if now.device != candidate.identity.device
+            || now.inode != candidate.identity.inode
+            || now.size_bytes != candidate.identity.size_bytes
+            || now.modified_ns != candidate.identity.modified_ns
+        {
+            return Err("the file at the new name is not the file that was prepared".into());
+        }
+        if fs::symlink_metadata(&candidate.old_path).is_ok() {
+            return Err("a file still exists at the old name".into());
+        }
+        let receipt = store.quick_check(&candidate.set_id)?;
+        store.link_source(&candidate.new_path, now, &candidate.set_id)?;
+        let _ = fs::remove_file(store.source_link_path(&candidate.old_path));
+        sync_directory(&store.sources_dir());
+        store.journal(
+            "source_link_followed_rename",
+            &candidate.set_id,
+            &format!(
+                "{} -> {}",
+                candidate.old_path.display(),
+                candidate.new_path.display()
+            ),
+        );
+        Ok(store.summary_of(&receipt))
+    }
+
+    /// Looks for an existing prepared copy of exactly this ZIP's disc and, if
+    /// there is one, links the ZIP to it. Never extracts: the ZIP is read in
+    /// full and every file must match the copy's recorded SHA-256. This is how
+    /// a ZIP renamed or moved outside EmuWiz finds its copy again.
+    pub fn relink(
+        &self,
+        source: &Path,
+        trusted: &TrustedRoots,
+        limits: &DiscSetLimits,
+        cancel: &AtomicBool,
+        progress: &dyn Fn(PrepareProgress<'_>),
+    ) -> Result<RelinkOutcome, PrepareError> {
+        let Some(store) = self.existing() else {
+            return Ok(RelinkOutcome::NoMatchingCopy);
+        };
+        let _lock = store.lock(cancel, true).map_err(|busy| {
+            if !busy {
+                PrepareError::Store("the lock file could not be opened".into())
+            } else if cancel.load(Ordering::Relaxed) {
+                PrepareError::Cancelled
+            } else {
+                PrepareError::Busy
+            }
+        })?;
+        let inspection = inspect_disc_zip(source, trusted, limits, cancel).map_err(|refusal| {
+            if refusal == DiscSetRefusal::Cancelled {
+                PrepareError::Cancelled
+            } else {
+                PrepareError::Refused(refusal)
+            }
+        })?;
+        let set_id = set_id_of(&inspection.fingerprint);
+        if fs::symlink_metadata(store.set_dir(&set_id)).is_err() {
+            return Ok(RelinkOutcome::NoMatchingCopy);
+        }
+        let listed = store.listed(&set_id, Some(&inspection.fingerprint));
+        let summary = match (listed.state, listed.summary) {
+            (SetState::Ready, Some(summary)) => summary,
+            (SetState::Damaged(detail), _) => {
+                return Err(PrepareError::ExistingCopyDamaged(detail));
+            }
+            (SetState::Ready, None) => {
+                return Err(PrepareError::ExistingCopyDamaged("no summary".into()));
+            }
+        };
+        store.source_matches_receipt(
+            source,
+            trusted,
+            limits,
+            cancel,
+            progress,
+            &inspection,
+            &set_id,
+        )?;
+        store
+            .link_source(source, inspection.source, &set_id)
+            .map_err(PrepareError::Store)?;
+        let mut gone = store.retire_stale_links(&set_id);
+        let moved_from = if gone.len() == 1 { gone.pop() } else { None };
+        store.journal(
+            "source_linked_by_content",
+            &set_id,
+            &source.display().to_string(),
+        );
+        Ok(RelinkOutcome::Linked {
+            summary: Box::new(summary),
+            moved_from,
+        })
+    }
+
     /// The verified prepared copy for this exact, unchanged ZIP, found without
     /// reading the ZIP: one small index record, the ZIP's own metadata and the
     /// set's quick check. Cheap enough for readiness; `None` whenever anything
@@ -586,6 +800,16 @@ impl PreparedMediaStore {
             })?;
         }
         Ok(store)
+    }
+
+    /// This store with its folders created and checked (see `ensure_layout`).
+    pub fn ready(&self) -> Result<PreparedMediaStore, String> {
+        self.ensure_layout()
+    }
+
+    /// This store resolved, if its folders already exist. Creates nothing.
+    pub fn resolved(&self) -> Option<PreparedMediaStore> {
+        self.existing()
     }
 
     /// The resolved store when its folders already exist; never creates any.
@@ -1140,6 +1364,7 @@ impl PreparedMediaStore {
                         &set_id,
                     )?;
                     let link_warning = store.link_source(source, inspection.source, &set_id).err();
+                    store.retire_stale_links(&set_id);
                     Ok(PrepareOutcome {
                         summary,
                         already_prepared: true,

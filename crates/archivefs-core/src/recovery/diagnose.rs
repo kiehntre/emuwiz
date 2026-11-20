@@ -160,6 +160,7 @@ pub fn diagnose(subject: &RecoverySubject, context: &RecoveryContext<'_>) -> Rec
     let mut plan = None;
     let mut prepared = None;
     let mut damaged_copy = None;
+    let mut relinkable = false;
 
     let source_ok = match std::fs::symlink_metadata(&subject.path) {
         Ok(metadata) if metadata.is_file() || metadata.is_dir() => true,
@@ -178,7 +179,7 @@ pub fn diagnose(subject: &RecoverySubject, context: &RecoveryContext<'_>) -> Rec
         }
     };
     if !source_ok {
-        return finish(subject, findings, plan, prepared, damaged_copy);
+        return finish(subject, findings, plan, prepared, damaged_copy, relinkable);
     }
 
     let extension = extension_of(&subject.path);
@@ -214,6 +215,7 @@ pub fn diagnose(subject: &RecoverySubject, context: &RecoveryContext<'_>) -> Rec
                     ready.is_some(),
                     identical_copy_exists,
                 ));
+                relinkable = identical_copy_exists;
                 match listed {
                     Some(super::prepared_media::ListedSet {
                         set_id,
@@ -267,7 +269,7 @@ pub fn diagnose(subject: &RecoverySubject, context: &RecoveryContext<'_>) -> Rec
     } else {
         findings.push(not_assessed("an unknown system", &extension));
     }
-    finish(subject, findings, plan, prepared, damaged_copy)
+    finish(subject, findings, plan, prepared, damaged_copy, relinkable)
 }
 
 /// The text with its first letter in upper case.
@@ -285,6 +287,7 @@ fn finish(
     plan: Option<super::prepared_media::PreparationPlan>,
     prepared: Option<super::prepared_media::PreparedSetSummary>,
     damaged_copy: Option<String>,
+    relinkable: bool,
 ) -> RecoveryReport {
     let has = |code: FindingCode| findings.iter().any(|finding| finding.code == code);
     let person_must_act = findings.iter().any(|finding| {
@@ -316,6 +319,7 @@ fn finish(
         plan,
         prepared,
         damaged_copy,
+        relinkable,
     }
 }
 

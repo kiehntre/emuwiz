@@ -137,6 +137,9 @@ emuwiz-cli recovery list [--json]
 emuwiz-cli recovery verify <copy-id>
 emuwiz-cli recovery remove <copy-id>
 emuwiz-cli recovery clean
+emuwiz-cli recovery prepare-all <game.zip>... --system AmigaCD32 [--yes]
+emuwiz-cli recovery queue | resume | forget-queue
+emuwiz-cli recovery storage [--set <folder> | --reset]
 ```
 
 `--store <folder>` points every command at another prepared-media folder. The CLI
@@ -151,6 +154,60 @@ the usual folder-only confirmation and then Play.
 The store is `<data>/prepared-media` (`EMUWIZ_PREPARED_MEDIA_DIR` overrides it with
 an absolute path). Do not point it inside a library source folder: a scan would then
 list the prepared files as games.
+
+## Renames and moves of a prepared ZIP
+
+A prepared copy is linked to its ZIP by the ZIP's exact path and file identity
+(device, inode, size, modification and change times), so a launch never has to read
+the ZIP. A rename or move changes the path (and the change time), so the link has to
+follow the file. Two routes, with different proof:
+
+| What happened | How the copy follows | Proof | Remembered launch choice |
+|---|---|---|---|
+| Blue's Rename, its Undo, or an Organise move (the shared journalled transaction) | At once, inside the operation; no game data is read | The link was fully valid just before the operation, and the file at the new path is the same file object (device and inode) with the same size and modification time, with nothing left at the old path | Moves with the file |
+| A rename or move outside EmuWiz, a move to another disk, or an EmuWiz rename that was interrupted or ran while the store was busy | The first time the game's page is opened (on a worker), or with `prepare` | The ZIP is read in full and every disc file must match the prepared copy's recorded SHA-256. Nothing is extracted | Moves only if exactly one earlier path of that copy no longer exists and the file has the size and time the choice was made for |
+| A copy of the ZIP (the original still exists) | As the row above | As the row above | Not inherited: two files, one choice, so nothing is assumed |
+| A different or modified ZIP, even with the same name, size and timestamps | Never linked | Fails the content comparison | Never moved |
+
+Link records whose ZIP no longer exists are removed when the copy is linked again.
+
+"Remember this launch choice" itself is unchanged: it is saved for one unchanged
+file, applies on later launches and after a restart, keeps the "System not confirmed"
+warning on every launch, and does not carry a launch past a missing firmware file, a
+missing core, a damaged prepared copy or a changed ZIP (each is a tested case).
+
+## Preparing several games
+
+`Game recovery` → "Prepare several games", or `emuwiz-cli recovery prepare-all`.
+
+1. **Review** (read-only): every candidate's index and cue sheet are read. Each is
+   shown as *prepare* (files and bytes), *matches an existing copy* (nothing to
+   extract), *already prepared*, or *cannot be prepared* with the reason. The same
+   disc in two ZIPs is counted once.
+2. **Preflight**: the bytes to extract, plus 3% and the store's 1 GiB reserve, are
+   compared with the free space where copies are kept. A selection that does not fit
+   cannot be started.
+3. **One confirmation** starts the batch for the ticked games only. Nothing is ever
+   added to a batch that was not chosen; there is no "prepare the whole library".
+4. **Run**: one game at a time, never in parallel, through the same verified
+   preparation a single game uses. At most 500 games per batch.
+5. **Stop and continue**: the batch is a small file in the store, rewritten after
+   every game. Cancelling, a crash or running out of space leaves finished games
+   prepared and the rest "to do"; "Continue the unfinished batch" (`resume`) cleans
+   any half-extracted game and goes on. A game that fails is reported with its
+   reason and the batch moves to the next one.
+
+## Where copies are kept
+
+Default: `<data>/prepared-media`. Another folder can be chosen on the page ("Where
+prepared copies are kept") or with `emuwiz-cli recovery storage --set <folder>`; the
+choice is one line in `prepared_media_folder.txt` in the configuration folder. A
+folder is accepted only if it is a real folder (not a link) that belongs to you and
+that others cannot write to, is not inside a game folder and does not contain one,
+is writable, and is on a filesystem with a no-replace rename (ext4, XFS, Btrfs).
+Its location is judged before anything is created there. Copies already prepared in
+another folder are not moved and are not used from there; a damaged setting is an
+error, never a silent return to the default.
 
 ## Extending it
 
@@ -194,6 +251,14 @@ with `members()`, `fingerprint()` and `verify_structure()` rather than a rewrite
   page yet.
 - While one process prepares a disc, another process's `list` shows that work as
   "unfinished"; `clean` and `remove` answer "busy" rather than waiting.
+- A copy is found again after an outside rename only when the game's page is opened
+  (or `prepare` is run); until then the game shows as not prepared.
+- A move to another disk through EmuWiz is treated like an outside move: it is
+  re-linked by content, not carried at once.
+- Changing the storage folder does not move existing copies; games prepared in the
+  old folder need preparing again (the old folder is left untouched).
+- Bulk preparation lists CD32 ZIPs only (the one validated preparation), runs one
+  batch at a time, and has no schedule or automatic start.
 - Like every `emuwiz-cli` command, `recovery` announces itself in EmuWiz's per-user
   runtime registry (`/run/user/<uid>/emuwiz`) while it runs and removes its record on
   exit. That location is fixed by design and is not redirected by a scratch profile.
@@ -245,6 +310,18 @@ Performance, on a copy of the 163,332-game library:
 - Readiness for a candidate (a CD32 ZIP): one index record, the ZIP's metadata and
   the set's `stat` calls, about 80 µs, remembered for 750 ms. The ZIP is not read.
 - Diagnosis and preparation run on a worker thread only.
+
+Optimised build, 79 real CD32 ZIPs (10.56 GB), run inside a sandbox with the whole
+system read-only, a scratch folder writable and a private folder mounted over the
+per-user runtime folder (warm file cache):
+
+| Measurement | Result |
+|---|---|
+| 79 diagnoses, one process each | 2.65 s in total; mean 33 ms, median 32 ms, slowest 81 ms |
+| Bytes read per diagnosis (whole process, including loading the program) | 1.32 MB mean; 104 MB for all 79, under 1% of the ZIPs' size |
+| Opens of each game ZIP | one, read-only; none with a write flag |
+| Preparing the 70 preparable discs (12.98 GB of new files) | 465 s in total; mean 6.6 s, median 1.9 s, slowest 52.6 s |
+| Writes outside scratch | none; the 79 ZIPs and the real runtime folder were identical afterwards |
 
 ## Roadmap
 

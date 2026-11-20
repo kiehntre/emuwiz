@@ -58,6 +58,35 @@ enum Outcome {
     /// A change was attempted: its message, then a fresh diagnosis.
     Changed(PathBuf, bool, String, Box<RecoveryReport>),
     Verified(bool, String),
+    /// The automatic content check for a renamed or moved file finished.
+    Relinked(PathBuf, Option<(bool, String)>, Box<RecoveryReport>),
+    BulkPlanned(
+        Result<Box<recovery::BulkPlan>, String>,
+        Option<recovery::Queue>,
+    ),
+    BulkRan(Result<recovery::Queue, String>),
+    Storage(Result<StorageView, String>),
+}
+
+/// What the storage card shows.
+#[derive(Debug, Clone)]
+pub(super) struct StorageView {
+    current: PathBuf,
+    chosen: bool,
+    available: Option<u64>,
+    /// The result of checking the folder typed into the box, if any.
+    checked: Option<recovery::storage::StorageCheck>,
+    message: Option<(bool, String)>,
+}
+
+/// The "prepare several games" part of the page.
+#[derive(Default)]
+struct Bulk {
+    plan: Option<Result<recovery::BulkPlan, String>>,
+    selected: std::collections::BTreeSet<PathBuf>,
+    confirm: bool,
+    queue: Option<recovery::Queue>,
+    message: Option<(bool, String)>,
 }
 
 /// Where the page reads and writes; replaced in tests.
@@ -102,6 +131,12 @@ pub(super) struct State {
     message: Option<(bool, String)>,
     confirm_prepare: bool,
     confirm_remove: bool,
+    /// The file an automatic relink was last tried for (once per file).
+    relink_tried: Option<PathBuf>,
+    bulk: Bulk,
+    storage: Option<StorageView>,
+    storage_folder: String,
+    storage_confirm: bool,
 }
 
 impl Default for State {
@@ -120,6 +155,11 @@ impl Default for State {
             message: None,
             confirm_prepare: false,
             confirm_remove: false,
+            relink_tried: None,
+            bulk: Bulk::default(),
+            storage: None,
+            storage_folder: String::new(),
+            storage_confirm: false,
         }
     }
 }
@@ -205,6 +245,75 @@ impl State {
                 }
             }
             Outcome::Verified(ok, text) => self.message = Some((ok, text)),
+            Outcome::Relinked(path, message, report) => {
+                crate::emulator_setup::prepared_media::forget();
+                if current(&path, &self.target) {
+                    self.report = Some(*report);
+                    if message.is_some() {
+                        self.message = message;
+                    }
+                }
+            }
+            Outcome::BulkPlanned(plan, queue) => {
+                self.bulk.selected = plan
+                    .as_ref()
+                    .map(|plan| {
+                        plan.actionable()
+                            .map(|item| item.candidate.path.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.bulk.plan = Some(plan.map(|plan| *plan));
+                self.bulk.queue = queue;
+                self.bulk.confirm = false;
+            }
+            Outcome::BulkRan(result) => {
+                crate::emulator_setup::prepared_media::forget();
+                // The single-game report may be about one of these games.
+                self.report = None;
+                self.relink_tried = None;
+                self.bulk.plan = None;
+                self.bulk.message = Some(match &result {
+                    Ok(queue) => {
+                        let counts = queue.counts();
+                        let of = |key: &str| counts.get(key).copied().unwrap_or(0);
+                        (
+                            of("failed") == 0 && of("pending") == 0,
+                            format!(
+                                "{} prepared, {} already had a matching copy, {} could not be prepared, {} still to do.{} Your game files were only read.",
+                                of("prepared"),
+                                of("reused"),
+                                of("failed"),
+                                of("pending"),
+                                queue
+                                    .stopped
+                                    .as_deref()
+                                    .map(|why| format!(" Stopped: {why}"))
+                                    .unwrap_or_default()
+                            ),
+                        )
+                    }
+                    Err(detail) => (false, format!("The batch did not run: {detail}.")),
+                });
+                if let Ok(queue) = result {
+                    self.bulk.queue = Some(queue);
+                }
+            }
+            Outcome::Storage(view) => match view {
+                Ok(view) => {
+                    crate::emulator_setup::prepared_media::forget();
+                    self.storage = Some(view);
+                }
+                Err(detail) => {
+                    self.storage = Some(StorageView {
+                        current: PathBuf::new(),
+                        chosen: false,
+                        available: None,
+                        checked: None,
+                        message: Some((false, detail)),
+                    });
+                }
+            },
         }
     }
 
@@ -424,6 +533,212 @@ impl State {
         );
     }
 
+    /// Starts the background work a finished diagnosis calls for: a file that
+    /// matches an existing copy by names, sizes and checksums but is not
+    /// linked to it (renamed or moved outside EmuWiz) is compared with that
+    /// copy in full, once, and linked if every file matches. Nothing is
+    /// extracted and the game file is only read.
+    pub(super) fn maintain(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        let wanted = self.job.is_none()
+            && self
+                .report
+                .as_ref()
+                .is_some_and(|report| report.relinkable && report.subject.path == target.path)
+            && self.relink_tried.as_ref() != Some(&target.path);
+        if !wanted {
+            return;
+        }
+        self.relink_tried = Some(target.path.clone());
+        let environment = self.environment.clone();
+        let cancel = self.cancel.clone();
+        self.start(ctx, "Comparing this file with a copy prepared earlier…", move || {
+            let remembered = archivefs_core::launch::remembered_launch_system::default_remembered_launch_systems_path().ok();
+            let result = environment.store().and_then(|store| {
+                recovery::moves::rediscover(
+                    &store,
+                    remembered.as_deref(),
+                    &target.path,
+                    &TrustedRoots::none(),
+                    &DiscSetLimits::default(),
+                    &cancel,
+                    &|_| {},
+                )
+                .map_err(|error| error.to_string())
+            });
+            let message = match result {
+                Ok(recovery::RelinkOutcome::Linked {
+                    moved_from: Some(old),
+                    ..
+                }) => Some((
+                    true,
+                    format!(
+                        "This is the file that was prepared earlier as {}. EmuWiz read it in full and every disc file matches the prepared copy, so that copy is used again. Nothing was extracted.",
+                        old.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    ),
+                )),
+                Ok(recovery::RelinkOutcome::Linked { .. }) => Some((
+                    true,
+                    "This file holds exactly the disc of a copy prepared earlier (every file compared), so that copy is used. Nothing was extracted.".to_string(),
+                )),
+                Ok(recovery::RelinkOutcome::NoMatchingCopy) => None,
+                Err(detail) => Some((
+                    false,
+                    format!("The copy prepared earlier is not used for this file: {detail}. Your game file was only read."),
+                )),
+            };
+            let report = environment
+                .diagnose(&target, &AtomicBool::new(false))
+                .unwrap_or_else(|detail| unavailable_report(&target, &detail));
+            Outcome::Relinked(target.path, message, Box::new(report))
+        });
+    }
+
+    fn plan_bulk(&mut self, ctx: &egui::Context, candidates: Vec<recovery::BulkCandidate>) {
+        let environment = self.environment.clone();
+        let cancel = self.cancel.clone();
+        self.bulk.message = None;
+        self.start(ctx, "Looking at the games…", move || {
+            let result = environment.store().and_then(|store| {
+                let queue = recovery::bulk::load_queue(&store);
+                recovery::bulk::plan_bulk(
+                    &store,
+                    &candidates,
+                    &TrustedRoots::none(),
+                    &DiscSetLimits::default(),
+                    &cancel,
+                )
+                .map(|plan| (plan, queue))
+            });
+            match result {
+                Ok((plan, queue)) => Outcome::BulkPlanned(Ok(Box::new(plan)), queue),
+                Err(detail) => Outcome::BulkPlanned(Err(detail), None),
+            }
+        });
+    }
+
+    /// Runs the saved batch; with `start`, first saves the selection of the
+    /// reviewed plan as the batch.
+    fn run_bulk(&mut self, ctx: &egui::Context, start: bool) {
+        let environment = self.environment.clone();
+        let cancel = self.cancel.clone();
+        let progress = self.progress.clone();
+        let repaint = ctx.clone();
+        let plan = self.bulk.plan.clone().and_then(Result::ok);
+        let selected = self.bulk.selected.clone();
+        self.bulk.message = None;
+        self.start(
+            ctx,
+            "Preparing the selected games, one at a time…",
+            move || {
+                let result = environment.store().and_then(|store| {
+                    if start {
+                        let plan = plan.ok_or("the list was not reviewed")?;
+                        recovery::bulk::start_queue(&store, &plan, &|path| selected.contains(path))
+                            .map_err(|error| error.to_string())?;
+                    }
+                    let titles = std::cell::RefCell::new(String::new());
+                    recovery::bulk::run_queue(
+                        &store,
+                        &TrustedRoots::none(),
+                        &DiscSetLimits::default(),
+                        &cancel,
+                        &|step| {
+                            let text = match step {
+                                recovery::bulk::BulkProgress::Starting {
+                                    index,
+                                    count,
+                                    title,
+                                } => {
+                                    *titles.borrow_mut() = title.to_string();
+                                    format!("Game {} of {count}: {title}", index + 1)
+                                }
+                                recovery::bulk::BulkProgress::Step { index, count, step } => {
+                                    let part = match step {
+                                        PrepareProgress::Extracting { index, count, .. } => {
+                                            format!("reading file {} of {count}", index + 1)
+                                        }
+                                        PrepareProgress::Verifying { index, count, .. } => {
+                                            format!("checking file {} of {count}", index + 1)
+                                        }
+                                        PrepareProgress::Publishing => "finishing".to_string(),
+                                    };
+                                    format!(
+                                        "Game {} of {count}: {} ({part})",
+                                        index + 1,
+                                        titles.borrow()
+                                    )
+                                }
+                            };
+                            if let Ok(mut shown) = progress.lock() {
+                                *shown = text;
+                            }
+                            repaint.request_repaint();
+                        },
+                    )
+                    .map_err(|error| error.to_string())
+                });
+                Outcome::BulkRan(result)
+            },
+        );
+    }
+
+    fn clear_bulk(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        if let Ok(store) = self.environment.store() {
+            // One small file in EmuWiz's own folder.
+            let _ = recovery::bulk::clear_queue(&store);
+        }
+        self.bulk = Bulk::default();
+    }
+
+    /// Reads the storage setting; with `check`, examines that folder; with
+    /// `apply`, saves it (`None` clears the choice) after it passes.
+    fn storage_job(
+        &mut self,
+        ctx: &egui::Context,
+        check: Option<PathBuf>,
+        apply: Option<Option<PathBuf>>,
+    ) {
+        self.start(ctx, "Checking the folder…", move || {
+            let library: Vec<PathBuf> = archivefs_core::default_config_path()
+                .ok()
+                .and_then(|config| archivefs_core::load_source_folder_configs_from(config).ok())
+                .map(|sources| sources.into_iter().map(|source| source.path).collect())
+                .unwrap_or_default();
+            let mut message = None;
+            if let Some(choice) = &apply {
+                message = Some(
+                    match recovery::storage::set_folder(choice.as_deref(), &library) {
+                        Ok(Some(_)) => (
+                            true,
+                            "Prepared copies will now be kept in this folder. Copies already prepared elsewhere stay where they are and are not used from there.".to_string(),
+                        ),
+                        Ok(None) => (
+                            true,
+                            "Prepared copies will be kept in EmuWiz's own data folder again.".to_string(),
+                        ),
+                        Err(detail) => (false, format!("The folder was not changed: {detail}")),
+                    },
+                );
+            }
+            let checked = check.map(|folder| recovery::storage::check_folder(&folder, &library, false));
+            Outcome::Storage(recovery::storage::describe_current().map(|(store, chosen)| StorageView {
+                available: store.available_bytes().ok(),
+                current: store.root().to_path_buf(),
+                chosen,
+                checked,
+                message,
+            }))
+        });
+    }
+
     /// The prepared copy the report says may be removed: a ready one, or a
     /// damaged one named by the plan's id.
     fn removable_set_id(&self) -> Option<String> {
@@ -452,6 +767,7 @@ fn unavailable_report(target: &Target, detail: &str) -> RecoveryReport {
         plan: None,
         prepared: None,
         damaged_copy: None,
+        relinkable: false,
     }
 }
 
@@ -528,15 +844,22 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-pub(super) fn show(ui: &mut egui::Ui, state: &mut State) -> Option<Request> {
+pub(super) fn show(
+    ui: &mut egui::Ui,
+    state: &mut State,
+    eligible: &dyn Fn() -> Vec<recovery::BulkCandidate>,
+) -> Option<Request> {
     state.poll();
+    state.maintain(ui.ctx());
     let mut request = None;
     section_header(ui, "Game recovery", Some(INTRO));
+    show_bulk(ui, state, eligible);
+    show_storage(ui, state);
     let Some(target) = state.target.clone() else {
         banner(
             ui,
-            "Choose a game first",
-            "Open a game that does not start and choose “Game recovery” on its page.",
+            "One game",
+            "To work on a single game, open it and choose “Open game recovery” on its page.",
             StatusTone::Pending,
         );
         return None;
@@ -784,4 +1107,298 @@ pub(super) fn show_game_card(ui: &mut egui::Ui, state: &State, path: &Path) -> b
         }
     });
     open
+}
+
+fn busy_line(ui: &mut egui::Ui, state: &State) {
+    if let Some(busy) = state.busy {
+        ui.horizontal_wrapped(|ui| {
+            ui.spinner();
+            ui.label(busy);
+            let progress = state
+                .progress
+                .lock()
+                .map(|text| text.clone())
+                .unwrap_or_default();
+            if !progress.is_empty() {
+                ui.label(progress);
+            }
+        });
+    }
+}
+
+/// Several games in one reviewed batch: find, review, one confirmation, then
+/// one game at a time on the worker. Nothing is prepared that was not ticked.
+fn show_bulk(
+    ui: &mut egui::Ui,
+    state: &mut State,
+    eligible: &dyn Fn() -> Vec<recovery::BulkCandidate>,
+) {
+    let idle = state.job.is_none();
+    let mut find = false;
+    let mut start = false;
+    let mut resume = false;
+    let mut clear = false;
+    egui::CollapsingHeader::new("Prepare several games")
+        .id_salt("game-recovery-bulk")
+        .show(ui, |ui| {
+            ui.label(
+                "EmuWiz lists the games it can prepare, you choose which, and it prepares them one at a time. Nothing starts until you confirm, and you can cancel at any point: finished games stay prepared and the rest can be continued later.",
+            );
+            if action_button(ui, "Find games EmuWiz can prepare", ActionStyle::Secondary, idle)
+                .clicked()
+            {
+                find = true;
+            }
+            if let Some((ok, text)) = &state.bulk.message {
+                banner(
+                    ui,
+                    if *ok { "Batch finished" } else { "Batch not finished" },
+                    text,
+                    if *ok { StatusTone::Success } else { StatusTone::Warning },
+                );
+            }
+            if let Some(queue) = &state.bulk.queue {
+                let failed: Vec<_> = queue
+                    .items
+                    .iter()
+                    .filter_map(|item| match &item.state {
+                        recovery::QueueState::Failed(why) => Some((&item.candidate.title, why)),
+                        _ => None,
+                    })
+                    .collect();
+                if !failed.is_empty() {
+                    ui.collapsing(format!("Games that could not be prepared ({})", failed.len()), |ui| {
+                        for (title, why) in failed {
+                            ui.label(format!("• {title}: {why}"));
+                        }
+                    });
+                }
+                if queue.pending() > 0 {
+                    ui.label(format!(
+                        "An earlier batch still has {} game(s) to do.",
+                        queue.pending()
+                    ));
+                    ui.horizontal_wrapped(|ui| {
+                        if action_button(ui, "Continue the unfinished batch", ActionStyle::Primary, idle)
+                            .clicked()
+                        {
+                            resume = true;
+                        }
+                        if action_button(ui, "Forget the unfinished batch", ActionStyle::Secondary, idle)
+                            .clicked()
+                        {
+                            clear = true;
+                        }
+                    });
+                }
+            }
+            match &state.bulk.plan {
+                None => {}
+                Some(Err(detail)) => {
+                    banner(ui, "The games could not be listed", detail, StatusTone::Blocked);
+                }
+                Some(Ok(plan)) => {
+                    let selected = &mut state.bulk.selected;
+                    let ready = plan.count(|item| matches!(item, recovery::BulkItemPlan::AlreadyPrepared));
+                    let refused = plan.count(|item| matches!(item, recovery::BulkItemPlan::Refused(_)));
+                    ui.label(format!(
+                        "{} game(s) can be prepared; {ready} already have a prepared copy; {refused} cannot be prepared.",
+                        plan.actionable().count()
+                    ));
+                    egui::ScrollArea::vertical()
+                        .id_salt("game-recovery-bulk-list")
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for item in plan.actionable() {
+                                let path = &item.candidate.path;
+                                let mut ticked = selected.contains(path);
+                                let what = match &item.plan {
+                                    recovery::BulkItemPlan::Extract { files, bytes } => {
+                                        format!("{files} new files, {}", human_bytes(*bytes))
+                                    }
+                                    _ => "matches an existing copy; nothing to extract".to_string(),
+                                };
+                                if ui
+                                    .checkbox(&mut ticked, format!("{} — {what}", item.candidate.title))
+                                    .changed()
+                                {
+                                    if ticked {
+                                        selected.insert(path.clone());
+                                    } else {
+                                        selected.remove(path);
+                                    }
+                                }
+                            }
+                        });
+                    if refused > 0 {
+                        ui.collapsing(format!("Cannot be prepared ({refused})"), |ui| {
+                            for item in &plan.items {
+                                if let recovery::BulkItemPlan::Refused(why) = &item.plan {
+                                    ui.label(format!("• {}: {why}", item.candidate.title));
+                                }
+                            }
+                        });
+                    }
+                    let chosen = |path: &Path| selected.contains(path);
+                    let needed = plan.required_for(&chosen);
+                    let fits = plan.enough_space_for(&chosen) || needed == 0;
+                    ui.label(format!(
+                        "Selected: {} game(s). Space needed (with a safety margin): {}. Free in {}: {}.",
+                        selected.len(),
+                        human_bytes(needed),
+                        plan.store.display(),
+                        plan.available_bytes
+                            .map_or("unknown".to_string(), human_bytes)
+                    ));
+                    if !fits {
+                        banner(
+                            ui,
+                            "Not enough free space for this selection",
+                            "Choose fewer games, free some space, or choose another folder for prepared copies below. Nothing has been started.",
+                            StatusTone::Blocked,
+                        );
+                    }
+                    ui.checkbox(
+                        &mut state.bulk.confirm,
+                        "Yes, prepare the selected games as new files. My game files stay as they are.",
+                    );
+                    if action_button(
+                        ui,
+                        "Prepare the selected games",
+                        ActionStyle::Primary,
+                        idle && state.bulk.confirm && fits && !selected.is_empty(),
+                    )
+                    .clicked()
+                    {
+                        start = true;
+                    }
+                }
+            }
+            busy_line(ui, state);
+            if !idle && action_button(ui, "Cancel the batch", ActionStyle::Secondary, true).clicked() {
+                state.cancel.store(true, Ordering::Relaxed);
+            }
+        });
+    if find {
+        state.plan_bulk(ui.ctx(), eligible());
+    }
+    if start {
+        state.bulk.confirm = false;
+        state.run_bulk(ui.ctx(), true);
+    }
+    if resume {
+        state.run_bulk(ui.ctx(), false);
+    }
+    if clear {
+        state.clear_bulk();
+    }
+}
+
+/// Where prepared copies are kept, and choosing another folder for them.
+fn show_storage(ui: &mut egui::Ui, state: &mut State) {
+    let idle = state.job.is_none();
+    let mut job: Option<(Option<PathBuf>, Option<Option<PathBuf>>)> = None;
+    let opened = egui::CollapsingHeader::new("Where prepared copies are kept")
+        .id_salt("game-recovery-storage")
+        .show(ui, |ui| {
+            ui.label(
+                "A prepared copy is as large as the disc it came from (a CD game is up to about 700 MiB). You can keep the copies on another disk.",
+            );
+            match &state.storage {
+                None => {
+                    ui.label("Looking…");
+                }
+                Some(view) => {
+                    if let Some((ok, text)) = &view.message {
+                        banner(
+                            ui,
+                            if *ok { "Done" } else { "Not done" },
+                            text,
+                            if *ok { StatusTone::Success } else { StatusTone::Blocked },
+                        );
+                    }
+                    ui.label(format!(
+                        "Now: {}{}. Free there: {}.",
+                        view.current.display(),
+                        if view.chosen { " (your choice)" } else { " (EmuWiz's own data folder)" },
+                        view.available.map_or("unknown".to_string(), human_bytes)
+                    ));
+                    if let Some(check) = &view.checked {
+                        if check.usable() {
+                            banner(
+                                ui,
+                                "This folder can be used",
+                                &format!(
+                                    "Free there: {}. {}",
+                                    check.available_bytes.map_or("unknown".to_string(), human_bytes),
+                                    check.notes.join(" ")
+                                ),
+                                StatusTone::Success,
+                            );
+                        } else {
+                            banner(
+                                ui,
+                                "This folder cannot be used",
+                                &check.problems.join(" "),
+                                StatusTone::Blocked,
+                            );
+                        }
+                    }
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("Another folder:");
+                ui.text_edit_singleline(&mut state.storage_folder);
+            });
+            let typed = PathBuf::from(state.storage_folder.trim());
+            let checked_ok = state.storage.as_ref().is_some_and(|view| {
+                view.checked
+                    .as_ref()
+                    .is_some_and(|check| check.usable() && check.folder == typed)
+            });
+            ui.checkbox(
+                &mut state.storage_confirm,
+                "Yes, keep new prepared copies in this folder. Copies already prepared elsewhere are not moved.",
+            );
+            ui.horizontal_wrapped(|ui| {
+                if action_button(
+                    ui,
+                    "Check this folder",
+                    ActionStyle::Secondary,
+                    idle && !state.storage_folder.trim().is_empty(),
+                )
+                .clicked()
+                {
+                    job = Some((Some(typed.clone()), None));
+                }
+                if action_button(
+                    ui,
+                    "Use this folder",
+                    ActionStyle::Primary,
+                    idle && checked_ok && state.storage_confirm,
+                )
+                .clicked()
+                {
+                    job = Some((None, Some(Some(typed.clone()))));
+                }
+                if action_button(
+                    ui,
+                    "Use EmuWiz's own data folder",
+                    ActionStyle::Secondary,
+                    idle && state.storage.as_ref().is_some_and(|view| view.chosen),
+                )
+                .clicked()
+                {
+                    job = Some((None, Some(None)));
+                }
+            });
+        });
+    // The first time the section is opened, read the setting once.
+    if opened.fully_open() && state.storage.is_none() && idle && job.is_none() {
+        job = Some((None, None));
+    }
+    if let Some((check, apply)) = job {
+        state.storage_confirm = false;
+        state.storage_job(ui.ctx(), check, apply);
+    }
 }

@@ -24,12 +24,18 @@ emuwiz-cli recovery <command>
   verify <copy-id>                           re-read a prepared copy against its receipt (read-only)
   remove <copy-id>                           delete a prepared copy EmuWiz created
   clean                                      delete the leftovers of unfinished preparations
+  prepare-all <game-file>... --system <s>    review several games; with --yes, prepare them one at a time
+  queue                                      the saved batch and what is left of it (read-only)
+  resume                                     continue an unfinished batch
+  forget-queue                               forget the saved batch (prepared copies are kept)
+  storage [--set <folder> | --reset]         where prepared copies are kept; choose another folder
 
 Options:
   --system <system>     the system the library records for the file, for example AmigaCD32
   --system-source <s>   how it was recorded (folder_alias, manual); a folder is never proof
   --store <folder>      use this prepared-media folder (absolute path) instead of the profile's
   --json                machine-readable output for diagnose and list
+  --yes                 with prepare-all: start the reviewed batch (without it, only the review is shown)
 
 The game file is only ever read. `prepare` never overwrites: an existing verified
 copy is reused, a damaged one is refused until you remove it. Nothing is downloaded.";
@@ -41,6 +47,9 @@ pub fn run(args: Vec<String>) -> Outcome {
     let mut system = None;
     let mut system_source = None;
     let mut store_override = None;
+    let mut yes = false;
+    let mut set_folder = None;
+    let mut reset_folder = false;
     let mut positional = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -51,6 +60,9 @@ pub fn run(args: Vec<String>) -> Outcome {
                 return Ok(());
             }
             "--json" => json = true,
+            "--yes" => yes = true,
+            "--set" => set_folder = Some(args.next().ok_or("--set needs a folder")?),
+            "--reset" => reset_folder = true,
             "--system" => system = Some(args.next().ok_or("--system needs a system name")?),
             "--system-source" => {
                 system_source = Some(args.next().ok_or("--system-source needs a value")?);
@@ -233,8 +245,151 @@ pub fn run(args: Vec<String>) -> Outcome {
                 print_removal(report);
             }
         }
+        "prepare-all" => {
+            let system = system
+                .as_deref()
+                .ok_or("recovery needs --system <system>: the engine never guesses a system")?;
+            let canonical = archivefs_core::canonical_platform_for_alias(system)
+                .ok_or_else(|| format!("{system:?} is not a system EmuWiz knows"))?;
+            if rest.is_empty() {
+                return Err(format!("recovery prepare-all needs game files\n\n{USAGE}").into());
+            }
+            let candidates: Vec<recovery::BulkCandidate> = rest
+                .iter()
+                .map(|value| {
+                    let path = absolute(Path::new(value));
+                    recovery::BulkCandidate {
+                        title: path
+                            .file_stem()
+                            .map(|stem| stem.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        path,
+                        platform_id: canonical.to_string(),
+                    }
+                })
+                .collect();
+            let plan = recovery::bulk::plan_bulk(
+                &store,
+                &candidates,
+                &trusted,
+                &DiscSetLimits::default(),
+                &cancel,
+            )?;
+            for item in &plan.items {
+                let what = match &item.plan {
+                    recovery::BulkItemPlan::Extract { files, bytes } => {
+                        format!("prepare: {files} new files, {bytes} bytes")
+                    }
+                    recovery::BulkItemPlan::Reuse => {
+                        "matches an existing copy: compare in full, extract nothing".to_string()
+                    }
+                    recovery::BulkItemPlan::AlreadyPrepared => "already prepared".to_string(),
+                    recovery::BulkItemPlan::Refused(why) => format!("cannot be prepared: {why}"),
+                };
+                println!("{}\n    {what}", item.candidate.path.display());
+            }
+            println!(
+                "\n{} to do, {} bytes of new files; needs {} bytes free in {}; {} free.",
+                plan.actionable().count(),
+                plan.extract_bytes,
+                plan.required_free_bytes,
+                plan.store.display(),
+                plan.available_bytes
+                    .map_or("unknown".to_string(), |bytes| bytes.to_string())
+            );
+            if !yes {
+                println!("Review only: nothing was changed. Add --yes to prepare these games.");
+                return Ok(());
+            }
+            recovery::bulk::start_queue(&store, &plan, &|_| true)
+                .map_err(|error| format!("{error}. Nothing was changed."))?;
+            run_batch(&store, &trusted, &cancel)?;
+        }
+        "queue" => match recovery::bulk::load_queue(&store) {
+            Some(queue) => print_queue(&queue),
+            None => println!("There is no saved batch. Nothing was changed."),
+        },
+        "resume" => run_batch(&store, &trusted, &cancel)?,
+        "forget-queue" => {
+            recovery::bulk::clear_queue(&store).map_err(|error| error.to_string())?;
+            println!("The saved batch was forgotten. Prepared copies were not touched.");
+        }
+        "storage" => {
+            let library: Vec<PathBuf> = archivefs_core::default_config_path()
+                .ok()
+                .and_then(|config| archivefs_core::load_source_folder_configs_from(config).ok())
+                .map(|sources| sources.into_iter().map(|source| source.path).collect())
+                .unwrap_or_default();
+            if reset_folder {
+                recovery::storage::set_folder(None, &library)?;
+                println!("Prepared copies will be kept in EmuWiz's own data folder again.");
+            } else if let Some(folder) = set_folder {
+                let check = recovery::storage::set_folder(Some(Path::new(&folder)), &library)
+                    .map_err(|detail| format!("The folder was not changed: {detail}"))?;
+                println!(
+                    "Prepared copies will now be kept in {folder}.{} Copies already prepared elsewhere are not moved.",
+                    check
+                        .and_then(|check| check.available_bytes)
+                        .map(|bytes| format!(" {bytes} bytes free there."))
+                        .unwrap_or_default()
+                );
+            }
+            let (current, chosen) = recovery::storage::describe_current()?;
+            println!(
+                "Prepared copies are kept in {}{}; {} free.",
+                current.root().display(),
+                if chosen {
+                    " (your choice)"
+                } else {
+                    " (default)"
+                },
+                current
+                    .available_bytes()
+                    .map_or("unknown space".to_string(), |bytes| format!(
+                        "{bytes} bytes"
+                    ))
+            );
+        }
         other => return Err(format!("unknown recovery command {other:?}\n\n{USAGE}").into()),
     }
+    Ok(())
+}
+
+fn print_queue(queue: &recovery::Queue) {
+    for item in &queue.items {
+        let state = match &item.state {
+            recovery::QueueState::Pending => "to do".to_string(),
+            recovery::QueueState::Prepared => "prepared".to_string(),
+            recovery::QueueState::Reused => "matched an existing copy".to_string(),
+            recovery::QueueState::Failed(why) => format!("not prepared: {why}"),
+        };
+        println!("{}\n    {state}", item.candidate.path.display());
+    }
+    if let Some(why) = &queue.stopped {
+        println!("Stopped early: {why}");
+    }
+    println!("{:?}", queue.counts());
+}
+
+fn run_batch(
+    store: &PreparedMediaStore,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let queue =
+        recovery::bulk::run_queue(store, trusted, &DiscSetLimits::default(), cancel, &|step| {
+            if let recovery::bulk::BulkProgress::Starting {
+                index,
+                count,
+                title,
+            } = step
+            {
+                eprintln!("game {}/{count}: {title}", index + 1);
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    print_queue(&queue);
+    println!("The game files were only read.");
     Ok(())
 }
 
@@ -455,5 +610,53 @@ mod tests {
         assert!(run(strings(&["remove", &prepared.set_id, "--store", store_arg])).is_err());
         assert!(run(strings(&["verify", &prepared.set_id, "--store", store_arg])).is_err());
         assert_eq!(std::fs::read(&zip).unwrap(), before);
+    }
+
+    #[test]
+    fn a_batch_is_only_reviewed_without_yes_and_runs_one_game_at_a_time_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let store = dir.join("store");
+        let store_arg = store.to_str().unwrap();
+        let mut zips = Vec::new();
+        for title in ["First Disc", "Second Disc"] {
+            let members = cd_disc_set(title);
+            let borrowed: Vec<(&str, &[u8])> = members
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+                .collect();
+            let zip = dir.join(format!("{title}.zip"));
+            std::fs::write(&zip, stored_zip(&borrowed)).unwrap();
+            zips.push(zip);
+        }
+        let broken = dir.join("Broken.zip");
+        std::fs::write(&broken, b"not a zip").unwrap();
+        let batch = |extra: &[&str]| {
+            let mut args = strings(&["prepare-all", "--system", "AmigaCD32", "--store", store_arg]);
+            args.extend(zips.iter().map(|zip| zip.to_str().unwrap().to_string()));
+            args.push(broken.to_str().unwrap().to_string());
+            args.extend(strings(extra));
+            run(args)
+        };
+        // Review only.
+        batch(&[]).unwrap();
+        assert!(!store.exists());
+        run(strings(&["queue", "--store", store_arg])).unwrap();
+        assert!(run(strings(&["resume", "--store", store_arg])).is_err());
+
+        batch(&["--yes"]).unwrap();
+        let prepared = PreparedMediaStore::at(&store);
+        assert_eq!(prepared.list().len(), 2);
+        for zip in &zips {
+            assert!(prepared.prepared_for_source(zip).is_some());
+        }
+        let queue = recovery::bulk::load_queue(&prepared).unwrap();
+        assert_eq!(queue.items.len(), 2, "the unreadable file was never queued");
+        assert_eq!(queue.pending(), 0);
+        // Nothing left to do: a second batch is refused, nothing changes.
+        assert!(batch(&["--yes"]).is_err());
+        run(strings(&["forget-queue", "--store", store_arg])).unwrap();
+        assert!(recovery::bulk::load_queue(&prepared).is_none());
+        assert_eq!(prepared.list().len(), 2);
     }
 }

@@ -161,7 +161,30 @@ impl App {
             ToolPage::MemoryCards => super::memory_cards::show(ui, &mut self.tools.memory_cards),
             ToolPage::GameRecovery => {
                 use super::game_recovery::{Request, show};
-                match show(ui, &mut self.tools.game_recovery) {
+                // Walked only when the person asks for the list.
+                let library = self.library.clone();
+                let eligible = move || {
+                    library
+                        .games
+                        .iter()
+                        .filter_map(|game| {
+                            let platform =
+                                archivefs_core::canonical_platform_for_alias(&game.platform)?;
+                            archivefs_core::recovery::preparation_may_apply(
+                                &game.archive.absolute_path,
+                                Some(platform),
+                            )
+                            .then(|| {
+                                archivefs_core::recovery::BulkCandidate {
+                                    path: game.archive.absolute_path.clone(),
+                                    platform_id: platform.to_string(),
+                                    title: game.title.clone(),
+                                }
+                            })
+                        })
+                        .collect()
+                };
+                match show(ui, &mut self.tools.game_recovery, &eligible) {
                     Some(Request::OpenLaunch(game)) => self.go(super::routes::Route::Task {
                         section: super::routes::Section::Launch,
                         game,

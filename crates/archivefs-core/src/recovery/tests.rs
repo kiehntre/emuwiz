@@ -1674,3 +1674,851 @@ fn a_disc_whose_own_label_names_another_system_is_not_prepared_as_cd32() {
     assert!(lab.store_files().is_empty());
     assert!(lab.store.list().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Renames and moves of a prepared ZIP
+// ---------------------------------------------------------------------------
+
+mod moves_tests {
+    use super::*;
+    use crate::launch::remembered_launch_system as remembered;
+    use crate::recovery::moves;
+
+    struct Moved {
+        lab: Lab,
+        zip: PathBuf,
+        summary: PreparedSetSummary,
+        remembered_file: PathBuf,
+    }
+
+    /// A prepared ZIP with a remembered launch choice.
+    fn prepared_and_remembered() -> Moved {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let summary = lab.prepare(&zip).unwrap().summary;
+        let remembered_file = lab.root.join("config/remembered_launch_systems.json");
+        remembered::remember_launch_system_at(
+            &remembered_file,
+            &remembered::RememberedLaunchSystem::for_current_file(&zip, "AmigaCD32").unwrap(),
+        )
+        .unwrap();
+        Moved {
+            lab,
+            zip,
+            summary,
+            remembered_file,
+        }
+    }
+
+    fn remembered_for(moved: &Moved, path: &Path) -> Option<&'static str> {
+        remembered::remembered_launch_system_at(&moved.remembered_file, path)
+    }
+
+    /// What EmuWiz's own rename does: capture, rename, carry.
+    fn emuwiz_rename(moved: &Moved, from: &Path, to: &Path) -> usize {
+        let pending = moves::before_in(&moved.lab.store, [(from, to)]);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::rename(from, to).unwrap();
+        moves::after_in(
+            &moved.lab.store,
+            Some(&moved.remembered_file),
+            pending,
+            |_, _| true,
+        )
+    }
+
+    fn rediscover(moved: &Moved, path: &Path) -> Result<RelinkOutcome, PrepareError> {
+        moves::rediscover(
+            &moved.lab.store,
+            Some(&moved.remembered_file),
+            path,
+            &moved.lab.trusted,
+            &DiscSetLimits::default(),
+            &moved.lab.cancel,
+            &|_| {},
+        )
+    }
+
+    #[test]
+    fn an_emuwiz_rename_move_and_undo_keep_the_copy_and_the_remembered_choice() {
+        let moved = prepared_and_remembered();
+        let track_inode = std::fs::metadata(&moved.summary.launch_path).unwrap().ino();
+        let renamed = moved.lab.zip_path("A Better Name (1994).zip");
+        assert_eq!(emuwiz_rename(&moved, &moved.zip, &renamed), 1);
+        assert_eq!(
+            moved.lab.store.prepared_for_source(&renamed),
+            Some(moved.summary.clone())
+        );
+        assert!(moved.lab.store.prepared_for_source(&moved.zip).is_none());
+        assert_eq!(remembered_for(&moved, &renamed), Some("AmigaCD32"));
+        assert_eq!(remembered_for(&moved, &moved.zip), None);
+
+        // A move to another folder on the same disk.
+        let elsewhere = moved
+            .lab
+            .root
+            .join("games/sorted/cd32/A Better Name (1994).zip");
+        assert_eq!(emuwiz_rename(&moved, &renamed, &elsewhere), 1);
+        assert_eq!(
+            moved.lab.store.prepared_for_source(&elsewhere),
+            Some(moved.summary.clone())
+        );
+        assert_eq!(remembered_for(&moved, &elsewhere), Some("AmigaCD32"));
+        // What a launch checks after the move: the copy for this file, and
+        // its cue sheet through the launch gate.
+        let after_move = moved.lab.store.prepared_for_source(&elsewhere).unwrap();
+        assert!(matches!(
+            moved.lab.store.check_launch_path(&after_move.launch_path),
+            LaunchPathCheck::Verified(_)
+        ));
+
+        // Undo, twice: back where it started.
+        assert_eq!(emuwiz_rename(&moved, &elsewhere, &renamed), 1);
+        assert_eq!(emuwiz_rename(&moved, &renamed, &moved.zip), 1);
+        assert_eq!(
+            moved.lab.store.prepared_for_source(&moved.zip),
+            Some(moved.summary.clone())
+        );
+        assert_eq!(remembered_for(&moved, &moved.zip), Some("AmigaCD32"));
+        // Nothing was extracted again and exactly one link record exists.
+        assert_eq!(
+            std::fs::metadata(&moved.summary.launch_path).unwrap().ino(),
+            track_inode
+        );
+        assert_eq!(
+            std::fs::read_dir(moved.lab.store.root().join("v1/sources"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            moved
+                .lab
+                .journal()
+                .matches("source_link_followed_rename")
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn a_rename_that_did_not_happen_or_a_stale_link_is_not_followed() {
+        let moved = prepared_and_remembered();
+        let renamed = moved.lab.zip_path("renamed.zip");
+        // The transaction reports that this entry was not applied.
+        let pending =
+            moves::before_in(&moved.lab.store, [(moved.zip.as_path(), renamed.as_path())]);
+        assert!(!pending.is_empty());
+        assert_eq!(
+            moves::after_in(
+                &moved.lab.store,
+                Some(&moved.remembered_file),
+                pending,
+                |_, _| false
+            ),
+            0
+        );
+        assert!(moved.lab.store.prepared_for_source(&moved.zip).is_some());
+
+        // The ZIP changed after preparation: nothing to capture, nothing carried.
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&moved.zip)
+            .unwrap();
+        file.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(3_000_000),
+        )
+        .unwrap();
+        drop(file);
+        assert_eq!(emuwiz_rename(&moved, &moved.zip, &renamed), 0);
+        assert!(moved.lab.store.prepared_for_source(&renamed).is_none());
+        assert_eq!(remembered_for(&moved, &renamed), None);
+    }
+
+    #[test]
+    fn a_different_file_with_the_same_name_size_and_times_is_never_accepted() {
+        let moved = prepared_and_remembered();
+        let metadata = std::fs::metadata(&moved.zip).unwrap();
+        let (size, modified, accessed) = (
+            metadata.len(),
+            metadata.modified().unwrap(),
+            metadata.accessed().unwrap(),
+        );
+        let renamed = moved.lab.zip_path("renamed.zip");
+        let pending =
+            moves::before_in(&moved.lab.store, [(moved.zip.as_path(), renamed.as_path())]);
+        // Instead of the rename: another file of the same size and times
+        // appears at the new name, and the original disappears.
+        std::fs::write(&renamed, vec![0x5a_u8; size as usize]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&renamed)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(accessed)
+                    .set_modified(modified),
+            )
+            .unwrap();
+        std::fs::remove_file(&moved.zip).unwrap();
+        assert_eq!(
+            moves::after_in(
+                &moved.lab.store,
+                Some(&moved.remembered_file),
+                pending,
+                |_, _| true
+            ),
+            0
+        );
+        assert!(moved.lab.store.prepared_for_source(&renamed).is_none());
+        assert_eq!(remembered_for(&moved, &renamed), None);
+        // The content check refuses it too.
+        assert!(rediscover(&moved, &renamed).is_err());
+        assert!(moved.lab.store.prepared_for_source(&renamed).is_none());
+
+        // The same trick at the original path: same name, size and times.
+        let second = prepared_and_remembered();
+        let metadata = std::fs::metadata(&second.zip).unwrap();
+        let (modified, accessed) = (metadata.modified().unwrap(), metadata.accessed().unwrap());
+        let mut members = standard_members();
+        members[0].1 = iso_bytes("CDTV", "IMPOSTOR!");
+        write_zip(&second.zip, &members);
+        std::fs::File::options()
+            .write(true)
+            .open(&second.zip)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(accessed)
+                    .set_modified(modified),
+            )
+            .unwrap();
+        assert!(second.lab.store.prepared_for_source(&second.zip).is_none());
+    }
+
+    #[test]
+    fn a_zip_renamed_outside_emuwiz_finds_its_copy_by_content_without_extracting() {
+        let moved = prepared_and_remembered();
+        let track_inode = std::fs::metadata(&moved.summary.launch_path).unwrap().ino();
+        let renamed = moved
+            .lab
+            .root
+            .join("games/amiga-cd32/Renamed In A File Manager.zip");
+        std::fs::rename(&moved.zip, &renamed).unwrap();
+        assert!(moved.lab.store.prepared_for_source(&renamed).is_none());
+        let report = moved.lab.diagnose(&renamed);
+        assert!(report.relinkable);
+        assert_eq!(report.verdict, RecoveryVerdict::FixableByPreparation);
+
+        assert_eq!(
+            rediscover(&moved, &renamed).unwrap(),
+            RelinkOutcome::Linked {
+                summary: Box::new(moved.summary.clone()),
+                moved_from: Some(moved.zip.clone()),
+            }
+        );
+        assert_eq!(
+            moved.lab.store.prepared_for_source(&renamed),
+            Some(moved.summary.clone())
+        );
+        assert_eq!(remembered_for(&moved, &renamed), Some("AmigaCD32"));
+        assert_eq!(
+            std::fs::metadata(&moved.summary.launch_path).unwrap().ino(),
+            track_inode,
+            "nothing was extracted again"
+        );
+        // The stale record of the old path is gone.
+        assert_eq!(
+            std::fs::read_dir(moved.lab.store.root().join("v1/sources"))
+                .unwrap()
+                .count(),
+            1
+        );
+        let report = moved.lab.diagnose(&renamed);
+        assert!(!report.relinkable);
+        assert_eq!(report.verdict, RecoveryVerdict::PlayableFromPreparedCopy);
+        assert!(moved.lab.journal().contains("source_linked_by_content"));
+    }
+
+    #[test]
+    fn a_copy_of_the_zip_is_linked_but_inherits_no_remembered_choice() {
+        let moved = prepared_and_remembered();
+        let duplicate = moved.lab.zip_path("duplicate.zip");
+        std::fs::copy(&moved.zip, &duplicate).unwrap();
+        assert_eq!(
+            rediscover(&moved, &duplicate).unwrap(),
+            RelinkOutcome::Linked {
+                summary: Box::new(moved.summary.clone()),
+                moved_from: None,
+            }
+        );
+        assert!(moved.lab.store.prepared_for_source(&duplicate).is_some());
+        assert!(moved.lab.store.prepared_for_source(&moved.zip).is_some());
+        assert_eq!(
+            remembered_for(&moved, &duplicate),
+            None,
+            "ambiguous: both exist"
+        );
+        assert_eq!(remembered_for(&moved, &moved.zip), Some("AmigaCD32"));
+    }
+
+    #[test]
+    fn a_modified_or_unknown_zip_is_not_linked() {
+        let moved = prepared_and_remembered();
+        std::fs::remove_file(&moved.zip).unwrap();
+        // Another disc entirely.
+        let other = moved.lab.zip_path("other.zip");
+        let mut members = standard_members();
+        members[0].1 = iso_bytes("CDTV", "OTHERDISC");
+        write_zip(&other, &members);
+        assert_eq!(
+            rediscover(&moved, &other).unwrap(),
+            RelinkOutcome::NoMatchingCopy
+        );
+        assert!(moved.lab.store.prepared_for_source(&other).is_none());
+        assert_eq!(remembered_for(&moved, &other), None);
+        // Not a ZIP at all.
+        let broken = moved.lab.zip_path("broken.zip");
+        std::fs::write(&broken, b"not a zip").unwrap();
+        assert!(rediscover(&moved, &broken).is_err());
+        // A store that does not exist yet is not created by looking.
+        let empty = Lab::new();
+        let zip = empty.standard_zip();
+        assert_eq!(
+            empty
+                .store
+                .relink(
+                    &zip,
+                    &empty.trusted,
+                    &DiscSetLimits::default(),
+                    &empty.cancel,
+                    &|_| {}
+                )
+                .unwrap(),
+            RelinkOutcome::NoMatchingCopy
+        );
+        assert!(!empty.store.root().exists());
+    }
+
+    #[test]
+    fn a_rename_during_another_preparation_is_recovered_by_content_afterwards() {
+        let moved = std::sync::Arc::new(prepared_and_remembered());
+        let other = moved.lab.zip_path("other.zip");
+        let mut members = standard_members();
+        members[0].1 = iso_bytes("CDTV", "OTHERDISC");
+        write_zip(&other, &members);
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let moved = moved.clone();
+            std::thread::spawn(move || {
+                with_hook(
+                    move |reached| {
+                        if reached == Point::AfterIntent {
+                            reached_tx.send(()).unwrap();
+                            resume_rx.recv().unwrap();
+                        }
+                    },
+                    || moved.lab.prepare(&other),
+                )
+            })
+        };
+        reached_rx.recv().unwrap();
+        let renamed = moved.lab.zip_path("renamed.zip");
+        // The store is busy: the rename itself is never held up or failed.
+        assert_eq!(emuwiz_rename(&moved, &moved.zip, &renamed), 0);
+        resume_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_ok());
+        assert!(moved.lab.store.prepared_for_source(&renamed).is_none());
+        assert!(matches!(
+            rediscover(&moved, &renamed).unwrap(),
+            RelinkOutcome::Linked {
+                moved_from: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(remembered_for(&moved, &renamed), Some("AmigaCD32"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk preparation
+// ---------------------------------------------------------------------------
+
+mod bulk_tests {
+    use super::*;
+    use crate::recovery::bulk::*;
+    use crate::recovery::prepared_media::FREE_SPACE_OVERRIDE;
+
+    fn candidate(path: &Path) -> BulkCandidate {
+        BulkCandidate {
+            path: path.to_path_buf(),
+            platform_id: "AmigaCD32".into(),
+            title: path.file_stem().unwrap().to_string_lossy().into_owned(),
+        }
+    }
+
+    /// `count` different discs.
+    fn discs(lab: &Lab, count: usize) -> Vec<PathBuf> {
+        (0..count)
+            .map(|index| {
+                let path = lab.zip_path(&format!("disc-{index}.zip"));
+                let mut members = standard_members();
+                members[0].1 = iso_bytes("CDTV", &format!("DISC{index}"));
+                write_zip(&path, &members);
+                path
+            })
+            .collect()
+    }
+
+    fn plan(lab: &Lab, paths: &[PathBuf]) -> BulkPlan {
+        let candidates: Vec<_> = paths.iter().map(|path| candidate(path)).collect();
+        plan_bulk(
+            &lab.store,
+            &candidates,
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+        )
+        .unwrap()
+    }
+
+    fn run(lab: &Lab) -> Result<Queue, BulkError> {
+        run_queue(
+            &lab.store,
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+            &|_| {},
+        )
+    }
+
+    fn states(queue: &Queue) -> Vec<&'static str> {
+        queue
+            .items
+            .iter()
+            .map(|item| match item.state {
+                QueueState::Pending => "pending",
+                QueueState::Prepared => "prepared",
+                QueueState::Reused => "reused",
+                QueueState::Failed(_) => "failed",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_review_sorts_games_and_counts_each_disc_once_and_writes_nothing() {
+        let lab = Lab::new();
+        let mut paths = discs(&lab, 2);
+        let duplicate = lab.zip_path("duplicate-of-0.zip");
+        std::fs::copy(&paths[0], &duplicate).unwrap();
+        let broken = lab.zip_path("broken.zip");
+        std::fs::write(&broken, b"not a zip").unwrap();
+        let wrong = lab.root.join("games/amiga-cd32/game.chd");
+        std::fs::write(&wrong, b"x").unwrap();
+        paths.extend([duplicate, broken, wrong, paths[1].clone()]);
+        let plan = plan(&lab, &paths);
+        let kinds: Vec<&str> = plan
+            .items
+            .iter()
+            .map(|item| match item.plan {
+                BulkItemPlan::Extract { .. } => "extract",
+                BulkItemPlan::Reuse => "reuse",
+                BulkItemPlan::AlreadyPrepared => "ready",
+                BulkItemPlan::Refused(_) => "refused",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "extract", "extract", "reuse", "refused", "refused", "refused"
+            ]
+        );
+        let one = match plan.items[0].plan {
+            BulkItemPlan::Extract { bytes, .. } => bytes,
+            _ => unreachable!(),
+        };
+        assert_eq!(plan.extract_bytes, 2 * one, "the duplicate adds nothing");
+        assert!(plan.required_free_bytes > plan.extract_bytes + FREE_SPACE_RESERVE_BYTES);
+        assert!(!lab.store.root().exists(), "a review creates nothing");
+
+        let too_many: Vec<_> = (0..=MAX_BULK_ITEMS)
+            .map(|index| candidate(&lab.zip_path(&format!("{index}.zip"))))
+            .collect();
+        assert!(
+            plan_bulk(
+                &lab.store,
+                &too_many,
+                &lab.trusted,
+                &DiscSetLimits::default(),
+                &lab.cancel
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_batch_prepares_only_the_chosen_games_and_reuses_existing_copies() {
+        let lab = Lab::new();
+        let mut paths = discs(&lab, 3);
+        let duplicate = lab.zip_path("duplicate-of-0.zip");
+        std::fs::copy(&paths[0], &duplicate).unwrap();
+        paths.push(duplicate.clone());
+        let before: Vec<_> = paths.iter().map(|path| snapshot(path)).collect();
+        let reviewed = plan(&lab, &paths);
+        // Disc 2 is left unticked.
+        let skipped = paths[2].clone();
+        let queue = start_queue(&lab.store, &reviewed, &|path| path != skipped).unwrap();
+        assert_eq!(states(&queue), ["pending", "pending", "pending"]);
+        let queue = run(&lab).unwrap();
+        assert_eq!(states(&queue), ["prepared", "prepared", "reused"]);
+        assert_eq!(queue.stopped, None);
+        assert_eq!(lab.store.list().len(), 2);
+        assert!(lab.store.prepared_for_source(&paths[0]).is_some());
+        assert!(lab.store.prepared_for_source(&duplicate).is_some());
+        assert!(
+            lab.store.prepared_for_source(&skipped).is_none(),
+            "not chosen, not prepared"
+        );
+        for (path, facts) in paths.iter().zip(before) {
+            assert_eq!(snapshot(path), facts, "{}", path.display());
+        }
+        // A new review sees them as done; a batch with nothing to do is refused.
+        let again = plan(&lab, &paths);
+        assert_eq!(again.actionable().count(), 1);
+        assert_eq!(
+            again.count(|item| matches!(item, BulkItemPlan::AlreadyPrepared)),
+            3
+        );
+        assert_eq!(
+            start_queue(&lab.store, &again, &|path| path != skipped),
+            Err(BulkError::NothingChosen)
+        );
+    }
+
+    #[test]
+    fn a_game_that_fails_is_reported_and_the_batch_goes_on() {
+        let lab = Lab::new();
+        let paths = discs(&lab, 3);
+        let reviewed = plan(&lab, &paths);
+        start_queue(&lab.store, &reviewed, &|_| true).unwrap();
+        // The second ZIP is damaged after the review.
+        let mut bytes = std::fs::read(&paths[1]).unwrap();
+        let middle = bytes.len() / 3;
+        bytes[middle] ^= 0x55;
+        std::fs::write(&paths[1], bytes).unwrap();
+        let queue = run(&lab).unwrap();
+        assert_eq!(states(&queue), ["prepared", "failed", "prepared"]);
+        assert!(matches!(&queue.items[1].state, QueueState::Failed(why) if !why.is_empty()));
+        assert_eq!(lab.store.list().len(), 2);
+        assert!(lab.store.interrupted().is_empty());
+    }
+
+    #[test]
+    fn cancelling_keeps_finished_games_and_the_rest_can_be_continued() {
+        let lab = Lab::new();
+        let paths = discs(&lab, 3);
+        start_queue(&lab.store, &plan(&lab, &paths), &|_| true).unwrap();
+        let queue = run_queue(
+            &lab.store,
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+            &|step| {
+                // During the second game.
+                if matches!(step, BulkProgress::Step { index: 1, .. }) {
+                    lab.cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(states(&queue), ["prepared", "pending", "pending"]);
+        assert_eq!(queue.stopped.as_deref(), Some("Cancelled."));
+        assert!(
+            lab.store.interrupted().is_empty(),
+            "the cancelled game left nothing"
+        );
+        assert_eq!(lab.store.list().len(), 1);
+        lab.cancel.store(false, Ordering::Relaxed);
+        // A new batch is refused while this one is unfinished.
+        assert_eq!(
+            start_queue(&lab.store, &plan(&lab, &paths), &|_| true),
+            Err(BulkError::QueueInProgress(2))
+        );
+        lab.cancel.store(false, Ordering::Relaxed);
+        let queue = run(&lab).unwrap();
+        assert_eq!(states(&queue), ["prepared", "prepared", "prepared"]);
+        assert_eq!(load_queue(&lab.store).unwrap(), queue);
+        clear_queue(&lab.store).unwrap();
+        assert!(load_queue(&lab.store).is_none());
+        assert_eq!(
+            lab.store.list().len(),
+            3,
+            "clearing the list keeps the copies"
+        );
+    }
+
+    #[test]
+    fn a_killed_batch_resumes_after_a_restart_including_a_half_extracted_game() {
+        let lab = Lab::new();
+        let paths = discs(&lab, 3);
+        start_queue(&lab.store, &plan(&lab, &paths), &|_| true).unwrap();
+        // Killed in the middle of extracting the second game.
+        let first_set = std::cell::Cell::new(true);
+        let crashed = with_hook(
+            move |reached| {
+                if reached == Point::AfterMember(1) {
+                    if first_set.get() {
+                        first_set.set(false);
+                    } else {
+                        panic!("simulated kill while extracting");
+                    }
+                }
+            },
+            || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&lab))),
+        );
+        assert!(crashed.is_err());
+        let saved = load_queue(&lab.store).unwrap();
+        assert_eq!(states(&saved), ["prepared", "pending", "pending"]);
+        assert_eq!(
+            lab.store.interrupted().len(),
+            1,
+            "partial files are kept apart"
+        );
+        assert_eq!(lab.store.list().len(), 1);
+
+        // "Restart": a new run cleans the partial extraction and finishes.
+        let queue = run(&lab).unwrap();
+        assert_eq!(states(&queue), ["prepared", "prepared", "prepared"]);
+        assert!(lab.store.interrupted().is_empty());
+        assert_eq!(lab.store.list().len(), 3);
+        for path in &paths {
+            let summary = lab.store.prepared_for_source(path).unwrap();
+            assert!(lab.store.verify_full(&summary.set_id, &lab.cancel).is_ok());
+        }
+        // Killed between two games instead.
+        let lab = Lab::new();
+        let paths = discs(&lab, 2);
+        start_queue(&lab.store, &plan(&lab, &paths), &|_| true).unwrap();
+        AFTER_ITEM.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|index| {
+                if index == 0 {
+                    panic!("simulated kill between games");
+                }
+            }));
+        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&lab)));
+        AFTER_ITEM.with(|hook| *hook.borrow_mut() = None);
+        assert!(crashed.is_err());
+        assert_eq!(
+            states(&load_queue(&lab.store).unwrap()),
+            ["prepared", "pending"]
+        );
+        assert_eq!(states(&run(&lab).unwrap()), ["prepared", "prepared"]);
+    }
+
+    #[test]
+    fn too_little_free_space_stops_before_anything_is_extracted() {
+        let lab = Lab::new();
+        let paths = discs(&lab, 3);
+        // The review itself reports it.
+        FREE_SPACE_OVERRIDE.with(|free| free.set(Some(10 * 1024 * 1024)));
+        let reviewed = plan(&lab, &paths);
+        assert_eq!(reviewed.available_bytes, Some(10 * 1024 * 1024));
+        assert!(!reviewed.enough_space_for(&|_| true));
+        let refused = start_queue(&lab.store, &reviewed, &|_| true);
+        assert!(
+            matches!(refused, Err(BulkError::NotEnoughSpace { .. })),
+            "{refused:?}"
+        );
+        assert!(load_queue(&lab.store).is_none());
+        assert!(lab.store.list().is_empty());
+        assert!(lab.store_files().is_empty());
+
+        // Space runs out after the batch was accepted: it stops, keeps what
+        // is done, and leaves the rest to do.
+        FREE_SPACE_OVERRIDE.with(|free| free.set(Some(u64::MAX / 2)));
+        start_queue(&lab.store, &plan(&lab, &paths), &|_| true).unwrap();
+        AFTER_ITEM.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|_| {
+                FREE_SPACE_OVERRIDE.with(|free| free.set(Some(1024)));
+            }));
+        });
+        let queue = run(&lab);
+        AFTER_ITEM.with(|hook| *hook.borrow_mut() = None);
+        let queue = queue.unwrap();
+        assert_eq!(states(&queue), ["prepared", "pending", "pending"]);
+        assert!(
+            queue.stopped.as_deref().unwrap().contains("free space"),
+            "{:?}",
+            queue.stopped
+        );
+        assert!(lab.store.interrupted().is_empty());
+        FREE_SPACE_OVERRIDE.with(|free| free.set(None));
+        assert_eq!(
+            states(&run(&lab).unwrap()),
+            ["prepared", "prepared", "prepared"]
+        );
+    }
+
+    #[test]
+    fn only_one_batch_runs_at_a_time_and_there_is_no_batch_without_a_start() {
+        let lab = std::sync::Arc::new(Lab::new());
+        assert_eq!(run(&lab), Err(BulkError::NoQueue));
+        let paths = discs(&lab, 2);
+        start_queue(&lab.store, &plan(&lab, &paths), &|_| true).unwrap();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let lab = lab.clone();
+            std::thread::spawn(move || {
+                with_hook(
+                    move |reached| {
+                        if reached == Point::AfterIntent {
+                            let _ = reached_tx.send(());
+                            let _ = resume_rx.recv();
+                        }
+                    },
+                    || run(&lab),
+                )
+            })
+        };
+        reached_rx.recv().unwrap();
+        assert_eq!(run(&lab), Err(BulkError::Busy));
+        assert_eq!(clear_queue(&lab.store), Err(BulkError::Busy));
+        resume_tx.send(()).unwrap();
+        drop(resume_tx);
+        assert_eq!(
+            states(&worker.join().unwrap().unwrap()),
+            ["prepared", "prepared"]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The storage folder
+// ---------------------------------------------------------------------------
+
+mod storage_tests {
+    use super::*;
+    use crate::recovery::storage::*;
+
+    #[test]
+    fn a_folder_is_accepted_only_when_it_is_safe_to_keep_copies_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let library = root.join("games");
+        std::fs::create_dir_all(library.join("amiga-cd32")).unwrap();
+        let libraries = vec![library.clone()];
+        let problems = |folder: &Path| check_folder(folder, &libraries, false).problems;
+
+        assert!(!problems(Path::new("relative/folder")).is_empty());
+        assert!(!problems(&root.join("a/../b")).is_empty());
+        let file = root.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(problems(&file)[0].contains("file"));
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(problems(&link)[0].contains("link"));
+        assert!(
+            problems(&library.join("amiga-cd32"))
+                .iter()
+                .any(|problem| problem.contains("inside your game folder"))
+        );
+        assert!(
+            problems(&root)
+                .iter()
+                .any(|problem| problem.contains("is inside this folder"))
+        );
+        let shared = root.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::os::unix::fs::PermissionsExt::from_mode(0o777))
+            .unwrap();
+        assert!(
+            problems(&shared)
+                .iter()
+                .any(|problem| problem.contains("Other users"))
+        );
+        assert!(
+            problems(&root.join("missing/parent/folder"))
+                .iter()
+                .any(|problem| problem.contains("does not exist"))
+        );
+
+        let good = check_folder(&real, &libraries, false);
+        assert!(good.usable(), "{:?}", good.problems);
+        assert!(good.available_bytes.is_some());
+        assert!(
+            std::fs::read_dir(&real).unwrap().next().is_none(),
+            "the probe is removed"
+        );
+        // A folder that does not exist yet is examined without creating it.
+        let new = root.join("new-folder");
+        assert!(check_folder(&new, &libraries, false).usable());
+        assert!(!new.exists());
+    }
+
+    #[test]
+    fn the_choice_is_saved_only_after_the_check_and_an_unusable_setting_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let setting = root.join("config/prepared_media_folder.txt");
+        assert_eq!(configured_folder_at(&setting), Ok(None));
+        let library = root.join("games");
+        std::fs::create_dir_all(&library).unwrap();
+
+        // Refused: nothing is saved and nothing is created.
+        assert!(
+            set_folder_at(
+                &setting,
+                Some(&library.join("copies")),
+                std::slice::from_ref(&library)
+            )
+            .is_err()
+        );
+        assert!(!setting.exists());
+        assert!(!library.join("copies").exists());
+
+        let chosen = root.join("big-disk/emuwiz-prepared");
+        std::fs::create_dir_all(chosen.parent().unwrap()).unwrap();
+        let check = set_folder_at(&setting, Some(&chosen), std::slice::from_ref(&library))
+            .unwrap()
+            .unwrap();
+        assert!(check.usable());
+        assert_eq!(configured_folder_at(&setting), Ok(Some(chosen.clone())));
+        assert_eq!(
+            std::fs::metadata(&chosen).unwrap().mode() & 0o777,
+            0o700,
+            "a folder EmuWiz creates is private"
+        );
+        // A store there works end to end.
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let store = PreparedMediaStore::at(&chosen);
+        let summary = store
+            .prepare(
+                &zip,
+                "AmigaCD32",
+                &lab.trusted,
+                &DiscSetLimits::default(),
+                &lab.cancel,
+                &|_| {},
+            )
+            .unwrap()
+            .summary;
+        assert!(summary.launch_path.starts_with(&chosen));
+
+        // A damaged setting is never silently replaced by the default.
+        std::fs::write(&setting, "relative/path\n").unwrap();
+        assert!(configured_folder_at(&setting).is_err());
+        std::fs::write(&setting, "/a\n/b\n").unwrap();
+        assert!(configured_folder_at(&setting).is_err());
+        assert_eq!(set_folder_at(&setting, None, &[]), Ok(None));
+        assert_eq!(configured_folder_at(&setting), Ok(None));
+        assert!(chosen.exists(), "clearing the choice deletes nothing");
+    }
+}

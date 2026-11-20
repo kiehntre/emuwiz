@@ -29,7 +29,13 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   or a remembered choice. Not supported and said so: ZIPs whose cue sheet
   does not match their files, `MODE2/2336` tracks, a bare ISO in a ZIP, 7z
   and RAR, CDTV, CHD, and every other system (see
-  `docs/GAME_RECOVERY_ENGINE.md`).
+  `docs/GAME_RECOVERY_ENGINE.md`). Several games can be prepared in one
+  reviewed batch (one confirmation, one game at a time, can be cancelled and
+  continued later, free space checked first), and the copies can be kept in
+  another folder, for example on a larger disk. A prepared game keeps its
+  copy and its remembered launch choice when it is renamed with Rename (and
+  on Undo); a ZIP renamed or moved outside EmuWiz finds its copy again by a
+  full content comparison, without extracting.
 - New Blue page "PlayStation memory cards" (All Tools, Saves) and
   `emuwiz-cli memory-cards`: finds PS1 and PS2 memory cards in the save
   folders of PCSX2, DuckStation, RetroArch and RPCS3, and shows each save's

@@ -251,6 +251,10 @@ pub struct RecoveryReport {
     /// The id of a prepared copy for this content that fails its checks and
     /// may be removed, when there is one.
     pub damaged_copy: Option<String>,
+    /// A prepared copy with the same file names, sizes and ZIP checksums
+    /// exists but is not linked to this file (it was renamed, moved or is a
+    /// duplicate). A full content comparison can link it without extracting.
+    pub relinkable: bool,
 }
 
 impl RecoveryReport {

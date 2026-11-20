@@ -3242,6 +3242,7 @@ impl App {
         }
         let recovery = &mut self.tools.game_recovery;
         recovery.poll();
+        recovery.maintain(ui.ctx());
         if recovery.report_for(path).is_none() && !recovery.is_working_on(path) {
             recovery.open_for(
                 ui.ctx(),
