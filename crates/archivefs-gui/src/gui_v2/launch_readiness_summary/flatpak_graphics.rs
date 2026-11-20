@@ -67,7 +67,12 @@ fn flatpak_emulator(input: &LaunchReadinessInput) -> Option<&'static str> {
 /// fetches the package for the driver that is loaded now.
 pub(crate) const FIX_COMMAND: &str = "flatpak update";
 
-fn warning(emulator: &str, host_driver: &str, installed_drivers: &[String]) -> String {
+fn warning(
+    emulator: &str,
+    host_driver: &str,
+    wanted_extension: &str,
+    installed_drivers: &[String],
+) -> String {
     let has = match installed_drivers {
         [] => "it has none".to_string(),
         drivers => format!("it has {}", drivers.join(", ")),
@@ -78,7 +83,7 @@ fn warning(emulator: &str, host_driver: &str, installed_drivers: &[String]) -> S
         ""
     };
     format!(
-        "{emulator} is installed as a Flatpak and cannot use your NVIDIA graphics card right now: Flatpak has no driver package for NVIDIA driver {host_driver} ({has}). Expect a slow game with stuttering sound.{vulkan} To fix it, run \"{FIX_COMMAND}\" in a terminal, then check again."
+        "{emulator} is installed as a Flatpak and cannot use your NVIDIA graphics card right now: Flatpak has no driver package for NVIDIA driver {host_driver} ({has}). Expect a slow game with stuttering sound.{vulkan} To fix it, run \"{FIX_COMMAND}\" in a terminal. If that asks for an administrator password you do not have, run \"flatpak install --user flathub {wanted_extension}\" instead: the package works from your own Flatpak installation as well as the system one. Then check again."
     )
 }
 
@@ -105,9 +110,10 @@ pub(crate) fn note_flatpak_graphics(
     };
     // First, so the card and Setup & Doctor name it before a routine notice
     // such as unverified firmware.
-    summary
-        .warnings
-        .insert(0, warning(emulator, host_driver, installed_drivers));
+    summary.warnings.insert(
+        0,
+        warning(emulator, host_driver, wanted_extension, installed_drivers),
+    );
     summary.status = State::ReadyWithWarnings;
     summary.details.push(format!(
         "Flatpak graphics driver: NVIDIA {host_driver} is loaded; Flatpak looks for {wanted_extension}, which is not installed."
@@ -335,6 +341,9 @@ mod tests {
         assert!(warning.contains("NVIDIA driver 580.196.07 (it has 580.178.04, 580.173.02)"));
         assert!(warning.contains("stuttering sound"));
         assert!(warning.contains("run \"flatpak update\" in a terminal"));
+        assert!(warning.contains(
+            "run \"flatpak install --user flathub org.freedesktop.Platform.GL.nvidia-580-196-07\" instead"
+        ));
         assert!(!warning.contains("RPCS3"));
         assert!(
             summary
@@ -468,7 +477,12 @@ mod tests {
 
     #[test]
     fn with_no_driver_package_at_all_the_warning_says_so() {
-        let text = warning("xemu", "580.196.07", &[]);
+        let text = warning(
+            "xemu",
+            "580.196.07",
+            "org.freedesktop.Platform.GL.nvidia-580-196-07",
+            &[],
+        );
         assert!(text.contains("NVIDIA driver 580.196.07 (it has none)"));
     }
 
@@ -487,12 +501,15 @@ mod tests {
         println!("{host:#?}");
         if let FlatpakGraphics::Missing {
             host_driver,
+            wanted_extension,
             installed_drivers,
-            ..
         } = &host
         {
             for emulator in ["xemu", "RPCS3"] {
-                println!("\n{}", warning(emulator, host_driver, installed_drivers));
+                println!(
+                    "\n{}",
+                    warning(emulator, host_driver, wanted_extension, installed_drivers)
+                );
             }
         }
     }

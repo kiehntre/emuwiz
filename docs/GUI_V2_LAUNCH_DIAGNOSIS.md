@@ -69,7 +69,10 @@ package for the loaded driver is missing and the game's chosen emulator is a
 Flatpak (xemu, RPCS3 or RetroArch, by their existing installation evidence),
 `note_flatpak_graphics` puts a warning first on the readiness card, and so in
 Setup & Doctor's selected-game check: which emulator, which driver version, which
-versions Flatpak has, what to expect, and the fix (`flatpak update`). Play stays
+versions Flatpak has, what to expect, and the fix: `flatpak update`, or, where the
+system-wide install needs an administrator password the person does not have,
+`flatpak install --user flathub <package>`. A package in either the system or
+the user's own installation counts and works. Play stays
 available. EmuWiz never runs the update itself.
 
 Limits: other Flatpak emulators (Dolphin, PCSX2, DuckStation) are not yet
