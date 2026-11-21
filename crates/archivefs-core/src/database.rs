@@ -4541,7 +4541,96 @@ pub struct PlatformIdentityConflictDetail {
     pub evidence: Vec<crate::platform::identity::PlatformIdentityEvidence>,
 }
 
+/// One platform question an import left for a person: the platform kept,
+/// where it came from, the platform RomM proposed, and why it was not applied.
+/// Nothing here is ever written to the library.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlatformReviewItem {
+    pub archive_id: i64,
+    /// The platform the game keeps (`None` when the conflict leaves it
+    /// without one).
+    pub current_platform: Option<String>,
+    /// Where the kept platform came from, in words.
+    pub current_source: String,
+    /// The platform RomM proposed.
+    pub proposed_platform: String,
+    pub reason: String,
+}
+
+/// Where a stored platform came from, in words.
+pub fn platform_source_words(source: &str) -> &'static str {
+    match source {
+        MANUAL_PLATFORM_SOURCE => "your choice",
+        ROMM_PLATFORM_SOURCE => "from RomM earlier",
+        VERIFIED_DAT_PLATFORM_SOURCE | DAT_ROMM_AGREEMENT_SOURCE => "a verified DAT match",
+        "header_identity" => "from the game's header",
+        "folder_alias" => "from its folder",
+        _ => "found by EmuWiz",
+    }
+}
+
 impl PlatformIdentityEnrichmentSummary {
+    /// Every item this import left for review, in import order: conflicts,
+    /// then RomM disagreeing with a verified DAT match, then RomM suggestions.
+    pub fn review_items(&self) -> Vec<PlatformReviewItem> {
+        use crate::platform::identity::PlatformIdentitySource as Source;
+        fn split(
+            evidence: &[crate::platform::identity::PlatformIdentityEvidence],
+        ) -> (
+            Option<&crate::platform::identity::PlatformIdentityEvidence>,
+            String,
+        ) {
+            let kept = evidence.iter().find(|item| item.source != Source::Romm);
+            let proposed = evidence
+                .iter()
+                .rev()
+                .find(|item| item.source == Source::Romm)
+                .map(|item| item.platform.clone())
+                .unwrap_or_default();
+            (kept, proposed)
+        }
+        let mut items = Vec::new();
+        for conflict in &self.conflict_details {
+            let (kept, proposed) = split(&conflict.evidence);
+            items.push(PlatformReviewItem {
+                archive_id: conflict.archive_id,
+                current_platform: kept.map(|item| item.platform.clone()),
+                current_source: kept
+                    .map(|item| match item.source {
+                        Source::ExistingStrongIdentity => "from the game's header",
+                        Source::VerifiedDat => "a verified DAT match",
+                        Source::Manual => "your choice",
+                        _ => "found by EmuWiz",
+                    })
+                    .unwrap_or("none")
+                    .to_string(),
+                proposed_platform: proposed,
+                reason: "RomM disagrees with the platform EmuWiz read from the game itself"
+                    .to_string(),
+            });
+        }
+        for disagreement in &self.romm_disagreement_details {
+            let (kept, proposed) = split(&disagreement.evidence);
+            items.push(PlatformReviewItem {
+                archive_id: disagreement.archive_id,
+                current_platform: kept.map(|item| item.platform.clone()),
+                current_source: "a verified DAT match".to_string(),
+                proposed_platform: proposed,
+                reason: "RomM disagrees with a verified DAT match".to_string(),
+            });
+        }
+        for suggestion in &self.romm_suggestion_details {
+            items.push(PlatformReviewItem {
+                archive_id: suggestion.archive_id,
+                current_platform: Some(suggestion.current_platform.clone()),
+                current_source: platform_source_words(&suggestion.current_source).to_string(),
+                proposed_platform: suggestion.proposed_platform.clone(),
+                reason: suggestion.reason.to_string(),
+            });
+        }
+        items
+    }
+
     fn note(&mut self, outcome: PlatformIdentityApplyOutcome) {
         match outcome {
             PlatformIdentityApplyOutcome::Applied => self.applied += 1,
@@ -6255,6 +6344,30 @@ impl Database {
                 path.display()
             ))),
         }
+    }
+
+    /// Display name and file name (no folder) of each archive in `ids`, for
+    /// listing games without printing where they live.
+    pub fn archive_names(&self, ids: &[i64]) -> Result<HashMap<i64, (String, String)>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT display_name, file_name_cached FROM archives WHERE id = ?1")
+            .map_err(|error| db_error("failed to prepare archive name lookup", error))?;
+        let mut names = HashMap::new();
+        for &id in ids {
+            let row: Option<(Option<String>, Vec<u8>)> = stmt
+                .query_row(params![id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()
+                .map_err(|error| db_error("failed to read archive name", error))?;
+            if let Some((display, file)) = row {
+                let file = String::from_utf8_lossy(&file).into_owned();
+                let display = display
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| file.clone());
+                names.insert(id, (display, file));
+            }
+        }
+        Ok(names)
     }
 
     /// Every archive's path, read in one pass, for a caller that looks up
@@ -19757,6 +19870,60 @@ echo "$out"
             assert_eq!(after.platform_source.as_deref(), Some("header_identity"));
             assert_eq!(platform_rows(&database, archive_id), rows);
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_review_list_names_every_kept_platform_its_source_and_romms_platform() {
+        // A header conflict and a folder suggestion, each from its own library.
+        let (root, mut database, archive_id) = unknown_archive_database("romm-review-header");
+        database
+            .assign_platform(archive_id, Some("Amiga"), "header_identity")
+            .unwrap();
+        let rows = platform_rows(&database, archive_id);
+        let archive = load_archive(&database, archive_id);
+        let summary = database
+            .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "AmigaCD32"), 10)
+            .unwrap();
+        assert_eq!(
+            summary.review_items(),
+            vec![PlatformReviewItem {
+                archive_id,
+                current_platform: Some("Amiga".into()),
+                current_source: "from the game's header".into(),
+                proposed_platform: "AmigaCD32".into(),
+                reason: "RomM disagrees with the platform EmuWiz read from the game itself".into(),
+            }]
+        );
+        assert_eq!(platform_rows(&database, archive_id), rows);
+        let names = database
+            .archive_names(&[archive_id, archive_id + 999])
+            .unwrap();
+        assert_eq!(names.len(), 1);
+        let (display, file) = &names[&archive_id];
+        assert!(!display.is_empty());
+        assert!(!file.contains('/'), "{file}");
+        let _ = fs::remove_dir_all(root);
+
+        let (root, mut database, archive_id) = unknown_archive_database("romm-review-folder");
+        database
+            .assign_platform(archive_id, Some("PSX"), "folder_alias")
+            .unwrap();
+        let archive = load_archive(&database, archive_id);
+        let summary = database
+            .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSP"), 10)
+            .unwrap();
+        let items = summary.review_items();
+        assert_eq!(items.len(), summary.romm_suggestions);
+        assert_eq!(items[0].current_platform.as_deref(), Some("PSX"));
+        assert_eq!(items[0].current_source, "from its folder");
+        assert_eq!(items[0].proposed_platform, "PSP");
+        assert_eq!(
+            load_archive(&database, archive_id)
+                .platform_source
+                .as_deref(),
+            Some("folder_alias")
+        );
         let _ = fs::remove_dir_all(root);
     }
 

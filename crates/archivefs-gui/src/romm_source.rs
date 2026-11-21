@@ -1417,7 +1417,11 @@ fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultV
                 "Platform conflicts",
                 format!("{} — Review required", enrichment.conflicts),
             ));
-            for conflict in enrichment.conflict_details.iter().take(3) {
+            for conflict in enrichment
+                .conflict_details
+                .iter()
+                .take(REVIEW_EXAMPLES_SHOWN)
+            {
                 notes.push(
                     conflict
                         .evidence
@@ -1433,13 +1437,18 @@ fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultV
                         .join(" · "),
                 );
             }
+            push_more_note(&mut notes, enrichment.conflict_details.len());
         }
         if enrichment.romm_disagreements > 0 {
             rows.push(row(
                 "RomM disagrees with a verified catalogue",
                 format!("{} — verified platform kept", enrichment.romm_disagreements),
             ));
-            for disagreement in enrichment.romm_disagreement_details.iter().take(3) {
+            for disagreement in enrichment
+                .romm_disagreement_details
+                .iter()
+                .take(REVIEW_EXAMPLES_SHOWN)
+            {
                 notes.push(
                     disagreement
                         .evidence
@@ -1455,6 +1464,7 @@ fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultV
                         .join(" · "),
                 );
             }
+            push_more_note(&mut notes, enrichment.romm_disagreement_details.len());
         }
         if enrichment.romm_suggestions > 0 {
             rows.push(row(
@@ -1464,7 +1474,11 @@ fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultV
                     enrichment.romm_suggestions
                 ),
             ));
-            for suggestion in enrichment.romm_suggestion_details.iter().take(3) {
+            for suggestion in enrichment
+                .romm_suggestion_details
+                .iter()
+                .take(REVIEW_EXAMPLES_SHOWN)
+            {
                 notes.push(format!(
                     "Kept {} ({}); RomM proposes {}. {}.",
                     archivefs_core::platform::display_name_for(&suggestion.current_platform),
@@ -1473,6 +1487,7 @@ fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultV
                     suggestion.reason,
                 ));
             }
+            push_more_note(&mut notes, enrichment.romm_suggestion_details.len());
         }
         if enrichment.applied > 0 {
             notes.push(
@@ -1995,11 +2010,18 @@ mod tests;
 
 /// Where a stored platform came from, in words, for the RomM result notes.
 fn platform_source_name(source: &str) -> &'static str {
-    match source {
-        archivefs_core::MANUAL_PLATFORM_SOURCE => "your choice",
-        archivefs_core::ROMM_PLATFORM_SOURCE => "from RomM earlier",
-        "header_identity" => "from the game's header",
-        "folder_alias" => "from its folder",
-        _ => "found by EmuWiz",
+    archivefs_core::platform_source_words(source)
+}
+
+/// How many review examples the import result shows per list.
+const REVIEW_EXAMPLES_SHOWN: usize = 3;
+
+/// After the examples, says how many more there are and where to see them all.
+fn push_more_note(notes: &mut Vec<String>, total: usize) {
+    if total > REVIEW_EXAMPLES_SHOWN {
+        notes.push(format!(
+            "+{} more not shown here; `emuwiz-cli identity source romm import` lists every one.",
+            total - REVIEW_EXAMPLES_SHOWN
+        ));
     }
 }

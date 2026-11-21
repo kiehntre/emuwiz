@@ -3264,3 +3264,36 @@ fn the_stale_summary_example_count_is_bounded() {
     }
     stub.stop();
 }
+
+#[test]
+fn the_review_listing_names_each_game_without_its_folder() {
+    let items = vec![
+        archivefs_core::PlatformReviewItem {
+            archive_id: 7,
+            current_platform: Some("Amiga".into()),
+            current_source: "from the game's header".into(),
+            proposed_platform: "AmigaCD32".into(),
+            reason: "RomM disagrees with the platform EmuWiz read from the game itself".into(),
+        },
+        archivefs_core::PlatformReviewItem {
+            archive_id: 8,
+            current_platform: None,
+            current_source: "none".into(),
+            proposed_platform: "PSX".into(),
+            reason: "r".into(),
+        },
+    ];
+    let names =
+        std::collections::HashMap::from([(7, ("Lotus II".to_string(), "Lotus2.hdf".to_string()))]);
+    let lines = super::review_lines(&items, &names);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(
+        lines[0],
+        "  Lotus II [Lotus2.hdf] (archive 7): keeps Commodore Amiga (from the game's header); \
+         RomM says Amiga CD32. RomM disagrees with the platform EmuWiz read from the game itself."
+    );
+    assert!(
+        lines[1].contains("(no longer in the library)") && lines[1].contains("keeps no platform")
+    );
+    assert!(lines.iter().all(|line| !line.contains('/')));
+}
