@@ -1478,3 +1478,35 @@ fn bytes_are_formatted_readably() {
     assert_eq!(human_bytes(1024 * 1024 * 1024), "1 GiB");
     assert_eq!(human_bytes(1024 * 1024 * 1024 * 3 / 2), "1.5 GiB");
 }
+
+#[test]
+fn romm_import_result_shows_romm_suggesting_another_platform_for_review() {
+    let mut summary = import_summary(true, 1);
+    summary.platform_enrichment = Some(Box::new(
+        archivefs_core::PlatformIdentityEnrichmentSummary {
+            romm_suggestions: 1,
+            romm_suggestion_details: vec![archivefs_core::RommPlatformSuggestion {
+                archive_id: 1,
+                current_platform: "PSX".into(),
+                current_source: "folder_alias".into(),
+                proposed_platform: "PSP".into(),
+                reason: "RomM disagrees with the platform EmuWiz found from the game's folder or files",
+            }],
+            ..Default::default()
+        },
+    ));
+    let view = build_result_view(
+        &RommOperation::FullImport,
+        Ok(&RommOperationOutcome::Import(Box::new(summary))),
+        false,
+    );
+    assert!(
+        view.rows
+            .iter()
+            .any(|row| row.label == "RomM suggests a different platform"
+                && row.value.contains("EmuWiz's platform kept"))
+    );
+    assert!(view.notes.iter().any(|note| note
+        == "Kept Sony PlayStation (from its folder); RomM proposes Sony PlayStation Portable. \
+            RomM disagrees with the platform EmuWiz found from the game's folder or files."));
+}

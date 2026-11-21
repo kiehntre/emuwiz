@@ -56,7 +56,9 @@ Playing Library and Library Views are plans over the evidence-backed library.
 RomM and ES-DE are projections/exports, not alternate identity authorities.
 A current, exact DAT verification outranks RomM's platform: RomM disagreeing is
 reported for review and never retires the verified assignment (manual choices
-still outrank both).
+still outrank both). RomM only fills a platform a game does not have. Beside any
+current platform (a scan's, a manual choice, or RomM's own earlier answer)
+agreeing writes nothing, and disagreeing is shown for review and never applied.
 The RomM client is local-path-aware and read-only toward RomM; publishing an
 ES-DE projection is a separate local operation. The one exception is optional
 and off by default: with "Rename also updates RomM's title" turned on (and a
