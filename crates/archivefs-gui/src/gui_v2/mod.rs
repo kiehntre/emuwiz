@@ -17,6 +17,7 @@ mod browse_play;
 mod card_restore;
 mod cheat_extras_page;
 pub(crate) mod classic_trainers;
+mod collection_reconcile;
 mod collections;
 #[cfg(test)]
 mod dat_exact_tests;

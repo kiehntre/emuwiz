@@ -349,6 +349,59 @@ profile, configuration, or home-directory paths. Runs require an explicit,
 bounded selection of at most 32 persisted archive IDs. See
 [`CHEAT_PROVIDER_COVERAGE.md`](CHEAT_PROVIDER_COVERAGE.md).
 
+## `emuwiz-cli collection reconcile --json`
+
+Read-only explanation of library records whose file is not at its recorded
+path, and of every symbolic link in the library folders. Design and evidence
+rules: `docs/COLLECTION_RECONCILIATION.md`.
+
+`records` is empty unless `--records` is given and `link_findings` is empty
+unless `--links` is given; every count is present either way.
+
+### Schema
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema_version` | number | `1`. Raised only when a field changes meaning or is removed |
+| `database_path` | string | The library database that was read |
+| `generated_at_unix` | number | When the report was made |
+| `inventory` | object | `roots[]` (`root`, `real_root`, `directories`, `files`, `links`, `other_filesystems_not_entered[]`, `errors[]`, `complete`), `complete`, `entries`, `directories_listed`, `seconds` |
+| `measures` | object | Separate counts that must not be added together: `rows_in_library`, `rows_present_as_recorded`, `rows_present_but_changed`, `rows_present_folders`, `rows_flagged_missing`, `rows_absent_never_flagged`, `rows_not_checked`, `forgotten_records_not_checked`, `links_that_are_library_rows`, `distinct_files_behind_present_rows`, `bytes_of_distinct_present_files`, `records_removed_by_forget_missing`, `records_examined`, `records_tied_to_a_file`, `distinct_files_reached` |
+| `record_sets` | object | Set (`flagged_missing`, `absent_never_flagged`, `forgotten`), then tier code, then `{records, recorded_bytes}` |
+| `by_class` | object | Records per evidence class |
+| `receipts[]` | array | Forget Missing exports used: `path`, `created_at`, `state`, `records`, `written_for_this_database` |
+| `content_check` | object | `requested`, `compared`, `matched`, `differed`, `not_comparable`, `bytes_read` |
+| `links` | object | `total`, `resolve`, `broken`, `target_identified`, `plausible_candidate`, `unresolved`, `storage_unavailable`, `target_missing`, `groups[]` (`link_folder`, `target_root`, `grade`, `cause`, `links`, `example_link`, `example_target`) |
+| `records[]` | array | One per record, ordered by set then `archive_id` (see below) |
+| `link_findings[]` | array | One per link, in path order: `link`, `stored_target`, `resolved_target`, `grade`, `cause`, `deepest_existing_ancestor`, `found`, `found_inode`, `evidence[]` |
+| `notes[]` | array of strings | What the reader must know before trusting a number |
+
+Each record: `set`, `archive_id`, `old_path`, `platform`, `archive_kind`,
+`size_bytes`, `modified_unix_seconds`, `first_seen_at`, `last_seen_at`,
+`flagged_missing_at`, `tier`, `class`, `code`, `target`, `target_archive_id`,
+`evidence[]`.
+
+### Values
+
+- `class`: `confirmed`, `strong`, `metadata`, `weak`, `present`, `candidate`, `unresolved`.
+- `tier` (`code`): `confirmed_content` (T1), `confirmed_object` (T2), `same_file_object` (T3),
+  `metadata_match` (T4), `name_and_size` (T5), `name_and_size_via_link` (T5L),
+  `present_at_recorded_path` (T6), `size_only_candidate` (T7), `name_only_lead` (T8),
+  `broken_link_only` (T9L), `no_trace` (T9).
+- Link `grade`: `resolves`, `target_identified`, `plausible_candidate`, `unresolved`.
+- `rows_not_checked` and `forgotten_records_not_checked` count records that were not judged
+  because their folder is missing, empty or on a filesystem that was not entered. They have no
+  entry in `records`.
+- Link `cause`: `location_gone`, `storage_empty`, `file_not_in_folder`, `folder_gone`,
+  `link_loop`, `permission_denied`, `other`.
+
+`target` is the file a record is tied to only for classes `confirmed`, `strong`,
+`metadata` and `weak`. For `candidate` it is a lead that was not accepted.
+Only `confirmed_content` states that file contents were compared.
+
+The command exits non-zero, printing nothing on stdout, when a library folder
+cannot be listed completely: a partial listing is never reported.
+
 ## Stability Guarantees
 
 The JSON output documented here is intended for integrations, scripts, and tests.
