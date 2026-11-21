@@ -805,11 +805,18 @@ fn a_non_zero_exit_code_of_an_undemonstrated_emulator_stays_unknown() {
             .mark_started(&case.session, 70, &case.machine)
             .unwrap();
         case.machine.exit(&[70]);
-        assert_eq!(
-            case.end(ExitObservation::Code(0)).end,
-            Some(SessionEnd::Clean),
-            "{emulator}"
-        );
+        let end = case.end(ExitObservation::Code(0)).end;
+        if emulator == "RetroArch" {
+            // RetroArch's statuses mean something only from inside a running
+            // game (owner decision 2026-11-21). Nothing showed that a game
+            // ran here, so even 0 claims nothing.
+            assert!(
+                matches!(end, Some(SessionEnd::ExitUnsettled { ref detail }) if detail.contains("status 0")),
+                "{end:?}"
+            );
+        } else {
+            assert_eq!(end, Some(SessionEnd::Clean), "{emulator}");
+        }
     }
 }
 
@@ -928,5 +935,402 @@ fn a_session_settled_long_ago_is_never_rewritten_by_a_late_exit_status() {
     assert_eq!(
         case.journal.get(&case.session).unwrap().state,
         SessionState::EndNotSeen
+    );
+}
+
+// ---- RetroArch: demonstrated from inside a running game only ----
+
+const RA_SCOPE: &str = "app-flatpak-org.libretro.RetroArch-100.scope";
+
+/// A RetroArch session. `game` and `core` say whether a game with a core
+/// was launched.
+fn retroarch(profile: &str, through_launcher: bool, game: bool, core: Option<&str>) -> Case {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = SessionJournal::open(dir.path(), "dev").unwrap();
+    let launch = SessionLaunch {
+        emulator: "RetroArch".into(),
+        profile: profile.into(),
+        core: core.map(str::to_string),
+        through_launcher,
+        ..Default::default()
+    };
+    let played = SessionGame {
+        title: "Test Game".into(),
+        content_path: game.then(|| PathBuf::from("/games/test.gb")),
+        ..Default::default()
+    };
+    let session = journal
+        .request(played, launch, vec![mark("v1")])
+        .unwrap()
+        .session_id;
+    Case {
+        _dir: dir,
+        journal,
+        machine: Machine::default(),
+        session,
+    }
+}
+
+fn retroarch_preceding(case: &Case, profile: &str) -> PrecedingSession {
+    preceding_session(
+        &case.journal.all(),
+        "dev",
+        "RetroArch",
+        profile,
+        &[mark("v2")],
+    )
+}
+
+const CORE: Option<&str> = Some("gambatte_libretro.so");
+const SEEN: &str = "test: the game was observed running";
+
+/// A Flatpak RetroArch session with the real process tree, ended with
+/// `code`. `seen` records evidence that the game was observed running.
+fn retroarch_flatpak_ends(
+    game: bool,
+    core: Option<&str>,
+    seen: bool,
+    code: i32,
+) -> (Case, SessionRecord) {
+    let case = retroarch("flatpak", true, game, core);
+    case.machine
+        .start(100, 1, "bwrap", "/usr/bin/bwrap", Some(RA_SCOPE));
+    case.journal
+        .mark_started(&case.session, 100, &case.machine)
+        .unwrap();
+    case.machine
+        .start(101, 100, "bwrap", "/usr/bin/bwrap", Some(RA_SCOPE));
+    case.machine
+        .start(102, 101, "retroarch", "/app/bin/retroarch", Some(RA_SCOPE));
+    case.look();
+    if seen {
+        case.journal
+            .record_game_seen_running(&case.session, SEEN)
+            .unwrap();
+    }
+    case.machine.exit(&[102, 101, 100]);
+    let ended = case.end(ExitObservation::Code(code));
+    (case, ended)
+}
+
+/// A native RetroArch started directly by EmuWiz, ended with `code`.
+fn retroarch_native_ends(
+    game: bool,
+    core: Option<&str>,
+    seen: bool,
+    code: i32,
+) -> (Case, SessionRecord) {
+    let case = retroarch("native", false, game, core);
+    case.machine
+        .start(70, 1, "retroarch", "/usr/bin/retroarch", None);
+    case.journal
+        .mark_started(&case.session, 70, &case.machine)
+        .unwrap();
+    if seen {
+        case.journal
+            .record_game_seen_running(&case.session, SEEN)
+            .unwrap();
+    }
+    case.machine.exit(&[70]);
+    let ended = case.end(ExitObservation::Code(code));
+    (case, ended)
+}
+
+/// Nothing is claimed: not clean, not abnormal, no warning, never a signal.
+fn nothing_is_claimed(case: &Case, ended: &SessionRecord, profile: &str, label: &str) {
+    assert_ne!(ended.end, Some(SessionEnd::Clean), "{label}");
+    assert!(!ended.end.as_ref().unwrap().abnormal(), "{label}");
+    assert!(
+        !matches!(ended.end, Some(SessionEnd::Signal { .. })),
+        "{label}"
+    );
+    let preceding = retroarch_preceding(case, profile);
+    assert!(!preceding.clean(), "{label}: {preceding:?}");
+    assert_eq!(preceding.warning(), None, "{label}");
+    assert_eq!(preceding.advisory(), Advisory::Caution, "{label}");
+    assert!(
+        !matches!(preceding, PrecedingSession::FatalSignal { .. }),
+        "{label}"
+    );
+}
+
+#[test]
+fn a_genuinely_observed_retroarch_game_session_reports_its_exit() {
+    // Native, started directly by EmuWiz, game seen running.
+    let (case, ended) = retroarch_native_ends(true, CORE, true, 0);
+    assert_eq!(ended.end, Some(SessionEnd::Clean));
+    assert_eq!(ended.exit_evidence, Some(ExitEvidence::EmulatorProcess));
+    assert_eq!(ended.game_seen_running.as_ref().unwrap().what, SEEN);
+    assert!(retroarch_preceding(&case, "native").clean());
+
+    let (case, ended) = retroarch_native_ends(true, CORE, true, 139);
+    // An exit code stays an exit code: never a signal, never "crash".
+    assert_eq!(ended.end, Some(SessionEnd::ExitCode { code: 139 }));
+    let preceding = retroarch_preceding(&case, "native");
+    assert!(
+        matches!(preceding, PrecedingSession::ErrorExit { code: 139, .. }),
+        "{preceding:?}"
+    );
+    let warning = preceding.warning().unwrap();
+    assert!(warning.starts_with("Abnormal exit detected"), "{warning}");
+    let lower = warning.to_lowercase();
+    assert!(
+        !lower.contains("crash") && !lower.contains("signal") && !lower.contains("damaged"),
+        "{warning}"
+    );
+
+    // Flatpak: the sandbox relays the emulator's status.
+    let (case, ended) = retroarch_flatpak_ends(true, CORE, true, 0);
+    assert_eq!(ended.end, Some(SessionEnd::Clean));
+    assert_eq!(ended.exit_evidence, Some(ExitEvidence::SandboxRelay));
+    assert!(retroarch_preceding(&case, "flatpak").clean());
+    let (case, ended) = retroarch_flatpak_ends(true, CORE, true, 139);
+    assert_eq!(ended.end, Some(SessionEnd::ExitCode { code: 139 }));
+    assert_eq!(ended.exit_evidence, Some(ExitEvidence::SandboxRelay));
+    assert_eq!(
+        retroarch_preceding(&case, "flatpak").advisory(),
+        Advisory::Warning
+    );
+}
+
+#[test]
+fn a_game_that_was_asked_for_but_never_seen_running_leaves_the_exit_unknown() {
+    // The game and core were requested. Whether the core loaded the game
+    // (or failed and left RetroArch at its menu) was not observed. That is
+    // every real session today: nothing in EmuWiz can observe gameplay.
+    for code in [0, 139, 134, 1] {
+        let label = format!("requested, not seen, {code}");
+        let (case, ended) = retroarch_native_ends(true, CORE, false, code);
+        assert_eq!(ended.game_seen_running, None);
+        // The observed number is kept as diagnostic evidence.
+        match &ended.end {
+            Some(SessionEnd::ExitUnsettled { detail }) => {
+                assert!(detail.contains(&format!("status {code}")), "{detail}");
+                assert!(
+                    detail.contains("not verified that the game actually ran"),
+                    "{detail}"
+                );
+            }
+            other => panic!("{label}: {other:?}"),
+        }
+        nothing_is_claimed(&case, &ended, "native", &label);
+
+        let (case, ended) = retroarch_flatpak_ends(true, CORE, false, code);
+        assert_eq!(
+            ended.exit_evidence,
+            Some(ExitEvidence::LauncherOnly),
+            "{label}"
+        );
+        if code != 0 {
+            assert_eq!(
+                ended.end,
+                Some(SessionEnd::LauncherEndedOtherwise {
+                    detail: format!("exit code {code}")
+                }),
+                "{label}"
+            );
+        }
+        nothing_is_claimed(&case, &ended, "flatpak", &label);
+    }
+}
+
+#[test]
+fn a_menu_only_retroarch_session_leaves_the_exit_unknown_including_the_unexplained_139() {
+    // No game, no core, or an empty core name.
+    for (game, core) in [
+        (false, None),
+        (true, None),
+        (false, CORE),
+        (true, Some("  ")),
+    ] {
+        for code in [0, 139, 1] {
+            let label = format!("{game} {core:?} {code}");
+            let (case, ended) = retroarch_native_ends(game, core, false, code);
+            assert!(
+                matches!(ended.end, Some(SessionEnd::ExitUnsettled { .. })),
+                "{label}: {:?}",
+                ended.end
+            );
+            nothing_is_claimed(&case, &ended, "native", &label);
+            let (case, ended) = retroarch_flatpak_ends(game, core, false, code);
+            assert_eq!(
+                ended.exit_evidence,
+                Some(ExitEvidence::LauncherOnly),
+                "{label}"
+            );
+            nothing_is_claimed(&case, &ended, "flatpak", &label);
+        }
+    }
+}
+
+#[test]
+fn uncertain_retroarch_sessions_stay_unknown() {
+    // Evidence can only be recorded for a running session, and has to say
+    // what it is.
+    let case = retroarch("native", false, true, CORE);
+    assert!(
+        case.journal
+            .record_game_seen_running(&case.session, SEEN)
+            .is_err(),
+        "not started yet"
+    );
+    case.machine
+        .start(70, 1, "retroarch", "/usr/bin/retroarch", None);
+    case.journal
+        .mark_started(&case.session, 70, &case.machine)
+        .unwrap();
+    assert!(
+        case.journal
+            .record_game_seen_running(&case.session, "  ")
+            .is_err()
+    );
+    case.machine.exit(&[70]);
+    let ended = case.end(ExitObservation::Code(139));
+    assert!(
+        case.journal
+            .record_game_seen_running(&case.session, SEEN)
+            .is_err(),
+        "already over: evidence cannot be added afterwards"
+    );
+    nothing_is_claimed(&case, &ended, "native", "evidence refused");
+
+    // A wrapper is still only a wrapper, even with the game seen running:
+    // a shell between EmuWiz and the sandbox...
+    let case = retroarch("flatpak", true, true, CORE);
+    case.machine.start(90, 1, "bash", "/usr/bin/bash", None);
+    case.journal
+        .mark_started(&case.session, 90, &case.machine)
+        .unwrap();
+    case.machine
+        .start(100, 90, "bwrap", "/usr/bin/bwrap", Some(RA_SCOPE));
+    case.machine
+        .start(102, 100, "retroarch", "/app/bin/retroarch", Some(RA_SCOPE));
+    case.look();
+    case.journal
+        .record_game_seen_running(&case.session, SEEN)
+        .unwrap();
+    case.machine.exit(&[102, 100, 90]);
+    let ended = case.end(ExitObservation::Code(0));
+    assert_eq!(ended.exit_evidence, Some(ExitEvidence::LauncherOnly));
+    nothing_is_claimed(&case, &ended, "flatpak", "shell wrapper");
+    // ...and a native wrapper script.
+    let case = retroarch("native", true, true, CORE);
+    case.machine.start(90, 1, "bash", "/usr/bin/bash", None);
+    case.journal
+        .mark_started(&case.session, 90, &case.machine)
+        .unwrap();
+    case.machine
+        .start(91, 90, "retroarch", "/usr/bin/retroarch", None);
+    case.look();
+    case.journal
+        .record_game_seen_running(&case.session, SEEN)
+        .unwrap();
+    case.machine.exit(&[91, 90]);
+    let ended = case.end(ExitObservation::Code(139));
+    assert_eq!(ended.exit_evidence, Some(ExitEvidence::LauncherOnly));
+    nothing_is_claimed(&case, &ended, "native", "script wrapper");
+
+    // A signal the kernel reported for RetroArch's own process is a
+    // different, direct kind of evidence and needs no gameplay proof.
+    let case = retroarch("native", false, false, None);
+    case.machine
+        .start(70, 1, "retroarch", "/usr/bin/retroarch", None);
+    case.journal
+        .mark_started(&case.session, 70, &case.machine)
+        .unwrap();
+    case.machine.exit(&[70]);
+    let ended = case.end(ExitObservation::Signal {
+        signal: 11,
+        core_dumped: true,
+    });
+    assert_eq!(
+        ended.end,
+        Some(SessionEnd::Signal {
+            signal: 11,
+            core_dumped: true
+        })
+    );
+    assert_eq!(
+        retroarch_preceding(&case, "native").advisory(),
+        Advisory::Warning
+    );
+}
+
+#[test]
+fn seeing_a_game_run_does_not_make_any_other_emulator_believed() {
+    for (emulator, binary, exe) in [
+        ("PPSSPP", "PPSSPPSDL", "/app/bin/PPSSPPSDL"),
+        ("PCSX2", "pcsx2-qt", "/app/bin/pcsx2-qt"),
+        ("RPCS3", "rpcs3", "/app/bin/rpcs3"),
+    ] {
+        for code in [0, 1, 134, 139] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = SessionJournal::open(dir.path(), "dev").unwrap();
+            let launch = SessionLaunch {
+                emulator: emulator.into(),
+                profile: "flatpak".into(),
+                core: Some("a_core".into()),
+                through_launcher: true,
+                ..Default::default()
+            };
+            let played = SessionGame {
+                content_path: Some(PathBuf::from("/games/test.iso")),
+                ..Default::default()
+            };
+            let session = journal
+                .request(played, launch, vec![mark("v1")])
+                .unwrap()
+                .session_id;
+            let machine = Machine::default();
+            machine.start(100, 1, "bwrap", "/usr/bin/bwrap", Some(SCOPE));
+            journal.mark_started(&session, 100, &machine).unwrap();
+            machine.start(101, 100, "bwrap", "/usr/bin/bwrap", Some(SCOPE));
+            machine.start(102, 101, binary, exe, Some(SCOPE));
+            journal.observe_running(&session, &machine).unwrap();
+            journal.record_game_seen_running(&session, SEEN).unwrap();
+            machine.exit(&[102, 101, 100]);
+            let after = [mark("v2")];
+            let ended = journal
+                .mark_ended(
+                    &session,
+                    ExitObservation::Code(code),
+                    Some(&after),
+                    &machine,
+                )
+                .unwrap();
+            let label = format!("{emulator} {code}");
+            assert_eq!(
+                ended.exit_evidence,
+                Some(ExitEvidence::LauncherOnly),
+                "{label}"
+            );
+            assert_ne!(ended.end, Some(SessionEnd::Clean), "{label}");
+            assert!(!ended.end.as_ref().unwrap().abnormal(), "{label}");
+        }
+    }
+    // The lists themselves.
+    assert_eq!(EXIT_STATUS_DEMONSTRATED_IN_GAME, ["RetroArch"]);
+    for emulator in [
+        "RetroArch",
+        "PPSSPP",
+        "PCSX2",
+        "RPCS3",
+        "DuckStation",
+        "Dolphin",
+    ] {
+        assert!(!exit_status_demonstrated(emulator), "{emulator}");
+    }
+    // An emulator on neither list keeps the older rule unchanged: its own
+    // exit 0, directly observed, is a normal close.
+    let case = launch("DuckStation", "native", false);
+    case.machine
+        .start(70, 1, "duckstation-qt", "/opt/duckstation-qt", None);
+    case.journal
+        .mark_started(&case.session, 70, &case.machine)
+        .unwrap();
+    case.machine.exit(&[70]);
+    assert_eq!(
+        case.end(ExitObservation::Code(0)).end,
+        Some(SessionEnd::Clean)
     );
 }

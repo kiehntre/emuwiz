@@ -173,6 +173,14 @@ pub struct SessionLaunch {
     pub through_launcher: bool,
 }
 
+/// What showed that a session's game really ran, and when it was seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameSeenRunning {
+    /// In plain words, what was observed.
+    pub what: String,
+    pub observed_unix: i64,
+}
+
 /// One process belonging to a session, identified so that a later process
 /// with the same id is never mistaken for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +243,14 @@ pub struct SessionRecord {
     /// Which boot of the machine that was (`ProcessTable::boot_id`).
     #[serde(default)]
     pub sandbox_main_boot: Option<String>,
+    /// Evidence that the game was actually seen running in this session.
+    /// A game and a core being asked for at launch is **not** such evidence:
+    /// loading can fail and leave the emulator at its menu. Empty unless a
+    /// caller that really observed gameplay recorded it
+    /// ([`SessionJournal::record_game_seen_running`]). Nothing in EmuWiz
+    /// does today.
+    #[serde(default)]
+    pub game_seen_running: Option<GameSeenRunning>,
     /// What the system's own crash records say about that process, when
     /// they were consulted. Independent of the exit status.
     #[serde(default)]
@@ -379,9 +395,11 @@ pub enum ExitEvidence {
 /// close at a menu with no game running is not enough (RetroArch returned 0
 /// that way and 139 for a polite stop on another run).
 ///
-/// **No emulator meets that standard yet, so this list is empty.** Until one
-/// does, an emulator's non-zero or signal exit is recorded as "not known
-/// whether that was a normal close" and never as an abnormal exit.
+/// **No emulator meets that standard for every kind of session, so this
+/// list is empty.** RetroArch meets it for sessions that launched a game
+/// (see [`EXIT_STATUS_DEMONSTRATED_IN_GAME`]). For everything else an
+/// emulator's non-zero exit is recorded as "not known whether that was a
+/// normal close" and never as an abnormal exit.
 ///
 /// Each entry is the emulator and the names (lowercase) its binary has
 /// inside a Flatpak sandbox, where a relayed status is believed only for
@@ -397,15 +415,15 @@ pub const EXIT_STATUS_DEMONSTRATED: [(&str, &[&str]); 1] = [("ProbeEmu", &["prob
 /// What has been observed so far for emulators that are **not** on the
 /// demonstrated list: preliminary evidence, quoted when a session of that
 /// emulator ends with a status that cannot be interpreted. From
-/// `scripts/qa/flatpak_exit_probe.py`, all with no game running.
+/// the probes in `scripts/qa/` (see the per-emulator table in the docs).
 pub const PRELIMINARY_EXIT_EVIDENCE: [(&str, &str); 4] = [
     (
         "RetroArch",
-        "a close at its menu returned 0 and a forced fault 139, but a polite stop once returned 139; not yet closed repeatedly from inside a running game",
+        "it was not verified that the game actually ran in this session; RetroArch's exit status has been shown to be meaningful only from inside a running game, and at its menu a polite stop once returned 139, which is unexplained",
     ),
     (
         "PPSSPP",
-        "a close at its menu returned 0, a polite stop 0 and a forced fault 139, and once it did not start (exit 1); not yet closed from inside a running game",
+        "from inside a game ordinary closes returned 0, but after a deliberate fault it hung instead of ending, so its exit status does not tell the two apart",
     ),
     (
         "PCSX2",
@@ -438,8 +456,48 @@ pub const SANDBOX_BINARIES: [(&str, &[&str]); 5] = [
     ("ProbeEmu", &["probeemu"]),
 ];
 
-/// Whether `emulator`'s exit status is believed (see
-/// [`EXIT_STATUS_DEMONSTRATED`]).
+/// Emulators whose exit status is believed **only for a session in which
+/// the game was actually seen running** (owner decisions 2026-11-21).
+///
+/// RetroArch, native 1.21.0 and Flatpak 1.22.2, from inside a running game
+/// (`scripts/qa/retroarch_exit_probe.py`): 18 ordinary endings per route
+/// returned 0 every time, 3 deliberate faults per route returned 139 every
+/// time, nothing hung.
+///
+/// Not covered, and deliberately not believed:
+/// - a session where gameplay was not verified. That includes RetroArch at
+///   its menu (one polite stop there returned 139 and is unexplained) and a
+///   session that asked for a game which may never have loaded. A game and
+///   a core being *requested* proves nothing;
+/// - any launch through a wrapper or launcher other than the checked
+///   Flatpak sandbox: that status is the wrapper's (decided before this
+///   list is consulted).
+///
+/// **EmuWiz has no reliable way to see that a game ran, and none is
+/// invented here.** [`SessionRecord::game_seen_running`] is therefore never
+/// set by shipped code, and every exit status of these emulators, 0
+/// included, is recorded as "not known" with the observed number kept. The
+/// rule takes effect only once a trustworthy observation exists.
+pub const EXIT_STATUS_DEMONSTRATED_IN_GAME: [&str; 1] = ["RetroArch"];
+
+fn demonstrated_in_game_only(emulator: &str) -> bool {
+    !exit_status_demonstrated(emulator)
+        && EXIT_STATUS_DEMONSTRATED_IN_GAME
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(emulator))
+}
+
+/// Whether this session's exit status is believed: its emulator is on the
+/// unconditional list, or it is on the in-game list and the game was seen
+/// running in this session.
+pub fn exit_status_believed(record: &SessionRecord) -> bool {
+    let emulator = &record.launch.emulator;
+    exit_status_demonstrated(emulator)
+        || (demonstrated_in_game_only(emulator) && record.game_seen_running.is_some())
+}
+
+/// Whether `emulator`'s exit status is believed for every kind of session
+/// (see [`EXIT_STATUS_DEMONSTRATED`]).
 pub fn exit_status_demonstrated(emulator: &str) -> bool {
     EXIT_STATUS_DEMONSTRATED
         .iter()
@@ -897,6 +955,7 @@ impl SessionJournal {
             sandbox_main_last_alive_unix: None,
             sandbox_main_reuse_mark: None,
             sandbox_main_boot: None,
+            game_seen_running: None,
             crash_evidence: None,
             end: None,
             play_evidence: PlayEvidence::None,
@@ -980,6 +1039,35 @@ impl SessionJournal {
                 self.write(&record)?;
             }
         }
+        Ok(record)
+    }
+
+    /// Records that the game was actually **observed running** in this
+    /// session, and what showed it. Only for a real observation: never
+    /// because a game was requested, a window appeared or time passed.
+    /// Without it, an emulator on [`EXIT_STATUS_DEMONSTRATED_IN_GAME`] has
+    /// its exit status recorded as "not known".
+    pub fn record_game_seen_running(
+        &self,
+        session_id: &str,
+        what: &str,
+    ) -> Result<SessionRecord, ContinuityError> {
+        let mut record = self.get(session_id)?;
+        if record.state != SessionState::Started {
+            return Err(ContinuityError::Refused(format!(
+                "session {session_id} is not running"
+            )));
+        }
+        if what.trim().is_empty() {
+            return Err(ContinuityError::Refused(
+                "what showed the game running must be stated".to_string(),
+            ));
+        }
+        record.game_seen_running = Some(GameSeenRunning {
+            what: what.trim().to_string(),
+            observed_unix: now_unix(),
+        });
+        self.write(&record)?;
         Ok(record)
     }
 
@@ -1107,7 +1195,7 @@ impl SessionJournal {
             && matches!(exit, ExitObservation::Code(_))
             // Checked again here, not only when the emulator was identified:
             // a stored record never widens what is believed.
-            && exit_status_demonstrated(&record.launch.emulator)
+            && exit_status_believed(&record)
             && record
                 .sandbox_main
                 .as_ref()
@@ -1171,9 +1259,15 @@ impl SessionJournal {
         //   abnormal only for an emulator whose codes have been demonstrated
         //   to mean that. For every other emulator it is recorded as a
         //   status EmuWiz cannot interpret. Zero is still zero.
-        let code_was_read =
-            evidence != ExitEvidence::LauncherOnly && matches!(end, SessionEnd::ExitCode { .. });
-        let end = if code_was_read && !exit_status_demonstrated(&record.launch.emulator) {
+        // For an emulator whose statuses mean something only from inside a
+        // running game, that includes 0: without evidence that the game
+        // ran, neither a normal in-game close nor an abnormal one is
+        // claimed. The number itself is kept either way.
+        let code_was_read = evidence != ExitEvidence::LauncherOnly
+            && (matches!(end, SessionEnd::ExitCode { .. })
+                || (end == SessionEnd::Clean
+                    && demonstrated_in_game_only(&record.launch.emulator)));
+        let end = if code_was_read && !exit_status_believed(&record) {
             let seen_so_far = PRELIMINARY_EXIT_EVIDENCE
                 .iter()
                 .find(|(emulator, _)| emulator.eq_ignore_ascii_case(&record.launch.emulator))
@@ -1181,8 +1275,12 @@ impl SessionJournal {
                     "a normal close of this emulator has not been shown to return 0",
                     |(_, evidence)| evidence,
                 );
+            let observed = match &end {
+                SessionEnd::Clean => "Ended with status 0".to_string(),
+                other => other.label(),
+            };
             SessionEnd::ExitUnsettled {
-                detail: format!("{} ({seen_so_far})", end.label()),
+                detail: format!("{observed} ({seen_so_far})"),
             }
         } else {
             end

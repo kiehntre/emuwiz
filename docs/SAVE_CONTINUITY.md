@@ -115,7 +115,7 @@ What counts as evidence, strongest first. Each is a separate source.
 |---|---|---|
 | The kernel reports a terminating signal for the emulator's own process (EmuWiz started it and waited on it) | That process was ended by that signal | Prominent: "Abnormal termination detected" |
 | The system's crash handler recorded a fatal termination for exactly the emulator process identified for this launch (see below) | That process was ended by a fatal signal; which one is not recorded | Prominent: "Abnormal termination detected" |
-| A non-zero exit code from an emulator on the demonstrated list | It did not close normally | Prominent: "Abnormal exit detected" |
+| A non-zero exit code from an emulator whose exit status is believed for that kind of session (see below) | It did not close normally | Prominent: "Abnormal exit detected" |
 | Exit status 0 from the emulator's own process, saves compared afterwards | It closed normally | Nothing |
 | A non-zero exit code from any other emulator | Nothing that can be interpreted | Quiet: "not known whether that was a normal close" |
 | Only a launcher's or wrapper's end was seen; EmuWiz was closed; no session | Nothing | Quiet: "not known how the emulator last ended" |
@@ -141,11 +141,26 @@ deliberate abnormal end returned something else. What has been observed
 
 | Emulator | From inside a running game | Status |
 |---|---|---|
-| RetroArch, native 1.21.0 and Flatpak 1.22.2 | 18 ordinary endings per route (quit command, quit key, window close, self-exit, polite stop, quit with an unwritable save state): 0 every time. 3 deliberate faults per route: 139 every time. Nothing hung | Meets the standard for in-game exits. One earlier polite stop **at the menu with no game loaded** returned 139 and is unexplained: menu-only and wrapper paths are not covered |
+| RetroArch, native 1.21.0 and Flatpak 1.22.2 | 18 ordinary endings per route (quit command, quit key, window close, self-exit, polite stop, quit with an unwritable save state): 0 every time. 3 deliberate faults per route: 139 every time. Nothing hung | Meets the standard **from inside a running game**. Believed only for a session in which the game was actually seen running; nothing can observe that today, so in practice every RetroArch exit status is "not known" (see below). One earlier polite stop **at the menu with no game loaded** returned 139 and is unexplained |
 | PPSSPP, Flatpak 1.20.4 | 9 ordinary endings (window close, in-app exit, polite stop): 0 every time. 3 deliberate faults: the process **hung**, and was only ended by the probe 40 s later | Not demonstrated: held as "not known" |
 | PCSX2, Flatpak 2.8.2 | Not yet closed from inside a game. At its first-run window a close returned 1 | Not demonstrated |
 | RPCS3, Flatpak | Not yet closed from inside a game. A window close returned 134 and the crash handler confirms it was ended by a fatal signal while closing; after a deliberate fault it kept running | Not demonstrated |
 | DuckStation, Dolphin, others | Not probed | Not demonstrated |
+
+#### RetroArch: requested is not running
+
+A game and a core being asked for at launch does not show that the game ran:
+loading can fail and leave RetroArch at its menu, where its exit status has
+not been shown to mean anything. So the rule needs evidence that the game was
+**seen running** (`SessionRecord::game_seen_running`, set only through
+`SessionJournal::record_game_seen_running`).
+
+EmuWiz has no reliable way to observe that, and none is invented: nothing in
+shipped code sets it. Until something trustworthy does, a RetroArch session
+ends as "not known whether that was a normal close", for 0 as much as for
+139, and the observed number is kept in the session record. A terminating
+signal reported directly by the kernel, and a crash-handler record, are
+separate evidence and still warn.
 
 #### Crash records for sandboxed emulators
 
@@ -306,7 +321,10 @@ development machine.
 - Session tracking is not yet called from Blue's launch path, so real launches
   produce no session and "how the emulator last ended" reads "not known".
 - No Blue page yet.
-- No emulator is on the demonstrated list in shipped code yet.
+- No emulator's exit status is believed in practice. RetroArch's would be
+  for a session in which the game was seen running, but EmuWiz cannot
+  observe that, so every RetroArch exit status (0 included) is recorded as
+  "not known" with the number kept.
 - The safe-point probes started each emulator idle, with no game: they show
   the emulator is *seen*, not what happens while it writes a save. Real save
   writing was exercised for RetroArch only (the synthetic game in the exit
