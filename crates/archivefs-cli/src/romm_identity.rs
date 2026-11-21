@@ -1541,12 +1541,22 @@ fn import(
                         let generation = u64::try_from(cache.imported_at_unix_seconds).unwrap_or(0);
                         let mut database = archivefs_core::Database::open_or_create(database_path)
                             .map_err(|error| error.to_string())?;
-                        database
+                        let enrichment = database
                             .enrich_platforms_from_romm_cache(&cache, generation)
-                            .map_err(|error| error.to_string())
+                            .map_err(|error| error.to_string())?;
+                        let review = enrichment.review_items();
+                        let ids = review
+                            .iter()
+                            .map(|item| item.archive_id)
+                            .collect::<Vec<_>>();
+                        let names = database
+                            .archive_names(&ids)
+                            .map_err(|error| error.to_string())?;
+                        Ok((enrichment, review_lines(&review, &names)))
                     });
                 match enrichment {
-                    Ok(enrichment) => context.progress(&format!(
+                    Ok((enrichment, review)) => {
+                        context.progress(&format!(
                         "Platform identity enrichment: {} applied, {} already current, {} manual assignment(s) preserved, {} conflict(s) require review, {} RomM platform(s) disagree with a verified catalogue (verified platform kept), {} RomM platform suggestion(s) for review (EmuWiz's platform kept).",
                         enrichment.applied,
                         enrichment.unchanged,
@@ -1554,7 +1564,17 @@ fn import(
                         enrichment.conflicts,
                         enrichment.romm_disagreements,
                         enrichment.romm_suggestions,
-                    )),
+                        ));
+                        if !review.is_empty() {
+                            context.progress(&format!(
+                                "Platforms for review ({}; nothing was changed):",
+                                review.len()
+                            ));
+                            for line in &review {
+                                context.progress(line);
+                            }
+                        }
+                    }
                     Err(error) => context.progress(&format!(
                         "RomM identity was published, but platform metadata could not be updated: {error}"
                     )),
@@ -3158,4 +3178,36 @@ fn artwork(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn std::
         }
         lines
     })
+}
+
+/// One readable line per platform review item: the game (by name and file
+/// name, never its folder), the platform it keeps and where that came from,
+/// RomM's platform, and why it was not applied.
+fn review_lines(
+    items: &[archivefs_core::PlatformReviewItem],
+    names: &std::collections::HashMap<i64, (String, String)>,
+) -> Vec<String> {
+    use archivefs_core::platform::display_name_for;
+    items
+        .iter()
+        .map(|item| {
+            let game = match names.get(&item.archive_id) {
+                Some((display, file)) if display != file => format!("{display} [{file}]"),
+                Some((_, file)) => file.clone(),
+                None => "(no longer in the library)".to_string(),
+            };
+            let kept = item
+                .current_platform
+                .as_deref()
+                .map(display_name_for)
+                .unwrap_or("no platform");
+            format!(
+                "  {game} (archive {}): keeps {kept} ({}); RomM says {}. {}.",
+                item.archive_id,
+                item.current_source,
+                display_name_for(&item.proposed_platform),
+                item.reason,
+            )
+        })
+        .collect()
 }
