@@ -4504,6 +4504,35 @@ pub struct PlatformIdentityEnrichmentSummary {
     /// verification. Shown for review; the verified platform stays current.
     pub romm_disagreements: usize,
     pub romm_disagreement_details: Vec<PlatformIdentityConflictDetail>,
+    /// RomM records whose platform differs from the current one, whoever set
+    /// it (a scan, a manual choice, or RomM itself earlier). Shown for review;
+    /// the current platform and its provenance stay as they are.
+    pub romm_suggestions: usize,
+    pub romm_suggestion_details: Vec<RommPlatformSuggestion>,
+}
+
+/// A platform RomM proposes for a game that already has a different one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RommPlatformSuggestion {
+    pub archive_id: i64,
+    /// The current platform, kept.
+    pub current_platform: String,
+    /// Where the current platform came from (its stored source).
+    pub current_source: String,
+    /// RomM's platform, not applied.
+    pub proposed_platform: String,
+    /// Why it needs review rather than being applied.
+    pub reason: &'static str,
+}
+
+impl RommPlatformSuggestion {
+    fn reason_for(current_source: &str) -> &'static str {
+        match current_source {
+            MANUAL_PLATFORM_SOURCE => "RomM disagrees with a platform you chose",
+            ROMM_PLATFORM_SOURCE => "RomM now reports a different platform than it gave before",
+            _ => "RomM disagrees with the platform EmuWiz found from the game's folder or files",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -5550,6 +5579,52 @@ impl Database {
             evidence.push(provider.clone());
             let resolution =
                 crate::platform::identity::resolve_platform_identity(generation, evidence);
+            // RomM is outside metadata. It fills a platform only where the game
+            // has none. Beside any current platform (a scan's, a manual
+            // choice, or RomM's own earlier answer) agreeing writes nothing,
+            // and disagreeing is shown for review and never applied: a header
+            // identity as a conflict, anything else as a suggestion. A current
+            // DAT verification is handled by the resolver above (RomM's
+            // agreement or disagreement only adjusts its DAT/RomM label).
+            if let Some((current_platform, current_source)) =
+                self.current_platform_assignment(archive_id)?
+                && !matches!(
+                    current_source.as_str(),
+                    VERIFIED_DAT_PLATFORM_SOURCE | DAT_ROMM_AGREEMENT_SOURCE
+                )
+            {
+                let manual = current_source == MANUAL_PLATFORM_SOURCE;
+                if current_platform == provider.platform {
+                    if manual {
+                        summary.manual_preserved += 1;
+                    } else {
+                        summary.unchanged += 1;
+                    }
+                    continue;
+                }
+                // A header identity against RomM is the resolver's conflict;
+                // its apply step writes nothing for a scan-owned row.
+                let header_conflict =
+                    matches!(resolution, PlatformIdentityResolution::Conflict { .. })
+                        && !manual
+                        && current_source != ROMM_PLATFORM_SOURCE;
+                if !header_conflict {
+                    if manual {
+                        summary.manual_preserved += 1;
+                    }
+                    summary.romm_suggestions += 1;
+                    summary
+                        .romm_suggestion_details
+                        .push(RommPlatformSuggestion {
+                            archive_id,
+                            reason: RommPlatformSuggestion::reason_for(&current_source),
+                            current_platform,
+                            current_source,
+                            proposed_platform: provider.platform,
+                        });
+                    continue;
+                }
+            }
             if let PlatformIdentityResolution::Conflict { evidence, .. } = &resolution {
                 summary
                     .conflict_details
@@ -5569,7 +5644,7 @@ impl Database {
             {
                 summary.romm_disagreements += 1;
                 let mut shown = evidence.clone();
-                shown.push(provider);
+                shown.push(provider.clone());
                 summary
                     .romm_disagreement_details
                     .push(PlatformIdentityConflictDetail {
@@ -19581,6 +19656,208 @@ echo "$out"
             unknown_platforms: Vec::new(),
             server_reported_total: Some(1),
         }
+    }
+
+    fn platform_rows(database: &Database, archive_id: i64) -> i64 {
+        database
+            .connection
+            .query_row(
+                "SELECT count(*) FROM platform_assignments WHERE archive_id = ?1",
+                params![archive_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn romm_agreeing_with_a_platform_emuwiz_found_keeps_it_and_its_provenance() {
+        for source in [
+            "folder_alias",
+            "header_identity",
+            ARCHIVE_MEMBER_PLATFORM_SOURCE,
+        ] {
+            let (root, mut database, archive_id) =
+                unknown_archive_database(&format!("romm-agrees-{source}"));
+            database
+                .assign_platform(archive_id, Some("PSP"), source)
+                .unwrap();
+            let rows = platform_rows(&database, archive_id);
+            let archive = load_archive(&database, archive_id);
+            // Imported twice: nothing is written either time.
+            for import in 0..2 {
+                let summary = database
+                    .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSP"), 10)
+                    .unwrap();
+                assert_eq!(
+                    (summary.applied, summary.unchanged),
+                    (0, 1),
+                    "{source} {import}"
+                );
+                assert_eq!(summary.romm_suggestions, 0, "{source}");
+                let after = load_archive(&database, archive_id);
+                assert_eq!(after.platform.as_deref(), Some("PSP"), "{source}");
+                assert_eq!(after.platform_source.as_deref(), Some(source), "{source}");
+                assert_eq!(platform_rows(&database, archive_id), rows, "{source}");
+            }
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn romm_disagreeing_with_a_folder_platform_is_only_a_suggestion() {
+        let (root, mut database, archive_id) = unknown_archive_database("romm-suggests");
+        database
+            .assign_platform(archive_id, Some("PSX"), "folder_alias")
+            .unwrap();
+        let rows = platform_rows(&database, archive_id);
+        let archive = load_archive(&database, archive_id);
+        for import in 0..2 {
+            let summary = database
+                .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSP"), 10)
+                .unwrap();
+            assert_eq!(summary.applied, 0, "{import}");
+            assert_eq!(summary.conflicts, 0, "{import}");
+            assert_eq!(summary.romm_suggestions, 1, "{import}");
+            assert_eq!(
+                summary.romm_suggestion_details,
+                [RommPlatformSuggestion {
+                    archive_id,
+                    current_platform: "PSX".into(),
+                    current_source: "folder_alias".into(),
+                    proposed_platform: "PSP".into(),
+                    reason: "RomM disagrees with the platform EmuWiz found from the game's folder or files",
+                }],
+                "{import}"
+            );
+            let after = load_archive(&database, archive_id);
+            assert_eq!(after.platform.as_deref(), Some("PSX"));
+            assert_eq!(after.platform_source.as_deref(), Some("folder_alias"));
+            assert_eq!(platform_rows(&database, archive_id), rows);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn romm_disagreeing_with_a_header_platform_stays_a_conflict_for_review() {
+        // The production case: WHDLoad installs read as Amiga, RomM says CD32.
+        let (root, mut database, archive_id) = unknown_archive_database("romm-vs-header");
+        database
+            .assign_platform(archive_id, Some("Amiga"), "header_identity")
+            .unwrap();
+        let rows = platform_rows(&database, archive_id);
+        let archive = load_archive(&database, archive_id);
+        for import in 0..2 {
+            let summary = database
+                .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "AmigaCD32"), 10)
+                .unwrap();
+            assert_eq!((summary.applied, summary.conflicts), (0, 1), "{import}");
+            assert_eq!(summary.romm_suggestions, 0, "{import}");
+            let after = load_archive(&database, archive_id);
+            assert_eq!(after.platform.as_deref(), Some("Amiga"));
+            assert_eq!(after.platform_source.as_deref(), Some("header_identity"));
+            assert_eq!(platform_rows(&database, archive_id), rows);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_unknown_romm_platform_never_replaces_a_known_one() {
+        let (root, mut database, archive_id) = unknown_archive_database("romm-unknown-platform");
+        database
+            .assign_platform(archive_id, Some("PSX"), "folder_alias")
+            .unwrap();
+        let archive = load_archive(&database, archive_id);
+        let summary = database
+            .enrich_platforms_from_romm_cache(
+                &romm_cache_for(&archive, "Not A Platform EmuWiz Knows"),
+                10,
+            )
+            .unwrap();
+        assert_eq!(summary.evidence_considered, 0);
+        assert_eq!(summary.applied + summary.romm_suggestions, 0);
+        assert_eq!(
+            load_archive(&database, archive_id)
+                .platform_source
+                .as_deref(),
+            Some("folder_alias")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn romm_fills_a_missing_platform_then_only_suggests_changing_it() {
+        // RomM A fills the gap; RomM B (twice) is held for review each time;
+        // RomM A again changes nothing.
+        let (root, mut database, archive_id) = unknown_archive_database("romm-a-b-b");
+        let archive = load_archive(&database, archive_id);
+        assert_eq!(archive.platform, None);
+        let first = database
+            .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSX"), 10)
+            .unwrap();
+        assert_eq!(first.applied, 1);
+        let rows = platform_rows(&database, archive_id);
+        for import in 0..2 {
+            let summary = database
+                .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSP"), 10)
+                .unwrap();
+            assert_eq!((summary.applied, summary.conflicts), (0, 0), "{import}");
+            assert_eq!(
+                summary.romm_suggestion_details,
+                [RommPlatformSuggestion {
+                    archive_id,
+                    current_platform: "PSX".into(),
+                    current_source: ROMM_PLATFORM_SOURCE.into(),
+                    proposed_platform: "PSP".into(),
+                    reason: "RomM now reports a different platform than it gave before",
+                }],
+                "{import}"
+            );
+            let after = load_archive(&database, archive_id);
+            assert_eq!(after.platform.as_deref(), Some("PSX"), "{import}");
+            assert_eq!(after.platform_source.as_deref(), Some(ROMM_PLATFORM_SOURCE));
+            assert_eq!(platform_rows(&database, archive_id), rows, "{import}");
+        }
+        let again = database
+            .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSX"), 10)
+            .unwrap();
+        assert_eq!(
+            (again.applied, again.unchanged, again.romm_suggestions),
+            (0, 1, 0)
+        );
+        assert_eq!(platform_rows(&database, archive_id), rows);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn romm_disagreeing_with_a_manual_choice_is_only_a_suggestion() {
+        let (root, mut database, archive_id) = unknown_archive_database("romm-vs-manual");
+        database.set_manual_platform(archive_id, "PSX").unwrap();
+        let rows = platform_rows(&database, archive_id);
+        let archive = load_archive(&database, archive_id);
+        let summary = database
+            .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSP"), 10)
+            .unwrap();
+        assert_eq!((summary.applied, summary.manual_preserved), (0, 1));
+        assert_eq!(summary.romm_suggestions, 1);
+        assert_eq!(
+            summary.romm_suggestion_details[0].reason,
+            "RomM disagrees with a platform you chose"
+        );
+        let agreeing = database
+            .enrich_platforms_from_romm_cache(&romm_cache_for(&archive, "PSX"), 10)
+            .unwrap();
+        assert_eq!(
+            (agreeing.manual_preserved, agreeing.romm_suggestions),
+            (1, 0)
+        );
+        let after = load_archive(&database, archive_id);
+        assert_eq!(after.platform.as_deref(), Some("PSX"));
+        assert_eq!(
+            after.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+        assert_eq!(platform_rows(&database, archive_id), rows);
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Adds archive rows that copy `template`'s columns, with `relative`

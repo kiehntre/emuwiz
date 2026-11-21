@@ -1456,6 +1456,24 @@ fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultV
                 );
             }
         }
+        if enrichment.romm_suggestions > 0 {
+            rows.push(row(
+                "RomM suggests a different platform",
+                format!(
+                    "{} — EmuWiz's platform kept, for review",
+                    enrichment.romm_suggestions
+                ),
+            ));
+            for suggestion in enrichment.romm_suggestion_details.iter().take(3) {
+                notes.push(format!(
+                    "Kept {} ({}); RomM proposes {}. {}.",
+                    archivefs_core::platform::display_name_for(&suggestion.current_platform),
+                    platform_source_name(&suggestion.current_source),
+                    archivefs_core::platform::display_name_for(&suggestion.proposed_platform),
+                    suggestion.reason,
+                ));
+            }
+        }
         if enrichment.applied > 0 {
             notes.push(
                 "Platform identity metadata was updated; no ROM files or links were changed."
@@ -1974,3 +1992,14 @@ pub(crate) fn show_romm_source_card(
 
 #[cfg(test)]
 mod tests;
+
+/// Where a stored platform came from, in words, for the RomM result notes.
+fn platform_source_name(source: &str) -> &'static str {
+    match source {
+        archivefs_core::MANUAL_PLATFORM_SOURCE => "your choice",
+        archivefs_core::ROMM_PLATFORM_SOURCE => "from RomM earlier",
+        "header_identity" => "from the game's header",
+        "folder_alias" => "from its folder",
+        _ => "found by EmuWiz",
+    }
+}

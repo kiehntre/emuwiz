@@ -184,7 +184,7 @@ pub use database::{
     PersistedSetAuditDependency, PersistedSetAuditResult, PlatformAlias, PlatformAssignmentChange,
     PlatformIdentityApplyOutcome, PlatformIdentityConflictDetail,
     PlatformIdentityEnrichmentSummary, PlatformProvenanceDetails, PreservedFile,
-    ROMM_PLATFORM_SOURCE, RecentScanAdditions, RegisteredSourceFolder,
+    ROMM_PLATFORM_SOURCE, RecentScanAdditions, RegisteredSourceFolder, RommPlatformSuggestion,
     SOURCE_PLATFORM_ASSIGNMENT_SOURCE, SavedDatEvidenceRow, SavedDatEvidenceStatus,
     ScanPersistSummary, ScanRunCounts, ScummVmScanReport, SourceFolderRecord, SourceRole,
     SourceScanStatus, TopologyPersistOutcome, UpgradeBackupInspection, UpgradeBackupState,
