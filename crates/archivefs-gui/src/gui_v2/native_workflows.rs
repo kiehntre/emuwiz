@@ -73,6 +73,9 @@ pub(super) struct NativeWorkflows {
     /// Records each launch in the save-continuity session journal (records
     /// only; never touches a save).
     session_tracking: super::session_tracking::SessionTracking,
+    /// The process log's next sequence number, as last noted while no
+    /// launch was active.
+    launch_sequence_mark: u64,
     launch_attempts: launch_readiness_summary::AttemptTracker,
     /// The summary the Game Details readiness card last displayed, keyed by
     /// game and path; read-only input for the Game Doctor.
@@ -536,6 +539,7 @@ impl NativeWorkflows {
             launch_was_active: false,
             launch_kind: None,
             session_tracking: Default::default(),
+            launch_sequence_mark: archivefs_core::launch::process_log::next_sequence(),
             launch_attempts: Default::default(),
             shown_readiness: None,
             pending_play: None,
@@ -635,12 +639,21 @@ impl NativeWorkflows {
 
     fn observe_launch_activity(&mut self, activity: &mut Activity) {
         let active = self.launch_active();
+        if !active && !self.launch_was_active {
+            // Noted while no launch is active: a launch can start its
+            // process before this first sees it as active, and that process
+            // must still be recognised as the launch's own.
+            self.launch_sequence_mark = archivefs_core::launch::process_log::next_sequence();
+        }
         if active && !self.launch_was_active {
             self.launch_kind = self.active_launch_kind();
             self.launch_game_at_start = self.selected_game;
             self.launch_attempts.started();
-            self.session_tracking
-                .launch_began(self.launch_kind_emulator(), self.launch_session_game());
+            self.session_tracking.launch_began(
+                self.launch_sequence_mark,
+                self.launch_kind_emulator(),
+                self.launch_session_game(),
+            );
             let job = activity.queue("Launching game", self.selected_route(), false);
             activity.start(job);
             self.launch_job = Some(job);

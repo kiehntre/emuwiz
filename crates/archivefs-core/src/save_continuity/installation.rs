@@ -31,6 +31,9 @@ pub enum Origin {
     /// The id this profile's records already carried (the one derived from
     /// its device key), kept so that existing history stays continuous.
     AdoptedFromDeviceKey,
+    /// The id file was missing; the id was taken from this profile's own
+    /// device record, which names the installation id its key speaks for.
+    RecoveredFromDeviceRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,7 +84,19 @@ pub fn existing(root: &Path) -> Result<Option<String>, ContinuityError> {
     if let Some(id) = read(root)? {
         return Ok(Some(id));
     }
+    if let Some(id) = super::device::recorded_history_id(root) {
+        return Ok(Some(id));
+    }
     super::device::key_derived_id(root)
+}
+
+/// Whether anything has been recorded under `root` already.
+fn holds_records(root: &Path) -> bool {
+    ["sessions", "manifests"].iter().any(|part| {
+        fs::read_dir(root.join(part))
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false)
+    })
 }
 
 /// The id to record under, created and stored on first use and the same
@@ -95,9 +110,22 @@ pub fn open_or_create(root: &Path) -> Result<String, ContinuityError> {
     if let Some(id) = read(root)? {
         return Ok(id);
     }
-    let (installation_id, origin) = match super::device::key_derived_id(root)? {
-        Some(id) => (id, Origin::AdoptedFromDeviceKey),
-        None => {
+    let recovered = super::device::recorded_history_id(root);
+    let (installation_id, origin) = match (recovered, super::device::key_derived_id(root)?) {
+        // The id file is gone but this profile's device record still says
+        // which id its history is under.
+        (Some(id), _) => (id, Origin::RecoveredFromDeviceRecord),
+        (None, Some(id)) => (id, Origin::AdoptedFromDeviceKey),
+        // No id anywhere, yet records exist: they are under an id that has
+        // been lost. A new id would silently start a second history beside
+        // them, so nothing is created.
+        (None, None) if holds_records(root) => {
+            return Err(ContinuityError::Corrupt(format!(
+                "{} is missing although this profile already holds records; a new id was not created, because it would split their history",
+                root.join(FILE).display()
+            )));
+        }
+        (None, None) => {
             use ring::rand::SecureRandom;
             let mut bytes = [0u8; 16];
             ring::rand::SystemRandom::new()

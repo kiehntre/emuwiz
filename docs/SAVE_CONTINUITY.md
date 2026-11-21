@@ -357,6 +357,7 @@ slice does.
 | 4 | Delta review of cdc75795..4fef4825 (direct signals, crash records, retention, diagnostic) | PASS WITH CONDITIONS: no blocker; five should-fix and six notes. Addressed: last-seen time kept current, daylight-saving and time-zone ambiguity, CLI crash source, wording when saves were not compared, document overclaims, bounded reading, a partial forged-line guard, an id-reuse heuristic, old manifest value still readable, override caveat. Left as it was: a compiled wrapper named like an emulator is taken for the emulator (older code, listed below) |
 | 5 | Delta review of the fixes (d6282b09) | PASS WITH CONDITIONS: four points (empty TZ, a look that cannot write, restart detection, two overclaims), addressed in 6148e365 |
 | 6 | Delta review of 6148e365 and of the RetroArch rule (cc1e11cf) | 6148e365: PASS. cc1e11cf: PASS WITH CONDITIONS, documentation only; the reviewer could not make a RetroArch session without gameplay evidence end as clean, abnormal or a signal. Addressed |
+| 7 | Final focused review of cc1e11cf..835bc8aa (Blue launch recording, the page, installation id and signing key, crash evidence) | PASS WITH CONDITIONS, no blocker: a failed launch could adopt the next launch's process; a very fast launch could be recorded as not started; a best-effort snapshot got a session warning. All three fixed with tests. Identity, crash evidence and docs passed |
 
 Remaining strict false positives the reviewers listed (they can only refuse a
 snapshot, never permit one): this repository's own test binaries named
@@ -376,6 +377,15 @@ development machine.
   launch creates the journal folder only: no snapshot store and no device
   signing key; it creates this installation's local id. A snapshot from the
   CLI likewise creates no key.
+- Recording a launch also writes `discovery-cache.json` beside the journal
+  (what each save file's content was when last read, so unchanged files are
+  not read again).
+- A launch started while another is still active is not recorded. A process
+  started by something other than the launch, in the instant between Blue
+  noting the process log and the launch starting, could be taken for the
+  launch's own.
+- The session journal has no retention yet: records accumulate, and each
+  look reads them all.
 - Flatpak crash-record detection is not verified end to end (see above).
 - The page shows recorded sessions and existing snapshots. It takes no
   snapshot and restores nothing; there is no automatic snapshot at session

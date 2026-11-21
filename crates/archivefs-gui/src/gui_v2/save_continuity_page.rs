@@ -249,6 +249,32 @@ fn reason(reason: &CaptureReason) -> &'static str {
     }
 }
 
+/// What to say about the session before a snapshot.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SessionNotice {
+    /// An abnormal end that was actually observed.
+    Warning(String),
+    /// Something that is not known: said quietly, never as a warning.
+    Quiet(String),
+    None,
+}
+
+/// Decided from the preceding session alone. How the copy was taken and
+/// whether its structure was checked are separate answers with their own
+/// badge and lines; they never turn into a warning about the session.
+pub(super) fn session_notice(entry: &TimelineEntry) -> SessionNotice {
+    let Some(session) = &entry.preceding_session else {
+        return SessionNotice::None;
+    };
+    if let Some(warning) = session.warning() {
+        return SessionNotice::Warning(warning);
+    }
+    match session.uncertainty() {
+        Some(text) if session.advisory() == Advisory::Caution => SessionNotice::Quiet(text),
+        _ => SessionNotice::None,
+    }
+}
+
 fn snapshot_card(ui: &mut egui::Ui, entry: &TimelineEntry) {
     widgets::full_width_card(ui, |ui| {
         ui.label(crate::ui::theme::card_title(&format!(
@@ -265,19 +291,17 @@ fn snapshot_card(ui: &mut egui::Ui, entry: &TimelineEntry) {
                 StatusTone::Pending,
             );
         }
-        // An abnormal end that was actually observed is prominent. What is
-        // merely not known is said quietly.
-        if let Some(warning) = &entry.warning {
-            widgets::banner(
+        match session_notice(entry) {
+            SessionNotice::Warning(text) => widgets::banner(
                 ui,
                 "About the session before this snapshot",
-                warning,
+                &text,
                 StatusTone::Warning,
-            );
-        } else if entry.advisory == Advisory::Caution
-            && let Some(uncertainty) = &entry.uncertainty
-        {
-            ui.weak(uncertainty);
+            ),
+            SessionNotice::Quiet(text) => {
+                ui.weak(text);
+            }
+            SessionNotice::None => {}
         }
         // Capture safety, structure and game-level validity are three
         // separate answers; they are shown as three lines, never as one.
@@ -545,6 +569,59 @@ mod tests {
                 "1 h 1 min"
             ]
         );
+    }
+
+    #[test]
+    fn only_the_preceding_session_decides_the_notice_on_a_snapshot() {
+        use archivefs_core::save_continuity::status::PrecedingSession;
+        use archivefs_core::save_continuity::store::CaptureBoundary;
+        // A best-effort copy: its own caution is in `warning`, which is
+        // about how the copy was taken, not about any session.
+        let entry = |session: Option<PrecedingSession>| TimelineEntry {
+            snapshot_id: "s".into(),
+            captured_unix: 1,
+            device_id: "d".into(),
+            emulator: "PCSX2".into(),
+            profile: "flatpak".into(),
+            source: PathBuf::from("/saves/card.ps2"),
+            boundary: CaptureBoundary::StableReadOnly,
+            verified_safe_point: false,
+            reason: CaptureReason::Manual,
+            session_id: None,
+            total_bytes: 1,
+            saves: Vec::new(),
+            changes: Vec::new(),
+            structure: None,
+            game_integrity: None,
+            preceding_session: session,
+            advisory: Advisory::Warning,
+            warning: Some("Emulator state not confirmed: may have been taken mid-write".into()),
+            uncertainty: None,
+            status_lines: Vec::new(),
+        };
+        // Nothing known about the session: said quietly, never a warning.
+        let unknown = session_notice(&entry(Some(PrecedingSession::unknown(
+            "no session was recorded",
+        ))));
+        assert!(matches!(unknown, SessionNotice::Quiet(_)), "{unknown:?}");
+        // A normal close, or no session information at all: nothing.
+        let clean = PrecedingSession::CleanExit {
+            session_id: "x".into(),
+        };
+        assert_eq!(session_notice(&entry(Some(clean))), SessionNotice::None);
+        assert_eq!(session_notice(&entry(None)), SessionNotice::None);
+        // An abnormal end that was observed: the warning, in its own words.
+        let fatal = PrecedingSession::FatalSignal {
+            session_id: "x".into(),
+            signal: 11,
+        };
+        match session_notice(&entry(Some(fatal))) {
+            SessionNotice::Warning(text) => {
+                assert!(text.starts_with("Abnormal termination detected"), "{text}");
+                assert!(!text.contains("mid-write"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

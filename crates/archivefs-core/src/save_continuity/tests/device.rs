@@ -875,6 +875,18 @@ fn a_profile_from_before_installation_ids_keeps_its_history_under_the_id_it_alwa
     let mut old = Device::new("Old desktop", 1_800_000_000);
     let root = old.dir.path().join("continuity");
     fs::remove_file(root.join("installation.json")).unwrap();
+    // Its device record was written before the field existed.
+    let record_path = root.join("device.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert!(
+        record["identity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("history_id")
+            .is_some()
+    );
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
     let key_id = old.device.identity.device_id.clone();
     let before_change = snapshot_under(&old.store, &old.card, &key_id, "v1", 100);
     let records_before = files_under(&root.join("manifests"));
@@ -1044,4 +1056,40 @@ fn the_history_a_device_speaks_for_is_pinned_when_it_is_paired() {
         .unwrap();
     list.body.snapshots.push(stray);
     assert!(laptop.peers().check(&list).is_err());
+}
+
+#[test]
+fn a_lost_id_file_is_never_replaced_by_a_new_id_while_records_exist() {
+    // Sessions recorded, no key, and the id file disappears.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("continuity");
+    let id = installation::open_or_create(&root).unwrap();
+    fs::create_dir_all(root.join("sessions")).unwrap();
+    fs::write(root.join("sessions/one.json"), b"{}").unwrap();
+    fs::remove_file(root.join("installation.json")).unwrap();
+    let refused = installation::open_or_create(&root).unwrap_err();
+    assert!(
+        matches!(refused, ContinuityError::Corrupt(ref why) if why.contains("split their history")),
+        "{refused:?}"
+    );
+    assert!(!root.join("installation.json").exists());
+    assert_eq!(installation::existing(&root).unwrap(), None);
+
+    // With two-device use switched on, the device record still names the
+    // id, and it is recovered from there instead of the key's own id.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("continuity");
+    let id2 = installation::open_or_create(&root).unwrap();
+    let device = LocalDevice::open_or_create(&root, "Desktop").unwrap();
+    assert_ne!(device.identity.device_id, id2);
+    fs::remove_file(root.join("installation.json")).unwrap();
+    assert_eq!(installation::existing(&root).unwrap(), Some(id2.clone()));
+    assert_eq!(installation::open_or_create(&root).unwrap(), id2);
+    let stored = fs::read_to_string(root.join("installation.json")).unwrap();
+    assert!(stored.contains("recovered_from_device_record"), "{stored}");
+    assert_eq!(
+        LocalDevice::open_existing(&root).unwrap().unwrap().identity,
+        device.identity
+    );
+    assert_ne!(id, id2);
 }

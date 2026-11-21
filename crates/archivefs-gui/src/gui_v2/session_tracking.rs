@@ -42,6 +42,9 @@ enum Message {
     },
     Finished {
         failure: Option<String>,
+        /// Processes started from this sequence on came after this launch
+        /// was over and belong to a later one.
+        until_sequence: u64,
     },
 }
 
@@ -56,10 +59,14 @@ pub(super) struct SessionTracking {
 }
 
 impl SessionTracking {
-    /// A launch has just become active.
-    pub(super) fn launch_began(&mut self, emulator: &str, game: SessionGame) {
+    /// A launch has just become active. `after_sequence` is the process
+    /// log's next sequence number as it was **before** the launch could
+    /// have started anything (the caller notes it while no launch is
+    /// active): a launch can start its process before Blue first sees it
+    /// as active.
+    pub(super) fn launch_began(&mut self, after_sequence: u64, emulator: &str, game: SessionGame) {
         self.send(Message::Began {
-            after_sequence: process_log::next_sequence(),
+            after_sequence,
             game,
             emulator: emulator.to_string(),
         });
@@ -68,7 +75,10 @@ impl SessionTracking {
     /// Blue's launch activity is over (the process it started has ended, or
     /// none could be started).
     pub(super) fn launch_finished(&mut self, failure: Option<String>) {
-        self.send(Message::Finished { failure });
+        self.send(Message::Finished {
+            failure,
+            until_sequence: process_log::next_sequence(),
+        });
     }
 
     fn send(&mut self, message: Message) {
@@ -97,9 +107,9 @@ impl SessionTracking {
 ///
 /// Recording a launch creates the session journal's folder and this
 /// installation's local id (a random number in `installation.json`, made
-/// once and reused), and nothing else: no snapshot store and no signing
-/// key. The key belongs to the two-device feature and is created only when
-/// that is used.
+/// once and reused) and a cache of what each save file held, and nothing
+/// else: no snapshot store and no signing key. The key belongs to the
+/// two-device feature and is created only when that is used.
 fn open_real_tracker() -> Result<LaunchTracker, ContinuityError> {
     use archivefs_core::save_continuity::discover::DiscoveryRoots;
     let root = archivefs_core::save_continuity::default_root()
@@ -125,6 +135,9 @@ fn start(open: OpenTracker, started_since: StartedSince, look_every: Duration) -
 struct Open {
     session_id: String,
     after_sequence: u64,
+    /// Set when the launch is over: only a process started before this
+    /// belongs to it.
+    until_sequence: Option<u64>,
     /// The started process has been passed to the tracker.
     started: bool,
     /// Blue reported the launch over.
@@ -176,34 +189,13 @@ fn work(
             // Opening failed once; keep draining so senders never block.
             continue;
         };
-        match message {
-            Some(Message::Began {
-                after_sequence,
-                game,
-                emulator,
-            }) => {
-                if let Ok(record) = tracker.begin(game, &emulator) {
-                    sessions.push(Open {
-                        session_id: record.session_id,
-                        after_sequence,
-                        started: false,
-                        over: None,
-                        launcher_done: false,
-                        waited_for_status: 0,
-                    });
-                }
-            }
-            Some(Message::Finished { failure }) => {
-                // The launch that is over is the newest one not yet over.
-                if let Some(session) = sessions
-                    .iter_mut()
-                    .rev()
-                    .find(|session| session.over.is_none())
-                {
-                    session.over = Some(failure);
-                }
-            }
-            None => {}
+        // Everything already sent is taken in before any launch is followed:
+        // a launch that is already over must be known to be over (and where
+        // its processes end) before a later launch's process is looked at.
+        let mut next = message;
+        while let Some(message) = next {
+            take(tracker, &mut sessions, message);
+            next = receiver.try_recv().ok();
         }
         sessions.retain_mut(|session| follow(tracker, session, started_since));
         if sessions.iter().any(|session| session.launcher_done) {
@@ -213,19 +205,66 @@ fn work(
     }
 }
 
+/// Notes one message. Slow for `Began` (it reads the saves).
+fn take(tracker: &LaunchTracker, sessions: &mut Vec<Open>, message: Message) {
+    match message {
+        Message::Began {
+            after_sequence,
+            game,
+            emulator,
+        } => {
+            if let Ok(record) = tracker.begin(game, &emulator) {
+                sessions.push(Open {
+                    session_id: record.session_id,
+                    after_sequence,
+                    until_sequence: None,
+                    started: false,
+                    over: None,
+                    launcher_done: false,
+                    waited_for_status: 0,
+                });
+            }
+        }
+        Message::Finished {
+            failure,
+            until_sequence,
+        } => {
+            // The launch that is over is the oldest one not yet over:
+            // launches do not overlap, and messages arrive in order.
+            if let Some(session) = sessions.iter_mut().find(|session| session.over.is_none()) {
+                session.over = Some(failure);
+                session.until_sequence = Some(until_sequence);
+            }
+        }
+    }
+}
+
 /// One step for one launch. Returns whether to keep following it.
 fn follow(tracker: &LaunchTracker, session: &mut Open, started_since: StartedSince) -> bool {
-    let process = started_since(session.after_sequence).into_iter().next();
+    // The first process started inside this launch's own span. Never one
+    // started after the launch was over: that is a later launch's.
+    let process = started_since(session.after_sequence)
+        .into_iter()
+        .find(|process| {
+            session
+                .until_sequence
+                .is_none_or(|until| process.sequence < until)
+        });
     if !session.started
         && let Some(process) = &process
     {
+        session.started = true;
         if tracker
             .process_started(&session.session_id, process)
             .is_err()
         {
-            return false;
+            // The record may already say "started" (the process was noted
+            // before the slower look at the saves failed). Keep following
+            // it then, so its end is still seen.
+            return tracker
+                .look_again(&session.session_id)
+                .is_ok_and(|record| record.state == SessionState::Started);
         }
-        session.started = true;
     }
     if session.launcher_done {
         // The launcher is gone; the emulator it started may still be
@@ -257,7 +296,13 @@ fn follow(tracker: &LaunchTracker, session: &mut Open, started_since: StartedSin
             session.launcher_done = true;
             true
         }
-        _ => false,
+        Ok(_) => false,
+        // Could not be recorded as ended now. Keep looking: the session is
+        // then settled as soon as its processes are seen gone.
+        Err(_) => {
+            session.launcher_done = true;
+            true
+        }
     }
 }
 
@@ -372,7 +417,12 @@ mod tests {
         // is written down. The worker waits for the status.
         child.kill().unwrap();
         child.wait().unwrap();
-        worker.send(Message::Finished { failure: None }).unwrap();
+        worker
+            .send(Message::Finished {
+                failure: None,
+                until_sequence: u64::MAX,
+            })
+            .unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(sessions(&root)[0].state, SessionState::Started);
         process.exit = Some(ExitSummary::Signal {
@@ -409,6 +459,7 @@ mod tests {
         worker
             .send(Message::Finished {
                 failure: Some("the core is missing".into()),
+                until_sequence: 9_000_002,
             })
             .unwrap();
         until("the failed launch is recorded", || {
@@ -427,6 +478,71 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_launch_never_adopts_the_next_launchs_process() {
+        // Launch 1 fails before starting anything. The person launches
+        // again at once; that launch starts a process. All three messages
+        // are waiting while the worker is still busy with the first.
+        let dir = tempfile::tempdir().unwrap();
+        let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+        std::fs::create_dir_all(&home).unwrap();
+        const SEQUENCE: u64 = 9_000_005;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        report(StartedProcess {
+            sequence: SEQUENCE,
+            pid: child.id(),
+            start_ticks: ticks(child.id()),
+            executable: PathBuf::from("/usr/bin/sleep"),
+            arguments: vec!["30".into()],
+            exit: None,
+        });
+        let worker = tracking(&root, &home, Duration::from_millis(40));
+        let named = |title: &str| SessionGame {
+            title: title.into(),
+            ..Default::default()
+        };
+        worker
+            .send(Message::Began {
+                after_sequence: SEQUENCE,
+                game: named("First, failed"),
+                emulator: "PCSX2".into(),
+            })
+            .unwrap();
+        worker
+            .send(Message::Finished {
+                failure: Some("the BIOS is missing".into()),
+                // Over before the process with this number was started.
+                until_sequence: SEQUENCE,
+            })
+            .unwrap();
+        worker
+            .send(Message::Began {
+                after_sequence: SEQUENCE,
+                game: named("Second, running"),
+                emulator: "PCSX2".into(),
+            })
+            .unwrap();
+        until("both launches are settled as they really were", || {
+            let all = sessions(&root);
+            all.len() == 2
+                && all
+                    .iter()
+                    .all(|session| session.state != SessionState::Requested)
+        });
+        let all = sessions(&root);
+        let by = |title: &str| all.iter().find(|s| s.game.title == title).unwrap();
+        assert_eq!(by("First, failed").state, SessionState::NeverStarted);
+        assert_eq!(by("First, failed").process_id, None);
+        assert_eq!(by("Second, running").state, SessionState::Started);
+        assert_eq!(by("Second, running").process_id, Some(child.id()));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        drop(worker);
+    }
+
+    #[test]
     fn a_tracker_that_cannot_be_opened_never_blocks_or_fails_a_launch() {
         let worker = start(
             Box::new(|| Err(ContinuityError::Refused("no folder".into()))),
@@ -441,7 +557,12 @@ mod tests {
                     emulator: "PCSX2".into(),
                 })
                 .unwrap();
-            worker.send(Message::Finished { failure: None }).unwrap();
+            worker
+                .send(Message::Finished {
+                    failure: None,
+                    until_sequence: u64::MAX,
+                })
+                .unwrap();
         }
     }
 

@@ -189,6 +189,17 @@ pub(super) fn create_private_once(path: &Path, bytes: &[u8]) -> Result<bool, Con
     }
 }
 
+/// The installation id a device record in `root` says its key speaks for,
+/// if there is such a record. Reads only.
+pub(super) fn recorded_history_id(root: &Path) -> Option<String> {
+    let bytes = fs::read(root.join("device.json")).ok()?;
+    serde_json::from_slice::<DeviceFile>(&bytes)
+        .ok()?
+        .identity
+        .history_id
+        .filter(|id| super::installation::well_formed(id))
+}
+
 /// The device id of the key in `root`, if there is a key: what records made
 /// before installation ids existed were recorded under. Reads only.
 pub(super) fn key_derived_id(root: &Path) -> Result<Option<String>, ContinuityError> {
