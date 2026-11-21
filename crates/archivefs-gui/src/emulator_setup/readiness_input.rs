@@ -374,6 +374,7 @@ impl ReadinessSources<'_> {
         // Reported in place of the generic reason, after the disc-file and
         // DOS checks below have had their say.
         let mut lane_reason = None;
+        let mut prepared_copy = None;
         if matches!(
             identity_status,
             archivefs_core::launch::CanonicalIdentityStatus::Unknown
@@ -384,21 +385,28 @@ impl ReadinessSources<'_> {
             let hint = focused_record
                 .and_then(|record| record.mount_plan.archive.identity.platform.clone())
                 .or_else(|| catalogued.clone());
+            // A disc the recovery engine prepared a verified copy of is
+            // judged by that copy: its files are what would be started, so
+            // the lane's format, content and system checks read them. The
+            // copy confers no system or identity; a folder-only system still
+            // needs the person's confirmation below.
+            prepared_copy = crate::emulator_setup::prepared_media::for_game(path, hint.as_deref());
             // A format EmuWiz explicitly does not start from here (Amiga HDF
             // and IPF, unsupported archives, cartridge formats the system's
             // check does not read) stays unsupported: the unverified lane
             // never manufactures launch support (owner rule 7, 2026-11-09).
-            let format_unsupported = matches!(
-                identity_unknown_reason(
-                    focused,
-                    selected_game_identity_report,
-                    Some(hint.as_deref()),
-                ),
-                launch_readiness_page::IdentityUnknownReason::AmigaHardDisk
-                    | launch_readiness_page::IdentityUnknownReason::AmigaIpf
-                    | launch_readiness_page::IdentityUnknownReason::UnsupportedArchive
-                    | launch_readiness_page::IdentityUnknownReason::UnsupportedFormat(_)
-            );
+            let format_unsupported = prepared_copy.is_none()
+                && matches!(
+                    identity_unknown_reason(
+                        focused,
+                        selected_game_identity_report,
+                        Some(hint.as_deref()),
+                    ),
+                    launch_readiness_page::IdentityUnknownReason::AmigaHardDisk
+                        | launch_readiness_page::IdentityUnknownReason::AmigaIpf
+                        | launch_readiness_page::IdentityUnknownReason::UnsupportedArchive
+                        | launch_readiness_page::IdentityUnknownReason::UnsupportedFormat(_)
+                );
             // No system recorded at all (owner decision 2026-11-10): the same
             // lane, with no recorded system to confirm - the person picks one
             // for a try or remembers it; nothing is saved as the system.
@@ -410,13 +418,24 @@ impl ReadinessSources<'_> {
                     .then(|| (self.platform_source)(path))
                     .flatten();
                 use crate::emulator_setup::unverified_media::Outcome;
+                // The try and the remembered choice belong to the library
+                // file; for a prepared copy only its own system applies.
+                let own_system = |system: Option<&'static str>| {
+                    system.filter(|system| {
+                        prepared_copy
+                            .as_ref()
+                            .is_none_or(|copy| copy.platform_id == *system)
+                    })
+                };
                 match crate::emulator_setup::unverified_media::resolve(
-                    path,
+                    prepared_copy
+                        .as_ref()
+                        .map_or(path, |copy| copy.launch_path.as_path()),
                     &hint,
                     source.as_deref(),
                     selected_game_identity_report.map(|report| report.platform),
-                    (self.system_trial)(path),
-                    (self.remembered_system)(path),
+                    own_system((self.system_trial)(path)),
+                    own_system((self.remembered_system)(path)),
                 ) {
                     Outcome::Allowed(resolved, basis) => {
                         identity_status =
@@ -589,7 +608,22 @@ impl ReadinessSources<'_> {
         // one verified ROM) is what authorises the substitution either way.
         // Before 2026-11-09 every zipped cartridge in Blue stopped at "No
         // runnable game file has been resolved".
-        if (content.requires_mount || content.resolved_path.is_none())
+        if let Some(copy) = prepared_copy
+            .as_ref()
+            .filter(|_| identity_unverified.is_some())
+        {
+            // Planned as the direct file it is. Launch preflight re-checks the
+            // copy against its receipt and re-derives the same unverified key
+            // from the cue sheet before anything is started.
+            content = archivefs_core::launch::LaunchContentRef {
+                kind: Some(archivefs_core::launch::LaunchContentKind::OpticalDisc),
+                container: Some(archivefs_core::launch::LaunchContainerKind::PlainFile),
+                resolved_path: Some(copy.launch_path.clone()),
+                requires_mount: false,
+                provenance: crate::emulator_setup::prepared_media::PREPARED_COPY_PROVENANCE
+                    .to_string(),
+            };
+        } else if (content.requires_mount || content.resolved_path.is_none())
             && let Some(zipped) = selected_game_identity_report
                 .filter(|report| focused.is_some_and(|path| report.archive_path == path))
                 .and_then(archivefs_core::launch::launch_content_ref_for_zipped_cartridge)

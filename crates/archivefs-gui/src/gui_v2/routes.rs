@@ -789,10 +789,11 @@ pub(super) enum ToolPage {
     FolderCheck,
     Relocation,
     MemoryCards,
+    GameRecovery,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
@@ -816,6 +817,7 @@ impl ToolPage {
         Self::FolderCheck,
         Self::Relocation,
         Self::MemoryCards,
+        Self::GameRecovery,
     ];
 
     pub fn title(self) -> &'static str {
@@ -843,6 +845,7 @@ impl ToolPage {
             Self::FolderCheck => "Organise my games",
             Self::Relocation => "Move a game between library folders",
             Self::MemoryCards => "PlayStation memory cards",
+            Self::GameRecovery => "Game recovery",
         }
     }
 
@@ -905,6 +908,9 @@ impl ToolPage {
             Self::MemoryCards => {
                 "See the saves on PS1 and PS2 memory cards, back a card up, and copy single saves in and out. A card is never changed: every result is a separate file."
             }
+            Self::GameRecovery => {
+                "See why a game cannot start, with the evidence, and let EmuWiz prepare a verified playable copy where that is safe. Your game file is only read; a copy is made of new files after you confirm."
+            }
         }
     }
 
@@ -933,6 +939,7 @@ impl ToolPage {
             Self::FolderCheck => Section::Games,
             Self::Relocation => Section::Games,
             Self::MemoryCards => Section::Saves,
+            Self::GameRecovery => Section::Problems,
         }
     }
 
@@ -960,6 +967,7 @@ impl ToolPage {
             Self::FolderCheck => "Games & collection",
             Self::Relocation => "Games & collection",
             Self::MemoryCards => "Saves & States",
+            Self::GameRecovery => "Health & Recovery",
         }
     }
 }

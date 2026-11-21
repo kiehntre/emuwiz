@@ -329,6 +329,10 @@ pub mod storage_health;
 /// generic source-root migration planner.
 pub mod source_folder_migration;
 
+/// Game recovery engine: evidence-backed diagnosis of games that cannot start
+/// and verified, create-new preparation of playable copies.
+pub mod recovery;
+
 /// Read-only projection of active rename/recovery transaction paths into the
 /// generic source-root migration planner.
 pub mod recovery_state_migration;

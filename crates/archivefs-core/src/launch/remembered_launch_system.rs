@@ -9,7 +9,9 @@
 //!   on the Launch page. "Try anyway" on its own never writes it.
 //! - It is bound to one file *as it was when chosen*: absolute path, size and
 //!   modification time. Any change to the file makes the entry inert (it is
-//!   never applied to different bytes).
+//!   never applied to different bytes). The one exception is
+//!   [`move_remembered_launch_system_at`]: when the same file is proven to
+//!   have been renamed or moved, the entry follows it.
 //! - It is launch-only. It never changes the library's recorded system, a
 //!   manual system choice, catalogue evidence or verified identity, and
 //!   anything the file says about itself (a header naming another system, a
@@ -169,6 +171,47 @@ pub fn forget_launch_system_at(path: &Path, file: &Path) -> Result<(), String> {
         return Ok(());
     }
     write_entries(path, entries)
+}
+
+/// Moves the remembered choice of `old` to `new`, for a caller that has
+/// proven `new` is the same game file under a new name or in a new place
+/// (EmuWiz's own rename of that file, or a full content comparison). Applies
+/// only when the entry for `old` remembers exactly `platform_id`, nothing is
+/// at `old` any more, and `new` has no entry of its own. Returns whether an
+/// entry was moved. The entry is re-bound to `new` as it is now.
+pub fn move_remembered_launch_system_at(
+    path: &Path,
+    old: &Path,
+    new: &Path,
+    platform_id: &str,
+) -> Result<bool, String> {
+    let _writer = write_lock();
+    let mut entries = load_remembered_launch_systems_at(path)?;
+    let wanted = crate::canonical_platform_for_alias(platform_id);
+    let applies = wanted.is_some()
+        && entries.iter().any(|entry| {
+            entry.path == old && crate::canonical_platform_for_alias(&entry.platform_id) == wanted
+        })
+        && entries.iter().all(|entry| entry.path != new)
+        // Provably gone: an unmounted disk or an unreadable folder is not.
+        && crate::recovery::prepared_media::source_is_gone(old, None);
+    if !applies {
+        return Ok(false);
+    }
+    let Some(moved) = RememberedLaunchSystem::for_current_file(new, platform_id) else {
+        return Ok(false);
+    };
+    // The choice was made for a file of this size and time; a file that was
+    // rebuilt rather than renamed or moved does not inherit it.
+    if !entries.iter().any(|entry| {
+        entry.path == old && entry.size == moved.size && entry.modified_ns == moved.modified_ns
+    }) {
+        return Ok(false);
+    }
+    entries.retain(|entry| entry.path != old);
+    entries.push(moved);
+    write_entries(path, entries)?;
+    Ok(true)
 }
 
 fn write_entries(path: &Path, mut entries: Vec<RememberedLaunchSystem>) -> Result<(), String> {

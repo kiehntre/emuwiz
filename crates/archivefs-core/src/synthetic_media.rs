@@ -505,3 +505,83 @@ pub fn samples() -> Vec<MediaSample> {
         },
     ]
 }
+
+/// A minimal ZIP archive holding `members` uncompressed ("stored"), written
+/// from the format's documented layout. For tests that need a real ZIP
+/// without a ZIP-writing dependency.
+pub fn stored_zip(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, data) in members {
+        let offset = out.len() as u32;
+        let mut crc = crate::identity_source::hashing::Crc32::new();
+        crc.update(data);
+        let crc: u32 = crc.finish();
+        let size = data.len() as u32;
+        out.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+        out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+        central.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
+        central.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&[0; 12]);
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+    }
+    let central_offset = out.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&(members.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(members.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&central_offset.to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
+/// A synthetic CD set as collectors store CD32 games: a cue sheet, one
+/// ISO 9660 data track (system identifier `CDTV`, no files) and one WAV audio
+/// track. `title` names the three files. Not a game and not bootable.
+pub fn cd_disc_set(title: &str) -> Vec<(String, Vec<u8>)> {
+    let iso_name = format!("{title}.iso");
+    let wav_name = format!("{title} (Track 2 of 2).wav");
+    let mut iso = vec![0_u8; 2048 * 24];
+    let descriptor = &mut iso[16 * 2048..17 * 2048];
+    descriptor[0] = 1;
+    descriptor[1..6].copy_from_slice(b"CD001");
+    descriptor[6] = 1;
+    descriptor[8..40].fill(b' ');
+    descriptor[8..12].copy_from_slice(b"CDTV");
+    descriptor[40..72].fill(b' ');
+    descriptor[40..49].copy_from_slice(b"SYNTHETIC");
+    for (index, byte) in iso[18 * 2048..].iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    let mut wav = b"RIFF".to_vec();
+    wav.extend_from_slice(&(36_u32 + 9408).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&[
+        16, 0, 0, 0, 1, 0, 2, 0, 0x44, 0xac, 0, 0, 0x10, 0xb1, 2, 0, 4, 0, 16, 0,
+    ]);
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&9408_u32.to_le_bytes());
+    wav.extend((0..9408).map(|index| (index % 97) as u8));
+    let cue = format!(
+        "FILE \"{iso_name}\" BINARY\r\n  TRACK 01 MODE1/2048\r\n    INDEX 01 00:00:00\r\nFILE \"{wav_name}\" WAVE\r\n  TRACK 02 AUDIO\r\n    INDEX 01 00:00:00\r\n"
+    );
+    vec![
+        (iso_name, iso),
+        (wav_name, wav),
+        (format!("{title}.cue"), cue.into_bytes()),
+    ]
+}

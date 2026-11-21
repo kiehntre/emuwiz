@@ -323,7 +323,17 @@ pub fn apply_organisation_transaction(
     }
     crate::database::organisation_paths::validate_bound(transaction, database)
         .map_err(ApplyError::Journal)?;
-    apply_filesystem_organisation_transaction(
+    // A game with a prepared copy (see `crate::recovery`) keeps it, and its
+    // remembered launch choice, under its new name. Captured before, carried
+    // after, only for entries that were really applied; never affects the
+    // outcome of the rename itself.
+    let prepared = crate::recovery::moves::before(transaction.entries.iter().map(|entry| {
+        (
+            entry.source_path.as_path(),
+            entry.destination_path.as_path(),
+        )
+    }));
+    let result = apply_filesystem_organisation_transaction(
         transaction,
         approved_sources,
         generation,
@@ -332,7 +342,17 @@ pub fn apply_organisation_transaction(
         cancel,
         mode,
         master_root,
-    )
+    );
+    if let Ok(outcome) = &result {
+        crate::recovery::moves::after(prepared, |old, new| {
+            outcome.transaction.entries.iter().any(|entry| {
+                entry.state == crate::dat::rename_apply::model::EntryState::Applied
+                    && entry.source_path == old
+                    && entry.destination_path == new
+            })
+        });
+    }
+    result
 }
 
 /// Directories the organiser may create and own: one platform folder
@@ -655,7 +675,28 @@ pub fn rollback_organisation_transaction(
         &transaction.transaction_id,
     );
     refuse_to_separate_a_game_from_its_saves(transaction)?;
+    // Undo puts a prepared copy's link (and remembered launch choice) back
+    // with the file, exactly as apply carried it forward.
+    let prepared = crate::recovery::moves::before(
+        transaction
+            .entries
+            .iter()
+            .filter(|entry| entry.state == crate::dat::rename_apply::model::EntryState::Applied)
+            .map(|entry| {
+                (
+                    entry.destination_path.as_path(),
+                    entry.source_path.as_path(),
+                )
+            }),
+    );
     let rollback = rollback_transaction(transaction, journal_dir, cancel)?;
+    crate::recovery::moves::after(prepared, |old, new| {
+        transaction.entries.iter().any(|entry| {
+            entry.state == crate::dat::rename_apply::model::EntryState::RolledBack
+                && entry.destination_path == old
+                && entry.source_path == new
+        })
+    });
 
     let mut directories_removed = Vec::new();
     let mut directories_remaining = Vec::new();
