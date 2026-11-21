@@ -80,8 +80,10 @@ pub(crate) fn configured_folder_unchecked_at(setting: &Path) -> Option<PathBuf> 
 }
 
 /// Re-checks a saved folder each time it is used: it must still be a real
-/// folder (not a link) of this user that others cannot write to. A folder
-/// that does not exist yet is acceptable; it is created private on first use.
+/// folder (not a link) of this user that others cannot write to. A missing
+/// folder passes this check (an earlier folder whose disk is away is simply
+/// not there); the folder in current use must also exist, which
+/// `PreparedMediaStore::configured` requires.
 pub fn still_safe(folder: &Path) -> Result<(), String> {
     if !has_plain_components(folder) {
         return Err(format!(

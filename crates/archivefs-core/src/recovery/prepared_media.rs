@@ -324,10 +324,22 @@ pub enum LaunchPathCheck {
     Refused(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PreparedMediaStore {
     root: PathBuf,
+    /// Set for a folder the person chose: it was created when it was chosen,
+    /// so if it is missing later (its disk is not connected) the store
+    /// refuses to work rather than create it again on whatever is there.
+    root_must_exist: bool,
 }
+
+impl PartialEq for PreparedMediaStore {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+    }
+}
+
+impl Eq for PreparedMediaStore {}
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -479,7 +491,10 @@ fn is_riff_wave(file: &mut File) -> bool {
 impl PreparedMediaStore {
     /// A store at an explicit root (tests, the CLI's `--store`).
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            root_must_exist: false,
+        }
     }
 
     /// The store for this profile: `EMUWIZ_PREPARED_MEDIA_DIR` when set to an
@@ -513,7 +528,10 @@ impl PreparedMediaStore {
                 folder.display()
             ));
         }
-        Ok(Some(Self::at(folder)))
+        Ok(Some(Self {
+            root: folder,
+            root_must_exist: true,
+        }))
     }
 
     /// Every store this profile may hold prepared copies in: the current one
@@ -835,6 +853,12 @@ impl PreparedMediaStore {
     fn ensure_layout(&self) -> Result<PreparedMediaStore, String> {
         if !self.root.is_absolute() {
             return Err("the store root is not an absolute path".into());
+        }
+        if self.root_must_exist && fs::symlink_metadata(&self.root).is_err() {
+            return Err(format!(
+                "{} is not there (is its disk connected?)",
+                self.root.display()
+            ));
         }
         let mut builder = fs::DirBuilder::new();
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
@@ -1850,15 +1874,30 @@ pub fn launch_refusal_with(
     stores: &[PreparedMediaStore],
     content: &Path,
 ) -> Option<String> {
+    // Judged by where the file really is as well as by how its path is
+    // written: a folder reached through a link, or a path with `..`, is the
+    // same folder.
+    let resolved = content
+        .parent()
+        .and_then(|parent| fs::canonicalize(parent).ok())
+        .zip(content.file_name())
+        .map(|(parent, name)| parent.join(name));
+    let inside = |folder: &Path| {
+        content.starts_with(folder)
+            || resolved.as_deref().is_some_and(|resolved| {
+                resolved.starts_with(folder)
+                    || fs::canonicalize(folder).is_ok_and(|folder| resolved.starts_with(folder))
+            })
+    };
     if let (Some(detail), Some(folder)) = (&current_error, &configured_unchecked)
-        && content.starts_with(folder)
+        && inside(folder)
     {
         return Some(format!(
             "The folder chosen for prepared copies can no longer be used ({detail})"
         ));
     }
     for folder in previous {
-        if content.starts_with(folder)
+        if inside(folder)
             && let Err(detail) = super::storage::still_safe(folder)
         {
             return Some(format!(

@@ -2874,6 +2874,28 @@ mod second_review_tests {
         let missing = PreparedMediaStore::configured(Some(chosen.clone()));
         assert!(missing.is_err_and(|detail| detail.contains("not there")));
         assert!(!chosen.exists());
+
+        // A store handed out while the folder was there (a batch in
+        // progress) does not recreate it either once it is gone.
+        std::fs::create_dir(&chosen).unwrap();
+        std::fs::set_permissions(&chosen, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let store = PreparedMediaStore::configured(Some(chosen.clone()))
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir(&chosen).unwrap();
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let result = store.prepare(
+            &zip,
+            "AmigaCD32",
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+            &|_| {},
+        );
+        assert!(matches!(result, Err(PrepareError::Store(detail)) if detail.contains("not there")));
+        assert!(!chosen.exists(), "the chosen folder was recreated");
     }
 
     #[test]
@@ -2924,6 +2946,35 @@ mod second_review_tests {
         )
         .unwrap();
 
+        // The same distrusted folder reached through a link in its path, and
+        // through `..`: still refused.
+        std::fs::set_permissions(
+            &old_root,
+            std::os::unix::fs::PermissionsExt::from_mode(0o777),
+        )
+        .unwrap();
+        let alias = lab.root.join("alias-to-root");
+        std::os::unix::fs::symlink(&lab.root, &alias).unwrap();
+        let through_link = alias
+            .join("old-store")
+            .join(track.strip_prefix(&old_root).unwrap());
+        assert!(launch_refusal_with(None, None, &previous, without_old, &through_link).is_some());
+        let dotted = track
+            .parent()
+            .unwrap()
+            .join("..")
+            .join("media")
+            .join(ISO_NAME);
+        assert!(launch_refusal_with(None, None, &previous, without_old, &dotted).is_some());
+        // And a previous folder that was saved under a path with a link in it.
+        let saved_with_link = vec![alias.join("old-store")];
+        assert!(launch_refusal_with(None, None, &saved_with_link, without_old, &track).is_some());
+        std::fs::set_permissions(
+            &old_root,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+
         // The saved choice cannot be used: files inside it are refused, even
         // with no store left to check them against.
         let refused = launch_refusal_with(
@@ -2952,6 +3003,14 @@ mod second_review_tests {
         );
         std::fs::write(&setting, "relative\n").unwrap();
         assert_eq!(configured_folder_unchecked_at(&setting), None);
+        // Far larger than any setting: only the bounded start is read.
+        let mut huge = b"/chosen/folder\n".to_vec();
+        huge.resize(4 * 1024 * 1024, b'x');
+        std::fs::write(&setting, huge).unwrap();
+        assert_eq!(
+            configured_folder_unchecked_at(&setting),
+            Some(PathBuf::from("/chosen/folder"))
+        );
         // A FIFO where the setting should be: answered at once, not waited on.
         std::fs::remove_file(&setting).unwrap();
         let name = std::ffi::CString::new(setting.to_str().unwrap()).unwrap();
