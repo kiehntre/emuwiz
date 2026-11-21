@@ -77,6 +77,10 @@ pub fn retroarch_save_writing(install: &str, config_file: &Path) -> Option<Retro
         );
     }
     advice.push(
+        "This reads RetroArch's main configuration file only. Settings overridden for one core or one game are not looked at, so a particular game may behave differently."
+            .to_string(),
+    );
+    advice.push(
         "This is about battery saves only. Save states are a separate feature with their own settings, and are not what this reports."
             .to_string(),
     );

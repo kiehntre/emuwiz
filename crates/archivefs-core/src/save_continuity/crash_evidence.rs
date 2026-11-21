@@ -3,9 +3,10 @@
 //! For an emulator inside a Flatpak sandbox, EmuWiz gets back only an exit
 //! code from `flatpak run`, and an exit code is never read as a signal. But
 //! the operating system itself may have written down that a process was
-//! ended by a core-dumping signal. On Ubuntu the kernel hands every such
-//! event to its crash handler (apport), which logs the **host process id**
-//! of the process, sandboxed or not:
+//! ended by a core-dumping signal. On Ubuntu the kernel hands such events to
+//! its crash handler (apport), which for a process inside a container or
+//! sandbox logs the **host process id**. Not every such process is certain
+//! to get a line (one that may not dump core, or too many at once, may not):
 //!
 //! ```text
 //! ERROR: apport (pid 3167710) 2026-11-20 23:39:17,940: host pid 3167430 crashed in a container without apport support
@@ -152,6 +153,18 @@ impl ApportLog {
 
 /// The machine's own idea of local time, through the C library.
 fn local_to_unix(time: &LocalTime) -> Option<i64> {
+    // The handler runs as root from the kernel and writes the machine's
+    // local time. If this process was given a time zone of its own, its
+    // idea of local time may differ: the times cannot then be compared.
+    if std::env::var_os("TZ").is_some_and(|zone| !zone.is_empty()) {
+        return None;
+    }
+    one_reading(local_as(time, 0), local_as(time, 1))
+}
+
+/// The wall-clock time read as standard time (`dst` 0) or as daylight-saving
+/// time (`dst` 1); `None` when that reading is not a real time.
+fn local_as(time: &LocalTime, dst: i32) -> Option<i64> {
     // SAFETY: `tm` is fully initialised before use; mktime only reads and
     // normalises it.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -161,15 +174,35 @@ fn local_to_unix(time: &LocalTime) -> Option<i64> {
     tm.tm_hour = time.hour as i32;
     tm.tm_min = time.minute as i32;
     tm.tm_sec = time.second as i32;
-    tm.tm_isdst = -1;
+    tm.tm_isdst = dst;
     let unix = unsafe { libc::mktime(&mut tm) };
-    // mktime normalises impossible dates instead of refusing them; a date
-    // that came back different was not a real one.
-    let unchanged = tm.tm_mday == time.day as i32
+    // mktime normalises instead of refusing: an impossible date, or a
+    // reading (standard/daylight) that does not apply at that time, comes
+    // back as a different wall-clock time or with the other flag.
+    let unchanged = tm.tm_isdst == dst
+        && tm.tm_mday == time.day as i32
         && tm.tm_mon == time.month as i32 - 1
         && tm.tm_hour == time.hour as i32
         && tm.tm_min == time.minute as i32;
     (unix != -1 && unchanged).then_some(unix as i64)
+}
+
+/// A wall-clock time is usable only when exactly one reading of it is real.
+/// In the hour that repeats when the clocks go back both are, an hour apart:
+/// the log does not say which was meant, so the time cannot be placed. In
+/// the hour skipped when they go forward neither is.
+pub(crate) fn one_reading(standard: Option<i64>, daylight: Option<i64>) -> Option<i64> {
+    match (standard, daylight) {
+        (Some(one), None) | (None, Some(one)) => Some(one),
+        (Some(a), Some(b)) if a == b => Some(a),
+        _ => None,
+    }
+}
+
+/// For tests: the real conversion.
+#[cfg(test)]
+pub(crate) fn local_to_unix_for_tests(time: &LocalTime) -> Option<i64> {
+    local_to_unix(time)
 }
 
 /// `YYYY-MM-DD HH:MM:SS` at the start of `text`.
@@ -277,17 +310,32 @@ impl CrashSource for ApportLog {
                     );
                 }
             };
-            let too_big = file
-                .metadata()
-                .map_or(true, |meta| meta.len() > MAX_LOG_BYTES);
+            // Never more than the limit, however the file grows meanwhile.
             let mut bytes = Vec::new();
-            if too_big || file.read_to_end(&mut bytes).is_err() {
+            let read = (&mut file).take(MAX_LOG_BYTES + 1).read_to_end(&mut bytes);
+            if read.is_err() || bytes.len() as u64 > MAX_LOG_BYTES {
                 return CrashEvidence::unavailable(
                     "the system's crash handler log could not be read",
                 );
             }
             read_any = true;
+            // The handler also logs each crashed program's command line,
+            // which that program chose and which may contain line breaks.
+            // Until such a quotation is closed, a line is not known to be
+            // the handler's own words.
+            let mut inside_quoted_command = false;
             for line in String::from_utf8_lossy(&bytes).lines() {
+                let was_inside = inside_quoted_command;
+                if line.contains("(command line \"") {
+                    inside_quoted_command = !line.ends_with("\")");
+                } else if was_inside && line.ends_with("\")") {
+                    inside_quoted_command = false;
+                }
+                if was_inside && line.contains(&format!("host pid {} ", process.pid)) {
+                    return CrashEvidence::unavailable(
+                        "the crash handler log names this process inside another program's quoted command line",
+                    );
+                }
                 let Some(parsed) = parse_line(line) else {
                     // A line that names this process but cannot be understood
                     // must not be silently skipped: the answer is then unclear.

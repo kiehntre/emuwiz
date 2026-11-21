@@ -322,7 +322,7 @@ struct Proc {
 }
 
 #[derive(Default)]
-struct Machine(RefCell<BTreeMap<u32, Proc>>);
+struct Machine(RefCell<BTreeMap<u32, Proc>>, Cell<Option<(u64, u64)>>);
 
 impl Machine {
     fn start(
@@ -352,6 +352,9 @@ impl Machine {
 }
 
 impl ProcessTable for Machine {
+    fn process_ids_issued(&self) -> Option<(u64, u64)> {
+        self.1.get()
+    }
     fn start_ticks(&self, pid: u32) -> Option<u64> {
         self.0.borrow().get(&pid).map(|p| p.ticks)
     }
@@ -885,6 +888,383 @@ fn a_reused_process_id_is_never_attributed_to_this_launch() {
         CrashEvidence::FatalTerminationRecorded {
             recorded_at: stamp(399),
             source: NO_RECORD.to_string()
+        }
+    );
+}
+
+// ---- Fourth review (2026-11-21) ----
+
+#[test]
+fn a_wall_clock_time_is_used_only_when_exactly_one_reading_of_it_is_real() {
+    // An ordinary time: one reading.
+    assert_eq!(one_reading(Some(100), None), Some(100));
+    assert_eq!(one_reading(None, Some(100)), Some(100));
+    // A zone without daylight saving: both readings agree.
+    assert_eq!(one_reading(Some(100), Some(100)), Some(100));
+    // The hour that repeats when the clocks go back: two instants an hour
+    // apart, and the log does not say which. Not placed.
+    assert_eq!(one_reading(Some(3600), Some(0)), None);
+    // The hour skipped when they go forward, or an impossible date.
+    assert_eq!(one_reading(None, None), None);
+}
+
+#[test]
+fn the_real_conversion_agrees_with_the_systems_own_clock_or_declines() {
+    // Take real instants, ask the C library for their local wall-clock time
+    // (what the handler writes), and convert back.
+    let now = super::super::now_unix();
+    let zone_set = std::env::var_os("TZ").is_some_and(|zone| !zone.is_empty());
+    for instant in [now, now - 86_400 * 30, now - 86_400 * 200, T0] {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let clock = instant as libc::time_t;
+        assert!(!unsafe { libc::localtime_r(&clock, &mut tm) }.is_null());
+        let local = LocalTime {
+            year: tm.tm_year + 1900,
+            month: (tm.tm_mon + 1) as u32,
+            day: tm.tm_mday as u32,
+            hour: tm.tm_hour as u32,
+            minute: tm.tm_min as u32,
+            second: tm.tm_sec as u32,
+        };
+        match local_to_unix_for_tests(&local) {
+            // Never a different instant.
+            Some(found) => assert_eq!(found, instant, "{local:?}"),
+            // Declining is allowed (a repeated hour, or TZ set for this
+            // process); a wrong answer is not.
+            None => assert!(zone_set || tm.tm_hour <= 3, "{local:?}"),
+        }
+    }
+    // Dates that do not exist are refused, not normalised into real ones.
+    for (month, day, hour) in [(2, 30, 12), (13, 1, 12), (11, 31, 12), (11, 20, 25)] {
+        let impossible = LocalTime {
+            year: 2026,
+            month,
+            day,
+            hour,
+            minute: 0,
+            second: 0,
+        };
+        assert_eq!(local_to_unix_for_tests(&impossible), None, "{impossible:?}");
+    }
+}
+
+#[test]
+fn a_time_that_cannot_be_placed_is_unknown_for_this_process_and_ignored_for_others() {
+    fn never(_: &LocalTime) -> Option<i64> {
+        None
+    }
+    fn not_at_250(time: &LocalTime) -> Option<i64> {
+        utc(time).filter(|at| *at != T0 + 250)
+    }
+    let log = other(0) + &crashed(250, 4242);
+    let files = Files::new(APPORT, None, Some(&log));
+    let mut source = files.source();
+    source.to_unix = not_at_250;
+    let found = source.lookup(&emulator());
+    assert!(
+        matches!(found, CrashEvidence::Unavailable { ref why } if why.contains("a time EmuWiz cannot place")),
+        "{found:?}"
+    );
+    // Another process's unplaceable line changes nothing.
+    let log = other(0) + &crashed(250, 7) + &crashed(260, 4242);
+    let files = Files::new(APPORT, None, Some(&log));
+    let mut source = files.source();
+    source.to_unix = not_at_250;
+    assert!(source.lookup(&emulator()).confirmed());
+    // Nothing can be placed at all: the log then covers nothing.
+    let files = Files::new(APPORT, None, Some(&(other(0) + &other(500))));
+    let mut source = files.source();
+    source.to_unix = never;
+    assert!(matches!(
+        source.lookup(&emulator()),
+        CrashEvidence::Unavailable { .. }
+    ));
+}
+
+#[test]
+fn an_oversized_log_or_one_with_binary_bytes_is_handled_without_guessing() {
+    // Larger than the limit: not read, not partly believed.
+    let files = Files::new(APPORT, None, Some(&(other(0) + &crashed(250, 4242))));
+    let path = files.dir.path().join("apport.log");
+    let mut big = fs::read(&path).unwrap();
+    big.resize(8 * 1024 * 1024 + 1, b'\n');
+    fs::write(&path, &big).unwrap();
+    assert!(matches!(
+        files.source().lookup(&emulator()),
+        CrashEvidence::Unavailable { .. }
+    ));
+    // Real non-UTF-8 bytes on other lines do not hide or create a record.
+    let files = Files::new(APPORT, None, None);
+    let mut bytes = other(0).into_bytes();
+    bytes.extend_from_slice(b"\xff\xfe\x80 junk \xc3\x28\n");
+    bytes.extend_from_slice(crashed(250, 4242).as_bytes());
+    fs::write(files.dir.path().join("apport.log"), &bytes).unwrap();
+    assert!(files.source().lookup(&emulator()).confirmed());
+    let mut bytes = other(0).into_bytes();
+    bytes.extend_from_slice(b"\xff\xfe\x80 junk\n");
+    bytes.extend_from_slice(other(500).as_bytes());
+    fs::write(files.dir.path().join("apport.log"), &bytes).unwrap();
+    assert_eq!(
+        files.source().lookup(&emulator()),
+        CrashEvidence::NoRecord {
+            source: NO_RECORD.to_string()
+        }
+    );
+}
+
+#[test]
+fn a_line_inside_another_programs_quoted_command_line_is_not_the_handlers_word() {
+    // A program that crashes with line breaks in its arguments gets them
+    // written into the log verbatim. It can make a line that looks exactly
+    // like the handler's.
+    let forged = other(0)
+        + &format!(
+            "ERROR: apport (pid 9) {},100: executable: /tmp/x (command line \"/tmp/x\n",
+            stamp(240)
+        )
+        + &crashed(250, 4242)
+        + "tail\")\n"
+        + &other(500);
+    let found = Files::new(APPORT, None, Some(&forged))
+        .source()
+        .lookup(&emulator());
+    assert!(
+        matches!(found, CrashEvidence::Unavailable { ref why } if why.contains("quoted command line")),
+        "{found:?}"
+    );
+    // The same shape naming another process changes nothing for this one.
+    let unrelated = other(0)
+        + &format!(
+            "ERROR: apport (pid 9) {},100: executable: /tmp/x (command line \"/tmp/x\n",
+            stamp(240)
+        )
+        + &crashed(245, 7)
+        + "tail\")\n"
+        + &crashed(250, 4242);
+    assert!(
+        Files::new(APPORT, None, Some(&unrelated))
+            .source()
+            .lookup(&emulator())
+            .confirmed()
+    );
+    // An ordinary one-line command line (the usual case) closes itself.
+    let usual = other(0)
+        + &format!(
+            "ERROR: apport (pid 9) {},100: executable: /app/bin/pcsx2-qt (command line \"pcsx2-qt -batch\")\n",
+            stamp(249)
+        )
+        + &crashed(250, 4242);
+    assert!(
+        Files::new(APPORT, None, Some(&usual))
+            .source()
+            .lookup(&emulator())
+            .confirmed()
+    );
+}
+
+/// Moves a session's recorded times back, as if it had started that long ago.
+fn age(case: &Case, seconds: i64) {
+    fn shift(value: &mut serde_json::Value, seconds: i64) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, inner) in map.iter_mut() {
+                    let timed = [
+                        "first_seen_unix",
+                        "sandbox_main_last_alive_unix",
+                        "started_unix",
+                    ];
+                    match inner.as_i64() {
+                        Some(at) if timed.contains(&key.as_str()) && at > 0 => {
+                            *inner = (at - seconds).into()
+                        }
+                        _ => shift(inner, seconds),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                items.iter_mut().for_each(|item| shift(item, seconds))
+            }
+            _ => {}
+        }
+    }
+    let dir = case._dir.path().join("sessions");
+    let mut changed = 0;
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        shift(&mut value, seconds);
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        changed += 1;
+    }
+    assert_eq!(changed, 1);
+}
+
+#[test]
+fn a_long_session_that_emuwiz_kept_watching_is_still_asked_about() {
+    // Half an hour of play, with EmuWiz looking from time to time.
+    let case = flatpak("PCSX2", "pcsx2-qt", "/app/bin/pcsx2-qt", recorded());
+    let first = case.look();
+    age(&case, 1800);
+    let aged = case.journal.all().remove(0);
+    assert_eq!(
+        aged.sandbox_main_last_alive_unix,
+        first.sandbox_main_last_alive_unix.map(|at| at - 1800)
+    );
+    // The next look finds it alive and that is written down, not just held.
+    case.look();
+    let stored = case.journal.all().remove(0);
+    let now = super::super::now_unix();
+    assert!(
+        (now - stored.sandbox_main_last_alive_unix.unwrap()).abs() <= 2,
+        "{stored:?}"
+    );
+    case.machine.exit(&[102, 101, 100]);
+    let ended = case.end(ExitObservation::Code(139));
+    assert!(
+        matches!(ended.end, Some(SessionEnd::FatalTerminationRecorded { .. })),
+        "{:?}",
+        ended.crash_evidence
+    );
+    // Asked with the real bounds: from when the emulator was first seen
+    // (half an hour ago) to now.
+    let asked = case.asked.borrow();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].pid, 102);
+    assert_eq!(
+        asked[0].started_unix,
+        aged.sandbox_main.as_ref().unwrap().first_seen_unix
+    );
+    assert!((asked[0].started_unix - (now - 1800)).abs() <= 2);
+    assert!((asked[0].gone_by_unix - now).abs() <= 2);
+    drop(asked);
+
+    // A look less than a minute after the last write is not written again
+    // (it is a look, not a write, on every frame).
+    let case = flatpak("PCSX2", "pcsx2-qt", "/app/bin/pcsx2-qt", recorded());
+    case.look();
+    age(&case, LAST_ALIVE_WRITE_SECONDS - 20);
+    let before = case.journal.all().remove(0).sandbox_main_last_alive_unix;
+    case.look();
+    assert_eq!(
+        case.journal.all().remove(0).sandbox_main_last_alive_unix,
+        before
+    );
+
+    // The same half hour with nobody looking after the first seconds: the
+    // id may mean something else by now, so the source is not asked.
+    let case = flatpak("PCSX2", "pcsx2-qt", "/app/bin/pcsx2-qt", recorded());
+    case.look();
+    age(&case, 1800);
+    case.machine.exit(&[102, 101, 100]);
+    let ended = case.end(ExitObservation::Code(139));
+    assert!(case.asked.borrow().is_empty());
+    assert!(matches!(
+        ended.crash_evidence,
+        Some(CrashEvidence::Unavailable { .. })
+    ));
+    assert!(!ended.needs_attention());
+}
+
+#[test]
+fn a_record_is_not_tied_to_the_launch_when_the_process_id_may_have_come_round() {
+    // Inside the ten-minute window, but the system has since started more
+    // processes than half its id range: the id may belong to another.
+    let case = flatpak("PCSX2", "pcsx2-qt", "/app/bin/pcsx2-qt", recorded());
+    case.machine.1.set(Some((1_000, 32_768)));
+    case.look();
+    case.machine.exit(&[102, 101, 100]);
+    case.machine.1.set(Some((1_000 + 16_384, 32_768)));
+    let settled = case
+        .journal
+        .reconcile(&case.machine, super::super::now_unix() + 300);
+    assert!(case.asked.borrow().is_empty());
+    assert_eq!(settled[0].state, SessionState::EndNotSeen);
+    assert!(
+        matches!(settled[0].crash_evidence, Some(CrashEvidence::Unavailable { ref why }) if why.contains("may have been given to another")),
+        "{:?}",
+        settled[0].crash_evidence
+    );
+    // Fewer than that: asked as usual.
+    let case = flatpak("PCSX2", "pcsx2-qt", "/app/bin/pcsx2-qt", recorded());
+    case.machine.1.set(Some((1_000, 32_768)));
+    case.look();
+    case.machine.exit(&[102, 101, 100]);
+    case.machine.1.set(Some((1_000 + 900, 32_768)));
+    let settled = case
+        .journal
+        .reconcile(&case.machine, super::super::now_unix() + 300);
+    assert_eq!(case.asked.borrow().len(), 1);
+    assert!(matches!(
+        settled[0].end,
+        Some(SessionEnd::FatalTerminationRecorded { .. })
+    ));
+}
+
+#[test]
+fn a_record_found_when_emuwiz_was_not_running_says_the_save_was_not_compared() {
+    // Settled later by a look, not at the moment it ended: nobody compared
+    // the saves then.
+    let case = flatpak("PCSX2", "pcsx2-qt", "/app/bin/pcsx2-qt", recorded());
+    case.look();
+    case.machine.exit(&[102, 101, 100]);
+    case.journal
+        .reconcile(&case.machine, super::super::now_unix() + 30);
+    let current = [mark("v1")];
+    let preceding = preceding_session(&case.journal.all(), "dev", "PCSX2", "flatpak", &current);
+    assert_eq!(
+        preceding,
+        PrecedingSession::FatalTerminationRecorded {
+            session_id: case.session.clone(),
+            saves_compared_afterwards: false
+        }
+    );
+    let warning = preceding.warning().unwrap();
+    assert!(
+        warning.contains("was not compared then and may also have changed since"),
+        "{warning}"
+    );
+    // Seen at the time, with the saves compared: no such caveat.
+    let case = flatpak("PCSX2", "pcsx2-qt", "/app/bin/pcsx2-qt", recorded());
+    case.look();
+    case.machine.exit(&[102, 101, 100]);
+    case.end(ExitObservation::Code(134));
+    let warning = case.preceding().warning().unwrap();
+    assert!(!warning.contains("was not compared"), "{warning}");
+    // And if the save has changed since a compared session, the session no
+    // longer speaks for it at all.
+    let changed = preceding_session(
+        &case.journal.all(),
+        "dev",
+        "PCSX2",
+        "flatpak",
+        &[mark("v3")],
+    );
+    assert!(
+        matches!(changed, PrecedingSession::Unknown { .. }),
+        "{changed:?}"
+    );
+}
+
+#[test]
+fn a_snapshot_status_written_before_the_rename_can_still_be_read() {
+    let old: PrecedingSession =
+        serde_json::from_str(r#"{"outcome":"crashed","session_id":"s","signal":11}"#).unwrap();
+    assert_eq!(
+        old,
+        PrecedingSession::FatalSignal {
+            session_id: "s".into(),
+            signal: 11
+        }
+    );
+    let no_field: PrecedingSession =
+        serde_json::from_str(r#"{"outcome":"fatal_termination_recorded","session_id":"s"}"#)
+            .unwrap();
+    assert_eq!(
+        no_field,
+        PrecedingSession::FatalTerminationRecorded {
+            session_id: "s".into(),
+            saves_compared_afterwards: true
         }
     );
 }

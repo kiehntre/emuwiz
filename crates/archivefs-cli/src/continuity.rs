@@ -481,7 +481,18 @@ pub fn run(args: Vec<String>) -> Outcome {
                             install.install,
                             install.config_file.display()
                         );
-                        println!("  battery saves: {:?}", install.battery_saves);
+                        use archivefs_core::save_continuity::diagnostics::BatterySaveWriting;
+                        match &install.battery_saves {
+                            BatterySaveWriting::PeriodicWritingOff => {
+                                println!("  battery saves: not written periodically (off)")
+                            }
+                            BatterySaveWriting::Every { seconds } => println!(
+                                "  battery saves: written every {seconds} seconds while a game runs"
+                            ),
+                            BatterySaveWriting::NotEstablished { why } => {
+                                println!("  battery saves: not established ({why})")
+                            }
+                        }
                         match install.save_state_on_exit {
                             Some(on) => println!(
                                 "  save state when a game is closed (a different feature): {}",
@@ -603,7 +614,13 @@ pub fn run(args: Vec<String>) -> Outcome {
             let device = device(&options, &store)?;
             // How the emulator last ended, if a recorded session can be tied
             // to this exact save; otherwise "unknown".
-            let journal = SessionJournal::open(store.root(), &device.identity.device_id)?;
+            // With the same read-only crash-record source the launch path
+            // uses: a session settled here must not be recorded as having
+            // had no source to ask.
+            let journal = SessionJournal::open(store.root(), &device.identity.device_id)?
+                .with_crash_source(Box::new(
+                    archivefs_core::save_continuity::crash_evidence::ApportLog::system(),
+                ));
             journal.reconcile(&ProcFs, continuity_now());
             let preceding = preceding_session(
                 &journal.recent(500),
@@ -857,7 +874,13 @@ pub fn run(args: Vec<String>) -> Outcome {
         "sessions" => {
             let store = existing_store(&options)?;
             let device = existing_device(&store)?;
-            let journal = SessionJournal::open(store.root(), &device.identity.device_id)?;
+            // With the same read-only crash-record source the launch path
+            // uses: a session settled here must not be recorded as having
+            // had no source to ask.
+            let journal = SessionJournal::open(store.root(), &device.identity.device_id)?
+                .with_crash_source(Box::new(
+                    archivefs_core::save_continuity::crash_evidence::ApportLog::system(),
+                ));
             let settled = journal.reconcile(&ProcFs, continuity_now());
             let sessions = journal.recent(200);
             emit(

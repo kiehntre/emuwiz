@@ -29,7 +29,7 @@ Three rules hold everywhere:
 | "Is the emulator closed?" | `ProcScanQuiescence` + kernel lease, PCSX2 and RetroArch only | Identities for DuckStation, RPCS3, PPSSPP (real launches checked) and Dolphin (synthetic only, kept off) | Dolphin real launch |
 | Save compatibility | Planner types with caller-asserted conversions; no converter | Five-level verdict; one implemented, checked conversion (card save onto a copy of another card) | Any other conversion |
 | Save states | `save_state_compatibility`: no producer of "Supported" | Stated plainly as not portable | Per-core format/version inspection |
-| Sessions | None persisted. Recently Played reads RetroArch's history only; `daedalus` records failed launches | Session journal: requested / started / ended, process identity, descendants, crash and unseen-exit handling | **Not yet called from Blue's launch path** |
+| Sessions | None persisted. Recently Played reads RetroArch's history only; `daedalus` records failed launches | Session journal: requested / started / ended, process identity, descendants, abnormal-end and unseen-exit handling | **Not yet called from Blue's launch path** |
 | Game identity | Verified facts per game file | `match_game_file`: save's product code against the identifier EmuWiz verifies inside the game file | Library lookup by serial (no index, facts table empty in the checked library copy) |
 | Devices | None | Offline model with signed lists, history-based ordering, resumable transfer | Any real transport |
 | Database | Schema 30 | **No schema change.** State is JSON under `<data>/save-continuity`, like other features outside the library database | See "Schema proposal" |
@@ -63,7 +63,7 @@ A snapshot records these separately. There is no combined "verified".
 | `boundary` (capture safety) | Was the copy taken while nothing could be writing? | emulator closed and observed · not confirmed (best-effort) · received from another device |
 | `structure` | Does the file have the shape its format requires? | passed (says exactly what was walked) · problems · not checked |
 | `game_integrity` | Is the data valid as the game sees it? | **not checked**, always. No game checksum is verified today, and there is deliberately no "verified" value |
-| `preceding_session` | How did the emulator end, the last time it could have written this save? | clean exit · crashed · forced stop · error exit · exit not seen · unknown |
+| `preceding_session` | How did the emulator end, the last time it could have written this save? | clean exit · fatal signal (observed directly) · fatal termination recorded (by the system's crash handler) · forced stop · error exit · exit not seen · unknown |
 
 What the structural check covers: memory cards (directory and allocation walked by
 two independent readers that must agree); GameCube `.gci` (file length against the
@@ -150,8 +150,9 @@ deliberate abnormal end returned something else. What has been observed
 #### Crash records for sandboxed emulators
 
 `crash_evidence` reads Ubuntu's crash handler log (`/var/log/apport.log`),
-which records the **host process id** of every process ended by a
-core-dumping signal, sandboxed or not. It only reads; it needs no privilege
+which, for a process inside a container or sandbox that was ended by a
+core-dumping signal, may record its **host process id**. Not every such
+process is certain to get a line. It only reads; it needs no privilege
 beyond the user's own (group `adm`); nothing about Flatpak or an emulator
 changes.
 
@@ -159,15 +160,21 @@ A record counts only when all of this holds:
 
 - its host process id is the one tracked for the emulator of this launch;
 - its time is inside that process's tracked lifetime (a few seconds' slack);
-- if EmuWiz was not watching when the process ended, the process was last
-  seen alive no more than ten minutes before it was found gone.
+- the process was last seen alive no more than ten minutes before it was
+  found gone. While EmuWiz is running it looks regularly and keeps that time
+  current (written at least once a minute), so this only bites when nobody
+  was looking;
+- where the system can say, fewer than half of all process ids were issued
+  since then (so the id cannot have come round to another process).
 
 Everything unclear is "unavailable", which is treated as not known and can
 never fail a launch or a snapshot: another crash handler (most other
 distributions; systemd-coredump is not supported yet), an unreadable or
 missing log, a log that does not reach back to the process's start, an entry
 for that process that cannot be read, two candidate entries, a record just
-outside the lifetime (within two minutes: timing unclear), or a kernel that
+outside the lifetime (within two minutes: timing unclear), a time in the hour
+that repeats when the clocks go back, a time zone set for EmuWiz alone (`TZ`),
+an entry inside another program's quoted command line, or a kernel that
 does not wait for its handler (`core_pipe_limit` 0 or unreadable: "no record"
 then establishes nothing).
 
@@ -271,11 +278,18 @@ slice does.
 | 1 | Snapshot store, recovery, continuation copy, device model, CLI (at 035f56a2) | PASS WITH CONDITIONS: no path overwrites or deletes an original save; eight conditions, all addressed |
 | 2 | Process identity, safe point, exit tracking (at 035f56a2) | PASS WITH CONDITIONS: no torn file published as a safe point while a lease is held; one latent blocker (a wrapper's exit 0 read as clean) and five should-fix, all addressed |
 | 3 | Delta review of the fixes (cdc75795) | PASS WITH CONDITIONS: earlier conditions closed; four further points, addressed |
+| 4 | Delta review of cdc75795..4fef4825 (direct signals, crash records, retention, diagnostic) | PASS WITH CONDITIONS: no blocker; five should-fix and six notes. Addressed: last-seen time kept current, daylight-saving and time-zone ambiguity, CLI crash source, wording when saves were not compared, document overclaims, bounded reading, forged-line guard, id-reuse guard, old manifest value still readable, override caveat. Left as it was: a compiled wrapper named like an emulator is taken for the emulator (older code, listed below) |
 
 Remaining strict false positives the reviewers listed (they can only refuse a
 snapshot, never permit one): this repository's own test binaries named
 `retroarch_cheat_...`; a script named like an emulator; `flatpak update
 <app id>`; any other user's process whose command line names the emulator.
+
+One case that is not refuse-only: a **compiled** program whose file name
+starts with an emulator's name is taken to be that emulator, so a compiled
+wrapper's exit would be read as the emulator's. Script wrappers are
+recognised; compiled ones are not. No such wrapper is known on the
+development machine.
 
 ## Limits of this slice
 

@@ -228,6 +228,10 @@ pub struct SessionRecord {
     /// When the emulator inside the sandbox was last seen alive.
     #[serde(default)]
     pub sandbox_main_last_alive_unix: Option<i64>,
+    /// How many process ids the system had issued, and its limit, when the
+    /// emulator was last seen alive (see `ProcessTable::process_ids_issued`).
+    #[serde(default)]
+    pub sandbox_main_reuse_mark: Option<(u64, u64)>,
     /// What the system's own crash records say about that process, when
     /// they were consulted. Independent of the exit status.
     #[serde(default)]
@@ -328,6 +332,13 @@ pub trait ProcessTable {
     }
     /// The short process name of `pid` (`comm`).
     fn name(&self, _pid: u32) -> Option<String> {
+        None
+    }
+    /// How many processes the system has started since boot, and the
+    /// largest process id it uses before starting again from the bottom.
+    /// An id cannot have been given to a second process until that many
+    /// more have been started. `None` when this table cannot say.
+    fn process_ids_issued(&self) -> Option<(u64, u64)> {
         None
     }
 }
@@ -507,6 +518,21 @@ fn flatpak_scope(cgroup: &str) -> Option<String> {
 pub struct ProcFs;
 
 impl ProcessTable for ProcFs {
+    fn process_ids_issued(&self) -> Option<(u64, u64)> {
+        let stat = fs::read_to_string("/proc/stat").ok()?;
+        let issued = stat
+            .lines()
+            .find_map(|line| line.strip_prefix("processes "))?
+            .trim()
+            .parse()
+            .ok()?;
+        let limit = fs::read_to_string("/proc/sys/kernel/pid_max")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some((issued, limit))
+    }
     fn start_ticks(&self, pid: u32) -> Option<u64> {
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         // The command name is in parentheses and may contain spaces.
@@ -653,6 +679,21 @@ fn refresh(record: &mut SessionRecord, processes: &dyn ProcessTable) {
         .is_some_and(|main| alive(main, processes))
     {
         record.sandbox_main_last_alive_unix = Some(now_unix());
+        record.sandbox_main_reuse_mark = processes.process_ids_issued();
+    }
+}
+
+/// How stale the stored "last seen alive" time may get before it is written
+/// again. It decides whether a crash record may still be tied to the
+/// process, so it has to follow a long session; it need not be written on
+/// every look.
+pub const LAST_ALIVE_WRITE_SECONDS: i64 = 60;
+
+fn last_alive_moved_on(before: Option<i64>, record: &SessionRecord) -> bool {
+    match (before, record.sandbox_main_last_alive_unix) {
+        (None, Some(_)) => true,
+        (Some(old), Some(new)) => new - old >= LAST_ALIVE_WRITE_SECONDS,
+        _ => false,
     }
 }
 
@@ -678,9 +719,25 @@ fn consult_crash_source(
     let last_alive = record
         .sandbox_main_last_alive_unix
         .unwrap_or(main.first_seen_unix);
+    // Could the id have gone round and been given to another process since
+    // the emulator was last seen? Only where the system can say.
+    let reused = match (
+        record.sandbox_main_reuse_mark,
+        processes.process_ids_issued(),
+    ) {
+        // Ids are handed out in a circle, skipping those in use, so coming
+        // back to one takes nearly a full round. Half a round is already
+        // treated as too many.
+        (Some((then, _)), Some((issued, limit))) => issued.saturating_sub(then) >= limit / 2,
+        _ => false,
+    };
     let evidence = if now - last_alive > CRASH_RECORD_WINDOW_SECONDS || now < last_alive {
         CrashEvidence::unavailable(
             "the emulator was last seen too long before it was found gone for a record to be tied to it",
+        )
+    } else if reused {
+        CrashEvidence::unavailable(
+            "so many processes were started since the emulator was last seen that its process id may have been given to another",
         )
     } else {
         crash.lookup(&ProcessLifetime {
@@ -817,6 +874,7 @@ impl SessionJournal {
             sandbox_main: None,
             exit_evidence: None,
             sandbox_main_last_alive_unix: None,
+            sandbox_main_reuse_mark: None,
             crash_evidence: None,
             end: None,
             play_evidence: PlayEvidence::None,
@@ -934,8 +992,11 @@ impl SessionJournal {
         let mut record = self.get(session_id)?;
         if record.state == SessionState::Started {
             let before = (record.processes.len(), record.app_scope.clone());
+            let seen_before = record.sandbox_main_last_alive_unix;
             refresh(&mut record, processes);
-            if before != (record.processes.len(), record.app_scope.clone()) {
+            if before != (record.processes.len(), record.app_scope.clone())
+                || last_alive_moved_on(seen_before, &record)
+            {
                 self.write(&record)?;
             }
         }
@@ -1194,6 +1255,7 @@ impl SessionJournal {
                 }
                 SessionState::Started => {
                     let before = record.processes.len();
+                    let seen_before = record.sandbox_main_last_alive_unix;
                     refresh(&mut record, processes);
                     // A process counts only while both its id and its start
                     // time match: a recycled id is a different process.
@@ -1202,7 +1264,9 @@ impl SessionJournal {
                         .iter()
                         .any(|process| alive(process, processes))
                     {
-                        if record.processes.len() != before {
+                        if record.processes.len() != before
+                            || last_alive_moved_on(seen_before, &record)
+                        {
                             let _ = self.write(&record);
                         }
                         continue;
@@ -1414,7 +1478,10 @@ pub fn preceding_session(
             }
         }
         (_, Some(SessionEnd::FatalTerminationRecorded { .. })) => {
-            PrecedingSession::FatalTerminationRecorded { session_id: id }
+            PrecedingSession::FatalTerminationRecorded {
+                session_id: id,
+                saves_compared_afterwards: latest.saves_after.is_some(),
+            }
         }
         (_, Some(SessionEnd::StatusUnavailable)) | (_, None) => PrecedingSession::ExitNotSeen {
             session_id: id,

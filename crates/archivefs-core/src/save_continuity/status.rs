@@ -58,17 +58,30 @@ impl GameIntegrity {
     }
 }
 
+fn yes() -> bool {
+    true
+}
+
 /// How the emulator ended the last time it could have written this save.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "outcome")]
 pub enum PrecedingSession {
     /// The emulator itself exited with status 0.
     CleanExit { session_id: String },
-    /// It died on a fault (segmentation fault, abort, bus error...).
+    /// Its process was ended by a fatal signal (segmentation fault, abort,
+    /// bus error...), as the kernel reported directly.
+    #[serde(alias = "crashed")]
     FatalSignal { session_id: String, signal: i32 },
     /// The operating system's crash handler recorded that the emulator's own
     /// process was ended by a fatal signal. Which signal is not recorded.
-    FatalTerminationRecorded { session_id: String },
+    FatalTerminationRecorded {
+        session_id: String,
+        /// Whether the saves were compared when that session was settled.
+        /// When they were not (EmuWiz was not running at the time), the
+        /// save may also have changed since, outside anything EmuWiz saw.
+        #[serde(default = "yes")]
+        saves_compared_afterwards: bool,
+    },
     /// It was stopped from outside (killed or terminated) rather than closed.
     ForcedStop { session_id: String, signal: i32 },
     /// It exited by itself with an error status.
@@ -144,7 +157,17 @@ impl PrecedingSession {
             Self::FatalSignal { signal, .. } => format!(
                 "Abnormal termination detected: the emulator's process was ended by a fatal signal ({signal}) in the session before this snapshot. Why is not known. This does not show that the game itself failed or that the save is damaged; it is an exact copy of what was on disk, and if the emulator was saving at that moment the save may be incomplete"
             ),
-            Self::FatalTerminationRecorded { .. } => "Abnormal termination detected: the system's crash handler recorded that the emulator's process was ended by a fatal signal in the session before this snapshot. Which signal, and why, is not recorded. This does not show that the game itself failed or that the save is damaged; it is an exact copy of what was on disk, and if the emulator was saving at that moment the save may be incomplete".to_string(),
+            Self::FatalTerminationRecorded {
+                saves_compared_afterwards,
+                ..
+            } => format!(
+                "Abnormal termination detected: the system's crash handler recorded that the emulator's process was ended by a fatal signal in the last session EmuWiz recorded before this snapshot. Which signal, and why, is not recorded. This does not show that the game itself failed or that the save is damaged; it is an exact copy of what was on disk, and if the emulator was saving at that moment the save may be incomplete{}",
+                if *saves_compared_afterwards {
+                    ""
+                } else {
+                    ". EmuWiz was not running when that session ended, so the save was not compared then and may also have changed since"
+                }
+            ),
             Self::ForcedStop { signal, .. } => format!(
                 "Abnormal termination detected: the emulator's process was stopped by signal {signal} in the session before this snapshot rather than closing by itself. Why is not known. This does not show that the save is damaged; if the emulator was saving at that moment the save may be incomplete"
             ),
