@@ -28,8 +28,17 @@ fn zip_path(root: &Path) -> PathBuf {
 /// the production scan; and a fake RetroArch with a PUAE core whose `.info`
 /// names the CD32 and its two required firmware files (synthetic stand-ins).
 fn profile(root: &Path) -> VerifiedGameFixture {
+    profile_in(root, "amiga-cd32")
+}
+
+/// [`profile`], with the zipped disc in `collection/<folder>`. Only the
+/// `amiga-cd32` folder names the system; any other leaves it unrecorded.
+fn profile_in(root: &Path, folder: &str) -> VerifiedGameFixture {
     let fixture = VerifiedGameFixture::build_at(root).unwrap();
-    let zip = zip_path(root);
+    let zip = root
+        .join("collection")
+        .join(folder)
+        .join(format!("{TITLE}.zip"));
     fs::create_dir_all(zip.parent().unwrap()).unwrap();
     let members = disc_members();
     let borrowed: Vec<(&str, &[u8])> = members
@@ -54,12 +63,16 @@ fn profile(root: &Path) -> VerifiedGameFixture {
         .into_iter()
         .find(|row| row.absolute_path == zip)
         .expect("the zipped disc is catalogued");
-    assert_eq!(row.platform.as_deref(), Some("AmigaCD32"), "{row:?}");
-    assert_eq!(
-        row.platform_source.as_deref(),
-        Some("folder_alias"),
-        "{row:?}"
-    );
+    if folder != "amiga-cd32" {
+        assert_eq!(row.platform, None, "{row:?}");
+    } else {
+        assert_eq!(row.platform.as_deref(), Some("AmigaCD32"), "{row:?}");
+        assert_eq!(
+            row.platform_source.as_deref(),
+            Some("folder_alias"),
+            "{row:?}"
+        );
+    }
 
     let fake = fixture.fake_retroarch("mGBA").unwrap();
     let core = fake.cores_dir.join("puae_libretro.so");
@@ -191,6 +204,8 @@ fn child_entry() {
         let zip = current_zip(&root);
         if scenario == "rename" {
             rename_and_undo_child(&fixture, &root, &zip);
+        } else if scenario == "organise" {
+            organise_move_child(&fixture, &root, &zip);
         } else {
             remembered_choice_child(&fixture, &root, &zip, &scenario);
         }
@@ -531,6 +546,26 @@ fn remembered_choice_child(fixture: &VerifiedGameFixture, root: &Path, zip: &Pat
                 "{args:?}"
             );
         }
+        // The person chose the system (a saved manual choice): no try, no
+        // remembered entry, the "game not identified" warning, Play works.
+        "chosen-launch" => {
+            let copy = copy.expect("a prepared copy for the chosen game");
+            blue.wait_until(|b| b.shown("Launch recipe"), 60);
+            blue.guard_executables(root);
+            assert!(
+                blue.seen
+                    .iter()
+                    .any(|text| text.starts_with("Game not identified: you chose Amiga CD32")),
+                "{:?}",
+                blue.last
+            );
+            assert!(find_by_scrolling(&mut blue, TRY_ONCE).is_none());
+            let args = play_and_collect(&mut blue, root);
+            assert!(
+                args.iter().any(|arg| Path::new(arg) == copy.launch_path),
+                "{args:?}"
+            );
+        }
         // Something the remembered choice must not paper over. The page is
         // given time to settle, Play is pressed wherever it is offered, and
         // the emulator must never be reached.
@@ -583,13 +618,71 @@ fn remembered_choice_child(fixture: &VerifiedGameFixture, root: &Path, zip: &Pat
 
 /// The one zipped disc in the collection, whatever it is called now.
 fn current_zip(root: &Path) -> PathBuf {
-    let mut zips: Vec<PathBuf> = fs::read_dir(root.join("collection/amiga-cd32"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "zip"))
-        .collect();
+    fn walk(folder: &Path, found: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().is_some_and(|extension| extension == "zip") {
+                found.push(path);
+            }
+        }
+    }
+    let mut zips = Vec::new();
+    walk(&root.join("collection"), &mut zips);
     assert_eq!(zips.len(), 1, "{zips:?}");
     zips.pop().unwrap()
+}
+
+/// "Organise my games" for a game whose system the person chose, sitting
+/// outside that system's folder: the production plan, prepare and apply, in
+/// a process with the profile's own environment. The prepared copy has to
+/// arrive with the file.
+fn organise_move_child(fixture: &VerifiedGameFixture, root: &Path, zip: &Path) {
+    use archivefs_core::folder_platform_check::organise::{
+        ChosenGame, apply, plan_organisation_with_choices, prepare,
+    };
+    let journal = fixture.data_dir.join("rename-transactions-sealed-v1");
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let store = archivefs_core::recovery::PreparedMediaStore::for_profile().unwrap();
+    assert!(store.root().starts_with(root), "{}", store.root().display());
+    let copy = store
+        .prepared_for_source(zip)
+        .expect("prepared before the move");
+    let database = archivefs_core::Database::open_existing(&fixture.database_path).unwrap();
+    let archive_id = database
+        .find_archive_id_by_absolute_path(zip)
+        .unwrap()
+        .expect("the game is in the library");
+    let chosen = [ChosenGame {
+        archive_id,
+        path: zip.to_path_buf(),
+        platform: "AmigaCD32".into(),
+    }];
+    let roots = [root.join("collection")];
+    let mut plans = plan_organisation_with_choices(&[], &chosen, &[], &roots, 1);
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    let plan = &mut plans[0];
+    prepare(plan, &database).unwrap();
+    let approved: std::collections::BTreeSet<String> = plan
+        .plan
+        .suggested()
+        .map(|entry| entry.source_path.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(approved.len(), 1, "{:?}", plan.left_alone);
+    apply(plan, &approved, &database, &journal, &never)
+        .map_err(|(error, _)| error.to_string())
+        .unwrap();
+    drop(database);
+    let moved = current_zip(root);
+    assert_ne!(moved, zip, "the game was moved");
+    assert!(!zip.exists());
+    assert_eq!(store.prepared_for_source(&moved), Some(copy));
+    println!(
+        "journey prepared-disc organise: ok ({} -> {})",
+        zip.display(),
+        moved.display()
+    );
 }
 
 /// Blue's Rename, through the functions its page calls, in a process with the
@@ -841,4 +934,63 @@ fn a_remembered_choice_for_a_prepared_disc_survives_restarts_and_bypasses_no_che
     run_scenario(&root, &fixture, "changed-zip");
     assert_eq!(fs::read(&zip).unwrap(), zip_before.0);
     assert_eq!(fs::read(&remembered_file).unwrap(), saved);
+}
+
+/// "Organise my games" moves a prepared game into its system's folder: it
+/// still starts from its prepared copy afterwards, with nothing extracted
+/// again.
+#[test]
+fn an_organise_move_keeps_a_prepared_game_playable() {
+    use archivefs_core::recovery::{DiscSetLimits, PreparedMediaStore};
+    let owned = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(owned.path()).unwrap().join("profile");
+    let fixture = profile_in(&root, "unsorted");
+    let zip = current_zip(&root);
+    // The person chooses the system for this game (a saved manual choice).
+    {
+        let mut database = archivefs_core::Database::open_existing(&fixture.database_path).unwrap();
+        let id = database
+            .find_archive_id_by_absolute_path(&zip)
+            .unwrap()
+            .unwrap();
+        database.set_manual_platform(id, "AmigaCD32").unwrap();
+    }
+    let bytes = fs::read(&zip).unwrap();
+    let store = PreparedMediaStore::at(root.join("data/prepared-media"));
+    let summary = store
+        .prepare(
+            &zip,
+            "AmigaCD32",
+            &archivefs_core::safe_read::TrustedRoots::none(),
+            &DiscSetLimits::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_| {},
+        )
+        .unwrap()
+        .summary;
+    let track_inode = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(&summary.launch_path).unwrap().ino()
+    };
+
+    run_scenario(&root, &fixture, "chosen-launch");
+    run_scenario(&root, &fixture, "organise");
+    let moved = current_zip(&root);
+    assert_ne!(moved, zip);
+    assert_eq!(fs::read(&moved).unwrap(), bytes, "a move changes no byte");
+    assert_eq!(
+        store.prepared_for_source(&moved).map(|copy| copy.set_id),
+        Some(summary.set_id.clone())
+    );
+    // Blue, restarted, on the moved game: Play from the same copy.
+    run_scenario(&root, &fixture, "chosen-launch");
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(&summary.launch_path).unwrap().ino(),
+            track_inode,
+            "nothing was extracted again"
+        );
+    }
+    assert_eq!(store.list().len(), 1);
 }

@@ -2896,6 +2896,46 @@ mod second_review_tests {
         );
         assert!(matches!(result, Err(PrepareError::Store(detail)) if detail.contains("not there")));
         assert!(!chosen.exists(), "the chosen folder was recreated");
+
+        // The same through a batch: a queue saved in the chosen folder, the
+        // folder then gone. The run does not happen and nothing is created.
+        std::fs::create_dir(&chosen).unwrap();
+        std::fs::set_permissions(&chosen, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let store = PreparedMediaStore::configured(Some(chosen.clone()))
+            .unwrap()
+            .unwrap();
+        let candidate = BulkCandidate {
+            path: zip.clone(),
+            platform_id: "AmigaCD32".into(),
+            title: "disc".into(),
+        };
+        let plan = plan_bulk(
+            &store,
+            std::slice::from_ref(&candidate),
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+        )
+        .unwrap();
+        start_queue(&store, &plan, &|_| true).unwrap();
+        // A resolved handle taken while the folder was there keeps the rule.
+        let resolved = store.resolved().unwrap();
+        std::fs::remove_dir_all(&chosen).unwrap();
+        assert!(resolved.ready().is_err());
+        let run = run_queue(
+            &store,
+            None,
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+            &|_| {},
+        );
+        assert!(run.is_err(), "{run:?}");
+        assert!(
+            !chosen.exists(),
+            "the chosen folder was recreated by a batch"
+        );
     }
 
     #[test]
@@ -2959,12 +2999,15 @@ mod second_review_tests {
             .join("old-store")
             .join(track.strip_prefix(&old_root).unwrap());
         assert!(launch_refusal_with(None, None, &previous, without_old, &through_link).is_some());
-        let dotted = track
-            .parent()
-            .unwrap()
+        // A path that leaves the folder's own spelling and comes back in.
+        std::fs::create_dir_all(lab.root.join("elsewhere")).unwrap();
+        let dotted = lab
+            .root
+            .join("elsewhere")
             .join("..")
-            .join("media")
-            .join(ISO_NAME);
+            .join("old-store")
+            .join(track.strip_prefix(&old_root).unwrap());
+        assert!(!dotted.starts_with(&old_root));
         assert!(launch_refusal_with(None, None, &previous, without_old, &dotted).is_some());
         // And a previous folder that was saved under a path with a link in it.
         let saved_with_link = vec![alias.join("old-store")];
@@ -3004,12 +3047,14 @@ mod second_review_tests {
         std::fs::write(&setting, "relative\n").unwrap();
         assert_eq!(configured_folder_unchecked_at(&setting), None);
         // Far larger than any setting: only the bounded start is read.
-        let mut huge = b"/chosen/folder\n".to_vec();
+        let mut huge = b"/".to_vec();
         huge.resize(4 * 1024 * 1024, b'x');
         std::fs::write(&setting, huge).unwrap();
-        assert_eq!(
-            configured_folder_unchecked_at(&setting),
-            Some(PathBuf::from("/chosen/folder"))
+        let read = configured_folder_unchecked_at(&setting).expect("an absolute path");
+        assert!(
+            read.as_os_str().len() <= 8 * 1024,
+            "{} bytes were read from the setting",
+            read.as_os_str().len()
         );
         // A FIFO where the setting should be: answered at once, not waited on.
         std::fs::remove_file(&setting).unwrap();

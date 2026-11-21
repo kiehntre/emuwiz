@@ -868,7 +868,11 @@ impl PreparedMediaStore {
             .map_err(|error| format!("{}: {error}", self.root.display()))?;
         let resolved = fs::canonicalize(&self.root)
             .map_err(|error| format!("{}: {error}", self.root.display()))?;
-        let store = Self::at(resolved);
+        // The resolved store keeps what is known about how it was chosen.
+        let store = Self {
+            root: resolved,
+            root_must_exist: self.root_must_exist,
+        };
         // One level at a time, each proven to be a plain folder before
         // anything is created inside it: a planted link is refused before it
         // is ever written through.
@@ -908,7 +912,11 @@ impl PreparedMediaStore {
     /// The resolved store when its folders already exist; never creates any.
     fn existing(&self) -> Option<PreparedMediaStore> {
         let resolved = fs::canonicalize(&self.root).ok()?;
-        let store = Self::at(resolved);
+        // The resolved store keeps what is known about how it was chosen.
+        let store = Self {
+            root: resolved,
+            root_must_exist: self.root_must_exist,
+        };
         // Every folder this store reads, moves into or deletes from must be
         // a plain folder; a link anywhere means the store is not used at all.
         for directory in [store.sets_dir(), store.staging_dir(), store.sources_dir()] {
