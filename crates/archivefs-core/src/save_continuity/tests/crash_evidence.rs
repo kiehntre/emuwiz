@@ -36,7 +36,8 @@ const T0: i64 = 1_795_217_400;
 fn stamp(offset: i64) -> String {
     let t = T0 + offset;
     let secs = t.rem_euclid(86_400);
-    let day = 20 + (t - T0 + 84_600) / 86_400; // T0 is 23:30 on the 20th
+    // T0 is 23:30 on the 20th; days before it count down (Euclidean division).
+    let day = 20 + (t - T0 + 84_600).div_euclid(86_400);
     format!(
         "2026-11-{day:02} {:02}:{:02}:{:02}",
         secs / 3600,
@@ -67,6 +68,8 @@ impl Files {
     fn new(pattern: &str, rotated: Option<&str>, current: Option<&str>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("core_pattern"), pattern).unwrap();
+        // As on the development machine: the kernel waits for the handler.
+        fs::write(dir.path().join("core_pipe_limit"), "10\n").unwrap();
         if let Some(text) = rotated {
             fs::write(dir.path().join("apport.log.1"), text).unwrap();
         }
@@ -79,6 +82,7 @@ impl Files {
     fn source(&self) -> ApportLog {
         ApportLog {
             core_pattern: self.dir.path().join("core_pattern"),
+            core_pipe_limit: self.dir.path().join("core_pipe_limit"),
             logs: vec![
                 self.dir.path().join("apport.log.1"),
                 self.dir.path().join("apport.log"),
@@ -115,6 +119,8 @@ fn the_time_arithmetic_of_this_test_file_is_right() {
     assert_eq!(stamp(0), "2026-11-20 23:30:00");
     assert_eq!(stamp(1800), "2026-11-21 00:00:00");
     assert_eq!(stamp(-60), "2026-11-20 23:29:00");
+    assert_eq!(stamp(-86_000), "2026-11-19 23:36:40");
+    assert_eq!(stamp(40_000), "2026-11-21 10:36:40");
 }
 
 #[test]
@@ -725,4 +731,160 @@ fn a_session_emuwiz_did_not_see_end_can_still_be_confirmed_but_only_while_the_pr
         Some(CrashEvidence::Unavailable { .. })
     ));
     let _ = Cell::new(0); // (keeps the import used on every configuration)
+}
+
+// ---- Timing refinements (owner decision 2026-11-21) ----
+
+const NO_RECORD: &str = "the system's crash handler log";
+
+#[test]
+fn a_record_near_but_outside_the_lifetime_is_unknown_and_a_clearly_stale_one_is_not_this_launch() {
+    let answer = |offset: i64| {
+        Files::new(APPORT, None, Some(&(other(-5000) + &crashed(offset, 4242))))
+            .source()
+            .lookup(&emulator())
+    };
+    // Lifetime: T0+100 .. T0+400, with LIFETIME_SLACK_SECONDS either side.
+    // Just before it started, or just after it was seen gone: timing unclear.
+    for offset in [
+        100 - LIFETIME_SLACK_SECONDS - 1,
+        60,
+        100 - LIFETIME_SLACK_SECONDS - UNCLEAR_TIMING_SECONDS,
+        400 + LIFETIME_SLACK_SECONDS + 1,
+        450,
+        400 + LIFETIME_SLACK_SECONDS + UNCLEAR_TIMING_SECONDS,
+    ] {
+        let found = answer(offset);
+        assert!(
+            matches!(found, CrashEvidence::Unavailable { ref why } if why.contains("close to, but not inside")),
+            "{offset}: {found:?}"
+        );
+    }
+    // Clearly another process with this id: long before, or long after.
+    for offset in [
+        100 - LIFETIME_SLACK_SECONDS - UNCLEAR_TIMING_SECONDS - 1,
+        -3000,
+        400 + LIFETIME_SLACK_SECONDS + UNCLEAR_TIMING_SECONDS + 1,
+        40_000,
+    ] {
+        assert_eq!(
+            answer(offset),
+            CrashEvidence::NoRecord {
+                source: NO_RECORD.to_string()
+            },
+            "{offset}"
+        );
+    }
+    // A genuine record inside the lifetime is still believed when a stale
+    // one for the same id also exists far away...
+    let both = other(-5000) + &crashed(-3000, 4242) + &crashed(250, 4242);
+    assert!(
+        Files::new(APPORT, None, Some(&both))
+            .source()
+            .lookup(&emulator())
+            .confirmed()
+    );
+    // ...but not when a second one sits just outside: that is unclear.
+    let unclear = other(-5000) + &crashed(250, 4242) + &crashed(450, 4242);
+    assert!(matches!(
+        Files::new(APPORT, None, Some(&unclear))
+            .source()
+            .lookup(&emulator()),
+        CrashEvidence::Unavailable { .. }
+    ));
+}
+
+#[test]
+fn a_record_written_late_in_a_long_dying_process_is_matched_by_when_the_process_was_really_gone() {
+    // The emulator caught the first fault and hung; it was finally ended 40
+    // seconds later, and the handler wrote its line then. What EmuWiz tracks
+    // is the process's lifetime up to when it was seen gone, so the late
+    // line is inside it.
+    let hung = ProcessLifetime {
+        pid: 4242,
+        started_unix: T0 + 100,
+        gone_by_unix: T0 + 440,
+    };
+    let log = other(0) + &crashed(439, 4242);
+    assert!(
+        Files::new(APPORT, None, Some(&log))
+            .source()
+            .lookup(&hung)
+            .confirmed()
+    );
+    // Had EmuWiz (wrongly) thought it gone at the time of the first fault,
+    // the same line would be near-but-outside: unknown, not a rejection.
+    let too_early = ProcessLifetime {
+        pid: 4242,
+        started_unix: T0 + 100,
+        gone_by_unix: T0 + 400,
+    };
+    assert!(matches!(
+        Files::new(APPORT, None, Some(&log))
+            .source()
+            .lookup(&too_early),
+        CrashEvidence::Unavailable { .. }
+    ));
+}
+
+#[test]
+fn when_the_kernel_does_not_wait_for_the_handler_no_record_establishes_nothing() {
+    let quiet = other(0) + &other(500);
+    let with_limit = |log: &str, limit: Option<&str>| {
+        let files = Files::new(APPORT, None, Some(log));
+        let path = files.dir.path().join("core_pipe_limit");
+        match limit {
+            Some(text) => fs::write(&path, text).unwrap(),
+            None => fs::remove_file(&path).unwrap(),
+        }
+        files.source().lookup(&emulator())
+    };
+    for limit in [Some("0\n"), Some("not a number"), None] {
+        let found = with_limit(&quiet, limit);
+        assert!(
+            matches!(found, CrashEvidence::Unavailable { ref why } if why.contains("may not have been written yet")),
+            "{limit:?}: {found:?}"
+        );
+        // A record that IS there still counts: it cannot be un-written.
+        assert!(
+            with_limit(&(other(0) + &crashed(250, 4242)), limit).confirmed(),
+            "{limit:?}"
+        );
+    }
+    // With a kernel that waits, the same quiet log is a real "no record".
+    assert_eq!(
+        Files::new(APPORT, None, Some(&quiet))
+            .source()
+            .lookup(&emulator()),
+        CrashEvidence::NoRecord {
+            source: NO_RECORD.to_string()
+        }
+    );
+}
+
+#[test]
+fn a_reused_process_id_is_never_attributed_to_this_launch() {
+    // The same host pid three times over two days: an old process, this
+    // launch's emulator, and a later unrelated process. Only a record inside
+    // this launch's lifetime is its own.
+    let old_and_new = other(-90_000) + &crashed(-86_000, 4242) + &other(0) + &crashed(20_000, 4242);
+    assert_eq!(
+        Files::new(APPORT, None, Some(&old_and_new))
+            .source()
+            .lookup(&emulator()),
+        CrashEvidence::NoRecord {
+            source: NO_RECORD.to_string()
+        },
+        "neither the earlier nor the later process is this one"
+    );
+    let with_ours = old_and_new + &crashed(399, 4242);
+    assert_eq!(
+        Files::new(APPORT, None, Some(&with_ours))
+            .source()
+            .lookup(&emulator()),
+        CrashEvidence::FatalTerminationRecorded {
+            recorded_at: stamp(399),
+            source: NO_RECORD.to_string()
+        }
+    );
 }

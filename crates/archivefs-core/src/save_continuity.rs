@@ -36,6 +36,7 @@
 pub mod compat;
 pub mod crash_evidence;
 pub mod device;
+pub mod diagnostics;
 pub mod discover;
 pub mod model;
 pub mod session;

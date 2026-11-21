@@ -39,6 +39,8 @@ Looking (reads only):
                                           can this save be continued there, and why
   match <save-id> --game <game-file>      is this the game the save was written by (by content)
   safe-points                             which emulators EmuWiz can prove are closed
+  retroarch-saving                        how often RetroArch writes battery saves to disk
+                                          (reads retroarch.cfg; changes nothing)
   safe-point --emulator <name> <file>     is this one save file at a safe point right now
   timeline                                snapshots, oldest first, per save
   verify <snapshot-id>                    re-read a snapshot and compare with its record
@@ -455,6 +457,43 @@ pub fn run(args: Vec<String>) -> Outcome {
                     println!(
                         "The game file and the save were only read. File names were not used."
                     );
+                },
+            )
+        }
+        "retroarch-saving" => {
+            let roots = roots(&options)?;
+            let installs = archivefs_core::save_continuity::diagnostics::retroarch_installs(
+                &roots.home,
+                &roots.config,
+            );
+            emit(
+                &options,
+                "retroarch-saving",
+                true,
+                json!({ "installs": installs }),
+                || {
+                    if installs.is_empty() {
+                        println!("No RetroArch configuration was found.");
+                    }
+                    for install in &installs {
+                        println!(
+                            "RetroArch ({}): {}",
+                            install.install,
+                            install.config_file.display()
+                        );
+                        println!("  battery saves: {:?}", install.battery_saves);
+                        match install.save_state_on_exit {
+                            Some(on) => println!(
+                                "  save state when a game is closed (a different feature): {}",
+                                if on { "on" } else { "off" }
+                            ),
+                            None => println!("  save state when a game is closed: not established"),
+                        }
+                        for line in &install.advice {
+                            println!("  {line}");
+                        }
+                    }
+                    println!("Nothing was changed.");
                 },
             )
         }

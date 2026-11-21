@@ -94,51 +94,116 @@ Reading the file twice is *not* what makes a copy safe: a writer that pauses
 half-way leaves a file that reads the same twice. A test caught this; the lease is
 the guarantee.
 
-### Crash awareness
+### How the emulator last ended
 
-A safe copy of a file that a crash left half-written is still half-written. So
-each snapshot records how the emulator last ended, **only** when a recorded
-session can be tied to that exact save:
+A safe copy of a file that an abnormal end left half-written is still
+half-written. So each snapshot records how the emulator last ended, **only**
+when a recorded session can be tied to that exact save:
 
-- it is the most recent started session of the same emulator and install on this
-  device;
+- it is the most recent started session of the same emulator and install on
+  this device;
 - it recorded this save, by id;
-- where the saves were compared after the session, the save still has the content
-  it had then;
+- where the saves were compared after the session, the save still has the
+  content it had then;
 - a normal exit counts only if the saves were compared afterwards.
 
-Anything else is "unknown", shown as a caution. Crash, forced stop, error exit and
-unseen exit are shown as a warning on the snapshot, in the timeline and in every
-recovery plan. Such snapshots are kept and recoverable. They never replace or hide
-an earlier one, and pruning never proposes the newest snapshot that was taken
-safely after a clean exit.
+Anything else is "not known".
 
-**Where crash detection cannot be trusted**
+What counts as evidence, strongest first. Each is a separate source.
 
-- An emulator started outside EmuWiz leaves no session: the answer is "unknown",
-  never "clean".
-- Through `flatpak run` or a wrapper script EmuWiz sees the launcher's exit, not
-  the emulator's: recorded as "exit not seen".
-- If EmuWiz is closed when the emulator stops: "exit not seen".
-- A game can corrupt its own save and exit cleanly. Only a game-level check would
-  catch that, and there is none.
-- An emulator can exit cleanly having failed to write (full disk). Not detected.
+| Evidence | What it establishes | Shown as |
+|---|---|---|
+| The kernel reports a terminating signal for the emulator's own process (EmuWiz started it and waited on it) | That process was ended by that signal | Prominent: "Abnormal termination detected" |
+| The system's crash handler recorded a fatal termination for exactly the emulator process identified for this launch (see below) | That process was ended by a fatal signal; which one is not recorded | Prominent: "Abnormal termination detected" |
+| A non-zero exit code from an emulator on the demonstrated list | It did not close normally | Prominent: "Abnormal exit detected" |
+| Exit status 0 from the emulator's own process, saves compared afterwards | It closed normally | Nothing |
+| A non-zero exit code from any other emulator | Nothing that can be interpreted | Quiet: "not known whether that was a normal close" |
+| Only a launcher's or wrapper's end was seen; EmuWiz was closed; no session | Nothing | Quiet: "not known how the emulator last ended" |
 
-## Emulator evidence matrix
+Rules that hold throughout:
 
-Real-launch results come from `scripts/qa/emulator_safe_point_probe.py`, which
-starts the installed emulator in an isolated scratch profile and checks the
-verdict before, during and after. See the ledger for the run that produced them.
+- **An exit code is never turned into a signal.** 139 or 134 coming back
+  through a sandbox or wrapper stays an exit status.
+- **No wording claims a crash, or that a save is damaged.** The text says what
+  was observed and that the save may be incomplete if the emulator was writing.
+- **A launcher's own end is never the emulator's**, clean or otherwise. A
+  relayed status is considered only when the process EmuWiz started is itself
+  the Flatpak sandbox and the emulator is its direct command.
+- Capture safety and structure are decided separately and do not depend on any
+  of this.
 
-| Emulator | Discovery | Identity from content | Safe-point rules | Real launch checked | Verified snapshot | Recovery to new folder | Continue elsewhere |
-|---|---|---|---|---|---|---|---|
-| PCSX2 | cards, per save | yes (serial) | reviewed (existing) | see ledger | yes | yes | card save onto a copy of another card: implemented and checked |
-| RetroArch | battery saves, states, PS1 cards | cards only | reviewed (existing) | see ledger | yes | yes | conditional (depends on core); states never |
-| DuckStation | PS1 cards | yes (serial) | added | see ledger | yes | yes | card route as PCSX2 |
-| RPCS3 | save folders | yes (`PARAM.SFO`) | added | see ledger | yes (files copied; signature not checked) | yes | unknown: signature not verified |
-| PPSSPP | save folders | yes (`PARAM.SFO`) | added | see ledger | yes (as RPCS3) | yes | unknown |
-| Dolphin (standalone) | `.gci` files | yes (game code) | added, **synthetic tests only** | **NOT TESTED: not installed** | **no: always "unknown"** | best-effort copies only, labelled unverified | conditional |
-| Anything else | not looked for | - | none | - | no | - | - |
+#### The demonstrated list
+
+An emulator's exit code is believed only after, on a real install and **from
+inside a running game**, ordinary ways of closing returned 0 every time and a
+deliberate abnormal end returned something else. What has been observed
+(`scripts/qa/*_exit_probe.py`; results in the audit ledger):
+
+| Emulator | From inside a running game | Status |
+|---|---|---|
+| RetroArch, native 1.21.0 and Flatpak 1.22.2 | 18 ordinary endings per route (quit command, quit key, window close, self-exit, polite stop, quit with an unwritable save state): 0 every time. 3 deliberate faults per route: 139 every time. Nothing hung | Meets the standard for in-game exits. One earlier polite stop **at the menu with no game loaded** returned 139 and is unexplained: menu-only and wrapper paths are not covered |
+| PPSSPP, Flatpak 1.20.4 | 9 ordinary endings (window close, in-app exit, polite stop): 0 every time. 3 deliberate faults: the process **hung**, and was only ended by the probe 40 s later | Not demonstrated: held as "not known" |
+| PCSX2, Flatpak 2.8.2 | Not yet closed from inside a game. At its first-run window a close returned 1 | Not demonstrated |
+| RPCS3, Flatpak | Not yet closed from inside a game. A window close returned 134 and the crash handler confirms it was ended by a fatal signal while closing; after a deliberate fault it kept running | Not demonstrated |
+| DuckStation, Dolphin, others | Not probed | Not demonstrated |
+
+#### Crash records for sandboxed emulators
+
+`crash_evidence` reads Ubuntu's crash handler log (`/var/log/apport.log`),
+which records the **host process id** of every process ended by a
+core-dumping signal, sandboxed or not. It only reads; it needs no privilege
+beyond the user's own (group `adm`); nothing about Flatpak or an emulator
+changes.
+
+A record counts only when all of this holds:
+
+- its host process id is the one tracked for the emulator of this launch;
+- its time is inside that process's tracked lifetime (a few seconds' slack);
+- if EmuWiz was not watching when the process ended, the process was last
+  seen alive no more than ten minutes before it was found gone.
+
+Everything unclear is "unavailable", which is treated as not known and can
+never fail a launch or a snapshot: another crash handler (most other
+distributions; systemd-coredump is not supported yet), an unreadable or
+missing log, a log that does not reach back to the process's start, an entry
+for that process that cannot be read, two candidate entries, a record just
+outside the lifetime (within two minutes: timing unclear), or a kernel that
+does not wait for its handler (`core_pipe_limit` 0 or unreadable: "no record"
+then establishes nothing).
+
+What a record cannot say: which signal, why, or anything about the game or
+its save. What its absence cannot say: that the emulator closed normally. A
+process ended by SIGKILL or SIGTERM, or one that handles the fault itself and
+carries on (RPCS3 and, in a game, PPSSPP did), leaves no record at that time.
+
+Measured on the development machine: the record's time is when the handler
+wrote its line, 0.15 to 0.25 s after the signal and about 35 ms before the
+parent saw the process gone. That ordering follows from `core_pipe_limit`
+being non-zero there; it is not assumed elsewhere.
+
+### Keeping recovery points
+
+Two separate questions about a snapshot:
+
+- **Is the copy sound?** Taken at a verified safe point and with no structural
+  problem found (`safe_copy`).
+- **What is known about the session before it?** Clean, abnormal, or not known.
+
+Pruning proposals never include: the newest safe copy; the newest safe copy
+that did not follow an observed abnormal termination; the newest safe copy
+after a session known to have ended normally. A snapshot after an abnormal end
+is kept, labelled, and never replaces or hides an earlier one.
+
+### What a snapshot cannot do: progress that was never written
+
+A snapshot copies what is on disk. In the RetroArch probes, every deliberate
+fault left **no save file at all**: the game's battery save had not been
+written yet. RetroArch's `autosave_interval` decides how often battery saves
+are written while a game runs; with it at 0, progress may stay only in memory
+until RetroArch closes normally. `emuwiz-cli continuity retroarch-saving`
+reports the setting for each install (read-only) and explains this. It does
+not change the setting, and turning it on is not a guarantee for every core
+or game. Save states are a separate feature and are reported separately.
 
 ## Compatibility
 
@@ -199,18 +264,38 @@ product code can be looked up without a scan. Both need a schema number from the
 coordination ledger and an approved upgrade; neither is needed for anything this
 slice does.
 
+## Independent reviews
+
+| Review | Scope | Verdict |
+|---|---|---|
+| 1 | Snapshot store, recovery, continuation copy, device model, CLI (at 035f56a2) | PASS WITH CONDITIONS: no path overwrites or deletes an original save; eight conditions, all addressed |
+| 2 | Process identity, safe point, exit tracking (at 035f56a2) | PASS WITH CONDITIONS: no torn file published as a safe point while a lease is held; one latent blocker (a wrapper's exit 0 read as clean) and five should-fix, all addressed |
+| 3 | Delta review of the fixes (cdc75795) | PASS WITH CONDITIONS: earlier conditions closed; four further points, addressed |
+
+Remaining strict false positives the reviewers listed (they can only refuse a
+snapshot, never permit one): this repository's own test binaries named
+`retroarch_cheat_...`; a script named like an emulator; `flatpak update
+<app id>`; any other user's process whose command line names the emulator.
+
 ## Limits of this slice
 
 - Session tracking is not yet called from Blue's launch path, so real launches
-  produce no session and "how the emulator last ended" reads "unknown".
+  produce no session and "how the emulator last ended" reads "not known".
 - No Blue page yet.
+- No emulator is on the demonstrated list in shipped code yet.
+- The safe-point probes started each emulator idle, with no game: they show
+  the emulator is *seen*, not what happens while it writes a save. Real save
+  writing was exercised for RetroArch only (the synthetic game in the exit
+  probes). The native and Flatpak RetroArch safe-point probes were
+  inconclusive and have not been re-run.
+- Crash records: Ubuntu only; group `adm` needed.
 - Emulator and core versions are not established for any save.
-- Standalone Dolphin snapshots are unverified by design until checked for real.
+- Standalone Dolphin: not installed, not tested against a real launch, always
+  "unknown".
 - No game-level save validation of any kind.
 - A lease needs a local filesystem (ext4, xfs, btrfs, f2fs, tmpfs) and a file
   with a single name; otherwise the answer degrades to "unknown".
-- The process scan refuses on any process whose command line names the emulator
-  (for RetroArch also "libretro"), so an unrelated command mentioning it can block
-  a snapshot. That errs on the safe side.
 - The existing `save_snapshots` feature still limits itself to PCSX2 and
-  RetroArch; it was not changed.
+  RetroArch; it was not changed. The installed EmuWiz still has the old
+  process-scan rule that reads "retroarch" in any command line as RetroArch
+  running; the fix is on this branch only.

@@ -42,6 +42,12 @@ use std::path::PathBuf;
 /// line a moment after the process is gone, and clocks have one-second
 /// resolution here.
 pub const LIFETIME_SLACK_SECONDS: i64 = 5;
+/// A record for the right process id that falls outside its lifetime but
+/// within this many seconds of it is neither accepted nor dismissed: the
+/// timing is unclear, and the answer is "unavailable". Only a record
+/// further away than this is treated as another process's (a stale record,
+/// a reused id).
+pub const UNCLEAR_TIMING_SECONDS: i64 = 120;
 /// The log is small; anything larger than this is not read at all.
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -102,6 +108,15 @@ pub struct ApportLog {
     /// `/proc/sys/kernel/core_pattern`: which program the kernel hands
     /// fatal terminations to.
     pub core_pattern: PathBuf,
+    /// `/proc/sys/kernel/core_pipe_limit`. When it is not 0 the kernel waits
+    /// for the handler to finish before the dying process is released, so a
+    /// record exists by the time the process is seen gone (measured on the
+    /// development machine: the record's time fell between the signal and
+    /// the moment the parent saw the process gone). That is a property of
+    /// this setting, not a guarantee: when it is 0, or cannot be read, the
+    /// handler may still be writing when EmuWiz looks, and the absence of a
+    /// record then establishes nothing.
+    pub core_pipe_limit: PathBuf,
     /// The log files, oldest first.
     pub logs: Vec<PathBuf>,
     /// Turns the handler's local wall-clock time into seconds since 1970.
@@ -125,6 +140,7 @@ impl ApportLog {
     pub fn system() -> Self {
         Self {
             core_pattern: PathBuf::from("/proc/sys/kernel/core_pattern"),
+            core_pipe_limit: PathBuf::from("/proc/sys/kernel/core_pipe_limit"),
             logs: vec![
                 PathBuf::from("/var/log/apport.log.1"),
                 PathBuf::from("/var/log/apport.log"),
@@ -239,8 +255,16 @@ impl CrashSource for ApportLog {
             process.started_unix - LIFETIME_SLACK_SECONDS,
             process.gone_by_unix + LIFETIME_SLACK_SECONDS,
         );
+        // Does the kernel wait for the handler? Only then is "no record by
+        // now" a statement about the process.
+        let handler_is_waited_for = fs::read_to_string(&self.core_pipe_limit)
+            .ok()
+            .and_then(|text| text.trim().parse::<i64>().ok())
+            .is_some_and(|limit| limit != 0);
         let mut earliest: Option<i64> = None;
         let mut matches: Vec<String> = Vec::new();
+        // The right process id, close to its lifetime but not inside it.
+        let mut unclear_timing = false;
         let mut read_any = false;
         for path in &self.logs {
             let mut file = match fs::File::open(path) {
@@ -283,15 +307,30 @@ impl CrashSource for ApportLog {
                     continue;
                 };
                 earliest = Some(earliest.map_or(at, |seen| seen.min(at)));
-                if parsed.crashed_host_pid == Some(process.pid)
-                    && (not_before..=not_after).contains(&at)
-                {
-                    matches.push(parsed.time_text.to_string());
+                if parsed.crashed_host_pid == Some(process.pid) {
+                    if (not_before..=not_after).contains(&at) {
+                        matches.push(parsed.time_text.to_string());
+                    } else if (not_before - UNCLEAR_TIMING_SECONDS
+                        ..=not_after + UNCLEAR_TIMING_SECONDS)
+                        .contains(&at)
+                    {
+                        unclear_timing = true;
+                    }
+                    // Further away than that: another process that had this
+                    // id (before this one existed, or long after it ended).
                 }
             }
         }
         if !read_any {
             return CrashEvidence::unavailable("the system's crash handler has no log to read");
+        }
+        // A record just outside the lifetime may be this process with a late
+        // or early clock reading, or a neighbour in time that reused the id.
+        // It is not accepted and it is not explained away.
+        if unclear_timing {
+            return CrashEvidence::unavailable(
+                "the crash handler log has an entry for this process id close to, but not inside, the time the process was running",
+            );
         }
         match matches.as_slice() {
             [one] => CrashEvidence::FatalTerminationRecorded {
@@ -303,10 +342,14 @@ impl CrashSource for ApportLog {
             [_, _, ..] => CrashEvidence::unavailable(
                 "the crash handler log has more than one entry that could be this process",
             ),
+            // No record. That is only a statement if the kernel waits for
+            // the handler (otherwise it may not have written yet)...
+            [] if !handler_is_waited_for => CrashEvidence::unavailable(
+                "this system does not wait for its crash handler, so a record may not have been written yet",
+            ),
             [] => match earliest {
-                // "No record" is only a statement if the log reaches back to
-                // before the process started; otherwise an entry may have
-                // been rotated away.
+                // ...and if the log reaches back to before the process
+                // started; otherwise an entry may have been rotated away.
                 Some(first) if first <= not_before => CrashEvidence::NoRecord {
                     source: SOURCE.to_string(),
                 },

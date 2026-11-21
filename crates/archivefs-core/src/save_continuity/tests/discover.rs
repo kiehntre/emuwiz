@@ -645,3 +645,94 @@ fn a_save_already_at_the_destination_is_a_conflict_and_nothing_is_written() {
     fs::remove_dir(&work).unwrap();
     assert_eq!(tree(home.dir.path()), before);
 }
+
+// ---- RetroArch battery-save writing (read-only diagnostic) ----
+
+#[test]
+fn the_retroarch_diagnostic_reports_battery_save_writing_and_changes_nothing() {
+    use super::super::diagnostics::{BatterySaveWriting, retroarch_installs};
+    let home = Home::new();
+    let native = home.put(
+        ".config/retroarch/retroarch.cfg",
+        b"autosave_interval = \"0\"\nsavestate_auto_save = \"false\"\n",
+    );
+    let flatpak = home.put(
+        ".var/app/org.libretro.RetroArch/config/retroarch/retroarch.cfg",
+        b"savestate_auto_save = \"true\"\nautosave_interval = \"10\"\n",
+    );
+    let before = tree(home.dir.path());
+    let roots = home.roots();
+    let found = retroarch_installs(&roots.home, &roots.config);
+    assert_eq!(tree(home.dir.path()), before, "reads only");
+    assert_eq!(found.len(), 2);
+
+    let off = &found[0];
+    assert_eq!(
+        (off.install.as_str(), &off.config_file),
+        ("native", &native)
+    );
+    assert_eq!(off.battery_saves, BatterySaveWriting::PeriodicWritingOff);
+    assert_eq!(off.save_state_on_exit, Some(false));
+    let text = off.advice.join(" ").to_lowercase();
+    // "May", not "always"; what a snapshot cannot do; no promise.
+    assert!(text.contains("may then stay only in memory"), "{text}");
+    assert!(
+        text.contains("cannot recover progress that was never written"),
+        "{text}"
+    );
+    assert!(
+        text.contains("not a guarantee for every core or game"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("always") && !text.contains("only when it closes"),
+        "{text}"
+    );
+    // Battery saves and save states are kept apart.
+    assert!(
+        text.contains("save states are a separate feature"),
+        "{text}"
+    );
+    assert!(
+        text.contains("emuwiz does not change this setting"),
+        "{text}"
+    );
+
+    let on = &found[1];
+    assert_eq!(
+        (on.install.as_str(), &on.config_file),
+        ("flatpak", &flatpak)
+    );
+    assert_eq!(on.battery_saves, BatterySaveWriting::Every { seconds: 10 });
+    assert_eq!(on.save_state_on_exit, Some(true));
+    assert!(!on.advice.join(" ").contains("may then stay only in memory"));
+
+    // A setting that is missing or unreadable is "not established", not "off".
+    let odd = Home::new();
+    odd.put(
+        ".config/retroarch/retroarch.cfg",
+        b"autosave_interval = \"often\"\n",
+    );
+    let roots = odd.roots();
+    assert!(matches!(
+        retroarch_installs(&roots.home, &roots.config)[0].battery_saves,
+        BatterySaveWriting::NotEstablished { .. }
+    ));
+    let empty = Home::new();
+    empty.put(
+        ".config/retroarch/retroarch.cfg",
+        b"video_driver = \"gl\"\n",
+    );
+    let roots = empty.roots();
+    assert!(matches!(
+        retroarch_installs(&roots.home, &roots.config)[0].battery_saves,
+        BatterySaveWriting::NotEstablished { .. }
+    ));
+    assert!(
+        retroarch_installs(
+            Path::new("/nonexistent-home"),
+            Path::new("/nonexistent-home/.config")
+        )
+        .is_empty()
+    );
+}
