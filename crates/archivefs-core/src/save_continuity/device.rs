@@ -70,6 +70,13 @@ pub struct DeviceIdentity {
     /// A label a person chose ("Desktop"). Not trusted for anything.
     pub name: String,
     pub public_key: String,
+    /// The installation id this device's own snapshots are recorded under,
+    /// when that is not `device_id` itself (see [`super::installation`]).
+    /// The key signs this claim with every list. Absent for a device whose
+    /// records were always under its key's id, so such a device's lists
+    /// are byte for byte what they were before installation ids existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_id: Option<String>,
 }
 
 impl DeviceIdentity {
@@ -77,9 +84,22 @@ impl DeviceIdentity {
         sha256_hex(public_key)[..32].to_string()
     }
 
-    /// The short code two people compare when pairing.
+    /// The id this device's own snapshots carry: its installation id.
+    pub fn history(&self) -> &str {
+        self.history_id.as_deref().unwrap_or(&self.device_id)
+    }
+
+    /// The short code two people compare when pairing. It covers the key
+    /// and, where there is one, the installation id the key speaks for, so
+    /// that what is compared is everything that is pinned.
     pub fn fingerprint(&self) -> String {
-        self.device_id
+        let covered = match &self.history_id {
+            None => self.device_id.clone(),
+            Some(history) => {
+                sha256_hex(format!("{}\0{history}", self.device_id).as_bytes())[..32].to_string()
+            }
+        };
+        covered
             .as_bytes()
             .chunks(4)
             .take(4)
@@ -98,6 +118,13 @@ impl DeviceIdentity {
             return Err(ContinuityError::Refused(
                 "the device id does not belong to its key".into(),
             ));
+        }
+        if let Some(history) = &self.history_id {
+            if !super::installation::well_formed(history) || *history == self.device_id {
+                return Err(ContinuityError::Refused(
+                    "the device's history id is malformed".into(),
+                ));
+            }
         }
         Ok(key)
     }
@@ -125,7 +152,7 @@ static CREATE_ONCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 
 /// Creates `path` with `bytes` only if nothing is there yet (one atomic
 /// step), mode 0600. `Ok(false)`: something already was; it is untouched.
-fn create_private_once(path: &Path, bytes: &[u8]) -> Result<bool, ContinuityError> {
+pub(super) fn create_private_once(path: &Path, bytes: &[u8]) -> Result<bool, ContinuityError> {
     let parent = path.parent().unwrap_or(Path::new("/"));
     let work = parent.join(format!(
         ".{}.{}-{}.new",
@@ -162,7 +189,24 @@ fn create_private_once(path: &Path, bytes: &[u8]) -> Result<bool, ContinuityErro
     }
 }
 
+/// The device id of the key in `root`, if there is a key: what records made
+/// before installation ids existed were recorded under. Reads only.
+pub(super) fn key_derived_id(root: &Path) -> Result<Option<String>, ContinuityError> {
+    let key_path = root.join("device.key");
+    let pkcs8 = match fs::read(&key_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(super::io("cannot read", &key_path, error)),
+    };
+    let key = Ed25519KeyPair::from_pkcs8(&pkcs8)
+        .map_err(|_| ContinuityError::Corrupt("the device key file is damaged".into()))?;
+    Ok(Some(DeviceIdentity::id_for(key.public_key().as_ref())))
+}
+
 impl LocalDevice {
+    /// Loads this profile's device, creating its key on first use. This is
+    /// the explicit start of two-device use: recording sessions and taking
+    /// snapshots never call it (they use [`super::installation`]).
     /// Loads this profile's device, creating its key on first use. The key
     /// never leaves `<root>/device.key` (mode 0600).
     pub fn open_or_create(root: &Path, name: &str) -> Result<Self, ContinuityError> {
@@ -175,6 +219,13 @@ impl LocalDevice {
             .mode(0o700)
             .create(root)
             .map_err(|error| super::io("cannot create", root, error))?;
+        // First the installation id, then the key: on a profile with no key
+        // yet, the id must not be derived from a key made a moment later.
+        let installation = if create {
+            super::installation::open_or_create(root)?
+        } else {
+            String::new()
+        };
         let key_path = root.join("device.key");
         let info_path = root.join("device.json");
         let pkcs8 = match fs::read(&key_path) {
@@ -197,8 +248,18 @@ impl LocalDevice {
         let key = Ed25519KeyPair::from_pkcs8(&pkcs8)
             .map_err(|_| ContinuityError::Corrupt("the device key file is damaged".into()))?;
         let public = key.public_key().as_ref().to_vec();
+        let device_id = DeviceIdentity::id_for(&public);
+        // The installation id this key speaks for. Where the records were
+        // always under the key's own id (a profile from before installation
+        // ids), that is the same id and nothing extra is declared.
+        let installation = if create {
+            Some(installation)
+        } else {
+            super::installation::existing(root)?
+        };
         let identity = DeviceIdentity {
-            device_id: DeviceIdentity::id_for(&public),
+            history_id: installation.filter(|id| *id != device_id),
+            device_id,
             name: name.to_string(),
             public_key: hex(&public),
         };
@@ -256,7 +317,7 @@ impl LocalDevice {
         let snapshots: Vec<SnapshotManifest> = store
             .list()
             .into_iter()
-            .filter(|manifest| manifest.body.provenance.device_id == self.identity.device_id)
+            .filter(|manifest| manifest.body.provenance.device_id == self.identity.history())
             .collect();
         let sequence = Self::recorded_sequence(&self.root)? + 1;
         self.write_info(sequence)?;
@@ -280,7 +341,7 @@ impl LocalDevice {
         let snapshots: Vec<SnapshotManifest> = store
             .list()
             .into_iter()
-            .filter(|manifest| manifest.body.provenance.device_id == self.identity.device_id)
+            .filter(|manifest| manifest.body.provenance.device_id == self.identity.history())
             .collect();
         self.list_body(snapshots, self.sequence())
     }
@@ -512,10 +573,35 @@ impl PeerBook {
                 "a device cannot be paired with itself".into(),
             ));
         }
+        // The history a device speaks for is pinned with its key. It may
+        // not be this installation's own history, nor one another paired
+        // device already speaks for: its snapshots would be taken for ours
+        // or for theirs.
+        let mine = [this_device.history(), this_device.device_id.as_str()];
+        if mine.contains(&identity.history()) || mine.contains(&identity.device_id.as_str()) {
+            return Err(ContinuityError::Refused(
+                "the other device claims this installation's own history; it was not paired".into(),
+            ));
+        }
+        if self.peers.values().any(|peer| {
+            peer.identity.device_id != identity.device_id
+                && (peer.identity.history() == identity.history()
+                    || peer.identity.device_id == identity.history()
+                    || peer.identity.history() == identity.device_id)
+        }) {
+            return Err(ContinuityError::Refused(
+                "the other device claims a history that an already paired device speaks for; it was not paired".into(),
+            ));
+        }
         if let Some(existing) = self.peers.get(&identity.device_id) {
             if existing.identity.public_key != identity.public_key {
                 return Err(ContinuityError::Refused(
                     "this device id is already paired with a different key".into(),
+                ));
+            }
+            if existing.identity.history_id != identity.history_id {
+                return Err(ContinuityError::Refused(
+                    "this device is already paired, speaking for a different history".into(),
                 ));
             }
             return Ok(());
@@ -572,6 +658,11 @@ impl PeerBook {
                 "the sender's key is not the key that was paired".into(),
             ));
         }
+        if peer.identity.history_id != body.device.history_id {
+            return Err(ContinuityError::Refused(
+                "the sender speaks for a different history than the one that was paired".into(),
+            ));
+        }
         let signature = unhex(&set.signature)
             .ok_or_else(|| ContinuityError::Refused("the signature is malformed".into()))?;
         UnparsedPublicKey::new(&ED25519, &key)
@@ -608,7 +699,7 @@ impl PeerBook {
             // Every rule a locally stored record must meet, including that
             // its history is the sender's own and not one of ours.
             super::store::check_manifest(manifest)?;
-            if manifest.body.provenance.device_id != body.device.device_id {
+            if manifest.body.provenance.device_id != body.device.history() {
                 return Err(ContinuityError::Refused(
                     "the list contains a snapshot the sender did not take".into(),
                 ));

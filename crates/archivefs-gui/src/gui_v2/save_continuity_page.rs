@@ -111,11 +111,28 @@ fn when(unix: i64) -> String {
     super::save_snapshots::format_unix_seconds(unix.max(0) as u64)
 }
 
-fn length(seconds: i64) -> String {
+pub(super) fn length(seconds: i64) -> String {
     match seconds.max(0) {
+        1 => "1 second".to_string(),
         s if s < 60 => format!("{s} seconds"),
+        s if s < 120 => "1 minute".to_string(),
         s if s < 3600 => format!("{} minutes", s / 60),
         s => format!("{} h {} min", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// One fact on one line.
+fn row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.label(format!("{label}: {value}"));
+}
+
+/// How long the emulator process ran, only where both ends were seen. For a
+/// session whose end EmuWiz did not see, the recorded end time is when it
+/// was found gone, which says nothing about how long it ran.
+pub(super) fn ran_for(record: &SessionRecord) -> Option<String> {
+    match (&record.state, record.started_unix, record.ended_unix) {
+        (SessionState::Ended, Some(started), Some(ended)) => Some(length(ended - started)),
+        _ => None,
     }
 }
 
@@ -191,10 +208,10 @@ fn session_card(ui: &mut egui::Ui, record: &SessionRecord) {
         } else {
             format!("{} ({})", record.launch.emulator, record.launch.profile)
         };
-        widgets::detail_row(ui, "Emulator", &emulator);
-        widgets::detail_row(ui, "Launch requested", &when(record.requested_unix));
-        if let (Some(started), Some(ended)) = (record.started_unix, record.ended_unix) {
-            widgets::detail_row(ui, "Emulator process ran for", &length(ended - started));
+        row(ui, "Emulator", &emulator);
+        row(ui, "Launch requested", &when(record.requested_unix));
+        if let Some(time) = ran_for(record) {
+            row(ui, "Emulator process ran for", &time);
         }
         // The number as observed, whatever was or was not concluded from it.
         // It belongs to the process EmuWiz started, which may be a launcher.
@@ -204,7 +221,7 @@ fn session_card(ui: &mut egui::Ui, record: &SessionRecord) {
                 ObservedStatus::ExitCode { code } => format!("exit status {code}"),
                 ObservedStatus::Signal { signal, .. } => format!("ended by signal {signal}"),
             };
-            widgets::detail_row(ui, "Process EmuWiz started", &text);
+            row(ui, "Process EmuWiz started", &text);
         }
         let saves = save_summary(record);
         if !saves.is_empty() {
@@ -499,6 +516,35 @@ mod tests {
         assert_eq!(by("Open").state, SessionState::Started);
         assert_eq!(save_summary(by("Open")), "");
         assert_eq!(session_status(by("Never")).0, "The emulator did not start");
+        // A duration only where both ends were seen.
+        assert!(ran_for(by("Clean")).is_some());
+        assert_eq!(ran_for(by("Open")), None);
+        assert_eq!(ran_for(by("Never")), None);
+        let mut unseen = by("Clean").clone();
+        unseen.state = SessionState::EndNotSeen;
+        assert_eq!(
+            ran_for(&unseen),
+            None,
+            "found gone later is not how long it ran"
+        );
+        assert_eq!(
+            [
+                length(1),
+                length(59),
+                length(60),
+                length(119),
+                length(120),
+                length(3700)
+            ],
+            [
+                "1 second",
+                "59 seconds",
+                "1 minute",
+                "1 minute",
+                "2 minutes",
+                "1 h 1 min"
+            ]
+        );
     }
 
     #[test]

@@ -311,6 +311,32 @@ A real transport (LAN discovery, an authenticated encrypted channel carrying
 exactly these messages, pairing by comparing the code on both screens) is future
 work and needs separate approval.
 
+## Which id records carry
+
+Snapshots and play sessions are recorded under this installation's **local
+id**: a random 128-bit number written once to `installation.json` and reused
+for good. It is not a cryptographic identity, and recording a session or
+taking a snapshot never creates a key.
+
+The **signing key** belongs to the two-device feature and is created only when
+that is used (`continuity device show`, export, pair). The key's identity then
+declares which installation id it speaks for (`history_id`), and its signature
+on every list covers that claim. Snapshots keep the installation id before and
+after, so a save's history is one history; nothing stored is rewritten.
+
+A profile that already had a key (made before installation ids) recorded
+everything under the key's own id. There the installation id **is** that id,
+adopted as it stands; the identity declares nothing extra and its signed lists
+are byte for byte what they were.
+
+What a receiving device enforces: the history a device speaks for is pinned at
+pairing together with its key, and the pairing code covers both. A device may
+not claim this installation's history or one another paired device speaks
+for; a paired key that later claims a different history has its lists
+refused; every snapshot in a list must be recorded under the pinned history.
+
+No migration is needed and none is performed.
+
 ## Schema proposal (not applied)
 
 No migration is included. Everything is files under `<data>/save-continuity`.
@@ -348,8 +374,8 @@ development machine.
 - Blue records each launch in the session journal (`gui_v2/session_tracking`)
   and has a looking-only page, "Play sessions & save history". Recording a
   launch creates the journal folder only: no snapshot store and no device
-  identity or signing key. An explicit snapshot from the CLI still creates a
-  device identity, because a snapshot's lineage is keyed by the device id.
+  signing key; it creates this installation's local id. A snapshot from the
+  CLI likewise creates no key.
 - Flatpak crash-record detection is not verified end to end (see above).
 - The page shows recorded sessions and existing snapshots. It takes no
   snapshot and restores nothing; there is no automatic snapshot at session

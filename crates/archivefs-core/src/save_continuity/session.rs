@@ -318,13 +318,6 @@ pub enum ObservedStatus {
     Signal { signal: i32, core_dumped: bool },
 }
 
-/// The device id recorded for sessions on a machine that has no device
-/// identity yet. Recording a launch must not create an identity or a
-/// signing key: those belong to the two-device feature and are created only
-/// when it is used. The session journal never leaves this machine, so a
-/// session recorded under this id is this machine's own.
-pub const UNPAIRED_DEVICE_ID: &str = "this-device";
-
 /// How the process ended, as the launcher saw it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitObservation {
@@ -1570,9 +1563,7 @@ pub fn preceding_session(
     current: &[SaveMark],
 ) -> PrecedingSession {
     let Some(latest) = sessions.iter().find(|session| {
-        // Sessions recorded before this machine had a device identity are
-        // this machine's own too.
-        (session.device_id == device_id || session.device_id == UNPAIRED_DEVICE_ID)
+        session.device_id == device_id
             && session.launch.emulator.eq_ignore_ascii_case(emulator)
             && session.launch.profile.eq_ignore_ascii_case(profile)
             && session.state != SessionState::NeverStarted

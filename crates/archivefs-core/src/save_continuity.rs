@@ -38,6 +38,7 @@ pub mod crash_evidence;
 pub mod device;
 pub mod diagnostics;
 pub mod discover;
+pub mod installation;
 pub mod model;
 pub mod session;
 pub mod status;

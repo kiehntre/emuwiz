@@ -95,23 +95,16 @@ impl SessionTracking {
 
 /// The person's own save-continuity folder and profile.
 ///
-/// Recording a launch creates the session journal's folder and nothing
-/// else: no snapshot store, and no device identity or signing key. Those
-/// belong to snapshots and to the two-device feature and are created only
-/// when those are used. If an identity already exists its id is used.
+/// Recording a launch creates the session journal's folder and this
+/// installation's local id (a random number in `installation.json`, made
+/// once and reused), and nothing else: no snapshot store and no signing
+/// key. The key belongs to the two-device feature and is created only when
+/// that is used.
 fn open_real_tracker() -> Result<LaunchTracker, ContinuityError> {
-    use archivefs_core::save_continuity::device::LocalDevice;
     use archivefs_core::save_continuity::discover::DiscoveryRoots;
-    use archivefs_core::save_continuity::session::UNPAIRED_DEVICE_ID;
     let root = archivefs_core::save_continuity::default_root()
         .map_err(|error| ContinuityError::Io(error.to_string()))?;
-    let device_id = LocalDevice::open_existing(&root)
-        .ok()
-        .flatten()
-        .map_or_else(
-            || UNPAIRED_DEVICE_ID.to_string(),
-            |device| device.identity.device_id,
-        );
+    let device_id = archivefs_core::save_continuity::installation::open_or_create(&root)?;
     let roots = DiscoveryRoots::current()
         .ok_or_else(|| ContinuityError::Refused("HOME is not set".to_string()))?;
     LaunchTracker::open(&root, roots, &device_id)

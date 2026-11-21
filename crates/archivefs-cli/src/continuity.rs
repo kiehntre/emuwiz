@@ -611,20 +611,22 @@ pub fn run(args: Vec<String>) -> Outcome {
             let report = find(&options)?;
             let save = pick(&report, need(0, "a save id")?)?;
             let store = store(&options)?;
-            let device = device(&options, &store)?;
+            // Recorded under this installation's local id. Taking a
+            // snapshot never creates a signing key.
+            let local_id =
+                archivefs_core::save_continuity::installation::open_or_create(store.root())?;
             // How the emulator last ended, if a recorded session can be tied
             // to this exact save; otherwise "unknown".
             // With the same read-only crash-record source the launch path
             // uses: a session settled here must not be recorded as having
             // had no source to ask.
-            let journal = SessionJournal::open(store.root(), &device.identity.device_id)?
-                .with_crash_source(Box::new(
-                    archivefs_core::save_continuity::crash_evidence::ApportLog::system(),
-                ));
+            let journal = SessionJournal::open(store.root(), &local_id)?.with_crash_source(
+                Box::new(archivefs_core::save_continuity::crash_evidence::ApportLog::system()),
+            );
             journal.reconcile(&ProcFs, continuity_now());
             let preceding = preceding_session(
                 &journal.recent(500),
-                &device.identity.device_id,
+                &local_id,
                 &save.emulator,
                 &save.profile,
                 &marks_of(save, &report.saves),
@@ -632,7 +634,7 @@ pub fn run(args: Vec<String>) -> Outcome {
             let request = capture_request(
                 save,
                 &report.saves,
-                &device.identity.device_id,
+                &local_id,
                 CaptureReason::Manual,
                 None,
                 options.best_effort,
@@ -873,14 +875,14 @@ pub fn run(args: Vec<String>) -> Outcome {
         }
         "sessions" => {
             let store = existing_store(&options)?;
-            let device = existing_device(&store)?;
+            let local_id = archivefs_core::save_continuity::installation::existing(store.root())?
+                .ok_or("nothing has been recorded in this profile yet")?;
             // With the same read-only crash-record source the launch path
             // uses: a session settled here must not be recorded as having
             // had no source to ask.
-            let journal = SessionJournal::open(store.root(), &device.identity.device_id)?
-                .with_crash_source(Box::new(
-                    archivefs_core::save_continuity::crash_evidence::ApportLog::system(),
-                ));
+            let journal = SessionJournal::open(store.root(), &local_id)?.with_crash_source(
+                Box::new(archivefs_core::save_continuity::crash_evidence::ApportLog::system()),
+            );
             let settled = journal.reconcile(&ProcFs, continuity_now());
             let sessions = journal.recent(200);
             emit(

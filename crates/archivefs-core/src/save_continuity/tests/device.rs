@@ -37,7 +37,7 @@ impl Device {
             .collect();
         fs::write(&self.card, body).unwrap();
         self.clock += 60;
-        let mut ask = request(&self.device.identity.device_id, &[&self.card], self.clock);
+        let mut ask = request(self.device.identity.history(), &[&self.card], self.clock);
         ask.contained_saves = saves
             .iter()
             .map(|(key, content)| save(key, content))
@@ -275,7 +275,7 @@ impl Link for Faulty {
 
 fn big_snapshot(device: &mut Device) -> SnapshotManifest {
     fs::write(&device.card, vec![0x5A; 300_000]).unwrap();
-    let mut ask = request(&device.device.identity.device_id, &[&device.card], 5);
+    let mut ask = request(device.device.identity.history(), &[&device.card], 5);
     ask.contained_saves = vec![save(GAME, "big")];
     device
         .store
@@ -338,7 +338,7 @@ fn an_interrupted_transfer_resumes_and_nothing_appears_until_it_is_whole() {
             .body
             .provenance
             .device_id,
-        desktop.device.identity.device_id
+        desktop.device.identity.history()
     );
     assert!(
         laptop
@@ -729,4 +729,319 @@ fn opening_an_existing_device_writes_nothing_and_an_unreadable_record_is_not_lis
     let empty = tempfile::tempdir().unwrap();
     assert!(LocalDevice::open_existing(empty.path()).unwrap().is_none());
     assert!(fs::read_dir(empty.path()).unwrap().next().is_none());
+}
+
+// ---- The local installation id and the signing key (owner decision 2026-11-21) ----
+
+use super::super::installation;
+
+fn files_under(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if entry.metadata().unwrap().is_dir() {
+                stack.push(path);
+            } else {
+                found.push((path.clone(), fs::read(&path).unwrap()));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Takes a snapshot of a one-file "card" holding `content`, under `id`.
+fn snapshot_under(
+    store: &SnapshotStore,
+    card: &Path,
+    id: &str,
+    content: &str,
+    time: i64,
+) -> SnapshotManifest {
+    fs::write(card, format!("{GAME}={content};")).unwrap();
+    let mut ask = request(id, &[card], time);
+    ask.contained_saves = vec![save(GAME, content)];
+    store.capture(&ask, &CLOSED).unwrap().manifest().clone()
+}
+
+#[test]
+fn a_fresh_installation_gets_one_local_id_and_no_key_and_keeps_it_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("continuity");
+    // Looking first creates nothing.
+    assert_eq!(installation::existing(&root).unwrap(), None);
+    assert!(!root.exists());
+    let id = installation::open_or_create(&root).unwrap();
+    assert!(installation::well_formed(&id), "{id}");
+    // No signing key, no device record.
+    assert!(!root.join("device.key").exists() && !root.join("device.json").exists());
+    // "Restarts": every later look gives the same id and writes nothing.
+    let before = files_under(&root);
+    for _ in 0..3 {
+        assert_eq!(installation::open_or_create(&root).unwrap(), id);
+        assert_eq!(installation::existing(&root).unwrap(), Some(id.clone()));
+    }
+    assert_eq!(files_under(&root), before);
+    // Two different installations do not share an id.
+    let other = tempfile::tempdir().unwrap();
+    assert_ne!(
+        installation::open_or_create(&other.path().join("c")).unwrap(),
+        id
+    );
+    // A damaged id file is an error, never quietly replaced by a new id
+    // (which would split every history).
+    fs::write(root.join("installation.json"), b"{ not json").unwrap();
+    assert!(installation::open_or_create(&root).is_err());
+    assert!(installation::existing(&root).is_err());
+    assert_eq!(
+        fs::read(root.join("installation.json")).unwrap(),
+        b"{ not json"
+    );
+    fs::write(
+        root.join("installation.json"),
+        br#"{"format_version":1,"installation_id":"short","origin":"generated"}"#,
+    )
+    .unwrap();
+    assert!(installation::open_or_create(&root).is_err());
+}
+
+#[test]
+fn first_use_of_two_devices_joins_the_key_to_the_existing_history_without_splitting_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("continuity");
+    let card = dir.path().join("Mcd001.ps2");
+    // Weeks of ordinary use: sessions and snapshots, no two-device feature.
+    let local = installation::open_or_create(&root).unwrap();
+    let store = SnapshotStore::open(&root).unwrap();
+    let first = snapshot_under(&store, &card, &local, "v1", 100);
+    let second = snapshot_under(&store, &card, &local, "v2", 200);
+    assert!(
+        !root.join("device.key").exists(),
+        "no key until two-device use"
+    );
+    let records_before = files_under(&root.join("manifests"));
+
+    // The person turns on two-device use.
+    let desktop = LocalDevice::open_or_create(&root, "Desktop").unwrap();
+    assert!(root.join("device.key").exists());
+    // The key speaks for the existing local history...
+    assert_eq!(desktop.identity.history(), local);
+    assert_eq!(desktop.identity.history_id.as_deref(), Some(local.as_str()));
+    assert_ne!(desktop.identity.device_id, local);
+    // ...the local id did not change, and no stored record was rewritten.
+    assert_eq!(installation::open_or_create(&root).unwrap(), local);
+    assert_eq!(files_under(&root.join("manifests")), records_before);
+
+    // A snapshot after activation continues the same history.
+    let third = snapshot_under(&store, &card, &local, "v3", 300);
+    assert_eq!(first.body.lineage, second.body.lineage);
+    assert_eq!(first.body.lineage, third.body.lineage);
+    let timelines = super::super::workflow::timelines(&store);
+    assert_eq!(timelines.len(), 1, "one history, not two");
+    assert_eq!(timelines[0].entries.len(), 3);
+
+    // The signed list carries everything, old and new, once each.
+    let list = desktop.export(&store).unwrap();
+    let ids: Vec<&str> = list
+        .body
+        .snapshots
+        .iter()
+        .map(|m| m.snapshot_id.as_str())
+        .collect();
+    assert_eq!(ids.len(), 3);
+    for snapshot in [&first, &second, &third] {
+        assert!(ids.contains(&snapshot.snapshot_id.as_str()));
+    }
+    assert_eq!(list.body.histories.len(), 1);
+
+    // Another device pairs with it and accepts the list.
+    let laptop = Device::new("Laptop", 1_700_000_000);
+    laptop
+        .peers()
+        .pair(&desktop.identity, &laptop.device.identity)
+        .unwrap();
+    laptop.peers().accept(&list).unwrap();
+    // Opening again later ("restart") gives the same identity and history.
+    let again = LocalDevice::open_existing(&root).unwrap().unwrap();
+    assert_eq!(again.identity, desktop.identity);
+}
+
+#[test]
+fn a_profile_from_before_installation_ids_keeps_its_history_under_the_id_it_always_had() {
+    // Such a profile has a key and records under the key's id, and no
+    // installation file.
+    let mut old = Device::new("Old desktop", 1_800_000_000);
+    let root = old.dir.path().join("continuity");
+    fs::remove_file(root.join("installation.json")).unwrap();
+    let key_id = old.device.identity.device_id.clone();
+    let before_change = snapshot_under(&old.store, &old.card, &key_id, "v1", 100);
+    let records_before = files_under(&root.join("manifests"));
+
+    // The new code, looking without creating: the id is the key's.
+    assert_eq!(installation::existing(&root).unwrap(), Some(key_id.clone()));
+    assert!(!root.join("installation.json").exists());
+    // First recording after the change adopts it and writes it down.
+    assert_eq!(installation::open_or_create(&root).unwrap(), key_id);
+    let stored = fs::read_to_string(root.join("installation.json")).unwrap();
+    assert!(stored.contains("adopted_from_device_key"), "{stored}");
+    let after_change = snapshot_under(&old.store, &old.card, &key_id, "v2", 200);
+    assert_eq!(before_change.body.lineage, after_change.body.lineage);
+    assert_eq!(super::super::workflow::timelines(&old.store).len(), 1);
+    // Nothing recorded earlier was rewritten.
+    for (path, bytes) in &records_before {
+        assert_eq!(&fs::read(path).unwrap(), bytes);
+    }
+
+    // Its identity declares nothing extra, so its lists are what they
+    // always were, and a device that paired with it before still accepts
+    // them.
+    old.device = LocalDevice::open_existing(&root).unwrap().unwrap();
+    assert_eq!(old.device.identity.history_id, None);
+    assert_eq!(old.device.identity.history(), key_id);
+    let as_json = serde_json::to_string(&old.device.identity).unwrap();
+    assert!(!as_json.contains("history_id"), "{as_json}");
+    let laptop = Device::new("Laptop", 1_700_000_000);
+    laptop
+        .peers()
+        .pair(&old.device.identity, &laptop.device.identity)
+        .unwrap();
+    let list = old.device.export(&old.store).unwrap();
+    assert_eq!(list.body.snapshots.len(), 2);
+    laptop.peers().accept(&list).unwrap();
+    // An identity written before the field existed still reads.
+    let legacy: DeviceIdentity = serde_json::from_str(&as_json).unwrap();
+    assert_eq!(legacy, old.device.identity);
+}
+
+/// A device whose installation file claims `history`.
+fn device_claiming(history: &str, name: &str) -> Device {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("continuity");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("installation.json"),
+        format!(r#"{{"format_version":1,"installation_id":"{history}","origin":"generated"}}"#),
+    )
+    .unwrap();
+    let device = LocalDevice::open_or_create(&root, name).unwrap();
+    let store = SnapshotStore::open(&root).unwrap();
+    let card = dir.path().join("Mcd001.ps2");
+    Device {
+        dir,
+        device,
+        store,
+        card,
+        clock: 1_600_000_000,
+    }
+}
+
+#[test]
+fn a_device_cannot_claim_this_installations_history_or_another_paired_devices() {
+    let (desktop, laptop) = paired();
+    // A device that says it speaks for the laptop's own local history.
+    let thief = device_claiming(laptop.device.identity.history(), "Thief");
+    assert!(
+        laptop
+            .peers()
+            .pair(&thief.device.identity, &laptop.device.identity)
+            .is_err()
+    );
+    // Or for the laptop's key id.
+    let thief = device_claiming(&laptop.device.identity.device_id, "Thief");
+    assert!(
+        laptop
+            .peers()
+            .pair(&thief.device.identity, &laptop.device.identity)
+            .is_err()
+    );
+    // Or for the history of a device the laptop is already paired with.
+    let thief = device_claiming(desktop.device.identity.history(), "Thief");
+    assert!(
+        laptop
+            .peers()
+            .pair(&thief.device.identity, &laptop.device.identity)
+            .is_err()
+    );
+    let thief = device_claiming(&desktop.device.identity.device_id, "Thief");
+    assert!(
+        laptop
+            .peers()
+            .pair(&thief.device.identity, &laptop.device.identity)
+            .is_err()
+    );
+    assert!(!laptop.peers().is_paired(&thief.device.identity.device_id));
+    // A malformed claim is refused outright.
+    let mut odd = desktop.device.identity.clone();
+    odd.history_id = Some("not-an-id".into());
+    let stranger = Device::new("Stranger", 1);
+    assert!(
+        stranger
+            .peers()
+            .pair(&odd, &stranger.device.identity)
+            .is_err()
+    );
+}
+
+#[test]
+fn the_history_a_device_speaks_for_is_pinned_when_it_is_paired() {
+    let (mut desktop, laptop) = paired();
+    desktop.play(&[(GAME, "v1")]);
+    let genuine = desktop.device.export(&desktop.store).unwrap();
+    laptop.peers().check(&genuine).unwrap();
+    // The pairing code covers the history as well as the key.
+    let mut other_history = desktop.device.identity.clone();
+    other_history.history_id = Some("0123456789abcdef0123456789abcdef".into());
+    assert_ne!(
+        other_history.fingerprint(),
+        desktop.device.identity.fingerprint()
+    );
+
+    // The same key later claiming a different history (its own profile's id
+    // file was swapped): its lists are refused, and it cannot re-pair.
+    let root = desktop.dir.path().join("continuity");
+    fs::write(
+        root.join("installation.json"),
+        br#"{"format_version":1,"installation_id":"0123456789abcdef0123456789abcdef","origin":"generated"}"#,
+    )
+    .unwrap();
+    let changed = LocalDevice::open_existing(&root).unwrap().unwrap();
+    assert_eq!(
+        changed.identity.device_id,
+        desktop.device.identity.device_id
+    );
+    let list = changed.export(&desktop.store).unwrap();
+    let refused = laptop.peers().check(&list).unwrap_err();
+    assert!(
+        matches!(refused, ContinuityError::Refused(ref why) if why.contains("different history")),
+        "{refused:?}"
+    );
+    assert!(
+        laptop
+            .peers()
+            .pair(&changed.identity, &laptop.device.identity)
+            .is_err()
+    );
+
+    // A list holding a snapshot recorded under the sender's key id instead
+    // of the history it speaks for is not the sender's own.
+    let (mut desktop, laptop) = paired();
+    let key_id = desktop.device.identity.device_id.clone();
+    snapshot_under(&desktop.store, &desktop.card, &key_id, "v1", 50);
+    desktop.play(&[(GAME, "v2")]);
+    let mut list = desktop.device.export(&desktop.store).unwrap();
+    assert_eq!(
+        list.body.snapshots.len(),
+        1,
+        "only its own history is exported"
+    );
+    let stray = desktop
+        .store
+        .list()
+        .into_iter()
+        .find(|m| m.body.provenance.device_id == key_id)
+        .unwrap();
+    list.body.snapshots.push(stray);
+    assert!(laptop.peers().check(&list).is_err());
 }
