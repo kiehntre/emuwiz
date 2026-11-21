@@ -2798,6 +2798,167 @@ mod second_review_tests {
         assert!(matches!(queue.items[0].state, QueueState::Failed(_)));
         assert!(lab.store.list().is_empty());
     }
+
+    #[test]
+    fn a_record_without_a_filesystem_id_or_with_another_one_is_never_retired() {
+        for tamper in ["strip", "other"] {
+            let lab = Lab::new();
+            let zip = lab.standard_zip();
+            let summary = lab.prepare(&zip).unwrap().summary;
+            let record = std::fs::read_dir(lab.store.root().join("v1/sources"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let mut link: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+            if tamper == "strip" {
+                link.as_object_mut().unwrap().remove("filesystem_id");
+            } else {
+                link["filesystem_id"] = serde_json::json!(0x1234_5678_9abc_u64);
+            }
+            std::fs::write(&record, serde_json::to_string(&link).unwrap()).unwrap();
+            assert_eq!(
+                lab.store.prepared_for_source(&zip),
+                Some(summary.clone()),
+                "{tamper}"
+            );
+
+            // The file disappears from a folder that is still there; a twin
+            // is then linked by content.
+            let twin = lab.zip_path("twin.zip");
+            std::fs::copy(&zip, &twin).unwrap();
+            std::fs::remove_file(&zip).unwrap();
+            let outcome = lab
+                .store
+                .relink(
+                    &twin,
+                    &lab.trusted,
+                    &DiscSetLimits::default(),
+                    &lab.cancel,
+                    &|_| {},
+                )
+                .unwrap();
+            assert_eq!(
+                outcome,
+                RelinkOutcome::Linked {
+                    summary: Box::new(summary),
+                    moved_from: None,
+                },
+                "{tamper}: nothing proves where the first file went"
+            );
+            assert!(record.exists(), "{tamper}: the record is kept");
+        }
+    }
+
+    #[test]
+    fn the_saved_folder_is_checked_when_used_and_a_missing_one_is_never_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(PreparedMediaStore::configured(None), Ok(None));
+        let chosen = root.join("chosen");
+        std::fs::create_dir(&chosen).unwrap();
+        std::fs::set_permissions(&chosen, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        assert_eq!(
+            PreparedMediaStore::configured(Some(chosen.clone())),
+            Ok(Some(PreparedMediaStore::at(&chosen)))
+        );
+        // Made writable by others afterwards.
+        std::fs::set_permissions(&chosen, std::os::unix::fs::PermissionsExt::from_mode(0o777))
+            .unwrap();
+        assert!(PreparedMediaStore::configured(Some(chosen.clone())).is_err());
+        // Gone (its disk is not connected): an error, and nothing is created.
+        std::fs::remove_dir(&chosen).unwrap();
+        let missing = PreparedMediaStore::configured(Some(chosen.clone()));
+        assert!(missing.is_err_and(|detail| detail.contains("not there")));
+        assert!(!chosen.exists());
+    }
+
+    #[test]
+    fn the_launch_gate_does_not_open_for_folders_it_can_no_longer_trust() {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let old_root = lab.root.join("old-store");
+        let old = PreparedMediaStore::at(&old_root);
+        let summary = old
+            .prepare(
+                &zip,
+                "AmigaCD32",
+                &lab.trusted,
+                &DiscSetLimits::default(),
+                &lab.cancel,
+                &|_| {},
+            )
+            .unwrap()
+            .summary;
+        let track = summary.directory.join("media").join(ISO_NAME);
+        let previous = vec![old_root.clone()];
+        let stores = vec![PreparedMediaStore::at(lab.root.join("current")), old];
+        // Trusted earlier folder: a track is refused, the cue sheet is not.
+        assert!(launch_refusal_with(None, None, &previous, &stores, &track).is_some());
+        assert_eq!(
+            launch_refusal_with(None, None, &previous, &stores, &summary.launch_path),
+            None
+        );
+        // The earlier folder stops being trustworthy and so drops out of the
+        // list of stores: files inside it are still refused, all of them.
+        std::fs::set_permissions(
+            &old_root,
+            std::os::unix::fs::PermissionsExt::from_mode(0o777),
+        )
+        .unwrap();
+        let without_old = &stores[..1];
+        assert!(launch_refusal_with(None, None, &previous, without_old, &track).is_some());
+        assert!(
+            launch_refusal_with(None, None, &previous, without_old, &summary.launch_path).is_some()
+        );
+        assert_eq!(
+            launch_refusal_with(None, None, &previous, without_old, &zip),
+            None
+        );
+        std::fs::set_permissions(
+            &old_root,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+
+        // The saved choice cannot be used: files inside it are refused, even
+        // with no store left to check them against.
+        let refused = launch_refusal_with(
+            Some("its disk is not connected".into()),
+            Some(old_root.clone()),
+            &[],
+            &[],
+            &summary.launch_path,
+        );
+        assert!(refused.is_some_and(|detail| detail.contains("can no longer be used")));
+        assert_eq!(
+            launch_refusal_with(Some("x".into()), Some(old_root), &[], &[], &zip),
+            None
+        );
+    }
+
+    #[test]
+    fn the_unchecked_setting_reader_is_bounded_and_never_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let setting = dir.path().join("prepared_media_folder.txt");
+        assert_eq!(configured_folder_unchecked_at(&setting), None);
+        std::fs::write(&setting, "/chosen/folder\n").unwrap();
+        assert_eq!(
+            configured_folder_unchecked_at(&setting),
+            Some(PathBuf::from("/chosen/folder"))
+        );
+        std::fs::write(&setting, "relative\n").unwrap();
+        assert_eq!(configured_folder_unchecked_at(&setting), None);
+        // A FIFO where the setting should be: answered at once, not waited on.
+        std::fs::remove_file(&setting).unwrap();
+        let name = std::ffi::CString::new(setting.to_str().unwrap()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert_eq!(configured_folder_unchecked_at(&setting), None);
+    }
 }
 
 /// A restart can give the same disk another device number. The link is to

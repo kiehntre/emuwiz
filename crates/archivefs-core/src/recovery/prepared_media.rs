@@ -106,10 +106,12 @@ struct SourceLink {
     source_path: PathBuf,
     source: SourceIdentity,
     set_id: String,
-    /// The filesystem the ZIP was on (`statvfs` f_fsid), which, unlike the
-    /// device number, stays the same across restarts on the usual Linux
-    /// filesystems. Used only to tell "the file is gone" from "its disk is
-    /// not there right now".
+    /// The filesystem the ZIP was on (`statvfs` f_fsid), when it reports
+    /// one. Used only to tell "the file is gone" from "its disk is not there
+    /// right now", and only ever to prove sameness: a filesystem that
+    /// reports none (FUSE, network), an older record without one, or an id
+    /// that changed (some filesystems derive it from the device number)
+    /// means "unknown", and nothing is retired or moved.
     #[serde(default)]
     filesystem_id: Option<u64>,
 }
@@ -490,12 +492,28 @@ impl PreparedMediaStore {
             }
             return Ok(Self::at(path));
         }
-        if let Some(folder) = super::storage::configured_folder()? {
-            // Checked when it was chosen, and again every time it is used.
-            super::storage::still_safe(&folder)?;
-            return Ok(Self::at(folder));
+        match Self::configured(super::storage::configured_folder()?)? {
+            Some(store) => Ok(store),
+            None => Self::default_location(),
         }
-        Self::default_location()
+    }
+
+    /// The store for a saved folder choice, checked as it is used: the
+    /// folder must be there and still pass [`super::storage::still_safe`].
+    /// A chosen folder that is missing (its disk is not connected, or it was
+    /// deleted) is an error: it is never quietly created somewhere else.
+    pub fn configured(folder: Option<PathBuf>) -> Result<Option<Self>, String> {
+        let Some(folder) = folder else {
+            return Ok(None);
+        };
+        super::storage::still_safe(&folder)?;
+        if fs::symlink_metadata(&folder).is_err() {
+            return Err(format!(
+                "{} is not there (is its disk connected?); choose the folder for prepared copies again or go back to the default",
+                folder.display()
+            ));
+        }
+        Ok(Some(Self::at(folder)))
     }
 
     /// Every store this profile may hold prepared copies in: the current one
@@ -639,7 +657,7 @@ impl PreparedMediaStore {
                 continue;
             };
             if link.set_id == set_id
-                && source_is_gone(&link.source_path, link.filesystem_id.map(Some))
+                && source_is_gone(&link.source_path, Some(link.filesystem_id))
                 && fs::remove_file(&path).is_ok()
             {
                 gone.push(link.source_path);
@@ -1810,19 +1828,45 @@ impl PreparedMediaStore {
 /// outside this profile's store or is the launch file of a verified prepared
 /// copy. This only ever adds a refusal; it grants nothing.
 pub fn launch_refusal(content: &Path) -> Option<String> {
-    // Every store this profile has used is guarded, not only the current
-    // one, and a storage setting that cannot be read does not open the gate:
-    // the default location and earlier folders are still checked, and a file
-    // inside the unreadable setting's own folder is refused outright.
-    if let Err(detail) = PreparedMediaStore::for_profile()
-        && let Some(folder) = super::storage::configured_folder_unchecked()
-        && content.starts_with(&folder)
+    launch_refusal_with(
+        PreparedMediaStore::for_profile().err(),
+        super::storage::configured_folder_unchecked(),
+        &super::storage::previous_folders(),
+        &PreparedMediaStore::known_for_profile(),
+        content,
+    )
+}
+
+/// [`launch_refusal`] with everything it reads given explicitly.
+///
+/// Every store this profile has used is guarded, not only the current one.
+/// A folder that can no longer be trusted (the saved choice when it cannot be
+/// used, or an earlier folder that fails its re-check) does not drop out of
+/// the guard: a file inside it is refused outright.
+pub fn launch_refusal_with(
+    current_error: Option<String>,
+    configured_unchecked: Option<PathBuf>,
+    previous: &[PathBuf],
+    stores: &[PreparedMediaStore],
+    content: &Path,
+) -> Option<String> {
+    if let (Some(detail), Some(folder)) = (&current_error, &configured_unchecked)
+        && content.starts_with(folder)
     {
         return Some(format!(
             "The folder chosen for prepared copies can no longer be used ({detail})"
         ));
     }
-    launch_refusal_in(&PreparedMediaStore::known_for_profile(), content)
+    for folder in previous {
+        if content.starts_with(folder)
+            && let Err(detail) = super::storage::still_safe(folder)
+        {
+            return Some(format!(
+                "A folder used earlier for prepared copies can no longer be trusted ({detail})"
+            ));
+        }
+    }
+    launch_refusal_in(stores, content)
 }
 
 /// [`launch_refusal`] over an explicit list of stores.
@@ -1844,7 +1888,9 @@ fn filesystem_id(path: &Path) -> Option<u64> {
     if unsafe { libc::statvfs(name.as_ptr(), &mut stats) } != 0 {
         return None;
     }
-    Some(stats.f_fsid as u64)
+    // FUSE and network filesystems report 0: no identity at all, and two
+    // unrelated ones would compare equal.
+    Some(stats.f_fsid as u64).filter(|id| *id != 0)
 }
 
 /// True only when `path` is provably absent: the name does not exist while
@@ -1855,10 +1901,13 @@ fn filesystem_id(path: &Path) -> Option<u64> {
 /// * `Some(Some(id))`: the folder must also still be on the filesystem the
 ///   file was recorded on, so an unmounted disk (whose empty mount point
 ///   still exists) is never mistaken for a deleted file.
-/// * `Some(None)`: an older record with no filesystem id; nothing can be
-///   proven, so the file is not treated as gone.
+/// * `Some(None)`: the record has no filesystem id (an older record, or a
+///   filesystem that reports none); nothing can be proven, so the file is
+///   not treated as gone.
 ///
-/// A permission error or an I/O error is "unknown", never "gone".
+/// A permission error or an I/O error is "unknown", never "gone". Not
+/// detectable this way: a pooled filesystem (mergerfs) with one member disk
+/// missing shows the folder, the same id, and no file.
 pub(crate) fn source_is_gone(path: &Path, recorded_filesystem: Option<Option<u64>>) -> bool {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

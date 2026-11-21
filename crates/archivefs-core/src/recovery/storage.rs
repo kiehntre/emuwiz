@@ -61,9 +61,21 @@ pub fn configured_folder_at(setting: &Path) -> Result<Option<PathBuf>, String> {
 /// The saved folder text even when it would not pass the checks, for the
 /// launch gate only (it must still be able to refuse files in that folder).
 pub(crate) fn configured_folder_unchecked() -> Option<PathBuf> {
-    let text = std::fs::read_to_string(setting_path().ok()?).ok()?;
-    let line = text.lines().next()?.trim();
-    let folder = PathBuf::from(line);
+    configured_folder_unchecked_at(&setting_path().ok()?)
+}
+
+pub(crate) fn configured_folder_unchecked_at(setting: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    // Bounded and non-blocking: this runs before every launch, exactly when
+    // the setting is in a state the normal reader refused.
+    let file = crate::safe_read::open_regular_file_nonblocking(setting, false).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SETTING_BYTES).read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let folder = PathBuf::from(text.lines().next()?.trim());
     folder.is_absolute().then_some(folder)
 }
 
@@ -149,8 +161,10 @@ fn remember_previous(setting: &Path, folder: &Path) -> Result<(), String> {
 /// cannot be read is an error, so the check is never silently skipped.
 pub fn library_folders() -> Result<Vec<PathBuf>, String> {
     let config = crate::default_config_path().map_err(|error| error.to_string())?;
-    if std::fs::symlink_metadata(&config).is_err() {
-        return Ok(Vec::new());
+    match std::fs::symlink_metadata(&config) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("your game folders could not be read ({error})")),
     }
     crate::load_source_folder_configs_from(&config)
         .map(|sources| sources.into_iter().map(|source| source.path).collect())

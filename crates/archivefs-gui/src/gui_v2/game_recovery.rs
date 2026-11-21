@@ -107,13 +107,18 @@ impl Environment {
         }
     }
 
+    /// The store that holds this game's copy: the current folder, or an
+    /// earlier one a game prepared before a folder change is still served
+    /// from. Reporting, checking and removing all use the same one.
+    fn store_for(&self, game: &Path) -> Result<PreparedMediaStore, String> {
+        match (&self.store, PreparedMediaStore::serving(game)) {
+            (None, Some((serving, _))) => Ok(serving),
+            _ => self.store(),
+        }
+    }
+
     fn diagnose(&self, target: &Target, cancel: &AtomicBool) -> Result<RecoveryReport, String> {
-        // A game prepared before the folder for copies was changed is still
-        // served from the earlier folder; report on that copy.
-        let store = match (&self.store, PreparedMediaStore::serving(&target.path)) {
-            (None, Some((serving, _))) => serving,
-            _ => self.store()?,
-        };
+        let store = self.store_for(&target.path)?;
         let host = self.host.clone().unwrap_or_else(HostFacts::probe);
         Ok(recovery::diagnose(
             &target.subject(),
@@ -451,7 +456,7 @@ impl State {
         let environment = self.environment.clone();
         self.start(ctx, "Removing the prepared copy…", move || {
             let result = environment
-                .store()
+                .store_for(&target.path)
                 .and_then(|store| store.remove(&set_id).map_err(|error| error.to_string()));
             let (ok, text) = match result {
                 Ok(removal) if removal.kept.is_empty() => (
@@ -530,11 +535,10 @@ impl State {
         };
         let environment = self.environment.clone();
         let cancel = self.cancel.clone();
-        self.start(
-            ctx,
-            "Checking the prepared copy…",
-            move || match environment
-                .store()
+        let game = self.target.as_ref().map(|target| target.path.clone());
+        self.start(ctx, "Checking the prepared copy…", move || {
+            match game
+                .map_or_else(|| environment.store(), |game| environment.store_for(&game))
                 .and_then(|store| store.verify_full(&set_id, &cancel))
             {
                 Ok(summary) => Outcome::Verified(
@@ -548,8 +552,8 @@ impl State {
                     false,
                     format!("The prepared copy did not pass: {detail}. Nothing was changed."),
                 ),
-            },
-        );
+            }
+        });
     }
 
     /// Starts the background work a finished diagnosis calls for: a file that

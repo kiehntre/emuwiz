@@ -172,8 +172,11 @@ follow the file. Two routes, with different proof:
 
 A link record is retired, and a remembered choice moved, only when the old path is
 provably gone: the name is missing while its folder is still there on the same
-filesystem. A disk that is not mounted, or a folder that cannot be read, is "unknown",
-and nothing is retired or moved on that basis.
+filesystem (by the filesystem's own id). A disk that is not mounted, a folder that
+cannot be read, a filesystem that reports no id (FUSE and network mounts) or a record
+made without one is "unknown", and nothing is retired or moved on that basis. One
+case cannot be told apart this way: a pooled filesystem (mergerfs) with a member disk
+missing looks exactly like a deleted file.
 
 "Remember this launch choice" itself is unchanged: it is saved for one unchanged
 file, applies on later launches and after a restart, keeps the "System not confirmed"
@@ -212,8 +215,9 @@ is writable, and is on a filesystem with a no-replace rename (ext4, XFS, Btrfs).
 Its location is judged before anything is created there. Copies already prepared in
 another folder are not moved. Folders used earlier are remembered: games prepared
 there keep starting from them, and the launch check still covers them. The saved
-folder is checked again every time it is used; one that has since become a link,
-another user's, or writable by others is refused with a message, and a damaged
+folder is checked again every time it is used; one that is missing (its disk is not
+connected), or has since become a link, another user's, or writable by others is
+refused with a message and never recreated somewhere else, and a damaged
 setting is an error, never a silent return to the default. If your game folders
 cannot be read, a new folder is not accepted (the "not inside a game folder" check
 could not be made).
@@ -268,7 +272,12 @@ with `members()`, `fingerprint()` and `verify_structure()` rather than a rewrite
   the earlier folder, which therefore has to stay where it is; there is no "move my
   copies" action yet.
 - The Game recovery page lists at most 500 games per batch; a larger library is
-  worked through in turns.
+  worked through in turns. Games that can never be prepared stay in the list, so a
+  library with more than 500 of those ahead of the rest would need them moved first.
+- Folders used earlier for copies stay known (up to 32) with no way to forget one
+  yet; `emuwiz-cli recovery list` and `diagnose` look at the current folder only.
+- If one of two identical ZIPs is deleted (not moved) and the other is then
+  prepared, the remembered launch choice of the deleted one passes to the other.
 - Bulk preparation lists CD32 ZIPs only (the one validated preparation), runs one
   batch at a time, and has no schedule or automatic start.
 - Like every `emuwiz-cli` command, `recovery` announces itself in EmuWiz's per-user
