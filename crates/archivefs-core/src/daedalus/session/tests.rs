@@ -226,3 +226,100 @@ fn no_output_at_all_is_still_a_diagnosis_and_says_saves_were_not_checked() {
         Some("Save check: not available for this launch.")
     );
 }
+
+mod output_only_save_check {
+    use super::*;
+    use crate::daedalus::saves::{MonitoringGap, SaveMechanism, SaveWriteStatus};
+    use crate::launch::process_spawn::{
+        OUTPUT_OMITTED_MARKER_PREFIX, OUTPUT_OMITTED_MARKER_SUFFIX,
+    };
+
+    fn check(code: i32, output: Option<&str>) -> SaveWriteAssessment {
+        assess_saves_from_output(
+            "retroarch",
+            ExitOutcome::Exited { code },
+            output.map(str::as_bytes),
+        )
+    }
+
+    #[test]
+    fn a_normal_exit_with_a_failed_save_is_a_write_failure() {
+        let assessment = check(0, Some(fixtures::RA_SAVE_DIR_READ_ONLY));
+        assert!(assessment.is_write_failure(), "{assessment:?}");
+        let state = check(0, Some(fixtures::RA_STATE_DIR_READ_ONLY));
+        assert!(state.is_write_failure(), "{state:?}");
+        assert_eq!(state.problem().unwrap().mechanism, SaveMechanism::SaveState);
+    }
+
+    #[test]
+    fn a_failed_exit_with_a_failed_save_still_reports_the_save() {
+        assert!(check(1, Some(fixtures::RA_SAVE_DIR_READ_ONLY)).is_write_failure());
+        let signalled = assess_saves_from_output(
+            "retroarch",
+            ExitOutcome::Signaled {
+                signal: 15,
+                core_dumped: false,
+            },
+            Some(fixtures::RA_SAVE_DIR_READ_ONLY.as_bytes()),
+        );
+        assert!(signalled.is_write_failure());
+    }
+
+    #[test]
+    fn a_healthy_save_is_no_failure_detected_never_more() {
+        let assessment = check(0, Some(fixtures::RA_SAVE_OK));
+        assert_eq!(assessment.status, SaveWriteStatus::NoFailureDetected);
+        assert!(assessment.problem().is_none());
+    }
+
+    #[test]
+    fn missing_or_empty_output_is_no_output_not_a_clean_result() {
+        for output in [None, Some("")] {
+            assert_eq!(
+                check(0, output).status,
+                SaveWriteStatus::MonitoringUnavailable(MonitoringGap::NoOutput),
+                "{output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quiet_cut_or_ambiguous_output_is_never_a_clean_result() {
+        assert_eq!(
+            check(0, Some(fixtures::RA_SAVE_DIR_READ_ONLY_QUIET)).status,
+            SaveWriteStatus::MonitoringUnavailable(MonitoringGap::NotDetailed)
+        );
+        let cut = format!(
+            "{}{OUTPUT_OMITTED_MARKER_PREFIX}4096{OUTPUT_OMITTED_MARKER_SUFFIX}\n",
+            fixtures::RA_SAVE_OK
+        );
+        assert_eq!(
+            check(0, Some(&cut)).status,
+            SaveWriteStatus::MonitoringUnavailable(MonitoringGap::CutShort)
+        );
+        // Messages that talk about failing and saving, but are none of the
+        // known lines: not a failure, and not a clean bill either.
+        let ambiguous = "[INFO] [Core]: Loading\n\
+            [ERROR] [State]: Failed to save state to \"/scratch/states/game.state\".\n\
+            [WARN] [SRAM]: could not save, will retry\n";
+        let assessment = check(0, Some(ambiguous));
+        assert!(assessment.problem().is_none(), "{assessment:?}");
+        assert_eq!(
+            assessment.status,
+            SaveWriteStatus::MonitoringUnavailable(MonitoringGap::SavePhaseNotSeen)
+        );
+    }
+
+    #[test]
+    fn an_emulator_without_a_provider_is_not_checked() {
+        let assessment = assess_saves_from_output(
+            "dolphin",
+            ExitOutcome::Exited { code: 0 },
+            Some(fixtures::RA_SAVE_DIR_READ_ONLY.as_bytes()),
+        );
+        assert_eq!(
+            assessment.status,
+            SaveWriteStatus::MonitoringUnavailable(MonitoringGap::NoProvider)
+        );
+    }
+}

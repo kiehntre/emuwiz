@@ -102,13 +102,13 @@ impl RetroArchLaunchState {
                 }
                 return;
             }
-            Some((_, RetroArchLaunchStage::Exited { process, stop })) => {
+            Some((_, RetroArchLaunchStage::Exited { process, stop, .. })) => {
                 let success = process
                     .poll()
                     .is_some_and(|report| matches!(&report.status, Ok(status) if status.success()));
                 (&*process, &*stop, success)
             }
-            Some((_, RetroArchLaunchStage::ExitedCheats { session, stop })) => {
+            Some((_, RetroArchLaunchStage::ExitedCheats { session, stop, .. })) => {
                 let success = session
                     .receipt()
                     .process

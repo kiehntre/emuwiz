@@ -172,6 +172,20 @@ pub const SIGNATURES: &[Signature] = &[
         meaning: LogMeaning::SaveWriteFailed,
         matcher: Matcher::Exact("[ERROR] [SRAM]: Failed to save SRAM."),
     },
+    // Printed when RetroArch closes content with automatic save states on
+    // and cannot write the state file. RetroArch 1.21.0, captured
+    // 2026-11-20 with a read-only save-state folder; it is tagged INFO and
+    // the exit status is still 0. A state saved by hand during play prints
+    // no result at all, so only this automatic save on exit is recognised.
+    Signature {
+        id: STATE_AUTO_SAVE_FAILED,
+        version: 1,
+        meaning: LogMeaning::SaveWriteFailed,
+        matcher: Matcher::PrefixQuotedThen {
+            prefix: "[INFO] [State]: Auto save state to ",
+            then: " failed.",
+        },
+    },
     // Both printed with detailed logging only, and both carry a path, which
     // is never copied into anything that is stored.
     Signature {
@@ -198,6 +212,10 @@ pub const SIGNATURES: &[Signature] = &[
         matcher: Matcher::Prefix("[INFO] [SRAM]: Saving RAM type "),
     },
 ];
+
+/// The signature for a failed automatic save state on exit. A failed write
+/// it matches is a save state, not a battery save.
+pub const STATE_AUTO_SAVE_FAILED: &str = "retroarch.state.auto_save_failed";
 
 /// Settings read for diagnosis. Nothing else in the file is recorded.
 pub const DIAGNOSTIC_KEYS: &[&str] = &[

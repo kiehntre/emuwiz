@@ -264,8 +264,9 @@ fn save_states_are_not_monitored_even_when_retroarch_talks_about_them() {
     assert_eq!(assessment.status, SaveWriteStatus::NoFailureDetected);
     assert_eq!(assessment.monitored, BATTERY_ONLY);
     assert!(assessment.not_monitored.contains(&SaveMechanism::SaveState));
-    // Text that looks like a failed save state is not a signature: no real
-    // one has been captured, so none is recognised.
+    // Text that looks like a failed save state is not a signature: this
+    // wording has never been captured from RetroArch, so it is not
+    // recognised. (The one real save-state failure line is tested below.)
     let unrecognised = "[INFO] [Core]: Loading\n[ERROR] [State]: Failed to save state to \"/scratch/states/game.state\".\n";
     let assessment = assess(&launch(0, Some(unrecognised)));
     assert!(assessment.problem().is_none(), "{assessment:?}");
@@ -477,4 +478,94 @@ fn a_clean_bill_needs_proof_that_a_failed_save_would_have_been_seen() {
     let saved = assess(&launch(0, Some(fixtures::RA_SAVE_OK)));
     assert_eq!(saved.status, SaveWriteStatus::NoFailureDetected);
     assert_eq!(saved.monitored, BATTERY_ONLY);
+}
+
+#[test]
+fn a_failed_automatic_save_state_on_exit_is_a_save_state_write_failure() {
+    // Real output: RetroArch 1.21.0, save-state folder read-only, battery
+    // folder writable, exit status 0. The battery save was written.
+    let set = launch(0, Some(fixtures::RA_STATE_DIR_READ_ONLY));
+    assert_eq!(diagnose(&set).launch, LaunchOutcome::NoFailureObserved);
+    let assessment = assess(&set);
+    assert!(assessment.is_write_failure(), "{assessment:?}");
+    let problem = problem_of(&assessment);
+    assert_eq!(problem.standing, SaveWriteStanding::ReportedByEmulator);
+    assert_eq!(problem.mechanism, SaveMechanism::SaveState);
+    assert_eq!(problem.times, 1);
+    assert_eq!(problem.folder, SaveFolderFinding::NotKnown);
+    assert!(!problem.recovery_copy_reported);
+    assert_eq!(assessment.saves_reported_written, 1);
+    let explanation = problem.explanation("RetroArch");
+    assert_eq!(
+        explanation,
+        "RetroArch reported that it could not write the save state it makes automatically on exit."
+    );
+    assert!(problem.next_step().contains("save-state folder"));
+    // Recognising this one failure does not make save states monitored: a
+    // state saved by hand prints no result.
+    assert_eq!(assessment.monitored, BATTERY_ONLY);
+    assert!(assessment.not_monitored.contains(&SaveMechanism::SaveState));
+    assert_eq!(assessment.coverage_line(), None);
+}
+
+#[test]
+fn a_healthy_automatic_save_state_is_not_a_failure_and_states_stay_unchecked() {
+    let assessment = assess(&launch(0, Some(fixtures::RA_STATE_AUTO_SAVE_OK)));
+    assert_eq!(assessment.status, SaveWriteStatus::NoFailureDetected);
+    assert_eq!(assessment.monitored, BATTERY_ONLY);
+    let line = assessment.coverage_line().unwrap();
+    assert!(line.contains("Not checked: save states"), "{line}");
+    assert!(!line.to_lowercase().contains("saved"), "{line}");
+}
+
+#[test]
+fn only_the_exact_save_state_failure_line_is_read_as_one() {
+    let start = "[INFO] [SRAM]: Saving RAM type #0 to \"/scratch/saves/game.srm\".\n\
+                 [INFO] [SRAM]: Saved successfully to \"/scratch/saves/game.srm\".\n";
+    let failed = |line: &str| {
+        let output = format!("{start}{line}\n");
+        assess(&launch(0, Some(&output))).problem().copied()
+    };
+    // The real line, and the same with a quote inside the path.
+    for line in [
+        "[INFO] [State]: Auto save state to \"/scratch/states/game.state.auto\" failed.",
+        "[INFO] [State]: Auto save state to \"/scratch/states/a \"b\" game.state.auto\" failed.",
+    ] {
+        let problem = failed(line).unwrap_or_else(|| panic!("not recognised: {line}"));
+        assert_eq!(problem.mechanism, SaveMechanism::SaveState, "{line}");
+    }
+    // Lines that are not that message.
+    for line in [
+        "[INFO] [State]: Auto save state to \"/scratch/states/game.state.auto\" succeeded.",
+        "[INFO] [State]: Auto save state to \"/scratch/states/game.state.auto\" failed. Retrying",
+        "[INFO] [State]: Auto save state to /scratch/states/game.state.auto failed.",
+        "[INFO] [State]: Saving state \"/scratch/states/game.state\", 34864 bytes.",
+        "game says: [INFO] [State]: Auto save state to \"/x\" failed.",
+    ] {
+        assert_eq!(failed(line), None, "{line}");
+    }
+}
+
+#[test]
+fn a_battery_failure_is_named_first_and_the_folder_check_is_kept_for_it() {
+    let both = format!(
+        "{}[INFO] [State]: Auto save state to \"/scratch/states/game.state.auto\" failed.\n",
+        fixtures::RA_SAVE_DIR_READ_ONLY
+    );
+    let mut set = launch(0, Some(&both));
+    save_folder(&mut set, PathPresence::Directory, Some(false));
+    let problem = problem_of(&assess(&set));
+    assert_eq!(problem.mechanism, SaveMechanism::BatterySave);
+    // The count is the battery save's own; the save state is not folded in.
+    assert_eq!(problem.times, 1);
+    assert_eq!(problem.standing, SaveWriteStanding::ConfirmedByCheck);
+    assert_eq!(problem.folder, SaveFolderFinding::NotWritable);
+
+    // A failed save state alone: the battery folder says nothing about it.
+    let mut set = launch(0, Some(fixtures::RA_STATE_DIR_READ_ONLY));
+    save_folder(&mut set, PathPresence::Directory, Some(false));
+    let problem = problem_of(&assess(&set));
+    assert_eq!(problem.mechanism, SaveMechanism::SaveState);
+    assert_eq!(problem.standing, SaveWriteStanding::ReportedByEmulator);
+    assert_eq!(problem.folder, SaveFolderFinding::NotKnown);
 }

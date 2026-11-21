@@ -46,6 +46,14 @@ pub enum Matcher {
         after: &'static str,
         until: &'static str,
     },
+    /// The start of the line, then one double-quoted value running to the
+    /// last double quote, then exactly `then` to the end of the line. The
+    /// value is what is between the quotes, so a path holding a quote
+    /// still matches; a line ending in anything else does not.
+    PrefixQuotedThen {
+        prefix: &'static str,
+        then: &'static str,
+    },
     /// A line that starts with one word (a program path without spaces)
     /// directly followed by `marker`; the value is the text between `marker`
     /// and the first following `until`, and must be a plain file name
@@ -90,6 +98,14 @@ impl Signature {
                 let start = rest.find(after)? + after.len();
                 let end = rest[start..].find(until)?;
                 Some(Some(&rest[start..start + end]))
+            }
+            Matcher::PrefixQuotedThen { prefix, then } => {
+                let value = line
+                    .strip_prefix(prefix)?
+                    .strip_prefix('"')?
+                    .strip_suffix(then)?
+                    .strip_suffix('"')?;
+                Some(Some(value))
             }
             Matcher::ProgramThenMarker { marker, until } => {
                 let program_end = line.find(marker)?;

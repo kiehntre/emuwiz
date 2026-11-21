@@ -62,6 +62,9 @@ mod retroarch_cheat_sets;
 mod retroarch_cheats;
 mod retroarch_setup;
 mod retroarch_stop;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "launch_readiness_page/save_check_tests.rs"]
+mod save_check_tests;
 #[cfg(test)]
 pub(crate) use retroarch_stop::retroarch_test_request;
 #[cfg(target_os = "linux")]
@@ -2253,6 +2256,9 @@ enum RetroArchLaunchStage {
     Exited {
         process: LaunchedRetroArchProcess,
         stop: retroarch_stop::StopControl,
+        /// Taken from the captured output the moment the exit was seen,
+        /// before anything is let go of.
+        saves: SaveCheck,
     },
     Failed {
         error: LaunchExecutionError,
@@ -2275,6 +2281,7 @@ enum RetroArchLaunchStage {
             archivefs_core::launch::cheat_runtime::CheatRuntimeSession<LaunchedRetroArchProcess>,
         >,
         stop: retroarch_stop::StopControl,
+        saves: SaveCheck,
     },
     FailedCheats {
         message: String,
@@ -2288,6 +2295,17 @@ impl RetroArchLaunchStage {
             stop: Default::default(),
         }
     }
+
+    /// The stage for a launch seen to have ended. The save check is taken
+    /// here, from the output as captured, before anything can let go of it.
+    fn exited(mut process: LaunchedRetroArchProcess, stop: retroarch_stop::StopControl) -> Self {
+        let saves = SaveCheck::of_exit(process.poll());
+        Self::Exited {
+            process,
+            stop,
+            saves,
+        }
+    }
 }
 
 /// The end of what RetroArch printed, for the technical-details box of a
@@ -2298,6 +2316,96 @@ fn shown_output_tail(stderr: &[u8]) -> String {
     use archivefs_core::daedalus::redact::{Redactor, output_tail_for_display};
     const SHOWN_OUTPUT_LINES: usize = 40;
     output_tail_for_display(stderr, &Redactor::for_current_user(), SHOWN_OUTPUT_LINES)
+}
+
+/// What Blue can say about saves once a RetroArch launch has ended, decided
+/// from the captured output before it is let go of. A clean exit is never
+/// read as saves having been written: RetroArch prints a failed save and
+/// still exits with status 0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SaveCheck {
+    /// RetroArch said a save could not be written.
+    WriteFailed {
+        headline: String,
+        explanation: String,
+        next_step: String,
+    },
+    /// Nothing was reported, but the save folder was found unusable.
+    AtRisk {
+        headline: String,
+        explanation: String,
+        next_step: String,
+    },
+    /// The check that was possible saw no failed write; `coverage` says
+    /// what it covered and what it did not.
+    NoFailureDetected { coverage: String },
+    /// No check was possible for this launch; `coverage` says so.
+    Unavailable { coverage: String },
+}
+
+impl SaveCheck {
+    fn from_assessment(assessment: &archivefs_core::daedalus::saves::SaveWriteAssessment) -> Self {
+        use archivefs_core::daedalus::saves::SaveWriteStatus;
+        let coverage = || {
+            assessment
+                .coverage_line()
+                .unwrap_or_else(|| "Save check: not available for this launch.".to_string())
+        };
+        let words = |problem: &archivefs_core::daedalus::saves::SaveWriteProblem| {
+            (
+                problem.headline().to_string(),
+                problem.explanation("RetroArch"),
+                problem.next_step().to_string(),
+            )
+        };
+        match &assessment.status {
+            SaveWriteStatus::WriteFailed(problem) => {
+                let (headline, explanation, next_step) = words(problem);
+                Self::WriteFailed {
+                    headline,
+                    explanation,
+                    next_step,
+                }
+            }
+            SaveWriteStatus::AtRisk(problem) => {
+                let (headline, explanation, next_step) = words(problem);
+                Self::AtRisk {
+                    headline,
+                    explanation,
+                    next_step,
+                }
+            }
+            SaveWriteStatus::NoFailureDetected => Self::NoFailureDetected {
+                coverage: coverage(),
+            },
+            SaveWriteStatus::MonitoringUnavailable(_) => Self::Unavailable {
+                coverage: coverage(),
+            },
+        }
+    }
+
+    /// The check for one ended launch, from its exit report (`None` when
+    /// no report is available). Reads no file.
+    fn of_exit(report: Option<&LaunchExitReport>) -> Self {
+        use archivefs_core::daedalus::{evidence::ExitOutcome, process, session};
+        let (exit, output) = match report {
+            Some(report) => (
+                process::exit_outcome(&report.status),
+                Some(report.stderr.as_slice()),
+            ),
+            None => (ExitOutcome::StatusUnavailable, None),
+        };
+        Self::from_assessment(&session::assess_saves_from_output(
+            archivefs_core::daedalus::retroarch::EMULATOR,
+            exit,
+            output,
+        ))
+    }
+
+    /// Whether this is a save problem to show prominently.
+    pub(crate) fn is_problem(&self) -> bool {
+        matches!(self, Self::WriteFailed { .. } | Self::AtRisk { .. })
+    }
 }
 
 /// Owned presentation snapshot for the launch currently associated with one
@@ -2316,6 +2424,8 @@ pub(crate) enum RetroArchLaunchDisplay {
         stderr_tail: Option<String>,
         /// What the player's Stop request, if any, returned.
         stop_outcome: Option<archivefs_core::launch::process_spawn::GracefulStopOutcome>,
+        /// What is known about this launch's saves.
+        saves: SaveCheck,
     },
     Failed {
         message: &'static str,
@@ -2438,7 +2548,7 @@ impl RetroArchLaunchState {
             },
             RetroArchLaunchStage::Running { mut process, stop } => {
                 if process.poll().is_some() {
-                    self.tracked = Some((key, RetroArchLaunchStage::Exited { process, stop }));
+                    self.tracked = Some((key, RetroArchLaunchStage::exited(process, stop)));
                     true
                 } else {
                     self.tracked = Some((key, RetroArchLaunchStage::Running { process, stop }));
@@ -2488,8 +2598,15 @@ impl RetroArchLaunchState {
             RetroArchLaunchStage::RunningCheats { mut session, stop } => {
                 session.poll();
                 if session.is_finished() {
-                    self.tracked =
-                        Some((key, RetroArchLaunchStage::ExitedCheats { session, stop }));
+                    let saves = SaveCheck::of_exit(session.process_mut().and_then(|p| p.poll()));
+                    self.tracked = Some((
+                        key,
+                        RetroArchLaunchStage::ExitedCheats {
+                            session,
+                            stop,
+                            saves,
+                        },
+                    ));
                     true
                 } else {
                     self.tracked =
@@ -2657,7 +2774,11 @@ impl RetroArchLaunchState {
                 RetroArchLaunchStage::Running { process, .. } => {
                     RetroArchLaunchDisplay::Running { pid: process.pid }
                 }
-                RetroArchLaunchStage::Exited { process, stop } => {
+                RetroArchLaunchStage::Exited {
+                    process,
+                    stop,
+                    saves,
+                } => {
                     let report: &LaunchExitReport = process
                         .poll()
                         .expect("Exited stage always has a cached exit report");
@@ -2666,11 +2787,13 @@ impl RetroArchLaunchState {
                         Ok(status) => format!("{status}"),
                         Err(error) => format!("wait() failed: {error}"),
                     };
-                    let stderr_tail = (!success && !report.stderr.is_empty())
-                        .then(|| shown_output_tail(&report.stderr));
-                    if success {
+                    let stderr_tail = ((!success || saves.is_problem())
+                        && !report.stderr.is_empty())
+                    .then(|| shown_output_tail(&report.stderr));
+                    if success && !saves.is_problem() {
                         // Nothing a launch that ended well printed is held
-                        // once it has been seen to end well.
+                        // once it has been seen to end well. The save check
+                        // was taken from it when the exit was seen.
                         process.discard_captured_output();
                     }
                     RetroArchLaunchDisplay::Exited {
@@ -2678,6 +2801,7 @@ impl RetroArchLaunchState {
                         status_detail,
                         stderr_tail,
                         stop_outcome: stop.outcome(),
+                        saves: saves.clone(),
                     }
                 }
                 RetroArchLaunchStage::Failed { error } => {
@@ -2690,7 +2814,11 @@ impl RetroArchLaunchState {
                         pid: session.process().map_or(0, |p| p.pid),
                     }
                 }
-                RetroArchLaunchStage::ExitedCheats { session, stop } => {
+                RetroArchLaunchStage::ExitedCheats {
+                    session,
+                    stop,
+                    saves,
+                } => {
                     // `poll` on an exited process returns its cached report, so
                     // calling it every frame is cheap and idempotent.
                     let exit = session
@@ -2707,7 +2835,7 @@ impl RetroArchLaunchState {
                         Some(_) => "ended without an exit code".to_string(),
                         None => "status unknown".to_string(),
                     };
-                    let stderr_tail = (!success)
+                    let stderr_tail = (!success || saves.is_problem())
                         .then(|| {
                             session
                                 .process_mut()
@@ -2716,7 +2844,10 @@ impl RetroArchLaunchState {
                                 .map(|report| shown_output_tail(&report.stderr))
                         })
                         .flatten();
-                    if success && let Some(process) = session.process_mut() {
+                    if success
+                        && !saves.is_problem()
+                        && let Some(process) = session.process_mut()
+                    {
                         process.discard_captured_output();
                     }
                     RetroArchLaunchDisplay::Exited {
@@ -2724,6 +2855,7 @@ impl RetroArchLaunchState {
                         status_detail,
                         stderr_tail,
                         stop_outcome: stop.outcome(),
+                        saves: saves.clone(),
                     }
                 }
                 RetroArchLaunchStage::FailedCheats { message } => RetroArchLaunchDisplay::Failed {
@@ -6682,9 +6814,49 @@ pub(crate) fn show_retroarch_launch_feedback(ui: &mut egui::Ui, display: &RetroA
             status_detail,
             stderr_tail,
             stop_outcome,
+            saves,
         } => {
+            // A save problem comes first and is never folded into how the
+            // process ended: a clean exit is exactly why it would be missed.
+            match saves {
+                SaveCheck::WriteFailed {
+                    headline,
+                    explanation,
+                    next_step,
+                } => {
+                    widgets::banner(ui, headline, explanation, widgets::StatusTone::Blocked);
+                    ui.small(next_step);
+                }
+                SaveCheck::AtRisk {
+                    headline,
+                    explanation,
+                    next_step,
+                } => {
+                    widgets::banner(ui, headline, explanation, widgets::StatusTone::Warning);
+                    ui.small(next_step);
+                }
+                SaveCheck::NoFailureDetected { .. } | SaveCheck::Unavailable { .. } => {}
+            }
             if let Some(summary) = retroarch_stop::requested_exit(*stop_outcome, *success) {
+                let summary = if *success && saves.is_problem() {
+                    (
+                        "RetroArch closed after you asked it to stop, but it reported a save problem (above).",
+                        widgets::StatusTone::Warning,
+                    )
+                } else {
+                    summary
+                };
                 widgets::banner(ui, "RetroArch stopped", summary.0, summary.1);
+                if *success
+                    && saves.is_problem()
+                    && let Some(stderr_tail) = stderr_tail
+                {
+                    widgets::technical_details(ui, "retroarch-stopped-save-stderr", |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(stderr_tail).monospace()).wrap(),
+                        );
+                    });
+                }
                 if !*success {
                     ui.small(format!("Exit status: {status_detail}"));
                     if let Some(stderr_tail) = stderr_tail {
@@ -6695,6 +6867,20 @@ pub(crate) fn show_retroarch_launch_feedback(ui: &mut egui::Ui, display: &RetroA
                             );
                         });
                     }
+                }
+            } else if *success && saves.is_problem() {
+                widgets::banner(
+                    ui,
+                    "RetroArch exited",
+                    "RetroArch closed normally, but it reported a save problem (above).",
+                    widgets::StatusTone::Warning,
+                );
+                if let Some(stderr_tail) = stderr_tail {
+                    widgets::technical_details(ui, "retroarch-save-stderr", |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(stderr_tail).monospace()).wrap(),
+                        );
+                    });
                 }
             } else if *success {
                 widgets::banner(
@@ -6718,6 +6904,13 @@ pub(crate) fn show_retroarch_launch_feedback(ui: &mut egui::Ui, display: &RetroA
                         );
                     });
                 }
+            }
+            // What the save check covered. It never says saves were written.
+            match saves {
+                SaveCheck::NoFailureDetected { coverage } | SaveCheck::Unavailable { coverage } => {
+                    ui.small(coverage);
+                }
+                SaveCheck::WriteFailed { .. } | SaveCheck::AtRisk { .. } => {}
             }
         }
         RetroArchLaunchDisplay::Failed { message, detail } => {

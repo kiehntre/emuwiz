@@ -1745,10 +1745,7 @@ fn clean_process_exit_enters_exited_and_shows_a_clean_exit_message() {
     let mut state = RetroArchLaunchState {
         tracked: Some((
             key,
-            RetroArchLaunchStage::Exited {
-                process,
-                stop: Default::default(),
-            },
+            RetroArchLaunchStage::exited(process, Default::default()),
         )),
         ..Default::default()
     };
@@ -1776,10 +1773,7 @@ fn non_zero_exit_shows_bounded_stderr_behind_technical_details() {
     let mut state = RetroArchLaunchState {
         tracked: Some((
             key,
-            RetroArchLaunchStage::Exited {
-                process,
-                stop: Default::default(),
-            },
+            RetroArchLaunchStage::exited(process, Default::default()),
         )),
         ..Default::default()
     };
@@ -1961,10 +1955,7 @@ fn relaunch_is_allowed_after_clean_exit_non_zero_exit_and_failure() {
         let mut state = RetroArchLaunchState {
             tracked: Some((
                 key.clone(),
-                RetroArchLaunchStage::Exited {
-                    process,
-                    stop: Default::default(),
-                },
+                RetroArchLaunchStage::exited(process, Default::default()),
             )),
             ..Default::default()
         };
