@@ -60,6 +60,7 @@ pub(super) fn request(device: &str, files: &[&Path], time: i64) -> CaptureReques
         },
         preceding_session: super::status::PrecedingSession::unknown("no session in this test"),
         expected_sha256: Default::default(),
+        expected_folder_sha256: None,
     }
 }
 

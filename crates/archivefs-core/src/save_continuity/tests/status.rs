@@ -172,7 +172,7 @@ fn a_crash_during_a_write_is_copied_faithfully_kept_and_loudly_labelled() {
     let preceding = world.preceding("ProbeEmu", "native", &[mark("save-1", "torn")]);
     assert_eq!(
         preceding,
-        PrecedingSession::Crashed {
+        PrecedingSession::FatalSignal {
             session_id: crashed.session_id,
             signal: 11
         }
@@ -189,7 +189,7 @@ fn a_crash_during_a_write_is_copied_faithfully_kept_and_loudly_labelled() {
     let warning = warning_of(&suspect).unwrap();
     assert!(
         warning.starts_with(
-            "Abnormal exit detected: the emulator's process was ended by a fault signal (11)"
+            "Abnormal termination detected: the emulator's process was ended by a fatal signal (11)"
         ),
         "{warning}"
     );
@@ -206,7 +206,7 @@ fn a_crash_during_a_write_is_copied_faithfully_kept_and_loudly_labelled() {
     assert!(
         plan.notes
             .iter()
-            .any(|note| note.starts_with("Abnormal exit detected"))
+            .any(|note| note.starts_with("Abnormal termination detected"))
     );
     assert!(
         plan.notes
@@ -275,7 +275,7 @@ fn a_forced_stop_an_error_exit_and_a_crash_are_told_apart() {
         world.session("ProbeEmu", "native", &now, exit, None);
         let preceding = world.preceding("ProbeEmu", "native", &now);
         assert_eq!(
-            matches!(preceding, PrecedingSession::Crashed { .. }),
+            matches!(preceding, PrecedingSession::FatalSignal { .. }),
             expect_crash,
             "{exit:?}"
         );
@@ -289,7 +289,7 @@ fn a_forced_stop_an_error_exit_and_a_crash_are_told_apart() {
             preceding
                 .warning()
                 .unwrap()
-                .starts_with("Abnormal exit detected")
+                .starts_with("Abnormal termination detected")
         );
     }
     let world = World::new();
@@ -546,7 +546,7 @@ fn the_same_bytes_after_a_crash_are_a_separate_snapshot_and_nothing_is_replaced(
         &bench,
         &file,
         20,
-        PrecedingSession::Crashed {
+        PrecedingSession::FatalSignal {
             session_id: "s2".into(),
             signal: 11,
         },
@@ -564,7 +564,7 @@ fn the_same_bytes_after_a_crash_are_a_separate_snapshot_and_nothing_is_replaced(
         &bench,
         &file,
         30,
-        PrecedingSession::Crashed {
+        PrecedingSession::FatalSignal {
             session_id: "s2".into(),
             signal: 11,
         },
@@ -599,7 +599,7 @@ fn pruning_never_proposes_the_newest_clean_recovery_point() {
             &bench,
             &file,
             round,
-            PrecedingSession::Crashed {
+            PrecedingSession::FatalSignal {
                 session_id: format!("s{round}"),
                 signal: 11,
             },
@@ -754,4 +754,148 @@ fn structure_results_claim_only_what_was_checked() {
             .unwrap()
             .starts_with("WARNING: the memory card does not read cleanly")
     );
+}
+
+#[test]
+fn the_newest_safe_copy_is_never_proposed_for_pruning_even_without_clean_exit_evidence() {
+    // The usual case today: nothing is known about how the emulator ended.
+    // A sound, safely copied snapshot is still the recovery point to keep.
+    let bench = Bench::new();
+    let file = bench.file("save.srm", b"0");
+    fs::write(&file, b"safe and sound").unwrap();
+    let safe = capture(
+        &bench,
+        &file,
+        1,
+        PrecedingSession::unknown("no session recorded"),
+    )
+    .manifest()
+    .clone();
+    assert!(
+        safe.body.safe_copy() && !safe.body.clean_recovery_point(),
+        "integrity and clean-session status are separate"
+    );
+    // Then newer snapshots that are NOT safe copies: best-effort ones, and
+    // one of a card that does not read cleanly.
+    for round in 2..=5 {
+        fs::write(&file, format!("unverified {round}")).unwrap();
+        let mut ask = request(DEVICE, &[&file], round);
+        ask.allow_unproven_closure = true;
+        let kept = bench.store.capture(&ask, &Fixed(InUse::Unknown)).unwrap();
+        assert!(!kept.manifest().body.safe_copy());
+    }
+    fs::write(&file, b"structurally broken").unwrap();
+    let mut ask = request(DEVICE, &[&file], 6);
+    ask.structure = StructureCheck::Problems {
+        what: "does not read cleanly".into(),
+    };
+    assert!(
+        !bench
+            .store
+            .capture(&ask, &CLOSED)
+            .unwrap()
+            .manifest()
+            .body
+            .safe_copy()
+    );
+
+    let before = tree(bench.store.root());
+    let proposal = bench.store.pruning_proposal(2);
+    assert!(
+        proposal
+            .candidates
+            .iter()
+            .all(|candidate| candidate.snapshot_id != safe.snapshot_id),
+        "the only safe copy must be kept"
+    );
+    assert_eq!(proposal.candidates.len(), 3);
+    assert_eq!(tree(bench.store.root()), before, "and nothing is deleted");
+}
+
+#[test]
+fn a_run_of_snapshots_after_abnormal_terminations_does_not_push_out_the_last_unsuspected_one() {
+    let bench = Bench::new();
+    let file = bench.file("save.srm", b"0");
+    fs::write(&file, b"before the trouble").unwrap();
+    let unsuspected = capture(
+        &bench,
+        &file,
+        1,
+        PrecedingSession::unknown("no session recorded"),
+    )
+    .manifest()
+    .snapshot_id
+    .clone();
+    for round in 2..=6 {
+        fs::write(&file, format!("after fatal signal {round}")).unwrap();
+        let after = capture(
+            &bench,
+            &file,
+            round,
+            PrecedingSession::FatalSignal {
+                session_id: format!("s{round}"),
+                signal: 11,
+            },
+        );
+        // Each of these is itself a safe copy: the emulator was closed.
+        assert!(
+            after.manifest().body.safe_copy()
+                && after.manifest().body.after_observed_abnormal_end()
+        );
+    }
+    let proposal = bench.store.pruning_proposal(1);
+    let proposed: Vec<&str> = proposal
+        .candidates
+        .iter()
+        .map(|candidate| candidate.snapshot_id.as_str())
+        .collect();
+    assert!(
+        !proposed.contains(&unsuspected.as_str()),
+        "the newest safe copy not taken after an observed abnormal end is kept"
+    );
+    assert_eq!(
+        proposed.len(),
+        4,
+        "kept: the newest, and the last unsuspected one"
+    );
+}
+
+#[test]
+fn copy_safety_is_decided_before_and_independently_of_any_exit_classification() {
+    // The same refusals whatever the session record says.
+    let bench = Bench::new();
+    let file = bench.file("save.srm", b"data");
+    for preceding in [
+        PrecedingSession::CleanExit {
+            session_id: "s".into(),
+        },
+        PrecedingSession::FatalSignal {
+            session_id: "s".into(),
+            signal: 11,
+        },
+        PrecedingSession::unknown("x"),
+    ] {
+        for state in [InUse::EmulatorRunning, InUse::OpenByAProgram] {
+            let mut ask = request(DEVICE, &[&file], 1);
+            ask.preceding_session = preceding.clone();
+            ask.allow_unproven_closure = true;
+            assert!(
+                matches!(
+                    bench.store.capture(&ask, &Fixed(state)),
+                    Err(crate::save_continuity::ContinuityError::InUse(_))
+                ),
+                "{preceding:?} {state:?}"
+            );
+        }
+        let mut ask = request(DEVICE, &[&file], 1);
+        ask.preceding_session = preceding.clone();
+        assert!(
+            matches!(
+                bench.store.capture(&ask, &Fixed(InUse::Unknown)),
+                Err(crate::save_continuity::ContinuityError::ClosureUnproven(_))
+            ),
+            "{preceding:?}"
+        );
+    }
+    assert!(bench.store.list().is_empty());
 }

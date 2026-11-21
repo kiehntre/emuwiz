@@ -142,15 +142,31 @@ pub struct SnapshotBody {
 }
 
 impl SnapshotBody {
-    /// Taken at a verified safe point, after a session that is known to
-    /// have ended normally. Says nothing about the game's own data.
-    pub fn clean_recovery_point(&self) -> bool {
+    /// **Snapshot integrity.** The copy itself can be relied on: taken at a
+    /// verified safe point (emulator closed, nothing holding the save), and
+    /// no structural problem was found. This is about the copy only. It is
+    /// true or false whatever is known about how the emulator last ended.
+    pub fn safe_copy(&self) -> bool {
         self.boundary == CaptureBoundary::EmulatorClosedObserved
+            && !matches!(self.structure, Some(StructureCheck::Problems { .. }))
+    }
+
+    /// **Session status.** An abnormal termination was actually observed in
+    /// the session before this snapshot. "Not known" is not this.
+    pub fn after_observed_abnormal_end(&self) -> bool {
+        self.preceding_session
+            .as_ref()
+            .is_some_and(|preceding| preceding.advisory() == super::status::Advisory::Warning)
+    }
+
+    /// A safe copy that also followed a session known to have ended
+    /// normally. Says nothing about the game's own data.
+    pub fn clean_recovery_point(&self) -> bool {
+        self.safe_copy()
             && self
                 .preceding_session
                 .as_ref()
                 .is_some_and(PrecedingSession::clean)
-            && !matches!(self.structure, Some(StructureCheck::Problems { .. }))
     }
 }
 
@@ -255,6 +271,11 @@ pub struct CaptureRequest {
     /// snapshot hashes to something else, the listing no longer describes
     /// it and the snapshot is refused.
     pub expected_sha256: BTreeMap<String, String>,
+    /// For a save folder: the fingerprint the whole folder had when it was
+    /// listed (every file's name, size and SHA-256, in name order). If the
+    /// files read for the snapshot give another, the folder changed in
+    /// between and the snapshot is refused.
+    pub expected_folder_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -885,7 +906,11 @@ impl SnapshotStore {
                     file.name
                 )));
             }
-            if file.name == RECOVERY_RECEIPT_NAME {
+            if Path::new(&file.name)
+                .components()
+                .next()
+                .is_some_and(|first| first.as_os_str() == RECOVERY_RECEIPT_NAME)
+            {
                 return Err(ContinuityError::Refused(format!(
                     "{RECOVERY_RECEIPT_NAME} is the record EmuWiz writes into a recovered folder; \
                      a snapshot cannot hold a file of that name"
@@ -951,6 +976,25 @@ impl SnapshotStore {
             }
             total += read.bytes.len() as u64;
             reads.push((file, read));
+        }
+        if let Some(expected) = &request.expected_folder_sha256 {
+            let mut items: Vec<(&str, u64, &str)> = reads
+                .iter()
+                .map(|(file, read)| {
+                    (
+                        file.name.as_str(),
+                        read.bytes.len() as u64,
+                        read.sha256.as_str(),
+                    )
+                })
+                .collect();
+            items.sort();
+            if super::folder_fingerprint(items.into_iter()) != *expected {
+                return Err(ContinuityError::Unstable(format!(
+                    "{} changed between being listed and being copied; list the saves again",
+                    request.provenance.source_root.display()
+                )));
+            }
         }
         // Still closed, and nothing opened a save, once every byte is read.
         let after = look("during the copy")?;
@@ -1364,13 +1408,31 @@ impl SnapshotStore {
                 (manifest.body.captured_unix, manifest.snapshot_id.clone())
             });
             let cut = snapshots.len().saturating_sub(keep);
-            // The newest snapshot taken safely after a normal exit is never
-            // proposed, even when newer (suspect) snapshots fill the quota.
-            let last_clean = snapshots
-                .iter()
-                .rposition(|manifest| manifest.body.clean_recovery_point());
+            // Never proposed, whatever the quota says and however many newer
+            // snapshots there are. Three separate protections, because
+            // snapshot integrity and session status are separate questions:
+            //  1. the newest safe copy (integrity only: clean-exit evidence
+            //     is usually not available, and its absence must not make a
+            //     sound recovery point disposable);
+            //  2. the newest safe copy that did not follow an observed
+            //     abnormal termination (so a run of post-crash snapshots
+            //     cannot push the last unsuspected one out);
+            //  3. the newest safe copy after a session known to have ended
+            //     normally.
+            let protected: BTreeSet<usize> = [
+                snapshots.iter().rposition(|m| m.body.safe_copy()),
+                snapshots
+                    .iter()
+                    .rposition(|m| m.body.safe_copy() && !m.body.after_observed_abnormal_end()),
+                snapshots
+                    .iter()
+                    .rposition(|m| m.body.clean_recovery_point()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
             for (index, manifest) in snapshots.iter().enumerate() {
-                if index >= cut || Some(index) == last_clean {
+                if index >= cut || protected.contains(&index) {
                     kept.push(manifest);
                 } else {
                     removable.push(manifest);
@@ -1480,7 +1542,13 @@ pub(crate) fn check_manifest(manifest: &SnapshotManifest) -> Result<(), Continui
                 file.name
             )));
         }
-        if file.name == RECOVERY_RECEIPT_NAME {
+        // Neither the name itself nor a folder of that name: either would
+        // collide with the record a recovery writes.
+        if Path::new(&file.name)
+            .components()
+            .next()
+            .is_some_and(|first| first.as_os_str() == RECOVERY_RECEIPT_NAME)
+        {
             return Err(ContinuityError::Refused(format!(
                 "a snapshot cannot hold a file called {RECOVERY_RECEIPT_NAME}"
             )));

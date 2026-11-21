@@ -201,33 +201,37 @@ fn a_normal_flatpak_shutdown_is_a_confirmed_clean_exit() {
 }
 
 #[test]
-fn a_crash_inside_the_sandbox_is_a_confirmed_crash() {
-    // 139 = 128 + SIGSEGV (PPSSPP, RetroArch); 134 = 128 + SIGABRT (PCSX2's
-    // own handler turns a segfault into an abort).
-    for (code, signal) in [(139, 11), (134, 6)] {
+fn an_exit_code_from_a_sandbox_is_never_turned_into_a_signal() {
+    // 139 and 134 are what a sandbox returns when its command dies of
+    // SIGSEGV or SIGABRT, and also just numbers a program may return. Even
+    // for an emulator whose exit codes are believed, they stay exit codes:
+    // an abnormal exit status, with no claim about a fatal signal.
+    for code in [139, 134, 143, 1] {
         let case = flatpak_probe();
         case.look();
         case.machine.exit(&[102, 101, 100]);
         let ended = case.end(ExitObservation::Code(code));
-        assert_eq!(
-            ended.end,
-            Some(SessionEnd::Signal {
-                signal,
-                core_dumped: false
-            })
-        );
+        assert_eq!(ended.end, Some(SessionEnd::ExitCode { code }), "{code}");
         assert_eq!(ended.exit_evidence, Some(ExitEvidence::SandboxRelay));
         assert!(
-            ended.status_line().starts_with("Ended by a fault signal"),
+            !ended.status_line().to_lowercase().contains("signal"),
             "{}",
             ended.status_line()
         );
         let preceding = case.preceding();
         assert!(
-            matches!(preceding, PrecedingSession::Crashed { signal: s, .. } if s == signal),
-            "{preceding:?}"
+            matches!(preceding, PrecedingSession::ErrorExit { code: c, .. } if c == code),
+            "{code}: {preceding:?}"
         );
-        assert_eq!(preceding.advisory(), Advisory::Warning);
+        assert!(!matches!(
+            preceding,
+            PrecedingSession::FatalSignal { .. } | PrecedingSession::ForcedStop { .. }
+        ));
+        let warning = preceding.warning().unwrap();
+        assert!(
+            warning.starts_with("Abnormal exit detected") && !warning.contains("signal"),
+            "{warning}"
+        );
     }
 }
 
@@ -236,10 +240,10 @@ fn a_forced_stop_and_an_error_exit_inside_the_sandbox_are_confirmed_as_such() {
     let case = flatpak_probe();
     case.look();
     case.machine.exit(&[102, 101, 100]);
-    case.end(ExitObservation::Code(143)); // 128 + SIGTERM, as RPCS3 reported
+    case.end(ExitObservation::Code(143)); // an exit code; never read as "signal 15"
     assert!(matches!(
         case.preceding(),
-        PrecedingSession::ForcedStop { signal: 15, .. }
+        PrecedingSession::ErrorExit { code: 143, .. }
     ));
 
     let case = flatpak_probe();
@@ -648,10 +652,10 @@ fn no_real_emulators_flatpak_exit_is_believed_until_demonstrated_from_inside_a_g
 // ---- Regression tests for the independent review of 2026-11-21 ----
 
 #[test]
-fn a_real_emulators_own_error_or_signal_exit_is_not_called_abnormal_on_any_route() {
-    // Started directly, so the status really is the emulator's own. It is
-    // still not interpreted: none of these has been shown to return 0 on an
-    // ordinary close from inside a game, and two did not when tried.
+fn a_signal_read_directly_from_the_emulators_own_process_warns_for_any_emulator() {
+    // EmuWiz started the emulator itself and the kernel reports the signal
+    // that ended it. That is an observation, not an interpretation, so it
+    // warns whether or not the emulator's exit codes are believed.
     for emulator in [
         "PCSX2",
         "RPCS3",
@@ -659,21 +663,44 @@ fn a_real_emulators_own_error_or_signal_exit_is_not_called_abnormal_on_any_route
         "PPSSPP",
         "DuckStation",
         "SomeOtherEmulator",
+        "ProbeEmu",
     ] {
-        for exit in [
-            ExitObservation::Code(1),
-            ExitObservation::Signal {
-                signal: 6,
-                core_dumped: true,
-            },
-            ExitObservation::Signal {
-                signal: 11,
-                core_dumped: true,
-            },
-            ExitObservation::Signal {
-                signal: 15,
-                core_dumped: false,
-            },
+        for (exit, fatal) in [
+            (
+                ExitObservation::Signal {
+                    signal: 11,
+                    core_dumped: true,
+                },
+                true,
+            ),
+            (
+                ExitObservation::Signal {
+                    signal: 11,
+                    core_dumped: false,
+                },
+                true,
+            ),
+            (
+                ExitObservation::Signal {
+                    signal: 6,
+                    core_dumped: false,
+                },
+                true,
+            ),
+            (
+                ExitObservation::Signal {
+                    signal: 9,
+                    core_dumped: false,
+                },
+                false,
+            ),
+            (
+                ExitObservation::Signal {
+                    signal: 15,
+                    core_dumped: false,
+                },
+                false,
+            ),
         ] {
             let case = launch(emulator, "native", false);
             case.machine.start(70, 1, "emu", "/usr/bin/emu", None);
@@ -683,11 +710,72 @@ fn a_real_emulators_own_error_or_signal_exit_is_not_called_abnormal_on_any_route
             case.machine.exit(&[70]);
             let ended = case.end(exit);
             assert!(
-                matches!(ended.end, Some(SessionEnd::ExitUnsettled { .. })),
+                matches!(ended.end, Some(SessionEnd::Signal { .. })),
                 "{emulator} {exit:?}: {:?}",
                 ended.end
             );
-            assert!(!ended.needs_attention(), "{emulator} {exit:?}");
+            assert_eq!(ended.exit_evidence, Some(ExitEvidence::EmulatorProcess));
+            assert!(ended.needs_attention(), "{emulator} {exit:?}");
+            let preceding = preceding_session(
+                &case.journal.all(),
+                "dev",
+                emulator,
+                "native",
+                &[mark("v2")],
+            );
+            assert_eq!(
+                matches!(preceding, PrecedingSession::FatalSignal { .. }),
+                fatal,
+                "{emulator} {exit:?}: {preceding:?}"
+            );
+            assert_eq!(
+                matches!(preceding, PrecedingSession::ForcedStop { .. }),
+                !fatal,
+                "{emulator} {exit:?}: {preceding:?}"
+            );
+            assert_eq!(preceding.advisory(), Advisory::Warning);
+            let warning = preceding.warning().unwrap();
+            assert!(
+                warning.starts_with("Abnormal termination detected"),
+                "{warning}"
+            );
+            // What it must not say.
+            let lower = warning.to_lowercase();
+            assert!(!lower.contains("crash"), "{warning}");
+            assert!(
+                lower.contains("does not show that") && lower.contains("save is damaged"),
+                "{warning}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_non_zero_exit_code_of_an_undemonstrated_emulator_stays_unknown() {
+    // A code needs interpreting, and nothing has shown what these emulators
+    // return on an ordinary close from inside a game.
+    for emulator in [
+        "PCSX2",
+        "RPCS3",
+        "RetroArch",
+        "PPSSPP",
+        "DuckStation",
+        "SomeOtherEmulator",
+    ] {
+        for code in [1, 2, 134, 139, 255] {
+            let case = launch(emulator, "native", false);
+            case.machine.start(70, 1, "emu", "/usr/bin/emu", None);
+            case.journal
+                .mark_started(&case.session, 70, &case.machine)
+                .unwrap();
+            case.machine.exit(&[70]);
+            let ended = case.end(ExitObservation::Code(code));
+            assert!(
+                matches!(ended.end, Some(SessionEnd::ExitUnsettled { .. })),
+                "{emulator} {code}: {:?}",
+                ended.end
+            );
+            assert!(!ended.needs_attention(), "{emulator} {code}");
             let preceding = preceding_session(
                 &case.journal.all(),
                 "dev",
@@ -697,13 +785,13 @@ fn a_real_emulators_own_error_or_signal_exit_is_not_called_abnormal_on_any_route
             );
             assert!(
                 matches!(preceding, PrecedingSession::ExitNotSeen { .. }),
-                "{emulator} {exit:?}: {preceding:?}"
+                "{emulator} {code}: {preceding:?}"
             );
             assert_eq!(preceding.advisory(), Advisory::Caution);
             assert_eq!(
                 preceding.warning(),
                 None,
-                "no warning from a status that cannot be interpreted"
+                "no warning from a code that cannot be interpreted"
             );
         }
         // An exit status of 0 from the emulator's own process is still 0.
@@ -718,6 +806,44 @@ fn a_real_emulators_own_error_or_signal_exit_is_not_called_abnormal_on_any_route
             Some(SessionEnd::Clean),
             "{emulator}"
         );
+    }
+}
+
+#[test]
+fn a_signal_that_ended_only_a_launcher_or_wrapper_is_not_a_fatal_signal_of_the_emulator() {
+    // The kernel does report a signal here, but for the launcher: whatever
+    // happened to the emulator behind it was not observed.
+    for (emulator, profile) in [
+        ("PCSX2", "flatpak"),
+        ("RetroArch", "flatpak"),
+        ("ProbeEmu", "flatpak"),
+        ("PCSX2", "native"),
+    ] {
+        for signal in [11, 6, 9] {
+            let case = launch(emulator, profile, true);
+            case.machine.start(50, 1, "bash", "/usr/bin/bash", None);
+            case.journal
+                .mark_started(&case.session, 50, &case.machine)
+                .unwrap();
+            case.machine.exit(&[50]);
+            let ended = case.end(ExitObservation::Signal {
+                signal,
+                core_dumped: signal != 9,
+            });
+            assert!(
+                matches!(ended.end, Some(SessionEnd::LauncherEndedOtherwise { .. })),
+                "{emulator} {signal}: {:?}",
+                ended.end
+            );
+            assert!(!ended.needs_attention());
+            let preceding =
+                preceding_session(&case.journal.all(), "dev", emulator, profile, &[mark("v2")]);
+            assert!(
+                matches!(preceding, PrecedingSession::ExitNotSeen { .. }),
+                "{emulator} {signal}: {preceding:?}"
+            );
+            assert_eq!(preceding.warning(), None);
+        }
     }
 }
 

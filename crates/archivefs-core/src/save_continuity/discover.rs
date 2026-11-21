@@ -969,6 +969,11 @@ fn sfo_folders(
                     if name == "PARAM.SFO" {
                         sfo = crate::param_sfo::parse_param_sfo(&bytes);
                     }
+                    // EmuWiz's own record in a recovered folder is not part
+                    // of the save, here or in a snapshot of it.
+                    if name == super::store::RECOVERY_RECEIPT_NAME {
+                        continue;
+                    }
                     text.extend_from_slice(name.as_bytes());
                     text.push(0);
                     text.extend_from_slice(&(bytes.len() as u64).to_le_bytes());

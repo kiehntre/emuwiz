@@ -65,7 +65,7 @@ pub enum PrecedingSession {
     /// The emulator itself exited with status 0.
     CleanExit { session_id: String },
     /// It died on a fault (segmentation fault, abort, bus error...).
-    Crashed { session_id: String, signal: i32 },
+    FatalSignal { session_id: String, signal: i32 },
     /// It was stopped from outside (killed or terminated) rather than closed.
     ForcedStop { session_id: String, signal: i32 },
     /// It exited by itself with an error status.
@@ -105,7 +105,7 @@ impl PrecedingSession {
             // observed is shown as plain uncertainty, exactly like "unknown".
             Self::Unknown { .. } | Self::ExitNotSeen { .. } => Advisory::Caution,
             // Only an exit that was actually observed to be abnormal warns.
-            Self::Crashed { .. } | Self::ForcedStop { .. } | Self::ErrorExit { .. } => {
+            Self::FatalSignal { .. } | Self::ForcedStop { .. } | Self::ErrorExit { .. } => {
                 Advisory::Warning
             }
         }
@@ -137,11 +137,11 @@ impl PrecedingSession {
             // What was observed, and no more: the emulator's process did not
             // end normally. Why is not known, and nothing is claimed about
             // the game or the save beyond "check it".
-            Self::Crashed { signal, .. } => format!(
-                "Abnormal exit detected: the emulator's process was ended by a fault signal ({signal}) in the session before this snapshot. Why is not known. This is an exact copy of what was on disk; if the emulator was saving at that moment, the save may be incomplete"
+            Self::FatalSignal { signal, .. } => format!(
+                "Abnormal termination detected: the emulator's process was ended by a fatal signal ({signal}) in the session before this snapshot. Why is not known. This does not show that the game itself failed or that the save is damaged; it is an exact copy of what was on disk, and if the emulator was saving at that moment the save may be incomplete"
             ),
             Self::ForcedStop { signal, .. } => format!(
-                "Abnormal exit detected: the emulator's process was stopped by signal {signal} in the session before this snapshot rather than closing by itself. If it was saving at that moment, the save may be incomplete"
+                "Abnormal termination detected: the emulator's process was stopped by signal {signal} in the session before this snapshot rather than closing by itself. Why is not known. This does not show that the save is damaged; if the emulator was saving at that moment the save may be incomplete"
             ),
             Self::ErrorExit { code, .. } => format!(
                 "Abnormal exit detected: the emulator's process ended with status {code} in the session before this snapshot. Why is not known; some emulators do this on an ordinary close. If it was saving at that moment, the save may be incomplete"

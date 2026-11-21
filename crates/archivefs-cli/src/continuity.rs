@@ -42,10 +42,12 @@ Looking (reads only):
   safe-point --emulator <name> <file>     is this one save file at a safe point right now
   timeline                                snapshots, oldest first, per save
   verify <snapshot-id>                    re-read a snapshot and compare with its record
-  sessions                                recorded play sessions, newest first
   pruning-proposal [--keep <n>]           what could be removed; removes nothing
 
 Making new files (never changes a save):
+  sessions                                recorded play sessions, newest first; also settles
+                                          sessions whose emulator has gone (updates EmuWiz's
+                                          own session records)
   snapshot <save-id> [--best-effort]      verified copy into the snapshot folder
   recover <snapshot-id> --to <new-folder> [--confirm]
                                           without --confirm: show the plan only
@@ -1101,7 +1103,7 @@ fn run_device(options: &Options, rest: &[String]) -> Outcome {
             PeerBook::open(store.root())?.accept(&theirs)?;
             // The sender's current list number, read from its own folder: the
             // offline stand-in for asking it.
-            let sender_now = LocalDevice::recorded_sequence(from.root());
+            let sender_now = LocalDevice::recorded_sequence(from.root())?;
             let report = receive_snapshot(
                 &theirs,
                 sender_now,

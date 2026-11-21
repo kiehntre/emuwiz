@@ -120,6 +120,11 @@ pub fn capture_request(
         preceding_session,
         // For a single file, the hash it had when its saves were listed:
         // the card's own for a card save, the file's for a save file.
+        expected_folder_sha256: if meta.is_dir() {
+            save.content_sha256.clone()
+        } else {
+            None
+        },
         expected_sha256: if meta.is_dir() {
             Default::default()
         } else {

@@ -774,8 +774,13 @@ impl SessionJournal {
         record.launch = launch;
         self.write(&record)?;
         let mut record = self.mark_started(session_id, pid, processes)?;
-        if record.process_start_ticks.is_none() {
+        // The start time read when the process was created is the truth. If
+        // the process table now shows nothing, or a different start time
+        // (the id was already given to something else), the launched
+        // process has gone and is recorded by its real start time.
+        if record.process_start_ticks != spawn_start_ticks {
             if let Some(start_ticks) = spawn_start_ticks {
+                record.processes.retain(|process| process.pid != pid);
                 record.process_start_ticks = Some(start_ticks);
                 record.processes.push(TrackedProcess {
                     pid,
@@ -906,6 +911,9 @@ impl SessionJournal {
         //    and says nothing about the emulator, clean or otherwise.
         let relayed = record.launch.through_launcher
             && matches!(exit, ExitObservation::Code(_))
+            // Checked again here, not only when the emulator was identified:
+            // a stored record never widens what is believed.
+            && exit_status_demonstrated(&record.launch.emulator)
             && record
                 .sandbox_main
                 .as_ref()
@@ -932,13 +940,10 @@ impl SessionJournal {
                     ExitEvidence::EmulatorProcess
                 },
             ),
-            ExitObservation::Code(code) if relayed && (129..=159).contains(&code) => (
-                SessionEnd::Signal {
-                    signal: code - 128,
-                    core_dumped: false,
-                },
-                ExitEvidence::SandboxRelay,
-            ),
+            // An exit *code* is never turned into a signal. 139 or 134 coming
+            // back through a sandbox or wrapper may be 128 + a signal, or may
+            // be a number some program chose; only the kernel reporting a
+            // signal for a process EmuWiz itself waited on is a signal.
             ExitObservation::Code(code) => (
                 SessionEnd::ExitCode { code },
                 if relayed {
@@ -961,13 +966,20 @@ impl SessionJournal {
                 (SessionEnd::StatusUnavailable, ExitEvidence::EmulatorProcess)
             }
         };
-        // A non-zero or signal exit is called abnormal only for an emulator
-        // whose exit status has been demonstrated to mean that. For every
-        // other emulator, on every route, it is recorded as what it is: a
-        // status EmuWiz cannot interpret. Zero is still zero.
-        let status_was_read = evidence != ExitEvidence::LauncherOnly
-            && matches!(end, SessionEnd::ExitCode { .. } | SessionEnd::Signal { .. });
-        let end = if status_was_read && !exit_status_demonstrated(&record.launch.emulator) {
+        // Two different kinds of evidence:
+        //
+        // - A *signal* reported by the kernel for the emulator's own process
+        //   (EmuWiz started it and waited on it) is a direct observation: it
+        //   was ended by that signal. That is recorded and warned about for
+        //   any emulator. It says the process ended abnormally; it does not
+        //   say the game crashed or the save is damaged.
+        // - A non-zero exit *code* needs interpreting, and is called
+        //   abnormal only for an emulator whose codes have been demonstrated
+        //   to mean that. For every other emulator it is recorded as a
+        //   status EmuWiz cannot interpret. Zero is still zero.
+        let code_was_read =
+            evidence != ExitEvidence::LauncherOnly && matches!(end, SessionEnd::ExitCode { .. });
+        let end = if code_was_read && !exit_status_demonstrated(&record.launch.emulator) {
             let seen_so_far = PRELIMINARY_EXIT_EVIDENCE
                 .iter()
                 .find(|(emulator, _)| emulator.eq_ignore_ascii_case(&record.launch.emulator))
@@ -1253,7 +1265,7 @@ pub fn preceding_session(
             }),
         ) => {
             if is_crash_signal(*signal, *core_dumped) {
-                PrecedingSession::Crashed {
+                PrecedingSession::FatalSignal {
                     session_id: id,
                     signal: *signal,
                 }

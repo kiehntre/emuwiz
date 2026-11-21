@@ -450,19 +450,49 @@ impl EmulatorIdentity {
             // Only that argument is tested: anything after it belongs to the
             // program being run (`ld.so python3 notes.py retroarch` runs
             // python, not RetroArch).
+            // Options of the loader and of qemu's user-mode runner that take
+            // a value in the next argument: the value is not the program.
+            let takes_a_value = |option: &str| {
+                matches!(
+                    option,
+                    "--argv0"
+                        | "--library-path"
+                        | "--preload"
+                        | "--inhibit-rpath"
+                        | "--audit"
+                        | "--glibc-hwcaps-prepend"
+                        | "--glibc-hwcaps-mask"
+                ) || (program.starts_with("qemu-")
+                    && matches!(
+                        option,
+                        "-L" | "-E"
+                            | "-U"
+                            | "-cpu"
+                            | "-g"
+                            | "-s"
+                            | "-B"
+                            | "-R"
+                            | "-0"
+                            | "-d"
+                            | "-D"
+                    ))
+            };
             let mut arguments = tokens.iter().skip(1);
             while let Some(token) = arguments.next() {
-                if matches!(
-                    token.as_str(),
-                    "--argv0" | "--library-path" | "--preload" | "--inhibit-rpath" | "--audit"
-                ) {
+                if takes_a_value(token) {
                     arguments.next();
                     continue;
                 }
                 if token.starts_with('-') {
                     continue;
                 }
-                return self.name(token);
+                if self.name(token) {
+                    return true;
+                }
+                // Not named like the emulator. Stop looking for a program
+                // name, but do not stop here: the rules below still apply
+                // (`valgrind renamed-frontend -L x_libretro.so`).
+                break;
             }
         }
         if self.libretro_core_argument {
@@ -477,7 +507,13 @@ impl EmulatorIdentity {
             // `-L/path/core`, `--libretro=core`, and getopt's shortened
             // `--libr=core`.
             let joined = tokens.iter().any(|token| {
-                let attached_short = token.starts_with("-L") && !token.starts_with("--");
+                // `-L/path/core` and bundled `-fL/path/core`: a short-option
+                // group containing L with the core path attached.
+                let attached_short = token.starts_with('-')
+                    && !token.starts_with("--")
+                    && token
+                        .split_once('L')
+                        .is_some_and(|(flags, _)| flags.len() <= 6 && !flags.contains('/'));
                 let attached_long = token.starts_with("--libr");
                 (attached_short || attached_long) && is_core(token)
             });

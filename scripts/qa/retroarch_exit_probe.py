@@ -21,6 +21,7 @@ times:
   terminate       a polite stop request (SIGTERM) to the emulator process
   failed-state    quit with "save state on exit" on and an unwritable state
                   folder (the case another session saw hang)
+  fault           a deliberate abnormal end: SIGSEGV to the emulator process
 
 For every run: the exit status EmuWiz would see, how long closing took,
 whether the process had to be given up on (hung), whether the log shows a
@@ -47,7 +48,7 @@ APP = "org.libretro.RetroArch"
 NATIVE = "/usr/games/retroarch"
 NATIVE_CORE = Path("/usr/lib/x86_64-linux-gnu/libretro/gambatte_libretro.so")
 FLATPAK_CORE = REAL_HOME / ".var/app" / APP / "config/retroarch/cores/gambatte_libretro.so"
-METHODS = ["quit-command", "quit-key", "window-close", "frame-limit", "terminate", "failed-state"]
+METHODS = ["quit-command", "quit-key", "window-close", "frame-limit", "terminate", "failed-state", "fault"]
 
 
 def synthetic_rom():
@@ -206,11 +207,11 @@ def one_run(route, method, work, index):
                 from flatpak_exit_probe import send_close_request
                 for window in windows(sandbox):
                     send_close_request(sandbox.display, window)
-            elif method == "terminate":
+            elif method in ("terminate", "fault"):
                 if inner is None:
                     note = "emulator process not found"
                 else:
-                    sandbox._signal(inner, signal.SIGTERM)
+                    sandbox._signal(inner, signal.SIGTERM if method == "terminate" else signal.SIGSEGV)
             # frame-limit: nothing to do, it stops by itself.
         except (BrokenPipeError, OSError, gui_sandbox.SandboxError) as error:
             note = f"could not deliver the request: {error!r}"[:160]

@@ -69,9 +69,12 @@ pub fn classify_started(executable: &Path, arguments: &[String]) -> SessionLaunc
     {
         // A file called like the emulator may still be a small script that
         // hands over to `flatpak run` (a common ~/.local/bin wrapper).
-        let head = std::fs::read(executable)
-            .map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]).into_owned())
-            .unwrap_or_default();
+        // If the file cannot be read, what it is cannot be told: treated as
+        // a launcher, so its exit status is never taken for the emulator's.
+        let Ok(bytes) = std::fs::read(executable) else {
+            return launch((*emulator).to_string(), "native", true);
+        };
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]).into_owned();
         if head.starts_with("#!") {
             return match flatpak_app(&mut head.lines()) {
                 Some(emulator) => launch(emulator, "flatpak", true),
@@ -86,7 +89,10 @@ pub fn classify_started(executable: &Path, arguments: &[String]) -> SessionLaunc
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Unknown".to_string()),
         "native",
-        false,
+        // Not a program EmuWiz recognises as an emulator itself: it may be
+        // a launcher (`gamemoderun`, `env`, a script), so its exit status is
+        // never taken for an emulator's.
+        true,
     )
 }
 

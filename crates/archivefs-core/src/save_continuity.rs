@@ -162,3 +162,19 @@ pub(crate) fn write_state_file(
     }
     Ok(())
 }
+
+/// One fingerprint for a save made of several files: each file's name, size
+/// and SHA-256, in name order. Discovery and snapshots compute it the same
+/// way, so a folder that changed between the two is noticed.
+pub(crate) fn folder_fingerprint<'a>(
+    files: impl Iterator<Item = (&'a str, u64, &'a str)>,
+) -> String {
+    let mut text = Vec::new();
+    for (name, size, sha256) in files {
+        text.extend_from_slice(name.as_bytes());
+        text.push(0);
+        text.extend_from_slice(&size.to_le_bytes());
+        text.extend_from_slice(sha256.as_bytes());
+    }
+    sha256_hex(&text)
+}

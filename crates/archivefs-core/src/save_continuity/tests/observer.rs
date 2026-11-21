@@ -765,3 +765,71 @@ fn an_emulator_started_through_a_loader_or_a_runner_is_still_seen() {
         InUse::NotDetected
     );
 }
+
+// ---- Regression tests for the delta review of cdc75795 ----
+
+#[test]
+fn a_runner_in_front_of_a_renamed_front_end_or_with_its_own_valued_options_is_still_seen() {
+    let dir = tempfile::tempdir().unwrap();
+    let save = save_file(&dir);
+    let cases: &[(&str, &str)] = &[
+        // The program is not named like the emulator, but it loads a core:
+        // the runner rule must not stop the core rule from being applied.
+        (
+            "/usr/bin/valgrind",
+            "valgrind /opt/ra/ra.bin -L /c/snes9x_libretro.so game.sfc",
+        ),
+        (
+            "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+            "/lib64/ld-linux-x86-64.so.2 /opt/ra/ra.bin -L /c/mgba_libretro.so",
+        ),
+        (
+            "/usr/bin/box64",
+            "box64 /opt/ra/frontend --libretro=/c/gambatte_libretro.so",
+        ),
+        // qemu's own -L takes a value (a folder), which is not the program.
+        (
+            "/usr/bin/qemu-x86_64",
+            "qemu-x86_64 -L /usr/x86_64-linux-gnu /usr/bin/retroarch",
+        ),
+        (
+            "/usr/bin/qemu-x86_64",
+            "qemu-x86_64 -cpu max -E LANG=C /opt/bin/retroarch --menu",
+        ),
+        // Bundled short options with the core path attached.
+        (
+            "/opt/frontend/emu",
+            "emu -fL/cores/snes9x_libretro.so game.sfc",
+        ),
+    ];
+    for (executable, cmdline) in cases {
+        let proc = Proc::new();
+        let dir = proc.add(4242, "x", cmdline, USER);
+        std::os::unix::fs::symlink(executable, dir.join("exe")).unwrap();
+        assert_eq!(
+            proc.observer().observe("RetroArch", &save),
+            InUse::EmulatorRunning,
+            "`{cmdline}`"
+        );
+    }
+    // And the same runners running something else stay harmless.
+    for (executable, cmdline) in [
+        (
+            "/usr/bin/qemu-x86_64",
+            "qemu-x86_64 -L /usr/x86_64-linux-gnu /usr/bin/python3 notes.py retroarch",
+        ),
+        (
+            "/usr/bin/valgrind",
+            "valgrind /usr/bin/less /usr/lib/libretro/snes9x_libretro.so",
+        ),
+    ] {
+        let proc = Proc::new();
+        let dir = proc.add(1, "x", cmdline, USER);
+        std::os::unix::fs::symlink(executable, dir.join("exe")).unwrap();
+        assert_eq!(
+            proc.observer().observe("RetroArch", &save),
+            InUse::NotDetected,
+            "`{cmdline}`"
+        );
+    }
+}

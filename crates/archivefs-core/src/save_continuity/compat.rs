@@ -595,7 +595,24 @@ pub fn prepare_card_continuation(
                 "the new card on disk is not the card that was checked",
             ));
         }
+        // Everything in the folder is flushed before it gets its final name.
+        for path in [&exported, &new_card] {
+            fs::File::open(path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| {
+                    ContinuationError::Stopped(super::io("cannot flush", path, error))
+                })?;
+        }
+        fs::File::open(work_dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| {
+                ContinuationError::Stopped(super::io("cannot flush", work_dir, error))
+            })?;
         super::store::rename_no_replace(work_dir, final_dir).map_err(ContinuationError::Stopped)?;
+        if let Some(parent) = final_dir.parent() {
+            // The folder is in place and complete either way.
+            let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
+        }
         Ok(ContinuationCopy {
             save_name: save_name.to_string(),
             exported_save: final_dir.join(exported.file_name().unwrap_or_default()),

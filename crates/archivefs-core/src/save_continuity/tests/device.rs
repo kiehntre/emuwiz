@@ -676,3 +676,57 @@ fn two_first_runs_end_up_with_one_identity() {
         *ids.iter().next().unwrap()
     );
 }
+
+// ---- Regression tests for the delta review of cdc75795 ----
+
+#[test]
+fn opening_an_existing_device_writes_nothing_and_an_unreadable_record_is_not_list_number_zero() {
+    let (mut desktop, _laptop) = paired();
+    desktop.play(&[(GAME, "v1")]);
+    desktop.device.export(&desktop.store).unwrap();
+    desktop.device.export(&desktop.store).unwrap();
+    let root = desktop.dir.path().join("continuity");
+    assert_eq!(LocalDevice::recorded_sequence(&root).unwrap(), 2);
+
+    // No device record: opening the existing device must not write one.
+    let record = root.join("device.json");
+    let saved = fs::read(&record).unwrap();
+    fs::remove_file(&record).unwrap();
+    let before = tree(&root);
+    let opened = LocalDevice::open_existing(&root)
+        .unwrap()
+        .expect("the key is there");
+    assert_eq!(opened.identity.device_id, desktop.device.identity.device_id);
+    assert_eq!(tree(&root), before, "nothing was created");
+    assert_eq!(
+        LocalDevice::recorded_sequence(&root).unwrap(),
+        0,
+        "no record yet: nothing signed"
+    );
+
+    // A record that is there but damaged: an error, and no list is signed.
+    fs::write(&record, b"{ damaged").unwrap();
+    assert!(matches!(
+        LocalDevice::recorded_sequence(&root),
+        Err(ContinuityError::Corrupt(_))
+    ));
+    assert!(
+        desktop.device.export(&desktop.store).is_err(),
+        "refuses to sign under a guessed number"
+    );
+    assert_eq!(
+        fs::read(&record).unwrap(),
+        b"{ damaged",
+        "left exactly as found"
+    );
+    fs::write(&record, saved).unwrap();
+    assert_eq!(
+        desktop.device.export(&desktop.store).unwrap().body.sequence,
+        3
+    );
+
+    // A folder with no device at all: nothing to open, nothing created.
+    let empty = tempfile::tempdir().unwrap();
+    assert!(LocalDevice::open_existing(empty.path()).unwrap().is_none());
+    assert!(fs::read_dir(empty.path()).unwrap().next().is_none());
+}

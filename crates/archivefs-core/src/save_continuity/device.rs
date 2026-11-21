@@ -166,6 +166,10 @@ impl LocalDevice {
     /// Loads this profile's device, creating its key on first use. The key
     /// never leaves `<root>/device.key` (mode 0600).
     pub fn open_or_create(root: &Path, name: &str) -> Result<Self, ContinuityError> {
+        Self::load(root, name, true)
+    }
+
+    fn load(root: &Path, name: &str, create: bool) -> Result<Self, ContinuityError> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -176,6 +180,9 @@ impl LocalDevice {
         let pkcs8 = match fs::read(&key_path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !create {
+                    return Err(ContinuityError::NotFound(format!("{}", key_path.display())));
+                }
                 let rng = ring::rand::SystemRandom::new();
                 let document = Ed25519KeyPair::generate_pkcs8(&rng)
                     .map_err(|_| ContinuityError::Io("cannot create a device key".into()))?;
@@ -200,7 +207,7 @@ impl LocalDevice {
             key,
             root: root.to_path_buf(),
         };
-        if fs::symlink_metadata(&info_path).is_err() {
+        if create && fs::symlink_metadata(&info_path).is_err() {
             device.write_info(0)?;
         }
         Ok(device)
@@ -216,18 +223,32 @@ impl LocalDevice {
         write_private(&self.root.join("device.json"), &text)
     }
 
-    /// The counter of the newest list this device has signed.
+    /// The counter of the newest list this device has signed, for display.
+    /// 0 when it cannot be read; signing uses [`Self::recorded_sequence`],
+    /// which refuses instead.
     pub fn sequence(&self) -> u64 {
-        Self::recorded_sequence(&self.root)
+        Self::recorded_sequence(&self.root).unwrap_or(0)
     }
 
     /// The counter recorded in a device folder, read without creating or
-    /// changing anything there.
-    pub fn recorded_sequence(root: &Path) -> u64 {
-        fs::read(root.join("device.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<DeviceFile>(&bytes).ok())
-            .map_or(0, |file| file.sequence)
+    /// changing anything there. A folder with no record yet has signed
+    /// nothing (0). A record that exists and cannot be read or understood
+    /// is an error: guessing 0 would make this device sign a list under a
+    /// number it has already used.
+    pub fn recorded_sequence(root: &Path) -> Result<u64, ContinuityError> {
+        let path = root.join("device.json");
+        match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice::<DeviceFile>(&bytes)
+                .map(|file| file.sequence)
+                .map_err(|error| {
+                    ContinuityError::Corrupt(format!(
+                        "{} cannot be understood ({error}); it was left as it is",
+                        path.display()
+                    ))
+                }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(super::io("cannot read", &path, error)),
+        }
     }
 
     /// Signs a list of this device's own snapshots in `store`.
@@ -237,7 +258,7 @@ impl LocalDevice {
             .into_iter()
             .filter(|manifest| manifest.body.provenance.device_id == self.identity.device_id)
             .collect();
-        let sequence = self.sequence() + 1;
+        let sequence = Self::recorded_sequence(&self.root)? + 1;
         self.write_info(sequence)?;
         let body = self.list_body(snapshots, sequence);
         if serde_json::to_vec(&body).is_err() {
@@ -285,7 +306,9 @@ impl LocalDevice {
             .and_then(|bytes| serde_json::from_slice::<DeviceFile>(&bytes).ok())
             .map(|file| file.identity.name)
             .unwrap_or_else(|| "This device".to_string());
-        Self::open_or_create(root, &name).map(Some)
+        // The key exists, so nothing needs creating; `false` also keeps a
+        // missing device record from being written here.
+        Self::load(root, &name, false).map(Some)
     }
 }
 
