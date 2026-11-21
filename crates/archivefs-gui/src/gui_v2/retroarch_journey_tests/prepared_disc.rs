@@ -483,7 +483,7 @@ fn play_and_collect(blue: &mut Blue, root: &Path) -> Vec<String> {
 fn remembered_choice_child(fixture: &VerifiedGameFixture, root: &Path, zip: &Path, scenario: &str) {
     let copy = crate::emulator_setup::prepared_media::for_game(zip, Some("AmigaCD32"));
     // The game page's Amiga card answers from the same lookup, on real files.
-    let card = crate::gui_v2::amiga_game::prepared_copy(zip, "AmigaCD32");
+    let card = crate::gui_v2::amiga_game::prepared_copy(zip, "AmigaCD32", false);
     let mut blue = blue_on_launch_page(fixture, zip);
     match scenario {
         // Tick, remember, play twice in one session.

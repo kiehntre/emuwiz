@@ -151,6 +151,14 @@ the page behind it lists the findings with their evidence and offers "Prepare a
 playable copy" behind a confirmation tick. Afterwards the game's Launch page offers
 the usual folder-only confirmation and then Play.
 
+The older "Amiga game" card on the same page asks the same lookup the Launch page
+plans from. With a usable prepared copy its Format row reads "Ready from a prepared
+copy" and its FS-UAE/Amiberry rows, which do not start a prepared copy, are left
+out. With no usable copy (never prepared, or the ZIP or the copy has changed) the
+"not started from inside a ZIP" warning stays and points to Game recovery. The card
+is left exactly as it was for a game whose last scan could not finish, for a game
+with an identity of its own, and for every other Amiga, CD32 and CDTV entry.
+
 The store is `<data>/prepared-media` (`EMUWIZ_PREPARED_MEDIA_DIR` overrides it with
 an absolute path). Do not point it inside a library source folder: a scan would then
 list the prepared files as games.
@@ -318,10 +326,17 @@ Real data, on a disposable profile (originals only read):
   display with the controller hidden: Akira reached its menu; Alfred Chicken reached
   its title screen and the log shows CD audio playing from an extracted WAV track.
 
-Not verified: clicking Play in Blue against the real RetroArch in one run (Blue was
-driven against the recording fake; the real emulator was started by hand with the
-argument list Blue plans), audio output (the sandbox has no sound device), gameplay
-beyond the first screens, and the other 68 prepared games.
+- Blue against the real RetroArch in one run (2026-11-21, sandboxed profile, private
+  display, one disposable copy of Akira): game page → Game recovery → confirm →
+  prepare → Launch page → "Try once as Amiga CD32" → Play. Blue started
+  `/usr/games/retroarch` with the PUAE core and the prepared cue sheet as its only
+  content argument; the emulator held the prepared ISO open and showed the game's
+  title screen. The ZIP, the real RetroArch settings and the real profile were
+  unchanged afterwards.
+
+Not verified: an Organise move followed by a launch against the real RetroArch (that
+journey runs against the recording fake), audio output (the sandbox has no sound
+device), gameplay beyond the first screens, and the other 68 prepared games.
 
 Performance, on a copy of the 163,332-game library:
 

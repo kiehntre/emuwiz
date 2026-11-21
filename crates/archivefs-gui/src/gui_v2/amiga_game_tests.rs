@@ -572,12 +572,35 @@ fn a_prepared_copy_changes_nothing_for_other_amiga_entries() {
     let mut same = cdtv.clone();
     apply_prepared_copy(&mut same, PreparedCopy::NotApplicable);
     assert_eq!(same, cdtv);
+    // Nor would the card change it if it were ever told a copy is ready.
+    for copy in [PreparedCopy::Ready, PreparedCopy::Missing] {
+        let mut same = cdtv.clone();
+        apply_prepared_copy(&mut same, copy);
+        assert_eq!(same, cdtv, "{copy:?}");
+    }
     assert_eq!(
-        prepared_copy(Path::new("/nowhere/g.zip"), "Amiga"),
+        prepared_copy(Path::new("/nowhere/g.zip"), "Amiga", false),
         PreparedCopy::NotApplicable
     );
     assert_eq!(
-        prepared_copy(Path::new("/nowhere/g.cue"), "AmigaCD32"),
+        prepared_copy(Path::new("/nowhere/g.cue"), "AmigaCD32", false),
         PreparedCopy::NotApplicable
     );
+}
+
+#[test]
+fn a_cd32_zip_whose_scan_did_not_finish_keeps_its_scan_warning() {
+    // The Launch page does not use a prepared copy for such a file, so the
+    // card must not call it ready or point at game recovery either.
+    assert_eq!(
+        prepared_copy(Path::new("/nowhere/g.zip"), "AmigaCD32", true),
+        PreparedCopy::NotApplicable
+    );
+    let unfinished = assess_amiga_game(AmigaCdMachine::Cd32, Path::new("g.zip"), true, None, None);
+    let media = row(&unfinished, AmigaCheckKind::Media);
+    assert_eq!(media.state, AmigaCheckState::Blocked);
+    assert!(media.detail.contains("could not finish reading"));
+    let mut shown = unfinished.clone();
+    apply_prepared_copy(&mut shown, PreparedCopy::NotApplicable);
+    assert_eq!(shown, unfinished);
 }

@@ -2919,10 +2919,14 @@ mod second_review_tests {
         )
         .unwrap();
         start_queue(&store, &plan, &|_| true).unwrap();
-        // A resolved handle taken while the folder was there keeps the rule.
+        // Handles taken while the folder was there keep the rule, whichever
+        // way they were obtained.
         let resolved = store.resolved().unwrap();
+        let made_ready = store.ready().unwrap();
         std::fs::remove_dir_all(&chosen).unwrap();
         assert!(resolved.ready().is_err());
+        assert!(made_ready.ready().is_err());
+        assert!(!chosen.exists(), "a ready handle recreated the folder");
         let run = run_queue(
             &store,
             None,
@@ -2935,6 +2939,63 @@ mod second_review_tests {
         assert!(
             !chosen.exists(),
             "the chosen folder was recreated by a batch"
+        );
+
+        // The folder goes while a batch is running, between two games. The
+        // next game is not prepared, the run stops with an error, and neither
+        // the preparation nor the saved queue brings the folder back.
+        std::fs::create_dir(&chosen).unwrap();
+        std::fs::set_permissions(&chosen, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let store = PreparedMediaStore::configured(Some(chosen.clone()))
+            .unwrap()
+            .unwrap();
+        let candidates: Vec<BulkCandidate> = (0..2)
+            .map(|index| {
+                let path = lab.zip_path(&format!("mid-run-{index}.zip"));
+                let mut members = standard_members();
+                members[0].1 = iso_bytes("CDTV", &format!("MID{index}"));
+                write_zip(&path, &members);
+                BulkCandidate {
+                    path,
+                    platform_id: "AmigaCD32".into(),
+                    title: format!("mid-run {index}"),
+                }
+            })
+            .collect();
+        let plan = plan_bulk(
+            &store,
+            &candidates,
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+        )
+        .unwrap();
+        start_queue(&store, &plan, &|_| true).unwrap();
+        let unplugged = chosen.clone();
+        AFTER_ITEM.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |index| {
+                if index == 0 {
+                    std::fs::remove_dir_all(&unplugged).unwrap();
+                }
+            }));
+        });
+        let run = run_queue(
+            &store,
+            None,
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+            &|_| {},
+        );
+        AFTER_ITEM.with(|hook| *hook.borrow_mut() = None);
+        assert!(
+            matches!(&run, Err(BulkError::Store(detail)) if detail.contains("not there")),
+            "{run:?}"
+        );
+        assert!(
+            !chosen.exists(),
+            "the chosen folder was recreated in the middle of a batch"
         );
     }
 

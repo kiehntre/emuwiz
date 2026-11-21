@@ -375,8 +375,26 @@ fn lock_queue(store: &PreparedMediaStore) -> Result<QueueLock, BulkError> {
 fn write_queue(store: &PreparedMediaStore, queue: &Queue) -> Result<(), BulkError> {
     let text =
         serde_json::to_string_pretty(queue).map_err(|error| BulkError::Store(error.to_string()))?;
-    crate::atomic_write_text(&queue_path(store), &format!("{text}\n"))
-        .map_err(|error| BulkError::Store(error.to_string()))
+    // Written only into the store's own folder as it stands: a store whose
+    // folder has gone (its disk was unplugged mid-run) is never recreated
+    // here, where later copies would land on the wrong disk.
+    use std::os::unix::fs::MetadataExt;
+    let folder = versioned(store);
+    let metadata = std::fs::symlink_metadata(&folder)
+        .ok()
+        .filter(std::fs::Metadata::is_dir)
+        .ok_or_else(|| {
+            BulkError::Store(format!(
+                "{} is not there (is its disk connected?)",
+                folder.display()
+            ))
+        })?;
+    crate::atomic_text::write_in_existing_parent(
+        &queue_path(store),
+        &format!("{text}\n"),
+        (metadata.dev(), metadata.ino()),
+    )
+    .map_err(|error| BulkError::Store(error.to_string()))
 }
 
 /// The saved batch, if there is one. Read-only.
