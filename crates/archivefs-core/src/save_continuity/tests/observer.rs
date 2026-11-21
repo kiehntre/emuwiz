@@ -437,3 +437,243 @@ fn snapshots_through_the_real_check_are_verified_only_at_a_safe_point() {
         assert_eq!(bench.store.list().len(), 1, "{emulator}");
     }
 }
+
+impl Proc {
+    /// A process whose executable can be read, as any process of the same
+    /// user can: `exe` points at `executable`.
+    fn readable(&self, pid: u32, executable: &str, cmdline: &str) -> PathBuf {
+        let name = executable.rsplit('/').next().unwrap_or(executable);
+        let dir = self.add(pid, &name[..name.len().min(15)], cmdline, USER);
+        std::os::unix::fs::symlink(executable, dir.join("exe")).unwrap();
+        dir
+    }
+
+    /// A process whose executable cannot be read (another user's): `exe`
+    /// exists but is not a link that can be followed.
+    fn hidden(&self, pid: u32, comm: &str, cmdline: &str) -> PathBuf {
+        let dir = self.add(pid, comm, cmdline, USER);
+        fs::write(dir.join("exe"), b"").unwrap();
+        dir
+    }
+}
+
+/// Commands that mention an emulator without being one. The first four are
+/// the ones that really made every RetroArch save read "in use" on
+/// 2026-11-20 (other sessions' test runs) plus the probe's own command.
+const NOT_EMULATORS: &[(&str, &str)] = &[
+    (
+        "/home/u/.rustup/toolchains/1.97.1/bin/cargo",
+        "cargo test -p archivefs-gui --lib -- gui_v2::retroarch_journey_tests",
+    ),
+    (
+        "/usr/bin/bash",
+        "/bin/bash -c scripts/cargo-iso test -p archivefs-gui --lib -- gui_v2::retroarch_journey_tests gui_v2::game_rename",
+    ),
+    (
+        "/usr/bin/bwrap",
+        "bwrap --bind / / -- cargo test -p archivefs-gui --lib -- gui_v2::retroarch_journey_tests",
+    ),
+    (
+        "/usr/bin/python3.12",
+        "python3 -B scripts/qa/emulator_safe_point_probe.py --work /mnt/x/probe-retroarch --only retroarch-native,retroarch-flatpak",
+    ),
+    (
+        "/usr/bin/vim",
+        "vim /home/u/.config/retroarch/retroarch.cfg",
+    ),
+    (
+        "/usr/bin/less",
+        "less /usr/lib/x86_64-linux-gnu/libretro/snes9x_libretro.so",
+    ),
+    ("/usr/bin/grep", "grep -r libretro /home/u/notes"),
+    (
+        "/usr/bin/nautilus",
+        "nautilus /home/u/.var/app/org.libretro.RetroArch/config/retroarch/saves",
+    ),
+    (
+        "/usr/bin/bash",
+        "bash -c echo retroarch pcsx2 duckstation rpcs3 ppsspp",
+    ),
+    (
+        "/usr/bin/python3.12",
+        "python3 notes.py --about retroarch -L not-a-core.txt",
+    ),
+    ("/usr/bin/tail", "tail -f /home/u/.config/rpcs3/RPCS3.log"),
+    (
+        "/usr/bin/vim",
+        "vim duckstation-settings.ini ppsspp.ini PCSX2.ini",
+    ),
+    (
+        "/usr/bin/git",
+        "git log --grep=ppsspp --grep=duckstation --grep=rpcs3",
+    ),
+];
+
+#[test]
+fn a_command_that_only_mentions_an_emulator_is_not_that_emulator() {
+    let dir = tempfile::tempdir().unwrap();
+    let save = save_file(&dir);
+    let proc = Proc::new();
+    for (index, (executable, cmdline)) in NOT_EMULATORS.iter().enumerate() {
+        proc.readable(1000 + index as u32, executable, cmdline);
+    }
+    for emulator in ALL_SIX {
+        assert_eq!(
+            proc.synthetic().observe(emulator, &save),
+            InUse::NotDetected,
+            "{emulator}: none of these commands is the emulator"
+        );
+    }
+    // One at a time as well, so no single entry hides behind another.
+    for (executable, cmdline) in NOT_EMULATORS {
+        let proc = Proc::new();
+        proc.readable(4242, executable, cmdline);
+        assert_eq!(
+            proc.synthetic().observe("RetroArch", &save),
+            InUse::NotDetected,
+            "{cmdline}"
+        );
+    }
+}
+
+#[test]
+fn the_real_emulator_is_still_seen_in_every_way_it_is_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let save = save_file(&dir);
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "RetroArch",
+            "/usr/games/retroarch",
+            "/usr/games/retroarch --verbose --config /x/ro.cfg -L /cores/gambatte_libretro.so game.gb",
+        ),
+        ("RetroArch", "/app/bin/retroarch", "retroarch"),
+        // A front end under another name, loading a core.
+        (
+            "RetroArch",
+            "/opt/frontend/emu",
+            "emu -L /cores/snes9x_libretro.so game.sfc",
+        ),
+        (
+            "RetroArch",
+            "/opt/frontend/emu",
+            "emu --libretro=/cores/mgba_libretro.so game.gba",
+        ),
+        // A wrapper script named like the emulator, run by a shell.
+        (
+            "RetroArch",
+            "/usr/bin/bash",
+            "bash /home/u/.local/bin/retroarch --fullscreen",
+        ),
+        (
+            "PCSX2",
+            "/usr/bin/bash",
+            "/usr/bin/env bash /home/u/.local/bin/pcsx2-qt",
+        ),
+        (
+            "RetroArch",
+            "/usr/bin/flatpak",
+            "flatpak run org.libretro.RetroArch",
+        ),
+        ("RetroArch", "/usr/bin/bwrap", "bwrap --args 41 retroarch"),
+        (
+            "DuckStation",
+            "/tmp/.mount_DuckStAbCd/usr/bin/duckstation-qt",
+            "/home/u/Applications/DuckStation.AppImage",
+        ),
+        ("RPCS3", "/app/bin/rpcs3", "rpcs3 --no-gui"),
+        ("PPSSPP", "/app/bin/PPSSPPSDL", "PPSSPPSDL game.iso"),
+    ];
+    for (emulator, executable, cmdline) in cases {
+        let proc = Proc::new();
+        // Alongside the commands that only mention it.
+        for (index, (other, text)) in NOT_EMULATORS.iter().enumerate() {
+            proc.readable(1000 + index as u32, other, text);
+        }
+        proc.readable(4242, executable, cmdline);
+        assert_eq!(
+            proc.synthetic().observe(emulator, &save),
+            InUse::EmulatorRunning,
+            "{emulator}: `{cmdline}`"
+        );
+    }
+    // RetroDECK runs RetroArch inside its own Flatpak scope: the scope says so.
+    let proc = Proc::new();
+    let scoped = proc.add(
+        7,
+        "bwrap",
+        "bwrap --args 40 retrodeck.sh",
+        "0::/app.slice/app-flatpak-net.retrodeck.retrodeck-7.scope\n",
+    );
+    std::os::unix::fs::symlink("/usr/bin/bwrap", scoped.join("exe")).unwrap();
+    assert_eq!(
+        proc.observer().observe("RetroArch", &save),
+        InUse::EmulatorRunning
+    );
+}
+
+#[test]
+fn a_process_that_cannot_be_classified_still_refuses_when_it_names_the_emulator() {
+    let dir = tempfile::tempdir().unwrap();
+    let save = save_file(&dir);
+    // Its executable cannot be read, so what it is cannot be established.
+    let proc = Proc::new();
+    proc.hidden(55, "python3", "python3 launcher.py --start retroarch");
+    assert_eq!(
+        proc.observer().observe("RetroArch", &save),
+        InUse::EmulatorRunning,
+        "unclassifiable and naming the emulator: fail closed"
+    );
+    assert_eq!(
+        proc.observer().observe("PCSX2", &save),
+        InUse::NotDetected,
+        "it does not name PCSX2"
+    );
+    // The same command from a process that *can* be read is just a script.
+    let proc = Proc::new();
+    proc.readable(
+        55,
+        "/usr/bin/python3.12",
+        "python3 launcher.py --start retroarch",
+    );
+    assert_eq!(
+        proc.observer().observe("RetroArch", &save),
+        InUse::NotDetected
+    );
+}
+
+#[test]
+fn a_process_that_vanishes_while_being_looked_at_is_not_an_emulator() {
+    let dir = tempfile::tempdir().unwrap();
+    let save = save_file(&dir);
+    let proc = Proc::new();
+    // Gone between reading its command line and its executable: no `exe`.
+    proc.add(
+        60,
+        "cargo",
+        "cargo test gui_v2::retroarch_journey_tests",
+        USER,
+    );
+    // Not a process at all.
+    fs::create_dir(proc.0.path().join("self")).unwrap();
+    assert_eq!(
+        proc.observer().observe("RetroArch", &save),
+        InUse::NotDetected
+    );
+    // A real emulator that is still there is not hidden by the ones that left.
+    proc.readable(62, "/usr/games/retroarch", "/usr/games/retroarch");
+    assert_eq!(
+        proc.observer().observe("RetroArch", &save),
+        InUse::EmulatorRunning
+    );
+}
+
+#[test]
+fn an_entry_that_exists_but_cannot_be_read_at_all_keeps_the_answer_unknown() {
+    // Fail closed: something is there and nothing about it can be read.
+    let dir = tempfile::tempdir().unwrap();
+    let save = save_file(&dir);
+    fs::hard_link(&save, dir.path().join("second-name")).unwrap(); // no lease to lean on
+    let proc = Proc::new();
+    fs::create_dir(proc.0.path().join("61")).unwrap();
+    assert_eq!(proc.observer().observe("RetroArch", &save), InUse::Unknown);
+}

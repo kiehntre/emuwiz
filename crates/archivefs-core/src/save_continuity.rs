@@ -39,6 +39,7 @@ pub mod model;
 pub mod session;
 pub mod status;
 pub mod store;
+pub mod tracker;
 pub mod workflow;
 
 #[cfg(test)]

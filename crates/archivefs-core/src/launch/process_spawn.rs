@@ -821,6 +821,10 @@ fn spawn_watched_process_inner(
         spawn_with_owned_identity(&mut process)
     })?;
     let pid = child.id();
+    // Noted for every route, so a caller that only knows "a launch is in
+    // progress" can learn the real process and how it ended.
+    let log_sequence =
+        super::process_log::record_start(pid, &command.executable, &command.arguments);
     if let Some(on_start) = on_start {
         on_start(pid);
     }
@@ -837,6 +841,7 @@ fn spawn_watched_process_inner(
             None => stderr.map(read_bounded_stderr).unwrap_or_default(),
         };
         let status = child.wait();
+        super::process_log::record_exit(log_sequence, &status);
         let report = ProcessExitReport {
             status,
             stderr: stderr_bytes,

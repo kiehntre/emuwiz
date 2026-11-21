@@ -138,6 +138,8 @@ pub struct TimelineEntry {
     /// Shown prominently when the emulator did not end normally (or that is
     /// not known) before this snapshot.
     pub warning: Option<String>,
+    /// Shown quietly: what is not known about the last session.
+    pub uncertainty: Option<String>,
     /// The same three statuses as sentences, for display.
     pub status_lines: Vec<String>,
 }
@@ -226,6 +228,7 @@ pub fn timelines(store: &SnapshotStore) -> Vec<Timeline> {
                 preceding_session: manifest.body.preceding_session.clone(),
                 advisory: advisory_of(manifest),
                 warning: warning_of(manifest),
+                uncertainty: uncertainty_of(manifest),
                 status_lines: status_lines(manifest),
             });
         }
@@ -314,16 +317,24 @@ pub fn advisory_of(manifest: &SnapshotManifest) -> Advisory {
     from_session.max(structural)
 }
 
+/// What is simply not known about a snapshot's last session, for quiet
+/// display. Never a warning: not knowing is not evidence of a problem.
+pub fn uncertainty_of(manifest: &SnapshotManifest) -> Option<String> {
+    match &manifest.body.preceding_session {
+        Some(preceding) => preceding.uncertainty(),
+        None => Some("How the emulator last ended was not recorded for this snapshot".to_string()),
+    }
+}
+
+/// What must be shown prominently: an observed abnormal end, a structural
+/// problem, or a copy that was not taken at a verified safe point.
 pub fn warning_of(manifest: &SnapshotManifest) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(StructureCheck::Problems { what }) = &manifest.body.structure {
         parts.push(format!("WARNING: {what}"));
     }
-    match &manifest.body.preceding_session {
-        Some(preceding) => parts.extend(preceding.warning()),
-        None => {
-            parts.push("How the emulator last ended was not recorded for this snapshot".to_string())
-        }
+    if let Some(preceding) = &manifest.body.preceding_session {
+        parts.extend(preceding.warning());
     }
     if manifest.body.boundary != CaptureBoundary::EmulatorClosedObserved {
         parts.push(manifest.body.boundary.label().to_string());

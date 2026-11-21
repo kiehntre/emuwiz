@@ -141,6 +141,11 @@ impl ProcScanQuiescence {
                         {
                             report.emulator_processes.push(pid);
                         }
+                        // Structured launch forms, read from where they sit in
+                        // the command line, never from a word somewhere in it.
+                        if leaf == "cmdline" && who.launch_arguments(&tokens) {
+                            report.emulator_processes.push(pid);
+                        }
                         tokens_seen.extend(tokens.iter().map(|token| token.to_string()));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound && !dir.exists() => {
@@ -160,14 +165,34 @@ impl ProcScanQuiescence {
                 }
                 Err(_) => cgroup_unreadable = true,
             }
-            // Any emulator marker anywhere in the name, command line or cgroup
-            // refuses, whether or not the process can otherwise be inspected:
-            // a wrapper, AppRun, `emu -L x_libretro.so`, RetroDECK's scope.
-            // Refusal only; a missing marker clears nothing.
-            if who.marker(&cgroup_text) || tokens_seen.iter().any(|token| who.marker(token)) {
+            // A marker in the cgroup refuses: the cgroup is set by the system
+            // (RetroDECK's app scope), not typed by anyone.
+            if who.marker(&cgroup_text) {
                 report.emulator_processes.push(pid);
             }
-            if let Ok(executable) = fs::read_link(dir.join("exe"))
+            // A process is the emulator by what it *is*: its name, the file
+            // it runs, how it was launched. A word in its command line is
+            // not identity: `cargo test retroarch_journey_tests`, an editor
+            // open on `retroarch.cfg` or a script given `--only retroarch`
+            // are not RetroArch (found 2026-11-20: three such processes of
+            // other sessions made every RetroArch save read "in use").
+            //
+            // The word match is kept only for a process whose executable
+            // cannot be read (another user's, a container's): it cannot be
+            // classified, so anything naming the emulator still refuses.
+            // A process that has simply gone is not such a process.
+            let executable = fs::read_link(dir.join("exe"));
+            let executable_hidden = matches!(
+                &executable,
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound
+            ) && tokens_seen
+                .iter()
+                .skip(1)
+                .any(|token| !token.trim().is_empty());
+            if executable_hidden && tokens_seen.iter().any(|token| who.marker(token)) {
+                report.emulator_processes.push(pid);
+            }
+            if let Ok(executable) = executable
                 && who.name(&executable.to_string_lossy())
             {
                 report.emulator_processes.push(pid);
@@ -290,7 +315,15 @@ struct EmulatorIdentity {
     markers: &'static [&'static str],
     /// Also match names like `retroarch_vulkan` / `retroarch32` (refusal only).
     loose_suffix: bool,
+    /// A program started with `-L <something>_libretro.so` is a libretro
+    /// front end running a core, whatever the program is called.
+    libretro_core_argument: bool,
 }
+
+/// Programs that run a script named in their first argument.
+const SCRIPT_RUNNERS: &[&str] = &[
+    "sh", "bash", "dash", "zsh", "ksh", "env", "python", "python3", "perl",
+];
 
 const RETROARCH_PROCESS_NAMES: &[&str] = &["retroarch"];
 
@@ -302,6 +335,7 @@ impl EmulatorIdentity {
                 flatpak_id: "org.libretro.RetroArch",
                 lease_waives_uninspectable: true,
                 loose_suffix: true,
+                libretro_core_argument: true,
                 markers: &["retroarch", "libretro", "retrodeck"],
             }
         } else if let Some(identity) = Self::other_emulator(&binding.emulator) {
@@ -312,6 +346,7 @@ impl EmulatorIdentity {
                 flatpak_id: "net.pcsx2.PCSX2",
                 lease_waives_uninspectable: true,
                 loose_suffix: false,
+                libretro_core_argument: false,
                 markers: &[],
             }
         }
@@ -358,8 +393,54 @@ impl EmulatorIdentity {
             flatpak_id,
             lease_waives_uninspectable: true,
             loose_suffix: true,
+            libretro_core_argument: false,
             markers,
         })
+    }
+
+    /// The emulator, recognised from the *shape* of a command line:
+    ///
+    /// - a script runner whose script (its first argument that is not an
+    ///   option) is named like the emulator: `bash ~/bin/retroarch`,
+    ///   `python3 /opt/pcsx2-qt-wrapper`;
+    /// - for RetroArch, a core handed over with `-L x_libretro.so` or
+    ///   `--libretro=x_libretro.so`.
+    ///
+    /// A word elsewhere (a test filter, a file being edited, a folder name,
+    /// text given to `-c`) is not looked at.
+    fn launch_arguments(&self, tokens: &[String]) -> bool {
+        let program = tokens
+            .first()
+            .and_then(|token| Path::new(token.trim()).file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if SCRIPT_RUNNERS.contains(&program) {
+            // The script is the first argument that is not an option, a
+            // `NAME=value` setting, or another runner (`env bash script`).
+            let script = tokens.iter().skip(1).find(|token| {
+                let runner = Path::new(token.as_str())
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| SCRIPT_RUNNERS.contains(&name));
+                !token.starts_with('-') && !token.contains('=') && !runner
+            });
+            // `sh -c "<text>"`: what follows -c is text to run, not a script.
+            let inline = tokens.iter().skip(1).any(|token| token == "-c");
+            if !inline && script.is_some_and(|script| self.name(script)) {
+                return true;
+            }
+        }
+        if self.libretro_core_argument {
+            let is_core = |token: &str| token.to_ascii_lowercase().ends_with("_libretro.so");
+            let paired = tokens
+                .windows(2)
+                .any(|pair| matches!(pair[0].as_str(), "-L" | "--libretro") && is_core(&pair[1]));
+            let joined = tokens
+                .iter()
+                .any(|token| token.strip_prefix("--libretro=").is_some_and(is_core));
+            return paired || joined;
+        }
+        false
     }
 
     fn marker(&self, text: &str) -> bool {

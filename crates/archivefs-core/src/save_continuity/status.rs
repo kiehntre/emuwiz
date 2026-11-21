@@ -83,10 +83,11 @@ pub enum PrecedingSession {
 pub enum Advisory {
     /// The last session that could have written the save ended normally.
     None,
-    /// How the emulator last ended is not known.
+    /// How the emulator last ended is not known (no session, or its exit
+    /// was not observed). Neutral: shown quietly, never as a crash.
     Caution,
-    /// The emulator crashed, was stopped, exited with an error, or its exit
-    /// was not seen. The save may be incomplete.
+    /// An abnormal end was actually observed: the emulator crashed, was
+    /// stopped from outside, or exited with an error. Shown prominently.
     Warning,
 }
 
@@ -100,11 +101,13 @@ impl PrecedingSession {
     pub fn advisory(&self) -> Advisory {
         match self {
             Self::CleanExit { .. } => Advisory::None,
-            Self::Unknown { .. } => Advisory::Caution,
-            Self::Crashed { .. }
-            | Self::ForcedStop { .. }
-            | Self::ErrorExit { .. }
-            | Self::ExitNotSeen { .. } => Advisory::Warning,
+            // Not knowing is not evidence of a problem: an exit that was not
+            // observed is shown as plain uncertainty, exactly like "unknown".
+            Self::Unknown { .. } | Self::ExitNotSeen { .. } => Advisory::Caution,
+            // Only an exit that was actually observed to be abnormal warns.
+            Self::Crashed { .. } | Self::ForcedStop { .. } | Self::ErrorExit { .. } => {
+                Advisory::Warning
+            }
         }
     }
 
@@ -113,8 +116,22 @@ impl PrecedingSession {
         matches!(self, Self::CleanExit { .. })
     }
 
-    /// One sentence for a person. `None` only after a clean exit.
+    /// A prominent warning: only when an abnormal end was actually observed.
     pub fn warning(&self) -> Option<String> {
+        (self.advisory() == Advisory::Warning)
+            .then(|| self.sentence())
+            .flatten()
+    }
+
+    /// A quiet statement of what is not known. Never worded as a problem.
+    pub fn uncertainty(&self) -> Option<String> {
+        (self.advisory() == Advisory::Caution)
+            .then(|| self.sentence())
+            .flatten()
+    }
+
+    /// One sentence for a person. `None` only after a clean exit.
+    pub fn sentence(&self) -> Option<String> {
         Some(match self {
             Self::CleanExit { .. } => return None,
             Self::Crashed { signal, .. } => format!(
@@ -127,7 +144,7 @@ impl PrecedingSession {
                 "WARNING: the emulator exited with an error (code {code}) in the session before this snapshot. The save may be incomplete"
             ),
             Self::ExitNotSeen { detail, .. } => format!(
-                "WARNING: how the emulator ended before this snapshot was not seen ({detail}). The save may be incomplete"
+                "Not known how the emulator last ended: {detail}. Nothing suggests a problem, and nothing rules one out"
             ),
             Self::Unknown { why } => format!(
                 "Not known how the emulator last ended: {why}. Nothing suggests a problem, and nothing rules one out"
@@ -183,7 +200,7 @@ pub fn describe_preceding(preceding: Option<&PrecedingSession>) -> String {
         Some(PrecedingSession::CleanExit { .. }) => {
             "The emulator closed normally in the session before this snapshot".to_string()
         }
-        Some(other) => other.warning().unwrap_or_default(),
+        Some(other) => other.sentence().unwrap_or_default(),
         None => "How the emulator last ended was not recorded for this snapshot".to_string(),
     }
 }

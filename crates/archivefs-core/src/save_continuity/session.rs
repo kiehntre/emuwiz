@@ -51,6 +51,12 @@ pub enum SessionEnd {
     /// Exit status 0, but from a launcher (`flatpak run`, a wrapper), which
     /// says nothing about the emulator inside.
     LauncherExitedOk,
+    /// The launcher itself ended with an error or was stopped. That is a
+    /// fact about the launcher only: the emulator may have carried on, or
+    /// closed normally. Never read as a crash.
+    LauncherEndedOtherwise {
+        detail: String,
+    },
     ExitCode {
         code: i32,
     },
@@ -70,11 +76,17 @@ impl SessionEnd {
                 "The launcher finished normally (the emulator's own result is not known)"
                     .to_string()
             }
+            Self::LauncherEndedOtherwise { detail } => {
+                format!("The launcher ended ({detail}); how the emulator itself ended is not known")
+            }
             Self::ExitCode { code } => format!("Stopped with an error (exit code {code})"),
             Self::Signal {
                 signal,
                 core_dumped: true,
             } => format!("Crashed (signal {signal})"),
+            Self::Signal { signal, .. } if is_crash_signal(*signal, false) => {
+                format!("Crashed (signal {signal})")
+            }
             Self::Signal { signal, .. } => format!("Was stopped (signal {signal})"),
             Self::StatusUnavailable => "Ended; how is not known".to_string(),
         }
@@ -161,6 +173,10 @@ pub struct SessionRecord {
     pub launch: SessionLaunch,
     pub state: SessionState,
     pub requested_unix: i64,
+    /// Nanoseconds within `requested_unix`, so sessions requested in the
+    /// same second still have an order.
+    #[serde(default)]
+    pub requested_order: u32,
     pub started_unix: Option<i64>,
     pub ended_unix: Option<i64>,
     pub process_id: Option<u32>,
@@ -176,6 +192,13 @@ pub struct SessionRecord {
     /// The Flatpak app scope the session's processes run in, when there is one.
     #[serde(default)]
     pub app_scope: Option<String>,
+    /// The emulator's own process inside a Flatpak sandbox, when it was
+    /// identified as the sandbox's direct command (see [`sandbox_main`]).
+    #[serde(default)]
+    pub sandbox_main: Option<TrackedProcess>,
+    /// How `end` was learned. `None` on older records.
+    #[serde(default)]
+    pub exit_evidence: Option<ExitEvidence>,
     pub end: Option<SessionEnd>,
     pub play_evidence: PlayEvidence,
     pub saves_before: Vec<SaveMark>,
@@ -266,6 +289,106 @@ pub trait ProcessTable {
     fn in_scope(&self, _scope: &str) -> Vec<u32> {
         Vec::new()
     }
+    /// The parent of `pid`, while it exists.
+    fn parent(&self, _pid: u32) -> Option<u32> {
+        None
+    }
+    /// The short process name of `pid` (`comm`).
+    fn name(&self, _pid: u32) -> Option<String> {
+        None
+    }
+}
+
+/// How a session's `end` was learned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitEvidence {
+    /// EmuWiz started the emulator itself and read its exit status.
+    EmulatorProcess,
+    /// EmuWiz started a Flatpak sandbox, identified the emulator as the
+    /// sandbox's direct command, and the sandbox relayed that command's
+    /// exit status when it ended.
+    SandboxRelay,
+    /// Only a launcher's end was seen. Says nothing about the emulator.
+    LauncherOnly,
+}
+
+/// Flatpak emulators whose relayed exit status is trusted. Two things were
+/// checked on a real install (`scripts/qa/flatpak_exit_probe.py`): the
+/// app's command is the emulator binary itself and `flatpak run` returns
+/// that binary's own status (a signal `N` arrives as exit code `128 + N`);
+/// **and** a normal close of the running emulator returned 0, so that a
+/// non-zero status really does mean it did not close normally. For any
+/// other app a sandbox's exit status is treated as the launcher's only.
+pub const SANDBOX_RELAY_CHECKED: [(&str, &[&str]); 2] = [
+    ("PPSSPP", &["ppssppsdl", "ppssppqt"]),
+    ("RetroArch", &["retroarch"]),
+];
+
+/// Flatpak emulators where the relay itself works but a normal close did
+/// **not** return 0 when tried, so their status cannot yet tell a normal
+/// close from a problem. Their exits stay "not known" until a real session
+/// shows what a normal close returns.
+pub const SANDBOX_RELAY_UNSETTLED: [(&str, &str); 2] = [
+    (
+        "PCSX2",
+        "closing its window returned exit code 1 (observed at the first-run setup window, not in a game)",
+    ),
+    (
+        "RPCS3",
+        "closing its window returned 134: it aborted while shutting down in the test environment",
+    ),
+];
+
+/// The emulator's own process among a session's tracked processes, but only
+/// when the session is a checked Flatpak route and the process sits exactly
+/// where the sandbox's command sits: its executable is the emulator binary,
+/// and its parents up to the process EmuWiz started are all `bwrap`. A shell
+/// or anything else in between means the status EmuWiz gets back may not be
+/// the emulator's, so there is no answer.
+pub fn sandbox_main(
+    record: &SessionRecord,
+    processes: &dyn ProcessTable,
+) -> Option<TrackedProcess> {
+    if !record.launch.profile.eq_ignore_ascii_case("flatpak") {
+        return None;
+    }
+    let binaries = SANDBOX_RELAY_CHECKED
+        .iter()
+        .find(|(emulator, _)| emulator.eq_ignore_ascii_case(&record.launch.emulator))?
+        .1;
+    let launched = record.process_id?;
+    record
+        .processes
+        .iter()
+        .filter(|process| process.pid != launched && alive(process, processes))
+        .find(|process| {
+            let binary = process
+                .executable
+                .as_deref()
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if !binaries.contains(&binary.as_str()) {
+                return false;
+            }
+            // Walk up: every process between it and the launched one is bwrap.
+            let mut current = process.pid;
+            for _ in 0..8 {
+                let Some(parent) = processes.parent(current) else {
+                    return false;
+                };
+                if parent == launched {
+                    return true;
+                }
+                if processes.name(parent).as_deref() != Some("bwrap") {
+                    return false;
+                }
+                current = parent;
+            }
+            false
+        })
+        .cloned()
 }
 
 fn flatpak_scope(cgroup: &str) -> Option<String> {
@@ -293,6 +416,25 @@ impl ProcessTable for ProcFs {
 
     fn app_scope(&self, pid: u32) -> Option<String> {
         flatpak_scope(&fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?)
+    }
+
+    fn parent(&self, pid: u32) -> Option<u32> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+
+    fn name(&self, pid: u32) -> Option<String> {
+        Some(
+            fs::read_to_string(format!("/proc/{pid}/comm"))
+                .ok()?
+                .trim()
+                .to_string(),
+        )
     }
 
     fn in_scope(&self, scope: &str) -> Vec<u32> {
@@ -395,6 +537,11 @@ fn refresh(record: &mut SessionRecord, processes: &dyn ProcessTable) {
             track(record, member, false, processes);
         }
     }
+    // Identify the emulator inside the sandbox while the chain can still be
+    // walked. Once found it is kept: the answer cannot be re-derived later.
+    if record.sandbox_main.is_none() {
+        record.sandbox_main = sandbox_main(record, processes);
+    }
 }
 
 pub struct SessionJournal {
@@ -451,9 +598,13 @@ impl SessionJournal {
     }
 
     fn path(&self, record: &SessionRecord) -> PathBuf {
+        // Second, then an order number within this run of EmuWiz, then id:
+        // file names sort in the order the sessions were requested, even
+        // when several fall in the same second.
         self.dir.join(format!(
-            "{:012}-{}.json",
+            "{:012}-{:09}-{}.json",
             record.requested_unix.max(0),
+            record.requested_order,
             record.session_id
         ))
     }
@@ -484,7 +635,11 @@ impl SessionJournal {
         launch: SessionLaunch,
         saves_before: Vec<SaveMark>,
     ) -> Result<SessionRecord, ContinuityError> {
-        let requested_unix = now_unix();
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let requested_unix = clock.as_secs() as i64;
+        let requested_order = clock.subsec_nanos();
         let seed = format!(
             "{}\0{}\0{}\0{}\0{}",
             self.device_id,
@@ -501,6 +656,7 @@ impl SessionJournal {
             launch,
             state: SessionState::Requested,
             requested_unix,
+            requested_order,
             started_unix: None,
             ended_unix: None,
             process_id: None,
@@ -508,6 +664,8 @@ impl SessionJournal {
             processes: Vec::new(),
             launcher_end: None,
             app_scope: None,
+            sandbox_main: None,
+            exit_evidence: None,
             end: None,
             play_evidence: PlayEvidence::None,
             saves_before,
@@ -548,6 +706,32 @@ impl SessionJournal {
         refresh(&mut record, processes);
         self.write(&record)?;
         Ok(record)
+    }
+
+    /// Step 2, when what was actually started is only known now: records
+    /// which emulator and install the process is, and keeps only the
+    /// "before" marks of that emulator's own saves (`its_saves`), so the
+    /// session speaks for those saves and no others.
+    pub fn mark_started_as(
+        &self,
+        session_id: &str,
+        pid: u32,
+        launch: SessionLaunch,
+        its_saves: &[String],
+        processes: &dyn ProcessTable,
+    ) -> Result<SessionRecord, ContinuityError> {
+        let mut record = self.get(session_id)?;
+        if record.state != SessionState::Requested {
+            return Err(ContinuityError::Refused(format!(
+                "session {session_id} is already past starting"
+            )));
+        }
+        record.launch = launch;
+        record
+            .saves_before
+            .retain(|mark| its_saves.contains(&mark.save_id));
+        self.write(&record)?;
+        self.mark_started(session_id, pid, processes)
     }
 
     /// Looks again for processes the session's processes have started. A
@@ -610,27 +794,81 @@ impl SessionJournal {
             )));
         }
         refresh(&mut record, processes);
-        let end = match exit {
-            ExitObservation::Code(0) if record.launch.through_launcher => {
-                SessionEnd::LauncherExitedOk
-            }
-            ExitObservation::Code(0) => SessionEnd::Clean,
-            ExitObservation::Code(code) => SessionEnd::ExitCode { code },
+        // Whose exit is this? Three cases, never mixed:
+        //  - EmuWiz started the emulator itself: the status is the emulator's.
+        //  - EmuWiz started a checked Flatpak sandbox, the emulator was
+        //    identified as its direct command, that process is now gone and
+        //    the sandbox exited by itself: the status is the emulator's,
+        //    relayed (a signal N arrives as exit code 128 + N).
+        //  - anything else through a launcher: the status is the launcher's
+        //    and says nothing about the emulator, clean or otherwise.
+        let relayed = record.launch.through_launcher
+            && matches!(exit, ExitObservation::Code(_))
+            && record
+                .sandbox_main
+                .as_ref()
+                .is_some_and(|main| !alive(main, processes));
+        let (end, evidence) = match exit {
+            _ if record.launch.through_launcher && !relayed => (
+                match exit {
+                    ExitObservation::Code(0) => SessionEnd::LauncherExitedOk,
+                    ExitObservation::Code(code) => SessionEnd::LauncherEndedOtherwise {
+                        detail: format!("exit code {code}"),
+                    },
+                    ExitObservation::Signal { signal, .. } => SessionEnd::LauncherEndedOtherwise {
+                        detail: format!("stopped by signal {signal}"),
+                    },
+                    ExitObservation::Unavailable => SessionEnd::StatusUnavailable,
+                },
+                ExitEvidence::LauncherOnly,
+            ),
+            ExitObservation::Code(0) => (
+                SessionEnd::Clean,
+                if relayed {
+                    ExitEvidence::SandboxRelay
+                } else {
+                    ExitEvidence::EmulatorProcess
+                },
+            ),
+            ExitObservation::Code(code) if relayed && (129..=159).contains(&code) => (
+                SessionEnd::Signal {
+                    signal: code - 128,
+                    core_dumped: false,
+                },
+                ExitEvidence::SandboxRelay,
+            ),
+            ExitObservation::Code(code) => (
+                SessionEnd::ExitCode { code },
+                if relayed {
+                    ExitEvidence::SandboxRelay
+                } else {
+                    ExitEvidence::EmulatorProcess
+                },
+            ),
             ExitObservation::Signal {
                 signal,
                 core_dumped,
-            } => SessionEnd::Signal {
-                signal,
-                core_dumped,
-            },
-            ExitObservation::Unavailable => SessionEnd::StatusUnavailable,
+            } => (
+                SessionEnd::Signal {
+                    signal,
+                    core_dumped,
+                },
+                ExitEvidence::EmulatorProcess,
+            ),
+            ExitObservation::Unavailable => {
+                (SessionEnd::StatusUnavailable, ExitEvidence::EmulatorProcess)
+            }
         };
+        record.exit_evidence = Some(evidence);
         let launched = record.process_id;
-        let still_running = record
-            .processes
-            .iter()
-            .filter(|process| Some(process.pid) != launched)
-            .any(|process| alive(process, processes));
+        // When the sandbox has relayed its command's exit, the emulator is
+        // over, whatever helper processes are still winding down.
+        let still_running = !relayed
+            && record
+                .processes
+                .iter()
+                .filter(|process| Some(process.pid) != launched)
+                .any(|process| alive(process, processes));
         if still_running {
             record.launcher_end = Some(end);
             record.notes.push(
@@ -720,9 +958,20 @@ impl SessionJournal {
                         // The launcher's end was seen; the emulator's own
                         // was not. Say exactly that.
                         record.state = SessionState::Ended;
+                        // Whatever the launcher's own end was, it happened
+                        // while the emulator was still running, so it is
+                        // the launcher's alone: neither clean nor a crash.
+                        record.exit_evidence = Some(ExitEvidence::LauncherOnly);
                         record.end = Some(match end {
-                            SessionEnd::Clean => SessionEnd::LauncherExitedOk,
-                            other => other,
+                            SessionEnd::Clean | SessionEnd::LauncherExitedOk => {
+                                SessionEnd::LauncherExitedOk
+                            }
+                            SessionEnd::LauncherEndedOtherwise { detail } => {
+                                SessionEnd::LauncherEndedOtherwise { detail }
+                            }
+                            other => SessionEnd::LauncherEndedOtherwise {
+                                detail: other.label(),
+                            },
                         });
                         record.notes.push(
                             "the emulator kept running after its launcher finished; EmuWiz saw that it has now stopped, not how"
@@ -858,10 +1107,12 @@ pub fn preceding_session(
         (_, Some(SessionEnd::Clean)) => PrecedingSession::unknown(
             "the last session ended normally, but the saves were not compared afterwards",
         ),
-        (_, Some(SessionEnd::LauncherExitedOk)) => PrecedingSession::ExitNotSeen {
-            session_id: id,
-            detail: "only the launcher's exit was seen, not the emulator's own".to_string(),
-        },
+        (_, Some(SessionEnd::LauncherExitedOk | SessionEnd::LauncherEndedOtherwise { .. })) => {
+            PrecedingSession::ExitNotSeen {
+                session_id: id,
+                detail: "only the launcher's end was seen, not the emulator's own".to_string(),
+            }
+        }
         (_, Some(SessionEnd::ExitCode { code })) => PrecedingSession::ErrorExit {
             session_id: id,
             code: *code,

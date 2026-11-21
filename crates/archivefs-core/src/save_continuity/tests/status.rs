@@ -5,7 +5,9 @@ use super::super::model::{AssociationStrength, DiscoveredSave, InUse, SaveFormat
 use super::super::session::*;
 use super::super::status::*;
 use super::super::store::*;
-use super::super::workflow::{advisory_of, status_lines, structure_of, timelines, warning_of};
+use super::super::workflow::{
+    advisory_of, status_lines, structure_of, timelines, uncertainty_of, warning_of,
+};
 use super::*;
 use std::cell::Cell;
 
@@ -315,7 +317,10 @@ fn an_exit_emuwiz_did_not_see_is_a_warning_not_a_clean_exit() {
         matches!(unseen, PrecedingSession::ExitNotSeen { .. }),
         "{unseen:?}"
     );
-    assert_eq!(unseen.advisory(), Advisory::Warning);
+    // Not knowing how it ended is uncertainty, not a crash warning.
+    assert_eq!(unseen.advisory(), Advisory::Caution);
+    assert_eq!(unseen.warning(), None);
+    assert!(unseen.uncertainty().unwrap().starts_with("Not known"));
 
     // Only a launcher's exit was seen (flatpak run): its 0 is not the emulator's.
     let world = World::new();
@@ -428,7 +433,12 @@ fn stale_session_information_is_never_used() {
     let none = world.preceding("PCSX2", "native", &v1);
     assert!(matches!(none, PrecedingSession::Unknown { .. }));
     assert_eq!(none.advisory(), Advisory::Caution);
-    assert!(none.warning().unwrap().contains("nothing rules one out"));
+    assert_eq!(none.warning(), None);
+    assert!(
+        none.uncertainty()
+            .unwrap()
+            .contains("nothing rules one out")
+    );
 }
 
 #[test]
@@ -593,7 +603,8 @@ fn a_record_written_before_these_fields_existed_still_loads_and_claims_nothing()
     let loaded = bench.store.get(&old.snapshot_id).unwrap();
     assert!(!loaded.body.clean_recovery_point());
     assert_eq!(advisory_of(&loaded), Advisory::Caution);
-    assert!(warning_of(&loaded).unwrap().contains("not recorded"));
+    assert_eq!(warning_of(&loaded), None);
+    assert!(uncertainty_of(&loaded).unwrap().contains("not recorded"));
 }
 
 fn found(format: SaveFormat, integrity: &[&str], unsupported: &[&str]) -> DiscoveredSave {

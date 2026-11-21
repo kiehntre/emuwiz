@@ -3,6 +3,7 @@
 
 mod device;
 mod discover;
+mod exit_tracking;
 mod observer;
 mod session;
 mod status;
