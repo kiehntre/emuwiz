@@ -37,7 +37,7 @@ use crate::safe_read::TrustedRoots;
 const MAX_NAME_BYTES: usize = 200;
 
 /// Sidecar types whose text names other game files.
-const REFERENCING_EXTENSIONS: [&str; 4] = ["cue", "m3u", "m3u8", "gdi"];
+pub(crate) const REFERENCING_EXTENSIONS: [&str; 4] = ["cue", "m3u", "m3u8", "gdi"];
 
 /// A reviewed one-game rename, ready to be confirmed.
 #[derive(Debug, Clone)]
@@ -593,7 +593,7 @@ const RETROARCH_RUNNING: &str = "RetroArch is running, so this game's saves cann
 /// below it (sorted by core), or anything named after the game in a
 /// configured save folder and its by-core / by-folder subfolders. Sorted.
 /// A folder that cannot be checked refuses rather than being skipped.
-fn find_retroarch_saves(
+pub(crate) fn find_retroarch_saves(
     source: &Path,
     locations: &RetroArchSaveLocations,
 ) -> Result<Vec<PathBuf>, String> {
@@ -909,7 +909,7 @@ fn is_save_suffix(rest: &str) -> bool {
 
 /// Arcade romsets must keep their set names: MAME and FBNeo find a game by
 /// its zip name, so renaming one stops it launching.
-fn refuse_arcade_set(
+pub(crate) fn refuse_arcade_set(
     database: &crate::Database,
     source: &Path,
     source_root: &Path,
@@ -932,7 +932,10 @@ fn refuse_arcade_set(
 }
 
 /// The enabled library source folder that holds `source` (longest match).
-fn owning_source_root(database: &crate::Database, source: &Path) -> Result<PathBuf, String> {
+pub(crate) fn owning_source_root(
+    database: &crate::Database,
+    source: &Path,
+) -> Result<PathBuf, String> {
     let folders = database
         .list_source_folders()
         .map_err(|error| format!("could not read the library folders: {error}"))?;
@@ -965,13 +968,23 @@ fn referencing_sidecar(source: &Path, source_root: &Path) -> Result<Option<PathB
 }
 
 fn sidecar_in(folder: &Path, source: &Path, name: &str) -> Result<Option<PathBuf>, String> {
+    Ok(folder_sidecars(folder)?
+        .into_iter()
+        .find(|(path, text)| path != source && text.contains(name))
+        .map(|(path, _)| path))
+}
+
+/// Every `.cue`/`.m3u`/`.m3u8`/`.gdi` directly in `folder`, with its text in
+/// lower case. Sidecars are small text files; one over 1 MiB is not a
+/// sidecar and is left out. A sidecar that cannot be read refuses: it may
+/// name the file. Shared by the one-game Rename and the bulk rename guard,
+/// which reads each folder once.
+pub(crate) fn folder_sidecars(folder: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     let entries = std::fs::read_dir(folder)
         .map_err(|error| format!("could not read {}: {error}", folder.display()))?;
+    let mut found = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path == source {
-            continue;
-        }
         let referencing = path
             .extension()
             .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
@@ -979,7 +992,6 @@ fn sidecar_in(folder: &Path, source: &Path, name: &str) -> Result<Option<PathBuf
         if !referencing || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
             continue;
         }
-        // Sidecars are small text files; a huge one is not a sidecar.
         if entry.metadata().is_ok_and(|meta| meta.len() > 1 << 20) {
             continue;
         }
@@ -989,12 +1001,7 @@ fn sidecar_in(folder: &Path, source: &Path, name: &str) -> Result<Option<PathBuf
                 path.display()
             )
         })?;
-        if String::from_utf8_lossy(&bytes)
-            .to_lowercase()
-            .contains(name)
-        {
-            return Ok(Some(path));
-        }
+        found.push((path, String::from_utf8_lossy(&bytes).to_lowercase()));
     }
-    Ok(None)
+    Ok(found)
 }

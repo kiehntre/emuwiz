@@ -34,12 +34,15 @@
 pub mod game_rename;
 pub mod model;
 pub mod plan;
+pub mod rename_guard;
 pub mod transaction;
 
 #[cfg(test)]
 mod game_rename_tests;
 #[cfg(test)]
 mod linked_library_tests;
+#[cfg(test)]
+mod rename_guard_tests;
 #[cfg(test)]
 mod tests;
 

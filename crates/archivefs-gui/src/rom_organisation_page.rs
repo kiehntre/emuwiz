@@ -14,6 +14,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use archivefs_core::dat::rom_organisation::game_rename::RetroArchSaveLocations;
+use archivefs_core::dat::rom_organisation::rename_guard as bulk_guard;
 use archivefs_core::dat::rom_organisation::*;
 use archivefs_core::identity_source::cache::{IdentityCacheLocation, load_cache};
 use archivefs_core::identity_source::model::IdentityProvider;
@@ -657,6 +659,31 @@ impl RomOrganisationPageState {
         ) else {
             return false;
         };
+        // A bulk rename or move refuses what the one-game Rename refuses
+        // (arcade sets, files a cue sheet or playlist names, games with
+        // RetroArch saves): those rows become Blocked with the reason.
+        if bulk_guard::mode_changes_real_files(plan.mode) && plan.suggested().next().is_some() {
+            progress.phase("Checking disc lists, arcade sets and saves", "steps", None);
+            progress.flush();
+            let guarded = default_database_path()
+                .and_then(Database::open_read_only)
+                .map_err(|e| e.to_string())
+                .map(|database| {
+                    bulk_guard::guard_bulk_rename_plan(
+                        &database,
+                        &mut plan,
+                        &RetroArchSaveLocations::discover(),
+                    )
+                });
+            if let Err(reason) = guarded {
+                self.error = Some(reason);
+                self.plan = None;
+                return true;
+            }
+            if stop() {
+                return false;
+            }
+        }
         if plan.suggested().next().is_some() {
             let catalogue = default_database_path()
                 .and_then(Database::open_read_only)
@@ -755,6 +782,17 @@ impl RomOrganisationPageState {
             plan,
             database.path(),
             &canonical_name_for,
+        ) {
+            self.error = Some(reason);
+            return;
+        }
+        // The same refusals again, read fresh: a cue sheet, playlist or save
+        // that appeared since the preview refuses the whole Apply.
+        if let Err(reason) = bulk_guard::refuse_if_newly_blocked(
+            &database,
+            plan,
+            &self.approved,
+            &RetroArchSaveLocations::discover(),
         ) {
             self.error = Some(reason);
             return;
@@ -1495,6 +1533,13 @@ pub(crate) fn validate_r2_selection(
     let names = NameResolver::load();
     let database = default_database_path().map_err(|e| e.to_string())?;
     revalidate_organisation_plan(plan, &database, &|p| names.choose(p).name)?;
+    let library = Database::open_read_only(&database).map_err(|e| e.to_string())?;
+    bulk_guard::refuse_if_newly_blocked(
+        &library,
+        plan,
+        approved,
+        &RetroArchSaveLocations::discover(),
+    )?;
     let tx = build_organisation_transaction(plan, approved, plan.generation)?;
     let expected = plan
         .suggested()
@@ -1621,6 +1666,28 @@ impl NameChoice {
             NameSource::Romm => "RomM".to_string(),
             NameSource::Original => "current file name (no verified name)".to_string(),
         }
+    }
+
+    /// How far the proposed name can be trusted: only a verified catalogue
+    /// match is verified; a RomM title is a hint.
+    pub(crate) fn confidence_label(&self) -> &'static str {
+        match self.source {
+            NameSource::VerifiedDat { .. } => "verified (exact catalogue match)",
+            NameSource::Romm => "hint (RomM title, not verified)",
+            NameSource::Original => "no match (name unchanged)",
+        }
+    }
+}
+
+/// Whether a preview row can be undone. Only rows that change a file are
+/// journalled; every other row leaves the file exactly as it is.
+pub(crate) fn undo_availability(status: OrganisationStatus) -> &'static str {
+    match status {
+        OrganisationStatus::Suggested => "Undo: yes, from History after Apply",
+        OrganisationStatus::AlreadyOrganised => "Undo: not needed, the name is already right",
+        OrganisationStatus::Conflict
+        | OrganisationStatus::Blocked
+        | OrganisationStatus::Unsupported => "Undo: not needed, this file will not be changed",
     }
 }
 
@@ -2608,6 +2675,7 @@ fn show_library_destination_cards(ui: &mut egui::Ui, state: &mut RomOrganisation
 fn show_name_choice(ui: &mut egui::Ui, choice: Option<&NameChoice>) {
     let Some(choice) = choice else { return };
     ui.label(format!("Name from: {}", choice.source_label()));
+    ui.label(format!("Confidence: {}", choice.confidence_label()));
     if let Some(note) = &choice.note {
         ui.label(egui::RichText::new(note).color(theme::muted(ui)).small());
     }
@@ -2787,7 +2855,10 @@ fn show_plan(
                     }
                 }
                 let quick_mame = quick_only
-                    && entry.status == OrganisationStatus::Suggested
+                    && matches!(
+                        entry.status,
+                        OrganisationStatus::Suggested | OrganisationStatus::Blocked
+                    )
                     && entry.platform_display_name.eq_ignore_ascii_case("Arcade");
                 widgets::status_badge(
                     ui,
@@ -2840,6 +2911,7 @@ fn show_plan(
                             ui.label(format!("Identity: Verified by {}", entry.platform_source));
                         }
                         ui.label(format!("Status: {}", entry.status.label()));
+                        ui.label(undo_availability(entry.status));
                         if let Some(reason) = &entry.reason {
                             ui.label(
                                 egui::RichText::new(reason)
@@ -2891,6 +2963,7 @@ fn show_plan(
                             OrganisationMode::OrganiseSymlinkOnly => "Action: Move existing link",
                             OrganisationMode::BuildLinkedLibrary => "Action: Create link",
                         });
+                        ui.label(undo_availability(entry.status));
                         if let Some(reason) = &entry.reason {
                             ui.label(
                                 egui::RichText::new(reason)
@@ -3310,6 +3383,46 @@ mod tests {
             .shapes
             .iter()
             .any(|clipped| shape_contains(&clipped.shape, needle))
+    }
+
+    #[test]
+    fn every_row_says_whether_undo_is_available() {
+        assert!(undo_availability(OrganisationStatus::Suggested).contains("yes"));
+        for status in [
+            OrganisationStatus::AlreadyOrganised,
+            OrganisationStatus::Conflict,
+            OrganisationStatus::Blocked,
+            OrganisationStatus::Unsupported,
+        ] {
+            assert!(
+                undo_availability(status).contains("not needed"),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_catalogue_match_reads_as_verified() {
+        let choice = |source| NameChoice {
+            name: None,
+            source,
+            note: None,
+            skipped_archive: false,
+        };
+        let dat = choice(NameSource::VerifiedDat {
+            catalogue: "No-Intro".into(),
+        });
+        assert!(dat.confidence_label().starts_with("verified"));
+        assert!(
+            choice(NameSource::Romm)
+                .confidence_label()
+                .starts_with("hint")
+        );
+        assert!(
+            choice(NameSource::Original)
+                .confidence_label()
+                .starts_with("no match")
+        );
     }
 
     #[test]
