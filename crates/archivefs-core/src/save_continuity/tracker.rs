@@ -230,7 +230,13 @@ impl LaunchTracker {
         self.journal.keep_saves(session_id, &its_saves)
     }
 
-    /// A moment into a launch: picks up what a launcher has started.
+    /// Picks up what a launcher has started, and notes that the emulator is
+    /// still alive. Call a moment into a launch **and then regularly while
+    /// it runs**: a crash record can be tied to the emulator only if it was
+    /// seen alive within `CRASH_RECORD_WINDOW_SECONDS` (ten minutes) of
+    /// being found gone, and that time is stored at most once a minute, so
+    /// the interval between calls has to stay well under nine minutes.
+    /// Cheap enough for once every few seconds; never fails a launch.
     pub fn look_again(&self, session_id: &str) -> Result<SessionRecord, ContinuityError> {
         self.journal.observe_running(session_id, &ProcFs)
     }

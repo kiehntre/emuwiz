@@ -161,11 +161,13 @@ A record counts only when all of this holds:
 - its host process id is the one tracked for the emulator of this launch;
 - its time is inside that process's tracked lifetime (a few seconds' slack);
 - the process was last seen alive no more than ten minutes before it was
-  found gone. While EmuWiz is running it looks regularly and keeps that time
-  current (written at least once a minute), so this only bites when nobody
-  was looking;
-- where the system can say, fewer than half of all process ids were issued
-  since then (so the id cannot have come round to another process).
+  found gone. That time is stored whenever a caller looks (at most once a
+  minute). **Nothing calls it regularly yet**: until Blue's launch path does
+  (a wiring condition: look at least every few minutes while a game runs),
+  a session longer than ten minutes gets "unavailable";
+- where the system can say, the machine has not restarted since, and fewer
+  than half of all process ids were issued since then, which makes it
+  unlikely (not impossible) that the id has come round to another process.
 
 Everything unclear is "unavailable", which is treated as not known and can
 never fail a launch or a snapshot: another crash handler (most other
@@ -177,6 +179,14 @@ that repeats when the clocks go back, a time zone set for EmuWiz alone (`TZ`),
 an entry inside another program's quoted command line, or a kernel that
 does not wait for its handler (`core_pipe_limit` 0 or unreadable: "no record"
 then establishes nothing).
+
+A limit that cannot be closed by reading the log: the handler writes each
+crashed program's command line into the log as it was given, line breaks
+included. A local program that crafts its arguments can therefore write a
+line that looks like the handler's own. The guard catches only a quotation
+left open; one that closes the quotation itself is not detected. The effect
+would be a false "abnormal termination" label on a snapshot, never a change
+to a save.
 
 What a record cannot say: which signal, why, or anything about the game or
 its save. What its absence cannot say: that the emulator closed normally. A
@@ -278,7 +288,7 @@ slice does.
 | 1 | Snapshot store, recovery, continuation copy, device model, CLI (at 035f56a2) | PASS WITH CONDITIONS: no path overwrites or deletes an original save; eight conditions, all addressed |
 | 2 | Process identity, safe point, exit tracking (at 035f56a2) | PASS WITH CONDITIONS: no torn file published as a safe point while a lease is held; one latent blocker (a wrapper's exit 0 read as clean) and five should-fix, all addressed |
 | 3 | Delta review of the fixes (cdc75795) | PASS WITH CONDITIONS: earlier conditions closed; four further points, addressed |
-| 4 | Delta review of cdc75795..4fef4825 (direct signals, crash records, retention, diagnostic) | PASS WITH CONDITIONS: no blocker; five should-fix and six notes. Addressed: last-seen time kept current, daylight-saving and time-zone ambiguity, CLI crash source, wording when saves were not compared, document overclaims, bounded reading, forged-line guard, id-reuse guard, old manifest value still readable, override caveat. Left as it was: a compiled wrapper named like an emulator is taken for the emulator (older code, listed below) |
+| 4 | Delta review of cdc75795..4fef4825 (direct signals, crash records, retention, diagnostic) | PASS WITH CONDITIONS: no blocker; five should-fix and six notes. Addressed: last-seen time kept current, daylight-saving and time-zone ambiguity, CLI crash source, wording when saves were not compared, document overclaims, bounded reading, a partial forged-line guard, an id-reuse heuristic, old manifest value still readable, override caveat. Left as it was: a compiled wrapper named like an emulator is taken for the emulator (older code, listed below) |
 
 Remaining strict false positives the reviewers listed (they can only refuse a
 snapshot, never permit one): this repository's own test binaries named

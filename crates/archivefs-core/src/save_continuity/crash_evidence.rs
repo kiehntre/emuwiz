@@ -156,7 +156,8 @@ fn local_to_unix(time: &LocalTime) -> Option<i64> {
     // The handler runs as root from the kernel and writes the machine's
     // local time. If this process was given a time zone of its own, its
     // idea of local time may differ: the times cannot then be compared.
-    if std::env::var_os("TZ").is_some_and(|zone| !zone.is_empty()) {
+    // (Set at all: an empty value means UTC to the C library.)
+    if std::env::var_os("TZ").is_some() {
         return None;
     }
     one_reading(local_as(time, 0), local_as(time, 1))

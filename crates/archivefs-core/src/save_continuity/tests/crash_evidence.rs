@@ -322,7 +322,11 @@ struct Proc {
 }
 
 #[derive(Default)]
-struct Machine(RefCell<BTreeMap<u32, Proc>>, Cell<Option<(u64, u64)>>);
+struct Machine(
+    RefCell<BTreeMap<u32, Proc>>,
+    Cell<Option<(u64, u64)>>,
+    Cell<Option<&'static str>>,
+);
 
 impl Machine {
     fn start(
@@ -354,6 +358,9 @@ impl Machine {
 impl ProcessTable for Machine {
     fn process_ids_issued(&self) -> Option<(u64, u64)> {
         self.1.get()
+    }
+    fn boot_id(&self) -> Option<String> {
+        self.2.get().map(str::to_string)
     }
     fn start_ticks(&self, pid: u32) -> Option<u64> {
         self.0.borrow().get(&pid).map(|p| p.ticks)
@@ -899,7 +906,8 @@ fn a_wall_clock_time_is_used_only_when_exactly_one_reading_of_it_is_real() {
     // An ordinary time: one reading.
     assert_eq!(one_reading(Some(100), None), Some(100));
     assert_eq!(one_reading(None, Some(100)), Some(100));
-    // A zone without daylight saving: both readings agree.
+    // (Cannot happen with a real clock, where one instant has one reading;
+    // kept so that two agreeing answers are not thrown away.)
     assert_eq!(one_reading(Some(100), Some(100)), Some(100));
     // The hour that repeats when the clocks go back: two instants an hour
     // apart, and the log does not say which. Not placed.
@@ -913,7 +921,8 @@ fn the_real_conversion_agrees_with_the_systems_own_clock_or_declines() {
     // Take real instants, ask the C library for their local wall-clock time
     // (what the handler writes), and convert back.
     let now = super::super::now_unix();
-    let zone_set = std::env::var_os("TZ").is_some_and(|zone| !zone.is_empty());
+    let zone_set = std::env::var_os("TZ").is_some();
+    let mut placed = 0;
     for instant in [now, now - 86_400 * 30, now - 86_400 * 200, T0] {
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         let clock = instant as libc::time_t;
@@ -928,11 +937,21 @@ fn the_real_conversion_agrees_with_the_systems_own_clock_or_declines() {
         };
         match local_to_unix_for_tests(&local) {
             // Never a different instant.
-            Some(found) => assert_eq!(found, instant, "{local:?}"),
-            // Declining is allowed (a repeated hour, or TZ set for this
-            // process); a wrong answer is not.
-            None => assert!(zone_set || tm.tm_hour <= 3, "{local:?}"),
+            Some(found) => {
+                assert_eq!(found, instant, "{local:?}");
+                placed += 1;
+            }
+            // Declining is always allowed (a repeated hour; TZ set for this
+            // process). A wrong answer never is.
+            None => {}
         }
+    }
+    // With TZ set nothing is placed at all; without it, four instants in
+    // different seasons cannot all fall in a repeated hour.
+    if zone_set {
+        assert_eq!(placed, 0);
+    } else {
+        assert!(placed >= 3, "{placed}");
     }
     // Dates that do not exist are refused, not normalised into real ones.
     for (month, day, hour) in [(2, 30, 12), (13, 1, 12), (11, 31, 12), (11, 20, 25)] {
@@ -987,7 +1006,12 @@ fn an_oversized_log_or_one_with_binary_bytes_is_handled_without_guessing() {
     let files = Files::new(APPORT, None, Some(&(other(0) + &crashed(250, 4242))));
     let path = files.dir.path().join("apport.log");
     let mut big = fs::read(&path).unwrap();
-    big.resize(8 * 1024 * 1024 + 1, b'\n');
+    // Exactly at the limit it is still read...
+    big.resize(8 * 1024 * 1024, b'\n');
+    fs::write(&path, &big).unwrap();
+    assert!(files.source().lookup(&emulator()).confirmed());
+    // ...and one byte more is not.
+    big.push(b'\n');
     fs::write(&path, &big).unwrap();
     assert!(matches!(
         files.source().lookup(&emulator()),
@@ -1267,4 +1291,67 @@ fn a_snapshot_status_written_before_the_rename_can_still_be_read() {
             saves_compared_afterwards: true
         }
     );
+}
+
+// ---- Fifth review (2026-11-21) ----
+
+#[test]
+fn after_a_restart_of_the_machine_a_process_id_means_nothing() {
+    type Count = Option<(u64, u64)>;
+    type Boot = Option<&'static str>;
+    let settle = |before: Count, after: Count, boots: (Boot, Boot)| {
+        let case = flatpak("PCSX2", "pcsx2-qt", "/app/bin/pcsx2-qt", recorded());
+        case.machine.1.set(before);
+        case.machine.2.set(boots.0);
+        case.look();
+        case.machine.exit(&[102, 101, 100]);
+        case.machine.1.set(after);
+        case.machine.2.set(boots.1);
+        let settled = case
+            .journal
+            .reconcile(&case.machine, super::super::now_unix() + 120);
+        (case.asked.borrow().len(), settled[0].clone())
+    };
+    const MAX: u64 = 4_194_304;
+    // The count of started processes went backwards: a restart.
+    let (asked, record) = settle(Some((50_000, MAX)), Some((900, MAX)), (None, None));
+    assert_eq!(asked, 0);
+    assert_eq!(record.state, SessionState::EndNotSeen);
+    assert!(matches!(
+        record.crash_evidence,
+        Some(CrashEvidence::Unavailable { .. })
+    ));
+    // A restart after which the count has already passed the old one: only
+    // the boot identifier shows it.
+    let boots = (Some("boot-a"), Some("boot-b"));
+    let (asked, record) = settle(Some((900, MAX)), Some((2_000, MAX)), boots);
+    assert_eq!(asked, 0);
+    assert!(matches!(
+        record.crash_evidence,
+        Some(CrashEvidence::Unavailable { .. })
+    ));
+    // The same boot, a few processes later: asked as usual.
+    let boots = (Some("boot-a"), Some("boot-a"));
+    let (asked, record) = settle(Some((900, MAX)), Some((2_000, MAX)), boots);
+    assert_eq!(asked, 1);
+    assert!(matches!(
+        record.end,
+        Some(SessionEnd::FatalTerminationRecorded { .. })
+    ));
+}
+
+#[test]
+fn a_look_that_cannot_store_the_still_alive_time_is_not_an_error() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let case = flatpak("PCSX2", "pcsx2-qt", "/app/bin/pcsx2-qt", recorded());
+    case.look();
+    age(&case, 1800);
+    let dir = case._dir.path().join("sessions");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let looked = case.journal.observe_running(&case.session, &case.machine);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(looked.is_ok(), "{looked:?}");
 }

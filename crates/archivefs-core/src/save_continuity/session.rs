@@ -232,6 +232,9 @@ pub struct SessionRecord {
     /// emulator was last seen alive (see `ProcessTable::process_ids_issued`).
     #[serde(default)]
     pub sandbox_main_reuse_mark: Option<(u64, u64)>,
+    /// Which boot of the machine that was (`ProcessTable::boot_id`).
+    #[serde(default)]
+    pub sandbox_main_boot: Option<String>,
     /// What the system's own crash records say about that process, when
     /// they were consulted. Independent of the exit status.
     #[serde(default)]
@@ -336,9 +339,16 @@ pub trait ProcessTable {
     }
     /// How many processes the system has started since boot, and the
     /// largest process id it uses before starting again from the bottom.
-    /// An id cannot have been given to a second process until that many
-    /// more have been started. `None` when this table cannot say.
+    /// An id is unlikely to have been given to a second process until
+    /// nearly that many more have been started. This is a heuristic, not a
+    /// proof: the count covers successful starts only, and a program with
+    /// the right to do so can ask for a particular id. `None` when this
+    /// table cannot say.
     fn process_ids_issued(&self) -> Option<(u64, u64)> {
+        None
+    }
+    /// An identifier that changes every time the machine starts.
+    fn boot_id(&self) -> Option<String> {
         None
     }
 }
@@ -518,6 +528,10 @@ fn flatpak_scope(cgroup: &str) -> Option<String> {
 pub struct ProcFs;
 
 impl ProcessTable for ProcFs {
+    fn boot_id(&self) -> Option<String> {
+        let id = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        Some(id.trim().to_string()).filter(|id| !id.is_empty())
+    }
     fn process_ids_issued(&self) -> Option<(u64, u64)> {
         let stat = fs::read_to_string("/proc/stat").ok()?;
         let issued = stat
@@ -680,6 +694,7 @@ fn refresh(record: &mut SessionRecord, processes: &dyn ProcessTable) {
     {
         record.sandbox_main_last_alive_unix = Some(now_unix());
         record.sandbox_main_reuse_mark = processes.process_ids_issued();
+        record.sandbox_main_boot = processes.boot_id();
     }
 }
 
@@ -728,7 +743,13 @@ fn consult_crash_source(
         // Ids are handed out in a circle, skipping those in use, so coming
         // back to one takes nearly a full round. Half a round is already
         // treated as too many.
-        (Some((then, _)), Some((issued, limit))) => issued.saturating_sub(then) >= limit / 2,
+        // A count that went backwards means the machine restarted: every
+        // id is being handed out afresh.
+        (Some((then, _)), Some((issued, limit))) => issued < then || issued - then >= limit / 2,
+        _ => false,
+    } || match (&record.sandbox_main_boot, processes.boot_id()) {
+        // A different boot: the id belongs to whatever has it now.
+        (Some(then), Some(now)) => *then != now,
         _ => false,
     };
     let evidence = if now - last_alive > CRASH_RECORD_WINDOW_SECONDS || now < last_alive {
@@ -875,6 +896,7 @@ impl SessionJournal {
             exit_evidence: None,
             sandbox_main_last_alive_unix: None,
             sandbox_main_reuse_mark: None,
+            sandbox_main_boot: None,
             crash_evidence: None,
             end: None,
             play_evidence: PlayEvidence::None,
@@ -994,10 +1016,12 @@ impl SessionJournal {
             let before = (record.processes.len(), record.app_scope.clone());
             let seen_before = record.sandbox_main_last_alive_unix;
             refresh(&mut record, processes);
-            if before != (record.processes.len(), record.app_scope.clone())
-                || last_alive_moved_on(seen_before, &record)
-            {
+            if before != (record.processes.len(), record.app_scope.clone()) {
                 self.write(&record)?;
+            } else if last_alive_moved_on(seen_before, &record) {
+                // Only the "still alive" time moved on. Failing to store it
+                // (a full disk) must not turn a look into an error.
+                let _ = self.write(&record);
             }
         }
         Ok(record)
