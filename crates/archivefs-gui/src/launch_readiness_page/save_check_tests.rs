@@ -6,13 +6,13 @@ use super::tests::spawn_test_process;
 use super::*;
 use std::time::{Duration, Instant};
 
-const SRAM_FAILED: &str = include_str!(
+pub(super) const SRAM_FAILED: &str = include_str!(
     "../../../archivefs-core/tests/fixtures/daedalus/retroarch-1.21.0/save-dir-read-only.log"
 );
 const SRAM_FAILED_QUIET: &str = include_str!(
     "../../../archivefs-core/tests/fixtures/daedalus/retroarch-1.21.0/save-dir-read-only-quiet.stderr"
 );
-const SRAM_OK: &str =
+pub(super) const SRAM_OK: &str =
     include_str!("../../../archivefs-core/tests/fixtures/daedalus/retroarch-1.21.0/save-ok.log");
 const STATE_FAILED: &str = include_str!(
     "../../../archivefs-core/tests/fixtures/daedalus/retroarch-1.21.0/state-dir-read-only.log"
@@ -62,7 +62,7 @@ fn kept_output(state: &mut RetroArchLaunchState) -> usize {
     }
 }
 
-fn rendered(display: &RetroArchLaunchDisplay) -> String {
+pub(super) fn rendered(display: &RetroArchLaunchDisplay) -> String {
     fn collect(shape: &egui::Shape, text: &mut String) {
         match shape {
             egui::Shape::Text(shape) => {
