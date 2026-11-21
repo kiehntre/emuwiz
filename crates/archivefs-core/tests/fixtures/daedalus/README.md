@@ -20,6 +20,8 @@ disposable settings and the bundled `2048` and `gambatte` cores:
 | `save-dir-read-only.log` | save folder not writable | status 0 |
 | `save-dir-read-only-quiet.stderr` | the same without `--verbose`: nothing is printed about the failed save | status 0 |
 | `save-ok.log` | save folder writable; the save is written (captured 2026-11-14) | status 0 |
+| `state-dir-read-only.log` | `gambatte`, automatic save state on exit, save-state folder `ro/states` not writable, battery-save folder `ro/saves` writable; the state is not written and the battery save is (captured 2026-11-20 with a synthetic test ROM, `--max-frames`) | status 0 |
+| `state-auto-save-ok.log` | the same with both folders writable (captured 2026-11-20) | status 0 |
 | `silent-core-audio.log` | core that produces no sound | status 0 |
 | `no-display.stderr` | `DISPLAY` unset | SIGABRT |
 

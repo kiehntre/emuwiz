@@ -34,6 +34,12 @@
 //! captured from RetroArch 1.21.0. Save states, files a core or an emulator
 //! writes by itself, and every standalone emulator are not monitored.
 //!
+//! One save-state message is still recognised: RetroArch 1.21.0 prints a
+//! line when its automatic save state on exit cannot be written (captured
+//! 2026-11-20). That failure is reported, as a save state. It does not make
+//! save states monitored: a state saved by hand during play prints nothing
+//! about how the write went, so its failure cannot be seen.
+//!
 //! Coverage is never inferred. That an emulator is RetroArch does not mean
 //! its save states are watched; that a launch exited with status 0 does not
 //! mean a save was written. [`SaveWriteStatus`] therefore keeps three
@@ -46,7 +52,22 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::evidence::{EvidenceArea, EvidenceSet, Fact, LogMeaning, PathPresence, PathRole, Trust};
+use super::evidence::{
+    EvidenceArea, EvidenceSet, Fact, LogEvent, LogMeaning, PathPresence, PathRole, Trust,
+};
+
+/// Failed-write signatures that are about save states rather than battery
+/// saves.
+const SAVE_STATE_FAILURE_SIGNATURES: &[&str] = &[super::retroarch::STATE_AUTO_SAVE_FAILED];
+
+/// Which kind of save a recognised failed write was about.
+fn failed_mechanism(event: &LogEvent) -> SaveMechanism {
+    if SAVE_STATE_FAILURE_SIGNATURES.contains(&event.signature.as_str()) {
+        SaveMechanism::SaveState
+    } else {
+        SaveMechanism::BatterySave
+    }
+}
 
 /// How sure it is that a save was not written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,8 +248,31 @@ pub fn assess(evidence: &EvidenceSet) -> SaveWriteAssessment {
             .count();
         u32::try_from(events).unwrap_or(u32::MAX)
     };
-    let failed = count(LogMeaning::SaveWriteFailed);
-    let folder = observed()
+    let failures: Vec<SaveMechanism> = observed()
+        .filter_map(|item| match &item.fact {
+            Fact::LogEvent(event) if event.meaning == LogMeaning::SaveWriteFailed => {
+                Some(failed_mechanism(event))
+            }
+            _ => None,
+        })
+        .collect();
+    let battery_failed = failures.contains(&SaveMechanism::BatterySave);
+    // A failed battery save is named first: it is the in-game progress.
+    // One problem names one mechanism, and its count is that mechanism's,
+    // so a failed save state beside it is not folded into its wording.
+    let reported_mechanism = if !battery_failed && !failures.is_empty() {
+        SaveMechanism::SaveState
+    } else {
+        SaveMechanism::BatterySave
+    };
+    let failed = u32::try_from(
+        failures
+            .iter()
+            .filter(|mechanism| **mechanism == reported_mechanism)
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let checked_folder = observed()
         .filter(|item| item.area == EvidenceArea::Filesystem)
         .find_map(|item| match &item.fact {
             Fact::PathAccess(access) if access.role == PathRole::SaveDirectory => {
@@ -242,6 +286,15 @@ pub fn assess(evidence: &EvidenceSet) -> SaveWriteAssessment {
             _ => None,
         })
         .unwrap_or(SaveFolderFinding::NotKnown);
+    // The folder looked at is the battery-save folder. It says nothing
+    // about a save state, which RetroArch keeps elsewhere. A risk to the
+    // battery folder found beside a failed save state is then not part of
+    // this problem; the diagnosis still reports the folder itself.
+    let folder = if failed > 0 && !battery_failed {
+        SaveFolderFinding::NotKnown
+    } else {
+        checked_folder
+    };
     let folder_unusable = matches!(
         folder,
         SaveFolderFinding::NotWritable | SaveFolderFinding::Missing
@@ -288,7 +341,7 @@ pub fn assess(evidence: &EvidenceSet) -> SaveWriteAssessment {
         .collect();
     let problem = |standing| SaveWriteProblem {
         standing,
-        mechanism: SaveMechanism::BatterySave,
+        mechanism: reported_mechanism,
         times: failed,
         folder,
         recovery_copy_reported: count(LogMeaning::SaveRecoveryWritten) > 0,
@@ -329,12 +382,14 @@ impl SaveWriteProblem {
 
     /// What was found, in plain words. `emulator` is a display name.
     pub fn explanation(&self, emulator: &str) -> String {
+        let what = match self.mechanism {
+            SaveMechanism::SaveState => "the save state it makes automatically on exit",
+            SaveMechanism::BatterySave | SaveMechanism::EmulatorOwnedFiles => "this game's save",
+        };
         let said = match self.times {
             0 => String::new(),
-            1 => format!("{emulator} reported that it could not write this game's save."),
-            times => format!(
-                "{emulator} reported {times} times that it could not write this game's save."
-            ),
+            1 => format!("{emulator} reported that it could not write {what}."),
+            times => format!("{emulator} reported {times} times that it could not write {what}."),
         };
         let folder = match self.folder {
             SaveFolderFinding::NotWritable => {
@@ -358,6 +413,11 @@ impl SaveWriteProblem {
 
     /// What a person can check. EmuWiz changes none of it.
     pub fn next_step(&self) -> &'static str {
+        if self.mechanism == SaveMechanism::SaveState {
+            return "Check that the save-state folder exists and can be written to, and that \
+                    its drive has free space. In-game progress kept in battery saves is \
+                    written separately. EmuWiz has not changed anything.";
+        }
         match self.folder {
             SaveFolderFinding::NotWritable => {
                 "Check the permissions of the save folder, and that the drive it is on is \

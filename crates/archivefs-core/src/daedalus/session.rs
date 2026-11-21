@@ -97,6 +97,34 @@ pub fn diagnose_finished_launch(
     }
 }
 
+/// The save check for a launch whose captured output is about to be let
+/// go of: what the output and the exit status alone say about saves.
+///
+/// It reads no file and looks at no path, so it can run on the interface
+/// thread the moment a launch is seen to end, before the capture is
+/// dropped. It does not check the save folder (the result never says
+/// [`SaveWriteStanding::ConfirmedByCheck`] or
+/// [`SaveWriteStatus::AtRisk`] on its own), and it records nothing.
+/// An exit status of 0 does not make the result any better: a failed save
+/// is printed by emulators that then exit normally.
+///
+/// [`SaveWriteStanding::ConfirmedByCheck`]: saves::SaveWriteStanding::ConfirmedByCheck
+/// [`SaveWriteStatus::AtRisk`]: saves::SaveWriteStatus::AtRisk
+pub fn assess_saves_from_output(
+    emulator: &str,
+    exit: ExitOutcome,
+    output: Option<&[u8]>,
+) -> SaveWriteAssessment {
+    saves::assess(&collect(&LaunchArtefacts {
+        emulator: emulator.to_string(),
+        exit: Some(exit),
+        // Nothing captured is not the same as empty detailed output.
+        stderr: output.filter(|bytes| !bytes.is_empty()).map(<[u8]>::to_vec),
+        provenance: Provenance::ObservedByEmuWiz,
+        ..LaunchArtefacts::default()
+    }))
+}
+
 #[cfg(test)]
 #[path = "session/tests.rs"]
 mod tests;
