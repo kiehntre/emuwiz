@@ -482,11 +482,14 @@ fn play_and_collect(blue: &mut Blue, root: &Path) -> Vec<String> {
 
 fn remembered_choice_child(fixture: &VerifiedGameFixture, root: &Path, zip: &Path, scenario: &str) {
     let copy = crate::emulator_setup::prepared_media::for_game(zip, Some("AmigaCD32"));
+    // The game page's Amiga card answers from the same lookup, on real files.
+    let card = crate::gui_v2::amiga_game::prepared_copy(zip, "AmigaCD32");
     let mut blue = blue_on_launch_page(fixture, zip);
     match scenario {
         // Tick, remember, play twice in one session.
         "remember" => {
             let copy = copy.expect("the parent prepared the copy");
+            assert_eq!(card, crate::gui_v2::amiga_game::PreparedCopy::Ready);
             blue.wait_until(|b| b.shown(TRY_ONCE), 60);
             blue.guard_executables(root);
             blue.click(REMEMBER);
@@ -550,6 +553,7 @@ fn remembered_choice_child(fixture: &VerifiedGameFixture, root: &Path, zip: &Pat
         // remembered entry, the "game not identified" warning, Play works.
         "chosen-launch" => {
             let copy = copy.expect("a prepared copy for the chosen game");
+            assert_eq!(card, crate::gui_v2::amiga_game::PreparedCopy::Ready);
             blue.wait_until(|b| b.shown("Launch recipe"), 60);
             blue.guard_executables(root);
             assert!(
@@ -595,11 +599,13 @@ fn remembered_choice_child(fixture: &VerifiedGameFixture, root: &Path, zip: &Pat
             match blocked {
                 "changed-zip" => {
                     assert!(copy.is_none(), "a changed ZIP has no prepared copy");
+                    assert_eq!(card, crate::gui_v2::amiga_game::PreparedCopy::Missing);
                     assert!(find_by_scrolling(&mut blue, REMEMBERED_NOTE).is_none());
                     assert!(!blue.saw("Launch recipe"), "{:?}", blue.last);
                 }
                 "damaged-copy" => {
                     assert!(copy.is_none(), "a damaged copy is never used");
+                    assert_eq!(card, crate::gui_v2::amiga_game::PreparedCopy::Missing);
                     assert!(!blue.saw("Launch recipe"), "{:?}", blue.last);
                 }
                 "missing-firmware" | "missing-core" => {
