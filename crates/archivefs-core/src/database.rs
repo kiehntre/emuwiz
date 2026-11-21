@@ -4467,6 +4467,27 @@ pub enum PlatformIdentityApplyOutcome {
     UnknownIgnored,
 }
 
+/// Archive ids by stored path; see [`Database::archive_path_lookup`].
+#[derive(Debug, Default)]
+pub struct ArchivePathLookup {
+    ids: HashMap<Vec<u8>, Vec<i64>>,
+}
+
+impl ArchivePathLookup {
+    /// Same answer as [`Database::find_archive_id_by_absolute_path`] at the
+    /// time the lookup was read.
+    pub fn find(&self, path: &Path) -> Result<Option<i64>> {
+        match self.ids.get(path.as_os_str().as_bytes()).map(Vec::as_slice) {
+            None | Some([]) => Ok(None),
+            Some([id]) => Ok(Some(*id)),
+            Some(_) => Err(ArchiveFsError::Database(format!(
+                "{} matches more than one archive row - this indicates a data inconsistency",
+                path.display()
+            ))),
+        }
+    }
+}
+
 /// Counts from enriching a catalogue with one current provider snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct PlatformIdentityEnrichmentSummary {
@@ -5528,6 +5549,8 @@ impl Database {
         generation: u64,
     ) -> Result<PlatformIdentityEnrichmentSummary> {
         let mut summary = PlatformIdentityEnrichmentSummary::default();
+        // Enrichment never adds or moves archives, so one read serves the run.
+        let archives = self.archive_path_lookup()?;
         for record in &cache.records {
             let Some(provider) =
                 crate::platform::identity::PlatformIdentityEvidence::from_romm(record, generation)
@@ -5538,7 +5561,7 @@ impl Database {
             let Some(path) = record.archivefs_path.as_deref() else {
                 continue;
             };
-            let Some(archive_id) = self.find_archive_id_by_absolute_path(path)? else {
+            let Some(archive_id) = archives.find(path)? else {
                 continue;
             };
             summary.archives_matched += 1;
@@ -6232,6 +6255,39 @@ impl Database {
                 path.display()
             ))),
         }
+    }
+
+    /// Every archive's path, read in one pass, for a caller that looks up
+    /// many paths in a row (a RomM import does one per record). Matches
+    /// exactly as [`Self::find_archive_id_by_absolute_path`] does: the same
+    /// bytes stored as a BLOB, and a path two archive rows share is an error
+    /// when it is looked up. `absolute_path_cached` has no index, so one
+    /// lookup per record would scan the whole table each time.
+    pub fn archive_path_lookup(&self) -> Result<ArchivePathLookup> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT id, absolute_path_cached FROM archives")
+            .map_err(|error| db_error("failed to prepare archive path list", error))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|error| db_error("failed to list archive paths", error))?;
+        let mut ids: HashMap<Vec<u8>, Vec<i64>> = HashMap::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| db_error("failed to read archive path list", error))?
+        {
+            // `= ?1` with a BLOB parameter only ever equals a BLOB.
+            if let rusqlite::types::ValueRef::Blob(bytes) = row
+                .get_ref(1)
+                .map_err(|error| db_error("failed to read archive path", error))?
+            {
+                let id: i64 = row
+                    .get(0)
+                    .map_err(|error| db_error("failed to read archive id", error))?;
+                ids.entry(bytes.to_vec()).or_default().push(id);
+            }
+        }
+        Ok(ArchivePathLookup { ids })
     }
 
     /// Sets `platform` as a manual, user-chosen platform assignment for
@@ -19801,6 +19857,121 @@ echo "$out"
             Some(MANUAL_PLATFORM_SOURCE)
         );
         assert_eq!(platform_rows(&database, archive_id), rows);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Adds archive rows that copy `template`'s columns, with `relative`
+    /// as their relative path and `absolute` as their stored path.
+    fn copy_archive_row(
+        database: &Database,
+        template: i64,
+        relative: &str,
+        absolute: rusqlite::types::Value,
+    ) -> i64 {
+        database
+            .connection
+            .execute(
+                "INSERT INTO archives (source_folder_id, relative_path, absolute_path_cached, \
+                 file_name_cached, archive_kind, display_name, normalized_name, first_seen_at, \
+                 last_seen_at, created_at, updated_at) \
+                 SELECT source_folder_id, CAST(?1 AS BLOB), ?2, file_name_cached, archive_kind, \
+                 display_name, normalized_name, first_seen_at, last_seen_at, created_at, updated_at \
+                 FROM archives WHERE id = ?3",
+                params![relative, absolute, template],
+            )
+            .unwrap();
+        database.connection.last_insert_rowid()
+    }
+
+    #[test]
+    fn archive_path_lookup_answers_exactly_like_the_single_path_lookup() {
+        use rusqlite::types::Value;
+        let (root, database, archive_id) = unknown_archive_database("archive-path-lookup");
+        let real = load_archive(&database, archive_id).absolute_path;
+        // Two rows sharing one stored path, and a path stored as TEXT (which
+        // the BLOB comparison never matches).
+        let shared = PathBuf::from("/fixture/shared.zip");
+        let text = PathBuf::from("/fixture/text.zip");
+        for (relative, value) in [
+            (
+                "shared-1.zip",
+                Value::Blob(shared.as_os_str().as_bytes().to_vec()),
+            ),
+            (
+                "shared-2.zip",
+                Value::Blob(shared.as_os_str().as_bytes().to_vec()),
+            ),
+            ("text.zip", Value::Text(text.display().to_string())),
+        ] {
+            copy_archive_row(&database, archive_id, relative, value);
+        }
+        let lookup = database.archive_path_lookup().unwrap();
+        for path in [
+            real.as_path(),
+            &shared,
+            &text,
+            Path::new("/fixture/missing.zip"),
+        ] {
+            let single = database.find_archive_id_by_absolute_path(path);
+            let batch = lookup.find(path);
+            match (&single, &batch) {
+                (Ok(single), Ok(batch)) => assert_eq!(single, batch, "{}", path.display()),
+                (Err(single), Err(batch)) => {
+                    assert_eq!(single.to_string(), batch.to_string(), "{}", path.display())
+                }
+                _ => panic!("{}: {single:?} vs {batch:?}", path.display()),
+            }
+        }
+        assert_eq!(lookup.find(&real).unwrap(), Some(archive_id));
+        assert!(lookup.find(&shared).is_err());
+        assert_eq!(lookup.find(&text).unwrap(), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_romm_import_reads_the_archive_paths_once_not_once_per_record() {
+        // A library-sized catalogue: one full scan per record made a real
+        // import (95,000 records, 163,000 archives) take well over an hour.
+        const ROWS: usize = 30_000;
+        let (root, mut database, archive_id) = unknown_archive_database("romm-import-scale");
+        database
+            .connection
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1) \
+                 INSERT INTO archives (source_folder_id, relative_path, absolute_path_cached, \
+                 file_name_cached, archive_kind, display_name, normalized_name, first_seen_at, \
+                 last_seen_at, created_at, updated_at) \
+                 SELECT a.source_folder_id, CAST('bulk/' || n.i || '.zip' AS BLOB), \
+                 CAST('/fixture/bulk/' || n.i || '.zip' AS BLOB), a.file_name_cached, \
+                 a.archive_kind, a.display_name, a.normalized_name, a.first_seen_at, \
+                 a.last_seen_at, a.created_at, a.updated_at FROM n, archives a WHERE a.id = ?2",
+                params![ROWS as i64, archive_id],
+            )
+            .unwrap();
+        let archive = load_archive(&database, archive_id);
+        let mut cache = romm_cache_for(&archive, "PSP");
+        let template = cache.records[0].clone();
+        // Records for paths EmuWiz has not scanned: each is looked up, none
+        // is written, so the time measured is the lookups.
+        cache.records.extend((0..ROWS).map(|i| {
+            let mut record = template.clone();
+            record.provider_game_id = format!("bulk-{i}");
+            record.archivefs_path = Some(PathBuf::from(format!("/fixture/elsewhere/{i}.zip")));
+            record
+        }));
+
+        let started = std::time::Instant::now();
+        let summary = database
+            .enrich_platforms_from_romm_cache(&cache, 10)
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(summary.evidence_considered, ROWS + 1);
+        assert_eq!(summary.archives_matched, 1);
+        assert_eq!(summary.applied, 1);
+        // One scan per record measured over a minute here; one read is well
+        // under a second even unoptimised.
+        assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
         let _ = fs::remove_dir_all(root);
     }
 
