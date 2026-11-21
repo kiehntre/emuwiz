@@ -141,7 +141,26 @@ pub struct SaveMark {
     pub save_id: String,
     pub label: String,
     pub content_sha256: String,
+    /// When the save's file (or any file of a folder save) last changed on
+    /// disk, read **after** its content was read: the later of its
+    /// modification and status-change times, rounded up to a whole second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_changed_unix: Option<i64>,
+    /// For a "before" mark taken while a launch was already under way:
+    /// whether the content is proven to be what was there before the
+    /// launch's first process existed (`Some(true)`), or not proven
+    /// (`Some(false)`). `None`: the mark was taken by a caller that reads
+    /// the saves first and only then starts the emulator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_launch: Option<bool>,
 }
+
+/// A "before" mark counts as taken before the launch only if its file last
+/// changed at least this long before the launch's first process started.
+/// The slack covers whole-second rounding and the small disagreement
+/// between the clock files are stamped with and a process start time worked
+/// out from the boot time.
+pub const BASELINE_MARGIN_SECONDS: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "change")]
@@ -154,6 +173,19 @@ pub enum SaveChange {
     },
     /// Present before, absent after. Reported, never "cleaned up".
     Missing {
+        label: String,
+    },
+    /// The content differed between the first read and the end of the
+    /// session, so the save was written during it. But the first read was
+    /// not proven to be earlier than the emulator's start, so what the save
+    /// held **before** the session is not known.
+    ModifiedBeforeNotKnown {
+        label: String,
+    },
+    /// The first read was not proven to be earlier than the emulator's
+    /// start and the content was the same at the end: whether the session
+    /// changed this save is not known.
+    NotKnown {
         label: String,
     },
 }
@@ -880,12 +912,18 @@ pub fn diff_saves(before: &[SaveMark], after: &[SaveMark]) -> Vec<SaveChange> {
             None => changes.push(SaveChange::Created {
                 label: mark.label.clone(),
             }),
-            Some(was) if was.content_sha256 != mark.content_sha256 => {
-                changes.push(SaveChange::Modified {
-                    label: mark.label.clone(),
-                });
+            Some(was) => {
+                let differs = was.content_sha256 != mark.content_sha256;
+                // `None` is a mark read before the emulator was started at all.
+                let proven = was.before_launch != Some(false);
+                let label = mark.label.clone();
+                match (differs, proven) {
+                    (true, true) => changes.push(SaveChange::Modified { label }),
+                    (true, false) => changes.push(SaveChange::ModifiedBeforeNotKnown { label }),
+                    (false, false) => changes.push(SaveChange::NotKnown { label }),
+                    (false, true) => {}
+                }
             }
-            Some(_) => {}
         }
     }
     for (id, mark) in &old {
@@ -1109,6 +1147,41 @@ impl SessionJournal {
             .saves_before
             .retain(|mark| its_saves.contains(&mark.save_id));
         if record.saves_before.len() != before {
+            self.write(&record)?;
+        }
+        Ok(record)
+    }
+
+    /// Decides, for every "before" mark still unproven, whether its content
+    /// is proven to predate the launch: its file must have last changed at
+    /// least [`BASELINE_MARGIN_SECONDS`] before `launch_start_unix`, the
+    /// start of the first process of the launch. Anything the emulator wrote
+    /// since it started would carry a later time, so a mark that passes is
+    /// the content from before the launch even though it was read a moment
+    /// into it. A mark that does not pass stays unproven; it is never
+    /// treated as the starting content.
+    pub fn judge_baselines(
+        &self,
+        session_id: &str,
+        launch_start_unix: Option<i64>,
+    ) -> Result<SessionRecord, ContinuityError> {
+        let mut record = self.get(session_id)?;
+        let mut changed = false;
+        for mark in &mut record.saves_before {
+            if mark.before_launch != Some(false) {
+                continue;
+            }
+            let proven = matches!(
+                (mark.last_changed_unix, launch_start_unix),
+                (Some(changed_at), Some(start))
+                    if changed_at.saturating_add(BASELINE_MARGIN_SECONDS) <= start
+            );
+            if proven {
+                mark.before_launch = Some(true);
+                changed = true;
+            }
+        }
+        if changed {
             self.write(&record)?;
         }
         Ok(record)
@@ -1373,7 +1446,9 @@ impl SessionJournal {
                 let wrote = record.save_changes.iter().any(|change| {
                     matches!(
                         change,
-                        SaveChange::Created { .. } | SaveChange::Modified { .. }
+                        SaveChange::Created { .. }
+                            | SaveChange::Modified { .. }
+                            | SaveChange::ModifiedBeforeNotKnown { .. }
                     )
                 });
                 record.play_evidence = if wrote {

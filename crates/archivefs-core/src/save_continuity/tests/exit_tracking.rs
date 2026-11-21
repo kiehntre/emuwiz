@@ -110,6 +110,8 @@ fn mark(content: &str) -> SaveMark {
         save_id: SAVE.into(),
         label: SAVE.into(),
         content_sha256: content.into(),
+        last_changed_unix: None,
+        before_launch: None,
     }
 }
 

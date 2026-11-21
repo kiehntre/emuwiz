@@ -321,6 +321,8 @@ pub fn marks_of(save: &DiscoveredSave, all: &[DiscoveredSave]) -> Vec<SaveMark> 
                     .clone()
                     .unwrap_or_else(|| other.source_path.display().to_string()),
                 content_sha256: other.content_sha256.clone()?,
+                last_changed_unix: None,
+                before_launch: None,
             })
         })
         .collect()

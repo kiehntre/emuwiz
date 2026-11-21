@@ -1,6 +1,7 @@
 //! Tests for save continuity. Every save here is synthetic and lives in a
 //! temporary folder; no test looks at a real emulator profile.
 
+mod baseline;
 mod crash_evidence;
 mod device;
 mod discover;

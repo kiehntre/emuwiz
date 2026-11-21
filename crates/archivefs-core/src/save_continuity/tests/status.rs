@@ -27,6 +27,8 @@ fn mark(id: &str, content: &str) -> SaveMark {
         save_id: id.to_string(),
         label: id.to_string(),
         content_sha256: content.to_string(),
+        last_changed_unix: None,
+        before_launch: None,
     }
 }
 

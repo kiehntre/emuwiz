@@ -109,7 +109,50 @@ fn mark_of(save: &DiscoveredSave) -> Option<SaveMark> {
                 .unwrap_or_default(),
         },
         content_sha256: save.content_sha256.clone()?,
+        last_changed_unix: None,
+        before_launch: None,
     })
+}
+
+/// When `path` last changed on disk: the later of the modification and
+/// status-change times, rounded up to a whole second. For a folder save,
+/// the latest over the folder and every entry directly inside it. `None`
+/// when anything cannot be checked. The status-change time is set by the
+/// system on every write, rename and replacement and cannot be set back by
+/// a program.
+fn last_changed(path: &Path) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    let of = |meta: &std::fs::Metadata| {
+        let up = |seconds: i64, nanos: i64| seconds.saturating_add(i64::from(nanos > 0));
+        up(meta.mtime(), meta.mtime_nsec()).max(up(meta.ctime(), meta.ctime_nsec()))
+    };
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    let mut latest = of(&meta);
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path).ok()? {
+            latest = latest.max(of(&std::fs::symlink_metadata(entry.ok()?.path()).ok()?));
+        }
+    }
+    Some(latest)
+}
+
+/// The wall-clock second a process started in, from its kernel start time
+/// and the machine's boot time. `None` when either cannot be read.
+pub fn process_start_unix(start_ticks: Option<u64>) -> Option<i64> {
+    let ticks = start_ticks?;
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let boot: i64 = stat
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    // SAFETY: sysconf only reads a system constant.
+    let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if per_second <= 0 {
+        return None;
+    }
+    Some(boot.saturating_add((ticks / per_second as u64) as i64))
 }
 
 pub struct LaunchTracker {
@@ -185,7 +228,20 @@ impl LaunchTracker {
     ) -> Result<SessionRecord, ContinuityError> {
         // Settle anything a previous run of EmuWiz left open first.
         self.journal.reconcile(&ProcFs, now_unix());
-        let before: Vec<SaveMark> = self.saves()?.iter().filter_map(mark_of).collect();
+        // The launcher may already have started the emulator by now, so
+        // these marks are unproven until `process_started` has compared each
+        // file's last change (looked up only after its content was read)
+        // with the moment the launch's first process began.
+        let before: Vec<SaveMark> = self
+            .saves()?
+            .iter()
+            .filter_map(|save| {
+                let mut mark = mark_of(save)?;
+                mark.last_changed_unix = last_changed(&save.source_path);
+                mark.before_launch = Some(false);
+                Some(mark)
+            })
+            .collect();
         let launch = SessionLaunch {
             emulator: expected_emulator.to_string(),
             ..Default::default()
@@ -208,6 +264,23 @@ impl LaunchTracker {
         process: &StartedProcess,
         processes: &dyn ProcessTable,
     ) -> Result<SessionRecord, ContinuityError> {
+        self.process_started_at(
+            session_id,
+            process,
+            processes,
+            process_start_unix(process.start_ticks),
+        )
+    }
+
+    /// As [`Self::process_started_in`], with the start time of the launch's
+    /// first process stated by the caller.
+    pub fn process_started_at(
+        &self,
+        session_id: &str,
+        process: &StartedProcess,
+        processes: &dyn ProcessTable,
+        launch_start_unix: Option<i64>,
+    ) -> Result<SessionRecord, ContinuityError> {
         let launch = classify_started(&process.executable, &process.arguments);
         // First, and quickly, note the process itself; only then the slower
         // look at the saves.
@@ -218,6 +291,8 @@ impl LaunchTracker {
             process.start_ticks,
             processes,
         )?;
+        self.journal
+            .judge_baselines(session_id, launch_start_unix)?;
         let its_saves: Vec<String> = self
             .saves()?
             .iter()

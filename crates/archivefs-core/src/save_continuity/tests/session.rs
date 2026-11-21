@@ -72,6 +72,8 @@ fn mark(id: &str, sha: &str) -> SaveMark {
         save_id: id.into(),
         label: format!("save {id}"),
         content_sha256: sha.into(),
+        last_changed_unix: None,
+        before_launch: None,
     }
 }
 
