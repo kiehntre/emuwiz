@@ -94,20 +94,27 @@ impl SessionTracking {
 }
 
 /// The person's own save-continuity folder and profile.
+///
+/// Recording a launch creates the session journal's folder and nothing
+/// else: no snapshot store, and no device identity or signing key. Those
+/// belong to snapshots and to the two-device feature and are created only
+/// when those are used. If an identity already exists its id is used.
 fn open_real_tracker() -> Result<LaunchTracker, ContinuityError> {
     use archivefs_core::save_continuity::device::LocalDevice;
     use archivefs_core::save_continuity::discover::DiscoveryRoots;
-    use archivefs_core::save_continuity::store::SnapshotStore;
+    use archivefs_core::save_continuity::session::UNPAIRED_DEVICE_ID;
     let root = archivefs_core::save_continuity::default_root()
         .map_err(|error| ContinuityError::Io(error.to_string()))?;
-    let store = SnapshotStore::open(&root)?;
-    let name = std::fs::read_to_string("/etc/hostname")
-        .map(|name| name.trim().to_string())
-        .unwrap_or_else(|_| "This device".to_string());
-    let device = LocalDevice::open_or_create(store.root(), &name)?;
+    let device_id = LocalDevice::open_existing(&root)
+        .ok()
+        .flatten()
+        .map_or_else(
+            || UNPAIRED_DEVICE_ID.to_string(),
+            |device| device.identity.device_id,
+        );
     let roots = DiscoveryRoots::current()
         .ok_or_else(|| ContinuityError::Refused("HOME is not set".to_string()))?;
-    LaunchTracker::open(store.root(), roots, &device.identity.device_id)
+    LaunchTracker::open(&root, roots, &device_id)
 }
 
 fn start(open: OpenTracker, started_since: StartedSince, look_every: Duration) -> Sender<Message> {

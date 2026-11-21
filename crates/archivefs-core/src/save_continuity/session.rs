@@ -254,6 +254,10 @@ pub struct SessionRecord {
     /// does today.
     #[serde(default)]
     pub game_seen_running: Option<GameSeenRunning>,
+    /// The exit status of the process EmuWiz started, as observed. Data
+    /// only; see [`ObservedStatus`].
+    #[serde(default)]
+    pub observed_status: Option<ObservedStatus>,
     /// What the system's own crash records say about that process, when
     /// they were consulted. Independent of the exit status.
     #[serde(default)]
@@ -301,6 +305,25 @@ impl SessionRecord {
                 .any(|change| matches!(change, SaveChange::Missing { .. }))
     }
 }
+
+/// The exit status of the process EmuWiz started, exactly as `wait()`
+/// returned it, kept as data whatever is made of it. It is the status of
+/// that process, which may be a launcher or sandbox and not the emulator:
+/// what it means is decided separately (`end`, `exit_evidence`). A code is
+/// never turned into a signal here or anywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ObservedStatus {
+    ExitCode { code: i32 },
+    Signal { signal: i32, core_dumped: bool },
+}
+
+/// The device id recorded for sessions on a machine that has no device
+/// identity yet. Recording a launch must not create an identity or a
+/// signing key: those belong to the two-device feature and are created only
+/// when it is used. The session journal never leaves this machine, so a
+/// session recorded under this id is this machine's own.
+pub const UNPAIRED_DEVICE_ID: &str = "this-device";
 
 /// How the process ended, as the launcher saw it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -964,6 +987,7 @@ impl SessionJournal {
             sandbox_main_reuse_mark: None,
             sandbox_main_boot: None,
             game_seen_running: None,
+            observed_status: None,
             crash_evidence: None,
             end: None,
             play_evidence: PlayEvidence::None,
@@ -1191,6 +1215,22 @@ impl SessionJournal {
             });
         }
         refresh(&mut record, processes);
+        // The number itself, kept whatever is concluded from it below.
+        match exit {
+            ExitObservation::Code(code) => {
+                record.observed_status = Some(ObservedStatus::ExitCode { code });
+            }
+            ExitObservation::Signal {
+                signal,
+                core_dumped,
+            } => {
+                record.observed_status = Some(ObservedStatus::Signal {
+                    signal,
+                    core_dumped,
+                });
+            }
+            ExitObservation::Unavailable => {}
+        }
         // Whose exit is this? Three cases, never mixed:
         //  - EmuWiz started the emulator itself: the status is the emulator's.
         //  - EmuWiz started a checked Flatpak sandbox, the emulator was
@@ -1470,7 +1510,21 @@ impl SessionJournal {
 
     /// The newest `limit` records. Reads only that many files.
     pub fn recent(&self, limit: usize) -> Vec<SessionRecord> {
-        let mut names: Vec<PathBuf> = fs::read_dir(&self.dir)
+        read_records(&self.dir, limit)
+    }
+}
+
+/// The newest `limit` session records under the save-continuity folder
+/// `root`, newest first, **without creating or changing anything**: for a
+/// page that only shows what was recorded. A folder that does not exist is
+/// simply no records.
+pub fn read_recorded_sessions(root: &Path, limit: usize) -> Vec<SessionRecord> {
+    read_records(&root.join("sessions"), limit)
+}
+
+fn read_records(dir: &Path, limit: usize) -> Vec<SessionRecord> {
+    {
+        let mut names: Vec<PathBuf> = fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()
@@ -1516,7 +1570,9 @@ pub fn preceding_session(
     current: &[SaveMark],
 ) -> PrecedingSession {
     let Some(latest) = sessions.iter().find(|session| {
-        session.device_id == device_id
+        // Sessions recorded before this machine had a device identity are
+        // this machine's own too.
+        (session.device_id == device_id || session.device_id == UNPAIRED_DEVICE_ID)
             && session.launch.emulator.eq_ignore_ascii_case(emulator)
             && session.launch.profile.eq_ignore_ascii_case(profile)
             && session.state != SessionState::NeverStarted

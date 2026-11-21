@@ -341,6 +341,13 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         purpose: ToolPage::MemoryCards.purpose(),
         safety: ToolSafety::LookingOnly,
     });
+    // Reads the session journal and the snapshot store; writes nothing.
+    saves.tools.push(Tool {
+        route: Route::Tool(ToolPage::SaveContinuity),
+        title: ToolPage::SaveContinuity.title(),
+        purpose: ToolPage::SaveContinuity.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
     vec![
         games,
         verification,

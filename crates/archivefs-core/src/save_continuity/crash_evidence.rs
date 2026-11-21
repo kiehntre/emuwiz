@@ -49,6 +49,9 @@ pub const LIFETIME_SLACK_SECONDS: i64 = 5;
 /// further away than this is treated as another process's (a stale record,
 /// a reused id).
 pub const UNCLEAR_TIMING_SECONDS: i64 = 120;
+/// What `/proc/self/ns/pid` points at for a process in the machine's own
+/// (initial) process-id space. The number is fixed by the kernel.
+pub const INITIAL_PID_NAMESPACE: &str = "pid:[4026531836]";
 /// The log is small; anything larger than this is not read at all.
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -106,6 +109,11 @@ impl CrashSource for NoCrashSource {
 
 /// Ubuntu's crash handler log.
 pub struct ApportLog {
+    /// `/proc/self/ns/pid`: which process-id space this program runs in.
+    /// The handler logs ids as the machine itself numbers them. A program
+    /// in a space of its own (a container, a sandbox) sees other numbers
+    /// for the same processes, so nothing it knows can be matched.
+    pub pid_namespace: PathBuf,
     /// `/proc/sys/kernel/core_pattern`: which program the kernel hands
     /// fatal terminations to.
     pub core_pattern: PathBuf,
@@ -140,6 +148,7 @@ impl ApportLog {
     /// The real files on this machine.
     pub fn system() -> Self {
         Self {
+            pid_namespace: PathBuf::from("/proc/self/ns/pid"),
             core_pattern: PathBuf::from("/proc/sys/kernel/core_pattern"),
             core_pipe_limit: PathBuf::from("/proc/sys/kernel/core_pipe_limit"),
             logs: vec![
@@ -271,6 +280,15 @@ impl CrashSource for ApportLog {
         const SOURCE: &str = "the system's crash handler log";
         if process.gone_by_unix < process.started_unix {
             return CrashEvidence::unavailable("the process's lifetime is not known");
+        }
+        // Are this program's process ids the machine's own? Only then is
+        // the id it tracked the id the handler wrote down.
+        let own_space = fs::read_link(&self.pid_namespace)
+            .is_ok_and(|space| space.as_os_str() == INITIAL_PID_NAMESPACE);
+        if !own_space {
+            return CrashEvidence::unavailable(
+                "EmuWiz is not running in the machine's own process-id space, so the ids it sees are not the ones the crash handler records",
+            );
         }
         // Is this handler the one the kernel uses? If not, its log (even if
         // one is lying around) says nothing about what happens now.

@@ -70,6 +70,8 @@ impl Files {
         fs::write(dir.path().join("core_pattern"), pattern).unwrap();
         // As on the development machine: the kernel waits for the handler.
         fs::write(dir.path().join("core_pipe_limit"), "10\n").unwrap();
+        // As for a program in the machine's own process-id space.
+        std::os::unix::fs::symlink(INITIAL_PID_NAMESPACE, dir.path().join("pid-space")).unwrap();
         if let Some(text) = rotated {
             fs::write(dir.path().join("apport.log.1"), text).unwrap();
         }
@@ -83,6 +85,7 @@ impl Files {
         ApportLog {
             core_pattern: self.dir.path().join("core_pattern"),
             core_pipe_limit: self.dir.path().join("core_pipe_limit"),
+            pid_namespace: self.dir.path().join("pid-space"),
             logs: vec![
                 self.dir.path().join("apport.log.1"),
                 self.dir.path().join("apport.log"),
@@ -1354,4 +1357,71 @@ fn a_look_that_cannot_store_the_still_alive_time_is_not_an_error() {
     let looked = case.journal.observe_running(&case.session, &case.machine);
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(looked.is_ok(), "{looked:?}");
+}
+
+// ---- Against the machine's real crash handler log (run by hand) ----
+
+/// Not a regression test: it reads this machine's real crash handler log
+/// through the real `ApportLog::system()` and prints what the lookup says
+/// for processes named in `LAZARUS_REAL_CRASH_CASES`
+/// (`label,pid,started_unix,gone_by_unix;...`). Read-only. Ignored unless
+/// asked for, and does nothing without the variable.
+#[test]
+#[ignore = "reads the real /var/log/apport.log; run by hand with LAZARUS_REAL_CRASH_CASES"]
+fn real_crash_records_lookup_by_hand() {
+    let Ok(cases) = std::env::var("LAZARUS_REAL_CRASH_CASES") else {
+        return;
+    };
+    let source = ApportLog::system();
+    for case in cases.split(';').filter(|case| !case.trim().is_empty()) {
+        let parts: Vec<&str> = case.split(',').collect();
+        let [label, pid, started, gone] = parts.as_slice() else {
+            panic!("bad case: {case}");
+        };
+        let process = ProcessLifetime {
+            pid: pid.trim().parse().unwrap(),
+            started_unix: started.trim().parse().unwrap(),
+            gone_by_unix: gone.trim().parse().unwrap(),
+        };
+        println!("REAL {label}: {process:?} => {:?}", source.lookup(&process));
+    }
+}
+
+// ---- Found by the Blue acceptance run (2026-11-21) ----
+
+#[test]
+fn a_program_in_a_process_id_space_of_its_own_cannot_match_anything() {
+    // Blue ran inside a test sandbox with its own process ids: the emulator
+    // was "107" to Blue and something else to the machine. The log's ids
+    // are the machine's, so even a perfect-looking match means nothing.
+    let log = other(0) + &crashed(250, 4242);
+    for space in [Some("pid:[4026532999]"), Some("something else"), None] {
+        let files = Files::new(APPORT, None, Some(&log));
+        let link = files.dir.path().join("pid-space");
+        fs::remove_file(&link).unwrap();
+        if let Some(target) = space {
+            std::os::unix::fs::symlink(target, &link).unwrap();
+        }
+        let found = files.source().lookup(&emulator());
+        assert!(
+            matches!(found, CrashEvidence::Unavailable { ref why } if why.contains("process-id space")),
+            "{space:?}: {found:?}"
+        );
+        // And never "no record" either, for a quiet log.
+        let quiet = Files::new(APPORT, None, Some(&(other(0) + &other(500))));
+        let link = quiet.dir.path().join("pid-space");
+        fs::remove_file(&link).unwrap();
+        if let Some(target) = space {
+            std::os::unix::fs::symlink(target, &link).unwrap();
+        }
+        assert!(matches!(
+            quiet.source().lookup(&emulator()),
+            CrashEvidence::Unavailable { .. }
+        ));
+    }
+    // The real source on this machine names a link that exists.
+    assert_eq!(
+        ApportLog::system().pid_namespace,
+        std::path::PathBuf::from("/proc/self/ns/pid")
+    );
 }

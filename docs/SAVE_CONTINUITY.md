@@ -207,6 +207,19 @@ an entry inside another program's quoted command line, or a kernel that
 does not wait for its handler (`core_pipe_limit` 0 or unreadable: "no record"
 then establishes nothing).
 
+**Status: not verified end to end.** The lookup's rules are covered by
+synthetic regression tests (made-up logs and process lists), and the real
+lookup code has been run by hand against this machine's real crash log for
+emulator processes that earlier probes recorded (see the acceptance notes in
+the audit ledger for the result). What has **not** been demonstrated is the
+whole path on a real launch: Blue starting a Flatpak emulator outside any test
+isolation, the tracker identifying that emulator's host process and lifetime,
+that process being ended by a fatal signal, and the warning appearing. The
+isolated acceptance run cannot show it, because Blue there runs in its own
+process-id space while the crash log records host ids. Until it is
+demonstrated, treat a crash-record warning as unproven in real use. Where the
+evidence is missing or unclear the answer is "not known", never a warning.
+
 A limit that cannot be closed by reading the log: the handler writes each
 crashed program's command line into the log as it was given, line breaks
 included. A local program that crafts its arguments can therefore write a
@@ -332,9 +345,15 @@ development machine.
 
 ## Limits of this slice
 
-- Session tracking is not yet called from Blue's launch path, so real launches
-  produce no session and "how the emulator last ended" reads "not known".
-- No Blue page yet.
+- Blue records each launch in the session journal (`gui_v2/session_tracking`)
+  and has a looking-only page, "Play sessions & save history". Recording a
+  launch creates the journal folder only: no snapshot store and no device
+  identity or signing key. An explicit snapshot from the CLI still creates a
+  device identity, because a snapshot's lineage is keyed by the device id.
+- Flatpak crash-record detection is not verified end to end (see above).
+- The page shows recorded sessions and existing snapshots. It takes no
+  snapshot and restores nothing; there is no automatic snapshot at session
+  start or end.
 - No non-zero exit code is believed in practice, for any emulator. Exit 0
   from a directly started emulator other than RetroArch is still read as a
   normal close. RetroArch's status would be believed for a session in which
