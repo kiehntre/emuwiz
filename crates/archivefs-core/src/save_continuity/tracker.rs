@@ -236,7 +236,8 @@ impl LaunchTracker {
     /// seen alive within `CRASH_RECORD_WINDOW_SECONDS` (ten minutes) of
     /// being found gone, and that time is stored at most once a minute, so
     /// the interval between calls has to stay well under nine minutes.
-    /// Cheap enough for once every few seconds; never fails a launch.
+    /// Cheap enough for once every few seconds. An error here is about the
+    /// record only; the caller should ignore it, never fail a launch on it.
     pub fn look_again(&self, session_id: &str) -> Result<SessionRecord, ContinuityError> {
         self.journal.observe_running(session_id, &ProcFs)
     }

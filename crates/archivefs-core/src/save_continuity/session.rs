@@ -58,9 +58,12 @@ pub enum SessionEnd {
     LauncherEndedOtherwise {
         detail: String,
     },
-    /// The emulator's own status was read, but for this emulator a non-zero
-    /// status has been seen on a perfectly normal close, so it cannot be
-    /// called an error or a crash. Never a warning.
+    /// The emulator's own status was read, but it cannot be interpreted:
+    /// for this emulator a non-zero status has been seen on a perfectly
+    /// normal close, or (RetroArch) its statuses mean something only from
+    /// inside a running game and the game was not seen running, in which
+    /// case this covers status 0 too. Neither a normal close nor an error.
+    /// Never a warning. `detail` keeps the observed status.
     ExitUnsettled {
         detail: String,
     },
@@ -396,8 +399,9 @@ pub enum ExitEvidence {
 /// that way and 139 for a polite stop on another run).
 ///
 /// **No emulator meets that standard for every kind of session, so this
-/// list is empty.** RetroArch meets it for sessions that launched a game
-/// (see [`EXIT_STATUS_DEMONSTRATED_IN_GAME`]). For everything else an
+/// list is empty.** RetroArch meets it for sessions in which the game was
+/// seen running, which nothing records today (see
+/// [`EXIT_STATUS_DEMONSTRATED_IN_GAME`]). For everything else an
 /// emulator's non-zero exit is recorded as "not known whether that was a
 /// normal close" and never as an abnormal exit.
 ///
@@ -752,7 +756,11 @@ fn refresh(record: &mut SessionRecord, processes: &dyn ProcessTable) {
     {
         record.sandbox_main_last_alive_unix = Some(now_unix());
         record.sandbox_main_reuse_mark = processes.process_ids_issued();
-        record.sandbox_main_boot = processes.boot_id();
+        // A boot id that could not be read this once does not erase the one
+        // already known.
+        if let Some(boot) = processes.boot_id() {
+            record.sandbox_main_boot = Some(boot);
+        }
     }
 }
 
@@ -816,7 +824,7 @@ fn consult_crash_source(
         )
     } else if reused {
         CrashEvidence::unavailable(
-            "so many processes were started since the emulator was last seen that its process id may have been given to another",
+            "the machine restarted, or started very many processes, since the emulator was last seen, so its process id may have been given to another",
         )
     } else {
         crash.lookup(&ProcessLifetime {

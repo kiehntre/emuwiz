@@ -402,7 +402,10 @@ impl CrashSource for ApportLog {
                 Some(first) if first <= not_before => CrashEvidence::NoRecord {
                     source: SOURCE.to_string(),
                 },
-                _ => CrashEvidence::unavailable(
+                None => CrashEvidence::unavailable(
+                    "no time in the crash handler log could be placed (it is empty, or this program runs with a time zone of its own)",
+                ),
+                Some(_) => CrashEvidence::unavailable(
                     "the crash handler log does not reach back to when this process started",
                 ),
             },

@@ -121,6 +121,7 @@ mod saves_states;
 mod scan_history;
 #[cfg(test)]
 mod scummvm_journey_tests;
+mod session_tracking;
 mod setup_portability;
 #[cfg(test)]
 #[path = "tests/shared_scroll.rs"]

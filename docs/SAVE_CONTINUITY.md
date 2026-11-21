@@ -116,7 +116,7 @@ What counts as evidence, strongest first. Each is a separate source.
 | The kernel reports a terminating signal for the emulator's own process (EmuWiz started it and waited on it) | That process was ended by that signal | Prominent: "Abnormal termination detected" |
 | The system's crash handler recorded a fatal termination for exactly the emulator process identified for this launch (see below) | That process was ended by a fatal signal; which one is not recorded | Prominent: "Abnormal termination detected" |
 | A non-zero exit code from an emulator whose exit status is believed for that kind of session (see below) | It did not close normally | Prominent: "Abnormal exit detected" |
-| Exit status 0 from the emulator's own process, saves compared afterwards | It closed normally | Nothing |
+| Exit status 0 from the emulator's own process (EmuWiz started it directly), saves compared afterwards. Not RetroArch unless the game was seen running: then "not known" | It closed normally | Nothing |
 | A non-zero exit code from any other emulator | Nothing that can be interpreted | Quiet: "not known whether that was a normal close" |
 | Only a launcher's or wrapper's end was seen; EmuWiz was closed; no session | Nothing | Quiet: "not known how the emulator last ended" |
 
@@ -156,11 +156,23 @@ not been shown to mean anything. So the rule needs evidence that the game was
 `SessionJournal::record_game_seen_running`).
 
 EmuWiz has no reliable way to observe that, and none is invented: nothing in
-shipped code sets it. Until something trustworthy does, a RetroArch session
-ends as "not known whether that was a normal close", for 0 as much as for
-139, and the observed number is kept in the session record. A terminating
-signal reported directly by the kernel, and a crash-handler record, are
-separate evidence and still warn.
+shipped code sets it. Until something trustworthy does, no RetroArch exit
+status is read as a normal or an abnormal close, 0 as much as 139:
+
+- started directly: "Ended; whether that was a normal close is not known",
+  with the observed status in the text;
+- through Flatpak: "The launcher finished normally" or "The launcher ended
+  (exit code N)", and how the emulator itself ended is not known.
+
+Two kinds of evidence are separate from this and still warn without any
+proof that a game ran, because they are about the process, not the game: a
+terminating signal the kernel reported for RetroArch's own process, and a
+crash-handler record for it. Their wording says the process was ended, and
+that this does not show the game failed or the save is damaged.
+
+Whoever later records that a game was seen running must also deal with the
+game being closed again: the mark is for the whole session, so an exit from
+the menu afterwards would be read as an in-game exit.
 
 #### Crash records for sandboxed emulators
 
@@ -304,6 +316,8 @@ slice does.
 | 2 | Process identity, safe point, exit tracking (at 035f56a2) | PASS WITH CONDITIONS: no torn file published as a safe point while a lease is held; one latent blocker (a wrapper's exit 0 read as clean) and five should-fix, all addressed |
 | 3 | Delta review of the fixes (cdc75795) | PASS WITH CONDITIONS: earlier conditions closed; four further points, addressed |
 | 4 | Delta review of cdc75795..4fef4825 (direct signals, crash records, retention, diagnostic) | PASS WITH CONDITIONS: no blocker; five should-fix and six notes. Addressed: last-seen time kept current, daylight-saving and time-zone ambiguity, CLI crash source, wording when saves were not compared, document overclaims, bounded reading, a partial forged-line guard, an id-reuse heuristic, old manifest value still readable, override caveat. Left as it was: a compiled wrapper named like an emulator is taken for the emulator (older code, listed below) |
+| 5 | Delta review of the fixes (d6282b09) | PASS WITH CONDITIONS: four points (empty TZ, a look that cannot write, restart detection, two overclaims), addressed in 6148e365 |
+| 6 | Delta review of 6148e365 and of the RetroArch rule (cc1e11cf) | 6148e365: PASS. cc1e11cf: PASS WITH CONDITIONS, documentation only; the reviewer could not make a RetroArch session without gameplay evidence end as clean, abnormal or a signal. Addressed |
 
 Remaining strict false positives the reviewers listed (they can only refuse a
 snapshot, never permit one): this repository's own test binaries named
@@ -321,10 +335,12 @@ development machine.
 - Session tracking is not yet called from Blue's launch path, so real launches
   produce no session and "how the emulator last ended" reads "not known".
 - No Blue page yet.
-- No emulator's exit status is believed in practice. RetroArch's would be
-  for a session in which the game was seen running, but EmuWiz cannot
-  observe that, so every RetroArch exit status (0 included) is recorded as
-  "not known" with the number kept.
+- No non-zero exit code is believed in practice, for any emulator. Exit 0
+  from a directly started emulator other than RetroArch is still read as a
+  normal close. RetroArch's status would be believed for a session in which
+  the game was seen running, but EmuWiz cannot observe that, so every
+  RetroArch exit status (0 included) is "not known", with the number kept in
+  the record's text.
 - The safe-point probes started each emulator idle, with no game: they show
   the emulator is *seen*, not what happens while it writes a save. Real save
   writing was exercised for RetroArch only (the synthetic game in the exit
