@@ -9,7 +9,9 @@
 //!   on the Launch page. "Try anyway" on its own never writes it.
 //! - It is bound to one file *as it was when chosen*: absolute path, size and
 //!   modification time. Any change to the file makes the entry inert (it is
-//!   never applied to different bytes).
+//!   never applied to different bytes). The one exception is
+//!   [`move_remembered_launch_system_at`]: when the same file is proven to
+//!   have been renamed or moved, the entry follows it.
 //! - It is launch-only. It never changes the library's recorded system, a
 //!   manual system choice, catalogue evidence or verified identity, and
 //!   anything the file says about itself (a header naming another system, a
@@ -191,7 +193,8 @@ pub fn move_remembered_launch_system_at(
             entry.path == old && crate::canonical_platform_for_alias(&entry.platform_id) == wanted
         })
         && entries.iter().all(|entry| entry.path != new)
-        && std::fs::symlink_metadata(old).is_err();
+        // Provably gone: an unmounted disk or an unreadable folder is not.
+        && crate::recovery::prepared_media::source_is_gone(old, None);
     if !applies {
         return Ok(false);
     }

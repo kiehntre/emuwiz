@@ -49,9 +49,11 @@ pub enum BulkItemPlan {
     Extract { files: usize, bytes: u64 },
     /// A verified copy is already linked to this exact file; nothing to do.
     AlreadyPrepared,
-    /// A copy of the same disc exists (or is earlier in this batch); this
-    /// file would be read in full and linked, with nothing extracted.
-    Reuse,
+    /// A copy of the same disc exists (`in_store`) or is earlier in this
+    /// batch; this file would be read in full and linked, with nothing
+    /// extracted. `bytes` is the disc's size: if the copy it relies on is not
+    /// there when the batch runs, this game is extracted after all.
+    Reuse { bytes: u64, in_store: bool },
     /// Cannot be prepared; why.
     Refused(String),
 }
@@ -60,6 +62,8 @@ pub enum BulkItemPlan {
 pub struct BulkPlanItem {
     pub candidate: BulkCandidate,
     pub plan: BulkItemPlan,
+    /// The disc's content fingerprint, when the ZIP could be inspected.
+    pub fingerprint: Option<String>,
 }
 
 /// The read-only review of a proposed batch.
@@ -84,23 +88,51 @@ impl BulkPlan {
         self.items.iter().filter(|item| {
             matches!(
                 item.plan,
-                BulkItemPlan::Extract { .. } | BulkItemPlan::Reuse
+                BulkItemPlan::Extract { .. } | BulkItemPlan::Reuse { .. }
             )
         })
     }
 
     /// Free space needed for just these games (by path), same estimate.
-    pub fn required_for(&self, chosen: &dyn Fn(&Path) -> bool) -> u64 {
-        let bytes: u64 = self
+    /// Each disc is counted once. A game that would reuse a copy counts in
+    /// full unless that copy is in the store (`in_store` says whether it is
+    /// right now) or another chosen game of this batch extracts it.
+    pub fn required_with(
+        &self,
+        chosen: &dyn Fn(&Path) -> bool,
+        in_store: &dyn Fn(&str) -> bool,
+    ) -> u64 {
+        let mut counted = std::collections::BTreeSet::new();
+        let mut bytes = 0_u64;
+        for item in self
             .items
             .iter()
             .filter(|item| chosen(&item.candidate.path))
-            .map(|item| match item.plan {
-                BulkItemPlan::Extract { bytes, .. } => bytes,
-                _ => 0,
-            })
-            .sum();
+        {
+            let size = match item.plan {
+                BulkItemPlan::Extract { bytes, .. } | BulkItemPlan::Reuse { bytes, .. } => bytes,
+                _ => continue,
+            };
+            let Some(fingerprint) = item.fingerprint.as_deref() else {
+                bytes = bytes.saturating_add(size);
+                continue;
+            };
+            if !in_store(fingerprint) && counted.insert(fingerprint) {
+                bytes = bytes.saturating_add(size);
+            }
+        }
         estimate(bytes)
+    }
+
+    /// [`Self::required_with`] using what the review saw in the store.
+    pub fn required_for(&self, chosen: &dyn Fn(&Path) -> bool) -> u64 {
+        let reviewed: std::collections::BTreeSet<&str> = self
+            .items
+            .iter()
+            .filter(|item| matches!(item.plan, BulkItemPlan::Reuse { in_store: true, .. }))
+            .filter_map(|item| item.fingerprint.as_deref())
+            .collect();
+        self.required_with(chosen, &|fingerprint| reviewed.contains(fingerprint))
     }
 
     pub fn enough_space_for(&self, chosen: &dyn Fn(&Path) -> bool) -> bool {
@@ -114,7 +146,7 @@ fn estimate(extract_bytes: u64) -> u64 {
         return 0;
     }
     extract_bytes
-        .saturating_add(extract_bytes / 100 * ESTIMATE_MARGIN_PERCENT)
+        .saturating_add(extract_bytes.saturating_mul(ESTIMATE_MARGIN_PERCENT) / 100)
         .saturating_add(FREE_SPACE_RESERVE_BYTES)
 }
 
@@ -140,6 +172,7 @@ pub fn plan_bulk(
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
+        let mut fingerprint = None;
         let plan = if !seen_paths.insert(candidate.path.clone()) {
             BulkItemPlan::Refused("This file is in the list twice.".into())
         } else if !super::diagnose::preparation_may_apply(
@@ -153,9 +186,14 @@ pub fn plan_bulk(
             match inspect_disc_zip(&candidate.path, trusted, limits, cancel) {
                 Err(refusal) => BulkItemPlan::Refused(sentence(&refusal.to_string())),
                 Ok(inspection) => {
-                    let exists = store.lookup(&inspection.fingerprint).is_some();
-                    if exists || !planned_sets.insert(inspection.fingerprint.clone()) {
-                        BulkItemPlan::Reuse
+                    let in_store = store.lookup(&inspection.fingerprint).is_some();
+                    let first = planned_sets.insert(inspection.fingerprint.clone());
+                    fingerprint = Some(inspection.fingerprint.clone());
+                    if in_store || !first {
+                        BulkItemPlan::Reuse {
+                            bytes: inspection.total_bytes,
+                            in_store,
+                        }
                     } else {
                         extract_bytes = extract_bytes.saturating_add(inspection.total_bytes);
                         BulkItemPlan::Extract {
@@ -169,6 +207,7 @@ pub fn plan_bulk(
         items.push(BulkPlanItem {
             candidate: candidate.clone(),
             plan,
+            fingerprint,
         });
     }
     Ok(BulkPlan {
@@ -376,8 +415,10 @@ pub fn start_queue(
     if items.is_empty() {
         return Err(BulkError::NothingChosen);
     }
-    let store = store.ready().map_err(BulkError::Store)?;
-    let needed = plan.required_for(chosen);
+    // Judged against the store as it is now, not as it was at the review: a
+    // copy that has gone since makes its games count in full. Nothing is
+    // created before this check passes.
+    let needed = plan.required_with(chosen, &|fingerprint| store.lookup(fingerprint).is_some());
     let available = store.available_bytes().map_err(BulkError::Store)?;
     if available < needed {
         return Err(BulkError::NotEnoughSpace {
@@ -385,6 +426,7 @@ pub fn start_queue(
             available_bytes: available,
         });
     }
+    let store = store.ready().map_err(BulkError::Store)?;
     let _lock = lock_queue(&store)?;
     if let Some(existing) = load_queue(&store)
         && existing.pending() > 0
@@ -420,6 +462,7 @@ pub fn clear_queue(store: &PreparedMediaStore) -> Result<(), BulkError> {
 /// problem or cancellation stops the run and leaves the rest pending.
 pub fn run_queue(
     store: &PreparedMediaStore,
+    remembered_file: Option<&Path>,
     trusted: &TrustedRoots,
     limits: &DiscSetLimits,
     cancel: &AtomicBool,
@@ -445,6 +488,14 @@ pub fn run_queue(
             count,
             title: &candidate.title,
         });
+        // The queue file is the store's own, but it is still re-checked:
+        // only a game the engine has a preparation for is ever prepared.
+        if !super::diagnose::preparation_may_apply(&candidate.path, Some(&candidate.platform_id)) {
+            queue.items[index].state =
+                QueueState::Failed("EmuWiz has no preparation for this kind of file.".into());
+            write_queue(&store, &queue)?;
+            continue;
+        }
         let result = store.prepare(
             &candidate.path,
             &candidate.platform_id,
@@ -453,6 +504,9 @@ pub fn run_queue(
             cancel,
             &|step| progress(BulkProgress::Step { index, count, step }),
         );
+        if let Ok(outcome) = &result {
+            super::moves::adopt_remembered_choice(remembered_file, outcome, &candidate.path);
+        }
         let mut stop = None;
         queue.items[index].state = match result {
             Ok(outcome) if outcome.link_warning.is_some() => QueueState::Failed(format!(

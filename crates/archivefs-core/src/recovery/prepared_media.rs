@@ -106,6 +106,12 @@ struct SourceLink {
     source_path: PathBuf,
     source: SourceIdentity,
     set_id: String,
+    /// The filesystem the ZIP was on (`statvfs` f_fsid), which, unlike the
+    /// device number, stays the same across restarts on the usual Linux
+    /// filesystems. Used only to tell "the file is gone" from "its disk is
+    /// not there right now".
+    #[serde(default)]
+    filesystem_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +209,9 @@ pub struct PrepareOutcome {
     /// could not be written; the Launch page will not find the copy until
     /// preparation is run again.
     pub link_warning: Option<String>,
+    /// When an existing copy was reused: the one path it was linked from that
+    /// is provably gone (this ZIP was renamed or moved from there).
+    pub moved_from: Option<PathBuf>,
 }
 
 /// A prepared copy's link to its ZIP, captured while it was valid, so it can
@@ -482,9 +491,44 @@ impl PreparedMediaStore {
             return Ok(Self::at(path));
         }
         if let Some(folder) = super::storage::configured_folder()? {
+            // Checked when it was chosen, and again every time it is used.
+            super::storage::still_safe(&folder)?;
             return Ok(Self::at(folder));
         }
         Self::default_location()
+    }
+
+    /// Every store this profile may hold prepared copies in: the current one
+    /// first, then the default location and folders used earlier. A store
+    /// whose setting can no longer be trusted is left out, never guessed.
+    pub fn known_for_profile() -> Vec<Self> {
+        let mut stores: Vec<Self> = Vec::new();
+        let mut add = |store: Self| {
+            if !stores.contains(&store) {
+                stores.push(store);
+            }
+        };
+        if let Ok(current) = Self::for_profile() {
+            add(current);
+        }
+        if let Ok(default) = Self::default_location() {
+            add(default);
+        }
+        for folder in super::storage::previous_folders() {
+            if super::storage::still_safe(&folder).is_ok() {
+                add(Self::at(folder));
+            }
+        }
+        stores
+    }
+
+    /// The store that holds a verified prepared copy for this exact file,
+    /// with the copy: the current store, or one used before a folder change.
+    pub fn serving(source: &Path) -> Option<(Self, PreparedSetSummary)> {
+        Self::known_for_profile().into_iter().find_map(|store| {
+            let summary = store.prepared_for_source(source)?;
+            Some((store, summary))
+        })
     }
 
     /// `<data>/prepared-media`, where copies go unless a folder was chosen.
@@ -551,6 +595,7 @@ impl PreparedMediaStore {
             source_path: source.to_path_buf(),
             source: identity,
             set_id: set_id.to_string(),
+            filesystem_id: source.parent().and_then(filesystem_id),
         };
         let text = serde_json::to_string_pretty(&link).map_err(|error| error.to_string())?;
         let mut temporary = tempfile::Builder::new()
@@ -594,7 +639,7 @@ impl PreparedMediaStore {
                 continue;
             };
             if link.set_id == set_id
-                && fs::symlink_metadata(&link.source_path).is_err()
+                && source_is_gone(&link.source_path, link.filesystem_id.map(Some))
                 && fs::remove_file(&path).is_ok()
             {
                 gone.push(link.source_path);
@@ -610,15 +655,18 @@ impl PreparedMediaStore {
     /// same check a launch uses). Called before EmuWiz renames or moves that
     /// file to `new_path`. Cheap; reads no game data.
     pub fn movable_link(&self, old_path: &Path, new_path: &Path) -> Option<MoveCandidate> {
+        // Almost every renamed file has no prepared copy: one `stat` says so.
+        fs::symlink_metadata(self.source_link_path(old_path)).ok()?;
         let summary = self.prepared_for_source(old_path)?;
-        let store = self.existing()?;
-        let link: SourceLink = read_json(&store.source_link_path(old_path)).ok()?;
+        // The file as it is at this moment: the device number is compared
+        // only between now and the end of this same operation.
+        let now = SourceIdentity::of(&fs::symlink_metadata(old_path).ok()?);
         Some(MoveCandidate {
             old_path: old_path.to_path_buf(),
             new_path: new_path.to_path_buf(),
             set_id: summary.set_id,
             platform_id: summary.platform_id,
-            identity: link.source,
+            identity: now,
         })
     }
 
@@ -649,8 +697,9 @@ impl PreparedMediaStore {
         {
             return Err("the file at the new name is not the file that was prepared".into());
         }
-        if fs::symlink_metadata(&candidate.old_path).is_ok() {
-            return Err("a file still exists at the old name".into());
+        if !source_is_gone(&candidate.old_path, None) {
+            // (`None`: EmuWiz itself has just moved the file away.)
+            return Err("the old name is still there, or cannot be examined".into());
         }
         let receipt = store.quick_check(&candidate.set_id)?;
         store.link_source(&candidate.new_path, now, &candidate.set_id)?;
@@ -751,7 +800,9 @@ impl PreparedMediaStore {
         let link: SourceLink = read_json(&store.source_link_path(source)).ok()?;
         if link.format_version != FORMAT_VERSION
             || link.source_path != source
-            || link.source != SourceIdentity::of(&metadata)
+            || !link
+                .source
+                .same_file_across_runs(&SourceIdentity::of(&metadata))
             || !valid_set_id(&link.set_id)
         {
             return None;
@@ -1364,11 +1415,12 @@ impl PreparedMediaStore {
                         &set_id,
                     )?;
                     let link_warning = store.link_source(source, inspection.source, &set_id).err();
-                    store.retire_stale_links(&set_id);
+                    let mut gone = store.retire_stale_links(&set_id);
                     Ok(PrepareOutcome {
                         summary,
                         already_prepared: true,
                         link_warning,
+                        moved_from: if gone.len() == 1 { gone.pop() } else { None },
                     })
                 }
                 (SetState::Damaged(detail), _) => Err(PrepareError::ExistingCopyDamaged(detail)),
@@ -1424,6 +1476,7 @@ impl PreparedMediaStore {
                     summary,
                     already_prepared: false,
                     link_warning,
+                    moved_from: None,
                 })
             }
             Err(error) => {
@@ -1757,10 +1810,70 @@ impl PreparedMediaStore {
 /// outside this profile's store or is the launch file of a verified prepared
 /// copy. This only ever adds a refusal; it grants nothing.
 pub fn launch_refusal(content: &Path) -> Option<String> {
-    let store = PreparedMediaStore::for_profile().ok()?;
-    match store.check_launch_path(content) {
-        LaunchPathCheck::Refused(detail) => Some(detail),
-        LaunchPathCheck::NotPreparedMedia | LaunchPathCheck::Verified(_) => None,
+    // Every store this profile has used is guarded, not only the current
+    // one, and a storage setting that cannot be read does not open the gate:
+    // the default location and earlier folders are still checked, and a file
+    // inside the unreadable setting's own folder is refused outright.
+    if let Err(detail) = PreparedMediaStore::for_profile()
+        && let Some(folder) = super::storage::configured_folder_unchecked()
+        && content.starts_with(&folder)
+    {
+        return Some(format!(
+            "The folder chosen for prepared copies can no longer be used ({detail})"
+        ));
+    }
+    launch_refusal_in(&PreparedMediaStore::known_for_profile(), content)
+}
+
+/// [`launch_refusal`] over an explicit list of stores.
+pub fn launch_refusal_in(stores: &[PreparedMediaStore], content: &Path) -> Option<String> {
+    stores
+        .iter()
+        .find_map(|store| match store.check_launch_path(content) {
+            LaunchPathCheck::Refused(detail) => Some(detail),
+            LaunchPathCheck::NotPreparedMedia | LaunchPathCheck::Verified(_) => None,
+        })
+}
+
+fn filesystem_id(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: zeroed is a valid initial value for this plain C struct.
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `name` is NUL-terminated and `stats` is writable and sized.
+    if unsafe { libc::statvfs(name.as_ptr(), &mut stats) } != 0 {
+        return None;
+    }
+    Some(stats.f_fsid as u64)
+}
+
+/// True only when `path` is provably absent: the name does not exist while
+/// its folder does. `recorded_filesystem` says how the folder is judged:
+///
+/// * `None`: the caller has just moved the file away itself; the folder
+///   existing is enough.
+/// * `Some(Some(id))`: the folder must also still be on the filesystem the
+///   file was recorded on, so an unmounted disk (whose empty mount point
+///   still exists) is never mistaken for a deleted file.
+/// * `Some(None)`: an older record with no filesystem id; nothing can be
+///   proven, so the file is not treated as gone.
+///
+/// A permission error or an I/O error is "unknown", never "gone".
+pub(crate) fn source_is_gone(path: &Path, recorded_filesystem: Option<Option<u64>>) -> bool {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return false,
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if !fs::metadata(parent).is_ok_and(|metadata| metadata.is_dir()) {
+        return false;
+    }
+    match recorded_filesystem {
+        None => true,
+        Some(None) => false,
+        Some(Some(recorded)) => filesystem_id(parent) == Some(recorded),
     }
 }
 

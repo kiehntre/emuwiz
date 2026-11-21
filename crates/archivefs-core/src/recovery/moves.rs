@@ -51,6 +51,10 @@ pub fn before_in<'a>(
     store: &PreparedMediaStore,
     moves: impl IntoIterator<Item = (&'a Path, &'a Path)>,
 ) -> PendingMoves {
+    // Resolved once; a store with no link records answers at once.
+    let Some(store) = store.resolved() else {
+        return PendingMoves::default();
+    };
     PendingMoves(
         moves
             .into_iter()
@@ -58,6 +62,24 @@ pub fn before_in<'a>(
             .filter_map(|(old, new)| store.movable_link(old, new))
             .collect(),
     )
+}
+
+/// After a preparation that reused an existing copy for a file that was
+/// renamed or moved: moves the remembered launch choice from the one path
+/// that is provably gone.
+pub fn adopt_remembered_choice(
+    remembered_file: Option<&Path>,
+    outcome: &super::prepared_media::PrepareOutcome,
+    source: &Path,
+) {
+    if let (Some(file), Some(old)) = (remembered_file, &outcome.moved_from) {
+        let _ = crate::launch::remembered_launch_system::move_remembered_launch_system_at(
+            file,
+            old,
+            source,
+            &outcome.summary.platform_id,
+        );
+    }
 }
 
 /// Carries each captured link whose move `happened` says took place, and

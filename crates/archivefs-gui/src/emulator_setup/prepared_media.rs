@@ -71,8 +71,9 @@ pub(crate) fn for_game(path: &Path, recorded: Option<&str>) -> Option<PreparedLa
 }
 
 fn look_up(path: &Path, platform: &'static str) -> Option<PreparedLaunchCopy> {
-    let store = archivefs_core::recovery::PreparedMediaStore::for_profile().ok()?;
-    let summary = store.prepared_for_source(path)?;
+    // The current folder for prepared copies first, then any used earlier:
+    // changing the folder does not strand games that were already prepared.
+    let (_, summary) = archivefs_core::recovery::PreparedMediaStore::serving(path)?;
     (summary.platform_id == platform).then_some(PreparedLaunchCopy {
         launch_path: summary.launch_path,
         platform_id: platform,

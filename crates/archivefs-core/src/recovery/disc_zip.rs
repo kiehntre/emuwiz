@@ -2,8 +2,9 @@
 //! and every track file it names.
 //!
 //! Only the ZIP's central directory and the (small) cue sheet are read. The
-//! sheet's bytes are decoded through the hardened member reader, which checks
-//! them against the CRC-32 the ZIP records. Nothing is written.
+//! sheet is decoded here from the byte range the validated index gives, bounded
+//! to 64 KiB, and checked against the size and CRC-32 the ZIP records.
+//! Nothing is written.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -86,6 +87,18 @@ pub struct SourceIdentity {
 }
 
 impl SourceIdentity {
+    /// The same file as recorded in an earlier run. The device number is
+    /// deliberately left out: it follows the order disks are found at boot,
+    /// so the same file on the same disk can have another one after a
+    /// restart. Inode, size and both timestamps (with the exact path the
+    /// record is filed under) identify the file.
+    pub fn same_file_across_runs(&self, other: &Self) -> bool {
+        self.inode == other.inode
+            && self.size_bytes == other.size_bytes
+            && self.modified_ns == other.modified_ns
+            && self.changed_ns == other.changed_ns
+    }
+
     pub(crate) fn of(metadata: &std::fs::Metadata) -> Self {
         Self {
             device: metadata.dev(),

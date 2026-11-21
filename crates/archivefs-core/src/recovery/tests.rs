@@ -2086,6 +2086,7 @@ mod bulk_tests {
     fn run(lab: &Lab) -> Result<Queue, BulkError> {
         run_queue(
             &lab.store,
+            None,
             &lab.trusted,
             &DiscSetLimits::default(),
             &lab.cancel,
@@ -2123,7 +2124,7 @@ mod bulk_tests {
             .iter()
             .map(|item| match item.plan {
                 BulkItemPlan::Extract { .. } => "extract",
-                BulkItemPlan::Reuse => "reuse",
+                BulkItemPlan::Reuse { .. } => "reuse",
                 BulkItemPlan::AlreadyPrepared => "ready",
                 BulkItemPlan::Refused(_) => "refused",
             })
@@ -2221,6 +2222,7 @@ mod bulk_tests {
         start_queue(&lab.store, &plan(&lab, &paths), &|_| true).unwrap();
         let queue = run_queue(
             &lab.store,
+            None,
             &lab.trusted,
             &DiscSetLimits::default(),
             &lab.cancel,
@@ -2521,4 +2523,330 @@ mod storage_tests {
         assert_eq!(configured_folder_at(&setting), Ok(None));
         assert!(chosen.exists(), "clearing the choice deletes nothing");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Regressions from the second independent review (2026-11-20, f6476af4)
+// ---------------------------------------------------------------------------
+
+mod second_review_tests {
+    use super::*;
+    use crate::launch::remembered_launch_system as remembered;
+    use crate::recovery::bulk::*;
+    use crate::recovery::moves;
+    use crate::recovery::storage::*;
+
+    /// A disk that is not there right now is not a file that is gone.
+    #[test]
+    fn an_unavailable_folder_retires_no_link_and_moves_no_remembered_choice() {
+        let lab = Lab::new();
+        let removable = lab.root.join("removable/amiga-cd32");
+        std::fs::create_dir_all(&removable).unwrap();
+        let original = removable.join("Game.zip");
+        write_zip(&original, &standard_members());
+        let summary = lab.prepare(&original).unwrap().summary;
+        let remembered_file = lab.root.join("config/remembered_launch_systems.json");
+        remembered::remember_launch_system_at(
+            &remembered_file,
+            &remembered::RememberedLaunchSystem::for_current_file(&original, "AmigaCD32").unwrap(),
+        )
+        .unwrap();
+        // A duplicate elsewhere with the same size and time (`cp -p`).
+        let duplicate = lab.zip_path("Game.zip");
+        std::fs::copy(&original, &duplicate).unwrap();
+        let metadata = std::fs::metadata(&original).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&duplicate)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(metadata.accessed().unwrap())
+                    .set_modified(metadata.modified().unwrap()),
+            )
+            .unwrap();
+        // The "disk" goes away: its whole folder is unavailable.
+        let parked = lab.root.join("unmounted");
+        std::fs::rename(lab.root.join("removable"), &parked).unwrap();
+
+        let outcome = moves::rediscover(
+            &lab.store,
+            Some(&remembered_file),
+            &duplicate,
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            RelinkOutcome::Linked {
+                summary: Box::new(summary.clone()),
+                moved_from: None,
+            },
+            "nothing proves the original was moved"
+        );
+        assert_eq!(
+            remembered::remembered_launch_system_at(&remembered_file, &duplicate),
+            None
+        );
+        // The "disk" comes back: the original has its copy and its choice.
+        std::fs::rename(&parked, lab.root.join("removable")).unwrap();
+        assert_eq!(lab.store.prepared_for_source(&original), Some(summary));
+        assert_eq!(
+            remembered::remembered_launch_system_at(&remembered_file, &original),
+            Some("AmigaCD32")
+        );
+    }
+
+    #[test]
+    fn a_second_name_for_the_same_file_does_not_carry_the_link_while_the_first_exists() {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let summary = lab.prepare(&zip).unwrap().summary;
+        let second = lab.zip_path("hard-link.zip");
+        let pending = moves::before_in(&lab.store, [(zip.as_path(), second.as_path())]);
+        // Not a rename: a hard link, so the old name is still there.
+        std::fs::hard_link(&zip, &second).unwrap();
+        assert_eq!(moves::after_in(&lab.store, None, pending, |_, _| true), 0);
+        assert!(lab.store.prepared_for_source(&second).is_none());
+        // (A hard link changes the file's change time, so the first name
+        // needs the content check too; it passes, being the same bytes.)
+        assert!(matches!(
+            lab.store
+                .relink(
+                    &zip,
+                    &lab.trusted,
+                    &DiscSetLimits::default(),
+                    &lab.cancel,
+                    &|_| {}
+                )
+                .unwrap(),
+            RelinkOutcome::Linked { .. }
+        ));
+        assert_eq!(lab.store.prepared_for_source(&zip), Some(summary));
+    }
+
+    #[test]
+    fn the_launch_gate_covers_every_store_given_to_it() {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let old = PreparedMediaStore::at(lab.root.join("old-store"));
+        let summary = old
+            .prepare(
+                &zip,
+                "AmigaCD32",
+                &lab.trusted,
+                &DiscSetLimits::default(),
+                &lab.cancel,
+                &|_| {},
+            )
+            .unwrap()
+            .summary;
+        let current = PreparedMediaStore::at(lab.root.join("new-store"));
+        let track = summary.directory.join("media").join(ISO_NAME);
+        // Only the current store: a track in the old one slips through.
+        assert_eq!(
+            launch_refusal_in(std::slice::from_ref(&current), &track),
+            None
+        );
+        // Every known store: refused; the old store's cue sheet still starts.
+        let known = [current, old];
+        assert!(launch_refusal_in(&known, &track).is_some());
+        assert_eq!(launch_refusal_in(&known, &summary.launch_path), None);
+        assert_eq!(launch_refusal_in(&known, &zip), None);
+    }
+
+    #[test]
+    fn a_saved_folder_is_rechecked_each_time_and_earlier_folders_are_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let setting = root.join("config/prepared_media_folder.txt");
+        let first = root.join("first");
+        let second = root.join("second");
+        set_folder_at(&setting, Some(&first), &[]).unwrap();
+        assert_eq!(still_safe(&first), Ok(()));
+        assert!(
+            previous_folders_at(&setting.with_file_name("prepared_media_previous_folders.txt"))
+                .is_empty()
+        );
+        set_folder_at(&setting, Some(&second), &[]).unwrap();
+        set_folder_at(&setting, None, &[]).unwrap();
+        assert_eq!(
+            previous_folders_at(&setting.with_file_name("prepared_media_previous_folders.txt")),
+            vec![second.clone(), first.clone()],
+            "folders used earlier stay known, newest first"
+        );
+        assert!(first.is_dir() && second.is_dir(), "nothing is deleted");
+
+        // Later made writable by others, or swapped for a link: refused at use.
+        std::fs::set_permissions(&first, std::os::unix::fs::PermissionsExt::from_mode(0o777))
+            .unwrap();
+        assert!(still_safe(&first).is_err());
+        std::fs::remove_dir(&second).unwrap();
+        std::os::unix::fs::symlink(&first, &second).unwrap();
+        assert!(still_safe(&second).is_err());
+        assert_eq!(still_safe(&root.join("not-created-yet")), Ok(()));
+        assert!(still_safe(Path::new("relative")).is_err());
+    }
+
+    #[test]
+    fn a_reuse_whose_copy_is_not_in_the_store_counts_towards_the_space_needed() {
+        let lab = Lab::new();
+        let first = lab.zip_path("first.zip");
+        write_zip(&first, &standard_members());
+        let twin = lab.zip_path("twin.zip");
+        std::fs::copy(&first, &twin).unwrap();
+        let candidates: Vec<BulkCandidate> = [&first, &twin]
+            .iter()
+            .map(|path| BulkCandidate {
+                path: path.to_path_buf(),
+                platform_id: "AmigaCD32".into(),
+                title: "disc".into(),
+            })
+            .collect();
+        let plan = plan_bulk(
+            &lab.store,
+            &candidates,
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+        )
+        .unwrap();
+        assert!(matches!(plan.items[0].plan, BulkItemPlan::Extract { .. }));
+        assert!(matches!(
+            plan.items[1].plan,
+            BulkItemPlan::Reuse {
+                in_store: false,
+                ..
+            }
+        ));
+        let both = plan.required_for(&|_| true);
+        let only_twin = plan.required_for(&|path| path == twin);
+        let only_first = plan.required_for(&|path| path == first);
+        assert!(only_twin > 0, "the twin alone has to be extracted");
+        assert_eq!(only_twin, only_first);
+        assert_eq!(both, only_first, "together the disc is counted once");
+
+        // Starting just the twin with too little space is refused, and
+        // nothing is created.
+        crate::recovery::prepared_media::FREE_SPACE_OVERRIDE.with(|free| free.set(Some(1024)));
+        let refused = start_queue(&lab.store, &plan, &|path| path == twin);
+        crate::recovery::prepared_media::FREE_SPACE_OVERRIDE.with(|free| free.set(None));
+        assert!(
+            matches!(refused, Err(BulkError::NotEnoughSpace { .. })),
+            "{refused:?}"
+        );
+        assert!(!lab.store.root().exists());
+
+        // A copy that was in the store at the review but is gone at the
+        // start counts again.
+        let summary = lab.prepare(&first).unwrap().summary;
+        let reviewed = plan_bulk(
+            &lab.store,
+            &candidates[1..],
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+        )
+        .unwrap();
+        assert!(matches!(
+            reviewed.items[0].plan,
+            BulkItemPlan::Reuse { in_store: true, .. }
+        ));
+        assert_eq!(reviewed.required_for(&|_| true), 0);
+        lab.store.remove(&summary.set_id).unwrap();
+        assert!(
+            reviewed.required_with(&|_| true, &|fingerprint| {
+                lab.store.lookup(fingerprint).is_some()
+            }) > 0
+        );
+    }
+
+    #[test]
+    fn a_queue_entry_the_engine_has_no_preparation_for_is_never_run() {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let candidate = BulkCandidate {
+            path: zip.clone(),
+            platform_id: "AmigaCD32".into(),
+            title: "disc".into(),
+        };
+        let plan = plan_bulk(
+            &lab.store,
+            std::slice::from_ref(&candidate),
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+        )
+        .unwrap();
+        start_queue(&lab.store, &plan, &|_| true).unwrap();
+        // The queue file is edited by hand to name another system.
+        let queue_file = lab.store.root().join("v1/queue.json");
+        let text = std::fs::read_to_string(&queue_file).unwrap();
+        std::fs::write(&queue_file, text.replace("AmigaCD32", "Xbox")).unwrap();
+        let queue = run_queue(
+            &lab.store,
+            None,
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+            &|_| {},
+        )
+        .unwrap();
+        assert!(matches!(queue.items[0].state, QueueState::Failed(_)));
+        assert!(lab.store.list().is_empty());
+    }
+}
+
+/// A restart can give the same disk another device number. The link is to
+/// the file, not to that number.
+#[test]
+fn a_prepared_copy_is_still_found_when_the_disk_gets_another_device_number() {
+    let lab = Lab::new();
+    let zip = lab.standard_zip();
+    let summary = lab.prepare(&zip).unwrap().summary;
+    // Rewrite the saved record as if it had been made when the disk had
+    // another device number.
+    let sources = lab.store.root().join("v1/sources");
+    let record = std::fs::read_dir(&sources)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut link: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    let device = link["source"]["device"].as_u64().unwrap();
+    link["source"]["device"] = serde_json::json!(device + 16);
+    std::fs::write(&record, serde_json::to_string(&link).unwrap()).unwrap();
+
+    assert_eq!(lab.store.prepared_for_source(&zip), Some(summary.clone()));
+    assert_eq!(
+        lab.diagnose(&zip).verdict,
+        RecoveryVerdict::PlayableFromPreparedCopy
+    );
+    // An EmuWiz rename still carries it (the comparison there is between the
+    // start and the end of the one operation).
+    let renamed = lab.zip_path("renamed-after-restart.zip");
+    let pending =
+        crate::recovery::moves::before_in(&lab.store, [(zip.as_path(), renamed.as_path())]);
+    std::fs::rename(&zip, &renamed).unwrap();
+    assert_eq!(
+        crate::recovery::moves::after_in(&lab.store, None, pending, |_, _| true),
+        1
+    );
+    assert_eq!(lab.store.prepared_for_source(&renamed), Some(summary));
+    // Anything else about the file changing still breaks the link.
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&renamed)
+        .unwrap();
+    file.set_modified(
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(4_000_000),
+    )
+    .unwrap();
+    drop(file);
+    assert!(lab.store.prepared_for_source(&renamed).is_none());
 }

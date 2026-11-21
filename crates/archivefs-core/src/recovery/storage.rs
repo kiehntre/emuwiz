@@ -3,8 +3,10 @@
 //! By default `<data>/prepared-media`. The person may choose another folder
 //! (for example on a larger disk); the choice is one line in
 //! `prepared_media_folder.txt` in EmuWiz's configuration folder and is
-//! accepted only after [`check_folder`] passes. Copies already in another
-//! folder are not moved and are not looked for there.
+//! accepted only after [`check_folder`] passes, and is re-checked each time
+//! it is used ([`still_safe`]). Copies already in another folder are not
+//! moved; folders used earlier are remembered, so their copies are still
+//! found and still covered by the launch gate.
 
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -54,6 +56,105 @@ pub fn configured_folder_at(setting: &Path) -> Result<Option<PathBuf>, String> {
         ));
     }
     Ok(Some(folder))
+}
+
+/// The saved folder text even when it would not pass the checks, for the
+/// launch gate only (it must still be able to refuse files in that folder).
+pub(crate) fn configured_folder_unchecked() -> Option<PathBuf> {
+    let text = std::fs::read_to_string(setting_path().ok()?).ok()?;
+    let line = text.lines().next()?.trim();
+    let folder = PathBuf::from(line);
+    folder.is_absolute().then_some(folder)
+}
+
+/// Re-checks a saved folder each time it is used: it must still be a real
+/// folder (not a link) of this user that others cannot write to. A folder
+/// that does not exist yet is acceptable; it is created private on first use.
+pub fn still_safe(folder: &Path) -> Result<(), String> {
+    if !has_plain_components(folder) {
+        return Err(format!(
+            "{} is not a plain absolute folder path",
+            folder.display()
+        ));
+    }
+    let metadata = match std::fs::symlink_metadata(folder) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{}: {error}", folder.display())),
+    };
+    // SAFETY: geteuid has no preconditions.
+    let mine = metadata.uid() == unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{} is no longer a real folder; choose the folder for prepared copies again",
+            folder.display()
+        ));
+    }
+    if !mine || metadata.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{} is no longer a folder only you can change; choose the folder for prepared copies again",
+            folder.display()
+        ));
+    }
+    Ok(())
+}
+
+const PREVIOUS_FOLDERS_FILE: &str = "prepared_media_previous_folders.txt";
+const MAX_PREVIOUS_FOLDERS: usize = 32;
+
+fn previous_path_beside(setting: &Path) -> PathBuf {
+    setting.with_file_name(PREVIOUS_FOLDERS_FILE)
+}
+
+/// Folders that were chosen for prepared copies earlier. Copies there are
+/// still found and still guarded by the launch gate.
+pub fn previous_folders() -> Vec<PathBuf> {
+    setting_path()
+        .map(|setting| previous_folders_at(&previous_path_beside(&setting)))
+        .unwrap_or_default()
+}
+
+pub fn previous_folders_at(list: &Path) -> Vec<PathBuf> {
+    use std::io::Read;
+    let Ok(file) = crate::safe_read::open_regular_file_nonblocking(list, false) else {
+        return Vec::new();
+    };
+    let mut text = String::new();
+    if file.take(64 * 1024).read_to_string(&mut text).is_err() {
+        return Vec::new();
+    }
+    text.lines()
+        .map(PathBuf::from)
+        .filter(|folder| has_plain_components(folder))
+        .take(MAX_PREVIOUS_FOLDERS)
+        .collect()
+}
+
+fn remember_previous(setting: &Path, folder: &Path) -> Result<(), String> {
+    let list = previous_path_beside(setting);
+    let mut folders = previous_folders_at(&list);
+    folders.retain(|known| known != folder);
+    folders.insert(0, folder.to_path_buf());
+    folders.truncate(MAX_PREVIOUS_FOLDERS);
+    let text: String = folders
+        .iter()
+        .filter_map(|folder| folder.to_str())
+        .map(|folder| format!("{folder}\n"))
+        .collect();
+    crate::atomic_write_text(&list, &text).map_err(|error| error.to_string())
+}
+
+/// The game folders EmuWiz scans, for the "not inside a game folder" check.
+/// No configuration at all means no game folders; a configuration that
+/// cannot be read is an error, so the check is never silently skipped.
+pub fn library_folders() -> Result<Vec<PathBuf>, String> {
+    let config = crate::default_config_path().map_err(|error| error.to_string())?;
+    if std::fs::symlink_metadata(&config).is_err() {
+        return Ok(Vec::new());
+    }
+    crate::load_source_folder_configs_from(&config)
+        .map(|sources| sources.into_iter().map(|source| source.path).collect())
+        .map_err(|error| format!("your game folders could not be read ({error})"))
 }
 
 /// The result of examining a folder proposed for prepared copies.
@@ -140,6 +241,7 @@ pub fn check_folder(folder: &Path, library_folders: &[PathBuf], create: bool) ->
     if !check.usable() {
         return check;
     }
+    let mut created = false;
     if !existing {
         if !create {
             check
@@ -157,6 +259,7 @@ pub fn check_folder(folder: &Path, library_folders: &[PathBuf], create: bool) ->
                 .push(format!("The folder could not be created: {error}."));
             return check;
         }
+        created = true;
     }
     let Ok(metadata) = std::fs::metadata(&resolved) else {
         check
@@ -201,6 +304,11 @@ pub fn check_folder(folder: &Path, library_folders: &[PathBuf], create: bool) ->
     }
     check.available_bytes = super::prepared_media::available_bytes(&resolved).ok();
     note_disk(&mut check, &resolved);
+    if created && !check.usable() {
+        // Refused after all: do not leave the folder this call made (it is
+        // empty; `remove_dir` removes nothing else).
+        let _ = std::fs::remove_dir(folder);
+    }
     check
 }
 
@@ -256,6 +364,12 @@ pub fn set_folder_at(
     folder: Option<&Path>,
     library_folders: &[PathBuf],
 ) -> Result<Option<StorageCheck>, String> {
+    // The folder in use until now keeps its copies; they stay findable.
+    if let Ok(Some(old)) = configured_folder_at(setting)
+        && folder != Some(old.as_path())
+    {
+        remember_previous(setting, &old)?;
+    }
     let Some(folder) = folder else {
         match std::fs::remove_file(setting) {
             Ok(()) => {}

@@ -63,6 +63,7 @@ enum Outcome {
     BulkPlanned(
         Result<Box<recovery::BulkPlan>, String>,
         Option<recovery::Queue>,
+        Option<String>,
     ),
     BulkRan(Result<recovery::Queue, String>),
     Storage(Result<StorageView, String>),
@@ -87,6 +88,8 @@ struct Bulk {
     confirm: bool,
     queue: Option<recovery::Queue>,
     message: Option<(bool, String)>,
+    /// How many games were found and how many are already prepared.
+    note: Option<String>,
 }
 
 /// Where the page reads and writes; replaced in tests.
@@ -105,7 +108,12 @@ impl Environment {
     }
 
     fn diagnose(&self, target: &Target, cancel: &AtomicBool) -> Result<RecoveryReport, String> {
-        let store = self.store()?;
+        // A game prepared before the folder for copies was changed is still
+        // served from the earlier folder; report on that copy.
+        let store = match (&self.store, PreparedMediaStore::serving(&target.path)) {
+            (None, Some((serving, _))) => serving,
+            _ => self.store()?,
+        };
         let host = self.host.clone().unwrap_or_else(HostFacts::probe);
         Ok(recovery::diagnose(
             &target.subject(),
@@ -254,7 +262,8 @@ impl State {
                     }
                 }
             }
-            Outcome::BulkPlanned(plan, queue) => {
+            Outcome::BulkPlanned(plan, queue, note) => {
+                self.bulk.note = note;
                 self.bulk.selected = plan
                     .as_ref()
                     .map(|plan| {
@@ -387,6 +396,16 @@ impl State {
                     )
                     .map_err(|error| error.to_string())
             });
+            if let Ok(outcome) = &result {
+                // A file renamed or moved since it was prepared gets its
+                // remembered launch choice back with its copy.
+                let remembered = archivefs_core::launch::remembered_launch_system::default_remembered_launch_systems_path().ok();
+                recovery::moves::adopt_remembered_choice(
+                    remembered.as_deref(),
+                    outcome,
+                    &target.path,
+                );
+            }
             let (ok, text) = match result {
                 Ok(outcome) if outcome.link_warning.is_some() => (
                     false,
@@ -605,18 +624,41 @@ impl State {
         self.start(ctx, "Looking at the games…", move || {
             let result = environment.store().and_then(|store| {
                 let queue = recovery::bulk::load_queue(&store);
+                // Games already prepared need no review, and one batch is
+                // bounded: a larger library is worked through in turns.
+                let found = candidates.len();
+                let mut todo: Vec<_> = candidates
+                    .into_iter()
+                    .filter(|candidate| {
+                        PreparedMediaStore::serving(&candidate.path).is_none()
+                            && store.prepared_for_source(&candidate.path).is_none()
+                    })
+                    .collect();
+                let ready = found - todo.len();
+                let later = todo.len().saturating_sub(recovery::bulk::MAX_BULK_ITEMS);
+                todo.truncate(recovery::bulk::MAX_BULK_ITEMS);
+                let note = format!(
+                    "{found} game(s) of this kind are in your library; {ready} already have a prepared copy.{}",
+                    if later > 0 {
+                        format!(" {later} more will be listed after these are done.")
+                    } else {
+                        String::new()
+                    }
+                );
                 recovery::bulk::plan_bulk(
                     &store,
-                    &candidates,
+                    &todo,
                     &TrustedRoots::none(),
                     &DiscSetLimits::default(),
                     &cancel,
                 )
-                .map(|plan| (plan, queue))
+                .map(|plan| (plan, queue, note))
             });
             match result {
-                Ok((plan, queue)) => Outcome::BulkPlanned(Ok(Box::new(plan)), queue),
-                Err(detail) => Outcome::BulkPlanned(Err(detail), None),
+                Ok((plan, queue, note)) => {
+                    Outcome::BulkPlanned(Ok(Box::new(plan)), queue, Some(note))
+                }
+                Err(detail) => Outcome::BulkPlanned(Err(detail), None, None),
             }
         });
     }
@@ -642,8 +684,10 @@ impl State {
                             .map_err(|error| error.to_string())?;
                     }
                     let titles = std::cell::RefCell::new(String::new());
+                    let remembered = archivefs_core::launch::remembered_launch_system::default_remembered_launch_systems_path().ok();
                     recovery::bulk::run_queue(
                         &store,
+                        remembered.as_deref(),
                         &TrustedRoots::none(),
                         &DiscSetLimits::default(),
                         &cancel,
@@ -707,35 +751,66 @@ impl State {
         apply: Option<Option<PathBuf>>,
     ) {
         self.start(ctx, "Checking the folder…", move || {
-            let library: Vec<PathBuf> = archivefs_core::default_config_path()
-                .ok()
-                .and_then(|config| archivefs_core::load_source_folder_configs_from(config).ok())
-                .map(|sources| sources.into_iter().map(|source| source.path).collect())
-                .unwrap_or_default();
+            // Without the list of game folders the "not inside a game folder"
+            // check cannot be made, so nothing is checked or changed.
+            let library = recovery::storage::library_folders();
             let mut message = None;
-            if let Some(choice) = &apply {
-                message = Some(
-                    match recovery::storage::set_folder(choice.as_deref(), &library) {
-                        Ok(Some(_)) => (
-                            true,
-                            "Prepared copies will now be kept in this folder. Copies already prepared elsewhere stay where they are and are not used from there.".to_string(),
-                        ),
-                        Ok(None) => (
-                            true,
-                            "Prepared copies will be kept in EmuWiz's own data folder again.".to_string(),
-                        ),
-                        Err(detail) => (false, format!("The folder was not changed: {detail}")),
-                    },
-                );
+            let mut checked = None;
+            match &library {
+                Err(detail) => {
+                    if check.is_some() || apply.as_ref().is_some_and(Option::is_some) {
+                        message = Some((
+                            false,
+                            format!("The folder was not checked or changed: {detail}."),
+                        ));
+                    } else if let Some(None) = &apply {
+                        // Going back to the default needs no library check.
+                        message = Some(match recovery::storage::set_folder(None, &[]) {
+                            Ok(_) => (
+                                true,
+                                "Prepared copies will be kept in EmuWiz's own data folder again.".to_string(),
+                            ),
+                            Err(detail) => (false, format!("The folder was not changed: {detail}")),
+                        });
+                    }
+                }
+                Ok(library) => {
+                    if let Some(choice) = &apply {
+                        message = Some(
+                            match recovery::storage::set_folder(choice.as_deref(), library) {
+                                Ok(Some(_)) => (
+                                    true,
+                                    "New prepared copies will be kept in this folder. Games already prepared keep working from the folder their copies are in.".to_string(),
+                                ),
+                                Ok(None) => (
+                                    true,
+                                    "New prepared copies will be kept in EmuWiz's own data folder again. Games already prepared keep working from the folder their copies are in.".to_string(),
+                                ),
+                                Err(detail) => (false, format!("The folder was not changed: {detail}")),
+                            },
+                        );
+                    }
+                    checked = check.map(|folder| recovery::storage::check_folder(&folder, library, false));
+                }
             }
-            let checked = check.map(|folder| recovery::storage::check_folder(&folder, &library, false));
-            Outcome::Storage(recovery::storage::describe_current().map(|(store, chosen)| StorageView {
-                available: store.available_bytes().ok(),
-                current: store.root().to_path_buf(),
-                chosen,
-                checked,
-                message,
-            }))
+            Outcome::Storage(match recovery::storage::describe_current() {
+                Ok((store, chosen)) => Ok(StorageView {
+                    available: store.available_bytes().ok(),
+                    current: store.root().to_path_buf(),
+                    chosen,
+                    checked,
+                    message,
+                }),
+                // The saved folder can no longer be used: say so, and keep
+                // "use EmuWiz's own data folder" available.
+                Err(detail) => Ok(StorageView {
+                    available: None,
+                    current: PathBuf::new(),
+                    chosen: true,
+                    checked,
+                    message: message.or(Some((false, format!("The folder chosen for prepared copies cannot be used: {detail}.")))),
+                }),
+            })
         });
     }
 
@@ -1199,10 +1274,12 @@ fn show_bulk(
                 }
                 Some(Ok(plan)) => {
                     let selected = &mut state.bulk.selected;
-                    let ready = plan.count(|item| matches!(item, recovery::BulkItemPlan::AlreadyPrepared));
+                    if let Some(note) = &state.bulk.note {
+                        ui.label(note);
+                    }
                     let refused = plan.count(|item| matches!(item, recovery::BulkItemPlan::Refused(_)));
                     ui.label(format!(
-                        "{} game(s) can be prepared; {ready} already have a prepared copy; {refused} cannot be prepared.",
+                        "{} game(s) can be prepared; {refused} cannot be prepared.",
                         plan.actionable().count()
                     ));
                     egui::ScrollArea::vertical()

@@ -158,8 +158,9 @@ list the prepared files as games.
 ## Renames and moves of a prepared ZIP
 
 A prepared copy is linked to its ZIP by the ZIP's exact path and file identity
-(device, inode, size, modification and change times), so a launch never has to read
-the ZIP. A rename or move changes the path (and the change time), so the link has to
+(inode, size, modification and change times), so a launch never has to read the ZIP.
+The disk's device number is not part of that identity: it follows the order disks are
+found at start-up, so it can change across a restart while the file has not. A rename or move changes the path (and the change time), so the link has to
 follow the file. Two routes, with different proof:
 
 | What happened | How the copy follows | Proof | Remembered launch choice |
@@ -169,7 +170,10 @@ follow the file. Two routes, with different proof:
 | A copy of the ZIP (the original still exists) | As the row above | As the row above | Not inherited: two files, one choice, so nothing is assumed |
 | A different or modified ZIP, even with the same name, size and timestamps | Never linked | Fails the content comparison | Never moved |
 
-Link records whose ZIP no longer exists are removed when the copy is linked again.
+A link record is retired, and a remembered choice moved, only when the old path is
+provably gone: the name is missing while its folder is still there on the same
+filesystem. A disk that is not mounted, or a folder that cannot be read, is "unknown",
+and nothing is retired or moved on that basis.
 
 "Remember this launch choice" itself is unchanged: it is saved for one unchanged
 file, applies on later launches and after a restart, keeps the "System not confirmed"
@@ -206,8 +210,13 @@ folder is accepted only if it is a real folder (not a link) that belongs to you 
 that others cannot write to, is not inside a game folder and does not contain one,
 is writable, and is on a filesystem with a no-replace rename (ext4, XFS, Btrfs).
 Its location is judged before anything is created there. Copies already prepared in
-another folder are not moved and are not used from there; a damaged setting is an
-error, never a silent return to the default.
+another folder are not moved. Folders used earlier are remembered: games prepared
+there keep starting from them, and the launch check still covers them. The saved
+folder is checked again every time it is used; one that has since become a link,
+another user's, or writable by others is refused with a message, and a damaged
+setting is an error, never a silent return to the default. If your game folders
+cannot be read, a new folder is not accepted (the "not inside a game folder" check
+could not be made).
 
 ## Extending it
 
@@ -255,8 +264,11 @@ with `members()`, `fingerprint()` and `verify_structure()` rather than a rewrite
   (or `prepare` is run); until then the game shows as not prepared.
 - A move to another disk through EmuWiz is treated like an outside move: it is
   re-linked by content, not carried at once.
-- Changing the storage folder does not move existing copies; games prepared in the
-  old folder need preparing again (the old folder is left untouched).
+- Changing the storage folder does not move existing copies. They keep working from
+  the earlier folder, which therefore has to stay where it is; there is no "move my
+  copies" action yet.
+- The Game recovery page lists at most 500 games per batch; a larger library is
+  worked through in turns.
 - Bulk preparation lists CD32 ZIPs only (the one validated preparation), runs one
   batch at a time, and has no schedule or automatic start.
 - Like every `emuwiz-cli` command, `recovery` announces itself in EmuWiz's per-user
@@ -321,7 +333,18 @@ per-user runtime folder (warm file cache):
 | Bytes read per diagnosis (whole process, including loading the program) | 1.32 MB mean; 104 MB for all 79, under 1% of the ZIPs' size |
 | Opens of each game ZIP | one, read-only; none with a write flag |
 | Preparing the 70 preparable discs (12.98 GB of new files) | 465 s in total; mean 6.6 s, median 1.9 s, slowest 52.6 s |
-| Writes outside scratch | none; the 79 ZIPs and the real runtime folder were identical afterwards |
+| Writes outside scratch | none by the sandboxed runs; the 79 ZIPs were identical afterwards |
+
+Batch preparation of the same 79 ZIPs (`prepare-all`, same sandbox, a fresh store):
+
+| Measurement | Result |
+|---|---|
+| Review of 79 (read-only; nothing created) | 4.1 s: 70 to prepare, 9 refused with their reasons |
+| Space preflight | 12.98 GB to extract; 14.44 GB required with margin and reserve |
+| The batch (70 games, one at a time) | 474 s; 70 prepared, 0 failed; store 12.98 GB |
+| The same batch again | 0.46 s: nothing to do, refused, nothing changed |
+| Three scratch copies of real ZIPs under other names | 9.0 s: all three matched existing copies by content; nothing extracted; store size unchanged |
+| One scratch copy renamed again, then `prepare` | 5.9 s: re-linked by content, nothing extracted |
 
 ## Roadmap
 

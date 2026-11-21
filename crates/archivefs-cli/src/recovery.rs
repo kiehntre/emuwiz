@@ -52,8 +52,15 @@ pub fn run(args: Vec<String>) -> Outcome {
     let mut reset_folder = false;
     let mut positional = Vec::new();
     let mut args = args.into_iter();
+    let mut only_files = false;
     while let Some(arg) = args.next() {
+        // After `--` everything is a file name, whatever it looks like.
+        if only_files {
+            positional.push(arg);
+            continue;
+        }
         match arg.as_str() {
+            "--" => only_files = true,
             // Asking for help must only ever print help.
             "--help" | "-h" | "help" => {
                 println!("{USAGE}");
@@ -80,6 +87,14 @@ pub fn run(args: Vec<String>) -> Outcome {
         return Ok(());
     };
     let rest: Vec<String> = positional.collect();
+    if set_folder.is_some() && reset_folder {
+        return Err("give either --set <folder> or --reset, not both".into());
+    }
+    // Commands that do not use the store must work even when the saved
+    // folder for prepared copies can no longer be used.
+    if matches!(command.as_str(), "capabilities" | "storage") {
+        return run_without_store(&command, set_folder, reset_folder);
+    }
     let store = match store_override {
         Some(folder) => {
             let folder = PathBuf::from(folder);
@@ -106,9 +121,6 @@ pub fn run(args: Vec<String>) -> Outcome {
     let trusted = TrustedRoots::none();
 
     match command.as_str() {
-        "capabilities" => {
-            print!("{}", recovery::capability_matrix_markdown());
-        }
         "diagnose" => {
             let (path, system) = game("a game file")?;
             let host = HostFacts::probe();
@@ -156,6 +168,13 @@ pub fn run(args: Vec<String>) -> Outcome {
                     },
                 )
                 .map_err(|error| format!("{error}. The game file was only read."))?;
+            recovery::moves::adopt_remembered_choice(
+                archivefs_core::launch::remembered_launch_system::default_remembered_launch_systems_path()
+                    .ok()
+                    .as_deref(),
+                &outcome,
+                &path,
+            );
             if let Some(warning) = &outcome.link_warning {
                 eprintln!(
                     "warning: the copy is in place but could not be linked to this ZIP ({warning}); run prepare again"
@@ -280,7 +299,7 @@ pub fn run(args: Vec<String>) -> Outcome {
                     recovery::BulkItemPlan::Extract { files, bytes } => {
                         format!("prepare: {files} new files, {bytes} bytes")
                     }
-                    recovery::BulkItemPlan::Reuse => {
+                    recovery::BulkItemPlan::Reuse { .. } => {
                         "matches an existing copy: compare in full, extract nothing".to_string()
                     }
                     recovery::BulkItemPlan::AlreadyPrepared => "already prepared".to_string(),
@@ -314,43 +333,53 @@ pub fn run(args: Vec<String>) -> Outcome {
             recovery::bulk::clear_queue(&store).map_err(|error| error.to_string())?;
             println!("The saved batch was forgotten. Prepared copies were not touched.");
         }
-        "storage" => {
-            let library: Vec<PathBuf> = archivefs_core::default_config_path()
-                .ok()
-                .and_then(|config| archivefs_core::load_source_folder_configs_from(config).ok())
-                .map(|sources| sources.into_iter().map(|source| source.path).collect())
-                .unwrap_or_default();
-            if reset_folder {
-                recovery::storage::set_folder(None, &library)?;
-                println!("Prepared copies will be kept in EmuWiz's own data folder again.");
-            } else if let Some(folder) = set_folder {
-                let check = recovery::storage::set_folder(Some(Path::new(&folder)), &library)
-                    .map_err(|detail| format!("The folder was not changed: {detail}"))?;
-                println!(
-                    "Prepared copies will now be kept in {folder}.{} Copies already prepared elsewhere are not moved.",
-                    check
-                        .and_then(|check| check.available_bytes)
-                        .map(|bytes| format!(" {bytes} bytes free there."))
-                        .unwrap_or_default()
-                );
-            }
-            let (current, chosen) = recovery::storage::describe_current()?;
-            println!(
-                "Prepared copies are kept in {}{}; {} free.",
-                current.root().display(),
-                if chosen {
-                    " (your choice)"
-                } else {
-                    " (default)"
-                },
-                current
-                    .available_bytes()
-                    .map_or("unknown space".to_string(), |bytes| format!(
-                        "{bytes} bytes"
-                    ))
-            );
-        }
         other => return Err(format!("unknown recovery command {other:?}\n\n{USAGE}").into()),
+    }
+    Ok(())
+}
+
+fn run_without_store(command: &str, set_folder: Option<String>, reset_folder: bool) -> Outcome {
+    if command == "capabilities" {
+        print!("{}", recovery::capability_matrix_markdown());
+        return Ok(());
+    }
+    if reset_folder {
+        recovery::storage::set_folder(None, &[])?;
+        println!(
+            "New prepared copies will be kept in EmuWiz's own data folder again. Games already prepared keep working from the folder their copies are in."
+        );
+    } else if let Some(folder) = set_folder {
+        // Without the list of game folders the check cannot be made.
+        let library = recovery::storage::library_folders()
+            .map_err(|detail| format!("The folder was not changed: {detail}"))?;
+        let check = recovery::storage::set_folder(Some(Path::new(&folder)), &library)
+            .map_err(|detail| format!("The folder was not changed: {detail}"))?;
+        println!(
+            "New prepared copies will be kept in {folder}.{} Games already prepared keep working from the folder their copies are in.",
+            check
+                .and_then(|check| check.available_bytes)
+                .map(|bytes| format!(" {bytes} bytes free there."))
+                .unwrap_or_default()
+        );
+    }
+    match recovery::storage::describe_current() {
+        Ok((current, chosen)) => println!(
+            "Prepared copies are kept in {}{}; {} free.",
+            current.root().display(),
+            if chosen {
+                " (your choice)"
+            } else {
+                " (default)"
+            },
+            current
+                .available_bytes()
+                .map_or("unknown space".to_string(), |bytes| format!(
+                    "{bytes} bytes"
+                ))
+        ),
+        Err(detail) => println!(
+            "The folder chosen for prepared copies cannot be used: {detail}. Choose another with `storage --set <folder>` or go back to the default with `storage --reset`."
+        ),
     }
     Ok(())
 }
@@ -376,8 +405,15 @@ fn run_batch(
     trusted: &TrustedRoots,
     cancel: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let queue =
-        recovery::bulk::run_queue(store, trusted, &DiscSetLimits::default(), cancel, &|step| {
+    let queue = recovery::bulk::run_queue(
+        store,
+        archivefs_core::launch::remembered_launch_system::default_remembered_launch_systems_path()
+            .ok()
+            .as_deref(),
+        trusted,
+        &DiscSetLimits::default(),
+        cancel,
+        &|step| {
             if let recovery::bulk::BulkProgress::Starting {
                 index,
                 count,
@@ -386,8 +422,9 @@ fn run_batch(
             {
                 eprintln!("game {}/{count}: {title}", index + 1);
             }
-        })
-        .map_err(|error| error.to_string())?;
+        },
+    )
+    .map_err(|error| error.to_string())?;
     print_queue(&queue);
     println!("The game files were only read.");
     Ok(())
