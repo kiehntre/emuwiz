@@ -50,7 +50,7 @@ impl Device {
     }
 
     fn peers(&self) -> PeerBook {
-        PeerBook::open(&self.dir.path().join("continuity"))
+        PeerBook::open(&self.dir.path().join("continuity")).unwrap()
     }
 }
 
@@ -491,4 +491,188 @@ fn receiving_changes_no_save_on_the_receiving_device() {
     assert_eq!(fs::read(&laptop.card).unwrap(), laptop_card);
     // Both histories are now on the laptop, side by side, for a person to choose.
     assert_eq!(laptop.store.list().len(), 2);
+}
+
+// ---- Regression tests for the independent review of 2026-11-21 ----
+
+#[test]
+fn a_paired_device_cannot_put_records_into_this_devices_histories() {
+    let (mut desktop, mut laptop) = paired();
+    let ours = laptop.play(&[(GAME, "laptop")]);
+    // The desktop (paired, but hostile) signs a list holding a record that
+    // claims the laptop's history key.
+    desktop.play(&[(GAME, "v1")]);
+    let mut list = desktop.device.export(&desktop.store).unwrap();
+    let mut body = list.body.snapshots[0].body.clone();
+    body.lineage = ours.body.lineage.clone();
+    body.captured_unix = 4_000_000_000;
+    let forged = SnapshotManifest {
+        format_version: 1,
+        snapshot_id: body_id(&body),
+        body,
+    };
+    list.body.snapshots = vec![forged];
+    // Even if it could sign this (it can: it is its own list), it is refused.
+    assert!(laptop.peers().accept(&list).is_err());
+    assert_eq!(laptop.store.list_lineage(&ours.body.lineage).len(), 1);
+}
+
+#[test]
+fn a_second_different_list_with_the_same_number_is_refused_and_the_same_one_is_fine() {
+    let (mut desktop, laptop) = paired();
+    desktop.play(&[(GAME, "v1")]);
+    let first = desktop.device.export(&desktop.store).unwrap();
+    laptop.peers().accept(&first).unwrap();
+    laptop.peers().accept(&first).unwrap(); // the very same list again: harmless
+    // The desktop's counter goes back (a power cut, a restored backup) and it
+    // signs something else under the same number.
+    let continuity = desktop.dir.path().join("continuity/device.json");
+    let reverted = fs::read_to_string(&continuity)
+        .unwrap()
+        .replace("\"sequence\": 1", "\"sequence\": 0");
+    fs::write(&continuity, reverted).unwrap();
+    desktop.play(&[(GAME, "v2")]);
+    let second = desktop.device.export(&desktop.store).unwrap();
+    assert_eq!(second.body.sequence, first.body.sequence);
+    let refused = laptop.peers().accept(&second).unwrap_err();
+    assert!(
+        matches!(refused, ContinuityError::Refused(ref text) if text.contains("same number")),
+        "{refused}"
+    );
+}
+
+#[test]
+fn checking_a_list_changes_nothing_and_comparing_does_not_use_up_a_number() {
+    let (mut desktop, mut laptop) = paired();
+    desktop.play(&[(GAME, "v1")]);
+    laptop.play(&[(GAME, "v1")]);
+    let exported_earlier = laptop.device.export(&laptop.store).unwrap();
+    let theirs = desktop.device.export(&desktop.store).unwrap();
+    let before = tree(&laptop.dir.path().join("continuity"));
+    laptop.peers().check(&theirs).unwrap();
+    let mine = laptop.device.current_histories(&laptop.store);
+    assert_eq!(compare(&mine, &theirs.body)[0].relation, Relation::Same);
+    assert_eq!(
+        tree(&laptop.dir.path().join("continuity")),
+        before,
+        "nothing written by looking"
+    );
+    assert_eq!(
+        laptop.device.sequence(),
+        exported_earlier.body.sequence,
+        "the earlier list is still current"
+    );
+}
+
+#[test]
+fn a_pairing_file_that_cannot_be_read_is_an_error_not_an_empty_book() {
+    let (desktop, laptop) = paired();
+    let file = laptop.dir.path().join("continuity/peers.json");
+    let good = fs::read(&file).unwrap();
+    fs::write(&file, b"{ damaged").unwrap();
+    assert!(matches!(
+        PeerBook::open(&laptop.dir.path().join("continuity")),
+        Err(ContinuityError::Corrupt(_))
+    ));
+    assert_eq!(
+        fs::read(&file).unwrap(),
+        b"{ damaged",
+        "left exactly as found"
+    );
+    fs::write(&file, good).unwrap();
+    assert!(laptop.peers().is_paired(&desktop.device.identity.device_id));
+}
+
+#[test]
+fn a_transfer_whose_content_is_not_the_stated_size_is_refused_before_anything_is_kept() {
+    let (mut desktop, laptop) = paired();
+    let snapshot = big_snapshot(&mut desktop);
+    let mut list = desktop.device.export(&desktop.store).unwrap();
+    laptop.peers().accept(&list).unwrap();
+    // The list (as the receiver holds it) is altered to state another size.
+    let mut body = snapshot.body.clone();
+    body.files[0].size_bytes = 1;
+    let lying = SnapshotManifest {
+        format_version: 1,
+        snapshot_id: body_id(&body),
+        body,
+    };
+    list.body.snapshots = vec![lying.clone()];
+    let refused = receive_snapshot(
+        &list,
+        desktop.device.sequence(),
+        &lying.snapshot_id,
+        &desktop.store,
+        &laptop.store,
+        &mut DirectLink,
+    )
+    .unwrap_err();
+    assert!(matches!(refused, ContinuityError::Refused(_)), "{refused}");
+    assert!(laptop.store.list().is_empty());
+    assert_eq!(laptop.store.usage().objects, 0);
+}
+
+#[test]
+fn receiving_respects_this_stores_own_size_limit() {
+    let (mut desktop, laptop) = paired();
+    let snapshot = big_snapshot(&mut desktop); // 300,000 bytes
+    let list = desktop.device.export(&desktop.store).unwrap();
+    laptop.peers().accept(&list).unwrap();
+    let small = SnapshotStore::open_with_budget(&laptop.dir.path().join("small"), 100_000).unwrap();
+    let refused = receive_snapshot(
+        &list,
+        desktop.device.sequence(),
+        &snapshot.snapshot_id,
+        &desktop.store,
+        &small,
+        &mut DirectLink,
+    )
+    .unwrap_err();
+    assert!(matches!(refused, ContinuityError::NoSpace(_)), "{refused}");
+    assert!(small.list().is_empty());
+}
+
+#[test]
+fn histories_that_disagree_about_the_order_are_a_conflict() {
+    let (mut desktop, mut laptop) = paired();
+    desktop.play(&[(GAME, "A")]);
+    desktop.play(&[(GAME, "B")]);
+    laptop.play(&[(GAME, "B")]);
+    laptop.play(&[(GAME, "A")]);
+    let seen = relation(&desktop, &laptop, GAME);
+    assert!(
+        matches!(seen.relation, Relation::Diverged { .. }),
+        "{:?}",
+        seen.relation
+    );
+    assert!(seen.needs_decision);
+}
+
+#[test]
+fn two_first_runs_end_up_with_one_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                LocalDevice::open_or_create(&root, "Desktop")
+                    .unwrap()
+                    .identity
+                    .device_id
+            })
+        })
+        .collect();
+    let ids: std::collections::BTreeSet<String> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 1, "every start uses the key that is on disk");
+    assert_eq!(
+        LocalDevice::open_or_create(&root, "Desktop")
+            .unwrap()
+            .identity
+            .device_id,
+        *ids.iter().next().unwrap()
+    );
 }

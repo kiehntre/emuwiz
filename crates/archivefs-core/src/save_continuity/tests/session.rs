@@ -59,7 +59,7 @@ fn game() -> SessionGame {
 
 fn launch(through_launcher: bool) -> SessionLaunch {
     SessionLaunch {
-        emulator: "PCSX2".into(),
+        emulator: "ProbeEmu".into(),
         profile: "native".into(),
         core: None,
         emulator_version: None,

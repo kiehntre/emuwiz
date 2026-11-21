@@ -40,13 +40,20 @@ use std::path::{Path, PathBuf};
 
 pub const MANIFEST_SET_FORMAT_VERSION: u32 = 1;
 pub const TRANSFER_CHUNK_BYTES: usize = 64 * 1024;
+/// More than this in one list is refused before anything is processed.
+pub const MAX_SNAPSHOTS_PER_LIST: usize = 20_000;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    // Lowercase hex digits only: no sign, no spaces, one spelling per value.
+    if text.len() % 2 != 0
+        || !text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return None;
     }
     (0..text.len())
@@ -111,19 +118,48 @@ struct DeviceFile {
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), ContinuityError> {
-    let work = path.with_extension(format!("part-{}", std::process::id()));
-    let _ = fs::remove_file(&work);
-    let result = OpenOptions::new()
+    super::write_state_file(path, bytes)
+}
+
+static CREATE_ONCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Creates `path` with `bytes` only if nothing is there yet (one atomic
+/// step), mode 0600. `Ok(false)`: something already was; it is untouched.
+fn create_private_once(path: &Path, bytes: &[u8]) -> Result<bool, ContinuityError> {
+    let parent = path.parent().unwrap_or(Path::new("/"));
+    let work = parent.join(format!(
+        ".{}.{}-{}.new",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        // Unique per call, not just per process: two threads of one EmuWiz
+        // may both be on their first run.
+        CREATE_ONCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut file = match OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&work)
-        .and_then(|mut file| {
-            file.write_all(bytes)?;
-            file.sync_all()
-        })
-        .and_then(|()| fs::rename(&work, path));
-    result.map_err(|error| super::io("cannot write", path, error))
+    {
+        Ok(file) => file,
+        Err(error) => return Err(super::io("cannot create", &work, error)),
+    };
+    let linked = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::hard_link(&work, path));
+    let _ = fs::remove_file(&work); // created above, by this call
+    match linked {
+        Ok(()) => {
+            fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|error| super::io("cannot flush", parent, error))?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(super::io("cannot write", path, error)),
+    }
 }
 
 impl LocalDevice {
@@ -143,8 +179,11 @@ impl LocalDevice {
                 let rng = ring::rand::SystemRandom::new();
                 let document = Ed25519KeyPair::generate_pkcs8(&rng)
                     .map_err(|_| ContinuityError::Io("cannot create a device key".into()))?;
-                write_private(&key_path, document.as_ref())?;
-                document.as_ref().to_vec()
+                // Put in place only if no key is there yet, then use whatever
+                // is on disk: if another EmuWiz got there first, its key is
+                // this device's key, and ours is discarded.
+                create_private_once(&key_path, document.as_ref())?;
+                fs::read(&key_path).map_err(|error| super::io("cannot read", &key_path, error))?
             }
             Err(error) => return Err(super::io("cannot read", &key_path, error)),
         };
@@ -200,19 +239,53 @@ impl LocalDevice {
             .collect();
         let sequence = self.sequence() + 1;
         self.write_info(sequence)?;
-        let body = ManifestSetBody {
+        let body = self.list_body(snapshots, sequence);
+        if serde_json::to_vec(&body).is_err() {
+            return Err(ContinuityError::Refused(
+                "this device's list cannot be written out (a save path is not valid text)".into(),
+            ));
+        }
+        let signature = self.key.sign(&body.signing_bytes());
+        Ok(SignedManifestSet {
+            body,
+            signature: hex(signature.as_ref()),
+        })
+    }
+
+    /// This device's histories as they are now, for comparing with another
+    /// device's list. Not signed, not numbered, and nothing is written: a
+    /// comparison must not make lists exported earlier look out of date.
+    pub fn current_histories(&self, store: &SnapshotStore) -> ManifestSetBody {
+        let snapshots: Vec<SnapshotManifest> = store
+            .list()
+            .into_iter()
+            .filter(|manifest| manifest.body.provenance.device_id == self.identity.device_id)
+            .collect();
+        self.list_body(snapshots, self.sequence())
+    }
+
+    fn list_body(&self, snapshots: Vec<SnapshotManifest>, sequence: u64) -> ManifestSetBody {
+        ManifestSetBody {
             format_version: MANIFEST_SET_FORMAT_VERSION,
             device: self.identity.clone(),
             sequence,
             generated_unix: now_unix(),
             histories: histories(&snapshots),
             snapshots,
-        };
-        let signature = self.key.sign(&body.signing_bytes());
-        Ok(SignedManifestSet {
-            body,
-            signature: hex(signature.as_ref()),
-        })
+        }
+    }
+
+    /// Loads this profile's device if it has one; creates nothing.
+    pub fn open_existing(root: &Path) -> Result<Option<Self>, ContinuityError> {
+        if fs::symlink_metadata(root.join("device.key")).is_err() {
+            return Ok(None);
+        }
+        let name = fs::read(root.join("device.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<DeviceFile>(&bytes).ok())
+            .map(|file| file.identity.name)
+            .unwrap_or_else(|| "This device".to_string());
+        Self::open_or_create(root, &name).map(Some)
     }
 }
 
@@ -357,6 +430,11 @@ struct Peer {
     identity: DeviceIdentity,
     paired_unix: i64,
     highest_sequence: u64,
+    /// SHA-256 of the signed bytes of the list accepted at
+    /// `highest_sequence`. The same number is accepted again only for
+    /// exactly the same list.
+    #[serde(default)]
+    highest_list_sha256: Option<String>,
 }
 
 /// The devices a person has paired with this one, and the newest list seen
@@ -367,13 +445,23 @@ pub struct PeerBook {
 }
 
 impl PeerBook {
-    pub fn open(root: &Path) -> Self {
+    /// Opens the pairing file. Only a file that does not exist is an empty
+    /// book: one that cannot be read or understood is an error, because
+    /// treating it as empty would forget every pairing and every "newest
+    /// list seen", and the next save would make that permanent.
+    pub fn open(root: &Path) -> Result<Self, ContinuityError> {
         let path = root.join("peers.json");
-        let peers = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        Self { path, peers }
+        let peers = match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+                ContinuityError::Corrupt(format!(
+                    "{} cannot be understood ({error}); it was left as it is",
+                    path.display()
+                ))
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => return Err(super::io("cannot read", &path, error)),
+        };
+        Ok(Self { path, peers })
     }
 
     fn save(&self) -> Result<(), ContinuityError> {
@@ -415,14 +503,34 @@ impl PeerBook {
                 identity: identity.clone(),
                 paired_unix: now_unix(),
                 highest_sequence: 0,
+                highest_list_sha256: None,
             },
         );
         self.save()
     }
 
-    /// Checks a received list: paired device, pinned key, valid signature,
-    /// well-formed snapshots, and not older than one already accepted.
+    /// Checks a received list and remembers it as the newest seen from that
+    /// device. Use [`Self::check`] to look without remembering.
     pub fn accept(&mut self, set: &SignedManifestSet) -> Result<(), ContinuityError> {
+        let list_sha256 = self.verified(set)?;
+        if let Some(peer) = self.peers.get_mut(&set.body.device.device_id) {
+            peer.highest_sequence = set.body.sequence;
+            peer.highest_list_sha256 = Some(list_sha256);
+        }
+        self.save()
+    }
+
+    /// Checks a received list exactly as [`Self::accept`] does and changes
+    /// nothing: for comparisons and dry runs.
+    pub fn check(&self, set: &SignedManifestSet) -> Result<(), ContinuityError> {
+        self.verified(set).map(|_| ())
+    }
+
+    /// Paired device, pinned key, valid signature, well-formed snapshots
+    /// that are the sender's own, and not older than (or a different list
+    /// with the same number as) one already accepted. Returns the SHA-256
+    /// of the signed bytes.
+    fn verified(&self, set: &SignedManifestSet) -> Result<String, ContinuityError> {
         let body = &set.body;
         if body.format_version != MANIFEST_SET_FORMAT_VERSION {
             return Err(ContinuityError::Refused(
@@ -452,12 +560,31 @@ impl PeerBook {
                 body.sequence, peer.highest_sequence
             )));
         }
+        // The same number again is fine only for the very same list. Two
+        // different lists under one number means the sender's counter went
+        // backwards (or someone is replaying): neither is believed.
+        let list_sha256 = sha256_hex(&body.signing_bytes());
+        if body.sequence == peer.highest_sequence
+            && peer
+                .highest_list_sha256
+                .as_ref()
+                .is_some_and(|seen| *seen != list_sha256)
+        {
+            return Err(ContinuityError::Refused(format!(
+                "a different list with the same number ({}) was already received from that device; refusing it",
+                body.sequence
+            )));
+        }
+        if body.snapshots.len() > MAX_SNAPSHOTS_PER_LIST {
+            return Err(ContinuityError::Refused(format!(
+                "the list holds {} snapshots, more than the {MAX_SNAPSHOTS_PER_LIST} accepted in one list",
+                body.snapshots.len()
+            )));
+        }
         for manifest in &body.snapshots {
-            if super::store::body_id(&manifest.body) != manifest.snapshot_id {
-                return Err(ContinuityError::Corrupt(
-                    "a snapshot record in the list does not match its id".into(),
-                ));
-            }
+            // Every rule a locally stored record must meet, including that
+            // its history is the sender's own and not one of ours.
+            super::store::check_manifest(manifest)?;
             if manifest.body.provenance.device_id != body.device.device_id {
                 return Err(ContinuityError::Refused(
                     "the list contains a snapshot the sender did not take".into(),
@@ -469,11 +596,15 @@ impl PeerBook {
                 "the list's histories do not follow from its snapshots".into(),
             ));
         }
-        let sequence = body.sequence;
-        if let Some(peer) = self.peers.get_mut(&body.device.device_id) {
-            peer.highest_sequence = sequence;
-        }
-        self.save()
+        Ok(list_sha256)
+    }
+
+    /// The name a person gave the device when pairing it. Shown instead of
+    /// whatever name a later list carries, which the sender chooses freely.
+    pub fn paired_name(&self, device_id: &str) -> Option<&str> {
+        self.peers
+            .get(device_id)
+            .map(|peer| peer.identity.name.as_str())
     }
 }
 
@@ -683,6 +814,16 @@ fn relate(here: &[&str], there: &[&str]) -> Relation {
     if here_last == there_last {
         return Relation::Same;
     }
+    // Each side's current content appears in the other's past: the two
+    // histories disagree about the order (A then B here, B then A there).
+    // Neither continued from the other. A person decides.
+    if here.contains(there_last) && there.contains(here_last) {
+        return Relation::Diverged {
+            shared_fingerprint: (*there_last).to_string(),
+            only_here: here.len() - 1 - here.iter().rposition(|f| f == there_last).unwrap_or(0),
+            only_there: there.len() - 1 - there.iter().rposition(|f| f == here_last).unwrap_or(0),
+        };
+    }
     // The other device's current content is somewhere in this device's past
     // (or the reverse): one continued from the other. This also holds when
     // old history was pruned on one side.
@@ -780,11 +921,20 @@ pub fn receive_snapshot(
             ContinuityError::NotFound(format!("snapshot {snapshot_id} in the other device's list"))
         })?;
     let incoming = to.root().join("incoming");
+    // The record must meet every rule a local one does before a byte moves.
+    super::store::check_manifest(manifest)?;
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&incoming)
         .map_err(|error| super::io("cannot create", &incoming, error))?;
+    // A real folder, not a link to somewhere else.
+    if !fs::symlink_metadata(&incoming).is_ok_and(|meta| meta.is_dir()) {
+        return Err(ContinuityError::Refused(format!(
+            "{} is not a real folder",
+            incoming.display()
+        )));
+    }
     let needed: u64 = manifest
         .body
         .files
@@ -792,12 +942,9 @@ pub fn receive_snapshot(
         .filter(|file| !to.has_object(&file.sha256))
         .map(|file| file.size_bytes)
         .sum();
-    let free = super::store::free_bytes(to.root())?;
-    if free < needed.saturating_add(super::store::FREE_SPACE_RESERVE_BYTES) {
-        return Err(ContinuityError::NoSpace(format!(
-            "{free} bytes free, {needed} needed for this transfer"
-        )));
-    }
+    // Free space and this store's own size limit, exactly as for a local
+    // snapshot: receiving cannot use up what local snapshots need.
+    to.require_space(needed)?;
     let mut report = TransferReport {
         snapshot_id: snapshot_id.to_string(),
         ..TransferReport::default()
@@ -809,9 +956,26 @@ pub fn receive_snapshot(
         }
         // The sender reads (and so verifies) its own copy before sending.
         let source = from.read_object(&file.sha256)?;
+        // The sender's copy must be the size the record says, or nothing is sent.
+        if source.len() as u64 != file.size_bytes {
+            return Err(ContinuityError::Refused(format!(
+                "the list says {} is {} bytes; the content is {}. Nothing was received",
+                file.name,
+                file.size_bytes,
+                source.len()
+            )));
+        }
         let part = incoming_path(to, &file.sha256);
         let mut have = match fs::symlink_metadata(&part) {
-            Ok(meta) if meta.is_file() && meta.len() <= source.len() as u64 => meta.len() as usize,
+            // Continue only a plain work file with a single name: a file that
+            // has another name somewhere is not one this code made.
+            Ok(meta)
+                if meta.is_file()
+                    && std::os::unix::fs::MetadataExt::nlink(&meta) == 1
+                    && meta.len() <= source.len() as u64 =>
+            {
+                meta.len() as usize
+            }
             Ok(_) => {
                 let _ = fs::remove_file(&part);
                 0
@@ -855,7 +1019,7 @@ pub fn receive_snapshot(
             .map_err(|error| super::io("cannot flush", &part, error))?;
         drop(out);
         let received = fs::read(&part).map_err(|error| super::io("cannot read", &part, error))?;
-        if sha256_hex(&received) != file.sha256 {
+        if received.len() as u64 != file.size_bytes || sha256_hex(&received) != file.sha256 {
             let _ = fs::remove_file(&part);
             return Err(ContinuityError::Corrupt(format!(
                 "{} did not arrive intact (SHA-256 mismatch); what arrived was discarded and nothing entered the store",

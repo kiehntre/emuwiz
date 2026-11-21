@@ -200,6 +200,15 @@ impl LaunchTracker {
         processes: &dyn ProcessTable,
     ) -> Result<SessionRecord, ContinuityError> {
         let launch = classify_started(&process.executable, &process.arguments);
+        // First, and quickly, note the process itself; only then the slower
+        // look at the saves.
+        self.journal.mark_started_as(
+            session_id,
+            process.pid,
+            launch.clone(),
+            process.start_ticks,
+            processes,
+        )?;
         let its_saves: Vec<String> = self
             .saves()?
             .iter()
@@ -209,8 +218,7 @@ impl LaunchTracker {
             })
             .map(|save| save.id.clone())
             .collect();
-        self.journal
-            .mark_started_as(session_id, process.pid, launch, &its_saves, processes)
+        self.journal.keep_saves(session_id, &its_saves)
     }
 
     /// A moment into a launch: picks up what a launcher has started.

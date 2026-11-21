@@ -35,6 +35,9 @@ pub const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_FILES_PER_SNAPSHOT: usize = 4096;
 /// Free space that must remain on the store's filesystem after a write.
 pub const FREE_SPACE_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+/// The record a recovery writes beside the recovered files. No snapshot may
+/// hold a file of this name, so the record can never replace one.
+pub const RECOVERY_RECEIPT_NAME: &str = "EMUWIZ-RECOVERY.json";
 /// Default ceiling for everything the store holds.
 pub const DEFAULT_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -165,8 +168,13 @@ impl SnapshotManifest {
 }
 
 pub(crate) fn body_id(body: &SnapshotBody) -> String {
-    // Field order is fixed by the struct, so this text is canonical.
-    sha256_hex(serde_json::to_string(body).unwrap_or_default().as_bytes())
+    // Field order is fixed by the struct, so this text is canonical. A body
+    // that cannot be written as JSON (a path that is not UTF-8) gets an empty
+    // id, which is not a SHA-256 and so can never match or be published.
+    match serde_json::to_string(body) {
+        Ok(text) => sha256_hex(text.as_bytes()),
+        Err(_) => String::new(),
+    }
 }
 
 /// The key for one save location on one device.
@@ -242,6 +250,11 @@ pub struct CaptureRequest {
     pub structure: StructureCheck,
     /// How the emulator last ended, when a session can be tied to this save.
     pub preceding_session: PrecedingSession,
+    /// SHA-256 each file had when the saves inside it were listed
+    /// (`contained_saves`), by snapshot file name. If a file read for the
+    /// snapshot hashes to something else, the listing no longer describes
+    /// it and the snapshot is refused.
+    pub expected_sha256: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -553,6 +566,30 @@ impl SnapshotStore {
         })
     }
 
+    /// Opens a store that already exists, creating nothing. For looking
+    /// (timeline, verify, proposals, dry runs) and for another device's
+    /// folder: a mistyped path is an error, not a new empty store.
+    pub fn open_existing(root: &Path) -> Result<Self, ContinuityError> {
+        if !root.is_absolute() {
+            return Err(ContinuityError::Refused(
+                "the store folder must be an absolute path".into(),
+            ));
+        }
+        for part in ["", "objects", "manifests"] {
+            let folder = root.join(part);
+            if !fs::symlink_metadata(&folder).is_ok_and(|meta| meta.is_dir()) {
+                return Err(ContinuityError::NotFound(format!(
+                    "no snapshot folder at {} (nothing was created)",
+                    root.display()
+                )));
+            }
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            budget_bytes: DEFAULT_BUDGET_BYTES,
+        })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -577,14 +614,16 @@ impl SnapshotStore {
     /// `Ok(false)` means a file was already there (left untouched).
     fn publish(&self, final_path: &Path, bytes: &[u8], mode: u32) -> Result<bool, ContinuityError> {
         let work = self.work_file();
+        // Created here or not at all: if this fails, nothing at `work` is
+        // ours and nothing there is removed.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&work)
+            .map_err(|error| io("cannot create", &work, error))?;
         let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&work)
-                .map_err(|error| io("cannot create", &work, error))?;
             file.write_all(bytes)
                 .map_err(|error| io("cannot write", &work, error))?;
             file.set_permissions(fs::Permissions::from_mode(mode))
@@ -593,7 +632,15 @@ impl SnapshotStore {
                 .map_err(|error| io("cannot flush", &work, error))?;
             crash_point("before-link")?;
             let parent = final_path.parent().unwrap_or(&self.root);
+            let parent_is_new = fs::symlink_metadata(parent).is_err();
             create_private_dir(parent)?;
+            if parent_is_new {
+                // A folder made just now must itself be durable before
+                // anything is published inside it.
+                if let Some(above) = parent.parent() {
+                    sync_dir(above)?;
+                }
+            }
             match fs::hard_link(&work, final_path) {
                 Ok(()) => {
                     sync_dir(parent)?;
@@ -680,19 +727,42 @@ impl SnapshotStore {
         manifest: &SnapshotManifest,
     ) -> Result<bool, ContinuityError> {
         check_manifest(manifest)?;
+        // Before a record becomes visible, every file it names must be
+        // stored, intact, and exactly the size the record says: a record
+        // is never published and checked afterwards.
         for file in &manifest.body.files {
-            if !self.has_object(&file.sha256) {
-                return Err(ContinuityError::Refused(format!(
-                    "snapshot {} names content that is not stored ({})",
+            let stored = self.read_object(&file.sha256).map_err(|error| {
+                ContinuityError::Refused(format!(
+                    "snapshot {} names content that is not stored intact ({}: {error})",
                     &manifest.snapshot_id[..12],
                     file.name
+                ))
+            })?;
+            if stored.len() as u64 != file.size_bytes {
+                return Err(ContinuityError::Refused(format!(
+                    "snapshot {} says {} is {} bytes; the stored content is {}",
+                    &manifest.snapshot_id[..12],
+                    file.name,
+                    file.size_bytes,
+                    stored.len()
                 )));
             }
         }
         let text = serde_json::to_vec_pretty(manifest)
             .map_err(|error| ContinuityError::Io(format!("cannot write manifest: {error}")))?;
         crash_point("before-manifest")?;
-        self.publish(&self.manifest_path(manifest), &text, 0o400)
+        let path = self.manifest_path(manifest);
+        if self.publish(&path, &text, 0o400)? {
+            return Ok(true);
+        }
+        // A record with this name is already there. It must be this record.
+        match Self::read_manifest_file(&path) {
+            Ok(existing) if existing == *manifest => Ok(false),
+            _ => Err(ContinuityError::Corrupt(format!(
+                "{} already exists and is not this snapshot's record; it was not replaced",
+                path.display()
+            ))),
+        }
     }
 
     fn read_manifest_file(path: &Path) -> Result<SnapshotManifest, ContinuityError> {
@@ -815,6 +885,12 @@ impl SnapshotStore {
                     file.name
                 )));
             }
+            if file.name == RECOVERY_RECEIPT_NAME {
+                return Err(ContinuityError::Refused(format!(
+                    "{RECOVERY_RECEIPT_NAME} is the record EmuWiz writes into a recovered folder; \
+                     a snapshot cannot hold a file of that name"
+                )));
+            }
             if file.source.starts_with(&self.root) {
                 return Err(ContinuityError::Refused(
                     "the snapshot store cannot take a snapshot of itself".into(),
@@ -863,11 +939,28 @@ impl SnapshotStore {
         let mut total = 0u64;
         for file in &request.files {
             let read = stable_read(&file.source)?;
+            if request
+                .expected_sha256
+                .get(&file.name)
+                .is_some_and(|expected| *expected != read.sha256)
+            {
+                return Err(ContinuityError::Unstable(format!(
+                    "{} changed between being listed and being copied; list the saves again",
+                    file.source.display()
+                )));
+            }
             total += read.bytes.len() as u64;
             reads.push((file, read));
         }
         // Still closed, and nothing opened a save, once every byte is read.
         let after = look("during the copy")?;
+        // The same rule at the end as at the start: without an explicit
+        // best-effort request, "could not tell" keeps nothing.
+        if after == InUse::Unknown && !request.allow_unproven_closure {
+            return Err(ContinuityError::ClosureUnproven(format!(
+                "by the end of the copy EmuWiz could no longer establish that {emulator} was closed and nothing had this save open; no snapshot was kept"
+            )));
+        }
         let kernel_watched = guards.iter().all(|guard| guard.kernel_watched());
         drop(guards);
 
@@ -986,7 +1079,7 @@ impl SnapshotStore {
         })
     }
 
-    fn require_space(&self, new_bytes: u64) -> Result<(), ContinuityError> {
+    pub(crate) fn require_space(&self, new_bytes: u64) -> Result<(), ContinuityError> {
         let free = free_bytes(&self.root)?;
         if free < new_bytes.saturating_add(FREE_SPACE_RESERVE_BYTES) {
             return Err(ContinuityError::NoSpace(format!(
@@ -1027,8 +1120,18 @@ impl SnapshotStore {
                     },
                     Err(ContinuityError::NotFound(_)) => FileCheck::Missing,
                     Err(ContinuityError::Corrupt(_)) => {
-                        let actual = fs::read(self.object_path(&file.sha256))
-                            .map(|bytes| sha256_hex(&bytes))
+                        // Read the damaged copy the same guarded way: no
+                        // link followed, size capped.
+                        let actual = open_no_follow(&self.object_path(&file.sha256))
+                            .ok()
+                            .filter(|(_, meta)| meta.len() <= MAX_FILE_BYTES)
+                            .and_then(|(mut object, _)| {
+                                let mut bytes = Vec::new();
+                                object
+                                    .read_to_end(&mut bytes)
+                                    .ok()
+                                    .map(|_| sha256_hex(&bytes))
+                            })
                             .unwrap_or_default();
                         FileCheck::Corrupt {
                             actual_sha256: actual,
@@ -1064,12 +1167,25 @@ impl SnapshotStore {
                 destination.display()
             ));
         }
-        if destination.starts_with(&self.root) {
+        // Compare real locations, not spellings: `/a/../store/x` is inside
+        // the store. The destination does not exist yet, so its parent is
+        // resolved and the last name put back.
+        let resolved = destination
+            .parent()
+            .and_then(|parent| fs::canonicalize(parent).ok())
+            .zip(destination.file_name())
+            .map(|(parent, name)| parent.join(name));
+        let real = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let located = resolved.as_deref().unwrap_or(destination);
+        if located.starts_with(real(&self.root)) || destination.starts_with(&self.root) {
             blockers.push("the destination is inside the snapshot store".to_string());
         }
         let source_root = &manifest.body.provenance.source_root;
+        let real_source = real(source_root);
         if destination == source_root.as_path()
-            || destination.starts_with(source_root) && source_root.is_dir()
+            || located == real_source
+            || (located.starts_with(&real_source) || destination.starts_with(source_root))
+                && source_root.is_dir()
         {
             blockers.push(format!(
                 "the destination is the emulator's own save location ({}). EmuWiz recovers beside it, never into it",
@@ -1152,11 +1268,20 @@ impl SnapshotStore {
             ],
         };
         let result = (|| {
+            let mut folders_made: BTreeSet<PathBuf> = BTreeSet::new();
             for file in &plan.files {
                 let bytes = self.read_object(&file.sha256)?;
                 let path = staging.join(&file.name);
                 if let Some(dir) = path.parent() {
                     create_private_dir(dir)?;
+                    // Every folder between the staging folder and the file.
+                    let mut folder = dir.to_path_buf();
+                    while folder != staging && folder.starts_with(&staging) {
+                        folders_made.insert(folder.clone());
+                        if !folder.pop() {
+                            break;
+                        }
+                    }
                 }
                 let mut out = OpenOptions::new()
                     .write(true)
@@ -1180,12 +1305,31 @@ impl SnapshotStore {
             }
             let text = serde_json::to_vec_pretty(&receipt)
                 .map_err(|error| ContinuityError::Io(error.to_string()))?;
-            let receipt_path = staging.join("EMUWIZ-RECOVERY.json");
-            fs::write(&receipt_path, text)
+            // The record is a new file like any other: it can replace nothing
+            // (no snapshot may hold a file of this name) and is flushed.
+            let receipt_path = staging.join(RECOVERY_RECEIPT_NAME);
+            let mut record = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&receipt_path)
+                .map_err(|error| io("cannot create", &receipt_path, error))?;
+            record
+                .write_all(&text)
+                .and_then(|()| record.sync_all())
                 .map_err(|error| io("cannot write", &receipt_path, error))?;
+            // Deepest folders first, then the staging folder itself.
+            for folder in folders_made.iter().rev() {
+                sync_dir(folder)?;
+            }
             sync_dir(&staging)?;
             rename_no_replace(&staging, destination)?;
-            sync_dir(parent)
+            // The folder is in place and complete. If flushing its parent
+            // fails now, the recovery still happened; saying otherwise would
+            // send a person looking for a failure that is not there.
+            let _ = sync_dir(parent);
+            Ok(())
         })();
         match result {
             Ok(()) => Ok(receipt),
@@ -1302,23 +1446,45 @@ impl SnapshotStore {
     }
 }
 
-fn check_manifest(manifest: &SnapshotManifest) -> Result<(), ContinuityError> {
+pub(crate) fn check_manifest(manifest: &SnapshotManifest) -> Result<(), ContinuityError> {
     if manifest.format_version != MANIFEST_FORMAT_VERSION {
         return Err(ContinuityError::Refused(format!(
             "snapshot record version {} is not one this EmuWiz reads",
             manifest.format_version
         )));
     }
-    if body_id(&manifest.body) != manifest.snapshot_id {
+    if !is_sha256(&manifest.snapshot_id) || body_id(&manifest.body) != manifest.snapshot_id {
         return Err(ContinuityError::Corrupt(
             "a snapshot record does not match its own id (it was altered or damaged)".into(),
         ));
     }
-    let lineage = &manifest.body.lineage;
-    if lineage.is_empty() || !lineage.bytes().all(|b| b.is_ascii_hexdigit()) {
+    // A record belongs to exactly one history: the one its own device,
+    // emulator and source location determine. Without this a record from
+    // another device could be filed into one of this device's histories.
+    let provenance = &manifest.body.provenance;
+    let expected = lineage_key(
+        &provenance.device_id,
+        &provenance.emulator,
+        &provenance.source_root,
+    );
+    if manifest.body.lineage != expected {
         return Err(ContinuityError::Refused(
-            "a snapshot record has a malformed save-location key".into(),
+            "a snapshot record names a save history that is not its own".into(),
         ));
+    }
+    let mut names = BTreeSet::new();
+    for file in &manifest.body.files {
+        if !names.insert(file.name.as_str()) {
+            return Err(ContinuityError::Refused(format!(
+                "{} is listed twice in a snapshot record",
+                file.name
+            )));
+        }
+        if file.name == RECOVERY_RECEIPT_NAME {
+            return Err(ContinuityError::Refused(format!(
+                "a snapshot cannot hold a file called {RECOVERY_RECEIPT_NAME}"
+            )));
+        }
     }
     if manifest.body.files.len() > MAX_FILES_PER_SNAPSHOT {
         return Err(ContinuityError::Refused(
@@ -1349,7 +1515,7 @@ fn sorted_dir(path: &Path) -> Vec<PathBuf> {
 }
 
 /// Renames `from` to `to` only if `to` does not exist (one atomic step).
-fn rename_no_replace(from: &Path, to: &Path) -> Result<(), ContinuityError> {
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> Result<(), ContinuityError> {
     use std::os::unix::ffi::OsStrExt;
     let c = |path: &Path| {
         std::ffi::CString::new(path.as_os_str().as_bytes())

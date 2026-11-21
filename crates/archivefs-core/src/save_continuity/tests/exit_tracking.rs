@@ -102,7 +102,7 @@ impl ProcessTable for Machine {
     }
 }
 
-const SCOPE: &str = "app-flatpak-org.libretro.RetroArch-100.scope";
+const SCOPE: &str = "app-flatpak-test.probe.ProbeEmu-100.scope";
 const SAVE: &str = "save-1";
 
 fn mark(content: &str) -> SaveMark {
@@ -120,10 +120,11 @@ struct Case {
     session: String,
 }
 
-/// A RetroArch Flatpak launch, with the tree really observed: 100 (bwrap, scope leader)
+/// A Flatpak launch of the made-up, trusted-in-tests emulator, with the
+/// process tree really observed for Flatpak emulators: 100 (bwrap, scope leader)
 /// -> 101 (bwrap) -> 102 (/app/bin/pcsx2-qt).
-fn flatpak_retroarch() -> Case {
-    let case = launch("RetroArch", "flatpak", true);
+fn flatpak_probe() -> Case {
+    let case = launch("ProbeEmu", "flatpak", true);
     case.machine
         .start(100, 1, "bwrap", "/usr/bin/bwrap", Some(SCOPE));
     case.journal
@@ -132,7 +133,7 @@ fn flatpak_retroarch() -> Case {
     case.machine
         .start(101, 100, "bwrap", "/usr/bin/bwrap", Some(SCOPE));
     case.machine
-        .start(102, 101, "retroarch", "/app/bin/retroarch", Some(SCOPE));
+        .start(102, 101, "probeemu", "/app/bin/probeemu", Some(SCOPE));
     case
 }
 
@@ -172,7 +173,7 @@ impl Case {
         preceding_session(
             &self.journal.all(),
             "dev",
-            "RetroArch",
+            "ProbeEmu",
             "flatpak",
             &[mark("v2")],
         )
@@ -181,7 +182,7 @@ impl Case {
 
 #[test]
 fn a_normal_flatpak_shutdown_is_a_confirmed_clean_exit() {
-    let case = flatpak_retroarch();
+    let case = flatpak_probe();
     let seen = case.look();
     assert_eq!(
         seen.sandbox_main.as_ref().map(|main| main.pid),
@@ -204,7 +205,7 @@ fn a_crash_inside_the_sandbox_is_a_confirmed_crash() {
     // 139 = 128 + SIGSEGV (PPSSPP, RetroArch); 134 = 128 + SIGABRT (PCSX2's
     // own handler turns a segfault into an abort).
     for (code, signal) in [(139, 11), (134, 6)] {
-        let case = flatpak_retroarch();
+        let case = flatpak_probe();
         case.look();
         case.machine.exit(&[102, 101, 100]);
         let ended = case.end(ExitObservation::Code(code));
@@ -217,7 +218,7 @@ fn a_crash_inside_the_sandbox_is_a_confirmed_crash() {
         );
         assert_eq!(ended.exit_evidence, Some(ExitEvidence::SandboxRelay));
         assert!(
-            ended.status_line().starts_with("Crashed"),
+            ended.status_line().starts_with("Ended by a fault signal"),
             "{}",
             ended.status_line()
         );
@@ -232,7 +233,7 @@ fn a_crash_inside_the_sandbox_is_a_confirmed_crash() {
 
 #[test]
 fn a_forced_stop_and_an_error_exit_inside_the_sandbox_are_confirmed_as_such() {
-    let case = flatpak_retroarch();
+    let case = flatpak_probe();
     case.look();
     case.machine.exit(&[102, 101, 100]);
     case.end(ExitObservation::Code(143)); // 128 + SIGTERM, as RPCS3 reported
@@ -241,7 +242,7 @@ fn a_forced_stop_and_an_error_exit_inside_the_sandbox_are_confirmed_as_such() {
         PrecedingSession::ForcedStop { signal: 15, .. }
     ));
 
-    let case = flatpak_retroarch();
+    let case = flatpak_probe();
     case.look();
     case.machine.exit(&[102, 101, 100]);
     case.end(ExitObservation::Code(1)); // PCSX2 exits 1 when asked to terminate
@@ -257,7 +258,7 @@ fn a_forced_stop_and_an_error_exit_inside_the_sandbox_are_confirmed_as_such() {
 fn a_launcher_returning_success_is_not_a_clean_exit_when_the_emulator_was_never_identified() {
     // The session was over before EmuWiz ever saw the emulator process, or
     // the app is one whose relay was never checked.
-    let case = flatpak_retroarch();
+    let case = flatpak_probe();
     case.machine.exit(&[102, 101, 100]); // no look() happened in between
     let ended = case.end(ExitObservation::Code(0));
     assert_eq!(ended.end, Some(SessionEnd::LauncherExitedOk));
@@ -301,7 +302,7 @@ fn a_launcher_returning_success_is_not_a_clean_exit_when_the_emulator_was_never_
 #[test]
 fn a_launcher_ending_badly_is_not_a_crash() {
     // Nothing was identified inside, and the launcher returns 139.
-    let case = flatpak_retroarch();
+    let case = flatpak_probe();
     case.machine.exit(&[102, 101, 100]);
     let ended = case.end(ExitObservation::Code(139));
     assert!(matches!(
@@ -319,7 +320,7 @@ fn a_launcher_ending_badly_is_not_a_crash() {
 
     // The launcher itself is killed while the emulator carries on (observed
     // for real: the emulator was still alive two seconds later).
-    let case = flatpak_retroarch();
+    let case = flatpak_probe();
     case.look();
     case.machine.exit(&[100]);
     let open = case.end(ExitObservation::Signal {
@@ -348,7 +349,7 @@ fn a_launcher_ending_badly_is_not_a_crash() {
     let preceding = preceding_session(
         &case.journal.all(),
         "dev",
-        "RetroArch",
+        "ProbeEmu",
         "flatpak",
         &[mark("v1")],
     );
@@ -362,7 +363,7 @@ fn a_launcher_ending_badly_is_not_a_crash() {
 fn a_wrapper_that_does_not_hand_over_cleanly_gives_no_answer() {
     // A shell script stays between EmuWiz and the sandbox: whatever status
     // it returns is the script's.
-    let case = launch("RetroArch", "flatpak", true);
+    let case = launch("ProbeEmu", "flatpak", true);
     case.machine.start(90, 1, "bash", "/usr/bin/bash", None);
     case.journal
         .mark_started(&case.session, 90, &case.machine)
@@ -372,13 +373,23 @@ fn a_wrapper_that_does_not_hand_over_cleanly_gives_no_answer() {
     case.machine
         .start(101, 100, "bwrap", "/usr/bin/bwrap", Some(SCOPE));
     case.machine
-        .start(102, 101, "retroarch", "/app/bin/retroarch", Some(SCOPE));
+        .start(102, 101, "probeemu", "/app/bin/probeemu", Some(SCOPE));
+    // The process EmuWiz started is a shell, not the sandbox. Whatever the
+    // script returns is the script's: here the emulator dies of a segfault
+    // mid-save and the script (`flatpak run ... ; true`) still exits 0.
     assert!(
-        case.look().sandbox_main.is_some(),
-        "bwrap, bwrap, then the shell EmuWiz started: still only bwrap in between"
+        case.look().sandbox_main.is_none(),
+        "a script between EmuWiz and the sandbox: no relayed status is believed"
     );
+    case.machine.exit(&[102, 101, 100, 90]);
+    let ended = case.end(ExitObservation::Code(0));
+    assert_eq!(ended.end, Some(SessionEnd::LauncherExitedOk), "never Clean");
+    assert_eq!(ended.exit_evidence, Some(ExitEvidence::LauncherOnly));
+    let preceding = case.preceding();
+    assert!(!preceding.clean(), "{preceding:?}");
+    assert!(matches!(preceding, PrecedingSession::ExitNotSeen { .. }));
     // ...but with a second shell inside the sandbox in front of the emulator:
-    let case = launch("RetroArch", "flatpak", true);
+    let case = launch("ProbeEmu", "flatpak", true);
     case.machine
         .start(100, 1, "bwrap", "/usr/bin/bwrap", Some(SCOPE));
     case.journal
@@ -389,7 +400,7 @@ fn a_wrapper_that_does_not_hand_over_cleanly_gives_no_answer() {
     case.machine
         .start(102, 101, "sh", "/usr/bin/sh", Some(SCOPE));
     case.machine
-        .start(103, 102, "retroarch", "/app/bin/retroarch", Some(SCOPE));
+        .start(103, 102, "probeemu", "/app/bin/probeemu", Some(SCOPE));
     assert!(
         case.look().sandbox_main.is_none(),
         "a shell between the sandbox and the emulator"
@@ -423,7 +434,7 @@ fn a_native_wrapper_script_exit_is_the_wrappers_only() {
 
 #[test]
 fn emuwiz_closing_first_leaves_plain_uncertainty() {
-    let case = flatpak_retroarch();
+    let case = flatpak_probe();
     case.look();
     // EmuWiz exits here: nobody calls mark_ended. The emulator closes later.
     case.machine.exit(&[102, 101, 100]);
@@ -434,7 +445,7 @@ fn emuwiz_closing_first_leaves_plain_uncertainty() {
     let preceding = preceding_session(
         &case.journal.all(),
         "dev",
-        "RetroArch",
+        "ProbeEmu",
         "flatpak",
         &[mark("v1")],
     );
@@ -448,15 +459,15 @@ fn emuwiz_closing_first_leaves_plain_uncertainty() {
 
 #[test]
 fn somebody_elses_emulator_does_not_change_this_session() {
-    let case = flatpak_retroarch();
+    let case = flatpak_probe();
     // Another PCSX2, started outside EmuWiz, in its own scope, with its own tree.
-    let other = "app-flatpak-org.libretro.RetroArch-900.scope";
+    let other = "app-flatpak-test.probe.ProbeEmu-900.scope";
     case.machine
         .start(900, 1, "bwrap", "/usr/bin/bwrap", Some(other));
     case.machine
         .start(901, 900, "bwrap", "/usr/bin/bwrap", Some(other));
     case.machine
-        .start(902, 901, "retroarch", "/app/bin/retroarch", Some(other));
+        .start(902, 901, "probeemu", "/app/bin/probeemu", Some(other));
     let seen = case.look();
     assert_eq!(seen.sandbox_main.as_ref().map(|main| main.pid), Some(102));
     assert!(
@@ -478,7 +489,7 @@ fn somebody_elses_emulator_does_not_change_this_session() {
 
 #[test]
 fn a_native_emulator_started_directly_reports_its_own_exit() {
-    let case = launch("DuckStation", "native", false);
+    let case = launch("ProbeEmu", "native", false);
     case.machine
         .start(70, 1, "duckstation-qt", "/opt/duckstation-qt", None);
     case.journal
@@ -542,21 +553,10 @@ fn copy_safety_does_not_depend_on_how_the_emulator_ended() {
 }
 
 #[test]
-fn pcsx2_and_rpcs3_flatpak_exits_stay_unknown_until_a_normal_close_is_shown_to_return_zero() {
-    // Observed for real: closing PCSX2's window returned 1 and RPCS3 aborted
-    // (134) while shutting down. Until a normal close is shown to return 0,
-    // neither a zero nor a non-zero status from them is believed.
-    assert!(
-        SANDBOX_RELAY_UNSETTLED
-            .iter()
-            .any(|(name, _)| *name == "PCSX2")
-    );
-    assert!(
-        SANDBOX_RELAY_UNSETTLED
-            .iter()
-            .any(|(name, _)| *name == "RPCS3")
-    );
-    for (emulator, binary, exe, scope) in [
+fn no_real_emulators_flatpak_exit_is_believed_until_demonstrated_from_inside_a_game() {
+    // Every real emulator probed so far, each with a perfect process tree.
+    // What was observed with no game running is preliminary evidence only.
+    let real: [(&str, &'static str, &'static str, &'static str); 4] = [
         (
             "PCSX2",
             "pcsx2-qt",
@@ -564,13 +564,36 @@ fn pcsx2_and_rpcs3_flatpak_exits_stay_unknown_until_a_normal_close_is_shown_to_r
             "app-flatpak-net.pcsx2.PCSX2-100.scope",
         ),
         (
+            "RetroArch",
+            "retroarch",
+            "/app/bin/retroarch",
+            "app-flatpak-org.libretro.RetroArch-100.scope",
+        ),
+        (
             "RPCS3",
             "rpcs3",
             "/app/bin/rpcs3",
             "app-flatpak-net.rpcs3.RPCS3-100.scope",
         ),
-    ] {
-        for code in [0, 1, 134, 139] {
+        (
+            "PPSSPP",
+            "PPSSPPSDL",
+            "/app/bin/PPSSPPSDL",
+            "app-flatpak-org.ppsspp.PPSSPP-100.scope",
+        ),
+    ];
+    for (emulator, binary, exe, scope) in real {
+        assert!(
+            !exit_status_demonstrated(emulator),
+            "{emulator} is not on the demonstrated list"
+        );
+        assert!(
+            PRELIMINARY_EXIT_EVIDENCE
+                .iter()
+                .any(|(name, _)| *name == emulator),
+            "{emulator}: what was observed is kept as preliminary evidence"
+        );
+        for code in [0, 1, 134, 139, 143] {
             let case = launch(emulator, "flatpak", true);
             case.machine
                 .start(100, 1, "bwrap", "/usr/bin/bwrap", Some(scope));
@@ -582,7 +605,7 @@ fn pcsx2_and_rpcs3_flatpak_exits_stay_unknown_until_a_normal_close_is_shown_to_r
             case.machine.start(102, 101, binary, exe, Some(scope));
             assert!(
                 case.look().sandbox_main.is_none(),
-                "{emulator}: no relayed status is trusted"
+                "{emulator}: no relayed status is believed"
             );
             case.machine.exit(&[102, 101, 100]);
             let ended = case.end(ExitObservation::Code(code));
@@ -593,13 +616,14 @@ fn pcsx2_and_rpcs3_flatpak_exits_stay_unknown_until_a_normal_close_is_shown_to_r
             );
             assert!(
                 !ended.end.as_ref().unwrap().abnormal(),
-                "{emulator} {code}: never a crash"
+                "{emulator} {code}: never abnormal"
             );
             assert_ne!(
                 ended.end,
                 Some(SessionEnd::Clean),
                 "{emulator} {code}: never clean"
             );
+            assert!(!ended.needs_attention(), "{emulator} {code}");
             let preceding = preceding_session(
                 &case.journal.all(),
                 "dev",
@@ -615,22 +639,164 @@ fn pcsx2_and_rpcs3_flatpak_exits_stay_unknown_until_a_normal_close_is_shown_to_r
             assert_eq!(preceding.warning(), None);
         }
     }
-    // PPSSPP, the other checked emulator, is trusted like RetroArch.
-    let case = launch("PPSSPP", "flatpak", true);
-    let scope = "app-flatpak-org.ppsspp.PPSSPP-100.scope";
+    // The shipped build believes no emulator at all; only the made-up test
+    // emulator is on the list, and only in test builds.
+    assert_eq!(EXIT_STATUS_DEMONSTRATED.len(), 1);
+    assert_eq!(EXIT_STATUS_DEMONSTRATED[0].0, "ProbeEmu");
+}
+
+// ---- Regression tests for the independent review of 2026-11-21 ----
+
+#[test]
+fn a_real_emulators_own_error_or_signal_exit_is_not_called_abnormal_on_any_route() {
+    // Started directly, so the status really is the emulator's own. It is
+    // still not interpreted: none of these has been shown to return 0 on an
+    // ordinary close from inside a game, and two did not when tried.
+    for emulator in [
+        "PCSX2",
+        "RPCS3",
+        "RetroArch",
+        "PPSSPP",
+        "DuckStation",
+        "SomeOtherEmulator",
+    ] {
+        for exit in [
+            ExitObservation::Code(1),
+            ExitObservation::Signal {
+                signal: 6,
+                core_dumped: true,
+            },
+            ExitObservation::Signal {
+                signal: 11,
+                core_dumped: true,
+            },
+            ExitObservation::Signal {
+                signal: 15,
+                core_dumped: false,
+            },
+        ] {
+            let case = launch(emulator, "native", false);
+            case.machine.start(70, 1, "emu", "/usr/bin/emu", None);
+            case.journal
+                .mark_started(&case.session, 70, &case.machine)
+                .unwrap();
+            case.machine.exit(&[70]);
+            let ended = case.end(exit);
+            assert!(
+                matches!(ended.end, Some(SessionEnd::ExitUnsettled { .. })),
+                "{emulator} {exit:?}: {:?}",
+                ended.end
+            );
+            assert!(!ended.needs_attention(), "{emulator} {exit:?}");
+            let preceding = preceding_session(
+                &case.journal.all(),
+                "dev",
+                emulator,
+                "native",
+                &[mark("v2")],
+            );
+            assert!(
+                matches!(preceding, PrecedingSession::ExitNotSeen { .. }),
+                "{emulator} {exit:?}: {preceding:?}"
+            );
+            assert_eq!(preceding.advisory(), Advisory::Caution);
+            assert_eq!(
+                preceding.warning(),
+                None,
+                "no warning from a status that cannot be interpreted"
+            );
+        }
+        // An exit status of 0 from the emulator's own process is still 0.
+        let case = launch(emulator, "native", false);
+        case.machine.start(70, 1, "emu", "/usr/bin/emu", None);
+        case.journal
+            .mark_started(&case.session, 70, &case.machine)
+            .unwrap();
+        case.machine.exit(&[70]);
+        assert_eq!(
+            case.end(ExitObservation::Code(0)).end,
+            Some(SessionEnd::Clean),
+            "{emulator}"
+        );
+    }
+}
+
+#[test]
+fn a_real_exit_status_completes_a_session_that_was_settled_a_moment_too_early() {
+    let case = launch("ProbeEmu", "native", false);
     case.machine
-        .start(100, 1, "bwrap", "/usr/bin/bwrap", Some(scope));
+        .start(70, 1, "duckstation-qt", "/opt/duckstation-qt", None);
     case.journal
-        .mark_started(&case.session, 100, &case.machine)
+        .mark_started(&case.session, 70, &case.machine)
         .unwrap();
-    case.machine
-        .start(101, 100, "bwrap", "/usr/bin/bwrap", Some(scope));
-    case.machine
-        .start(102, 101, "PPSSPPSDL", "/app/bin/PPSSPPSDL", Some(scope));
-    assert!(case.look().sandbox_main.is_some());
-    case.machine.exit(&[102, 101, 100]);
+    case.machine.exit(&[70]);
+    // Another EmuWiz command settles open sessions while this one is still
+    // comparing saves.
+    let settled = case
+        .journal
+        .reconcile(&case.machine, crate::save_continuity::now_unix());
+    assert_eq!(settled[0].state, SessionState::EndNotSeen);
+    let ended = case.end(ExitObservation::Code(0));
+    assert_eq!(ended.state, SessionState::Ended);
+    assert_eq!(ended.end, Some(SessionEnd::Clean));
+    assert!(
+        !ended
+            .notes
+            .iter()
+            .any(|note| note.contains("did not see it end"))
+    );
+    // But not twice, and not for a session whose id was reused by a live process.
+    assert!(
+        case.journal
+            .mark_ended(&case.session, ExitObservation::Code(0), None, &case.machine)
+            .is_err()
+    );
+    let other = launch("ProbeEmu", "native", false);
+    other
+        .machine
+        .start(70, 1, "duckstation-qt", "/opt/duckstation-qt", None);
+    other
+        .journal
+        .mark_started(&other.session, 70, &other.machine)
+        .unwrap();
+    other.machine.exit(&[70]);
+    other
+        .journal
+        .reconcile(&other.machine, crate::save_continuity::now_unix());
+    other
+        .machine
+        .start(70, 1, "something-else", "/usr/bin/something-else", None); // same pid, same fake start time
+    assert!(
+        other
+            .journal
+            .mark_ended(
+                &other.session,
+                ExitObservation::Code(0),
+                None,
+                &other.machine
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn a_session_settled_long_ago_is_never_rewritten_by_a_late_exit_status() {
+    let case = launch("ProbeEmu", "native", false);
+    case.machine.start(70, 1, "probeemu", "/opt/probeemu", None);
+    case.journal
+        .mark_started(&case.session, 70, &case.machine)
+        .unwrap();
+    case.machine.exit(&[70]);
+    // Settled at a time far in the past.
+    let settled = case.journal.reconcile(&case.machine, 1_000);
+    assert_eq!(settled[0].state, SessionState::EndNotSeen);
+    assert!(
+        case.journal
+            .mark_ended(&case.session, ExitObservation::Code(0), None, &case.machine)
+            .is_err()
+    );
     assert_eq!(
-        case.end(ExitObservation::Code(0)).end,
-        Some(SessionEnd::Clean)
+        case.journal.get(&case.session).unwrap().state,
+        SessionState::EndNotSeen
     );
 }

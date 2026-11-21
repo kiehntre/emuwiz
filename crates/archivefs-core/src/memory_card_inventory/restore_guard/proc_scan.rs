@@ -192,8 +192,10 @@ impl ProcScanQuiescence {
             if executable_hidden && tokens_seen.iter().any(|token| who.marker(token)) {
                 report.emulator_processes.push(pid);
             }
+            // After an update or a replaced AppImage the kernel shows the
+            // running file as "<path> (deleted)": still the same program.
             if let Ok(executable) = executable
-                && who.name(&executable.to_string_lossy())
+                && who.name(executable.to_string_lossy().trim_end_matches(" (deleted)"))
             {
                 report.emulator_processes.push(pid);
             }
@@ -430,14 +432,55 @@ impl EmulatorIdentity {
                 return true;
             }
         }
+        // A program that runs another program named in its arguments: the
+        // dynamic loader (`/lib64/ld-linux-x86-64.so.2 /path/retroarch`, how
+        // some bundled builds start), or a tool that runs a binary under it.
+        // Its own name and executable say nothing, so each argument is
+        // tested as a program name.
+        let runs_a_program = program.starts_with("ld-")
+            || program.starts_with("ld.so")
+            || program.starts_with("qemu-")
+            || matches!(
+                program,
+                "valgrind" | "box64" | "box86" | "strace" | "gdb" | "gamemoderun" | "mangohud"
+            );
+        if runs_a_program {
+            // The program it runs is its first argument that is not one of
+            // its own options (nor the value of an option that takes one).
+            // Only that argument is tested: anything after it belongs to the
+            // program being run (`ld.so python3 notes.py retroarch` runs
+            // python, not RetroArch).
+            let mut arguments = tokens.iter().skip(1);
+            while let Some(token) = arguments.next() {
+                if matches!(
+                    token.as_str(),
+                    "--argv0" | "--library-path" | "--preload" | "--inhibit-rpath" | "--audit"
+                ) {
+                    arguments.next();
+                    continue;
+                }
+                if token.starts_with('-') {
+                    continue;
+                }
+                return self.name(token);
+            }
+        }
         if self.libretro_core_argument {
             let is_core = |token: &str| token.to_ascii_lowercase().ends_with("_libretro.so");
-            let paired = tokens
-                .windows(2)
-                .any(|pair| matches!(pair[0].as_str(), "-L" | "--libretro") && is_core(&pair[1]));
-            let joined = tokens
-                .iter()
-                .any(|token| token.strip_prefix("--libretro=").is_some_and(is_core));
+            // `-L core`, `--libretro core`, and bundled short options (`-fL core`).
+            let paired = tokens.windows(2).any(|pair| {
+                let option = pair[0].as_str();
+                let short_bundle =
+                    option.starts_with('-') && !option.starts_with("--") && option.ends_with('L');
+                (short_bundle || option == "--libretro") && is_core(&pair[1])
+            });
+            // `-L/path/core`, `--libretro=core`, and getopt's shortened
+            // `--libr=core`.
+            let joined = tokens.iter().any(|token| {
+                let attached_short = token.starts_with("-L") && !token.starts_with("--");
+                let attached_long = token.starts_with("--libr");
+                (attached_short || attached_long) && is_core(token)
+            });
             return paired || joined;
         }
         false

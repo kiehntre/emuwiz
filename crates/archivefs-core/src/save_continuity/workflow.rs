@@ -54,6 +54,14 @@ pub fn capture_request(
             .collect();
         members.sort();
         for member in members {
+            // The record EmuWiz itself wrote into a recovered folder is not
+            // part of the save.
+            if member
+                .file_name()
+                .is_some_and(|name| name == super::store::RECOVERY_RECEIPT_NAME)
+            {
+                continue;
+            }
             let kind = fs::symlink_metadata(&member)
                 .map_err(|error| super::io("cannot check", &member, error))?;
             if !kind.is_file() {
@@ -110,6 +118,19 @@ pub fn capture_request(
         captured_unix: None,
         structure: structure_of(save),
         preceding_session,
+        // For a single file, the hash it had when its saves were listed:
+        // the card's own for a card save, the file's for a save file.
+        expected_sha256: if meta.is_dir() {
+            Default::default()
+        } else {
+            save.container_sha256
+                .clone()
+                .or_else(|| save.content_sha256.clone())
+                .zip(name_of(source))
+                .map(|(sha256, name)| (name, sha256))
+                .into_iter()
+                .collect()
+        },
     })
 }
 

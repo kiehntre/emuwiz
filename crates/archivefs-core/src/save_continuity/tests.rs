@@ -59,6 +59,7 @@ pub(super) fn request(device: &str, files: &[&Path], time: i64) -> CaptureReques
             why: "synthetic test file".to_string(),
         },
         preceding_session: super::status::PrecedingSession::unknown("no session in this test"),
+        expected_sha256: Default::default(),
     }
 }
 

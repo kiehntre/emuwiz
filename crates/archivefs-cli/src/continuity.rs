@@ -215,6 +215,25 @@ fn store(options: &Options) -> Result<SnapshotStore, Box<dyn std::error::Error>>
     Ok(SnapshotStore::open(&root)?)
 }
 
+/// The snapshot folder for commands that only look or only plan: it must
+/// already exist, and nothing is created (a mistyped `--store` is an error,
+/// not a new empty folder).
+fn existing_store(options: &Options) -> Result<SnapshotStore, Box<dyn std::error::Error>> {
+    let root = match &options.store {
+        Some(folder) => folder.clone(),
+        None => continuity::default_root()?,
+    };
+    Ok(SnapshotStore::open_existing(&root)?)
+}
+
+/// This profile's device, if it already has one. Creates nothing.
+fn existing_device(store: &SnapshotStore) -> Result<LocalDevice, Box<dyn std::error::Error>> {
+    LocalDevice::open_existing(store.root())?.ok_or_else(|| {
+        "this profile has no device identity yet; run `continuity device show` once to create it"
+            .into()
+    })
+}
+
 fn device(
     options: &Options,
     store: &SnapshotStore,
@@ -595,7 +614,7 @@ pub fn run(args: Vec<String>) -> Outcome {
             )
         }
         "timeline" => {
-            let store = store(&options)?;
+            let store = existing_store(&options)?;
             let lines = timelines(&store);
             emit(
                 &options,
@@ -637,7 +656,7 @@ pub fn run(args: Vec<String>) -> Outcome {
             )
         }
         "verify" => {
-            let store = store(&options)?;
+            let store = existing_store(&options)?;
             let report = store.verify(need(0, "a snapshot id")?)?;
             let intact = report.intact();
             emit(
@@ -669,7 +688,7 @@ pub fn run(args: Vec<String>) -> Outcome {
             }
         }
         "recover" => {
-            let store = store(&options)?;
+            let store = existing_store(&options)?;
             let id = need(0, "a snapshot id")?;
             let destination = absolute(Path::new(
                 options
@@ -795,8 +814,8 @@ pub fn run(args: Vec<String>) -> Outcome {
             }
         }
         "sessions" => {
-            let store = store(&options)?;
-            let device = device(&options, &store)?;
+            let store = existing_store(&options)?;
+            let device = existing_device(&store)?;
             let journal = SessionJournal::open(store.root(), &device.identity.device_id)?;
             let settled = journal.reconcile(&ProcFs, continuity_now());
             let sessions = journal.recent(200);
@@ -824,7 +843,7 @@ pub fn run(args: Vec<String>) -> Outcome {
             )
         }
         "pruning-proposal" => {
-            let store = store(&options)?;
+            let store = existing_store(&options)?;
             let proposal = store.pruning_proposal(options.keep.unwrap_or(5));
             emit(
                 &options,
@@ -875,32 +894,50 @@ fn run_device(options: &Options, rest: &[String]) -> Outcome {
         rest.get(index)
             .ok_or_else(|| format!("continuity device {action} needs {what}"))
     };
-    let store = store(options)?;
-    let device = device(options, &store)?;
+    // What a person sees for another device is the name given when it was
+    // paired, never whatever name a later list carries.
+    let shown_name = |peers: &PeerBook, identity: &DeviceIdentity| {
+        peers
+            .paired_name(&identity.device_id)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("unpaired device {}", identity.fingerprint()))
+    };
     match action.as_str() {
-        "show" => emit(
-            options,
-            "device show",
-            false,
-            json!({ "device": device.identity, "pairing_code": device.identity.fingerprint() }),
-            || {
-                println!("{}  id {}", device.identity.name, device.identity.device_id);
-                println!(
-                    "Pairing code (compare on both devices): {}",
-                    device.identity.fingerprint()
-                );
-            },
-        ),
+        // Creates this profile's device identity on first use: that is what
+        // the command is for.
+        "show" => {
+            let store = store(options)?;
+            let device = device(options, &store)?;
+            emit(
+                options,
+                "device show",
+                false,
+                json!({ "device": device.identity, "pairing_code": device.identity.fingerprint() }),
+                || {
+                    println!("{}  id {}", device.identity.name, device.identity.device_id);
+                    println!(
+                        "Pairing code (compare on both devices): {}",
+                        device.identity.fingerprint()
+                    );
+                },
+            )
+        }
         "export" => {
             let out = options
                 .out
                 .clone()
                 .ok_or("device export needs --out <file>")?;
-            if std::fs::symlink_metadata(&out).is_ok() {
-                return Err(format!("{} already exists", out.display()).into());
-            }
+            let store = store(options)?;
+            let device = device(options, &store)?;
             let list = device.export(&store)?;
-            std::fs::write(&out, serde_json::to_vec_pretty(&list)?)?;
+            // A new file only: never through a link, never over a file.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out)
+                .map_err(|error| format!("cannot create {}: {error}", out.display()))?;
+            std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(&list)?)?;
+            file.sync_all()?;
             emit(
                 options,
                 "device export",
@@ -929,6 +966,7 @@ fn run_device(options: &Options, rest: &[String]) -> Outcome {
                 })
                 .map_err(|error| format!("{path} does not hold a device identity: {error}"))?;
             if !options.confirm {
+                // Looks at the file only: no folder, key or pairing is made.
                 return emit(
                     options,
                     "device pair",
@@ -936,7 +974,7 @@ fn run_device(options: &Options, rest: &[String]) -> Outcome {
                     json!({ "dry_run": true, "device": identity, "pairing_code": identity.fingerprint() }),
                     || {
                         println!(
-                            "Would pair with \"{}\". Its pairing code is {}.",
+                            "Would pair with a device calling itself \"{}\". Its pairing code is {}.",
                             identity.name,
                             identity.fingerprint()
                         );
@@ -946,7 +984,9 @@ fn run_device(options: &Options, rest: &[String]) -> Outcome {
                     },
                 );
             }
-            PeerBook::open(store.root()).pair(&identity, &device.identity)?;
+            let store = store(options)?;
+            let device = device(options, &store)?;
+            PeerBook::open(store.root())?.pair(&identity, &device.identity)?;
             emit(
                 options,
                 "device pair",
@@ -961,20 +1001,28 @@ fn run_device(options: &Options, rest: &[String]) -> Outcome {
                 },
             )
         }
+        // Reads only: the other device's list is checked but not remembered,
+        // and this device signs and numbers nothing.
         "compare" => {
             let theirs = read_list(need(1, "the other device's list file")?)?;
-            PeerBook::open(store.root()).accept(&theirs)?;
-            let mine = device.export(&store)?;
-            let result = compare(&mine.body, &theirs.body);
+            let store = existing_store(options)?;
+            let device = existing_device(&store)?;
+            let peers = PeerBook::open(store.root())?;
+            peers.check(&theirs)?;
+            let mine = device.current_histories(&store);
+            let other = shown_name(&peers, &theirs.body.device);
+            let mut their_body = theirs.body.clone();
+            their_body.device.name = other.clone();
+            let result = compare(&mine, &their_body);
             emit(
                 options,
                 "device compare",
-                false,
-                json!({ "this_device": mine.body.device, "other_device": theirs.body.device, "saves": result }),
+                true,
+                json!({ "this_device": mine.device, "other_device": their_body.device, "saves": result }),
                 || {
                     println!(
                         "This device: {}   Other device: {}",
-                        mine.body.device.name, theirs.body.device.name
+                        mine.device.name, other
                     );
                     for item in &result {
                         println!(
@@ -1004,22 +1052,32 @@ fn run_device(options: &Options, rest: &[String]) -> Outcome {
         "receive" => {
             let theirs = read_list(need(1, "the other device's list file")?)?;
             let id = need(2, "a snapshot id")?;
-            let from = SnapshotStore::open(
+            if id.len() < 8 {
+                return Err("name the snapshot by at least 8 characters of its id".into());
+            }
+            let matching: Vec<_> = theirs
+                .body
+                .snapshots
+                .iter()
+                .filter(|manifest| manifest.snapshot_id.starts_with(id.as_str()))
+                .collect();
+            let manifest = match matching.as_slice() {
+                [one] => (*one).clone(),
+                [] => return Err(format!("the other device's list has no snapshot {id}").into()),
+                _ => return Err(format!("{id} matches more than one snapshot in that list").into()),
+            };
+            // The other device's folder is only ever read: it must exist.
+            let from = SnapshotStore::open_existing(
                 options
                     .from_store
                     .as_deref()
                     .ok_or("device receive needs --from-store <folder>")?,
             )?;
-            PeerBook::open(store.root()).accept(&theirs)?;
-            let Some(manifest) = theirs
-                .body
-                .snapshots
-                .iter()
-                .find(|manifest| manifest.snapshot_id.starts_with(id.as_str()))
-            else {
-                return Err(format!("the other device's list has no snapshot {id}").into());
-            };
             if !options.confirm {
+                let store = existing_store(options)?;
+                let peers = PeerBook::open(store.root())?;
+                peers.check(&theirs)?;
+                let other = shown_name(&peers, &theirs.body.device);
                 return emit(
                     options,
                     "device receive",
@@ -1030,7 +1088,7 @@ fn run_device(options: &Options, rest: &[String]) -> Outcome {
                             "Would receive snapshot {} ({} bytes) from \"{}\" into {}.",
                             &manifest.snapshot_id[..12],
                             manifest.total_bytes(),
-                            theirs.body.device.name,
+                            other,
                             store.root().display()
                         );
                         println!(
@@ -1039,7 +1097,10 @@ fn run_device(options: &Options, rest: &[String]) -> Outcome {
                     },
                 );
             }
-            // The sender's current list number, read from its own folder: the offline stand-in for asking it.
+            let store = store(options)?;
+            PeerBook::open(store.root())?.accept(&theirs)?;
+            // The sender's current list number, read from its own folder: the
+            // offline stand-in for asking it.
             let sender_now = LocalDevice::recorded_sequence(from.root());
             let report = receive_snapshot(
                 &theirs,

@@ -514,6 +514,16 @@ pub fn prepare_card_continuation(
             .clone()
             .ok_or_else(|| stopped("folder cards are not supported here"))?,
     );
+    // Built out of sight, beside where it will end up, and given its final
+    // name only once every check has passed: a folder with that name is
+    // always a finished, checked copy, whatever interrupts this.
+    let final_dir = work_dir;
+    let staging = final_dir.with_file_name(format!(
+        ".{}.building-{}",
+        final_dir.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    let work_dir = staging.as_path();
     fs::DirBuilder::new()
         .mode(0o700)
         .create(work_dir)
@@ -580,10 +590,16 @@ pub fn prepare_card_continuation(
             ),
             "the source and destination cards have the same SHA-256 as before".to_string(),
         ]);
+        if after.sha256.as_deref() != Some(import.new_card_sha256.as_str()) {
+            return Err(stopped(
+                "the new card on disk is not the card that was checked",
+            ));
+        }
+        super::store::rename_no_replace(work_dir, final_dir).map_err(ContinuationError::Stopped)?;
         Ok(ContinuationCopy {
             save_name: save_name.to_string(),
-            exported_save: exported,
-            new_card,
+            exported_save: final_dir.join(exported.file_name().unwrap_or_default()),
+            new_card: final_dir.join(&card_name),
             new_card_sha256: import.new_card_sha256,
             save_fingerprint: source_print.clone(),
             source_card_sha256: source_sha.clone(),
@@ -596,7 +612,8 @@ pub fn prepare_card_continuation(
         })
     })();
     if result.is_err() {
-        // Only the folder this call created.
+        // Only the hidden folder this call created; the final name was
+        // never given to anything.
         let _ = fs::remove_dir_all(work_dir);
     }
     result

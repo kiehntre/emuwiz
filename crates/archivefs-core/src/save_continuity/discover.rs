@@ -115,9 +115,7 @@ impl DiscoveryCache {
         let mut cache = self.clone();
         cache.format_version = Self::FORMAT_VERSION;
         let text = serde_json::to_vec(&cache).map_err(|e| ContinuityError::Io(e.to_string()))?;
-        let work = path.with_extension(format!("part-{}", std::process::id()));
-        fs::write(&work, text).map_err(|error| super::io("cannot write", &work, error))?;
-        fs::rename(&work, path).map_err(|error| super::io("cannot write", path, error))
+        super::write_state_file(path, &text)
     }
 
     pub fn len(&self) -> usize {

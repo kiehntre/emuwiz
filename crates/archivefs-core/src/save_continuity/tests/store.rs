@@ -611,3 +611,215 @@ fn snapshot_ids_are_repeatable() {
         .collect();
     assert_eq!(ids[0], ids[1]);
 }
+
+// ---- Regression tests for the independent review of 2026-11-21 ----
+
+#[test]
+fn a_record_cannot_be_filed_into_another_history() {
+    // A record whose history key is not the one its own device, emulator
+    // and source location give (for example one of this device's keys).
+    let bench = Bench::new();
+    let a = bench.file("a.srm", b"mine");
+    let mine = bench
+        .store
+        .capture(&request("this-device", &[&a], 1), &CLOSED)
+        .unwrap()
+        .manifest()
+        .clone();
+    let mut body = mine.body.clone();
+    body.provenance.device_id = "other-device".to_string(); // lineage left as ours
+    body.captured_unix = 4_000_000_000;
+    let foreign = SnapshotManifest {
+        format_version: 1,
+        snapshot_id: body_id(&body),
+        body,
+    };
+    let refused = bench.store.put_manifest(&foreign).unwrap_err();
+    assert!(
+        matches!(refused, ContinuityError::Refused(ref text) if text.contains("not its own")),
+        "{refused}"
+    );
+    assert_eq!(bench.store.list_lineage(&mine.body.lineage).len(), 1);
+}
+
+#[test]
+fn a_record_is_never_published_with_a_size_its_content_does_not_have() {
+    let bench = Bench::new();
+    let a = bench.file("a.srm", b"twelve bytes");
+    let good = bench
+        .store
+        .capture(&request("dev", &[&a], 1), &CLOSED)
+        .unwrap()
+        .manifest()
+        .clone();
+    for claimed in [0u64, 127 * 1024 * 1024] {
+        let mut body = good.body.clone();
+        body.captured_unix = 50;
+        body.files[0].size_bytes = claimed;
+        let lying = SnapshotManifest {
+            format_version: 1,
+            snapshot_id: body_id(&body),
+            body,
+        };
+        assert!(
+            bench.store.put_manifest(&lying).is_err(),
+            "claimed {claimed}"
+        );
+    }
+    assert_eq!(bench.store.list().len(), 1);
+    assert_eq!(bench.store.usage().stored_bytes, 12);
+}
+
+#[test]
+fn the_recovery_record_can_never_replace_a_file_of_the_snapshot() {
+    let bench = Bench::new();
+    let named_like_the_record = bench.file(
+        RECOVERY_RECEIPT_NAME,
+        b"a save file that happens to have this name",
+    );
+    let refused = bench
+        .store
+        .capture(&request("dev", &[&named_like_the_record], 1), &CLOSED)
+        .unwrap_err();
+    assert!(matches!(refused, ContinuityError::Refused(_)), "{refused}");
+    assert!(bench.store.list().is_empty());
+    // A recovery writes its record as a new file and files in sub-folders survive.
+    let a = bench.file("a.srm", b"data");
+    let mut ask = request("dev", &[&a], 2);
+    ask.files[0].name = "sub/folder/a.srm".to_string();
+    let id = bench
+        .store
+        .capture(&ask, &CLOSED)
+        .unwrap()
+        .manifest()
+        .snapshot_id
+        .clone();
+    let out = bench.dir.path().join("out");
+    bench.store.recover_to_new(&id, &out).unwrap();
+    assert_eq!(fs::read(out.join("sub/folder/a.srm")).unwrap(), b"data");
+    assert!(fs::read(out.join(RECOVERY_RECEIPT_NAME)).unwrap().len() > 10);
+}
+
+#[test]
+fn a_destination_spelled_with_dots_is_still_recognised_as_inside_the_store() {
+    let bench = Bench::new();
+    let a = bench.file("a.srm", b"data");
+    let id = bench
+        .store
+        .capture(&request("dev", &[&a], 1), &CLOSED)
+        .unwrap()
+        .manifest()
+        .snapshot_id
+        .clone();
+    let sneaky = bench.dir.path().join("saves/../store/manifests/new");
+    let plan = bench.store.plan_recovery(&id, &sneaky).unwrap();
+    assert!(
+        plan.blockers
+            .iter()
+            .any(|blocker| blocker.contains("inside the snapshot store")),
+        "{:?}",
+        plan.blockers
+    );
+    let into_saves = bench.dir.path().join("store/../saves/inner");
+    let plan = bench.store.plan_recovery(&id, &into_saves).unwrap();
+    assert!(
+        plan.blockers
+            .iter()
+            .any(|blocker| blocker.contains("own save location")),
+        "{:?}",
+        plan.blockers
+    );
+}
+
+#[test]
+fn a_save_that_changed_since_it_was_listed_is_not_snapshotted_under_the_old_listing() {
+    let bench = Bench::new();
+    let card = bench.file("card.ps2", b"as it was when listed");
+    let mut ask = request("dev", &[&card], 1);
+    ask.expected_sha256.insert(
+        "card.ps2".into(),
+        crate::save_continuity::sha256_hex(b"as it was when listed"),
+    );
+    fs::write(&card, b"written again since").unwrap();
+    let refused = bench.store.capture(&ask, &CLOSED).unwrap_err();
+    assert!(
+        matches!(refused, ContinuityError::Unstable(ref text) if text.contains("list the saves again")),
+        "{refused}"
+    );
+    assert!(bench.store.list().is_empty());
+}
+
+/// Closed before the copy, impossible to tell by the end of it.
+struct UnknownByTheEnd(AtomicUsize);
+impl InUseObserver for UnknownByTheEnd {
+    fn observe(&self, _: &str, _: &Path) -> InUse {
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            InUse::NotDetected
+        } else {
+            InUse::Unknown
+        }
+    }
+}
+
+#[test]
+fn not_being_able_to_tell_at_the_end_of_the_copy_keeps_nothing_unless_asked() {
+    let bench = Bench::new();
+    let a = bench.file("a.srm", b"data");
+    let refused = bench
+        .store
+        .capture(
+            &request("dev", &[&a], 1),
+            &UnknownByTheEnd(AtomicUsize::new(0)),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(refused, ContinuityError::ClosureUnproven(_)),
+        "{refused}"
+    );
+    assert!(bench.store.list().is_empty());
+    let mut ask = request("dev", &[&a], 2);
+    ask.allow_unproven_closure = true;
+    let kept = bench
+        .store
+        .capture(&ask, &UnknownByTheEnd(AtomicUsize::new(0)))
+        .unwrap();
+    assert_eq!(
+        kept.manifest().body.boundary,
+        CaptureBoundary::StableReadOnly
+    );
+}
+
+#[test]
+fn opening_a_store_to_look_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("typo");
+    assert!(matches!(
+        SnapshotStore::open_existing(&missing),
+        Err(ContinuityError::NotFound(_))
+    ));
+    assert!(!missing.exists());
+    SnapshotStore::open(&missing).unwrap();
+    assert!(SnapshotStore::open_existing(&missing).is_ok());
+}
+
+#[test]
+fn a_planted_link_at_a_state_file_work_name_is_not_followed() {
+    // The guarded writer creates its own work file or fails; it never writes
+    // through something that is already there.
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim.txt");
+    fs::write(&victim, b"do not touch").unwrap();
+    let state = dir.path().join("state.json");
+    for attempt in 0..3 {
+        crate::save_continuity::write_state_file(&state, format!("{{\"n\":{attempt}}}").as_bytes())
+            .unwrap();
+    }
+    assert_eq!(fs::read(&state).unwrap(), b"{\"n\":2}");
+    assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
+    let leftovers: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(leftovers.len(), 2, "{leftovers:?}");
+}

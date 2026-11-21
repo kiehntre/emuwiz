@@ -677,3 +677,91 @@ fn an_entry_that_exists_but_cannot_be_read_at_all_keeps_the_answer_unknown() {
     fs::create_dir(proc.0.path().join("61")).unwrap();
     assert_eq!(proc.observer().observe("RetroArch", &save), InUse::Unknown);
 }
+
+// ---- Regression tests for the independent review of 2026-11-21 ----
+
+#[test]
+fn an_emulator_started_through_a_loader_or_a_runner_is_still_seen() {
+    let dir = tempfile::tempdir().unwrap();
+    let save = save_file(&dir);
+    let cases: &[(&str, &str, &str)] = &[
+        // The dynamic loader runs the program named in its arguments.
+        (
+            "RetroArch",
+            "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+            "/lib64/ld-linux-x86-64.so.2 /opt/bundle/bin/retroarch",
+        ),
+        (
+            "RetroArch",
+            "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+            "/lib64/ld-linux-x86-64.so.2 --argv0 retroarch /opt/bundle/bin/retroarch",
+        ),
+        (
+            "PCSX2",
+            "/usr/bin/valgrind",
+            "valgrind --tool=memcheck /usr/bin/pcsx2-qt",
+        ),
+        ("RPCS3", "/usr/bin/box64", "box64 /opt/rpcs3/rpcs3"),
+        (
+            "PPSSPP",
+            "/usr/bin/gamemoderun",
+            "gamemoderun /usr/bin/PPSSPPSDL game.iso",
+        ),
+        // Attached and bundled forms of the core option.
+        (
+            "RetroArch",
+            "/opt/frontend/emu",
+            "emu -L/usr/lib/libretro/snes9x_libretro.so game.sfc",
+        ),
+        (
+            "RetroArch",
+            "/opt/frontend/emu",
+            "emu -fL /cores/mgba_libretro.so game.gba",
+        ),
+        (
+            "RetroArch",
+            "/opt/frontend/emu",
+            "emu --libr=/cores/gambatte_libretro.so game.gb",
+        ),
+        // The binary was replaced while running (an update): same program.
+        (
+            "RetroArch",
+            "/usr/local/bin/retroarch (deleted)",
+            "ra --menu",
+        ),
+        (
+            "DuckStation",
+            "/home/u/Applications/duckstation-qt (deleted)",
+            "ds",
+        ),
+    ];
+    for (emulator, executable, cmdline) in cases {
+        let proc = Proc::new();
+        // comm is the executable's own name, which for a loader or a
+        // differently named link says nothing.
+        let dir = proc.add(4242, "x", cmdline, USER);
+        std::os::unix::fs::symlink(executable, dir.join("exe")).unwrap();
+        assert_eq!(
+            proc.synthetic().observe(emulator, &save),
+            InUse::EmulatorRunning,
+            "{emulator}: `{cmdline}` ({executable})"
+        );
+    }
+    // A loader or runner running something else is not an emulator.
+    let proc = Proc::new();
+    let dir = proc.add(
+        1,
+        "x",
+        "/lib64/ld-linux-x86-64.so.2 /usr/bin/python3 notes.py retroarch",
+        USER,
+    );
+    std::os::unix::fs::symlink(
+        "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        dir.join("exe"),
+    )
+    .unwrap();
+    assert_eq!(
+        proc.synthetic().observe("RetroArch", &save),
+        InUse::NotDetected
+    );
+}

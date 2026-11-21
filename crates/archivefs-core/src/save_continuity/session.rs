@@ -57,6 +57,12 @@ pub enum SessionEnd {
     LauncherEndedOtherwise {
         detail: String,
     },
+    /// The emulator's own status was read, but for this emulator a non-zero
+    /// status has been seen on a perfectly normal close, so it cannot be
+    /// called an error or a crash. Never a warning.
+    ExitUnsettled {
+        detail: String,
+    },
     ExitCode {
         code: i32,
     },
@@ -79,13 +85,16 @@ impl SessionEnd {
             Self::LauncherEndedOtherwise { detail } => {
                 format!("The launcher ended ({detail}); how the emulator itself ended is not known")
             }
-            Self::ExitCode { code } => format!("Stopped with an error (exit code {code})"),
+            Self::ExitUnsettled { detail } => {
+                format!("Ended; whether that was a normal close is not known: {detail}")
+            }
+            Self::ExitCode { code } => format!("Ended with status {code}"),
             Self::Signal {
                 signal,
                 core_dumped: true,
-            } => format!("Crashed (signal {signal})"),
+            } => format!("Ended by a fault signal ({signal})"),
             Self::Signal { signal, .. } if is_crash_signal(*signal, false) => {
-                format!("Crashed (signal {signal})")
+                format!("Ended by a fault signal ({signal})")
             }
             Self::Signal { signal, .. } => format!("Was stopped (signal {signal})"),
             Self::StatusUnavailable => "Ended; how is not known".to_string(),
@@ -313,23 +322,43 @@ pub enum ExitEvidence {
     LauncherOnly,
 }
 
-/// Flatpak emulators whose relayed exit status is trusted. Two things were
-/// checked on a real install (`scripts/qa/flatpak_exit_probe.py`): the
-/// app's command is the emulator binary itself and `flatpak run` returns
-/// that binary's own status (a signal `N` arrives as exit code `128 + N`);
-/// **and** a normal close of the running emulator returned 0, so that a
-/// non-zero status really does mean it did not close normally. For any
-/// other app a sandbox's exit status is treated as the launcher's only.
-pub const SANDBOX_RELAY_CHECKED: [(&str, &[&str]); 2] = [
-    ("PPSSPP", &["ppssppsdl", "ppssppqt"]),
-    ("RetroArch", &["retroarch"]),
-];
+/// Emulators whose exit status is believed: a status of 0 means it closed
+/// normally and anything else means it did not.
+///
+/// The standard for being listed: on a real install, **from inside a running
+/// game**, ordinary ways of closing were tried repeatedly and returned 0
+/// every time, and a deliberate abnormal end returned something else. A
+/// close at a menu with no game running is not enough (RetroArch returned 0
+/// that way and 139 for a polite stop on another run).
+///
+/// **No emulator meets that standard yet, so this list is empty.** Until one
+/// does, an emulator's non-zero or signal exit is recorded as "not known
+/// whether that was a normal close" and never as an abnormal exit.
+///
+/// Each entry is the emulator and the names (lowercase) its binary has
+/// inside a Flatpak sandbox, where a relayed status is believed only for
+/// that binary as the sandbox's direct command.
+#[cfg(not(test))]
+pub const EXIT_STATUS_DEMONSTRATED: [(&str, &[&str]); 0] = [];
 
-/// Flatpak emulators where the relay itself works but a normal close did
-/// **not** return 0 when tried, so their status cannot yet tell a normal
-/// close from a problem. Their exits stay "not known" until a real session
-/// shows what a normal close returns.
-pub const SANDBOX_RELAY_UNSETTLED: [(&str, &str); 2] = [
+/// Tests exercise the rules with a made-up emulator, so that no real one
+/// has to be listed as trusted for a test to run.
+#[cfg(test)]
+pub const EXIT_STATUS_DEMONSTRATED: [(&str, &[&str]); 1] = [("ProbeEmu", &["probeemu"])];
+
+/// What has been observed so far for emulators that are **not** on the
+/// demonstrated list: preliminary evidence, quoted when a session of that
+/// emulator ends with a status that cannot be interpreted. From
+/// `scripts/qa/flatpak_exit_probe.py`, all with no game running.
+pub const PRELIMINARY_EXIT_EVIDENCE: [(&str, &str); 4] = [
+    (
+        "RetroArch",
+        "a close at its menu returned 0 and a forced fault 139, but a polite stop once returned 139; not yet closed repeatedly from inside a running game",
+    ),
+    (
+        "PPSSPP",
+        "a close at its menu returned 0, a polite stop 0 and a forced fault 139, and once it did not start (exit 1); not yet closed from inside a running game",
+    ),
     (
         "PCSX2",
         "closing its window returned exit code 1 (observed at the first-run setup window, not in a game)",
@@ -339,6 +368,14 @@ pub const SANDBOX_RELAY_UNSETTLED: [(&str, &str); 2] = [
         "closing its window returned 134: it aborted while shutting down in the test environment",
     ),
 ];
+
+/// Whether `emulator`'s exit status is believed (see
+/// [`EXIT_STATUS_DEMONSTRATED`]).
+pub fn exit_status_demonstrated(emulator: &str) -> bool {
+    EXIT_STATUS_DEMONSTRATED
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(emulator))
+}
 
 /// The emulator's own process among a session's tracked processes, but only
 /// when the session is a checked Flatpak route and the process sits exactly
@@ -353,11 +390,30 @@ pub fn sandbox_main(
     if !record.launch.profile.eq_ignore_ascii_case("flatpak") {
         return None;
     }
-    let binaries = SANDBOX_RELAY_CHECKED
+    let binaries = EXIT_STATUS_DEMONSTRATED
         .iter()
         .find(|(emulator, _)| emulator.eq_ignore_ascii_case(&record.launch.emulator))?
         .1;
     let launched = record.process_id?;
+    // The process EmuWiz started must itself be the sandbox (`flatpak run`,
+    // which becomes `bwrap`). If it is a script or anything else, then what
+    // comes back to EmuWiz is that program's exit status, which can be 0
+    // whatever happened to the emulator it ran.
+    let launcher_is_sandbox = |text: Option<String>| {
+        text.as_deref()
+            .and_then(|text| Path::new(text.trim_end_matches(" (deleted)")).file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "flatpak" | "bwrap"))
+    };
+    let by_name = launcher_is_sandbox(processes.name(launched));
+    let by_file = launcher_is_sandbox(
+        processes
+            .executable(launched)
+            .map(|path| path.to_string_lossy().into_owned()),
+    );
+    if !(by_name && by_file) {
+        return None;
+    }
     record
         .processes
         .iter()
@@ -611,21 +667,9 @@ impl SessionJournal {
 
     fn write(&self, record: &SessionRecord) -> Result<(), ContinuityError> {
         let path = self.path(record);
-        let work = path.with_extension(format!(
-            "part-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
         let text = serde_json::to_vec_pretty(record)
             .map_err(|error| ContinuityError::Io(error.to_string()))?;
-        let result = fs::write(&work, text)
-            .and_then(|()| fs::File::open(&work)?.sync_all())
-            .and_then(|()| fs::rename(&work, &path));
-        if let Err(error) = result {
-            let _ = fs::remove_file(&work);
-            return Err(super::io("cannot record the session in", &path, error));
-        }
-        Ok(())
+        super::write_state_file(&path, &text)
     }
 
     /// Step 1: a launch was asked for.
@@ -709,15 +753,16 @@ impl SessionJournal {
     }
 
     /// Step 2, when what was actually started is only known now: records
-    /// which emulator and install the process is, and keeps only the
-    /// "before" marks of that emulator's own saves (`its_saves`), so the
-    /// session speaks for those saves and no others.
+    /// which emulator and install the process is. Quick: no file work
+    /// besides the record, so the process is noted while it certainly
+    /// still exists. `spawn_start_ticks` is the start time read when the
+    /// process was created, used if it has already gone by now.
     pub fn mark_started_as(
         &self,
         session_id: &str,
         pid: u32,
         launch: SessionLaunch,
-        its_saves: &[String],
+        spawn_start_ticks: Option<u64>,
         processes: &dyn ProcessTable,
     ) -> Result<SessionRecord, ContinuityError> {
         let mut record = self.get(session_id)?;
@@ -727,11 +772,39 @@ impl SessionJournal {
             )));
         }
         record.launch = launch;
+        self.write(&record)?;
+        let mut record = self.mark_started(session_id, pid, processes)?;
+        if record.process_start_ticks.is_none() {
+            if let Some(start_ticks) = spawn_start_ticks {
+                record.process_start_ticks = Some(start_ticks);
+                record.processes.push(TrackedProcess {
+                    pid,
+                    start_ticks,
+                    executable: None,
+                    launched_by_emuwiz: true,
+                });
+                self.write(&record)?;
+            }
+        }
+        Ok(record)
+    }
+
+    /// Keeps only the "before" marks of the launched emulator's own saves,
+    /// so the session speaks for those saves and no others.
+    pub fn keep_saves(
+        &self,
+        session_id: &str,
+        its_saves: &[String],
+    ) -> Result<SessionRecord, ContinuityError> {
+        let mut record = self.get(session_id)?;
+        let before = record.saves_before.len();
         record
             .saves_before
             .retain(|mark| its_saves.contains(&mark.save_id));
-        self.write(&record)?;
-        self.mark_started(session_id, pid, processes)
+        if record.saves_before.len() != before {
+            self.write(&record)?;
+        }
+        Ok(record)
     }
 
     /// Looks again for processes the session's processes have started. A
@@ -788,10 +861,39 @@ impl SessionJournal {
         processes: &dyn ProcessTable,
     ) -> Result<SessionRecord, ContinuityError> {
         let mut record = self.get(session_id)?;
-        if record.state != SessionState::Started || record.launcher_end.is_some() {
+        // A session that a concurrent "settle" marked "end not seen" a
+        // moment ago (the process had just gone, and this call was still
+        // comparing saves) is completed by the real exit status now: what
+        // was actually observed replaces "not seen". A recycled process id
+        // cannot get here, because such a session has no status to give.
+        // "A moment ago" is meant literally: within a few minutes of being
+        // settled. An old "end not seen" record is never rewritten.
+        let settled_too_early = record.state == SessionState::EndNotSeen
+            && record.end.is_none()
+            && record
+                .ended_unix
+                .is_some_and(|settled| (now_unix() - settled).abs() <= 300);
+        if (record.state != SessionState::Started && !settled_too_early)
+            || record.launcher_end.is_some()
+        {
             return Err(ContinuityError::Refused(format!(
                 "session {session_id} is not running"
             )));
+        }
+        if settled_too_early {
+            // Only while the launched process really is gone.
+            let gone = record
+                .processes
+                .iter()
+                .all(|process| !alive(process, processes));
+            if !gone {
+                return Err(ContinuityError::Refused(format!(
+                    "session {session_id} is not running"
+                )));
+            }
+            record.notes.retain(|note| {
+                !note.starts_with("the emulator process is gone and EmuWiz did not see it end")
+            });
         }
         refresh(&mut record, processes);
         // Whose exit is this? Three cases, never mixed:
@@ -858,6 +960,26 @@ impl SessionJournal {
             ExitObservation::Unavailable => {
                 (SessionEnd::StatusUnavailable, ExitEvidence::EmulatorProcess)
             }
+        };
+        // A non-zero or signal exit is called abnormal only for an emulator
+        // whose exit status has been demonstrated to mean that. For every
+        // other emulator, on every route, it is recorded as what it is: a
+        // status EmuWiz cannot interpret. Zero is still zero.
+        let status_was_read = evidence != ExitEvidence::LauncherOnly
+            && matches!(end, SessionEnd::ExitCode { .. } | SessionEnd::Signal { .. });
+        let end = if status_was_read && !exit_status_demonstrated(&record.launch.emulator) {
+            let seen_so_far = PRELIMINARY_EXIT_EVIDENCE
+                .iter()
+                .find(|(emulator, _)| emulator.eq_ignore_ascii_case(&record.launch.emulator))
+                .map_or(
+                    "a normal close of this emulator has not been shown to return 0",
+                    |(_, evidence)| evidence,
+                );
+            SessionEnd::ExitUnsettled {
+                detail: format!("{} ({seen_so_far})", end.label()),
+            }
+        } else {
+            end
         };
         record.exit_evidence = Some(evidence);
         let launched = record.process_id;
@@ -1107,6 +1229,12 @@ pub fn preceding_session(
         (_, Some(SessionEnd::Clean)) => PrecedingSession::unknown(
             "the last session ended normally, but the saves were not compared afterwards",
         ),
+        (_, Some(SessionEnd::ExitUnsettled { detail })) => PrecedingSession::ExitNotSeen {
+            session_id: id,
+            detail: format!(
+                "this emulator's exit status does not tell a normal close from a problem ({detail})"
+            ),
+        },
         (_, Some(SessionEnd::LauncherExitedOk | SessionEnd::LauncherEndedOtherwise { .. })) => {
             PrecedingSession::ExitNotSeen {
                 session_id: id,

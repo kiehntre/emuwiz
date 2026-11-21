@@ -134,14 +134,17 @@ impl PrecedingSession {
     pub fn sentence(&self) -> Option<String> {
         Some(match self {
             Self::CleanExit { .. } => return None,
+            // What was observed, and no more: the emulator's process did not
+            // end normally. Why is not known, and nothing is claimed about
+            // the game or the save beyond "check it".
             Self::Crashed { signal, .. } => format!(
-                "WARNING: the emulator crashed (signal {signal}) in the session before this snapshot. The save may have been half-written; this is an exact copy of whatever was on disk"
+                "Abnormal exit detected: the emulator's process was ended by a fault signal ({signal}) in the session before this snapshot. Why is not known. This is an exact copy of what was on disk; if the emulator was saving at that moment, the save may be incomplete"
             ),
             Self::ForcedStop { signal, .. } => format!(
-                "WARNING: the emulator was stopped from outside (signal {signal}) in the session before this snapshot, not closed normally. The save may be incomplete"
+                "Abnormal exit detected: the emulator's process was stopped by signal {signal} in the session before this snapshot rather than closing by itself. If it was saving at that moment, the save may be incomplete"
             ),
             Self::ErrorExit { code, .. } => format!(
-                "WARNING: the emulator exited with an error (code {code}) in the session before this snapshot. The save may be incomplete"
+                "Abnormal exit detected: the emulator's process ended with status {code} in the session before this snapshot. Why is not known; some emulators do this on an ordinary close. If it was saving at that moment, the save may be incomplete"
             ),
             Self::ExitNotSeen { detail, .. } => format!(
                 "Not known how the emulator last ended: {detail}. Nothing suggests a problem, and nothing rules one out"

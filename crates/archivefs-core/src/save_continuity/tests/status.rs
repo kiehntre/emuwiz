@@ -88,13 +88,13 @@ fn after_a_clean_exit_the_snapshot_says_so_and_still_does_not_call_the_save_good
     let world = World::new();
     let now = [mark("save-1", "v2")];
     let session = world.session(
-        "PCSX2",
+        "ProbeEmu",
         "native",
         &[mark("save-1", "v1")],
         ExitObservation::Code(0),
         Some(&now),
     );
-    let preceding = world.preceding("PCSX2", "native", &now);
+    let preceding = world.preceding("ProbeEmu", "native", &now);
     assert_eq!(
         preceding,
         PrecedingSession::CleanExit {
@@ -140,16 +140,27 @@ fn a_crash_during_a_write_is_copied_faithfully_kept_and_loudly_labelled() {
 
     // A clean session first, and a recovery point from it.
     let v1 = [mark("save-1", "v1")];
-    world.session("PCSX2", "native", &v1, ExitObservation::Code(0), Some(&v1));
-    let good = capture(&bench, &file, 10, world.preceding("PCSX2", "native", &v1))
-        .manifest()
-        .clone();
+    world.session(
+        "ProbeEmu",
+        "native",
+        &v1,
+        ExitObservation::Code(0),
+        Some(&v1),
+    );
+    let good = capture(
+        &bench,
+        &file,
+        10,
+        world.preceding("ProbeEmu", "native", &v1),
+    )
+    .manifest()
+    .clone();
     assert!(good.body.clean_recovery_point());
 
     // The emulator dies with a segmentation fault half-way through writing.
     fs::write(&file, b"a compl").unwrap();
     let crashed = world.session(
-        "PCSX2",
+        "ProbeEmu",
         "native",
         &v1,
         ExitObservation::Signal {
@@ -158,7 +169,7 @@ fn a_crash_during_a_write_is_copied_faithfully_kept_and_loudly_labelled() {
         },
         None, // nothing was compared: there was no orderly end
     );
-    let preceding = world.preceding("PCSX2", "native", &[mark("save-1", "torn")]);
+    let preceding = world.preceding("ProbeEmu", "native", &[mark("save-1", "torn")]);
     assert_eq!(
         preceding,
         PrecedingSession::Crashed {
@@ -177,10 +188,12 @@ fn a_crash_during_a_write_is_copied_faithfully_kept_and_loudly_labelled() {
     assert_eq!(advisory_of(&suspect), Advisory::Warning);
     let warning = warning_of(&suspect).unwrap();
     assert!(
-        warning.starts_with("WARNING: the emulator crashed (signal 11)"),
+        warning.starts_with(
+            "Abnormal exit detected: the emulator's process was ended by a fault signal (11)"
+        ),
         "{warning}"
     );
-    assert!(warning.contains("half-written"));
+    assert!(warning.contains("Why is not known") && !warning.to_lowercase().contains("crash"));
 
     // Kept, not discarded; recoverable for inspection; clearly labelled.
     assert!(bench.store.verify(&suspect.snapshot_id).unwrap().intact());
@@ -193,7 +206,7 @@ fn a_crash_during_a_write_is_copied_faithfully_kept_and_loudly_labelled() {
     assert!(
         plan.notes
             .iter()
-            .any(|note| note.starts_with("WARNING: the emulator crashed"))
+            .any(|note| note.starts_with("Abnormal exit detected"))
     );
     assert!(
         plan.notes
@@ -259,8 +272,8 @@ fn a_forced_stop_an_error_exit_and_a_crash_are_told_apart() {
     ] {
         let world = World::new();
         let now = [mark("save-1", "v1")];
-        world.session("RetroArch", "native", &now, exit, None);
-        let preceding = world.preceding("RetroArch", "native", &now);
+        world.session("ProbeEmu", "native", &now, exit, None);
+        let preceding = world.preceding("ProbeEmu", "native", &now);
         assert_eq!(
             matches!(preceding, PrecedingSession::Crashed { .. }),
             expect_crash,
@@ -272,18 +285,23 @@ fn a_forced_stop_an_error_exit_and_a_crash_are_told_apart() {
             "{exit:?}"
         );
         assert_eq!(preceding.advisory(), Advisory::Warning);
-        assert!(preceding.warning().unwrap().starts_with("WARNING"));
+        assert!(
+            preceding
+                .warning()
+                .unwrap()
+                .starts_with("Abnormal exit detected")
+        );
     }
     let world = World::new();
     let now = [mark("save-1", "v1")];
     world.session(
-        "RetroArch",
+        "ProbeEmu",
         "native",
         &now,
         ExitObservation::Code(3),
         Some(&now),
     );
-    let preceding = world.preceding("RetroArch", "native", &now);
+    let preceding = world.preceding("ProbeEmu", "native", &now);
     assert!(matches!(
         preceding,
         PrecedingSession::ErrorExit { code: 3, .. }
@@ -298,7 +316,7 @@ fn an_exit_emuwiz_did_not_see_is_a_warning_not_a_clean_exit() {
     let now = [mark("save-1", "v1")];
     let table = Alive(Cell::new(true));
     let launch = SessionLaunch {
-        emulator: "DuckStation".into(),
+        emulator: "ProbeEmu".into(),
         profile: "native".into(),
         ..Default::default()
     };
@@ -312,7 +330,7 @@ fn an_exit_emuwiz_did_not_see_is_a_warning_not_a_clean_exit() {
         .unwrap();
     table.0.set(false);
     world.journal.reconcile(&table, 0);
-    let unseen = world.preceding("DuckStation", "native", &now);
+    let unseen = world.preceding("ProbeEmu", "native", &now);
     assert!(
         matches!(unseen, PrecedingSession::ExitNotSeen { .. }),
         "{unseen:?}"
@@ -377,8 +395,15 @@ fn stale_session_information_is_never_used() {
     // The save changed after the last recorded session ended: something
     // wrote it that EmuWiz did not see.
     let world = World::new();
-    world.session("PCSX2", "native", &v1, ExitObservation::Code(0), Some(&v1));
-    let changed_since = world.preceding("PCSX2", "native", &[mark("save-1", "v2-from-somewhere")]);
+    world.session(
+        "ProbeEmu",
+        "native",
+        &v1,
+        ExitObservation::Code(0),
+        Some(&v1),
+    );
+    let changed_since =
+        world.preceding("ProbeEmu", "native", &[mark("save-1", "v2-from-somewhere")]);
     assert!(
         matches!(changed_since, PrecedingSession::Unknown { ref why } if why.contains("changed since")),
         "{changed_since:?}"
@@ -387,10 +412,16 @@ fn stale_session_information_is_never_used() {
     // A clean session recorded this save, then a newer session of the same
     // emulator ran without recording it. The older "clean" no longer applies.
     let world = World::new();
-    world.session("PCSX2", "native", &v1, ExitObservation::Code(0), Some(&v1));
+    world.session(
+        "ProbeEmu",
+        "native",
+        &v1,
+        ExitObservation::Code(0),
+        Some(&v1),
+    );
     let other = [mark("another-save", "x")];
     world.session(
-        "PCSX2",
+        "ProbeEmu",
         "native",
         &other,
         ExitObservation::Signal {
@@ -399,7 +430,7 @@ fn stale_session_information_is_never_used() {
         },
         None,
     );
-    let superseded = world.preceding("PCSX2", "native", &v1);
+    let superseded = world.preceding("ProbeEmu", "native", &v1);
     assert!(
         matches!(superseded, PrecedingSession::Unknown { ref why } if why.contains("did not record this save")),
         "{superseded:?}"
@@ -407,16 +438,16 @@ fn stale_session_information_is_never_used() {
 
     // A normal exit where the saves were never compared afterwards.
     let world = World::new();
-    world.session("PCSX2", "native", &v1, ExitObservation::Code(0), None);
+    world.session("ProbeEmu", "native", &v1, ExitObservation::Code(0), None);
     assert!(matches!(
-        world.preceding("PCSX2", "native", &v1),
+        world.preceding("ProbeEmu", "native", &v1),
         PrecedingSession::Unknown { .. }
     ));
 
     // A session still recorded as open.
     let world = World::new();
     let launch = SessionLaunch {
-        emulator: "PCSX2".into(),
+        emulator: "ProbeEmu".into(),
         profile: "native".into(),
         ..Default::default()
     };
@@ -425,12 +456,12 @@ fn stale_session_information_is_never_used() {
         .request(SessionGame::default(), launch, v1.to_vec())
         .unwrap();
     assert!(
-        matches!(world.preceding("PCSX2", "native", &v1), PrecedingSession::Unknown { ref why } if why.contains("still recorded as open"))
+        matches!(world.preceding("ProbeEmu", "native", &v1), PrecedingSession::Unknown { ref why } if why.contains("still recorded as open"))
     );
 
     // No sessions at all.
     let world = World::new();
-    let none = world.preceding("PCSX2", "native", &v1);
+    let none = world.preceding("ProbeEmu", "native", &v1);
     assert!(matches!(none, PrecedingSession::Unknown { .. }));
     assert_eq!(none.advisory(), Advisory::Caution);
     assert_eq!(none.warning(), None);
@@ -445,14 +476,20 @@ fn stale_session_information_is_never_used() {
 fn a_session_for_a_different_emulator_install_device_or_save_says_nothing() {
     let world = World::new();
     let v1 = [mark("save-1", "v1")];
-    world.session("PCSX2", "native", &v1, ExitObservation::Code(0), Some(&v1));
-    assert!(world.preceding("PCSX2", "native", &v1).clean());
+    world.session(
+        "ProbeEmu",
+        "native",
+        &v1,
+        ExitObservation::Code(0),
+        Some(&v1),
+    );
+    assert!(world.preceding("ProbeEmu", "native", &v1).clean());
 
     for (emulator, profile, current) in [
-        ("RetroArch", "native", &v1[..]),                 // another emulator
-        ("PCSX2", "flatpak", &v1[..]),                    // the other install of the same emulator
-        ("PCSX2", "native", &[mark("save-2", "v1")][..]), // another save, same content
-        ("PCSX2", "native", &[][..]),                     // a save with no identity
+        ("PPSSPP", "native", &v1[..]),                       // another emulator
+        ("ProbeEmu", "flatpak", &v1[..]), // the other install of the same emulator
+        ("ProbeEmu", "native", &[mark("save-2", "v1")][..]), // another save, same content
+        ("ProbeEmu", "native", &[][..]),  // a save with no identity
     ] {
         let preceding = world.preceding(emulator, profile, current);
         assert!(
@@ -461,18 +498,24 @@ fn a_session_for_a_different_emulator_install_device_or_save_says_nothing() {
         );
     }
     // Another device's session, even if it is in the list.
-    let foreign = preceding_session(&world.journal.all(), "other-device", "PCSX2", "native", &v1);
+    let foreign = preceding_session(
+        &world.journal.all(),
+        "other-device",
+        "ProbeEmu",
+        "native",
+        &v1,
+    );
     assert!(matches!(foreign, PrecedingSession::Unknown { .. }));
     // Two saves on one card: the session must have recorded both.
     let both = [mark("save-1", "v1"), mark("save-9", "v1")];
     assert!(matches!(
-        world.preceding("PCSX2", "native", &both),
+        world.preceding("ProbeEmu", "native", &both),
         PrecedingSession::Unknown { .. }
     ));
 
     // A launch that never produced a process wrote nothing: it is skipped.
     let launch = SessionLaunch {
-        emulator: "PCSX2".into(),
+        emulator: "ProbeEmu".into(),
         profile: "native".into(),
         ..Default::default()
     };
@@ -484,7 +527,7 @@ fn a_session_for_a_different_emulator_install_device_or_save_says_nothing() {
         .journal
         .mark_never_started(&failed.session_id, "emulator not found")
         .unwrap();
-    assert!(world.preceding("PCSX2", "native", &v1).clean());
+    assert!(world.preceding("ProbeEmu", "native", &v1).clean());
 }
 
 #[test]

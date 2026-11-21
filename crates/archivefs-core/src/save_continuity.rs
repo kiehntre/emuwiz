@@ -113,3 +113,52 @@ pub(crate) fn now_unix() -> i64 {
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0)
 }
+
+static STATE_WORK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Replaces one of EmuWiz's own small state files (a session record, the
+/// discovery cache, the device or pairing file) with new content, safely:
+/// the new content goes into a work file that is created here and only here
+/// (never an existing file, never through a link), is flushed, takes the
+/// place of the old file in one step, and the folder is flushed so the
+/// change survives a power cut. If creating the work file fails, nothing is
+/// removed. Only ever used on files inside the save-continuity folder.
+pub(crate) fn write_state_file(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), ContinuityError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = path
+        .parent()
+        .ok_or_else(|| ContinuityError::Refused("a state file needs a folder".into()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| ContinuityError::Refused("a state file needs a name".into()))?
+        .to_string_lossy()
+        .into_owned();
+    let work = parent.join(format!(
+        ".{name}.{}-{}.part",
+        std::process::id(),
+        STATE_WORK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&work)
+        .map_err(|error| io("cannot create", &work, error))?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&work, path))
+        .and_then(|()| std::fs::File::open(parent)?.sync_all());
+    if let Err(error) = written {
+        // The work file was created by this call; removing it is safe. After
+        // a successful rename it no longer exists under this name.
+        let _ = std::fs::remove_file(&work);
+        return Err(io("cannot write", path, error));
+    }
+    Ok(())
+}
