@@ -17,6 +17,7 @@
 //! what was observed: how long the process ran, and whether a save's content
 //! changed. Nothing here watches the emulator or scans the disk on a timer.
 
+use super::crash_evidence::{CrashEvidence, CrashSource, NoCrashSource, ProcessLifetime};
 use super::status::{PrecedingSession, is_crash_signal};
 use super::{ContinuityError, now_unix};
 use serde::{Deserialize, Serialize};
@@ -72,6 +73,12 @@ pub enum SessionEnd {
     },
     /// The exit status could not be read.
     StatusUnavailable,
+    /// The operating system's crash handler recorded that the emulator's
+    /// own process, identified for this launch, was ended by a fatal signal.
+    /// Which signal is not recorded.
+    FatalTerminationRecorded {
+        recorded_at: String,
+    },
 }
 
 impl SessionEnd {
@@ -98,11 +105,17 @@ impl SessionEnd {
             }
             Self::Signal { signal, .. } => format!("Was stopped (signal {signal})"),
             Self::StatusUnavailable => "Ended; how is not known".to_string(),
+            Self::FatalTerminationRecorded { recorded_at } => format!(
+                "Ended by a fatal signal (recorded by the system's crash handler at {recorded_at})"
+            ),
         }
     }
 
     pub fn abnormal(&self) -> bool {
-        matches!(self, Self::ExitCode { .. } | Self::Signal { .. })
+        matches!(
+            self,
+            Self::ExitCode { .. } | Self::Signal { .. } | Self::FatalTerminationRecorded { .. }
+        )
     }
 }
 
@@ -171,6 +184,10 @@ pub struct TrackedProcess {
     pub executable: Option<PathBuf>,
     /// Started by EmuWiz itself (false: found as a child of one that was).
     pub launched_by_emuwiz: bool,
+    /// When EmuWiz first saw this process (seconds since 1970). It existed
+    /// then, so nothing recorded earlier can be about it. 0 on older records.
+    #[serde(default)]
+    pub first_seen_unix: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +225,13 @@ pub struct SessionRecord {
     /// How `end` was learned. `None` on older records.
     #[serde(default)]
     pub exit_evidence: Option<ExitEvidence>,
+    /// When the emulator inside the sandbox was last seen alive.
+    #[serde(default)]
+    pub sandbox_main_last_alive_unix: Option<i64>,
+    /// What the system's own crash records say about that process, when
+    /// they were consulted. Independent of the exit status.
+    #[serde(default)]
+    pub crash_evidence: Option<CrashEvidence>,
     pub end: Option<SessionEnd>,
     pub play_evidence: PlayEvidence,
     pub saves_before: Vec<SaveMark>,
@@ -320,6 +344,9 @@ pub enum ExitEvidence {
     SandboxRelay,
     /// Only a launcher's end was seen. Says nothing about the emulator.
     LauncherOnly,
+    /// The system's crash handler recorded that the emulator's own process
+    /// was ended by a fatal signal. Independent of any exit status.
+    CrashRecord,
 }
 
 /// Emulators whose exit status is believed: a status of 0 means it closed
@@ -369,6 +396,27 @@ pub const PRELIMINARY_EXIT_EVIDENCE: [(&str, &str); 4] = [
     ),
 ];
 
+/// The names (lowercase) each emulator's binary has inside its Flatpak
+/// sandbox. Used only to *identify* the emulator's own process there, so
+/// that evidence about exactly that process (a crash record) can be tied to
+/// the launch. Being listed here does not make an exit status believed.
+#[cfg(not(test))]
+pub const SANDBOX_BINARIES: [(&str, &[&str]); 4] = [
+    ("PCSX2", &["pcsx2-qt", "pcsx2"]),
+    ("RPCS3", &["rpcs3"]),
+    ("PPSSPP", &["ppssppsdl", "ppssppqt"]),
+    ("RetroArch", &["retroarch"]),
+];
+
+#[cfg(test)]
+pub const SANDBOX_BINARIES: [(&str, &[&str]); 5] = [
+    ("PCSX2", &["pcsx2-qt", "pcsx2"]),
+    ("RPCS3", &["rpcs3"]),
+    ("PPSSPP", &["ppssppsdl", "ppssppqt"]),
+    ("RetroArch", &["retroarch"]),
+    ("ProbeEmu", &["probeemu"]),
+];
+
 /// Whether `emulator`'s exit status is believed (see
 /// [`EXIT_STATUS_DEMONSTRATED`]).
 pub fn exit_status_demonstrated(emulator: &str) -> bool {
@@ -390,7 +438,7 @@ pub fn sandbox_main(
     if !record.launch.profile.eq_ignore_ascii_case("flatpak") {
         return None;
     }
-    let binaries = EXIT_STATUS_DEMONSTRATED
+    let binaries = SANDBOX_BINARIES
         .iter()
         .find(|(emulator, _)| emulator.eq_ignore_ascii_case(&record.launch.emulator))?
         .1;
@@ -561,6 +609,7 @@ fn track(record: &mut SessionRecord, pid: u32, launched: bool, processes: &dyn P
         start_ticks,
         executable: processes.executable(pid),
         launched_by_emuwiz: launched,
+        first_seen_unix: now_unix(),
     });
 }
 
@@ -598,11 +647,61 @@ fn refresh(record: &mut SessionRecord, processes: &dyn ProcessTable) {
     if record.sandbox_main.is_none() {
         record.sandbox_main = sandbox_main(record, processes);
     }
+    if record
+        .sandbox_main
+        .as_ref()
+        .is_some_and(|main| alive(main, processes))
+    {
+        record.sandbox_main_last_alive_unix = Some(now_unix());
+    }
+}
+
+/// How long after the emulator was last seen alive a crash record may
+/// still be matched to it. Process ids are reused; the longer nobody was
+/// looking, the less a matching id means.
+pub const CRASH_RECORD_WINDOW_SECONDS: i64 = 600;
+
+/// Asks the crash source about the emulator process identified for this
+/// session, if there is one, it is gone, and it was seen alive recently
+/// enough for its id to still mean that process. Stores what it learns.
+/// Returns the time of a confirmed record.
+fn consult_crash_source(
+    record: &mut SessionRecord,
+    processes: &dyn ProcessTable,
+    crash: &dyn CrashSource,
+    now: i64,
+) -> Option<String> {
+    let main = record.sandbox_main.clone()?;
+    if alive(&main, processes) || main.first_seen_unix <= 0 {
+        return None;
+    }
+    let last_alive = record
+        .sandbox_main_last_alive_unix
+        .unwrap_or(main.first_seen_unix);
+    let evidence = if now - last_alive > CRASH_RECORD_WINDOW_SECONDS || now < last_alive {
+        CrashEvidence::unavailable(
+            "the emulator was last seen too long before it was found gone for a record to be tied to it",
+        )
+    } else {
+        crash.lookup(&ProcessLifetime {
+            pid: main.pid,
+            started_unix: main.first_seen_unix,
+            gone_by_unix: now,
+        })
+    };
+    let confirmed = match &evidence {
+        CrashEvidence::FatalTerminationRecorded { recorded_at, .. } => Some(recorded_at.clone()),
+        _ => None,
+    };
+    record.crash_evidence = Some(evidence);
+    confirmed
 }
 
 pub struct SessionJournal {
     dir: PathBuf,
     device_id: String,
+    /// Where fatal terminations are looked up. Never knows, by default.
+    crash: Box<dyn CrashSource>,
 }
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -650,7 +749,14 @@ impl SessionJournal {
         Ok(Self {
             dir,
             device_id: device_id.to_string(),
+            crash: Box::new(NoCrashSource),
         })
+    }
+
+    /// Uses `crash` to look up fatal terminations of sandboxed emulators.
+    pub fn with_crash_source(mut self, crash: Box<dyn CrashSource>) -> Self {
+        self.crash = crash;
+        self
     }
 
     fn path(&self, record: &SessionRecord) -> PathBuf {
@@ -710,6 +816,8 @@ impl SessionJournal {
             app_scope: None,
             sandbox_main: None,
             exit_evidence: None,
+            sandbox_main_last_alive_unix: None,
+            crash_evidence: None,
             end: None,
             play_evidence: PlayEvidence::None,
             saves_before,
@@ -787,6 +895,7 @@ impl SessionJournal {
                     start_ticks,
                     executable: None,
                     launched_by_emuwiz: true,
+                    first_seen_unix: now_unix(),
                 });
                 self.write(&record)?;
             }
@@ -1015,6 +1124,17 @@ impl SessionJournal {
         record.state = SessionState::Ended;
         record.ended_unix = Some(now_unix());
         record.end = Some(end);
+        // Independent evidence, for a sandboxed emulator only: did the
+        // system record that exactly that process was ended by a fatal
+        // signal? If so that is what happened, whatever number came back.
+        if record.launch.through_launcher {
+            if let Some(recorded_at) =
+                consult_crash_source(&mut record, processes, self.crash.as_ref(), now_unix())
+            {
+                record.end = Some(SessionEnd::FatalTerminationRecorded { recorded_at });
+                record.exit_evidence = Some(ExitEvidence::CrashRecord);
+            }
+        }
         self.finish(&mut record, saves_after);
         self.write(&record)?;
         Ok(record)
@@ -1088,6 +1208,23 @@ impl SessionJournal {
                         continue;
                     }
                     record.ended_unix = Some(now);
+                    // Whoever saw (or did not see) the end: if the system
+                    // recorded that exactly this emulator process was ended
+                    // by a fatal signal, that is what happened.
+                    if record.launch.through_launcher {
+                        if let Some(recorded_at) =
+                            consult_crash_source(&mut record, processes, self.crash.as_ref(), now)
+                        {
+                            record.launcher_end = None;
+                            record.state = SessionState::Ended;
+                            record.end = Some(SessionEnd::FatalTerminationRecorded { recorded_at });
+                            record.exit_evidence = Some(ExitEvidence::CrashRecord);
+                            if self.write(&record).is_ok() {
+                                settled.push(record);
+                            }
+                            continue;
+                        }
+                    }
                     if let Some(end) = record.launcher_end.take() {
                         // The launcher's end was seen; the emulator's own
                         // was not. Say exactly that.
@@ -1275,6 +1412,9 @@ pub fn preceding_session(
                     signal: *signal,
                 }
             }
+        }
+        (_, Some(SessionEnd::FatalTerminationRecorded { .. })) => {
+            PrecedingSession::FatalTerminationRecorded { session_id: id }
         }
         (_, Some(SessionEnd::StatusUnavailable)) | (_, None) => PrecedingSession::ExitNotSeen {
             session_id: id,

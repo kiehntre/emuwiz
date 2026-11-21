@@ -130,7 +130,10 @@ impl LaunchTracker {
         Ok(Self {
             root: root.to_path_buf(),
             roots,
-            journal: SessionJournal::open(root, device_id)?,
+            // Sandboxed emulators: the system's own crash records, read-only.
+            // Wherever that source is missing the answer is simply "not known".
+            journal: SessionJournal::open(root, device_id)?
+                .with_crash_source(Box::new(super::crash_evidence::ApportLog::system())),
             device_id: device_id.to_string(),
         })
     }

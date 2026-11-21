@@ -607,9 +607,13 @@ fn no_real_emulators_flatpak_exit_is_believed_until_demonstrated_from_inside_a_g
             case.machine
                 .start(101, 100, "bwrap", "/usr/bin/bwrap", Some(scope));
             case.machine.start(102, 101, binary, exe, Some(scope));
-            assert!(
-                case.look().sandbox_main.is_none(),
-                "{emulator}: no relayed status is believed"
+            // The emulator's own process inside the sandbox is identified
+            // (so that evidence about exactly that process can be tied to
+            // the launch), but that does not make its exit status believed.
+            assert_eq!(
+                case.look().sandbox_main.map(|main| main.pid),
+                Some(102),
+                "{emulator}: the emulator inside the sandbox is identified"
             );
             case.machine.exit(&[102, 101, 100]);
             let ended = case.end(ExitObservation::Code(code));

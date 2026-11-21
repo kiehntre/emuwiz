@@ -25,6 +25,7 @@
 //! | [`compat`] | Five-level compatibility verdicts and conversion plans |
 //! | [`store`] | Content-addressed snapshot store: capture, verify, recover, pruning proposals |
 //! | [`status`] | Capture safety, structure, game integrity and last-exit context, kept separate |
+//! | [`crash_evidence`] | Read-only lookup of the system's own record that a process was ended by a fatal signal |
 //! | [`session`] | Play-session journal: attempt, started, ended, what changed |
 //! | [`workflow`] | The steps the CLI and Blue share |
 //! | [`device`] | Offline two-device comparison and resumable transfer (no network code) |
@@ -33,6 +34,7 @@
 //! [`crate::memory_card_manager`]; this module adds no second card reader.
 
 pub mod compat;
+pub mod crash_evidence;
 pub mod device;
 pub mod discover;
 pub mod model;
