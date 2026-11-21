@@ -264,3 +264,24 @@ fn files_changed_around_the_launch_start_are_reported_as_not_known() {
             .all(|change| !matches!(change, SaveChange::Modified { .. }))
     );
 }
+
+/// By hand only: how long the launch-time read of the saves takes over a
+/// given home folder, first with no remembered contents and then with them.
+/// `LAZARUS_PERF_HOME` is the home to read (nothing is written there);
+/// `LAZARUS_PERF_ROOT` is an empty scratch folder for the journal.
+#[test]
+#[ignore = "by hand: needs LAZARUS_PERF_HOME and LAZARUS_PERF_ROOT"]
+fn launch_time_save_reading_by_hand() {
+    let home = PathBuf::from(std::env::var("LAZARUS_PERF_HOME").unwrap());
+    let root = PathBuf::from(std::env::var("LAZARUS_PERF_ROOT").unwrap());
+    let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "perf").unwrap();
+    for run in ["no remembered contents", "remembered", "remembered again"] {
+        let began = std::time::Instant::now();
+        let session = tracker.begin(SessionGame::default(), "RetroArch").unwrap();
+        println!(
+            "PERF {run}: {:.3} s, {} saves marked",
+            began.elapsed().as_secs_f64(),
+            session.saves_before.len()
+        );
+    }
+}

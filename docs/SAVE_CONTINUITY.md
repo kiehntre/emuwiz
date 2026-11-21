@@ -290,6 +290,33 @@ open are settled on the next look as "never started" or "end not seen", never as
 clean. "Running" is not reported as "played": the record says how long the process
 ran and whether a save's content changed.
 
+### What a save held before the session
+
+Blue does not hold a launch back to read the saves first: the "before" marks
+are read on a worker thread while the emulator may already be starting. So a
+mark is not taken on trust. After a save's content is read, EmuWiz looks up
+when its file last changed (the later of the modification time and the
+status-change time, which the system sets on every write, rename or replacement
+and a program cannot set back). The mark is the starting content only if that
+is at least three seconds earlier than the start of the launch's first process:
+anything the emulator wrote since it started would carry a later time. For a
+folder save the folder and every file directly inside it are checked.
+
+A mark that does not pass is kept but never treated as the starting content:
+
+| First read | Content at the end | Reported |
+|---|---|---|
+| proven earlier than the launch | different | changed |
+| proven earlier than the launch | same | (nothing) |
+| not proven | different | changed; what it held before the session is not known |
+| not proven | same | not known whether it changed |
+
+A save absent at the first read and present at the end is "new". Limits: a save
+written in the last three seconds before a launch is reported as not proven;
+a step backwards of the system clock during a launch could defeat the check;
+the launch start comes from the process start time and the boot time, good to
+about a second.
+
 ## Two devices (offline model only)
 
 **There is no network code.** `device` defines what two devices would exchange and
