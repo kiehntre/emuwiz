@@ -390,6 +390,15 @@ pub fn preflight_retroarch_launch(
         ));
     }
     let content_identity = inspect_and_capture_content_identity(content_path)?;
+    // A file inside EmuWiz's prepared-media store is started only as the
+    // launch file of a prepared copy that still passes its receipt checks
+    // (never a track, a work-in-progress folder, or a copy that changed).
+    if let Some(detail) = crate::recovery::prepared_media::launch_refusal(content_path) {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::CandidateContentUnsupported,
+            detail,
+        ));
+    }
 
     // --- 4: RetroArch-specific profile kind gate ---
     if !matches!(
@@ -1153,6 +1162,12 @@ pub(crate) fn spawn_retroarch_guarded(
         selected
             .revalidate_files()
             .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
+    }
+    // The same prepared-copy check as preflight, repeated at the last moment.
+    if let Some(detail) =
+        crate::recovery::prepared_media::launch_refusal(&command.selection.content_path)
+    {
+        return Err(LaunchSpawnError::Spawn(std::io::Error::other(detail)));
     }
     let mut backend_stamps = None;
     let current_snapshot = if let Some(expected_key) = &command.unverified_game_key {

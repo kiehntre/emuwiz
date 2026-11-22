@@ -785,14 +785,30 @@ impl NativeWorkflows {
                 RetroArchProfilesState::Ready(discovery) => Some(&discovery.environment),
                 _ => None,
             };
-            crate::emulator_setup::unverified_media::trial_systems(path, recorded, &|system| {
+            let has_route = |system: &str| {
                 environment.is_some_and(|environment| {
                     archivefs_core::launch::planning::retroarch_core_installed_for(
                         system,
                         environment,
                     )
                 })
-            })
+            };
+            // A disc started from its verified prepared copy is offered for
+            // the one system it was prepared for, never for every system
+            // that reads cue sheets.
+            match crate::emulator_setup::prepared_media::for_game(path, recorded) {
+                Some(copy) => crate::emulator_setup::unverified_media::trial_systems(
+                    &copy.launch_path,
+                    recorded,
+                    &has_route,
+                )
+                .into_iter()
+                .filter(|system| *system == copy.platform_id)
+                .collect(),
+                None => crate::emulator_setup::unverified_media::trial_systems(
+                    path, recorded, &has_route,
+                ),
+            }
         } else {
             Vec::new()
         };

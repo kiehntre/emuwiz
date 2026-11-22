@@ -29,6 +29,7 @@ pub(crate) mod firmware_answers;
 pub(crate) mod flycast_gdi;
 pub(crate) mod hatari;
 pub(crate) mod mesen;
+pub(crate) mod prepared_media;
 pub(crate) mod profile_resolution;
 pub(crate) mod readiness_input;
 #[cfg(target_os = "linux")]

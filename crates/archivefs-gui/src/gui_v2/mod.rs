@@ -37,6 +37,7 @@ mod game_detail_blue;
 mod game_detail_facts;
 mod game_doctor;
 mod game_documents;
+mod game_recovery;
 mod game_rename;
 mod game_verification_guidance;
 #[cfg(test)]
