@@ -393,3 +393,532 @@ fn a_guarded_bulk_rename_applies_only_safe_rows_and_undo_restores_them() {
     assert_eq!(undo.rollback.result, RollbackResult::FullyRolledBack);
     assert!(safe.exists() && !renamed.exists() && disc.exists());
 }
+
+// ---- shared save index: each folder read once per preview ----
+
+use super::game_rename::{SaveSearchIndex, find_retroarch_saves, find_retroarch_saves_with};
+use super::rename_guard::guard_bulk_rename_plan_with_stats;
+
+/// `count` games in one `nes` folder, a RetroArch save folder with two core
+/// folders (one with a nested folder), and a save for every 100th game.
+fn crowded_library(count: usize) -> (Lib, Vec<PathBuf>, RetroArchSaveLocations) {
+    let mut lib = Lib::new();
+    let saves = lib.temp.path().join("saves");
+    for core in ["Mesen", "FCEUmm/nested"] {
+        std::fs::create_dir_all(saves.join(core)).unwrap();
+    }
+    std::fs::create_dir_all(lib.root.join("nes").join("states")).unwrap();
+    let mut games = Vec::with_capacity(count);
+    for index in 0..count {
+        let game = lib.game("nes", &format!("Game {index:05}.nes"), "nes");
+        if index % 100 == 0 {
+            std::fs::write(
+                saves.join("Mesen").join(format!("Game {index:05}.srm")),
+                b"s",
+            )
+            .unwrap();
+        }
+        games.push(game);
+    }
+    let locations = RetroArchSaveLocations {
+        directories: vec![saves],
+        ..Default::default()
+    };
+    (lib, games, locations)
+}
+
+fn rename_plan(lib: &Lib, games: &[PathBuf]) -> OrganisationPlan {
+    let names: Vec<String> = games
+        .iter()
+        .map(|game| {
+            let stem = game.file_stem().unwrap().to_string_lossy().into_owned();
+            format!("{stem} (USA).nes")
+        })
+        .collect();
+    let pairs: Vec<(&Path, &str)> = games
+        .iter()
+        .zip(&names)
+        .map(|(game, name)| (game.as_path(), name.as_str()))
+        .collect();
+    lib.plan(OrganisationMode::RenameInPlace, &pairs)
+}
+
+#[test]
+fn thousands_of_games_in_one_folder_read_each_folder_once() {
+    let (lib, games, locations) = crowded_library(3000);
+    let mut plan = rename_plan(&lib, &games);
+    assert_eq!(plan.suggested().count(), 3000);
+    let stats = guard_bulk_rename_plan_with_stats(&lib.db, &mut plan, &locations);
+    assert_eq!(stats.checked, 3000);
+    assert_eq!(stats.blocked, 30, "every 100th game has a save");
+    // Game folder + its `states` sub-folder + save root + Mesen + FCEUmm + nested:
+    // six folders, read once each, for 3000 games.
+    assert_eq!(stats.saves.folder_reads, 6, "{stats:?}");
+    assert!(stats.saves.entries_read < 3000 + 50, "{stats:?}");
+    // Binary search: a game compares only the names starting with its stem
+    // (plus one), not the 3000-entry folder.
+    assert!(stats.saves.entries_compared < 3000 * 6 * 3, "{stats:?}");
+    assert_eq!(
+        stats.sidecar_folder_reads, 2,
+        "nes folder and the library root: {stats:?}"
+    );
+    let rows = statuses(&plan);
+    assert_eq!(rows["Game 00100.nes"].0, OrganisationStatus::Blocked);
+    assert_eq!(rows["Game 00101.nes"].0, OrganisationStatus::Suggested);
+}
+
+#[test]
+fn the_shared_index_finds_exactly_what_a_fresh_search_finds() {
+    let mut lib = Lib::new();
+    let names = [
+        "Super Mario Bros.nes",
+        "Super Mario Bros. 3.nes",
+        "Gradius Vol.nes",
+        "Card.nes",
+        "Plain.nes",
+    ];
+    let games: Vec<PathBuf> = names.iter().map(|n| lib.game("mix", n, "nes")).collect();
+    let folder = lib.root.join("mix");
+    std::fs::create_dir_all(folder.join("core")).unwrap();
+    for save in [
+        "Super Mario Bros.srm",
+        "Super Mario Bros.state1.png",
+        "Super Mario Bros. 3.srm",
+        "Gradius Vol.2.mcr",
+        "Card.1.mcr",
+        "Card.notes.txt",
+    ] {
+        std::fs::write(folder.join(save), b"s").unwrap();
+    }
+    std::fs::write(folder.join("core").join("Plain.state"), b"s").unwrap();
+    let saves = lib.temp.path().join("ra");
+    std::fs::create_dir_all(saves.join("core/deep")).unwrap();
+    std::fs::write(saves.join("core/deep/Plain.anything.here"), b"s").unwrap();
+    let locations = RetroArchSaveLocations {
+        directories: vec![saves],
+        ..Default::default()
+    };
+    let mut shared = SaveSearchIndex::default();
+    for game in &games {
+        let fresh = find_retroarch_saves(game, &locations).unwrap();
+        let indexed = find_retroarch_saves_with(game, &locations, &mut shared).unwrap();
+        assert_eq!(indexed, fresh, "{}", game.display());
+    }
+    let mario = find_retroarch_saves(&games[0], &locations).unwrap();
+    assert_eq!(
+        mario.len(),
+        2,
+        "{mario:?}: the `. 3` save belongs to the other game"
+    );
+    assert!(find_retroarch_saves(&games[4], &locations).unwrap().len() == 2);
+}
+
+#[test]
+fn a_linked_or_unreadable_folder_still_refuses_every_game_that_needs_it() {
+    let (lib, games, locations) = crowded_library(50);
+    let outside = lib.temp.path().join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, lib.root.join("nes").join("linked")).unwrap();
+    let mut plan = rename_plan(&lib, &games);
+    let stats = guard_bulk_rename_plan_with_stats(&lib.db, &mut plan, &locations);
+    assert_eq!(stats.blocked, 50, "the cached refusal reaches every game");
+    assert!(
+        plan.entries
+            .iter()
+            .all(|e| e.reason.as_deref().unwrap().contains("linked folder"))
+    );
+    assert_eq!(stats.saves.folder_reads, 1, "{stats:?}");
+
+    if nix_is_root() {
+        return; // root reads anything; the permission case cannot be shown
+    }
+    let (lib, games, locations) = crowded_library(20);
+    let locked = lib.root.join("nes").join("states");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut plan = rename_plan(&lib, &games);
+    let stats = guard_bulk_rename_plan_with_stats(&lib.db, &mut plan, &locations);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(stats.blocked, 20, "{stats:?}");
+    assert!(
+        plan.entries
+            .iter()
+            .all(|e| e.reason.as_deref().unwrap().contains("could not be read"))
+    );
+}
+
+fn nix_is_root() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Uid:")).map(str::to_owned))
+        .is_some_and(|line| line.split_whitespace().nth(1) == Some("0"))
+}
+
+fn rss_kib(field: &str) -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find(|line| line.starts_with(field))
+        .and_then(|line| line.split_whitespace().nth(1)?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Benchmark (ignored by default): 4000 games in one folder.
+/// `cargo-iso test -p archivefs-core --lib -- --ignored --nocapture bulk_guard_benchmark`
+#[test]
+#[ignore]
+fn bulk_guard_benchmark_4000_games_in_one_folder() {
+    let started = std::time::Instant::now();
+    let (lib, games, locations) = crowded_library(4000);
+    let setup = started.elapsed();
+    let started = std::time::Instant::now();
+    let mut plan = rename_plan(&lib, &games);
+    let planning = started.elapsed();
+    let rss_before = rss_kib("VmRSS:");
+    let started = std::time::Instant::now();
+    let stats = guard_bulk_rename_plan_with_stats(&lib.db, &mut plan, &locations);
+    let guard = started.elapsed();
+    let rss_after = rss_kib("VmRSS:");
+    // The old behaviour, for comparison: every game searched with a fresh index.
+    let started = std::time::Instant::now();
+    let mut per_game = super::game_rename::SaveSearchStats::default();
+    for game in &games {
+        let mut fresh = SaveSearchIndex::default();
+        let _ = find_retroarch_saves_with(game, &locations, &mut fresh);
+        per_game.folder_reads += fresh.stats.folder_reads;
+        per_game.entries_read += fresh.stats.entries_read;
+    }
+    let old_saves_only = started.elapsed();
+    println!(
+        "BENCH games=4000 setup={setup:?} plan={planning:?} guard={guard:?} \
+         checked={} blocked={} save_folder_reads={} save_entries_read={} \
+         save_entries_compared={} sidecar_folder_reads={} rss_before_kib={rss_before} \
+         rss_after_kib={rss_after} peak_kib={} | OLD per-game save search only: \
+         time={old_saves_only:?} folder_reads={} entries_read={}",
+        stats.checked,
+        stats.blocked,
+        stats.saves.folder_reads,
+        stats.saves.entries_read,
+        stats.saves.entries_compared,
+        stats.sidecar_folder_reads,
+        rss_kib("VmHWM:"),
+        per_game.folder_reads,
+        per_game.entries_read,
+    );
+    assert_eq!(stats.blocked, 40);
+}
+
+// ---- mount boundaries (pretend mount points: tests cannot mount without root) ----
+
+use super::rename_guard::guard_with_index;
+
+fn mounted(paths: &[&Path]) -> SaveSearchIndex {
+    SaveSearchIndex::with_mount_points(paths.iter().map(|p| std::fs::canonicalize(p).unwrap()))
+}
+
+fn reasons(plan: &OrganisationPlan) -> Vec<(String, String)> {
+    plan.entries
+        .iter()
+        .filter(|e| e.status == OrganisationStatus::Blocked)
+        .map(|e| {
+            let name = e
+                .source_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            (name, e.reason.clone().unwrap_or_default())
+        })
+        .collect()
+}
+
+/// A folder standing in for a mounted archive: top-level files plus a
+/// sub-folder whose contents must never be read.
+fn archive_mount(at: &Path, top: &[&str], inner: &[&str]) {
+    std::fs::create_dir_all(at.join("inner")).unwrap();
+    for name in top {
+        std::fs::write(at.join(name), b"x").unwrap();
+    }
+    for name in inner {
+        std::fs::write(at.join("inner").join(name), b"x").unwrap();
+    }
+}
+
+#[test]
+fn an_unrelated_sibling_mount_is_skipped_and_never_entered() {
+    let (lib, games, locations) = crowded_library(50);
+    let mount = lib.root.join("nes").join("Archive Pack");
+    // `inner/Game 00003.srm` is below the mount's top level: never read.
+    archive_mount(
+        &mount,
+        &["Other Game.nes", "readme.txt"],
+        &["Game 00003.srm"],
+    );
+    let mut plan = rename_plan(&lib, &games);
+    let stats = guard_with_index(&lib.db, &mut plan, &locations, mounted(&[&mount]));
+    assert_eq!(reasons(&plan).len(), 1, "{:?}", reasons(&plan));
+    assert_eq!(reasons(&plan)[0].0, "Game 00000.nes", "the one real save");
+    assert_eq!(stats.saves.mounts_seen, 1, "{stats:?}");
+    // nes, states, mount top level, save root, Mesen, FCEUmm, nested: 7.
+    assert_eq!(
+        stats.saves.folder_reads, 7,
+        "the mount's inner folder is not read: {stats:?}"
+    );
+}
+
+#[test]
+fn a_mount_holding_this_games_save_refuses_only_that_game() {
+    let (lib, games, locations) = crowded_library(50);
+    let mount = lib.root.join("nes").join("Archive Pack");
+    archive_mount(&mount, &["Game 00007.srm", "Game 00007 (Beta).srm"], &[]);
+    let mut plan = rename_plan(&lib, &games);
+    guard_with_index(&lib.db, &mut plan, &locations, mounted(&[&mount]));
+    let blocked = reasons(&plan);
+    assert_eq!(blocked.len(), 2, "{blocked:?}");
+    let seven = blocked
+        .iter()
+        .find(|(name, _)| name == "Game 00007.nes")
+        .unwrap();
+    assert!(
+        seven.1.contains("separate mounted filesystem"),
+        "{}",
+        seven.1
+    );
+    assert!(
+        seven.1.contains("a save named after this game"),
+        "{}",
+        seven.1
+    );
+}
+
+#[test]
+fn nested_mounts_are_never_entered_and_deep_save_mounts_refuse() {
+    // A mount inside a mount next to the games: neither inner level is read.
+    let (lib, games, locations) = crowded_library(30);
+    let outer = lib.root.join("nes").join("Pack");
+    archive_mount(&outer, &["unrelated.nes"], &["Game 00001.srm"]);
+    let inner = outer.join("inner");
+    let mut plan = rename_plan(&lib, &games);
+    let stats = guard_with_index(&lib.db, &mut plan, &locations, mounted(&[&outer, &inner]));
+    assert_eq!(reasons(&plan).len(), 1, "{:?}", reasons(&plan));
+    assert_eq!(stats.saves.folder_reads, 7, "{stats:?}");
+
+    // A mount as a grandchild of the save folder: its top level is checked,
+    // as any grandchild is, and an unrelated one is skipped.
+    let (lib, games, locations) = crowded_library(30);
+    let nested = locations.directories[0].join("FCEUmm").join("nested");
+    archive_mount(&nested, &["Someone Else.srm"], &["Game 00002.srm"]);
+    let mut plan = rename_plan(&lib, &games);
+    guard_with_index(&lib.db, &mut plan, &locations, mounted(&[&nested]));
+    assert_eq!(reasons(&plan).len(), 1, "{:?}", reasons(&plan));
+
+    // A mount directly in the save folder holding folders of its own: the
+    // search would look inside those, which means entering the mount, so its
+    // relevance cannot be shown and every game refuses with that reason.
+    let (lib, games, locations) = crowded_library(30);
+    let core = locations.directories[0].join("Mounted Core");
+    archive_mount(&core, &["Someone Else.srm"], &[]);
+    let mut plan = rename_plan(&lib, &games);
+    guard_with_index(&lib.db, &mut plan, &locations, mounted(&[&core]));
+    let blocked = reasons(&plan);
+    assert_eq!(blocked.len(), 30, "{blocked:?}");
+    assert!(
+        blocked
+            .iter()
+            .all(|(_, r)| r.contains("cannot be ruled out without searching the mount"))
+    );
+
+    // The same mount with no folders of its own: top level checked, skipped.
+    std::fs::remove_dir(core.join("inner")).unwrap();
+    let mut plan = rename_plan(&lib, &games);
+    guard_with_index(&lib.db, &mut plan, &locations, mounted(&[&core]));
+    assert_eq!(reasons(&plan).len(), 1, "{:?}", reasons(&plan));
+}
+
+#[test]
+fn an_unreadable_mount_refuses_every_game_that_would_check_it() {
+    if nix_is_root() {
+        return; // root reads anything; the permission case cannot be shown
+    }
+    let (lib, games, locations) = crowded_library(20);
+    let mount = lib.root.join("nes").join("Locked Pack");
+    archive_mount(&mount, &["x.nes"], &[]);
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut plan = rename_plan(&lib, &games);
+    let index = mounted(&[&mount]);
+    let stats = guard_with_index(&lib.db, &mut plan, &locations, index);
+    std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let blocked = reasons(&plan);
+    assert_eq!(blocked.len(), 20, "{blocked:?} {stats:?}");
+    assert!(
+        blocked.iter().all(|(_, r)| r.contains("could not be read")),
+        "{blocked:?}"
+    );
+}
+
+#[test]
+fn games_inside_a_mounted_archive_are_searched_normally() {
+    let (lib, games, locations) = crowded_library(20);
+    let folder = lib.root.join("nes");
+    std::fs::write(folder.join("states").join("Game 00005.state"), b"s").unwrap();
+    let mut plan = rename_plan(&lib, &games);
+    let stats = guard_with_index(&lib.db, &mut plan, &locations, mounted(&[&folder]));
+    let blocked: Vec<String> = reasons(&plan).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(blocked, ["Game 00000.nes", "Game 00005.nes"]);
+    assert_eq!(
+        stats.saves.mounts_seen, 0,
+        "its own sub-folders share its filesystem"
+    );
+}
+
+#[test]
+fn one_game_and_bulk_checks_agree_with_mounts_present() {
+    let (lib, games, locations) = crowded_library(40);
+    let mount = lib.root.join("nes").join("Archive Pack");
+    archive_mount(&mount, &["Game 00011.srm"], &["Game 00012.srm"]);
+    let mut shared = mounted(&[&mount]);
+    for game in &games {
+        let alone = find_retroarch_saves_with(game, &locations, &mut mounted(&[&mount]));
+        let bulk = find_retroarch_saves_with(game, &locations, &mut shared);
+        assert_eq!(alone, bulk, "{}", game.display());
+    }
+    assert!(find_retroarch_saves_with(&games[11], &locations, &mut mounted(&[&mount])).is_err());
+    assert!(
+        find_retroarch_saves_with(&games[12], &locations, &mut mounted(&[&mount]))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Benchmark (ignored by default): 4000 games in one folder beside five
+/// mounted-archive stand-ins of 200 entries each, plus a nested mount.
+#[test]
+#[ignore]
+fn bulk_guard_benchmark_4000_games_with_mounts() {
+    let started = std::time::Instant::now();
+    let (lib, games, locations) = crowded_library(4000);
+    let mut mounts = Vec::new();
+    for pack in 0..5 {
+        let at = lib.root.join("nes").join(format!("Pack {pack}"));
+        let names: Vec<String> = (0..200)
+            .map(|i| format!("Other {pack} {i:03}.nes"))
+            .collect();
+        let top: Vec<&str> = names.iter().map(String::as_str).collect();
+        archive_mount(&at, &top, &["Game 00001.srm"]);
+        mounts.push(at.join("inner"));
+        mounts.push(at);
+    }
+    let setup = started.elapsed();
+    let mut plan = rename_plan(&lib, &games);
+    let refs: Vec<&Path> = mounts.iter().map(PathBuf::as_path).collect();
+    let index = mounted(&refs);
+    let rss_before = rss_kib("VmRSS:");
+    let started = std::time::Instant::now();
+    let stats = guard_with_index(&lib.db, &mut plan, &locations, index);
+    let guard = started.elapsed();
+    println!(
+        "BENCH-MOUNTS games=4000 mounts=5(+5 nested) setup={setup:?} guard={guard:?} checked={} \
+         blocked={} save_folder_reads={} save_entries_read={} save_entries_compared={} \
+         mounts_seen={} sidecar_folder_reads={} rss_before_kib={rss_before} rss_after_kib={} peak_kib={}",
+        stats.checked,
+        stats.blocked,
+        stats.saves.folder_reads,
+        stats.saves.entries_read,
+        stats.saves.entries_compared,
+        stats.saves.mounts_seen,
+        stats.sidecar_folder_reads,
+        rss_kib("VmRSS:"),
+        rss_kib("VmHWM:"),
+    );
+    assert_eq!(stats.blocked, 40);
+    assert_eq!(stats.saves.folder_reads, 6 + 5, "{stats:?}");
+}
+
+/// Profile (ignored by default): where the guard's time goes, at two sizes.
+#[test]
+#[ignore]
+fn bulk_guard_phase_profile() {
+    use super::game_rename::{owning_source_root, refuse_arcade_set};
+    use std::time::Instant;
+    for count in [1000usize, 2000] {
+        let (lib, games, locations) = crowded_library(count);
+        let t = Instant::now();
+        for _ in &games {
+            lib.db.list_source_folders().unwrap();
+        }
+        let folders = t.elapsed();
+        let t = Instant::now();
+        for game in &games {
+            lib.db.find_archive_id_by_absolute_path(game).unwrap();
+        }
+        let find_id = t.elapsed();
+        let t = Instant::now();
+        for game in &games {
+            let _ = live_resolution_for(&lib.db, game, 1);
+        }
+        let resolution = t.elapsed();
+        let t = Instant::now();
+        for game in &games {
+            let root = owning_source_root(&lib.db, game).unwrap();
+            let _ = refuse_arcade_set(&lib.db, game, &root, 1);
+        }
+        let arcade_total = t.elapsed();
+        let t = Instant::now();
+        let mut index = SaveSearchIndex::default();
+        for game in &games {
+            let _ = find_retroarch_saves_with(game, &locations, &mut index);
+        }
+        let saves = t.elapsed();
+        let mut plan = rename_plan(&lib, &games);
+        let t = Instant::now();
+        guard_bulk_rename_plan_with_stats(&lib.db, &mut plan, &locations);
+        let guard = t.elapsed();
+        println!(
+            "PROFILE games={count} guard={guard:?} | list_source_folders x{count}={folders:?} \
+             find_archive_id x{count}={find_id:?} live_resolution x{count}={resolution:?} \
+             source_root+arcade x{count}={arcade_total:?} saves(shared)={saves:?}"
+        );
+    }
+}
+
+/// Real mount boundary (ignored by default; needs a real mount, made without
+/// root by a user namespace). `EMUWIZ_REAL_MOUNT_GAMES` names an empty
+/// scratch folder whose `Pack` sub-folder is a separate mount, e.g.
+/// `bwrap --dev-bind / / --unshare-user --tmpfs $DIR/Pack -- <test binary> ...`.
+#[test]
+#[ignore]
+fn a_real_mount_beside_the_game_is_detected_by_device_and_mount_list() {
+    let Some(games) = std::env::var_os("EMUWIZ_REAL_MOUNT_GAMES").map(PathBuf::from) else {
+        panic!("EMUWIZ_REAL_MOUNT_GAMES is not set");
+    };
+    let pack = games.join("Pack");
+    use std::os::unix::fs::MetadataExt;
+    let device = |p: &Path| std::fs::metadata(p).unwrap().dev();
+    assert_ne!(
+        device(&games),
+        device(&pack),
+        "Pack must be a separate mount"
+    );
+    let game = games.join("Real Game.nes");
+    std::fs::write(&game, b"g").unwrap();
+    std::fs::write(pack.join("Someone Else.srm"), b"s").unwrap();
+    std::fs::create_dir(pack.join("deep")).unwrap();
+    std::fs::write(pack.join("deep").join("Real Game.srm"), b"s").unwrap();
+    let none = RetroArchSaveLocations::default();
+    // Real detection (default index reads /proc/self/mountinfo and devices).
+    let mut index = SaveSearchIndex::default();
+    assert_eq!(
+        find_retroarch_saves_with(&game, &none, &mut index),
+        Ok(vec![])
+    );
+    assert_eq!(index.stats.mounts_seen, 1, "{:?}", index.stats);
+    assert_eq!(
+        index.stats.folder_reads, 2,
+        "game folder + mount top level only"
+    );
+    std::fs::write(pack.join("Real Game.srm"), b"s").unwrap();
+    let refused = find_retroarch_saves(&game, &none).unwrap_err();
+    assert!(refused.contains("separate mounted filesystem"), "{refused}");
+    println!("REAL-MOUNT ok: {refused}");
+}

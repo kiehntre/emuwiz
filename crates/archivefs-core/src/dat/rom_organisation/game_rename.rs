@@ -597,6 +597,17 @@ pub(crate) fn find_retroarch_saves(
     source: &Path,
     locations: &RetroArchSaveLocations,
 ) -> Result<Vec<PathBuf>, String> {
+    find_retroarch_saves_with(source, locations, &mut SaveSearchIndex::default())
+}
+
+/// [`find_retroarch_saves`] reading folders through `index`, so a bulk check
+/// lists each shared folder once instead of once per game. The index belongs
+/// to one check: build a new one for every preview and every Apply.
+pub(crate) fn find_retroarch_saves_with(
+    source: &Path,
+    locations: &RetroArchSaveLocations,
+    index: &mut SaveSearchIndex,
+) -> Result<Vec<PathBuf>, String> {
     if let Some(folder) = locations.uncheckable.first() {
         return Err(format!(
             "RetroArch's save setting {folder} could not be checked, so saves for this game cannot be ruled out. Nothing was changed."
@@ -608,20 +619,34 @@ pub(crate) fn find_retroarch_saves(
     else {
         return Ok(Vec::new());
     };
+    // A sub-folder that is a mount boundary (a mounted archive, for example)
+    // is never searched below its top level: see `refuse_if_mount_is_relevant`.
     let mut saves = Vec::new();
     if let Some(game_folder) = source.parent() {
-        saves.extend(saves_named_after(game_folder, &stem, source, false)?);
-        for child in subdirectories(game_folder)? {
-            saves.extend(saves_named_after(&child, &stem, source, false)?);
+        saves.extend(index.saves_named_after(game_folder, &stem, source, false)?);
+        let children = index.subdirectories(game_folder)?;
+        for child in &children.plain {
+            saves.extend(index.saves_named_after(child, &stem, source, false)?);
+        }
+        for mount in &children.mounts {
+            index.refuse_if_mount_is_relevant(mount, &stem, source, false, false)?;
         }
     }
     for root in &locations.directories {
-        saves.extend(saves_named_after(root, &stem, source, true)?);
-        for child in subdirectories(root)? {
-            saves.extend(saves_named_after(&child, &stem, source, true)?);
-            for grandchild in subdirectories(&child)? {
-                saves.extend(saves_named_after(&grandchild, &stem, source, true)?);
+        saves.extend(index.saves_named_after(root, &stem, source, true)?);
+        let children = index.subdirectories(root)?;
+        for child in &children.plain {
+            saves.extend(index.saves_named_after(child, &stem, source, true)?);
+            let grandchildren = index.subdirectories(child)?;
+            for grandchild in &grandchildren.plain {
+                saves.extend(index.saves_named_after(grandchild, &stem, source, true)?);
             }
+            for mount in &grandchildren.mounts {
+                index.refuse_if_mount_is_relevant(mount, &stem, source, true, false)?;
+            }
+        }
+        for mount in &children.mounts {
+            index.refuse_if_mount_is_relevant(mount, &stem, source, true, true)?;
         }
     }
     saves.sort();
@@ -771,72 +796,288 @@ fn unreadable(folder: &Path, error: impl std::fmt::Display) -> String {
     )
 }
 
-/// Real sub-folders of `folder`. A linked sub-folder, an unreadable entry or
-/// more than [`MAX_SAVE_SUBFOLDERS`] refuses rather than being skipped.
-fn subdirectories(folder: &Path) -> Result<Vec<PathBuf>, String> {
-    let entries = match std::fs::read_dir(folder) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(unreadable(folder, error)),
-    };
-    let mut folders = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| unreadable(folder, error))?;
-        let kind = entry
-            .file_type()
-            .map_err(|error| unreadable(&entry.path(), error))?;
-        if kind.is_symlink() && entry.path().is_dir() {
-            return Err(format!(
-                "{} is a linked folder, so saves inside it cannot be ruled out. Nothing was changed.",
-                entry.path().display()
-            ));
-        }
-        if kind.is_dir() {
-            folders.push(entry.path());
-            if folders.len() > MAX_SAVE_SUBFOLDERS {
-                return Err(format!(
-                    "{} holds too many folders to check for saves. Nothing was changed.",
-                    folder.display()
-                ));
-            }
-        }
-    }
-    Ok(folders)
+/// Counts of the real folder reads a [`SaveSearchIndex`] made.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SaveSearchStats {
+    /// `read_dir` calls: one per distinct folder, however many games ask.
+    pub folder_reads: u64,
+    /// Directory entries read from disk across those folders.
+    pub entries_read: u64,
+    /// Entries compared while answering games (binary search keeps this
+    /// close to the number of matches, not the folder size).
+    pub entries_compared: u64,
+    /// Distinct mount boundaries met (each listed at its top level only).
+    pub mounts_seen: u64,
 }
 
-/// Files in `folder` named `<stem>.` plus a save suffix (or, in a
-/// configured save folder, any suffix: nothing else lives there).
-fn saves_named_after(
-    folder: &Path,
-    stem: &str,
-    source: &Path,
-    any_suffix: bool,
-) -> Result<Vec<PathBuf>, String> {
-    let entries = match std::fs::read_dir(folder) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(unreadable(folder, error)),
-    };
-    let prefix = format!("{stem}.");
-    let mut found = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| unreadable(folder, error))?;
-        let path = entry.path();
-        if path == source {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(rest) = name.strip_prefix(&prefix) else {
-            continue;
-        };
-        // "Super Mario Bros. 3.srm" starts with "Super Mario Bros." too, but
-        // its remainder (" 3.srm") is not a plain extension: it is named
-        // after another game and is left alone.
-        if is_extension_chain(rest) && (any_suffix || is_save_suffix(&rest.to_ascii_lowercase())) {
-            found.push(path);
+/// A folder's real sub-folders, split at mount boundaries.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Subfolders {
+    pub(crate) plain: Vec<PathBuf>,
+    /// On another filesystem than the folder, or a mount point: listed at
+    /// their top level only, never searched below it.
+    pub(crate) mounts: Vec<PathBuf>,
+}
+
+/// One folder as read once: its entries sorted by name, plus each entry's
+/// kind as `read_dir` reported it (or the error reading that entry).
+struct FolderListing {
+    names: Vec<(String, PathBuf)>,
+    kinds: Vec<(PathBuf, Result<std::fs::FileType, String>)>,
+}
+
+/// Read-only cache of the folders a save search lists. Every folder is read
+/// at most once per index, and so is its sub-folder check; an error is kept
+/// and returned to every game that asks, exactly as if each had read it. It
+/// holds no state between checks: a preview and an Apply each build their own.
+#[derive(Default)]
+pub struct SaveSearchIndex {
+    listings: std::collections::HashMap<PathBuf, Result<Option<FolderListing>, String>>,
+    subfolders: std::collections::HashMap<PathBuf, Result<Subfolders, String>>,
+    /// Mount points from `/proc/self/mountinfo`, read once when first needed
+    /// (catches bind mounts that share the parent's device number).
+    mount_points: Option<Result<std::collections::HashSet<PathBuf>, String>>,
+    pub stats: SaveSearchStats,
+}
+
+impl SaveSearchIndex {
+    /// An index that takes these as the system's mount points instead of
+    /// reading `/proc/self/mountinfo` (tests cannot mount without root).
+    #[cfg(test)]
+    pub(crate) fn with_mount_points(points: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            mount_points: Some(Ok(points.into_iter().collect())),
+            ..Self::default()
         }
     }
-    Ok(found)
+
+    fn mount_points(&mut self) -> Result<&std::collections::HashSet<PathBuf>, String> {
+        let loaded = self.mount_points.get_or_insert_with(read_mount_points);
+        loaded.as_ref().map_err(Clone::clone)
+    }
+
+    /// A mount sub-folder, met where saves may be: it is listed at its top
+    /// level (one read per check, shared by every game), never below it.
+    /// - nothing there named after this game: unrelated, skipped;
+    /// - a save named after this game: refused (it cannot move with the game);
+    /// - unreadable: refused (it cannot be ruled out);
+    /// - `searched_deeper` (the search would also look one level inside it)
+    ///   and it holds folders: refused, as relevance cannot be shown without
+    ///   entering the mount.
+    fn refuse_if_mount_is_relevant(
+        &mut self,
+        mount: &Path,
+        stem: &str,
+        source: &Path,
+        any_suffix: bool,
+        searched_deeper: bool,
+    ) -> Result<(), String> {
+        let found = self.saves_named_after(mount, stem, source, any_suffix)?;
+        if !found.is_empty() {
+            return Err(format!(
+                "{} is a separate mounted filesystem (a mounted archive, for example) holding {} named after this game; it cannot be renamed with the game. Nothing was changed.",
+                mount.display(),
+                if found.len() == 1 {
+                    "a save".to_string()
+                } else {
+                    format!("{} saves", found.len())
+                }
+            ));
+        }
+        if searched_deeper && let Some(listing) = self.listing(mount)? {
+            for (path, kind) in &listing.kinds {
+                if kind.clone()?.is_dir() {
+                    return Err(format!(
+                        "{} is a separate mounted filesystem inside RetroArch's save folder with folders of its own ({}); saves in them cannot be ruled out without searching the mount. Nothing was changed.",
+                        mount.display(),
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `Ok(None)`: the folder does not exist (no saves there).
+    fn listing(&mut self, folder: &Path) -> Result<Option<&FolderListing>, String> {
+        if !self.listings.contains_key(folder) {
+            let read = Self::read(folder, &mut self.stats);
+            self.listings.insert(folder.to_path_buf(), read);
+        }
+        match &self.listings[folder] {
+            Ok(listing) => Ok(listing.as_ref()),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    fn read(folder: &Path, stats: &mut SaveSearchStats) -> Result<Option<FolderListing>, String> {
+        stats.folder_reads += 1;
+        let entries = match std::fs::read_dir(folder) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(unreadable(folder, error)),
+        };
+        let mut names = Vec::new();
+        let mut kinds = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| unreadable(folder, error))?;
+            stats.entries_read += 1;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|error| unreadable(&path, error));
+            names.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                path.clone(),
+            ));
+            kinds.push((path, kind));
+        }
+        names.sort();
+        Ok(Some(FolderListing { names, kinds }))
+    }
+
+    /// Real sub-folders of `folder`. A linked sub-folder, a sub-folder on
+    /// another filesystem (a mounted archive, for example), an unreadable
+    /// entry or more than [`MAX_SAVE_SUBFOLDERS`] refuses rather than being
+    /// skipped or searched.
+    fn subdirectories(&mut self, folder: &Path) -> Result<Subfolders, String> {
+        if let Some(known) = self.subfolders.get(folder) {
+            return known.clone();
+        }
+        let found = self.find_subdirectories(folder);
+        self.subfolders.insert(folder.to_path_buf(), found.clone());
+        found
+    }
+
+    fn find_subdirectories(&mut self, folder: &Path) -> Result<Subfolders, String> {
+        let Some(listing) = self.listing(folder)? else {
+            return Ok(Subfolders::default());
+        };
+        let mut candidates = Vec::new();
+        for (path, kind) in &listing.kinds {
+            let kind = kind.clone()?;
+            if kind.is_symlink() && path.is_dir() {
+                return Err(format!(
+                    "{} is a linked folder, so saves inside it cannot be ruled out. Nothing was changed.",
+                    path.display()
+                ));
+            }
+            if kind.is_dir() {
+                candidates.push(path.clone());
+                if candidates.len() > MAX_SAVE_SUBFOLDERS {
+                    return Err(format!(
+                        "{} holds too many folders to check for saves. Nothing was changed.",
+                        folder.display()
+                    ));
+                }
+            }
+        }
+        let mut found = Subfolders::default();
+        if candidates.is_empty() {
+            return Ok(found);
+        }
+        use std::os::unix::fs::MetadataExt;
+        // The device of the folder as listed (followed: a configured save
+        // folder may itself be a link to another disk).
+        let device = std::fs::metadata(folder)
+            .map_err(|error| unreadable(folder, error))?
+            .dev();
+        for path in candidates {
+            let child =
+                std::fs::symlink_metadata(&path).map_err(|error| unreadable(&path, error))?;
+            let canonical =
+                std::fs::canonicalize(&path).map_err(|error| unreadable(&path, error))?;
+            let mount_point = self.mount_points()?.contains(&canonical);
+            if child.dev() != device || mount_point {
+                self.stats.mounts_seen += 1;
+                found.mounts.push(path);
+            } else {
+                found.plain.push(path);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Entries in `folder` named `<stem>.` plus a save suffix (or, in a
+    /// configured save folder, any suffix: nothing else lives there).
+    fn saves_named_after(
+        &mut self,
+        folder: &Path,
+        stem: &str,
+        source: &Path,
+        any_suffix: bool,
+    ) -> Result<Vec<PathBuf>, String> {
+        let prefix = format!("{stem}.");
+        let mut compared = 0u64;
+        let found = {
+            let Some(listing) = self.listing(folder)? else {
+                return Ok(Vec::new());
+            };
+            let start = listing
+                .names
+                .partition_point(|(name, _)| name.as_str() < prefix.as_str());
+            let mut found = Vec::new();
+            for (name, path) in &listing.names[start..] {
+                compared += 1;
+                let Some(rest) = name.strip_prefix(&prefix) else {
+                    break; // sorted: no later name starts with the prefix
+                };
+                if path == source {
+                    continue;
+                }
+                // "Super Mario Bros. 3.srm" starts with "Super Mario Bros." too, but
+                // its remainder (" 3.srm") is not a plain extension: it is named
+                // after another game and is left alone.
+                if is_extension_chain(rest)
+                    && (any_suffix || is_save_suffix(&rest.to_ascii_lowercase()))
+                {
+                    found.push(path.clone());
+                }
+            }
+            found
+        };
+        self.stats.entries_compared += compared;
+        Ok(found)
+    }
+}
+
+/// Mount points of this process's mount namespace. Unreadable means mount
+/// boundaries cannot be told apart, so every save check that needs it refuses.
+fn read_mount_points() -> Result<std::collections::HashSet<PathBuf>, String> {
+    let text = std::fs::read_to_string("/proc/self/mountinfo").map_err(|error| {
+        format!("the system's mount list could not be read ({error}), so mounted folders cannot be recognised and saves cannot be ruled out. Nothing was changed.")
+    })?;
+    Ok(text
+        .lines()
+        .filter_map(|line| line.split(' ').nth(4))
+        .map(|field| PathBuf::from(unescape_mount_field(field)))
+        .collect())
+}
+
+/// `/proc/self/mountinfo` writes space, tab, newline and backslash as
+/// three-digit octal escapes (`\040`).
+fn unescape_mount_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && (b'0'..=b'3').contains(&bytes[index + 1])
+            && bytes[index + 2..index + 4]
+                .iter()
+                .all(|b| (b'0'..=b'7').contains(b))
+        {
+            // At most \377: always fits a byte.
+            let value = (bytes[index + 1] - b'0') * 64
+                + (bytes[index + 2] - b'0') * 8
+                + (bytes[index + 3] - b'0');
+            out.push(value);
+            index += 4;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `srm`, `state1.png`, `1.mcr`: dot-separated parts of letters, digits,
@@ -915,9 +1156,22 @@ pub(crate) fn refuse_arcade_set(
     source_root: &Path,
     generation: u64,
 ) -> Result<(), String> {
-    let arcade_folder = database
+    let folders = database
         .list_source_folders()
-        .map_err(|error| format!("could not read the library folders: {error}"))?
+        .map_err(|error| format!("could not read the library folders: {error}"))?;
+    refuse_arcade_set_in(&folders, database, source, source_root, generation)
+}
+
+/// [`refuse_arcade_set`] with the library folders already read (a bulk check
+/// reads them once per run instead of once per game).
+pub(crate) fn refuse_arcade_set_in(
+    folders: &[crate::SourceFolderRecord],
+    database: &crate::Database,
+    source: &Path,
+    source_root: &Path,
+    generation: u64,
+) -> Result<(), String> {
+    let arcade_folder = folders
         .iter()
         .any(|folder| folder.path == source_root && folder.role == crate::SourceRole::ArcadeRomset);
     let arcade_platform = matches!(
@@ -939,11 +1193,20 @@ pub(crate) fn owning_source_root(
     let folders = database
         .list_source_folders()
         .map_err(|error| format!("could not read the library folders: {error}"))?;
+    owning_source_root_in(&folders, source)
+}
+
+/// [`owning_source_root`] with the library folders already read.
+pub(crate) fn owning_source_root_in(
+    folders: &[crate::SourceFolderRecord],
+    source: &Path,
+) -> Result<PathBuf, String> {
     folders
-        .into_iter()
-        .map(|folder| folder.path)
-        .filter(|root| source.starts_with(root) && source != root)
+        .iter()
+        .map(|folder| &folder.path)
+        .filter(|root| source.starts_with(root) && source != root.as_path())
         .max_by_key(|root| root.components().count())
+        .cloned()
         .ok_or_else(|| "This game is not inside a library folder. Nothing was changed.".into())
 }
 
@@ -1004,4 +1267,34 @@ pub(crate) fn folder_sidecars(folder: &Path) -> Result<Vec<(PathBuf, String)>, S
         found.push((path, String::from_utf8_lossy(&bytes).to_lowercase()));
     }
     Ok(found)
+}
+
+#[cfg(test)]
+mod mount_list_tests {
+    use super::{read_mount_points, unescape_mount_field};
+    use std::path::Path;
+
+    #[test]
+    fn mountinfo_escapes_are_decoded() {
+        assert_eq!(
+            unescape_mount_field(r"/mnt/usb\040drive/a\134b"),
+            r"/mnt/usb drive/a\b"
+        );
+        assert_eq!(
+            unescape_mount_field(r"/x\0"),
+            r"/x\0",
+            "short escape left as is"
+        );
+        assert_eq!(
+            unescape_mount_field(r"/x\777y"),
+            r"/x\777y",
+            "out of range left as is"
+        );
+    }
+
+    #[test]
+    fn the_real_mount_list_is_read_and_holds_the_root() {
+        let points = read_mount_points().expect("/proc/self/mountinfo is readable");
+        assert!(points.contains(Path::new("/")), "{points:?}");
+    }
 }

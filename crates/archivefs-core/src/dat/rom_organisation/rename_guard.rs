@@ -21,8 +21,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use super::game_rename::{
-    RetroArchSaveLocations, find_retroarch_saves, folder_sidecars, owning_source_root,
-    refuse_arcade_set,
+    RetroArchSaveLocations, SaveSearchIndex, SaveSearchStats, find_retroarch_saves_with,
+    folder_sidecars, owning_source_root_in, refuse_arcade_set_in,
 };
 use super::model::{OrganisationMode, OrganisationPlan, OrganisationStatus};
 
@@ -35,6 +35,16 @@ pub fn mode_changes_real_files(mode: OrganisationMode) -> bool {
     )
 }
 
+/// What one guard run did: how many rows it blocked and how much it read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GuardStats {
+    pub checked: usize,
+    pub blocked: usize,
+    /// Folders read for cue sheets and playlists (each once per run).
+    pub sidecar_folder_reads: u64,
+    pub saves: SaveSearchStats,
+}
+
 /// Marks every `Suggested` entry that the one-game Rename would refuse as
 /// `Blocked`, with the reason. Returns how many entries were blocked. Plans in
 /// modes that leave the real file alone are returned unchanged.
@@ -43,10 +53,38 @@ pub fn guard_bulk_rename_plan(
     plan: &mut OrganisationPlan,
     save_locations: &RetroArchSaveLocations,
 ) -> usize {
+    guard_bulk_rename_plan_with_stats(database, plan, save_locations).blocked
+}
+
+/// [`guard_bulk_rename_plan`], also reporting what it read. Every folder
+/// (game folders, their sub-folders, RetroArch save folders, folders that may
+/// hold cue sheets) is read at most once per run; nothing is kept afterwards.
+pub fn guard_bulk_rename_plan_with_stats(
+    database: &crate::Database,
+    plan: &mut OrganisationPlan,
+    save_locations: &RetroArchSaveLocations,
+) -> GuardStats {
+    guard_with_index(database, plan, save_locations, SaveSearchIndex::default())
+}
+
+/// The guard run with a given (fresh) save index; tests pass one that knows
+/// their pretend mount points.
+pub(crate) fn guard_with_index(
+    database: &crate::Database,
+    plan: &mut OrganisationPlan,
+    save_locations: &RetroArchSaveLocations,
+    mut saves: SaveSearchIndex,
+) -> GuardStats {
+    let mut stats = GuardStats::default();
     if !mode_changes_real_files(plan.mode) {
-        return 0;
+        return stats;
     }
     let mut sidecars = SidecarCache::default();
+    // Read once per run (each preview and each Apply check reads it afresh).
+    let folders = match database.list_source_folders() {
+        Ok(folders) => Ok(folders),
+        Err(error) => Err(format!("could not read the library folders: {error}")),
+    };
     let mut blocked = 0;
     for entry in &mut plan.entries {
         if entry.status != OrganisationStatus::Suggested
@@ -54,20 +92,30 @@ pub fn guard_bulk_rename_plan(
         {
             continue;
         }
-        if let Some(reason) = refusal_for(
-            database,
-            &entry.source_path,
-            &plan.master_root,
-            plan.generation,
-            save_locations,
-            &mut sidecars,
-        ) {
+        stats.checked += 1;
+        let refusal = match &folders {
+            Err(reason) => Some(reason.clone()),
+            Ok(folders) => refusal_for(
+                folders,
+                database,
+                &entry.source_path,
+                &plan.master_root,
+                plan.generation,
+                save_locations,
+                &mut sidecars,
+                &mut saves,
+            ),
+        };
+        if let Some(reason) = refusal {
             entry.status = OrganisationStatus::Blocked;
             entry.reason = Some(reason);
             blocked += 1;
         }
     }
-    blocked
+    stats.blocked = blocked;
+    stats.sidecar_folder_reads = sidecars.folders.len() as u64;
+    stats.saves = saves.stats;
+    stats
 }
 
 /// Apply-time check: runs the guard again on a copy of the reviewed plan and
@@ -103,19 +151,22 @@ pub fn refuse_if_newly_blocked(
 }
 
 /// Why this file must not be renamed or moved in bulk, or `None`.
+#[allow(clippy::too_many_arguments)]
 fn refusal_for(
+    folders: &[crate::SourceFolderRecord],
     database: &crate::Database,
     source: &Path,
     plan_root: &Path,
     generation: u64,
     save_locations: &RetroArchSaveLocations,
     sidecars: &mut SidecarCache,
+    saves: &mut SaveSearchIndex,
 ) -> Option<String> {
     // The library folder that holds the file bounds the sidecar search, as
     // in the one-game Rename. A file outside every library folder (a Quick
     // Rename root that is not a library folder) uses the plan's root, or
     // only its own folder when it is outside that too.
-    let source_root = owning_source_root(database, source)
+    let source_root = owning_source_root_in(folders, source)
         .ok()
         .or_else(|| {
             source
@@ -123,7 +174,7 @@ fn refusal_for(
                 .then(|| plan_root.to_path_buf())
         })
         .or_else(|| source.parent().map(Path::to_path_buf))?;
-    if let Err(reason) = refuse_arcade_set(database, source, &source_root, generation) {
+    if let Err(reason) = refuse_arcade_set_in(folders, database, source, &source_root, generation) {
         return Some(reason);
     }
     match sidecars.referencing(source, &source_root) {
@@ -136,7 +187,7 @@ fn refusal_for(
         }
         Ok(None) => {}
     }
-    match find_retroarch_saves(source, save_locations) {
+    match find_retroarch_saves_with(source, save_locations, saves) {
         Err(reason) => Some(reason),
         Ok(saves) if !saves.is_empty() => Some(format!(
             "This game has {} RetroArch save{} or save state{} named after it. Bulk rename does not move saves yet: rename it on its own from Game Details, which moves its saves with it. Nothing will change for this file.",
