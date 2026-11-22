@@ -972,3 +972,113 @@ fn bookkeeping_reads_only_the_sessions_that_are_not_over() {
     let settled = run.tracker.settle();
     assert!(settled.iter().any(|record| record.session_id == stray));
 }
+
+#[test]
+fn a_flatpak_emulators_saves_kept_outside_its_own_folder_are_still_its_saves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+    let config = home.join(".var/app/org.libretro.RetroArch/config/retroarch");
+    let saves = home.join("my-saves");
+    fs::create_dir_all(&config).unwrap();
+    fs::create_dir_all(&saves).unwrap();
+    fs::write(
+        config.join("retroarch.cfg"),
+        format!("savefile_directory = \"{}\"\n", saves.display()),
+    )
+    .unwrap();
+    fs::write(saves.join("Played (USA).srm"), [1u8; 8192]).unwrap();
+    let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
+    let process = StartedProcess {
+        executable: PathBuf::from("/usr/bin/flatpak"),
+        arguments: vec!["run".into(), "org.libretro.RetroArch".into()],
+        ..started()
+    };
+    let launch = super::super::tracker::classify_started(&process.executable, &process.arguments);
+    assert_eq!(
+        (launch.emulator.as_str(), launch.profile.as_str()),
+        ("RetroArch", "flatpak")
+    );
+    let baseline = tracker.baseline_before_start(&launch).unwrap();
+    assert_eq!(baseline.marks.len(), 1, "{baseline:?}");
+    // A native RetroArch launch on the same profile does not take them.
+    assert!(
+        tracker
+            .baseline_before_start(&retroarch())
+            .unwrap()
+            .marks
+            .is_empty()
+    );
+
+    let table = One(Cell::new(true));
+    let session = tracker
+        .begin_gated(SessionGame::default(), "RetroArch")
+        .unwrap();
+    tracker
+        .process_started_gated(&session.session_id, &process, Ok((baseline, 1, 0)), &table)
+        .unwrap();
+    fs::write(saves.join("Played (USA).srm"), [9u8; 8192]).unwrap();
+    table.0.set(false);
+    let ended = tracker
+        .finished_in(
+            &session.session_id,
+            Some(ExitSummary::Code(0)),
+            None,
+            &table,
+        )
+        .unwrap();
+    assert_eq!(
+        ended.save_changes,
+        vec![SaveChange::Modified {
+            label: "Played (USA).srm".into()
+        }]
+    );
+}
+
+#[test]
+fn a_memory_card_in_a_save_folder_of_ones_own_is_reported_not_passed_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+    let config = home.join(".config/retroarch");
+    let saves = home.join("my-saves");
+    fs::create_dir_all(&config).unwrap();
+    fs::create_dir_all(&saves).unwrap();
+    fs::write(
+        config.join("retroarch.cfg"),
+        format!("savefile_directory = \"{}\"\n", saves.display()),
+    )
+    .unwrap();
+    let card = saves.join("Some PlayStation Game.srm");
+    fs::write(&card, crate::memory_card_manager::tests::ps1_card(&[])).unwrap();
+    let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
+    let baseline = tracker.baseline_before_start(&retroarch()).unwrap();
+    assert!(baseline.marks.is_empty());
+    assert_eq!(baseline.unread, vec![card.clone()]);
+
+    let table = One(Cell::new(true));
+    let session = tracker
+        .begin_gated(SessionGame::default(), "RetroArch")
+        .unwrap();
+    tracker
+        .process_started_gated(
+            &session.session_id,
+            &started(),
+            Ok((baseline, 1, 0)),
+            &table,
+        )
+        .unwrap();
+    table.0.set(false);
+    let ended = tracker
+        .finished_in(
+            &session.session_id,
+            Some(ExitSummary::Code(0)),
+            None,
+            &table,
+        )
+        .unwrap();
+    assert_eq!(
+        ended.save_changes,
+        vec![SaveChange::NotKnown {
+            label: "Some PlayStation Game.srm".into()
+        }]
+    );
+}
