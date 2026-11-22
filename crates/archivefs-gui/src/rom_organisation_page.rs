@@ -1488,13 +1488,66 @@ fn build_candidates(
     if sources.is_empty() {
         return Some(Default::default());
     }
-    let mut choices = std::collections::BTreeMap::new();
-
     let database_path = default_database_path().ok()?;
     let database = Database::open_read_only(&database_path).ok()?;
-    let mut candidates = Vec::new();
+    Some(build_candidates_in(&database, sources, generation, names))
+}
+
+/// [`build_candidates`] on an open database. Every library path's archive id
+/// is read once ([`Database::archive_path_lookup`], same answers as
+/// `find_archive_id_by_absolute_path`): one lookup per file scanned the whole
+/// archive table each time, so a 4000-game preview grew quadratically.
+pub(crate) fn build_candidates_in(
+    database: &Database,
+    sources: &[PathBuf],
+    generation: u64,
+    names: &NameResolver,
+) -> (
+    Vec<OrganisationCandidate>,
+    std::collections::BTreeMap<PathBuf, NameChoice>,
+) {
+    let ids = database
+        .archive_path_lookup()
+        .map_err(|error| error.to_string());
+    candidates_from_lookups(database, sources, generation, names, |source| match &ids {
+        Ok(ids) => ids.find(source).map_err(|error| error.to_string()),
+        Err(error) => Err(error.clone()),
+    })
+}
+
+/// The pre-optimisation path: one database lookup per file. Kept for the
+/// equivalence tests that prove both give the same preview.
+#[cfg(test)]
+pub(crate) fn build_candidates_per_file(
+    database: &Database,
+    sources: &[PathBuf],
+    generation: u64,
+    names: &NameResolver,
+) -> (
+    Vec<OrganisationCandidate>,
+    std::collections::BTreeMap<PathBuf, NameChoice>,
+) {
+    candidates_from_lookups(database, sources, generation, names, |source| {
+        database
+            .find_archive_id_by_absolute_path(source)
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn candidates_from_lookups(
+    database: &Database,
+    sources: &[PathBuf],
+    generation: u64,
+    names: &NameResolver,
+    mut look_up: impl FnMut(&Path) -> Result<Option<i64>, String>,
+) -> (
+    Vec<OrganisationCandidate>,
+    std::collections::BTreeMap<PathBuf, NameChoice>,
+) {
+    let mut choices = std::collections::BTreeMap::new();
+    let mut candidates = Vec::with_capacity(sources.len());
     for source in sources {
-        let lookup = database.find_archive_id_by_absolute_path(source);
+        let lookup = look_up(source);
         let archive_id = lookup.as_ref().ok().copied().flatten();
         let resolution = match archive_id {
             Some(archive_id) => {
@@ -1516,7 +1569,7 @@ fn build_candidates(
         });
         choices.insert(source.clone(), choice);
     }
-    Some((candidates, choices))
+    (candidates, choices)
 }
 
 /// Uses exactly the existing organisation freshness/planning checks, on a worker.
@@ -1763,9 +1816,24 @@ pub(crate) fn choose_name(
 
 /// Chooses proposed names from live evidence. Loaded once per preview and
 /// again at apply, so both use the same rule on the then-current state.
+/// A one-pass archive-id lookup ([`Database::archive_path_lookup`]) behind a
+/// closure, as the lookup type is not exported by the core crate.
+type ArchiveIds = Box<dyn Fn(&Path) -> Result<Option<i64>, String> + Send + Sync>;
+
+fn read_archive_ids(database: &Database) -> Option<ArchiveIds> {
+    let ids = database.archive_path_lookup().ok()?;
+    Some(Box::new(move |path: &Path| {
+        ids.find(path).map_err(|error| error.to_string())
+    }))
+}
+
 pub(crate) struct NameResolver {
     romm: RommTitles,
     database: Option<Database>,
+    /// Every library path's archive id, read once with the resolver (each
+    /// preview and each Apply load their own). `None` when that read failed:
+    /// each file is then looked up on its own, as before.
+    archive_ids: Option<ArchiveIds>,
     /// Archives with any saved DAT row; `None` when the index could not be
     /// read (every item is then looked up, as before).
     saved_archives: Option<std::collections::HashSet<i64>>,
@@ -1799,9 +1867,30 @@ impl NameResolver {
         };
         Self {
             romm: RommTitles::new(load_romm_cache().as_ref()),
+            archive_ids: database.as_ref().and_then(read_archive_ids),
             database,
             saved_archives: index.map(|(archives, _)| archives),
             catalogues,
+        }
+    }
+
+    /// Test seam: a resolver over this database and RomM cache, without
+    /// reading the real profile's paths.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        database: Option<Database>,
+        romm: Option<&archivefs_core::identity_source::cache::IdentityCache>,
+    ) -> Self {
+        let saved_archives = database
+            .as_ref()
+            .and_then(|database| database.saved_dat_row_index().ok())
+            .map(|(archives, _)| archives);
+        Self {
+            romm: RommTitles::new(romm),
+            archive_ids: database.as_ref().and_then(read_archive_ids),
+            database,
+            saved_archives,
+            catalogues: Default::default(),
         }
     }
 
@@ -1809,9 +1898,12 @@ impl NameResolver {
         use archivefs_core::VerifiedDatName as V;
         match &self.database {
             None => self.finish(V::NotUsable("the library could not be read".into()), source),
-            Some(database) => {
-                self.choose_looked_up(source, database.find_archive_id_by_absolute_path(source))
-            }
+            Some(database) => match &self.archive_ids {
+                Some(ids) => self.choose_looked_up(source, ids(source)),
+                None => {
+                    self.choose_looked_up(source, database.find_archive_id_by_absolute_path(source))
+                }
+            },
         }
     }
 
@@ -3811,6 +3903,7 @@ mod tests {
         let names = NameResolver {
             romm: RommTitles::default(),
             database: None,
+            archive_ids: None,
             saved_archives: None,
             catalogues: Default::default(),
         };
@@ -4790,3 +4883,7 @@ mod tests {
         assert_ne!(before, state.input_fingerprint());
     }
 }
+
+#[cfg(test)]
+#[path = "rom_organisation_page_preview_perf_tests.rs"]
+mod preview_perf_tests;

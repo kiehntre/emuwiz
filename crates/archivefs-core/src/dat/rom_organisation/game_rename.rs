@@ -1159,24 +1159,24 @@ pub(crate) fn refuse_arcade_set(
     let folders = database
         .list_source_folders()
         .map_err(|error| format!("could not read the library folders: {error}"))?;
-    refuse_arcade_set_in(&folders, database, source, source_root, generation)
+    let resolution = live_resolution_for(database, source, generation);
+    refuse_arcade_set_in(&folders, &resolution, source_root)
 }
 
-/// [`refuse_arcade_set`] with the library folders already read (a bulk check
-/// reads them once per run instead of once per game).
+/// [`refuse_arcade_set`] with the library folders read and the game's live
+/// platform identity resolved by the caller (a bulk check reads both once
+/// per run instead of once per game).
 pub(crate) fn refuse_arcade_set_in(
     folders: &[crate::SourceFolderRecord],
-    database: &crate::Database,
-    source: &Path,
+    resolution: &crate::platform::identity::PlatformIdentityResolution,
     source_root: &Path,
-    generation: u64,
 ) -> Result<(), String> {
     let arcade_folder = folders
         .iter()
         .any(|folder| folder.path == source_root && folder.role == crate::SourceRole::ArcadeRomset);
     let arcade_platform = matches!(
-        live_resolution_for(database, source, generation),
-        crate::platform::identity::PlatformIdentityResolution::Resolved { ref platform, .. }
+        resolution,
+        crate::platform::identity::PlatformIdentityResolution::Resolved { platform, .. }
             if platform.eq_ignore_ascii_case("arcade")
     );
     if arcade_folder || arcade_platform {

@@ -466,7 +466,174 @@ impl OrganisationPlanEntry {
 
 /// Detects collisions across the batch and against the live destination
 /// directory, and marks the affected entries as Conflict. Never auto-resolves.
-fn detect_collisions(master_root: &Path, entries: &mut [OrganisationPlanEntry]) {
+/// Marks destination clashes as `Conflict`: two entries with the same
+/// destination, or destinations differing only by ASCII case, and live
+/// destinations that exist or have a case-only sibling on disk.
+///
+/// Same result as comparing every pair ([`detect_collisions_pairwise`]):
+/// entries can only clash when their ASCII-lowercased destinations are equal,
+/// so the pair loop runs within each such group, in the original index order
+/// (a marked entry keeps its first reason, as before). Each destination
+/// folder is listed once per plan instead of once per entry.
+pub(crate) fn detect_collisions(master_root: &Path, entries: &mut [OrganisationPlanEntry]) {
+    let count = entries.len();
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for index in 0..count {
+        if entries[index].destination_path.as_os_str().is_empty() {
+            continue;
+        }
+        let key = entries[index]
+            .destination_path
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        groups.entry(key).or_default().push(index);
+    }
+    let mut groups: Vec<Vec<usize>> = groups.into_values().filter(|g| g.len() > 1).collect();
+    groups.sort();
+    for group in &groups {
+        for (position, &left_index) in group.iter().enumerate() {
+            if !matches!(
+                entries[left_index].status,
+                OrganisationStatus::Suggested | OrganisationStatus::AlreadyOrganised
+            ) {
+                continue;
+            }
+            let left_destination = entries[left_index]
+                .destination_path
+                .to_string_lossy()
+                .into_owned();
+            for &right_index in &group[position + 1..] {
+                let right = &entries[right_index];
+                if !matches!(
+                    right.status,
+                    OrganisationStatus::Suggested | OrganisationStatus::AlreadyOrganised
+                ) {
+                    continue;
+                }
+                let right_destination = right.destination_path.to_string_lossy().into_owned();
+                if left_destination == right_destination {
+                    mark_conflict(entries, left_index, "two plans target the same destination");
+                    mark_conflict(
+                        entries,
+                        right_index,
+                        "two plans target the same destination",
+                    );
+                }
+                if left_destination.eq_ignore_ascii_case(&right_destination)
+                    && left_destination != right_destination
+                {
+                    mark_conflict(entries, left_index, "two plans differ only by case");
+                    mark_conflict(entries, right_index, "two plans differ only by case");
+                }
+            }
+        }
+    }
+
+    // Live destination: occupied, or a case-only sibling. Read-only; each
+    // destination folder's names are read once (lowercased name -> names).
+    let mut folders: std::collections::HashMap<
+        PathBuf,
+        Option<std::collections::HashMap<String, Vec<String>>>,
+    > = std::collections::HashMap::new();
+    for index in 0..count {
+        if entries[index].destination_path.as_os_str().is_empty() {
+            continue;
+        }
+        if entries[index].status == OrganisationStatus::AlreadyOrganised {
+            continue;
+        }
+        // Linked-library destinations are classified by their exact object
+        // state rather than by bare existence: an identical link is a no-op
+        // ("already present"), anything else occupying the name is a conflict.
+        // Nothing is ever auto-replaced.
+        if entries[index].mode == OrganisationMode::BuildLinkedLibrary {
+            match std::fs::symlink_metadata(&entries[index].destination_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let target = std::fs::read_link(&entries[index].destination_path).ok();
+                    if target.as_deref() == Some(entries[index].source_path.as_path()) {
+                        entries[index].status = OrganisationStatus::AlreadyOrganised;
+                        entries[index].reason =
+                            Some("already linked to this exact file; nothing to do".to_string());
+                    } else {
+                        mark_conflict(
+                            entries,
+                            index,
+                            "a different link already occupies the destination; nothing is \
+                             replaced",
+                        );
+                    }
+                    continue;
+                }
+                Ok(_) => {
+                    mark_conflict(
+                        entries,
+                        index,
+                        "the destination exists and is not a link; nothing is ever replaced",
+                    );
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
+        }
+        if std::fs::symlink_metadata(&entries[index].destination_path).is_ok() {
+            mark_conflict(
+                entries,
+                index,
+                "the destination already exists; nothing is overwritten",
+            );
+            continue;
+        }
+        let Some(parent) = entries[index].destination_path.parent() else {
+            continue;
+        };
+        let file_name = entries[index]
+            .destination_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if file_name.is_empty() {
+            continue;
+        }
+        let names = folders.entry(parent.to_path_buf()).or_insert_with(|| {
+            std::fs::read_dir(parent).ok().map(|dir_entries| {
+                let mut names: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for dir_entry in dir_entries.flatten() {
+                    let name = dir_entry.file_name().to_string_lossy().into_owned();
+                    names
+                        .entry(name.to_ascii_lowercase())
+                        .or_default()
+                        .push(name);
+                }
+                names
+            })
+        });
+        if let Some(names) = names {
+            let collision = names
+                .get(&file_name.to_ascii_lowercase())
+                .is_some_and(|same| same.iter().any(|name| *name != file_name));
+            if collision {
+                mark_conflict(
+                    entries,
+                    index,
+                    "a file differing from the destination only by case exists",
+                );
+            }
+        }
+    }
+
+    let _ = master_root;
+}
+
+/// The original all-pairs version, kept to prove [`detect_collisions`]
+/// marks exactly the same entries with exactly the same reasons.
+#[cfg(test)]
+pub(crate) fn detect_collisions_pairwise(
+    master_root: &Path,
+    entries: &mut [OrganisationPlanEntry],
+) {
     let count = entries.len();
     // Exact duplicates and case-only duplicates across the batch.
     for left_index in 0..count {

@@ -922,3 +922,123 @@ fn a_real_mount_beside_the_game_is_detected_by_device_and_mount_list() {
     assert!(refused.contains("separate mounted filesystem"), "{refused}");
     println!("REAL-MOUNT ok: {refused}");
 }
+
+#[test]
+fn the_one_pass_platform_lookup_matches_the_per_file_lookup() {
+    use super::rename_guard::LiveResolutions;
+    let mut lib = Lib::new();
+    let mut files = vec![
+        lib.game("nes", "Plain.nes", "nes"),
+        lib.game("arcade", "galaga.zip", "arcade"),
+        lib.game("psx", "quest.iso", "psx"),
+    ];
+    let outside = lib.root.join("nes").join("Not Scanned.nes");
+    std::fs::write(&outside, b"x").unwrap();
+    files.push(outside);
+    files.push(lib.root.join("nes").join("gone.nes"));
+    // One path, two archive rows (a nested second source): both lookups
+    // treat it as unknown rather than picking one.
+    let psx = lib.root.join("psx");
+    lib.db
+        .register_source_folders(&[lib.root.clone(), psx.clone()])
+        .unwrap();
+    let nested = lib
+        .db
+        .list_source_folders()
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.path == psx)
+        .unwrap()
+        .id;
+    let archive = crate::Archive::from_path_in_root(&psx.join("quest.iso"), &psx).unwrap();
+    lib.db.upsert_archive(nested, &psx, &archive).unwrap();
+    assert!(
+        lib.db
+            .find_archive_id_by_absolute_path(&psx.join("quest.iso"))
+            .is_err()
+    );
+
+    let batched = LiveResolutions::read(&lib.db);
+    for generation in [0, 1, 7] {
+        for file in &files {
+            assert_eq!(
+                batched.for_path(file, generation),
+                live_resolution_for(&lib.db, file, generation),
+                "{} at generation {generation}",
+                file.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn grouped_collision_detection_matches_the_all_pairs_version() {
+    use super::plan::{detect_collisions, detect_collisions_pairwise};
+    let mut lib = Lib::new();
+    let source = lib.game("nes", "Source.nes", "nes");
+    let template = lib
+        .plan(
+            OrganisationMode::RenameInPlace,
+            &[(&source, "Template (USA).nes")],
+        )
+        .entries
+        .remove(0);
+    let here = lib.root.join("nes");
+    let there = lib.root.join("other");
+    std::fs::create_dir_all(&there).unwrap();
+    for existing in ["Taken (USA).nes", "case (usa).nes", "Linked.nes"] {
+        std::fs::write(here.join(existing), b"x").unwrap();
+    }
+    std::os::unix::fs::symlink(&source, here.join("Link Here.nes")).unwrap();
+    let pool = [
+        here.join("A.nes"),
+        here.join("a.nes"),
+        here.join("Taken (USA).nes"),
+        here.join("TAKEN (usa).nes"),
+        here.join("Case (USA).nes"),
+        here.join("Link Here.nes"),
+        here.join("B.nes"),
+        there.join("A.nes"),
+        there.join("b.NES"),
+        PathBuf::new(),
+    ];
+    let statuses = [
+        OrganisationStatus::Suggested,
+        OrganisationStatus::Suggested,
+        OrganisationStatus::AlreadyOrganised,
+        OrganisationStatus::Blocked,
+        OrganisationStatus::Conflict,
+    ];
+    let modes = [
+        OrganisationMode::RenameInPlace,
+        OrganisationMode::BuildLinkedLibrary,
+    ];
+    let mut seed: u64 = 0x5eed;
+    let mut next = |bound: usize| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % bound
+    };
+    for _ in 0..60 {
+        let size = 1 + next(120);
+        let entries: Vec<_> = (0..size)
+            .map(|_| {
+                let mut entry = template.clone();
+                entry.destination_path = pool[next(pool.len())].clone();
+                entry.status = statuses[next(statuses.len())];
+                entry.reason = (next(3) == 0).then(|| "earlier reason".to_string());
+                entry.mode = modes[next(modes.len())];
+                if next(4) == 0 {
+                    entry.source_path = source.clone();
+                }
+                entry
+            })
+            .collect();
+        let mut grouped = entries.clone();
+        let mut pairwise = entries;
+        detect_collisions(&lib.root, &mut grouped);
+        detect_collisions_pairwise(&lib.root, &mut pairwise);
+        assert_eq!(grouped, pairwise);
+    }
+}

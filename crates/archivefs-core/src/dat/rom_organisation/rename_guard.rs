@@ -25,6 +25,45 @@ use super::game_rename::{
     folder_sidecars, owning_source_root_in, refuse_arcade_set_in,
 };
 use super::model::{OrganisationMode, OrganisationPlan, OrganisationStatus};
+use super::transaction::live_resolution_for;
+use crate::platform::identity::{PlatformIdentityResolution, resolve_platform_identity};
+
+/// Every library path's archive id, read in one pass per guard run. Without
+/// it each game's platform lookup scans the whole archive table (the path
+/// column has no index), which made a 4000-game preview quadratic.
+pub(crate) struct LiveResolutions<'a> {
+    database: &'a crate::Database,
+    ids: Option<crate::database::ArchivePathLookup>,
+}
+
+impl<'a> LiveResolutions<'a> {
+    pub(crate) fn read(database: &'a crate::Database) -> Self {
+        Self {
+            database,
+            ids: database.archive_path_lookup().ok(),
+        }
+    }
+
+    /// Exactly [`live_resolution_for`]'s answer: a path that is not in the
+    /// library, or that two rows share, is `Unknown`. If the one-pass read
+    /// failed, falls back to `live_resolution_for` itself.
+    pub(crate) fn for_path(&self, source: &Path, generation: u64) -> PlatformIdentityResolution {
+        let Some(ids) = &self.ids else {
+            return live_resolution_for(self.database, source, generation);
+        };
+        match ids.find(source).ok().flatten() {
+            Some(archive_id) => {
+                let evidence = self
+                    .database
+                    .current_platform_identity_evidence(archive_id, generation)
+                    .ok()
+                    .unwrap_or_default();
+                resolve_platform_identity(generation, evidence)
+            }
+            None => PlatformIdentityResolution::Unknown { generation },
+        }
+    }
+}
 
 /// Whether `mode` changes the real file's path (and so can break a game).
 /// Symlink-only and linked-library modes never touch the real file.
@@ -80,6 +119,7 @@ pub(crate) fn guard_with_index(
         return stats;
     }
     let mut sidecars = SidecarCache::default();
+    let resolutions = LiveResolutions::read(database);
     // Read once per run (each preview and each Apply check reads it afresh).
     let folders = match database.list_source_folders() {
         Ok(folders) => Ok(folders),
@@ -97,7 +137,7 @@ pub(crate) fn guard_with_index(
             Err(reason) => Some(reason.clone()),
             Ok(folders) => refusal_for(
                 folders,
-                database,
+                &resolutions,
                 &entry.source_path,
                 &plan.master_root,
                 plan.generation,
@@ -154,7 +194,7 @@ pub fn refuse_if_newly_blocked(
 #[allow(clippy::too_many_arguments)]
 fn refusal_for(
     folders: &[crate::SourceFolderRecord],
-    database: &crate::Database,
+    resolutions: &LiveResolutions<'_>,
     source: &Path,
     plan_root: &Path,
     generation: u64,
@@ -174,7 +214,8 @@ fn refusal_for(
                 .then(|| plan_root.to_path_buf())
         })
         .or_else(|| source.parent().map(Path::to_path_buf))?;
-    if let Err(reason) = refuse_arcade_set_in(folders, database, source, &source_root, generation) {
+    let resolution = resolutions.for_path(source, generation);
+    if let Err(reason) = refuse_arcade_set_in(folders, &resolution, &source_root) {
         return Some(reason);
     }
     match sidecars.referencing(source, &source_root) {
