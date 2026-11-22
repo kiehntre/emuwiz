@@ -4,7 +4,9 @@
 //! (for example on a larger disk); the choice is one line in
 //! `prepared_media_folder.txt` in EmuWiz's configuration folder and is
 //! accepted only after [`check_folder`] passes, and is re-checked each time
-//! it is used ([`still_safe`]). Copies already in another folder are not
+//! it is used ([`still_safe`]). The filesystem the folder is on is recorded
+//! with the choice, and the folder is used only while it is still on that
+//! filesystem. Copies already in another folder are not
 //! moved; folders used earlier are remembered, so their copies are still
 //! found and still covered by the launch gate.
 
@@ -111,6 +113,119 @@ pub fn still_safe(folder: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Which filesystem each chosen folder was on when it was chosen, beside the
+/// setting. A folder merely existing later proves nothing: an unmounted disk
+/// leaves its empty mount point behind, and another disk can be mounted in
+/// its place. The store compares this id each time the folder is used.
+const FILESYSTEMS_FILE: &str = "prepared_media_folder_filesystems.json";
+const FILESYSTEMS_FORMAT: u32 = 1;
+const MAX_FILESYSTEMS_BYTES: u64 = 256 * 1024;
+const MAX_RECORDED_FOLDERS: usize = 64;
+
+#[derive(serde::Deserialize, Serialize)]
+struct RecordedFilesystems {
+    format_version: u32,
+    /// Folder path as chosen -> the filesystem's own id.
+    folders: std::collections::BTreeMap<String, u64>,
+}
+
+fn filesystems_path_beside(setting: &Path) -> PathBuf {
+    setting.with_file_name(FILESYSTEMS_FILE)
+}
+
+fn read_recorded(setting: &Path) -> Result<RecordedFilesystems, String> {
+    use std::io::Read;
+    let path = filesystems_path_beside(setting);
+    let empty = || RecordedFilesystems {
+        format_version: FILESYSTEMS_FORMAT,
+        folders: std::collections::BTreeMap::new(),
+    };
+    let file = match crate::safe_read::open_regular_file_nonblocking(&path, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(empty()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let mut text = String::new();
+    file.take(MAX_FILESYSTEMS_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let unusable = || format!("{} is not a record EmuWiz wrote", path.display());
+    if text.len() as u64 > MAX_FILESYSTEMS_BYTES {
+        return Err(unusable());
+    }
+    let recorded: RecordedFilesystems = serde_json::from_str(&text).map_err(|_| unusable())?;
+    if recorded.format_version != FILESYSTEMS_FORMAT {
+        return Err(unusable());
+    }
+    Ok(recorded)
+}
+
+/// The id of the filesystem `folder` was on when it was chosen, if that was
+/// recorded. A record that cannot be read is an error, never "no record".
+pub(crate) fn recorded_filesystem(folder: &Path) -> Result<Option<u64>, String> {
+    recorded_filesystem_at(&setting_path()?, folder)
+}
+
+pub(crate) fn recorded_filesystem_at(setting: &Path, folder: &Path) -> Result<Option<u64>, String> {
+    let Some(folder) = folder.to_str() else {
+        return Ok(None);
+    };
+    Ok(read_recorded(setting)?.folders.get(folder).copied())
+}
+
+/// Whether an earlier folder may still be treated as a store of this
+/// profile: it must pass [`still_safe`], its filesystem must have been
+/// recorded and the record readable, and, while the folder exists, it must
+/// be on that filesystem. `Err` carries the reason. The launch gate refuses
+/// every file inside a folder this distrusts.
+pub(crate) fn earlier_folder_distrust(folder: &Path) -> Result<(), String> {
+    earlier_folder_distrust_at(&setting_path()?, folder)
+}
+
+pub(crate) fn earlier_folder_distrust_at(setting: &Path, folder: &Path) -> Result<(), String> {
+    still_safe(folder)?;
+    let Some(recorded) = recorded_filesystem_at(setting, folder)? else {
+        return Err(format!(
+            "EmuWiz has no record of which disk {} was on; choose it as the folder for prepared copies again to use the copies in it",
+            folder.display()
+        ));
+    };
+    if std::fs::symlink_metadata(folder).is_ok()
+        && super::prepared_media::filesystem_id(folder) != Some(recorded)
+    {
+        return Err(format!(
+            "{} is not on the disk it was on when it was chosen (is its disk connected?)",
+            folder.display()
+        ));
+    }
+    Ok(())
+}
+
+fn record_filesystem(setting: &Path, folder: &str, id: u64) -> Result<(), String> {
+    // A record that cannot be read is replaced: the folder being chosen now
+    // is the one whose disk is known for certain. Earlier folders lose their
+    // entries with it and are then not used until chosen again.
+    let mut recorded = read_recorded(setting).unwrap_or_else(|_| RecordedFilesystems {
+        format_version: FILESYSTEMS_FORMAT,
+        folders: std::collections::BTreeMap::new(),
+    });
+    recorded.folders.insert(folder.to_string(), id);
+    // Bounded: only the current folder and the remembered earlier ones are
+    // ever looked up.
+    if recorded.folders.len() > MAX_RECORDED_FOLDERS {
+        let keep: std::collections::BTreeSet<String> =
+            previous_folders_at(&previous_path_beside(setting))
+                .iter()
+                .filter_map(|known| known.to_str().map(str::to_string))
+                .chain(std::iter::once(folder.to_string()))
+                .collect();
+        recorded.folders.retain(|known, _| keep.contains(known));
+    }
+    let text = serde_json::to_string_pretty(&recorded).map_err(|error| error.to_string())?;
+    crate::atomic_write_text(&filesystems_path_beside(setting), &format!("{text}\n"))
+        .map_err(|error| error.to_string())
 }
 
 const PREVIOUS_FOLDERS_FILE: &str = "prepared_media_previous_folders.txt";
@@ -254,6 +369,11 @@ pub fn check_folder(folder: &Path, library_folders: &[PathBuf], create: bool) ->
         return check;
     };
     check = location_checks(check, &resolved, library_folders);
+    // A folder that is itself a mount point is never accepted (see
+    // `is_mount_root`); one that does not exist yet cannot be one.
+    if existing && let Some(refusal) = super::prepared_media::mount_root_refusal(&resolved) {
+        check.problems.push(format!("{refusal}."));
+    }
     if !check.usable() {
         return check;
     }
@@ -308,7 +428,7 @@ pub fn check_folder(folder: &Path, library_folders: &[PathBuf], create: bool) ->
                     && crate::dat::rename_apply::noclobber::rename_noreplace(&from, &to).is_ok();
                 if !renamed {
                     check.problems.push(
-                        "This disk's filesystem cannot publish a copy safely (no no-replace rename). Use a Linux filesystem such as ext4, XFS or Btrfs."
+                        "This disk's filesystem cannot publish a copy safely (no no-replace rename). Use a Linux filesystem such as ext4 or Btrfs."
                             .into(),
                     );
                 }
@@ -316,6 +436,28 @@ pub fn check_folder(folder: &Path, library_folders: &[PathBuf], create: bool) ->
             Err(error) => check
                 .problems
                 .push(format!("EmuWiz cannot write in this folder: {error}.")),
+        }
+    }
+    // The store works only while the folder is still on the filesystem it
+    // was chosen on, so that filesystem must be recognisable later.
+    if check.problems.is_empty() {
+        match super::prepared_media::filesystem_at(&resolved) {
+            Some(filesystem) => match filesystem.id {
+                None => check.problems.push(
+                    "EmuWiz cannot tell which disk this folder is on (network and FUSE filesystems report no identity), so it could not notice that disk going away. Choose a folder on a local disk."
+                        .into(),
+                ),
+                Some(id) if super::prepared_media::id_is_device_number(id, filesystem.device) => {
+                    check.problems.push(
+                        "This disk's filesystem has no identity of its own (XFS, FAT and exFAT report only which connector the disk is on), so EmuWiz could not tell it from another disk connected in its place. Use a disk formatted as ext4 or Btrfs."
+                            .into(),
+                    );
+                }
+                Some(_) => {}
+            },
+            None => check
+                .problems
+                .push("Which disk this folder is on could not be checked.".into()),
         }
     }
     check.available_bytes = super::prepared_media::available_bytes(&resolved).ok();
@@ -405,6 +547,11 @@ pub fn set_folder_at(
     if let Some(parent) = setting.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
+    // Which filesystem the folder is on now, recorded before the choice
+    // itself: a saved choice without this record is refused when used.
+    let filesystem = super::prepared_media::filesystem_id(folder)
+        .ok_or("EmuWiz cannot tell which disk this folder is on.")?;
+    record_filesystem(setting, &text, filesystem)?;
     crate::atomic_write_text(setting, &format!("{text}\n")).map_err(|error| error.to_string())?;
     Ok(Some(check))
 }

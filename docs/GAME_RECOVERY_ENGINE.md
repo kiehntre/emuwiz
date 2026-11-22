@@ -219,7 +219,8 @@ prepared copies are kept") or with `emuwiz-cli recovery storage --set <folder>`;
 choice is one line in `prepared_media_folder.txt` in the configuration folder. A
 folder is accepted only if it is a real folder (not a link) that belongs to you and
 that others cannot write to, is not inside a game folder and does not contain one,
-is writable, and is on a filesystem with a no-replace rename (ext4, XFS, Btrfs).
+is writable, is on a filesystem with a no-replace rename that can be recognised
+again later (ext4, Btrfs), and is not itself a mount point (see below).
 Its location is judged before anything is created there. Copies already prepared in
 another folder are not moved. Folders used earlier are remembered: games prepared
 there keep starting from them, and the launch check still covers them. The saved
@@ -229,6 +230,61 @@ refused with a message and never recreated somewhere else, and a damaged
 setting is an error, never a silent return to the default. If your game folders
 cannot be read, a new folder is not accepted (the "not inside a game folder" check
 could not be made).
+
+### The folder must stay on the disk it is expected on
+
+A folder merely existing is not evidence that its disk is there: when a disk is
+unmounted, its mount point stays behind as an empty folder on the disk underneath,
+and another disk can be mounted in its place. So the store checks which filesystem
+the folder is on, not just that the folder exists. What is enforced:
+
+- **A mount point is never accepted.** The top folder of a disk, or any folder
+  something is mounted on, is refused when it is chosen, refused again every time a
+  saved choice is used, and refused whenever a store is made ready for preparing a
+  copy or starting a batch (the default folder and `--store` included): it is the
+  one kind of folder that is still there, empty, after its disk has gone. Use a
+  folder inside the disk; that folder does not exist once the disk is unmounted. If
+  it cannot be told whether a folder is a mount point, the folder is refused. The
+  check reads the system's mount table (`/proc/self/mountinfo`), so where `/proc`
+  is not available nothing can be prepared.
+- **When a folder is chosen**, the filesystem's own id (the one that survives a
+  restart; the device number does not) is recorded beside the setting, in
+  `prepared_media_folder_filesystems.json`. Refused as a place for prepared copies,
+  in the application itself: a filesystem that reports no id (FUSE and network
+  mounts), because EmuWiz could not notice it going away; and a filesystem whose id
+  is only its device number (XFS, FAT, exFAT), because another disk connected in its
+  place would look the same.
+- **Every time the chosen folder is used** (preparing, a batch, reuse, re-linking,
+  removal, clean-up, and looking up a copy for a launch) the folder must be on the
+  recorded filesystem. If it is not, or the filesystem cannot be identified, or
+  there is no record (a setting written by hand or by a build before this check),
+  the folder is refused with a message that says so. Nothing is created, written,
+  linked or removed there, a copy found there is not used for a launch, and the
+  launch check refuses any file inside that folder. Folders used earlier are held to
+  the same rule: one whose record is missing, cannot be read, or names another
+  filesystem is not used, and the launch check refuses every file inside it.
+- **Within one operation or batch**, for every store including the default one, the
+  store is tied to the folder (device and inode) and filesystem it had when the work
+  started. This is checked again before the store's folders are created, after
+  waiting for the lock, before the work folder is made, before each file of a disc
+  is created, before the copy is published, before a link record is written, before
+  a removal or clean-up deletes anything, and before each write of the batch file
+  (so: between the games of a batch). The store's own `v1`, `sets`, `staging` and
+  `sources` folders must be on the root's filesystem too. A change
+  stops the work with a store error; a batch keeps its finished games, leaves the
+  rest "to do" and can be continued when the disk is back. A store that was made
+  ready never creates its root folder again.
+- **Between a check and the write that follows it**: the store's own folders, its
+  lock, journal, batch-lock, batch file and link records are created through an open
+  handle on the folder that was just checked, not by looking the path up again, so
+  they are created in that folder even if the mount changes at that instant. Each
+  preparation works in a new folder with a random name, created the same way and then
+  confirmed to be reachable by path on the store's filesystem; the disc files are
+  written by path into it. If the path comes to lead to another disk, no folder of
+  that name exists there and the write fails instead of landing on that disk.
+  Publishing is a rename, which cannot cross filesystems.
+
+What this does not cover is listed under Limitations.
 
 ## Extending it
 
@@ -282,6 +338,62 @@ with `members()`, `fingerprint()` and `verify_structure()` rather than a rewrite
 - The Game recovery page lists at most 500 games per batch; a larger library is
   worked through in turns. Games that can never be prepared stay in the list, so a
   library with more than 500 of those ahead of the rest would need them moved first.
+- Limits of the "folder must stay on its disk" check (see "Where copies are kept"):
+  - The default folder (`<data>/prepared-media`), a folder given with
+    `EMUWIZ_PREPARED_MEDIA_DIR` and one given with the CLI's `--store` have no
+    recorded filesystem. A `--store` or `EMUWIZ_PREPARED_MEDIA_DIR` folder that does
+    not exist is created, so one that names a folder inside a disk that is not
+    mounted is created on the disk underneath (a mount point itself is refused).
+    Those two are developer and test options; Blue and the saved choice do not use
+    them. They are tied to their
+    folder and filesystem only from the start of each operation or batch, not from
+    one run to the next: if EmuWiz's whole data folder is on a disk that is not
+    mounted when EmuWiz starts, the default store is created on whatever is there,
+    like the rest of EmuWiz's data.
+  - A folder on a network or FUSE filesystem, or on XFS, FAT or exFAT, cannot be
+    chosen at all, and neither can a mount point.
+  - The filesystem id is whatever the kernel reports; ext4 and Btrfs derive it from
+    the filesystem's own UUID. Recognising an id that is only a device number relies
+    on the forms the kernel uses today; a filesystem that hid its device number in
+    another form would be accepted, and another disk at the same device number
+    would then not be noticed.
+  - Two filesystems with the same id (a block-level clone of a disk) cannot be told
+    apart. A pooled filesystem (mergerfs) with one member disk missing keeps its id,
+    so it is not noticed.
+  - A disk that is unmounted "lazily" while a preparation is running stays usable
+    by that preparation's open files; the files already being written finish on the
+    real disk, and the next check stops the work.
+  - Deletions are made by path directly after a check, not through a handle: an
+    old link record, the batch file when a batch is forgotten, the work folder of a
+    failed attempt, and the files of a prepared copy being removed. In the instant
+    between the check and the deletion a changed mount could make it miss, or, only
+    if the other disk holds a store with identically named folders and files of the
+    recorded sizes, delete those. No original is involved.
+  - The mount-point refusal is made when a folder is chosen, when a saved choice is
+    used, and when a store is made ready for preparing. Removal, clean-up,
+    re-linking and forgetting a batch in a store given with `--store` or
+    `EMUWIZ_PREPARED_MEDIA_DIR`, or in a default folder that is itself a mount
+    point, are not refused for that reason; they act only on a store that already
+    exists there, on the filesystem it had when the command started.
+  - The top folder of a Btrfs subvolume has another device number than its parent
+    and is refused as a mount point even when it is not mounted separately; a
+    folder at a path that the mount table still lists but a later mount hides is
+    refused too. Use a folder inside.
+  - A filesystem stacked on another (overlayfs, eCryptfs) can pass on the lower
+    filesystem's id, so XFS, FAT or exFAT underneath one is not recognised.
+  - Copies in a folder that can no longer be chosen (a mount point, or a disk
+    formatted as XFS, FAT or exFAT) stay refused; no build that allowed such a
+    choice was ever installed.
+  - If the record of filesystems cannot be read, choosing a folder writes a new
+    one; earlier folders then have no entry and are not used (and files in them are
+    refused at launch) until each is chosen again.
+  - With the disk away, `remove`, `clean` and re-linking through a store handle
+    that was opened earlier answer "not found" or do nothing, rather than saying the
+    disk is missing; a fresh command says so.
+  - Installing this over a build that saved a folder choice without a filesystem
+    record makes that folder refused until it is chosen again.
+  - The reason for a refusal is shown where the folder is used (preparing, a batch,
+    the storage section of the page); the game card only shows "not prepared".
 - Folders used earlier for copies stay known (up to 32) with no way to forget one
   yet; `emuwiz-cli recovery list` and `diagnose` look at the current folder only.
 - If one of two identical ZIPs is deleted (not moved) and the other is then
@@ -369,6 +481,48 @@ Batch preparation of the same 79 ZIPs (`prepare-all`, same sandbox, a fresh stor
 | The same batch again | 0.46 s: nothing to do, refused, nothing changed |
 | Three scratch copies of real ZIPs under other names | 9.0 s: all three matched existing copies by content; nothing extracted; store size unchanged |
 | One scratch copy renamed again, then `prepare` | 5.9 s: re-linked by content, nothing extracted |
+
+### The folder must stay on its disk (2026-11-22)
+
+- Tests in `recovery::tests::mount_identity_tests` (eleven; the first seven are
+  described here, the others cover the mount-point refusal, device-number ids, the
+  sequence mounted, unmounted, another disk, remounted, and the launch check for an
+  earlier folder without a usable record): the filesystem is recorded
+  when a folder is chosen and one without an identity is refused; an unavailable
+  mount (the empty mount point) is refused and nothing is created in it; a changed
+  filesystem is refused for preparing, reuse, re-linking, removal and launch; a ready
+  store is tied to its folder and filesystem; a preparation stops at each write
+  boundary; a work folder on another disk is never written to; a batch that loses
+  its destination between two games writes nothing more and continues when the disk
+  is back. A test cannot mount a disk, so the loss is either a record that names
+  another filesystem than the folder is really on, or a test-only hook that reports
+  another filesystem from a chosen moment. Each of thirteen protections was removed
+  in turn and at least one of these tests failed each time.
+- With real mounts, in a sandbox (system read-only, private mount namespace, a
+  throw-away tmpfs standing in for the removable disk, three synthetic ZIPs): the
+  top folder of the mounted disk was chosen and a game prepared; after the unmount,
+  `prepare` (new and already-prepared game), `prepare-all`, `list` and `clean` were
+  all refused with "not on the disk it was on when it was chosen" and nothing was
+  created under the mount point; with another disk mounted at the same path
+  `prepare` was refused and that disk stayed empty; choosing the folder again made
+  it usable. (That run was made before mount points themselves were refused.)
+- With real mounts changed while a command was running (same kind of sandbox, the
+  normal build, no test hook; destination a folder inside the disk; 2026-11-22):
+  - Between the games of a batch of four 96 MB games: a plain unmount was refused by
+    the kernel ("target is busy": the running command holds the store's lock files
+    open), so another filesystem's folder, holding an empty store, was mounted over
+    the path 5 ms after the first game was published, just as the second game
+    started. The second game was refused, the command ended with an error, one copy
+    was on the disk, nothing was written to the other filesystem, and with the disk
+    back `resume` prepared the other three.
+  - During the writing of a 512 MB disc file (64 MB written): same change. The file
+    being written was finished on the real disk through its open handle, the next
+    file was refused 9 s later, the command ended with an error and printed no
+    success, no copy was published, nothing was written to the other filesystem;
+    with the disk back `clean` removed the unfinished work and the game prepared
+    normally.
+  - Not reproduced: an unmount that actually succeeds during a command. The kernel
+    refuses it while the command runs, and a forced or lazy unmount was not used.
 
 ## Roadmap
 

@@ -2858,20 +2858,23 @@ mod second_review_tests {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         assert_eq!(PreparedMediaStore::configured(None), Ok(None));
         let chosen = root.join("chosen");
+        // The filesystem the folder is on, as recorded when it is chosen.
+        let on_disk = filesystem_id(&root);
+        assert!(on_disk.is_some(), "the test folder's filesystem has no id");
         std::fs::create_dir(&chosen).unwrap();
         std::fs::set_permissions(&chosen, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
         assert_eq!(
-            PreparedMediaStore::configured(Some(chosen.clone())),
+            PreparedMediaStore::configured_recorded(Some(chosen.clone()), on_disk),
             Ok(Some(PreparedMediaStore::at(&chosen)))
         );
         // Made writable by others afterwards.
         std::fs::set_permissions(&chosen, std::os::unix::fs::PermissionsExt::from_mode(0o777))
             .unwrap();
-        assert!(PreparedMediaStore::configured(Some(chosen.clone())).is_err());
+        assert!(PreparedMediaStore::configured_recorded(Some(chosen.clone()), on_disk).is_err());
         // Gone (its disk is not connected): an error, and nothing is created.
         std::fs::remove_dir(&chosen).unwrap();
-        let missing = PreparedMediaStore::configured(Some(chosen.clone()));
+        let missing = PreparedMediaStore::configured_recorded(Some(chosen.clone()), on_disk);
         assert!(missing.is_err_and(|detail| detail.contains("not there")));
         assert!(!chosen.exists());
 
@@ -2880,7 +2883,7 @@ mod second_review_tests {
         std::fs::create_dir(&chosen).unwrap();
         std::fs::set_permissions(&chosen, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
-        let store = PreparedMediaStore::configured(Some(chosen.clone()))
+        let store = PreparedMediaStore::configured_recorded(Some(chosen.clone()), on_disk)
             .unwrap()
             .unwrap();
         std::fs::remove_dir(&chosen).unwrap();
@@ -2902,7 +2905,7 @@ mod second_review_tests {
         std::fs::create_dir(&chosen).unwrap();
         std::fs::set_permissions(&chosen, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
-        let store = PreparedMediaStore::configured(Some(chosen.clone()))
+        let store = PreparedMediaStore::configured_recorded(Some(chosen.clone()), on_disk)
             .unwrap()
             .unwrap();
         let candidate = BulkCandidate {
@@ -2947,7 +2950,7 @@ mod second_review_tests {
         std::fs::create_dir(&chosen).unwrap();
         std::fs::set_permissions(&chosen, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
-        let store = PreparedMediaStore::configured(Some(chosen.clone()))
+        let store = PreparedMediaStore::configured_recorded(Some(chosen.clone()), on_disk)
             .unwrap()
             .unwrap();
         let candidates: Vec<BulkCandidate> = (0..2)
@@ -3175,4 +3178,815 @@ fn a_prepared_copy_is_still_found_when_the_disk_gets_another_device_number() {
     .unwrap();
     drop(file);
     assert!(lab.store.prepared_for_source(&renamed).is_none());
+}
+
+/// The folder for prepared copies must stay on the filesystem it is expected
+/// on. A test cannot mount or unmount a disk, so "the disk went away" is
+/// either a record that names another filesystem than the one the folder is
+/// really on (exactly what an unmounted disk's empty mount point looks like),
+/// or, for a change in the middle of an operation, `FILESYSTEM_OVERRIDE`.
+mod mount_identity_tests {
+    use super::*;
+    use crate::recovery::bulk::*;
+    use crate::recovery::prepared_media::{
+        FILESYSTEM_OVERRIDE, Filesystem, MOUNT_ROOT_OVERRIDE, filesystem_id, id_is_device_number,
+        is_mount_root, launch_refusal_judged, mount_points_in,
+    };
+    use crate::recovery::storage::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// Clears the pretended filesystem when the test ends, however it ends.
+    struct Pretend;
+
+    impl Drop for Pretend {
+        fn drop(&mut self) {
+            FILESYSTEM_OVERRIDE.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    fn real_filesystem(path: &Path) -> Filesystem {
+        Filesystem {
+            device: std::fs::metadata(path).unwrap().dev(),
+            id: filesystem_id(path),
+        }
+    }
+
+    fn another(real: Filesystem) -> Filesystem {
+        Filesystem {
+            device: real.device.wrapping_add(7),
+            id: Some(real.id.unwrap() ^ 0x5a5a_5a5a),
+        }
+    }
+
+    /// From now on (while `active` is set) every folder at or below `below`
+    /// reports `pretended`: the disk that was mounted there is gone and what
+    /// is at that path now is on another filesystem.
+    fn pretend_below(below: &Path, pretended: Filesystem, active: Rc<Cell<bool>>) -> Pretend {
+        let below = below.to_path_buf();
+        FILESYSTEM_OVERRIDE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                (active.get() && path.starts_with(&below)).then_some(pretended)
+            }));
+        });
+        Pretend
+    }
+
+    fn everything_under(folder: &Path) -> Vec<PathBuf> {
+        fn walk(directory: &Path, found: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                found.push(path.clone());
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    walk(&path, found);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(folder, &mut found);
+        // Everything: folders, the journal and the lock included.
+        found.sort();
+        found
+    }
+
+    fn prepare_in(
+        store: &PreparedMediaStore,
+        lab: &Lab,
+        zip: &Path,
+    ) -> Result<PrepareOutcome, PrepareError> {
+        store.prepare(
+            zip,
+            "AmigaCD32",
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+            &|_| {},
+        )
+    }
+
+    fn disc(lab: &Lab, label: &str) -> PathBuf {
+        let path = lab.zip_path(&format!("{label}.zip"));
+        let mut members = standard_members();
+        members[0].1 = iso_bytes("CDTV", label);
+        write_zip(&path, &members);
+        path
+    }
+
+    fn private_folder(path: &Path) {
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+    }
+
+    /// Choosing a folder records which filesystem it is on, and a filesystem
+    /// that cannot be recognised later is refused in the application itself.
+    #[test]
+    fn choosing_a_folder_records_its_filesystem_and_refuses_one_without_identity() {
+        let lab = Lab::new();
+        let setting = lab.root.join("config/prepared_media_folder.txt");
+        let chosen = lab.root.join("chosen");
+        set_folder_at(&setting, Some(&chosen), &[]).unwrap();
+        let real = filesystem_id(&chosen);
+        assert!(real.is_some());
+        assert_eq!(recorded_filesystem_at(&setting, &chosen), Ok(real));
+        assert_eq!(
+            recorded_filesystem_at(&setting, &lab.root.join("never-chosen")),
+            Ok(None)
+        );
+
+        // A filesystem that reports no id (FUSE, network): refused, nothing
+        // saved, and the folder the check made is not left behind.
+        let nameless = lab.root.join("on-a-network-share");
+        let active = Rc::new(Cell::new(true));
+        let _pretend = pretend_below(
+            &nameless,
+            Filesystem {
+                device: 99,
+                id: None,
+            },
+            active.clone(),
+        );
+        let check = check_folder(&nameless, &[], false);
+        assert!(check.usable(), "nothing is known before it exists");
+        let refused = set_folder_at(&setting, Some(&nameless), &[]);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|detail| detail.contains("cannot tell which disk")),
+            "{refused:?}"
+        );
+        assert!(!nameless.exists());
+        assert_eq!(configured_folder_at(&setting), Ok(Some(chosen.clone())));
+        assert_eq!(recorded_filesystem_at(&setting, &nameless), Ok(None));
+
+        // A record that is not EmuWiz's is an error, never "no record".
+        std::fs::write(
+            setting.with_file_name("prepared_media_folder_filesystems.json"),
+            b"{ not json",
+        )
+        .unwrap();
+        assert!(recorded_filesystem_at(&setting, &chosen).is_err());
+        // Choosing again writes a good record.
+        set_folder_at(&setting, Some(&chosen), &[]).unwrap();
+        assert_eq!(recorded_filesystem_at(&setting, &chosen), Ok(real));
+    }
+
+    /// An unmounted disk leaves its mount point behind as an empty folder on
+    /// the disk underneath. The folder exists; nothing may be written to it.
+    #[test]
+    fn an_unavailable_mount_is_refused_and_nothing_is_created_in_its_place() {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let mount_point = lab.root.join("mnt-external");
+        private_folder(&mount_point);
+        let underneath = filesystem_id(&mount_point).unwrap();
+        // The id of the disk that was mounted here when the folder was
+        // chosen. It is not what is at this path now.
+        let disk = underneath ^ 0x1234_5678;
+
+        let refused =
+            PreparedMediaStore::configured_recorded(Some(mount_point.clone()), Some(disk));
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|detail| detail.contains("not on the disk it was on")),
+            "{refused:?}"
+        );
+        // No record at all is a refusal too, never "any disk will do".
+        let unrecorded = PreparedMediaStore::configured_recorded(Some(mount_point.clone()), None);
+        assert!(
+            unrecorded
+                .as_ref()
+                .is_err_and(|detail| detail.contains("no record")),
+            "{unrecorded:?}"
+        );
+        assert!(everything_under(&mount_point).is_empty());
+
+        // A handle obtained while the disk was mounted (a page left open, a
+        // batch about to start) refuses every write once it is gone.
+        let active = Rc::new(Cell::new(true));
+        let _pretend = pretend_below(
+            &mount_point,
+            Filesystem {
+                device: 4242,
+                id: Some(disk),
+            },
+            active.clone(),
+        );
+        let store = PreparedMediaStore::configured_recorded(Some(mount_point.clone()), Some(disk))
+            .unwrap()
+            .unwrap();
+        active.set(false); // unmounted: the path is the empty folder underneath
+        for attempt in [
+            prepare_in(&store, &lab, &zip).map(|_| ()),
+            store.ready().map(|_| ()).map_err(PrepareError::Store),
+        ] {
+            assert!(
+                matches!(&attempt, Err(PrepareError::Store(detail)) if detail.contains("not on the disk it was on")),
+                "{attempt:?}"
+            );
+        }
+        assert!(store.resolved().is_none());
+        let plan = plan_bulk(
+            &store,
+            &[BulkCandidate {
+                path: zip.clone(),
+                platform_id: "AmigaCD32".into(),
+                title: "disc".into(),
+            }],
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+        )
+        .unwrap();
+        let started = start_queue(&store, &plan, &|_| true);
+        assert!(matches!(&started, Err(BulkError::Store(_))), "{started:?}");
+        assert!(
+            everything_under(&mount_point).is_empty(),
+            "something was written to the folder under the missing disk: {:?}",
+            everything_under(&mount_point)
+        );
+    }
+
+    /// The folder is there and holds a store, but on another filesystem than
+    /// the one it was chosen on (another disk mounted in its place, or copies
+    /// an earlier build left on the disk underneath). Nothing is prepared,
+    /// reused, linked or removed there, and nothing in it may be started.
+    #[test]
+    fn a_changed_filesystem_is_refused_for_writing_removing_and_launching() {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let chosen = lab.root.join("chosen");
+        private_folder(&chosen);
+        let real = real_filesystem(&chosen);
+        let store = PreparedMediaStore::configured_recorded(Some(chosen.clone()), real.id)
+            .unwrap()
+            .unwrap();
+        let summary = prepare_in(&store, &lab, &zip).unwrap().summary;
+        assert!(matches!(
+            store.check_launch_path(&summary.launch_path),
+            LaunchPathCheck::Verified(_)
+        ));
+        assert_eq!(store.prepared_for_source(&zip), Some(summary.clone()));
+        let before = everything_under(&chosen);
+
+        let active = Rc::new(Cell::new(true));
+        let _pretend = pretend_below(&chosen, another(real), active.clone());
+        // Looked up again, as every new operation does.
+        let refused = PreparedMediaStore::configured_recorded(Some(chosen.clone()), real.id);
+        assert!(refused.is_err(), "{refused:?}");
+        // The handle from before the change.
+        let other = disc(&lab, "OTHER");
+        let attempt = prepare_in(&store, &lab, &other);
+        assert!(
+            matches!(&attempt, Err(PrepareError::Store(detail)) if detail.contains("not on the disk it was on")),
+            "{attempt:?}"
+        );
+        // Not even the copy that is already there is handed out or linked.
+        let again = prepare_in(&store, &lab, &zip);
+        assert!(matches!(&again, Err(PrepareError::Store(_))), "{again:?}");
+        assert_eq!(store.prepared_for_source(&zip), None);
+        assert!(store.resolved().is_none());
+        assert_eq!(store.list(), Vec::new());
+        assert_eq!(store.remove(&summary.set_id), Err(RemoveError::NotFound));
+        assert_eq!(
+            store.relink(
+                &zip,
+                &lab.trusted,
+                &DiscSetLimits::default(),
+                &lab.cancel,
+                &|_| {}
+            ),
+            Ok(RelinkOutcome::NoMatchingCopy)
+        );
+        assert!(matches!(
+            store.check_launch_path(&summary.launch_path),
+            LaunchPathCheck::Refused(detail) if detail.contains("not on the disk it was chosen on")
+        ));
+        assert_eq!(everything_under(&chosen), before, "the folder was changed");
+
+        // A filesystem whose identity cannot be read is refused as well.
+        drop(_pretend);
+        let _pretend = pretend_below(
+            &chosen,
+            Filesystem {
+                device: real.device,
+                id: None,
+            },
+            active.clone(),
+        );
+        let unverifiable = prepare_in(&store, &lab, &other);
+        assert!(
+            matches!(&unverifiable, Err(PrepareError::Store(_))),
+            "{unverifiable:?}"
+        );
+        assert_eq!(everything_under(&chosen), before);
+
+        // The disk is back: everything works again, nothing was lost.
+        active.set(false);
+        assert_eq!(store.prepared_for_source(&zip), Some(summary));
+        prepare_in(&store, &lab, &other).unwrap();
+    }
+
+    /// A store that was not chosen (the default folder, an explicit one) has
+    /// no recorded filesystem, but a handle made ready is still tied to the
+    /// folder and filesystem it started with.
+    #[test]
+    fn a_ready_store_is_tied_to_the_folder_and_filesystem_it_started_with() {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let ready = lab.store.ready().unwrap();
+        let root = ready.root().to_path_buf();
+        let real = real_filesystem(&root);
+
+        // Another filesystem at the same path.
+        let active = Rc::new(Cell::new(true));
+        let pretend = pretend_below(&root, another(real), active.clone());
+        let attempt = prepare_in(&ready, &lab, &zip);
+        assert!(
+            matches!(&attempt, Err(PrepareError::Store(detail)) if detail.contains("no longer the folder on the disk")),
+            "{attempt:?}"
+        );
+        assert!(ready.ready().is_err());
+        assert!(ready.resolved().is_none());
+        drop(pretend);
+
+        // Another folder at the same path (really: no pretending). The
+        // original is moved aside and an empty folder takes its place.
+        let aside = lab.root.join("data/moved-aside");
+        std::fs::rename(&root, &aside).unwrap();
+        private_folder(&root);
+        let attempt = prepare_in(&ready, &lab, &zip);
+        assert!(
+            matches!(&attempt, Err(PrepareError::Store(detail)) if detail.contains("no longer the folder on the disk")),
+            "{attempt:?}"
+        );
+        assert!(
+            everything_under(&root).is_empty(),
+            "the replacement folder was written to"
+        );
+        // And when the folder is gone altogether it is not created again.
+        std::fs::remove_dir(&root).unwrap();
+        let attempt = prepare_in(&ready, &lab, &zip);
+        assert!(
+            matches!(&attempt, Err(PrepareError::Store(detail)) if detail.contains("not there")),
+            "{attempt:?}"
+        );
+        assert!(!root.exists());
+    }
+
+    /// The disk goes at each write boundary inside one preparation. The
+    /// preparation stops with a store error and no copy is published.
+    #[test]
+    fn a_preparation_stops_at_the_next_write_boundary_when_the_disk_goes() {
+        for boundary in ["after intent", "after first file", "before publish"] {
+            let lab = Lab::new();
+            let zip = lab.standard_zip();
+            let ready = lab.store.ready().unwrap();
+            let root = ready.root().to_path_buf();
+            let real = real_filesystem(&root);
+            let active = Rc::new(Cell::new(false));
+            let _pretend = pretend_below(&root, another(real), active.clone());
+            let trigger = active.clone();
+            let attempt = with_hook(
+                move |point| {
+                    let now = match point {
+                        Point::AfterIntent => boundary == "after intent",
+                        Point::AfterMember(0) => boundary == "after first file",
+                        Point::BeforePublish => boundary == "before publish",
+                        _ => false,
+                    };
+                    if now {
+                        trigger.set(true);
+                    }
+                },
+                || prepare_in(&ready, &lab, &zip),
+            );
+            assert!(
+                matches!(&attempt, Err(PrepareError::Store(detail)) if detail.contains("no longer the folder on the disk")),
+                "{boundary}: {attempt:?}"
+            );
+            active.set(false);
+            assert!(
+                everything_under(&root.join("v1/sets")).is_empty(),
+                "{boundary}: a copy was published"
+            );
+            assert_eq!(lab.store.prepared_for_source(&zip), None, "{boundary}");
+            // With the disk back the same game prepares normally.
+            let _ = lab.store.clean_interrupted();
+            prepare_in(&lab.store, &lab, &zip).unwrap();
+        }
+    }
+
+    /// The path of the store's staging folder comes to lead to another disk
+    /// between the check of the root and the first write. The new work folder
+    /// is never used there.
+    #[test]
+    fn a_work_folder_on_another_disk_is_never_written_to() {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let ready = lab.store.ready().unwrap();
+        let root = ready.root().to_path_buf();
+        let real = real_filesystem(&root);
+        let elsewhere = another(real);
+        let staging = root.join("v1/staging");
+        let inside = staging.clone();
+        FILESYSTEM_OVERRIDE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                (path != inside && path.starts_with(&inside)).then_some(elsewhere)
+            }));
+        });
+        let _pretend = Pretend;
+        // Refused before the first byte: the preparation never gets as far
+        // as writing its intent record into that folder.
+        let wrote = Rc::new(Cell::new(false));
+        let seen = wrote.clone();
+        let attempt = with_hook(move |_| seen.set(true), || prepare_in(&ready, &lab, &zip));
+        assert!(
+            matches!(&attempt, Err(PrepareError::Store(detail)) if detail.contains("not on the disk the prepared-media folder is on")),
+            "{attempt:?}"
+        );
+        assert!(!wrote.get(), "something was written into the work folder");
+        assert!(
+            everything_under(&staging).is_empty(),
+            "a work folder was left behind: {:?}",
+            everything_under(&staging)
+        );
+        assert!(everything_under(&root.join("v1/sets")).is_empty());
+    }
+
+    /// A batch loses its destination between two games. The finished game
+    /// stays finished, the next one is not prepared, the run stops with an
+    /// error, nothing is written, and the batch continues once the disk is
+    /// back.
+    #[test]
+    fn a_batch_interrupted_by_the_loss_of_its_destination_writes_nothing_more() {
+        let lab = Lab::new();
+        let chosen = lab.root.join("chosen");
+        private_folder(&chosen);
+        let real = real_filesystem(&chosen);
+        let store = PreparedMediaStore::configured_recorded(Some(chosen.clone()), real.id)
+            .unwrap()
+            .unwrap();
+        let candidates: Vec<BulkCandidate> = (0..3)
+            .map(|index| BulkCandidate {
+                path: disc(&lab, &format!("BATCH{index}")),
+                platform_id: "AmigaCD32".into(),
+                title: format!("batch {index}"),
+            })
+            .collect();
+        let plan = plan_bulk(
+            &store,
+            &candidates,
+            &lab.trusted,
+            &DiscSetLimits::default(),
+            &lab.cancel,
+        )
+        .unwrap();
+        start_queue(&store, &plan, &|_| true).unwrap();
+
+        let active = Rc::new(Cell::new(false));
+        let _pretend = pretend_below(&chosen, another(real), active.clone());
+        let unplug = active.clone();
+        let at_loss: Rc<std::cell::RefCell<Vec<PathBuf>>> = Rc::default();
+        let listing = at_loss.clone();
+        let folder = chosen.clone();
+        AFTER_ITEM.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |index| {
+                if index == 0 {
+                    *listing.borrow_mut() = everything_under(&folder);
+                    unplug.set(true);
+                }
+            }));
+        });
+        let run = |store: &PreparedMediaStore| {
+            run_queue(
+                store,
+                None,
+                &lab.trusted,
+                &DiscSetLimits::default(),
+                &lab.cancel,
+                &|_| {},
+            )
+        };
+        let interrupted = run(&store);
+        AFTER_ITEM.with(|hook| *hook.borrow_mut() = None);
+        assert!(
+            matches!(&interrupted, Err(BulkError::Store(detail)) if detail.contains("not on the disk it was on")),
+            "{interrupted:?}"
+        );
+        assert_eq!(
+            everything_under(&chosen),
+            *at_loss.borrow(),
+            "something was written after the disk went"
+        );
+        // While it is away the batch cannot be run or restarted.
+        let while_away = run(&store);
+        assert!(while_away.is_err(), "{while_away:?}");
+        assert_eq!(everything_under(&chosen), *at_loss.borrow());
+
+        // Back again: the first game is as it was, the other two are done.
+        active.set(false);
+        let saved = load_queue(&store.resolved().unwrap()).unwrap();
+        assert_eq!(saved.items[0].state, QueueState::Prepared);
+        assert_eq!(saved.items[1].state, QueueState::Pending);
+        assert_eq!(saved.items[2].state, QueueState::Pending);
+        let finished = run(&store).unwrap();
+        assert!(
+            finished
+                .items
+                .iter()
+                .all(|item| item.state == QueueState::Prepared),
+            "{finished:?}"
+        );
+    }
+
+    /// Clears the pretended mount points when the test ends.
+    struct PretendMount;
+
+    impl Drop for PretendMount {
+        fn drop(&mut self) {
+            MOUNT_ROOT_OVERRIDE.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    fn pretend_mount_root(folder: &Path) -> PretendMount {
+        let folder = folder.to_path_buf();
+        MOUNT_ROOT_OVERRIDE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| (path == folder).then_some(true)));
+        });
+        PretendMount
+    }
+
+    /// A folder that is itself a mount point stays behind, empty, when its
+    /// disk is unmounted. It is never accepted as the place for prepared
+    /// copies: not when chosen, not when used, not by a store given directly.
+    #[test]
+    fn a_mount_root_is_never_a_place_for_prepared_copies() {
+        // Real mount points of this machine, and the mount table's format.
+        assert_eq!(is_mount_root(Path::new("/")), Ok(true));
+        assert_eq!(is_mount_root(Path::new("/proc")), Ok(true));
+        let lab = Lab::new();
+        assert_eq!(is_mount_root(&lab.root), Ok(false));
+        let table = "36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw\n\
+                     40 36 0:31 / /mnt/My\\040Disk\\134x rw shared:5 - tmpfs tmpfs rw\n";
+        assert_eq!(
+            mount_points_in(table),
+            vec![PathBuf::from("/mnt2"), PathBuf::from("/mnt/My Disk\\x")]
+        );
+        let real_mount = Path::new("/proc");
+        let refused = check_folder(real_mount, &[], false);
+        assert!(
+            refused
+                .problems
+                .iter()
+                .any(|problem| problem.contains("top folder of a disk")),
+            "{refused:?}"
+        );
+
+        // A folder of our own, as if a disk were mounted on it.
+        let zip = lab.standard_zip();
+        let setting = lab.root.join("config/prepared_media_folder.txt");
+        let mount_point = lab.root.join("mnt-disk");
+        private_folder(&mount_point);
+        let recorded = filesystem_id(&mount_point);
+        let pretend = pretend_mount_root(&mount_point);
+        let chosen = set_folder_at(&setting, Some(&mount_point), &[]);
+        assert!(
+            chosen
+                .as_ref()
+                .is_err_and(|detail| detail.contains("top folder of a disk")),
+            "{chosen:?}"
+        );
+        assert_eq!(
+            configured_folder_at(&setting),
+            Ok(None),
+            "nothing was saved"
+        );
+        // A setting that names it anyway (written by hand, or by a build
+        // before this check) is refused when used.
+        let used = PreparedMediaStore::configured_recorded(Some(mount_point.clone()), recorded);
+        assert!(
+            used.as_ref()
+                .is_err_and(|detail| detail.contains("top folder of a disk")),
+            "{used:?}"
+        );
+        // And a store pointed straight at it prepares nothing.
+        let direct = PreparedMediaStore::at(&mount_point);
+        let attempt = prepare_in(&direct, &lab, &zip);
+        assert!(
+            matches!(&attempt, Err(PrepareError::Store(detail)) if detail.contains("top folder of a disk")),
+            "{attempt:?}"
+        );
+        assert!(direct.ready().is_err());
+        assert!(
+            everything_under(&mount_point).is_empty(),
+            "something was created in the mount point"
+        );
+        // A folder inside the disk is fine.
+        let inside = mount_point.join("prepared");
+        set_folder_at(&setting, Some(&inside), &[]).unwrap();
+        assert_eq!(configured_folder_at(&setting), Ok(Some(inside.clone())));
+        drop(pretend);
+        // Not a mount point after all: the same folder is accepted.
+        set_folder_at(&setting, Some(&mount_point), &[]).unwrap();
+    }
+
+    /// An id that is only the device number does not identify a disk.
+    #[test]
+    fn a_filesystem_identified_only_by_its_device_number_is_refused_when_chosen() {
+        let sdb1 = libc::makedev(8, 17);
+        assert!(id_is_device_number(0x811, sdb1));
+        assert!(id_is_device_number(0x811 << 32, sdb1));
+        let nvme = libc::makedev(259, 300);
+        let encoded = (300 & 0xff) | (259 << 8) | ((300 & !0xff_u64) << 12);
+        assert!(id_is_device_number(encoded, nvme));
+        assert!(!id_is_device_number(0x736d_3899_3d24_8fc4, sdb1));
+        assert!(!id_is_device_number(0x9611_5acb_debb_fc0d, nvme));
+
+        let lab = Lab::new();
+        let setting = lab.root.join("config/prepared_media_folder.txt");
+        let folder = lab.root.join("on-xfs");
+        let active = Rc::new(Cell::new(true));
+        let _pretend = pretend_below(
+            &folder,
+            Filesystem {
+                device: sdb1,
+                id: Some(0x811),
+            },
+            active,
+        );
+        let refused = set_folder_at(&setting, Some(&folder), &[]);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|detail| detail.contains("no identity of its own")),
+            "{refused:?}"
+        );
+        assert!(!folder.exists());
+        assert_eq!(configured_folder_at(&setting), Ok(None));
+    }
+
+    /// The whole life of a removable disk in one sequence: mounted,
+    /// unmounted, another disk in its place, and the first disk back.
+    #[test]
+    fn mounted_unmounted_changed_and_remounted() {
+        let lab = Lab::new();
+        let setting = lab.root.join("config/prepared_media_folder.txt");
+        let chosen = lab.root.join("mnt-disk/prepared");
+        std::fs::create_dir(lab.root.join("mnt-disk")).unwrap();
+        let underneath = real_filesystem(&lab.root);
+        let disk = another(underneath);
+        let other_disk = Filesystem {
+            device: disk.device + 1,
+            id: Some(disk.id.unwrap() ^ 0xffff),
+        };
+        // 0 = unmounted (what is really there), 1 = the disk, 2 = another.
+        let phase = Rc::new(Cell::new(1_u8));
+        let now = phase.clone();
+        let below = chosen.clone();
+        FILESYSTEM_OVERRIDE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if !path.starts_with(&below) {
+                    return None;
+                }
+                match now.get() {
+                    1 => Some(disk),
+                    2 => Some(other_disk),
+                    _ => None,
+                }
+            }));
+        });
+        let _pretend = Pretend;
+        let open = || {
+            PreparedMediaStore::configured_recorded(
+                Some(chosen.clone()),
+                recorded_filesystem_at(&setting, &chosen).unwrap(),
+            )
+        };
+
+        // Mounted: chosen (which records the disk), saved, used.
+        set_folder_at(&setting, Some(&chosen), &[]).unwrap();
+        assert_eq!(recorded_filesystem_at(&setting, &chosen), Ok(disk.id));
+        let first = disc(&lab, "FIRST");
+        let second = disc(&lab, "SECOND");
+        let store = open().unwrap().unwrap();
+        let summary = prepare_in(&store, &lab, &first).unwrap().summary;
+        let on_the_disk = everything_under(&chosen);
+
+        // Unmounted, then another disk: refused both ways, for a fresh
+        // lookup and for the handle from before; nothing is written.
+        for (state, name) in [(0_u8, "unmounted"), (2, "another disk")] {
+            phase.set(state);
+            let fresh = open();
+            assert!(
+                fresh
+                    .as_ref()
+                    .is_err_and(|detail| detail.contains("not on the disk it was on")),
+                "{name}: {fresh:?}"
+            );
+            let attempt = prepare_in(&store, &lab, &second);
+            assert!(
+                matches!(&attempt, Err(PrepareError::Store(detail)) if detail.contains("not on the disk it was on")),
+                "{name}: {attempt:?}"
+            );
+            assert_eq!(store.prepared_for_source(&first), None, "{name}");
+            assert_eq!(everything_under(&chosen), on_the_disk, "{name}");
+        }
+
+        // Remounted: the same disk again. The copy is served and new ones
+        // can be prepared, through the old handle and a fresh lookup alike.
+        phase.set(1);
+        assert_eq!(store.prepared_for_source(&first), Some(summary));
+        let fresh = open().unwrap().unwrap();
+        prepare_in(&fresh, &lab, &second).unwrap();
+
+        // The saved record decides, not the folder: with the record naming
+        // another disk the very same folder is refused.
+        std::fs::write(
+            setting.with_file_name("prepared_media_folder_filesystems.json"),
+            format!(
+                "{{\"format_version\":1,\"folders\":{{{:?}:{}}}}}",
+                chosen.to_str().unwrap(),
+                other_disk.id.unwrap()
+            ),
+        )
+        .unwrap();
+        assert!(open().is_err());
+    }
+
+    /// An earlier folder whose disk record is missing, unreadable or names
+    /// another disk is not used, and the launch check refuses every file in
+    /// it rather than letting it through unchecked.
+    #[test]
+    fn an_earlier_folder_without_a_usable_disk_record_is_refused_at_launch() {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let setting = lab.root.join("config/prepared_media_folder.txt");
+        let earlier = lab.root.join("earlier");
+        set_folder_at(&setting, Some(&earlier), &[]).unwrap();
+        let store = PreparedMediaStore::configured_recorded(
+            Some(earlier.clone()),
+            recorded_filesystem_at(&setting, &earlier).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let summary = prepare_in(&store, &lab, &zip).unwrap().summary;
+        let track = summary.directory.join("media").join(ISO_NAME);
+        assert_eq!(earlier_folder_distrust_at(&setting, &earlier), Ok(()));
+
+        let record = setting.with_file_name("prepared_media_folder_filesystems.json");
+        let good = std::fs::read(&record).unwrap();
+        let other = filesystem_id(&earlier).unwrap() ^ 0x77;
+        for (name, contents) in [
+            ("unreadable", b"{ not json".to_vec()),
+            (
+                "from a later build",
+                b"{\"format_version\":2,\"folders\":{}}".to_vec(),
+            ),
+            (
+                "no entry",
+                b"{\"format_version\":1,\"folders\":{}}".to_vec(),
+            ),
+            (
+                "another disk",
+                format!(
+                    "{{\"format_version\":1,\"folders\":{{{:?}:{other}}}}}",
+                    earlier.to_str().unwrap()
+                )
+                .into_bytes(),
+            ),
+        ] {
+            std::fs::write(&record, contents).unwrap();
+            let trust = earlier_folder_distrust_at(&setting, &earlier);
+            assert!(trust.is_err(), "{name}: {trust:?}");
+            // The folder is not among the stores any more; the gate still
+            // refuses everything inside it, the cue sheet included.
+            let previous = vec![(earlier.clone(), trust)];
+            for inside in [&track, &summary.launch_path] {
+                assert!(
+                    launch_refusal_judged(None, None, &previous, &[], inside).is_some(),
+                    "{name}: {} was let through",
+                    inside.display()
+                );
+            }
+            assert_eq!(
+                launch_refusal_judged(None, None, &previous, &[], &zip),
+                None,
+                "{name}: a file outside the folder is not this gate's business"
+            );
+        }
+        std::fs::write(&record, good).unwrap();
+        assert_eq!(earlier_folder_distrust_at(&setting, &earlier), Ok(()));
+        let previous = vec![(earlier.clone(), Ok(()))];
+        let stores = vec![store];
+        assert!(launch_refusal_judged(None, None, &previous, &stores, &track).is_some());
+        assert_eq!(
+            launch_refusal_judged(None, None, &previous, &stores, &summary.launch_path),
+            None
+        );
+    }
 }
