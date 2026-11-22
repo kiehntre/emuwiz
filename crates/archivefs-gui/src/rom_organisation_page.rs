@@ -781,7 +781,6 @@ impl RomOrganisationPageState {
         // that went stale or a file that changed since the preview changes the
         // name, and the apply is refused.
         let names = NameResolver::load();
-        let canonical_name_for = |source: &Path| names.choose(source).name;
         let database_path = default_database_path();
         let database = match database_path.and_then(archivefs_core::Database::open_read_only) {
             Ok(database) => database,
@@ -790,17 +789,9 @@ impl RomOrganisationPageState {
                 return;
             }
         };
-        if let Err(reason) = archivefs_core::dat::rom_organisation::revalidate_organisation_plan(
-            plan,
-            database.path(),
-            &canonical_name_for,
-        ) {
-            self.error = Some(reason);
-            return;
-        }
-        // Only verified catalogue names rename in bulk, chosen again live: a
-        // stale preview that still holds a RomM hint is refused.
-        if let Err(reason) = hint_gate::refuse_unverified_names(plan, &self.approved, &names) {
+        if let Err(reason) =
+            hint_gate::check_live_names(plan, &self.approved, database.path(), &names)
+        {
             self.error = Some(reason);
             return;
         }
@@ -1613,8 +1604,7 @@ pub(crate) fn validate_r2_selection(
     }
     let names = NameResolver::load();
     let database = default_database_path().map_err(|e| e.to_string())?;
-    revalidate_organisation_plan(plan, &database, &|p| names.choose(p).name)?;
-    hint_gate::refuse_unverified_names(plan, approved, &names)?;
+    hint_gate::check_live_names(plan, approved, &database, &names)?;
     let library = Database::open_read_only(&database).map_err(|e| e.to_string())?;
     bulk_guard::refuse_if_newly_blocked(
         &library,

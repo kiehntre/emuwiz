@@ -3,7 +3,7 @@
 //! catalogue name does.
 
 use super::hint_gate::{
-    UNVERIFIED_HINT_REASON, block_unverified_names, refuse_unverified_names,
+    UNVERIFIED_HINT_REASON, block_unverified_names, check_live_names, refuse_unverified_names,
     refuse_unverified_names_with,
 };
 use super::*;
@@ -307,4 +307,44 @@ fn the_page_labels_a_hint_row_and_offers_no_apply_for_it() {
     assert!(has("0 file(s) selected"), "{texts:?}");
     assert!(has("Apply approved organisation (0)"), "{texts:?}");
     assert!(state.approved.is_empty());
+}
+
+/// The check both Apply paths run refuses a stale preview holding an approved
+/// RomM row before any database is read (this path does not exist).
+#[test]
+fn the_shared_apply_check_refuses_a_stale_romm_row_first() {
+    let (plan, _) = mixed_preview(OrganisationMode::RenameInPlace);
+    let names = NameResolver::for_test(None, None);
+    let error = check_live_names(
+        &plan,
+        &all_approved(&plan),
+        Path::new("/nonexistent/emuwiz-hint-gate-test.sqlite3"),
+        &names,
+    )
+    .unwrap_err();
+    assert!(error.contains("verified catalogue names only"), "{error}");
+}
+
+/// Both Apply paths go through the shared check, and neither keeps a
+/// revalidation of its own that could run without it.
+#[test]
+fn standard_apply_and_advanced_protection_both_run_the_shared_check() {
+    let page = include_str!("rom_organisation_page.rs");
+    let calls = |needle: &str| page.matches(needle).count();
+    assert_eq!(
+        calls("hint_gate::check_live_names(plan, &self.approved, database.path(), &names)"),
+        1,
+        "Standard Apply"
+    );
+    assert_eq!(
+        calls("hint_gate::check_live_names(plan, approved, &database, &names)?"),
+        1,
+        "Advanced Protection"
+    );
+    assert_eq!(calls("revalidate_organisation_plan("), 0);
+    assert_eq!(
+        calls("block_unverified_names(&mut plan, &name_choices)"),
+        1,
+        "preview"
+    );
 }

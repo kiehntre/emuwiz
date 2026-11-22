@@ -58,6 +58,24 @@ pub(crate) fn block_unverified_names(
     blocked
 }
 
+/// Every Apply path (Standard Apply and Advanced Protection) runs exactly
+/// this before building a transaction: only verified catalogue names may
+/// rename (checked first, without reading the platform database), then the
+/// existing live revalidation of platform, destination and name.
+pub(crate) fn check_live_names(
+    plan: &OrganisationPlan,
+    approved: &BTreeSet<String>,
+    database_path: &Path,
+    names: &NameResolver,
+) -> Result<(), String> {
+    refuse_unverified_names(plan, approved, names)?;
+    archivefs_core::dat::rom_organisation::revalidate_organisation_plan(
+        plan,
+        database_path,
+        &|source| names.choose(source).name,
+    )
+}
+
 /// Apply (every path): the name of each approved renaming row is chosen again
 /// from live evidence, and the whole Apply is refused unless it is a verified
 /// catalogue name. A preview made before this rule, or one whose catalogue
