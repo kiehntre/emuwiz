@@ -693,6 +693,9 @@ impl RomOrganisationPageState {
                 return false;
             }
         }
+        // Bulk rename renames only from verified catalogue names: a RomM
+        // title stays visible as a hint, but its row is Blocked.
+        hint_gate::block_unverified_names(&mut plan, &name_choices);
         if plan.suggested().next().is_some() {
             let catalogue = default_database_path()
                 .and_then(Database::open_read_only)
@@ -792,6 +795,12 @@ impl RomOrganisationPageState {
             database.path(),
             &canonical_name_for,
         ) {
+            self.error = Some(reason);
+            return;
+        }
+        // Only verified catalogue names rename in bulk, chosen again live: a
+        // stale preview that still holds a RomM hint is refused.
+        if let Err(reason) = hint_gate::refuse_unverified_names(plan, &self.approved, &names) {
             self.error = Some(reason);
             return;
         }
@@ -1605,6 +1614,7 @@ pub(crate) fn validate_r2_selection(
     let names = NameResolver::load();
     let database = default_database_path().map_err(|e| e.to_string())?;
     revalidate_organisation_plan(plan, &database, &|p| names.choose(p).name)?;
+    hint_gate::refuse_unverified_names(plan, approved, &names)?;
     let library = Database::open_read_only(&database).map_err(|e| e.to_string())?;
     bulk_guard::refuse_if_newly_blocked(
         &library,
@@ -1702,10 +1712,13 @@ pub(crate) fn name_counts(
     let mut counts = NameCounts::default();
     for entry in &plan.entries {
         // Blocked, unsupported or colliding entries have no usable destination.
-        if !matches!(
-            entry.status,
-            OrganisationStatus::Suggested | OrganisationStatus::AlreadyOrganised
-        ) {
+        let hint_only = entry.reason.as_deref() == Some(hint_gate::UNVERIFIED_HINT_REASON);
+        if !hint_only
+            && !matches!(
+                entry.status,
+                OrganisationStatus::Suggested | OrganisationStatus::AlreadyOrganised
+            )
+        {
             continue;
         }
         let Some(choice) = choices.get(&entry.source_path) else {
@@ -2943,7 +2956,7 @@ fn show_plan(
     if !name_choices.is_empty() {
         let c = name_counts(plan, &name_choices);
         ui.label(format!(
-            "Names: {} verified catalogue names to apply · {} already correct · {} RomM names (no verified catalogue name) · {} archives skipped (catalogue names a file inside)",
+            "Names: {} verified catalogue names to apply · {} already correct · {} RomM hints (not verified, not renamed in bulk) · {} archives skipped (catalogue names a file inside)",
             c.dat_changes, c.dat_already_correct, c.romm_fallbacks, c.archives_skipped
         ));
     }
@@ -3155,7 +3168,16 @@ fn show_plan(
                         if quick_mame {
                             ui.label("MAME collections use the dedicated MAME tools.");
                         } else {
-                            ui.label(format!("Rename to: {}", entry.destination_path.display()));
+                            let hint_only =
+                                entry.reason.as_deref() == Some(hint_gate::UNVERIFIED_HINT_REASON);
+                            ui.label(if hint_only {
+                                format!(
+                                    "RomM suggests (hint only, not applied): {}",
+                                    entry.destination_path.display()
+                                )
+                            } else {
+                                format!("Rename to: {}", entry.destination_path.display())
+                            });
                             show_name_choice(ui, name_choices.get(&entry.source_path));
                             ui.label(format!("Identity: Verified by {}", entry.platform_source));
                         }
@@ -5045,9 +5067,16 @@ mod tests {
     }
 }
 
+#[path = "rom_organisation_page_hint_gate.rs"]
+mod hint_gate;
 #[cfg(test)]
 #[path = "rom_organisation_page_preview_perf_tests.rs"]
 mod preview_perf_tests;
+
+#[cfg(test)]
+#[path = "rom_organisation_page_hint_gate_tests.rs"]
+mod hint_gate_tests;
+
 #[cfg(test)]
 #[path = "rom_organisation_page_undo_tests.rs"]
 mod undo_tests;
