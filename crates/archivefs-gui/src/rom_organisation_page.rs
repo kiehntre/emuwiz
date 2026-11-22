@@ -5079,5 +5079,9 @@ mod preview_perf_tests;
 mod hint_gate_tests;
 
 #[cfg(test)]
+#[path = "rom_organisation_page_hint_gate_runtime_tests.rs"]
+mod hint_gate_runtime_tests;
+
+#[cfg(test)]
 #[path = "rom_organisation_page_undo_tests.rs"]
 mod undo_tests;

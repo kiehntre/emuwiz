@@ -3,6 +3,16 @@ mod backend;
 mod copy;
 mod view;
 use backend::{Helper, Info, Preview, Review, Selection};
+
+/// Test seam: Advanced Protection's own validation (the call its prepare,
+/// apply and review steps make) on a selection, with nothing signed or run.
+#[cfg(test)]
+pub(crate) fn validate_selection_for_test(
+    plan: archivefs_core::dat::rom_organisation::OrganisationPlan,
+    approved: std::collections::BTreeSet<String>,
+) -> Result<archivefs_core::dat::rename_apply::model::RenameTransaction, String> {
+    Selection { plan, approved }.validate()
+}
 use eframe::egui;
 use serde_json::Value;
 use std::{
