@@ -255,18 +255,43 @@ struct Fresh {
     disks: Vec<(PathBuf, u64)>,
 }
 
-/// The disk (device number) of every folder that was searched or that held
-/// something read. A disk taken away during a session leaves the folder it
-/// was mounted on behind, empty: the folder is then on another disk, which
-/// is how [`same_disks`] tells that from saves really deleted.
+/// The disk (device number) of every folder that was listed, or that held
+/// something read. A folder that is not there is noted by the nearest
+/// folder above it that is, so that a disk put in below it later shows. A
+/// disk taken away during a session leaves the folder it was mounted on
+/// behind, empty: the folder is then on another disk, which is how
+/// [`same_disks`] tells that from saves really deleted.
+///
+/// Fails when a folder is on another disk now than when it was listed: a
+/// disk came or went while the saves were being read, and what was read is
+/// not one state of one place.
 fn disks_of(
+    searched: &[(PathBuf, Option<u64>)],
     places: &[PathBuf],
     saves: &[DiscoveredSave],
     whole: &[(PathBuf, String)],
     unread: &[PathBuf],
 ) -> Result<Vec<(PathBuf, u64)>, ContinuityError> {
     use std::os::unix::fs::MetadataExt;
+    let moved = |folder: &Path| {
+        ContinuityError::Io(format!(
+            "a disk came or went at {} while the saves were being read",
+            folder.display()
+        ))
+    };
     let mut folders: Vec<PathBuf> = places.to_vec();
+    for (folder, listed_on) in searched {
+        match (listed_on, nearest_disk(folder)) {
+            // There when listed: still there, on the same disk.
+            (Some(then), Some((at, now))) if &at == folder && now == *then => {
+                folders.push(at);
+            }
+            (Some(_), _) => return Err(moved(folder)),
+            // Not there when listed: the nearest folder above stands for it.
+            (None, Some((at, _))) if &at != folder => folders.push(at),
+            (None, _) => return Err(moved(folder)),
+        }
+    }
     let held = saves
         .iter()
         .map(|save| &save.source_path)
@@ -294,35 +319,38 @@ fn disks_of(
         .collect()
 }
 
-/// Whether the folders of the read before a session are still on the disks
-/// they were on, and every folder that is new is on the disk of the folder
-/// it is in. When this is false a disk came or went and what is there now
-/// is not the same place: nothing is compared.
-pub(crate) fn same_disks(before: &[(PathBuf, u64)], after: &[(PathBuf, u64)]) -> bool {
+/// `folder`, or the nearest folder above it that is there, and its disk.
+/// `None` when that cannot be told (a folder that cannot be looked at).
+fn nearest_disk(folder: &Path) -> Option<(PathBuf, u64)> {
     use std::os::unix::fs::MetadataExt;
-    let now = |folder: &Path| -> Option<u64> {
-        // A folder that is gone is judged by the nearest one above it that
-        // is still there: on the same disk, it was deleted; on another, its
-        // disk went.
-        let mut at = Some(folder);
-        while let Some(path) = at {
-            match std::fs::metadata(path) {
-                Ok(meta) => return Some(meta.dev()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => at = path.parent(),
-                Err(_) => return None,
-            }
+    let mut at = Some(folder);
+    while let Some(path) = at {
+        match std::fs::metadata(path) {
+            Ok(meta) => return Some((path.to_path_buf(), meta.dev())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => at = path.parent(),
+            Err(_) => return None,
         }
-        None
-    };
+    }
+    None
+}
+
+/// Whether the folders of the read before a session are still on the disks
+/// they were on, and every folder of the read after it is on the disk of
+/// the nearest folder above it that the first read noted. A folder that has
+/// gone is judged by the nearest one above it that is still there: on the
+/// same disk, it was deleted; on another, its disk went. When this is false
+/// a disk came or went, or the saves are somewhere the first read never
+/// looked, and what is there now is not the same place: nothing is compared.
+pub(crate) fn same_disks(before: &[(PathBuf, u64)], after: &[(PathBuf, u64)]) -> bool {
     let unmoved = before
         .iter()
-        .all(|(folder, disk)| now(folder) == Some(*disk));
+        .all(|(folder, disk)| nearest_disk(folder).is_some_and(|(_, now)| now == *disk));
     let new_on_the_same = after.iter().all(|(folder, disk)| {
         before
             .iter()
             .filter(|(known, _)| folder.starts_with(known))
             .max_by_key(|(known, _)| known.components().count())
-            .is_none_or(|(_, known_disk)| known_disk == disk)
+            .is_some_and(|(_, known_disk)| known_disk == disk)
     });
     unmoved && new_on_the_same
 }
@@ -386,7 +414,13 @@ fn fresh_read(
     let mut places = report.places;
     places.sort();
     places.dedup();
-    let disks = disks_of(&places, &report.saves, &report.whole_files, &unread)?;
+    let disks = disks_of(
+        &report.searched,
+        &places,
+        &report.saves,
+        &report.whole_files,
+        &unread,
+    )?;
     Ok(Fresh {
         saves: report.saves,
         unread,

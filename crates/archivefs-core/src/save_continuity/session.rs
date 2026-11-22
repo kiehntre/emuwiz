@@ -1075,8 +1075,15 @@ pub fn diff_saves_with(
     let mut unread: Vec<&PathBuf> = unread_before.iter().chain(unread_after).collect();
     unread.sort();
     unread.dedup();
+    // A file read whole at every end at which it could not be taken apart
+    // is answered for by the comparison of its whole content.
+    let whole = |marks: &BTreeMap<String, SaveMark>, path: &Path| {
+        marks.contains_key(&format!("whole:{}", path.display()))
+    };
     for path in unread {
-        if !answered.iter().any(|done| done.starts_with(path)) {
+        let read_whole = (!unread_before.contains(path) || whole(&old, path))
+            && (!unread_after.contains(path) || whole(&new, path));
+        if !read_whole && !answered.iter().any(|done| done.starts_with(path)) {
             changes.push(SaveChange::NotKnown {
                 label: path
                     .file_name()

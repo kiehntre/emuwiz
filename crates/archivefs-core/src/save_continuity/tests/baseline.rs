@@ -1622,6 +1622,68 @@ fn a_card_in_any_state_is_never_taken_for_an_empty_or_a_read_one() {
             "{who}"
         );
 
+        // A card with a save becomes bytes that are not a card's: the card
+        // changed, and its save is not known, not gone. It is not an
+        // emptied card.
+        fresh();
+        let ended = session_with(&|| {}, &|| {
+            fs::write(&second, vec![7u8; case.one.len()]).unwrap()
+        });
+        assert!(
+            ended.save_changes.contains(&SaveChange::Modified {
+                label: whole(case.names[1])
+            }) && ended
+                .save_changes
+                .iter()
+                .any(|change| matches!(change, SaveChange::NotKnown { .. })),
+            "{who}: {:?}",
+            ended.save_changes
+        );
+        all(&ended, &|change| {
+            matches!(
+                change,
+                SaveChange::Modified { .. } | SaveChange::NotKnown { .. }
+            )
+        });
+        // The other way: bytes that are not a card's become a card with a
+        // save. What it held before is not known, so the save is not new.
+        let ended = session_with(&|| {}, &|| fs::write(&second, &case.one).unwrap());
+        assert!(
+            ended.save_changes.contains(&SaveChange::Modified {
+                label: whole(case.names[1])
+            }) && ended
+                .save_changes
+                .iter()
+                .any(|change| matches!(change, SaveChange::CreatedBeforeNotKnown { .. })),
+            "{who}: {:?}",
+            ended.save_changes
+        );
+        all(&ended, &|change| {
+            matches!(
+                change,
+                SaveChange::Modified { .. } | SaveChange::CreatedBeforeNotKnown { .. }
+            )
+        });
+        // A file in the card folder that never was a card says nothing by
+        // being there, and is simply new when it appears.
+        fresh();
+        let stray = case.folder.join("notes.txt");
+        let ended = session_with(&|| {}, &|| fs::write(&stray, b"not a card").unwrap());
+        assert_eq!(
+            ended.save_changes,
+            vec![SaveChange::Created {
+                label: whole("notes.txt")
+            }],
+            "{who}"
+        );
+        let ended = session_with(&|| {}, &|| {});
+        assert!(
+            ended.save_changes.is_empty(),
+            "{who}: {:?}",
+            ended.save_changes
+        );
+        fs::remove_file(&stray).unwrap();
+
         // Cannot be opened before the start, can afterwards: not an empty
         // card that filled, so nothing is "new".
         fresh();
@@ -1775,6 +1837,103 @@ fn a_folder_is_judged_by_the_disk_it_is_on() {
         &[(saves.clone(), here)],
         &[(saves.clone(), here), (saves.join("new"), here)]
     ));
+    // A new folder is judged by the nearest folder above it that was noted,
+    // not by one further up.
+    fs::create_dir_all(&game).unwrap();
+    let nested = vec![(dir.path().to_path_buf(), here), (saves.clone(), here + 1)];
+    assert!(!same_disks(&[(saves.clone(), here + 1)], &[]));
+    let judged = |disk| {
+        let after = [(game.clone(), disk)];
+        // Only the second half is under test: the first is put right.
+        let before = [(dir.path().to_path_buf(), here)];
+        (
+            same_disks(&before, &after),
+            nested
+                .iter()
+                .filter(|(known, _)| game.starts_with(known))
+                .max_by_key(|(known, _)| known.components().count())
+                .is_some_and(|(_, known)| *known == disk),
+        )
+    };
+    assert_eq!(judged(here), (true, false));
+    assert_eq!(judged(here + 1), (false, true));
+    // Saves somewhere the first read never looked: not the same place.
+    let elsewhere = tempfile::tempdir().unwrap();
+    assert!(!same_disks(
+        &[(saves.clone(), here)],
+        &[(elsewhere.path().to_path_buf(), here)]
+    ));
+}
+
+/// A save folder made during the session, on the disk its place was on,
+/// is an ordinary new save: the disk check holds nothing back.
+#[test]
+fn a_save_folder_made_during_the_session_on_the_same_disk_is_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+    fs::create_dir_all(home.join(".config")).unwrap();
+    let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
+    let ended = rpcs3_session(&tracker, &|| rpcs3_save(&home.join(".config/rpcs3")));
+    assert!(ended.saves_after.is_some());
+    assert!(
+        !ended.save_changes.is_empty()
+            && ended
+                .save_changes
+                .iter()
+                .all(|change| matches!(change, SaveChange::Created { .. })),
+        "{:?}",
+        ended.save_changes
+    );
+}
+
+/// One PlayStation 3 save under an RPCS3 folder.
+fn rpcs3_save(rpcs3: &Path) {
+    let save = rpcs3.join("dev_hdd0/home/00000001/savedata/BLUS30750_RERC_SAVE");
+    fs::create_dir_all(&save).unwrap();
+    fs::write(
+        save.join("PARAM.SFO"),
+        super::discover::sfo(&[
+            ("CATEGORY", "SD"),
+            ("TITLE", "Synthetic Game"),
+            ("SAVEDATA_DIRECTORY", "BLUS30750_RERC_SAVE"),
+        ]),
+    )
+    .unwrap();
+    fs::write(save.join("DATA.BIN"), [4u8; 2000]).unwrap();
+}
+
+/// A gated RPCS3 session during which `during` runs.
+fn rpcs3_session(tracker: &LaunchTracker, during: &dyn Fn()) -> SessionRecord {
+    let process = StartedProcess {
+        executable: PathBuf::from("/nowhere/rpcs3"),
+        ..started()
+    };
+    let launch = super::super::tracker::classify_started(&process.executable, &[]);
+    assert_eq!(launch.emulator, "RPCS3");
+    let read = tracker.baseline_before_start(&launch);
+    let table = One(Cell::new(true));
+    let session = tracker
+        .begin_gated(SessionGame::default(), "RPCS3")
+        .unwrap();
+    tracker
+        .process_started_gated(
+            &session.session_id,
+            &process,
+            read.map(|baseline| (baseline, 1, 0))
+                .map_err(|error| error.to_string()),
+            &table,
+        )
+        .unwrap();
+    during();
+    table.0.set(false);
+    tracker
+        .finished_in(
+            &session.session_id,
+            Some(ExitSummary::Code(0)),
+            None,
+            &table,
+        )
+        .unwrap()
 }
 
 /// By hand only, with a real mount: run inside `unshare -Urm` so that a
@@ -1853,6 +2012,81 @@ fn a_real_disk_taken_away_or_put_in_during_a_session_by_hand() {
     command("umount", &[run.saves.as_os_str()]);
     println!(
         "MOUNT disk put in: compared {}; changes {:?}",
+        ended.saves_after.is_some(),
+        ended.save_changes
+    );
+    assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
+
+    // An emulator whose save folder is not a setting (RPCS3). Its save
+    // folder is there, empty, at the start; a disk holding a save is put on
+    // it while the game runs. The save is not new.
+    let mount = |folder: &Path| {
+        command(
+            "mount",
+            &[
+                "-t".as_ref(),
+                "tmpfs".as_ref(),
+                "tmpfs".as_ref(),
+                folder.as_os_str(),
+            ],
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+    let rpcs3 = home.join(".config/rpcs3");
+    let savedata = rpcs3.join("dev_hdd0/home/00000001/savedata");
+    fs::create_dir_all(&savedata).unwrap();
+    let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
+    let ended = rpcs3_session(&tracker, &|| {
+        mount(&rpcs3.join("dev_hdd0"));
+        rpcs3_save(&rpcs3);
+    });
+    println!(
+        "MOUNT disk put in under an empty RPCS3 folder: tracking {:?}; compared {}; changes {:?}",
+        ended.save_tracking,
+        ended.saves_after.is_some(),
+        ended.save_changes
+    );
+    assert!(matches!(
+        ended.save_tracking,
+        Some(SaveTracking::Established { .. })
+    ));
+    assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
+    // The disk stays: the next session is an ordinary one, and a save
+    // written during it is seen.
+    let ended = rpcs3_session(&tracker, &|| {
+        fs::write(savedata.join("BLUS30750_RERC_SAVE/DATA.BIN"), [5u8; 2000]).unwrap()
+    });
+    println!(
+        "MOUNT disk stays, save written: compared {}; changes {:?}",
+        ended.saves_after.is_some(),
+        ended.save_changes
+    );
+    assert!(
+        ended
+            .save_changes
+            .iter()
+            .any(|change| matches!(change, SaveChange::Modified { .. })),
+        "{:?}",
+        ended.save_changes
+    );
+    command("umount", &[rpcs3.join("dev_hdd0").as_os_str()]);
+
+    // Nothing of the emulator is there at the start; its whole folder
+    // arrives on a disk while the game runs.
+    let dir = tempfile::tempdir().unwrap();
+    let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+    let rpcs3 = home.join(".config/rpcs3");
+    fs::create_dir_all(home.join(".config")).unwrap();
+    let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
+    let ended = rpcs3_session(&tracker, &|| {
+        fs::create_dir_all(&rpcs3).unwrap();
+        mount(&rpcs3);
+        rpcs3_save(&rpcs3);
+    });
+    command("umount", &[rpcs3.as_os_str()]);
+    println!(
+        "MOUNT whole emulator folder arrives on a disk: compared {}; changes {:?}",
         ended.saves_after.is_some(),
         ended.save_changes
     );

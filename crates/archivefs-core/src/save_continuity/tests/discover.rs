@@ -37,7 +37,7 @@ fn gci(code: &str, name: &str, blocks: u16) -> Vec<u8> {
 }
 
 /// A minimal PARAM.SFO with text keys.
-fn sfo(pairs: &[(&str, &str)]) -> Vec<u8> {
+pub(super) fn sfo(pairs: &[(&str, &str)]) -> Vec<u8> {
     let mut keys = Vec::new();
     let mut data = Vec::new();
     let mut index = Vec::new();

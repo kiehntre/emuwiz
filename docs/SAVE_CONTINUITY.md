@@ -391,17 +391,31 @@ either. A save or memory-card folder that is not there at all is taken as
 holding nothing; one whose path appears or goes between the two reads of a session
 means nothing is compared. A folder that is itself the place a drive is
 mounted is still there, empty, once the drive is taken away. For that the
-read before the start notes which disk (device number) every folder searched,
-and every folder holding a save, is on. If at the end one of them is on
-another disk, a folder that has gone had been on another disk than the folder
-above it, or a new folder is on another disk than the folder it is in, a drive
-came or went and nothing is compared. What this cannot tell apart: a drive
-replaced during the session by another that the system gives the same device
-number. The first session in which an emulator
-creates its save or card folder is not compared at all. A PCSX2 folder memory card
+read before the start notes which disk (device number) every folder it listed
+is on, at the moment it lists it, and every folder that held a save; for a
+folder that is not there it notes the nearest folder above it that is. A read
+during which one of these folders moved to another disk fails (the session is
+then not tracked). Nothing is compared at the end of the session if one of the
+noted folders is on another disk; if one has gone and the nearest folder above
+it that is still there is on another disk than it was; if a folder of the
+second read is on another disk than the nearest noted folder above it; or if
+it is under no noted folder at all. The rule before that holds back one session,
+once, for a setup in which an emulator's save folder is always on another
+disk than its parent and held no save before. What this cannot tell apart: a
+drive that the system gives the same device number as what it replaces or
+covers. That is so for a folder mounted from elsewhere on the same disk (a
+bind mount), and can be so for a memory disk, a network or FUSE mount put in
+where another just left; saves are then reported as gone or new. Sessions not
+started through the gate, and records from before this check, have no disk
+check. The first session in which RetroArch's save or state folder, or a
+memory-card folder, comes to be there is not compared at all; for the other
+emulators the saves of such a session are reported as new. A PCSX2 folder memory card
 is "not known" in every session, and so is a link or special file in a
 memory-card folder (an ordinary sub-folder there is passed over). Every plain file in a memory-card folder is
-fingerprinted, card or not. Among RetroArch's saves, a file under a name saves
+fingerprinted, card or not. A file there whose bytes are not a
+card's holds saves that cannot be listed: if it was a card at the other read
+of the session, the saves then listed on it are "not known" (not gone, not
+new), beside the change of the file itself. Among RetroArch's saves, a file under a name saves
 do not go by is tracked only while it is card-shaped (if it stops or starts
 being one between the two reads it is reported as gone or new). At most 20,000
 files are looked at per read, counting every file in RetroArch's save folders;

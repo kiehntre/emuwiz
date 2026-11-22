@@ -173,6 +173,10 @@ pub struct DiscoveryReport {
     /// seen to change even when it holds no save that can be listed, or
     /// cannot be taken apart at all.
     pub whole_files: Vec<(PathBuf, String)>,
+    /// Every folder that was listed, there or not, with the disk (device
+    /// number) it was on at the moment it was listed (`None`: not there).
+    #[serde(skip)]
+    pub searched: Vec<(PathBuf, Option<u64>)>,
     pub stats: DiscoveryStats,
     /// Formats discovery does not look for at all.
     pub not_covered: Vec<&'static str>,
@@ -516,8 +520,14 @@ fn evidence(
 
 /// The entries of `dir`, sorted. A folder that is not there has none; one
 /// that is there but cannot be listed is noted in `incomplete`.
-fn listed(dir: &Path, incomplete: &mut Vec<String>) -> Vec<PathBuf> {
+fn listed(dir: &Path, report: &mut DiscoveryReport) -> Vec<PathBuf> {
     use std::io::ErrorKind;
+    use std::os::unix::fs::MetadataExt;
+    report.searched.push((
+        dir.to_path_buf(),
+        fs::metadata(dir).ok().map(|meta| meta.dev()),
+    ));
+    let incomplete = &mut report.incomplete;
     let mut children = Vec::new();
     match fs::read_dir(dir) {
         Ok(entries) => {
@@ -593,7 +603,7 @@ pub fn discover(
         ] {
             if run.wanted("RPCS3", &hdd) {
                 card_folder_whole(&mut run, &hdd.join("savedata/vmc"))?;
-                for title in listed(&hdd.join("game"), &mut run.report.incomplete) {
+                for title in listed(&hdd.join("game"), &mut run.report) {
                     card_folder_whole(&mut run, &title.join("USRDIR/SAVEDATA"))?;
                 }
             }
@@ -617,7 +627,7 @@ pub fn discover(
         if !run.wanted("RPCS3", &base) {
             continue;
         }
-        for user in listed(&base, &mut run.report.incomplete) {
+        for user in listed(&base, &mut run.report) {
             sfo_folders(
                 &mut run,
                 &user.join("savedata"),
@@ -730,13 +740,24 @@ fn card_folder_whole(run: &mut Run<'_, '_>, folder: &Path) -> Result<(), Continu
     if fs::metadata(folder).is_ok_and(|meta| meta.is_dir()) {
         run.report.places.push(folder.to_path_buf());
     }
-    for path in listed(folder, &mut run.report.incomplete) {
+    for path in listed(folder, &mut run.report) {
         check(run)?;
         if !run.admit() {
             return Ok(());
         }
         match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.is_file() => whole_file(run, &path),
+            Ok(meta) if meta.is_file() => {
+                whole_file(run, &path);
+                // Read whole, but not a card as far as its bytes go: which
+                // saves it holds is not known. A save listed on it at the
+                // other read of a session is then neither gone nor new.
+                if crate::memory_card_manager::discovery::sniff_format(&path)
+                    == CardFormat::NotACard
+                    && !run.report.unread.contains(&path)
+                {
+                    run.report.unread.push(path);
+                }
+            }
             Ok(meta) if meta.is_dir() => {
                 if crate::memory_card_manager::discovery::sniff_format(&path)
                     == CardFormat::Pcsx2Folder
@@ -976,12 +997,12 @@ pub fn parse_gci(bytes: &[u8]) -> Option<GciHeader> {
 }
 
 fn gamecube(run: &mut Run<'_, '_>, base: &Path, emulator: &str) -> Result<(), ContinuityError> {
-    for region_dir in listed(base, &mut run.report.incomplete) {
-        for card_dir in listed(&region_dir, &mut run.report.incomplete)
+    for region_dir in listed(base, &mut run.report) {
+        for card_dir in listed(&region_dir, &mut run.report)
             .into_iter()
             .filter(|p| real_dir(p))
         {
-            for path in listed(&card_dir, &mut run.report.incomplete) {
+            for path in listed(&card_dir, &mut run.report) {
                 check(run)?;
                 if path
                     .extension()
@@ -1098,7 +1119,7 @@ fn sfo_folders(
     emulator: &str,
     format: SaveFormat,
 ) -> Result<(), ContinuityError> {
-    for folder in listed(base, &mut run.report.incomplete)
+    for folder in listed(base, &mut run.report)
         .into_iter()
         .filter(|p| real_dir(p))
     {
@@ -1111,7 +1132,7 @@ fn sfo_folders(
             return Ok(());
         }
         // The folder's signature covers every file directly inside it.
-        let members: Vec<PathBuf> = listed(&folder, &mut run.report.incomplete);
+        let members: Vec<PathBuf> = listed(&folder, &mut run.report);
         if members.len() > MAX_FOLDER_SAVE_FILES {
             run.report.skipped.push(format!(
                 "{} holds more than {MAX_FOLDER_SAVE_FILES} files",
@@ -1352,11 +1373,11 @@ fn retroarch(run: &mut Run<'_, '_>, config_dir: &Path, home: &Path) -> Result<()
             }
         }
         let mut files = Vec::new();
-        for child in listed(&dir, &mut run.report.incomplete) {
+        for child in listed(&dir, &mut run.report) {
             if real_dir(&child) {
                 // One level down: RetroArch's "sort saves into folders by core".
                 files.extend(
-                    listed(&child, &mut run.report.incomplete)
+                    listed(&child, &mut run.report)
                         .into_iter()
                         .map(|path| (path, true)),
                 );
