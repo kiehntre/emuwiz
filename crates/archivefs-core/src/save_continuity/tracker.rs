@@ -260,7 +260,7 @@ struct Fresh {
 /// Notes that a battery save was a memory card, looked at save by save, at
 /// this read. It is never itself reported as changed (see
 /// [`super::session::CARD_NOTE`]).
-fn card_note(path: &PathBuf) -> SaveMark {
+fn card_note(path: &Path) -> SaveMark {
     SaveMark {
         save_id: format!("{}{}", super::session::CARD_NOTE, path.display()),
         label: path
@@ -271,7 +271,7 @@ fn card_note(path: &PathBuf) -> SaveMark {
         last_changed_unix: None,
         before_launch: None,
         folder: None,
-        path: Some(path.clone()),
+        path: Some(path.to_path_buf()),
     }
 }
 
@@ -485,7 +485,7 @@ pub fn read_baseline(
         .filter(|save| save.emulator.eq_ignore_ascii_case(&launch.emulator))
         .filter_map(mark_of)
         .chain(read.whole.iter().map(whole_mark))
-        .chain(read.as_cards.iter().map(card_note))
+        .chain(read.as_cards.iter().map(|path| card_note(path)))
         .map(|mut mark| {
             mark.before_launch = Some(true);
             mark
@@ -831,7 +831,12 @@ impl LaunchTracker {
             })
             .filter_map(mark_of)
             .chain(read.whole.iter().filter(|_| gated).map(whole_mark))
-            .chain(read.as_cards.iter().filter(|_| gated).map(card_note))
+            .chain(
+                read.as_cards
+                    .iter()
+                    .filter(|_| gated)
+                    .map(|path| card_note(path)),
+            )
             .collect();
         if record.folders_before.is_some() {
             let saves = self.saves()?;
