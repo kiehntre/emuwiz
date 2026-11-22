@@ -1,9 +1,10 @@
-//! Bulk naming eligibility (owner rule, 2026-11-22): in a bulk run only a
+//! Bulk naming eligibility (owner rules, 2026-11-22): in a bulk run only a
 //! verified catalogue name may give a file or a link a new name, in every
-//! organisation mode (rename, move, existing-link reorganise, linked library). A RomM title stays visible in
-//! the preview, labelled as an unverified hint, but its row is Blocked with
-//! the reason, and every Apply path refuses an approved row whose live name
-//! is not a verified catalogue name (a stale preview included).
+//! organisation mode. In Rename and Move a RomM title stays visible as an
+//! unverified hint and its row is Blocked with the reason. In the link modes
+//! (linked library, reorganise existing links) such a link keeps the file's
+//! own name instead ([`bulk_name`]). Every Apply path refuses an approved row
+//! whose live name is not a verified catalogue name (a stale preview included).
 //!
 //! This is an eligibility rule only: RomM data and game identity are never
 //! changed here, and a row that keeps its own file name is not affected.
@@ -27,6 +28,9 @@ pub(crate) const UNVERIFIED_NAME_REASON: &str = "Not renamed in bulk: the new na
 /// Link modes: the same two reasons, worded for a link (nothing is renamed
 /// there, and single-game Rename would touch the real file instead).
 pub(crate) const UNVERIFIED_LINK_HINT_REASON: &str = "Not used for this link: this name is an unverified RomM hint, not a verified catalogue name. Links are named in bulk from verified catalogue names only. Check this game against a catalogue first.";
+/// Link modes: the file's own name (the fallback) had to change to be a safe
+/// link name, so it is not the original file name either.
+pub(crate) const UNSAFE_LINK_FALLBACK_REASON: &str = "No link made in bulk: this file's own name cannot be used as a link name as it is (it had to be changed to be safe), and there is no verified catalogue name to use instead. Rename the file itself first, or check it against a catalogue.";
 pub(crate) const UNVERIFIED_LINK_NAME_REASON: &str = "Not used for this link: the new name does not come from a verified catalogue name. Links are named in bulk from verified catalogue names only.";
 
 /// The name a bulk run may give this file or link (owner rules 2026-11-22):
@@ -99,6 +103,7 @@ pub(crate) fn unverified_name_label(entry: &OrganisationPlanEntry) -> Option<&'s
         Some(UNVERIFIED_NAME_REASON | UNVERIFIED_LINK_NAME_REASON) => {
             Some("Proposed name (not verified, not applied)")
         }
+        Some(UNSAFE_LINK_FALLBACK_REASON) => Some("Own file name needs changing (no link made)"),
         _ => None,
     }
 }
@@ -127,12 +132,29 @@ pub(crate) fn block_unverified_names(
             && gives_a_new_name(entry)
             && !name_is_verified(choices.get(&entry.source_path))
         {
-            let from_romm = matches!(
-                choices.get(&entry.source_path).map(|c| &c.source),
-                Some(NameSource::Romm)
-            );
+            let choice = choices.get(&entry.source_path);
+            let from_romm = matches!(choice.map(|c| &c.source), Some(NameSource::Romm));
+            // In a link mode the plan names a link from a RomM title only when
+            // it was built outside this rule (a stale preview); otherwise the
+            // own file name was used and had to be changed to be safe.
+            let names_the_romm_title = from_romm
+                && choice.and_then(|c| c.name.as_deref()).is_some_and(|title| {
+                    entry
+                        .destination_path
+                        .file_stem()
+                        .is_some_and(|stem| stem.to_string_lossy() == title)
+                        || entry
+                            .destination_path
+                            .file_name()
+                            .is_some_and(|name| name.to_string_lossy() == title)
+                });
+            let reason = if is_link_mode(plan_mode) && !names_the_romm_title {
+                UNSAFE_LINK_FALLBACK_REASON
+            } else {
+                unverified_reason(plan_mode, from_romm)
+            };
             entry.status = OrganisationStatus::Blocked;
-            entry.reason = Some(unverified_reason(plan_mode, from_romm).to_string());
+            entry.reason = Some(reason.to_string());
             blocked += 1;
         }
     }

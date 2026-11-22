@@ -3,8 +3,8 @@
 //! catalogue name does.
 
 use super::hint_gate::{
-    UNVERIFIED_HINT_REASON, block_unverified_names, check_live_names, refuse_unverified_names,
-    refuse_unverified_names_with, unverified_name_label,
+    UNVERIFIED_HINT_REASON, UNVERIFIED_NAME_REASON, block_unverified_names, check_live_names,
+    refuse_unverified_names, refuse_unverified_names_with, unverified_name_label,
 };
 use super::*;
 use archivefs_core::VerifiedDatName as V;
@@ -200,7 +200,8 @@ fn every_link_mode_refuses_romm_names_and_keeps_verified_and_unrenamed_links() {
 
 #[test]
 fn a_new_name_from_neither_source_gets_its_own_reason_not_the_romm_one() {
-    let (mut plan, mut choices) = mixed_preview(OrganisationMode::OrganiseSymlinkOnly);
+    // Rename/Move: a new name RomM did not give is "not verified", not a hint.
+    let (mut plan, mut choices) = mixed_preview(OrganisationMode::MoveRealFile);
     choices.insert(
         PathBuf::from(HINT_SRC),
         choose_name(V::None, None, Path::new(HINT_SRC)),
@@ -211,15 +212,39 @@ fn a_new_name_from_neither_source_gets_its_own_reason_not_the_romm_one() {
         .iter()
         .find(|e| e.source_path == Path::new(HINT_SRC))
         .unwrap();
-    assert_eq!(
-        row.reason.as_deref(),
-        Some(super::hint_gate::UNVERIFIED_LINK_NAME_REASON),
-        "a link row says link, not rename"
-    );
+    assert_eq!(row.reason.as_deref(), Some(UNVERIFIED_NAME_REASON));
     assert_eq!(
         unverified_name_label(row),
         Some("Proposed name (not verified, not applied)")
     );
+}
+
+/// Link modes: when the file's own name (the fallback) had to be changed to
+/// be a safe link name, the row says so; it is not called a RomM hint and is
+/// not counted as one, even when RomM has a title for the game.
+#[test]
+fn a_link_whose_own_name_had_to_change_is_not_called_a_romm_hint() {
+    for mode in [
+        OrganisationMode::OrganiseSymlinkOnly,
+        OrganisationMode::BuildLinkedLibrary,
+    ] {
+        let source = Path::new("/roms/nes/ h_one.nes");
+        let mut plan = plan(mode, vec![entry("/roms/nes/ h_one.nes", "h_one.nes", mode)]);
+        let mut choices = BTreeMap::new();
+        choices.insert(source.to_path_buf(), romm_only(source, "Hint One (USA)"));
+        assert_eq!(block_unverified_names(&mut plan, &choices), 1);
+        let row = &plan.entries[0];
+        assert_eq!(
+            row.reason.as_deref(),
+            Some(super::hint_gate::UNSAFE_LINK_FALLBACK_REASON),
+            "{mode:?}"
+        );
+        assert_eq!(
+            unverified_name_label(row),
+            Some("Own file name needs changing (no link made)")
+        );
+        assert_eq!(name_counts(&plan, &choices).romm_fallbacks, 0);
+    }
 }
 
 fn page_texts(state: &mut RomOrganisationPageState) -> Vec<String> {
