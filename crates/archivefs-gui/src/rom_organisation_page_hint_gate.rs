@@ -1,5 +1,6 @@
-//! Bulk rename eligibility (owner rule, 2026-11-22): in a bulk run only a
-//! verified catalogue name may rename a file. A RomM title stays visible in
+//! Bulk naming eligibility (owner rule, 2026-11-22): in a bulk run only a
+//! verified catalogue name may give a file or a link a new name, in every
+//! organisation mode (rename, move, existing-link reorganise, linked library). A RomM title stays visible in
 //! the preview, labelled as an unverified hint, but its row is Blocked with
 //! the reason, and every Apply path refuses an approved row whose live name
 //! is not a verified catalogue name (a stale preview included).
@@ -10,7 +11,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use archivefs_core::dat::rom_organisation::rename_guard::mode_changes_real_files;
 use archivefs_core::dat::rom_organisation::{
     OrganisationPlan, OrganisationPlanEntry, OrganisationStatus,
 };
@@ -18,11 +18,33 @@ use archivefs_core::dat::rom_organisation::{
 use super::{NameChoice, NameResolver, NameSource};
 
 /// The reason shown on a row whose new name is only a RomM hint.
-pub(crate) const UNVERIFIED_HINT_REASON: &str = "Not renamed in bulk: this name is an unverified RomM hint, not a verified catalogue name. Bulk rename uses verified catalogue names only. Check this game against a catalogue first, or rename it on its own.";
+pub(crate) const UNVERIFIED_HINT_REASON: &str = "Not renamed in bulk: this name is an unverified RomM hint, not a verified catalogue name. Bulk renaming of files and links uses verified catalogue names only. Check this game against a catalogue first, or rename it on its own.";
+
+/// The reason shown on a row whose new name has no verified catalogue source
+/// and no RomM title either (for example a name the layout had to adjust).
+pub(crate) const UNVERIFIED_NAME_REASON: &str = "Not renamed in bulk: the new name does not come from a verified catalogue name. Bulk renaming of files and links uses verified catalogue names only. Rename it on its own if you want this name.";
+
+/// Whether this row was blocked by this rule (either reason).
+pub(crate) fn blocked_for_unverified_name(entry: &OrganisationPlanEntry) -> bool {
+    matches!(
+        entry.reason.as_deref(),
+        Some(UNVERIFIED_HINT_REASON | UNVERIFIED_NAME_REASON)
+    )
+}
 
 /// Whether applying this row would give the file a new name.
 fn gives_a_new_name(entry: &OrganisationPlanEntry) -> bool {
     entry.destination_path.file_name() != entry.source_path.file_name()
+}
+
+/// The label for the name a row blocked by this rule was not given, or
+/// `None` for every other row.
+pub(crate) fn unverified_name_label(entry: &OrganisationPlanEntry) -> Option<&'static str> {
+    match entry.reason.as_deref() {
+        Some(UNVERIFIED_HINT_REASON) => Some("RomM suggests (hint only, not applied)"),
+        Some(UNVERIFIED_NAME_REASON) => Some("Proposed name (not verified, not applied)"),
+        _ => None,
+    }
 }
 
 /// A row may rename in bulk only when its name is a verified catalogue name.
@@ -34,24 +56,33 @@ fn name_is_verified(choice: Option<&NameChoice>) -> bool {
     )
 }
 
-/// Preview: every Suggested row that would rename a file from anything other
-/// than a verified catalogue name becomes Blocked with
-/// [`UNVERIFIED_HINT_REASON`]. Returns how many rows were blocked.
+/// Preview, every mode: every Suggested row that would give a file or link a
+/// new name from anything other than a verified catalogue name becomes
+/// Blocked with [`UNVERIFIED_HINT_REASON`] (RomM title) or
+/// [`UNVERIFIED_NAME_REASON`]. Returns how many rows were blocked.
 pub(crate) fn block_unverified_names(
     plan: &mut OrganisationPlan,
     choices: &BTreeMap<PathBuf, NameChoice>,
 ) -> usize {
-    if !mode_changes_real_files(plan.mode) {
-        return 0;
-    }
     let mut blocked = 0;
     for entry in &mut plan.entries {
         if entry.status == OrganisationStatus::Suggested
             && gives_a_new_name(entry)
             && !name_is_verified(choices.get(&entry.source_path))
         {
+            let from_romm = matches!(
+                choices.get(&entry.source_path).map(|c| &c.source),
+                Some(NameSource::Romm)
+            );
             entry.status = OrganisationStatus::Blocked;
-            entry.reason = Some(UNVERIFIED_HINT_REASON.to_string());
+            entry.reason = Some(
+                if from_romm {
+                    UNVERIFIED_HINT_REASON
+                } else {
+                    UNVERIFIED_NAME_REASON
+                }
+                .to_string(),
+            );
             blocked += 1;
         }
     }
@@ -94,9 +125,6 @@ pub(crate) fn refuse_unverified_names_with(
     approved: &BTreeSet<String>,
     live_choice: &dyn Fn(&Path) -> NameChoice,
 ) -> Result<(), String> {
-    if !mode_changes_real_files(plan.mode) {
-        return Ok(());
-    }
     for entry in plan.suggested() {
         if !approved.contains(entry.source_path.to_string_lossy().as_ref())
             || !gives_a_new_name(entry)
@@ -106,7 +134,7 @@ pub(crate) fn refuse_unverified_names_with(
         let live = live_choice(&entry.source_path);
         if !name_is_verified(Some(&live)) {
             return Err(format!(
-                "{} would be renamed from an unverified name ({}), not a verified catalogue name. Bulk rename uses verified catalogue names only. Nothing was changed. Preview again.",
+                "{} would get a new name from an unverified source ({}), not a verified catalogue name. Bulk renaming of files and links uses verified catalogue names only. Nothing was changed. Preview again.",
                 entry.source_path.display(),
                 live.source_label()
             ));

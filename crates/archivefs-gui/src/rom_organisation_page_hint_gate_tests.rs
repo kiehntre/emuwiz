@@ -3,8 +3,8 @@
 //! catalogue name does.
 
 use super::hint_gate::{
-    UNVERIFIED_HINT_REASON, block_unverified_names, check_live_names, refuse_unverified_names,
-    refuse_unverified_names_with,
+    UNVERIFIED_HINT_REASON, UNVERIFIED_NAME_REASON, block_unverified_names, check_live_names,
+    refuse_unverified_names, refuse_unverified_names_with, unverified_name_label,
 };
 use super::*;
 use archivefs_core::VerifiedDatName as V;
@@ -149,14 +149,126 @@ fn a_move_that_would_rename_from_a_hint_is_blocked_too() {
     assert_eq!(status_of(&plan, HINT_SRC), OrganisationStatus::Blocked);
 }
 
+/// Owner decision 2026-11-22: link modes are gated too. Reorganising
+/// existing links and building a linked library never take a RomM name; a
+/// link that keeps its file's own name, and a verified name, are unaffected.
 #[test]
-fn a_linked_library_never_touches_real_files_and_is_unchanged() {
-    let (mut plan, choices) = mixed_preview(OrganisationMode::BuildLinkedLibrary);
-    assert_eq!(block_unverified_names(&mut plan, &choices), 0);
-    assert!(
-        refuse_unverified_names_with(&plan, &all_approved(&plan), &|p| { romm_only(p, "x") })
-            .is_ok()
+fn every_link_mode_refuses_romm_names_and_keeps_verified_and_unrenamed_links() {
+    for mode in [
+        OrganisationMode::OrganiseSymlinkOnly,
+        OrganisationMode::BuildLinkedLibrary,
+    ] {
+        let (mut plan, choices) = mixed_preview(mode);
+        assert_eq!(block_unverified_names(&mut plan, &choices), 1, "{mode:?}");
+        assert_eq!(
+            status_of(&plan, HINT_SRC),
+            OrganisationStatus::Blocked,
+            "{mode:?}"
+        );
+        assert_eq!(
+            status_of(&plan, VERIFIED_SRC),
+            OrganisationStatus::Suggested
+        );
+        assert_eq!(status_of(&plan, KEEP_SRC), OrganisationStatus::Suggested);
+
+        // Apply, stale preview: the RomM row is refused in this mode too.
+        let (stale, _) = mixed_preview(mode);
+        let error = refuse_unverified_names_with(&stale, &all_approved(&stale), &|p| {
+            if p == Path::new(VERIFIED_SRC) {
+                verified(p, "Verified One (USA).nes")
+            } else {
+                romm_only(p, "Hint One (USA)")
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("h_one.nes"), "{mode:?}: {error}");
+        assert!(error.contains("files and links"), "{error}");
+    }
+}
+
+#[test]
+fn a_new_name_from_neither_source_gets_its_own_reason_not_the_romm_one() {
+    let (mut plan, mut choices) = mixed_preview(OrganisationMode::OrganiseSymlinkOnly);
+    choices.insert(
+        PathBuf::from(HINT_SRC),
+        choose_name(V::None, None, Path::new(HINT_SRC)),
     );
+    block_unverified_names(&mut plan, &choices);
+    let row = plan
+        .entries
+        .iter()
+        .find(|e| e.source_path == Path::new(HINT_SRC))
+        .unwrap();
+    assert_eq!(row.reason.as_deref(), Some(UNVERIFIED_NAME_REASON));
+    assert_eq!(
+        unverified_name_label(row),
+        Some("Proposed name (not verified, not applied)")
+    );
+}
+
+fn page_texts(state: &mut RomOrganisationPageState) -> Vec<String> {
+    let ctx = egui::Context::default();
+    let output = ctx.run(Default::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                show_rom_organisation_page_with_busy(ui, state, false, false);
+            });
+        });
+    });
+    fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+            egui::Shape::Vec(nested) => nested.iter().for_each(|s| collect(s, out)),
+            _ => {}
+        }
+    }
+    let mut texts = Vec::new();
+    output
+        .shapes
+        .iter()
+        .for_each(|c| collect(&c.shape, &mut texts));
+    texts
+}
+
+fn blocked_hint_page(mode: OrganisationMode) -> RomOrganisationPageState {
+    let mut state = RomOrganisationPageState::default();
+    state.set_mode(mode);
+    let (mut plan, choices) = mixed_preview(mode);
+    plan.entries
+        .retain(|e| e.source_path == Path::new(HINT_SRC));
+    block_unverified_names(&mut plan, &choices);
+    state.plan = Some(plan);
+    state.name_choices = choices;
+    state
+}
+
+#[test]
+fn the_existing_link_page_says_the_hint_is_not_applied_and_no_action_runs() {
+    let mut state = blocked_hint_page(OrganisationMode::OrganiseSymlinkOnly);
+    let texts = page_texts(&mut state);
+    let has = |needle: &str| texts.iter().any(|t| t.contains(needle));
+    assert!(has("RomM suggests (hint only, not applied)"), "{texts:?}");
+    assert!(
+        has("Action: none (the new name is not verified)"),
+        "{texts:?}"
+    );
+    assert!(!has("Will become:"), "{texts:?}");
+    assert!(!has("Action: Move existing link"), "{texts:?}");
+    assert!(has("not used to name files or links in bulk"), "{texts:?}");
+    assert!(state.approved.is_empty());
+}
+
+#[test]
+fn the_linked_library_page_says_no_link_is_created_for_a_hint() {
+    let mut state = blocked_hint_page(OrganisationMode::BuildLinkedLibrary);
+    let texts = page_texts(&mut state);
+    let has = |needle: &str| texts.iter().any(|t| t.contains(needle));
+    assert!(
+        has("RomM suggests (hint only, not applied), no link is created"),
+        "{texts:?}"
+    );
+    assert!(!has("Destination link:"), "{texts:?}");
+    assert!(state.approved.is_empty());
 }
 
 #[test]

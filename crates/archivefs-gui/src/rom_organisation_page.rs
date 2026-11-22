@@ -1702,7 +1702,7 @@ pub(crate) fn name_counts(
     let mut counts = NameCounts::default();
     for entry in &plan.entries {
         // Blocked, unsupported or colliding entries have no usable destination.
-        let hint_only = entry.reason.as_deref() == Some(hint_gate::UNVERIFIED_HINT_REASON);
+        let hint_only = hint_gate::blocked_for_unverified_name(entry);
         if !hint_only
             && !matches!(
                 entry.status,
@@ -2946,7 +2946,7 @@ fn show_plan(
     if !name_choices.is_empty() {
         let c = name_counts(plan, &name_choices);
         ui.label(format!(
-            "Names: {} verified catalogue names to apply · {} already correct · {} RomM hints (not verified, not renamed in bulk) · {} archives skipped (catalogue names a file inside)",
+            "Names: {} verified catalogue names to apply · {} already correct · {} RomM hints (not verified, not used to name files or links in bulk) · {} archives skipped (catalogue names a file inside)",
             c.dat_changes, c.dat_already_correct, c.romm_fallbacks, c.archives_skipped
         ));
     }
@@ -3134,10 +3134,16 @@ fn show_plan(
                                 .monospace(),
                         );
                         ui.label(
-                            egui::RichText::new(format!(
-                                "Destination link: {}",
-                                entry.destination_path.display()
-                            ))
+                            egui::RichText::new(match hint_gate::unverified_name_label(entry) {
+                                Some(label) => format!(
+                                    "{label}, no link is created: {}",
+                                    entry.destination_path.display()
+                                ),
+                                None => format!(
+                                    "Destination link: {}",
+                                    entry.destination_path.display()
+                                ),
+                            })
                             .monospace(),
                         );
                         ui.label("Source action: Untouched");
@@ -3158,15 +3164,11 @@ fn show_plan(
                         if quick_mame {
                             ui.label("MAME collections use the dedicated MAME tools.");
                         } else {
-                            let hint_only =
-                                entry.reason.as_deref() == Some(hint_gate::UNVERIFIED_HINT_REASON);
-                            ui.label(if hint_only {
-                                format!(
-                                    "RomM suggests (hint only, not applied): {}",
-                                    entry.destination_path.display()
-                                )
-                            } else {
-                                format!("Rename to: {}", entry.destination_path.display())
+                            ui.label(match hint_gate::unverified_name_label(entry) {
+                                Some(label) => {
+                                    format!("{label}: {}", entry.destination_path.display())
+                                }
+                                None => format!("Rename to: {}", entry.destination_path.display()),
                             });
                             show_name_choice(ui, name_choices.get(&entry.source_path));
                             ui.label(format!("Identity: Verified by {}", entry.platform_source));
@@ -3210,7 +3212,13 @@ fn show_plan(
                 } else {
                     ui.vertical(|ui| {
                         ui.label(format!("Current: {}", entry.source_path.display()));
-                        ui.label(format!("Will become: {}", entry.destination_path.display()));
+                        let unverified = hint_gate::unverified_name_label(entry);
+                        ui.label(match unverified {
+                            Some(label) => {
+                                format!("{label}: {}", entry.destination_path.display())
+                            }
+                            None => format!("Will become: {}", entry.destination_path.display()),
+                        });
                         show_name_choice(ui, name_choices.get(&entry.source_path));
                         if !entry.platform_display_name.is_empty() {
                             ui.label(format!(
@@ -3219,6 +3227,9 @@ fn show_plan(
                             ));
                         }
                         ui.label(match plan.mode {
+                            _ if unverified.is_some() => {
+                                "Action: none (the new name is not verified)"
+                            }
                             OrganisationMode::RenameInPlace => "Action: Rename file",
                             OrganisationMode::MoveRealFile => "Action: Move file",
                             OrganisationMode::OrganiseSymlinkOnly => "Action: Move existing link",
