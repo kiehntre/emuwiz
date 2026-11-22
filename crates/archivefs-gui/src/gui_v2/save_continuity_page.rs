@@ -180,7 +180,7 @@ pub(super) fn save_summary(record: &SessionRecord) -> String {
         return "The saves were not compared after this session.".to_string();
     }
     if record.save_changes.is_empty() {
-        return "No save changed in this session.".to_string();
+        return "None of the saves EmuWiz read changed in this session.".to_string();
     }
     let changes: Vec<String> = record
         .save_changes

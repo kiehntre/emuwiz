@@ -480,7 +480,7 @@ impl Gated {
             .process_started_gated(
                 &session.session_id,
                 &started(),
-                Ok((baseline, 3)),
+                Ok((baseline, 3, 0)),
                 &self.table,
             )
             .unwrap();
@@ -646,7 +646,7 @@ fn only_the_started_emulators_saves_are_read_and_another_emulators_baseline_is_r
         .process_started_gated(
             &session.session_id,
             &started(),
-            Ok((baseline, 1)),
+            Ok((baseline, 1, 0)),
             &run.table,
         )
         .unwrap();
@@ -657,4 +657,318 @@ fn only_the_started_emulators_saves_are_read_and_another_emulators_baseline_is_r
     fs::write(run.saves.join("Played (USA).srm"), [9u8; 8192]).unwrap();
     let ended = run.end(&session.session_id);
     assert!(ended.save_changes.is_empty() && ended.saves_after.is_none());
+}
+
+#[test]
+fn a_save_unreadable_at_both_ends_is_said_to_be_not_known() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid only reads the process's own id.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let run = gated();
+    let untouched = run.saves.join("Untouched (USA).srm");
+    fs::set_permissions(&untouched, fs::Permissions::from_mode(0o000)).unwrap();
+    let session = run.start();
+    let ended = run.end(&session);
+    fs::set_permissions(&untouched, fs::Permissions::from_mode(0o644)).unwrap();
+    // Not silence: silence would read as "nothing changed".
+    assert_eq!(
+        ended.save_changes,
+        vec![SaveChange::NotKnown {
+            label: "Untouched (USA).srm".into()
+        }]
+    );
+}
+
+#[test]
+fn a_save_folder_that_cannot_be_listed_is_never_taken_for_an_empty_one() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid only reads the process's own id.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let lock = |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode));
+
+    // Before the start: no baseline at all, rather than an empty one.
+    let run = gated();
+    lock(&run.saves, 0o000).unwrap();
+    let read = run.tracker.baseline_before_start(&retroarch());
+    lock(&run.saves, 0o755).unwrap();
+    assert!(read.is_err(), "{read:?}");
+
+    // After the session: the end is recorded, nothing is compared, and no
+    // save is called gone.
+    let run = gated();
+    let session = run.start();
+    lock(&run.saves, 0o000).unwrap();
+    let ended = run.end(&session);
+    lock(&run.saves, 0o755).unwrap();
+    assert_eq!(ended.state, SessionState::Ended);
+    assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
+    assert!(!ended.needs_attention());
+
+    // The save folder moved between the two reads: nothing is compared.
+    let run = gated();
+    let session = run.start();
+    let config = run.saves.parent().unwrap().join("retroarch.cfg");
+    fs::create_dir_all(run.saves.parent().unwrap().join("elsewhere")).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "savefile_directory = \"{}\"\n",
+            run.saves.parent().unwrap().join("elsewhere").display()
+        ),
+    )
+    .unwrap();
+    let ended = run.end(&session);
+    assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
+}
+
+#[test]
+fn a_gated_session_is_untracked_until_its_read_is_handed_over() {
+    let run = gated();
+    let session = run
+        .tracker
+        .begin_gated(SessionGame::default(), "RetroArch")
+        .unwrap();
+    assert!(matches!(
+        session.save_tracking,
+        Some(SaveTracking::Unavailable { .. })
+    ));
+}
+
+fn high_water_kb() -> u64 {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("VmHWM:"))
+                .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// By hand only: what a launch costs with `LAZARUS_HISTORY_N` sessions
+/// already in the journal. Everything is synthetic and lives in a temporary
+/// folder (under `TMPDIR`).
+#[test]
+#[ignore = "by hand: needs LAZARUS_HISTORY_N"]
+fn launch_cost_with_a_long_history_by_hand() {
+    use super::super::tracker::read_baseline;
+    use std::time::Instant;
+    let count: usize = std::env::var("LAZARUS_HISTORY_N").unwrap().parse().unwrap();
+    let run = gated();
+    let ms = |began: Instant| began.elapsed().as_secs_f64() * 1000.0;
+
+    // One real finished session as the pattern, then `count` copies of it
+    // under their own names and ids, all over.
+    let pattern = run.end(&run.start());
+    run.table.0.set(true);
+    let text = serde_json::to_string_pretty(&pattern).unwrap();
+    let sessions = run.root.join("sessions");
+    for old in fs::read_dir(&sessions).unwrap().flatten() {
+        fs::remove_file(old.path()).unwrap();
+    }
+    for index in 0..count {
+        let id = format!("{index:016x}");
+        let requested = 1_600_000_000 + index as i64;
+        let record = text.replace(&pattern.session_id, &id).replace(
+            &format!("\"requested_unix\": {}", pattern.requested_unix),
+            &format!("\"requested_unix\": {requested}"),
+        );
+        fs::write(
+            sessions.join(format!(
+                "{requested:012}-{:09}-{id}.json",
+                pattern.requested_order
+            )),
+            record,
+        )
+        .unwrap();
+    }
+    let journal = run.tracker.journal();
+    println!("HISTORY n={count}");
+
+    // What every look-up used to cost: reading the whole history.
+    let began = Instant::now();
+    assert_eq!(journal.all().len(), count);
+    println!(
+        "HISTORY n={count} whole history read once (old cost of each look-up): {:.1} ms",
+        ms(began)
+    );
+
+    // A journal from before the open list: the list is built once.
+    let _ = fs::remove_file(run.root.join("sessions-open/.complete"));
+    let began = Instant::now();
+    let first = run
+        .tracker
+        .begin_gated(SessionGame::default(), "RetroArch")
+        .unwrap();
+    println!(
+        "HISTORY n={count} first launch after upgrade (list built once): {:.1} ms",
+        ms(began)
+    );
+    run.tracker
+        .finished(&first.session_id, None, Some("not started"))
+        .unwrap();
+
+    // An ordinary launch, step by step.
+    let mut worst = 0f64;
+    let mut step = |name: &str, began: Instant| {
+        let took = ms(began);
+        worst = worst.max(took);
+        println!("HISTORY n={count} {name}: {took:.1} ms");
+    };
+    let began = Instant::now();
+    let baseline = read_baseline(
+        &DiscoveryRoots::under_home(run.saves.ancestors().nth(3).unwrap()),
+        &retroarch(),
+        None,
+    )
+    .unwrap();
+    step("read before the start (what holds the launch)", began);
+    let began = Instant::now();
+    let session = run
+        .tracker
+        .begin_gated(SessionGame::default(), "RetroArch")
+        .unwrap();
+    step("session requested", began);
+    let began = Instant::now();
+    run.tracker
+        .process_started_gated(
+            &session.session_id,
+            &started(),
+            Ok((baseline, 1, 0)),
+            &run.table,
+        )
+        .unwrap();
+    step("process recorded", began);
+    let began = Instant::now();
+    for _ in 0..10 {
+        journal
+            .observe_running(&session.session_id, &run.table)
+            .unwrap();
+    }
+    step("ten looks while running", began);
+    let began = Instant::now();
+    run.tracker.settle();
+    step("settle", began);
+    fs::write(run.saves.join("Played (USA).srm"), [5u8; 8192]).unwrap();
+    let began = Instant::now();
+    let ended = run.end(&session.session_id);
+    step("session ended (second read and comparison)", began);
+    assert_eq!(
+        ended.save_changes,
+        vec![SaveChange::Modified {
+            label: "Played (USA).srm".into()
+        }]
+    );
+    println!("HISTORY n={count} slowest bookkeeping step: {worst:.1} ms");
+
+    // The read before a start while bookkeeping runs flat out beside it.
+    run.table.0.set(true);
+    let roots = DiscoveryRoots::under_home(run.saves.ancestors().nth(3).unwrap());
+    let time_reads = |label: &str| {
+        let mut times: Vec<f64> = (0..200)
+            .map(|_| {
+                let began = Instant::now();
+                read_baseline(&roots, &retroarch(), None).unwrap();
+                ms(began)
+            })
+            .collect();
+        times.sort_by(f64::total_cmp);
+        println!(
+            "HISTORY n={count} read before the start, {label}: median {:.2} ms, worst {:.2} ms (200 reads)",
+            times[100], times[199]
+        );
+    };
+    time_reads("alone");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let (root, home) = (
+            run.root.clone(),
+            run.saves.ancestors().nth(3).unwrap().to_path_buf(),
+        );
+        let stop = &stop;
+        let busy = scope.spawn(move || {
+            // A second handle on the same journal, as another thread has.
+            let tracker =
+                LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
+            let table = One(Cell::new(true));
+            let mut rounds = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let session = tracker
+                    .begin_gated(SessionGame::default(), "RetroArch")
+                    .unwrap();
+                let _ = tracker
+                    .journal()
+                    .observe_running(&session.session_id, &table);
+                tracker.settle();
+                let _ = tracker.finished(&session.session_id, None, Some("not started"));
+                // And the worst a reader of history can do: all of it.
+                let _ = tracker.journal().all();
+                rounds += 1;
+            }
+            rounds
+        });
+        time_reads("beside constant bookkeeping and whole-history reads");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "HISTORY n={count} bookkeeping rounds meanwhile: {}",
+            busy.join().unwrap()
+        );
+    });
+    // Nothing of the history was removed.
+    let left = fs::read_dir(&sessions).unwrap().count();
+    assert!(left >= count, "{left} records left of {count}");
+    println!(
+        "HISTORY n={count} records still present: {left}; peak memory {} MB",
+        high_water_kb() / 1024
+    );
+}
+
+#[test]
+fn bookkeeping_reads_only_the_sessions_that_are_not_over() {
+    let run = gated();
+    // A finished session, then its record made unreadable as JSON: any
+    // step that read the whole history would trip over it or skip it; the
+    // steps of a launch never open it at all.
+    let old = run.end(&run.start());
+    run.table.0.set(true);
+    let open_list = run.root.join("sessions-open");
+    let listed = |dir: &Path| {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+            .count()
+    };
+    assert_eq!(listed(&open_list), 0, "a finished session is not listed");
+    let session = run.start();
+    assert_eq!(listed(&open_list), 1);
+    // Found by its id without the history, and the old one still readable.
+    assert_eq!(
+        run.tracker.journal().get(&session).unwrap().session_id,
+        session
+    );
+    assert_eq!(run.tracker.journal().get(&old.session_id).unwrap(), old);
+    let ended = run.end(&session);
+    assert_eq!(ended.state, SessionState::Ended);
+    assert_eq!(listed(&open_list), 0);
+    assert_eq!(
+        listed(&run.root.join("sessions")),
+        2,
+        "no record was removed"
+    );
+
+    // A session left open by a build that keeps no list is still settled.
+    let stray = run.start();
+    for entry in fs::read_dir(&open_list).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().ends_with(".json") {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    run.table.0.set(false);
+    let settled = run.tracker.settle();
+    assert!(settled.iter().any(|record| record.session_id == stray));
 }

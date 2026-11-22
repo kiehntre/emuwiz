@@ -202,4 +202,62 @@ mod tests {
         assert_eq!(entry.exit, Some(ExitSummary::Code(3)));
         assert!(started_since(next_sequence()).is_empty());
     }
+
+    #[test]
+    fn the_gate_runs_before_the_process_exists_and_its_answer_stays_with_the_process() {
+        use super::super::process_spawn::{PreparedProcessCommand, spawn_watched_process};
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("the-gate-was-here");
+        // Other tests start processes too; the gate answers only for ours.
+        let ours = format!("gate-order-{}", std::process::id());
+        let mark = next_sequence();
+        {
+            let (marker, ours) = (marker.clone(), ours.clone());
+            set_before_start(std::sync::Arc::new(move |_, arguments| {
+                if !arguments.iter().any(|argument| argument.contains(&ours)) {
+                    return None;
+                }
+                // Nothing of this start exists yet.
+                assert!(started_since(mark).iter().all(|process| {
+                    !process
+                        .arguments
+                        .iter()
+                        .any(|argument| argument.contains(&ours))
+                }));
+                // The start waits for the gate, however long it takes.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::write(&marker, b"done").unwrap();
+                Some(4242)
+            }));
+        }
+        // The child succeeds only if the gate had finished before it ran.
+        let command = PreparedProcessCommand {
+            executable: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                format!("test -e '{}' # {ours}", marker.display()).into(),
+            ],
+            working_directory: None,
+        };
+        let _process = spawn_watched_process(&command).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let entry = loop {
+            let entry = started_since(mark).into_iter().find(|process| {
+                process
+                    .arguments
+                    .iter()
+                    .any(|argument| argument.contains(&ours))
+            });
+            if let Some(entry) = entry.filter(|entry| entry.exit.is_some()) {
+                break entry;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(entry.gate_token, Some(4242));
+        assert_eq!(entry.exit, Some(ExitSummary::Code(0)));
+    }
 }

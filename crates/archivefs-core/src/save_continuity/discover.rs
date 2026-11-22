@@ -156,6 +156,17 @@ pub struct DiscoveryReport {
     pub saves: Vec<DiscoveredSave>,
     /// Files that are in a save folder but were not listed, with the reason.
     pub skipped: Vec<String>,
+    /// The path of every entry of `skipped`: a save file, folder or card
+    /// that is there but whose content was not taken in.
+    pub unread: Vec<PathBuf>,
+    /// Places whose contents could not be listed or located at all (a
+    /// folder that cannot be opened, a save folder that is a link, an
+    /// emulator configuration that cannot be read). The list of saves is
+    /// then not complete, and which saves are missing from it is not known.
+    pub incomplete: Vec<String>,
+    /// The folders that were listed for saves whose location is a setting
+    /// (RetroArch's save and state folders).
+    pub places: Vec<PathBuf>,
     pub stats: DiscoveryStats,
     /// Formats discovery does not look for at all.
     pub not_covered: Vec<&'static str>,
@@ -497,13 +508,25 @@ fn evidence(
     }
 }
 
-fn sorted_children(dir: &Path) -> Vec<PathBuf> {
-    let mut children: Vec<PathBuf> = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .collect();
+/// The entries of `dir`, sorted. A folder that is not there has none; one
+/// that is there but cannot be listed is noted in `incomplete`.
+fn listed(dir: &Path, incomplete: &mut Vec<String>) -> Vec<PathBuf> {
+    use std::io::ErrorKind;
+    let mut children = Vec::new();
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => children.push(entry.path()),
+                    Err(error) => {
+                        incomplete.push(format!("{} could not be listed ({error})", dir.display()))
+                    }
+                }
+            }
+        }
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
+        Err(error) => incomplete.push(format!("{} could not be opened ({error})", dir.display())),
+    }
     children.sort();
     children
 }
@@ -556,7 +579,7 @@ pub fn discover(
         if !run.wanted("RPCS3", &base) {
             continue;
         }
-        for user in sorted_children(&base) {
+        for user in listed(&base, &mut run.report.incomplete) {
             sfo_folders(
                 &mut run,
                 &user.join("savedata"),
@@ -626,6 +649,7 @@ fn cards(run: &mut Run<'_, '_>, roots: &DiscoveryRoots) -> Result<(), Continuity
             run.report
                 .skipped
                 .push(format!("{} is a link, not a card", card.path.display()));
+            run.report.unread.push(card.path.clone());
             continue;
         }
         let sig = signature(&meta);
@@ -643,6 +667,7 @@ fn cards(run: &mut Run<'_, '_>, roots: &DiscoveryRoots) -> Result<(), Continuity
                 run.report
                     .skipped
                     .push(format!("{}: {error}", card.path.display()));
+                run.report.unread.push(card.path.clone());
                 continue;
             }
         };
@@ -811,12 +836,12 @@ pub fn parse_gci(bytes: &[u8]) -> Option<GciHeader> {
 }
 
 fn gamecube(run: &mut Run<'_, '_>, base: &Path, emulator: &str) -> Result<(), ContinuityError> {
-    for region_dir in sorted_children(base) {
-        for card_dir in sorted_children(&region_dir)
+    for region_dir in listed(base, &mut run.report.incomplete) {
+        for card_dir in listed(&region_dir, &mut run.report.incomplete)
             .into_iter()
             .filter(|p| real_dir(p))
         {
-            for path in sorted_children(&card_dir) {
+            for path in listed(&card_dir, &mut run.report.incomplete) {
                 check(run)?;
                 if path
                     .extension()
@@ -841,6 +866,7 @@ fn gamecube(run: &mut Run<'_, '_>, base: &Path, emulator: &str) -> Result<(), Co
                     Ok(read) => read,
                     Err(why) => {
                         run.report.skipped.push(format!("{} {why}", path.display()));
+                        run.report.unread.push(path.clone());
                         continue;
                     }
                 };
@@ -851,6 +877,7 @@ fn gamecube(run: &mut Run<'_, '_>, base: &Path, emulator: &str) -> Result<(), Co
                         "{} is named .gci but is not a complete GameCube save file",
                         path.display()
                     ));
+                    run.report.unread.push(path.clone());
                     continue;
                 };
                 let folder_region = region_dir
@@ -931,7 +958,10 @@ fn sfo_folders(
     emulator: &str,
     format: SaveFormat,
 ) -> Result<(), ContinuityError> {
-    for folder in sorted_children(base).into_iter().filter(|p| real_dir(p)) {
+    for folder in listed(base, &mut run.report.incomplete)
+        .into_iter()
+        .filter(|p| real_dir(p))
+    {
         check(run)?;
         let sfo_path = folder.join("PARAM.SFO");
         if fs::symlink_metadata(&sfo_path).is_err() {
@@ -941,12 +971,13 @@ fn sfo_folders(
             return Ok(());
         }
         // The folder's signature covers every file directly inside it.
-        let members: Vec<PathBuf> = sorted_children(&folder);
+        let members: Vec<PathBuf> = listed(&folder, &mut run.report.incomplete);
         if members.len() > MAX_FOLDER_SAVE_FILES {
             run.report.skipped.push(format!(
                 "{} holds more than {MAX_FOLDER_SAVE_FILES} files",
                 folder.display()
             ));
+            run.report.unread.push(folder.clone());
             continue;
         }
         let mut sig = String::new();
@@ -1010,6 +1041,7 @@ fn sfo_folders(
             run.report
                 .skipped
                 .push(format!("{}: PARAM.SFO could not be read", folder.display()));
+            run.report.unread.push(folder.clone());
             continue;
         };
         let declared = sfo.get_text("SAVEDATA_DIRECTORY").map(str::to_string);
@@ -1118,8 +1150,17 @@ fn is_state_suffix(suffix: &str) -> bool {
 
 fn retroarch(run: &mut Run<'_, '_>, config_dir: &Path, home: &Path) -> Result<(), ContinuityError> {
     let config_file = config_dir.join("retroarch.cfg");
-    let Ok(config_text) = fs::read_to_string(&config_file) else {
-        return Ok(());
+    let config_text = match fs::read_to_string(&config_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            // Where this RetroArch keeps its saves cannot be told.
+            run.report.incomplete.push(format!(
+                "{} could not be read ({error})",
+                config_file.display()
+            ));
+            return Ok(());
+        }
     };
     let saves_dir = configured_dir(
         &config_text,
@@ -1149,14 +1190,34 @@ fn retroarch(run: &mut Run<'_, '_>, config_dir: &Path, home: &Path) -> Result<()
     }
     let mut observed: BTreeMap<PathBuf, InUse> = BTreeMap::new();
     for (dir, states) in [(saves_dir, false), (states_dir, true)] {
-        if !real_dir(&dir) {
-            continue;
+        run.report.places.push(dir.clone());
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Ok(_) => {
+                // A link (or a file) where the folder should be: not followed.
+                run.report.incomplete.push(format!(
+                    "{} is not a plain folder; what it holds was not read",
+                    dir.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                run.report
+                    .incomplete
+                    .push(format!("{} could not be checked ({error})", dir.display()));
+                continue;
+            }
         }
         let mut files = Vec::new();
-        for child in sorted_children(&dir) {
+        for child in listed(&dir, &mut run.report.incomplete) {
             if real_dir(&child) {
                 // One level down: RetroArch's "sort saves into folders by core".
-                files.extend(sorted_children(&child).into_iter().map(|path| (path, true)));
+                files.extend(
+                    listed(&child, &mut run.report.incomplete)
+                        .into_iter()
+                        .map(|path| (path, true)),
+                );
             } else {
                 files.push((child, false));
             }
@@ -1213,11 +1274,21 @@ fn retroarch(run: &mut Run<'_, '_>, config_dir: &Path, home: &Path) -> Result<()
                 Ok(read) => read,
                 Err(why) => {
                     run.report.skipped.push(format!("{} {why}", path.display()));
+                    run.report.unread.push(path.clone());
                     continue;
                 }
             };
             if crate::memory_card_manager::discovery::sniff_format(&path) != CardFormat::NotACard {
-                // A PlayStation card kept as .srm: already listed save by save.
+                // A PlayStation card kept as .srm: listed save by save where
+                // cards are looked for. Elsewhere (a save folder of the
+                // person's own choosing) it is not read at all: say so.
+                if !run.report.saves.iter().any(|save| save.source_path == path) {
+                    run.report.skipped.push(format!(
+                        "{} is a memory card that was not read save by save",
+                        path.display()
+                    ));
+                    run.report.unread.push(path.clone());
+                }
                 continue;
             }
             run.report.stats.files_read += 1;

@@ -292,13 +292,19 @@ ran and whether a save's content changed.
 
 ### What a save held before the session
 
-**The saves are read before the emulator exists.** Every emulator process, on
-every route, is created by one function (`launch::process_spawn`). Just before
-it creates the process it calls a gate (`launch::process_log::set_before_start`)
-and waits for it. Blue sets that gate: it works out which emulator and profile
-(native or Flatpak) is about to start, has the session worker read that
-emulator's saves, and returns only when the read has finished. The process is
-created after that. The order is guaranteed by construction; no file time is
+**The saves are read before the emulator exists.** Every process Blue starts
+for a game, on every route, is created by one function
+(`launch::process_spawn`), and only processes it creates enter the process log
+that sessions are built from. (Version probes and helpers started elsewhere
+never become sessions.) Just before it creates the process it calls a gate
+(`launch::process_log::set_before_start`) and waits for it. Blue sets that
+gate: it works out which emulator and profile (native or Flatpak) is about to
+start, reads that emulator's saves, and returns only when the read has
+finished. The process is created after that.
+
+The read has a thread of its own and needs only the profile's folders. It does
+not open the session journal and never waits behind session bookkeeping, so
+the length of the play history does not affect how long a start is held. The order is guaranteed by construction; no file time is
 consulted.
 
 - **Fresh content, always.** Both the read before the start and the read after
@@ -322,7 +328,18 @@ consulted.
   "unchanged" is said. The game still starts.
 - **A save that cannot be read** before the start is reported as "not known
   whether it existed before" if it can be read afterwards, never as new. One
-  that cannot be read afterwards is "not known", never "no longer there".
+  that cannot be read afterwards is "not known", never "no longer there". One
+  that can be read at neither end (a PCSX2 folder memory card, a card that
+  does not parse, a file over the size limit) is listed as "not known" in
+  every session: silence would read as "unchanged".
+- **A save folder that cannot be listed** (or a RetroArch configuration that
+  cannot be read, or a save folder that is a link) is never taken for an empty
+  one. Before the start it means no baseline; after the session it means
+  nothing is compared. The same if RetroArch's save folder setting differs
+  between the two reads. The session's end is recorded either way.
+- **"None of the saves EmuWiz read changed"** is what a quiet session says. It
+  speaks only for saves discovery covers; the formats it does not look for are
+  listed under Discovery.
 
 | Read before the start | After the session | Reported |
 |---|---|---|
@@ -332,6 +349,7 @@ consulted.
 | read | absent | no longer there |
 | could not be read | present | written; not known whether it existed before |
 | read | cannot be read | not known |
+| could not be read | could not be read | not known |
 | no baseline for the session | (not compared) | save changes were not tracked |
 
 Cost: the start is held for the read. Measured in the release build: see the
@@ -343,8 +361,18 @@ seconds earlier than the launch's first process, on an unstepped clock) is
 still in the library (`LaunchTracker::begin` / `process_started`). Blue does not
 use it.
 
-Limits: a program other than the started emulator writing a save between the
-read and the emulator's start is not told apart from the emulator. A Flatpak
+Routine bookkeeping does not read the history. The journal keeps, beside the
+records, a list of the sessions that are not over (`sessions-open/`, one empty
+file per open session). Settling, looking at a running session and fetching a
+record by id read only those and the record asked for. The list is built once
+for a journal that has none. No record is moved, pruned or removed.
+
+Limits: a second copy of the same emulator already running, or any program
+other than the started emulator writing a save between the read and the
+emulator's start, is not told apart from the session's emulator. PlayStation
+memory cards kept outside the folders cards are read from are reported as "not
+known", not read. PCSX2 and DuckStation card folders that cannot be listed are
+not detected as such (their lister belongs to the card manager). A Flatpak
 or wrapper launcher that itself changes saves before the emulator starts would
 be counted as the session. A torn read (a file being written by something else
 during the read) gives the fingerprint of what was read.

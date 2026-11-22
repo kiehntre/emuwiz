@@ -162,17 +162,12 @@ pub struct SaveMark {
     pub path: Option<PathBuf>,
 }
 
-/// Whether `mark`'s file is one of those a read could not take in. Each
-/// entry of `unread` starts with the file's path.
-fn among_unread(unread: &[String], mark: &SaveMark) -> bool {
-    mark.path.as_ref().is_some_and(|path| {
-        let path = path.display().to_string();
-        unread.iter().any(|entry| {
-            entry
-                .strip_prefix(&path)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', ':']))
-        })
-    })
+/// Whether `mark`'s file (or the card or folder it is in) is one of those
+/// a read could not take in.
+fn among_unread(unread: &[PathBuf], mark: &SaveMark) -> bool {
+    mark.path
+        .as_ref()
+        .is_some_and(|path| unread.iter().any(|entry| path.starts_with(entry)))
 }
 
 /// Whether a session can say what its saves held before the emulator ran.
@@ -183,8 +178,11 @@ pub enum SaveTracking {
     /// created: the launch was held until the read had finished.
     Established {
         captured_unix: i64,
-        /// How long the launch was held for the read.
+        /// How long the launch was held for the read, in all.
         held_milliseconds: u64,
+        /// Of that, how long the read waited before it began.
+        #[serde(default)]
+        queued_milliseconds: u64,
     },
     /// What the saves held before the session is not known, so the session
     /// says nothing about which saves changed.
@@ -365,10 +363,14 @@ pub struct SessionRecord {
     /// Save files the read before the start could not take in (each entry
     /// starts with the path). Their starting content is not known.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub saves_unread_before: Vec<String>,
+    pub saves_unread_before: Vec<PathBuf>,
     /// The same for the read after the session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub saves_unread_after: Vec<String>,
+    pub saves_unread_after: Vec<PathBuf>,
+    /// The folders that were searched for saves at the read before the
+    /// start, where their location is a setting that can change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_places_before: Option<Vec<PathBuf>>,
     /// The saves as they were once the session had ended, when they were
     /// compared. `None`: not compared (a crash, an exit EmuWiz did not see).
     #[serde(default)]
@@ -963,6 +965,10 @@ fn consult_crash_source(
 
 pub struct SessionJournal {
     dir: PathBuf,
+    /// One empty file per session that is not over yet, named like its
+    /// record: what routine bookkeeping looks at, instead of every record
+    /// ever written. The records themselves are never moved or removed.
+    open_dir: PathBuf,
     device_id: String,
     /// Where fatal terminations are looked up. Never knows, by default.
     crash: Box<dyn CrashSource>,
@@ -987,9 +993,11 @@ pub fn diff_saves_with(
     before: &[SaveMark],
     after: &[SaveMark],
     folders: Option<&[FolderMark]>,
-    unread_before: &[String],
-    unread_after: &[String],
+    unread_before: &[PathBuf],
+    unread_after: &[PathBuf],
 ) -> Vec<SaveChange> {
+    // Unread files already answered for through one of their marks.
+    let mut answered: Vec<&Path> = Vec::new();
     let index = |marks: &[SaveMark]| -> BTreeMap<String, SaveMark> {
         marks
             .iter()
@@ -1009,7 +1017,11 @@ pub fn diff_saves_with(
                             .any(|known| known.before_launch && &known.path == folder)
                     })
                 });
-                changes.push(if absent_before && !among_unread(unread_before, mark) {
+                let unread = among_unread(unread_before, mark);
+                if unread {
+                    answered.extend(mark.path.as_deref());
+                }
+                changes.push(if absent_before && !unread {
                     SaveChange::Created { label }
                 } else {
                     SaveChange::CreatedBeforeNotKnown { label }
@@ -1034,13 +1046,30 @@ pub fn diff_saves_with(
             let label = mark.label.clone();
             // An unproven mark may be of a file the emulator itself made
             // after it started: its going is not a save lost.
-            changes.push(
-                if mark.before_launch == Some(false) || among_unread(unread_after, mark) {
-                    SaveChange::NotKnown { label }
-                } else {
-                    SaveChange::Missing { label }
-                },
-            );
+            let unread = among_unread(unread_after, mark);
+            if unread {
+                answered.extend(mark.path.as_deref());
+            }
+            changes.push(if mark.before_launch == Some(false) || unread {
+                SaveChange::NotKnown { label }
+            } else {
+                SaveChange::Missing { label }
+            });
+        }
+    }
+    // A save file that could not be read at one end or both, and that no
+    // mark above stands for: nothing is known about it, and that is said.
+    let mut unread: Vec<&PathBuf> = unread_before.iter().chain(unread_after).collect();
+    unread.sort();
+    unread.dedup();
+    for path in unread {
+        if !answered.iter().any(|done| done.starts_with(path)) {
+            changes.push(SaveChange::NotKnown {
+                label: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string()),
+            });
         }
     }
     changes
@@ -1054,8 +1083,15 @@ impl SessionJournal {
             .mode(0o700)
             .create(&dir)
             .map_err(|error| super::io("cannot create", &dir, error))?;
+        let open_dir = root.join("sessions-open");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&open_dir)
+            .map_err(|error| super::io("cannot create", &open_dir, error))?;
         Ok(Self {
             dir,
+            open_dir,
             device_id: device_id.to_string(),
             crash: Box::new(NoCrashSource),
         })
@@ -1067,23 +1103,102 @@ impl SessionJournal {
         self
     }
 
-    fn path(&self, record: &SessionRecord) -> PathBuf {
+    fn file_name(record: &SessionRecord) -> String {
         // Second, then an order number within this run of EmuWiz, then id:
         // file names sort in the order the sessions were requested, even
         // when several fall in the same second.
-        self.dir.join(format!(
+        format!(
             "{:012}-{:09}-{}.json",
             record.requested_unix.max(0),
             record.requested_order,
             record.session_id
-        ))
+        )
+    }
+
+    fn path(&self, record: &SessionRecord) -> PathBuf {
+        self.dir.join(Self::file_name(record))
+    }
+
+    fn is_open(record: &SessionRecord) -> bool {
+        matches!(
+            record.state,
+            SessionState::Requested | SessionState::Started
+        )
+    }
+
+    /// Record file names in `dir`, sorted (oldest first). Names only.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn read_named(&self, name: &str) -> Option<SessionRecord> {
+        let bytes = fs::read(self.dir.join(name)).ok()?;
+        let record: SessionRecord = serde_json::from_slice(&bytes).ok()?;
+        (record.format_version == SESSION_FORMAT_VERSION).then_some(record)
+    }
+
+    /// The sessions that are not over, without reading the whole history.
+    ///
+    /// The first time (a journal from before the open list existed) every
+    /// record is read once to build the list. After that only the listed
+    /// sessions are read, plus the newest few records by name, which covers
+    /// sessions written by a build that does not keep the list.
+    fn open_records(&self) -> Vec<SessionRecord> {
+        const NEWEST_ALWAYS_READ: usize = 32;
+        let complete = self.open_dir.join(".complete");
+        if fs::symlink_metadata(&complete).is_err() {
+            for record in self.all() {
+                if Self::is_open(&record) {
+                    let _ = fs::File::create(self.open_dir.join(Self::file_name(&record)));
+                }
+            }
+            let _ = fs::File::create(&complete);
+        }
+        let mut names = Self::names_in(&self.open_dir);
+        let all = Self::names_in(&self.dir);
+        names.extend(all.iter().rev().take(NEWEST_ALWAYS_READ).cloned());
+        names.sort();
+        names.dedup();
+        let mut open = Vec::new();
+        for name in names.iter().rev() {
+            match self.read_named(name) {
+                Some(record) if Self::is_open(&record) => open.push(record),
+                // Over, or its record is gone or unreadable: not open.
+                _ => {
+                    let _ = fs::remove_file(self.open_dir.join(name));
+                }
+            }
+        }
+        open
     }
 
     fn write(&self, record: &SessionRecord) -> Result<(), ContinuityError> {
         let path = self.path(record);
         let text = serde_json::to_vec_pretty(record)
             .map_err(|error| ContinuityError::Io(error.to_string()))?;
-        super::write_state_file(&path, &text)
+        let listed = self.open_dir.join(Self::file_name(record));
+        if Self::is_open(record) {
+            // Listed before it is written: a session can be listed and
+            // over (the list is then corrected), never open and unlisted.
+            let _ = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&listed);
+        }
+        super::write_state_file(&path, &text)?;
+        if !Self::is_open(record) {
+            let _ = fs::remove_file(&listed);
+        }
+        Ok(())
     }
 
     /// Step 1: a launch was asked for.
@@ -1137,6 +1252,7 @@ impl SessionJournal {
             save_tracking: None,
             saves_unread_before: Vec::new(),
             saves_unread_after: Vec::new(),
+            save_places_before: None,
             saves_after: None,
             save_changes: Vec::new(),
             snapshots: Vec::new(),
@@ -1147,9 +1263,18 @@ impl SessionJournal {
     }
 
     pub fn get(&self, session_id: &str) -> Result<SessionRecord, ContinuityError> {
-        self.all()
-            .into_iter()
-            .find(|record| record.session_id == session_id)
+        // The id is the end of the record's file name: one file is read,
+        // not the whole history. Open sessions are looked for first.
+        let suffix = format!("-{session_id}.json");
+        let named = |dir: &Path| {
+            Self::names_in(dir)
+                .into_iter()
+                .find(|name| name.ends_with(&suffix))
+        };
+        named(&self.open_dir)
+            .and_then(|name| self.read_named(&name))
+            .or_else(|| named(&self.dir).and_then(|name| self.read_named(&name)))
+            .filter(|record| record.session_id == session_id)
             .ok_or_else(|| ContinuityError::NotFound(format!("session {session_id}")))
     }
 
@@ -1319,7 +1444,8 @@ impl SessionJournal {
         session_id: &str,
         tracking: SaveTracking,
         saves_before: Vec<SaveMark>,
-        unread_before: Vec<String>,
+        unread_before: Vec<PathBuf>,
+        places: Vec<PathBuf>,
     ) -> Result<SessionRecord, ContinuityError> {
         let mut record = self.get(session_id)?;
         (record.saves_before, record.saves_unread_before) = match &tracking {
@@ -1327,6 +1453,7 @@ impl SessionJournal {
             SaveTracking::Unavailable { .. } => (Vec::new(), Vec::new()),
         };
         record.folders_before = None;
+        record.save_places_before = Some(places);
         record.save_tracking = Some(tracking);
         self.write(&record)?;
         Ok(record)
@@ -1336,7 +1463,7 @@ impl SessionJournal {
     pub fn note_unread_after(
         &self,
         session_id: &str,
-        unread: Vec<String>,
+        unread: Vec<PathBuf>,
     ) -> Result<(), ContinuityError> {
         if unread.is_empty() {
             return Ok(());
@@ -1662,7 +1789,7 @@ impl SessionJournal {
     /// Returns the records it changed.
     pub fn reconcile(&self, processes: &dyn ProcessTable, now: i64) -> Vec<SessionRecord> {
         let mut settled = Vec::new();
-        for mut record in self.all() {
+        for mut record in self.open_records() {
             match record.state {
                 SessionState::Requested if now - record.requested_unix > START_GRACE_SECONDS => {
                     record.state = SessionState::NeverStarted;

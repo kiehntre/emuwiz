@@ -212,8 +212,10 @@ fn folder_of(save: &DiscoveredSave) -> Option<PathBuf> {
 pub struct Baseline {
     pub launch: SessionLaunch,
     pub marks: Vec<SaveMark>,
-    /// Save files that could not be read (each entry starts with the path).
-    pub unread: Vec<String>,
+    /// Save files, folders or cards that could not be read.
+    pub unread: Vec<PathBuf>,
+    /// The folders searched, where their location is a setting.
+    pub places: Vec<PathBuf>,
     pub captured_unix: i64,
 }
 
@@ -222,6 +224,94 @@ pub fn saves_known_for(emulator: &str) -> bool {
     NATIVE_NAMES
         .iter()
         .any(|(_, known)| known.eq_ignore_ascii_case(emulator))
+}
+
+/// One fresh read of the saves.
+struct Fresh {
+    saves: Vec<DiscoveredSave>,
+    /// Save files, folders or cards that are there but were not taken in.
+    unread: Vec<PathBuf>,
+    /// The folders searched, where the location is a setting.
+    places: Vec<PathBuf>,
+}
+
+/// Reads every save file's content afresh: never a remembered
+/// fingerprint, whatever the file's size and times say. `only` narrows
+/// the look to one emulator and profile. Fails, rather than return a
+/// list with saves missing from it, when a save folder could not be
+/// listed or located. No in-use check: this is only for content marks.
+fn fresh_read(
+    roots: &DiscoveryRoots,
+    only: Option<&SessionLaunch>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Fresh, ContinuityError> {
+    let report = discover(
+        roots,
+        DiscoveryOptions {
+            cancel,
+            only: only.map(|launch| (launch.emulator.as_str(), launch.profile.as_str())),
+            ..Default::default()
+        },
+    )?;
+    if report.stats.stopped_at_limit {
+        return Err(ContinuityError::Io(
+            "there are too many save files to read them all".into(),
+        ));
+    }
+    if let Some(first) = report.incomplete.first() {
+        return Err(ContinuityError::Io(format!(
+            "the saves could not all be found: {first}"
+        )));
+    }
+    let mut unread = report.unread;
+    unread.extend(
+        report
+            .saves
+            .iter()
+            .filter(|save| save.content_sha256.is_none())
+            .map(|save| save.source_path.clone()),
+    );
+    unread.sort();
+    unread.dedup();
+    let mut places = report.places;
+    places.sort();
+    places.dedup();
+    Ok(Fresh {
+        saves: report.saves,
+        unread,
+        places,
+    })
+}
+
+/// Reads the saves of the emulator `launch` names, and only those, afresh.
+/// Needs nothing but the profile to look in: no journal, no session. For a
+/// launcher that **holds the start of the emulator until this has
+/// returned**. `cancel` stops the read (it then fails).
+pub fn read_baseline(
+    roots: &DiscoveryRoots,
+    launch: &SessionLaunch,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Baseline, ContinuityError> {
+    let read = fresh_read(roots, Some(launch), cancel)?;
+    // Everything a narrowed look returns was found under the starting
+    // emulator's own profile, wherever its settings put the save folder.
+    let marks = read
+        .saves
+        .iter()
+        .filter(|save| save.emulator.eq_ignore_ascii_case(&launch.emulator))
+        .filter_map(|save| {
+            let mut mark = mark_of(save)?;
+            mark.before_launch = Some(true);
+            Some(mark)
+        })
+        .collect();
+    Ok(Baseline {
+        launch: launch.clone(),
+        marks,
+        unread: read.unread,
+        places: read.places,
+        captured_unix: now_unix(),
+    })
 }
 
 pub struct LaunchTracker {
@@ -256,42 +346,12 @@ impl LaunchTracker {
         &self.device_id
     }
 
-    /// Reads every save file's content afresh: never a remembered
-    /// fingerprint, whatever the file's size and times say. `only` narrows
-    /// the look to one emulator and profile. Returns the saves and the save
-    /// files that could not be taken in (each entry starts with the path).
-    /// No in-use check: this is only for content marks.
-    fn fresh(
-        &self,
-        only: Option<&SessionLaunch>,
-    ) -> Result<(Vec<DiscoveredSave>, Vec<String>), ContinuityError> {
-        let report = discover(
-            &self.roots,
-            DiscoveryOptions {
-                only: only.map(|launch| (launch.emulator.as_str(), launch.profile.as_str())),
-                ..Default::default()
-            },
-        )?;
-        if report.stats.stopped_at_limit {
-            return Err(ContinuityError::Io(
-                "there are too many save files to read them all".into(),
-            ));
-        }
-        let mut unread = report.skipped;
-        unread.extend(
-            report
-                .saves
-                .iter()
-                .filter(|save| save.content_sha256.is_none())
-                .map(|save| save.source_path.display().to_string()),
-        );
-        unread.sort();
-        unread.dedup();
-        Ok((report.saves, unread))
+    fn fresh(&self, only: Option<&SessionLaunch>) -> Result<Fresh, ContinuityError> {
+        fresh_read(&self.roots, only, None)
     }
 
     fn saves(&self) -> Result<Vec<DiscoveredSave>, ContinuityError> {
-        Ok(self.fresh(None)?.0)
+        Ok(self.fresh(None)?.saves)
     }
 
     /// Reads the saves of the emulator `launch` names, and only those. For
@@ -302,25 +362,7 @@ impl LaunchTracker {
         &self,
         launch: &SessionLaunch,
     ) -> Result<Baseline, ContinuityError> {
-        let (saves, unread) = self.fresh(Some(launch))?;
-        let marks = saves
-            .iter()
-            .filter(|save| {
-                save.emulator.eq_ignore_ascii_case(&launch.emulator)
-                    && save.profile.eq_ignore_ascii_case(&launch.profile)
-            })
-            .filter_map(|save| {
-                let mut mark = mark_of(save)?;
-                mark.before_launch = Some(true);
-                Some(mark)
-            })
-            .collect();
-        Ok(Baseline {
-            launch: launch.clone(),
-            marks,
-            unread,
-            captured_unix: now_unix(),
-        })
+        read_baseline(&self.roots, launch, None)
     }
 
     /// A launch was asked for by a launcher that holds the emulator's start
@@ -335,7 +377,19 @@ impl LaunchTracker {
             emulator: expected_emulator.to_string(),
             ..Default::default()
         };
-        self.journal.request(game, launch, Vec::new())
+        let record = self.journal.request(game, launch, Vec::new())?;
+        // Not tracked until a read made before the start says otherwise: a
+        // session that never gets that far must not look like one whose
+        // saves were read.
+        self.journal.set_save_tracking(
+            &record.session_id,
+            SaveTracking::Unavailable {
+                reason: "the saves were not read before the emulator started".into(),
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     /// The gated launcher started `process`. `baseline` is what its gate
@@ -345,7 +399,7 @@ impl LaunchTracker {
         &self,
         session_id: &str,
         process: &StartedProcess,
-        baseline: Result<(Baseline, u64), String>,
+        baseline: Result<(Baseline, u64, u64), String>,
         processes: &dyn ProcessTable,
     ) -> Result<SessionRecord, ContinuityError> {
         let launch = classify_started(&process.executable, &process.arguments);
@@ -356,8 +410,16 @@ impl LaunchTracker {
             process.start_ticks,
             processes,
         )?;
-        let (tracking, marks, unread) = match baseline {
-            Ok((baseline, held_milliseconds))
+        let unavailable = |reason: String| {
+            (
+                SaveTracking::Unavailable { reason },
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let (tracking, marks, unread, places) = match baseline {
+            Ok((baseline, held_milliseconds, queued_milliseconds))
                 if baseline.launch.emulator == launch.emulator
                     && baseline.launch.profile == launch.profile =>
             {
@@ -365,22 +427,18 @@ impl LaunchTracker {
                     SaveTracking::Established {
                         captured_unix: baseline.captured_unix,
                         held_milliseconds,
+                        queued_milliseconds,
                     },
                     baseline.marks,
                     baseline.unread,
+                    baseline.places,
                 )
             }
-            Ok(_) => (
-                SaveTracking::Unavailable {
-                    reason: "the saves read before the start were another emulator's".into(),
-                },
-                Vec::new(),
-                Vec::new(),
-            ),
-            Err(reason) => (SaveTracking::Unavailable { reason }, Vec::new(), Vec::new()),
+            Ok(_) => unavailable("the saves read before the start were another emulator's".into()),
+            Err(reason) => unavailable(reason),
         };
         self.journal
-            .set_save_tracking(session_id, tracking, marks, unread)
+            .set_save_tracking(session_id, tracking, marks, unread, places)
     }
 
     /// A launch was asked for. Which emulator will really start is not known
@@ -540,13 +598,40 @@ impl LaunchTracker {
                 .journal
                 .mark_ended(session_id, observed, None, processes);
         }
-        let (saves_after, unread_after) = self.fresh(Some(&record.launch))?;
-        self.journal.note_unread_after(session_id, unread_after)?;
-        let mut after: Vec<SaveMark> = saves_after
+        // The session's end is recorded whatever happens to the read of
+        // the saves: without a complete second read, or with the saves kept
+        // somewhere else than at the first read, nothing is compared.
+        let read = match self.fresh(Some(&record.launch)) {
+            Ok(read)
+                if record
+                    .save_places_before
+                    .as_ref()
+                    .is_none_or(|places| places == &read.places) =>
+            {
+                read
+            }
+            _ => {
+                return self
+                    .journal
+                    .mark_ended(session_id, observed, None, processes);
+            }
+        };
+        let gated = record.save_tracking.is_some();
+        if self
+            .journal
+            .note_unread_after(session_id, read.unread.clone())
+            .is_err()
+        {
+            return self
+                .journal
+                .mark_ended(session_id, observed, None, processes);
+        }
+        let mut after: Vec<SaveMark> = read
+            .saves
             .iter()
             .filter(|save| {
                 save.emulator.eq_ignore_ascii_case(&record.launch.emulator)
-                    && save.profile.eq_ignore_ascii_case(&record.launch.profile)
+                    && (gated || save.profile.eq_ignore_ascii_case(&record.launch.profile))
             })
             .filter_map(mark_of)
             .collect();

@@ -9,9 +9,11 @@
 //! **The saves are read before the emulator exists.** This module sets the
 //! process log's before-start gate: the one function that creates every
 //! emulator process calls it first and waits, and the gate returns only when
-//! the worker has finished reading that emulator's saves (or has given up,
+//! that emulator's saves have been read (or the read has been given up on,
 //! in which case the session says save changes were not tracked, never
-//! "changed" or "unchanged"). Nothing is inferred from file times.
+//! "changed" or "unchanged"). Nothing is inferred from file times. That read
+//! has a thread of its own and needs only the profile's folders: it never
+//! waits behind the session bookkeeping below, however long the history is.
 //!
 //! Everything slow (reading saves to mark their content) happens on one
 //! worker thread; the interface thread only sends a message. While a session
@@ -47,7 +49,7 @@ const ABANDONED: u8 = 2;
 
 /// What the gate's read gave for one start: the saves and how long the
 /// start was held (milliseconds), or why there is nothing.
-type GateResult = Result<(Baseline, u64), String>;
+type GateResult = Result<(Baseline, u64, u64), String>;
 
 const NOT_READ: &str = "the saves could not be read before the emulator started";
 const TOO_SLOW: &str = "reading the saves took longer than the start could be held";
@@ -77,17 +79,6 @@ enum Message {
         /// was over and belong to a later one.
         until_sequence: u64,
     },
-    /// The gate: an emulator is about to be started and is being held.
-    ReadBeforeStart {
-        token: u64,
-        launch: SessionLaunch,
-        /// PENDING until the worker has the result (DONE) or the gate has
-        /// stopped waiting (ABANDONED); whichever comes first stands.
-        state: Arc<AtomicU8>,
-        began: Instant,
-        /// Dropped or sent to: either releases the gate.
-        reply: Sender<()>,
-    },
 }
 
 type OpenTracker = Box<dyn FnOnce() -> Result<LaunchTracker, ContinuityError> + Send>;
@@ -109,38 +100,90 @@ fn worker() -> Option<Sender<Message>> {
         .map(|sender| sender.clone())
 }
 
+/// What the gate read, by token, until the session of the started process
+/// claims it.
+static READS: Mutex<BTreeMap<u64, GateResult>> = Mutex::new(BTreeMap::new());
+
+fn claim_read(token: u64) -> Option<GateResult> {
+    READS.lock().ok()?.remove(&token)
+}
+
 /// The before-start gate. Runs on whichever thread is about to create the
 /// process, and returns only when the saves have been read or given up on.
 fn gate(executable: &Path, arguments: &[String]) -> Option<u64> {
+    use archivefs_core::save_continuity::discover::DiscoveryRoots;
+    use archivefs_core::save_continuity::tracker::read_baseline;
     let launch = classify_started(executable, arguments);
     if !saves_known_for(&launch.emulator) {
         // Not an emulator whose saves are looked for: nothing to wait for.
         return None;
     }
-    hold_for_read(&worker()?, launch)
+    let roots = DiscoveryRoots::current()?;
+    Some(hold_for_read(GATE_PATIENCE, move |cancel| {
+        read_baseline(&roots, &launch, Some(cancel))
+            .map_err(|error| format!("{NOT_READ} ({error})"))
+    }))
 }
 
-/// Asks `worker` to read `launch`'s saves and waits for it.
-fn hold_for_read(worker: &Sender<Message>, launch: SessionLaunch) -> Option<u64> {
+/// Runs `read` on a thread of its own and waits for it, at most `patience`.
+/// Returns the token under which the outcome is kept: the read, if it
+/// finished while the caller was still waiting, or else why there is none.
+/// A read that finishes after the wait was given up is thrown away: by then
+/// the emulator may exist.
+fn hold_for_read(
+    patience: Duration,
+    read: impl FnOnce(&std::sync::atomic::AtomicBool) -> Result<Baseline, String> + Send + 'static,
+) -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let token = NEXT.fetch_add(1, Ordering::Relaxed);
+    let began = Instant::now();
     let state = Arc::new(AtomicU8::new(PENDING));
-    let (reply, done) = mpsc::channel();
-    worker
-        .send(Message::ReadBeforeStart {
-            token,
-            launch,
-            state: Arc::clone(&state),
-            began: Instant::now(),
-            reply,
-        })
-        .ok()?;
-    if done.recv_timeout(GATE_PATIENCE).is_err() {
-        // Not waiting any longer. If the worker finished in this very
-        // instant its result stands; otherwise it will be thrown away.
-        let _ = state.compare_exchange(PENDING, ABANDONED, Ordering::SeqCst, Ordering::SeqCst);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (reply, done) = mpsc::channel::<()>();
+    let reader = {
+        let (state, cancel) = (Arc::clone(&state), Arc::clone(&cancel));
+        std::thread::Builder::new()
+            .name("save-baseline-before-start".to_string())
+            .spawn(move || {
+                let queued = began.elapsed().as_millis() as u64;
+                let read = read(&cancel);
+                let held = began.elapsed().as_millis() as u64;
+                // Only a read that finished while the start was still held
+                // counts. This is decided before the gate is released.
+                let in_time = state
+                    .compare_exchange(PENDING, DONE, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok();
+                if in_time {
+                    keep_read(token, read.map(|baseline| (baseline, held, queued)));
+                }
+                let _ = reply.send(());
+            })
+    };
+    let waited = match reader {
+        Ok(_) => done.recv_timeout(patience).is_ok(),
+        Err(_) => false,
+    };
+    if !waited
+        && state
+            .compare_exchange(PENDING, ABANDONED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        // Not waiting any longer; the reader is told to stop, and whatever
+        // it still produces is not kept.
+        cancel.store(true, Ordering::SeqCst);
+        keep_read(token, Err(TOO_SLOW.to_string()));
     }
-    Some(token)
+    token
+}
+
+fn keep_read(token: u64, read: GateResult) {
+    if let Ok(mut reads) = READS.lock() {
+        reads.insert(token, read);
+        while reads.len() > 16 {
+            // Reads no started process ever claimed (the start failed).
+            reads.pop_first();
+        }
+    }
 }
 
 /// The interface thread's handle. Creating it sets the before-start gate.
@@ -246,8 +289,6 @@ fn work(
     let mut open = Some(open);
     let mut tracker: Option<LaunchTracker> = None;
     let mut sessions: Vec<Open> = Vec::new();
-    // What the gate read, by token, until the started process claims it.
-    let mut read_before: BTreeMap<u64, GateResult> = BTreeMap::new();
     loop {
         let waiting_for_status = sessions
             .iter()
@@ -286,8 +327,6 @@ fn work(
         }
         let Some(tracker) = tracker.as_ref() else {
             // Opening failed once; keep draining so senders never block.
-            // A held start is released at once: dropping the message drops
-            // its reply channel, and the gate stops waiting.
             continue;
         };
         // Everything already sent is taken in before any launch is followed:
@@ -295,14 +334,10 @@ fn work(
         // its processes end) before a later launch's process is looked at.
         let mut next = message;
         while let Some(message) = next {
-            take(tracker, &mut sessions, &mut read_before, message);
+            take(tracker, &mut sessions, message);
             next = receiver.try_recv().ok();
         }
-        sessions.retain_mut(|session| follow(tracker, session, &mut read_before, started_since));
-        while read_before.len() > 16 {
-            // Reads no started process ever claimed (the start failed).
-            read_before.pop_first();
-        }
+        sessions.retain_mut(|session| follow(tracker, session, started_since));
         if sessions.iter().any(|session| session.launcher_done) {
             // Ends the sessions whose emulator has gone since.
             tracker.settle();
@@ -310,40 +345,9 @@ fn work(
     }
 }
 
-/// Notes one message. Slow only for `ReadBeforeStart` (it reads the saves).
-fn take(
-    tracker: &LaunchTracker,
-    sessions: &mut Vec<Open>,
-    read_before: &mut BTreeMap<u64, GateResult>,
-    message: Message,
-) {
+/// Notes one message.
+fn take(tracker: &LaunchTracker, sessions: &mut Vec<Open>, message: Message) {
     match message {
-        Message::ReadBeforeStart {
-            token,
-            launch,
-            state,
-            began,
-            reply,
-        } => {
-            let read = tracker
-                .baseline_before_start(&launch)
-                .map_err(|error| format!("{NOT_READ} ({error})"));
-            let held = began.elapsed().as_millis() as u64;
-            // Only a read that finished while the start was still held
-            // counts. This is decided before the gate is released.
-            let in_time = state
-                .compare_exchange(PENDING, DONE, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok();
-            read_before.insert(
-                token,
-                if in_time {
-                    read.map(|baseline| (baseline, held))
-                } else {
-                    Err(TOO_SLOW.to_string())
-                },
-            );
-            let _ = reply.send(());
-        }
         Message::Began {
             after_sequence,
             game,
@@ -376,30 +380,30 @@ fn take(
 }
 
 /// One step for one launch. Returns whether to keep following it.
-fn follow(
-    tracker: &LaunchTracker,
-    session: &mut Open,
-    read_before: &mut BTreeMap<u64, GateResult>,
-    started_since: StartedSince,
-) -> bool {
+fn follow(tracker: &LaunchTracker, session: &mut Open, started_since: StartedSince) -> bool {
     // The first process started inside this launch's own span. Never one
     // started after the launch was over: that is a later launch's.
-    let process = started_since(session.after_sequence)
+    // Of those, one the gate held (an emulator whose saves were read for
+    // it) before any helper the launch may also have started.
+    let in_span: Vec<StartedProcess> = started_since(session.after_sequence)
         .into_iter()
-        .find(|process| {
+        .filter(|process| {
             session
                 .until_sequence
                 .is_none_or(|until| process.sequence < until)
-        });
+        })
+        .collect();
+    let process = in_span
+        .iter()
+        .find(|process| process.gate_token.is_some())
+        .or(in_span.first())
+        .cloned();
     if !session.started
         && let Some(process) = &process
     {
         session.started = true;
         // What the gate read for this very start, if anything.
-        let read = match process
-            .gate_token
-            .and_then(|token| read_before.remove(&token))
-        {
+        let read = match process.gate_token.and_then(claim_read) {
             Some(read) => read,
             None if !saves_known_for(
                 &classify_started(&process.executable, &process.arguments).emulator,
@@ -787,18 +791,27 @@ mod tests {
         classify_started(Path::new("/nowhere/retroarch"), &[])
     }
 
-    /// Runs one launch through the worker: `read` is what the gate hands the
-    /// started process (a token, or none), and the "emulator" writes one
-    /// save and makes another once it has been started.
-    fn gated_launch(
-        sequence: u64,
-        read: impl FnOnce(&Sender<Message>) -> Option<u64>,
-    ) -> SessionRecord {
+    fn read_of(
+        home: &Path,
+    ) -> impl FnOnce(&std::sync::atomic::AtomicBool) -> Result<Baseline, String> + Send + 'static
+    {
+        use archivefs_core::save_continuity::tracker::read_baseline;
+        let roots = DiscoveryRoots::under_home(home);
+        move |cancel| {
+            read_baseline(&roots, &retroarch(), Some(cancel)).map_err(|error| error.to_string())
+        }
+    }
+
+    /// Runs one launch through the worker: `gate` is what happens before
+    /// the "emulator" starts (it gets the home folder and gives the token,
+    /// or none), and the "emulator" writes one save and makes another once
+    /// it has been started.
+    fn gated_launch(sequence: u64, gate: impl FnOnce(&Path) -> Option<u64>) -> SessionRecord {
         let dir = tempfile::tempdir().unwrap();
         let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
         let saves = home_with_saves(&home);
         let worker = tracking(&root, &home, Duration::from_millis(50));
-        let gate_token = read(&worker);
+        let gate_token = gate(&home);
         // Only now does the emulator exist, and write.
         std::fs::write(saves.join("Played (USA).srm"), [9u8; 8192]).unwrap();
         std::fs::write(saves.join("Brand New (USA).srm"), [7u8; 8192]).unwrap();
@@ -826,7 +839,7 @@ mod tests {
         until("the process is recorded", || {
             sessions(&root)
                 .first()
-                .is_some_and(|record| record.save_tracking.is_some())
+                .is_some_and(|record| record.state == SessionState::Started)
         });
         child.kill().unwrap();
         child.wait().unwrap();
@@ -847,7 +860,9 @@ mod tests {
     #[test]
     fn saves_read_while_the_start_is_held_are_the_starting_content() {
         use archivefs_core::save_continuity::session::{SaveChange, SaveTracking};
-        let ended = gated_launch(9_000_010, |worker| hold_for_read(worker, retroarch()));
+        let ended = gated_launch(9_000_010, |home| {
+            Some(hold_for_read(GATE_PATIENCE, read_of(home)))
+        });
         assert!(
             matches!(ended.save_tracking, Some(SaveTracking::Established { .. })),
             "{:?}",
@@ -870,62 +885,96 @@ mod tests {
         );
     }
 
-    #[test]
-    fn without_a_read_before_the_start_nothing_is_said_about_the_saves() {
+    fn untracked(ended: &SessionRecord, reason: &str) {
         use archivefs_core::save_continuity::session::SaveTracking;
-        // The gate gave no token at all.
-        let ended = gated_launch(9_000_011, |_| None);
-        assert_eq!(
-            ended.save_tracking,
-            Some(SaveTracking::Unavailable {
-                reason: NOT_READ.into()
-            })
-        );
+        match &ended.save_tracking {
+            Some(SaveTracking::Unavailable { reason: given }) => {
+                assert!(given.starts_with(reason), "{given}")
+            }
+            other => panic!("{other:?}"),
+        }
+        // Nothing is said about any save, changed or unchanged.
         assert!(ended.saves_before.is_empty());
         assert!(ended.saves_after.is_none());
         assert!(ended.save_changes.is_empty());
-
-        // The gate stopped waiting before the read was done: the read is
-        // thrown away even though it did finish.
-        let ended = gated_launch(9_000_012, |worker| {
-            let (reply, done) = mpsc::channel();
-            worker
-                .send(Message::ReadBeforeStart {
-                    token: 77,
-                    launch: retroarch(),
-                    state: Arc::new(AtomicU8::new(ABANDONED)),
-                    began: Instant::now(),
-                    reply,
-                })
-                .unwrap();
-            done.recv_timeout(Duration::from_secs(20)).unwrap();
-            Some(77)
-        });
-        assert_eq!(
-            ended.save_tracking,
-            Some(SaveTracking::Unavailable {
-                reason: TOO_SLOW.into()
-            })
-        );
-        assert!(ended.save_changes.is_empty() && ended.saves_after.is_none());
     }
 
     #[test]
-    fn a_start_is_not_held_when_the_journal_cannot_be_opened() {
+    fn without_a_read_before_the_start_nothing_is_said_about_the_saves() {
+        // The gate gave no token at all.
+        untracked(&gated_launch(9_000_011, |_| None), NOT_READ);
+
+        // The read failed.
+        untracked(
+            &gated_launch(9_000_013, |_| {
+                Some(hold_for_read(GATE_PATIENCE, |_| {
+                    Err(format!("{NOT_READ} (made to fail)"))
+                }))
+            }),
+            NOT_READ,
+        );
+    }
+
+    #[test]
+    fn a_read_still_running_when_the_wait_is_over_is_thrown_away() {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended = {
+            let finished = Arc::clone(&finished);
+            gated_launch(9_000_012, move |home| {
+                let read = read_of(home);
+                let began = Instant::now();
+                // The read takes longer than the start is held for.
+                let token = hold_for_read(Duration::from_millis(100), move |cancel| {
+                    std::thread::sleep(Duration::from_millis(600));
+                    let read = read(&std::sync::atomic::AtomicBool::new(false));
+                    assert!(cancel.load(Ordering::SeqCst), "the reader was told to stop");
+                    finished.store(true, Ordering::SeqCst);
+                    read
+                });
+                // The start was released at the end of the wait, not of the read.
+                assert!(began.elapsed() < Duration::from_millis(500));
+                Some(token)
+            })
+        };
+        untracked(&ended, TOO_SLOW);
+        // The late read did complete, with a real baseline, and was not used.
+        until("the late read finishes", || finished.load(Ordering::SeqCst));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    #[test]
+    fn the_read_before_a_start_does_not_wait_for_session_bookkeeping() {
+        // A worker that is busy for a long time (its journal takes seconds
+        // to open) does not delay the read: the read has its own thread.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        home_with_saves(&home);
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             work(
                 receiver,
-                Box::new(|| Err(ContinuityError::Refused("no folder".into()))),
+                Box::new(|| {
+                    std::thread::sleep(Duration::from_secs(3));
+                    Err(ContinuityError::Refused("no folder".into()))
+                }),
                 started_since,
                 Duration::from_millis(50),
             )
         });
+        sender
+            .send(Message::Began {
+                after_sequence: 9_000_014,
+                game: game(),
+                emulator: "RetroArch".into(),
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
         let began = Instant::now();
-        assert!(hold_for_read(&sender, retroarch()).is_some());
+        let token = hold_for_read(GATE_PATIENCE, read_of(&home));
         assert!(
-            began.elapsed() < Duration::from_secs(5),
+            began.elapsed() < Duration::from_secs(2),
             "the start was held"
         );
+        assert!(matches!(claim_read(token), Some(Ok(_))));
     }
 }
