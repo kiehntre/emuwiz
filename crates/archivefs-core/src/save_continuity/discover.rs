@@ -703,10 +703,33 @@ fn whole_file(run: &mut Run<'_, '_>, path: &Path) {
     }
 }
 
+/// A file among RetroArch's saves under a name saves do not go by, at a
+/// launch: taken whole if it is a memory card, noted as unread if it cannot
+/// be opened (what it is cannot then be told), left alone otherwise.
+fn odd_named_at_launch(run: &mut Run<'_, '_>, path: &Path) {
+    if !fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()) {
+        return;
+    }
+    if fs::File::open(path).is_err() {
+        run.report
+            .skipped
+            .push(format!("{} cannot be opened", path.display()));
+        run.report.unread.push(path.to_path_buf());
+    } else if crate::memory_card_manager::discovery::sniff_format(path) != CardFormat::NotACard {
+        whole_file(run, path);
+    }
+}
+
 /// Every entry of a memory-card folder, whole. A folder that cannot be
 /// listed makes the look incomplete; a file that cannot be read, a link and
 /// a folder card (whose content is not fingerprinted) are noted as unread.
 fn card_folder_whole(run: &mut Run<'_, '_>, folder: &Path) -> Result<(), ContinuityError> {
+    // A card folder that is there counts as a place searched: if it is
+    // there at one read of a session and not at the other (a drive mounted
+    // or not), the two reads are of different places and are not compared.
+    if fs::metadata(folder).is_ok_and(|meta| meta.is_dir()) {
+        run.report.places.push(folder.to_path_buf());
+    }
     for path in listed(folder, &mut run.report.incomplete) {
         check(run)?;
         if !run.admit() {
@@ -1355,6 +1378,13 @@ fn retroarch(run: &mut Run<'_, '_>, config_dir: &Path, home: &Path) -> Result<()
                 name.rsplit_once('.')
                     .map(|(stem, ext)| (stem.to_string(), ext.to_ascii_lowercase()))
             }) else {
+                // No suffix at all. At a launch it may still be a card.
+                if !states && run.options.only.is_some() {
+                    if !run.admit() {
+                        return Ok(());
+                    }
+                    odd_named_at_launch(run, &path);
+                }
                 continue;
             };
             let format = if is_state_suffix(&suffix) {
@@ -1365,20 +1395,10 @@ fn retroarch(run: &mut Run<'_, '_>, config_dir: &Path, home: &Path) -> Result<()
                 // Not a name saves go by. At a launch, a memory card under
                 // another name (.mcr, .mcd) is still taken whole.
                 if !states && run.options.only.is_some() {
-                    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file())
-                        && fs::File::open(&path).is_err()
-                    {
-                        // Cannot be opened, so what it is cannot be told:
-                        // it may be a card.
-                        run.report
-                            .skipped
-                            .push(format!("{} cannot be opened", path.display()));
-                        run.report.unread.push(path.clone());
-                    } else if crate::memory_card_manager::discovery::sniff_format(&path)
-                        != CardFormat::NotACard
-                    {
-                        whole_file(run, &path);
+                    if !run.admit() {
+                        return Ok(());
                     }
+                    odd_named_at_launch(run, &path);
                 }
                 continue;
             };

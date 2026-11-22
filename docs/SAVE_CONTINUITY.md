@@ -329,9 +329,10 @@ consulted.
 - **A save that cannot be read** before the start is reported as "not known
   whether it existed before" if it can be read afterwards, never as new. One
   that cannot be read afterwards is "not known", never "no longer there". One
-  that can be read at neither end (a PCSX2 folder memory card, a card that
-  does not parse, a file over the size limit) is listed as "not known" in
-  every session: silence would read as "unchanged".
+  that can be read at neither end (a PCSX2 folder memory card, a file over
+  the size limit) is listed as "not known" in every session: silence would
+  read as "unchanged". A card that reads as a file but cannot be taken apart
+  is compared whole and not listed again.
 - **A save folder that cannot be listed** (or a RetroArch configuration that
   cannot be read, or a save folder that is a link) is never taken for an empty
   one. Before the start it means no baseline; after the session it means
@@ -385,11 +386,16 @@ emulator's start, is not told apart from the session's emulator. PCSX2 and
 DuckStation memory-card folders set to somewhere other than the standard
 folders are not looked at: saves there are not tracked and nothing says so.
 The same for cards in RetroArch's standard save folder when its settings name
-another save folder. A save folder that is not there at all is taken as
-holding nothing; for RetroArch's save and state folders, one that appears or
-goes between the two reads means nothing is compared, for a memory-card folder
-that appears its cards are reported as new. A PCSX2 folder memory card is "not
-known" in every session. A Flatpak
+another save folder. An RPCS3 storage folder (`dev_hdd0`) set to somewhere else is not looked at
+either. A save or memory-card folder that is not there at all is taken as
+holding nothing; one that appears or goes between the two reads of a session
+(a drive mounted or not) means nothing is compared. A PCSX2 folder memory card
+is "not known" in every session, and so is anything in a memory-card folder
+that is not a plain file. Every plain file in a memory-card folder is
+fingerprinted, card or not. Among RetroArch's saves, a file under a name saves
+do not go by is tracked only while it is card-shaped. A folder card kept among
+RetroArch's saves is not tracked. The older, ungated library path has none of
+the card protections described here. A Flatpak
 or wrapper launcher that itself changes saves before the emulator starts would
 be counted as the session. A torn read (a file being written by something else
 during the read) gives the fingerprint of what was read.

@@ -1271,3 +1271,135 @@ fn a_card_that_cannot_be_opened_never_makes_its_saves_look_new() {
         );
     }
 }
+
+#[test]
+fn saves_on_a_card_are_never_new_or_gone_because_the_card_could_not_be_opened() {
+    use crate::memory_card_manager::tests::{ps1_card, ps1_save};
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid only reads the process's own id.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let lock =
+        |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+    // A PlayStation Classic's own card folder inside RPCS3, and a card with
+    // no suffix among RetroArch's saves; both hold a save.
+    let classic = home.join(".config/rpcs3/dev_hdd0/game/NPUJ00001/USRDIR/SAVEDATA");
+    let retro = home.join(".config/retroarch");
+    fs::create_dir_all(&classic).unwrap();
+    fs::create_dir_all(retro.join("saves")).unwrap();
+    fs::write(
+        retro.join("retroarch.cfg"),
+        "savefile_directory = \"default\"\n",
+    )
+    .unwrap();
+    let cards = [
+        (classic.join("SCEVMC0.VMP.VM1"), "rpcs3", "RPCS3"),
+        (retro.join("saves/CARDFILE"), "retroarch", "RetroArch"),
+    ];
+    let bytes = ps1_card(&[ps1_save("BASLUS-00001GAME", 1, "GAME")]);
+    for (card, _, _) in &cards {
+        fs::write(card, &bytes).unwrap();
+    }
+    let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
+    for (card, program, emulator) in &cards {
+        let process = StartedProcess {
+            executable: PathBuf::from(format!("/nowhere/{program}")),
+            ..started()
+        };
+        let launch = super::super::tracker::classify_started(&process.executable, &[]);
+        let session_with = |before: &dyn Fn(), during: &dyn Fn()| {
+            before();
+            let baseline = tracker.baseline_before_start(&launch).unwrap();
+            let table = One(Cell::new(true));
+            let session = tracker
+                .begin_gated(SessionGame::default(), emulator)
+                .unwrap();
+            tracker
+                .process_started_gated(&session.session_id, &process, Ok((baseline, 1, 0)), &table)
+                .unwrap();
+            during();
+            table.0.set(false);
+            tracker
+                .finished_in(
+                    &session.session_id,
+                    Some(ExitSummary::Code(0)),
+                    None,
+                    &table,
+                )
+                .unwrap()
+        };
+        // Readable at both ends and untouched: nothing to say.
+        let quiet = session_with(&|| {}, &|| {});
+        assert!(
+            quiet
+                .saves_before
+                .iter()
+                .any(|mark| mark.path.as_ref() == Some(card)),
+            "{emulator}: the card is tracked: {:?}",
+            quiet.saves_before
+        );
+        assert!(
+            quiet.save_changes.is_empty(),
+            "{emulator}: {:?}",
+            quiet.save_changes
+        );
+        // Unopenable before, readable after: nothing is "new".
+        let ended = session_with(&|| lock(card, 0o000), &|| lock(card, 0o644));
+        assert!(
+            !ended.save_changes.is_empty()
+                && ended
+                    .save_changes
+                    .iter()
+                    .all(|change| matches!(change, SaveChange::CreatedBeforeNotKnown { .. })),
+            "{emulator}: {:?}",
+            ended.save_changes
+        );
+        // Readable before, unopenable after: nothing is "gone".
+        let ended = session_with(&|| {}, &|| lock(card, 0o000));
+        lock(card, 0o644);
+        assert!(
+            !ended.save_changes.is_empty()
+                && ended
+                    .save_changes
+                    .iter()
+                    .all(|change| matches!(change, SaveChange::NotKnown { .. })),
+            "{emulator}: {:?}",
+            ended.save_changes
+        );
+        assert!(!ended.needs_attention());
+    }
+    // The card folder is not there at the second read (its drive went):
+    // nothing is compared.
+    let (card, _, _) = &cards[0];
+    let process = StartedProcess {
+        executable: PathBuf::from("/nowhere/rpcs3"),
+        ..started()
+    };
+    let launch = super::super::tracker::classify_started(&process.executable, &[]);
+    let baseline = tracker.baseline_before_start(&launch).unwrap();
+    let table = One(Cell::new(true));
+    let session = tracker
+        .begin_gated(SessionGame::default(), "RPCS3")
+        .unwrap();
+    tracker
+        .process_started_gated(&session.session_id, &process, Ok((baseline, 1, 0)), &table)
+        .unwrap();
+    fs::rename(
+        card.parent().unwrap(),
+        card.parent().unwrap().with_extension("away"),
+    )
+    .unwrap();
+    table.0.set(false);
+    let ended = tracker
+        .finished_in(
+            &session.session_id,
+            Some(ExitSummary::Code(0)),
+            None,
+            &table,
+        )
+        .unwrap();
+    assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
+}

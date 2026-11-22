@@ -428,6 +428,11 @@ fn follow(tracker: &LaunchTracker, session: &mut Open, started_since: StartedSin
         Some(sequence) => in_span.iter().find(|process| process.sequence == sequence),
         None => {
             let held = in_span.iter().find(|process| process.gate_token.is_some());
+            if STARTS_HELD.load(Ordering::SeqCst) > 0 {
+                // An emulator is at the gate: the short wait below starts
+                // over once it has been let through.
+                session.waited_for_emulator = 0;
+            }
             if held.is_none()
                 && !in_span.is_empty()
                 && session.over.is_none()
