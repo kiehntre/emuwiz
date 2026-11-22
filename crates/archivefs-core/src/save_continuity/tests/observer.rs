@@ -17,6 +17,15 @@ impl Proc {
 
     /// One process: name, command line (spaces separate arguments), cgroup.
     fn add(&self, pid: u32, comm: &str, cmdline: &str, cgroup: &str) -> PathBuf {
+        // The scan always passes over its own process. These made-up
+        // processes must never share this test's own process id, which is a
+        // small number (2, say) when the tests run in a process-id space of
+        // their own.
+        let pid = if pid == std::process::id() {
+            pid + 4_000_000
+        } else {
+            pid
+        };
         let dir = self.0.path().join(pid.to_string());
         fs::create_dir_all(dir.join("fd")).unwrap();
         fs::write(dir.join("comm"), comm).unwrap();
