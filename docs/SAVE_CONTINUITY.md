@@ -402,11 +402,17 @@ it that is still there is on another disk than it was; if a folder of the
 second read is on another disk than the nearest noted folder above it; or if
 it is under no noted folder at all. The rule before that holds back one session,
 once, for a setup in which an emulator's save folder is always on another
-disk than its parent and held no save before. What this cannot tell apart: a
-drive that the system gives the same device number as what it replaces or
-covers. That is so for a folder mounted from elsewhere on the same disk (a
-bind mount), and can be so for a memory disk, a network or FUSE mount put in
-where another just left; saves are then reported as gone or new. Sessions not
+disk than its parent and held no save before. The same is done, with the same rules, for the mount each of those folders
+is on (the system's mount number, from `statx`). The mount is what shows a
+folder mounted from elsewhere on the same disk (a bind mount) being taken
+away or put in: such a folder has the disk's own device number. A mount taken
+away and put back during the session is another mount, and nothing is
+compared: what happened to the saves meanwhile is not known. On Linux 6.8 and
+later the mount number is one the system never gives to another mount. On an
+older system it can be given again to a mount made after one was taken away;
+there, a mount replaced by another on the same disk during one session can go
+unseen, and saves are then reported as gone or new. Where the system gives no
+mount number at all, the read fails and the session is not tracked. Sessions not
 started through the gate, and records from before this check, have no disk
 check. The first session in which RetroArch's save or state folder, or a
 memory-card folder, comes to be there is not compared at all; for the other
@@ -420,8 +426,13 @@ new), beside the change of the file itself. The same holds for a
 PlayStation card that RetroArch keeps as a battery save (`.srm`): each read
 notes whether the file was a card, and a save listed on it at one read is
 "not known" when at the other read the file was there but was not a card. Among RetroArch's saves, a file under a name saves
-do not go by is tracked only while it is card-shaped (if it stops or starts
-being one between the two reads it is reported as gone or new). At most 20,000
+do not go by (`.mcr`, `.mcd`, no suffix) is told to be a memory card from its
+bytes at every read, never from its name, and is read only while it is one.
+While it is not a card it is only noted as being there. If it is a card at one
+read and was there but was not a card at the other, what was read from it is
+"not known" (not gone, not new); the same when it cannot be opened at one of
+the two reads. A file of that kind that is not a card at either read is not a
+save file, and nothing is said of it. At most 20,000
 files are looked at per read, counting every file in RetroArch's save folders;
 past that, save changes are not tracked for the session. If a launch starts a
 helper program and the emulator is logged more than about two seconds after
