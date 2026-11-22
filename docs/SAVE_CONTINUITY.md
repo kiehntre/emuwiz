@@ -389,9 +389,15 @@ The same for cards in RetroArch's standard save folder when its settings name
 another save folder. An RPCS3 storage folder (`dev_hdd0`) set to somewhere else is not looked at
 either. A save or memory-card folder that is not there at all is taken as
 holding nothing; one whose path appears or goes between the two reads of a session
-means nothing is compared. That does not cover a folder that is itself the
-place a drive is mounted: unmounted, it is still there, empty, and its saves
-are then reported as no longer there. The first session in which an emulator
+means nothing is compared. A folder that is itself the place a drive is
+mounted is still there, empty, once the drive is taken away. For that the
+read before the start notes which disk (device number) every folder searched,
+and every folder holding a save, is on. If at the end one of them is on
+another disk, a folder that has gone had been on another disk than the folder
+above it, or a new folder is on another disk than the folder it is in, a drive
+came or went and nothing is compared. What this cannot tell apart: a drive
+replaced during the session by another that the system gives the same device
+number. The first session in which an emulator
 creates its save or card folder is not compared at all. A PCSX2 folder memory card
 is "not known" in every session, and so is a link or special file in a
 memory-card folder (an ordinary sub-folder there is passed over). Every plain file in a memory-card folder is
