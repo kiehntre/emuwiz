@@ -58,9 +58,24 @@ pub(crate) fn link_name_line(choice: Option<&NameChoice>) -> String {
             name: Some(title),
             ..
         }) => format!(
-            "Link name: original file name (RomM suggests '{title}', not used: not verified)"
+            "Link name: the game file's own name (RomM suggests '{title}', not used: not verified)"
         ),
-        _ => "Link name: original file name (no verified catalogue name)".to_string(),
+        _ => "Link name: the game file's own name (no verified catalogue name)".to_string(),
+    }
+}
+
+/// The path whose identity and catalogue name describe `source` (an existing
+/// link's checked target game file in reorganise-existing-links mode).
+pub(crate) fn identity_path(mode: OrganisationMode, source: &Path) -> PathBuf {
+    archivefs_core::dat::rom_organisation::link_target::identity_path(mode, source)
+}
+
+/// Reorganise existing links: the game file a link points at (its name is
+/// the fallback link name), or why it cannot be used.
+pub(crate) fn existing_link_line(link: &Path) -> String {
+    match archivefs_core::dat::rom_organisation::link_target::resolve_link_target(link) {
+        Ok(target) => format!("Links to game file: {}", target.display()),
+        Err(reason) => format!("Links to: cannot be checked ({reason})"),
     }
 }
 
@@ -89,9 +104,33 @@ pub(crate) fn blocked_for_unverified_name(entry: &OrganisationPlanEntry) -> bool
     unverified_name_label(entry).is_some()
 }
 
-/// Whether applying this row would give the file a new name.
+/// The name a row keeps without a verified catalogue name: the file's own
+/// name, or for an existing link its target game file's name (never the
+/// link's current name, owner policy 2026-11-22). `None` when an existing
+/// link's target cannot be resolved safely (the planner refuses those).
+pub(crate) fn own_name(mode: OrganisationMode, source: &Path) -> Option<String> {
+    match mode {
+        OrganisationMode::OrganiseSymlinkOnly => {
+            archivefs_core::dat::rom_organisation::link_target::existing_link_target_name(source)
+                .ok()
+        }
+        _ => source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string),
+    }
+}
+
+/// Whether applying this row would give the file or link a name other than
+/// its own name ([`own_name`]). Fails closed when the own name is unknown.
 fn gives_a_new_name(entry: &OrganisationPlanEntry) -> bool {
-    entry.destination_path.file_name() != entry.source_path.file_name()
+    match own_name(entry.mode, &entry.source_path) {
+        Some(own) => entry
+            .destination_path
+            .file_name()
+            .is_none_or(|name| name.to_string_lossy() != own),
+        None => true,
+    }
 }
 
 /// The label for the name a row blocked by this rule was not given, or
@@ -170,12 +209,13 @@ pub(crate) fn check_live_names(
     database_path: &Path,
     names: &NameResolver,
 ) -> Result<(), String> {
-    refuse_unverified_names(plan, approved, names)?;
-    refuse_changed_names_with(plan, approved, &|source| names.choose(source))?;
+    let live = |source: &Path| names.choose(&identity_path(plan.mode, source));
+    refuse_unverified_names_with(plan, approved, &live)?;
+    refuse_changed_names_with(plan, approved, &live)?;
     archivefs_core::dat::rom_organisation::revalidate_organisation_plan(
         plan,
         database_path,
-        &|source| bulk_name(plan.mode, &names.choose(source)),
+        &|source| bulk_name(plan.mode, &live(source)),
     )
 }
 
@@ -195,13 +235,14 @@ pub(crate) fn refuse_changed_names_with(
             continue;
         }
         let (Some(own), Some(reviewed)) = (
-            entry.source_path.file_name().and_then(|n| n.to_str()),
+            own_name(plan.mode, &entry.source_path),
             entry.destination_path.file_name().and_then(|n| n.to_str()),
         ) else {
             continue; // left to the full revalidation
         };
         let live = bulk_name(plan.mode, &live_choice(&entry.source_path));
-        let DeriveOutcome::Ok(now) = derive_proposed_basename(live.as_deref().unwrap_or(own), own)
+        let DeriveOutcome::Ok(now) =
+            derive_proposed_basename(live.as_deref().unwrap_or(&own), &own)
         else {
             continue; // left to the full revalidation
         };
@@ -225,7 +266,9 @@ pub(crate) fn refuse_unverified_names(
     approved: &BTreeSet<String>,
     names: &NameResolver,
 ) -> Result<(), String> {
-    refuse_unverified_names_with(plan, approved, &|source| names.choose(source))
+    refuse_unverified_names_with(plan, approved, &|source| {
+        names.choose(&identity_path(plan.mode, source))
+    })
 }
 
 /// [`refuse_unverified_names`] with the live name choice supplied.

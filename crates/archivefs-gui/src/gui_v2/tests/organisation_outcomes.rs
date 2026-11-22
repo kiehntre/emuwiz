@@ -859,6 +859,7 @@ fn bound_organisation_apply(
         candidates: std::slice::from_ref(&candidate),
         generation: 1,
         unknown_folder: None,
+        link_target_roots: None,
     });
     org::prepare_organisation_catalogue(&mut plan, &db).unwrap();
     let approved: std::collections::BTreeSet<String> =

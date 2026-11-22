@@ -223,6 +223,29 @@ pub(crate) fn bind(
             bindings.push(None);
             continue;
         }
+        // Reorganise existing links: a link object with no library row at
+        // either path (the game's row is its target, which never moves) has
+        // no catalogue path to change, and need not sit in a library folder.
+        if entry.unknown.contains_key(UNCATALOGUED_KEY)
+            && entry.identity.kind == crate::dat::rename_apply::model::ObjectKind::Symlink
+            && row_ids(
+                c,
+                "archives",
+                "absolute_path_cached",
+                entry.source_path.as_os_str().as_bytes(),
+            )?
+            .is_empty()
+            && row_ids(
+                c,
+                "archives",
+                "absolute_path_cached",
+                entry.destination_path.as_os_str().as_bytes(),
+            )?
+            .is_empty()
+        {
+            bindings.push(None);
+            continue;
+        }
         let old = association(c, &entry.source_path)?;
         let new = association(c, &entry.destination_path)?;
         let ids = row_ids(c, "archives", "absolute_path_cached", &old.absolute)?;
@@ -766,9 +789,23 @@ pub(crate) fn validate_bound(
         if !matches!(entry.operation, TransactionOperation::RenameMove) {
             continue;
         }
-        if (entry.unknown.contains_key(COMPANION_KEY)
-            || entry.unknown.contains_key(UNCATALOGUED_KEY)
-            || entry.unknown.contains_key(SAVE_KEY))
+        if entry.unknown.contains_key(UNCATALOGUED_KEY) && !entry.unknown.contains_key(KEY) {
+            // Uncatalogued means no library row at either path; one that
+            // appeared since the preview must not be left pointing at a path
+            // this move empties or fills.
+            let c = &database.connection;
+            for path in [&entry.source_path, &entry.destination_path] {
+                let absolute = path.as_os_str().as_bytes();
+                if !row_ids(c, "archives", "absolute_path_cached", absolute)?.is_empty() {
+                    return Err(format!(
+                        "{} now has a library entry, so it is no longer an uncatalogued move; regenerate the preview",
+                        path.display()
+                    ));
+                }
+            }
+            continue;
+        }
+        if (entry.unknown.contains_key(COMPANION_KEY) || entry.unknown.contains_key(SAVE_KEY))
             && !entry.unknown.contains_key(KEY)
         {
             continue;
@@ -953,4 +990,19 @@ pub(crate) fn folder_rows_moved(
     } else {
         None
     })
+}
+
+/// The enabled, registered source folders, as stored (read-only). Used as
+/// the approved folders an existing link's game file must be inside.
+pub(crate) fn enabled_source_roots(
+    database: &Database,
+) -> std::result::Result<Vec<PathBuf>, String> {
+    let mut stmt = database
+        .connection
+        .prepare("SELECT path FROM source_folders WHERE removed_from_config_at IS NULL AND NOT EXISTS(SELECT 1 FROM source_enablement e WHERE e.source_folder_id=source_folders.id AND e.enabled=0)")
+        .map_err(|e| e.to_string())?;
+    let roots = stmt
+        .query_map([], |r| Ok(PathBuf::from(OsString::from_vec(r.get(0)?))))
+        .map_err(|e| e.to_string())?;
+    roots.map(|root| root.map_err(|e| e.to_string())).collect()
 }

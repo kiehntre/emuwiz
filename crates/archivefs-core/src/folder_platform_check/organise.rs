@@ -335,6 +335,7 @@ pub fn plan_organisation_with_exclusions(
                 candidates: &candidates,
                 generation,
                 unknown_folder: unknown_roots.contains(&root).then_some(unknown_folder),
+                link_target_roots: None,
             });
             let sets = attach_sets(&mut plan, &packages);
             let uncatalogued = picked_files

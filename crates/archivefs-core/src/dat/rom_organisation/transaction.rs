@@ -210,16 +210,24 @@ pub fn build_organisation_transaction(
             failure_reason: None,
             applied_at_unix: None,
             rolled_back_at_unix: None,
-            unknown: entry
-                .catalogue_binding
-                .as_ref()
-                .map(|binding| {
+            unknown: match &entry.catalogue_binding {
+                Some(binding) => std::collections::BTreeMap::from([(
+                    "organisation_catalogue_v1".into(),
+                    binding.clone(),
+                )]),
+                // An existing link normally has no library row of its own
+                // (the game's row is its target, which never moves): it
+                // moves with no catalogue path to change. Binding still binds
+                // a link that does have a row, and Apply refuses an
+                // uncatalogued move once a row exists at either path.
+                None if plan.mode == OrganisationMode::OrganiseSymlinkOnly => {
                     std::collections::BTreeMap::from([(
-                        "organisation_catalogue_v1".into(),
-                        binding.clone(),
+                        crate::database::organisation_paths::UNCATALOGUED_KEY.into(),
+                        serde_json::json!(true),
                     )])
-                })
-                .unwrap_or_default(),
+                }
+                None => Default::default(),
+            },
         });
     }
     if entries.is_empty() {
@@ -408,10 +416,25 @@ pub fn revalidate_organisation_plan(
 
     let database = crate::Database::open_read_only(database_path)
         .map_err(|error| format!("could not open the platform identity database: {error}"))?;
+    // Existing links: the approved folders are read again from the library,
+    // and each link's game file is checked against them again below.
+    let link_roots = if plan.mode == super::model::OrganisationMode::OrganiseSymlinkOnly {
+        Some(
+            super::link_target::approved_library_roots(&database).map_err(|error| {
+                format!("could not read the library's approved folders: {error}")
+            })?,
+        )
+    } else {
+        None
+    };
     for entry in plan.suggested() {
         let candidate = OrganisationCandidate {
             source_path: entry.source_path.clone(),
-            resolution: live_resolution_for(&database, &entry.source_path, plan.generation),
+            resolution: live_resolution_for(
+                &database,
+                &super::link_target::identity_path(plan.mode, &entry.source_path),
+                plan.generation,
+            ),
             canonical_name: canonical_name_for(&entry.source_path),
             content_classification: entry.content_classification.clone(),
             original_metadata: entry.original_metadata.clone(),
@@ -423,6 +446,7 @@ pub fn revalidate_organisation_plan(
             candidates: std::slice::from_ref(&candidate),
             generation: plan.generation,
             unknown_folder: None,
+            link_target_roots: link_roots.as_deref(),
         });
         let re_entry = &re_plan.entries[0];
         if re_entry.status != super::model::OrganisationStatus::Suggested

@@ -177,6 +177,12 @@ fn both_apply_paths_refuse_a_stale_romm_row_at_runtime() {
         text.contains("HINT-GATE-RUNTIME linked-library links=4 conflicts=2 rerun=already-present"),
         "{text}"
     );
+    assert!(
+        text.contains(
+            "HINT-GATE-RUNTIME existing-links moved=4 conflicts=2 refused=4 database=unchanged undo=restored retargeted=refused"
+        ),
+        "{text}"
+    );
 }
 
 /// Everything under the throwaway root, recursively and without following
@@ -473,6 +479,7 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
     state.apply();
     assert!(state.error.is_none(), "{:?}", state.error);
     let mut links = BTreeMap::new();
+    #[allow(clippy::items_after_statements)]
     fn collect(dir: &Path, out: &mut BTreeMap<String, PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -519,4 +526,251 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
         4
     );
     println!("HINT-GATE-RUNTIME linked-library links=4 conflicts=2 rerun=already-present");
+
+    // Reorganise existing links (owner policy 2026-11-22): links made earlier
+    // under RomM or other names are named from their target game file - the
+    // verified catalogue name when the game is verified, otherwise the game
+    // file's own name. Broken and escaping links, and links whose names
+    // collide, are refused and left exactly as they are.
+    let old_links = root.join("old-links");
+    let reorganised = root.join("reorganised");
+    std::fs::create_dir(&old_links).unwrap();
+    std::fs::create_dir(&reorganised).unwrap();
+    let link_to = |name: &str, target: &Path| {
+        let link = old_links.join(name);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        link
+    };
+    let plain = games.join(PLAIN_FILE);
+    let alpha_link = link_to("Alpha RomM Guess (USA).gba", &verified);
+    let romm_link = link_to("Hint One (USA).gba", &hint);
+    let plain_link = link_to("Plain Link.gba", &plain);
+    let clash_a = link_to("Clash A.gba", &games.join(CLASH_FILE));
+    let clash_b = link_to("Clash B.gba", &games.join("sub").join(CLASH_FILE));
+    let broken = link_to("Broken.gba", &games.join("gone.gba"));
+    // A safe relative link ('..' into the approved games folder) at the same
+    // depth as its new folder, so its exact text still reaches the game.
+    std::fs::create_dir(old_links.join("sub")).unwrap();
+    let relative = old_links.join("sub").join("Relative Kept.gba");
+    let relative_text = Path::new("../../games").join(KEPT_FILE);
+    std::os::unix::fs::symlink(&relative_text, &relative).unwrap();
+    // A relative link one level shallower: moved, its text would reach a
+    // different file, so it is refused.
+    let shallow = old_links.join("Shallow Relative.gba");
+    std::os::unix::fs::symlink(Path::new("..").join("games").join(KEPT_FILE), &shallow).unwrap();
+    // A relative link to a file outside the library's approved folders.
+    let outside_dir = root.join("outside");
+    std::fs::create_dir(&outside_dir).unwrap();
+    std::fs::write(outside_dir.join("away.gba"), synthetic_rom(0x5107)).unwrap();
+    let outside = old_links.join("Outside.gba");
+    std::os::unix::fs::symlink(Path::new("..").join("outside").join("away.gba"), &outside).unwrap();
+    // A link to a game file in the approved folder that the library has not
+    // indexed: no platform identity, so it is refused, not guessed.
+    let unindexed_game = games.join("unindexed.gba");
+    std::fs::write(&unindexed_game, synthetic_rom(0x5108)).unwrap();
+    let unindexed = link_to("Unindexed.gba", &unindexed_game);
+    let links_before = snapshot(&old_links);
+    // Every row of every library table, to prove nothing is created,
+    // changed or deleted (the moved links have no library rows).
+    let database_rows = || {
+        let c = rusqlite::Connection::open_with_flags(
+            default_database_path().unwrap(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let tables: Vec<String> = c
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut rows = Vec::new();
+        for table in tables {
+            let mut stmt = c.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let columns = stmt.column_count();
+            let mut table_rows: Vec<String> = stmt
+                .query_map([], |r| {
+                    let mut row = String::new();
+                    for i in 0..columns {
+                        row.push_str(&format!("{:?}|", r.get_ref(i)?));
+                    }
+                    Ok(row)
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            table_rows.sort();
+            rows.push((table, table_rows));
+        }
+        rows
+    };
+    let rows_before = database_rows();
+    let games_before: Vec<_> = snapshot(&root)
+        .into_iter()
+        .filter(|(path, _)| path.starts_with("games"))
+        .collect();
+    let catalogue_paths = || {
+        let database =
+            archivefs_core::Database::open_read_only(&default_database_path().unwrap()).unwrap();
+        let mut known = Vec::new();
+        for path in [&verified, &hint, &plain, &alpha_link, &romm_link] {
+            known.push(
+                database
+                    .find_archive_id_by_absolute_path(path)
+                    .unwrap()
+                    .is_some(),
+            );
+        }
+        known
+    };
+    let catalogue_before = catalogue_paths();
+    assert_eq!(catalogue_before, [true, true, true, false, false]);
+
+    let mut links_state =
+        RomOrganisationPageState::default().with_deferred_source_roots(vec![old_links.clone()]);
+    links_state.configure_for_test(reorganised.clone(), root.join("data/links-journal"));
+    links_state.set_mode(OrganisationMode::OrganiseSymlinkOnly);
+    links_state.generate_plan();
+    assert!(links_state.error.is_none(), "{:?}", links_state.error);
+    let plan = links_state.plan.clone().expect("an existing-links preview");
+    let row = |link: &Path| {
+        plan.entries
+            .iter()
+            .find(|e| e.source_path == link)
+            .unwrap_or_else(|| panic!("no row for {}", link.display()))
+            .clone()
+    };
+    let mut expected = BTreeMap::new();
+    for (link, name, target) in [
+        (&alpha_link, VERIFIED_NAME, &verified),
+        (&romm_link, HINT_FILE, &hint),
+        (&plain_link, PLAIN_FILE, &plain),
+        (&relative, KEPT_FILE, &kept),
+    ] {
+        let entry = row(link);
+        assert_eq!(entry.status, OrganisationStatus::Suggested, "{entry:?}");
+        assert_eq!(
+            entry.destination_path.file_name().unwrap(),
+            name,
+            "{entry:?}"
+        );
+        assert!(entry.destination_path.starts_with(&reorganised));
+        let text = if link == &relative {
+            relative_text.clone()
+        } else {
+            target.clone()
+        };
+        expected.insert(name.to_string(), text);
+        // Each link inherits its game file's platform.
+        assert_eq!(entry.platform.as_deref(), Some("Game Boy Advance"), "{entry:?}");
+    }
+    for link in [&clash_a, &clash_b] {
+        let entry = row(link);
+        assert_eq!(entry.status, OrganisationStatus::Conflict, "{entry:?}");
+        assert!(entry.reason.is_some());
+    }
+    for (link, words) in [
+        (&broken, "broken"),
+        (&outside, "outside the library's approved folders"),
+        (&unindexed, "no platform identity"),
+        (&shallow, "different file"),
+    ] {
+        let entry = row(link);
+        assert_eq!(entry.status, OrganisationStatus::Blocked, "{entry:?}");
+        assert!(
+            entry.reason.as_deref().unwrap().contains(words),
+            "{entry:?}"
+        );
+    }
+    assert_eq!(plan.entries.len(), 10, "every link is accounted for");
+    assert_eq!(plan.suggested().count(), 4);
+
+    links_state.apply();
+    assert!(links_state.error.is_none(), "{:?}", links_state.error);
+    let mut moved = BTreeMap::new();
+    collect(&reorganised, &mut moved);
+    assert_eq!(
+        moved, expected,
+        "each link under its game's name, exact target kept"
+    );
+    for link in [&alpha_link, &romm_link, &plain_link, &relative] {
+        assert!(
+            std::fs::symlink_metadata(link).is_err(),
+            "{} still there",
+            link.display()
+        );
+    }
+    // Refused links are exactly as they were.
+    let left: Vec<_> = snapshot(&old_links);
+    let refused: Vec<_> = links_before
+        .iter()
+        .filter(|(name, _)| {
+            [
+                "Clash A.gba",
+                "Clash B.gba",
+                "Broken.gba",
+                "Outside.gba",
+                "Unindexed.gba",
+                "Shallow Relative.gba",
+                "sub",
+            ]
+            .contains(&name.as_str())
+        })
+        .cloned()
+        .collect();
+    assert_eq!(left, refused);
+    let games_now: Vec<_> = snapshot(&root)
+        .into_iter()
+        .filter(|(path, _)| path.starts_with("games"))
+        .collect();
+    assert_eq!(games_now, games_before, "game files changed");
+    assert_eq!(
+        catalogue_paths(),
+        catalogue_before,
+        "the library's game rows did not move"
+    );
+    assert!(
+        database_rows() == rows_before,
+        "the library database changed on Apply"
+    );
+
+    // Undo puts every link back under its old name with its exact target.
+    links_state.rollback();
+    assert!(links_state.error.is_none(), "{:?}", links_state.error);
+    assert_eq!(
+        snapshot(&old_links),
+        links_before,
+        "Undo restored the links"
+    );
+    let mut after_undo = BTreeMap::new();
+    collect(&reorganised, &mut after_undo);
+    assert!(after_undo.is_empty(), "{after_undo:?}");
+    let games_now: Vec<_> = snapshot(&root)
+        .into_iter()
+        .filter(|(path, _)| path.starts_with("games"))
+        .collect();
+    assert_eq!(games_now, games_before, "game files changed by Undo");
+    assert_eq!(catalogue_paths(), catalogue_before);
+    assert!(
+        database_rows() == rows_before,
+        "the library database changed on Undo"
+    );
+
+    // A link pointed at another game after the preview is not moved.
+    links_state.generate_plan();
+    assert!(links_state.error.is_none(), "{:?}", links_state.error);
+    std::fs::remove_file(&romm_link).unwrap();
+    std::os::unix::fs::symlink(&plain, &romm_link).unwrap();
+    let before_retarget = snapshot(&root);
+    links_state.apply();
+    assert!(
+        links_state.error.is_some(),
+        "a retargeted link must refuse the Apply"
+    );
+    assert!(links_state.applied.is_none());
+    assert_eq!(snapshot(&root), before_retarget, "nothing changed");
+    println!(
+        "HINT-GATE-RUNTIME existing-links moved=4 conflicts=2 refused=4 database=unchanged undo=restored retargeted=refused"
+    );
 }

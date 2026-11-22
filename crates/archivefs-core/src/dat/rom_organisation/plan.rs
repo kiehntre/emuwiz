@@ -55,6 +55,10 @@ pub struct OrganisationPlanRequest<'a> {
     /// `Unnamed/Unknown`). `None` keeps every Unknown game Blocked. Platform
     /// conflicts are always Blocked.
     pub unknown_folder: Option<&'a Path>,
+    /// Reorganise existing links only: the library's approved folders (its
+    /// enabled, registered source folders) that a link's game file must be
+    /// inside. `None` refuses every existing link (fail closed).
+    pub link_target_roots: Option<&'a [PathBuf]>,
 }
 
 /// The folder under `master_root` that holds `platform_id` games: an existing
@@ -247,6 +251,14 @@ fn plan_entry(
                      only reorganises shortcuts that already exist",
                 );
             }
+            // Owner policy 2026-11-22: the link is named from its target
+            // game file; a broken, ambiguous or escaping link is refused.
+            if let Err(reason) = super::link_target::existing_link_target(
+                &candidate.source_path,
+                request.link_target_roots,
+            ) {
+                return blocked(&reason);
+            }
         }
         OrganisationMode::BuildLinkedLibrary => {
             // A linked library links regular files only: the original stays
@@ -333,12 +345,20 @@ fn plan_entry(
     };
 
     // Canonical filename: reuse the rename planner's derivation, never a
-    // second filename engine. Extension mismatches are Unsupported.
-    let rom_name = candidate
-        .canonical_name
-        .as_deref()
-        .unwrap_or(&source_basename);
-    let proposed_basename = match derive_proposed_basename(rom_name, &source_basename) {
+    // second filename engine. Extension mismatches are Unsupported. An
+    // existing link's own name is its target game file's name, never the
+    // link's current name (checked above).
+    let own_name = match mode {
+        OrganisationMode::OrganiseSymlinkOnly => {
+            match super::link_target::existing_link_target_name(&candidate.source_path) {
+                Ok(name) => name,
+                Err(reason) => return blocked(&reason),
+            }
+        }
+        _ => source_basename.clone(),
+    };
+    let rom_name = candidate.canonical_name.as_deref().unwrap_or(&own_name);
+    let proposed_basename = match derive_proposed_basename(rom_name, &own_name) {
         crate::dat::rename_plan::DeriveOutcome::Ok(derived) => derived.proposed_basename,
         crate::dat::rename_plan::DeriveOutcome::Blocked(reason) => return blocked(&reason),
         crate::dat::rename_plan::DeriveOutcome::Unsupported(reason) => {
@@ -362,6 +382,13 @@ fn plan_entry(
             return blocked("no canonical EmuWiz folder exists for this platform");
         }
     };
+
+    if mode == OrganisationMode::OrganiseSymlinkOnly
+        && let Err(reason) =
+            super::link_target::moved_link_still_resolves(&candidate.source_path, &destination_path)
+    {
+        return blocked(&reason);
+    }
 
     let already_organised = if candidate.source_path == destination_path {
         true
@@ -765,4 +792,14 @@ fn mark_conflict(entries: &mut [OrganisationPlanEntry], index: usize, reason: &s
     }
     entry.status = OrganisationStatus::Conflict;
     entry.reason = Some(reason.to_string());
+}
+
+/// Whether `name` can be used unchanged as a link name: a safe single path
+/// component that the name derivation keeps exactly as it is.
+pub(crate) fn is_usable_link_basename(name: &str) -> bool {
+    is_safe_basename(name)
+        && matches!(
+            derive_proposed_basename(name, name),
+            crate::dat::rename_plan::DeriveOutcome::Ok(ref derived) if derived.proposed_basename == name
+        )
 }

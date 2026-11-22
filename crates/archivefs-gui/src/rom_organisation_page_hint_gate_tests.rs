@@ -154,10 +154,9 @@ fn a_move_that_would_rename_from_a_hint_is_blocked_too() {
 /// link that keeps its file's own name, and a verified name, are unaffected.
 #[test]
 fn every_link_mode_refuses_romm_names_and_keeps_verified_and_unrenamed_links() {
-    for mode in [
-        OrganisationMode::OrganiseSymlinkOnly,
-        OrganisationMode::BuildLinkedLibrary,
-    ] {
+    // Reorganise existing links needs real links (its own name is the
+    // target's): see existing_links_are_judged_by_their_target_game_file.
+    for mode in [OrganisationMode::BuildLinkedLibrary] {
         let (mut plan, choices) = mixed_preview(mode);
         assert_eq!(block_unverified_names(&mut plan, &choices), 1, "{mode:?}");
         assert_eq!(
@@ -546,15 +545,15 @@ fn link_rows_say_where_the_link_name_comes_from() {
     );
     assert_eq!(
         link_name_line(Some(&romm_only(src, "Hint One (USA)"))),
-        "Link name: original file name (RomM suggests 'Hint One (USA)', not used: not verified)"
+        "Link name: the game file's own name (RomM suggests 'Hint One (USA)', not used: not verified)"
     );
     assert_eq!(
         link_name_line(Some(&choose_name(V::None, None, src))),
-        "Link name: original file name (no verified catalogue name)"
+        "Link name: the game file's own name (no verified catalogue name)"
     );
     assert_eq!(
         link_name_line(None),
-        "Link name: original file name (no verified catalogue name)"
+        "Link name: the game file's own name (no verified catalogue name)"
     );
 }
 
@@ -593,4 +592,97 @@ fn a_name_that_changed_since_the_preview_is_refused_with_that_reason() {
     })
     .unwrap_err();
     assert!(error.contains("changed since the preview"), "{error}");
+}
+
+/// Reorganise existing links (owner policy 2026-11-22): a link's own name is
+/// its target game file's name, so an old RomM-titled link is a new name (it
+/// is blocked when a plan still carries it, and refused at Apply), a link
+/// renamed to its game file's name is not, and a link whose target cannot be
+/// checked fails closed.
+#[test]
+fn existing_links_are_judged_by_their_target_game_file() {
+    use super::hint_gate::{UNVERIFIED_LINK_HINT_REASON, own_name};
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let games = root.join("games");
+    let links = root.join("links");
+    std::fs::create_dir_all(&games).unwrap();
+    std::fs::create_dir_all(&links).unwrap();
+    for game in ["v_one.nes", "h_one.nes"] {
+        std::fs::write(games.join(game), game).unwrap();
+    }
+    let verified_link = links.join("Alpha RomM Guess (USA).nes");
+    let romm_link = links.join("Hint One (USA).nes");
+    let broken_link = links.join("Broken.nes");
+    std::os::unix::fs::symlink(games.join("v_one.nes"), &verified_link).unwrap();
+    std::os::unix::fs::symlink(games.join("h_one.nes"), &romm_link).unwrap();
+    std::os::unix::fs::symlink(games.join("gone.nes"), &broken_link).unwrap();
+    let mode = OrganisationMode::OrganiseSymlinkOnly;
+    assert_eq!(own_name(mode, &romm_link).as_deref(), Some("h_one.nes"));
+    assert_eq!(own_name(mode, &broken_link), None);
+    let row = |link: &Path, name: &str| {
+        let mut row = entry(&link.to_string_lossy(), name, mode);
+        row.destination_path = root.join("roms/nes").join(name);
+        row
+    };
+    let mut choices = BTreeMap::new();
+    choices.insert(
+        verified_link.clone(),
+        verified(&verified_link, "Verified One (USA).nes"),
+    );
+    choices.insert(romm_link.clone(), romm_only(&romm_link, "Hint One (USA)"));
+    choices.insert(broken_link.clone(), romm_only(&broken_link, "Broken"));
+
+    // A plan that still carries the old RomM-titled link name.
+    let mut stale = plan(
+        mode,
+        vec![
+            row(&verified_link, "Verified One (USA).nes"),
+            row(&romm_link, "Hint One (USA).nes"),
+            row(&broken_link, "Broken.nes"),
+        ],
+    );
+    let approved = all_approved(&stale);
+    let error =
+        refuse_unverified_names_with(&stale, &approved, &|p| choices.get(p).cloned().unwrap())
+            .unwrap_err();
+    assert!(error.contains("Hint One (USA).nes"), "{error}");
+    assert_eq!(block_unverified_names(&mut stale, &choices), 2);
+    let find = |plan: &OrganisationPlan, link: &Path| {
+        plan.entries
+            .iter()
+            .find(|e| e.source_path == link)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        find(&stale, &verified_link).status,
+        OrganisationStatus::Suggested
+    );
+    let romm_row = find(&stale, &romm_link);
+    assert_eq!(romm_row.status, OrganisationStatus::Blocked);
+    assert_eq!(
+        romm_row.reason.as_deref(),
+        Some(UNVERIFIED_LINK_HINT_REASON)
+    );
+    assert_eq!(
+        find(&stale, &broken_link).status,
+        OrganisationStatus::Blocked
+    );
+
+    // The fallback the planner now gives: the game file's own name.
+    let fallback = plan(mode, vec![row(&romm_link, "h_one.nes")]);
+    assert_eq!(
+        refuse_unverified_names_with(&fallback, &all_approved(&fallback), &|p| {
+            choices.get(p).cloned().unwrap()
+        }),
+        Ok(())
+    );
+    let mut fallback = fallback;
+    assert_eq!(block_unverified_names(&mut fallback, &choices), 0);
+    assert_eq!(
+        super::hint_gate::existing_link_line(&romm_link),
+        format!("Links to game file: {}", games.join("h_one.nes").display())
+    );
+    assert!(super::hint_gate::existing_link_line(&broken_link).contains("broken"));
 }

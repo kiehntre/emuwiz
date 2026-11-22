@@ -275,6 +275,7 @@ pub fn preview_game_rename(
         candidates: std::slice::from_ref(&candidate),
         generation,
         unknown_folder: None,
+        link_target_roots: None,
     });
     let entry = plan
         .entries

@@ -86,6 +86,24 @@ fn plan_for(
         candidates,
         generation,
         unknown_folder: None,
+        link_target_roots: None,
+    })
+}
+
+/// Reorganise existing links, with these approved library folders.
+fn plan_with_link_roots(
+    master_root: &Path,
+    candidates: &[OrganisationCandidate],
+    roots: &[PathBuf],
+) -> OrganisationPlan {
+    build_organisation_plan(&OrganisationPlanRequest {
+        master_root,
+        mode: OrganisationMode::OrganiseSymlinkOnly,
+        content_policy: crate::dat::classification::ContentSelectionPolicy::AllEntries,
+        candidates,
+        generation: 1,
+        unknown_folder: None,
+        link_target_roots: Some(roots),
     })
 }
 
@@ -874,7 +892,7 @@ fn symlink_object_move_preserves_the_target_text_and_never_dereferences() {
     let master = dir.path().join("roms");
     let source = dir.path().join("library");
     std::fs::create_dir_all(&source).unwrap();
-    let real_target = dir.path().join("elsewhere").join("real.bin");
+    let real_target = dir.path().join("elsewhere").join("real.iso");
     std::fs::create_dir_all(real_target.parent().unwrap()).unwrap();
     std::fs::write(&real_target, b"real content").unwrap();
     let link = source.join("Game.iso");
@@ -887,11 +905,10 @@ fn symlink_object_move_preserves_the_target_text_and_never_dereferences() {
         content_classification: None,
         original_metadata: Default::default(),
     };
-    let plan = plan_for(
+    let plan = plan_with_link_roots(
         &master,
-        OrganisationMode::OrganiseSymlinkOnly,
         std::slice::from_ref(&cand),
-        1,
+        &[std::fs::canonicalize(real_target.parent().unwrap()).unwrap()],
     );
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
@@ -953,7 +970,9 @@ fn move_real_file_mode_rejects_a_symlink_source() {
 }
 
 #[test]
-fn broken_symlink_object_may_be_moved_with_target_text_preserved() {
+fn a_broken_existing_link_is_refused_and_left_as_it_is() {
+    // Owner policy 2026-11-22: a broken link has no game file to be named
+    // from, so it is refused (it used to be moved).
     let dir = tempfile::tempdir().unwrap();
     let master = dir.path().join("roms");
     let source = dir.path().join("library");
@@ -967,29 +986,23 @@ fn broken_symlink_object_may_be_moved_with_target_text_preserved() {
         content_classification: None,
         original_metadata: Default::default(),
     };
-    let plan = plan_for(
-        &master,
-        OrganisationMode::OrganiseSymlinkOnly,
-        std::slice::from_ref(&cand),
-        1,
+    let plan = plan_for(&master, OrganisationMode::OrganiseSymlinkOnly, &[cand], 1);
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked);
+    assert!(
+        plan.entries[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("broken")
     );
-    let journal = dir.path().join("journal");
-    std::fs::create_dir_all(&journal).unwrap();
-    let cancel = no_cancel();
-    let outcome = apply_plan(&plan, &approved_of(&[&link]), &journal, &cancel);
     assert_eq!(
-        outcome.transaction.state,
-        crate::dat::rename_apply::TransactionState::Applied
-    );
-    let moved = master.join("Sony PlayStation Portable").join("Game.iso");
-    assert_eq!(
-        std::fs::read_link(&moved).unwrap(),
+        std::fs::read_link(&link).unwrap(),
         dir.path().join("nowhere.bin")
     );
 }
 
 #[test]
-fn symlink_to_directory_is_unsupported() {
+fn a_link_to_a_folder_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let master = dir.path().join("roms");
     let source = dir.path().join("library");
@@ -1008,8 +1021,8 @@ fn symlink_to_directory_is_unsupported() {
     let plan = plan_for(&master, OrganisationMode::OrganiseSymlinkOnly, &[cand], 1);
     assert_eq!(
         plan.entries[0].status,
-        OrganisationStatus::Suggested,
-        "a symlink-to-directory link object may be moved (the object itself, never the target)"
+        OrganisationStatus::Blocked,
+        "a link to a folder has no game file to be named from (owner policy 2026-11-22)"
     );
     assert!(target_dir.exists(), "the target directory is never touched");
 }
@@ -1719,6 +1732,7 @@ fn games_only_organisation_blocks_unknown_without_mutation() {
         candidates: &[candidate],
         generation: 1,
         unknown_folder: None,
+        link_target_roots: None,
     });
     assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked);
     assert!(
@@ -1764,6 +1778,7 @@ fn games_only_organisation_allows_confirmed_game_classes() {
             candidates: &[candidate],
             generation: 1,
             unknown_folder: None,
+            link_target_roots: None,
         });
         assert_eq!(plan.entries[0].status, OrganisationStatus::Suggested);
     }
@@ -1937,6 +1952,7 @@ fn the_preview_reports_its_real_phases_and_matches_the_plain_planner() {
         candidates: &candidates,
         generation: 1,
         unknown_folder: None,
+        link_target_roots: None,
     };
     let mut seen: Vec<JobProgress> = Vec::new();
     let plan = {
@@ -1976,6 +1992,7 @@ fn a_cancelled_preview_yields_no_plan_and_changes_nothing_on_disk() {
         candidates: &candidates,
         generation: 1,
         unknown_folder: None,
+        link_target_roots: None,
     };
     let cancel = AtomicBool::new(false);
     let mut sink = |progress: crate::job_progress::JobProgress| {
@@ -2059,6 +2076,7 @@ fn plan_with_unknown(
         candidates,
         generation: 1,
         unknown_folder: unknown,
+        link_target_roots: None,
     })
 }
 
@@ -2153,4 +2171,389 @@ fn conflicting_platforms_never_move_even_with_an_unknown_folder() {
     let cand = candidate(&root.join("mixed"), "Both.zip", conflict);
     let plan = plan_with_unknown(&root, &[cand], Some(Path::new("Unnamed/Unknown")));
     assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked);
+}
+
+// ---------------------------------------------------------------------------
+// Reorganise existing links: named from the target game file (owner 2026-11-22)
+// ---------------------------------------------------------------------------
+
+struct LinkFixture {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    master: PathBuf,
+    games: PathBuf,
+    links: PathBuf,
+}
+
+impl LinkFixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (master, games, links) = (root.join("roms"), root.join("games"), root.join("links"));
+        std::fs::create_dir_all(&games).unwrap();
+        std::fs::create_dir_all(&links).unwrap();
+        Self {
+            _dir: dir,
+            root,
+            master,
+            games,
+            links,
+        }
+    }
+    /// A game file and a link to it under `link_name`.
+    fn link(&self, game: &str, link_name: &str) -> (PathBuf, PathBuf) {
+        let target = self.games.join(game);
+        if !target.exists() {
+            std::fs::write(&target, format!("contents of {game}")).unwrap();
+        }
+        let link = self.links.join(link_name);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        (target, link)
+    }
+    fn candidate(&self, link: &Path, verified_name: Option<&str>) -> OrganisationCandidate {
+        OrganisationCandidate {
+            source_path: link.to_path_buf(),
+            resolution: resolved("PSP", PlatformIdentitySource::Romm),
+            canonical_name: verified_name.map(str::to_string),
+            content_classification: None,
+            original_metadata: Default::default(),
+        }
+    }
+    /// Reorganise existing links, with `games` as the approved folder.
+    fn plan(&self, candidates: &[OrganisationCandidate], _generation: u64) -> OrganisationPlan {
+        plan_with_link_roots(&self.master, candidates, std::slice::from_ref(&self.games))
+    }
+    fn folder(&self) -> PathBuf {
+        self.master.join("Sony PlayStation Portable")
+    }
+}
+
+#[test]
+fn an_unverified_existing_link_is_named_from_its_target_game_file() {
+    // The link was made earlier under a RomM title; with no verified name
+    // (the GUI passes none) it is named from the game file, not kept.
+    let fx = LinkFixture::new();
+    let (target, link) = fx.link("ugly_game.iso", "Romm Title (USA).iso");
+    let plan = fx.plan(&[fx.candidate(&link, None)], 1);
+    let row = &plan.entries[0];
+    assert_eq!(row.status, OrganisationStatus::Suggested, "{row:?}");
+    assert_eq!(row.destination_path, fx.folder().join("ugly_game.iso"));
+    let before = std::fs::read(&target).unwrap();
+    let journal = fx.root.join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let outcome = apply_plan(&plan, &approved_of(&[&link]), &journal, &no_cancel());
+    assert_eq!(
+        outcome.transaction.state,
+        crate::dat::rename_apply::TransactionState::Applied
+    );
+    let moved = fx.folder().join("ugly_game.iso");
+    assert_eq!(
+        std::fs::read_link(&moved).unwrap(),
+        target,
+        "exact target kept"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "the old link name is gone"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        before,
+        "game file untouched"
+    );
+    assert!(std::fs::symlink_metadata(&target).unwrap().is_file());
+}
+
+#[test]
+fn a_verified_existing_link_takes_the_verified_name() {
+    let fx = LinkFixture::new();
+    let (_, link) = fx.link("ugly_game.iso", "Romm Title (USA).iso");
+    let plan = fx.plan(&[fx.candidate(&link, Some("Verified Game (USA).iso"))], 1);
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Suggested);
+    assert_eq!(
+        plan.entries[0].destination_path,
+        fx.folder().join("Verified Game (USA).iso")
+    );
+}
+
+#[test]
+fn an_existing_link_already_named_after_its_game_in_place_is_left_alone() {
+    let fx = LinkFixture::new();
+    std::fs::create_dir_all(fx.folder()).unwrap();
+    let target = fx.games.join("game.iso");
+    std::fs::write(&target, b"g").unwrap();
+    let link = fx.folder().join("game.iso");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let plan = fx.plan(&[fx.candidate(&link, None)], 1);
+    assert_eq!(plan.entries[0].status, OrganisationStatus::AlreadyOrganised);
+}
+
+#[test]
+fn two_existing_links_whose_games_share_a_name_are_both_conflicts() {
+    let fx = LinkFixture::new();
+    let (_, first) = fx.link("same.iso", "Romm A.iso");
+    let sub = fx.games.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let other = sub.join("same.iso");
+    std::fs::write(&other, b"other").unwrap();
+    let second = fx.links.join("Romm B.iso");
+    std::os::unix::fs::symlink(&other, &second).unwrap();
+    let plan = fx.plan(
+        &[fx.candidate(&first, None), fx.candidate(&second, None)],
+        1,
+    );
+    assert_eq!(plan.entries.len(), 2, "neither is dropped");
+    for row in &plan.entries {
+        assert_eq!(row.status, OrganisationStatus::Conflict, "{row:?}");
+        assert!(row.reason.is_some());
+    }
+    assert!(
+        std::fs::symlink_metadata(&first).is_ok() && std::fs::symlink_metadata(&second).is_ok()
+    );
+}
+
+#[test]
+fn an_existing_link_onto_an_occupied_name_is_a_conflict_not_an_overwrite() {
+    let fx = LinkFixture::new();
+    let (_, link) = fx.link("game.iso", "Romm.iso");
+    std::fs::create_dir_all(fx.folder()).unwrap();
+    std::fs::write(fx.folder().join("game.iso"), b"someone else's file").unwrap();
+    let plan = fx.plan(&[fx.candidate(&link, None)], 1);
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Conflict);
+    assert_eq!(
+        std::fs::read(fx.folder().join("game.iso")).unwrap(),
+        b"someone else's file"
+    );
+}
+
+#[test]
+fn relative_absolute_escaping_chained_and_broken_existing_links() {
+    let fx = LinkFixture::new();
+    std::fs::write(fx.games.join("game.iso"), b"g").unwrap();
+    std::fs::write(fx.games.join("other.iso"), b"o").unwrap();
+    let outside = fx.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("away.iso"), b"a").unwrap();
+    let link = |name: &str, text: &Path| {
+        let link = fx.links.join(name);
+        std::os::unix::fs::symlink(text, &link).unwrap();
+        link
+    };
+    // Safe: a relative '..' link and an absolute link to a game in the
+    // approved folder, named from the game file.
+    std::fs::create_dir_all(fx.links.join("sub")).unwrap();
+    let relative = fx.links.join("sub").join("Romm Rel.iso");
+    std::os::unix::fs::symlink("../../games/game.iso", &relative).unwrap();
+    let absolute = link("Romm Abs.iso", &fx.games.join("other.iso"));
+    let plan = fx.plan(
+        &[fx.candidate(&relative, None), fx.candidate(&absolute, None)],
+        1,
+    );
+    for (link, name) in [(&relative, "game.iso"), (&absolute, "other.iso")] {
+        let row = plan
+            .entries
+            .iter()
+            .find(|e| &e.source_path == link)
+            .unwrap();
+        assert_eq!(row.status, OrganisationStatus::Suggested, "{row:?}");
+        assert_eq!(row.destination_path, fx.folder().join(name));
+    }
+    // A plain relative target in the link's own folder is resolved there, and
+    // is outside the approved folder.
+    std::fs::write(fx.links.join("local.iso"), b"l").unwrap();
+    let local = link("Romm Local.iso", Path::new("local.iso"));
+    // Refused.
+    let escaping = link("Escaping.iso", Path::new("../outside/away.iso"));
+    let sneaky = link("Sneaky.iso", Path::new("../games/../outside/away.iso"));
+    let outside_abs = link("Outside.iso", &outside.join("away.iso"));
+    let chained = link("Chained.iso", &relative);
+    let loop_a = fx.links.join("Loop A.iso");
+    let loop_b = fx.links.join("Loop B.iso");
+    std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+    std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+    let alias = fx.root.join("alias");
+    std::os::unix::fs::symlink(&fx.games, &alias).unwrap();
+    let via_folder = link("Via Folder.iso", &alias.join("game.iso"));
+    let to_folder = link("To Folder.iso", &fx.games);
+    let broken = link("Broken.iso", &fx.games.join("gone.iso"));
+    std::fs::write(fx.games.join(" spaced.iso"), b"s").unwrap();
+    let spaced = link("Spaced.iso", &fx.games.join(" spaced.iso"));
+    for (link, words) in [
+        (&local, "outside the library's approved folders"),
+        (&escaping, "outside the library's approved folders"),
+        (&sneaky, "outside the library's approved folders"),
+        (&outside_abs, "outside the library's approved folders"),
+        (&chained, "through another link"),
+        (&loop_a, "through another link"),
+        (&via_folder, "through another link"),
+        (&to_folder, "does not point at a game file"),
+        (&broken, "broken"),
+        (&spaced, "can be used safely"),
+    ] {
+        let before = std::fs::read_link(link).unwrap();
+        let plan = fx.plan(&[fx.candidate(link, None)], 1);
+        let row = &plan.entries[0];
+        assert_eq!(
+            row.status,
+            OrganisationStatus::Blocked,
+            "{}",
+            link.display()
+        );
+        assert!(row.reason.as_deref().unwrap().contains(words), "{row:?}");
+        assert_eq!(std::fs::read_link(link).unwrap(), before, "left as it is");
+    }
+    // No approved folders: every link is refused (fail closed).
+    for roots in [None, Some(&[][..]), Some(&[alias.clone()][..])] {
+        let plan = build_organisation_plan(&OrganisationPlanRequest {
+            master_root: &fx.master,
+            mode: OrganisationMode::OrganiseSymlinkOnly,
+            content_policy: crate::dat::classification::ContentSelectionPolicy::AllEntries,
+            candidates: &[fx.candidate(&relative, None)],
+            generation: 1,
+            unknown_folder: None,
+            link_target_roots: roots,
+        });
+        assert_eq!(
+            plan.entries[0].status,
+            OrganisationStatus::Blocked,
+            "{roots:?}"
+        );
+        assert!(
+            plan.entries[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("approved folders")
+        );
+    }
+}
+
+#[test]
+fn a_folder_swapped_for_a_link_after_the_preview_is_not_applied() {
+    // Target substitution through a path component: the game's folder is
+    // replaced by a link to another folder holding a same-named file.
+    let fx = LinkFixture::new();
+    let sub = fx.games.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("game.iso"), b"real").unwrap();
+    std::fs::create_dir_all(fx.links.join("deep")).unwrap();
+    let link = fx.links.join("deep").join("Romm.iso");
+    std::os::unix::fs::symlink("../../games/sub/game.iso", &link).unwrap();
+    let plan = fx.plan(&[fx.candidate(&link, None)], 1);
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Suggested);
+    let decoy = fx.root.join("decoy");
+    std::fs::create_dir_all(&decoy).unwrap();
+    std::fs::write(decoy.join("game.iso"), b"decoy").unwrap();
+    std::fs::rename(&sub, fx.root.join("sub-moved")).unwrap();
+    std::os::unix::fs::symlink(&decoy, &sub).unwrap();
+    // Re-planning at Apply (what revalidation does) now refuses the link.
+    let again = fx.plan(&[fx.candidate(&link, None)], 1);
+    assert_eq!(again.entries[0].status, OrganisationStatus::Blocked);
+    assert!(
+        again.entries[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("through another link")
+    );
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        Path::new("../../games/sub/game.iso")
+    );
+}
+
+#[test]
+fn an_existing_link_retargeted_after_the_preview_is_not_applied() {
+    let fx = LinkFixture::new();
+    let (target, link) = fx.link("game.iso", "Romm.iso");
+    let plan = fx.plan(&[fx.candidate(&link, None)], 1);
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Suggested);
+    // After the preview the link is pointed at another game.
+    std::fs::write(fx.games.join("other.iso"), b"o").unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(fx.games.join("other.iso"), &link).unwrap();
+    let journal = fx.root.join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    std::fs::create_dir_all(&fx.master).unwrap();
+    // Refused at the first check (building the transaction), or failing
+    // that at Apply: either way nothing moves.
+    let approved = approved_of(&[&link]);
+    let applied = match build_organisation_transaction(&plan, &approved, 1) {
+        Err(error) => {
+            assert!(error.contains("source identity changed"), "{error}");
+            false
+        }
+        Ok(mut tx) => matches!(
+            apply_organisation_transaction(
+                &mut tx,
+                &approved,
+                1,
+                TrustedRoots::from_paths(vec![fx.master.clone(), fx.links.clone()]),
+                &journal,
+                &no_cancel(),
+                OrganisationMode::OrganiseSymlinkOnly,
+                &fx.master,
+            ),
+            Ok(ref outcome) if outcome.transaction.state
+                == crate::dat::rename_apply::TransactionState::Applied
+        ),
+    };
+    assert!(!applied, "a retargeted link must not be moved");
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        fx.games.join("other.iso")
+    );
+    assert!(std::fs::symlink_metadata(fx.folder().join("game.iso")).is_err());
+    assert!(target.exists());
+}
+
+#[test]
+fn a_relative_link_moves_only_when_it_still_reaches_its_game_from_the_new_folder() {
+    let fx = LinkFixture::new();
+    std::fs::write(fx.games.join("game.iso"), b"g").unwrap();
+    // links/x.iso -> ../games/game.iso: from roms/<folder>/ that would be
+    // roms/games/game.iso, a different file, so it is refused.
+    let shallow = fx.links.join("Shallow.iso");
+    std::os::unix::fs::symlink("../games/game.iso", &shallow).unwrap();
+    // links/sub/x.iso -> ../../games/game.iso: the same depth as
+    // roms/<folder>/, so it still reaches the game and may move.
+    std::fs::create_dir_all(fx.links.join("sub")).unwrap();
+    let same_depth = fx.links.join("sub").join("Deep.iso");
+    std::os::unix::fs::symlink("../../games/game.iso", &same_depth).unwrap();
+    // Down and back up: refused as uncheckable.
+    let zigzag = fx.links.join("Zigzag.iso");
+    std::os::unix::fs::symlink("../games/../games/game.iso", &zigzag).unwrap();
+    let plan = fx.plan(&[fx.candidate(&same_depth, None)], 1);
+    assert_eq!(
+        plan.entries[0].status,
+        OrganisationStatus::Suggested,
+        "{:?}",
+        plan.entries[0]
+    );
+    for (link, words) in [(&shallow, "different file"), (&zigzag, "down and back up")] {
+        let plan = fx.plan(&[fx.candidate(link, None)], 1);
+        assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked);
+        assert!(
+            plan.entries[0].reason.as_deref().unwrap().contains(words),
+            "{:?}",
+            plan.entries[0]
+        );
+    }
+    // Applied, the moved link still reaches the same game file.
+    let journal = fx.root.join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let outcome = apply_plan(&plan, &approved_of(&[&same_depth]), &journal, &no_cancel());
+    assert_eq!(
+        outcome.transaction.state,
+        crate::dat::rename_apply::TransactionState::Applied
+    );
+    let moved = fx.folder().join("game.iso");
+    assert_eq!(
+        std::fs::read_link(&moved).unwrap(),
+        Path::new("../../games/game.iso")
+    );
+    assert_eq!(
+        std::fs::canonicalize(&moved).unwrap(),
+        fx.games.join("game.iso")
+    );
 }

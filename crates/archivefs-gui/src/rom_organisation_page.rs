@@ -642,7 +642,7 @@ impl RomOrganisationPageState {
         progress.phase("Reading your game list", "steps", None);
         let names = NameResolver::load();
         let Some((mut candidates, name_choices)) =
-            build_candidates(&self.sources, self.plan_generation, &names)
+            build_candidates_for(self.mode, &self.sources, self.plan_generation, &names)
         else {
             self.error = Some("could not read the platform identity database".to_string());
             self.plan = None;
@@ -658,6 +658,21 @@ impl RomOrganisationPageState {
                 .get(&candidate.source_path)
                 .and_then(|choice| hint_gate::bulk_name(self.mode, choice));
         }
+        // Existing links: the library's approved folders, read from the
+        // library. Unreadable means none, and every link is refused.
+        let link_roots = (self.mode == OrganisationMode::OrganiseSymlinkOnly)
+            .then(|| {
+                default_database_path()
+                    .and_then(Database::open_read_only)
+                    .ok()
+                    .and_then(|database| {
+                        archivefs_core::dat::rom_organisation::link_target::approved_library_roots(
+                            &database,
+                        )
+                        .ok()
+                    })
+            })
+            .flatten();
         // No RomM mapping is consulted: generic destinations derive from the
         // neutral EmuWiz platform layout identity.
         let Some(mut plan) = build_organisation_plan_reporting(
@@ -669,6 +684,7 @@ impl RomOrganisationPageState {
                 candidates: &candidates,
                 generation: self.plan_generation,
                 unknown_folder: None,
+                link_target_roots: link_roots.as_deref(),
             },
             cancel,
             progress,
@@ -1500,7 +1516,8 @@ pub(crate) fn collect_source_files_reported(
 /// identity from the database, and attaching the proposed name chosen by
 /// [`NameResolver`] (verified catalogue name, then RomM, else unchanged).
 /// Returns `None` when the database is unreadable.
-fn build_candidates(
+fn build_candidates_for(
+    mode: OrganisationMode,
     sources: &[PathBuf],
     generation: u64,
     names: &NameResolver,
@@ -1516,6 +1533,22 @@ fn build_candidates(
     }
     let database_path = default_database_path().ok()?;
     let database = Database::open_read_only(&database_path).ok()?;
+    if mode == OrganisationMode::OrganiseSymlinkOnly {
+        // An existing link is described by its checked target game file:
+        // its platform and any verified catalogue name are the game's.
+        return Some(candidates_from_lookups(
+            &database,
+            sources,
+            generation,
+            names,
+            |source| {
+                database
+                    .find_archive_id_by_absolute_path(source)
+                    .map_err(|error| error.to_string())
+            },
+            &|source| hint_gate::identity_path(mode, source),
+        ));
+    }
     Some(build_candidates_in(&database, sources, generation, names))
 }
 
@@ -1535,10 +1568,17 @@ pub(crate) fn build_candidates_in(
     let ids = database
         .archive_path_lookup()
         .map_err(|error| error.to_string());
-    candidates_from_lookups(database, sources, generation, names, |source| match &ids {
-        Ok(ids) => ids.find(source).map_err(|error| error.to_string()),
-        Err(error) => Err(error.clone()),
-    })
+    candidates_from_lookups(
+        database,
+        sources,
+        generation,
+        names,
+        |source| match &ids {
+            Ok(ids) => ids.find(source).map_err(|error| error.to_string()),
+            Err(error) => Err(error.clone()),
+        },
+        &|source| source.to_path_buf(),
+    )
 }
 
 /// The pre-optimisation path: one database lookup per file. Kept for the
@@ -1553,11 +1593,18 @@ pub(crate) fn build_candidates_per_file(
     Vec<OrganisationCandidate>,
     std::collections::BTreeMap<PathBuf, NameChoice>,
 ) {
-    candidates_from_lookups(database, sources, generation, names, |source| {
-        database
-            .find_archive_id_by_absolute_path(source)
-            .map_err(|error| error.to_string())
-    })
+    candidates_from_lookups(
+        database,
+        sources,
+        generation,
+        names,
+        |source| {
+            database
+                .find_archive_id_by_absolute_path(source)
+                .map_err(|error| error.to_string())
+        },
+        &|source| source.to_path_buf(),
+    )
 }
 
 fn candidates_from_lookups(
@@ -1566,6 +1613,7 @@ fn candidates_from_lookups(
     generation: u64,
     names: &NameResolver,
     mut look_up: impl FnMut(&Path) -> Result<Option<i64>, String>,
+    identity_of: &dyn Fn(&Path) -> PathBuf,
 ) -> (
     Vec<OrganisationCandidate>,
     std::collections::BTreeMap<PathBuf, NameChoice>,
@@ -1573,7 +1621,8 @@ fn candidates_from_lookups(
     let mut choices = std::collections::BTreeMap::new();
     let mut candidates = Vec::with_capacity(sources.len());
     for source in sources {
-        let lookup = look_up(source);
+        let identity = identity_of(source);
+        let lookup = look_up(&identity);
         let archive_id = lookup.as_ref().ok().copied().flatten();
         let resolution = match archive_id {
             Some(archive_id) => {
@@ -1585,7 +1634,7 @@ fn candidates_from_lookups(
             }
             None => PlatformIdentityResolution::Unknown { generation },
         };
-        let choice = names.choose_looked_up(source, lookup);
+        let choice = names.choose_looked_up(&identity, lookup);
         candidates.push(OrganisationCandidate {
             source_path: source.clone(),
             resolution,
@@ -3223,6 +3272,9 @@ fn show_plan(
                 } else {
                     ui.vertical(|ui| {
                         ui.label(format!("Current: {}", entry.source_path.display()));
+                        if plan.mode == OrganisationMode::OrganiseSymlinkOnly {
+                            ui.label(hint_gate::existing_link_line(&entry.source_path));
+                        }
                         let unverified = hint_gate::unverified_name_label(entry);
                         ui.label(match unverified {
                             Some(label) => {

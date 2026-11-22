@@ -559,6 +559,7 @@ pub fn plan_library(
         candidates: &candidates,
         generation: context.generation,
         unknown_folder: None,
+        link_target_roots: None,
     });
 
     // organisation_plan.entries is sorted (status, source_path,

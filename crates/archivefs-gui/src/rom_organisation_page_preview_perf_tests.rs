@@ -127,6 +127,7 @@ fn plan(lib: &Library, candidates: &[OrganisationCandidate]) -> OrganisationPlan
             candidates,
             generation: 1,
             unknown_folder: None,
+            link_target_roots: None,
         },
         None,
         &mut progress,

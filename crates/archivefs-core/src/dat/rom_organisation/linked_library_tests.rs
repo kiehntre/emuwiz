@@ -64,6 +64,7 @@ fn plan_for(library_root: &Path, candidates: &[OrganisationCandidate]) -> Organi
         candidates,
         generation: 1,
         unknown_folder: None,
+        link_target_roots: None,
     })
 }
 
@@ -248,6 +249,7 @@ fn existing_move_mode_still_emits_rename_move_operations() {
         candidates: std::slice::from_ref(&candidate),
         generation: 1,
         unknown_folder: None,
+        link_target_roots: None,
     });
     let approved = approved_of(&[&source]);
     let tx = build_tx(&plan, &approved);

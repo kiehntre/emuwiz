@@ -32,6 +32,7 @@
 //! untouched regular sources.
 
 pub mod game_rename;
+pub mod link_target;
 pub mod model;
 pub mod plan;
 pub mod rename_guard;

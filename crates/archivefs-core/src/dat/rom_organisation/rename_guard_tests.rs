@@ -72,6 +72,7 @@ impl Lib {
             candidates: &candidates,
             generation: 1,
             unknown_folder: None,
+            link_target_roots: None,
         })
     }
 }
