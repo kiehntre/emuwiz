@@ -1876,10 +1876,16 @@ fn a_folder_is_judged_by_the_mount_it_is_on() {
     use super::super::tracker::same_mounts;
     let dir = tempfile::tempdir().unwrap();
     let (disk, mount) = disk_and_mount(dir.path()).unwrap();
-    // The same call follows a link, and a folder made here is on this mount.
+    // A folder made here is on this mount, and a link to it is followed.
     let saves = dir.path().join("saves");
     fs::create_dir_all(&saves).unwrap();
     assert_eq!(disk_and_mount(&saves).unwrap(), (disk, mount));
+    let link = dir.path().join("link-to-saves");
+    std::os::unix::fs::symlink(&saves, &link).unwrap();
+    assert_eq!(disk_and_mount(&link).unwrap(), (disk, mount));
+    // Another mount really has another number: /proc is always one.
+    let (_, proc_mount) = disk_and_mount(Path::new("/proc")).unwrap();
+    assert_ne!(proc_mount, mount);
     assert!(disk_and_mount(&dir.path().join("not-there")).is_err());
     let before = vec![(saves.clone(), mount)];
     assert!(same_mounts(&before, &before));
@@ -2075,10 +2081,9 @@ fn a_battery_save_that_stops_or_starts_being_a_card_does_not_lose_or_gain_saves(
 fn an_oddly_named_card_in_any_state_never_loses_or_gains_saves_falsely() {
     use crate::memory_card_manager::tests::{ps1_card, ps1_save};
     use std::os::unix::fs::PermissionsExt;
+    // Only the unopenable states need a user that permissions apply to.
     // SAFETY: geteuid only reads the process's own id.
-    if unsafe { libc::geteuid() } == 0 {
-        return;
-    }
+    let permissions_apply = unsafe { libc::geteuid() } != 0;
     let lock =
         |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     let valid = ps1_card(&[ps1_save("BASLUS-00001GAME", 1, "GAME")]);
@@ -2169,6 +2174,43 @@ fn an_oddly_named_card_in_any_state_never_loses_or_gains_saves_falsely() {
             matches!(change, SaveChange::CreatedBeforeNotKnown { .. })
         });
 
+        // A card replaced by a link (to a card, even): a link is never
+        // followed or read, so nothing is gone; and back: nothing is new.
+        let kept = run.saves.parent().unwrap().join(format!("kept-{name}"));
+        let ended = session_with(&|| {
+            fs::rename(&card, &kept).unwrap();
+            std::os::unix::fs::symlink(&kept, &card).unwrap();
+        });
+        all(&ended, &|change| {
+            matches!(change, SaveChange::NotKnown { .. })
+        });
+        none(&session_with(&|| {}));
+        let ended = session_with(&|| {
+            fs::remove_file(&card).unwrap();
+            fs::rename(&kept, &card).unwrap();
+        });
+        all(&ended, &|change| {
+            matches!(change, SaveChange::CreatedBeforeNotKnown { .. })
+        });
+
+        // Really deleted: gone. Really new: new.
+        let ended = session_with(&|| fs::remove_file(&card).unwrap());
+        all(&ended, &|change| {
+            matches!(change, SaveChange::Missing { .. })
+        });
+        let ended = session_with(&|| fs::write(&card, &valid).unwrap());
+        all(&ended, &|change| {
+            matches!(change, SaveChange::Created { .. })
+        });
+        // Not a card, and deleted or made: it is not a save file.
+        fs::write(&card, &garbage).unwrap();
+        none(&session_with(&|| fs::remove_file(&card).unwrap()));
+        none(&session_with(&|| fs::write(&card, &garbage).unwrap()));
+        fs::write(&card, &valid).unwrap();
+
+        if !permissions_apply {
+            continue;
+        }
         // Readable, then unopenable: nothing is gone.
         let ended = session_with(&|| lock(&card, 0o000));
         all(&ended, &|change| {
@@ -2198,15 +2240,21 @@ fn an_oddly_named_card_in_any_state_never_loses_or_gains_saves_falsely() {
             ended.save_changes
         );
 
-        // Really deleted: gone. Really new: new.
-        let ended = session_with(&|| fs::remove_file(&card).unwrap());
-        all(&ended, &|change| {
-            matches!(change, SaveChange::Missing { .. })
-        });
-        let ended = session_with(&|| fs::write(&card, &valid).unwrap());
-        all(&ended, &|change| {
-            matches!(change, SaveChange::Created { .. })
-        });
+        // Not a card and unopenable, in turn: nothing is said but that the
+        // unopenable file is not known.
+        fs::write(&card, &garbage).unwrap();
+        let ended = session_with(&|| lock(&card, 0o000));
+        assert_eq!(
+            ended.save_changes,
+            vec![SaveChange::NotKnown { label: name.into() }],
+            "{name}"
+        );
+        let ended = session_with(&|| lock(&card, 0o644));
+        assert_eq!(
+            ended.save_changes,
+            vec![SaveChange::NotKnown { label: name.into() }],
+            "{name}"
+        );
     }
 }
 

@@ -412,7 +412,12 @@ later the mount number is one the system never gives to another mount. On an
 older system it can be given again to a mount made after one was taken away;
 there, a mount replaced by another on the same disk during one session can go
 unseen, and saves are then reported as gone or new. Where the system gives no
-mount number at all, the read fails and the session is not tracked. Sessions not
+mount number at all, the read fails and the session is not tracked. Two things
+the mount check does not see: something mounted on a single save file, and
+something mounted on a folder inside a save that is itself a folder. And one
+ordinary setup it holds back: a save folder on a mount the system takes away
+when idle and makes again on use (an automount) is another mount afterwards,
+so a session during which that happens is not compared. Sessions not
 started through the gate, and records from before this check, have no disk
 check. The first session in which RetroArch's save or state folder, or a
 memory-card folder, comes to be there is not compared at all; for the other
@@ -432,7 +437,11 @@ While it is not a card it is only noted as being there. If it is a card at one
 read and was there but was not a card at the other, what was read from it is
 "not known" (not gone, not new); the same when it cannot be opened at one of
 the two reads. A file of that kind that is not a card at either read is not a
-save file, and nothing is said of it. At most 20,000
+save file, and nothing is said of it. A link or special file under such a name
+is never followed or read; it is noted as being there in the same way. In a
+session record, and in the JSON form of the sessions list, these notes appear
+among the marks of the saves with ids beginning `card:` and `seen:` and an
+empty fingerprint: they are not saves and are never reported as changed. At most 20,000
 files are looked at per read, counting every file in RetroArch's save folders;
 past that, save changes are not tracked for the session. If a launch starts a
 helper program and the emulator is logged more than about two seconds after

@@ -728,11 +728,23 @@ fn whole_file(run: &mut Run<'_, '_>, path: &Path) {
 }
 
 /// A file among RetroArch's saves under a name saves do not go by, at a
-/// launch: taken whole if it is a memory card, noted as unread if it cannot
-/// be opened (what it is cannot then be told), left alone otherwise.
+/// launch: taken whole if it is a memory card; noted as unread if it cannot
+/// be opened (what it is cannot then be told); otherwise (not a card by its
+/// bytes, or a link or special file, which are never followed or read)
+/// only noted as being there.
 fn odd_named_at_launch(run: &mut Run<'_, '_>, path: &Path) {
-    if !fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()) {
-        return;
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        // A folder is not a save file under any name.
+        Ok(meta) if meta.is_dir() => return,
+        // A link or a special file: there, and not read. If a card was
+        // read under this name at the other read of the session, what was
+        // on it is not known.
+        Ok(_) => {
+            run.report.seen.push(path.to_path_buf());
+            return;
+        }
+        Err(_) => return,
     }
     if fs::File::open(path).is_err() {
         run.report
@@ -762,9 +774,11 @@ pub(crate) fn disk_and_mount(path: &Path) -> std::io::Result<(u64, u64)> {
     const MOUNT_ID_UNIQUE: u32 = 0x4000;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
-    // call, and `found` is a plain zeroed out-parameter that statx fills in.
+    // SAFETY: `statx` is a plain record of integers; all zeroes is a valid
+    // value of it.
     let mut found: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` points to a NUL-terminated string that lives until
+    // the call returns, and `found` is a valid, writable `statx` record.
     let status = unsafe {
         libc::statx(
             libc::AT_FDCWD,

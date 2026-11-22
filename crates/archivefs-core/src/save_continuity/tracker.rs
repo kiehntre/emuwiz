@@ -317,7 +317,17 @@ fn disks_of(
     };
     let mut folders: Vec<PathBuf> = places.to_vec();
     for (folder, listed_on) in searched {
-        match (listed_on, nearest(folder)) {
+        let now = nearest(folder);
+        if now.is_none() {
+            // Not a disk that moved: the folder, or what is above it,
+            // cannot be looked at (or the system does not say which mount a
+            // folder is on).
+            return Err(ContinuityError::Io(format!(
+                "the disk and mount of {} could not be told",
+                folder.display()
+            )));
+        }
+        match (listed_on, now) {
             // There when listed: still there, on the same disk and mount.
             (Some(then), Some((at, now))) if &at == folder && now == *then => {
                 folders.push(at);
