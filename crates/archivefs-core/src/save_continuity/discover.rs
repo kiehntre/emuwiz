@@ -586,6 +586,18 @@ pub fn discover(
                 card_folder_whole(&mut run, &folder)?;
             }
         }
+        // RPCS3 keeps PlayStation cards in two kinds of folder.
+        for hdd in [
+            roots.config.join("rpcs3/dev_hdd0"),
+            flatpak("net.rpcs3.RPCS3", "config/rpcs3/dev_hdd0"),
+        ] {
+            if run.wanted("RPCS3", &hdd) {
+                card_folder_whole(&mut run, &hdd.join("savedata/vmc"))?;
+                for title in listed(&hdd.join("game"), &mut run.report.incomplete) {
+                    card_folder_whole(&mut run, &title.join("USRDIR/SAVEDATA"))?;
+                }
+            }
+        }
     }
     for (base, emulator) in [
         (roots.data.join("dolphin-emu/GC"), "Dolphin"),
@@ -630,6 +642,38 @@ pub fn discover(
             retroarch(&mut run, &config, &roots.home)?;
         }
     }
+    if run.options.only.is_some() {
+        // At a launch a save listed from inside a card counts only if that
+        // same card file was read whole in this very look (or was noted as
+        // unreadable). The lister that finds cards passes over what it
+        // cannot open without a word; this way a card it passed over can
+        // never make its saves look new, gone or untouched.
+        let backed: Vec<PathBuf> = run
+            .report
+            .whole_files
+            .iter()
+            .map(|(path, _)| path.clone())
+            .chain(run.report.unread.iter().cloned())
+            .chain(
+                run.report
+                    .saves
+                    .iter()
+                    .filter(|save| {
+                        !matches!(
+                            save.format,
+                            SaveFormat::Ps1CardSave | SaveFormat::Ps2CardSave
+                        )
+                    })
+                    .map(|save| save.source_path.clone()),
+            )
+            .collect();
+        run.report.saves.retain(|save| {
+            !matches!(
+                save.format,
+                SaveFormat::Ps1CardSave | SaveFormat::Ps2CardSave
+            ) || backed.contains(&save.source_path)
+        });
+    }
     run.report.saves.sort_by(|a, b| {
         (&a.emulator, &a.profile, &a.source_path, &a.entry_name).cmp(&(
             &b.emulator,
@@ -665,6 +709,9 @@ fn whole_file(run: &mut Run<'_, '_>, path: &Path) {
 fn card_folder_whole(run: &mut Run<'_, '_>, folder: &Path) -> Result<(), ContinuityError> {
     for path in listed(folder, &mut run.report.incomplete) {
         check(run)?;
+        if !run.admit() {
+            return Ok(());
+        }
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.is_file() => whole_file(run, &path),
             Ok(meta) if meta.is_dir() => {
@@ -1317,12 +1364,21 @@ fn retroarch(run: &mut Run<'_, '_>, config_dir: &Path, home: &Path) -> Result<()
             } else {
                 // Not a name saves go by. At a launch, a memory card under
                 // another name (.mcr, .mcd) is still taken whole.
-                if !states
-                    && run.options.only.is_some()
-                    && crate::memory_card_manager::discovery::sniff_format(&path)
+                if !states && run.options.only.is_some() {
+                    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file())
+                        && fs::File::open(&path).is_err()
+                    {
+                        // Cannot be opened, so what it is cannot be told:
+                        // it may be a card.
+                        run.report
+                            .skipped
+                            .push(format!("{} cannot be opened", path.display()));
+                        run.report.unread.push(path.clone());
+                    } else if crate::memory_card_manager::discovery::sniff_format(&path)
                         != CardFormat::NotACard
-                {
-                    whole_file(run, &path);
+                    {
+                        whole_file(run, &path);
+                    }
                 }
                 continue;
             };

@@ -338,9 +338,11 @@ consulted.
   nothing is compared. The same if RetroArch's save folder setting differs
   between the two reads. The session's end is recorded either way.
 - **Memory cards are also compared whole.** At a launch every file in the
-  started emulator's memory-card folder (PCSX2, DuckStation), and every
-  card-shaped file among RetroArch's saves whatever its name, is fingerprinted
-  as one file, besides the saves listed from inside it. A card that holds no
+  started emulator's memory-card folders (PCSX2, DuckStation, RPCS3's
+  PlayStation cards), and every card-shaped file among RetroArch's saves
+  whatever its name, is fingerprinted as one file, besides the saves listed
+  from inside it. A save listed from inside a card counts only if that card
+  file was read whole in the same look. A card that holds no
   save yet, or cannot be taken apart, is still seen to change; one that cannot
   be opened is "not known"; a card folder that cannot be listed means no
   baseline. A session that writes a save to a card therefore reports both the
@@ -381,10 +383,13 @@ Limits: a second copy of the same emulator already running, or any program
 other than the started emulator writing a save between the read and the
 emulator's start, is not told apart from the session's emulator. PCSX2 and
 DuckStation memory-card folders set to somewhere other than the standard
-folders are not looked at, and nor are RPCS3's PS1 card folders: saves there
-are not tracked and nothing says so. A save folder that is not there at all is
-taken as holding nothing (if it appears or goes between the two reads, nothing
-is compared). A Flatpak
+folders are not looked at: saves there are not tracked and nothing says so.
+The same for cards in RetroArch's standard save folder when its settings name
+another save folder. A save folder that is not there at all is taken as
+holding nothing; for RetroArch's save and state folders, one that appears or
+goes between the two reads means nothing is compared, for a memory-card folder
+that appears its cards are reported as new. A PCSX2 folder memory card is "not
+known" in every session. A Flatpak
 or wrapper launcher that itself changes saves before the emulator starts would
 be counted as the session. A torn read (a file being written by something else
 during the read) gives the fingerprint of what was read.

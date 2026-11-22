@@ -1006,6 +1006,13 @@ pub fn diff_saves_with(
     };
     let (old, new) = (index(before), index(after));
     let mut changes = Vec::new();
+    // A file whose content was read at both ends is answered for by that
+    // comparison, even if it could not also be taken apart save by save.
+    answered.extend(
+        new.iter()
+            .filter(|(id, _)| old.contains_key(*id))
+            .filter_map(|(_, mark)| mark.path.as_deref()),
+    );
     for (id, mark) in &new {
         match old.get(id) {
             None => {

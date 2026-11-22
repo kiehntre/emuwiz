@@ -107,6 +107,9 @@ fn worker() -> Option<Sender<Message>> {
 /// claims it.
 static READS: Mutex<BTreeMap<u64, GateResult>> = Mutex::new(BTreeMap::new());
 
+/// How many emulator starts are being held at the gate right now.
+static STARTS_HELD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn claim_read(token: u64) -> Option<GateResult> {
     READS.lock().ok()?.remove(&token)
 }
@@ -122,6 +125,16 @@ fn gate(executable: &Path, arguments: &[String]) -> Option<u64> {
         return None;
     }
     let roots = DiscoveryRoots::current()?;
+    // Said while an emulator is held at the gate: its session waits for it
+    // rather than take a helper of the same launch for the emulator.
+    struct Held;
+    impl Drop for Held {
+        fn drop(&mut self) {
+            STARTS_HELD.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    STARTS_HELD.fetch_add(1, Ordering::SeqCst);
+    let _held = Held;
     Some(hold_for_read(GATE_PATIENCE, move |cancel| {
         read_baseline(&roots, &launch, Some(cancel))
             .map_err(|error| format!("{NOT_READ} ({error})"))
@@ -418,7 +431,8 @@ fn follow(tracker: &LaunchTracker, session: &mut Open, started_since: StartedSin
             if held.is_none()
                 && !in_span.is_empty()
                 && session.over.is_none()
-                && session.waited_for_emulator < EMULATOR_PATIENCE
+                && (session.waited_for_emulator < EMULATOR_PATIENCE
+                    || STARTS_HELD.load(Ordering::SeqCst) > 0)
             {
                 // Only a helper so far: give the emulator a moment.
                 session.waited_for_emulator += 1;

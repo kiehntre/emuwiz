@@ -1192,3 +1192,82 @@ fn a_memory_card_folder_is_taken_whole_at_a_launch() {
     ));
     assert!(ended.save_changes.is_empty() && ended.saves_after.is_none());
 }
+
+#[test]
+fn a_card_that_cannot_be_opened_never_makes_its_saves_look_new() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid only reads the process's own id.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let lock =
+        |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+    // An RPCS3 PlayStation card, and a RetroArch card under a name saves do
+    // not go by.
+    let vmc = home.join(".config/rpcs3/dev_hdd0/savedata/vmc");
+    let retro = home.join(".config/retroarch");
+    fs::create_dir_all(&vmc).unwrap();
+    fs::create_dir_all(retro.join("saves")).unwrap();
+    fs::write(
+        retro.join("retroarch.cfg"),
+        "savefile_directory = \"default\"\n",
+    )
+    .unwrap();
+    let cards = [
+        (vmc.join("shared.VM1"), "rpcs3", "RPCS3"),
+        (retro.join("saves/Game.mcr"), "retroarch", "RetroArch"),
+    ];
+    for (card, _, _) in &cards {
+        fs::write(card, crate::memory_card_manager::tests::ps1_card(&[])).unwrap();
+    }
+    let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
+    for (card, program, emulator) in &cards {
+        let process = StartedProcess {
+            executable: PathBuf::from(format!("/nowhere/{program}")),
+            ..started()
+        };
+        let launch = super::super::tracker::classify_started(&process.executable, &[]);
+        assert_eq!(&launch.emulator, emulator);
+        // Readable: taken whole.
+        let open = tracker.baseline_before_start(&launch).unwrap();
+        assert!(
+            open.marks
+                .iter()
+                .any(|mark| mark.path.as_ref() == Some(card)),
+            "{emulator}: {open:?}"
+        );
+        // Unopenable before the start, readable after it.
+        lock(card, 0o000);
+        let baseline = tracker.baseline_before_start(&launch).unwrap();
+        assert_eq!(baseline.unread, vec![card.clone()], "{emulator}");
+        assert!(baseline.marks.is_empty(), "{emulator}: {baseline:?}");
+        let table = One(Cell::new(true));
+        let session = tracker
+            .begin_gated(SessionGame::default(), emulator)
+            .unwrap();
+        tracker
+            .process_started_gated(&session.session_id, &process, Ok((baseline, 1, 0)), &table)
+            .unwrap();
+        lock(card, 0o644);
+        table.0.set(false);
+        let ended = tracker
+            .finished_in(
+                &session.session_id,
+                Some(ExitSummary::Code(0)),
+                None,
+                &table,
+            )
+            .unwrap();
+        assert!(
+            !ended.save_changes.is_empty()
+                && ended
+                    .save_changes
+                    .iter()
+                    .all(|change| matches!(change, SaveChange::CreatedBeforeNotKnown { .. })),
+            "{emulator}: {:?}",
+            ended.save_changes
+        );
+    }
+}

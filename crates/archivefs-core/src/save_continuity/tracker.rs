@@ -636,7 +636,10 @@ impl LaunchTracker {
         // The session's end is recorded whatever happens to the read of
         // the saves: without a complete second read, or with the saves kept
         // somewhere else than at the first read, nothing is compared.
-        let read = match self.fresh(Some(&record.launch)) {
+        // The same kind of look as the first read of this session: one
+        // emulator's saves for a gated session, all of them otherwise.
+        let gated = record.save_tracking.is_some();
+        let read = match self.fresh(gated.then_some(&record.launch)) {
             Ok(read)
                 if record
                     .save_places_before
@@ -651,7 +654,6 @@ impl LaunchTracker {
                     .mark_ended(session_id, observed, None, processes);
             }
         };
-        let gated = record.save_tracking.is_some();
         if self
             .journal
             .note_unread_after(session_id, read.unread.clone())
