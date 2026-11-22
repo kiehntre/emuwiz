@@ -292,6 +292,9 @@ fn note(kind: &str, path: &Path) -> SaveMark {
     }
 }
 
+/// Folders, each with a number noted for it (its disk, or its mount).
+type Noted = Vec<(PathBuf, u64)>;
+
 /// The disk (device number) of every folder that was listed, or that held
 /// something read. A folder that is not there is noted by the nearest
 /// folder above it that is, so that a disk put in below it later shows. A
@@ -308,7 +311,7 @@ fn disks_of(
     saves: &[DiscoveredSave],
     whole: &[(PathBuf, String)],
     unread: &[PathBuf],
-) -> Result<(Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>), ContinuityError> {
+) -> Result<(Noted, Noted), ContinuityError> {
     let moved = |folder: &Path| {
         ContinuityError::Io(format!(
             "a disk came or went at {} while the saves were being read",
