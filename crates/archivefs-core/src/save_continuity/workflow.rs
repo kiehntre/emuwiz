@@ -82,24 +82,23 @@ pub fn capture_request(
         });
     }
     let mut contained = contained_saves(all, source);
-    if contained.is_empty() {
-        if let (Some(code), Some(fingerprint)) = (&save.identity.product_code, &save.content_sha256)
-        {
-            let prefix = match save.format {
-                SaveFormat::GameCubeGci => "gc",
-                SaveFormat::Ps3Savedata => "ps3",
-                SaveFormat::PspSavedata => "psp",
-                _ => "save",
-            };
-            let name = save.entry_name.clone().unwrap_or_else(|| code.clone());
-            contained.push(ContainedSave {
-                key: format!("{prefix}:{code}:{name}"),
-                name,
-                product_code: Some(code.clone()),
-                title: save.identity.title.clone(),
-                fingerprint: fingerprint.clone(),
-            });
-        }
+    if contained.is_empty()
+        && let (Some(code), Some(fingerprint)) = (&save.identity.product_code, &save.content_sha256)
+    {
+        let prefix = match save.format {
+            SaveFormat::GameCubeGci => "gc",
+            SaveFormat::Ps3Savedata => "ps3",
+            SaveFormat::PspSavedata => "psp",
+            _ => "save",
+        };
+        let name = save.entry_name.clone().unwrap_or_else(|| code.clone());
+        contained.push(ContainedSave {
+            key: format!("{prefix}:{code}:{name}"),
+            name,
+            product_code: Some(code.clone()),
+            title: save.identity.title.clone(),
+            fingerprint: fingerprint.clone(),
+        });
     }
     Ok(CaptureRequest {
         provenance: Provenance {

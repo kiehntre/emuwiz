@@ -49,7 +49,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
     // Lowercase hex digits only: no sign, no spaces, one spelling per value.
-    if text.len() % 2 != 0
+    if !text.len().is_multiple_of(2)
         || !text
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -119,12 +119,12 @@ impl DeviceIdentity {
                 "the device id does not belong to its key".into(),
             ));
         }
-        if let Some(history) = &self.history_id {
-            if !super::installation::well_formed(history) || *history == self.device_id {
-                return Err(ContinuityError::Refused(
-                    "the device's history id is malformed".into(),
-                ));
-            }
+        if let Some(history) = &self.history_id
+            && (!super::installation::well_formed(history) || *history == self.device_id)
+        {
+            return Err(ContinuityError::Refused(
+                "the device's history id is malformed".into(),
+            ));
         }
         Ok(key)
     }
@@ -433,7 +433,9 @@ pub fn histories(snapshots: &[SnapshotManifest]) -> Vec<SaveHistory> {
             ordered.push(remaining.remove(next));
         }
         for manifest in ordered {
-            let mut items: Vec<(String, String, Option<String>, Option<String>, String)> = manifest
+            // key, name, product code, title, fingerprint
+            type Item = (String, String, Option<String>, Option<String>, String);
+            let mut items: Vec<Item> = manifest
                 .body
                 .contained_saves
                 .iter()
@@ -897,9 +899,7 @@ pub fn compare(here: &ManifestSetBody, there: &ManifestSetBody) -> Vec<SaveCompa
             ),
             Relation::Unrelated => (
                 true,
-                format!(
-                    "Both devices have this save, with no shared history. They may be two separate playthroughs. Nothing will replace either; choose which to continue."
-                ),
+                "Both devices have this save, with no shared history. They may be two separate playthroughs. Nothing will replace either; choose which to continue.".to_string(),
             ),
             Relation::OnlyHere => (
                 false,

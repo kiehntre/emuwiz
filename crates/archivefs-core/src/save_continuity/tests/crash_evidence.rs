@@ -942,15 +942,11 @@ fn the_real_conversion_agrees_with_the_systems_own_clock_or_declines() {
             minute: tm.tm_min as u32,
             second: tm.tm_sec as u32,
         };
-        match local_to_unix_for_tests(&local) {
-            // Never a different instant.
-            Some(found) => {
-                assert_eq!(found, instant, "{local:?}");
-                placed += 1;
-            }
-            // Declining is always allowed (a repeated hour; TZ set for this
-            // process). A wrong answer never is.
-            None => {}
+        // Never a different instant. Declining is always allowed (a
+        // repeated hour; TZ set for this process). A wrong answer never is.
+        if let Some(found) = local_to_unix_for_tests(&local) {
+            assert_eq!(found, instant, "{local:?}");
+            placed += 1;
         }
     }
     // With TZ set nothing is placed at all; without it, four instants in

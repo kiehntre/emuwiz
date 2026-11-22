@@ -9,7 +9,7 @@ use crate::memory_card_manager::tests::{add_ecc, psu};
 use std::sync::atomic::AtomicBool;
 
 /// A PS2 card (with ECC) holding the given saves.
-fn ps2_card(dir: &Path, name: &str, saves: &[(&str, &[u8])]) -> PathBuf {
+pub(super) fn ps2_card(dir: &Path, name: &str, saves: &[(&str, &[u8])]) -> PathBuf {
     let mut current = dir.join(format!(".{name}.0"));
     fs::write(&current, add_ecc(&ps2_inventory_fixture())).unwrap();
     for (index, (save_name, payload)) in saves.iter().enumerate() {

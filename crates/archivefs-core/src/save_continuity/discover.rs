@@ -794,12 +794,12 @@ fn cards(run: &mut Run<'_, '_>, roots: &DiscoveryRoots) -> Result<(), Continuity
         }
         let sig = signature(&meta);
         let in_use = run.in_use(&emulator, &card.path);
-        if !meta.is_dir() {
-            if let Some(mut saves) = run.cached(&card.path, &sig) {
-                saves.iter_mut().for_each(|save| save.in_use = in_use);
-                run.report.saves.extend(saves);
-                continue;
-            }
+        if !meta.is_dir()
+            && let Some(mut saves) = run.cached(&card.path, &sig)
+        {
+            saves.iter_mut().for_each(|save| save.in_use = in_use);
+            run.report.saves.extend(saves);
+            continue;
         }
         let (report, fingerprints) = match read_card_with_fingerprints(&card.path) {
             Ok(read) => read,
@@ -1030,13 +1030,13 @@ fn gamecube(run: &mut Run<'_, '_>, base: &Path, emulator: &str) -> Result<(), Co
                     Some("Japan") => Some("JAP"),
                     _ => None,
                 };
-                if let (Some(expected), Some(actual)) = (expected, folder_region.as_deref()) {
-                    if expected != actual {
-                        ambiguity.push(format!(
-                            "the save is for a {} game but sits in Dolphin's {actual} folder",
-                            header.region.unwrap_or("?")
-                        ));
-                    }
+                if let (Some(expected), Some(actual)) = (expected, folder_region.as_deref())
+                    && expected != actual
+                {
+                    ambiguity.push(format!(
+                        "the save is for a {} game but sits in Dolphin's {actual} folder",
+                        header.region.unwrap_or("?")
+                    ));
                 }
                 let save = DiscoveredSave {
                     id: stable_id(&path, None),

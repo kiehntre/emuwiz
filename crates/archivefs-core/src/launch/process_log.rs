@@ -137,14 +137,13 @@ pub(super) fn record_exit(sequence: u64, status: &std::io::Result<ExitStatus>) {
         },
         Err(_) => ExitSummary::Unavailable,
     };
-    if let Ok(mut log) = LOG.lock() {
-        if let Some(entry) = log
+    if let Ok(mut log) = LOG.lock()
+        && let Some(entry) = log
             .entries
             .iter_mut()
             .find(|entry| entry.sequence == sequence)
-        {
-            entry.exit = Some(summary);
-        }
+    {
+        entry.exit = Some(summary);
     }
 }
 
@@ -200,7 +199,12 @@ mod tests {
             .find(|entry| entry.sequence == sequence)
             .unwrap();
         assert_eq!(entry.exit, Some(ExitSummary::Code(3)));
-        assert!(started_since(next_sequence()).is_empty());
+        // Other tests start processes too; ours is not among later ones.
+        assert!(
+            started_since(next_sequence())
+                .iter()
+                .all(|entry| entry.sequence != sequence)
+        );
     }
 
     #[test]

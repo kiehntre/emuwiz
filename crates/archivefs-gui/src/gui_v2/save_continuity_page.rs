@@ -287,7 +287,7 @@ pub(super) fn session_notice(entry: &TimelineEntry) -> SessionNotice {
 
 fn snapshot_card(ui: &mut egui::Ui, entry: &TimelineEntry) {
     widgets::full_width_card(ui, |ui| {
-        ui.label(crate::ui::theme::card_title(&format!(
+        ui.label(crate::ui::theme::card_title(format!(
             "{} · {}",
             when(entry.captured_unix),
             reason(&entry.reason)
@@ -396,7 +396,7 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut State) {
         );
     }
     for save in &loaded.saves {
-        ui.label(crate::ui::theme::section_title(&format!(
+        ui.label(crate::ui::theme::section_title(format!(
             "{} · {}",
             save.emulator,
             save.source.display()

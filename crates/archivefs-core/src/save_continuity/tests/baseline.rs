@@ -1414,6 +1414,286 @@ fn saves_on_a_card_are_never_new_or_gone_because_the_card_could_not_be_opened() 
     assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
 }
 
+/// PCSX2's and DuckStation's own cards, in every state a card can be found
+/// in: a card that cannot be opened, or whose bytes are not a card's, is
+/// never an empty card and never a card read; what is said about it is
+/// "not known", at the read before the start, at the read after, and in the
+/// session after that, when it can be read again.
+#[test]
+fn a_card_in_any_state_is_never_taken_for_an_empty_or_a_read_one() {
+    use crate::memory_card_manager::tests::{ps1_card, ps1_save};
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid only reads the process's own id.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let lock =
+        |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+    let made = dir.path().join("made");
+    fs::create_dir_all(&made).unwrap();
+    let ps2 = |payload: Option<&[u8]>| -> Vec<u8> {
+        let saves: Vec<(&str, &[u8])> = payload
+            .iter()
+            .map(|bytes| ("BASLUS-20001", *bytes))
+            .collect();
+        let path = super::discover::ps2_card(&made, "card", &saves);
+        fs::read(path).unwrap()
+    };
+    let ps1 = |title: Option<&str>| -> Vec<u8> {
+        match title {
+            Some(title) => ps1_card(&[ps1_save("BASLUS-00001GAME", 1, title)]),
+            None => ps1_card(&[]),
+        }
+    };
+    struct Case {
+        emulator: &'static str,
+        process: StartedProcess,
+        folder: PathBuf,
+        names: [&'static str; 2],
+        empty: Vec<u8>,
+        one: Vec<u8>,
+        other: Vec<u8>,
+    }
+    let cases = [
+        Case {
+            emulator: "PCSX2",
+            process: StartedProcess {
+                executable: PathBuf::from("/usr/bin/flatpak"),
+                arguments: vec!["run".into(), "net.pcsx2.PCSX2".into()],
+                ..started()
+            },
+            folder: home.join(".var/app/net.pcsx2.PCSX2/config/PCSX2/memcards"),
+            names: ["Mcd001.ps2", "Mcd002.ps2"],
+            empty: ps2(None),
+            one: ps2(Some(&[1u8; 2048])),
+            other: ps2(Some(&[2u8; 2048])),
+        },
+        Case {
+            emulator: "DuckStation",
+            process: StartedProcess {
+                executable: PathBuf::from("/nowhere/duckstation"),
+                ..started()
+            },
+            folder: home.join(".local/share/duckstation/memcards"),
+            names: ["shared_card_1.mcd", "Game (USA).mcd"],
+            empty: ps1(None),
+            one: ps1(Some("GAME")),
+            other: ps1(Some("GAM2")),
+        },
+    ];
+    let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
+    for case in &cases {
+        let who = case.emulator;
+        fs::create_dir_all(&case.folder).unwrap();
+        let (first, second) = (
+            case.folder.join(case.names[0]),
+            case.folder.join(case.names[1]),
+        );
+        let whole = |name: &str| format!("{name} (the whole card file)");
+        let launch = super::super::tracker::classify_started(
+            &case.process.executable,
+            &case.process.arguments,
+        );
+        assert_eq!(launch.emulator, who);
+        let session_with = |before: &dyn Fn(), during: &dyn Fn()| {
+            before();
+            let read = tracker.baseline_before_start(&launch);
+            let table = One(Cell::new(true));
+            let session = tracker.begin_gated(SessionGame::default(), who).unwrap();
+            tracker
+                .process_started_gated(
+                    &session.session_id,
+                    &case.process,
+                    read.map(|baseline| (baseline, 1, 0))
+                        .map_err(|error| error.to_string()),
+                    &table,
+                )
+                .unwrap();
+            during();
+            table.0.set(false);
+            tracker
+                .finished_in(
+                    &session.session_id,
+                    Some(ExitSummary::Code(0)),
+                    None,
+                    &table,
+                )
+                .unwrap()
+        };
+        let all = |ended: &SessionRecord, wanted: &dyn Fn(&SaveChange) -> bool| {
+            assert!(
+                !ended.save_changes.is_empty() && ended.save_changes.iter().all(wanted),
+                "{who}: {:?}",
+                ended.save_changes
+            );
+        };
+        let fresh = || {
+            lock(&case.folder, 0o755);
+            for card in [&first, &second] {
+                if card.exists() {
+                    lock(card, 0o644);
+                }
+            }
+            fs::write(&first, &case.empty).unwrap();
+            fs::write(&second, &case.one).unwrap();
+        };
+
+        // A valid, empty card and a card with a save, both left alone: both
+        // were read, nothing is said.
+        fresh();
+        let ended = session_with(&|| {}, &|| {});
+        assert!(matches!(
+            ended.save_tracking,
+            Some(SaveTracking::Established { .. })
+        ));
+        for card in [&first, &second] {
+            assert!(
+                ended.saves_before.iter().any(|mark| {
+                    mark.save_id.starts_with("whole:") && mark.path.as_ref() == Some(card)
+                }),
+                "{who}: {:?}",
+                ended.saves_before
+            );
+        }
+        assert!(ended.saves_unread_before.is_empty() && ended.saves_unread_after.is_empty());
+        assert!(
+            ended.save_changes.is_empty(),
+            "{who}: {:?}",
+            ended.save_changes
+        );
+
+        // The game saves onto the valid, empty card: the card changed, and
+        // what is on it now is new. Nothing is said of the other card.
+        let ended = session_with(&|| {}, &|| fs::write(&first, &case.one).unwrap());
+        assert!(
+            ended.save_changes.contains(&SaveChange::Modified {
+                label: whole(case.names[0])
+            }),
+            "{who}: {:?}",
+            ended.save_changes
+        );
+        all(&ended, &|change| {
+            matches!(
+                change,
+                SaveChange::Modified { .. } | SaveChange::Created { .. }
+            )
+        });
+        assert!(
+            !ended
+                .save_changes
+                .iter()
+                .any(|change| format!("{change:?}").contains(case.names[1])),
+            "{who}: {:?}",
+            ended.save_changes
+        );
+
+        // A card that is not there at the start and is afterwards is new;
+        // one that was there and is deleted is gone. Both were seen.
+        fresh();
+        fs::remove_file(&first).unwrap();
+        let ended = session_with(&|| {}, &|| fs::write(&first, &case.one).unwrap());
+        all(&ended, &|change| {
+            matches!(change, SaveChange::Created { .. })
+        });
+        let ended = session_with(&|| {}, &|| fs::remove_file(&first).unwrap());
+        all(&ended, &|change| {
+            matches!(change, SaveChange::Missing { .. })
+        });
+
+        // Bytes that are not a card's: still compared, as a file.
+        fresh();
+        fs::write(&first, vec![5u8; case.empty.len()]).unwrap();
+        let ended = session_with(&|| {}, &|| {});
+        assert!(
+            ended.save_changes.is_empty(),
+            "{who}: {:?}",
+            ended.save_changes
+        );
+        let ended = session_with(&|| {}, &|| {
+            fs::write(&first, vec![6u8; case.empty.len()]).unwrap()
+        });
+        assert_eq!(
+            ended.save_changes,
+            vec![SaveChange::Modified {
+                label: whole(case.names[0])
+            }],
+            "{who}"
+        );
+
+        // Cannot be opened before the start, can afterwards: not an empty
+        // card that filled, so nothing is "new".
+        fresh();
+        let ended = session_with(&|| lock(&second, 0o000), &|| lock(&second, 0o644));
+        assert_eq!(ended.saves_unread_before, vec![second.clone()], "{who}");
+        all(&ended, &|change| {
+            matches!(change, SaveChange::CreatedBeforeNotKnown { .. })
+        });
+
+        // Can be opened before, cannot afterwards: not a card that emptied,
+        // so nothing is "gone".
+        let ended = session_with(&|| {}, &|| lock(&second, 0o000));
+        assert_eq!(ended.saves_unread_after, vec![second.clone()], "{who}");
+        all(&ended, &|change| {
+            matches!(change, SaveChange::NotKnown { .. })
+        });
+        assert!(!ended.needs_attention());
+
+        // One card fails at both ends while the other is written: the one is
+        // "not known", the other "changed"; neither is new or gone.
+        let ended = session_with(&|| fs::write(&first, &case.one).unwrap(), &|| {
+            fs::write(&first, &case.other).unwrap()
+        });
+        assert!(
+            ended.save_changes.contains(&SaveChange::NotKnown {
+                label: case.names[1].into()
+            }) && ended.save_changes.contains(&SaveChange::Modified {
+                label: whole(case.names[0])
+            }),
+            "{who}: {:?}",
+            ended.save_changes
+        );
+        all(&ended, &|change| {
+            matches!(
+                change,
+                SaveChange::NotKnown { .. } | SaveChange::Modified { .. }
+            )
+        });
+
+        // The card can be read again: the next session is an ordinary one.
+        lock(&second, 0o644);
+        let ended = session_with(&|| {}, &|| {});
+        assert!(ended.saves_unread_before.is_empty() && ended.saves_unread_after.is_empty());
+        assert!(
+            ended.save_changes.is_empty(),
+            "{who}: {:?}",
+            ended.save_changes
+        );
+        let ended = session_with(&|| {}, &|| fs::write(&second, &case.other).unwrap());
+        assert!(
+            ended.save_changes.contains(&SaveChange::Modified {
+                label: whole(case.names[1])
+            }),
+            "{who}: {:?}",
+            ended.save_changes
+        );
+
+        // The card folder itself cannot be listed: no read at all, so the
+        // session is not tracked and nothing is claimed.
+        let ended = session_with(&|| lock(&case.folder, 0o000), &|| lock(&case.folder, 0o755));
+        assert!(matches!(
+            ended.save_tracking,
+            Some(SaveTracking::Unavailable { .. })
+        ));
+        assert!(ended.save_changes.is_empty() && ended.saves_after.is_none());
+        // ... and at the end of a session only: nothing is compared.
+        let ended = session_with(&|| {}, &|| lock(&case.folder, 0o000));
+        lock(&case.folder, 0o755);
+        assert!(ended.save_changes.is_empty() && ended.saves_after.is_none());
+    }
+}
+
 // ----- A disk that comes or goes during a session -----
 
 /// A save folder that is where a disk is mounted is still there, empty,

@@ -397,7 +397,7 @@ pub struct SnapshotStore {
 
 static WORK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Test seam: stop after a named step, as a crash would.
+// Test seam: stop after a named step, as a crash would.
 #[cfg(test)]
 thread_local! {
     pub(crate) static CRASH_AT: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
@@ -1250,12 +1250,12 @@ impl SnapshotStore {
             );
         }
         let total = manifest.total_bytes();
-        if let Some(Ok(free)) = parent.map(free_bytes) {
-            if free < total.saturating_add(FREE_SPACE_RESERVE_BYTES) {
-                blockers.push(format!(
-                    "not enough free space at the destination ({free} bytes free, {total} needed)"
-                ));
-            }
+        if let Some(Ok(free)) = parent.map(free_bytes)
+            && free < total.saturating_add(FREE_SPACE_RESERVE_BYTES)
+        {
+            blockers.push(format!(
+                "not enough free space at the destination ({free} bytes free, {total} needed)"
+            ));
         }
         Ok(RecoveryPlan {
             snapshot_id: manifest.snapshot_id.clone(),

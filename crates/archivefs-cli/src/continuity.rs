@@ -690,11 +690,13 @@ pub fn run(args: Vec<String>) -> Outcome {
                                 &entry.snapshot_id[..12],
                                 when(entry.captured_unix),
                                 entry.boundary.label(),
-                                entry
-                                    .session_id
-                                    .as_deref()
-                                    .map(|id| format!("  (session {id})"))
-                                    .unwrap_or_default()
+                                // Which session is in the JSON form; the
+                                // text only says that there was one.
+                                if entry.session_id.is_some() {
+                                    "  (in a play session)"
+                                } else {
+                                    ""
+                                }
                             );
                             if let Some(warning) = &entry.warning {
                                 println!("      >>> {warning}");

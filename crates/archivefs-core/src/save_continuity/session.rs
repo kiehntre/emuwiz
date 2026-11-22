@@ -1344,19 +1344,19 @@ impl SessionJournal {
         // the process table now shows nothing, or a different start time
         // (the id was already given to something else), the launched
         // process has gone and is recorded by its real start time.
-        if record.process_start_ticks != spawn_start_ticks {
-            if let Some(start_ticks) = spawn_start_ticks {
-                record.processes.retain(|process| process.pid != pid);
-                record.process_start_ticks = Some(start_ticks);
-                record.processes.push(TrackedProcess {
-                    pid,
-                    start_ticks,
-                    executable: None,
-                    launched_by_emuwiz: true,
-                    first_seen_unix: now_unix(),
-                });
-                self.write(&record)?;
-            }
+        if record.process_start_ticks != spawn_start_ticks
+            && let Some(start_ticks) = spawn_start_ticks
+        {
+            record.processes.retain(|process| process.pid != pid);
+            record.process_start_ticks = Some(start_ticks);
+            record.processes.push(TrackedProcess {
+                pid,
+                start_ticks,
+                executable: None,
+                launched_by_emuwiz: true,
+                first_seen_unix: now_unix(),
+            });
+            self.write(&record)?;
         }
         Ok(record)
     }
@@ -1742,13 +1742,12 @@ impl SessionJournal {
         // Independent evidence, for a sandboxed emulator only: did the
         // system record that exactly that process was ended by a fatal
         // signal? If so that is what happened, whatever number came back.
-        if record.launch.through_launcher {
-            if let Some(recorded_at) =
+        if record.launch.through_launcher
+            && let Some(recorded_at) =
                 consult_crash_source(&mut record, processes, self.crash.as_ref(), now_unix())
-            {
-                record.end = Some(SessionEnd::FatalTerminationRecorded { recorded_at });
-                record.exit_evidence = Some(ExitEvidence::CrashRecord);
-            }
+        {
+            record.end = Some(SessionEnd::FatalTerminationRecorded { recorded_at });
+            record.exit_evidence = Some(ExitEvidence::CrashRecord);
         }
         self.finish(&mut record, saves_after);
         self.write(&record)?;
@@ -1838,19 +1837,18 @@ impl SessionJournal {
                     // Whoever saw (or did not see) the end: if the system
                     // recorded that exactly this emulator process was ended
                     // by a fatal signal, that is what happened.
-                    if record.launch.through_launcher {
-                        if let Some(recorded_at) =
+                    if record.launch.through_launcher
+                        && let Some(recorded_at) =
                             consult_crash_source(&mut record, processes, self.crash.as_ref(), now)
-                        {
-                            record.launcher_end = None;
-                            record.state = SessionState::Ended;
-                            record.end = Some(SessionEnd::FatalTerminationRecorded { recorded_at });
-                            record.exit_evidence = Some(ExitEvidence::CrashRecord);
-                            if self.write(&record).is_ok() {
-                                settled.push(record);
-                            }
-                            continue;
+                    {
+                        record.launcher_end = None;
+                        record.state = SessionState::Ended;
+                        record.end = Some(SessionEnd::FatalTerminationRecorded { recorded_at });
+                        record.exit_evidence = Some(ExitEvidence::CrashRecord);
+                        if self.write(&record).is_ok() {
+                            settled.push(record);
                         }
+                        continue;
                     }
                     if let Some(end) = record.launcher_end.take() {
                         // The launcher's end was seen; the emulator's own

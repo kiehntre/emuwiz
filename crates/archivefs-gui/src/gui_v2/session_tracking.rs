@@ -26,7 +26,7 @@
 
 use archivefs_core::launch::process_log::{self, StartedProcess};
 use archivefs_core::save_continuity::ContinuityError;
-use archivefs_core::save_continuity::session::{ProcFs, SessionGame, SessionLaunch, SessionState};
+use archivefs_core::save_continuity::session::{ProcFs, SessionGame, SessionState};
 use archivefs_core::save_continuity::tracker::{
     Baseline, LaunchTracker, classify_started, saves_known_for,
 };
@@ -520,7 +520,9 @@ mod tests {
     use super::*;
     use archivefs_core::launch::process_log::ExitSummary;
     use archivefs_core::save_continuity::discover::DiscoveryRoots;
-    use archivefs_core::save_continuity::session::{SessionEnd, SessionJournal, SessionRecord};
+    use archivefs_core::save_continuity::session::{
+        SessionEnd, SessionJournal, SessionLaunch, SessionRecord,
+    };
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::time::Instant;
