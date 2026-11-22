@@ -794,7 +794,7 @@ pub(super) enum ToolPage {
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
