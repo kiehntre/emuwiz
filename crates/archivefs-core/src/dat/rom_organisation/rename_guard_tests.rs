@@ -1108,7 +1108,11 @@ fn grouped_collision_detection_matches_the_all_pairs_version() {
 #[ignore]
 fn catalogue_and_revalidate_phase_profile() {
     use std::time::Instant;
-    for count in [1000usize, 2000] {
+    let sizes: Vec<usize> = std::env::var("PREVIEW_BENCH_SIZES")
+        .ok()
+        .map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1000, 2000]);
+    for count in sizes {
         let (lib, games, _) = crowded_library(count);
         let plan = rename_plan(&lib, &games);
         let approved: BTreeSet<String> = plan
