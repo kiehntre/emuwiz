@@ -310,12 +310,16 @@ pub fn prepare_organisation_catalogue_with_platforms(
         }
     }
     crate::database::organisation_paths::bind(&mut transaction, database)?;
+    // The first transaction entry for each source, as `iter().find` gave.
+    let mut bound_by_source: std::collections::HashMap<&Path, &TransactionEntry> =
+        std::collections::HashMap::with_capacity(transaction.entries.len());
+    for bound in &transaction.entries {
+        bound_by_source
+            .entry(bound.source_path.as_path())
+            .or_insert(bound);
+    }
     for entry in &mut plan.entries {
-        if let Some(bound) = transaction
-            .entries
-            .iter()
-            .find(|e| e.source_path == entry.source_path)
-        {
+        if let Some(bound) = bound_by_source.get(entry.source_path.as_path()) {
             entry.catalogue_binding = bound.unknown.get("organisation_catalogue_v1").cloned();
         }
     }
@@ -437,6 +441,58 @@ fn planned_platform_directories(
 /// any mutation. No RomM mapping is consulted: preview and apply agree on the
 /// neutral folder by construction.
 pub fn revalidate_organisation_plan(
+    plan: &OrganisationPlan,
+    database_path: &Path,
+    canonical_name_for: &dyn Fn(&Path) -> Option<String>,
+) -> Result<(), String> {
+    use super::plan::{OrganisationCandidate, OrganisationPlanRequest, plan_each_candidate_alone};
+
+    let database = crate::Database::open_read_only(database_path)
+        .map_err(|error| format!("could not open the platform identity database: {error}"))?;
+    // Read now, for this check only: every archive id in one pass (the path
+    // column has no index, so a lookup per entry scanned the whole table),
+    // and each destination folder listed once while every entry is still
+    // planned on its own, exactly as before.
+    let resolutions = super::rename_guard::LiveResolutions::read(&database);
+    let suggested: Vec<_> = plan.suggested().collect();
+    let candidates: Vec<OrganisationCandidate> = suggested
+        .iter()
+        .map(|entry| OrganisationCandidate {
+            source_path: entry.source_path.clone(),
+            resolution: resolutions.for_path(&entry.source_path, plan.generation),
+            canonical_name: canonical_name_for(&entry.source_path),
+            content_classification: entry.content_classification.clone(),
+            original_metadata: entry.original_metadata.clone(),
+        })
+        .collect();
+    let re_entries = plan_each_candidate_alone(&OrganisationPlanRequest {
+        master_root: &plan.master_root,
+        mode: plan.mode,
+        content_policy: plan.content_policy,
+        candidates: &candidates,
+        generation: plan.generation,
+        unknown_folder: None,
+    });
+    for (entry, re_entry) in suggested.iter().zip(&re_entries) {
+        if re_entry.status != super::model::OrganisationStatus::Suggested
+            || re_entry.destination_path != entry.destination_path
+            || re_entry.platform.as_deref() != entry.platform.as_deref()
+            || re_entry.layout_folder != entry.layout_folder
+        {
+            return Err(format!(
+                "the platform identity for {} changed since the plan was generated; regenerate \
+                 the plan",
+                entry.source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The original one-entry-at-a-time revalidation, kept to prove the batched
+/// version above reaches the same decision with the same message.
+#[cfg(test)]
+pub(crate) fn revalidate_organisation_plan_per_entry(
     plan: &OrganisationPlan,
     database_path: &Path,
     canonical_name_for: &dyn Fn(&Path) -> Option<String>,

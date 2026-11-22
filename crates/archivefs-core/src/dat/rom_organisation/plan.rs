@@ -554,6 +554,43 @@ impl OrganisationPlanEntry {
 /// (a marked entry keeps its first reason, as before). Each destination
 /// folder is listed once per plan instead of once per entry.
 pub(crate) fn detect_collisions(master_root: &Path, entries: &mut [OrganisationPlanEntry]) {
+    detect_collisions_with(master_root, entries, &mut FolderNames::default());
+}
+
+/// Destination folders' names as listed during one check (lowercased name
+/// -> names; `None` when the folder could not be listed). Never kept beyond
+/// the call that builds it.
+#[derive(Default)]
+pub(crate) struct FolderNames {
+    folders:
+        std::collections::HashMap<PathBuf, Option<std::collections::HashMap<String, Vec<String>>>>,
+}
+
+/// Plans every candidate on its own, exactly as a one-candidate
+/// [`build_organisation_plan`] would (no collision checks between them), but
+/// lists each destination folder once for the whole call. Used by the Apply
+/// revalidation, which checks each entry independently.
+pub(crate) fn plan_each_candidate_alone(
+    request: &OrganisationPlanRequest<'_>,
+) -> Vec<OrganisationPlanEntry> {
+    let mut folders = FolderNames::default();
+    request
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let mut entry = [plan_entry(request, candidate)];
+            detect_collisions_with(request.master_root, &mut entry, &mut folders);
+            let [entry] = entry;
+            entry
+        })
+        .collect()
+}
+
+fn detect_collisions_with(
+    master_root: &Path,
+    entries: &mut [OrganisationPlanEntry],
+    folders: &mut FolderNames,
+) {
     let count = entries.len();
     let mut groups: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
@@ -609,11 +646,7 @@ pub(crate) fn detect_collisions(master_root: &Path, entries: &mut [OrganisationP
     }
 
     // Live destination: occupied, or a case-only sibling. Read-only; each
-    // destination folder's names are read once (lowercased name -> names).
-    let mut folders: std::collections::HashMap<
-        PathBuf,
-        Option<std::collections::HashMap<String, Vec<String>>>,
-    > = std::collections::HashMap::new();
+    // destination folder's names are read once per call (see FolderNames).
     for index in 0..count {
         if entries[index].destination_path.as_os_str().is_empty() {
             continue;
@@ -678,20 +711,23 @@ pub(crate) fn detect_collisions(master_root: &Path, entries: &mut [OrganisationP
         if file_name.is_empty() {
             continue;
         }
-        let names = folders.entry(parent.to_path_buf()).or_insert_with(|| {
-            std::fs::read_dir(parent).ok().map(|dir_entries| {
-                let mut names: std::collections::HashMap<String, Vec<String>> =
-                    std::collections::HashMap::new();
-                for dir_entry in dir_entries.flatten() {
-                    let name = dir_entry.file_name().to_string_lossy().into_owned();
+        let names = folders
+            .folders
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| {
+                std::fs::read_dir(parent).ok().map(|dir_entries| {
+                    let mut names: std::collections::HashMap<String, Vec<String>> =
+                        std::collections::HashMap::new();
+                    for dir_entry in dir_entries.flatten() {
+                        let name = dir_entry.file_name().to_string_lossy().into_owned();
+                        names
+                            .entry(name.to_ascii_lowercase())
+                            .or_default()
+                            .push(name);
+                    }
                     names
-                        .entry(name.to_ascii_lowercase())
-                        .or_default()
-                        .push(name);
-                }
-                names
-            })
-        });
+                })
+            });
         if let Some(names) = names {
             let collision = names
                 .get(&file_name.to_ascii_lowercase())

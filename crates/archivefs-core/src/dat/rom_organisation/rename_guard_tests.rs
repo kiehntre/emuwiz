@@ -1101,3 +1101,237 @@ fn grouped_collision_detection_matches_the_all_pairs_version() {
         assert_eq!(grouped, pairwise);
     }
 }
+
+/// Profile (ignored by default): where catalogue preparation and the Apply
+/// revalidation spend their time.
+#[test]
+#[ignore]
+fn catalogue_and_revalidate_phase_profile() {
+    use std::time::Instant;
+    for count in [1000usize, 2000] {
+        let (lib, games, _) = crowded_library(count);
+        let plan = rename_plan(&lib, &games);
+        let approved: BTreeSet<String> = plan
+            .suggested()
+            .map(|e| e.source_path.to_string_lossy().into_owned())
+            .collect();
+        let t = Instant::now();
+        let mut transaction = build_organisation_transaction(&plan, &approved, 1).unwrap();
+        let build = t.elapsed();
+        let t = Instant::now();
+        crate::database::organisation_paths::bind(&mut transaction, &lib.db).unwrap();
+        let bind = t.elapsed();
+        let t = Instant::now();
+        let mut found = 0;
+        for entry in &plan.entries {
+            if transaction
+                .entries
+                .iter()
+                .any(|e| e.source_path == entry.source_path)
+            {
+                found += 1;
+            }
+        }
+        let copy_back = t.elapsed();
+        let t = Instant::now();
+        for entry in plan.suggested() {
+            let _ = live_resolution_for(&lib.db, &entry.source_path, 1);
+        }
+        let resolutions = t.elapsed();
+        let t = Instant::now();
+        for entry in plan.suggested() {
+            let candidate = OrganisationCandidate {
+                source_path: entry.source_path.clone(),
+                resolution: live_resolution_for(&lib.db, &entry.source_path, 1),
+                canonical_name: entry
+                    .destination_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned()),
+                content_classification: None,
+                original_metadata: Default::default(),
+            };
+            let _ = build_organisation_plan(&OrganisationPlanRequest {
+                master_root: &plan.master_root,
+                mode: plan.mode,
+                content_policy: plan.content_policy,
+                candidates: std::slice::from_ref(&candidate),
+                generation: 1,
+                unknown_folder: None,
+            });
+        }
+        let replans = t.elapsed();
+        println!(
+            "CATALOGUE-PROFILE games={count} | prepare: build_transaction={build:?} bind={bind:?} \
+             copy_back_find={copy_back:?} ({found}) | revalidate: live_resolution={resolutions:?} \
+             resolution+one_entry_plan={replans:?}"
+        );
+    }
+}
+
+#[test]
+fn batched_apply_revalidation_decides_exactly_as_the_per_entry_check() {
+    use super::transaction::{
+        revalidate_organisation_plan, revalidate_organisation_plan_per_entry,
+    };
+    let (mut lib, games, _) = crowded_library(40);
+    let plan = rename_plan(&lib, &games);
+    let database = lib.temp.path().join("library.sqlite3");
+    let same_names = |path: &Path| {
+        let stem = path.file_stem()?.to_string_lossy().into_owned();
+        Some(format!("{stem} (USA).nes"))
+    };
+    let both = |plan: &OrganisationPlan, names: &dyn Fn(&Path) -> Option<String>| {
+        let batched = revalidate_organisation_plan(plan, &database, names);
+        let per_entry = revalidate_organisation_plan_per_entry(plan, &database, names);
+        assert_eq!(batched, per_entry);
+        batched
+    };
+    assert_eq!(both(&plan, &same_names), Ok(()));
+
+    // A proposed name that changed since the preview.
+    let renamed = |path: &Path| {
+        if path.ends_with("Game 00007.nes") {
+            Some("Something Else.nes".to_string())
+        } else {
+            same_names(path)
+        }
+    };
+    assert!(
+        both(&plan, &renamed)
+            .unwrap_err()
+            .contains("Game 00007.nes")
+    );
+
+    // The destination appeared on disk; a case-only sibling appeared.
+    let nes = lib.root.join("nes");
+    std::fs::write(nes.join("Game 00012 (USA).nes"), b"x").unwrap();
+    assert!(
+        both(&plan, &same_names)
+            .unwrap_err()
+            .contains("Game 00012.nes")
+    );
+    std::fs::remove_file(nes.join("Game 00012 (USA).nes")).unwrap();
+    std::fs::write(nes.join("GAME 00003 (usa).nes"), b"x").unwrap();
+    assert!(
+        both(&plan, &same_names)
+            .unwrap_err()
+            .contains("Game 00003.nes")
+    );
+    std::fs::remove_file(nes.join("GAME 00003 (usa).nes")).unwrap();
+
+    // Two failures: both report the first in plan order.
+    std::fs::write(nes.join("Game 00030 (USA).nes"), b"x").unwrap();
+    std::fs::write(nes.join("Game 00020 (USA).nes"), b"x").unwrap();
+    assert!(
+        both(&plan, &same_names)
+            .unwrap_err()
+            .contains("Game 00020.nes")
+    );
+    for name in ["Game 00030 (USA).nes", "Game 00020 (USA).nes"] {
+        std::fs::remove_file(nes.join(name)).unwrap();
+    }
+
+    // The platform changed; the source file went away.
+    let id = lib
+        .db
+        .find_archive_id_by_absolute_path(&games[5])
+        .unwrap()
+        .unwrap();
+    lib.db.set_manual_platform(id, "snes").unwrap();
+    assert!(
+        both(&plan, &same_names)
+            .unwrap_err()
+            .contains("Game 00005.nes")
+    );
+    lib.db.set_manual_platform(id, "nes").unwrap();
+    std::fs::remove_file(&games[9]).unwrap();
+    assert!(
+        both(&plan, &same_names)
+            .unwrap_err()
+            .contains("Game 00009.nes")
+    );
+}
+
+/// Benchmark (ignored by default; meant for `--release`): the preview and
+/// Apply-check stages Blue runs, through the core functions, at 1000, 2000
+/// and 4000 games (override with PREVIEW_BENCH_SIZES=1000,2000).
+#[test]
+#[ignore]
+fn core_pipeline_benchmark() {
+    use super::rename_guard::LiveResolutions;
+    use std::time::Instant;
+    let sizes: Vec<usize> = std::env::var("PREVIEW_BENCH_SIZES")
+        .ok()
+        .map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1000, 2000, 4000]);
+    let rss = |field: &str| rss_kib(field);
+    for count in sizes {
+        let started = Instant::now();
+        let (lib, games, locations) = crowded_library(count);
+        let setup = started.elapsed();
+        let database = lib.temp.path().join("library.sqlite3");
+        let rss_start = rss("VmRSS:");
+        // Preview.
+        let t = Instant::now();
+        let resolutions = LiveResolutions::read(&lib.db);
+        let candidates: Vec<OrganisationCandidate> = games
+            .iter()
+            .map(|game| OrganisationCandidate {
+                source_path: game.clone(),
+                resolution: resolutions.for_path(game, 1),
+                canonical_name: Some(format!(
+                    "{} (USA).nes",
+                    game.file_stem().unwrap().to_string_lossy()
+                )),
+                content_classification: None,
+                original_metadata: Default::default(),
+            })
+            .collect();
+        let lookup = t.elapsed();
+        let t = Instant::now();
+        let mut plan = build_organisation_plan(&OrganisationPlanRequest {
+            master_root: &lib.root,
+            mode: OrganisationMode::RenameInPlace,
+            content_policy: ContentSelectionPolicy::AllEntries,
+            candidates: &candidates,
+            generation: 1,
+            unknown_folder: None,
+        });
+        let planning = t.elapsed();
+        let t = Instant::now();
+        let stats = guard_bulk_rename_plan_with_stats(&lib.db, &mut plan, &locations);
+        let guard = t.elapsed();
+        let t = Instant::now();
+        super::transaction::prepare_organisation_catalogue(&mut plan, &lib.db).unwrap();
+        let catalogue = t.elapsed();
+        let preview = lookup + planning + guard + catalogue;
+        let rss_preview = rss("VmRSS:");
+        // Apply checks (nothing is applied).
+        let approved: BTreeSet<String> = plan
+            .suggested()
+            .map(|e| e.source_path.to_string_lossy().into_owned())
+            .collect();
+        let names =
+            |path: &Path| Some(format!("{} (USA).nes", path.file_stem()?.to_string_lossy()));
+        let t = Instant::now();
+        let revalidated =
+            super::transaction::revalidate_organisation_plan(&plan, &database, &names);
+        let revalidate = t.elapsed();
+        let t = Instant::now();
+        let reguarded = refuse_if_newly_blocked(&lib.db, &plan, &approved, &locations);
+        let reguard = t.elapsed();
+        println!(
+            "CORE-PIPELINE games={count} setup={setup:?} | PREVIEW total={preview:?} = \
+             lookup={lookup:?} plan={planning:?} guard={guard:?} catalogue={catalogue:?} | \
+             suggested={} blocked={} | rss_start_kib={rss_start} rss_after_preview_kib={rss_preview} \
+             peak_kib={} | APPLY checks total={:?} = revalidate={revalidate:?} ({}) reguard={reguard:?} ({})",
+            plan.suggested().count(),
+            stats.blocked,
+            rss("VmHWM:"),
+            revalidate + reguard,
+            if revalidated.is_ok() { "ok" } else { "refused" },
+            if reguarded.is_ok() { "ok" } else { "refused" },
+        );
+        assert!(revalidated.is_ok() && reguarded.is_ok());
+    }
+}
