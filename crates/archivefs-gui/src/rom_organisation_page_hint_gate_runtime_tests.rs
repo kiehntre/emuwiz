@@ -174,6 +174,14 @@ fn both_apply_paths_refuse_a_stale_romm_row_at_runtime() {
         "{text}"
     );
     assert!(
+        text.contains("VERIFIED-ROUND-TRIP apply=verified undo=verified"),
+        "{text}"
+    );
+    assert!(
+        text.contains("HINT-GATE-RUNTIME link-destination overlap=refused"),
+        "{text}"
+    );
+    assert!(
         text.contains("HINT-GATE-RUNTIME linked-library links=4 conflicts=2 rerun=already-present"),
         "{text}"
     );
@@ -428,6 +436,62 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
     );
     println!("HINT-GATE-RUNTIME standard=refused advanced=refused unchanged=yes");
 
+    // A verified game keeps its verified catalogue name across its own
+    // Standard Apply and Undo: the saved check moves with the file EmuWiz
+    // renamed (a rename changes the file's change time), so the next preview
+    // still names it from the catalogue.
+    let renamed = games.join(VERIFIED_NAME);
+    let verified_choice = |path: &Path| {
+        let choice = NameResolver::load().choose(path);
+        assert!(
+            matches!(choice.source, NameSource::VerifiedDat { .. }),
+            "{}: {choice:?}",
+            path.display()
+        );
+        assert_eq!(choice.name.as_deref(), Some(VERIFIED_NAME));
+    };
+    state.generate_plan();
+    assert!(state.error.is_none(), "{:?}", state.error);
+    assert_eq!(state.approved, BTreeSet::from([key(&verified)]));
+    state.apply();
+    assert!(state.error.is_none(), "{:?}", state.error);
+    assert!(renamed.is_file() && !verified.exists());
+    verified_choice(&renamed);
+    // The page walks its folders once per visit; walk again as reopening
+    // the page does, so the renamed file is listed.
+    state.scan_sources();
+    state.generate_plan();
+    assert!(state.error.is_none(), "{:?}", state.error);
+    assert_eq!(
+        state
+            .plan
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .find(|e| e.source_path == renamed)
+            .map(|e| e.status),
+        Some(OrganisationStatus::AlreadyOrganised),
+        "after Apply the game is still verified and already named: {:?}",
+        state
+            .plan
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| (&e.source_path, e.status))
+            .collect::<Vec<_>>()
+    );
+    state.rollback();
+    assert!(state.error.is_none(), "{:?}", state.error);
+    assert!(verified.is_file() && !renamed.exists());
+    verified_choice(&verified);
+    state.scan_sources();
+    state.generate_plan();
+    assert!(state.error.is_none(), "{:?}", state.error);
+    assert_eq!(state.approved, BTreeSet::from([key(&verified)]));
+    println!("VERIFIED-ROUND-TRIP apply=verified undo=verified");
+
     // Linked library (owner policy 2026-11-22): every eligible game gets a
     // link. A verified catalogue name names it; a RomM-only or unnamed game
     // keeps its own file name; colliding names are Conflicts, never
@@ -631,6 +695,34 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
         RomOrganisationPageState::default().with_deferred_source_roots(vec![old_links.clone()]);
     links_state.configure_for_test(reorganised.clone(), root.join("data/links-journal"));
     links_state.set_mode(OrganisationMode::OrganiseSymlinkOnly);
+    // Reorganised links need their own folder (owner decision 2026-11-22):
+    // none chosen, the game folder, a folder inside it, or one holding it
+    // is refused before anything is planned - never redirected.
+    links_state.generate_plan();
+    assert!(
+        links_state
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("choose a separate folder")),
+        "{:?}",
+        links_state.error
+    );
+    for (folder, says) in [
+        (games.clone(), "is your game folder"),
+        (games.join("sub"), "is inside your game folder"),
+        (root.clone(), "holds your game folder"),
+    ] {
+        links_state.saved_library_root = Some(folder.clone());
+        links_state.generate_plan();
+        let error = links_state
+            .error
+            .clone()
+            .expect("an overlapping folder is refused");
+        assert!(error.contains(says), "{}: {error}", folder.display());
+        assert!(links_state.plan.is_none());
+    }
+    println!("HINT-GATE-RUNTIME link-destination overlap=refused");
+    links_state.saved_library_root = Some(reorganised.clone());
     links_state.generate_plan();
     assert!(links_state.error.is_none(), "{:?}", links_state.error);
     let plan = links_state.plan.clone().expect("an existing-links preview");
@@ -663,7 +755,11 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
         };
         expected.insert(name.to_string(), text);
         // Each link inherits its game file's platform.
-        assert_eq!(entry.platform.as_deref(), Some("Game Boy Advance"), "{entry:?}");
+        assert_eq!(
+            entry.platform.as_deref(),
+            Some("Game Boy Advance"),
+            "{entry:?}"
+        );
     }
     for link in [&clash_a, &clash_b] {
         let entry = row(link);

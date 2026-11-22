@@ -210,3 +210,67 @@ pub fn identity_path(mode: super::OrganisationMode, source: &Path) -> PathBuf {
 pub fn approved_library_roots(database: &crate::Database) -> Result<Vec<PathBuf>, String> {
     crate::database::organisation_paths::enabled_source_roots(database)
 }
+
+/// Reorganise existing links needs its own destination folder (owner
+/// decision 2026-11-22). A destination that is one of the library's game
+/// folders, inside one, or holding one could put a link where a game file
+/// already is, so it is refused before anything is planned; nothing is
+/// redirected. Both sides are compared as real paths. Returns the
+/// destination's real path.
+pub fn separate_link_destination(
+    destination: &Path,
+    approved_roots: &[PathBuf],
+) -> Result<PathBuf, String> {
+    const CHOOSE: &str = "Choose a separate, empty folder for the reorganised links (not one of your game folders). Nothing was changed.";
+    let real = std::fs::canonicalize(destination)
+        .ok()
+        .filter(|real| real.is_dir())
+        .ok_or_else(|| {
+            format!(
+                "The folder for reorganised links, {}, does not exist or is not a folder. {CHOOSE}",
+                destination.display()
+            )
+        })?;
+    if approved_roots.is_empty() {
+        return Err(format!(
+            "The library's game folders could not be read, so the folder for reorganised links cannot be checked. {CHOOSE}"
+        ));
+    }
+    for root in approved_roots {
+        let Ok(root_real) = std::fs::canonicalize(root) else {
+            return Err(format!(
+                "The game folder {} could not be checked, so the folder for reorganised links cannot be confirmed as separate. {CHOOSE}",
+                root.display()
+            ));
+        };
+        let relation = if real == root_real {
+            "is your game folder"
+        } else if real.starts_with(&root_real) {
+            "is inside your game folder"
+        } else if root_real.starts_with(&real) {
+            "holds your game folder"
+        } else {
+            continue;
+        };
+        return Err(format!(
+            "The folder for reorganised links, {}, {relation} {}, so a link could be placed where a game file already is. {CHOOSE}",
+            destination.display(),
+            root.display()
+        ));
+    }
+    Ok(real)
+}
+
+/// Why an occupied destination is a conflict for an existing link: the
+/// object there is the very game file the link points at (its own game
+/// already sits in the destination folder), or something else.
+pub(crate) fn occupied_destination_reason(source: &Path, destination: &Path) -> &'static str {
+    let own_game = resolve_link_target(source).is_ok_and(|target| {
+        std::fs::canonicalize(destination).is_ok_and(|occupant| occupant == target)
+    });
+    if own_game {
+        "this link's new place is its own game file (the game already sits in the destination folder); nothing is overwritten. Choose a separate folder for reorganised links"
+    } else {
+        "the destination already exists; nothing is overwritten"
+    }
+}

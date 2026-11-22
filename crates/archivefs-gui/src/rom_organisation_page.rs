@@ -522,11 +522,14 @@ impl RomOrganisationPageState {
     }
 
     /// The destination root the current mode plans into: the explicitly
-    /// chosen linked-library root in BuildLinkedLibrary mode, otherwise the
+    /// chosen (session-only) link folder for the two link modes (building a
+    /// linked library, reorganising existing links), otherwise the
     /// configured master ROM root.
     pub(crate) fn effective_root(&self) -> Option<PathBuf> {
         match self.mode {
-            OrganisationMode::BuildLinkedLibrary => self.saved_library_root.clone(),
+            OrganisationMode::BuildLinkedLibrary | OrganisationMode::OrganiseSymlinkOnly => {
+                self.saved_library_root.clone()
+            }
             _ => self.saved_master_root.clone(),
         }
     }
@@ -633,6 +636,9 @@ impl RomOrganisationPageState {
         let Some(master_root) = self.effective_root() else {
             self.error = Some(if self.mode == OrganisationMode::BuildLinkedLibrary {
                 "choose a linked library folder first".to_string()
+            } else if self.mode == OrganisationMode::OrganiseSymlinkOnly {
+                "choose a separate folder for the reorganised links first (not one of your game folders)"
+                    .to_string()
             } else {
                 "configure a master ROM root first".to_string()
             });
@@ -673,6 +679,19 @@ impl RomOrganisationPageState {
                     })
             })
             .flatten();
+        // Reorganised links go into their own folder, never one of the game
+        // folders (or one inside or holding them): refused, not redirected.
+        if self.mode == OrganisationMode::OrganiseSymlinkOnly
+            && let Err(reason) =
+                archivefs_core::dat::rom_organisation::link_target::separate_link_destination(
+                    &master_root,
+                    link_roots.as_deref().unwrap_or_default(),
+                )
+        {
+            self.error = Some(reason);
+            self.plan = None;
+            return true;
+        }
         // No RomM mapping is consulted: generic destinations derive from the
         // neutral EmuWiz platform layout identity.
         let Some(mut plan) = build_organisation_plan_reporting(
@@ -2341,17 +2360,31 @@ fn show_rom_organisation_page_with_options(
         return page_action;
     }
 
-    if state.mode == OrganisationMode::BuildLinkedLibrary {
-        // Linked-library mode plans into an explicitly chosen destination
-        // root that is separate from the master ROM root. It is never
-        // inferred from the source folders.
+    if matches!(
+        state.mode,
+        OrganisationMode::BuildLinkedLibrary | OrganisationMode::OrganiseSymlinkOnly
+    ) {
+        // Both link modes plan into an explicitly chosen destination root
+        // that is separate from the master ROM root. It is never inferred
+        // from the source folders and never saved.
+        let reorganise = state.mode == OrganisationMode::OrganiseSymlinkOnly;
         widgets::card(ui, |ui| {
-            ui.label(egui::RichText::new("Linked library folder").strong());
             ui.label(
-                egui::RichText::new(
+                egui::RichText::new(if reorganise {
+                    "Folder for reorganised links"
+                } else {
+                    "Linked library folder"
+                })
+                .strong(),
+            );
+            ui.label(
+                egui::RichText::new(if reorganise {
+                    "Your existing links are moved into this folder, one folder per system. \
+                     It must be separate from your game folders; your games stay where they are."
+                } else {
                     "The organised links are created inside this folder; your original \
-                     files stay where they are.",
-                )
+                     files stay where they are."
+                })
                 .color(theme::muted(ui)),
             );
             match &state.saved_library_root {
@@ -2379,8 +2412,12 @@ fn show_rom_organisation_page_with_options(
                 }
                 None => {
                     ui.label(
-                        egui::RichText::new("No linked library folder is chosen yet.")
-                            .color(theme::muted(ui)),
+                        egui::RichText::new(if reorganise {
+                            "No folder for the reorganised links is chosen yet."
+                        } else {
+                            "No linked library folder is chosen yet."
+                        })
+                        .color(theme::muted(ui)),
                     );
                     if widgets::action_button(
                         ui,

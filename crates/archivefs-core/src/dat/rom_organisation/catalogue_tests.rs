@@ -1288,3 +1288,294 @@ fn organise_and_undo_keep_favourites_and_collections_on_the_same_game() {
         assert_eq!(members(&f.db), expected);
     }
 }
+
+/// Saved catalogue checks (owner blocker 2026-11-22): a check of exactly the
+/// file being renamed moves with it on Apply and back on Undo, so a verified
+/// game stays verified after EmuWiz renames it.
+mod carried_catalogue_checks {
+    use super::*;
+    use crate::dat::library_identity_summary::DiscFileState;
+    use crate::identity_source::hashing::FileFingerprint;
+
+    fn check_of(path: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "audit_file": FileFingerprint::observe(path).unwrap(),
+            "disc_members": [],
+            "archive_member": null,
+            "untouched": "every other fact stays as it was",
+        })
+    }
+
+    fn insert(f: &Fixture, facts: &serde_json::Value) -> i64 {
+        let c = f.sql();
+        c.execute(
+            "INSERT INTO library_dat_identities(archive_id,dat_source_id,verification_state,completeness,audited_at,facts_json,created_at,updated_at) \
+             VALUES(?1,'dat-fixture-'||(SELECT COUNT(*) FROM library_dat_identities),'verified_single_match','exhaustive','t',?2,'t','t')",
+            params![f.id, serde_json::to_vec(facts).unwrap()],
+        )
+        .unwrap();
+        c.last_insert_rowid()
+    }
+
+    fn stored(f: &Fixture, row: i64) -> Vec<u8> {
+        f.sql()
+            .query_row(
+                "SELECT facts_json FROM library_dat_identities WHERE id=?1",
+                [row],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn recorded(f: &Fixture, row: i64) -> FileFingerprint {
+        let facts: serde_json::Value = serde_json::from_slice(&stored(f, row)).unwrap();
+        assert_eq!(facts["untouched"], "every other fact stays as it was");
+        serde_json::from_value(facts["audit_file"].clone()).unwrap()
+    }
+
+    /// Binds the preview again, as a fresh preview would, after the rows above.
+    fn rebind(f: &mut Fixture) {
+        for entry in &mut f.plan.entries {
+            entry.catalogue_binding = None;
+        }
+        prepare_organisation_catalogue(&mut f.plan, &f.db).unwrap();
+        f.tx = build_organisation_transaction(&f.plan, &f.approved, 1).unwrap();
+    }
+
+    #[test]
+    fn a_current_check_moves_with_its_file_on_apply_and_back_on_undo() {
+        for mode in [
+            OrganisationMode::RenameInPlace,
+            OrganisationMode::MoveRealFile,
+        ] {
+            let mut f = Fixture::new(mode);
+            let row = insert(&f, &check_of(&f.source));
+            rebind(&mut f);
+            f.apply().unwrap();
+            let moved = recorded(&f, row);
+            assert_eq!(moved.path, f.destination, "{mode:?}");
+            assert_eq!(
+                DiscFileState::of(&moved),
+                DiscFileState::Unchanged,
+                "{mode:?}"
+            );
+            f.reload();
+            f.undo().unwrap();
+            let back = recorded(&f, row);
+            assert_eq!(back.path, f.source, "{mode:?}");
+            assert_eq!(
+                DiscFileState::of(&back),
+                DiscFileState::Unchanged,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_member_disc_and_changed_checks_stay_exactly_where_they_were() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        // Changed after it was saved: the change time no longer matches.
+        let mut stale = check_of(&f.source);
+        stale["audit_file"]["object"]["changed_seconds"] = serde_json::json!(1);
+        let stale = insert(&f, &stale);
+        // A check of a member inside an archive, or of a disc set, is not a
+        // check of this one file.
+        let mut member = check_of(&f.source);
+        member["archive_member"] = serde_json::json!({"member": "inside.bin"});
+        let member = insert(&f, &member);
+        let mut disc = check_of(&f.source);
+        disc["disc_members"] = serde_json::json!([FileFingerprint::observe(&f.source).unwrap()]);
+        let disc = insert(&f, &disc);
+        // Current when the preview was bound, then saved again elsewhere.
+        let resaved = insert(&f, &check_of(&f.source));
+        rebind(&mut f);
+        let other = f.temp.path().join("elsewhere.zip");
+        std::fs::write(&other, b"other").unwrap();
+        f.sql()
+            .execute(
+                "UPDATE library_dat_identities SET facts_json=?1 WHERE id=?2",
+                params![serde_json::to_vec(&check_of(&other)).unwrap(), resaved],
+            )
+            .unwrap();
+        let before: Vec<_> = [stale, member, disc, resaved]
+            .iter()
+            .map(|row| stored(&f, *row))
+            .collect();
+        f.apply().unwrap();
+        assert_eq!(
+            f.path_id(&f.destination),
+            Some(f.id),
+            "the game itself moved"
+        );
+        let after: Vec<_> = [stale, member, disc, resaved]
+            .iter()
+            .map(|row| stored(&f, *row))
+            .collect();
+        assert_eq!(after, before);
+        f.reload();
+        f.undo().unwrap();
+        let undone: Vec<_> = [stale, member, disc, resaved]
+            .iter()
+            .map(|row| stored(&f, *row))
+            .collect();
+        assert_eq!(undone, before);
+    }
+
+    #[test]
+    fn a_game_with_no_saved_check_gets_none() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let count = |f: &Fixture| -> i64 {
+            f.sql()
+                .query_row("SELECT COUNT(*) FROM library_dat_identities", [], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        f.apply().unwrap();
+        assert_eq!(count(&f), 0, "Apply never makes a check");
+        f.reload();
+        f.undo().unwrap();
+        assert_eq!(count(&f), 0, "Undo never makes a check");
+    }
+
+    #[test]
+    fn a_check_made_stale_after_the_preview_stays_stale() {
+        // Same content, but the file changed after the preview (here its
+        // permissions, which set a new change time): the check was not
+        // valid immediately before the rename, so it is not carried.
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let row = insert(&f, &check_of(&f.source));
+        rebind(&mut f);
+        let before = stored(&f, row);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&f.source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        f.apply().unwrap();
+        assert_eq!(f.path_id(&f.destination), Some(f.id), "the game moved");
+        assert_eq!(stored(&f, row), before, "the check was left as it was");
+    }
+
+    #[test]
+    fn content_changed_after_the_preview_moves_nothing() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let row = insert(&f, &check_of(&f.source));
+        rebind(&mut f);
+        let before = stored(&f, row);
+        let modified = std::fs::metadata(&f.source).unwrap().modified().unwrap();
+        std::fs::write(&f.source, b"fixture CONTENTS").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&f.source)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(f.apply().is_err() || f.path_id(&f.destination).is_none());
+        assert!(f.source.exists() && !f.destination.exists());
+        assert_eq!(stored(&f, row), before);
+    }
+
+    #[test]
+    fn an_interrupted_apply_finished_by_recovery_carries_nothing() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let row = insert(&f, &check_of(&f.source));
+        rebind(&mut f);
+        let before = stored(&f, row);
+        f.fault();
+        assert!(f.apply().is_err());
+        assert!(f.destination.exists());
+        assert_eq!(stored(&f, row), before, "the failed commit changed nothing");
+        f.clear_fault();
+        f.reload();
+        f.reconcile();
+        assert_eq!(f.tx.state, TransactionState::Applied);
+        assert_eq!(f.path_id(&f.destination), Some(f.id));
+        assert_eq!(
+            stored(&f, row),
+            before,
+            "recovery cannot prove the moment before the rename: the check stays stale"
+        );
+        assert_ne!(
+            DiscFileState::of(&recorded(&f, row)),
+            DiscFileState::Unchanged,
+            "and it does not describe the moved file"
+        );
+    }
+
+    #[test]
+    fn an_unverified_check_moves_but_is_never_made_verified() {
+        // A saved "no match" result is still a saved result: it follows the
+        // file, and its verification state stays exactly what it was.
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let row = insert(&f, &check_of(&f.source));
+        f.sql()
+            .execute(
+                "UPDATE library_dat_identities SET verification_state='no_match' WHERE id=?1",
+                [row],
+            )
+            .unwrap();
+        rebind(&mut f);
+        let state = |f: &Fixture| -> String {
+            f.sql()
+                .query_row(
+                    "SELECT verification_state FROM library_dat_identities WHERE id=?1",
+                    [row],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        f.apply().unwrap();
+        assert_eq!(recorded(&f, row).path, f.destination);
+        assert_eq!(state(&f), "no_match");
+        let count: i64 = f
+            .sql()
+            .query_row("SELECT COUNT(*) FROM library_dat_identities", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "no check was made");
+    }
+
+    #[test]
+    fn a_check_made_stale_after_apply_stays_stale_through_undo() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let row = insert(&f, &check_of(&f.source));
+        rebind(&mut f);
+        f.apply().unwrap();
+        assert_eq!(recorded(&f, row).path, f.destination);
+        assert_eq!(
+            DiscFileState::of(&recorded(&f, row)),
+            DiscFileState::Unchanged
+        );
+        // Changed outside EmuWiz after Apply (new change time).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&f.destination, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = stored(&f, row);
+        f.reload();
+        assert_eq!(
+            f.undo().unwrap().rollback.result,
+            crate::dat::rename_apply::RollbackResult::FullyRolledBack
+        );
+        assert_eq!(f.path_id(&f.source), Some(f.id), "the game went back");
+        assert_eq!(stored(&f, row), before, "the stale check did not move");
+    }
+
+    #[test]
+    fn a_journal_bound_without_checks_reads_and_moves_as_before() {
+        let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+        let binding = f.tx.entries[0].unknown
+            [crate::database::organisation_paths::CATALOGUE_BINDING_KEY]
+            .clone();
+        assert!(
+            binding.get("proofs").is_none(),
+            "no field when nothing moves"
+        );
+        let row = insert(&f, &check_of(&f.source));
+        let before = stored(&f, row);
+        // The preview was bound before this check existed (as an older
+        // journal would be): Apply moves the game and leaves the check.
+        f.apply().unwrap();
+        assert_eq!(f.path_id(&f.destination), Some(f.id));
+        assert_eq!(stored(&f, row), before);
+    }
+}

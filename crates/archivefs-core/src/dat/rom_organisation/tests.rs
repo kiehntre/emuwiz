@@ -2327,6 +2327,86 @@ fn an_existing_link_onto_an_occupied_name_is_a_conflict_not_an_overwrite() {
 }
 
 #[test]
+fn a_link_whose_new_place_is_its_own_game_says_so() {
+    // The destination folder already holds the game itself (the master root
+    // overlaps the game folder): a self-target conflict, worded as such,
+    // distinct from a different file in the way. Nothing is overwritten.
+    let fx = LinkFixture::new();
+    std::fs::create_dir_all(fx.folder()).unwrap();
+    let own = fx.folder().join("own.iso");
+    std::fs::write(&own, b"the game").unwrap();
+    let own_link = fx.links.join("Romm Own.iso");
+    std::os::unix::fs::symlink(&own, &own_link).unwrap();
+    let (_, other_link) = fx.link("taken.iso", "Romm Taken.iso");
+    std::fs::write(fx.folder().join("taken.iso"), b"someone else's file").unwrap();
+    let plan = plan_with_link_roots(
+        &fx.master,
+        &[
+            fx.candidate(&own_link, None),
+            fx.candidate(&other_link, None),
+        ],
+        &[fx.master.clone(), fx.games.clone()],
+    );
+    let row = |link: &Path| plan.entries.iter().find(|e| e.source_path == link).unwrap();
+    assert_eq!(row(&own_link).status, OrganisationStatus::Conflict);
+    assert!(
+        row(&own_link)
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("its own game file"),
+        "{:?}",
+        row(&own_link).reason
+    );
+    assert_eq!(row(&other_link).status, OrganisationStatus::Conflict);
+    assert_eq!(
+        row(&other_link).reason.as_deref(),
+        Some("the destination already exists; nothing is overwritten")
+    );
+    assert_eq!(std::fs::read(&own).unwrap(), b"the game");
+    assert_eq!(
+        std::fs::read(fx.folder().join("taken.iso")).unwrap(),
+        b"someone else's file"
+    );
+    assert!(
+        std::fs::symlink_metadata(&own_link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn reorganised_links_need_a_folder_separate_from_every_game_folder() {
+    use super::link_target::separate_link_destination as check;
+    let fx = LinkFixture::new();
+    let games = vec![fx.games.clone()];
+    let inside = fx.games.join("links-here");
+    std::fs::create_dir_all(&inside).unwrap();
+    let separate = fx.root.join("reorganised");
+    std::fs::create_dir_all(&separate).unwrap();
+    // A link to a folder inside the game folder resolves there: refused.
+    let disguised = fx.root.join("disguised");
+    std::os::unix::fs::symlink(&inside, &disguised).unwrap();
+    for (destination, says) in [
+        (&fx.games, "is your game folder"),
+        (&inside, "is inside your game folder"),
+        (&fx.root, "holds your game folder"),
+        (&disguised, "is inside your game folder"),
+    ] {
+        let error = check(destination, &games).unwrap_err();
+        assert!(error.contains(says), "{}: {error}", destination.display());
+        assert!(error.contains("Nothing was changed"), "{error}");
+    }
+    assert_eq!(check(&separate, &games).unwrap(), separate);
+    // Unknown game folders, an unreadable game folder or a missing
+    // destination cannot be confirmed separate: refused.
+    assert!(check(&separate, &[]).is_err());
+    assert!(check(&separate, &[fx.root.join("no-such-games")]).is_err());
+    assert!(check(&fx.root.join("missing"), &games).is_err());
+}
+
+#[test]
 fn relative_absolute_escaping_chained_and_broken_existing_links() {
     let fx = LinkFixture::new();
     std::fs::write(fx.games.join("game.iso"), b"g").unwrap();

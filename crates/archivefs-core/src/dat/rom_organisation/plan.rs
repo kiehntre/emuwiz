@@ -605,11 +605,15 @@ pub(crate) fn detect_collisions(master_root: &Path, entries: &mut [OrganisationP
             }
         }
         if std::fs::symlink_metadata(&entries[index].destination_path).is_ok() {
-            mark_conflict(
-                entries,
-                index,
-                "the destination already exists; nothing is overwritten",
-            );
+            let reason = if entries[index].mode == OrganisationMode::OrganiseSymlinkOnly {
+                super::link_target::occupied_destination_reason(
+                    &entries[index].source_path,
+                    &entries[index].destination_path,
+                )
+            } else {
+                "the destination already exists; nothing is overwritten"
+            };
+            mark_conflict(entries, index, reason);
             continue;
         }
         let Some(parent) = entries[index].destination_path.parent() else {
@@ -749,11 +753,15 @@ pub(crate) fn detect_collisions_pairwise(
             }
         }
         if std::fs::symlink_metadata(&entries[index].destination_path).is_ok() {
-            mark_conflict(
-                entries,
-                index,
-                "the destination already exists; nothing is overwritten",
-            );
+            let reason = if entries[index].mode == OrganisationMode::OrganiseSymlinkOnly {
+                super::link_target::occupied_destination_reason(
+                    &entries[index].source_path,
+                    &entries[index].destination_path,
+                )
+            } else {
+                "the destination already exists; nothing is overwritten"
+            };
+            mark_conflict(entries, index, reason);
             continue;
         }
         let Some(parent) = entries[index].destination_path.parent() else {

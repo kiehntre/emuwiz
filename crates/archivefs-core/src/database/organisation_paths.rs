@@ -80,6 +80,152 @@ struct Binding {
     fingerprint: bool,
     #[serde(default)]
     platform: Option<PlatformChange>,
+    /// Saved catalogue checks of this exact file that move with it. Empty
+    /// (and absent from older journals) means none: the check then stays at
+    /// the old path and the game must be checked again, as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    proofs: Vec<ProofCarry>,
+}
+
+/// One saved catalogue check (`library_dat_identities` row) whose recorded
+/// file is the very object this move renames (owner decision 2026-11-22: an
+/// EmuWiz-controlled rename or Undo keeps a valid check; it never makes one).
+///
+/// The chain, each link failing closed (the check then stays where it was
+/// and the game must be checked again, as under #420):
+/// 1. Bind (preview): the check is unchanged for this object - device,
+///    inode, size, modification AND change time - after the preview captured
+///    the file's full-content proof (`sha256`).
+/// 2. Begin (Apply/Undo, catalogue write lock held, just before the rename):
+///    the check is still unchanged at the path being renamed. Recovery after
+///    an interruption carries nothing.
+/// 3. The executor re-reads the whole file before and after the rename and
+///    requires the same object and content (`identity_matches`).
+/// 4. Commit: the renamed file is observed, read in full again (same object
+///    and content), and observed again with identical results; only then is
+///    the check re-pointed to the new path and the new change time.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ProofCarry {
+    row: i64,
+    device: u64,
+    inode: u64,
+    size_bytes: u64,
+    modified_unix_seconds: i64,
+    modified_nanoseconds: i64,
+    /// The full-content proof the transaction captured (hex SHA-256).
+    sha256: String,
+}
+
+impl ProofCarry {
+    /// The recorded single-file check in `facts`, if it describes this
+    /// object at `path` (an archive member or disc set never moves this way).
+    fn recorded(
+        &self,
+        facts: &serde_json::Value,
+        path: &Path,
+    ) -> Option<crate::identity_source::hashing::FileFingerprint> {
+        let empty = |key: &str| match facts.get(key) {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Array(items)) => items.is_empty(),
+            Some(_) => false,
+        };
+        if !empty("disc_members") || !empty("archive_member") {
+            return None;
+        }
+        let proof: crate::identity_source::hashing::FileFingerprint =
+            serde_json::from_value(facts.get("audit_file")?.clone()).ok()?;
+        (proof.path == path && self.describes(&proof)).then_some(proof)
+    }
+
+    /// Whether `path` holds this object with this content now: observed,
+    /// read in full (no leaf link followed), and observed again unchanged.
+    /// Returns that observation, bound to the verified content.
+    fn verified_at(&self, path: &Path) -> Option<crate::identity_source::hashing::FileFingerprint> {
+        use crate::identity_source::hashing::FileFingerprint;
+        if !fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+            return None;
+        }
+        let before = FileFingerprint::observe(path)?;
+        let content = crate::dat::rename_apply::identity::capture_identity(path).ok()?;
+        let after = FileFingerprint::observe(path)?;
+        let same_content = content.kind == crate::dat::rename_apply::model::ObjectKind::RegularFile
+            && content.dev == self.device
+            && content.ino == self.inode
+            && content.size_bytes == self.size_bytes
+            && content
+                .freshness
+                .as_ref()
+                .is_some_and(|f| hex_of(&f.sha256) == self.sha256);
+        (before == after && before.path == path && same_content && self.describes(&before))
+            .then_some(before)
+    }
+
+    fn describes(&self, proof: &crate::identity_source::hashing::FileFingerprint) -> bool {
+        proof.size_bytes == self.size_bytes
+            && proof.modified_unix_seconds == Some(self.modified_unix_seconds)
+            && proof.object.is_some_and(|object| {
+                object.device == self.device
+                    && object.inode == self.inode
+                    && object.modified_nanoseconds == self.modified_nanoseconds
+            })
+    }
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The saved single-file checks of `archive` that are current for exactly
+/// the object `entry` captured (its content proof was taken first, so an
+/// unchanged check now means that content is the content that was hashed).
+fn carried_proofs(
+    c: &Connection,
+    archive: i64,
+    entry: &TransactionEntry,
+) -> std::result::Result<Vec<ProofCarry>, String> {
+    use crate::dat::library_identity_summary::DiscFileState;
+    use crate::dat::rename_apply::model::ObjectKind;
+    let identity = &entry.identity;
+    let Some(freshness) = identity.freshness.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if identity.kind != ObjectKind::RegularFile {
+        return Ok(Vec::new());
+    }
+    let Ok(modified) = freshness.modified.duration_since(std::time::UNIX_EPOCH) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = c
+        .prepare("SELECT id,facts_json FROM library_dat_identities WHERE archive_id=?1 ORDER BY id")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([archive], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut carried = Vec::new();
+    for (row, bytes) in rows {
+        let carry = ProofCarry {
+            row,
+            device: identity.dev,
+            inode: identity.ino,
+            size_bytes: identity.size_bytes,
+            modified_unix_seconds: identity.modified_unix,
+            modified_nanoseconds: i64::from(modified.subsec_nanos()),
+            sha256: hex_of(&freshness.sha256),
+        };
+        let Ok(facts) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if let Some(proof) = carry.recorded(&facts, &entry.source_path)
+            && DiscFileState::of(&proof) == DiscFileState::Unchanged
+        {
+            carried.push(carry);
+        }
+    }
+    Ok(carried)
 }
 
 impl Binding {
@@ -307,6 +453,7 @@ pub(crate) fn bind(
             inode: meta.ino(),
             archive: ids[0],
             fingerprint: fingerprint(c, &old)?,
+            proofs: carried_proofs(c, ids[0], entry)?,
             old,
             new,
             projections,
@@ -331,6 +478,9 @@ pub(crate) struct CatalogueMove {
     binding: Binding,
     reverse: bool,
     already: bool,
+    /// The bound checks still unchanged at the path being renamed when this
+    /// move began (never in recovery): the only ones commit may carry.
+    carry: Vec<ProofCarry>,
 }
 impl Drop for CatalogueMove {
     fn drop(&mut self) {
@@ -471,11 +621,19 @@ impl CatalogueMove {
             // still roll back. Make it durable before anyone records it.
             persist_visible_state(&b.database)?;
         }
+        // Catalogue checks move only with a move that starts now, from a
+        // check that is still unchanged for this object at its path.
+        let carry = if write && !recovery {
+            current_checks(&c, &b, from)?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             connection: c,
             binding: b,
             reverse,
             already,
+            carry,
         })
     }
     /// Whether recovery found the row already at the move's target.
@@ -511,6 +669,9 @@ impl CatalogueMove {
             if let Some(change) = &b.platform {
                 self.commit_platform(change, to)?;
             }
+            for carry in &self.carry {
+                self.carry_proof(carry, from, to)?;
+            }
             for (i, (t, p)) in PROJECTIONS.iter().enumerate() {
                 for id in &b.projections[i] {
                     let n = self
@@ -534,7 +695,88 @@ impl CatalogueMove {
     }
 }
 
+/// The bound checks whose row still records this object at `from` and is
+/// unchanged there now (device, inode, size, modification and change time).
+fn current_checks(
+    c: &Connection,
+    b: &Binding,
+    from: &Association,
+) -> std::result::Result<Vec<ProofCarry>, String> {
+    use crate::dat::library_identity_summary::DiscFileState;
+    let from_path = Path::new(OsStr::from_bytes(&from.absolute));
+    let mut current = Vec::new();
+    for carry in &b.proofs {
+        let stored: Option<Vec<u8>> = c
+            .query_row(
+                "SELECT facts_json FROM library_dat_identities WHERE id=?1 AND archive_id=?2",
+                params![carry.row, b.archive],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(facts) = stored.and_then(|s| serde_json::from_slice(&s).ok()) else {
+            continue;
+        };
+        if carry
+            .recorded(&facts, from_path)
+            .is_some_and(|proof| DiscFileState::of(&proof) == DiscFileState::Unchanged)
+        {
+            current.push(carry.clone());
+        }
+    }
+    Ok(current)
+}
+
 impl CatalogueMove {
+    /// Re-points one bound catalogue check from `from` to `to`, in this
+    /// commit. Skipped (the check stays where it was and the game is checked
+    /// again later) unless the row still records this object at `from` and
+    /// the renamed file at `to` is that same object with the same content
+    /// (read in full again), unchanged apart from the change time a rename
+    /// sets. Compare-and-swap on the stored facts.
+    fn carry_proof(
+        &self,
+        carry: &ProofCarry,
+        from: &Association,
+        to: &Association,
+    ) -> std::result::Result<(), String> {
+        let c = &self.connection;
+        let stored: Option<Vec<u8>> = c
+            .query_row(
+                "SELECT facts_json FROM library_dat_identities WHERE id=?1 AND archive_id=?2",
+                params![carry.row, self.binding.archive],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(stored) = stored else {
+            return Ok(());
+        };
+        let Ok(mut facts) = serde_json::from_slice::<serde_json::Value>(&stored) else {
+            return Ok(());
+        };
+        let from_path = Path::new(OsStr::from_bytes(&from.absolute));
+        let to_path = Path::new(OsStr::from_bytes(&to.absolute));
+        if carry.recorded(&facts, from_path).is_none() {
+            return Ok(());
+        }
+        let Some(now) = carry.verified_at(to_path) else {
+            return Ok(());
+        };
+        facts["audit_file"] = serde_json::to_value(&now).map_err(|e| e.to_string())?;
+        let updated = serde_json::to_vec(&facts).map_err(|e| e.to_string())?;
+        let n = c
+            .execute(
+                "UPDATE library_dat_identities SET facts_json=?1 WHERE id=?2 AND facts_json=?3",
+                params![updated, carry.row, stored],
+            )
+            .map_err(|e| e.to_string())?;
+        if n != 1 {
+            return Err("catalogue check compare-and-swap failed".into());
+        }
+        Ok(())
+    }
+
     fn commit_platform(
         &self,
         change: &PlatformChange,
@@ -1012,4 +1254,61 @@ pub(crate) fn enabled_source_roots(
         .query_map([], |r| Ok(PathBuf::from(OsString::from_vec(r.get(0)?))))
         .map_err(|e| e.to_string())?;
     roots.map(|root| root.map_err(|e| e.to_string())).collect()
+}
+
+#[cfg(test)]
+mod carried_check_tests {
+    use super::*;
+
+    fn carry_for(path: &Path) -> ProofCarry {
+        let identity = crate::dat::rename_apply::identity::capture_identity(path).unwrap();
+        let freshness = identity.freshness.unwrap();
+        let modified = freshness
+            .modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        ProofCarry {
+            row: 1,
+            device: identity.dev,
+            inode: identity.ino,
+            size_bytes: identity.size_bytes,
+            modified_unix_seconds: identity.modified_unix,
+            modified_nanoseconds: i64::from(modified.subsec_nanos()),
+            sha256: hex_of(&freshness.sha256),
+        }
+    }
+
+    #[test]
+    fn only_the_same_object_with_the_same_content_is_verified() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game.bin");
+        std::fs::write(&game, b"verified contents").unwrap();
+        let carry = carry_for(&game);
+        let seen = carry.verified_at(&game).expect("the same file verifies");
+        assert_eq!(seen.path, game);
+
+        // A link in its place (even to the very file) is never followed.
+        let link = temp.path().join("link.bin");
+        std::os::unix::fs::symlink(&game, &link).unwrap();
+        assert!(carry.verified_at(&link).is_none());
+
+        // A copy with identical content is another object.
+        let copy = temp.path().join("copy.bin");
+        std::fs::copy(&game, &copy).unwrap();
+        assert!(carry.verified_at(&copy).is_none());
+
+        // Same object, same size and modification time, other content.
+        let modified = std::fs::metadata(&game).unwrap().modified().unwrap();
+        std::fs::write(&game, b"VERIFIED contents").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&game)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(carry.verified_at(&game).is_none());
+
+        // Missing.
+        assert!(carry.verified_at(&temp.path().join("gone.bin")).is_none());
+    }
 }
