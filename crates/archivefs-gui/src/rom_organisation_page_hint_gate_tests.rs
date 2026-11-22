@@ -3,8 +3,8 @@
 //! catalogue name does.
 
 use super::hint_gate::{
-    UNVERIFIED_HINT_REASON, UNVERIFIED_NAME_REASON, block_unverified_names, check_live_names,
-    refuse_unverified_names, refuse_unverified_names_with, unverified_name_label,
+    UNVERIFIED_HINT_REASON, block_unverified_names, check_live_names, refuse_unverified_names,
+    refuse_unverified_names_with, unverified_name_label,
 };
 use super::*;
 use archivefs_core::VerifiedDatName as V;
@@ -165,6 +165,18 @@ fn every_link_mode_refuses_romm_names_and_keeps_verified_and_unrenamed_links() {
             OrganisationStatus::Blocked,
             "{mode:?}"
         );
+        let reason = plan
+            .entries
+            .iter()
+            .find(|e| e.source_path == Path::new(HINT_SRC))
+            .and_then(|e| e.reason.clone())
+            .unwrap();
+        assert_eq!(
+            reason,
+            super::hint_gate::UNVERIFIED_LINK_HINT_REASON,
+            "{mode:?}"
+        );
+        assert!(!reason.contains("rename"), "{reason}");
         assert_eq!(
             status_of(&plan, VERIFIED_SRC),
             OrganisationStatus::Suggested
@@ -199,7 +211,11 @@ fn a_new_name_from_neither_source_gets_its_own_reason_not_the_romm_one() {
         .iter()
         .find(|e| e.source_path == Path::new(HINT_SRC))
         .unwrap();
-    assert_eq!(row.reason.as_deref(), Some(UNVERIFIED_NAME_REASON));
+    assert_eq!(
+        row.reason.as_deref(),
+        Some(super::hint_gate::UNVERIFIED_LINK_NAME_REASON),
+        "a link row says link, not rename"
+    );
     assert_eq!(
         unverified_name_label(row),
         Some("Proposed name (not verified, not applied)")
@@ -458,5 +474,61 @@ fn standard_apply_and_advanced_protection_both_run_the_shared_check() {
         calls("block_unverified_names(&mut plan, &name_choices)"),
         1,
         "preview"
+    );
+}
+
+/// Owner policy 2026-11-22 (linked libraries): a link takes a verified
+/// catalogue name; any other link keeps the file's own name, so no game is
+/// left out and no RomM title is used. Rename and Move keep the chosen name
+/// (and the row is then blocked unless verified).
+#[test]
+fn link_modes_fall_back_to_the_file_name_and_file_modes_keep_the_choice() {
+    use super::hint_gate::bulk_name;
+    let src = Path::new("/roms/nes/h_one.nes");
+    let dat = verified(src, "Verified One (USA).nes");
+    let romm = romm_only(src, "Hint One (USA)");
+    let none = choose_name(V::None, None, src);
+    for mode in [
+        OrganisationMode::OrganiseSymlinkOnly,
+        OrganisationMode::BuildLinkedLibrary,
+    ] {
+        assert_eq!(
+            bulk_name(mode, &dat).as_deref(),
+            Some("Verified One (USA).nes")
+        );
+        assert_eq!(
+            bulk_name(mode, &romm),
+            None,
+            "{mode:?}: RomM title not used"
+        );
+        assert_eq!(bulk_name(mode, &none), None, "{mode:?}");
+    }
+    for mode in [
+        OrganisationMode::RenameInPlace,
+        OrganisationMode::MoveRealFile,
+    ] {
+        assert_eq!(bulk_name(mode, &romm), romm.name, "{mode:?}");
+    }
+}
+
+#[test]
+fn link_rows_say_where_the_link_name_comes_from() {
+    use super::hint_gate::link_name_line;
+    let src = Path::new("/roms/nes/h_one.nes");
+    assert_eq!(
+        link_name_line(Some(&verified(src, "Verified One (USA).nes"))),
+        "Link name: verified catalogue name (synthetic-nes)"
+    );
+    assert_eq!(
+        link_name_line(Some(&romm_only(src, "Hint One (USA)"))),
+        "Link name: original file name (RomM suggests 'Hint One (USA)', not used: not verified)"
+    );
+    assert_eq!(
+        link_name_line(Some(&choose_name(V::None, None, src))),
+        "Link name: original file name (no verified catalogue name)"
+    );
+    assert_eq!(
+        link_name_line(None),
+        "Link name: original file name (no verified catalogue name)"
     );
 }

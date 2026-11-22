@@ -641,7 +641,7 @@ impl RomOrganisationPageState {
         };
         progress.phase("Reading your game list", "steps", None);
         let names = NameResolver::load();
-        let Some((candidates, name_choices)) =
+        let Some((mut candidates, name_choices)) =
             build_candidates(&self.sources, self.plan_generation, &names)
         else {
             self.error = Some("could not read the platform identity database".to_string());
@@ -650,6 +650,13 @@ impl RomOrganisationPageState {
         };
         if stop() {
             return false;
+        }
+        // Only a verified catalogue name names a link; any other link keeps
+        // the file's own name (Rename/Move rows are blocked further down).
+        for candidate in &mut candidates {
+            candidate.canonical_name = name_choices
+                .get(&candidate.source_path)
+                .and_then(|choice| hint_gate::bulk_name(self.mode, choice));
         }
         // No RomM mapping is consulted: generic destinations derive from the
         // neutral EmuWiz platform layout identity.
@@ -1702,7 +1709,8 @@ pub(crate) fn name_counts(
     let mut counts = NameCounts::default();
     for entry in &plan.entries {
         // Blocked, unsupported or colliding entries have no usable destination.
-        let hint_only = hint_gate::blocked_for_unverified_name(entry);
+        let hint_only = hint_gate::unverified_name_label(entry)
+            == Some("RomM suggests (hint only, not applied)");
         if !hint_only
             && !matches!(
                 entry.status,
@@ -3147,6 +3155,9 @@ fn show_plan(
                             .monospace(),
                         );
                         ui.label("Source action: Untouched");
+                        ui.label(hint_gate::link_name_line(
+                            name_choices.get(&entry.source_path),
+                        ));
                         ui.label(format!("Result: {}", linked_library_preview_result(entry)));
                         if !entry.platform_display_name.is_empty() {
                             ui.label(
@@ -3219,7 +3230,13 @@ fn show_plan(
                             }
                             None => format!("Will become: {}", entry.destination_path.display()),
                         });
-                        show_name_choice(ui, name_choices.get(&entry.source_path));
+                        if hint_gate::is_link_mode(plan.mode) {
+                            ui.label(hint_gate::link_name_line(
+                                name_choices.get(&entry.source_path),
+                            ));
+                        } else {
+                            show_name_choice(ui, name_choices.get(&entry.source_path));
+                        }
                         if !entry.platform_display_name.is_empty() {
                             ui.label(format!(
                                 "Reason: Verified for {}",

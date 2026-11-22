@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use archivefs_core::dat::rom_organisation::{
-    OrganisationPlan, OrganisationPlanEntry, OrganisationStatus,
+    OrganisationMode, OrganisationPlan, OrganisationPlanEntry, OrganisationStatus,
 };
 
 use super::{NameChoice, NameResolver, NameSource};
@@ -24,12 +24,64 @@ pub(crate) const UNVERIFIED_HINT_REASON: &str = "Not renamed in bulk: this name 
 /// and no RomM title either (for example a name the layout had to adjust).
 pub(crate) const UNVERIFIED_NAME_REASON: &str = "Not renamed in bulk: the new name does not come from a verified catalogue name. Bulk renaming of files and links uses verified catalogue names only. Rename it on its own if you want this name.";
 
-/// Whether this row was blocked by this rule (either reason).
-pub(crate) fn blocked_for_unverified_name(entry: &OrganisationPlanEntry) -> bool {
+/// Link modes: the same two reasons, worded for a link (nothing is renamed
+/// there, and single-game Rename would touch the real file instead).
+pub(crate) const UNVERIFIED_LINK_HINT_REASON: &str = "Not used for this link: this name is an unverified RomM hint, not a verified catalogue name. Links are named in bulk from verified catalogue names only. Check this game against a catalogue first.";
+pub(crate) const UNVERIFIED_LINK_NAME_REASON: &str = "Not used for this link: the new name does not come from a verified catalogue name. Links are named in bulk from verified catalogue names only.";
+
+/// The name a bulk run may give this file or link (owner rules 2026-11-22):
+/// a verified catalogue name always. In a link mode any other name (a RomM
+/// title, or none) falls back to the file's own name (`None`), so the game
+/// still gets its link and no unverified title is used. In Rename and Move
+/// the chosen name is kept here and the row is then blocked by
+/// [`block_unverified_names`] unless it is verified.
+pub(crate) fn bulk_name(mode: OrganisationMode, choice: &NameChoice) -> Option<String> {
+    if is_link_mode(mode) && !name_is_verified(Some(choice)) {
+        None
+    } else {
+        choice.name.clone()
+    }
+}
+
+/// Link modes: where this link's name comes from, in words.
+pub(crate) fn link_name_line(choice: Option<&NameChoice>) -> String {
+    match choice {
+        Some(NameChoice {
+            source: NameSource::VerifiedDat { catalogue },
+            ..
+        }) => format!("Link name: verified catalogue name ({catalogue})"),
+        Some(NameChoice {
+            source: NameSource::Romm,
+            name: Some(title),
+            ..
+        }) => format!(
+            "Link name: original file name (RomM suggests '{title}', not used: not verified)"
+        ),
+        _ => "Link name: original file name (no verified catalogue name)".to_string(),
+    }
+}
+
+pub(crate) fn is_link_mode(mode: OrganisationMode) -> bool {
     matches!(
-        entry.reason.as_deref(),
-        Some(UNVERIFIED_HINT_REASON | UNVERIFIED_NAME_REASON)
+        mode,
+        OrganisationMode::OrganiseSymlinkOnly | OrganisationMode::BuildLinkedLibrary
     )
+}
+
+/// The reason for `mode`, for a RomM title (`from_romm`) or any other
+/// unverified name.
+pub(crate) fn unverified_reason(mode: OrganisationMode, from_romm: bool) -> &'static str {
+    match (is_link_mode(mode), from_romm) {
+        (false, true) => UNVERIFIED_HINT_REASON,
+        (false, false) => UNVERIFIED_NAME_REASON,
+        (true, true) => UNVERIFIED_LINK_HINT_REASON,
+        (true, false) => UNVERIFIED_LINK_NAME_REASON,
+    }
+}
+
+/// Whether this row was blocked by this rule (any reason).
+pub(crate) fn blocked_for_unverified_name(entry: &OrganisationPlanEntry) -> bool {
+    unverified_name_label(entry).is_some()
 }
 
 /// Whether applying this row would give the file a new name.
@@ -41,8 +93,12 @@ fn gives_a_new_name(entry: &OrganisationPlanEntry) -> bool {
 /// `None` for every other row.
 pub(crate) fn unverified_name_label(entry: &OrganisationPlanEntry) -> Option<&'static str> {
     match entry.reason.as_deref() {
-        Some(UNVERIFIED_HINT_REASON) => Some("RomM suggests (hint only, not applied)"),
-        Some(UNVERIFIED_NAME_REASON) => Some("Proposed name (not verified, not applied)"),
+        Some(UNVERIFIED_HINT_REASON | UNVERIFIED_LINK_HINT_REASON) => {
+            Some("RomM suggests (hint only, not applied)")
+        }
+        Some(UNVERIFIED_NAME_REASON | UNVERIFIED_LINK_NAME_REASON) => {
+            Some("Proposed name (not verified, not applied)")
+        }
         _ => None,
     }
 }
@@ -65,6 +121,7 @@ pub(crate) fn block_unverified_names(
     choices: &BTreeMap<PathBuf, NameChoice>,
 ) -> usize {
     let mut blocked = 0;
+    let plan_mode = plan.mode;
     for entry in &mut plan.entries {
         if entry.status == OrganisationStatus::Suggested
             && gives_a_new_name(entry)
@@ -75,14 +132,7 @@ pub(crate) fn block_unverified_names(
                 Some(NameSource::Romm)
             );
             entry.status = OrganisationStatus::Blocked;
-            entry.reason = Some(
-                if from_romm {
-                    UNVERIFIED_HINT_REASON
-                } else {
-                    UNVERIFIED_NAME_REASON
-                }
-                .to_string(),
-            );
+            entry.reason = Some(unverified_reason(plan_mode, from_romm).to_string());
             blocked += 1;
         }
     }
@@ -103,7 +153,7 @@ pub(crate) fn check_live_names(
     archivefs_core::dat::rom_organisation::revalidate_organisation_plan(
         plan,
         database_path,
-        &|source| names.choose(source).name,
+        &|source| bulk_name(plan.mode, &names.choose(source)),
     )
 }
 
