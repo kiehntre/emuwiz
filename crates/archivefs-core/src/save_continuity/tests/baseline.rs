@@ -1346,6 +1346,16 @@ fn saves_on_a_card_are_never_new_or_gone_because_the_card_could_not_be_opened() 
             "{emulator}: {:?}",
             quiet.save_changes
         );
+        // The save inside the card is listed too, not only the card file.
+        assert!(
+            quiet.saves_before.iter().any(|mark| {
+                mark.path.as_ref() == Some(card)
+                    && !mark.save_id.starts_with("whole:")
+                    && mark.label.contains("BASLUS-00001GAME")
+            }),
+            "{emulator}: the card's save is listed: {:?}",
+            quiet.saves_before
+        );
         // Unopenable before, readable after: nothing is "new".
         let ended = session_with(&|| lock(card, 0o000), &|| lock(card, 0o644));
         assert!(

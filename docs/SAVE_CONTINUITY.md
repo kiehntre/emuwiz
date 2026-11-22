@@ -388,12 +388,21 @@ folders are not looked at: saves there are not tracked and nothing says so.
 The same for cards in RetroArch's standard save folder when its settings name
 another save folder. An RPCS3 storage folder (`dev_hdd0`) set to somewhere else is not looked at
 either. A save or memory-card folder that is not there at all is taken as
-holding nothing; one that appears or goes between the two reads of a session
-(a drive mounted or not) means nothing is compared. A PCSX2 folder memory card
-is "not known" in every session, and so is anything in a memory-card folder
-that is not a plain file. Every plain file in a memory-card folder is
+holding nothing; one whose path appears or goes between the two reads of a session
+means nothing is compared. That does not cover a folder that is itself the
+place a drive is mounted: unmounted, it is still there, empty, and its saves
+are then reported as no longer there. The first session in which an emulator
+creates its save or card folder is not compared at all. A PCSX2 folder memory card
+is "not known" in every session, and so is a link or special file in a
+memory-card folder (an ordinary sub-folder there is passed over). Every plain file in a memory-card folder is
 fingerprinted, card or not. Among RetroArch's saves, a file under a name saves
-do not go by is tracked only while it is card-shaped. A folder card kept among
+do not go by is tracked only while it is card-shaped (if it stops or starts
+being one between the two reads it is reported as gone or new). At most 20,000
+files are looked at per read, counting every file in RetroArch's save folders;
+past that, save changes are not tracked for the session. If a launch starts a
+helper program and the emulator is logged more than about two seconds after
+its start was let through, the session is recorded against the helper, with
+save changes not tracked. A folder card kept among
 RetroArch's saves is not tracked. The older, ungated library path has none of
 the card protections described here. A Flatpak
 or wrapper launcher that itself changes saves before the emulator starts would
