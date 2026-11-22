@@ -229,6 +229,9 @@ pub struct Baseline {
     pub unread: Vec<PathBuf>,
     /// The folders searched, where their location is a setting.
     pub places: Vec<PathBuf>,
+    /// The disk each folder that was searched, or that held a save, was
+    /// on (see [`disks_of`]).
+    pub disks: Vec<(PathBuf, u64)>,
     pub captured_unix: i64,
 }
 
@@ -248,6 +251,80 @@ struct Fresh {
     places: Vec<PathBuf>,
     /// Card files taken whole (a narrowed look only).
     whole: Vec<(PathBuf, String)>,
+    /// The disk each of those folders was on.
+    disks: Vec<(PathBuf, u64)>,
+}
+
+/// The disk (device number) of every folder that was searched or that held
+/// something read. A disk taken away during a session leaves the folder it
+/// was mounted on behind, empty: the folder is then on another disk, which
+/// is how [`same_disks`] tells that from saves really deleted.
+fn disks_of(
+    places: &[PathBuf],
+    saves: &[DiscoveredSave],
+    whole: &[(PathBuf, String)],
+    unread: &[PathBuf],
+) -> Result<Vec<(PathBuf, u64)>, ContinuityError> {
+    use std::os::unix::fs::MetadataExt;
+    let mut folders: Vec<PathBuf> = places.to_vec();
+    let held = saves
+        .iter()
+        .map(|save| &save.source_path)
+        .chain(whole.iter().map(|(path, _)| path))
+        .chain(unread);
+    for path in held {
+        if let Some(parent) = path.parent() {
+            folders.push(parent.to_path_buf());
+        }
+        if std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
+            folders.push(path.clone());
+        }
+    }
+    folders.sort();
+    folders.dedup();
+    folders
+        .into_iter()
+        .map(|folder| match std::fs::metadata(&folder) {
+            Ok(meta) => Ok((folder, meta.dev())),
+            Err(error) => Err(ContinuityError::Io(format!(
+                "the save folder {} could not be looked at: {error}",
+                folder.display()
+            ))),
+        })
+        .collect()
+}
+
+/// Whether the folders of the read before a session are still on the disks
+/// they were on, and every folder that is new is on the disk of the folder
+/// it is in. When this is false a disk came or went and what is there now
+/// is not the same place: nothing is compared.
+pub(crate) fn same_disks(before: &[(PathBuf, u64)], after: &[(PathBuf, u64)]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let now = |folder: &Path| -> Option<u64> {
+        // A folder that is gone is judged by the nearest one above it that
+        // is still there: on the same disk, it was deleted; on another, its
+        // disk went.
+        let mut at = Some(folder);
+        while let Some(path) = at {
+            match std::fs::metadata(path) {
+                Ok(meta) => return Some(meta.dev()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => at = path.parent(),
+                Err(_) => return None,
+            }
+        }
+        None
+    };
+    let unmoved = before
+        .iter()
+        .all(|(folder, disk)| now(folder) == Some(*disk));
+    let new_on_the_same = after.iter().all(|(folder, disk)| {
+        before
+            .iter()
+            .filter(|(known, _)| folder.starts_with(known))
+            .max_by_key(|(known, _)| known.components().count())
+            .is_none_or(|(_, known_disk)| known_disk == disk)
+    });
+    unmoved && new_on_the_same
 }
 
 /// The mark of a card file taken whole.
@@ -309,11 +386,13 @@ fn fresh_read(
     let mut places = report.places;
     places.sort();
     places.dedup();
+    let disks = disks_of(&places, &report.saves, &report.whole_files, &unread)?;
     Ok(Fresh {
         saves: report.saves,
         unread,
         places,
         whole: report.whole_files,
+        disks,
     })
 }
 
@@ -345,6 +424,7 @@ pub fn read_baseline(
         marks,
         unread: read.unread,
         places: read.places,
+        disks: read.disks,
         captured_unix: now_unix(),
     })
 }
@@ -424,6 +504,7 @@ impl LaunchTracker {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -451,9 +532,10 @@ impl LaunchTracker {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             )
         };
-        let (tracking, marks, unread, places) = match baseline {
+        let (tracking, marks, unread, places, disks) = match baseline {
             Ok((baseline, held_milliseconds, queued_milliseconds))
                 if baseline.launch.emulator == launch.emulator
                     && baseline.launch.profile == launch.profile =>
@@ -467,13 +549,14 @@ impl LaunchTracker {
                     baseline.marks,
                     baseline.unread,
                     baseline.places,
+                    baseline.disks,
                 )
             }
             Ok(_) => unavailable("the saves read before the start were another emulator's".into()),
             Err(reason) => unavailable(reason),
         };
         self.journal
-            .set_save_tracking(session_id, tracking, marks, unread, places)
+            .set_save_tracking(session_id, tracking, marks, unread, places, disks)
     }
 
     /// A launch was asked for. Which emulator will really start is not known
@@ -644,7 +727,11 @@ impl LaunchTracker {
                 if record
                     .save_places_before
                     .as_ref()
-                    .is_none_or(|places| places == &read.places) =>
+                    .is_none_or(|places| places == &read.places)
+                    && record
+                        .save_disks_before
+                        .as_ref()
+                        .is_none_or(|disks| same_disks(disks, &read.disks)) =>
             {
                 read
             }

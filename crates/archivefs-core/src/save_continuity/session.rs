@@ -371,6 +371,12 @@ pub struct SessionRecord {
     /// start, where their location is a setting that can change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub save_places_before: Option<Vec<PathBuf>>,
+    /// The disk (device number) each folder searched, or holding a save,
+    /// was on at the read before the start. A disk that goes during the
+    /// session leaves its folder behind, empty; the saves are then not
+    /// "gone" but out of sight, and nothing is compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_disks_before: Option<Vec<(PathBuf, u64)>>,
     /// The saves as they were once the session had ended, when they were
     /// compared. `None`: not compared (a crash, an exit EmuWiz did not see).
     #[serde(default)]
@@ -1263,6 +1269,7 @@ impl SessionJournal {
             saves_unread_before: Vec::new(),
             saves_unread_after: Vec::new(),
             save_places_before: None,
+            save_disks_before: None,
             saves_after: None,
             save_changes: Vec::new(),
             snapshots: Vec::new(),
@@ -1456,6 +1463,7 @@ impl SessionJournal {
         saves_before: Vec<SaveMark>,
         unread_before: Vec<PathBuf>,
         places: Vec<PathBuf>,
+        disks: Vec<(PathBuf, u64)>,
     ) -> Result<SessionRecord, ContinuityError> {
         let mut record = self.get(session_id)?;
         (record.saves_before, record.saves_unread_before) = match &tracking {
@@ -1464,6 +1472,7 @@ impl SessionJournal {
         };
         record.folders_before = None;
         record.save_places_before = Some(places);
+        record.save_disks_before = Some(disks);
         record.save_tracking = Some(tracking);
         self.write(&record)?;
         Ok(record)

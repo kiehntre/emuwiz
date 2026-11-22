@@ -1413,3 +1413,168 @@ fn saves_on_a_card_are_never_new_or_gone_because_the_card_could_not_be_opened() 
         .unwrap();
     assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
 }
+
+// ----- A disk that comes or goes during a session -----
+
+/// A save folder that is where a disk is mounted is still there, empty,
+/// once the disk is taken away. The folder is then on another disk than at
+/// the read before the start, and its saves are not "gone".
+#[test]
+fn saves_whose_disk_went_during_the_session_are_not_called_gone() {
+    let empty = |run: &Gated| {
+        for entry in fs::read_dir(&run.saves).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                fs::remove_file(path).unwrap();
+            }
+        }
+    };
+    // The folder was on another disk when the saves were read.
+    let run = gated();
+    let session = run
+        .tracker
+        .begin_gated(SessionGame::default(), "RetroArch")
+        .unwrap()
+        .session_id;
+    let mut baseline = run.tracker.baseline_before_start(&retroarch()).unwrap();
+    assert!(
+        baseline
+            .disks
+            .iter()
+            .any(|(folder, _)| folder == &run.saves)
+    );
+    for (_, disk) in &mut baseline.disks {
+        *disk = disk.wrapping_add(1);
+    }
+    run.tracker
+        .process_started_gated(&session, &started(), Ok((baseline, 3, 0)), &run.table)
+        .unwrap();
+    empty(&run);
+    let ended = run.end(&session);
+    assert_eq!(ended.state, SessionState::Ended);
+    assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
+
+    // The same emptying on the same disk: the saves really are gone.
+    let run = gated();
+    let session = run.start();
+    empty(&run);
+    let ended = run.end(&session);
+    assert!(ended.saves_after.is_some());
+    assert!(
+        ended
+            .save_changes
+            .iter()
+            .any(|change| matches!(change, SaveChange::Missing { .. })),
+        "{:?}",
+        ended.save_changes
+    );
+}
+
+#[test]
+fn a_folder_is_judged_by_the_disk_it_is_on() {
+    use super::super::tracker::same_disks;
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let here = fs::metadata(dir.path()).unwrap().dev();
+    let (saves, game) = (dir.path().join("saves"), dir.path().join("saves/game"));
+    fs::create_dir_all(&game).unwrap();
+    let before = vec![(saves.clone(), here), (game.clone(), here)];
+    assert!(same_disks(&before, &before));
+    // A folder deleted from a disk that is still there.
+    fs::remove_dir(&game).unwrap();
+    assert!(same_disks(&before, &[(saves.clone(), here)]));
+    // A folder that was on another disk, there or not.
+    assert!(!same_disks(&[(saves.clone(), here + 1)], &[]));
+    assert!(!same_disks(&[(game.clone(), here + 1)], &[]));
+    // A new folder on another disk than the folder it is in.
+    assert!(!same_disks(
+        &[(saves.clone(), here)],
+        &[(saves.clone(), here), (saves.join("new"), here + 1)]
+    ));
+    assert!(same_disks(
+        &[(saves.clone(), here)],
+        &[(saves.clone(), here), (saves.join("new"), here)]
+    ));
+}
+
+/// By hand only, with a real mount: run inside `unshare -Urm` so that a
+/// memory disk can be mounted on, and taken off, the save folder.
+#[test]
+#[ignore = "by hand: needs LAZARUS_MOUNT_TEST=1 inside unshare -Urm"]
+fn a_real_disk_taken_away_or_put_in_during_a_session_by_hand() {
+    assert_eq!(std::env::var("LAZARUS_MOUNT_TEST").as_deref(), Ok("1"));
+    let command = |program: &str, arguments: &[&std::ffi::OsStr]| {
+        let status = std::process::Command::new(program)
+            .args(arguments)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{program} {arguments:?}");
+    };
+    let take = |folder: &Path| -> Vec<(PathBuf, Vec<u8>)> {
+        fs::read_dir(folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file())
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                fs::remove_file(&path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    };
+
+    // The saves are on a disk mounted on the save folder; it is taken away
+    // while the game runs.
+    let run = gated();
+    let files = take(&run.saves);
+    assert!(!files.is_empty());
+    command(
+        "mount",
+        &[
+            "-t".as_ref(),
+            "tmpfs".as_ref(),
+            "tmpfs".as_ref(),
+            run.saves.as_os_str(),
+        ],
+    );
+    for (path, bytes) in &files {
+        fs::write(path, bytes).unwrap();
+    }
+    let session = run.start();
+    let before = run.tracker.journal().get(&session).unwrap();
+    command("umount", &[run.saves.as_os_str()]);
+    assert_eq!(fs::read_dir(&run.saves).unwrap().count(), 0);
+    let ended = run.end(&session);
+    println!(
+        "MOUNT disk taken away: read before {} saves; state {:?}; compared {}; changes {:?}",
+        before.saves_before.len(),
+        ended.state,
+        ended.saves_after.is_some(),
+        ended.save_changes
+    );
+    assert!(!before.saves_before.is_empty());
+    assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
+
+    // The other way round: a disk is put on the save folder while the game
+    // runs and hides the saves that were there.
+    let run = gated();
+    let session = run.start();
+    command(
+        "mount",
+        &[
+            "-t".as_ref(),
+            "tmpfs".as_ref(),
+            "tmpfs".as_ref(),
+            run.saves.as_os_str(),
+        ],
+    );
+    fs::write(run.saves.join("From the other disk.srm"), [7u8; 8192]).unwrap();
+    let ended = run.end(&session);
+    command("umount", &[run.saves.as_os_str()]);
+    println!(
+        "MOUNT disk put in: compared {}; changes {:?}",
+        ended.saves_after.is_some(),
+        ended.save_changes
+    );
+    assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
+}
