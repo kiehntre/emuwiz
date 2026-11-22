@@ -2764,7 +2764,7 @@ pub(crate) fn undo_confirmation_lines(
                 .parent()
                 .map(|folder| folder.display().to_string())
                 .unwrap_or_default();
-            format!("{now} \u{2192} {} (in {folder})", entry.original_basename)
+            format!("{now} -> {} (in {folder})", entry.original_basename)
         })
         .collect();
     if affected.len() > limit {

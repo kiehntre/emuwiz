@@ -169,9 +169,9 @@ fn undo_asks_first_and_names_the_rename_operation_it_reverses() {
     assert!(shows(&output, "It puts 2 file(s) back"));
     assert!(shows(
         &output,
-        "Alpha Quest (USA).nes \u{2192} ugly_one.nes (in /roms/nes)"
+        "Alpha Quest (USA).nes -> ugly_one.nes (in /roms/nes)"
     ));
-    assert!(shows(&output, "Plain Sailing (USA).nes \u{2192} plain.nes"));
+    assert!(shows(&output, "Plain Sailing (USA).nes -> plain.nes"));
     assert!(
         !shows(&output, "Left Alone"),
         "a skipped entry is not offered as something Undo puts back"
