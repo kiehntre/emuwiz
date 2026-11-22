@@ -71,10 +71,23 @@ pub fn classify_started(executable: &Path, arguments: &[String]) -> SessionLaunc
         // hands over to `flatpak run` (a common ~/.local/bin wrapper).
         // If the file cannot be read, what it is cannot be told: treated as
         // a launcher, so its exit status is never taken for the emulator's.
-        let Ok(bytes) = std::fs::read(executable) else {
+        // Only the start of the file is looked at, however large it is.
+        let mut bytes = [0u8; 1024];
+        let read = std::fs::File::open(executable).and_then(|mut file| {
+            use std::io::Read;
+            let mut filled = 0;
+            while filled < bytes.len() {
+                match file.read(&mut bytes[filled..])? {
+                    0 => break,
+                    more => filled += more,
+                }
+            }
+            Ok(filled)
+        });
+        let Ok(filled) = read else {
             return launch((*emulator).to_string(), "native", true);
         };
-        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]).into_owned();
+        let head = String::from_utf8_lossy(&bytes[..filled]).into_owned();
         if head.starts_with("#!") {
             return match flatpak_app(&mut head.lines()) {
                 Some(emulator) => launch(emulator, "flatpak", true),
@@ -233,6 +246,26 @@ struct Fresh {
     unread: Vec<PathBuf>,
     /// The folders searched, where the location is a setting.
     places: Vec<PathBuf>,
+    /// Card files taken whole (a narrowed look only).
+    whole: Vec<(PathBuf, String)>,
+}
+
+/// The mark of a card file taken whole.
+fn whole_mark((path, content): &(PathBuf, String)) -> SaveMark {
+    SaveMark {
+        save_id: format!("whole:{}", path.display()),
+        label: format!(
+            "{} (the whole card file)",
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ),
+        content_sha256: content.clone(),
+        last_changed_unix: None,
+        before_launch: None,
+        folder: None,
+        path: Some(path.clone()),
+    }
 }
 
 /// Reads every save file's content afresh: never a remembered
@@ -280,6 +313,7 @@ fn fresh_read(
         saves: report.saves,
         unread,
         places,
+        whole: report.whole_files,
     })
 }
 
@@ -299,10 +333,11 @@ pub fn read_baseline(
         .saves
         .iter()
         .filter(|save| save.emulator.eq_ignore_ascii_case(&launch.emulator))
-        .filter_map(|save| {
-            let mut mark = mark_of(save)?;
+        .filter_map(mark_of)
+        .chain(read.whole.iter().map(whole_mark))
+        .map(|mut mark| {
             mark.before_launch = Some(true);
-            Some(mark)
+            mark
         })
         .collect();
     Ok(Baseline {
@@ -634,6 +669,7 @@ impl LaunchTracker {
                     && (gated || save.profile.eq_ignore_ascii_case(&record.launch.profile))
             })
             .filter_map(mark_of)
+            .chain(read.whole.iter().filter(|_| gated).map(whole_mark))
             .collect();
         if record.folders_before.is_some() {
             let saves = self.saves()?;

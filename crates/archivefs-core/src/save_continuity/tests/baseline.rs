@@ -952,6 +952,17 @@ fn bookkeeping_reads_only_the_sessions_that_are_not_over() {
         session
     );
     assert_eq!(run.tracker.journal().get(&old.session_id).unwrap(), old);
+    // Now the old record is made unreadable: every step of the open
+    // session still works, because none of them opens it.
+    let old_file = fs::read_dir(run.root.join("sessions"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().contains(&old.session_id))
+        .unwrap();
+    fs::write(&old_file, b"not a record").unwrap();
+    run.tracker.settle();
+    run.tracker.look_again(&session).ok();
     let ended = run.end(&session);
     assert_eq!(ended.state, SessionState::Ended);
     assert_eq!(listed(&open_list), 0);
@@ -959,6 +970,11 @@ fn bookkeeping_reads_only_the_sessions_that_are_not_over() {
         listed(&run.root.join("sessions")),
         2,
         "no record was removed"
+    );
+    assert_eq!(
+        fs::read(&old_file).unwrap(),
+        b"not a record",
+        "nor rewritten"
     );
 
     // A session left open by a build that keeps no list is still settled.
@@ -1035,7 +1051,7 @@ fn a_flatpak_emulators_saves_kept_outside_its_own_folder_are_still_its_saves() {
 }
 
 #[test]
-fn a_memory_card_in_a_save_folder_of_ones_own_is_reported_not_passed_over() {
+fn a_memory_card_among_retroarchs_saves_is_compared_whole_at_a_launch() {
     let dir = tempfile::tempdir().unwrap();
     let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
     let config = home.join(".config/retroarch");
@@ -1047,12 +1063,14 @@ fn a_memory_card_in_a_save_folder_of_ones_own_is_reported_not_passed_over() {
         format!("savefile_directory = \"{}\"\n", saves.display()),
     )
     .unwrap();
+    // An empty card: it holds no save that could be listed.
     let card = saves.join("Some PlayStation Game.srm");
-    fs::write(&card, crate::memory_card_manager::tests::ps1_card(&[])).unwrap();
+    let mut bytes = crate::memory_card_manager::tests::ps1_card(&[]);
+    fs::write(&card, &bytes).unwrap();
     let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
     let baseline = tracker.baseline_before_start(&retroarch()).unwrap();
-    assert!(baseline.marks.is_empty());
-    assert_eq!(baseline.unread, vec![card.clone()]);
+    assert_eq!(baseline.marks.len(), 1, "{baseline:?}");
+    assert!(baseline.unread.is_empty());
 
     let table = One(Cell::new(true));
     let session = tracker
@@ -1066,6 +1084,10 @@ fn a_memory_card_in_a_save_folder_of_ones_own_is_reported_not_passed_over() {
             &table,
         )
         .unwrap();
+    // The game writes to the card.
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    fs::write(&card, &bytes).unwrap();
     table.0.set(false);
     let ended = tracker
         .finished_in(
@@ -1077,8 +1099,96 @@ fn a_memory_card_in_a_save_folder_of_ones_own_is_reported_not_passed_over() {
         .unwrap();
     assert_eq!(
         ended.save_changes,
-        vec![SaveChange::NotKnown {
+        vec![SaveChange::Modified {
             label: "Some PlayStation Game.srm".into()
         }]
     );
+}
+
+#[test]
+fn a_memory_card_folder_is_taken_whole_at_a_launch() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+    let cards = home.join(".var/app/net.pcsx2.PCSX2/config/PCSX2/memcards");
+    fs::create_dir_all(&cards).unwrap();
+    // Not even a card as far as its bytes go: it is still compared.
+    fs::write(cards.join("Mcd001.ps2"), [3u8; 4096]).unwrap();
+    fs::write(cards.join("Mcd002.ps2"), [4u8; 4096]).unwrap();
+    let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
+    let process = StartedProcess {
+        executable: PathBuf::from("/usr/bin/flatpak"),
+        arguments: vec!["run".into(), "net.pcsx2.PCSX2".into()],
+        ..started()
+    };
+    let launch = super::super::tracker::classify_started(&process.executable, &process.arguments);
+    let run_once = |before: &dyn Fn(), during: &dyn Fn()| {
+        before();
+        let read = tracker.baseline_before_start(&launch);
+        let table = One(Cell::new(true));
+        let session = tracker
+            .begin_gated(SessionGame::default(), "PCSX2")
+            .unwrap();
+        tracker
+            .process_started_gated(
+                &session.session_id,
+                &process,
+                read.map(|baseline| (baseline, 1, 0))
+                    .map_err(|error| error.to_string()),
+                &table,
+            )
+            .unwrap();
+        during();
+        table.0.set(false);
+        tracker
+            .finished_in(
+                &session.session_id,
+                Some(ExitSummary::Code(0)),
+                None,
+                &table,
+            )
+            .unwrap()
+    };
+    // One card written during the session, the other left alone.
+    let ended = run_once(&|| {}, &|| {
+        fs::write(cards.join("Mcd001.ps2"), [9u8; 4096]).unwrap()
+    });
+    assert_eq!(
+        ended.save_changes,
+        vec![SaveChange::Modified {
+            label: "Mcd001.ps2 (the whole card file)".into()
+        }]
+    );
+    // SAFETY: geteuid only reads the process's own id.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let lock =
+        |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    // A card that cannot be opened before the start and can afterwards is
+    // not "new"; one that cannot be opened at either end is "not known".
+    let ended = run_once(&|| lock(&cards.join("Mcd002.ps2"), 0o000), &|| {
+        lock(&cards.join("Mcd002.ps2"), 0o644)
+    });
+    assert_eq!(
+        ended.save_changes,
+        vec![SaveChange::CreatedBeforeNotKnown {
+            label: "Mcd002.ps2 (the whole card file)".into()
+        }]
+    );
+    let ended = run_once(&|| lock(&cards.join("Mcd002.ps2"), 0o000), &|| {});
+    lock(&cards.join("Mcd002.ps2"), 0o644);
+    assert_eq!(
+        ended.save_changes,
+        vec![SaveChange::NotKnown {
+            label: "Mcd002.ps2".into()
+        }]
+    );
+    // A card folder that cannot be listed: no baseline, so nothing claimed.
+    let ended = run_once(&|| lock(&cards, 0o000), &|| lock(&cards, 0o755));
+    assert!(matches!(
+        ended.save_tracking,
+        Some(SaveTracking::Unavailable { .. })
+    ));
+    assert!(ended.save_changes.is_empty() && ended.saves_after.is_none());
 }

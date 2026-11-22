@@ -167,6 +167,12 @@ pub struct DiscoveryReport {
     /// The folders that were listed for saves whose location is a setting
     /// (RetroArch's save and state folders).
     pub places: Vec<PathBuf>,
+    /// For a narrowed look (a launch): every file in the started emulator's
+    /// memory-card folders, and every card-shaped file among its other
+    /// saves, with the fingerprint of its whole content. A card is thereby
+    /// seen to change even when it holds no save that can be listed, or
+    /// cannot be taken apart at all.
+    pub whole_files: Vec<(PathBuf, String)>,
     pub stats: DiscoveryStats,
     /// Formats discovery does not look for at all.
     pub not_covered: Vec<&'static str>,
@@ -561,6 +567,26 @@ pub fn discover(
     let flatpak = |app: &str, rest: &str| roots.home.join(".var/app").join(app).join(rest);
 
     cards(&mut run, roots)?;
+    if run.options.only.is_some() {
+        for (folder, emulator) in [
+            (roots.config.join("PCSX2/memcards"), "PCSX2"),
+            (flatpak("net.pcsx2.PCSX2", "config/PCSX2/memcards"), "PCSX2"),
+            (roots.data.join("duckstation/memcards"), "DuckStation"),
+            (roots.config.join("duckstation/memcards"), "DuckStation"),
+            (
+                flatpak("org.duckstation.DuckStation", "data/duckstation/memcards"),
+                "DuckStation",
+            ),
+            (
+                flatpak("org.duckstation.DuckStation", "config/duckstation/memcards"),
+                "DuckStation",
+            ),
+        ] {
+            if run.wanted(emulator, &folder) {
+                card_folder_whole(&mut run, &folder)?;
+            }
+        }
+    }
     for (base, emulator) in [
         (roots.data.join("dolphin-emu/GC"), "Dolphin"),
         (
@@ -613,6 +639,50 @@ pub fn discover(
         ))
     });
     Ok(run.report)
+}
+
+/// Takes one file whole: its content's fingerprint, or a note that it could
+/// not be read.
+fn whole_file(run: &mut Run<'_, '_>, path: &Path) {
+    match read_plain(path) {
+        Ok((bytes, _)) => {
+            run.report.stats.files_read += 1;
+            run.report.stats.bytes_hashed += bytes.len() as u64;
+            run.report
+                .whole_files
+                .push((path.to_path_buf(), sha256_hex(&bytes)));
+        }
+        Err(why) => {
+            run.report.skipped.push(format!("{} {why}", path.display()));
+            run.report.unread.push(path.to_path_buf());
+        }
+    }
+}
+
+/// Every entry of a memory-card folder, whole. A folder that cannot be
+/// listed makes the look incomplete; a file that cannot be read, a link and
+/// a folder card (whose content is not fingerprinted) are noted as unread.
+fn card_folder_whole(run: &mut Run<'_, '_>, folder: &Path) -> Result<(), ContinuityError> {
+    for path in listed(folder, &mut run.report.incomplete) {
+        check(run)?;
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => whole_file(run, &path),
+            Ok(meta) if meta.is_dir() => {
+                if crate::memory_card_manager::discovery::sniff_format(&path)
+                    == CardFormat::Pcsx2Folder
+                {
+                    run.report.unread.push(path);
+                }
+            }
+            _ => {
+                run.report
+                    .skipped
+                    .push(format!("{} is not a plain file", path.display()));
+                run.report.unread.push(path);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check(run: &Run<'_, '_>) -> Result<(), ContinuityError> {
@@ -1190,9 +1260,11 @@ fn retroarch(run: &mut Run<'_, '_>, config_dir: &Path, home: &Path) -> Result<()
     }
     let mut observed: BTreeMap<PathBuf, InUse> = BTreeMap::new();
     for (dir, states) in [(saves_dir, false), (states_dir, true)] {
-        run.report.places.push(dir.clone());
         match fs::symlink_metadata(&dir) {
-            Ok(meta) if meta.is_dir() => {}
+            // Only a folder that is there counts as a place searched: one
+            // that appears or goes between two reads (a drive mounted or
+            // not) makes them reads of different places.
+            Ok(meta) if meta.is_dir() => run.report.places.push(dir.clone()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Ok(_) => {
                 // A link (or a file) where the folder should be: not followed.
@@ -1243,6 +1315,15 @@ fn retroarch(run: &mut Run<'_, '_>, config_dir: &Path, home: &Path) -> Result<()
             } else if !states && BATTERY_SUFFIXES.contains(&suffix.as_str()) {
                 SaveFormat::CartridgeBattery
             } else {
+                // Not a name saves go by. At a launch, a memory card under
+                // another name (.mcr, .mcd) is still taken whole.
+                if !states
+                    && run.options.only.is_some()
+                    && crate::memory_card_manager::discovery::sniff_format(&path)
+                        != CardFormat::NotACard
+                {
+                    whole_file(run, &path);
+                }
                 continue;
             };
             let Ok(link_meta) = fs::symlink_metadata(&path) else {
@@ -1279,17 +1360,23 @@ fn retroarch(run: &mut Run<'_, '_>, config_dir: &Path, home: &Path) -> Result<()
                 }
             };
             if crate::memory_card_manager::discovery::sniff_format(&path) != CardFormat::NotACard {
-                // A PlayStation card kept as .srm: listed save by save where
-                // cards are looked for. Elsewhere (a save folder of the
-                // person's own choosing) it is not read at all: say so.
-                if !run.report.saves.iter().any(|save| save.source_path == path) {
-                    run.report.skipped.push(format!(
-                        "{} is a memory card that was not read save by save",
-                        path.display()
-                    ));
-                    run.report.unread.push(path.clone());
+                // A PlayStation card kept as .srm. In a full listing it is
+                // shown save by save where cards are looked for, and
+                // reported as not read elsewhere (a save folder of the
+                // person's own choosing). For a launch (a narrowed look,
+                // which only compares content) the file is taken whole
+                // below as well: an empty card holds no save to list, and
+                // must still be seen to change.
+                if run.options.only.is_none() {
+                    if !run.report.saves.iter().any(|save| save.source_path == path) {
+                        run.report.skipped.push(format!(
+                            "{} is a memory card that was not read save by save",
+                            path.display()
+                        ));
+                        run.report.unread.push(path.clone());
+                    }
+                    continue;
                 }
-                continue;
             }
             run.report.stats.files_read += 1;
             run.report.stats.bytes_hashed += bytes.len() as u64;

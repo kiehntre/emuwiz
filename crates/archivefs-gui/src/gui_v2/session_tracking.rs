@@ -65,6 +65,9 @@ pub(super) const LOOK_EVERY: Duration = Duration::from_secs(20);
 /// Blue reports the launch over, before recording it as not available.
 const EXIT_STATUS_PATIENCE: u32 = 15;
 const SHORT_WAIT: Duration = Duration::from_millis(200);
+/// Looks (a fifth of a second apart) to wait for the emulator itself when a
+/// launch has so far started only something else.
+const EMULATOR_PATIENCE: u32 = 10;
 
 enum Message {
     Began {
@@ -159,11 +162,18 @@ fn hold_for_read(
                 let _ = reply.send(());
             })
     };
-    let waited = match reader {
-        Ok(_) => done.recv_timeout(patience).is_ok(),
-        Err(_) => false,
+    let why_not = match reader {
+        Ok(_) => match done.recv_timeout(patience) {
+            Ok(()) => None,
+            Err(RecvTimeoutError::Timeout) => Some(TOO_SLOW.to_string()),
+            // The reader ended without an answer.
+            Err(RecvTimeoutError::Disconnected) => {
+                Some(format!("{NOT_READ} (the read stopped unexpectedly)"))
+            }
+        },
+        Err(_) => Some(format!("{NOT_READ} (the read could not be started)")),
     };
-    if !waited
+    if let Some(why_not) = why_not
         && state
             .compare_exchange(PENDING, ABANDONED, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
@@ -171,7 +181,7 @@ fn hold_for_read(
         // Not waiting any longer; the reader is told to stop, and whatever
         // it still produces is not kept.
         cancel.store(true, Ordering::SeqCst);
-        keep_read(token, Err(TOO_SLOW.to_string()));
+        keep_read(token, Err(why_not));
     }
     token
 }
@@ -273,6 +283,11 @@ struct Open {
     until_sequence: Option<u64>,
     /// The started process has been passed to the tracker.
     started: bool,
+    /// Which process of the log the session is bound to, once it is.
+    bound: Option<u64>,
+    /// Looks spent waiting for a process the gate held to appear, while
+    /// only helpers of the launch had been started.
+    waited_for_emulator: u32,
     /// Blue reported the launch over.
     over: Option<Option<String>>,
     /// The launcher's exit has been passed on; the emulator may live on.
@@ -359,6 +374,8 @@ fn take(tracker: &LaunchTracker, sessions: &mut Vec<Open>, message: Message) {
                     after_sequence,
                     until_sequence: None,
                     started: false,
+                    bound: None,
+                    waited_for_emulator: 0,
                     over: None,
                     launcher_done: false,
                     waited_for_status: 0,
@@ -393,15 +410,29 @@ fn follow(tracker: &LaunchTracker, session: &mut Open, started_since: StartedSin
                 .is_none_or(|until| process.sequence < until)
         })
         .collect();
-    let process = in_span
-        .iter()
-        .find(|process| process.gate_token.is_some())
-        .or(in_span.first())
-        .cloned();
+    // Once bound, a session stays with its process.
+    let process = match session.bound {
+        Some(sequence) => in_span.iter().find(|process| process.sequence == sequence),
+        None => {
+            let held = in_span.iter().find(|process| process.gate_token.is_some());
+            if held.is_none()
+                && !in_span.is_empty()
+                && session.over.is_none()
+                && session.waited_for_emulator < EMULATOR_PATIENCE
+            {
+                // Only a helper so far: give the emulator a moment.
+                session.waited_for_emulator += 1;
+                return true;
+            }
+            held.or(in_span.first())
+        }
+    }
+    .cloned();
     if !session.started
         && let Some(process) = &process
     {
         session.started = true;
+        session.bound = Some(process.sequence);
         // What the gate read for this very start, if anything.
         let read = match process.gate_token.and_then(claim_read) {
             Some(read) => read,
@@ -925,14 +956,14 @@ mod tests {
                 let began = Instant::now();
                 // The read takes longer than the start is held for.
                 let token = hold_for_read(Duration::from_millis(100), move |cancel| {
-                    std::thread::sleep(Duration::from_millis(600));
+                    std::thread::sleep(Duration::from_millis(3000));
                     let read = read(&std::sync::atomic::AtomicBool::new(false));
                     assert!(cancel.load(Ordering::SeqCst), "the reader was told to stop");
                     finished.store(true, Ordering::SeqCst);
                     read
                 });
                 // The start was released at the end of the wait, not of the read.
-                assert!(began.elapsed() < Duration::from_millis(500));
+                assert!(began.elapsed() < Duration::from_millis(2500));
                 Some(token)
             })
         };
@@ -976,5 +1007,19 @@ mod tests {
             "the start was held"
         );
         assert!(matches!(claim_read(token), Some(Ok(_))));
+    }
+
+    #[test]
+    fn a_read_that_dies_releases_the_start_at_once_and_claims_nothing() {
+        let began = Instant::now();
+        let token = hold_for_read(GATE_PATIENCE, |_| panic!("made to fail"));
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the start was held"
+        );
+        match claim_read(token) {
+            Some(Err(reason)) => assert!(reason.starts_with(NOT_READ), "{reason}"),
+            other => panic!("{other:?}"),
+        }
     }
 }

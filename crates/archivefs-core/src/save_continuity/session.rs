@@ -1171,10 +1171,13 @@ impl SessionJournal {
         for name in names.iter().rev() {
             match self.read_named(name) {
                 Some(record) if Self::is_open(&record) => open.push(record),
-                // Over, or its record is gone or unreadable: not open.
-                _ => {
+                // Read, and over: no longer listed.
+                Some(_) => {
                     let _ = fs::remove_file(self.open_dir.join(name));
                 }
+                // Not readable just now (or not written yet): it stays
+                // listed and is looked at again next time.
+                None => {}
             }
         }
         open

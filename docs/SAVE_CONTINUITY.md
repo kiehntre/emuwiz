@@ -337,6 +337,14 @@ consulted.
   one. Before the start it means no baseline; after the session it means
   nothing is compared. The same if RetroArch's save folder setting differs
   between the two reads. The session's end is recorded either way.
+- **Memory cards are also compared whole.** At a launch every file in the
+  started emulator's memory-card folder (PCSX2, DuckStation), and every
+  card-shaped file among RetroArch's saves whatever its name, is fingerprinted
+  as one file, besides the saves listed from inside it. A card that holds no
+  save yet, or cannot be taken apart, is still seen to change; one that cannot
+  be opened is "not known"; a card folder that cannot be listed means no
+  baseline. A session that writes a save to a card therefore reports both the
+  save and "the whole card file".
 - **"None of the saves EmuWiz read changed"** is what a quiet session says. It
   speaks only for saves discovery covers; the formats it does not look for are
   listed under Discovery.
@@ -364,15 +372,19 @@ use it.
 Routine bookkeeping does not read the history. The journal keeps, beside the
 records, a list of the sessions that are not over (`sessions-open/`, one empty
 file per open session). Settling, looking at a running session and fetching a
-record by id read only those and the record asked for. The list is built once
+record by id read only those, the newest 32 records by name (which covers
+sessions written by a build that keeps no list) and the record asked for. A
+listed session is unlisted only once its record has been read and is over. The list is built once
 for a journal that has none. No record is moved, pruned or removed.
 
 Limits: a second copy of the same emulator already running, or any program
 other than the started emulator writing a save between the read and the
-emulator's start, is not told apart from the session's emulator. PlayStation
-memory cards kept outside the folders cards are read from are reported as "not
-known", not read. PCSX2 and DuckStation card folders that cannot be listed are
-not detected as such (their lister belongs to the card manager). A Flatpak
+emulator's start, is not told apart from the session's emulator. PCSX2 and
+DuckStation memory-card folders set to somewhere other than the standard
+folders are not looked at, and nor are RPCS3's PS1 card folders: saves there
+are not tracked and nothing says so. A save folder that is not there at all is
+taken as holding nothing (if it appears or goes between the two reads, nothing
+is compared). A Flatpak
 or wrapper launcher that itself changes saves before the emulator starts would
 be counted as the session. A torn read (a file being written by something else
 during the read) gives the fingerprint of what was read.
