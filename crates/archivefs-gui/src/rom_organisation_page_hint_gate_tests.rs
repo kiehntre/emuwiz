@@ -557,3 +557,40 @@ fn link_rows_say_where_the_link_name_comes_from() {
         "Link name: original file name (no verified catalogue name)"
     );
 }
+
+/// A verified-status change between preview and Apply is reported as a name
+/// change, not as a platform change, in either direction.
+#[test]
+fn a_name_that_changed_since_the_preview_is_refused_with_that_reason() {
+    use super::hint_gate::refuse_changed_names_with;
+    // Linked library: previewed under its own name (RomM only), verified now.
+    let mode = OrganisationMode::BuildLinkedLibrary;
+    let linked = plan(mode, vec![entry(HINT_SRC, "h_one.nes", mode)]);
+    let approved = all_approved(&linked);
+    let error = refuse_changed_names_with(&linked, &approved, &|p| {
+        verified(p, "Hint One Verified (USA).nes")
+    })
+    .unwrap_err();
+    assert!(
+        error.contains("The name for /roms/nes/h_one.nes changed"),
+        "{error}"
+    );
+    assert!(error.contains("'h_one.nes'") && error.contains("'Hint One Verified (USA).nes'"));
+    assert!(!error.contains("platform"), "{error}");
+    // Unchanged: RomM only, still the own name.
+    assert_eq!(
+        refuse_changed_names_with(&linked, &approved, &|p| romm_only(p, "Hint One (USA)")),
+        Ok(())
+    );
+    // Rename: previewed verified, the catalogue check is gone now.
+    let mode = OrganisationMode::RenameInPlace;
+    let renamed = plan(
+        mode,
+        vec![entry(VERIFIED_SRC, "Verified One (USA).nes", mode)],
+    );
+    let error = refuse_changed_names_with(&renamed, &all_approved(&renamed), &|p| {
+        choose_name(V::None, None, p)
+    })
+    .unwrap_err();
+    assert!(error.contains("changed since the preview"), "{error}");
+}

@@ -31,7 +31,6 @@ pub(crate) const UNVERIFIED_LINK_HINT_REASON: &str = "Not used for this link: th
 /// Link modes: the file's own name (the fallback) had to change to be a safe
 /// link name, so it is not the original file name either.
 pub(crate) const UNSAFE_LINK_FALLBACK_REASON: &str = "No link made in bulk: this file's own name cannot be used as a link name as it is (it had to be changed to be safe), and there is no verified catalogue name to use instead. Rename the file itself first, or check it against a catalogue.";
-pub(crate) const UNVERIFIED_LINK_NAME_REASON: &str = "Not used for this link: the new name does not come from a verified catalogue name. Links are named in bulk from verified catalogue names only.";
 
 /// The name a bulk run may give this file or link (owner rules 2026-11-22):
 /// a verified catalogue name always. In a link mode any other name (a RomM
@@ -79,7 +78,9 @@ pub(crate) fn unverified_reason(mode: OrganisationMode, from_romm: bool) -> &'st
         (false, true) => UNVERIFIED_HINT_REASON,
         (false, false) => UNVERIFIED_NAME_REASON,
         (true, true) => UNVERIFIED_LINK_HINT_REASON,
-        (true, false) => UNVERIFIED_LINK_NAME_REASON,
+        // A link that keeps its own name only gets a new one when that name
+        // had to change to be safe.
+        (true, false) => UNSAFE_LINK_FALLBACK_REASON,
     }
 }
 
@@ -100,9 +101,7 @@ pub(crate) fn unverified_name_label(entry: &OrganisationPlanEntry) -> Option<&'s
         Some(UNVERIFIED_HINT_REASON | UNVERIFIED_LINK_HINT_REASON) => {
             Some("RomM suggests (hint only, not applied)")
         }
-        Some(UNVERIFIED_NAME_REASON | UNVERIFIED_LINK_NAME_REASON) => {
-            Some("Proposed name (not verified, not applied)")
-        }
+        Some(UNVERIFIED_NAME_REASON) => Some("Proposed name (not verified, not applied)"),
         Some(UNSAFE_LINK_FALLBACK_REASON) => Some("Own file name needs changing (no link made)"),
         _ => None,
     }
@@ -172,11 +171,49 @@ pub(crate) fn check_live_names(
     names: &NameResolver,
 ) -> Result<(), String> {
     refuse_unverified_names(plan, approved, names)?;
+    refuse_changed_names_with(plan, approved, &|source| names.choose(source))?;
     archivefs_core::dat::rom_organisation::revalidate_organisation_plan(
         plan,
         database_path,
         &|source| bulk_name(plan.mode, &names.choose(source)),
     )
+}
+
+/// Apply: each approved row's name is derived again from the live name rule
+/// ([`bulk_name`]); a row whose name would now differ from the reviewed
+/// preview (its catalogue check or name source changed, in either direction)
+/// refuses the whole Apply with that reason, before the platform
+/// revalidation could report it as a platform change.
+pub(crate) fn refuse_changed_names_with(
+    plan: &OrganisationPlan,
+    approved: &BTreeSet<String>,
+    live_choice: &dyn Fn(&Path) -> NameChoice,
+) -> Result<(), String> {
+    use archivefs_core::dat::rename_plan::{DeriveOutcome, derive_proposed_basename};
+    for entry in plan.suggested() {
+        if !approved.contains(entry.source_path.to_string_lossy().as_ref()) {
+            continue;
+        }
+        let (Some(own), Some(reviewed)) = (
+            entry.source_path.file_name().and_then(|n| n.to_str()),
+            entry.destination_path.file_name().and_then(|n| n.to_str()),
+        ) else {
+            continue; // left to the full revalidation
+        };
+        let live = bulk_name(plan.mode, &live_choice(&entry.source_path));
+        let DeriveOutcome::Ok(now) = derive_proposed_basename(live.as_deref().unwrap_or(own), own)
+        else {
+            continue; // left to the full revalidation
+        };
+        if now.proposed_basename != reviewed {
+            return Err(format!(
+                "The name for {} changed since the preview (its catalogue check or name source changed): the preview named it '{reviewed}', it would now be '{}'. Nothing was changed. Preview again.",
+                entry.source_path.display(),
+                now.proposed_basename
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Apply (every path): the name of each approved renaming row is chosen again
