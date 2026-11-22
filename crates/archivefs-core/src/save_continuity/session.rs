@@ -157,6 +157,38 @@ pub struct SaveMark {
     /// already under way (see [`FolderMark`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<PathBuf>,
+    /// The file (or folder, or card) the save was read from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+}
+
+/// Whether `mark`'s file is one of those a read could not take in. Each
+/// entry of `unread` starts with the file's path.
+fn among_unread(unread: &[String], mark: &SaveMark) -> bool {
+    mark.path.as_ref().is_some_and(|path| {
+        let path = path.display().to_string();
+        unread.iter().any(|entry| {
+            entry
+                .strip_prefix(&path)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', ':']))
+        })
+    })
+}
+
+/// Whether a session can say what its saves held before the emulator ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "baseline")]
+pub enum SaveTracking {
+    /// The saves were read, completely, before the emulator's process was
+    /// created: the launch was held until the read had finished.
+    Established {
+        captured_unix: i64,
+        /// How long the launch was held for the read.
+        held_milliseconds: u64,
+    },
+    /// What the saves held before the session is not known, so the session
+    /// says nothing about which saves changed.
+    Unavailable { reason: String },
 }
 
 /// A folder holding saves, as it was when the "before" marks were read
@@ -325,6 +357,18 @@ pub struct SessionRecord {
     /// saves were read before the emulator was started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folders_before: Option<Vec<FolderMark>>,
+    /// Set for a session started through a launcher that holds the start
+    /// until the saves are read (Blue). `None`: a session from a caller
+    /// that reads the saves itself before starting the emulator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_tracking: Option<SaveTracking>,
+    /// Save files the read before the start could not take in (each entry
+    /// starts with the path). Their starting content is not known.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saves_unread_before: Vec<String>,
+    /// The same for the read after the session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saves_unread_after: Vec<String>,
     /// The saves as they were once the session had ended, when they were
     /// compared. `None`: not compared (a crash, an exit EmuWiz did not see).
     #[serde(default)]
@@ -927,17 +971,24 @@ pub struct SessionJournal {
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn diff_saves(before: &[SaveMark], after: &[SaveMark]) -> Vec<SaveChange> {
-    diff_saves_with(before, after, None)
+    diff_saves_with(before, after, None, &[], &[])
 }
 
 /// As [`diff_saves`]. `folders` is `Some` when the "before" marks were read
 /// during a launch already under way: a save is then "new" only if its
 /// folder is proven unchanged since before the launch, and "gone" only if
 /// its own mark is proven.
+///
+/// `unread_before` / `unread_after` are the save files the first and the
+/// last read could not take in. A save that could not be read before is not
+/// "new" when it can be read afterwards, and one that cannot be read
+/// afterwards is not "gone": both are reported as not known.
 pub fn diff_saves_with(
     before: &[SaveMark],
     after: &[SaveMark],
     folders: Option<&[FolderMark]>,
+    unread_before: &[String],
+    unread_after: &[String],
 ) -> Vec<SaveChange> {
     let index = |marks: &[SaveMark]| -> BTreeMap<String, SaveMark> {
         marks
@@ -958,7 +1009,7 @@ pub fn diff_saves_with(
                             .any(|known| known.before_launch && &known.path == folder)
                     })
                 });
-                changes.push(if absent_before {
+                changes.push(if absent_before && !among_unread(unread_before, mark) {
                     SaveChange::Created { label }
                 } else {
                     SaveChange::CreatedBeforeNotKnown { label }
@@ -983,11 +1034,13 @@ pub fn diff_saves_with(
             let label = mark.label.clone();
             // An unproven mark may be of a file the emulator itself made
             // after it started: its going is not a save lost.
-            changes.push(if mark.before_launch == Some(false) {
-                SaveChange::NotKnown { label }
-            } else {
-                SaveChange::Missing { label }
-            });
+            changes.push(
+                if mark.before_launch == Some(false) || among_unread(unread_after, mark) {
+                    SaveChange::NotKnown { label }
+                } else {
+                    SaveChange::Missing { label }
+                },
+            );
         }
     }
     changes
@@ -1081,6 +1134,9 @@ impl SessionJournal {
             play_evidence: PlayEvidence::None,
             saves_before,
             folders_before: None,
+            save_tracking: None,
+            saves_unread_before: Vec::new(),
+            saves_unread_after: Vec::new(),
             saves_after: None,
             save_changes: Vec::new(),
             snapshots: Vec::new(),
@@ -1254,6 +1310,40 @@ impl SessionJournal {
             self.write(&record)?;
         }
         Ok(record)
+    }
+
+    /// Records what the launch gate established about the saves before the
+    /// emulator existed: the marks it read, or why there are none.
+    pub fn set_save_tracking(
+        &self,
+        session_id: &str,
+        tracking: SaveTracking,
+        saves_before: Vec<SaveMark>,
+        unread_before: Vec<String>,
+    ) -> Result<SessionRecord, ContinuityError> {
+        let mut record = self.get(session_id)?;
+        (record.saves_before, record.saves_unread_before) = match &tracking {
+            SaveTracking::Established { .. } => (saves_before, unread_before),
+            SaveTracking::Unavailable { .. } => (Vec::new(), Vec::new()),
+        };
+        record.folders_before = None;
+        record.save_tracking = Some(tracking);
+        self.write(&record)?;
+        Ok(record)
+    }
+
+    /// Notes the save files the read after the session could not take in.
+    pub fn note_unread_after(
+        &self,
+        session_id: &str,
+        unread: Vec<String>,
+    ) -> Result<(), ContinuityError> {
+        if unread.is_empty() {
+            return Ok(());
+        }
+        let mut record = self.get(session_id)?;
+        record.saves_unread_after = unread;
+        self.write(&record)
     }
 
     /// Notes the folders the saves were in at the first read of a launch
@@ -1528,6 +1618,8 @@ impl SessionJournal {
                     &record.saves_before,
                     after,
                     record.folders_before.as_deref(),
+                    &record.saves_unread_before,
+                    &record.saves_unread_after,
                 );
                 let wrote = record.save_changes.iter().any(|change| {
                     matches!(

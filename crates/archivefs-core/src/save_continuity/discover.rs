@@ -136,6 +136,9 @@ pub struct DiscoveryOptions<'a> {
     /// Checks whether each save's emulator is running. `None` reports
     /// [`InUse::Unknown`] for everything.
     pub observer: Option<&'a dyn InUseObserver>,
+    /// Look only where this emulator and profile ("native" / "flatpak")
+    /// keep their saves; nothing else is examined or read.
+    pub only: Option<(&'a str, &'a str)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -361,6 +364,13 @@ struct Run<'a, 'b> {
 }
 
 impl Run<'_, '_> {
+    /// Whether `emulator`'s saves at `path` are being looked for at all.
+    fn wanted(&self, emulator: &str, path: &Path) -> bool {
+        self.options.only.is_none_or(|(only, profile)| {
+            only.eq_ignore_ascii_case(emulator) && profile.eq_ignore_ascii_case(profile_of(path))
+        })
+    }
+
     fn cancelled(&self) -> bool {
         self.options
             .cancel
@@ -535,12 +545,17 @@ pub fn discover(
             "Dolphin",
         ),
     ] {
-        gamecube(&mut run, &base, emulator)?;
+        if run.wanted(emulator, &base) {
+            gamecube(&mut run, &base, emulator)?;
+        }
     }
     for base in [
         roots.config.join("rpcs3/dev_hdd0/home"),
         flatpak("net.rpcs3.RPCS3", "config/rpcs3/dev_hdd0/home"),
     ] {
+        if !run.wanted("RPCS3", &base) {
+            continue;
+        }
         for user in sorted_children(&base) {
             sfo_folders(
                 &mut run,
@@ -554,13 +569,17 @@ pub fn discover(
         roots.config.join("ppsspp/PSP/SAVEDATA"),
         flatpak("org.ppsspp.PPSSPP", "config/ppsspp/PSP/SAVEDATA"),
     ] {
-        sfo_folders(&mut run, &base, "PPSSPP", SaveFormat::PspSavedata)?;
+        if run.wanted("PPSSPP", &base) {
+            sfo_folders(&mut run, &base, "PPSSPP", SaveFormat::PspSavedata)?;
+        }
     }
     for config in [
         roots.config.join("retroarch"),
         flatpak("org.libretro.RetroArch", "config/retroarch"),
     ] {
-        retroarch(&mut run, &config, &roots.home)?;
+        if run.wanted("RetroArch", &config) {
+            retroarch(&mut run, &config, &roots.home)?;
+        }
     }
     run.report.saves.sort_by(|a, b| {
         (&a.emulator, &a.profile, &a.source_path, &a.entry_name).cmp(&(
@@ -597,6 +616,9 @@ fn cards(run: &mut Run<'_, '_>, roots: &DiscoveryRoots) -> Result<(), Continuity
             .emulator
             .clone()
             .unwrap_or_else(|| "Unknown".to_string());
+        if !run.wanted(&emulator, &card.path) {
+            continue;
+        }
         let Ok(meta) = fs::symlink_metadata(&card.path) else {
             continue;
         };

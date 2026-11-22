@@ -292,44 +292,62 @@ ran and whether a save's content changed.
 
 ### What a save held before the session
 
-Blue does not hold a launch back to read the saves first: the "before" marks
-are read on a worker thread while the emulator may already be starting. So a
-mark is not taken on trust. After a save's content is read, EmuWiz looks up
-when its file last changed (the later of the modification time and the
-status-change time, which the system sets on every write, rename or replacement
-and a program cannot set back). The mark is the starting content only if that
-is at least three seconds earlier than the start of the launch's first process:
-anything the emulator wrote since it started would carry a later time. For a
-folder save the folder and every file directly inside it are checked.
+**The saves are read before the emulator exists.** Every emulator process, on
+every route, is created by one function (`launch::process_spawn`). Just before
+it creates the process it calls a gate (`launch::process_log::set_before_start`)
+and waits for it. Blue sets that gate: it works out which emulator and profile
+(native or Flatpak) is about to start, has the session worker read that
+emulator's saves, and returns only when the read has finished. The process is
+created after that. The order is guaranteed by construction; no file time is
+consulted.
 
-A mark that does not pass is kept but never treated as the starting content:
+- **Fresh content, always.** Both the read before the start and the read after
+  the session open every save file and hash its bytes. No remembered
+  fingerprint is used, whatever the file's size, times and file number say.
+  (Discovery's cache still exists for browsing; the launch path does not pass
+  one.)
+- **Only the starting emulator's saves** are read: for a native RetroArch
+  launch, the native RetroArch save folders and nothing else. Within one
+  emulator the set is not narrowed to the game: which save file belongs to
+  which game is not known reliably enough, and guessing would silently leave
+  a save out.
+- **The answer travels with the process.** The gate's answer is stored with
+  the started process in the process log, so the session uses exactly the read
+  made for its own process. A read made for another emulator or profile is
+  refused.
+- **No baseline, no claim.** If the read fails, takes longer than the start is
+  held (ten seconds), the journal cannot be opened, or the emulator is one
+  whose saves discovery does not cover, the session records "save changes were
+  not tracked" with the reason. Nothing is compared and neither "changed" nor
+  "unchanged" is said. The game still starts.
+- **A save that cannot be read** before the start is reported as "not known
+  whether it existed before" if it can be read afterwards, never as new. One
+  that cannot be read afterwards is "not known", never "no longer there".
 
-| First read | Content at the end | Reported |
+| Read before the start | After the session | Reported |
 |---|---|---|
-| proven earlier than the launch | different | changed |
-| proven earlier than the launch | same | (nothing) |
-| not proven | different | changed; what it held before the session is not known |
-| not proven | same | not known whether it changed |
-| absent, its folder proven unchanged since before the launch | present | new |
-| absent, folder not proven | present | written; not known whether it existed before the session |
-| not proven | gone | not known |
-| proven | gone | no longer there |
+| read | different content | changed |
+| read | same content | (nothing) |
+| absent | present | new |
+| read | absent | no longer there |
+| could not be read | present | written; not known whether it existed before |
+| read | cannot be read | not known |
+| no baseline for the session | (not compared) | save changes were not tracked |
 
-A folder's times change when a file in it is made, removed, renamed or
-replaced, so a folder proven unchanged held exactly the files found in it.
+Cost: the start is held for the read. Measured in the release build: see the
+acceptance evidence.
 
-The launch start is worked out from the process's start time since boot and the
-difference between the wall clock and the since-boot clock, which Blue notes
-**before** the launch can start anything. If that difference has moved by more
-than a second when the marks are judged (the wall clock was set or stepped, in
-either direction), or the start would lie in the future, nothing is proven.
+The older rule for a caller that cannot hold the start (a first read made
+during the launch, trusted only if the file's last change is at least three
+seconds earlier than the launch's first process, on an unstepped clock) is
+still in the library (`LaunchTracker::begin` / `process_started`). Blue does not
+use it.
 
-Limits: a save written in the last three seconds before a launch is reported as
-not proven. The proof assumes file times come from this machine's clock: for
-saves on a network or FUSE mount, whose times are set elsewhere, it is not
-sound, and that is not checked. A clock stepped away and back between the note
-and the judging would go unnoticed. A session begun by a build from before this
-rule and ended by this one is compared the old way.
+Limits: a program other than the started emulator writing a save between the
+read and the emulator's start is not told apart from the emulator. A Flatpak
+or wrapper launcher that itself changes saves before the emulator starts would
+be counted as the session. A torn read (a file being written by something else
+during the read) gives the fingerprint of what was read.
 
 ## Two devices (offline model only)
 
@@ -418,9 +436,9 @@ development machine.
   launch creates the journal folder only: no snapshot store and no device
   signing key; it creates this installation's local id. A snapshot from the
   CLI likewise creates no key.
-- Recording a launch also writes `discovery-cache.json` beside the journal
-  (what each save file's content was when last read, so unchanged files are
-  not read again).
+- Recording a launch reads the started emulator's saves twice (before the
+  start and after the session), afresh each time; nothing is remembered
+  between launches.
 - A launch started while another is still active is not recorded. A process
   started by something other than the launch, in the instant between Blue
   noting the process log and the launch starting, could be taken for the

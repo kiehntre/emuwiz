@@ -324,6 +324,7 @@ pub fn marks_of(save: &DiscoveredSave, all: &[DiscoveredSave]) -> Vec<SaveMark> 
                 last_changed_unix: None,
                 before_launch: None,
                 folder: None,
+                path: None,
             })
         })
         .collect()

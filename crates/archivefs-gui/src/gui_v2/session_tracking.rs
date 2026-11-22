@@ -6,6 +6,13 @@
 //! This module joins the two and passes them to
 //! [`LaunchTracker`](archivefs_core::save_continuity::tracker::LaunchTracker).
 //!
+//! **The saves are read before the emulator exists.** This module sets the
+//! process log's before-start gate: the one function that creates every
+//! emulator process calls it first and waits, and the gate returns only when
+//! the worker has finished reading that emulator's saves (or has given up,
+//! in which case the session says save changes were not tracked, never
+//! "changed" or "unchanged"). Nothing is inferred from file times.
+//!
 //! Everything slow (reading saves to mark their content) happens on one
 //! worker thread; the interface thread only sends a message. While a session
 //! is open the worker looks at it every [`LOOK_EVERY`], with its own timer,
@@ -17,10 +24,34 @@
 
 use archivefs_core::launch::process_log::{self, StartedProcess};
 use archivefs_core::save_continuity::ContinuityError;
-use archivefs_core::save_continuity::session::{SessionGame, SessionState};
-use archivefs_core::save_continuity::tracker::LaunchTracker;
+use archivefs_core::save_continuity::session::{ProcFs, SessionGame, SessionLaunch, SessionState};
+use archivefs_core::save_continuity::tracker::{
+    Baseline, LaunchTracker, classify_started, saves_known_for,
+};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// The longest an emulator's start is held for the read of its saves. The
+/// read takes a few hundredths of a second; if it has not finished by then
+/// the game starts anyway and the session records that save changes were
+/// not tracked.
+const GATE_PATIENCE: Duration = Duration::from_secs(10);
+
+const PENDING: u8 = 0;
+const DONE: u8 = 1;
+const ABANDONED: u8 = 2;
+
+/// What the gate's read gave for one start: the saves and how long the
+/// start was held (milliseconds), or why there is nothing.
+type GateResult = Result<(Baseline, u64), String>;
+
+const NOT_READ: &str = "the saves could not be read before the emulator started";
+const TOO_SLOW: &str = "reading the saves took longer than the start could be held";
+const NOT_COVERED: &str = "EmuWiz does not know where this emulator keeps its saves";
 
 /// How often an open session is looked at. The stored "last seen alive"
 /// time is written at most once a minute and must never be more than ten
@@ -37,8 +68,6 @@ enum Message {
     Began {
         /// Processes started from this sequence on belong to this launch.
         after_sequence: u64,
-        /// `tracker::clock_offset_ms()` as noted before the launch.
-        clock_before: Option<i64>,
         game: SessionGame,
         emulator: String,
     },
@@ -48,16 +77,85 @@ enum Message {
         /// was over and belong to a later one.
         until_sequence: u64,
     },
+    /// The gate: an emulator is about to be started and is being held.
+    ReadBeforeStart {
+        token: u64,
+        launch: SessionLaunch,
+        /// PENDING until the worker has the result (DONE) or the gate has
+        /// stopped waiting (ABANDONED); whichever comes first stands.
+        state: Arc<AtomicU8>,
+        began: Instant,
+        /// Dropped or sent to: either releases the gate.
+        reply: Sender<()>,
+    },
 }
 
 type OpenTracker = Box<dyn FnOnce() -> Result<LaunchTracker, ContinuityError> + Send>;
 type StartedSince = fn(u64) -> Vec<StartedProcess>;
 
-/// The interface thread's handle. Cheap; the worker starts with the first
-/// launch.
-#[derive(Default)]
-pub(super) struct SessionTracking {
-    worker: Option<Sender<Message>>,
+/// The one worker of this program, started with the first message.
+fn worker() -> Option<Sender<Message>> {
+    static WORKER: OnceLock<Mutex<Sender<Message>>> = OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            Mutex::new(start(
+                Box::new(open_real_tracker),
+                process_log::started_since,
+                LOOK_EVERY,
+            ))
+        })
+        .lock()
+        .ok()
+        .map(|sender| sender.clone())
+}
+
+/// The before-start gate. Runs on whichever thread is about to create the
+/// process, and returns only when the saves have been read or given up on.
+fn gate(executable: &Path, arguments: &[String]) -> Option<u64> {
+    let launch = classify_started(executable, arguments);
+    if !saves_known_for(&launch.emulator) {
+        // Not an emulator whose saves are looked for: nothing to wait for.
+        return None;
+    }
+    hold_for_read(&worker()?, launch)
+}
+
+/// Asks `worker` to read `launch`'s saves and waits for it.
+fn hold_for_read(worker: &Sender<Message>, launch: SessionLaunch) -> Option<u64> {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let token = NEXT.fetch_add(1, Ordering::Relaxed);
+    let state = Arc::new(AtomicU8::new(PENDING));
+    let (reply, done) = mpsc::channel();
+    worker
+        .send(Message::ReadBeforeStart {
+            token,
+            launch,
+            state: Arc::clone(&state),
+            began: Instant::now(),
+            reply,
+        })
+        .ok()?;
+    if done.recv_timeout(GATE_PATIENCE).is_err() {
+        // Not waiting any longer. If the worker finished in this very
+        // instant its result stands; otherwise it will be thrown away.
+        let _ = state.compare_exchange(PENDING, ABANDONED, Ordering::SeqCst, Ordering::SeqCst);
+    }
+    Some(token)
+}
+
+/// The interface thread's handle. Creating it sets the before-start gate.
+pub(super) struct SessionTracking;
+
+impl Default for SessionTracking {
+    fn default() -> Self {
+        // Blue's own tests drive the launch activity with made-up launches.
+        // They must never open the real save-continuity folder or profile;
+        // the worker is tested directly, with folders of its own.
+        if !cfg!(test) {
+            process_log::set_before_start(Arc::new(gate));
+        }
+        Self
+    }
 }
 
 impl SessionTracking {
@@ -66,17 +164,9 @@ impl SessionTracking {
     /// have started anything (the caller notes it while no launch is
     /// active): a launch can start its process before Blue first sees it
     /// as active.
-    /// `clock_before` is noted at the same moment, for the same reason.
-    pub(super) fn launch_began(
-        &mut self,
-        after_sequence: u64,
-        clock_before: Option<i64>,
-        emulator: &str,
-        game: SessionGame,
-    ) {
+    pub(super) fn launch_began(&mut self, after_sequence: u64, emulator: &str, game: SessionGame) {
         self.send(Message::Began {
             after_sequence,
-            clock_before,
             game,
             emulator: emulator.to_string(),
         });
@@ -92,23 +182,13 @@ impl SessionTracking {
     }
 
     fn send(&mut self, message: Message) {
-        // Blue's own tests drive the launch activity with made-up launches.
-        // They must never open the real save-continuity folder or profile;
-        // the worker is tested directly, with folders of its own.
         if cfg!(test) {
             drop(message);
             return;
         }
-        let worker = self.worker.get_or_insert_with(|| {
-            start(
-                Box::new(open_real_tracker),
-                process_log::started_since,
-                LOOK_EVERY,
-            )
-        });
         // A worker that has gone away only means nothing is recorded.
-        if worker.send(message).is_err() {
-            self.worker = None;
+        if let Some(worker) = worker() {
+            let _ = worker.send(message);
         }
     }
 }
@@ -117,7 +197,7 @@ impl SessionTracking {
 ///
 /// Recording a launch creates the session journal's folder and this
 /// installation's local id (a random number in `installation.json`, made
-/// once and reused) and a cache of what each save file held, and nothing
+/// once and reused), and nothing
 /// else: no snapshot store and no signing key. The key belongs to the
 /// two-device feature and is created only when that is used.
 fn open_real_tracker() -> Result<LaunchTracker, ContinuityError> {
@@ -143,7 +223,6 @@ fn start(open: OpenTracker, started_since: StartedSince, look_every: Duration) -
 
 /// One launch the worker is following.
 struct Open {
-    clock_before: Option<i64>,
     session_id: String,
     after_sequence: u64,
     /// Set when the launch is over: only a process started before this
@@ -167,6 +246,8 @@ fn work(
     let mut open = Some(open);
     let mut tracker: Option<LaunchTracker> = None;
     let mut sessions: Vec<Open> = Vec::new();
+    // What the gate read, by token, until the started process claims it.
+    let mut read_before: BTreeMap<u64, GateResult> = BTreeMap::new();
     loop {
         let waiting_for_status = sessions
             .iter()
@@ -177,7 +258,14 @@ fn work(
                 Err(_) => return,
             }
         } else {
-            let wait = if waiting_for_status {
+            // Until a launch's process has been seen, look often: the
+            // process log is in memory and the look costs nothing, and the
+            // session's start should be noted when it happens, not at the
+            // next slow look.
+            let awaiting_process = sessions
+                .iter()
+                .any(|session| !session.started && session.over.is_none());
+            let wait = if waiting_for_status || awaiting_process {
                 SHORT_WAIT.min(look_every)
             } else {
                 look_every
@@ -198,6 +286,8 @@ fn work(
         }
         let Some(tracker) = tracker.as_ref() else {
             // Opening failed once; keep draining so senders never block.
+            // A held start is released at once: dropping the message drops
+            // its reply channel, and the gate stops waiting.
             continue;
         };
         // Everything already sent is taken in before any launch is followed:
@@ -205,10 +295,14 @@ fn work(
         // its processes end) before a later launch's process is looked at.
         let mut next = message;
         while let Some(message) = next {
-            take(tracker, &mut sessions, message);
+            take(tracker, &mut sessions, &mut read_before, message);
             next = receiver.try_recv().ok();
         }
-        sessions.retain_mut(|session| follow(tracker, session, started_since));
+        sessions.retain_mut(|session| follow(tracker, session, &mut read_before, started_since));
+        while read_before.len() > 16 {
+            // Reads no started process ever claimed (the start failed).
+            read_before.pop_first();
+        }
         if sessions.iter().any(|session| session.launcher_done) {
             // Ends the sessions whose emulator has gone since.
             tracker.settle();
@@ -216,20 +310,49 @@ fn work(
     }
 }
 
-/// Notes one message. Slow for `Began` (it reads the saves).
-fn take(tracker: &LaunchTracker, sessions: &mut Vec<Open>, message: Message) {
+/// Notes one message. Slow only for `ReadBeforeStart` (it reads the saves).
+fn take(
+    tracker: &LaunchTracker,
+    sessions: &mut Vec<Open>,
+    read_before: &mut BTreeMap<u64, GateResult>,
+    message: Message,
+) {
     match message {
+        Message::ReadBeforeStart {
+            token,
+            launch,
+            state,
+            began,
+            reply,
+        } => {
+            let read = tracker
+                .baseline_before_start(&launch)
+                .map_err(|error| format!("{NOT_READ} ({error})"));
+            let held = began.elapsed().as_millis() as u64;
+            // Only a read that finished while the start was still held
+            // counts. This is decided before the gate is released.
+            let in_time = state
+                .compare_exchange(PENDING, DONE, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+            read_before.insert(
+                token,
+                if in_time {
+                    read.map(|baseline| (baseline, held))
+                } else {
+                    Err(TOO_SLOW.to_string())
+                },
+            );
+            let _ = reply.send(());
+        }
         Message::Began {
             after_sequence,
-            clock_before,
             game,
             emulator,
         } => {
-            if let Ok(record) = tracker.begin(game, &emulator) {
+            if let Ok(record) = tracker.begin_gated(game, &emulator) {
                 sessions.push(Open {
                     session_id: record.session_id,
                     after_sequence,
-                    clock_before,
                     until_sequence: None,
                     started: false,
                     over: None,
@@ -253,7 +376,12 @@ fn take(tracker: &LaunchTracker, sessions: &mut Vec<Open>, message: Message) {
 }
 
 /// One step for one launch. Returns whether to keep following it.
-fn follow(tracker: &LaunchTracker, session: &mut Open, started_since: StartedSince) -> bool {
+fn follow(
+    tracker: &LaunchTracker,
+    session: &mut Open,
+    read_before: &mut BTreeMap<u64, GateResult>,
+    started_since: StartedSince,
+) -> bool {
     // The first process started inside this launch's own span. Never one
     // started after the launch was over: that is a later launch's.
     let process = started_since(session.after_sequence)
@@ -267,8 +395,22 @@ fn follow(tracker: &LaunchTracker, session: &mut Open, started_since: StartedSin
         && let Some(process) = &process
     {
         session.started = true;
+        // What the gate read for this very start, if anything.
+        let read = match process
+            .gate_token
+            .and_then(|token| read_before.remove(&token))
+        {
+            Some(read) => read,
+            None if !saves_known_for(
+                &classify_started(&process.executable, &process.arguments).emulator,
+            ) =>
+            {
+                Err(NOT_COVERED.to_string())
+            }
+            None => Err(NOT_READ.to_string()),
+        };
         if tracker
-            .process_started(&session.session_id, process, session.clock_before)
+            .process_started_gated(&session.session_id, process, read, &ProcFs)
             .is_err()
         {
             // The record may already say "started" (the process was noted
@@ -399,7 +541,6 @@ mod tests {
         worker
             .send(Message::Began {
                 after_sequence: SEQUENCE,
-                clock_before: None,
                 game: game(),
                 emulator: "PCSX2".into(),
             })
@@ -420,6 +561,7 @@ mod tests {
             executable: PathBuf::from("/usr/bin/sleep"),
             arguments: vec!["30".into()],
             exit: None,
+            gate_token: None,
         };
         report(process.clone());
         until("the process is recorded", || {
@@ -466,7 +608,6 @@ mod tests {
         worker
             .send(Message::Began {
                 after_sequence: 9_000_002,
-                clock_before: None,
                 game: game(),
                 emulator: "RetroArch".into(),
             })
@@ -512,6 +653,7 @@ mod tests {
             executable: PathBuf::from("/usr/bin/sleep"),
             arguments: vec!["30".into()],
             exit: None,
+            gate_token: None,
         });
         let worker = tracking(&root, &home, Duration::from_millis(40));
         let named = |title: &str| SessionGame {
@@ -521,7 +663,6 @@ mod tests {
         worker
             .send(Message::Began {
                 after_sequence: SEQUENCE,
-                clock_before: None,
                 game: named("First, failed"),
                 emulator: "PCSX2".into(),
             })
@@ -536,7 +677,6 @@ mod tests {
         worker
             .send(Message::Began {
                 after_sequence: SEQUENCE,
-                clock_before: None,
                 game: named("Second, running"),
                 emulator: "PCSX2".into(),
             })
@@ -570,7 +710,6 @@ mod tests {
             worker
                 .send(Message::Began {
                     after_sequence: 9_000_003,
-                    clock_before: None,
                     game: game(),
                     emulator: "PCSX2".into(),
                 })
@@ -606,7 +745,6 @@ mod tests {
         worker
             .send(Message::Began {
                 after_sequence: SEQUENCE,
-                clock_before: None,
                 game: game(),
                 emulator: "PCSX2".into(),
             })
@@ -623,6 +761,7 @@ mod tests {
             executable: PathBuf::from("/usr/bin/sleep"),
             arguments: vec!["30".into()],
             exit: None,
+            gate_token: None,
         });
         until("the worker noticed the process by itself", || {
             sessions(&root)[0].state == SessionState::Started
@@ -630,5 +769,163 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         drop(worker);
+    }
+    fn home_with_saves(home: &Path) -> PathBuf {
+        let config = home.join(".config/retroarch");
+        std::fs::create_dir_all(config.join("saves")).unwrap();
+        std::fs::write(
+            config.join("retroarch.cfg"),
+            "savefile_directory = \"default\"\n",
+        )
+        .unwrap();
+        std::fs::write(config.join("saves/Played (USA).srm"), [1u8; 8192]).unwrap();
+        std::fs::write(config.join("saves/Untouched (USA).srm"), [2u8; 8192]).unwrap();
+        config.join("saves")
+    }
+
+    fn retroarch() -> SessionLaunch {
+        classify_started(Path::new("/nowhere/retroarch"), &[])
+    }
+
+    /// Runs one launch through the worker: `read` is what the gate hands the
+    /// started process (a token, or none), and the "emulator" writes one
+    /// save and makes another once it has been started.
+    fn gated_launch(
+        sequence: u64,
+        read: impl FnOnce(&Sender<Message>) -> Option<u64>,
+    ) -> SessionRecord {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+        let saves = home_with_saves(&home);
+        let worker = tracking(&root, &home, Duration::from_millis(50));
+        let gate_token = read(&worker);
+        // Only now does the emulator exist, and write.
+        std::fs::write(saves.join("Played (USA).srm"), [9u8; 8192]).unwrap();
+        std::fs::write(saves.join("Brand New (USA).srm"), [7u8; 8192]).unwrap();
+        worker
+            .send(Message::Began {
+                after_sequence: sequence,
+                game: game(),
+                emulator: "RetroArch".into(),
+            })
+            .unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut process = StartedProcess {
+            sequence,
+            pid: child.id(),
+            start_ticks: ticks(child.id()),
+            executable: PathBuf::from("/nowhere/retroarch"),
+            arguments: Vec::new(),
+            exit: None,
+            gate_token,
+        };
+        report(process.clone());
+        until("the process is recorded", || {
+            sessions(&root)
+                .first()
+                .is_some_and(|record| record.save_tracking.is_some())
+        });
+        child.kill().unwrap();
+        child.wait().unwrap();
+        process.exit = Some(ExitSummary::Code(0));
+        report(process);
+        worker
+            .send(Message::Finished {
+                failure: None,
+                until_sequence: u64::MAX,
+            })
+            .unwrap();
+        until("the end is recorded", || {
+            sessions(&root)[0].state == SessionState::Ended
+        });
+        sessions(&root).remove(0)
+    }
+
+    #[test]
+    fn saves_read_while_the_start_is_held_are_the_starting_content() {
+        use archivefs_core::save_continuity::session::{SaveChange, SaveTracking};
+        let ended = gated_launch(9_000_010, |worker| hold_for_read(worker, retroarch()));
+        assert!(
+            matches!(ended.save_tracking, Some(SaveTracking::Established { .. })),
+            "{:?}",
+            ended.save_tracking
+        );
+        // Both saves as they were before the "emulator" wrote.
+        assert_eq!(ended.saves_before.len(), 2);
+        let mut changes = ended.save_changes.clone();
+        changes.sort_by_key(|change| format!("{change:?}"));
+        assert_eq!(
+            changes,
+            vec![
+                SaveChange::Created {
+                    label: "Brand New (USA).srm".into()
+                },
+                SaveChange::Modified {
+                    label: "Played (USA).srm".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn without_a_read_before_the_start_nothing_is_said_about_the_saves() {
+        use archivefs_core::save_continuity::session::SaveTracking;
+        // The gate gave no token at all.
+        let ended = gated_launch(9_000_011, |_| None);
+        assert_eq!(
+            ended.save_tracking,
+            Some(SaveTracking::Unavailable {
+                reason: NOT_READ.into()
+            })
+        );
+        assert!(ended.saves_before.is_empty());
+        assert!(ended.saves_after.is_none());
+        assert!(ended.save_changes.is_empty());
+
+        // The gate stopped waiting before the read was done: the read is
+        // thrown away even though it did finish.
+        let ended = gated_launch(9_000_012, |worker| {
+            let (reply, done) = mpsc::channel();
+            worker
+                .send(Message::ReadBeforeStart {
+                    token: 77,
+                    launch: retroarch(),
+                    state: Arc::new(AtomicU8::new(ABANDONED)),
+                    began: Instant::now(),
+                    reply,
+                })
+                .unwrap();
+            done.recv_timeout(Duration::from_secs(20)).unwrap();
+            Some(77)
+        });
+        assert_eq!(
+            ended.save_tracking,
+            Some(SaveTracking::Unavailable {
+                reason: TOO_SLOW.into()
+            })
+        );
+        assert!(ended.save_changes.is_empty() && ended.saves_after.is_none());
+    }
+
+    #[test]
+    fn a_start_is_not_held_when_the_journal_cannot_be_opened() {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            work(
+                receiver,
+                Box::new(|| Err(ContinuityError::Refused("no folder".into()))),
+                started_since,
+                Duration::from_millis(50),
+            )
+        });
+        let began = Instant::now();
+        assert!(hold_for_read(&sender, retroarch()).is_some());
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the start was held"
+        );
     }
 }

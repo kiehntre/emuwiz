@@ -5,11 +5,11 @@
 //! drawing thread. Nothing here starts, stops or watches an emulator: it is
 //! told what happened by the launcher and looks at saves at the two ends.
 
-use super::discover::{DiscoveryCache, DiscoveryOptions, DiscoveryRoots, discover};
+use super::discover::{DiscoveryOptions, DiscoveryRoots, discover};
 use super::model::DiscoveredSave;
 use super::session::{
-    ExitObservation, FolderMark, ProcFs, ProcessTable, SaveMark, SessionGame, SessionJournal,
-    SessionLaunch, SessionRecord, SessionState,
+    ExitObservation, FolderMark, ProcFs, ProcessTable, SaveMark, SaveTracking, SessionGame,
+    SessionJournal, SessionLaunch, SessionRecord, SessionState,
 };
 use super::{ContinuityError, now_unix};
 use crate::launch::process_log::{ExitSummary, StartedProcess};
@@ -112,6 +112,7 @@ fn mark_of(save: &DiscoveredSave) -> Option<SaveMark> {
         last_changed_unix: None,
         before_launch: None,
         folder: None,
+        path: Some(save.source_path.clone()),
     })
 }
 
@@ -205,8 +206,25 @@ fn folder_of(save: &DiscoveredSave) -> Option<PathBuf> {
     save.source_path.parent().map(Path::to_path_buf)
 }
 
+/// What the saves of one emulator held, read before that emulator was
+/// started (see [`LaunchTracker::baseline_before_start`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Baseline {
+    pub launch: SessionLaunch,
+    pub marks: Vec<SaveMark>,
+    /// Save files that could not be read (each entry starts with the path).
+    pub unread: Vec<String>,
+    pub captured_unix: i64,
+}
+
+/// Whether discovery knows where `emulator` keeps its saves.
+pub fn saves_known_for(emulator: &str) -> bool {
+    NATIVE_NAMES
+        .iter()
+        .any(|(_, known)| known.eq_ignore_ascii_case(emulator))
+}
+
 pub struct LaunchTracker {
-    root: PathBuf,
     roots: DiscoveryRoots,
     journal: SessionJournal,
     device_id: String,
@@ -221,7 +239,6 @@ impl LaunchTracker {
         device_id: &str,
     ) -> Result<Self, ContinuityError> {
         Ok(Self {
-            root: root.to_path_buf(),
             roots,
             // Sandboxed emulators: the system's own crash records, read-only.
             // Wherever that source is missing the answer is simply "not known".
@@ -239,33 +256,131 @@ impl LaunchTracker {
         &self.device_id
     }
 
-    /// Every save, read through the on-disk cache so an unchanged file is
-    /// not read again. No in-use check: this is only for content marks.
-    fn saves(&self) -> Result<Vec<DiscoveredSave>, ContinuityError> {
-        let cache_file = self.root.join("discovery-cache.json");
-        let mut cache = DiscoveryCache::load(&cache_file);
+    /// Reads every save file's content afresh: never a remembered
+    /// fingerprint, whatever the file's size and times say. `only` narrows
+    /// the look to one emulator and profile. Returns the saves and the save
+    /// files that could not be taken in (each entry starts with the path).
+    /// No in-use check: this is only for content marks.
+    fn fresh(
+        &self,
+        only: Option<&SessionLaunch>,
+    ) -> Result<(Vec<DiscoveredSave>, Vec<String>), ContinuityError> {
         let report = discover(
             &self.roots,
             DiscoveryOptions {
-                cache: Some(&mut cache),
+                only: only.map(|launch| (launch.emulator.as_str(), launch.profile.as_str())),
                 ..Default::default()
             },
         )?;
-        // A cache that cannot be written only costs time next launch.
-        let _ = cache.save(&cache_file);
-        Ok(report.saves)
+        if report.stats.stopped_at_limit {
+            return Err(ContinuityError::Io(
+                "there are too many save files to read them all".into(),
+            ));
+        }
+        let mut unread = report.skipped;
+        unread.extend(
+            report
+                .saves
+                .iter()
+                .filter(|save| save.content_sha256.is_none())
+                .map(|save| save.source_path.display().to_string()),
+        );
+        unread.sort();
+        unread.dedup();
+        Ok((report.saves, unread))
     }
 
-    fn marks_for(&self, launch: &SessionLaunch) -> Result<Vec<SaveMark>, ContinuityError> {
-        Ok(self
-            .saves()?
+    fn saves(&self) -> Result<Vec<DiscoveredSave>, ContinuityError> {
+        Ok(self.fresh(None)?.0)
+    }
+
+    /// Reads the saves of the emulator `launch` names, and only those. For
+    /// a launcher that **holds the start of the emulator until this has
+    /// returned**: the result is then what the saves held before the
+    /// emulator existed, by construction and not by any comparison of times.
+    pub fn baseline_before_start(
+        &self,
+        launch: &SessionLaunch,
+    ) -> Result<Baseline, ContinuityError> {
+        let (saves, unread) = self.fresh(Some(launch))?;
+        let marks = saves
             .iter()
             .filter(|save| {
                 save.emulator.eq_ignore_ascii_case(&launch.emulator)
                     && save.profile.eq_ignore_ascii_case(&launch.profile)
             })
-            .filter_map(mark_of)
-            .collect())
+            .filter_map(|save| {
+                let mut mark = mark_of(save)?;
+                mark.before_launch = Some(true);
+                Some(mark)
+            })
+            .collect();
+        Ok(Baseline {
+            launch: launch.clone(),
+            marks,
+            unread,
+            captured_unix: now_unix(),
+        })
+    }
+
+    /// A launch was asked for by a launcher that holds the emulator's start
+    /// for [`Self::baseline_before_start`]. No save is read here.
+    pub fn begin_gated(
+        &self,
+        game: SessionGame,
+        expected_emulator: &str,
+    ) -> Result<SessionRecord, ContinuityError> {
+        self.journal.reconcile(&ProcFs, now_unix());
+        let launch = SessionLaunch {
+            emulator: expected_emulator.to_string(),
+            ..Default::default()
+        };
+        self.journal.request(game, launch, Vec::new())
+    }
+
+    /// The gated launcher started `process`. `baseline` is what its gate
+    /// read for this very start, or why it read nothing. A baseline for a
+    /// different emulator or profile than the one that started is refused.
+    pub fn process_started_gated(
+        &self,
+        session_id: &str,
+        process: &StartedProcess,
+        baseline: Result<(Baseline, u64), String>,
+        processes: &dyn ProcessTable,
+    ) -> Result<SessionRecord, ContinuityError> {
+        let launch = classify_started(&process.executable, &process.arguments);
+        self.journal.mark_started_as(
+            session_id,
+            process.pid,
+            launch.clone(),
+            process.start_ticks,
+            processes,
+        )?;
+        let (tracking, marks, unread) = match baseline {
+            Ok((baseline, held_milliseconds))
+                if baseline.launch.emulator == launch.emulator
+                    && baseline.launch.profile == launch.profile =>
+            {
+                (
+                    SaveTracking::Established {
+                        captured_unix: baseline.captured_unix,
+                        held_milliseconds,
+                    },
+                    baseline.marks,
+                    baseline.unread,
+                )
+            }
+            Ok(_) => (
+                SaveTracking::Unavailable {
+                    reason: "the saves read before the start were another emulator's".into(),
+                },
+                Vec::new(),
+                Vec::new(),
+            ),
+            Err(reason) => (SaveTracking::Unavailable { reason }, Vec::new(), Vec::new()),
+        };
+        self.journal
+            .set_save_tracking(session_id, tracking, marks, unread)
     }
 
     /// A launch was asked for. Which emulator will really start is not known
@@ -419,7 +534,22 @@ impl LaunchTracker {
             },
             Some(ExitSummary::Unavailable) | None => ExitObservation::Unavailable,
         };
-        let mut after = self.marks_for(&record.launch)?;
+        if matches!(record.save_tracking, Some(SaveTracking::Unavailable { .. })) {
+            // No starting content: nothing is compared, nothing is claimed.
+            return self
+                .journal
+                .mark_ended(session_id, observed, None, processes);
+        }
+        let (saves_after, unread_after) = self.fresh(Some(&record.launch))?;
+        self.journal.note_unread_after(session_id, unread_after)?;
+        let mut after: Vec<SaveMark> = saves_after
+            .iter()
+            .filter(|save| {
+                save.emulator.eq_ignore_ascii_case(&record.launch.emulator)
+                    && save.profile.eq_ignore_ascii_case(&record.launch.profile)
+            })
+            .filter_map(mark_of)
+            .collect();
         if record.folders_before.is_some() {
             let saves = self.saves()?;
             for mark in &mut after {

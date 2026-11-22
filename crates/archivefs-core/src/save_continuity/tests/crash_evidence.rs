@@ -494,6 +494,7 @@ fn mark(content: &str) -> SaveMark {
         last_changed_unix: None,
         before_launch: None,
         folder: None,
+        path: None,
     }
 }
 

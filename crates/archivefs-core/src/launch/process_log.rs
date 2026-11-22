@@ -36,6 +36,42 @@ pub struct StartedProcess {
     /// The first few arguments, for telling a launcher from an emulator.
     pub arguments: Vec<String>,
     pub exit: Option<ExitSummary>,
+    /// What the [`set_before_start`] gate answered for this very start,
+    /// just before the process was created.
+    pub gate_token: Option<u64>,
+}
+
+/// Runs just before a process is created and returns only when it is
+/// content for the process to exist. Its answer is kept with the started
+/// process ([`StartedProcess::gate_token`]).
+pub type BeforeStart = dyn Fn(&std::path::Path, &[String]) -> Option<u64> + Send + Sync;
+
+static BEFORE_START: Mutex<Option<std::sync::Arc<BeforeStart>>> = Mutex::new(None);
+
+/// Sets the gate every start passes through first. The program that sets it
+/// (Blue) uses it to read a game's saves **before** the emulator exists, so
+/// the emulator cannot have touched them yet. One gate per program; setting
+/// it again replaces it.
+pub fn set_before_start(gate: std::sync::Arc<BeforeStart>) {
+    if let Ok(mut slot) = BEFORE_START.lock() {
+        *slot = Some(gate);
+    }
+}
+
+/// Called by the spawn primitive before it creates a process. Blocks for as
+/// long as the gate does. `None` when no gate is set or it has no answer.
+pub(super) fn before_start(
+    executable: &std::path::Path,
+    arguments: &[std::ffi::OsString],
+) -> Option<u64> {
+    // The lock is not held while the gate runs.
+    let gate = BEFORE_START.lock().ok()?.clone()?;
+    let arguments: Vec<String> = arguments
+        .iter()
+        .take(6)
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    gate(executable, &arguments)
 }
 
 struct Log {
@@ -63,6 +99,7 @@ pub(super) fn record_start(
     pid: u32,
     executable: &std::path::Path,
     arguments: &[std::ffi::OsString],
+    gate_token: Option<u64>,
 ) -> u64 {
     let Ok(mut log) = LOG.lock() else { return 0 };
     let sequence = log.next;
@@ -81,6 +118,7 @@ pub(super) fn record_start(
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect(),
         exit: None,
+        gate_token,
     });
     sequence
 }
@@ -145,6 +183,7 @@ mod tests {
             child.id(),
             std::path::Path::new("/bin/sh"),
             &["-c".into(), "exit 3".into()],
+            None,
         );
         let seen = started_since(mark);
         let entry = seen

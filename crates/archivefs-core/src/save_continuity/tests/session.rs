@@ -75,6 +75,7 @@ fn mark(id: &str, sha: &str) -> SaveMark {
         last_changed_unix: None,
         before_launch: None,
         folder: None,
+        path: None,
     }
 }
 

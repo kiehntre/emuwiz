@@ -26,6 +26,7 @@ fn late_mark(id: &str, sha: &str, last_changed_unix: Option<i64>) -> SaveMark {
         last_changed_unix,
         before_launch: Some(false),
         folder: None,
+        path: None,
     }
 }
 
@@ -37,6 +38,7 @@ fn plain_mark(id: &str, sha: &str) -> SaveMark {
         last_changed_unix: None,
         before_launch: None,
         folder: None,
+        path: None,
     }
 }
 
@@ -167,6 +169,7 @@ fn started() -> StartedProcess {
         executable: PathBuf::from("/nowhere/retroarch"),
         arguments: Vec::new(),
         exit: None,
+        gate_token: None,
     }
 }
 
@@ -290,7 +293,7 @@ fn new_and_gone_are_plain_only_with_proof() {
         plain_mark("folder-not-stated", "x"),
     ];
     let folders = [folder("/saves/quiet", true), folder("/saves/busy", false)];
-    let mut changes = diff_saves_with(&before, &after, Some(&folders));
+    let mut changes = diff_saves_with(&before, &after, Some(&folders), &[], &[]);
     changes.sort_by_key(|change| format!("{change:?}"));
     assert_eq!(
         changes,
@@ -405,13 +408,253 @@ fn launch_time_save_reading_by_hand() {
     let home = PathBuf::from(std::env::var("LAZARUS_PERF_HOME").unwrap());
     let root = PathBuf::from(std::env::var("LAZARUS_PERF_ROOT").unwrap());
     let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "perf").unwrap();
-    for run in ["no remembered contents", "remembered", "remembered again"] {
-        let began = std::time::Instant::now();
-        let session = tracker.begin(SessionGame::default(), "RetroArch").unwrap();
-        println!(
-            "PERF {run}: {:.3} s, {} saves marked",
-            began.elapsed().as_secs_f64(),
-            session.saves_before.len()
-        );
+    // What a launch through the gate costs: the started emulator's saves,
+    // read afresh, once before the start (and the same again afterwards).
+    for (program, flatpak) in [
+        ("retroarch", false),
+        ("retroarch", true),
+        ("pcsx2", false),
+        ("pcsx2", true),
+        ("rpcs3", false),
+        ("rpcs3", true),
+        ("dolphin-emu", true),
+        ("ppsspp", true),
+    ] {
+        let mut launch =
+            super::super::tracker::classify_started(Path::new(&format!("/nowhere/{program}")), &[]);
+        if flatpak {
+            launch.profile = "flatpak".into();
+        }
+        for run in 1..=3 {
+            let began = std::time::Instant::now();
+            let baseline = tracker.baseline_before_start(&launch).unwrap();
+            println!(
+                "PERF {} {} run {run}: {:.1} ms, {} saves, {} unread",
+                launch.emulator,
+                launch.profile,
+                began.elapsed().as_secs_f64() * 1000.0,
+                baseline.marks.len(),
+                baseline.unread.len()
+            );
+        }
     }
+}
+
+// ----- The gated launch: saves read, afresh, before the emulator exists -----
+
+struct Gated {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    saves: PathBuf,
+    tracker: LaunchTracker,
+    table: One,
+}
+
+fn gated() -> Gated {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+    home_with_saves(&home);
+    let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
+    Gated {
+        saves: home.join(".config/retroarch/saves"),
+        root,
+        tracker,
+        table: One(Cell::new(true)),
+        _dir: dir,
+    }
+}
+
+fn retroarch() -> SessionLaunch {
+    super::super::tracker::classify_started(Path::new("/nowhere/retroarch"), &[])
+}
+
+impl Gated {
+    /// Request, read before the start, start. Returns the session id.
+    fn start(&self) -> String {
+        let session = self
+            .tracker
+            .begin_gated(SessionGame::default(), "RetroArch")
+            .unwrap();
+        let baseline = self.tracker.baseline_before_start(&retroarch()).unwrap();
+        self.tracker
+            .process_started_gated(
+                &session.session_id,
+                &started(),
+                Ok((baseline, 3)),
+                &self.table,
+            )
+            .unwrap();
+        session.session_id
+    }
+
+    fn end(&self, session_id: &str) -> SessionRecord {
+        self.table.0.set(false);
+        self.tracker
+            .finished_in(session_id, Some(ExitSummary::Code(0)), None, &self.table)
+            .unwrap()
+    }
+}
+
+fn sorted(mut changes: Vec<SaveChange>) -> Vec<SaveChange> {
+    changes.sort_by_key(|change| format!("{change:?}"));
+    changes
+}
+
+#[test]
+fn a_same_size_change_with_its_old_date_put_back_is_still_changed() {
+    let run = gated();
+    let played = run.saves.join("Played (USA).srm");
+    let dated = fs::metadata(&played).unwrap().modified().unwrap();
+    let session = run.start();
+    // Same size, one byte different, modification time put back.
+    let mut bytes = fs::read(&played).unwrap();
+    bytes[4000] ^= 0x01;
+    fs::write(&played, &bytes).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&played)
+        .unwrap()
+        .set_modified(dated)
+        .unwrap();
+    assert_eq!(fs::metadata(&played).unwrap().modified().unwrap(), dated);
+    let ended = run.end(&session);
+    assert!(matches!(
+        ended.save_tracking,
+        Some(SaveTracking::Established { .. })
+    ));
+    assert_eq!(
+        ended.save_changes,
+        vec![SaveChange::Modified {
+            label: "Played (USA).srm".into()
+        }]
+    );
+}
+
+#[test]
+fn a_remembered_fingerprint_is_never_used_for_a_launch() {
+    use super::super::discover::{DiscoveryCache, DiscoveryOptions, discover};
+    let run = gated();
+    let roots = DiscoveryRoots::under_home(run.saves.ancestors().nth(3).unwrap());
+    // A memory of the saves whose file sizes, times and file numbers all
+    // still match, but whose remembered content is wrong: exactly what a
+    // change that left size and times alone would leave behind.
+    let cache_file = run.root.join("discovery-cache.json");
+    let mut cache = DiscoveryCache::default();
+    fn options(cache: &mut DiscoveryCache) -> DiscoveryOptions<'_> {
+        DiscoveryOptions {
+            cache: Some(cache),
+            ..Default::default()
+        }
+    }
+    let real = discover(&roots, options(&mut cache)).unwrap().saves;
+    cache.save(&cache_file).unwrap();
+    let stale = "0".repeat(64);
+    let mut text = fs::read_to_string(&cache_file).unwrap();
+    for save in &real {
+        text = text.replace(save.content_sha256.as_ref().unwrap(), &stale);
+    }
+    fs::write(&cache_file, text).unwrap();
+    let mut poisoned = DiscoveryCache::load(&cache_file);
+    let remembered = discover(&roots, options(&mut poisoned)).unwrap().saves;
+    assert!(
+        remembered
+            .iter()
+            .all(|save| save.content_sha256.as_deref() == Some(stale.as_str())),
+        "the memory must be in effect for this test to mean anything"
+    );
+
+    // The read before the start reports what the files really hold.
+    let baseline = run.tracker.baseline_before_start(&retroarch()).unwrap();
+    let mut read: Vec<&str> = baseline
+        .marks
+        .iter()
+        .map(|mark| mark.content_sha256.as_str())
+        .collect();
+    let mut truth: Vec<&str> = real
+        .iter()
+        .map(|save| save.content_sha256.as_deref().unwrap())
+        .collect();
+    read.sort();
+    truth.sort();
+    assert_eq!(read, truth);
+    // And so does the read after: an untouched session reports no change.
+    let session = run.start();
+    assert!(run.end(&session).save_changes.is_empty());
+}
+
+#[test]
+fn a_save_that_cannot_be_read_is_not_known_rather_than_new_or_gone() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid only reads the process's own id.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root reads everything; the case cannot be made.
+    }
+    let lock = |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    let run = gated();
+    let untouched = run.saves.join("Untouched (USA).srm");
+
+    // Unreadable before the start, readable afterwards: not "new".
+    lock(&untouched, 0o000).unwrap();
+    let session = run.start();
+    let record = run.tracker.journal().get(&session).unwrap();
+    assert_eq!(record.saves_before.len(), 1);
+    assert_eq!(record.saves_unread_before.len(), 1, "{record:?}");
+    lock(&untouched, 0o644).unwrap();
+    fs::write(run.saves.join("Brand New (USA).srm"), [7u8; 64]).unwrap();
+    assert_eq!(
+        sorted(run.end(&session).save_changes),
+        vec![
+            SaveChange::Created {
+                label: "Brand New (USA).srm".into()
+            },
+            SaveChange::CreatedBeforeNotKnown {
+                label: "Untouched (USA).srm".into()
+            },
+        ]
+    );
+
+    // Readable before, unreadable afterwards: not "gone".
+    let run = gated();
+    let untouched = run.saves.join("Untouched (USA).srm");
+    let session = run.start();
+    lock(&untouched, 0o000).unwrap();
+    let ended = run.end(&session);
+    lock(&untouched, 0o644).unwrap();
+    assert_eq!(
+        ended.save_changes,
+        vec![SaveChange::NotKnown {
+            label: "Untouched (USA).srm".into()
+        }]
+    );
+    assert!(!ended.needs_attention(), "nothing is known to be lost");
+}
+
+#[test]
+fn only_the_started_emulators_saves_are_read_and_another_emulators_baseline_is_refused() {
+    let run = gated();
+    // A PPSSPP launch on this profile: RetroArch's saves are not its saves.
+    let ppsspp = super::super::tracker::classify_started(Path::new("/nowhere/ppsspp"), &[]);
+    let baseline = run.tracker.baseline_before_start(&ppsspp).unwrap();
+    assert!(baseline.marks.is_empty() && baseline.unread.is_empty());
+    // Handed to a RetroArch start, it is not taken for RetroArch's baseline.
+    let session = run
+        .tracker
+        .begin_gated(SessionGame::default(), "RetroArch")
+        .unwrap();
+    let record = run
+        .tracker
+        .process_started_gated(
+            &session.session_id,
+            &started(),
+            Ok((baseline, 1)),
+            &run.table,
+        )
+        .unwrap();
+    assert!(matches!(
+        record.save_tracking,
+        Some(SaveTracking::Unavailable { .. })
+    ));
+    fs::write(run.saves.join("Played (USA).srm"), [9u8; 8192]).unwrap();
+    let ended = run.end(&session.session_id);
+    assert!(ended.save_changes.is_empty() && ended.saves_after.is_none());
 }

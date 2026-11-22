@@ -14,7 +14,7 @@
 use super::guidance::GuidanceCategory;
 use crate::ui::components::{self as widgets, ActionStyle, StatusTone};
 use archivefs_core::save_continuity::session::{
-    SaveChange, SessionEnd, SessionRecord, SessionState, read_recorded_sessions,
+    SaveChange, SaveTracking, SessionEnd, SessionRecord, SessionState, read_recorded_sessions,
 };
 use archivefs_core::save_continuity::status::Advisory;
 use archivefs_core::save_continuity::store::{CaptureReason, SnapshotStore};
@@ -172,6 +172,9 @@ pub(super) fn save_summary(record: &SessionRecord) -> String {
         SessionState::Requested | SessionState::Started | SessionState::NeverStarted
     ) {
         return String::new();
+    }
+    if let Some(SaveTracking::Unavailable { reason }) = &record.save_tracking {
+        return format!("Save changes were not tracked for this session: {reason}.");
     }
     if record.saves_after.is_none() {
         return "The saves were not compared after this session.".to_string();
@@ -426,6 +429,7 @@ mod tests {
             last_changed_unix: None,
             before_launch: None,
             folder: None,
+            path: None,
         }
     }
 
