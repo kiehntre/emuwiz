@@ -95,6 +95,11 @@ pub(crate) struct RomOrganisationPageState {
     /// confirmation for large batches.
     pending_apply: Option<usize>,
     confirm_text: String,
+    /// Set when Undo was asked for: Undo runs only from its confirm card.
+    pending_undo: bool,
+    /// One-shot: bring the next confirm card or Apply/Undo outcome into
+    /// view, so it never opens below the visible part of the page.
+    reveal: bool,
     /// Set on the frame "Preview changes" is clicked; the actual (currently
     /// synchronous, potentially slow for a large library) `generate_plan()`
     /// call is deferred to the start of the *next* frame so this frame can
@@ -253,6 +258,8 @@ impl RomOrganisationPageState {
             stopped: false,
             pending_apply: None,
             confirm_text: String::new(),
+            pending_undo: false,
+            reveal: false,
             pending_preview: false,
             approval_persistence_warning: None,
             approvals_file: None,
@@ -401,6 +408,8 @@ impl RomOrganisationPageState {
         self.result_complete = false;
         self.last_rollback = None;
         self.stopped = false;
+        self.pending_undo = false;
+        self.reveal = true;
     }
 
     /// Loads the configured master root and scans the configured source
@@ -832,7 +841,10 @@ impl RomOrganisationPageState {
 
     /// Records one Apply outcome: complete only for a fully resolved batch,
     /// and an Undo handle whenever the journalled transaction may have changed
-    /// files. The reviewed plan and approvals are never cleared here.
+    /// files. A complete Apply clears the reviewed plan and its approvals:
+    /// that preview described the files before they were renamed, so Apply
+    /// stays off until a fresh preview. An incomplete or failed Apply keeps
+    /// them for review.
     fn record_apply_result(
         &mut self,
         result: Result<
@@ -853,6 +865,13 @@ impl RomOrganisationPageState {
                 let (message, complete) = apply_result_report(self.mode, &outcome.summary);
                 self.result_message = Some(message);
                 self.result_complete = complete;
+                if complete {
+                    self.plan = None;
+                    self.approved.clear();
+                    // Persist the empty set so a restart does not restore
+                    // approvals for files that have already moved.
+                    self.persist_approved_set();
+                }
             }
             Err(error) => {
                 self.stopped = matches!(
@@ -2549,12 +2568,17 @@ fn show_rom_organisation_page_with_options(
 
     if let Some(message) = &state.result_message {
         ui.add_space(8.0);
+        let top = ui.cursor().min.y;
         let tone = if state.result_complete {
             widgets::StatusTone::Success
         } else {
             widgets::StatusTone::Warning
         };
         widgets::banner(ui, "Result", message, tone);
+        if state.plan.is_none() && state.result_complete && state.applied.is_some() {
+            ui.label("This preview has been used. Preview again before renaming anything else.");
+        }
+        reveal_from(ui, &mut state.reveal, top);
         if let Some(transaction) = state.applied() {
             // Same condition as the Undo button below.
             crate::transaction_outcome::show(
@@ -2599,12 +2623,14 @@ fn show_rom_organisation_page_with_options(
 
     if let Some(error) = &state.error {
         ui.add_space(8.0);
+        let top = ui.cursor().min.y;
         let title = if state.error_after_changes {
             "Not finished"
         } else {
             "Not applied"
         };
         widgets::banner(ui, title, error, widgets::StatusTone::Blocked);
+        reveal_from(ui, &mut state.reveal, top);
     }
 
     // Offered whenever this page holds an Undo handle with something left to
@@ -2644,7 +2670,30 @@ fn show_rom_organisation_page_with_options(
         )
         .clicked()
     {
-        page_action = Some(RomOrganisationPageAction::Rollback);
+        state.pending_undo = true;
+        state.pending_apply = None;
+        state.reveal = true;
+    }
+    if state.pending_undo {
+        match state.applied.as_ref() {
+            Some(transaction) if undo_blocker.is_none() && !state.advanced_r2_selected => {
+                let confirmed = show_undo_confirmation(
+                    ui,
+                    transaction,
+                    !async_busy && older_writer.is_none(),
+                    &mut state.reveal,
+                );
+                match confirmed {
+                    Some(true) => {
+                        state.pending_undo = false;
+                        page_action = Some(RomOrganisationPageAction::Rollback);
+                    }
+                    Some(false) => state.pending_undo = false,
+                    None => {}
+                }
+            }
+            _ => state.pending_undo = false,
+        }
     }
 
     if let Some(warning) = &state.approval_persistence_warning {
@@ -2659,7 +2708,115 @@ fn show_rom_organisation_page_with_options(
             widgets::StatusTone::Pending,
         );
     }
+    // A reveal nothing on this page used (an outcome with no banner) must not
+    // jump the page later.
+    state.reveal = false;
     page_action
+}
+
+/// Scrolls the part of the page drawn since `top` into view, once.
+fn reveal_from(ui: &mut egui::Ui, reveal: &mut bool, top: f32) {
+    if std::mem::take(reveal) {
+        let bottom = ui.cursor().min.y.max(top);
+        let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=bottom);
+        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+    }
+}
+
+/// Entries an Undo of `transaction` may put back: every one that may have
+/// changed on disk. The engine decides per entry; this is only what to show.
+fn undo_affected_entries(
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+) -> Vec<&archivefs_core::dat::rename_apply::TransactionEntry> {
+    use archivefs_core::dat::rename_apply::EntryState;
+    transaction
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.state,
+                EntryState::Applying
+                    | EntryState::Applied
+                    | EntryState::RollingBack
+                    | EntryState::RollbackFailed
+            )
+        })
+        .collect()
+}
+
+/// Lines naming what an Undo would put back, at most `limit` of them.
+pub(crate) fn undo_confirmation_lines(
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+    limit: usize,
+) -> Vec<String> {
+    let affected = undo_affected_entries(transaction);
+    let mut lines: Vec<String> = affected
+        .iter()
+        .take(limit)
+        .map(|entry| {
+            let now = entry
+                .destination_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.destination_path.display().to_string());
+            let folder = entry
+                .source_path
+                .parent()
+                .map(|folder| folder.display().to_string())
+                .unwrap_or_default();
+            format!("{now} \u{2192} {} (in {folder})", entry.original_basename)
+        })
+        .collect();
+    if affected.len() > limit {
+        lines.push(format!("and {} more", affected.len() - limit));
+    }
+    lines
+}
+
+/// The Undo confirm card. `Some(true)` confirmed, `Some(false)` cancelled.
+fn show_undo_confirmation(
+    ui: &mut egui::Ui,
+    transaction: &archivefs_core::dat::rename_apply::RenameTransaction,
+    enabled: bool,
+    reveal: &mut bool,
+) -> Option<bool> {
+    ui.add_space(6.0);
+    let top = ui.cursor().min.y;
+    let mut answer = None;
+    widgets::card(ui, |ui| {
+        let count = undo_affected_entries(transaction).len();
+        ui.label(
+            egui::RichText::new(format!(
+                "Undo rename operation {}? It puts {count} file(s) back under their \
+                 earlier names. Nothing changes until you confirm.",
+                transaction.transaction_id
+            ))
+            .strong(),
+        );
+        for line in undo_confirmation_lines(transaction, 10) {
+            ui.label(line);
+        }
+        ui.label(
+            egui::RichText::new(
+                "Each file is checked again before it is moved back; anything that \
+                 changed since is left alone and reported.",
+            )
+            .color(theme::muted(ui)),
+        );
+        ui.horizontal(|ui| {
+            if widgets::action_button(ui, "Confirm undo", widgets::ActionStyle::Primary, enabled)
+                .clicked()
+            {
+                answer = Some(true);
+            }
+            if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Secondary, true).clicked()
+            {
+                answer = Some(false);
+            }
+        });
+    });
+    reveal_from(ui, reveal, top);
+    answer
 }
 
 const LIBRARY_DESTINATION_CARDS: [(&str, &str, PlayingLibraryDestination); 4] = [
@@ -3130,7 +3287,9 @@ fn show_plan(
     .clicked()
     {
         state.pending_apply = Some(approved);
+        state.pending_undo = false;
         state.confirm_text.clear();
+        state.reveal = true;
     }
 
     // Explicit confirmation before any mutation. Large batches require typing
@@ -3141,6 +3300,7 @@ fn show_plan(
     }
     if let Some(count) = state.pending_apply {
         ui.add_space(6.0);
+        let top = ui.cursor().min.y;
         widgets::card(ui, |ui| {
             ui.label(
                 egui::RichText::new(format!(
@@ -3180,6 +3340,7 @@ fn show_plan(
                 }
             });
         });
+        reveal_from(ui, &mut state.reveal, top);
     }
 }
 
@@ -4887,3 +5048,6 @@ mod tests {
 #[cfg(test)]
 #[path = "rom_organisation_page_preview_perf_tests.rs"]
 mod preview_perf_tests;
+#[cfg(test)]
+#[path = "rom_organisation_page_undo_tests.rs"]
+mod undo_tests;
