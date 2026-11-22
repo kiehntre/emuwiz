@@ -167,6 +167,21 @@ pub struct SaveMark {
 /// reported as changed, new or gone.
 pub const CARD_NOTE: &str = "card:";
 
+/// The start of the id of a mark that only notes that a file was there at
+/// that read and was not read (an oddly named file among RetroArch's saves
+/// that was not a memory card). Never reported itself. What is read from
+/// that file at the other read of the session is neither gone nor new.
+pub const SEEN_NOTE: &str = "seen:";
+
+/// Where the read before a session looked: the folders whose location is a
+/// setting, and the disk and the mount of every folder searched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotedPlaces {
+    pub places: Vec<PathBuf>,
+    pub disks: Vec<(PathBuf, u64)>,
+    pub mounts: Vec<(PathBuf, u64)>,
+}
+
 /// Whether `mark`'s file (or the card or folder it is in) is one of those
 /// a read could not take in.
 fn among_unread(unread: &[PathBuf], mark: &SaveMark) -> bool {
@@ -382,6 +397,10 @@ pub struct SessionRecord {
     /// "gone" but out of sight, and nothing is compared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub save_disks_before: Option<Vec<(PathBuf, u64)>>,
+    /// The mount each of those folders was on. It differs where the disk
+    /// does not: for a folder mounted from elsewhere on the same disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_mounts_before: Option<Vec<(PathBuf, u64)>>,
     /// The saves as they were once the session had ended, when they were
     /// compared. `None`: not compared (a crash, an exit EmuWiz did not see).
     #[serde(default)]
@@ -1012,7 +1031,9 @@ pub fn diff_saves_with(
     let index = |marks: &[SaveMark]| -> BTreeMap<String, SaveMark> {
         marks
             .iter()
-            .filter(|mark| !mark.save_id.starts_with(CARD_NOTE))
+            .filter(|mark| {
+                !mark.save_id.starts_with(CARD_NOTE) && !mark.save_id.starts_with(SEEN_NOTE)
+            })
             .map(|mark| (mark.save_id.clone(), mark.clone()))
             .collect()
     };
@@ -1027,11 +1048,16 @@ pub fn diff_saves_with(
     };
     let not_a_card_at = |here: &[SaveMark], there: &[SaveMark], mark: &SaveMark| {
         mark.path.as_deref().is_some_and(|path| {
-            was_card(here, path)
-                && !was_card(there, path)
-                && there
-                    .iter()
-                    .any(|other| other.path.as_deref() == Some(path))
+            // The file was there at the other read and was not read at all.
+            let only_seen = there.iter().any(|other| {
+                other.save_id.starts_with(SEEN_NOTE) && other.path.as_deref() == Some(path)
+            });
+            only_seen
+                || (was_card(here, path)
+                    && !was_card(there, path)
+                    && there
+                        .iter()
+                        .any(|other| other.path.as_deref() == Some(path)))
         })
     };
     let mut changes = Vec::new();
@@ -1301,6 +1327,7 @@ impl SessionJournal {
             saves_unread_after: Vec::new(),
             save_places_before: None,
             save_disks_before: None,
+            save_mounts_before: None,
             saves_after: None,
             save_changes: Vec::new(),
             snapshots: Vec::new(),
@@ -1493,8 +1520,7 @@ impl SessionJournal {
         tracking: SaveTracking,
         saves_before: Vec<SaveMark>,
         unread_before: Vec<PathBuf>,
-        places: Vec<PathBuf>,
-        disks: Vec<(PathBuf, u64)>,
+        noted: NotedPlaces,
     ) -> Result<SessionRecord, ContinuityError> {
         let mut record = self.get(session_id)?;
         (record.saves_before, record.saves_unread_before) = match &tracking {
@@ -1502,8 +1528,9 @@ impl SessionJournal {
             SaveTracking::Unavailable { .. } => (Vec::new(), Vec::new()),
         };
         record.folders_before = None;
-        record.save_places_before = Some(places);
-        record.save_disks_before = Some(disks);
+        record.save_places_before = Some(noted.places);
+        record.save_disks_before = Some(noted.disks);
+        record.save_mounts_before = Some(noted.mounts);
         record.save_tracking = Some(tracking);
         self.write(&record)?;
         Ok(record)

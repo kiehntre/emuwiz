@@ -1822,6 +1822,77 @@ fn saves_whose_disk_went_during_the_session_are_not_called_gone() {
     );
 }
 
+/// A folder mounted from elsewhere on the same disk has the disk's own
+/// number: only the mount tells it from the bare folder left behind when it
+/// is taken away. With the disks as they were and the mount another, the
+/// saves are not called gone.
+#[test]
+fn saves_whose_mount_went_while_the_disk_number_stayed_are_not_called_gone() {
+    let empty = |run: &Gated| {
+        for entry in fs::read_dir(&run.saves).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                fs::remove_file(path).unwrap();
+            }
+        }
+    };
+    let run = gated();
+    let session = run
+        .tracker
+        .begin_gated(SessionGame::default(), "RetroArch")
+        .unwrap()
+        .session_id;
+    let mut baseline = run.tracker.baseline_before_start(&retroarch()).unwrap();
+    assert!(
+        baseline
+            .mounts
+            .iter()
+            .any(|(folder, _)| folder == &run.saves)
+    );
+    assert_eq!(baseline.mounts.len(), baseline.disks.len());
+    // Only the mount is another; every disk number is as it is now.
+    for (_, mount) in &mut baseline.mounts {
+        *mount = mount.wrapping_add(1);
+    }
+    run.tracker
+        .process_started_gated(&session, &started(), Ok((baseline, 3, 0)), &run.table)
+        .unwrap();
+    let noted = run.tracker.journal().get(&session).unwrap();
+    assert!(
+        noted
+            .save_mounts_before
+            .is_some_and(|mounts| !mounts.is_empty())
+    );
+    empty(&run);
+    let ended = run.end(&session);
+    assert_eq!(ended.state, SessionState::Ended);
+    assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
+    assert!(!ended.needs_attention());
+}
+
+#[test]
+fn a_folder_is_judged_by_the_mount_it_is_on() {
+    use super::super::discover::disk_and_mount;
+    use super::super::tracker::same_mounts;
+    let dir = tempfile::tempdir().unwrap();
+    let (disk, mount) = disk_and_mount(dir.path()).unwrap();
+    // The same call follows a link, and a folder made here is on this mount.
+    let saves = dir.path().join("saves");
+    fs::create_dir_all(&saves).unwrap();
+    assert_eq!(disk_and_mount(&saves).unwrap(), (disk, mount));
+    assert!(disk_and_mount(&dir.path().join("not-there")).is_err());
+    let before = vec![(saves.clone(), mount)];
+    assert!(same_mounts(&before, &before));
+    assert!(same_mounts(&before, &[(saves.join("new"), mount)]));
+    // Another mount at the noted folder, or at a new folder inside it.
+    assert!(!same_mounts(&[(saves.clone(), mount + 1)], &[]));
+    assert!(!same_mounts(&before, &[(saves.join("new"), mount + 1)]));
+    // A noted folder that has gone: judged by the folder above it.
+    fs::remove_dir(&saves).unwrap();
+    assert!(same_mounts(&before, &[]));
+    assert!(!same_mounts(&[(saves.clone(), mount + 1)], &[]));
+}
+
 #[test]
 fn a_folder_is_judged_by_the_disk_it_is_on() {
     use super::super::tracker::{noted_disk, same_disks};
@@ -1994,6 +2065,151 @@ fn a_battery_save_that_stops_or_starts_being_a_card_does_not_lose_or_gain_saves(
     );
 }
 
+/// A PlayStation card among RetroArch's saves under names saves do not go
+/// by (.mcr, .mcd, no suffix at all). Whether it is a card is told from its
+/// bytes at every read, never from its name. Whatever the file is at one
+/// read (a card, bytes that are not a card's, unopenable), a save listed on
+/// it at the other read is only ever gone or new when the card was read as
+/// a card at both.
+#[test]
+fn an_oddly_named_card_in_any_state_never_loses_or_gains_saves_falsely() {
+    use crate::memory_card_manager::tests::{ps1_card, ps1_save};
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid only reads the process's own id.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let lock =
+        |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    let valid = ps1_card(&[ps1_save("BASLUS-00001GAME", 1, "GAME")]);
+    let with_two = ps1_card(&[
+        ps1_save("BASLUS-00001GAME", 1, "GAME"),
+        ps1_save("BASLUS-00002GAME", 1, "MORE"),
+    ]);
+    let garbage = vec![0x5Au8; valid.len()];
+    for name in [
+        "Card Game (USA).mcr",
+        "Card Game (USA).mcd",
+        "CARDFILE",
+        "card.bin",
+    ] {
+        let run = gated();
+        let card = run.saves.join(name);
+        let all = |ended: &SessionRecord, wanted: &dyn Fn(&SaveChange) -> bool| {
+            assert!(
+                !ended.save_changes.is_empty() && ended.save_changes.iter().all(wanted),
+                "{name}: {:?}",
+                ended.save_changes
+            );
+        };
+        let none = |ended: &SessionRecord| {
+            assert!(
+                ended.saves_after.is_some() && ended.save_changes.is_empty(),
+                "{name}: {:?}",
+                ended.save_changes
+            );
+        };
+        let session_with = |during: &dyn Fn()| {
+            let session = run.start();
+            during();
+            run.end(&session)
+        };
+
+        // A card by its bytes, whatever its name: read, save by save.
+        fs::write(&card, &valid).unwrap();
+        let session = run.start();
+        let noted = run.tracker.journal().get(&session).unwrap();
+        assert!(
+            noted.saves_before.iter().any(|mark| {
+                mark.path.as_ref() == Some(&card) && mark.label.contains("BASLUS-00001GAME")
+            }),
+            "{name}: the save on the card is listed: {:?}",
+            noted.saves_before
+        );
+        none(&run.end(&session));
+        // A card at both ends: a save gained is new, a save lost is gone.
+        let ended = session_with(&|| fs::write(&card, &with_two).unwrap());
+        assert!(
+            ended
+                .save_changes
+                .iter()
+                .any(|change| matches!(change, SaveChange::Created { .. })),
+            "{name}: {:?}",
+            ended.save_changes
+        );
+        all(&ended, &|change| {
+            matches!(
+                change,
+                SaveChange::Created { .. } | SaveChange::Modified { .. }
+            )
+        });
+        let ended = session_with(&|| fs::write(&card, &valid).unwrap());
+        assert!(
+            ended
+                .save_changes
+                .iter()
+                .any(|change| matches!(change, SaveChange::Missing { .. })),
+            "{name}: {:?}",
+            ended.save_changes
+        );
+
+        // The card becomes bytes that are not a card's: nothing is gone.
+        let ended = session_with(&|| fs::write(&card, &garbage).unwrap());
+        all(&ended, &|change| {
+            matches!(change, SaveChange::NotKnown { .. })
+        });
+        // Not a card at either end: it is not a save file, nothing is said.
+        none(&session_with(&|| {}));
+        none(&session_with(&|| {
+            fs::write(&card, vec![0x3Cu8; valid.len()]).unwrap()
+        }));
+        // Bytes that are not a card's become a card: nothing is new.
+        let ended = session_with(&|| fs::write(&card, &valid).unwrap());
+        all(&ended, &|change| {
+            matches!(change, SaveChange::CreatedBeforeNotKnown { .. })
+        });
+
+        // Readable, then unopenable: nothing is gone.
+        let ended = session_with(&|| lock(&card, 0o000));
+        all(&ended, &|change| {
+            matches!(change, SaveChange::NotKnown { .. })
+        });
+        // Unopenable at both ends: not known, once, by its name.
+        let ended = session_with(&|| {});
+        assert_eq!(
+            ended.save_changes,
+            vec![SaveChange::NotKnown { label: name.into() }],
+            "{name}"
+        );
+        // Unopenable, then readable again: nothing is new.
+        let ended = session_with(&|| lock(&card, 0o644));
+        all(&ended, &|change| {
+            matches!(change, SaveChange::CreatedBeforeNotKnown { .. })
+        });
+        // Restored: the session after that is an ordinary one.
+        none(&session_with(&|| {}));
+        let ended = session_with(&|| fs::write(&card, &with_two).unwrap());
+        assert!(
+            ended
+                .save_changes
+                .iter()
+                .any(|change| matches!(change, SaveChange::Created { .. })),
+            "{name}: {:?}",
+            ended.save_changes
+        );
+
+        // Really deleted: gone. Really new: new.
+        let ended = session_with(&|| fs::remove_file(&card).unwrap());
+        all(&ended, &|change| {
+            matches!(change, SaveChange::Missing { .. })
+        });
+        let ended = session_with(&|| fs::write(&card, &valid).unwrap());
+        all(&ended, &|change| {
+            matches!(change, SaveChange::Created { .. })
+        });
+    }
+}
+
 /// One PlayStation 3 save under an RPCS3 folder.
 fn rpcs3_save(rpcs3: &Path) {
     let save = rpcs3.join("dev_hdd0/home/00000001/savedata/BLUS30750_RERC_SAVE");
@@ -2120,6 +2336,90 @@ fn a_real_disk_taken_away_or_put_in_during_a_session_by_hand() {
     command("umount", &[run.saves.as_os_str()]);
     println!(
         "MOUNT disk put in: compared {}; changes {:?}",
+        ended.saves_after.is_some(),
+        ended.save_changes
+    );
+    assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
+
+    // A folder mounted from elsewhere ON THE SAME DISK (a bind mount): the
+    // disk's number does not change when it is taken away, only the mount.
+    let bind = |from: &Path, to: &Path| {
+        command(
+            "mount",
+            &["--bind".as_ref(), from.as_os_str(), to.as_os_str()],
+        )
+    };
+    let run = gated();
+    let elsewhere = run.saves.parent().unwrap().join("kept-elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    for (path, bytes) in take(&run.saves) {
+        fs::write(elsewhere.join(path.file_name().unwrap()), bytes).unwrap();
+    }
+    bind(&elsewhere, &run.saves);
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(&run.saves).unwrap().dev(),
+            fs::metadata(run.saves.parent().unwrap()).unwrap().dev(),
+            "the bind mount is on the same disk as the folder it covers"
+        );
+    }
+    // Taken away while the game runs.
+    let session = run.start();
+    let before = run.tracker.journal().get(&session).unwrap();
+    command("umount", &[run.saves.as_os_str()]);
+    assert_eq!(fs::read_dir(&run.saves).unwrap().count(), 0);
+    let ended = run.end(&session);
+    println!(
+        "MOUNT bind mount taken away (same disk number): read before {} saves; compared {}; changes {:?}",
+        before.saves_before.len(),
+        ended.saves_after.is_some(),
+        ended.save_changes
+    );
+    assert!(!before.saves_before.is_empty());
+    assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
+    // Taken away and put back while the game runs: every save is there
+    // again, but it is another mount and what happened meanwhile is not
+    // known, so nothing is called changed or unchanged.
+    bind(&elsewhere, &run.saves);
+    let session = run.start();
+    command("umount", &[run.saves.as_os_str()]);
+    bind(&elsewhere, &run.saves);
+    let ended = run.end(&session);
+    println!(
+        "MOUNT bind mount taken away and put back: compared {}; changes {:?}",
+        ended.saves_after.is_some(),
+        ended.save_changes
+    );
+    assert!(ended.saves_after.is_none() && ended.save_changes.is_empty());
+    // Left alone for a whole session, with a save written: an ordinary
+    // session again.
+    let session = run.start();
+    let played = run.saves.join("Played (USA).srm");
+    let mut bytes = fs::read(&played).unwrap();
+    bytes[10] ^= 0x01;
+    fs::write(&played, &bytes).unwrap();
+    let ended = run.end(&session);
+    println!(
+        "MOUNT bind mount stays, save written: compared {}; changes {:?}",
+        ended.saves_after.is_some(),
+        ended.save_changes
+    );
+    assert_eq!(
+        ended.save_changes,
+        vec![SaveChange::Modified {
+            label: "Played (USA).srm".into()
+        }]
+    );
+    // Put in while the game runs, over saves that were there.
+    command("umount", &[run.saves.as_os_str()]);
+    fs::write(run.saves.join("Underneath (USA).srm"), [3u8; 8192]).unwrap();
+    let session = run.start();
+    bind(&elsewhere, &run.saves);
+    let ended = run.end(&session);
+    command("umount", &[run.saves.as_os_str()]);
+    println!(
+        "MOUNT bind mount put in over saves: compared {}; changes {:?}",
         ended.saves_after.is_some(),
         ended.save_changes
     );

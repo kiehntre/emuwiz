@@ -8,8 +8,8 @@
 use super::discover::{DiscoveryOptions, DiscoveryRoots, discover};
 use super::model::DiscoveredSave;
 use super::session::{
-    ExitObservation, FolderMark, ProcFs, ProcessTable, SaveMark, SaveTracking, SessionGame,
-    SessionJournal, SessionLaunch, SessionRecord, SessionState,
+    ExitObservation, FolderMark, NotedPlaces, ProcFs, ProcessTable, SaveMark, SaveTracking,
+    SessionGame, SessionJournal, SessionLaunch, SessionRecord, SessionState,
 };
 use super::{ContinuityError, now_unix};
 use crate::launch::process_log::{ExitSummary, StartedProcess};
@@ -232,6 +232,8 @@ pub struct Baseline {
     /// The disk each folder that was searched, or that held a save, was
     /// on (see [`disks_of`]).
     pub disks: Vec<(PathBuf, u64)>,
+    /// The mount each of those folders was on.
+    pub mounts: Vec<(PathBuf, u64)>,
     pub captured_unix: i64,
 }
 
@@ -253,6 +255,11 @@ struct Fresh {
     whole: Vec<(PathBuf, String)>,
     /// The disk each of those folders was on.
     disks: Vec<(PathBuf, u64)>,
+    /// The mount each of those folders was on.
+    mounts: Vec<(PathBuf, u64)>,
+    /// Oddly named files among RetroArch's saves that were there but were
+    /// not cards, and so were not read (a narrowed look).
+    seen: Vec<PathBuf>,
     /// Battery saves that were memory cards at this read (a narrowed look).
     as_cards: Vec<PathBuf>,
 }
@@ -261,8 +268,18 @@ struct Fresh {
 /// this read. It is never itself reported as changed (see
 /// [`super::session::CARD_NOTE`]).
 fn card_note(path: &Path) -> SaveMark {
+    note(super::session::CARD_NOTE, path)
+}
+
+/// Notes that an oddly named file among RetroArch's saves was there, was
+/// not a card, and was not read (see [`super::session::SEEN_NOTE`]).
+fn seen_note(path: &Path) -> SaveMark {
+    note(super::session::SEEN_NOTE, path)
+}
+
+fn note(kind: &str, path: &Path) -> SaveMark {
     SaveMark {
-        save_id: format!("{}{}", super::session::CARD_NOTE, path.display()),
+        save_id: format!("{kind}{}", path.display()),
         label: path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -286,13 +303,12 @@ fn card_note(path: &Path) -> SaveMark {
 /// disk came or went while the saves were being read, and what was read is
 /// not one state of one place.
 fn disks_of(
-    searched: &[(PathBuf, Option<u64>)],
+    searched: &[(PathBuf, Option<(u64, u64)>)],
     places: &[PathBuf],
     saves: &[DiscoveredSave],
     whole: &[(PathBuf, String)],
     unread: &[PathBuf],
-) -> Result<Vec<(PathBuf, u64)>, ContinuityError> {
-    use std::os::unix::fs::MetadataExt;
+) -> Result<(Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>), ContinuityError> {
     let moved = |folder: &Path| {
         ContinuityError::Io(format!(
             "a disk came or went at {} while the saves were being read",
@@ -301,8 +317,8 @@ fn disks_of(
     };
     let mut folders: Vec<PathBuf> = places.to_vec();
     for (folder, listed_on) in searched {
-        match (listed_on, nearest_disk(folder)) {
-            // There when listed: still there, on the same disk.
+        match (listed_on, nearest(folder)) {
+            // There when listed: still there, on the same disk and mount.
             (Some(then), Some((at, now))) if &at == folder && now == *then => {
                 folders.push(at);
             }
@@ -327,26 +343,32 @@ fn disks_of(
     }
     folders.sort();
     folders.dedup();
-    folders
-        .into_iter()
-        .map(|folder| match std::fs::metadata(&folder) {
-            Ok(meta) => Ok((folder, meta.dev())),
-            Err(error) => Err(ContinuityError::Io(format!(
-                "the save folder {} could not be looked at: {error}",
-                folder.display()
-            ))),
-        })
-        .collect()
+    let (mut disks, mut mounts) = (Vec::new(), Vec::new());
+    for folder in folders {
+        match super::discover::disk_and_mount(&folder) {
+            Ok((disk, mount)) => {
+                disks.push((folder.clone(), disk));
+                mounts.push((folder, mount));
+            }
+            Err(error) => {
+                return Err(ContinuityError::Io(format!(
+                    "the save folder {} could not be looked at: {error}",
+                    folder.display()
+                )));
+            }
+        }
+    }
+    Ok((disks, mounts))
 }
 
-/// `folder`, or the nearest folder above it that is there, and its disk.
-/// `None` when that cannot be told (a folder that cannot be looked at).
-fn nearest_disk(folder: &Path) -> Option<(PathBuf, u64)> {
-    use std::os::unix::fs::MetadataExt;
+/// `folder`, or the nearest folder above it that is there, with its disk
+/// and its mount. `None` when that cannot be told (a folder that cannot be
+/// looked at).
+fn nearest(folder: &Path) -> Option<(PathBuf, (u64, u64))> {
     let mut at = Some(folder);
     while let Some(path) = at {
-        match std::fs::metadata(path) {
-            Ok(meta) => return Some((path.to_path_buf(), meta.dev())),
+        match super::discover::disk_and_mount(path) {
+            Ok(found) => return Some((path.to_path_buf(), found)),
             // Not there, or under something that is a file: look above.
             Err(error)
                 if matches!(
@@ -382,12 +404,34 @@ pub(crate) fn noted_disk(before: &[(PathBuf, u64)], folder: &Path) -> Option<u64
 /// a disk came or went, or the saves are somewhere the first read never
 /// looked, and what is there now is not the same place: nothing is compared.
 pub(crate) fn same_disks(before: &[(PathBuf, u64)], after: &[(PathBuf, u64)]) -> bool {
+    same_noted(before, after, |folder| {
+        nearest(folder).map(|(_, (disk, _))| disk)
+    })
+}
+
+/// The same for mounts: whether every noted folder is still on the mount it
+/// was on, and every folder of the second read on the mount of the nearest
+/// noted folder above it. This is what shows a folder mounted from
+/// elsewhere on the same disk being taken away, or put in, or taken away
+/// and put back (which is another mount: what was done to the saves
+/// meanwhile is not known).
+pub(crate) fn same_mounts(before: &[(PathBuf, u64)], after: &[(PathBuf, u64)]) -> bool {
+    same_noted(before, after, |folder| {
+        nearest(folder).map(|(_, (_, mount))| mount)
+    })
+}
+
+fn same_noted(
+    before: &[(PathBuf, u64)],
+    after: &[(PathBuf, u64)],
+    now: impl Fn(&Path) -> Option<u64>,
+) -> bool {
     let unmoved = before
         .iter()
-        .all(|(folder, disk)| nearest_disk(folder).is_some_and(|(_, now)| now == *disk));
+        .all(|(folder, noted)| now(folder) == Some(*noted));
     let new_on_the_same = after
         .iter()
-        .all(|(folder, disk)| noted_disk(before, folder) == Some(*disk));
+        .all(|(folder, found)| noted_disk(before, folder) == Some(*found));
     unmoved && new_on_the_same
 }
 
@@ -450,7 +494,7 @@ fn fresh_read(
     let mut places = report.places;
     places.sort();
     places.dedup();
-    let disks = disks_of(
+    let (disks, mounts) = disks_of(
         &report.searched,
         &places,
         &report.saves,
@@ -463,6 +507,8 @@ fn fresh_read(
         places,
         whole: report.whole_files,
         disks,
+        mounts,
+        seen: report.seen,
         as_cards: report.as_cards,
     })
 }
@@ -486,6 +532,7 @@ pub fn read_baseline(
         .filter_map(mark_of)
         .chain(read.whole.iter().map(whole_mark))
         .chain(read.as_cards.iter().map(|path| card_note(path)))
+        .chain(read.seen.iter().map(|path| seen_note(path)))
         .map(|mut mark| {
             mark.before_launch = Some(true);
             mark
@@ -497,6 +544,7 @@ pub fn read_baseline(
         unread: read.unread,
         places: read.places,
         disks: read.disks,
+        mounts: read.mounts,
         captured_unix: now_unix(),
     })
 }
@@ -575,8 +623,7 @@ impl LaunchTracker {
             },
             Vec::new(),
             Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            NotedPlaces::default(),
         )
     }
 
@@ -603,11 +650,10 @@ impl LaunchTracker {
                 SaveTracking::Unavailable { reason },
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
-                Vec::new(),
+                NotedPlaces::default(),
             )
         };
-        let (tracking, marks, unread, places, disks) = match baseline {
+        let (tracking, marks, unread, noted) = match baseline {
             Ok((baseline, held_milliseconds, queued_milliseconds))
                 if baseline.launch.emulator == launch.emulator
                     && baseline.launch.profile == launch.profile =>
@@ -620,15 +666,18 @@ impl LaunchTracker {
                     },
                     baseline.marks,
                     baseline.unread,
-                    baseline.places,
-                    baseline.disks,
+                    NotedPlaces {
+                        places: baseline.places,
+                        disks: baseline.disks,
+                        mounts: baseline.mounts,
+                    },
                 )
             }
             Ok(_) => unavailable("the saves read before the start were another emulator's".into()),
             Err(reason) => unavailable(reason),
         };
         self.journal
-            .set_save_tracking(session_id, tracking, marks, unread, places, disks)
+            .set_save_tracking(session_id, tracking, marks, unread, noted)
     }
 
     /// A launch was asked for. Which emulator will really start is not known
@@ -803,7 +852,11 @@ impl LaunchTracker {
                     && record
                         .save_disks_before
                         .as_ref()
-                        .is_none_or(|disks| same_disks(disks, &read.disks)) =>
+                        .is_none_or(|disks| same_disks(disks, &read.disks))
+                    && record
+                        .save_mounts_before
+                        .as_ref()
+                        .is_none_or(|mounts| same_mounts(mounts, &read.mounts)) =>
             {
                 read
             }
@@ -836,6 +889,12 @@ impl LaunchTracker {
                     .iter()
                     .filter(|_| gated)
                     .map(|path| card_note(path)),
+            )
+            .chain(
+                read.seen
+                    .iter()
+                    .filter(|_| gated)
+                    .map(|path| seen_note(path)),
             )
             .collect();
         if record.folders_before.is_some() {

@@ -175,9 +175,17 @@ pub struct DiscoveryReport {
     /// cannot be taken apart at all.
     pub whole_files: Vec<(PathBuf, String)>,
     /// Every folder that was listed, there or not, with the disk (device
-    /// number) it was on at the moment it was listed (`None`: not there).
+    /// number) and the mount it was on at the moment it was listed (see
+    /// [`disk_and_mount`]; `None`: not there).
     #[serde(skip)]
-    pub searched: Vec<(PathBuf, Option<u64>)>,
+    pub searched: Vec<(PathBuf, Option<(u64, u64)>)>,
+    /// For a narrowed look (a launch): files among RetroArch's saves, under
+    /// a name saves do not go by, that were there but were not memory cards
+    /// as far as their bytes go, and so were not read. If such a file is a
+    /// card at the other read of the session, what is then read from it is
+    /// neither gone nor new.
+    #[serde(skip)]
+    pub seen: Vec<PathBuf>,
     /// For a narrowed look (a launch): the files among RetroArch's battery
     /// saves that were memory cards as far as their bytes go, and so were
     /// looked at save by save. A save listed on such a file at one read of
@@ -530,11 +538,9 @@ fn evidence(
 /// that is there but cannot be listed is noted in `incomplete`.
 fn listed(dir: &Path, report: &mut DiscoveryReport) -> Vec<PathBuf> {
     use std::io::ErrorKind;
-    use std::os::unix::fs::MetadataExt;
-    report.searched.push((
-        dir.to_path_buf(),
-        fs::metadata(dir).ok().map(|meta| meta.dev()),
-    ));
+    report
+        .searched
+        .push((dir.to_path_buf(), disk_and_mount(dir).ok()));
     let incomplete = &mut report.incomplete;
     let mut children = Vec::new();
     match fs::read_dir(dir) {
@@ -735,7 +741,52 @@ fn odd_named_at_launch(run: &mut Run<'_, '_>, path: &Path) {
         run.report.unread.push(path.to_path_buf());
     } else if crate::memory_card_manager::discovery::sniff_format(path) != CardFormat::NotACard {
         whole_file(run, path);
+    } else {
+        // There, readable, and not a card by its bytes: not read. Noted,
+        // so that it is not taken for absent if it is a card at the other
+        // read of the session.
+        run.report.seen.push(path.to_path_buf());
     }
+}
+
+/// The disk (device number) and the mount `path` is on, following links.
+/// The mount is what tells a folder from the same folder with something
+/// mounted on it, or taken off it, even when both are on one disk (a
+/// folder mounted from elsewhere on the same disk has the disk's number).
+/// The system's lasting mount number is asked for (Linux 6.8 and later: it
+/// is never given to another mount); an older system gives its reusable
+/// one. Fails where the system gives neither.
+pub(crate) fn disk_and_mount(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    const MOUNT_ID: u32 = 0x1000;
+    const MOUNT_ID_UNIQUE: u32 = 0x4000;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+    // call, and `found` is a plain zeroed out-parameter that statx fills in.
+    let mut found: libc::statx = unsafe { std::mem::zeroed() };
+    let status = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            0,
+            libc::STATX_BASIC_STATS | MOUNT_ID | MOUNT_ID_UNIQUE,
+            &mut found,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if found.stx_mask & (MOUNT_ID | MOUNT_ID_UNIQUE) == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this system does not say which mount a folder is on",
+        ));
+    }
+    Ok((
+        libc::makedev(found.stx_dev_major, found.stx_dev_minor),
+        found.stx_mnt_id,
+    ))
 }
 
 /// Every entry of a memory-card folder, whole. A folder that cannot be
