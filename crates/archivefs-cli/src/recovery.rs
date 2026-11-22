@@ -33,7 +33,7 @@ emuwiz-cli recovery <command>
 Options:
   --system <system>     the system the library records for the file, for example AmigaCD32
   --system-source <s>   how it was recorded (folder_alias, manual); a folder is never proof
-  --store <folder>      use this prepared-media folder (absolute path) instead of the profile's
+  --store <folder>      use this existing prepared-media folder (absolute path; never created) instead of the profile's
   --json                machine-readable output for diagnose and list
   --yes                 with prepare-all: start the reviewed batch (without it, only the review is shown)
 
@@ -96,13 +96,9 @@ pub fn run(args: Vec<String>) -> Outcome {
         return run_without_store(&command, set_folder, reset_folder);
     }
     let store = match store_override {
-        Some(folder) => {
-            let folder = PathBuf::from(folder);
-            if !folder.is_absolute() {
-                return Err("--store needs an absolute path".into());
-            }
-            PreparedMediaStore::at(folder)
-        }
+        // A named folder must already exist: it is never created here (it
+        // may be inside a disk that is not connected).
+        Some(folder) => PreparedMediaStore::named(PathBuf::from(folder), "--store")?,
         None => PreparedMediaStore::for_profile()?,
     };
     let game = |what: &str| -> Result<(PathBuf, String), String> {
@@ -540,7 +536,72 @@ mod tests {
             .collect();
         let zip = dir.join("Synthetic Disc (1994)(Test)[!].zip");
         std::fs::write(&zip, stored_zip(&borrowed)).unwrap();
-        (zip, dir.join("store"))
+        (zip, existing_store(dir))
+    }
+
+    /// `--store` never creates its folder: the tests make it first.
+    fn existing_store(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let store = dir.join("store");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&store)
+            .unwrap();
+        store
+    }
+
+    /// Nothing at all was created in the (existing) store folder.
+    fn untouched(store: &Path) -> bool {
+        std::fs::read_dir(store).unwrap().next().is_none()
+    }
+
+    /// A `--store` folder that is not there is refused by every command and
+    /// never created (it may be inside a disk that is not connected).
+    #[test]
+    fn a_store_folder_that_is_missing_is_refused_and_never_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let (zip, _existing) = lab(&dir);
+        let zip = zip.to_str().unwrap();
+        let mount_point = dir.join("mnt");
+        std::fs::create_dir(&mount_point).unwrap();
+        let missing = mount_point.join("prepared");
+        let missing_arg = missing.to_str().unwrap();
+        let error = |args: &[&str]| run(strings(args)).unwrap_err().to_string();
+        for command in [
+            vec![
+                "prepare",
+                zip,
+                "--system",
+                "AmigaCD32",
+                "--store",
+                missing_arg,
+            ],
+            vec![
+                "prepare-all",
+                zip,
+                "--system",
+                "AmigaCD32",
+                "--yes",
+                "--store",
+                missing_arg,
+            ],
+            vec!["list", "--store", missing_arg],
+            vec!["clean", "--store", missing_arg],
+            vec!["queue", "--store", missing_arg],
+            vec!["resume", "--store", missing_arg],
+        ] {
+            let detail = error(&command);
+            assert!(
+                detail.contains("--store") && detail.contains("is not there"),
+                "{command:?}: {detail}"
+            );
+        }
+        assert!(error(&["list", "--store", "relative/folder"]).contains("absolute path"));
+        assert!(
+            std::fs::read_dir(&mount_point).unwrap().next().is_none(),
+            "the missing --store folder was created"
+        );
     }
 
     #[test]
@@ -559,7 +620,7 @@ mod tests {
                 help,
             ]))
             .unwrap();
-            assert!(!store.exists(), "{help} prepared a copy");
+            assert!(untouched(&store), "{help} prepared a copy");
         }
         run(Vec::new()).unwrap();
     }
@@ -601,7 +662,7 @@ mod tests {
         );
         assert!(error(&["frobnicate"]).contains("unknown recovery command"));
         assert!(error(&["list", "--frobnicate"]).contains("unknown recovery option"));
-        assert!(!store.exists());
+        assert!(untouched(&store));
     }
 
     #[test]
@@ -629,7 +690,7 @@ mod tests {
         run(json).unwrap();
         run(strings(&["list", "--store", store.to_str().unwrap()])).unwrap();
         run(strings(&["capabilities"])).unwrap();
-        assert!(!store.exists());
+        assert!(untouched(&store));
 
         run(common("prepare")).unwrap();
         let prepared = PreparedMediaStore::at(&store)
@@ -653,7 +714,7 @@ mod tests {
     fn a_batch_is_only_reviewed_without_yes_and_runs_one_game_at_a_time_with_it() {
         let dir = tempfile::tempdir().unwrap();
         let dir = std::fs::canonicalize(dir.path()).unwrap();
-        let store = dir.join("store");
+        let store = existing_store(&dir);
         let store_arg = store.to_str().unwrap();
         let mut zips = Vec::new();
         for title in ["First Disc", "Second Disc"] {
@@ -677,7 +738,7 @@ mod tests {
         };
         // Review only.
         batch(&[]).unwrap();
-        assert!(!store.exists());
+        assert!(untouched(&store));
         run(strings(&["queue", "--store", store_arg])).unwrap();
         assert!(run(strings(&["resume", "--store", store_arg])).is_err());
 

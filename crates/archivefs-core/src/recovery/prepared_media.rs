@@ -753,7 +753,12 @@ fn is_riff_wave(file: &mut File) -> bool {
 }
 
 impl PreparedMediaStore {
-    /// A store at an explicit root (tests, the CLI's `--store`).
+    /// A store at a root that is created when it is first made ready. Only
+    /// for the default location inside the data folder and for tests. A
+    /// folder a person names (the CLI's `--store`,
+    /// `EMUWIZ_PREPARED_MEDIA_DIR`, a saved choice) never comes through
+    /// here: see [`Self::named`] and [`Self::configured`].
+    #[doc(hidden)]
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -763,15 +768,74 @@ impl PreparedMediaStore {
         }
     }
 
-    /// The store for this profile: `EMUWIZ_PREPARED_MEDIA_DIR` when set to an
-    /// absolute path, otherwise `<data>/prepared-media`.
-    pub fn for_profile() -> Result<Self, String> {
-        if let Some(value) = std::env::var_os(PREPARED_MEDIA_DIR_ENV) {
-            let path = PathBuf::from(value);
-            if !path.is_absolute() {
-                return Err(format!("{PREPARED_MEDIA_DIR_ENV} must be an absolute path"));
+    /// A store in a folder named for this one run (`how` says by what: the
+    /// CLI's `--store`, or `EMUWIZ_PREPARED_MEDIA_DIR`).
+    ///
+    /// The folder must already be there and pass the checks a chosen folder
+    /// passes. It is never created: a named folder that is missing may be
+    /// inside a disk that is not connected, and creating it would put the
+    /// copies on the disk underneath. The store is then tied to the
+    /// filesystem the folder is on now, for as long as this value is used.
+    pub fn named(folder: impl Into<PathBuf>, how: &str) -> Result<Self, String> {
+        let folder = folder.into();
+        if !folder.is_absolute() {
+            return Err(format!("{how} needs an absolute path"));
+        }
+        super::storage::still_safe(&folder).map_err(|error| format!("{how}: {error}"))?;
+        // `still_safe` accepts a missing folder (it has nothing to say about
+        // one); here a missing folder is the refusal.
+        if fs::symlink_metadata(&folder).is_err() {
+            return Err(format!(
+                "{how}: {} is not there (is its disk connected?). EmuWiz does not create this folder itself; create it first if this is where the copies should go",
+                folder.display()
+            ));
+        }
+        let resolved = fs::canonicalize(&folder)
+            .map_err(|error| format!("{how}: {}: {error}", folder.display()))?;
+        if let Some(refusal) = mount_root_refusal(&resolved) {
+            return Err(format!("{how}: {refusal}"));
+        }
+        let filesystem = filesystem_at(&resolved).ok_or_else(|| {
+            format!(
+                "{how}: which disk {} is on could not be checked",
+                folder.display()
+            )
+        })?;
+        let id = match filesystem.id {
+            None => {
+                return Err(format!(
+                    "{how}: EmuWiz cannot tell which disk {} is on (network and FUSE filesystems report no identity), so it could not notice that disk going away",
+                    folder.display()
+                ));
             }
-            return Ok(Self::at(path));
+            Some(id) if id_is_device_number(id, filesystem.device) => {
+                return Err(format!(
+                    "{how}: the filesystem {} is on has no identity of its own (XFS, FAT and exFAT report only which connector the disk is on); use a disk formatted as ext4 or Btrfs",
+                    folder.display()
+                ));
+            }
+            Some(id) => id,
+        };
+        Ok(Self {
+            root: folder,
+            root_must_exist: true,
+            chosen_filesystem: Some(id),
+            pinned: None,
+        })
+    }
+
+    /// The store for this profile: `EMUWIZ_PREPARED_MEDIA_DIR` when set (an
+    /// existing folder, see [`Self::named`]), otherwise the saved choice,
+    /// otherwise `<data>/prepared-media`.
+    pub fn for_profile() -> Result<Self, String> {
+        Self::for_profile_given(std::env::var_os(PREPARED_MEDIA_DIR_ENV))
+    }
+
+    /// [`Self::for_profile`] with the value of `EMUWIZ_PREPARED_MEDIA_DIR`
+    /// given explicitly.
+    pub(crate) fn for_profile_given(named: Option<std::ffi::OsString>) -> Result<Self, String> {
+        if let Some(value) = named {
+            return Self::named(PathBuf::from(value), PREPARED_MEDIA_DIR_ENV);
         }
         match Self::configured(super::storage::configured_folder()?)? {
             Some(store) => Ok(store),

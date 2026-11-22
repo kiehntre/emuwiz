@@ -3989,4 +3989,148 @@ mod mount_identity_tests {
             None
         );
     }
+
+    /// A folder named for one run (`--store`, `EMUWIZ_PREPARED_MEDIA_DIR`)
+    /// has no record from an earlier run, so it must already be there and
+    /// pass the checks a chosen folder passes. A missing one is never
+    /// created: it may be a folder inside a disk that is not connected.
+    #[test]
+    fn a_named_folder_must_already_exist_and_is_never_created() {
+        use crate::recovery::prepared_media::PREPARED_MEDIA_DIR_ENV;
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        // The empty mount point of a disk that is not connected, and the
+        // folder inside that disk the copies are meant to go to.
+        let mount_point = lab.root.join("mnt-absent");
+        private_folder(&mount_point);
+        let inside = mount_point.join("prepared");
+        for how in ["--store", PREPARED_MEDIA_DIR_ENV] {
+            let refused = PreparedMediaStore::named(&inside, how);
+            assert!(
+                refused.as_ref().is_err_and(
+                    |detail| detail.starts_with(how) && detail.contains("is not there")
+                ),
+                "{refused:?}"
+            );
+        }
+        let by_environment =
+            PreparedMediaStore::for_profile_given(Some(inside.clone().into_os_string()));
+        assert!(
+            by_environment
+                .as_ref()
+                .is_err_and(|detail| detail.contains("is not there")),
+            "{by_environment:?}"
+        );
+        assert!(
+            everything_under(&mount_point).is_empty(),
+            "the missing folder was created under the absent disk: {:?}",
+            everything_under(&mount_point)
+        );
+
+        // Not a relative path, a file, a link, or a folder others can change.
+        assert!(PreparedMediaStore::named("prepared", "--store").is_err());
+        let file = lab.root.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(PreparedMediaStore::named(&file, "--store").is_err());
+        let real = lab.root.join("real-folder");
+        private_folder(&real);
+        let link = lab.root.join("a-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(PreparedMediaStore::named(&link, "--store").is_err());
+        let open = lab.root.join("open-folder");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o777))
+            .unwrap();
+        assert!(PreparedMediaStore::named(&open, "--store").is_err());
+        for folder in [&real, &open] {
+            assert!(everything_under(folder).is_empty());
+        }
+
+        // Not a mount point itself.
+        {
+            let _mount = pretend_mount_root(&real);
+            let refused = PreparedMediaStore::named(&real, "--store");
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|detail| detail.contains("top folder of a disk")),
+                "{refused:?}"
+            );
+        }
+        // Not a filesystem that cannot be recognised later.
+        let genuine = real_filesystem(&real);
+        for (unusable, reason) in [
+            (
+                Filesystem {
+                    device: genuine.device,
+                    id: None,
+                },
+                "cannot tell which disk",
+            ),
+            (
+                Filesystem {
+                    device: 0x0811,
+                    id: Some(0x0811),
+                },
+                "no identity of its own",
+            ),
+        ] {
+            let _pretend = pretend_below(&real, unusable, Rc::new(Cell::new(true)));
+            let refused = PreparedMediaStore::named(&real, "--store");
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|detail| detail.contains(reason)),
+                "{refused:?}"
+            );
+        }
+        assert!(everything_under(&real).is_empty());
+
+        // An existing, plain, private folder on a recognisable filesystem is
+        // accepted and works as before, through either route.
+        let store = PreparedMediaStore::named(&real, "--store").unwrap();
+        prepare_in(&store, &lab, &zip).unwrap();
+        assert_eq!(store.list().len(), 1);
+        let again =
+            PreparedMediaStore::for_profile_given(Some(real.clone().into_os_string())).unwrap();
+        assert_eq!(again.list().len(), 1);
+    }
+
+    /// A named folder is tied to the filesystem it was on when the command
+    /// started: if another filesystem is at that path afterwards, or the
+    /// folder is gone, nothing is written and nothing is created.
+    #[test]
+    fn a_named_folder_is_tied_to_the_filesystem_it_started_on() {
+        let lab = Lab::new();
+        let zip = lab.standard_zip();
+        let mount_point = lab.root.join("mnt-named");
+        private_folder(&mount_point);
+        let named = mount_point.join("prepared");
+        private_folder(&named);
+        let underneath = real_filesystem(&named);
+        let disk = another(underneath);
+        let active = Rc::new(Cell::new(true));
+        let _pretend = pretend_below(&mount_point, disk, active.clone());
+        let store = PreparedMediaStore::named(&named, "--store").unwrap();
+        // The disk goes: the same path is now a folder on the disk underneath.
+        active.set(false);
+        let attempt = prepare_in(&store, &lab, &zip);
+        assert!(
+            matches!(&attempt, Err(PrepareError::Store(detail)) if detail.contains("not on the disk it was on")),
+            "{attempt:?}"
+        );
+        assert!(store.ready().is_err());
+        assert!(store.resolved().is_none());
+        assert!(
+            everything_under(&named).is_empty(),
+            "something was written under the absent disk: {:?}",
+            everything_under(&named)
+        );
+        // The folder itself gone (as after a real unmount): not recreated.
+        std::fs::remove_dir(&named).unwrap();
+        active.set(true);
+        assert!(store.ready().is_err());
+        assert!(prepare_in(&store, &lab, &zip).is_err());
+        assert!(everything_under(&mount_point).is_empty());
+    }
 }

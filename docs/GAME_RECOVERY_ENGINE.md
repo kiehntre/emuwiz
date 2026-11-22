@@ -160,8 +160,17 @@ is left exactly as it was for a game whose last scan could not finish, for a gam
 with an identity of its own, and for every other Amiga, CD32 and CDTV entry.
 
 The store is `<data>/prepared-media` (`EMUWIZ_PREPARED_MEDIA_DIR` overrides it with
-an absolute path). Do not point it inside a library source folder: a scan would then
-list the prepared files as games.
+the absolute path of a folder that already exists; see below). Do not point it inside
+a library source folder: a scan would then list the prepared files as games.
+
+A folder named for one run, with `EMUWIZ_PREPARED_MEDIA_DIR` or the CLI's `--store`,
+is never created by EmuWiz. It must already be there, be a real folder (not a link)
+that only you can change, not be a mount point, and be on a filesystem with an
+identity of its own (the same rule as for a chosen folder). A named folder that is
+missing is refused with "is not there (is its disk connected?)": it may be a folder
+inside a disk that is not mounted, and creating it would put the copies on the disk
+underneath. Once accepted, the store is tied to the filesystem the folder is on at
+that moment for the rest of the command.
 
 ## Renames and moves of a prepared ZIP
 
@@ -339,19 +348,25 @@ with `members()`, `fingerprint()` and `verify_structure()` rather than a rewrite
   worked through in turns. Games that can never be prepared stay in the list, so a
   library with more than 500 of those ahead of the rest would need them moved first.
 - Limits of the "folder must stay on its disk" check (see "Where copies are kept"):
-  - The default folder (`<data>/prepared-media`), a folder given with
-    `EMUWIZ_PREPARED_MEDIA_DIR` and one given with the CLI's `--store` have no
-    recorded filesystem. A `--store` or `EMUWIZ_PREPARED_MEDIA_DIR` folder that does
-    not exist is created, so one that names a folder inside a disk that is not
-    mounted is created on the disk underneath (a mount point itself is refused).
-    Those two are developer and test options; Blue and the saved choice do not use
-    them. They are tied to their
-    folder and filesystem only from the start of each operation or batch, not from
-    one run to the next: if EmuWiz's whole data folder is on a disk that is not
-    mounted when EmuWiz starts, the default store is created on whatever is there,
-    like the rest of EmuWiz's data.
-  - A folder on a network or FUSE filesystem, or on XFS, FAT or exFAT, cannot be
-    chosen at all, and neither can a mount point.
+  - A folder given with `EMUWIZ_PREPARED_MEDIA_DIR` or the CLI's `--store` (developer
+    and test options; Blue and the saved choice do not use them) has no filesystem
+    recorded from an earlier run. It must already exist and is never created, so a
+    folder inside a disk that is not mounted is refused as missing. What is not
+    noticed: a folder of the same name that really exists on the disk underneath the
+    mount point (made by hand, or by a build before this rule). It is accepted,
+    because nothing says which disk was meant. The saved choice does not have this
+    gap.
+  - The default folder (`<data>/prepared-media`) has no recorded filesystem either
+    and is created when first used. It is tied to its folder and filesystem only
+    from the start of each operation or batch, not from one run to the next: if
+    EmuWiz's whole data folder is on a disk that is not mounted when EmuWiz starts,
+    the default store is created on whatever is there, like the rest of EmuWiz's
+    data.
+  - Compatibility: a folder on a network or FUSE filesystem, or on XFS, FAT or
+    exFAT, cannot be chosen or named at all, and neither can a mount point. Prepared
+    copies can therefore only be kept on filesystems that report an identity of
+    their own (ext4 and Btrfs are the tested ones). The default folder is not held
+    to this rule.
   - The filesystem id is whatever the kernel reports; ext4 and Btrfs derive it from
     the filesystem's own UUID. Recognising an id that is only a device number relies
     on the forms the kernel uses today; a filesystem that hid its device number in
@@ -370,11 +385,11 @@ with `members()`, `fingerprint()` and `verify_structure()` rather than a rewrite
     if the other disk holds a store with identically named folders and files of the
     recorded sizes, delete those. No original is involved.
   - The mount-point refusal is made when a folder is chosen, when a saved choice is
-    used, and when a store is made ready for preparing. Removal, clean-up,
-    re-linking and forgetting a batch in a store given with `--store` or
-    `EMUWIZ_PREPARED_MEDIA_DIR`, or in a default folder that is itself a mount
-    point, are not refused for that reason; they act only on a store that already
-    exists there, on the filesystem it had when the command started.
+    used, when a folder is named with `--store` or `EMUWIZ_PREPARED_MEDIA_DIR`, and
+    when a store is made ready for preparing. Removal, clean-up, re-linking and
+    forgetting a batch in a default folder that is itself a mount point are not
+    refused for that reason; they act only on a store that already exists there, on
+    the filesystem it had when the command started.
   - The top folder of a Btrfs subvolume has another device number than its parent
     and is refused as a mount point even when it is not mounted separately; a
     folder at a path that the mount table still lists but a later mount hides is
@@ -484,10 +499,14 @@ Batch preparation of the same 79 ZIPs (`prepare-all`, same sandbox, a fresh stor
 
 ### The folder must stay on its disk (2026-11-22)
 
-- Tests in `recovery::tests::mount_identity_tests` (eleven; the first seven are
+- Tests in `recovery::tests::mount_identity_tests` (thirteen; the first seven are
   described here, the others cover the mount-point refusal, device-number ids, the
-  sequence mounted, unmounted, another disk, remounted, and the launch check for an
-  earlier folder without a usable record): the filesystem is recorded
+  sequence mounted, unmounted, another disk, remounted, the launch check for an
+  earlier folder without a usable record, and the two rules for a folder named with
+  `--store` or `EMUWIZ_PREPARED_MEDIA_DIR`: it must already exist and is never
+  created, and it is tied to the filesystem it started on), with one CLI test that a
+  missing `--store` folder is refused by every command and never created: the
+  filesystem is recorded
   when a folder is chosen and one without an identity is refused; an unavailable
   mount (the empty mount point) is refused and nothing is created in it; a changed
   filesystem is refused for preparing, reuse, re-linking, removal and launch; a ready
@@ -496,7 +515,7 @@ Batch preparation of the same 79 ZIPs (`prepare-all`, same sandbox, a fresh stor
   its destination between two games writes nothing more and continues when the disk
   is back. A test cannot mount a disk, so the loss is either a record that names
   another filesystem than the folder is really on, or a test-only hook that reports
-  another filesystem from a chosen moment. Each of thirteen protections was removed
+  another filesystem from a chosen moment. Each of nineteen protections was removed
   in turn and at least one of these tests failed each time.
 - With real mounts, in a sandbox (system read-only, private mount namespace, a
   throw-away tmpfs standing in for the removable disk, three synthetic ZIPs): the
