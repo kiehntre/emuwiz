@@ -789,7 +789,12 @@ pub(crate) fn validate_bound(
         if !matches!(entry.operation, TransactionOperation::RenameMove) {
             continue;
         }
-        if entry.unknown.contains_key(UNCATALOGUED_KEY) && !entry.unknown.contains_key(KEY) {
+        // Reorganise existing links only (a link object): other workflows'
+        // uncatalogued moves keep their previous handling below.
+        if entry.unknown.contains_key(UNCATALOGUED_KEY)
+            && !entry.unknown.contains_key(KEY)
+            && entry.identity.kind == crate::dat::rename_apply::model::ObjectKind::Symlink
+        {
             // Uncatalogued means no library row at either path; one that
             // appeared since the preview must not be left pointing at a path
             // this move empties or fills.
@@ -805,7 +810,9 @@ pub(crate) fn validate_bound(
             }
             continue;
         }
-        if (entry.unknown.contains_key(COMPANION_KEY) || entry.unknown.contains_key(SAVE_KEY))
+        if (entry.unknown.contains_key(COMPANION_KEY)
+            || entry.unknown.contains_key(UNCATALOGUED_KEY)
+            || entry.unknown.contains_key(SAVE_KEY))
             && !entry.unknown.contains_key(KEY)
         {
             continue;
