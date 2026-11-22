@@ -3,7 +3,7 @@
 
 use super::super::discover::DiscoveryRoots;
 use super::super::session::*;
-use super::super::tracker::LaunchTracker;
+use super::super::tracker::{LaunchTracker, clock_offset_ms, launch_start_unix};
 use crate::launch::process_log::{ExitSummary, StartedProcess};
 use std::cell::Cell;
 use std::fs;
@@ -25,6 +25,7 @@ fn late_mark(id: &str, sha: &str, last_changed_unix: Option<i64>) -> SaveMark {
         content_sha256: sha.into(),
         last_changed_unix,
         before_launch: Some(false),
+        folder: None,
     }
 }
 
@@ -35,6 +36,7 @@ fn plain_mark(id: &str, sha: &str) -> SaveMark {
         content_sha256: sha.into(),
         last_changed_unix: None,
         before_launch: None,
+        folder: None,
     }
 }
 
@@ -246,7 +248,7 @@ fn files_changed_around_the_launch_start_are_reported_as_not_known() {
     assert_eq!(
         changes,
         vec![
-            SaveChange::Created {
+            SaveChange::CreatedBeforeNotKnown {
                 label: "Brand New (USA).srm".into()
             },
             SaveChange::ModifiedBeforeNotKnown {
@@ -257,11 +259,139 @@ fn files_changed_around_the_launch_start_are_reported_as_not_known() {
             },
         ]
     );
+    assert!(tracked(None).save_changes.iter().all(|change| !matches!(
+        change,
+        SaveChange::Modified { .. } | SaveChange::Created { .. } | SaveChange::Missing { .. }
+    )));
+}
+
+#[test]
+fn new_and_gone_are_plain_only_with_proof() {
+    let folder = |path: &str, before_launch| FolderMark {
+        path: PathBuf::from(path),
+        last_changed_unix: Some(1),
+        before_launch,
+    };
+    let in_folder = |id: &str, path: &str| SaveMark {
+        folder: Some(PathBuf::from(path)),
+        ..plain_mark(id, "x")
+    };
+    let before = [
+        late_mark("made-by-the-emulator-then-removed", "a", Some(9)),
+        SaveMark {
+            before_launch: Some(true),
+            ..late_mark("really-gone", "b", Some(1))
+        },
+    ];
+    let after = [
+        in_folder("in-a-quiet-folder", "/saves/quiet"),
+        in_folder("in-a-busy-folder", "/saves/busy"),
+        in_folder("in-a-folder-not-seen-before", "/saves/other"),
+        plain_mark("folder-not-stated", "x"),
+    ];
+    let folders = [folder("/saves/quiet", true), folder("/saves/busy", false)];
+    let mut changes = diff_saves_with(&before, &after, Some(&folders));
+    changes.sort_by_key(|change| format!("{change:?}"));
+    assert_eq!(
+        changes,
+        vec![
+            SaveChange::Created {
+                label: "in-a-quiet-folder".into()
+            },
+            SaveChange::CreatedBeforeNotKnown {
+                label: "folder-not-stated".into()
+            },
+            SaveChange::CreatedBeforeNotKnown {
+                label: "in-a-busy-folder".into()
+            },
+            SaveChange::CreatedBeforeNotKnown {
+                label: "in-a-folder-not-seen-before".into()
+            },
+            SaveChange::Missing {
+                label: "really-gone".into()
+            },
+            SaveChange::NotKnown {
+                label: "made-by-the-emulator-then-removed".into()
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_backdated_modification_time_proves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+    home_with_saves(&home);
+    let started_at = now();
+    // The file claims to be an hour old; the system's own change time
+    // still says "just now".
+    let save = home.join(".config/retroarch/saves/Played (USA).srm");
+    fs::File::options()
+        .write(true)
+        .open(&save)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+    let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
+    let session = tracker.begin(SessionGame::default(), "RetroArch").unwrap();
+    for mark in &session.saves_before {
+        assert!(mark.last_changed_unix.unwrap() >= started_at, "{mark:?}");
+    }
+    let folders = session.folders_before.unwrap();
+    assert_eq!(folders.len(), 1);
+    assert!(folders[0].last_changed_unix.unwrap() >= started_at);
+    assert!(!folders[0].before_launch);
+}
+
+#[test]
+fn the_launch_start_is_stated_only_on_an_unstepped_clock() {
+    let before = clock_offset_ms();
+    assert!(before.is_some());
+    let earliest = now();
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let stat = fs::read_to_string(format!("/proc/{}/stat", child.id())).unwrap();
+    let ticks: u64 = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let start = launch_start_unix(Some(ticks), before, clock_offset_ms(), now());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let start = start.expect("a real process on an unstepped clock has a start time");
     assert!(
-        tracked(None)
-            .save_changes
-            .iter()
-            .all(|change| !matches!(change, SaveChange::Modified { .. }))
+        (earliest - 1..=now()).contains(&start),
+        "{start} vs {earliest}"
+    );
+
+    // The wall clock was stepped (either way) since the note: nothing.
+    let offset = before.unwrap();
+    for step in [10_000, -10_000] {
+        assert_eq!(
+            launch_start_unix(Some(ticks), Some(offset - step), Some(offset), now()),
+            None
+        );
+    }
+    // Not noted before the launch, or no start ticks: nothing.
+    assert_eq!(
+        launch_start_unix(Some(ticks), None, clock_offset_ms(), now()),
+        None
+    );
+    assert_eq!(
+        launch_start_unix(None, before, clock_offset_ms(), now()),
+        None
+    );
+    // A start that would lie in the future is not a start time.
+    assert_eq!(
+        launch_start_unix(Some(ticks), before, before, earliest - 3600),
+        None
     );
 }
 

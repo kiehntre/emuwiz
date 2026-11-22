@@ -8,8 +8,8 @@
 use super::discover::{DiscoveryCache, DiscoveryOptions, DiscoveryRoots, discover};
 use super::model::DiscoveredSave;
 use super::session::{
-    ExitObservation, ProcFs, ProcessTable, SaveMark, SessionGame, SessionJournal, SessionLaunch,
-    SessionRecord, SessionState,
+    ExitObservation, FolderMark, ProcFs, ProcessTable, SaveMark, SessionGame, SessionJournal,
+    SessionLaunch, SessionRecord, SessionState,
 };
 use super::{ContinuityError, now_unix};
 use crate::launch::process_log::{ExitSummary, StartedProcess};
@@ -111,6 +111,7 @@ fn mark_of(save: &DiscoveredSave) -> Option<SaveMark> {
         content_sha256: save.content_sha256.clone()?,
         last_changed_unix: None,
         before_launch: None,
+        folder: None,
     })
 }
 
@@ -121,38 +122,87 @@ fn mark_of(save: &DiscoveredSave) -> Option<SaveMark> {
 /// system on every write, rename and replacement and cannot be set back by
 /// a program.
 fn last_changed(path: &Path) -> Option<i64> {
-    use std::os::unix::fs::MetadataExt;
-    let of = |meta: &std::fs::Metadata| {
-        let up = |seconds: i64, nanos: i64| seconds.saturating_add(i64::from(nanos > 0));
-        up(meta.mtime(), meta.mtime_nsec()).max(up(meta.ctime(), meta.ctime_nsec()))
-    };
     let meta = std::fs::symlink_metadata(path).ok()?;
-    let mut latest = of(&meta);
     if meta.is_dir() {
+        // A folder save: the folder and everything directly inside it.
+        let mut latest = folder_last_changed(path)?;
         for entry in std::fs::read_dir(path).ok()? {
-            latest = latest.max(of(&std::fs::symlink_metadata(entry.ok()?.path()).ok()?));
+            latest = latest.max(stamp(&std::fs::symlink_metadata(entry.ok()?.path()).ok()?));
         }
+        return Some(latest);
     }
-    Some(latest)
+    Some(stamp(&meta))
 }
 
-/// The wall-clock second a process started in, from its kernel start time
-/// and the machine's boot time. `None` when either cannot be read.
-pub fn process_start_unix(start_ticks: Option<u64>) -> Option<i64> {
-    let ticks = start_ticks?;
-    let stat = std::fs::read_to_string("/proc/stat").ok()?;
-    let boot: i64 = stat
-        .lines()
-        .find_map(|line| line.strip_prefix("btime "))?
-        .trim()
-        .parse()
-        .ok()?;
+fn stamp(meta: &std::fs::Metadata) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    let up = |seconds: i64, nanos: i64| seconds.saturating_add(i64::from(nanos > 0));
+    up(meta.mtime(), meta.mtime_nsec()).max(up(meta.ctime(), meta.ctime_nsec()))
+}
+
+/// When a folder itself last changed (an entry made, removed or renamed).
+fn folder_last_changed(path: &Path) -> Option<i64> {
+    Some(stamp(&std::fs::symlink_metadata(path).ok()?))
+}
+
+fn clock_ms(clock: libc::clockid_t) -> Option<i64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime only fills the struct it is given.
+    if unsafe { libc::clock_gettime(clock, &mut time) } != 0 {
+        return None;
+    }
+    Some(time.tv_sec.saturating_mul(1000) + time.tv_nsec / 1_000_000)
+}
+
+/// How far the wall clock is ahead of the time-since-boot clock, in
+/// milliseconds: in effect when the machine booted, as the wall clock
+/// stands now. It changes only when the wall clock is set or stepped.
+///
+/// A launcher notes this **before** a launch can start anything and hands
+/// it to [`LaunchTracker::process_started`], which works out the launch's
+/// start in wall-clock time from it and refuses to prove anything if the
+/// wall clock has been stepped since (file times and the start time would
+/// then be on different clocks).
+pub fn clock_offset_ms() -> Option<i64> {
+    Some(clock_ms(libc::CLOCK_REALTIME)? - clock_ms(libc::CLOCK_BOOTTIME)?)
+}
+
+/// The wall clock may drift this far against the time-since-boot clock
+/// between the note before the launch and the judging (ordinary gradual
+/// correction); more is a step, and nothing is then proven.
+const CLOCK_STEP_MS: i64 = 1_000;
+
+/// The wall-clock second the launch's first process started in, or `None`
+/// when that cannot be stated safely. `clock_before` is
+/// [`clock_offset_ms`] as noted before the launch, `clock_now` the same
+/// now, `now_unix` the wall clock now.
+pub fn launch_start_unix(
+    start_ticks: Option<u64>,
+    clock_before: Option<i64>,
+    clock_now: Option<i64>,
+    now_unix: i64,
+) -> Option<i64> {
+    let (ticks, before, now) = (start_ticks?, clock_before?, clock_now?);
+    if (before - now).abs() > CLOCK_STEP_MS {
+        return None;
+    }
     // SAFETY: sysconf only reads a system constant.
     let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     if per_second <= 0 {
         return None;
     }
-    Some(boot.saturating_add((ticks / per_second as u64) as i64))
+    let since_boot_ms = (ticks as i64).saturating_mul(1000) / per_second as i64;
+    let start = before.saturating_add(since_boot_ms).div_euclid(1000);
+    // A start in the future is no start time at all.
+    (start <= now_unix).then_some(start)
+}
+
+/// The folder a save sits in.
+fn folder_of(save: &DiscoveredSave) -> Option<PathBuf> {
+    save.source_path.parent().map(Path::to_path_buf)
 }
 
 pub struct LaunchTracker {
@@ -239,36 +289,51 @@ impl LaunchTracker {
                 let mut mark = mark_of(save)?;
                 mark.last_changed_unix = last_changed(&save.source_path);
                 mark.before_launch = Some(false);
+                mark.folder = folder_of(save);
                 Some(mark)
             })
             .collect();
+        // Looked up after the saves were read, like the files' own times.
+        let mut folders: Vec<FolderMark> = Vec::new();
+        for folder in before.iter().filter_map(|mark| mark.folder.as_ref()) {
+            if folders.iter().all(|known| &known.path != folder) {
+                folders.push(FolderMark {
+                    path: folder.clone(),
+                    last_changed_unix: std::fs::symlink_metadata(folder)
+                        .ok()
+                        .filter(std::fs::Metadata::is_dir)
+                        .and_then(|_| folder_last_changed(folder)),
+                    before_launch: false,
+                });
+            }
+        }
         let launch = SessionLaunch {
             emulator: expected_emulator.to_string(),
             ..Default::default()
         };
-        self.journal.request(game, launch, before)
+        let record = self.journal.request(game, launch, before)?;
+        self.journal.note_folders(&record.session_id, folders)
     }
 
-    /// The launcher started `process` for this session.
+    /// The launcher started `process` for this session. `clock_before` is
+    /// [`clock_offset_ms`] as the launcher noted it before the launch could
+    /// start anything; without it no "before" mark is proven.
     pub fn process_started(
         &self,
         session_id: &str,
         process: &StartedProcess,
-    ) -> Result<SessionRecord, ContinuityError> {
-        self.process_started_in(session_id, process, &ProcFs)
-    }
-
-    pub fn process_started_in(
-        &self,
-        session_id: &str,
-        process: &StartedProcess,
-        processes: &dyn ProcessTable,
+        clock_before: Option<i64>,
     ) -> Result<SessionRecord, ContinuityError> {
         self.process_started_at(
             session_id,
             process,
-            processes,
-            process_start_unix(process.start_ticks),
+            &ProcFs,
+            launch_start_unix(
+                process.start_ticks,
+                clock_before,
+                clock_offset_ms(),
+                now_unix(),
+            ),
         )
     }
 
@@ -354,7 +419,16 @@ impl LaunchTracker {
             },
             Some(ExitSummary::Unavailable) | None => ExitObservation::Unavailable,
         };
-        let after = self.marks_for(&record.launch)?;
+        let mut after = self.marks_for(&record.launch)?;
+        if record.folders_before.is_some() {
+            let saves = self.saves()?;
+            for mark in &mut after {
+                mark.folder = saves
+                    .iter()
+                    .find(|save| save.id == mark.save_id)
+                    .and_then(folder_of);
+            }
+        }
         self.journal
             .mark_ended(session_id, observed, Some(&after), processes)
     }

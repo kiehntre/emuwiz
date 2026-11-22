@@ -153,6 +153,22 @@ pub struct SaveMark {
     /// the saves first and only then starts the emulator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_launch: Option<bool>,
+    /// The folder the save sits in, when the mark was taken for a launch
+    /// already under way (see [`FolderMark`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<PathBuf>,
+}
+
+/// A folder holding saves, as it was when the "before" marks were read
+/// during a launch. Creating, deleting, renaming or replacing a file changes
+/// its folder's times, so a folder proven unchanged since before the launch
+/// held exactly the files that were found in it: a save that appears in it
+/// later is new, not one the emulator removed before the first read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderMark {
+    pub path: PathBuf,
+    pub last_changed_unix: Option<i64>,
+    pub before_launch: bool,
 }
 
 /// A "before" mark counts as taken before the launch only if its file last
@@ -183,9 +199,16 @@ pub enum SaveChange {
         label: String,
     },
     /// The first read was not proven to be earlier than the emulator's
-    /// start and the content was the same at the end: whether the session
-    /// changed this save is not known.
+    /// start and the content was the same at the end (or the save was gone
+    /// at the end): whether the session changed this save, or whether it
+    /// existed before the session at all, is not known.
     NotKnown {
+        label: String,
+    },
+    /// Not there at the first read and there at the end, but its folder was
+    /// not proven unchanged since before the emulator's start: it may be
+    /// new, or a save the emulator removed and wrote again.
+    CreatedBeforeNotKnown {
         label: String,
     },
 }
@@ -297,6 +320,11 @@ pub struct SessionRecord {
     pub end: Option<SessionEnd>,
     pub play_evidence: PlayEvidence,
     pub saves_before: Vec<SaveMark>,
+    /// The folders the saves were in at the first read, when that read was
+    /// made during a launch already under way. `None` for a session whose
+    /// saves were read before the emulator was started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folders_before: Option<Vec<FolderMark>>,
     /// The saves as they were once the session had ended, when they were
     /// compared. `None`: not compared (a crash, an exit EmuWiz did not see).
     #[serde(default)]
@@ -899,6 +927,18 @@ pub struct SessionJournal {
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn diff_saves(before: &[SaveMark], after: &[SaveMark]) -> Vec<SaveChange> {
+    diff_saves_with(before, after, None)
+}
+
+/// As [`diff_saves`]. `folders` is `Some` when the "before" marks were read
+/// during a launch already under way: a save is then "new" only if its
+/// folder is proven unchanged since before the launch, and "gone" only if
+/// its own mark is proven.
+pub fn diff_saves_with(
+    before: &[SaveMark],
+    after: &[SaveMark],
+    folders: Option<&[FolderMark]>,
+) -> Vec<SaveChange> {
     let index = |marks: &[SaveMark]| -> BTreeMap<String, SaveMark> {
         marks
             .iter()
@@ -909,9 +949,21 @@ pub fn diff_saves(before: &[SaveMark], after: &[SaveMark]) -> Vec<SaveChange> {
     let mut changes = Vec::new();
     for (id, mark) in &new {
         match old.get(id) {
-            None => changes.push(SaveChange::Created {
-                label: mark.label.clone(),
-            }),
+            None => {
+                let label = mark.label.clone();
+                let absent_before = folders.is_none_or(|folders| {
+                    mark.folder.as_ref().is_some_and(|folder| {
+                        folders
+                            .iter()
+                            .any(|known| known.before_launch && &known.path == folder)
+                    })
+                });
+                changes.push(if absent_before {
+                    SaveChange::Created { label }
+                } else {
+                    SaveChange::CreatedBeforeNotKnown { label }
+                });
+            }
             Some(was) => {
                 let differs = was.content_sha256 != mark.content_sha256;
                 // `None` is a mark read before the emulator was started at all.
@@ -928,8 +980,13 @@ pub fn diff_saves(before: &[SaveMark], after: &[SaveMark]) -> Vec<SaveChange> {
     }
     for (id, mark) in &old {
         if !new.contains_key(id) {
-            changes.push(SaveChange::Missing {
-                label: mark.label.clone(),
+            let label = mark.label.clone();
+            // An unproven mark may be of a file the emulator itself made
+            // after it started: its going is not a save lost.
+            changes.push(if mark.before_launch == Some(false) {
+                SaveChange::NotKnown { label }
+            } else {
+                SaveChange::Missing { label }
             });
         }
     }
@@ -1023,6 +1080,7 @@ impl SessionJournal {
             end: None,
             play_evidence: PlayEvidence::None,
             saves_before,
+            folders_before: None,
             saves_after: None,
             save_changes: Vec::new(),
             snapshots: Vec::new(),
@@ -1181,9 +1239,33 @@ impl SessionJournal {
                 changed = true;
             }
         }
+        for folder in record.folders_before.iter_mut().flatten() {
+            let proven = matches!(
+                (folder.last_changed_unix, launch_start_unix),
+                (Some(changed_at), Some(start))
+                    if changed_at.saturating_add(BASELINE_MARGIN_SECONDS) <= start
+            );
+            if proven && !folder.before_launch {
+                folder.before_launch = true;
+                changed = true;
+            }
+        }
         if changed {
             self.write(&record)?;
         }
+        Ok(record)
+    }
+
+    /// Notes the folders the saves were in at the first read of a launch
+    /// already under way. All start unproven.
+    pub fn note_folders(
+        &self,
+        session_id: &str,
+        folders: Vec<FolderMark>,
+    ) -> Result<SessionRecord, ContinuityError> {
+        let mut record = self.get(session_id)?;
+        record.folders_before = Some(folders);
+        self.write(&record)?;
         Ok(record)
     }
 
@@ -1442,13 +1524,18 @@ impl SessionJournal {
         match saves_after {
             Some(after) => {
                 record.saves_after = Some(after.to_vec());
-                record.save_changes = diff_saves(&record.saves_before, after);
+                record.save_changes = diff_saves_with(
+                    &record.saves_before,
+                    after,
+                    record.folders_before.as_deref(),
+                );
                 let wrote = record.save_changes.iter().any(|change| {
                     matches!(
                         change,
                         SaveChange::Created { .. }
                             | SaveChange::Modified { .. }
                             | SaveChange::ModifiedBeforeNotKnown { .. }
+                            | SaveChange::CreatedBeforeNotKnown { .. }
                     )
                 });
                 record.play_evidence = if wrote {

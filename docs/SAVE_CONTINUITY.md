@@ -310,12 +310,26 @@ A mark that does not pass is kept but never treated as the starting content:
 | proven earlier than the launch | same | (nothing) |
 | not proven | different | changed; what it held before the session is not known |
 | not proven | same | not known whether it changed |
+| absent, its folder proven unchanged since before the launch | present | new |
+| absent, folder not proven | present | written; not known whether it existed before the session |
+| not proven | gone | not known |
+| proven | gone | no longer there |
 
-A save absent at the first read and present at the end is "new". Limits: a save
-written in the last three seconds before a launch is reported as not proven;
-a step backwards of the system clock during a launch could defeat the check;
-the launch start comes from the process start time and the boot time, good to
-about a second.
+A folder's times change when a file in it is made, removed, renamed or
+replaced, so a folder proven unchanged held exactly the files found in it.
+
+The launch start is worked out from the process's start time since boot and the
+difference between the wall clock and the since-boot clock, which Blue notes
+**before** the launch can start anything. If that difference has moved by more
+than a second when the marks are judged (the wall clock was set or stepped, in
+either direction), or the start would lie in the future, nothing is proven.
+
+Limits: a save written in the last three seconds before a launch is reported as
+not proven. The proof assumes file times come from this machine's clock: for
+saves on a network or FUSE mount, whose times are set elsewhere, it is not
+sound, and that is not checked. A clock stepped away and back between the note
+and the judging would go unnoticed. A session begun by a build from before this
+rule and ended by this one is compared the old way.
 
 ## Two devices (offline model only)
 

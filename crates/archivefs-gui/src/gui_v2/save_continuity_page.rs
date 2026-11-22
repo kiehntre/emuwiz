@@ -190,6 +190,9 @@ pub(super) fn save_summary(record: &SessionRecord) -> String {
                 format!("changed (what it held before the session is not known): {label}")
             }
             SaveChange::NotKnown { label } => format!("not known whether it changed: {label}"),
+            SaveChange::CreatedBeforeNotKnown { label } => {
+                format!("written (not known whether it existed before the session): {label}")
+            }
         })
         .collect();
     format!("Saves in this session: {}.", changes.join("; "))
@@ -422,6 +425,7 @@ mod tests {
             content_sha256: content.into(),
             last_changed_unix: None,
             before_launch: None,
+            folder: None,
         }
     }
 

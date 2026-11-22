@@ -493,6 +493,7 @@ fn mark(content: &str) -> SaveMark {
         content_sha256: content.into(),
         last_changed_unix: None,
         before_launch: None,
+        folder: None,
     }
 }
 

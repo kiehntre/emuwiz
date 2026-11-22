@@ -76,6 +76,9 @@ pub(super) struct NativeWorkflows {
     /// The process log's next sequence number, as last noted while no
     /// launch was active.
     launch_sequence_mark: u64,
+    /// The wall clock's offset from the time-since-boot clock, noted at the
+    /// same moment (see `tracker::clock_offset_ms`).
+    launch_clock_mark: Option<i64>,
     launch_attempts: launch_readiness_summary::AttemptTracker,
     /// The summary the Game Details readiness card last displayed, keyed by
     /// game and path; read-only input for the Game Doctor.
@@ -540,6 +543,7 @@ impl NativeWorkflows {
             launch_kind: None,
             session_tracking: Default::default(),
             launch_sequence_mark: archivefs_core::launch::process_log::next_sequence(),
+            launch_clock_mark: archivefs_core::save_continuity::tracker::clock_offset_ms(),
             launch_attempts: Default::default(),
             shown_readiness: None,
             pending_play: None,
@@ -644,6 +648,7 @@ impl NativeWorkflows {
             // process before this first sees it as active, and that process
             // must still be recognised as the launch's own.
             self.launch_sequence_mark = archivefs_core::launch::process_log::next_sequence();
+            self.launch_clock_mark = archivefs_core::save_continuity::tracker::clock_offset_ms();
         }
         if active && !self.launch_was_active {
             self.launch_kind = self.active_launch_kind();
@@ -651,6 +656,7 @@ impl NativeWorkflows {
             self.launch_attempts.started();
             self.session_tracking.launch_began(
                 self.launch_sequence_mark,
+                self.launch_clock_mark,
                 self.launch_kind_emulator(),
                 self.launch_session_game(),
             );

@@ -29,6 +29,7 @@ fn mark(id: &str, content: &str) -> SaveMark {
         content_sha256: content.to_string(),
         last_changed_unix: None,
         before_launch: None,
+        folder: None,
     }
 }
 

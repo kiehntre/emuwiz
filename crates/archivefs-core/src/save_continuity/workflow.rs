@@ -323,6 +323,7 @@ pub fn marks_of(save: &DiscoveredSave, all: &[DiscoveredSave]) -> Vec<SaveMark> 
                 content_sha256: other.content_sha256.clone()?,
                 last_changed_unix: None,
                 before_launch: None,
+                folder: None,
             })
         })
         .collect()

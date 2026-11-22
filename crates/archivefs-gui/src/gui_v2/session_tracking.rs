@@ -37,6 +37,8 @@ enum Message {
     Began {
         /// Processes started from this sequence on belong to this launch.
         after_sequence: u64,
+        /// `tracker::clock_offset_ms()` as noted before the launch.
+        clock_before: Option<i64>,
         game: SessionGame,
         emulator: String,
     },
@@ -64,9 +66,17 @@ impl SessionTracking {
     /// have started anything (the caller notes it while no launch is
     /// active): a launch can start its process before Blue first sees it
     /// as active.
-    pub(super) fn launch_began(&mut self, after_sequence: u64, emulator: &str, game: SessionGame) {
+    /// `clock_before` is noted at the same moment, for the same reason.
+    pub(super) fn launch_began(
+        &mut self,
+        after_sequence: u64,
+        clock_before: Option<i64>,
+        emulator: &str,
+        game: SessionGame,
+    ) {
         self.send(Message::Began {
             after_sequence,
+            clock_before,
             game,
             emulator: emulator.to_string(),
         });
@@ -133,6 +143,7 @@ fn start(open: OpenTracker, started_since: StartedSince, look_every: Duration) -
 
 /// One launch the worker is following.
 struct Open {
+    clock_before: Option<i64>,
     session_id: String,
     after_sequence: u64,
     /// Set when the launch is over: only a process started before this
@@ -210,6 +221,7 @@ fn take(tracker: &LaunchTracker, sessions: &mut Vec<Open>, message: Message) {
     match message {
         Message::Began {
             after_sequence,
+            clock_before,
             game,
             emulator,
         } => {
@@ -217,6 +229,7 @@ fn take(tracker: &LaunchTracker, sessions: &mut Vec<Open>, message: Message) {
                 sessions.push(Open {
                     session_id: record.session_id,
                     after_sequence,
+                    clock_before,
                     until_sequence: None,
                     started: false,
                     over: None,
@@ -255,7 +268,7 @@ fn follow(tracker: &LaunchTracker, session: &mut Open, started_since: StartedSin
     {
         session.started = true;
         if tracker
-            .process_started(&session.session_id, process)
+            .process_started(&session.session_id, process, session.clock_before)
             .is_err()
         {
             // The record may already say "started" (the process was noted
@@ -386,6 +399,7 @@ mod tests {
         worker
             .send(Message::Began {
                 after_sequence: SEQUENCE,
+                clock_before: None,
                 game: game(),
                 emulator: "PCSX2".into(),
             })
@@ -452,6 +466,7 @@ mod tests {
         worker
             .send(Message::Began {
                 after_sequence: 9_000_002,
+                clock_before: None,
                 game: game(),
                 emulator: "RetroArch".into(),
             })
@@ -506,6 +521,7 @@ mod tests {
         worker
             .send(Message::Began {
                 after_sequence: SEQUENCE,
+                clock_before: None,
                 game: named("First, failed"),
                 emulator: "PCSX2".into(),
             })
@@ -520,6 +536,7 @@ mod tests {
         worker
             .send(Message::Began {
                 after_sequence: SEQUENCE,
+                clock_before: None,
                 game: named("Second, running"),
                 emulator: "PCSX2".into(),
             })
@@ -553,6 +570,7 @@ mod tests {
             worker
                 .send(Message::Began {
                     after_sequence: 9_000_003,
+                    clock_before: None,
                     game: game(),
                     emulator: "PCSX2".into(),
                 })
@@ -588,6 +606,7 @@ mod tests {
         worker
             .send(Message::Began {
                 after_sequence: SEQUENCE,
+                clock_before: None,
                 game: game(),
                 emulator: "PCSX2".into(),
             })

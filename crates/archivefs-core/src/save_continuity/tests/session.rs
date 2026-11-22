@@ -74,6 +74,7 @@ fn mark(id: &str, sha: &str) -> SaveMark {
         content_sha256: sha.into(),
         last_changed_unix: None,
         before_launch: None,
+        folder: None,
     }
 }
 
