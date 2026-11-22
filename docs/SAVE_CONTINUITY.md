@@ -393,7 +393,8 @@ means nothing is compared. A folder that is itself the place a drive is
 mounted is still there, empty, once the drive is taken away. For that the
 read before the start notes which disk (device number) every folder it listed
 is on, at the moment it lists it, and every folder that held a save; for a
-folder that is not there it notes the nearest folder above it that is. A read
+folder that is not there it notes the nearest folder above it that is
+(RetroArch's save and state folders are noted only when they are there). A read
 during which one of these folders moved to another disk fails (the session is
 then not tracked). Nothing is compared at the end of the session if one of the
 noted folders is on another disk; if one has gone and the nearest folder above
@@ -415,7 +416,10 @@ memory-card folder (an ordinary sub-folder there is passed over). Every plain fi
 fingerprinted, card or not. A file there whose bytes are not a
 card's holds saves that cannot be listed: if it was a card at the other read
 of the session, the saves then listed on it are "not known" (not gone, not
-new), beside the change of the file itself. Among RetroArch's saves, a file under a name saves
+new), beside the change of the file itself. The same holds for a
+PlayStation card that RetroArch keeps as a battery save (`.srm`): each read
+notes whether the file was a card, and a save listed on it at one read is
+"not known" when at the other read the file was there but was not a card. Among RetroArch's saves, a file under a name saves
 do not go by is tracked only while it is card-shaped (if it stops or starts
 being one between the two reads it is reported as gone or new). At most 20,000
 files are looked at per read, counting every file in RetroArch's save folders;

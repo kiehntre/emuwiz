@@ -253,6 +253,26 @@ struct Fresh {
     whole: Vec<(PathBuf, String)>,
     /// The disk each of those folders was on.
     disks: Vec<(PathBuf, u64)>,
+    /// Battery saves that were memory cards at this read (a narrowed look).
+    as_cards: Vec<PathBuf>,
+}
+
+/// Notes that a battery save was a memory card, looked at save by save, at
+/// this read. It is never itself reported as changed (see
+/// [`super::session::CARD_NOTE`]).
+fn card_note(path: &PathBuf) -> SaveMark {
+    SaveMark {
+        save_id: format!("{}{}", super::session::CARD_NOTE, path.display()),
+        label: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        content_sha256: String::new(),
+        last_changed_unix: None,
+        before_launch: None,
+        folder: None,
+        path: Some(path.clone()),
+    }
 }
 
 /// The disk (device number) of every folder that was listed, or that held
@@ -327,31 +347,47 @@ fn nearest_disk(folder: &Path) -> Option<(PathBuf, u64)> {
     while let Some(path) = at {
         match std::fs::metadata(path) {
             Ok(meta) => return Some((path.to_path_buf(), meta.dev())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => at = path.parent(),
+            // Not there, or under something that is a file: look above.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                at = path.parent()
+            }
             Err(_) => return None,
         }
     }
     None
 }
 
+/// The disk of the nearest folder above `folder` (or `folder` itself) that
+/// the read before the session noted.
+pub(crate) fn noted_disk(before: &[(PathBuf, u64)], folder: &Path) -> Option<u64> {
+    before
+        .iter()
+        .filter(|(known, _)| folder.starts_with(known))
+        .max_by_key(|(known, _)| known.components().count())
+        .map(|(_, disk)| *disk)
+}
+
 /// Whether the folders of the read before a session are still on the disks
 /// they were on, and every folder of the read after it is on the disk of
 /// the nearest folder above it that the first read noted. A folder that has
-/// gone is judged by the nearest one above it that is still there: on the
-/// same disk, it was deleted; on another, its disk went. When this is false
+/// gone is judged by the nearest one above it that is still there: on
+/// another disk, its disk went. (A folder that was listed and has gone
+/// altogether also leaves the second read with a folder the first did not
+/// note, the one above it; that too is not compared.) When this is false
 /// a disk came or went, or the saves are somewhere the first read never
 /// looked, and what is there now is not the same place: nothing is compared.
 pub(crate) fn same_disks(before: &[(PathBuf, u64)], after: &[(PathBuf, u64)]) -> bool {
     let unmoved = before
         .iter()
         .all(|(folder, disk)| nearest_disk(folder).is_some_and(|(_, now)| now == *disk));
-    let new_on_the_same = after.iter().all(|(folder, disk)| {
-        before
-            .iter()
-            .filter(|(known, _)| folder.starts_with(known))
-            .max_by_key(|(known, _)| known.components().count())
-            .is_some_and(|(_, known_disk)| known_disk == disk)
-    });
+    let new_on_the_same = after
+        .iter()
+        .all(|(folder, disk)| noted_disk(before, folder) == Some(*disk));
     unmoved && new_on_the_same
 }
 
@@ -427,6 +463,7 @@ fn fresh_read(
         places,
         whole: report.whole_files,
         disks,
+        as_cards: report.as_cards,
     })
 }
 
@@ -448,6 +485,7 @@ pub fn read_baseline(
         .filter(|save| save.emulator.eq_ignore_ascii_case(&launch.emulator))
         .filter_map(mark_of)
         .chain(read.whole.iter().map(whole_mark))
+        .chain(read.as_cards.iter().map(card_note))
         .map(|mut mark| {
             mark.before_launch = Some(true);
             mark
@@ -793,6 +831,7 @@ impl LaunchTracker {
             })
             .filter_map(mark_of)
             .chain(read.whole.iter().filter(|_| gated).map(whole_mark))
+            .chain(read.as_cards.iter().filter(|_| gated).map(card_note))
             .collect();
         if record.folders_before.is_some() {
             let saves = self.saves()?;

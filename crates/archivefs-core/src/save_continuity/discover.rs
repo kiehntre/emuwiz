@@ -156,8 +156,9 @@ pub struct DiscoveryReport {
     pub saves: Vec<DiscoveredSave>,
     /// Files that are in a save folder but were not listed, with the reason.
     pub skipped: Vec<String>,
-    /// The path of every entry of `skipped`: a save file, folder or card
-    /// that is there but whose content was not taken in.
+    /// A save file, folder or card that is there but whose content was
+    /// not taken in, or (in a memory-card folder, at a launch) was taken
+    /// whole but is not a card and so could not be looked at save by save.
     pub unread: Vec<PathBuf>,
     /// Places whose contents could not be listed or located at all (a
     /// folder that cannot be opened, a save folder that is a link, an
@@ -177,6 +178,13 @@ pub struct DiscoveryReport {
     /// number) it was on at the moment it was listed (`None`: not there).
     #[serde(skip)]
     pub searched: Vec<(PathBuf, Option<u64>)>,
+    /// For a narrowed look (a launch): the files among RetroArch's battery
+    /// saves that were memory cards as far as their bytes go, and so were
+    /// looked at save by save. A save listed on such a file at one read of
+    /// a session, when at the other read the file was there but was not a
+    /// card, is neither gone nor new: what the file then held is not known.
+    #[serde(skip)]
+    pub as_cards: Vec<PathBuf>,
     pub stats: DiscoveryStats,
     /// Formats discovery does not look for at all.
     pub not_covered: Vec<&'static str>,
@@ -1464,6 +1472,9 @@ fn retroarch(run: &mut Run<'_, '_>, config_dir: &Path, home: &Path) -> Result<()
                 // which only compares content) the file is taken whole
                 // below as well: an empty card holds no save to list, and
                 // must still be seen to change.
+                if run.options.only.is_some() {
+                    run.report.as_cards.push(path.clone());
+                }
                 if run.options.only.is_none() {
                     if !run.report.saves.iter().any(|save| save.source_path == path) {
                         run.report.skipped.push(format!(

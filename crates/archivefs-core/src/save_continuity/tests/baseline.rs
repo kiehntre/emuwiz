@@ -1069,7 +1069,17 @@ fn a_memory_card_among_retroarchs_saves_is_compared_whole_at_a_launch() {
     fs::write(&card, &bytes).unwrap();
     let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
     let baseline = tracker.baseline_before_start(&retroarch()).unwrap();
-    assert_eq!(baseline.marks.len(), 1, "{baseline:?}");
+    // The file's own content, and a note that it was read as a card.
+    assert_eq!(
+        baseline
+            .marks
+            .iter()
+            .filter(|mark| !mark.save_id.starts_with(CARD_NOTE))
+            .count(),
+        1,
+        "{baseline:?}"
+    );
+    assert_eq!(baseline.marks.len(), 2, "{baseline:?}");
     assert!(baseline.unread.is_empty());
 
     let table = One(Cell::new(true));
@@ -1814,7 +1824,7 @@ fn saves_whose_disk_went_during_the_session_are_not_called_gone() {
 
 #[test]
 fn a_folder_is_judged_by_the_disk_it_is_on() {
-    use super::super::tracker::same_disks;
+    use super::super::tracker::{noted_disk, same_disks};
     use std::os::unix::fs::MetadataExt;
     let dir = tempfile::tempdir().unwrap();
     let here = fs::metadata(dir.path()).unwrap().dev();
@@ -1839,24 +1849,10 @@ fn a_folder_is_judged_by_the_disk_it_is_on() {
     ));
     // A new folder is judged by the nearest folder above it that was noted,
     // not by one further up.
-    fs::create_dir_all(&game).unwrap();
-    let nested = vec![(dir.path().to_path_buf(), here), (saves.clone(), here + 1)];
-    assert!(!same_disks(&[(saves.clone(), here + 1)], &[]));
-    let judged = |disk| {
-        let after = [(game.clone(), disk)];
-        // Only the second half is under test: the first is put right.
-        let before = [(dir.path().to_path_buf(), here)];
-        (
-            same_disks(&before, &after),
-            nested
-                .iter()
-                .filter(|(known, _)| game.starts_with(known))
-                .max_by_key(|(known, _)| known.components().count())
-                .is_some_and(|(_, known)| *known == disk),
-        )
-    };
-    assert_eq!(judged(here), (true, false));
-    assert_eq!(judged(here + 1), (false, true));
+    let noted = [(dir.path().to_path_buf(), here), (saves.clone(), here + 1)];
+    assert_eq!(noted_disk(&noted, &game), Some(here + 1));
+    assert_eq!(noted_disk(&noted, &dir.path().join("other")), Some(here));
+    assert_eq!(noted_disk(&noted, Path::new("/elsewhere")), None);
     // Saves somewhere the first read never looked: not the same place.
     let elsewhere = tempfile::tempdir().unwrap();
     assert!(!same_disks(
@@ -1881,6 +1877,118 @@ fn a_save_folder_made_during_the_session_on_the_same_disk_is_new() {
                 .save_changes
                 .iter()
                 .all(|change| matches!(change, SaveChange::Created { .. })),
+        "{:?}",
+        ended.save_changes
+    );
+}
+
+/// A file that is not a folder where RPCS3 keeps one folder for each user
+/// or game (a desktop's own note file, say) is passed over: the saves are
+/// still read and compared.
+#[test]
+fn a_stray_file_among_rpcs3s_folders_does_not_stop_its_saves_being_tracked() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, home) = (dir.path().join("continuity"), dir.path().join("home"));
+    let rpcs3 = home.join(".config/rpcs3");
+    rpcs3_save(&rpcs3);
+    fs::create_dir_all(rpcs3.join("dev_hdd0/game")).unwrap();
+    fs::write(rpcs3.join("dev_hdd0/home/.directory"), b"[Desktop Entry]").unwrap();
+    fs::write(rpcs3.join("dev_hdd0/game/.directory"), b"[Desktop Entry]").unwrap();
+    let tracker = LaunchTracker::open(&root, DiscoveryRoots::under_home(&home), "dev").unwrap();
+    let data = rpcs3.join("dev_hdd0/home/00000001/savedata/BLUS30750_RERC_SAVE/DATA.BIN");
+    let ended = rpcs3_session(&tracker, &|| fs::write(&data, [9u8; 2000]).unwrap());
+    assert!(
+        matches!(ended.save_tracking, Some(SaveTracking::Established { .. })),
+        "{:?}",
+        ended.save_tracking
+    );
+    assert!(
+        ended
+            .save_changes
+            .iter()
+            .any(|change| matches!(change, SaveChange::Modified { .. })),
+        "{:?}",
+        ended.save_changes
+    );
+    // A stray file that appears while the game runs changes nothing either.
+    let ended = rpcs3_session(&tracker, &|| {
+        fs::write(rpcs3.join("dev_hdd0/home/notes.txt"), b"x").unwrap()
+    });
+    assert!(ended.saves_after.is_some() && ended.save_changes.is_empty());
+}
+
+/// A PlayStation card that RetroArch keeps as a battery save, with a save
+/// on it. If the file stops being a card (or starts being one) during the
+/// session, the save listed on it is not known: not gone, not new. The file
+/// itself is seen to have changed.
+#[test]
+fn a_battery_save_that_stops_or_starts_being_a_card_does_not_lose_or_gain_saves() {
+    use crate::memory_card_manager::tests::{ps1_card, ps1_save};
+    let run = gated();
+    let card = run.saves.join("Card Game (USA).srm");
+    let valid = ps1_card(&[ps1_save("BASLUS-00001GAME", 1, "GAME")]);
+    let with_two = ps1_card(&[
+        ps1_save("BASLUS-00001GAME", 1, "GAME"),
+        ps1_save("BASLUS-00002GAME", 1, "MORE"),
+    ]);
+    let file_changed = SaveChange::Modified {
+        label: "Card Game (USA).srm".into(),
+    };
+    let only = |ended: &SessionRecord, wanted: &dyn Fn(&SaveChange) -> bool| {
+        let others: Vec<&SaveChange> = ended
+            .save_changes
+            .iter()
+            .filter(|change| **change != file_changed)
+            .collect();
+        assert!(
+            ended.save_changes.contains(&file_changed)
+                && !others.is_empty()
+                && others.iter().all(|change| wanted(change)),
+            "{:?}",
+            ended.save_changes
+        );
+    };
+
+    // A card at both ends, left alone: nothing; and nothing is said of the
+    // note that it was a card.
+    fs::write(&card, &valid).unwrap();
+    let session = run.start();
+    let ended = run.end(&session);
+    assert!(ended.save_changes.is_empty(), "{:?}", ended.save_changes);
+    // A card at both ends that gains a save: that save is new.
+    let session = run.start();
+    fs::write(&card, &with_two).unwrap();
+    only(&run.end(&session), &|change| {
+        matches!(change, SaveChange::Created { .. })
+    });
+    // ... and one that loses it again: that save is gone.
+    let session = run.start();
+    fs::write(&card, &valid).unwrap();
+    only(&run.end(&session), &|change| {
+        matches!(change, SaveChange::Missing { .. })
+    });
+    // A card that stops being one: its save is not known.
+    let session = run.start();
+    fs::write(&card, vec![0x5Au8; valid.len() / 2]).unwrap();
+    only(&run.end(&session), &|change| {
+        matches!(change, SaveChange::NotKnown { .. })
+    });
+    // Bytes that become a card: its save is not new.
+    let session = run.start();
+    fs::write(&card, &valid).unwrap();
+    only(&run.end(&session), &|change| {
+        matches!(change, SaveChange::CreatedBeforeNotKnown { .. })
+    });
+    // The file deleted outright: the file and the save on it are gone.
+    let session = run.start();
+    fs::remove_file(&card).unwrap();
+    let ended = run.end(&session);
+    assert!(
+        !ended.save_changes.is_empty()
+            && ended
+                .save_changes
+                .iter()
+                .all(|change| matches!(change, SaveChange::Missing { .. })),
         "{:?}",
         ended.save_changes
     );

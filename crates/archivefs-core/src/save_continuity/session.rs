@@ -162,6 +162,11 @@ pub struct SaveMark {
     pub path: Option<PathBuf>,
 }
 
+/// The start of the id of a mark that only notes that a battery save was a
+/// memory card, looked at save by save, at that read. Such a mark is never
+/// reported as changed, new or gone.
+pub const CARD_NOTE: &str = "card:";
+
 /// Whether `mark`'s file (or the card or folder it is in) is one of those
 /// a read could not take in.
 fn among_unread(unread: &[PathBuf], mark: &SaveMark) -> bool {
@@ -1007,10 +1012,28 @@ pub fn diff_saves_with(
     let index = |marks: &[SaveMark]| -> BTreeMap<String, SaveMark> {
         marks
             .iter()
+            .filter(|mark| !mark.save_id.starts_with(CARD_NOTE))
             .map(|mark| (mark.save_id.clone(), mark.clone()))
             .collect()
     };
     let (old, new) = (index(before), index(after));
+    // A battery save that was a memory card at one read, and was there but
+    // was not a card at the other: the saves listed on it at the one read
+    // are not gone or new, for what it held at the other is not known.
+    let was_card = |marks: &[SaveMark], path: &Path| {
+        marks
+            .iter()
+            .any(|mark| mark.save_id.starts_with(CARD_NOTE) && mark.path.as_deref() == Some(path))
+    };
+    let not_a_card_at = |here: &[SaveMark], there: &[SaveMark], mark: &SaveMark| {
+        mark.path.as_deref().is_some_and(|path| {
+            was_card(here, path)
+                && !was_card(there, path)
+                && there
+                    .iter()
+                    .any(|other| other.path.as_deref() == Some(path))
+        })
+    };
     let mut changes = Vec::new();
     // A file whose content was read at both ends is answered for by that
     // comparison, even if it could not also be taken apart save by save.
@@ -1030,7 +1053,8 @@ pub fn diff_saves_with(
                             .any(|known| known.before_launch && &known.path == folder)
                     })
                 });
-                let unread = among_unread(unread_before, mark);
+                let unread =
+                    among_unread(unread_before, mark) || not_a_card_at(after, before, mark);
                 if unread {
                     answered.extend(mark.path.as_deref());
                 }
@@ -1059,7 +1083,7 @@ pub fn diff_saves_with(
             let label = mark.label.clone();
             // An unproven mark may be of a file the emulator itself made
             // after it started: its going is not a save lost.
-            let unread = among_unread(unread_after, mark);
+            let unread = among_unread(unread_after, mark) || not_a_card_at(before, after, mark);
             if unread {
                 answered.extend(mark.path.as_deref());
             }
