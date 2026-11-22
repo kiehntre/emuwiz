@@ -616,6 +616,53 @@ fn row_ids(
         .collect::<std::result::Result<_, _>>()
         .map_err(|e| e.to_string())
 }
+/// Every archive row's id by its stored absolute path, read once for one
+/// [`bind`] call (the path column has no index, so a query per entry scanned
+/// the whole table each time). Same answers as
+/// `row_ids(c, "archives", "absolute_path_cached", path)`: only BLOB values
+/// can equal the BLOB parameter, and each path's ids are in id order. Never
+/// kept beyond the call; Apply, Undo and recovery query the table directly.
+struct ArchivePaths {
+    ids: std::collections::HashMap<Vec<u8>, Vec<i64>>,
+}
+
+impl ArchivePaths {
+    fn read(c: &Connection) -> std::result::Result<Self, String> {
+        let mut stmt = c
+            .prepare(
+                "SELECT id, absolute_path_cached FROM archives \
+                 WHERE typeof(absolute_path_cached) = 'blob' ORDER BY id",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        let mut ids: std::collections::HashMap<Vec<u8>, Vec<i64>> =
+            std::collections::HashMap::new();
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+            let path: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
+            ids.entry(path).or_default().push(id);
+        }
+        Ok(Self { ids })
+    }
+
+    fn row_ids(&self, path: &[u8]) -> Vec<i64> {
+        self.ids.get(path).cloned().unwrap_or_default()
+    }
+}
+
+/// Archive ids at `path`: from the per-bind lookup when one is given,
+/// otherwise straight from the table.
+fn archive_ids(
+    c: &Connection,
+    paths: Option<&ArchivePaths>,
+    path: &[u8],
+) -> std::result::Result<Vec<i64>, String> {
+    match paths {
+        Some(paths) => Ok(paths.row_ids(path)),
+        None => row_ids(c, "archives", "absolute_path_cached", path),
+    }
+}
+
 fn fingerprint(c: &Connection, a: &Association) -> std::result::Result<bool, String> {
     c.query_row("SELECT EXISTS(SELECT 1 FROM scan_fingerprints WHERE source_folder_id=?1 AND relative_path=?2)", params![a.folder, a.relative], |r| r.get(0)).map_err(|e| e.to_string())
 }
@@ -716,6 +763,7 @@ pub(crate) fn bind(
     let path = fs::canonicalize(database.path()).map_err(|e| e.to_string())?;
     let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
     let c = &database.connection;
+    let paths = ArchivePaths::read(c)?;
     let mut bindings = Vec::new();
     for entry in &transaction.entries {
         if entry.unknown.contains_key(KEY) {
@@ -750,13 +798,13 @@ pub(crate) fn bind(
         }
         let old = association(c, &entry.source_path)?;
         let new = association(c, &entry.destination_path)?;
-        let ids = row_ids(c, "archives", "absolute_path_cached", &old.absolute)?;
+        let ids = paths.row_ids(&old.absolute);
         // A set's track or disc file with no library row of its own moves
         // with its set and has no catalogue path to change.
         let companion = entry.unknown.contains_key(COMPANION_KEY)
             || entry.unknown.contains_key(UNCATALOGUED_KEY);
         if companion && ids.is_empty() {
-            if !row_ids(c, "archives", "absolute_path_cached", &new.absolute)?.is_empty() {
+            if !paths.row_ids(&new.absolute).is_empty() {
                 return Err("catalogue absolute path collision".into());
             }
             bindings.push(None);
@@ -816,7 +864,7 @@ pub(crate) fn bind(
             projections,
             platform,
         };
-        let guard = CatalogueMove::validate(binding.clone(), entry)?;
+        let guard = CatalogueMove::validate(binding.clone(), entry, &paths)?;
         drop(guard);
         bindings.push(Some(
             serde_json::to_value(binding).map_err(|e| e.to_string())?,
@@ -851,14 +899,21 @@ impl CatalogueMove {
         reverse: bool,
         recovery: bool,
     ) -> std::result::Result<Self, String> {
-        Self::open_with(b, entry, reverse, recovery, true)
+        Self::open_with(b, entry, reverse, recovery, true, None)
     }
 
     /// The same checks as [`Self::open`], on a read-only connection in a
     /// deferred (read) transaction: preview validation takes no write lock
     /// on the catalogue. The result cannot commit.
-    fn validate(b: Binding, entry: &TransactionEntry) -> std::result::Result<Self, String> {
-        Self::open_with(b, entry, false, false, false)
+    ///
+    /// `paths` is the calling [`bind`]'s one-pass archive path lookup, used
+    /// for the archive path checks instead of a table scan per entry.
+    fn validate(
+        b: Binding,
+        entry: &TransactionEntry,
+        paths: &ArchivePaths,
+    ) -> std::result::Result<Self, String> {
+        Self::open_with(b, entry, false, false, false, Some(paths))
     }
 
     fn open_with(
@@ -867,6 +922,7 @@ impl CatalogueMove {
         reverse: bool,
         recovery: bool,
         write: bool,
+        paths: Option<&ArchivePaths>,
     ) -> std::result::Result<Self, String> {
         if b.old.absolute != entry.source_path.as_os_str().as_bytes()
             || b.new.absolute != entry.destination_path.as_os_str().as_bytes()
@@ -934,8 +990,8 @@ impl CatalogueMove {
             return Err("catalogue association changed; manual review required".into());
         }
         let (at, free) = if already { (to, from) } else { (from, to) };
-        if row_ids(&c, "archives", "absolute_path_cached", &at.absolute)? != vec![b.archive]
-            || !row_ids(&c, "archives", "absolute_path_cached", &free.absolute)?.is_empty()
+        if archive_ids(&c, paths, &at.absolute)? != vec![b.archive]
+            || !archive_ids(&c, paths, &free.absolute)?.is_empty()
         {
             return Err("catalogue absolute path collision".into());
         }
@@ -1716,3 +1772,72 @@ mod carried_check_tests {
 
 #[path = "organisation_paths_reattest.rs"]
 pub(crate) mod reattest;
+
+#[cfg(test)]
+mod archive_paths_tests {
+    use super::{ArchivePaths, archive_ids, row_ids};
+    use rusqlite::{Connection, params};
+
+    #[test]
+    fn the_one_pass_lookup_answers_exactly_as_the_path_query() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE archives (id INTEGER PRIMARY KEY, absolute_path_cached BLOB)",
+        )
+        .unwrap();
+        let blob = |id: i64, path: &str| {
+            c.execute(
+                "INSERT INTO archives (id, absolute_path_cached) VALUES (?1, ?2)",
+                params![id, path.as_bytes()],
+            )
+            .unwrap();
+        };
+        blob(5, "/games/a.nes");
+        blob(9, "/games/shared.nes"); // two rows, inserted out of id order
+        blob(3, "/games/shared.nes");
+        blob(7, "/games/caf\u{e9}.nes");
+        // Stored as TEXT or NULL: a BLOB parameter never equals these.
+        c.execute(
+            "INSERT INTO archives (id, absolute_path_cached) VALUES (11, '/games/text.nes')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO archives (id, absolute_path_cached) VALUES (12, NULL)",
+            [],
+        )
+        .unwrap();
+        let mut odd = b"/games/".to_vec();
+        odd.extend_from_slice(&[0xff, 0xfe, b'.', b'n']);
+        c.execute(
+            "INSERT INTO archives (id, absolute_path_cached) VALUES (13, ?1)",
+            params![odd],
+        )
+        .unwrap();
+
+        let paths = ArchivePaths::read(&c).unwrap();
+        let probes: Vec<Vec<u8>> = vec![
+            b"/games/a.nes".to_vec(),
+            b"/games/shared.nes".to_vec(),
+            "/games/caf\u{e9}.nes".as_bytes().to_vec(),
+            b"/games/text.nes".to_vec(),
+            b"/games/missing.nes".to_vec(),
+            b"/games/A.nes".to_vec(),
+            b"".to_vec(),
+            odd,
+        ];
+        for probe in &probes {
+            let queried = row_ids(&c, "archives", "absolute_path_cached", probe).unwrap();
+            assert_eq!(
+                paths.row_ids(probe),
+                queried,
+                "{}",
+                String::from_utf8_lossy(probe)
+            );
+            assert_eq!(archive_ids(&c, Some(&paths), probe).unwrap(), queried);
+            assert_eq!(archive_ids(&c, None, probe).unwrap(), queried);
+        }
+        assert_eq!(paths.row_ids(b"/games/shared.nes"), vec![3, 9]);
+        assert!(paths.row_ids(b"/games/text.nes").is_empty());
+    }
+}
