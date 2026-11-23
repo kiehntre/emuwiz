@@ -633,7 +633,15 @@ fn rollback_transaction_inner(
     // where it is for this pass.
     let mut stopped_sets = std::collections::BTreeSet::<String>::new();
     for index in order {
-        if cancelled(cancel) {
+        // Cancel is honoured between games: a disc set already started in
+        // this pass (its files are handled one after another) is finished
+        // first, so a cancel never leaves it split.
+        if cancelled(cancel)
+            && !crate::database::organisation_paths::disc_set_of(&transaction.entries[index])
+                .is_some_and(|lead| {
+                    reversed_in_set.contains_key(&lead) && !stopped_sets.contains(&lead)
+                })
+        {
             stopped_by_cancellation = true;
             break;
         }

@@ -1419,4 +1419,34 @@ mod never_split {
             "someone else's file"
         );
     }
+
+    /// Review (PR #536): Cancel during Undo, after one file of a set went
+    /// back, finishes that set and stops before the next game.
+    #[test]
+    fn cancel_during_undo_finishes_the_started_set() {
+        let s = setup(true); // Aaa.iso first, so Undo reaches the set first
+        let mut tx = s.lib.apply(&s.plan, &all_of(&s.plan)).unwrap();
+        assert_eq!(tx.state, TransactionState::Applied);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        crate::dat::rename_apply::rollback::set_after_reversal_hook(Some(Box::new(move |count| {
+            if count == 1 {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })));
+        let path =
+            crate::dat::rename_apply::journal_path(&s.lib.journal(), &tx.transaction_id).unwrap();
+        tx = crate::dat::rename_apply::read_journal(&path).unwrap();
+        let result =
+            rollback_organisation_transaction(&mut tx, &s.lib.journal(), &cancel, &s.lib.root);
+        crate::dat::rename_apply::rollback::set_after_reversal_hook(None);
+        assert!(!matches!(
+            result.unwrap().rollback.result,
+            RollbackResult::FullyRolledBack
+        ));
+        set_at_source(&s);
+        assert!(!s.other.exists(), "the next game is left for a later Undo");
+        assert_eq!(s.lib.undo(&mut tx), RollbackResult::FullyRolledBack);
+        assert!(s.other.exists());
+    }
 }
