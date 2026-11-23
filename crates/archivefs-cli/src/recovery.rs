@@ -572,6 +572,35 @@ mod tests {
     use super::*;
     use archivefs_core::synthetic_media::{cd_disc_set, stored_zip};
 
+    /// Whether the temporary folder is on ext4. EmuWiz accepts a store
+    /// folder outside its own data folder only on ext4, so a test that needs
+    /// an accepted folder cannot run on overlayfs, tmpfs and the like: it
+    /// says so and is skipped. CI points TMPDIR at an ext4 image and sets
+    /// EMUWIZ_R2_REQUIRE_QUALIFIED=1, with which a skip is a failure, so
+    /// these tests cannot go green there without having run.
+    fn temp_on_ext4_or_skip(test: &str) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let folder = std::env::temp_dir();
+        let name = std::ffi::CString::new(folder.as_os_str().as_bytes()).unwrap();
+        // SAFETY: zeroed is a valid initial value for this plain C struct,
+        // `name` is NUL-terminated and `stats` is writable and sized.
+        let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
+        let on_ext4 = unsafe { libc::statfs(name.as_ptr(), &mut stats) } == 0
+            && stats.f_type == libc::EXT4_SUPER_MAGIC;
+        if !on_ext4 {
+            assert!(
+                std::env::var_os("EMUWIZ_R2_REQUIRE_QUALIFIED").is_none_or(|value| value != "1"),
+                "{test}: the temporary folder {} is not on ext4, and this run requires it",
+                folder.display()
+            );
+            eprintln!(
+                "SKIPPED {test}: the temporary folder {} is not on ext4, so there is no folder EmuWiz would accept",
+                folder.display()
+            );
+        }
+        on_ext4
+    }
+
     /// Exactly these arguments.
     fn exact(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
@@ -745,6 +774,9 @@ mod tests {
     /// and nothing is written into it.
     #[test]
     fn a_store_folder_is_refused_without_its_disk_or_on_another_disk() {
+        if !temp_on_ext4_or_skip("a_store_folder_is_refused_without_its_disk_or_on_another_disk") {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let dir = std::fs::canonicalize(dir.path()).unwrap();
         let (zip, _existing) = lab(&dir);
@@ -842,6 +874,9 @@ mod tests {
 
     #[test]
     fn a_system_is_never_guessed_and_unknown_input_is_refused() {
+        if !temp_on_ext4_or_skip("a_system_is_never_guessed_and_unknown_input_is_refused") {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let dir = std::fs::canonicalize(dir.path()).unwrap();
         let (zip, store) = lab(&dir);
@@ -882,6 +917,11 @@ mod tests {
 
     #[test]
     fn diagnose_prepare_verify_and_remove_work_headlessly_and_leave_the_game_file_alone() {
+        if !temp_on_ext4_or_skip(
+            "diagnose_prepare_verify_and_remove_work_headlessly_and_leave_the_game_file_alone",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let dir = std::fs::canonicalize(dir.path()).unwrap();
         let (zip, store) = lab(&dir);
@@ -927,6 +967,11 @@ mod tests {
 
     #[test]
     fn a_batch_is_only_reviewed_without_yes_and_runs_one_game_at_a_time_with_it() {
+        if !temp_on_ext4_or_skip(
+            "a_batch_is_only_reviewed_without_yes_and_runs_one_game_at_a_time_with_it",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let dir = std::fs::canonicalize(dir.path()).unwrap();
         let store = existing_store(&dir);
