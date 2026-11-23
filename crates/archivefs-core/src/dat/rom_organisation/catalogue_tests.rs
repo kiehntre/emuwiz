@@ -1916,5 +1916,272 @@ mod carried_catalogue_checks {
             assert_eq!(f.path_id(&f.destination), Some(f.id));
             assert_eq!(state_of(&record), "applied");
         }
+        /// The real recovery engine's enrollment (the same calls the
+        /// `--r2-operator` process makes) links an anchor to the file, which
+        /// changes its change time and link count. Apply confirms that one
+        /// file again (owner approval 2026-11-23); nothing else is accepted.
+        mod enrolled {
+            use super::*;
+            use crate::dat::rename_apply::compact_recovery::{
+                controller::RecoveryAction, deployment as d,
+            };
+            use crate::dat::rom_organisation::protected_catalogue::{
+                confirm_enrolled, record_enrollment,
+            };
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+            struct Enrolled {
+                f: Fixture,
+                row: i64,
+                root: PathBuf,
+                state: PathBuf,
+                signer: PathBuf,
+                workspace: PathBuf,
+                operator: RenameTransaction,
+            }
+
+            fn hashed_check(path: &Path) -> serde_json::Value {
+                let h =
+                    crate::identity_source::hashing::hash_file(path, &TrustedRoots::none(), None)
+                        .unwrap();
+                let mut facts = check_of(path);
+                facts["audited_hashes"] = serde_json::json!({
+                    "size_bytes": h.fingerprint.size_bytes, "crc32": h.crc32,
+                    "md5": h.md5, "sha1": h.sha1, "sha256": null});
+                facts["hash_evidence"] = serde_json::json!({
+                    "matched_algorithm": "SHA-1", "matched_value": h.sha1,
+                    "available_algorithms": ["SHA-1", "MD5", "CRC32"]});
+                facts
+            }
+
+            /// `None` where the filesystem is not one Advanced Protection
+            /// admits (unless `EMUWIZ_R2_REQUIRE_QUALIFIED=1`).
+            fn enrolled(record: bool) -> Option<Enrolled> {
+                let mut f = Fixture::new(OrganisationMode::RenameInPlace);
+                let row = insert(&f, &hashed_check(&f.source));
+                rebind(&mut f);
+                let root = f.source.parent().unwrap().canonicalize().unwrap();
+                if let Err(e) = d::preview_root(&root) {
+                    assert_ne!(
+                        std::env::var("EMUWIZ_R2_REQUIRE_QUALIFIED").as_deref(),
+                        Ok("1"),
+                        "{e}"
+                    );
+                    return None;
+                }
+                let workspace = f.temp.path().canonicalize().unwrap().join("protection");
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&workspace)
+                    .unwrap();
+                let signer = workspace.join("operator");
+                let state = workspace.join("state-0");
+                let key = d::issuer_init(&signer).unwrap();
+                d::provision(
+                    &root,
+                    &state,
+                    &key,
+                    "Blue advanced safety operator",
+                    "Contract1-I",
+                )
+                .unwrap();
+                let plan = d::plan(&state, &[("Old.zip".into(), "New.zip".into())]).unwrap();
+                let bytes = serde_json::to_vec_pretty(&plan).unwrap();
+                if record {
+                    record_enrollment(&workspace, &f.tx, &plan.transaction_id).unwrap();
+                }
+                d::enroll(&state, &bytes, &d::plan_confirmation(&bytes).unwrap(), true).unwrap();
+                let operator = d::review(&state, RecoveryAction::Apply)
+                    .unwrap()
+                    .transaction;
+                assert_eq!(operator.transaction_id, plan.transaction_id);
+                // The anchor is linked: the saved check no longer looks current.
+                assert_eq!(std::fs::metadata(&f.source).unwrap().nlink(), 2);
+                assert!(matches!(
+                    DiscFileState::of(&recorded(&f, row)),
+                    DiscFileState::Changed(_)
+                ));
+                Some(Enrolled {
+                    f,
+                    row,
+                    root,
+                    state,
+                    signer,
+                    workspace,
+                    operator,
+                })
+            }
+
+            fn run(e: &Enrolled, action: RecoveryAction) {
+                let review = d::review(&e.state, action).unwrap();
+                assert!(review.actionable, "{:?}", review.refusal);
+                let grant = d::approve(&e.state, &e.signer, action, &review.confirmation).unwrap();
+                assert!(
+                    d::execute(&e.state, &grant, action, true)
+                        .unwrap()
+                        .completed
+                );
+            }
+
+            fn rows(checked: &std::collections::BTreeMap<usize, Vec<i64>>) -> Vec<i64> {
+                checked.values().flatten().copied().collect()
+            }
+
+            #[test]
+            fn apply_confirms_its_own_enrolled_file_and_the_check_follows_apply_and_undo() {
+                let Some(mut e) = enrolled(true) else {
+                    return;
+                };
+                rebind(&mut e.f);
+                assert!(rows(&checks_before_protected(&e.f.tx, false)).is_empty());
+                assert_eq!(confirm_enrolled(&e.workspace, &e.operator, &e.root), Ok(1));
+                assert_eq!(
+                    DiscFileState::of(&recorded(&e.f, e.row)),
+                    DiscFileState::Unchanged
+                );
+                // Confirming again (a retried Apply) changes nothing.
+                let confirmed = stored(&e.f, e.row);
+                assert_eq!(confirm_enrolled(&e.workspace, &e.operator, &e.root), Ok(0));
+                assert_eq!(stored(&e.f, e.row), confirmed);
+                rebind(&mut e.f);
+                validate_protected_catalogue(&e.f.tx, &e.f.db).unwrap();
+                let checked = checks_before_protected(&e.f.tx, false);
+                assert_eq!(rows(&checked), vec![e.row]);
+                run(&e, RecoveryAction::Apply);
+                assert!(!e.f.source.exists());
+                let out = complete_protected_catalogue(&e.f.tx, false, &checked);
+                assert_eq!(out.updated, vec![e.f.destination.clone()]);
+                assert!(out.is_consistent());
+                let moved = recorded(&e.f, e.row);
+                assert_eq!(moved.path, e.f.destination);
+                assert_eq!(DiscFileState::of(&moved), DiscFileState::Unchanged);
+                assert_eq!(e.f.path_id(&e.f.destination), Some(e.f.id));
+                // Undo: the engine puts the file back; the row and check follow.
+                let checked = checks_before_protected(&e.f.tx, true);
+                assert_eq!(rows(&checked), vec![e.row]);
+                run(&e, RecoveryAction::Undo);
+                let back = complete_protected_catalogue(&e.f.tx, true, &checked);
+                assert_eq!(back.updated, vec![e.f.source.clone()]);
+                let back = recorded(&e.f, e.row);
+                assert_eq!(back.path, e.f.source);
+                assert_eq!(DiscFileState::of(&back), DiscFileState::Unchanged);
+                assert_eq!(e.f.path_id(&e.f.source), Some(e.f.id));
+                assert_eq!(std::fs::read(&e.f.source).unwrap(), b"fixture contents");
+            }
+
+            #[test]
+            fn any_other_change_after_enrollment_refuses_and_leaves_the_check_stale() {
+                type Change = fn(&Enrolled) -> bool;
+                let cases: [(&str, Change, &str); 5] = [
+                    (
+                        "another hard link",
+                        |e| {
+                            std::fs::hard_link(&e.f.source, e.f.temp.path().join("extra")).unwrap();
+                            true
+                        },
+                        "hard link other than this operation's recovery anchor",
+                    ),
+                    (
+                        "permissions",
+                        |e| {
+                            let mode = std::fs::metadata(&e.f.source).unwrap().mode();
+                            std::fs::set_permissions(
+                                &e.f.source,
+                                std::fs::Permissions::from_mode((mode ^ 0o040) & 0o7777),
+                            )
+                            .unwrap();
+                            true
+                        },
+                        "its permissions changed",
+                    ),
+                    (
+                        "same-size rewrite with the modification time put back",
+                        |e| {
+                            let modified =
+                                std::fs::metadata(&e.f.source).unwrap().modified().unwrap();
+                            std::fs::write(&e.f.source, b"Fixture contents").unwrap();
+                            std::fs::File::options()
+                                .write(true)
+                                .open(&e.f.source)
+                                .unwrap()
+                                .set_modified(modified)
+                                .unwrap();
+                            true
+                        },
+                        "its content differs from the content that was prepared",
+                    ),
+                    (
+                        "an extended attribute",
+                        |e| {
+                            use std::os::unix::ffi::OsStrExt;
+                            let path =
+                                std::ffi::CString::new(e.f.source.as_os_str().as_bytes()).unwrap();
+                            // SAFETY: valid C strings and a 1-byte value.
+                            unsafe {
+                                libc::lsetxattr(
+                                    path.as_ptr(),
+                                    c"user.emuwiz-test".as_ptr(),
+                                    b"1".as_ptr().cast(),
+                                    1,
+                                    0,
+                                ) == 0
+                            }
+                        },
+                        "its extended attributes",
+                    ),
+                    (
+                        "the game checked again",
+                        |e| {
+                            let mut facts: serde_json::Value =
+                                serde_json::from_slice(&stored(&e.f, e.row)).unwrap();
+                            facts["audit_file"]["size_bytes"] = serde_json::json!(1);
+                            e.f.sql()
+                                .execute(
+                                    "UPDATE library_dat_identities SET facts_json=?1 WHERE id=?2",
+                                    params![serde_json::to_vec(&facts).unwrap(), e.row],
+                                )
+                                .unwrap();
+                            true
+                        },
+                        "checked again since it was prepared",
+                    ),
+                ];
+                for (name, change, reason) in cases {
+                    let Some(e) = enrolled(true) else {
+                        return;
+                    };
+                    if !change(&e) {
+                        eprintln!("skipped {name}: not supported on this filesystem");
+                        continue;
+                    }
+                    let before = stored(&e.f, e.row);
+                    let refused =
+                        confirm_enrolled(&e.workspace, &e.operator, &e.root).expect_err(name);
+                    assert!(refused.contains(reason), "{name}: {refused}");
+                    assert!(refused.contains("Nothing was changed"), "{name}: {refused}");
+                    assert_eq!(stored(&e.f, e.row), before, "{name}");
+                    assert_ne!(
+                        DiscFileState::of(&recorded(&e.f, e.row)),
+                        DiscFileState::Unchanged,
+                        "{name}"
+                    );
+                    assert!(e.f.source.exists(), "{name}");
+                }
+            }
+
+            #[test]
+            fn an_operation_enrolled_without_a_record_is_not_confirmed() {
+                let Some(e) = enrolled(false) else {
+                    return;
+                };
+                let before = stored(&e.f, e.row);
+                assert_eq!(confirm_enrolled(&e.workspace, &e.operator, &e.root), Ok(0));
+                assert_eq!(stored(&e.f, e.row), before);
+                assert!(matches!(
+                    DiscFileState::of(&recorded(&e.f, e.row)),
+                    DiscFileState::Changed(_)
+                ));
+            }
+        }
     }
 }

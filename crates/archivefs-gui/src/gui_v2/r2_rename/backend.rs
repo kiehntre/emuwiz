@@ -327,6 +327,18 @@ pub(super) fn enroll(h: &Helper, info: &Info, p: &Preview) -> Result<Review, Str
     if inspected["plan"] != p.plan || inspected["confirmation"] != p.confirmation {
         return Err("Reviewed plan document changed; enrollment refused".into());
     }
+    // The enrollment record (exact file state and the saved checks current
+    // now) is written first, under the workspace lock, so Apply can confirm
+    // these files again after the recovery anchors are linked to them.
+    let _lock = pc::WorkspaceLock::try_take(&info.workspace)?.ok_or(
+        "Another Advanced Protection step is running for this folder. Nothing was changed.",
+    )?;
+    if pc::involves_catalogue(&expected) {
+        let id = p.plan["transaction_id"]
+            .as_str()
+            .ok_or("The reviewed plan has no transaction id; enrollment refused")?;
+        pc::record_enrollment(&info.workspace, &expected, id)?;
+    }
     h.run(vec![
         "enroll".into(),
         text(&info.state)?,
@@ -335,9 +347,20 @@ pub(super) fn enroll(h: &Helper, info: &Info, p: &Preview) -> Result<Review, Str
         p.confirmation.clone(),
         "--enable-contract-1-i".into(),
     ])?;
+    drop(_lock);
     let r = review(h, info, "apply", Some(p.selection.clone()))?;
     check_plan(&expected, &r.value["transaction"])?;
     Ok(r)
+}
+
+/// The saved checks of the enrolled Apply's own files, confirmed again
+/// (owner approval 2026-11-23): its recovery anchors changed their change
+/// time and link count. Only this transaction's files; anything else stays
+/// stale and the usual refusal follows.
+fn confirm_enrolled(info: &Info, transaction: &Value) -> Result<(), String> {
+    let operator: RenameTransaction =
+        serde_json::from_value(transaction.clone()).map_err(|e| e.to_string())?;
+    pc::confirm_enrolled(&info.workspace, &operator, &info.root).map(|_| ())
 }
 pub(super) fn review(
     h: &Helper,
@@ -362,8 +385,14 @@ pub(super) fn review(
     })
 }
 pub(super) fn review_apply(h: &Helper, i: &Info, selection: Selection) -> Result<Review, String> {
+    let r = review(h, i, "apply", Some(selection.clone()))?;
+    {
+        let _lock = pc::WorkspaceLock::try_take(&i.workspace)?.ok_or(
+            "Another Advanced Protection step is running for this folder. Nothing was changed.",
+        )?;
+        confirm_enrolled(i, &r.value["transaction"])?;
+    }
     let expected = selection.validate()?;
-    let r = review(h, i, "apply", Some(selection))?;
     check_plan(&expected, &r.value["transaction"])?;
     Ok(r)
 }
@@ -377,7 +406,16 @@ pub(super) fn execute(h: &Helper, info: &Info, r: &Review) -> Result<(Value, Inf
             .unwrap_or("Operation requires review")
             .into());
     }
+    // The library catalogue follows the files (owner option 1). Under the
+    // workspace lock (a scan waits for it) and the catalogue hold: the
+    // record is written as pending with the checks current now, the engine
+    // moves the files, then the library is brought in line file by file. An
+    // interruption is finished by the next scan or visit, from this record.
+    let _lock = pc::WorkspaceLock::try_take(&info.workspace)?.ok_or(
+        "Another Advanced Protection step is running for this folder. Nothing was changed.",
+    )?;
     if let Some(s) = &r.selection {
+        confirm_enrolled(info, &r.value["transaction"])?;
         let tx = s.validate()?;
         check_plan(&tx, &r.value["transaction"])?;
     }
@@ -408,14 +446,6 @@ pub(super) fn execute(h: &Helper, info: &Info, r: &Review) -> Result<(Value, Inf
             "Fresh approval is not applicable. Preserve it and review current state.".into(),
         );
     }
-    // The library catalogue follows the files (owner option 1). Under the
-    // workspace lock (a scan waits for it) and the catalogue hold: the
-    // record is written as pending with the checks current now, the engine
-    // moves the files, then the library is brought in line file by file. An
-    // interruption is finished by the next scan or visit, from this record.
-    let _lock = pc::WorkspaceLock::try_take(&info.workspace)?.ok_or(
-        "Another Advanced Protection step is running for this folder. Nothing was changed.",
-    )?;
     let mut catalogue = catalogue_step(info, r)?;
     let hold = match &mut catalogue {
         Some((path, record)) => {
@@ -447,6 +477,7 @@ pub(super) fn execute(h: &Helper, info: &Info, r: &Review) -> Result<(Value, Inf
     }
     let mut result = result?;
     result["catalogue"] = serde_json::json!(notes);
+    drop(_lock);
     Ok((result, info.refresh(h)?))
 }
 

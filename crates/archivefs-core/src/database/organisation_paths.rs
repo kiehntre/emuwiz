@@ -1713,3 +1713,6 @@ mod carried_check_tests {
         assert!(carry.verified_at(&temp.path().join("gone.bin")).is_none());
     }
 }
+
+#[path = "organisation_paths_reattest.rs"]
+pub(crate) mod reattest;

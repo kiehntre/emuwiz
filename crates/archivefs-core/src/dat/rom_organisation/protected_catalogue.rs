@@ -519,3 +519,65 @@ pub fn finish_pending_before_scan<'a>(
         "Library scan refused to protect verified games. An Advanced Protection rename moved files whose library entries could not be updated: {detail}. Open that folder in Advanced Protection to review it: if the files can be proved there the update finishes; otherwise choose \"Let the library rescan these files\" (their games are then re-checked with Check Games). Or switch that library folder off in Settings to scan the others. Nothing was scanned."
     ))
 }
+
+/// Where the enrollment record of recovery transaction `id` is kept.
+fn enrolled_path(workspace: &Path, id: &str) -> Result<PathBuf, String> {
+    if id.is_empty() || id.len() > 80 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err("the recovery transaction has an unusable id".into());
+    }
+    Ok(workspace.join(format!("enrolled-{id}.json")))
+}
+
+/// Just before enrollment (under the workspace lock): records the exact
+/// state of each catalogue-checked file of `transaction` (the preview's,
+/// with its sealed bindings) and the saved checks current for it, for
+/// [`confirm_enrolled`] at Apply. `id` is the recovery engine's id for the
+/// same plan. An existing record is never replaced.
+pub fn record_enrollment(
+    workspace: &Path,
+    transaction: &RenameTransaction,
+    id: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = enrolled_path(workspace, id)?;
+    let baseline = crate::database::organisation_paths::reattest::capture(transaction, id)?;
+    let bytes = serde_json::to_vec(&baseline).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| {
+            format!("the enrollment record cannot be written ({e}); nothing was enrolled")
+        })?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::File::open(workspace)?.sync_all())
+        .map_err(|e| format!("the enrollment record cannot be written ({e}); nothing was enrolled"))
+}
+
+/// At Apply of the enrolled `operator` transaction (rooted at `root`): the
+/// saved checks of its own files, confirmed again against the enrollment
+/// record and re-pointed at the change time the recovery anchor gave them
+/// (see [`crate::database::organisation_paths::reattest`]). Returns how many
+/// checks were re-pointed. Without a record (an operation enrolled by an
+/// older EmuWiz) nothing is confirmed and the usual stale-check refusal
+/// stands.
+pub fn confirm_enrolled(
+    workspace: &Path,
+    operator: &RenameTransaction,
+    root: &Path,
+) -> Result<usize, String> {
+    let path = enrolled_path(workspace, &operator.transaction_id)?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("the enrollment record cannot be read ({e})")),
+    };
+    let baseline: crate::database::organisation_paths::reattest::EnrolledBaseline =
+        serde_json::from_slice(&bytes)
+            .map_err(|_| format!("{} cannot be read; it is kept for review", path.display()))?;
+    crate::database::organisation_paths::reattest::reattest(&baseline, operator, root)
+}
