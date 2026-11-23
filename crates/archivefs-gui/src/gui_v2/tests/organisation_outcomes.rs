@@ -149,6 +149,9 @@ fn applied_app(fixture: &Fixture, names: &[&str]) -> (App, RenameTransaction, u6
     worker.record_apply_result_for_test(result, transaction.clone());
     app.canonical_organisation = reviewed_page(fixture);
     let id = finish(&mut app, Kind::Apply, worker);
+    // A complete Apply retires the preview it used: Apply stays off until a
+    // fresh preview.
+    assert!(!app.canonical_organisation.has_plan_for_test());
     (app, transaction, id)
 }
 
@@ -357,6 +360,9 @@ fn complete_undo_is_proven_before_history_is_marked_rolled_back() {
 fn partial_undo_keeps_handle_plan_and_never_marks_history_rolled_back() {
     let fixture = disposable();
     let (mut app, transaction, _) = applied_app(&fixture, &["a", "b"]);
+    // A preview made after the Apply: a partial Undo must keep it.
+    app.canonical_organisation
+        .hold_plan_for_test(&fixture.root, "reviewed-source");
     // Undo reverses b first, then finds a's original name taken.
     let blocker = fixture.root.join("a.old.bin");
     fs::write(&blocker, b"someone else's file").unwrap();
@@ -853,6 +859,7 @@ fn bound_organisation_apply(
         candidates: std::slice::from_ref(&candidate),
         generation: 1,
         unknown_folder: None,
+        link_target_roots: None,
     });
     org::prepare_organisation_catalogue(&mut plan, &db).unwrap();
     let approved: std::collections::BTreeSet<String> =

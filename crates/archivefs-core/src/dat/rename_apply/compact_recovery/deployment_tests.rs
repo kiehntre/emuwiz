@@ -150,8 +150,12 @@ fn permissions_symlinks_and_second_authority_are_refused() {
         fs::Permissions::from_mode(0o600),
     )
     .unwrap();
-    fs::set_permissions(&f.root, fs::Permissions::from_mode(0o755)).unwrap();
+    // Owner decision 2026-11-23: a game folder others can read (0755) is
+    // accepted; one other users can change (0775) is refused.
+    fs::set_permissions(&f.root, fs::Permissions::from_mode(0o775)).unwrap();
     assert!(load(&f.state).is_err());
+    fs::set_permissions(&f.root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(load(&f.state).is_ok());
 }
 #[test]
 fn enrollment_limits_and_occupied_root_never_fallback() {

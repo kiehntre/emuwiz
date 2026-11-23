@@ -99,9 +99,7 @@ impl Bridge {
         {
             // This is the bounded store's root policy, not a requirement of
             // procfd publication itself. Check before claims or artifacts.
-            private(&open_dir(root)?).map_err(|_| {
-                fail("this bounded controller requires a private owned collection root")
-            })?;
+            collection_root(&open_dir(root)?)?;
             crate::dat::rename_apply::identity::fd_publication_probe::contract::capability::probe(
                 root,
             )?;

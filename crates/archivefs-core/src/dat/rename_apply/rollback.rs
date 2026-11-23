@@ -127,7 +127,7 @@ pub fn rollback_transaction(
     journal_dir: &Path,
     cancel: &AtomicBool,
 ) -> Result<RollbackOutcome, String> {
-    rollback_transaction_inner(transaction, journal_dir, cancel, None, false)
+    rollback_transaction_inner(transaction, journal_dir, cancel, None, false, None)
 }
 
 /// Identical to [`rollback_transaction`], but additionally re-verifies, for
@@ -147,7 +147,7 @@ pub fn rollback_transaction_confined(
     cancel: &AtomicBool,
     trusted: &TrustedRoots,
 ) -> Result<RollbackOutcome, String> {
-    rollback_transaction_inner(transaction, journal_dir, cancel, Some(trusted), false)
+    rollback_transaction_inner(transaction, journal_dir, cancel, Some(trusted), false, None)
 }
 
 pub(crate) fn rollback_retrodeck_links(
@@ -157,7 +157,7 @@ pub(crate) fn rollback_retrodeck_links(
     trusted: &TrustedRoots,
 ) -> Result<RollbackOutcome, String> {
     crate::launch::es_de_publish::operation::validate_child(journal_dir, transaction)?;
-    rollback_transaction_inner(transaction, journal_dir, cancel, Some(trusted), true)
+    rollback_transaction_inner(transaction, journal_dir, cancel, Some(trusted), true, None)
 }
 
 /// The one refusal text for a journal whose Undo was surrendered.
@@ -170,13 +170,299 @@ pub(crate) fn undo_surrendered_message(state: TransactionState) -> String {
     }
 }
 
+/// Puts back only the files of the named disc sets (each set's lead source
+/// path), with every check of a normal Undo; every other entry is left as it
+/// is. Used when an Apply stopped part-way through a set, so the set is
+/// restored whole and the transaction keeps its own state.
+pub fn rollback_disc_sets(
+    transaction: &mut RenameTransaction,
+    journal_dir: &Path,
+    sets: &std::collections::BTreeSet<String>,
+) -> Result<RollbackOutcome, String> {
+    rollback_transaction_inner(
+        transaction,
+        journal_dir,
+        &AtomicBool::new(false),
+        None,
+        false,
+        Some(sets),
+    )
+}
+
+/// The disc sets this Undo must leave exactly where they are, with the reason:
+/// a moved file of the set changed since it was moved, or its old place is
+/// taken. Putting the rest back would split the set, so none of it moves.
+/// Linked sets are not held: their Undo only removes links.
+fn disc_sets_to_keep(
+    transaction: &RenameTransaction,
+) -> std::collections::BTreeMap<String, String> {
+    let mut held = std::collections::BTreeMap::new();
+    for entry in &transaction.entries {
+        // Applied, or an earlier Undo of it failed (it is still at its new
+        // place): either way the whole set must be able to go back.
+        if !matches!(
+            entry.state,
+            EntryState::Applied | EntryState::RollbackFailed
+        ) || !matches!(entry.operation, TransactionOperation::RenameMove)
+        {
+            continue;
+        }
+        let Some(lead) = crate::database::organisation_paths::disc_set_of(entry) else {
+            continue;
+        };
+        if held.contains_key(&lead) {
+            continue;
+        }
+        let unchanged = capture_identity(&entry.destination_path)
+            .is_ok_and(|current| identity_matches(&entry.identity, &current));
+        let free = matches!(
+            std::fs::symlink_metadata(&entry.source_path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        let why = if !unchanged {
+            format!(
+                "{} has changed since it was moved",
+                entry.destination_path.display()
+            )
+        } else if !free {
+            format!("something now occupies {}", entry.source_path.display())
+        } else {
+            continue;
+        };
+        held.insert(
+            lead.clone(),
+            format!(
+                "kept with its disc set ({lead}): {why}, so putting the other files back would split the set; nothing of this set was changed. Fix that file, then Undo again"
+            ),
+        );
+    }
+    held
+}
+
+/// Entry indices in reverse order, with the files of each disc set kept
+/// together at the place of the set's last file.
+/// A file of a moved disc set could not go back after others of its set
+/// did: those are moved forward again (an `Applying` checkpoint before each
+/// move, never overwriting, catalogue row moved with the file), so the set
+/// stays whole at its new place. Success is claimed only for what really
+/// moved; anything that did not is reported, and the set's location report
+/// (`split_disc_set_reports`) then says where every file is.
+#[allow(clippy::too_many_arguments)]
+fn roll_forward_set(
+    transaction: &mut RenameTransaction,
+    journal_dir: &Path,
+    fence: &mut Option<JournalFence>,
+    trusted: Option<&TrustedRoots>,
+    lead: &str,
+    back: Vec<usize>,
+    rolled_back: &mut Vec<std::path::PathBuf>,
+    reported: &mut std::collections::BTreeSet<usize>,
+    failed: &mut Vec<(std::path::PathBuf, String)>,
+) -> Result<(), String> {
+    let trusted_roots = trusted.cloned().unwrap_or_else(TrustedRoots::none);
+    let mut moved_forward = 0usize;
+    let mut not_forward = 0usize;
+    for member in back {
+        if !matches!(
+            transaction.entries[member].operation,
+            TransactionOperation::RenameMove
+        ) {
+            // A removed link is not recreated here; a later Undo removes the
+            // rest of the set's links (the original files never moved).
+            not_forward += 1;
+            continue;
+        }
+        let catalogue = match crate::database::organisation_paths::begin(
+            &transaction.entries[member],
+            false,
+            false,
+        ) {
+            Ok(catalogue) => catalogue,
+            Err(error) => {
+                not_forward += 1;
+                reported.insert(member);
+                failed.push((
+                    transaction.entries[member].source_path.clone(),
+                    format!("could not be moved forward to keep its disc set whole: {error}"),
+                ));
+                continue;
+            }
+        };
+        transaction.entries[member].state = EntryState::Applying;
+        persist(journal_dir, transaction, fence)?;
+        match super::executor::apply_mutation_in(&transaction.entries[member], &trusted_roots) {
+            Ok(()) => {
+                if let Some(catalogue) = catalogue {
+                    catalogue.commit()?;
+                }
+                transaction.entries[member].state = EntryState::Applied;
+                transaction.entries[member].rolled_back_at_unix = None;
+                let source = transaction.entries[member].source_path.clone();
+                rolled_back.retain(|path| *path != source);
+                moved_forward += 1;
+            }
+            Err((state, reason)) => {
+                not_forward += 1;
+                let reason =
+                    format!("could not be moved forward to keep its disc set whole: {reason}");
+                transaction.entries[member].state = state;
+                transaction.entries[member].failure_reason = Some(reason.clone());
+                reported.insert(member);
+                failed.push((transaction.entries[member].source_path.clone(), reason));
+            }
+        }
+        persist(journal_dir, transaction, fence)?;
+    }
+    if moved_forward > 0 && not_forward == 0 {
+        failed.push((
+            std::path::PathBuf::from(lead),
+            format!(
+                "{moved_forward} file(s) of the disc set of {lead} had already gone back; they were moved forward again so the set stays together at its new place. Fix the problem above, then Undo again"
+            ),
+        ));
+    } else if not_forward > 0 {
+        failed.push((
+            std::path::PathBuf::from(lead),
+            format!(
+                "the disc set of {lead} is not whole: {not_forward} file(s) or link(s) could not be kept with it; Undo again once the problem above is fixed"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn grouped_reverse_order(transaction: &RenameTransaction) -> Vec<usize> {
+    let mut order = Vec::with_capacity(transaction.entries.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for index in (0..transaction.entries.len()).rev() {
+        match crate::database::organisation_paths::disc_set_of(&transaction.entries[index]) {
+            None => order.push(index),
+            Some(lead) => {
+                if seen.insert(lead.clone()) {
+                    order.extend((0..transaction.entries.len()).rev().filter(|&other| {
+                        crate::database::organisation_paths::disc_set_of(
+                            &transaction.entries[other],
+                        )
+                        .as_deref()
+                            == Some(lead.as_str())
+                    }));
+                }
+            }
+        }
+    }
+    order
+}
+
+/// Each moved disc set whose files are not all in one place (all at their
+/// old or all at their new path), with where each file is: `Some(true)` new
+/// place, `Some(false)` old place, `None` neither. Read from the filesystem:
+/// a file is where the same file object (device and inode, which a rename
+/// keeps) is, whether or not its content has since changed.
+#[allow(clippy::type_complexity)]
+fn split_disc_sets_on_disk(
+    transaction: &RenameTransaction,
+) -> Vec<(String, Vec<(&super::model::TransactionEntry, Option<bool>)>)> {
+    let mut sets =
+        std::collections::BTreeMap::<String, Vec<&super::model::TransactionEntry>>::new();
+    for entry in &transaction.entries {
+        if matches!(entry.operation, TransactionOperation::RenameMove)
+            && let Some(lead) = crate::database::organisation_paths::disc_set_of(entry)
+        {
+            sets.entry(lead).or_default().push(entry);
+        }
+    }
+    let at = |path: &Path, entry: &super::model::TransactionEntry| {
+        capture_identity(path).is_ok_and(|current| {
+            #[cfg(unix)]
+            {
+                current.ino == entry.identity.ino && current.dev == entry.identity.dev
+            }
+            #[cfg(not(unix))]
+            {
+                identity_matches(&entry.identity, &current)
+            }
+        })
+    };
+    let mut split = Vec::new();
+    for (lead, members) in sets {
+        let places: Vec<(&super::model::TransactionEntry, Option<bool>)> = members
+            .iter()
+            .map(|entry| {
+                let place = if at(&entry.destination_path, entry) {
+                    Some(true)
+                } else if at(&entry.source_path, entry) {
+                    Some(false)
+                } else {
+                    None
+                };
+                (*entry, place)
+            })
+            .collect();
+        let all_new = places.iter().all(|(_, place)| *place == Some(true));
+        let all_old = places.iter().all(|(_, place)| *place == Some(false));
+        if !(all_new || all_old) {
+            split.push((lead, places));
+        }
+    }
+    split
+}
+
+/// Every path (old and new) of each disc set this transaction left not
+/// whole, so later operations can refuse them until the set is recovered.
+pub fn split_disc_set_paths(
+    transaction: &RenameTransaction,
+) -> Vec<(String, Vec<std::path::PathBuf>)> {
+    split_disc_sets_on_disk(transaction)
+        .into_iter()
+        .map(|(lead, places)| {
+            let paths = places
+                .iter()
+                .flat_map(|(entry, _)| [entry.source_path.clone(), entry.destination_path.clone()])
+                .collect();
+            (lead, paths)
+        })
+        .collect()
+}
+
+/// For each moved disc set whose files are not all in one place, a report
+/// naming where every file is now and how to finish. Read from the
+/// filesystem.
+pub fn split_disc_set_reports(transaction: &RenameTransaction) -> Vec<(String, String)> {
+    let mut reports = Vec::new();
+    for (lead, places) in split_disc_sets_on_disk(transaction) {
+        let lines: Vec<String> = places
+            .iter()
+            .map(|(entry, place)| match place {
+                Some(true) => format!("{} (new place)", entry.destination_path.display()),
+                Some(false) => format!("{} (old place)", entry.source_path.display()),
+                None => format!(
+                    "{}: not found at {} or {}",
+                    entry.original_basename,
+                    entry.source_path.display(),
+                    entry.destination_path.display()
+                ),
+            })
+            .collect();
+        reports.push((
+            lead.clone(),
+            format!(
+                "DISC SET NOT WHOLE: the files of {lead} are not together. Where they are now: {}. Until the set is whole, every preview blocks these files and Apply refuses them, and nothing is overwritten. To recover: fix the problem reported for the file above, then Undo again from History; Undo puts the moved files back and then the set is whole at its old place. If a file is reported as not found, restore it from a backup before Undo.",
+                lines.join("; ")
+            ),
+        ));
+    }
+    reports
+}
+
 fn rollback_transaction_inner(
     transaction: &mut RenameTransaction,
     journal_dir: &Path,
     cancel: &AtomicBool,
     trusted: Option<&TrustedRoots>,
     coordinated: bool,
+    only_sets: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<RollbackOutcome, String> {
+    let state_before = transaction.state;
     if !coordinated {
         crate::launch::es_de_publish::operation::require_independent(journal_dir, transaction)?;
     }
@@ -331,11 +617,54 @@ fn rollback_transaction_inner(
     let mut reported = std::collections::BTreeSet::new();
     let mut stopped_by_cancellation = false;
 
-    // Reverse order of successful operations only.
-    for index in (0..transaction.entries.len()).rev() {
-        if cancelled(cancel) {
+    let held = disc_sets_to_keep(transaction);
+    let in_scope = |entry: &super::model::TransactionEntry| {
+        only_sets.is_none_or(|sets| {
+            crate::database::organisation_paths::disc_set_of(entry)
+                .is_some_and(|lead| sets.contains(&lead))
+        })
+    };
+    // Reverse order of successful operations only; the files of one disc set
+    // are handled one after another, so a failure inside a set can be made
+    // good before anything else is touched.
+    let order = grouped_reverse_order(transaction);
+    let mut reversed_in_set = std::collections::BTreeMap::<String, Vec<usize>>::new();
+    // Sets where a file could not go back: the rest of the set is left
+    // where it is for this pass.
+    let mut stopped_sets = std::collections::BTreeSet::<String>::new();
+    for index in order {
+        // Cancel is honoured between games: a disc set already started in
+        // this pass (its files are handled one after another) is finished
+        // first, so a cancel never leaves it split.
+        if cancelled(cancel)
+            && !crate::database::organisation_paths::disc_set_of(&transaction.entries[index])
+                .is_some_and(|lead| {
+                    reversed_in_set.contains_key(&lead) && !stopped_sets.contains(&lead)
+                })
+        {
             stopped_by_cancellation = true;
             break;
+        }
+        if !in_scope(&transaction.entries[index]) {
+            continue;
+        }
+        if crate::database::organisation_paths::disc_set_of(&transaction.entries[index])
+            .is_some_and(|lead| stopped_sets.contains(&lead))
+        {
+            continue;
+        }
+        if let Some(reason) =
+            crate::database::organisation_paths::disc_set_of(&transaction.entries[index])
+                .and_then(|lead| held.get(&lead))
+        {
+            if transaction.entries[index].state == EntryState::Applied {
+                reported.insert(index);
+                failed.push((
+                    transaction.entries[index].source_path.clone(),
+                    reason.clone(),
+                ));
+            }
+            continue;
         }
         if !transaction.entries[index].is_eligible_for_rollback() {
             if !is_review_retry_candidate(&transaction.entries[index]) {
@@ -355,6 +684,26 @@ fn rollback_transaction_inner(
                             .unwrap_or("an earlier undo of this entry failed")
                     ),
                 ));
+                if let Some(lead) =
+                    crate::database::organisation_paths::disc_set_of(&transaction.entries[index])
+                {
+                    stopped_sets.insert(lead.clone());
+                    if only_sets.is_none()
+                        && let Some(back) = reversed_in_set.remove(&lead)
+                    {
+                        roll_forward_set(
+                            transaction,
+                            journal_dir,
+                            &mut fence,
+                            trusted,
+                            &lead,
+                            back,
+                            &mut rolled_back,
+                            &mut reported,
+                            &mut failed,
+                        )?;
+                    }
+                }
                 continue;
             }
         }
@@ -435,6 +784,11 @@ fn rollback_transaction_inner(
                     Some(crate::dat::sources::now_unix());
                 transaction.entries[index].failure_reason = None;
                 rolled_back.push(transaction.entries[index].source_path.clone());
+                if let Some(lead) =
+                    crate::database::organisation_paths::disc_set_of(&transaction.entries[index])
+                {
+                    reversed_in_set.entry(lead).or_default().push(index);
+                }
                 #[cfg(test)]
                 AFTER_REVERSAL.with(|hook| {
                     if let Some(hook) = hook.borrow_mut().as_mut() {
@@ -475,6 +829,32 @@ fn rollback_transaction_inner(
                 transaction.entries[index].failure_reason = Some(reason.clone());
                 reported.insert(index);
                 failed.push((transaction.entries[index].source_path.clone(), reason));
+                // A file of a moved disc set could not go back after others
+                // of its set did: those are moved forward again (journalled,
+                // never overwriting), so the set stays whole at its new place.
+                if let Some(lead) =
+                    crate::database::organisation_paths::disc_set_of(&transaction.entries[index])
+                {
+                    stopped_sets.insert(lead);
+                }
+                if only_sets.is_none()
+                    && let Some(lead) = crate::database::organisation_paths::disc_set_of(
+                        &transaction.entries[index],
+                    )
+                    && let Some(back) = reversed_in_set.remove(&lead)
+                {
+                    roll_forward_set(
+                        transaction,
+                        journal_dir,
+                        &mut fence,
+                        trusted,
+                        &lead,
+                        back,
+                        &mut rolled_back,
+                        &mut reported,
+                        &mut failed,
+                    )?;
+                }
                 // An in-flight or replacement failure stops the pass; any other
                 // refusal lets the independent remaining entries continue.
                 if !is_review_retry_candidate(&transaction.entries[index]) {
@@ -491,9 +871,16 @@ fn rollback_transaction_inner(
     // above). Cancellation leaves the untouched entries Applied rather than
     // marking them failed, so a later retry can finish them - and it must never
     // be read as a full rollback.
+    // A set still not whole after this pass is named with where each of its
+    // files actually is now (read from disk, not from the journal).
+    for (lead, report) in split_disc_set_reports(transaction) {
+        failed.push((std::path::PathBuf::from(lead), report));
+    }
+
     let remaining_incomplete: Vec<std::path::PathBuf> = transaction
         .entries
         .iter()
+        .filter(|entry| in_scope(entry))
         .filter(|entry| matches!(entry.state, EntryState::Applied | EntryState::RollingBack))
         .map(|entry| entry.source_path.clone())
         .collect();
@@ -529,7 +916,11 @@ fn rollback_transaction_inner(
 
     let fully_rolled_back = failed.is_empty() && remaining_incomplete.is_empty();
 
-    transaction.state = if fully_rolled_back {
+    transaction.state = if only_sets.is_some() && fully_rolled_back {
+        // Only the named sets were put back: the transaction keeps its state
+        // (the other entries are untouched and a normal Undo still covers them).
+        state_before
+    } else if fully_rolled_back {
         TransactionState::RolledBack
     } else {
         TransactionState::RollbackFailed
@@ -944,7 +1335,7 @@ pub(super) fn rollback_coordinated_for_test(
     cancel: &AtomicBool,
     trusted: &TrustedRoots,
 ) -> Result<RollbackOutcome, String> {
-    rollback_transaction_inner(transaction, journal_dir, cancel, Some(trusted), true)
+    rollback_transaction_inner(transaction, journal_dir, cancel, Some(trusted), true, None)
 }
 
 /// Whether a link's folders are unreachable right now (a folder or device is
@@ -1381,4 +1772,10 @@ thread_local! {
 
 fn cancelled(cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::Relaxed)
+}
+
+/// Test hook: `hook` runs with the number of files put back so far.
+#[cfg(test)]
+pub(crate) fn set_after_reversal_hook(hook: Option<Box<dyn FnMut(usize)>>) {
+    AFTER_REVERSAL.with(|slot| *slot.borrow_mut() = hook);
 }

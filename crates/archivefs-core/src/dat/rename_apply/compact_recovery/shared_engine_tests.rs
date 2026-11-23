@@ -300,7 +300,7 @@ fn shared_bare_legacy_undo_refuses_without_admitted_controller() {
 }
 
 #[test]
-fn shared_nonprivate_root_refused_before_ownership_or_artifacts() {
+fn group_writable_root_refused_before_ownership_or_artifacts() {
     use super::super::controller::{Controller, RuntimeSwitch};
     let home = tempfile::Builder::new()
         .prefix("emuwiz-r2-ineligible-")
@@ -313,11 +313,16 @@ fn shared_nonprivate_root_refused_before_ownership_or_artifacts() {
     private_dir(&auth);
     let config = admission::Configuration::create(&auth).unwrap();
     let tx = transaction(&root, 1);
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    // Owner decision 2026-11-23: a game folder others can read is fine, one
+    // others can change is not.
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o775)).unwrap();
     let err = Controller::enroll(&root, &tx, &config, RuntimeSwitch::enabled_for_evaluation())
         .err()
         .unwrap();
-    assert!(err.to_string().contains("private owned collection root"));
+    assert!(
+        err.to_string().contains("can be changed by other users"),
+        "{err}"
+    );
     assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
     let db = rusqlite::Connection::open(auth.join("owners.sqlite")).unwrap();
     let claims: i64 = db

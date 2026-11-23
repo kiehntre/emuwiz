@@ -440,7 +440,7 @@ fn target(c: &Configuration, next: &Path) -> io::Result<Option<(u64, u64)>> {
         next.parent()
             .ok_or_else(|| fail("missing successor parent"))?,
     )?;
-    if parent.metadata()?.dev() != directory(&c.root)?.metadata()?.dev() {
+    if parent.metadata()?.dev() != collection_directory(&c.root)?.metadata()?.dev() {
         return Err(fail("successor must share local eligible filesystem"));
     }
     if exists(next)? {
@@ -495,7 +495,7 @@ pub fn reuse(state: &Path, next: &Path, confirmation: &str, enable: bool) -> io:
     }
     guard.require_idle()?;
     contract::capability::probe(&c.root)?;
-    capacity(&directory(&c.root)?)?;
+    capacity(&collection_directory(&c.root)?)?;
     let bytes = serde_json::to_vec(&seal).map_err(fail)?;
     publish(
         &store.directory,

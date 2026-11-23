@@ -6,6 +6,7 @@ fn selection(count: usize) -> Selection {
         .map(|n| OrganisationPlanEntry {
             source_identity: None,
             catalogue_binding: None,
+            disc_set: None,
             source_path: PathBuf::from(format!("/collection/{n}.bin")),
             destination_path: PathBuf::from(format!("/collection/new{n}.bin")),
             platform: None,
@@ -129,6 +130,8 @@ fn unavailable_selection_rejects_inflight_enrollment_review_but_keeps_registrati
         next_state: "/private/state-1".into(),
         signer: "/private/operator".into(),
         status: serde_json::json!({"state":"awaiting_apply","ownership":"owned"}),
+        catalogue_notes: Vec::new(),
+        unresolved: Vec::new(),
     };
     tx.send(Ok(ResultValue::Review(
         Review {
@@ -242,4 +245,108 @@ fn unsupported_non_utf8_preview_never_panics_the_gui() {
     assert!(std::panic::catch_unwind(|| s.fingerprint()).is_ok());
     assert!(s.fingerprint().unwrap_err().contains("not UTF-8"));
     assert!(s.pairs().is_err());
+}
+
+#[test]
+fn a_shared_game_folder_refusal_says_how_to_fix_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+    let text = super::copy::explain_refusal(
+        "R2 refused: game folder can be changed by other users (group or other write permission)",
+        Some(t.path()),
+    );
+    assert!(text.contains("its permissions are 775"), "{text}");
+    assert!(text.contains("chmod g-w,o-w '"), "{text}");
+    assert!(text.contains("Standard Rename"), "{text}");
+    assert!(text.contains("Nothing was changed."), "{text}");
+}
+
+#[test]
+fn a_recovery_folder_refusal_never_claims_nothing_changed() {
+    let text = super::copy::explain_refusal(
+        "R2 refused: storage binding or ownership changed",
+        Some(std::path::Path::new("/games/nes")),
+    );
+    assert!(text.contains("Do not delete it"), "{text}");
+    assert!(!text.contains("Nothing was changed"), "{text}");
+}
+
+#[test]
+fn an_unknown_refusal_is_shown_unchanged() {
+    assert_eq!(super::copy::explain_refusal("odd", None), "odd");
+}
+
+// Owner option 1: the recovery workspace sits beside the library folder,
+// on the games' disk, outside every library folder.
+#[test]
+fn the_workspace_sits_beside_the_library_folder_and_never_inside_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let beside = std::fs::canonicalize(t.path()).unwrap().join("disk");
+    let library = beside.join("games");
+    let root = library.join("nes");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&beside, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ws = backend::workspace_for(&root, std::slice::from_ref(&library)).unwrap();
+    assert!(
+        ws.starts_with(beside.join(".emuwiz-protection")),
+        "{}",
+        ws.display()
+    );
+    assert!(!ws.starts_with(&library), "never scanned as games");
+    // A folder other users can change is refused with the fix, never changed.
+    std::fs::set_permissions(&beside, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let refused = backend::workspace_for(&root, std::slice::from_ref(&library)).unwrap_err();
+    assert!(
+        refused.contains("chmod go-w") && refused.contains("Nothing was changed"),
+        "{refused}"
+    );
+    assert_eq!(
+        std::fs::metadata(&beside).unwrap().permissions().mode() & 0o777,
+        0o775,
+        "EmuWiz never changes its permissions"
+    );
+    std::fs::set_permissions(&beside, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Beside a library folder that is itself inside another library folder.
+    let refused = backend::workspace_for(&root, &[library.clone(), beside.clone()]).unwrap_err();
+    assert!(refused.contains("inside a library folder"), "{refused}");
+    // A folder outside every library folder.
+    let elsewhere = t.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    assert!(backend::workspace_for(&elsewhere, &[library]).is_err());
+}
+
+#[test]
+fn blue_says_a_deleted_protected_game_may_not_free_its_space() {
+    let text = copy::DISK_SPACE;
+    assert!(text.contains("not freed until that retained link is safely released"));
+    assert!(text.contains("Undo releases it"));
+    assert!(text.contains("Never delete these recovery folders by hand"));
+}
+
+/// Owner 2026-11-23: Advanced Protection is deferred. New operations are not
+/// offered, the choice snaps back to Standard Rename, and an operation it
+/// already started (Standard not allowed for those files) still opens.
+#[test]
+fn advanced_protection_is_deferred_but_started_operations_stay_reachable() {
+    const { assert!(!super::OFFERED_IN_THIS_RELEASE) };
+    assert!(!super::offered(true));
+    assert!(super::offered(false));
+    let ctx = egui::Context::default();
+    let mut selected = true;
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            super::choice(ui, &mut selected, false, true);
+        });
+    });
+    assert!(!selected, "Standard Rename is used for new operations");
+    let mut started = true;
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            super::choice(ui, &mut started, false, false);
+        });
+    });
+    assert!(started, "an enrolled operation keeps its own panel");
+    assert!(copy::DEFERRED.contains("stays in History"));
 }

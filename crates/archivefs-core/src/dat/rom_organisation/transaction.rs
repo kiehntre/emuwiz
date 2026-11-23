@@ -149,6 +149,8 @@ pub fn build_organisation_transaction(
             plan.generation
         ));
     }
+    // A disc set moves whole or not at all: refused before anything else.
+    super::disc_sets::refuse_partial_disc_sets(plan, approved_sources)?;
     let mut entries = Vec::new();
     for entry in plan
         .entries
@@ -210,16 +212,32 @@ pub fn build_organisation_transaction(
             failure_reason: None,
             applied_at_unix: None,
             rolled_back_at_unix: None,
-            unknown: entry
-                .catalogue_binding
-                .as_ref()
-                .map(|binding| {
+            unknown: with_disc_set(entry, match &entry.catalogue_binding {
+                Some(binding) => std::collections::BTreeMap::from([(
+                    "organisation_catalogue_v1".into(),
+                    binding.clone(),
+                )]),
+                // A disc-set file the library has no row for (a track, a
+                // disc of a playlist) moves with its set and has no
+                // catalogue path to change; binding refuses it if a row
+                // appears at either path.
+                None if entry.disc_set.is_some() => std::collections::BTreeMap::from([(
+                    crate::database::organisation_paths::COMPANION_KEY.into(),
+                    serde_json::json!({"lead": entry.disc_set.as_ref().map(|s| s.to_string_lossy())}),
+                )]),
+                // An existing link normally has no library row of its own
+                // (the game's row is its target, which never moves): it
+                // moves with no catalogue path to change. Binding still binds
+                // a link that does have a row, and Apply refuses an
+                // uncatalogued move once a row exists at either path.
+                None if plan.mode == OrganisationMode::OrganiseSymlinkOnly => {
                     std::collections::BTreeMap::from([(
-                        "organisation_catalogue_v1".into(),
-                        binding.clone(),
+                        crate::database::organisation_paths::UNCATALOGUED_KEY.into(),
+                        serde_json::json!(true),
                     )])
-                })
-                .unwrap_or_default(),
+                }
+                None => Default::default(),
+            }),
         });
     }
     if entries.is_empty() {
@@ -273,6 +291,8 @@ pub fn prepare_organisation_catalogue_with_platforms(
     database: &crate::Database,
     corrections: &std::collections::BTreeMap<std::path::PathBuf, PlatformCorrection>,
 ) -> Result<(), String> {
+    // Rows blocked after planning (guard, name rules) block their whole set.
+    super::disc_sets::hold_disc_sets_together(&mut plan.entries);
     let approved = plan
         .suggested()
         .map(|e| e.source_path.to_string_lossy().into_owned())
@@ -290,12 +310,16 @@ pub fn prepare_organisation_catalogue_with_platforms(
         }
     }
     crate::database::organisation_paths::bind(&mut transaction, database)?;
+    // The first transaction entry for each source, as `iter().find` gave.
+    let mut bound_by_source: std::collections::HashMap<&Path, &TransactionEntry> =
+        std::collections::HashMap::with_capacity(transaction.entries.len());
+    for bound in &transaction.entries {
+        bound_by_source
+            .entry(bound.source_path.as_path())
+            .or_insert(bound);
+    }
     for entry in &mut plan.entries {
-        if let Some(bound) = transaction
-            .entries
-            .iter()
-            .find(|e| e.source_path == entry.source_path)
-        {
+        if let Some(bound) = bound_by_source.get(entry.source_path.as_path()) {
             entry.catalogue_binding = bound.unknown.get("organisation_catalogue_v1").cloned();
         }
     }
@@ -323,6 +347,10 @@ pub fn apply_organisation_transaction(
     }
     crate::database::organisation_paths::validate_bound(transaction, database)
         .map_err(ApplyError::Journal)?;
+    // Disc-set checks still current at their files right before the move
+    // (metadata only); only these may follow a complete Apply.
+    let disc_checks =
+        crate::database::organisation_paths::current_disc_set_checks(transaction, false);
     // A game with a prepared copy (see `crate::recovery`) keeps it, and its
     // remembered launch choice, under its new name. Captured before, carried
     // after, only for entries that were really applied; never affects the
@@ -333,7 +361,7 @@ pub fn apply_organisation_transaction(
             entry.destination_path.as_path(),
         )
     }));
-    let result = apply_filesystem_organisation_transaction(
+    let outcome = apply_filesystem_organisation_transaction(
         transaction,
         approved_sources,
         generation,
@@ -342,17 +370,63 @@ pub fn apply_organisation_transaction(
         cancel,
         mode,
         master_root,
-    );
-    if let Ok(outcome) = &result {
-        crate::recovery::moves::after(prepared, |old, new| {
-            outcome.transaction.entries.iter().any(|entry| {
-                entry.state == crate::dat::rename_apply::model::EntryState::Applied
-                    && entry.source_path == old
-                    && entry.destination_path == new
-            })
-        });
+    )?;
+    // An Apply that stopped part-way through a disc set (a file changed or a
+    // destination appeared between the checks and the move) puts that set
+    // back whole at once, with Undo's own checks; other games are untouched.
+    let split = split_disc_sets(transaction);
+    let outcome = if split.is_empty() {
+        outcome
+    } else {
+        let repair = crate::dat::rename_apply::rollback_disc_sets(transaction, journal_dir, &split)
+            .map_err(ApplyError::Journal)?;
+        *transaction = repair.transaction;
+        // The repair could not put a set back whole: say so, with where its
+        // files are (never reported as a finished Apply).
+        let reports = crate::dat::rename_apply::split_disc_set_reports(transaction);
+        if !reports.is_empty() {
+            // Games that did move keep their prepared copies.
+            let moved = transaction.clone();
+            crate::recovery::moves::after(prepared, |old, new| {
+                moved.entries.iter().any(|entry| {
+                    entry.state == crate::dat::rename_apply::model::EntryState::Applied
+                        && entry.source_path == old
+                        && entry.destination_path == new
+                })
+            });
+            return Err(ApplyError::Journal(
+                reports
+                    .into_iter()
+                    .map(|(_, report)| report)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ));
+        }
+        crate::dat::rename_apply::ApplyOutcome {
+            summary: crate::dat::rename_apply::TransactionSummary::from_transaction(transaction),
+            transaction: transaction.clone(),
+        }
+    };
+    crate::recovery::moves::after(prepared, |old, new| {
+        outcome.transaction.entries.iter().any(|entry| {
+            entry.state == crate::dat::rename_apply::model::EntryState::Applied
+                && entry.source_path == old
+                && entry.destination_path == new
+        })
+    });
+    let complete = transaction.state == TransactionState::Applied
+        && transaction
+            .entries
+            .iter()
+            .all(|entry| entry.state == EntryState::Applied);
+    if complete {
+        crate::database::organisation_paths::carry_disc_set_checks(
+            transaction,
+            &disc_checks,
+            false,
+        );
     }
-    result
+    Ok(outcome)
 }
 
 /// Directories the organiser may create and own: one platform folder
@@ -424,14 +498,117 @@ pub fn revalidate_organisation_plan(
     database_path: &Path,
     canonical_name_for: &dyn Fn(&Path) -> Option<String>,
 ) -> Result<(), String> {
+    use super::plan::{OrganisationCandidate, OrganisationPlanRequest, plan_each_candidate_alone};
+
+    let database = crate::Database::open_read_only(database_path)
+        .map_err(|error| format!("could not open the platform identity database: {error}"))?;
+    // Existing links: the approved folders are read again from the library,
+    // and each link's game file is checked against them again below.
+    let link_roots = if plan.mode == super::model::OrganisationMode::OrganiseSymlinkOnly {
+        Some(
+            super::link_target::approved_library_roots(&database).map_err(|error| {
+                format!("could not read the library's approved folders: {error}")
+            })?,
+        )
+    } else {
+        None
+    };
+    // Read now, for this check only: every archive id in one pass (the path
+    // column has no index, so a lookup per entry scanned the whole table),
+    // and each destination folder listed once while every entry is still
+    // planned on its own, exactly as before. Disc sets are re-planned as a
+    // whole, as before. Nothing is reused from the preview.
+    let resolutions = super::rename_guard::LiveResolutions::read(&database);
+    let single: Vec<_> = plan.suggested().filter(|e| e.disc_set.is_none()).collect();
+    let candidates: Vec<OrganisationCandidate> = single
+        .iter()
+        .map(|entry| OrganisationCandidate {
+            source_path: entry.source_path.clone(),
+            resolution: resolutions.for_path(
+                &super::link_target::identity_path(plan.mode, &entry.source_path),
+                plan.generation,
+            ),
+            canonical_name: canonical_name_for(&entry.source_path),
+            content_classification: entry.content_classification.clone(),
+            original_metadata: entry.original_metadata.clone(),
+        })
+        .collect();
+    let mut re_entries = plan_each_candidate_alone(&OrganisationPlanRequest {
+        master_root: &plan.master_root,
+        mode: plan.mode,
+        content_policy: plan.content_policy,
+        candidates: &candidates,
+        generation: plan.generation,
+        unknown_folder: None,
+        link_target_roots: link_roots.as_deref(),
+    })
+    .into_iter();
+    // Same order, first failure and message as the one-entry check.
+    let mut disc_sets_checked = BTreeSet::new();
+    for entry in plan.suggested() {
+        if let Some(sheet) = &entry.disc_set {
+            if disc_sets_checked.insert(sheet.clone()) {
+                revalidate_disc_set(plan, sheet, &database)?;
+            }
+            continue;
+        }
+        let re_entry = re_entries
+            .next()
+            .ok_or("the organisation could not be checked again")?;
+        if re_entry.status != super::model::OrganisationStatus::Suggested
+            || re_entry.destination_path != entry.destination_path
+            || re_entry.platform.as_deref() != entry.platform.as_deref()
+            || re_entry.layout_folder != entry.layout_folder
+        {
+            return Err(format!(
+                "the platform identity for {} changed since the plan was generated; regenerate \
+                 the plan",
+                entry.source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The original one-entry-at-a-time revalidation, kept to prove the batched
+/// version above reaches the same decision with the same message.
+#[cfg(test)]
+pub(crate) fn revalidate_organisation_plan_per_entry(
+    plan: &OrganisationPlan,
+    database_path: &Path,
+    canonical_name_for: &dyn Fn(&Path) -> Option<String>,
+) -> Result<(), String> {
     use super::plan::{OrganisationCandidate, OrganisationPlanRequest, build_organisation_plan};
 
     let database = crate::Database::open_read_only(database_path)
         .map_err(|error| format!("could not open the platform identity database: {error}"))?;
+    // Existing links: the approved folders are read again from the library,
+    // and each link's game file is checked against them again below.
+    let link_roots = if plan.mode == super::model::OrganisationMode::OrganiseSymlinkOnly {
+        Some(
+            super::link_target::approved_library_roots(&database).map_err(|error| {
+                format!("could not read the library's approved folders: {error}")
+            })?,
+        )
+    } else {
+        None
+    };
+    let mut disc_sets_checked = BTreeSet::new();
     for entry in plan.suggested() {
+        // A disc set is planned as a whole, so it is re-planned as a whole.
+        if let Some(sheet) = &entry.disc_set {
+            if disc_sets_checked.insert(sheet.clone()) {
+                revalidate_disc_set(plan, sheet, &database)?;
+            }
+            continue;
+        }
         let candidate = OrganisationCandidate {
             source_path: entry.source_path.clone(),
-            resolution: live_resolution_for(&database, &entry.source_path, plan.generation),
+            resolution: live_resolution_for(
+                &database,
+                &super::link_target::identity_path(plan.mode, &entry.source_path),
+                plan.generation,
+            ),
             canonical_name: canonical_name_for(&entry.source_path),
             content_classification: entry.content_classification.clone(),
             original_metadata: entry.original_metadata.clone(),
@@ -443,6 +620,7 @@ pub fn revalidate_organisation_plan(
             candidates: std::slice::from_ref(&candidate),
             generation: plan.generation,
             unknown_folder: None,
+            link_target_roots: link_roots.as_deref(),
         });
         let re_entry = &re_plan.entries[0];
         if re_entry.status != super::model::OrganisationStatus::Suggested
@@ -454,6 +632,67 @@ pub fn revalidate_organisation_plan(
                 "the platform identity for {} changed since the plan was generated; regenerate \
                  the plan",
                 entry.source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`revalidate_organisation_plan`] for one disc set: every file of the set
+/// is planned again together from live platform evidence and must get
+/// exactly the reviewed folder, platform and set.
+fn revalidate_disc_set(
+    plan: &OrganisationPlan,
+    sheet: &Path,
+    database: &crate::Database,
+) -> Result<(), String> {
+    use super::plan::{
+        OrganisationCandidate, OrganisationPlanRequest, build_organisation_plan_reporting,
+    };
+    let members: Vec<_> = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.disc_set.as_deref() == Some(sheet))
+        .collect();
+    let candidates: Vec<OrganisationCandidate> = members
+        .iter()
+        .map(|entry| OrganisationCandidate {
+            source_path: entry.source_path.clone(),
+            resolution: live_resolution_for(database, &entry.source_path, plan.generation),
+            canonical_name: None,
+            content_classification: entry.content_classification.clone(),
+            original_metadata: entry.original_metadata.clone(),
+        })
+        .collect();
+    let mut ignore = |_: crate::job_progress::JobProgress| {};
+    let mut reporter = crate::job_progress::ProgressReporter::new(&mut ignore);
+    let re_plan = build_organisation_plan_reporting(
+        &OrganisationPlanRequest {
+            master_root: &plan.master_root,
+            mode: plan.mode,
+            content_policy: plan.content_policy,
+            candidates: &candidates,
+            generation: plan.generation,
+            unknown_folder: None,
+            link_target_roots: None,
+        },
+        None,
+        &mut reporter,
+    )
+    .ok_or("the disc set could not be checked again")?;
+    for entry in members {
+        let same = re_plan.entries.iter().any(|re_entry| {
+            re_entry.source_path == entry.source_path
+                && re_entry.status == entry.status
+                && re_entry.destination_path == entry.destination_path
+                && re_entry.platform == entry.platform
+                && re_entry.layout_folder == entry.layout_folder
+                && re_entry.disc_set == entry.disc_set
+        });
+        if !same {
+            return Err(format!(
+                "the disc set of {} changed since the plan was generated (its files, sheets or platform); regenerate the plan",
+                sheet.display()
             ));
         }
     }
@@ -651,6 +890,8 @@ pub struct OrganisationRollbackOutcome {
     /// Directories this transaction created that remain (not empty, or not
     /// removable). Never a pre-existing user directory.
     pub directories_remaining: Vec<std::path::PathBuf>,
+    /// Hidden link tombstones retired after a complete Undo, and any kept.
+    pub tombstones: super::tombstones::TombstoneCleanup,
 }
 
 /// Rolls back an organisation transaction: the entry moves via the shared
@@ -675,6 +916,8 @@ pub fn rollback_organisation_transaction(
         &transaction.transaction_id,
     );
     refuse_to_separate_a_game_from_its_saves(transaction)?;
+    let disc_checks =
+        crate::database::organisation_paths::current_disc_set_checks(transaction, true);
     // Undo puts a prepared copy's link (and remembered launch choice) back
     // with the file, exactly as apply carried it forward.
     let prepared = crate::recovery::moves::before(
@@ -697,6 +940,22 @@ pub fn rollback_organisation_transaction(
                 && entry.source_path == new
         })
     });
+    // Only after the engine and the journal agree the Undo is complete.
+    let fully = matches!(
+        rollback.result,
+        crate::dat::rename_apply::RollbackResult::FullyRolledBack
+    ) && transaction.is_fully_rolled_back();
+    let tombstones = if matches!(
+        rollback.result,
+        crate::dat::rename_apply::RollbackResult::FullyRolledBack
+    ) {
+        super::tombstones::retire_link_tombstones(transaction)
+    } else {
+        Default::default()
+    };
+    if fully {
+        crate::database::organisation_paths::carry_disc_set_checks(transaction, &disc_checks, true);
+    }
 
     let mut directories_removed = Vec::new();
     let mut directories_remaining = Vec::new();
@@ -730,7 +989,40 @@ pub fn rollback_organisation_transaction(
         rollback,
         directories_removed,
         directories_remaining,
+        tombstones,
     })
+}
+
+/// Disc sets an Apply left part-way: some files moved, others did not.
+fn split_disc_sets(transaction: &RenameTransaction) -> BTreeSet<String> {
+    use crate::dat::rename_apply::model::EntryState;
+    let mut moved = BTreeSet::new();
+    let mut not_moved = BTreeSet::new();
+    for entry in &transaction.entries {
+        if let Some(lead) = crate::database::organisation_paths::disc_set_of(entry) {
+            if entry.state == EntryState::Applied {
+                moved.insert(lead);
+            } else {
+                not_moved.insert(lead);
+            }
+        }
+    }
+    moved.intersection(&not_moved).cloned().collect()
+}
+
+/// Adds the disc-set marker to an entry's journal fields when it is part of
+/// a set (see [`crate::database::organisation_paths::DISC_SET_KEY`]).
+fn with_disc_set(
+    entry: &super::model::OrganisationPlanEntry,
+    mut unknown: std::collections::BTreeMap<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    if let Some(lead) = &entry.disc_set {
+        unknown.insert(
+            crate::database::organisation_paths::DISC_SET_KEY.into(),
+            serde_json::json!({"lead": lead.to_string_lossy()}),
+        );
+    }
+    unknown
 }
 
 /// A game renamed with its RetroArch saves is undone as one group. The shared

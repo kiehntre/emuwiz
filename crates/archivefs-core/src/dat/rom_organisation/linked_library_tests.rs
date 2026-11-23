@@ -64,6 +64,7 @@ fn plan_for(library_root: &Path, candidates: &[OrganisationCandidate]) -> Organi
         candidates,
         generation: 1,
         unknown_folder: None,
+        link_target_roots: None,
     })
 }
 
@@ -248,6 +249,7 @@ fn existing_move_mode_still_emits_rename_move_operations() {
         candidates: std::slice::from_ref(&candidate),
         generation: 1,
         unknown_folder: None,
+        link_target_roots: None,
     });
     let approved = approved_of(&[&source]);
     let tx = build_tx(&plan, &approved);
@@ -704,4 +706,149 @@ fn atari_2600_source_is_linked_into_a_separate_library_root_end_to_end() {
     assert_eq!(std::fs::read(&source).unwrap(), contents);
     let final_metadata = std::fs::symlink_metadata(&source).unwrap();
     assert!(final_metadata.is_file() && !final_metadata.file_type().is_symlink());
+}
+
+// ---------------------------------------------------------------------------
+// Owner item 4 (2026-11-23): no hidden leftovers after a complete Undo
+// ---------------------------------------------------------------------------
+
+fn undo_all(
+    fx: &Fixture,
+    plan: &OrganisationPlan,
+) -> (RenameTransaction, OrganisationRollbackOutcome) {
+    let (mut transactions, problems) =
+        crate::dat::rename_apply::journal::list_journals(&fx.journal_dir);
+    assert!(problems.is_empty(), "{problems:?}");
+    let mut transaction = transactions.remove(0);
+    let result = rollback_organisation_transaction(
+        &mut transaction,
+        &fx.journal_dir,
+        &no_cancel(),
+        &plan.master_root,
+    )
+    .unwrap();
+    (transaction, result)
+}
+
+fn names_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_complete_undo_leaves_no_hidden_link_and_removes_its_empty_folder() {
+    let fx = Fixture::new("no-leftovers");
+    let source = write_source(&fx.source_tree, "Combat.bin", b"combat");
+    let plan = plan_for(
+        &fx.library_root,
+        &[candidate(
+            source.clone(),
+            Some("Combat (USA).bin".to_string()),
+        )],
+    );
+    apply_plan(&plan, &approved_of(&[&source]), &fx.journal_dir);
+    let (_, result) = undo_all(&fx, &plan);
+    assert_eq!(
+        result.tombstones.removed.len(),
+        1,
+        "{:?}",
+        result.tombstones
+    );
+    assert!(result.tombstones.kept.is_empty(), "{:?}", result.tombstones);
+    assert!(!fx.library_root.join("Atari 2600").exists());
+    assert_eq!(result.directories_removed.len(), 1);
+    assert_eq!(std::fs::read(&source).unwrap(), b"combat");
+}
+
+#[test]
+fn a_complete_undo_in_an_existing_folder_removes_only_its_own_link() {
+    let fx = Fixture::new("own-only");
+    let source = write_source(&fx.source_tree, "Combat.bin", b"combat");
+    std::fs::create_dir_all(fx.library_root.join("Atari 2600")).unwrap();
+    let other = write_source(&fx.source_tree, "Pitfall.bin", b"pitfall");
+    let other_link = fx.library_root.join("Atari 2600").join("Pitfall.bin");
+    std::os::unix::fs::symlink(&other, &other_link).unwrap();
+    let unrelated = fx.library_root.join("Atari 2600").join("notes.txt");
+    std::fs::write(&unrelated, b"mine").unwrap();
+    let plan = plan_for(
+        &fx.library_root,
+        &[
+            candidate(source.clone(), Some("Combat (USA).bin".to_string())),
+            candidate(other.clone(), Some("Pitfall.bin".to_string())),
+        ],
+    );
+    apply_plan(&plan, &approved_of(&[&source]), &fx.journal_dir);
+    let (_, result) = undo_all(&fx, &plan);
+    assert_eq!(result.tombstones.removed.len(), 1);
+    assert_eq!(
+        names_in(&fx.library_root.join("Atari 2600")),
+        vec!["Pitfall.bin".to_string(), "notes.txt".to_string()]
+    );
+    assert_eq!(std::fs::read_link(&other_link).unwrap(), other);
+    assert_eq!(std::fs::read(&unrelated).unwrap(), b"mine");
+}
+
+#[test]
+fn an_object_swapped_in_at_the_tombstone_name_is_never_removed() {
+    let fx = Fixture::new("swapped-tombstone");
+    let source = write_source(&fx.source_tree, "Combat.bin", b"combat");
+    std::fs::create_dir_all(fx.library_root.join("Atari 2600")).unwrap();
+    let plan = plan_for(
+        &fx.library_root,
+        &[candidate(
+            source.clone(),
+            Some("Combat (USA).bin".to_string()),
+        )],
+    );
+    apply_plan(&plan, &approved_of(&[&source]), &fx.journal_dir);
+    let (transaction, result) = undo_all(&fx, &plan);
+    let recorded = result.tombstones.removed[0].clone();
+    // A same-target link (different object) and then a regular file appear
+    // under the recorded name; a second retirement pass must keep both.
+    std::os::unix::fs::symlink(&source, &recorded).unwrap();
+    let again = super::tombstones::retire_link_tombstones(&transaction);
+    assert!(again.removed.is_empty());
+    assert_eq!(again.kept.len(), 1, "{again:?}");
+    assert_eq!(std::fs::read_link(&recorded).unwrap(), source);
+    std::fs::remove_file(&recorded).unwrap();
+    std::fs::write(&recorded, b"someone's file").unwrap();
+    let again = super::tombstones::retire_link_tombstones(&transaction);
+    assert_eq!(again.kept.len(), 1, "{again:?}");
+    assert_eq!(std::fs::read(&recorded).unwrap(), b"someone's file");
+    // No quarantine folder is left behind by a refused retirement.
+    assert!(
+        names_in(&fx.library_root.join("Atari 2600"))
+            .iter()
+            .all(|n| !n.starts_with(".emuwiz-undo-q-")),
+        "{:?}",
+        names_in(&fx.library_root.join("Atari 2600"))
+    );
+}
+
+#[test]
+fn a_partial_undo_retires_nothing() {
+    let fx = Fixture::new("partial-keeps");
+    let source = write_source(&fx.source_tree, "Combat.bin", b"combat");
+    write_source(&fx.source_tree, "other.bin", b"other");
+    let plan = plan_for(
+        &fx.library_root,
+        &[candidate(
+            source.clone(),
+            Some("Combat (USA).bin".to_string()),
+        )],
+    );
+    apply_plan(&plan, &approved_of(&[&source]), &fx.journal_dir);
+    let destination = fx.library_root.join("Atari 2600").join("Combat (USA).bin");
+    std::fs::remove_file(&destination).unwrap();
+    std::os::unix::fs::symlink(fx.source_tree.join("other.bin"), &destination).unwrap();
+    let (_, result) = undo_all(&fx, &plan);
+    assert!(result.tombstones.removed.is_empty() && result.tombstones.kept.is_empty());
+    assert_eq!(
+        std::fs::read_link(&destination).unwrap(),
+        fx.source_tree.join("other.bin")
+    );
 }

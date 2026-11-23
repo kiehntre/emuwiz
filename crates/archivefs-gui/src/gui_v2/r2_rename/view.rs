@@ -343,9 +343,37 @@ pub(super) fn show(
             }
             ui.collapsing("Recovery evidence location",|ui|{ui.label(info.workspace.display().to_string());ui.label("Keep this directory and all holding files. Do not restore older copies over live state.");});
         }
+        if let Some(info) = s.info.clone() {
+            for note in &info.catalogue_notes {
+                ui.label(note);
+            }
+            if !info.unresolved.is_empty() {
+                let detail = info
+                    .unresolved
+                    .iter()
+                    .map(|u| format!("{}: {}", u.folder.display(), u.reasons.join(" ")))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                w::banner(
+                    ui,
+                    "Library scans are paused to protect verified games",
+                    &format!("An Advanced Protection rename moved files whose library entries could not be updated, because EmuWiz cannot prove they are the files it moved:\n{detail}\nIf you restore the files, open this history again and the update finishes. Otherwise let the library rescan them: their old entries are marked missing (their checks are kept there) and the files are added again, unverified until Check Games checks them. The records are kept."),
+                    w::StatusTone::Blocked,
+                );
+                ui.add_enabled(!busy, egui::Checkbox::new(&mut s.release_confirm, "I reviewed these files. Let the library rescan them."));
+                if button(ui, "Let the library rescan these files", !busy && s.release_confirm) {
+                    let h = helper.clone();
+                    s.start(ui.ctx(), move || Ok(ResultValue::Info(backend::release_for_rescan(&h, &info)?)));
+                }
+            }
+        }
         if let Some(v) = &s.result {
+            for note in v["catalogue"].as_array().into_iter().flatten() {
+                ui.label(note.as_str().unwrap_or_default());
+            }
             if v["completed"] == true {
                 ui.label("Operation completed. The current state above records whether ownership is released.");
+                ui.label(copy::DISK_SPACE);
             } else if v["copied"] == true {
                 ui.label(format!(
                     "Retrieved verified copy: {}",

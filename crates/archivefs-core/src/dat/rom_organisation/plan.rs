@@ -55,6 +55,10 @@ pub struct OrganisationPlanRequest<'a> {
     /// `Unnamed/Unknown`). `None` keeps every Unknown game Blocked. Platform
     /// conflicts are always Blocked.
     pub unknown_folder: Option<&'a Path>,
+    /// Reorganise existing links only: the library's approved folders (its
+    /// enabled, registered source folders) that a link's game file must be
+    /// inside. `None` refuses every existing link (fail closed).
+    pub link_target_roots: Option<&'a [PathBuf]>,
 }
 
 /// The folder under `master_root` that holds `platform_id` games: an existing
@@ -87,24 +91,61 @@ pub fn layout_folder_in(master_root: &Path, platform_id: &str) -> Result<String,
     }
 }
 
-/// Builds a read-only organisation plan. Never mutates the filesystem.
+/// The reason an entry is blocked only because its platform is unknown. A
+/// disc-set file with this reason takes its set's platform.
+pub(crate) const NO_PLATFORM_REASON: &str = "no platform identity could be resolved for this game";
+
+/// Builds a read-only organisation plan, one entry per candidate on its own.
+/// Never mutates the filesystem. Disc sets are not grouped here: this is the
+/// planner for single-game rechecks and for workflows that move a set with
+/// its lead themselves. The bulk Organise preview uses
+/// [`build_organisation_plan_reporting`].
 pub fn build_organisation_plan(request: &OrganisationPlanRequest<'_>) -> OrganisationPlan {
     let mut ignore = |_: crate::job_progress::JobProgress| {};
     let mut reporter = crate::job_progress::ProgressReporter::new(&mut ignore);
-    build_organisation_plan_reporting(request, None, &mut reporter)
+    plan_reporting(request, None, &mut reporter, false)
         .expect("a plan without a cancel flag is never cancelled")
 }
 
-/// [`build_organisation_plan`] with real checkpoints and cooperative
-/// cancellation between candidates. Planning only reads (it stats sources and
-/// computes destinations), so `None` - cancelled - means nothing on disk was
-/// touched and there is no half-built plan to reason about.
+/// The bulk Organise preview: [`build_organisation_plan`] with real
+/// checkpoints and cooperative cancellation between candidates, and, in Move
+/// mode, disc sets moved as a whole ([`super::disc_sets`]). Planning only
+/// reads (it stats sources, reads sheets and computes destinations), so
+/// `None` - cancelled - means nothing on disk was touched and there is no
+/// half-built plan to reason about.
 pub fn build_organisation_plan_reporting(
     request: &OrganisationPlanRequest<'_>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     progress: &mut crate::job_progress::ProgressReporter<'_>,
 ) -> Option<OrganisationPlan> {
+    plan_reporting(request, cancel, progress, true)
+}
+
+fn plan_reporting(
+    request: &OrganisationPlanRequest<'_>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: &mut crate::job_progress::ProgressReporter<'_>,
+    group_disc_sets: bool,
+) -> Option<OrganisationPlan> {
     let stop = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+    // A disc set keeps every name (its sheets name the files), so its files
+    // are planned under their own names. A linked library links the whole
+    // set into one folder the same way (owner 2026-11-23), so each sheet's
+    // plain-name references resolve beside its links.
+    let sets = if group_disc_sets
+        && matches!(
+            request.mode,
+            OrganisationMode::MoveRealFile | OrganisationMode::BuildLinkedLibrary
+        ) {
+        let files: Vec<&Path> = request
+            .candidates
+            .iter()
+            .map(|candidate| candidate.source_path.as_path())
+            .collect();
+        super::disc_sets::detect(&files)
+    } else {
+        Default::default()
+    };
     progress.phase(
         "Analysing files",
         "files",
@@ -116,14 +157,24 @@ pub fn build_organisation_plan_reporting(
             return None;
         }
         progress.tick(position as u64);
-        entries.push(plan_entry(request, candidate));
+        entries.push(if sets.contains(&candidate.source_path) {
+            let own_name = OrganisationCandidate {
+                canonical_name: None,
+                ..candidate.clone()
+            };
+            plan_entry(request, &own_name)
+        } else {
+            plan_entry(request, candidate)
+        });
     }
     progress.tick(request.candidates.len() as u64);
     if stop() {
         return None;
     }
+    super::disc_sets::settle(&sets, request.master_root, &mut entries);
     progress.phase("Checking destination conflicts", "files", None);
     detect_collisions(request.master_root, &mut entries);
+    super::disc_sets::hold_disc_sets_together(&mut entries);
     if stop() {
         return None;
     }
@@ -168,6 +219,7 @@ fn plan_entry(
     let blocked = |reason: &str| OrganisationPlanEntry {
         source_identity: source_identity.clone(),
         catalogue_binding: None,
+        disc_set: None,
         source_path: candidate.source_path.clone(),
         destination_path: PathBuf::new(),
         platform: None,
@@ -186,6 +238,7 @@ fn plan_entry(
         OrganisationPlanEntry {
             source_identity: source_identity.clone(),
             catalogue_binding: None,
+            disc_set: None,
             source_path: candidate.source_path.clone(),
             destination_path: PathBuf::new(),
             platform,
@@ -247,6 +300,14 @@ fn plan_entry(
                      only reorganises shortcuts that already exist",
                 );
             }
+            // Owner policy 2026-11-22: the link is named from its target
+            // game file; a broken, ambiguous or escaping link is refused.
+            if let Err(reason) = super::link_target::existing_link_target(
+                &candidate.source_path,
+                request.link_target_roots,
+            ) {
+                return blocked(&reason);
+            }
         }
         OrganisationMode::BuildLinkedLibrary => {
             // A linked library links regular files only: the original stays
@@ -286,7 +347,7 @@ fn plan_entry(
                     &source_basename,
                     source_identity,
                 ),
-                _ => blocked("no platform identity could be resolved for this game"),
+                _ => blocked(NO_PLATFORM_REASON),
             };
         }
         PlatformIdentityResolution::Conflict { .. } => {
@@ -333,12 +394,20 @@ fn plan_entry(
     };
 
     // Canonical filename: reuse the rename planner's derivation, never a
-    // second filename engine. Extension mismatches are Unsupported.
-    let rom_name = candidate
-        .canonical_name
-        .as_deref()
-        .unwrap_or(&source_basename);
-    let proposed_basename = match derive_proposed_basename(rom_name, &source_basename) {
+    // second filename engine. Extension mismatches are Unsupported. An
+    // existing link's own name is its target game file's name, never the
+    // link's current name (checked above).
+    let own_name = match mode {
+        OrganisationMode::OrganiseSymlinkOnly => {
+            match super::link_target::existing_link_target_name(&candidate.source_path) {
+                Ok(name) => name,
+                Err(reason) => return blocked(&reason),
+            }
+        }
+        _ => source_basename.clone(),
+    };
+    let rom_name = candidate.canonical_name.as_deref().unwrap_or(&own_name);
+    let proposed_basename = match derive_proposed_basename(rom_name, &own_name) {
         crate::dat::rename_plan::DeriveOutcome::Ok(derived) => derived.proposed_basename,
         crate::dat::rename_plan::DeriveOutcome::Blocked(reason) => return blocked(&reason),
         crate::dat::rename_plan::DeriveOutcome::Unsupported(reason) => {
@@ -363,6 +432,13 @@ fn plan_entry(
         }
     };
 
+    if mode == OrganisationMode::OrganiseSymlinkOnly
+        && let Err(reason) =
+            super::link_target::moved_link_still_resolves(&candidate.source_path, &destination_path)
+    {
+        return blocked(&reason);
+    }
+
     let already_organised = if candidate.source_path == destination_path {
         true
     } else if mode != OrganisationMode::RenameInPlace
@@ -381,6 +457,7 @@ fn plan_entry(
     OrganisationPlanEntry {
         source_identity: source_identity.clone(),
         catalogue_binding: None,
+        disc_set: None,
         source_path: candidate.source_path.clone(),
         destination_path,
         platform: Some(platform),
@@ -437,6 +514,7 @@ fn unknown_entry(
     OrganisationPlanEntry {
         source_identity,
         catalogue_binding: None,
+        disc_set: None,
         source_path: candidate.source_path.clone(),
         destination_path,
         platform: None,
@@ -466,7 +544,214 @@ impl OrganisationPlanEntry {
 
 /// Detects collisions across the batch and against the live destination
 /// directory, and marks the affected entries as Conflict. Never auto-resolves.
-fn detect_collisions(master_root: &Path, entries: &mut [OrganisationPlanEntry]) {
+/// Marks destination clashes as `Conflict`: two entries with the same
+/// destination, or destinations differing only by ASCII case, and live
+/// destinations that exist or have a case-only sibling on disk.
+///
+/// Same result as comparing every pair ([`detect_collisions_pairwise`]):
+/// entries can only clash when their ASCII-lowercased destinations are equal,
+/// so the pair loop runs within each such group, in the original index order
+/// (a marked entry keeps its first reason, as before). Each destination
+/// folder is listed once per plan instead of once per entry.
+pub(crate) fn detect_collisions(master_root: &Path, entries: &mut [OrganisationPlanEntry]) {
+    detect_collisions_with(master_root, entries, &mut FolderNames::default());
+}
+
+/// Destination folders' names as listed during one check (lowercased name
+/// -> names; `None` when the folder could not be listed). Never kept beyond
+/// the call that builds it.
+#[derive(Default)]
+pub(crate) struct FolderNames {
+    folders:
+        std::collections::HashMap<PathBuf, Option<std::collections::HashMap<String, Vec<String>>>>,
+}
+
+/// Plans every candidate on its own, exactly as a one-candidate
+/// [`build_organisation_plan`] would (no collision checks between them), but
+/// lists each destination folder once for the whole call. Used by the Apply
+/// revalidation, which checks each entry independently.
+pub(crate) fn plan_each_candidate_alone(
+    request: &OrganisationPlanRequest<'_>,
+) -> Vec<OrganisationPlanEntry> {
+    let mut folders = FolderNames::default();
+    request
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let mut entry = [plan_entry(request, candidate)];
+            detect_collisions_with(request.master_root, &mut entry, &mut folders);
+            let [entry] = entry;
+            entry
+        })
+        .collect()
+}
+
+fn detect_collisions_with(
+    master_root: &Path,
+    entries: &mut [OrganisationPlanEntry],
+    folders: &mut FolderNames,
+) {
+    let count = entries.len();
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.destination_path.as_os_str().is_empty() {
+            continue;
+        }
+        let key = entry
+            .destination_path
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        groups.entry(key).or_default().push(index);
+    }
+    let mut groups: Vec<Vec<usize>> = groups.into_values().filter(|g| g.len() > 1).collect();
+    groups.sort();
+    for group in &groups {
+        for (position, &left_index) in group.iter().enumerate() {
+            if !matches!(
+                entries[left_index].status,
+                OrganisationStatus::Suggested | OrganisationStatus::AlreadyOrganised
+            ) {
+                continue;
+            }
+            let left_destination = entries[left_index]
+                .destination_path
+                .to_string_lossy()
+                .into_owned();
+            for &right_index in &group[position + 1..] {
+                let right = &entries[right_index];
+                if !matches!(
+                    right.status,
+                    OrganisationStatus::Suggested | OrganisationStatus::AlreadyOrganised
+                ) {
+                    continue;
+                }
+                let right_destination = right.destination_path.to_string_lossy().into_owned();
+                if left_destination == right_destination {
+                    mark_conflict(entries, left_index, "two plans target the same destination");
+                    mark_conflict(
+                        entries,
+                        right_index,
+                        "two plans target the same destination",
+                    );
+                }
+                if left_destination.eq_ignore_ascii_case(&right_destination)
+                    && left_destination != right_destination
+                {
+                    mark_conflict(entries, left_index, "two plans differ only by case");
+                    mark_conflict(entries, right_index, "two plans differ only by case");
+                }
+            }
+        }
+    }
+
+    // Live destination: occupied, or a case-only sibling. Read-only; each
+    // destination folder's names are read once per call (see FolderNames).
+    for index in 0..count {
+        if entries[index].destination_path.as_os_str().is_empty() {
+            continue;
+        }
+        if entries[index].status == OrganisationStatus::AlreadyOrganised {
+            continue;
+        }
+        // Linked-library destinations are classified by their exact object
+        // state rather than by bare existence: an identical link is a no-op
+        // ("already present"), anything else occupying the name is a conflict.
+        // Nothing is ever auto-replaced.
+        if entries[index].mode == OrganisationMode::BuildLinkedLibrary {
+            match std::fs::symlink_metadata(&entries[index].destination_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let target = std::fs::read_link(&entries[index].destination_path).ok();
+                    if target.as_deref() == Some(entries[index].source_path.as_path()) {
+                        entries[index].status = OrganisationStatus::AlreadyOrganised;
+                        entries[index].reason =
+                            Some("already linked to this exact file; nothing to do".to_string());
+                    } else {
+                        mark_conflict(
+                            entries,
+                            index,
+                            "a different link already occupies the destination; nothing is \
+                             replaced",
+                        );
+                    }
+                    continue;
+                }
+                Ok(_) => {
+                    mark_conflict(
+                        entries,
+                        index,
+                        "the destination exists and is not a link; nothing is ever replaced",
+                    );
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
+        }
+        if std::fs::symlink_metadata(&entries[index].destination_path).is_ok() {
+            let reason = if entries[index].mode == OrganisationMode::OrganiseSymlinkOnly {
+                super::link_target::occupied_destination_reason(
+                    &entries[index].source_path,
+                    &entries[index].destination_path,
+                )
+            } else {
+                "the destination already exists; nothing is overwritten"
+            };
+            mark_conflict(entries, index, reason);
+            continue;
+        }
+        let Some(parent) = entries[index].destination_path.parent() else {
+            continue;
+        };
+        let file_name = entries[index]
+            .destination_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if file_name.is_empty() {
+            continue;
+        }
+        let names = folders
+            .folders
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| {
+                std::fs::read_dir(parent).ok().map(|dir_entries| {
+                    let mut names: std::collections::HashMap<String, Vec<String>> =
+                        std::collections::HashMap::new();
+                    for dir_entry in dir_entries.flatten() {
+                        let name = dir_entry.file_name().to_string_lossy().into_owned();
+                        names
+                            .entry(name.to_ascii_lowercase())
+                            .or_default()
+                            .push(name);
+                    }
+                    names
+                })
+            });
+        if let Some(names) = names {
+            let collision = names
+                .get(&file_name.to_ascii_lowercase())
+                .is_some_and(|same| same.iter().any(|name| *name != file_name));
+            if collision {
+                mark_conflict(
+                    entries,
+                    index,
+                    "a file differing from the destination only by case exists",
+                );
+            }
+        }
+    }
+
+    let _ = master_root;
+}
+
+/// The original all-pairs version, kept to prove [`detect_collisions`]
+/// marks exactly the same entries with exactly the same reasons.
+#[cfg(test)]
+pub(crate) fn detect_collisions_pairwise(
+    master_root: &Path,
+    entries: &mut [OrganisationPlanEntry],
+) {
     let count = entries.len();
     // Exact duplicates and case-only duplicates across the batch.
     for left_index in 0..count {
@@ -555,11 +840,15 @@ fn detect_collisions(master_root: &Path, entries: &mut [OrganisationPlanEntry]) 
             }
         }
         if std::fs::symlink_metadata(&entries[index].destination_path).is_ok() {
-            mark_conflict(
-                entries,
-                index,
-                "the destination already exists; nothing is overwritten",
-            );
+            let reason = if entries[index].mode == OrganisationMode::OrganiseSymlinkOnly {
+                super::link_target::occupied_destination_reason(
+                    &entries[index].source_path,
+                    &entries[index].destination_path,
+                )
+            } else {
+                "the destination already exists; nothing is overwritten"
+            };
+            mark_conflict(entries, index, reason);
             continue;
         }
         let Some(parent) = entries[index].destination_path.parent() else {
@@ -598,4 +887,14 @@ fn mark_conflict(entries: &mut [OrganisationPlanEntry], index: usize, reason: &s
     }
     entry.status = OrganisationStatus::Conflict;
     entry.reason = Some(reason.to_string());
+}
+
+/// Whether `name` can be used unchanged as a link name: a safe single path
+/// component that the name derivation keeps exactly as it is.
+pub(crate) fn is_usable_link_basename(name: &str) -> bool {
+    is_safe_basename(name)
+        && matches!(
+            derive_proposed_basename(name, name),
+            crate::dat::rename_plan::DeriveOutcome::Ok(ref derived) if derived.proposed_basename == name
+        )
 }
