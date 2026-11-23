@@ -3,9 +3,10 @@
 //!
 //! The accepting test names the disk by the UUID that `findmnt` reports for
 //! the filesystem the temporary folder is on: a real UUID, read by a tool
-//! that is not EmuWiz. It runs only where that filesystem is ext4 (true on
-//! the CI runners); elsewhere it says so and is skipped, because EmuWiz
-//! refuses every other filesystem and there is nothing to accept.
+//! that is not EmuWiz. It runs only where that filesystem is ext4; elsewhere
+//! it says so and is skipped, because EmuWiz refuses every other filesystem
+//! and there is nothing to accept. CI points TMPDIR at an ext4 image and sets
+//! EMUWIZ_R2_REQUIRE_QUALIFIED=1, with which a skip is a failure.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -50,7 +51,8 @@ impl Fixture {
             .unwrap()
     }
 
-    /// Everything under the folders a refused command must leave alone.
+    /// Everything in the fixture apart from the four empty folders it starts
+    /// with: a refused command must leave all of it alone.
     fn written(&self) -> Vec<PathBuf> {
         fn walk(path: &Path, found: &mut Vec<PathBuf>) {
             for entry in fs::read_dir(path).into_iter().flatten().flatten() {
@@ -61,9 +63,12 @@ impl Fixture {
             }
         }
         let mut found = Vec::new();
-        for folder in ["config", "disk"] {
-            walk(&self.path(folder), &mut found);
-        }
+        walk(&self.path(""), &mut found);
+        found.retain(|path| {
+            !["bin", "data", "config", "disk"]
+                .iter()
+                .any(|start| *path == self.path(start))
+        });
         found
     }
 
@@ -156,6 +161,10 @@ fn a_folder_is_not_chosen_without_its_disk_or_with_a_wrong_one() {
 fn a_folder_is_chosen_on_the_disk_named_by_its_real_uuid_and_reset_again() {
     let fixture = Fixture::new();
     let Some(uuid) = fixture.real_ext4_uuid() else {
+        assert!(
+            std::env::var_os("EMUWIZ_R2_REQUIRE_QUALIFIED").is_none_or(|value| value != "1"),
+            "findmnt names no ext4 filesystem for the temporary folder, and this run requires one"
+        );
         eprintln!(
             "SKIPPED: the temporary folder is not on an ext4 filesystem that findmnt can name, so there is no disk EmuWiz would accept here"
         );
