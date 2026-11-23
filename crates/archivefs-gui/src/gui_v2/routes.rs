@@ -770,6 +770,7 @@ pub(super) enum ToolPage {
     NeedsAttention,
     Mounts,
     MediaSets,
+    SaveContinuity,
     ViewHistory,
     LibraryViews,
     PlatformAliases,
@@ -789,14 +790,16 @@ pub(super) enum ToolPage {
     FolderCheck,
     Relocation,
     MemoryCards,
+    GameRecovery,
 }
 
 impl ToolPage {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::AlternativeProviders,
         Self::NeedsAttention,
         Self::Mounts,
         Self::MediaSets,
+        Self::SaveContinuity,
         Self::ViewHistory,
         Self::LibraryViews,
         Self::PlatformAliases,
@@ -816,6 +819,7 @@ impl ToolPage {
         Self::FolderCheck,
         Self::Relocation,
         Self::MemoryCards,
+        Self::GameRecovery,
     ];
 
     pub fn title(self) -> &'static str {
@@ -824,6 +828,7 @@ impl ToolPage {
             Self::NeedsAttention => "Needs Attention",
             Self::Mounts => "Mounts",
             Self::MediaSets => "Media Sets",
+            Self::SaveContinuity => "Play sessions & save history",
             Self::ViewHistory => "Library View History",
             Self::LibraryViews => "Library Views",
             Self::PlatformAliases => "Platform aliases",
@@ -843,6 +848,7 @@ impl ToolPage {
             Self::FolderCheck => "Organise my games",
             Self::Relocation => "Move a game between library folders",
             Self::MemoryCards => "PlayStation memory cards",
+            Self::GameRecovery => "Game recovery",
         }
     }
 
@@ -856,6 +862,9 @@ impl ToolPage {
             }
             Self::Mounts => "Choose archives, review destinations, and mount the ready queue.",
             Self::MediaSets => "Inspect multi-media releases and their read-only swap plans.",
+            Self::SaveContinuity => {
+                "See the play sessions EmuWiz recorded and the save snapshots it holds. Looking only: nothing is restored or changed."
+            }
             Self::LibraryViews => "Create and review saved symlink-based views of your catalogue.",
             Self::ViewHistory => {
                 "Every Library View Apply or Remove EmuWiz has recorded to disk, newest first."
@@ -905,6 +914,9 @@ impl ToolPage {
             Self::MemoryCards => {
                 "See the saves on PS1 and PS2 memory cards, back a card up, and copy single saves in and out. A card is never changed: every result is a separate file."
             }
+            Self::GameRecovery => {
+                "See why a game cannot start, with the evidence, and let EmuWiz prepare a verified playable copy where that is safe. Your game file is only read; a copy is made of new files after you confirm."
+            }
         }
     }
 
@@ -915,6 +927,7 @@ impl ToolPage {
             Self::NeedsAttention => Section::Problems,
             Self::Mounts => Section::Storage,
             Self::MediaSets => Section::MultiDisc,
+            Self::SaveContinuity => Section::Saves,
             Self::ViewHistory | Self::LibraryViews => Section::Build,
             Self::PlatformAliases => Section::Settings,
             Self::DatabaseStatus => Section::Settings,
@@ -933,6 +946,7 @@ impl ToolPage {
             Self::FolderCheck => Section::Games,
             Self::Relocation => Section::Games,
             Self::MemoryCards => Section::Saves,
+            Self::GameRecovery => Section::Problems,
         }
     }
 
@@ -943,6 +957,7 @@ impl ToolPage {
             Self::NeedsAttention => "Health & Recovery",
             Self::Mounts => "Tools",
             Self::MediaSets => "Multi-disc games",
+            Self::SaveContinuity => "Saves & States",
             Self::ViewHistory | Self::LibraryViews => "Organise & Export",
             Self::PlatformAliases | Self::DatabaseStatus => "Settings",
             Self::PatchPackagePreview => "Tools",
@@ -960,6 +975,7 @@ impl ToolPage {
             Self::FolderCheck => "Games & collection",
             Self::Relocation => "Games & collection",
             Self::MemoryCards => "Saves & States",
+            Self::GameRecovery => "Health & Recovery",
         }
     }
 }

@@ -118,18 +118,118 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game, discs: Option<&DiscGuidance>)
         ui.ctx(),
     );
     panel.poll();
-    let readiness = assess_amiga_game(
+    let mut readiness = assess_amiga_game(
         machine,
         &game.archive.absolute_path,
         game.inspection_incomplete,
         disk_facts(discs),
         panel.facts.as_ref(),
     );
+    apply_prepared_copy(
+        &mut readiness,
+        prepared_copy(
+            &game.archive.absolute_path,
+            &game.platform,
+            // The Launch page plans from a prepared copy only for a game
+            // with current evidence and no identity of its own.
+            game.inspection_incomplete || game.identified,
+        ),
+    );
     let (fix, recheck) = render(ui, &readiness, panel.job.is_some());
     if recheck {
         panel.start(ui.ctx());
     }
     fix.map(|fix| route(fix, game.archive.id))
+}
+
+/// What game recovery says about a disc stored in a ZIP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PreparedCopy {
+    /// Game recovery has no preparation for this kind of entry.
+    NotApplicable,
+    /// It could be prepared, but no usable prepared copy exists: none was
+    /// made, or the ZIP or the copy has changed since.
+    Missing,
+    /// A checked prepared copy serves this exact file; Play starts it.
+    Ready,
+}
+
+/// Asks the same lookup the Launch page plans from, so the card and Play
+/// never disagree about whether a prepared copy is usable.
+///
+/// `launch_ignores_copy`: the Launch page does not plan from a prepared copy
+/// for this game (its last scan could not finish, or it has an identity of
+/// its own). The card is then left exactly as it was, "scan it again"
+/// warning included.
+pub(super) fn prepared_copy(
+    path: &std::path::Path,
+    recorded_platform: &str,
+    launch_ignores_copy: bool,
+) -> PreparedCopy {
+    let platform = archivefs_core::canonical_platform_for_alias(recorded_platform);
+    if launch_ignores_copy || !archivefs_core::recovery::preparation_may_apply(path, platform) {
+        PreparedCopy::NotApplicable
+    } else if crate::emulator_setup::prepared_media::for_game(path, Some(recorded_platform))
+        .is_some()
+    {
+        PreparedCopy::Ready
+    } else {
+        PreparedCopy::Missing
+    }
+}
+
+pub(super) const PREPARED_COPY_READY: &str = "Ready from a prepared copy. EmuWiz extracted this disc as new files and checked them against the ZIP; Play starts that copy. The ZIP was not changed.";
+pub(super) const PREPARED_COPY_PLAY: &str = "Start it from the Launch page with RetroArch (PUAE). The game is not identified, so the Launch page asks you to confirm the system, and it still checks the emulator, its firmware and the prepared files.";
+
+/// Brings the card's "stored in a ZIP" rows in line with game recovery. Only
+/// the refusal for a CD32 ZIP is touched; every other entry keeps the
+/// checklist it was given.
+pub(super) fn apply_prepared_copy(readiness: &mut AmigaGameReadiness, copy: PreparedCopy) {
+    // Game recovery prepares CD32 discs only.
+    let zipped_disc =
+        readiness.media == AmigaMediaKind::ZipArchive && readiness.machine == AmigaCdMachine::Cd32;
+    if !zipped_disc || copy == PreparedCopy::NotApplicable {
+        return;
+    }
+    let Some(media) = readiness
+        .checks
+        .iter_mut()
+        .find(|check| check.kind == AmigaCheckKind::Media)
+    else {
+        return;
+    };
+    if media.state != AmigaCheckState::Blocked {
+        return;
+    }
+    match copy {
+        PreparedCopy::Ready => {
+            media.state = AmigaCheckState::Ready;
+            media.detail = PREPARED_COPY_READY.into();
+            if let Some(play) = readiness
+                .checks
+                .iter_mut()
+                .find(|check| check.kind == AmigaCheckKind::Play)
+            {
+                play.state = AmigaCheckState::Warning;
+                play.detail = PREPARED_COPY_PLAY.into();
+            }
+            // These rows describe FS-UAE and Amiberry, which do not start a
+            // prepared copy; the Launch page checks RetroArch for it.
+            readiness.checks.retain(|check| {
+                !matches!(
+                    check.kind,
+                    AmigaCheckKind::Emulator | AmigaCheckKind::Machine | AmigaCheckKind::Kickstart
+                )
+            });
+        }
+        PreparedCopy::Missing => {
+            media.detail = format!(
+                "{} discs are not started from inside a ZIP. Game recovery, on this page, can prepare a checked playable copy as new files; the ZIP is not changed.",
+                machine_label(readiness.machine)
+            );
+        }
+        PreparedCopy::NotApplicable => {}
+    }
 }
 
 pub(super) fn route(fix: AmigaFixRoute, game_id: i64) -> Route {

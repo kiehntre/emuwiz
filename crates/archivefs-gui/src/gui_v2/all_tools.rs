@@ -172,6 +172,14 @@ pub(super) fn groups() -> Vec<ToolGroup> {
             S::Activity,
         ],
     );
+    // Reads a game file and, after a confirmation, writes only new files in
+    // EmuWiz's own prepared-media folder; a game file is never changed.
+    health.tools.push(Tool {
+        route: Route::Tool(ToolPage::GameRecovery),
+        title: ToolPage::GameRecovery.title(),
+        purpose: ToolPage::GameRecovery.purpose(),
+        safety: ToolSafety::AsksFirst,
+    });
     health.tools.insert(
         2,
         Tool {
@@ -331,6 +339,13 @@ pub(super) fn groups() -> Vec<ToolGroup> {
         route: Route::Tool(ToolPage::MemoryCards),
         title: ToolPage::MemoryCards.title(),
         purpose: ToolPage::MemoryCards.purpose(),
+        safety: ToolSafety::LookingOnly,
+    });
+    // Reads the session journal and the snapshot store; writes nothing.
+    saves.tools.push(Tool {
+        route: Route::Tool(ToolPage::SaveContinuity),
+        title: ToolPage::SaveContinuity.title(),
+        purpose: ToolPage::SaveContinuity.purpose(),
         safety: ToolSafety::LookingOnly,
     });
     vec![

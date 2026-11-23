@@ -228,7 +228,9 @@ pub struct WatchedProcess {
     receiver: Receiver<ProcessExitReport>,
     exit_report: Option<ProcessExitReport>,
     stop_identity: OwnedChildIdentity,
-    stop_requested: bool,
+    /// SIGTERMs sent so far: 0, 1 ([`Self::request_graceful_stop`]) or 2
+    /// ([`Self::request_second_stop`]). Never more.
+    stop_signals_sent: u8,
 }
 
 /// The caller must explicitly choose the scope of a stop request.
@@ -260,6 +262,9 @@ pub enum GracefulStopRefusal {
     /// The owned child is not proven to be the emulator itself. It may be a
     /// launcher whose exit says nothing about the emulator, so nothing is sent.
     TargetNotEmulator,
+    /// A second stop is only ever the follow-up to a graceful stop already
+    /// sent to this child, never a first signal.
+    NoEarlierStopRequest,
 }
 
 /// Describes the launched child only, never an entire emulator tree. Child
@@ -393,6 +398,32 @@ impl WatchedProcess {
         scope: GracefulStopScope,
         grace_period: Duration,
     ) -> GracefulStopOutcome {
+        self.signal_owned_child(scope, grace_period, 0)
+    }
+
+    /// The one follow-up to [`Self::request_graceful_stop`]: exactly one more
+    /// SIGTERM to the same owned child, only after the first was sent and the
+    /// child has not exited, and only when the player explicitly asks.
+    /// Some emulators (RetroArch) treat a second termination request while
+    /// already closing as "exit now"; that is the only way out once their own
+    /// shutdown has stalled, at the cost of whatever they would still have
+    /// written. Repeats only observe. Still no SIGKILL, timer, PID lookup,
+    /// process-group signal or descendant walk.
+    pub fn request_second_stop(&mut self, grace_period: Duration) -> GracefulStopOutcome {
+        if self.stop_signals_sent == 0 {
+            return GracefulStopOutcome::Refused(GracefulStopRefusal::NoEarlierStopRequest);
+        }
+        self.signal_owned_child(GracefulStopScope::LaunchedChild, grace_period, 1)
+    }
+
+    /// Sends a SIGTERM only when exactly `already_sent` have been sent, then
+    /// observes for at most `grace_period`.
+    fn signal_owned_child(
+        &mut self,
+        scope: GracefulStopScope,
+        grace_period: Duration,
+        already_sent: u8,
+    ) -> GracefulStopOutcome {
         if scope == GracefulStopScope::ProcessTree {
             return GracefulStopOutcome::Refused(GracefulStopRefusal::ProcessTreeNotSupervised);
         }
@@ -427,7 +458,7 @@ impl WatchedProcess {
                         );
                     }
                 }
-                let request_already_pending = self.stop_requested;
+                let request_already_pending = self.stop_signals_sent > already_sent;
                 if !request_already_pending {
                     // SAFETY: fd is a live OwnedFd acquired from this exact
                     // child before exec. A null siginfo and zero flags target
@@ -450,7 +481,7 @@ impl WatchedProcess {
                             raw_os_error: error.raw_os_error(),
                         });
                     }
-                    self.stop_requested = true;
+                    self.stop_signals_sent = already_sent + 1;
                 }
                 loop {
                     match pidfd_has_exited(fd) {
@@ -732,6 +763,9 @@ fn spawn_watched_process_inner(
     // (and reset) by each spawn attempt below, so a retried spawn can never
     // read an earlier attempt's pipe.
     let mut shared_output: Option<std::io::PipeReader> = None;
+    // Whoever set a gate gets to finish its work before the process exists
+    // (Blue reads the game's saves here, while nothing can have changed them).
+    let gate_token = super::process_log::before_start(&command.executable, &command.arguments);
     // Each test-only ETXTBSY retry needs a fresh command and ownership
     // channel, so a failed exec's descriptor can never name a later child.
     let (mut child, stop_identity) = spawn_child(|| {
@@ -821,6 +855,10 @@ fn spawn_watched_process_inner(
         spawn_with_owned_identity(&mut process)
     })?;
     let pid = child.id();
+    // Noted for every route, so a caller that only knows "a launch is in
+    // progress" can learn the real process and how it ended.
+    let log_sequence =
+        super::process_log::record_start(pid, &command.executable, &command.arguments, gate_token);
     if let Some(on_start) = on_start {
         on_start(pid);
     }
@@ -837,6 +875,7 @@ fn spawn_watched_process_inner(
             None => stderr.map(read_bounded_stderr).unwrap_or_default(),
         };
         let status = child.wait();
+        super::process_log::record_exit(log_sequence, &status);
         let report = ProcessExitReport {
             status,
             stderr: stderr_bytes,
@@ -852,7 +891,7 @@ fn spawn_watched_process_inner(
         receiver,
         exit_report: None,
         stop_identity,
-        stop_requested: false,
+        stop_signals_sent: 0,
     })
 }
 
@@ -1359,3 +1398,7 @@ mod captured_identity_ctime_tests {
 #[cfg(test)]
 #[path = "process_spawn/capture_tests.rs"]
 mod capture_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "process_spawn/second_stop_tests.rs"]
+mod second_stop_tests;

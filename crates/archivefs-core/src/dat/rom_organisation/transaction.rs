@@ -351,6 +351,16 @@ pub fn apply_organisation_transaction(
     // (metadata only); only these may follow a complete Apply.
     let disc_checks =
         crate::database::organisation_paths::current_disc_set_checks(transaction, false);
+    // A game with a prepared copy (see `crate::recovery`) keeps it, and its
+    // remembered launch choice, under its new name. Captured before, carried
+    // after, only for entries that were really applied; never affects the
+    // outcome of the rename itself.
+    let prepared = crate::recovery::moves::before(transaction.entries.iter().map(|entry| {
+        (
+            entry.source_path.as_path(),
+            entry.destination_path.as_path(),
+        )
+    }));
     let outcome = apply_filesystem_organisation_transaction(
         transaction,
         approved_sources,
@@ -361,6 +371,13 @@ pub fn apply_organisation_transaction(
         mode,
         master_root,
     )?;
+    crate::recovery::moves::after(prepared, |old, new| {
+        outcome.transaction.entries.iter().any(|entry| {
+            entry.state == crate::dat::rename_apply::model::EntryState::Applied
+                && entry.source_path == old
+                && entry.destination_path == new
+        })
+    });
     let complete = transaction.state == TransactionState::Applied
         && transaction
             .entries
@@ -865,7 +882,28 @@ pub fn rollback_organisation_transaction(
     refuse_to_separate_a_game_from_its_saves(transaction)?;
     let disc_checks =
         crate::database::organisation_paths::current_disc_set_checks(transaction, true);
+    // Undo puts a prepared copy's link (and remembered launch choice) back
+    // with the file, exactly as apply carried it forward.
+    let prepared = crate::recovery::moves::before(
+        transaction
+            .entries
+            .iter()
+            .filter(|entry| entry.state == crate::dat::rename_apply::model::EntryState::Applied)
+            .map(|entry| {
+                (
+                    entry.destination_path.as_path(),
+                    entry.source_path.as_path(),
+                )
+            }),
+    );
     let rollback = rollback_transaction(transaction, journal_dir, cancel)?;
+    crate::recovery::moves::after(prepared, |old, new| {
+        transaction.entries.iter().any(|entry| {
+            entry.state == crate::dat::rename_apply::model::EntryState::RolledBack
+                && entry.destination_path == old
+                && entry.source_path == new
+        })
+    });
     // Only after the engine and the journal agree the Undo is complete.
     let fully = matches!(
         rollback.result,

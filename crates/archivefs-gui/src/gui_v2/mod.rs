@@ -37,6 +37,7 @@ mod game_detail_blue;
 mod game_detail_facts;
 mod game_doctor;
 mod game_documents;
+mod game_recovery;
 mod game_rename;
 mod game_verification_guidance;
 #[cfg(test)]
@@ -116,12 +117,14 @@ mod romm_library;
 mod routes;
 mod saturn_manifest;
 mod save_compatibility;
+mod save_continuity_page;
 mod save_snapshots;
 mod save_state_guidance;
 mod saves_states;
 mod scan_history;
 #[cfg(test)]
 mod scummvm_journey_tests;
+mod session_tracking;
 mod setup_portability;
 #[cfg(test)]
 #[path = "tests/shared_scroll.rs"]

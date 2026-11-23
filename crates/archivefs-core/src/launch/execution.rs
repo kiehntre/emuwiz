@@ -390,6 +390,15 @@ pub fn preflight_retroarch_launch(
         ));
     }
     let content_identity = inspect_and_capture_content_identity(content_path)?;
+    // A file inside EmuWiz's prepared-media store is started only as the
+    // launch file of a prepared copy that still passes its receipt checks
+    // (never a track, a work-in-progress folder, or a copy that changed).
+    if let Some(detail) = crate::recovery::prepared_media::launch_refusal(content_path) {
+        return Err(preflight_error(
+            LaunchPreflightErrorKind::CandidateContentUnsupported,
+            detail,
+        ));
+    }
 
     // --- 4: RetroArch-specific profile kind gate ---
     if !matches!(
@@ -1069,6 +1078,28 @@ impl LaunchedRetroArchProcess {
             }
         }
     }
+
+    /// The player's confirmed follow-up when RetroArch did not close after
+    /// [`Self::request_graceful_stop`]: one more SIGTERM to the same child,
+    /// which RetroArch takes as "exit now" while it is already closing. Its
+    /// own shutdown can stall after a save state it could not write
+    /// (RetroArch 1.21.0 and 1.22.2, issue #528); it then writes nothing
+    /// more, including the in-game save. Same target check as the first
+    /// request; see [`WatchedProcess::request_second_stop`].
+    pub fn request_second_stop(
+        &mut self,
+        grace_period: std::time::Duration,
+    ) -> process_spawn::GracefulStopOutcome {
+        use process_spawn::{GracefulStopOutcome, GracefulStopRefusal, OwnedExecutable};
+        match self.stop_target() {
+            OwnedExecutable::Matches | OwnedExecutable::Exited => {
+                self.watched.request_second_stop(grace_period)
+            }
+            OwnedExecutable::Differs | OwnedExecutable::Unavailable => {
+                GracefulStopOutcome::Refused(GracefulStopRefusal::TargetNotEmulator)
+            }
+        }
+    }
 }
 
 /// Spawns exactly the process `command` describes - never a shell, never
@@ -1153,6 +1184,12 @@ pub(crate) fn spawn_retroarch_guarded(
         selected
             .revalidate_files()
             .map_err(|e| LaunchSpawnError::Spawn(std::io::Error::other(e)))?;
+    }
+    // The same prepared-copy check as preflight, repeated at the last moment.
+    if let Some(detail) =
+        crate::recovery::prepared_media::launch_refusal(&command.selection.content_path)
+    {
+        return Err(LaunchSpawnError::Spawn(std::io::Error::other(detail)));
     }
     let mut backend_stamps = None;
     let current_snapshot = if let Some(expected_key) = &command.unverified_game_key {

@@ -143,6 +143,7 @@ pub mod retroachievements;
 pub mod retrobios_provider;
 pub mod retrobios_viewer;
 pub mod rom_representation_diagnostics;
+pub mod save_continuity;
 pub mod save_migration_planner;
 pub mod save_migration_readiness;
 /// Local immutable emulator-save snapshots and conservative restore previews.
@@ -328,6 +329,10 @@ pub mod storage_health;
 /// Read-only projection of persisted source-folder/database state into the
 /// generic source-root migration planner.
 pub mod source_folder_migration;
+
+/// Game recovery engine: evidence-backed diagnosis of games that cannot start
+/// and verified, create-new preparation of playable copies.
+pub mod recovery;
 
 /// Read-only projection of active rename/recovery transaction paths into the
 /// generic source-root migration planner.
