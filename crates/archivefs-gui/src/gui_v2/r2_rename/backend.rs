@@ -136,18 +136,68 @@ fn text(p: &Path) -> Result<String, String> {
         .map(str::to_owned)
         .ok_or("Path is not UTF-8".into())
 }
+/// Advanced Protection's private recovery workspace for `root` (owner option
+/// 1, 2026-11-23): `<folder holding your library folder>/.emuwiz-protection/
+/// <root key>`, on the same disk as the games (the engine requires that), outside
+/// every library folder (so no scan reads it) and created owner-only (0700).
 pub(super) fn workspace(root: &Path) -> Result<PathBuf, String> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .ok_or("No private application-data directory")?;
-    if !base.is_absolute() {
-        return Err("Application-data directory must be absolute".into());
+    let database = archivefs_core::default_database_path().map_err(|e| e.to_string())?;
+    let library = archivefs_core::Database::open_read_only(&database).map_err(|e| e.to_string())?;
+    let libraries = library
+        .list_source_folders()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|folder| folder.path)
+        .collect::<Vec<_>>();
+    workspace_for(root, &libraries)
+}
+
+pub(super) fn workspace_for(root: &Path, libraries: &[PathBuf]) -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+    let library = libraries
+        .iter()
+        .filter(|library| root.starts_with(library))
+        .max_by_key(|library| library.components().count())
+        .ok_or("Advanced Protection works only on a folder inside one of your library folders. Nothing was changed.")?;
+    let beside = library.parent().ok_or(
+        "Your library folder has no parent folder for the recovery workspace. Nothing was changed.",
+    )?;
+    let shown = beside.display();
+    let meta = std::fs::symlink_metadata(beside).map_err(|e| format!("{shown}: {e}"))?;
+    if !meta.is_dir() || std::fs::canonicalize(beside).ok().as_deref() != Some(beside) {
+        return Err(format!(
+            "Advanced Protection keeps its private recovery folder in {shown}, which must be a real folder (not a link). Nothing was changed."
+        ));
     }
-    Ok(base
-        .join("emuwiz-r2-blue")
+    // SAFETY: plain syscall.
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return Err(format!(
+            "Advanced Protection keeps its private recovery folder in {shown}, which must be owned by you. Nothing was changed."
+        ));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(format!(
+            "Advanced Protection keeps its private recovery folder in {shown}, which other users can change (permissions {:o}). To use it, remove their write access yourself, for example: chmod go-w '{shown}'. Nothing was changed.",
+            meta.mode() & 0o777
+        ));
+    }
+    if std::fs::metadata(root).map_err(|e| e.to_string())?.dev() != meta.dev() {
+        return Err(format!(
+            "Advanced Protection needs its recovery folder on the same disk as the games, but {shown} is on another disk (your library folder is a disk's top folder). Nothing was changed."
+        ));
+    }
+    if libraries.iter().any(|other| beside.starts_with(other)) {
+        return Err(format!(
+            "{shown} is itself inside a library folder, so a recovery folder there would be scanned as games. Advanced Protection cannot be used for this library. Nothing was changed."
+        ));
+    }
+    Ok(beside
+        .join(pc::WORKSPACE_FOLDER)
         .join(hex(Sha256::digest(root.as_os_str().as_encoded_bytes()))))
 }
+
+use archivefs_core::dat::rom_organisation::protected_catalogue as pc;
+
 #[derive(Clone)]
 pub(super) struct Info {
     pub root: PathBuf,
@@ -156,6 +206,11 @@ pub(super) struct Info {
     pub next_state: PathBuf,
     pub signer: PathBuf,
     pub status: Value,
+    /// Notes from finishing interrupted library steps on load.
+    pub catalogue_notes: Vec<String>,
+    /// Operations whose library step cannot be finished from evidence; a
+    /// library scan refuses until each is reviewed here.
+    pub unresolved: Vec<pc::Unresolved>,
 }
 impl Info {
     pub fn load(h: &Helper, root: &Path, workspace: &Path, init: bool) -> Result<Self, String> {
@@ -164,7 +219,16 @@ impl Info {
             text(root)?,
             text(workspace)?,
         ])?;
-        Self::from(v, workspace)
+        let mut info = Self::from(v, workspace)?;
+        // Never fails the page: it must open to review what blocks a scan.
+        match pc::WorkspaceLock::try_take(workspace) {
+            Ok(Some(_lock)) => info.unresolved = pc::unresolved_in(workspace),
+            Ok(None) => info
+                .catalogue_notes
+                .push("Another Advanced Protection step is running for this folder.".into()),
+            Err(e) => info.catalogue_notes.push(e),
+        }
+        Ok(info)
     }
     fn from(v: Value, workspace: &Path) -> Result<Self, String> {
         let path = |k: &str| {
@@ -179,6 +243,8 @@ impl Info {
             next_state: path("next_state")?,
             signer: path("signer")?,
             status: v["status"].clone(),
+            catalogue_notes: Vec::new(),
+            unresolved: Vec::new(),
         })
     }
     pub fn refresh(&self, h: &Helper) -> Result<Self, String> {
@@ -342,6 +408,27 @@ pub(super) fn execute(h: &Helper, info: &Info, r: &Review) -> Result<(Value, Inf
             "Fresh approval is not applicable. Preserve it and review current state.".into(),
         );
     }
+    // The library catalogue follows the files (owner option 1). Under the
+    // workspace lock (a scan waits for it) and the catalogue hold: the
+    // record is written as pending with the checks current now, the engine
+    // moves the files, then the library is brought in line file by file. An
+    // interruption is finished by the next scan or visit, from this record.
+    let _lock = pc::WorkspaceLock::try_take(&info.workspace)?.ok_or(
+        "Another Advanced Protection step is running for this folder. Nothing was changed.",
+    )?;
+    let mut catalogue = catalogue_step(info, r)?;
+    let hold = match &mut catalogue {
+        Some((path, record)) => {
+            let reverse = record.pending().unwrap_or_default();
+            let hold = pc::CatalogueHold::take(
+                &archivefs_core::default_database_path().map_err(|e| e.to_string())?,
+            )?;
+            record.checked = pc::checks_before_protected(&record.transaction, reverse);
+            pc::write_record(path, record)?;
+            Some(hold)
+        }
+        None => None,
+    };
     let result = h.call(
         &[
             "execute".into(),
@@ -351,9 +438,93 @@ pub(super) fn execute(h: &Helper, info: &Info, r: &Review) -> Result<(Value, Inf
             "--enable-contract-1-i".into(),
         ],
         true,
-    )?;
+    );
+    drop(hold);
+    fault_after_protected_move();
+    let mut notes = Vec::new();
+    if let Some((path, mut record)) = catalogue {
+        notes = pc::settle_record(&path, &mut record)?;
+    }
+    let mut result = result?;
+    result["catalogue"] = serde_json::json!(notes);
     Ok((result, info.refresh(h)?))
 }
+
+/// Acceptance fault point (debug builds only, owner 2026-11-23): when the
+/// one-shot marker `fault-after-protected-move` is in the profile's data
+/// folder, Blue stops right after the engine moved the files and before the
+/// library step, exactly as an interruption there would. The marker is
+/// renamed to `.used` so it fires once. Release builds have no such point.
+fn fault_after_protected_move() {
+    #[cfg(debug_assertions)]
+    {
+        let Some(data) = std::env::var_os("EMUWIZ_DATA_HOME") else {
+            return;
+        };
+        let marker = PathBuf::from(data).join("fault-after-protected-move");
+        if std::fs::rename(&marker, marker.with_extension("used")).is_ok() {
+            std::process::exit(86);
+        }
+    }
+}
+
+/// The record this execution's library step uses (not yet written): a new
+/// one for Apply (the preview's own transaction with its sealed library
+/// bindings, checked again now), or the applied one an Undo reverses.
+/// `None` when no library entry is involved.
+fn catalogue_step(info: &Info, r: &Review) -> Result<Option<(PathBuf, pc::PendingRecord)>, String> {
+    match (r.action.as_str(), &r.selection) {
+        ("apply", Some(selection)) => {
+            let transaction = selection.validate()?;
+            if !pc::involves_catalogue(&transaction) {
+                return Ok(None);
+            }
+            Ok(Some((
+                info.workspace.join(format!("catalogue-{}.json", nonce())),
+                pc::PendingRecord {
+                    version: 1,
+                    created_ns: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos(),
+                    state: "apply_pending".into(),
+                    transaction,
+                    checked: Default::default(),
+                },
+            )))
+        }
+        ("undo", _) => {
+            let Some((path, mut record)) =
+                pc::records(&info.workspace)?
+                    .into_iter()
+                    .rev()
+                    .find(|(_, record)| {
+                        record.state == "applied"
+                            && check_plan(&record.transaction, &r.value["transaction"]).is_ok()
+                    })
+            else {
+                return Ok(None);
+            };
+            record.state = "undo_pending".into();
+            Ok(Some((path, record)))
+        }
+        _ => Ok(None),
+    }
+}
+/// The reviewed way out for operations whose library step cannot be
+/// proved: their records are kept (renamed `reviewed-…`), and the next scan
+/// treats the files as moved outside EmuWiz.
+pub(super) fn release_for_rescan(h: &Helper, info: &Info) -> Result<Info, String> {
+    let _lock = pc::WorkspaceLock::try_take(&info.workspace)?.ok_or(
+        "Another Advanced Protection step is running for this folder. Nothing was changed.",
+    )?;
+    for unresolved in &info.unresolved {
+        pc::release_for_rescan(&unresolved.record)?;
+    }
+    drop(_lock);
+    info.refresh(h)
+}
+
 pub(super) fn reuse_preview(h: &Helper, i: &Info) -> Result<Value, String> {
     h.run(vec![
         "preview-reuse".into(),

@@ -1642,4 +1642,279 @@ mod carried_catalogue_checks {
         assert_eq!(f.path_id(&f.destination), Some(f.id));
         assert_eq!(stored(&f, row), before);
     }
+
+    // Advanced Protection (owner option 1): its engine moves the file, then
+    // the catalogue follows with the preview's own sealed binding.
+    mod protected {
+        use super::*;
+        use crate::dat::rom_organisation::protected_catalogue::{
+            CatalogueHold, checks_before_protected, complete_protected_catalogue,
+            validate_protected_catalogue,
+        };
+
+        fn verified(mode: OrganisationMode) -> (Fixture, i64) {
+            let mut f = Fixture::new(mode);
+            let row = insert(&f, &check_of(&f.source));
+            rebind(&mut f);
+            (f, row)
+        }
+
+        #[test]
+        fn the_row_and_its_check_follow_the_protected_rename_and_its_undo() {
+            let (f, row) = verified(OrganisationMode::RenameInPlace);
+            validate_protected_catalogue(&f.tx, &f.db).unwrap();
+            let checked = checks_before_protected(&f.tx, false);
+            assert_eq!(checked.values().flatten().collect::<Vec<_>>(), vec![&row]);
+            std::fs::rename(&f.source, &f.destination).unwrap();
+            let out = complete_protected_catalogue(&f.tx, false, &checked);
+            assert_eq!(out.updated, vec![f.destination.clone()]);
+            assert!(out.is_consistent());
+            assert_eq!(f.path_id(&f.destination), Some(f.id));
+            assert_eq!(f.path_id(&f.source), None);
+            let moved = recorded(&f, row);
+            assert_eq!(moved.path, f.destination);
+            assert_eq!(DiscFileState::of(&moved), DiscFileState::Unchanged);
+            // Running it again (an interrupted run finished) changes nothing.
+            let before = stored(&f, row);
+            let again = complete_protected_catalogue(&f.tx, false, &checked);
+            assert_eq!(again.updated, vec![f.destination.clone()]);
+            assert_eq!(stored(&f, row), before);
+            assert_eq!(f.path_id(&f.destination), Some(f.id));
+            // Undo: the engine puts the file back, the row and check follow.
+            let checked = checks_before_protected(&f.tx, true);
+            std::fs::rename(&f.destination, &f.source).unwrap();
+            let back = complete_protected_catalogue(&f.tx, true, &checked);
+            assert_eq!(back.updated, vec![f.source.clone()]);
+            assert_eq!(f.path_id(&f.source), Some(f.id));
+            let back = recorded(&f, row);
+            assert_eq!(back.path, f.source);
+            assert_eq!(DiscFileState::of(&back), DiscFileState::Unchanged);
+        }
+
+        #[test]
+        fn a_file_the_engine_did_not_move_keeps_its_row() {
+            let (f, row) = verified(OrganisationMode::RenameInPlace);
+            let before = stored(&f, row);
+            let checked = checks_before_protected(&f.tx, false);
+            let out = complete_protected_catalogue(&f.tx, false, &checked);
+            assert_eq!(out.not_moved, vec![f.source.clone()]);
+            assert!(out.updated.is_empty() && out.is_consistent());
+            assert_eq!(f.path_id(&f.source), Some(f.id));
+            assert_eq!(stored(&f, row), before);
+        }
+
+        #[test]
+        fn a_different_file_at_the_new_place_changes_nothing() {
+            let (f, row) = verified(OrganisationMode::RenameInPlace);
+            let before = stored(&f, row);
+            let bytes = std::fs::read(&f.source).unwrap();
+            std::fs::remove_file(&f.source).unwrap();
+            let checked = checks_before_protected(&f.tx, false);
+            std::fs::write(&f.destination, bytes).unwrap();
+            let out = complete_protected_catalogue(&f.tx, false, &checked);
+            assert_eq!(out.needs_review.len(), 1);
+            assert!(out.updated.is_empty());
+            assert_eq!(f.path_id(&f.source), Some(f.id));
+            assert_eq!(f.path_id(&f.destination), None);
+            assert_eq!(stored(&f, row), before);
+        }
+
+        #[test]
+        fn a_changed_library_row_is_a_stale_preview() {
+            let (f, _) = verified(OrganisationMode::RenameInPlace);
+            f.sql()
+                .execute(
+                    "UPDATE archives SET size_bytes=size_bytes+1 WHERE id=?1",
+                    [f.id],
+                )
+                .unwrap();
+            let refused = validate_protected_catalogue(&f.tx, &f.db).unwrap_err();
+            assert!(refused.contains("stale"), "{refused}");
+        }
+
+        #[test]
+        fn the_hold_keeps_other_writers_out_until_released() {
+            let (f, _) = verified(OrganisationMode::RenameInPlace);
+            let hold = CatalogueHold::take(f.db.path()).unwrap();
+            let other = f.sql();
+            other.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let write = "UPDATE archives SET size_bytes=size_bytes WHERE id=1";
+            assert!(
+                other.execute(write, []).is_err(),
+                "a writer waits for the hold"
+            );
+            drop(hold);
+            other.execute(write, []).unwrap();
+        }
+
+        /// Owner 2026-11-23: the engine moved the file, the library step did
+        /// not run (Blue stopped), then a library scan runs.
+        fn interrupted(f: &Fixture) -> (PathBuf, PathBuf) {
+            use crate::dat::rom_organisation::protected_catalogue::{
+                PendingRecord, WORKSPACE_FOLDER, write_record,
+            };
+            let workspace = f.temp.path().join(WORKSPACE_FOLDER).join("key");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let record = workspace.join("catalogue-1.json");
+            let checked = checks_before_protected(&f.tx, false);
+            write_record(
+                &record,
+                &PendingRecord {
+                    version: 1,
+                    created_ns: 1,
+                    state: "apply_pending".into(),
+                    transaction: f.tx.clone(),
+                    checked,
+                },
+            )
+            .unwrap();
+            std::fs::rename(&f.source, &f.destination).unwrap();
+            (workspace, record)
+        }
+
+        fn scan(f: &mut Fixture) -> crate::Result<crate::database::ScanPersistSummary> {
+            let games = f.temp.path().join("games");
+            let config = crate::Config {
+                configured_source_roots: Some(vec![games.clone()]),
+                source_folders: vec![games],
+                mount_root: f.temp.path().join("mount"),
+                ratarmount_bin: "ratarmount".into(),
+                master_rom_root: None,
+            };
+            crate::database::scan_and_persist(&mut f.db, &config, "test")
+        }
+
+        fn archives(f: &Fixture) -> Vec<(i64, Vec<u8>, Option<String>)> {
+            let c = f.sql();
+            let mut st = c
+                .prepare("SELECT id, absolute_path_cached, last_verified_missing_at FROM archives ORDER BY id")
+                .unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+
+        fn state_of(record: &Path) -> String {
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+            v["state"].as_str().unwrap().to_string()
+        }
+
+        #[test]
+        fn a_rescan_first_finishes_an_interrupted_protected_rename() {
+            let (mut f, row) = verified(OrganisationMode::RenameInPlace);
+            let rows_before = archives(&f).len();
+            let (_, record) = interrupted(&f);
+            scan(&mut f).unwrap();
+            // The same game entry, at the new name, not missing; no new entry.
+            assert_eq!(f.path_id(&f.destination), Some(f.id));
+            assert_eq!(f.path_id(&f.source), None);
+            assert_eq!(archives(&f).len(), rows_before, "no duplicate entry");
+            assert!(
+                archives(&f).iter().all(|(_, _, missing)| missing.is_none()),
+                "nothing marked missing"
+            );
+            // Its verified check moved with it, still current.
+            let moved = recorded(&f, row);
+            assert_eq!(moved.path, f.destination);
+            assert_eq!(DiscFileState::of(&moved), DiscFileState::Unchanged);
+            assert_eq!(state_of(&record), "applied");
+        }
+
+        #[test]
+        fn a_rescan_is_refused_when_the_interrupted_rename_cannot_be_proved() {
+            let (mut f, row) = verified(OrganisationMode::RenameInPlace);
+            let (_, record) = interrupted(&f);
+            // Not the file the engine moved: replaced after the move.
+            let bytes = std::fs::read(&f.destination).unwrap();
+            std::fs::remove_file(&f.destination).unwrap();
+            std::fs::write(&f.destination, [bytes.as_slice(), b"x"].concat()).unwrap();
+            let before = (archives(&f), stored(&f, row));
+            let refused = scan(&mut f).unwrap_err().to_string();
+            assert!(refused.contains("Nothing was scanned"), "{refused}");
+            // It names the exact game folder and why, and how to resolve it.
+            let folder = f.source.parent().unwrap().display().to_string();
+            assert!(refused.contains(&folder), "{refused}");
+            assert!(
+                refused.contains("not at its new place as the same file"),
+                "{refused}"
+            );
+            assert!(
+                refused.contains("Let the library rescan these files"),
+                "{refused}"
+            );
+            assert_eq!((archives(&f), stored(&f, row)), before, "nothing changed");
+            assert_eq!(state_of(&record), "apply_pending", "kept for review");
+            // The reviewed way out, chosen in Advanced Protection: the record
+            // is kept (renamed), and the scan then runs, treating the file as
+            // moved outside EmuWiz. The old entry keeps its check.
+            let reviewed =
+                crate::dat::rom_organisation::protected_catalogue::release_for_rescan(&record)
+                    .unwrap();
+            assert!(reviewed.exists() && !record.exists());
+            assert_eq!(state_of(&reviewed), "apply_pending", "evidence unchanged");
+            scan(&mut f).unwrap();
+            assert!(
+                archives(&f)
+                    .iter()
+                    .any(|(id, _, missing)| *id == f.id && missing.is_some())
+            );
+            assert!(f.path_id(&f.destination).is_some_and(|id| id != f.id));
+            assert!(!stored(&f, row).is_empty(), "the old entry keeps its check");
+        }
+
+        #[test]
+        fn an_unreadable_record_blocks_the_scan_and_says_where() {
+            let (mut f, _) = verified(OrganisationMode::RenameInPlace);
+            let workspace = f
+                .temp
+                .path()
+                .join(crate::dat::rom_organisation::protected_catalogue::WORKSPACE_FOLDER)
+                .join("key");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("catalogue-9.json"), b"not json").unwrap();
+            let before = archives(&f);
+            let refused = scan(&mut f).unwrap_err().to_string();
+            assert!(refused.contains("cannot be read"), "{refused}");
+            assert!(
+                refused.contains(&workspace.display().to_string()),
+                "{refused}"
+            );
+            assert_eq!(archives(&f), before);
+        }
+
+        #[test]
+        fn a_library_folder_switched_off_does_not_block_the_others() {
+            use crate::dat::rom_organisation::protected_catalogue::finish_pending_before_scan;
+            let (f, _) = verified(OrganisationMode::RenameInPlace);
+            let (_, record) = interrupted(&f);
+            std::fs::remove_file(&f.destination).unwrap();
+            // A different library folder beside it: not concerned.
+            let other = f.temp.path().join("other-library");
+            std::fs::create_dir_all(&other).unwrap();
+            finish_pending_before_scan([other.as_path()]).unwrap();
+            assert_eq!(state_of(&record), "apply_pending");
+            assert!(finish_pending_before_scan([f.temp.path().join("games").as_path()]).is_err());
+        }
+
+        #[test]
+        fn a_rescan_waits_while_advanced_protection_is_working() {
+            let (mut f, _) = verified(OrganisationMode::RenameInPlace);
+            let (workspace, record) = interrupted(&f);
+            let lock = crate::dat::rom_organisation::protected_catalogue::WorkspaceLock::try_take(
+                &workspace,
+            )
+            .unwrap()
+            .unwrap();
+            let before = archives(&f);
+            let refused = scan(&mut f).unwrap_err().to_string();
+            assert!(refused.contains("is renaming files"), "{refused}");
+            assert_eq!(archives(&f), before);
+            drop(lock);
+            scan(&mut f).unwrap();
+            assert_eq!(f.path_id(&f.destination), Some(f.id));
+            assert_eq!(state_of(&record), "applied");
+        }
+    }
 }

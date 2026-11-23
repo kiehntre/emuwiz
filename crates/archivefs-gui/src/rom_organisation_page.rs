@@ -1718,12 +1718,6 @@ pub(crate) fn validate_r2_selection(
     plan: &OrganisationPlan,
     approved: &BTreeSet<String>,
 ) -> Result<archivefs_core::dat::rename_apply::RenameTransaction, String> {
-    if plan.suggested().any(|e| {
-        e.catalogue_binding.is_some()
-            && approved.contains(&e.source_path.to_string_lossy().into_owned())
-    }) {
-        return Err("Catalogue-backed organisation requires Standard Apply so filesystem and catalogue Undo remain coordinated.".into());
-    }
     archivefs_core::dat::rom_organisation::refuse_partial_disc_sets(plan, approved)?;
     let names = NameResolver::load();
     let database = default_database_path().map_err(|e| e.to_string())?;
@@ -1736,6 +1730,11 @@ pub(crate) fn validate_r2_selection(
         &RetroArchSaveLocations::discover(),
     )?;
     let tx = build_organisation_transaction(plan, approved, plan.generation)?;
+    // Catalogue-backed files (owner option 1): the library entries must still
+    // be exactly as the preview saw them, the same check Standard Apply makes.
+    archivefs_core::dat::rom_organisation::protected_catalogue::validate_protected_catalogue(
+        &tx, &library,
+    )?;
     let expected = plan
         .suggested()
         .filter(|e| approved.contains(&e.source_path.to_string_lossy().into_owned()))
@@ -4982,7 +4981,7 @@ mod tests {
     }
 
     #[test]
-    fn advanced_protection_refuses_catalogue_bound_selection_before_io() {
+    fn advanced_protection_never_accepts_an_unsealed_catalogue_binding() {
         let mut entry = linked_library_plan_entry(OrganisationStatus::Suggested);
         entry.catalogue_binding = Some(serde_json::json!({"reviewed":true}));
         let approved =
@@ -4995,8 +4994,9 @@ mod tests {
             generation: 1,
             entries: vec![entry],
         };
-        let error = validate_r2_selection(&plan, &approved).unwrap_err();
-        assert!(error.contains("Standard Apply"), "{error}");
+        // Catalogue-backed files are eligible (owner option 1), but only with
+        // a binding the library confirms; this one is refused, no I/O done.
+        assert!(validate_r2_selection(&plan, &approved).is_err());
     }
 
     fn linked_library_plan_entry(status: OrganisationStatus) -> OrganisationPlanEntry {

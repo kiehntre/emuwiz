@@ -1309,6 +1309,9 @@ impl super::App {
         self.organisation
             .r2
             .show(ui, self.canonical_organisation.r2_selection(), true);
+        if std::mem::take(&mut self.organisation.r2.refresh_list) {
+            self.canonical_organisation.scan_sources();
+        }
         self.refresh_history_model();
         let game_path = self
             .router

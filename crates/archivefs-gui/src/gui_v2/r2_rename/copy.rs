@@ -3,6 +3,8 @@ pub(super) const ADVANCED: &str = "Advanced Protection";
 pub(super) const COMPARISON: &str = "Standard Rename keeps the existing reviewed preview, freshness checks and Undo. It is the recommended everyday choice. Advanced Protection adds durable original-file anchors, transaction-bound one-shot approval, conservative interrupted recovery and verified ownership release. Its extra checks take longer.";
 pub(super) const SCOPE: &str = "Advanced Protection eligibility: local ext4 with 4096-byte blocks; one to eight direct regular files in one folder; supported RenameMove only. Links, nested moves, other filesystems and larger batches are not supported.";
 pub(super) const LIMITS: &str = "Advanced Protection does not prevent other programs modifying files and is not resistant to complete authority-store rollback. Keep other writers away during the operation; do not restore old recovery records over live state.";
+/// The retained original-file link (owner decision 2026-11-23).
+pub(super) const DISK_SPACE: &str = "Disk space: after an Advanced Protection rename, EmuWiz keeps a hidden second link to each original file in the folder's private recovery folders (.emuwiz-r2-holding and emuwiz-enrolled-recovery-v3), so the operation can always be undone. It uses no extra space while the game is there. But if you later delete or replace a protected game, its disk space is not freed until that retained link is safely released, and EmuWiz does not release it yet. Undo releases it. Never delete these recovery folders by hand.";
 pub(super) const MR_WIZ: &str = "Standard Rename is a good everyday choice. Advanced Protection is optional: it keeps extra identity and recovery evidence for a small rename batch, so it takes more time. I'll show the files and any limits before you decide. You can choose Standard Rename explicitly if this operation doesn't fit.";
 pub(super) const BENCHMARKS: &str = "Measured examples, not guarantees: on the test host, warm-cache medians from two samples of a complete plan/review/Apply/Undo cycle were about 0.14 s with Standard Rename versus 0.88 s with Advanced Protection for one 1 MiB file; eight 1 MiB files took about 0.55 s versus 4.00 s. These are backend measurements, not GUI timing promises. File size, storage and other work change the time.";
 
@@ -49,9 +51,9 @@ pub(super) fn explain_refusal(refusal: &str, root: Option<&std::path::Path>) -> 
     } else if refusal.contains("Safety workspace must be canonical")
         || refusal.contains("Unsafe data-directory parent")
     {
-        "Advanced Protection's safety folder in your EmuWiz data folder \
-         (emuwiz-r2-blue) must be a real folder that only you can open (permissions 700) and that \
-         you own. Fix its permissions, for example chmod 700 on it, then try again."
+        "Advanced Protection's private recovery folder (.emuwiz-protection, beside your \
+         library folder) must be a real folder that you own and only you can open \
+         (permissions 700). EmuWiz never changes it for you: check it, then try again."
             .to_string()
     } else if refusal.contains("private owner-only fixture required")
         || refusal.contains("holding directory is not private and owned")

@@ -1214,6 +1214,50 @@ pub(crate) fn begin(
     CatalogueMove::open(binding, entry, reverse, recovery).map(Some)
 }
 
+/// Advanced Protection: the saved checks of `entry` still current for the
+/// file at the path it is about to leave (read-only), taken under the
+/// catalogue hold just before its engine moves the file. Only these may
+/// follow it ([`begin_protected`]).
+pub(crate) fn current_protected_checks(entry: &TransactionEntry, reverse: bool) -> Vec<i64> {
+    let Some(value) = entry.unknown.get(KEY) else {
+        return Vec::new();
+    };
+    let Ok(binding) = serde_json::from_value::<Binding>(value.clone()) else {
+        return Vec::new();
+    };
+    if binding.verify_storage().is_err() {
+        return Vec::new();
+    }
+    let Ok(c) = open_read_only_connection(&binding.database) else {
+        return Vec::new();
+    };
+    let from = if reverse { &binding.new } else { &binding.old };
+    current_checks(&c, &binding, from)
+        .map(|checks| checks.iter().map(|carry| carry.row).collect())
+        .unwrap_or_default()
+}
+
+/// [`begin`] after Advanced Protection's engine has moved the file: the same
+/// sealed checks, carrying only the checks that were current just before the
+/// move (`checked`); each is still read in full again at its new place.
+pub(crate) fn begin_protected(
+    entry: &TransactionEntry,
+    reverse: bool,
+    checked: &[i64],
+) -> std::result::Result<Option<CatalogueMove>, String> {
+    let Some(mut change) = begin(entry, reverse, false)? else {
+        return Ok(None);
+    };
+    change.carry = change
+        .binding
+        .proofs
+        .iter()
+        .filter(|carry| checked.contains(&carry.row))
+        .cloned()
+        .collect();
+    Ok(Some(change))
+}
+
 /// A read-only catalogue connection for validation (no write lock, no
 /// journal).
 fn open_read_only_connection(path: &Path) -> std::result::Result<Connection, String> {

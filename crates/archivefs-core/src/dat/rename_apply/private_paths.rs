@@ -8,6 +8,8 @@ pub(crate) fn is_private_recovery_path(path: &Path) -> bool {
         part.file_name().is_some_and(|name| {
             name == ".emuwiz-r2-holding"
                 || name == "emuwiz-enrolled-recovery-v3"
+                // Advanced Protection's private workspace beside a library.
+                || name == ".emuwiz-protection"
                 || name.to_string_lossy().starts_with(".emuwiz-copy-")
                 // Ouroboros: a relocation's private staging folder and the
                 // folder retaining its original. A scan must not catalogue
@@ -35,6 +37,7 @@ mod tests {
         for name in [
             ".emuwiz-r2-holding",
             "emuwiz-enrolled-recovery-v3",
+            ".emuwiz-protection",
             ".emuwiz-copy-fixture",
             ".emuwiz-transform-0123456789abcdef0123456789abcdef",
             ".emuwiz-retired-0123456789abcdef0123456789abcdef",

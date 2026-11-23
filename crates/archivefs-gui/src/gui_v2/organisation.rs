@@ -575,6 +575,7 @@ impl App {
                     );
                     if self.canonical_organisation.advanced_r2_selected {
                         self.organisation.r2.show(ui, self.canonical_organisation.r2_selection(), false);
+                        if std::mem::take(&mut self.organisation.r2.refresh_list) { self.canonical_organisation.scan_sources(); }
                         if self.organisation.r2.can_choose_standard() && !self.organisation.r2.busy() && ui.button("Use Standard Rename instead").clicked(){ self.canonical_organisation.advanced_r2_selected=false; }
                     }
                 }

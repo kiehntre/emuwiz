@@ -51,6 +51,9 @@ pub(super) struct State {
     preview_confirm: bool,
     action_confirm: bool,
     reuse_confirm: bool,
+    /// Set when an Apply or Undo ran: the page refreshes its game list.
+    pub(super) refresh_list: bool,
+    release_confirm: bool,
 }
 impl State {
     pub(super) fn can_choose_standard(&self) -> bool {
@@ -77,6 +80,7 @@ impl State {
         self.preview_confirm = false;
         self.action_confirm = false;
         self.reuse_confirm = false;
+        self.release_confirm = false;
         let (tx, rx) = mpsc::channel();
         self.job = Some(Job {
             receiver: rx,
@@ -138,6 +142,7 @@ impl State {
                         self.review = Some(r);
                     }
                     ResultValue::Executed(v, i) => {
+                        self.refresh_list = true;
                         self.result = Some(v);
                         self.info = Some(i);
                         self.review = None;
@@ -229,6 +234,7 @@ pub(super) fn choice(ui: &mut egui::Ui, selected: &mut bool, busy: bool, can_sta
         ui.label(copy::COMPARISON);
         ui.label(copy::SCOPE);
         ui.label(copy::LIMITS);
+        ui.label(copy::DISK_SPACE);
         ui.label(copy::BENCHMARKS);
     });
     if !can_standard {

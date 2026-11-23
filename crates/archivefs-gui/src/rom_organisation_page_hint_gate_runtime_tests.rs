@@ -405,19 +405,31 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
     assert_eq!(snapshot(&root), before, "Standard Apply changed something");
 
     // Advanced Protection, its own validation call (made by its prepare,
-    // apply and review steps). Library rows are catalogue-bound, and that
-    // path refuses any bound row outright, so the stale selection is refused
-    // whole before any name is chosen.
+    // apply and review steps). Catalogue-backed rows are accepted (owner
+    // option 1), so the same verified-name check refuses the stale RomM row,
+    // alone or with the verified game.
     let plan = state.plan.clone().unwrap();
     let both = crate::gui_v2::validate_selection_for_test(plan.clone(), state.approved.clone())
         .err()
         .expect("Advanced Protection must refuse the whole selection");
-    assert!(both.contains("Catalogue-backed"), "{both}");
+    assert!(both.contains(HINT_FILE), "{both}");
+    assert!(both.contains("verified catalogue names only"), "{both}");
     let alone =
         crate::gui_v2::validate_selection_for_test(plan.clone(), BTreeSet::from([key(&hint)]))
             .err()
             .expect("Advanced Protection must refuse the stale RomM row");
-    assert!(alone.contains("Catalogue-backed"), "{alone}");
+    assert!(alone.contains("verified catalogue names only"), "{alone}");
+    // The verified game alone is eligible, with its sealed library binding.
+    let eligible =
+        crate::gui_v2::validate_selection_for_test(plan.clone(), BTreeSet::from([key(&verified)]))
+            .expect("a current verified game is eligible for Advanced Protection");
+    assert!(
+        eligible
+            .entries
+            .iter()
+            .all(|e| e.unknown.contains_key("organisation_catalogue_v1")),
+        "the library entry follows the file"
+    );
     // An unbound stale RomM row (no library binding at all) gets past that
     // rule and is refused by the verified-name check on this path.
     let mut unbound = plan;
