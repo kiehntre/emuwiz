@@ -449,31 +449,59 @@ pub fn revalidate_organisation_plan(
 
     let database = crate::Database::open_read_only(database_path)
         .map_err(|error| format!("could not open the platform identity database: {error}"))?;
+    // Existing links: the approved folders are read again from the library,
+    // and each link's game file is checked against them again below.
+    let link_roots = if plan.mode == super::model::OrganisationMode::OrganiseSymlinkOnly {
+        Some(
+            super::link_target::approved_library_roots(&database).map_err(|error| {
+                format!("could not read the library's approved folders: {error}")
+            })?,
+        )
+    } else {
+        None
+    };
     // Read now, for this check only: every archive id in one pass (the path
     // column has no index, so a lookup per entry scanned the whole table),
     // and each destination folder listed once while every entry is still
-    // planned on its own, exactly as before.
+    // planned on its own, exactly as before. Disc sets are re-planned as a
+    // whole, as before. Nothing is reused from the preview.
     let resolutions = super::rename_guard::LiveResolutions::read(&database);
-    let suggested: Vec<_> = plan.suggested().collect();
-    let candidates: Vec<OrganisationCandidate> = suggested
+    let single: Vec<_> = plan.suggested().filter(|e| e.disc_set.is_none()).collect();
+    let candidates: Vec<OrganisationCandidate> = single
         .iter()
         .map(|entry| OrganisationCandidate {
             source_path: entry.source_path.clone(),
-            resolution: resolutions.for_path(&entry.source_path, plan.generation),
+            resolution: resolutions.for_path(
+                &super::link_target::identity_path(plan.mode, &entry.source_path),
+                plan.generation,
+            ),
             canonical_name: canonical_name_for(&entry.source_path),
             content_classification: entry.content_classification.clone(),
             original_metadata: entry.original_metadata.clone(),
         })
         .collect();
-    let re_entries = plan_each_candidate_alone(&OrganisationPlanRequest {
+    let mut re_entries = plan_each_candidate_alone(&OrganisationPlanRequest {
         master_root: &plan.master_root,
         mode: plan.mode,
         content_policy: plan.content_policy,
         candidates: &candidates,
         generation: plan.generation,
         unknown_folder: None,
-    });
-    for (entry, re_entry) in suggested.iter().zip(&re_entries) {
+        link_target_roots: link_roots.as_deref(),
+    })
+    .into_iter();
+    // Same order, first failure and message as the one-entry check.
+    let mut disc_sets_checked = BTreeSet::new();
+    for entry in plan.suggested() {
+        if let Some(sheet) = &entry.disc_set {
+            if disc_sets_checked.insert(sheet.clone()) {
+                revalidate_disc_set(plan, sheet, &database)?;
+            }
+            continue;
+        }
+        let re_entry = re_entries
+            .next()
+            .ok_or("the organisation could not be checked again")?;
         if re_entry.status != super::model::OrganisationStatus::Suggested
             || re_entry.destination_path != entry.destination_path
             || re_entry.platform.as_deref() != entry.platform.as_deref()
