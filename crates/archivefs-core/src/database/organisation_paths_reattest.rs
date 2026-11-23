@@ -91,8 +91,11 @@ impl FileState {
     }
 }
 
+/// Extended attributes as (name, value) pairs.
+type Attributes = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// Every extended attribute of `path` itself (never a link target).
-fn attributes(path: &Path) -> std::result::Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+fn attributes(path: &Path) -> std::result::Result<Attributes, String> {
     let c = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| "has an unusable name".to_string())?;
     let failed = || {

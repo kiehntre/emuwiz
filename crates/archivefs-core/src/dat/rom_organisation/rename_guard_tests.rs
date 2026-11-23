@@ -1007,7 +1007,7 @@ fn the_one_pass_platform_lookup_matches_the_per_file_lookup() {
         .find(|folder| folder.path == psx)
         .unwrap()
         .id;
-    let archive = crate::Archive::from_path_in_root(&psx.join("quest.iso"), &psx).unwrap();
+    let archive = crate::Archive::from_path_in_root(psx.join("quest.iso"), &psx).unwrap();
     lib.db.upsert_archive(nested, &psx, &archive).unwrap();
     assert!(
         lib.db

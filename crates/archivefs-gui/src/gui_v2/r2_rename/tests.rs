@@ -330,7 +330,7 @@ fn blue_says_a_deleted_protected_game_may_not_free_its_space() {
 /// already started (Standard not allowed for those files) still opens.
 #[test]
 fn advanced_protection_is_deferred_but_started_operations_stay_reachable() {
-    assert!(!super::OFFERED_IN_THIS_RELEASE);
+    const { assert!(!super::OFFERED_IN_THIS_RELEASE) };
     assert!(!super::offered(true));
     assert!(super::offered(false));
     let ctx = egui::Context::default();

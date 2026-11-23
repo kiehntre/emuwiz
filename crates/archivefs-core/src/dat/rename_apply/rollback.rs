@@ -353,10 +353,15 @@ fn grouped_reverse_order(transaction: &RenameTransaction) -> Vec<usize> {
     order
 }
 
-/// For each moved disc set whose files are not all in one place (all at
-/// their old or all at their new path, unchanged), a report naming where
-/// every file is now and how to finish. Read from the filesystem.
-pub fn split_disc_set_reports(transaction: &RenameTransaction) -> Vec<(String, String)> {
+/// Each moved disc set whose files are not all in one place (all at their
+/// old or all at their new path), with where each file is: `Some(true)` new
+/// place, `Some(false)` old place, `None` neither. Read from the filesystem:
+/// a file is where the same file object (device and inode, which a rename
+/// keeps) is, whether or not its content has since changed.
+#[allow(clippy::type_complexity)]
+fn split_disc_sets_on_disk(
+    transaction: &RenameTransaction,
+) -> Vec<(String, Vec<(&super::model::TransactionEntry, Option<bool>)>)> {
     let mut sets =
         std::collections::BTreeMap::<String, Vec<&super::model::TransactionEntry>>::new();
     for entry in &transaction.entries {
@@ -366,8 +371,6 @@ pub fn split_disc_set_reports(transaction: &RenameTransaction) -> Vec<(String, S
             sets.entry(lead).or_default().push(entry);
         }
     }
-    // Where a file is: the same file object (device and inode, which a
-    // rename keeps), whether or not its content has since changed.
     let at = |path: &Path, entry: &super::model::TransactionEntry| {
         capture_identity(path).is_ok_and(|current| {
             #[cfg(unix)]
@@ -380,7 +383,7 @@ pub fn split_disc_set_reports(transaction: &RenameTransaction) -> Vec<(String, S
             }
         })
     };
-    let mut reports = Vec::new();
+    let mut split = Vec::new();
     for (lead, members) in sets {
         let places: Vec<(&super::model::TransactionEntry, Option<bool>)> = members
             .iter()
@@ -397,9 +400,36 @@ pub fn split_disc_set_reports(transaction: &RenameTransaction) -> Vec<(String, S
             .collect();
         let all_new = places.iter().all(|(_, place)| *place == Some(true));
         let all_old = places.iter().all(|(_, place)| *place == Some(false));
-        if all_new || all_old {
-            continue;
+        if !(all_new || all_old) {
+            split.push((lead, places));
         }
+    }
+    split
+}
+
+/// Every path (old and new) of each disc set this transaction left not
+/// whole, so later operations can refuse them until the set is recovered.
+pub fn split_disc_set_paths(
+    transaction: &RenameTransaction,
+) -> Vec<(String, Vec<std::path::PathBuf>)> {
+    split_disc_sets_on_disk(transaction)
+        .into_iter()
+        .map(|(lead, places)| {
+            let paths = places
+                .iter()
+                .flat_map(|(entry, _)| [entry.source_path.clone(), entry.destination_path.clone()])
+                .collect();
+            (lead, paths)
+        })
+        .collect()
+}
+
+/// For each moved disc set whose files are not all in one place, a report
+/// naming where every file is now and how to finish. Read from the
+/// filesystem.
+pub fn split_disc_set_reports(transaction: &RenameTransaction) -> Vec<(String, String)> {
+    let mut reports = Vec::new();
+    for (lead, places) in split_disc_sets_on_disk(transaction) {
         let lines: Vec<String> = places
             .iter()
             .map(|(entry, place)| match place {
@@ -416,7 +446,7 @@ pub fn split_disc_set_reports(transaction: &RenameTransaction) -> Vec<(String, S
         reports.push((
             lead.clone(),
             format!(
-                "DISC SET NOT WHOLE: the files of {lead} are not together. Where they are now: {}. Nothing will be overwritten, and a preview refuses this incomplete set, so nothing else moves these files. To recover: fix the problem reported for the file above, then Undo again from History; Undo puts the moved files back and then the set is whole at its old place. If a file is reported as not found, restore it from a backup before Undo.",
+                "DISC SET NOT WHOLE: the files of {lead} are not together. Where they are now: {}. Until the set is whole, every preview blocks these files and Apply refuses them, and nothing is overwritten. To recover: fix the problem reported for the file above, then Undo again from History; Undo puts the moved files back and then the set is whole at its old place. If a file is reported as not found, restore it from a backup before Undo.",
                 lines.join("; ")
             ),
         ));

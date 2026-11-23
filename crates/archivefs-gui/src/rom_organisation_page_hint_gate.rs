@@ -99,11 +99,6 @@ pub(crate) fn unverified_reason(mode: OrganisationMode, from_romm: bool) -> &'st
     }
 }
 
-/// Whether this row was blocked by this rule (any reason).
-pub(crate) fn blocked_for_unverified_name(entry: &OrganisationPlanEntry) -> bool {
-    unverified_name_label(entry).is_some()
-}
-
 /// The name a row keeps without a verified catalogue name: the file's own
 /// name, or for an existing link its target game file's name (never the
 /// link's current name, owner policy 2026-11-22). `None` when an existing
@@ -264,6 +259,7 @@ pub(crate) fn refuse_changed_names_with(
 /// from live evidence, and the whole Apply is refused unless it is a verified
 /// catalogue name. A preview made before this rule, or one whose catalogue
 /// check went stale since, is refused here. Nothing is changed either way.
+#[cfg(test)]
 pub(crate) fn refuse_unverified_names(
     plan: &OrganisationPlan,
     approved: &BTreeSet<String>,

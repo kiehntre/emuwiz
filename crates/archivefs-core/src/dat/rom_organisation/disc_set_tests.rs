@@ -120,6 +120,7 @@ impl Lib {
         )
         .unwrap();
         guard_bulk_rename_plan(&self.db, &mut plan, &RetroArchSaveLocations::default());
+        super::rename_guard::block_split_disc_sets(&mut plan, &self.journal());
         prepare_organisation_catalogue(&mut plan, &self.db).unwrap();
         plan
     }
@@ -1317,5 +1318,105 @@ mod never_split {
         let mut tx = crate::dat::rename_apply::read_journal(&journal).unwrap();
         assert_eq!(s.lib.undo(&mut tx), RollbackResult::FullyRolledBack);
         set_at_source(&s);
+    }
+
+    /// A playlist set left split by an unrecovered failure (the repair's
+    /// way back is blocked): a fresh preview, in every mode and over any
+    /// selection, offers none of its files for rename, move or link.
+    #[test]
+    fn an_unrecovered_split_playlist_set_is_refused_by_every_later_preview() {
+        let mut lib = Lib::new();
+        let m3u = lib.file(
+            "Saga.m3u",
+            "#EXTM3U\nSaga (Disc 1).chd\nSaga (Disc 2).chd\n",
+        );
+        let one = lib.game("Saga (Disc 1).chd", "disc one", "PSX");
+        let two = lib.game("Saga (Disc 2).chd", "disc two", "PSX");
+        let set = [m3u.clone(), one.clone(), two.clone()];
+        let plan = lib.preview(OrganisationMode::MoveRealFile, &[&m3u, &one, &two]);
+        let hook_set = set.clone();
+        let occupied = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = occupied.clone();
+        test_hook::after_applied(move |count, _| {
+            if count == 1 {
+                let moved_one = hook_set.iter().find(|path| !path.exists()).unwrap().clone();
+                let waiting_one = waiting(&hook_set)[0].clone();
+                std::fs::write(&waiting_one, "changed during Apply").unwrap();
+                std::fs::write(&moved_one, "someone else's file").unwrap();
+                *record.borrow_mut() = Some(moved_one);
+            }
+        });
+        let result = lib.apply(&plan, &all_of(&plan));
+        test_hook::clear();
+        assert!(result.unwrap_err().contains("DISC SET NOT WHOLE"));
+        let occupant = occupied.borrow().clone().unwrap();
+        // Where each set file is now (the occupant at an old path is not one).
+        let set_files: Vec<PathBuf> = set
+            .iter()
+            .map(|old| {
+                let new = moved(&plan, old);
+                if new.exists() { new } else { old.clone() }
+            })
+            .collect();
+        let at_new = set_files.iter().filter(|path| !set.contains(path)).count();
+        assert!((1..3).contains(&at_new), "the set is split: {set_files:?}");
+        assert!(set_files.iter().all(|path| path.exists()));
+        let discs: Vec<&PathBuf> = set_files
+            .iter()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "chd"))
+            .collect();
+        assert_eq!(discs.len(), 2);
+        let selections: Vec<Vec<&Path>> =
+            std::iter::once(set_files.iter().map(PathBuf::as_path).collect::<Vec<_>>())
+                .chain(set_files.iter().map(|path| vec![path.as_path()]))
+                .collect();
+        for mode in [
+            OrganisationMode::RenameInPlace,
+            OrganisationMode::MoveRealFile,
+            OrganisationMode::BuildLinkedLibrary,
+        ] {
+            for selection in &selections {
+                let fresh = lib.preview(mode, selection);
+                for entry in &fresh.entries {
+                    if set_files.contains(&entry.source_path) {
+                        assert_ne!(
+                            entry.status,
+                            OrganisationStatus::Suggested,
+                            "{mode:?} {selection:?} offers {:?}: {entry:?}",
+                            entry.source_path
+                        );
+                    }
+                }
+                // Nothing of the set can be approved and applied either.
+                let approved: BTreeSet<String> = selection
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect();
+                // Apply re-reads the journals: refused before anything is built.
+                let refused = super::super::rename_guard::refuse_split_disc_sets(
+                    &fresh,
+                    &approved,
+                    &lib.journal(),
+                );
+                let touches_set = selection
+                    .iter()
+                    .any(|path| set_files.iter().any(|f| f == path));
+                assert_eq!(refused.is_err(), touches_set, "{mode:?} {selection:?}");
+                if let Ok(tx) = build_organisation_transaction(&fresh, &approved, 1) {
+                    assert!(
+                        tx.entries
+                            .iter()
+                            .all(|e| !set_files.contains(&e.source_path)),
+                        "{mode:?} {selection:?} would change a set file"
+                    );
+                }
+            }
+        }
+        // Every set file is still exactly where it was.
+        assert!(set_files.iter().all(|path| path.exists()));
+        assert_eq!(
+            std::fs::read_to_string(&occupant).unwrap(),
+            "someone else's file"
+        );
     }
 }

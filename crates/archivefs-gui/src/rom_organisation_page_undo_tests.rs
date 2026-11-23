@@ -144,8 +144,10 @@ fn click(
 }
 
 fn undo_ready() -> RomOrganisationPageState {
-    let mut state = RomOrganisationPageState::default();
-    state.applied = Some(applied_transaction());
+    let mut state = RomOrganisationPageState {
+        applied: Some(applied_transaction()),
+        ..Default::default()
+    };
     state.result_message = Some("Applied 2 organisation(s).".into());
     state.result_complete = true;
     state

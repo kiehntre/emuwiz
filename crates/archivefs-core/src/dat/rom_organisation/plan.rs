@@ -594,11 +594,11 @@ fn detect_collisions_with(
     let count = entries.len();
     let mut groups: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
-    for index in 0..count {
-        if entries[index].destination_path.as_os_str().is_empty() {
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.destination_path.as_os_str().is_empty() {
             continue;
         }
-        let key = entries[index]
+        let key = entry
             .destination_path
             .to_string_lossy()
             .to_ascii_lowercase();

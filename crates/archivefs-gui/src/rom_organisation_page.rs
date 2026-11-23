@@ -731,9 +731,12 @@ impl RomOrganisationPageState {
                 self.plan = None;
                 return true;
             }
-            if stop() {
-                return false;
-            }
+        }
+        // In every mode: files of a disc set an earlier operation left in two
+        // places stay blocked until that set is whole again (Undo).
+        bulk_guard::block_split_disc_sets(&mut plan, &self.applied_journal);
+        if stop() {
+            return false;
         }
         // Bulk rename renames only from verified catalogue names: a RomM
         // title stays visible as a hint, but its row is Blocked.
@@ -872,6 +875,12 @@ impl RomOrganisationPageState {
             &self.approved,
             &RetroArchSaveLocations::discover(),
         ) {
+            self.error = Some(reason);
+            return;
+        }
+        if let Err(reason) =
+            bulk_guard::refuse_split_disc_sets(plan, &self.approved, &self.applied_journal)
+        {
             self.error = Some(reason);
             return;
         }

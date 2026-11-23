@@ -154,6 +154,7 @@ fn a_move_that_would_rename_from_a_hint_is_blocked_too() {
 /// existing links and building a linked library never take a RomM name; a
 /// link that keeps its file's own name, and a verified name, are unaffected.
 #[test]
+#[allow(clippy::single_element_loop)] // one link mode today; more join the list
 fn every_link_mode_refuses_romm_names_and_keeps_verified_and_unrenamed_links() {
     // Reorganise existing links needs real links (its own name is the
     // target's): see existing_links_are_judged_by_their_target_game_file.
@@ -424,8 +425,10 @@ fn apply_accepts_verified_names_and_ignores_unapproved_or_unrenamed_rows() {
 
 #[test]
 fn the_page_labels_a_hint_row_and_offers_no_apply_for_it() {
-    let mut state = RomOrganisationPageState::default();
-    state.mode = OrganisationMode::RenameInPlace;
+    let mut state = RomOrganisationPageState {
+        mode: OrganisationMode::RenameInPlace,
+        ..Default::default()
+    };
     let (mut plan, choices) = mixed_preview(OrganisationMode::RenameInPlace);
     plan.entries
         .retain(|e| e.source_path == Path::new(HINT_SRC));

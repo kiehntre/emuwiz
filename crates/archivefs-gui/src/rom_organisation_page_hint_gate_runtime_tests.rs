@@ -295,10 +295,7 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
             "DAT registry",
             archivefs_core::dat::sources::default_dat_sources_config_path().unwrap(),
         ),
-        (
-            "RomM cache",
-            PathBuf::from(default_identity_root().unwrap()),
-        ),
+        ("RomM cache", default_identity_root().unwrap()),
     ] {
         assert!(path.starts_with(&root), "{what}: {}", path.display());
     }
@@ -410,14 +407,12 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
     // alone or with the verified game.
     let plan = state.plan.clone().unwrap();
     let both = crate::gui_v2::validate_selection_for_test(plan.clone(), state.approved.clone())
-        .err()
-        .expect("Advanced Protection must refuse the whole selection");
+        .expect_err("Advanced Protection must refuse the whole selection");
     assert!(both.contains(HINT_FILE), "{both}");
     assert!(both.contains("verified catalogue names only"), "{both}");
     let alone =
         crate::gui_v2::validate_selection_for_test(plan.clone(), BTreeSet::from([key(&hint)]))
-            .err()
-            .expect("Advanced Protection must refuse the stale RomM row");
+            .expect_err("Advanced Protection must refuse the stale RomM row");
     assert!(alone.contains("verified catalogue names only"), "{alone}");
     // The verified game alone is eligible, with its sealed library binding.
     let eligible =
@@ -437,8 +432,7 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
         entry.catalogue_binding = None;
     }
     let named = crate::gui_v2::validate_selection_for_test(unbound, BTreeSet::from([key(&hint)]))
-        .err()
-        .expect("Advanced Protection must refuse an unbound RomM row");
+        .expect_err("Advanced Protection must refuse an unbound RomM row");
     assert!(named.contains(HINT_FILE), "{named}");
     assert!(named.contains("verified catalogue names only"), "{named}");
     assert_eq!(
@@ -688,7 +682,7 @@ fn child_both_apply_paths_refuse_a_stale_romm_row() {
         .collect();
     let catalogue_paths = || {
         let database =
-            archivefs_core::Database::open_read_only(&default_database_path().unwrap()).unwrap();
+            archivefs_core::Database::open_read_only(default_database_path().unwrap()).unwrap();
         let mut known = Vec::new();
         for path in [&verified, &hint, &plain, &alpha_link, &romm_link] {
             known.push(

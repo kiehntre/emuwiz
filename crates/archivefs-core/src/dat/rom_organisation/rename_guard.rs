@@ -360,3 +360,71 @@ impl SidecarCache {
         Ok(None)
     }
 }
+
+/// Files of disc sets an earlier operation left not whole (read from the
+/// journals in `journal_dir`, located on disk), with the set they belong to.
+/// An unreadable journal folder yields nothing here; Apply cannot run
+/// without that folder anyway.
+fn split_disc_set_files(journal_dir: &Path) -> std::collections::BTreeMap<PathBuf, String> {
+    let mut files = std::collections::BTreeMap::new();
+    if journal_dir.as_os_str().is_empty() {
+        return files;
+    }
+    let (journals, _unreadable) = crate::dat::rename_apply::journal::list_journals(journal_dir);
+    for journal in &journals {
+        for (lead, paths) in crate::dat::rename_apply::split_disc_set_paths(journal) {
+            for path in paths {
+                files.insert(path, lead.clone());
+            }
+        }
+    }
+    files
+}
+
+fn split_set_reason(lead: &str) -> String {
+    format!(
+        "this file belongs to the disc set of {lead}, which an earlier operation left with its files in two places. Nothing will change it until that set is whole again: finish it with Undo from History."
+    )
+}
+
+/// Blocks, in any mode, every file of a disc set an earlier operation left
+/// not whole. Returns how many rows were blocked.
+pub fn block_split_disc_sets(plan: &mut OrganisationPlan, journal_dir: &Path) -> usize {
+    let files = split_disc_set_files(journal_dir);
+    if files.is_empty() {
+        return 0;
+    }
+    let mut blocked = 0;
+    for entry in &mut plan.entries {
+        if let Some(lead) = files.get(&entry.source_path)
+            && entry.status != OrganisationStatus::Blocked
+        {
+            entry.status = OrganisationStatus::Blocked;
+            entry.reason = Some(split_set_reason(lead));
+            blocked += 1;
+        }
+    }
+    blocked
+}
+
+/// At Apply, read fresh: refuses the whole Apply if an approved file belongs
+/// to a disc set an earlier operation left not whole.
+pub fn refuse_split_disc_sets(
+    plan: &OrganisationPlan,
+    approved: &BTreeSet<String>,
+    journal_dir: &Path,
+) -> Result<(), String> {
+    let files = split_disc_set_files(journal_dir);
+    for entry in &plan.entries {
+        if approved.contains(entry.source_path.to_string_lossy().as_ref())
+            && let Some(lead) = files.get(&entry.source_path)
+        {
+            return Err(format!(
+                "{}: {} Nothing was changed.",
+                entry.source_path.display(),
+                split_set_reason(lead)
+            ));
+        }
+    }
+    Ok(())
+}
