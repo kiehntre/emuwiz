@@ -4,11 +4,15 @@
 //! (for example on a larger disk); the choice is one line in
 //! `prepared_media_folder.txt` in EmuWiz's configuration folder and is
 //! accepted only after [`check_folder`] passes, and is re-checked each time
-//! it is used ([`still_safe`]). Copies already in another folder are not
+//! it is used ([`still_safe`]). The person says which disk the folder is on
+//! by that disk's filesystem UUID; the folder is accepted only when it is on
+//! that filesystem (see [`super::disk_identity`]), the UUID is saved with
+//! the choice, and the folder is used only while it is still on that
+//! filesystem. Copies already in another folder are not
 //! moved; folders used earlier are remembered, so their copies are still
 //! found and still covered by the launch gate.
 
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -18,6 +22,11 @@ use super::prepared_media::PreparedMediaStore;
 /// File name inside EmuWiz's configuration folder.
 pub const STORAGE_SETTING_FILE: &str = "prepared_media_folder.txt";
 const MAX_SETTING_BYTES: u64 = 8 * 1024;
+
+/// Where the choice is saved, for callers that pass it on explicitly.
+pub fn setting_file() -> Result<PathBuf, String> {
+    setting_path()
+}
 
 fn setting_path() -> Result<PathBuf, String> {
     crate::app_dirs::config_path(STORAGE_SETTING_FILE).map_err(|error| error.to_string())
@@ -113,6 +122,152 @@ pub fn still_safe(folder: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Which filesystem each chosen folder must be on, beside the setting: the
+/// UUID the person named when choosing it, saved only after the folder was
+/// verified to be on that filesystem. A folder merely existing later proves
+/// nothing: an unmounted disk leaves its empty mount point behind, and
+/// another disk can be mounted in its place. The store compares the
+/// filesystem's identity each time the folder is used.
+///
+/// Format 1 (never in an installed build) recorded whatever filesystem the
+/// folder was on when it was chosen, which is not proof of the intended
+/// disk; such a record is not trusted and the folder must be chosen again.
+const FILESYSTEMS_FILE: &str = "prepared_media_folder_filesystems.json";
+const FILESYSTEMS_FORMAT: u32 = 2;
+const MAX_FILESYSTEMS_BYTES: u64 = 256 * 1024;
+const MAX_RECORDED_FOLDERS: usize = 64;
+
+#[derive(serde::Deserialize, Serialize)]
+struct RecordedFilesystems {
+    format_version: u32,
+    /// Folder path as chosen -> the UUID of the filesystem it must be on.
+    folders: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RecordVersion {
+    format_version: u32,
+}
+
+fn filesystems_path_beside(setting: &Path) -> PathBuf {
+    setting.with_file_name(FILESYSTEMS_FILE)
+}
+
+fn read_recorded(setting: &Path) -> Result<RecordedFilesystems, String> {
+    use std::io::Read;
+    let path = filesystems_path_beside(setting);
+    let empty = || RecordedFilesystems {
+        format_version: FILESYSTEMS_FORMAT,
+        folders: std::collections::BTreeMap::new(),
+    };
+    let file = match crate::safe_read::open_regular_file_nonblocking(&path, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(empty()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let mut text = String::new();
+    file.take(MAX_FILESYSTEMS_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let unusable = || format!("{} is not a record EmuWiz wrote", path.display());
+    if text.len() as u64 > MAX_FILESYSTEMS_BYTES {
+        return Err(unusable());
+    }
+    let version: RecordVersion = serde_json::from_str(&text).map_err(|_| unusable())?;
+    if version.format_version == 1 {
+        return Err(format!(
+            "{} was written by a build that did not verify which disk a folder is on; choose the folder for prepared copies again, naming its disk",
+            path.display()
+        ));
+    }
+    if version.format_version != FILESYSTEMS_FORMAT {
+        return Err(unusable());
+    }
+    let recorded: RecordedFilesystems = serde_json::from_str(&text).map_err(|_| unusable())?;
+    // A UUID that cannot be read back is a damaged record, not "no record".
+    if recorded
+        .folders
+        .values()
+        .any(|uuid| super::disk_identity::ExpectedFilesystem::parse(uuid).is_err())
+    {
+        return Err(unusable());
+    }
+    Ok(recorded)
+}
+
+/// The id of the filesystem `folder` must be on (the identity of the UUID
+/// saved when it was chosen), if one was recorded. A record that cannot be
+/// read is an error, never "no record".
+pub(crate) fn recorded_filesystem(folder: &Path) -> Result<Option<u64>, String> {
+    recorded_filesystem_at(&setting_path()?, folder)
+}
+
+pub(crate) fn recorded_filesystem_at(setting: &Path, folder: &Path) -> Result<Option<u64>, String> {
+    let Some(folder) = folder.to_str() else {
+        return Ok(None);
+    };
+    Ok(read_recorded(setting)?
+        .folders
+        .get(folder)
+        .and_then(|uuid| super::disk_identity::ExpectedFilesystem::parse(uuid).ok())
+        .map(|expected| expected.id()))
+}
+
+/// Whether an earlier folder may still be treated as a store of this
+/// profile: it must pass [`still_safe`], its filesystem must have been
+/// recorded and the record readable, and, while the folder exists, it must
+/// be on that filesystem. `Err` carries the reason. The launch gate refuses
+/// every file inside a folder this distrusts.
+pub(crate) fn earlier_folder_distrust(folder: &Path) -> Result<(), String> {
+    earlier_folder_distrust_at(&setting_path()?, folder)
+}
+
+pub(crate) fn earlier_folder_distrust_at(setting: &Path, folder: &Path) -> Result<(), String> {
+    still_safe(folder)?;
+    let Some(recorded) = recorded_filesystem_at(setting, folder)? else {
+        return Err(format!(
+            "EmuWiz has no record of which disk {} was on; choose it as the folder for prepared copies again to use the copies in it",
+            folder.display()
+        ));
+    };
+    if std::fs::symlink_metadata(folder).is_ok()
+        && super::prepared_media::filesystem_id(folder) != Some(recorded)
+    {
+        return Err(format!(
+            "{} is not on the disk it was on when it was chosen (is its disk connected?)",
+            folder.display()
+        ));
+    }
+    Ok(())
+}
+
+fn record_filesystem(setting: &Path, folder: &str, uuid: &str) -> Result<(), String> {
+    // A record that cannot be read is replaced: the folder being chosen now
+    // is the one whose disk is known for certain. Earlier folders lose their
+    // entries with it and are then not used until chosen again.
+    let mut recorded = read_recorded(setting).unwrap_or_else(|_| RecordedFilesystems {
+        format_version: FILESYSTEMS_FORMAT,
+        folders: std::collections::BTreeMap::new(),
+    });
+    recorded
+        .folders
+        .insert(folder.to_string(), uuid.to_string());
+    // Bounded: only the current folder and the remembered earlier ones are
+    // ever looked up.
+    if recorded.folders.len() > MAX_RECORDED_FOLDERS {
+        let keep: std::collections::BTreeSet<String> =
+            previous_folders_at(&previous_path_beside(setting))
+                .iter()
+                .filter_map(|known| known.to_str().map(str::to_string))
+                .chain(std::iter::once(folder.to_string()))
+                .collect();
+        recorded.folders.retain(|known, _| keep.contains(known));
+    }
+    let text = serde_json::to_string_pretty(&recorded).map_err(|error| error.to_string())?;
+    crate::atomic_write_text(&filesystems_path_beside(setting), &format!("{text}\n"))
+        .map_err(|error| error.to_string())
+}
+
 const PREVIOUS_FOLDERS_FILE: &str = "prepared_media_previous_folders.txt";
 const MAX_PREVIOUS_FOLDERS: usize = 32;
 
@@ -184,6 +339,10 @@ pub struct StorageCheck {
     pub available_bytes: Option<u64>,
     /// True when the folder is on the same filesystem as EmuWiz's data folder.
     pub same_disk_as_data: Option<bool>,
+    /// The UUID of the filesystem the folder (or, when it does not exist
+    /// yet, the folder above it) was verified to be on. `None` until that
+    /// verification passed; nothing is written anywhere before it has.
+    pub filesystem_uuid: Option<String>,
 }
 
 impl StorageCheck {
@@ -202,17 +361,28 @@ fn has_plain_components(path: &Path) -> bool {
         })
 }
 
-/// Examines `folder` without changing anything except, when `create` is set
-/// and it does not exist, creating that one folder (0700) and, inside it, a
-/// probe that is removed again. `library_folders` are the game folders EmuWiz
-/// scans: prepared copies inside one would be listed as games.
-pub fn check_folder(folder: &Path, library_folders: &[PathBuf], create: bool) -> StorageCheck {
+/// Examines `folder`. `filesystem_uuid` names the disk the person means (the
+/// UUID of its ext4 filesystem); `library_folders` are the game folders
+/// EmuWiz scans: prepared copies inside one would be listed as games.
+///
+/// Nothing is created. The first thing established is which disk the folder
+/// is on, through a handle on the folder itself or, when it does not exist
+/// yet, on the folder above it: unless that is the named disk, the check
+/// stops there and nothing has been written. Only on the verified disk, and
+/// only for a folder that exists, a probe folder is created inside it and
+/// removed again (the store needs a no-replace rename).
+pub fn check_folder(
+    folder: &Path,
+    library_folders: &[PathBuf],
+    filesystem_uuid: Option<&str>,
+) -> StorageCheck {
     let mut check = StorageCheck {
         folder: folder.to_path_buf(),
         problems: Vec::new(),
         notes: Vec::new(),
         available_bytes: None,
         same_disk_as_data: None,
+        filesystem_uuid: None,
     };
     if !has_plain_components(folder) {
         check
@@ -235,47 +405,82 @@ pub fn check_folder(folder: &Path, library_folders: &[PathBuf], create: bool) ->
         Err(_) => false,
     };
     // Where the folder really is (or would be), before anything is created.
-    let resolved = if existing {
+    let anchor = if existing {
         std::fs::canonicalize(folder).ok()
     } else {
         folder
             .parent()
             .filter(|parent| std::fs::metadata(parent).is_ok_and(|m| m.is_dir()))
             .and_then(|parent| std::fs::canonicalize(parent).ok())
-            .zip(folder.file_name())
-            .map(|(parent, name)| parent.join(name))
     };
-    let Some(resolved) = resolved else {
+    let Some(anchor) = anchor else {
         check.problems.push(if existing {
             "The folder could not be opened.".into()
         } else {
-            "The folder above this one does not exist.".into()
+            "The folder above this one does not exist. EmuWiz creates only the last folder of the path, and only on the disk you name.".into()
         });
         return check;
     };
+    let resolved = if existing {
+        anchor.clone()
+    } else {
+        match folder.file_name() {
+            Some(name) => anchor.join(name),
+            None => {
+                check
+                    .problems
+                    .push("Give the full path of a folder.".into());
+                return check;
+            }
+        }
+    };
+    // Which disk: named by the person, verified through a handle. Until
+    // this passes nothing else is examined and nothing is written.
+    let Some(filesystem_uuid) = filesystem_uuid.filter(|uuid| !uuid.trim().is_empty()) else {
+        check.problems.push(format!(
+            "Say which disk this folder is on: choose the disk, or give the UUID of its ext4 filesystem. A folder being there does not prove the right disk is connected ({}).",
+            super::disk_identity::HOW_TO_FIND_UUID
+        ));
+        return check;
+    };
+    let expected = match super::disk_identity::ExpectedFilesystem::parse(filesystem_uuid) {
+        Ok(expected) => expected,
+        Err(detail) => {
+            check.problems.push(format!("{detail}."));
+            return check;
+        }
+    };
+    // The handle of the verified folder is kept: the only thing this check
+    // ever writes (the probe below) goes through it, not through the path.
+    let verified = crate::safe_read::open_directory_no_symlinks(&anchor)
+        .map_err(|refusal| format!("{} is not a plain folder ({refusal:?})", anchor.display()))
+        .and_then(|directory| {
+            super::disk_identity::verify_on(&directory, &anchor, &expected).map(|()| directory)
+        });
+    let directory = match verified {
+        Ok(directory) => directory,
+        Err(detail) => {
+            check.problems.push(format!("{detail}."));
+            return check;
+        }
+    };
+    check.filesystem_uuid = Some(expected.uuid().to_string());
     check = location_checks(check, &resolved, library_folders);
+    // A folder that is itself a mount point is never accepted (see
+    // `is_mount_root`); one that does not exist yet cannot be one.
+    if existing && let Some(refusal) = super::prepared_media::mount_root_refusal(&resolved) {
+        check.problems.push(format!("{refusal}."));
+    }
     if !check.usable() {
         return check;
     }
-    let mut created = false;
     if !existing {
-        if !create {
-            check
-                .notes
-                .push("The folder does not exist yet; it will be created.".into());
-            if let Some(parent) = resolved.parent() {
-                check.available_bytes = super::prepared_media::available_bytes(parent).ok();
-                note_disk(&mut check, parent);
-            }
-            return check;
-        }
-        if let Err(error) = std::fs::DirBuilder::new().mode(0o700).create(folder) {
-            check
-                .problems
-                .push(format!("The folder could not be created: {error}."));
-            return check;
-        }
-        created = true;
+        check
+            .notes
+            .push("The folder does not exist yet; it will be created on that disk.".into());
+        check.available_bytes = super::prepared_media::available_bytes(&anchor).ok();
+        note_disk(&mut check, &anchor);
+        return check;
     }
     let Ok(metadata) = std::fs::metadata(&resolved) else {
         check
@@ -296,23 +501,14 @@ pub fn check_folder(folder: &Path, library_folders: &[PathBuf], create: bool) ->
     }
     if check.problems.is_empty() {
         // The store publishes each copy with a no-replace rename; a
-        // filesystem without it cannot hold the store.
-        match tempfile::Builder::new()
-            .prefix(".emuwiz-storage-check-")
-            .tempdir_in(&resolved)
-        {
-            Ok(probe) => {
-                let from = probe.path().join("a");
-                let to = probe.path().join("b");
-                let renamed = std::fs::create_dir(&from).is_ok()
-                    && crate::dat::rename_apply::noclobber::rename_noreplace(&from, &to).is_ok();
-                if !renamed {
-                    check.problems.push(
-                        "This disk's filesystem cannot publish a copy safely (no no-replace rename). Use a Linux filesystem such as ext4, XFS or Btrfs."
-                            .into(),
-                    );
-                }
-            }
+        // filesystem without it cannot hold the store. Tried on an empty
+        // folder made, renamed and removed through the verified handle.
+        match probe_noreplace_rename(&directory) {
+            Ok(true) => {}
+            Ok(false) => check.problems.push(
+                "This disk's filesystem cannot publish a copy safely (no no-replace rename)."
+                    .into(),
+            ),
             Err(error) => check
                 .problems
                 .push(format!("EmuWiz cannot write in this folder: {error}.")),
@@ -320,12 +516,41 @@ pub fn check_folder(folder: &Path, library_folders: &[PathBuf], create: bool) ->
     }
     check.available_bytes = super::prepared_media::available_bytes(&resolved).ok();
     note_disk(&mut check, &resolved);
-    if created && !check.usable() {
-        // Refused after all: do not leave the folder this call made (it is
-        // empty; `remove_dir` removes nothing else).
-        let _ = std::fs::remove_dir(folder);
-    }
     check
+}
+
+/// Makes an empty folder inside `directory`, renames it without replacing,
+/// and removes it again, all relative to the open handle: whatever the path
+/// leads to by now, nothing is written anywhere but in that folder. `false`
+/// when the filesystem has no no-replace rename.
+fn probe_noreplace_rename(directory: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let fd = directory.as_raw_fd();
+    // Unpredictable enough that no other folder has this name.
+    let stem = {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        format!("{:016x}", hasher.finish())
+    };
+    let name = |suffix: &str| {
+        std::ffi::CString::new(format!(".emuwiz-storage-check-{stem}{suffix}"))
+            .map_err(|_| std::io::Error::other("name"))
+    };
+    let (from, to) = (name("-a")?, name("-b")?);
+    // SAFETY: both names are NUL-terminated; `fd` is an open folder.
+    if unsafe { libc::mkdirat(fd, from.as_ptr(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    let renamed =
+        unsafe { libc::renameat2(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) } == 0;
+    // SAFETY: as above. Only the empty folder this call made is removed.
+    unsafe {
+        libc::unlinkat(fd, to.as_ptr(), libc::AT_REMOVEDIR);
+        libc::unlinkat(fd, from.as_ptr(), libc::AT_REMOVEDIR);
+    }
+    Ok(renamed)
 }
 
 /// Refuses a folder inside a game folder, or one that contains a game folder.
@@ -365,28 +590,34 @@ fn note_disk(check: &mut StorageCheck, existing: &Path) {
     }
 }
 
-/// Saves `folder` as the place for prepared copies after it passes
-/// [`check_folder`] (creating it if needed), or clears the choice with
-/// `None`. Copies already prepared elsewhere stay where they are.
+/// Saves `folder` as the place for prepared copies, or clears the choice
+/// with `None`. Copies already prepared elsewhere stay where they are.
+///
+/// `filesystem_uuid` names the disk the folder is meant to be on and is
+/// required with a folder. The folder must pass [`check_folder`] for that
+/// disk. One that does not exist yet is created (0700) only after the folder
+/// above it was verified to be on that disk, through that folder's handle,
+/// and is then checked again; if it fails after all, the empty folder this
+/// call made is removed. The UUID is saved with the choice.
 pub fn set_folder(
     folder: Option<&Path>,
     library_folders: &[PathBuf],
+    filesystem_uuid: Option<&str>,
 ) -> Result<Option<StorageCheck>, String> {
-    set_folder_at(&setting_path()?, folder, library_folders)
+    set_folder_at(&setting_path()?, folder, library_folders, filesystem_uuid)
 }
 
 pub fn set_folder_at(
     setting: &Path,
     folder: Option<&Path>,
     library_folders: &[PathBuf],
+    filesystem_uuid: Option<&str>,
 ) -> Result<Option<StorageCheck>, String> {
-    // The folder in use until now keeps its copies; they stay findable.
-    if let Ok(Some(old)) = configured_folder_at(setting)
-        && folder != Some(old.as_path())
-    {
-        remember_previous(setting, &old)?;
-    }
     let Some(folder) = folder else {
+        // The folder in use until now keeps its copies; they stay findable.
+        if let Ok(Some(old)) = configured_folder_at(setting) {
+            remember_previous(setting, &old)?;
+        }
         match std::fs::remove_file(setting) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -394,19 +625,98 @@ pub fn set_folder_at(
         }
         return Ok(None);
     };
-    let check = check_folder(folder, library_folders, true);
-    if !check.usable() {
-        return Err(check.problems.join(" "));
-    }
     let text = folder
         .to_str()
         .ok_or("The folder name is not valid text.")?
         .to_string();
+    let mut check = check_folder(folder, library_folders, filesystem_uuid);
+    if !check.usable() {
+        return Err(check.problems.join(" "));
+    }
+    if std::fs::symlink_metadata(folder).is_err() {
+        check = create_on_verified_disk(folder, library_folders, filesystem_uuid)?;
+    }
+    // Only a check that verified the disk carries its UUID.
+    let Some(uuid) = check.filesystem_uuid.clone() else {
+        return Err("Which disk this folder is on was not verified.".into());
+    };
     if let Some(parent) = setting.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
+    if let Ok(Some(old)) = configured_folder_at(setting)
+        && old != folder
+    {
+        remember_previous(setting, &old)?;
+    }
+    // The disk the folder must be on, recorded before the choice itself: a
+    // saved choice without this record is refused when used.
+    record_filesystem(setting, &text, &uuid)?;
     crate::atomic_write_text(setting, &format!("{text}\n")).map_err(|error| error.to_string())?;
     Ok(Some(check))
+}
+
+/// Creates the last folder of `folder` (0700) through a handle on the folder
+/// above it, after proving through that same handle that it is on the named
+/// disk, then checks the new folder like an existing one. A mount change
+/// between the proof and the creation cannot redirect it: the handle is of
+/// the verified folder, not of the path.
+pub(super) fn create_on_verified_disk(
+    folder: &Path,
+    library_folders: &[PathBuf],
+    filesystem_uuid: Option<&str>,
+) -> Result<StorageCheck, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let expected = super::disk_identity::ExpectedFilesystem::parse(
+        filesystem_uuid.ok_or("Which disk this folder is on was not said.")?,
+    )?;
+    let (Some(parent), Some(name)) = (folder.parent(), folder.file_name()) else {
+        return Err("Give the full path of a folder.".into());
+    };
+    let parent = std::fs::canonicalize(parent).map_err(|error| error.to_string())?;
+    let above = crate::safe_read::open_directory_no_symlinks(&parent)
+        .map_err(|refusal| format!("{} is not a plain folder ({refusal:?})", parent.display()))?;
+    super::disk_identity::verify_on(&above, &parent, &expected)?;
+    let c_name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| "The folder name is not valid.".to_string())?;
+    // SAFETY: `c_name` is NUL-terminated and `above` is an open folder.
+    if unsafe { libc::mkdirat(above.as_raw_fd(), c_name.as_ptr(), 0o700) } != 0 {
+        return Err(format!(
+            "The folder could not be created: {}.",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let remove = || {
+        // Refused after all: do not leave the folder this call made (it is
+        // empty; this removes nothing else).
+        // SAFETY: as above.
+        unsafe { libc::unlinkat(above.as_raw_fd(), c_name.as_ptr(), libc::AT_REMOVEDIR) };
+    };
+    // SAFETY: as above; the new folder is opened through the same handle,
+    // never through a link.
+    let made = unsafe {
+        libc::openat(
+            above.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if made < 0 {
+        remove();
+        return Err("The new folder could not be opened.".into());
+    }
+    // SAFETY: a fresh descriptor this function owns.
+    let made = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(made) };
+    if let Err(detail) = super::disk_identity::verify_on(&made, folder, &expected) {
+        remove();
+        return Err(detail);
+    }
+    let check = check_folder(folder, library_folders, filesystem_uuid);
+    if !check.usable() || check.filesystem_uuid.is_none() {
+        remove();
+        return Err(check.problems.join(" "));
+    }
+    Ok(check)
 }
 
 /// The store this profile uses now, and the default one, for display.

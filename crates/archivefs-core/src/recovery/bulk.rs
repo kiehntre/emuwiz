@@ -13,8 +13,7 @@
 //! added to a queue except the games the person chose.
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -356,15 +355,11 @@ fn queue_path(store: &PreparedMediaStore) -> PathBuf {
 
 fn lock_queue(store: &PreparedMediaStore) -> Result<QueueLock, BulkError> {
     use std::os::fd::AsRawFd;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(versioned(store).join("queue.lock"))
-        .map_err(|error| BulkError::Store(error.to_string()))?;
+    // Through a proven handle on the store's own folder: never created on
+    // whatever a changed mount has put at that path.
+    let file = store
+        .open_store_file("queue.lock", libc::O_RDWR)
+        .map_err(BulkError::Store)?;
     // SAFETY: the descriptor is open; flock has no memory effects.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(BulkError::Busy);
@@ -375,26 +370,17 @@ fn lock_queue(store: &PreparedMediaStore) -> Result<QueueLock, BulkError> {
 fn write_queue(store: &PreparedMediaStore, queue: &Queue) -> Result<(), BulkError> {
     let text =
         serde_json::to_string_pretty(queue).map_err(|error| BulkError::Store(error.to_string()))?;
-    // Written only into the store's own folder as it stands: a store whose
-    // folder has gone (its disk was unplugged mid-run) is never recreated
-    // here, where later copies would land on the wrong disk.
-    use std::os::unix::fs::MetadataExt;
-    let folder = versioned(store);
-    let metadata = std::fs::symlink_metadata(&folder)
-        .ok()
-        .filter(std::fs::Metadata::is_dir)
-        .ok_or_else(|| {
-            BulkError::Store(format!(
-                "{} is not there (is its disk connected?)",
-                folder.display()
-            ))
-        })?;
-    crate::atomic_text::write_in_existing_parent(
-        &queue_path(store),
-        &format!("{text}\n"),
-        (metadata.dev(), metadata.ino()),
-    )
-    .map_err(|error| BulkError::Store(error.to_string()))
+    // Written only into the store's own folder as it stands, and only while
+    // the store is still on the filesystem this batch started with: a store
+    // whose folder has gone, or whose disk was unmounted mid-run (the empty
+    // mount point is still a folder), is never written to or recreated here,
+    // where later copies would land on the wrong disk. The write itself
+    // names the folder by device and inode, so it cannot be redirected
+    // between this check and the open.
+    store.still_there().map_err(BulkError::Store)?;
+    let identity = store.versioned_identity().map_err(BulkError::Store)?;
+    crate::atomic_text::write_in_existing_parent(&queue_path(store), &format!("{text}\n"), identity)
+        .map_err(|error| BulkError::Store(error.to_string()))
 }
 
 /// The saved batch, if there is one. Read-only.
