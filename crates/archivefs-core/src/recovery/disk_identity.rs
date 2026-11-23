@@ -142,18 +142,34 @@ fn on_ext4(directory: &File, path: &Path) -> std::io::Result<bool> {
     Ok(stats.f_type == libc::EXT4_SUPER_MAGIC)
 }
 
-/// One line of a `/proc/self/mountinfo` table: device ("major:minor"), mount
-/// point and filesystem type.
-fn mount_lines(table: &str) -> Vec<(String, PathBuf, String)> {
-    table
+/// The mounts of a `/proc/self/mountinfo` table that are not covered by
+/// another mount stacked directly on top of them: device ("major:minor"),
+/// mount point and filesystem type. A covered mount cannot be reached by its
+/// path (the path answers for what is on top), and asking would mean asking
+/// the filesystem on top, which may be a network or FUSE mount that hangs.
+pub(crate) fn mount_lines(table: &str) -> Vec<(String, PathBuf, String)> {
+    let parsed: Vec<(String, String, String, PathBuf, String)> = table
         .lines()
         .filter_map(|line| {
             let (before, after) = line.split_once(" - ")?;
             let mut fields = before.split(' ');
-            let device = fields.nth(2)?.to_string();
+            let id = fields.next()?.to_string();
+            let parent = fields.next()?.to_string();
+            let device = fields.next()?.to_string();
             let mount_point = unescape_mount_path(fields.nth(1)?);
             let kind = after.split(' ').next()?.to_string();
-            Some((device, mount_point, kind))
+            Some((id, parent, device, mount_point, kind))
+        })
+        .collect();
+    parsed
+        .iter()
+        .filter(|(id, _, _, mount_point, _)| {
+            !parsed
+                .iter()
+                .any(|(_, parent, _, on_top, _)| parent == id && on_top == mount_point)
+        })
+        .map(|(_, _, device, mount_point, kind)| {
+            (device.clone(), mount_point.clone(), kind.clone())
         })
         .collect()
 }
@@ -210,9 +226,12 @@ fn disks_reporting(id: u64, own: u64) -> Result<usize, String> {
     let listed = mount_lines(&table).iter().any(|(device, _, kind)| {
         *device == device_name(own) && EXT_FAMILY.contains(&kind.as_str())
     });
-    if listed {
-        devices.insert(device_name(own));
+    if !listed {
+        // The folder's own disk is not among the visible ext4 mounts: its
+        // identity cannot be confirmed against the list at all.
+        return Ok(0);
     }
+    devices.insert(device_name(own));
     Ok(devices.len())
 }
 

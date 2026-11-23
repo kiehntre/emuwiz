@@ -4827,18 +4827,46 @@ mod disk_identity_tests {
         }
     }
 
-    /// A mount is asked for its identity only if its path still leads to
-    /// that device: a mount hidden under another one must not be given the
-    /// identity of what covers it. Read-only, on this machine's own "/".
+    /// A mount with another mount stacked directly on top of it is left out
+    /// of the list altogether: it is neither counted nor asked (asking would
+    /// reach the filesystem on top). Mounts elsewhere, and a mount below the
+    /// covered one, stay.
     #[test]
-    fn a_mount_that_is_covered_by_another_reports_nothing() {
+    fn a_mount_covered_by_another_is_not_listed() {
+        let stacked = "\
+24 1 252:0 / / rw - ext4 /dev/mapper/vg-root rw\n\
+77 24 8:33 /inner /mnt/stack rw - ext4 /dev/sdc1 rw\n\
+90 24 8:33 / /mnt/disk rw - ext4 /dev/sdc1 rw\n\
+91 90 8:49 / /mnt/disk/inside rw - ext4 /dev/sdd1 rw\n\
+3406 77 0:178 / /mnt/stack rw - fuse.x x rw\n";
+        let listed: Vec<(String, PathBuf, String)> = mount_lines(stacked);
+        let points: Vec<&str> = listed
+            .iter()
+            .map(|(_, point, _)| point.to_str().unwrap())
+            .collect();
+        assert_eq!(points, ["/", "/mnt/disk", "/mnt/disk/inside", "/mnt/stack"]);
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|(_, point, _)| point == Path::new("/mnt/stack"))
+                .map(|(_, _, kind)| kind.as_str())
+                .collect::<Vec<_>>(),
+            ["fuse.x"]
+        );
+    }
+
+    /// A mount is asked for its identity only if its path leads to that
+    /// device now. Read-only, on this machine's own "/". (This shows the
+    /// device comparison only; no covered mount is involved.)
+    #[test]
+    fn a_mount_is_asked_only_if_its_path_leads_to_its_device() {
         assert_eq!(device_name(libc::makedev(8, 33)), "8:33");
         assert_eq!(device_name(libc::makedev(252, 0)), "252:0");
         let root = Path::new("/");
         let device = std::fs::metadata(root).unwrap().dev();
         let real = crate::recovery::prepared_media::filesystem_id(root);
         assert_eq!(visible_identity(&device_name(device), root), real);
-        // The table says another device is mounted here: it is covered.
+        // The table names another device for this path: not asked.
         let other = device_name(device.wrapping_add(1));
         assert_eq!(visible_identity(&other, root), None);
     }

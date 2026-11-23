@@ -387,7 +387,9 @@ with `members()`, `fingerprint()` and `verify_structure()` rather than a rewrite
     UUID: with both copies connected and mounted where EmuWiz can see them it is
     refused as ambiguous, when a folder is chosen or named and each time a saved
     choice is used; with only one connected it cannot be told from the original. A
-    copy whose mount is hidden under another mount is not seen.
+    copy whose mount is hidden under another mount, is mounted only in another
+    mount namespace (a container), or is below a folder this user cannot enter is
+    not seen. Mounts covered by another mount are left out without being touched.
   - Compatibility: only ext4 (with ext2 and ext3) can hold prepared copies outside
     EmuWiz's own data folder. Btrfs, XFS, FAT, exFAT, network and FUSE filesystems
     and tmpfs are refused, because their reported identity cannot be checked against
