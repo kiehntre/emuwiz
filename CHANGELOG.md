@@ -36,6 +36,19 @@ Changes promoted to `main` since `v0.9.0`. Linux-only and pre-1.0.
   copy and its remembered launch choice when it is renamed with Rename (and
   on Undo); a ZIP renamed or moved outside EmuWiz finds its copy again by a
   full content comparison, without extracting.
+- Library files check (Problems & Repair) has a second part, "Where missing
+  entries went", and there is a new `emuwiz-cli collection reconcile`. They
+  explain what became of library entries whose file is not where the library
+  last saw it: entries marked "file not found", entries that are not marked
+  but have no file, and entries removed earlier by Forget Missing. Each entry
+  gets an evidence level (confirmed move, strong match, metadata match, weak
+  match, stale missing mark, possible match, unresolved) with the reasons,
+  using EmuWiz's own rename history and the file system's record of each file
+  rather than a checksum EmuWiz never stored. A matching name, size and date
+  is reported as a metadata match, never as proof of the same contents. Links
+  in the library folders are listed separately as working, broken, or
+  pointing at storage that is not there. It only looks: no entry, mark, link
+  or file is changed. Design: `docs/COLLECTION_RECONCILIATION.md`.
 - New Blue page "PlayStation memory cards" (All Tools, Saves) and
   `emuwiz-cli memory-cards`: finds PS1 and PS2 memory cards in the save
   folders of PCSX2, DuckStation, RetroArch and RPCS3, and shows each save's

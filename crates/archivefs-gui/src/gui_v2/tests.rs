@@ -10103,6 +10103,67 @@ mod library_files_check {
     }
 
     #[test]
+    fn the_page_has_two_parts_and_opening_either_starts_nothing() {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.router.current = Route::LibraryFiles;
+        let strings = render(&context, &mut app);
+        // The existing part is the default and is unchanged.
+        assert!(shows(&strings, "Library files check"), "{strings:?}");
+        assert!(shows(&strings, "Files and entries"));
+        assert!(shows(&strings, "Where missing entries went"));
+        assert!(shows(&strings, "Nothing has been checked yet"));
+        assert!(shows(&strings, "Check library now"));
+        assert_eq!(app.reconcile.runs_started, 0);
+
+        // The second part is on the same page: no second destination.
+        app.reconcile.evidence_open = true;
+        let strings = render(&context, &mut app);
+        assert_eq!(app.router.current, Route::LibraryFiles);
+        assert!(shows(&strings, "Library files check"), "{strings:?}");
+        assert!(shows(&strings, "Check now"));
+        assert!(shows(&strings, "Not checked yet"));
+        assert!(
+            !shows(&strings, "Check library now"),
+            "the first part is not drawn underneath"
+        );
+        assert!(
+            !app.reconcile.evidence.busy(),
+            "looking at the page must not list the disks"
+        );
+        assert_eq!(app.reconcile.runs_started, 0);
+        assert_eq!(app.reconcile.hash_runs_started, 0);
+
+        // Going back shows the first part exactly as before, results included.
+        app.reconcile.evidence_open = false;
+        app.reconcile.view = Some(Arc::new(view_of(
+            &[],
+            &[],
+            &[],
+            RootWalkState::Complete,
+            &[],
+        )));
+        let strings = render(&context, &mut app);
+        assert!(shows(
+            &strings,
+            "Everything EmuWiz checked is accounted for."
+        ));
+    }
+
+    #[test]
+    fn no_tool_page_duplicates_the_library_files_check() {
+        // One page for one task: the evidence views live inside Library files
+        // check, not behind a second entry in All Tools.
+        for tool in crate::gui_v2::routes::ToolPage::ALL {
+            let title = tool.title().to_lowercase();
+            assert!(
+                !title.contains("missing games") && !title.contains("reconcil"),
+                "{title}"
+            );
+        }
+    }
+
+    #[test]
     fn all_zero_shows_the_success_note_and_a_disabled_hash_action() {
         let context = egui::Context::default();
         let mut app = page(
