@@ -229,6 +229,7 @@ fn a_stop_request_never_shows_a_success_banner_beside_a_failed_save() {
         status_detail,
         stderr_tail,
         stop_outcome: Some(GracefulStopOutcome::ExitedAfterRequest),
+        forced_stop: false,
         saves,
     };
     let text = rendered(&display);

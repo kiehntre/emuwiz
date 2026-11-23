@@ -15,13 +15,19 @@ use std::time::Duration;
 
 const EXPLANATION: &str = "RetroArch is asked to close normally, so save in the game first if it needs it. Only the RetroArch that EmuWiz started is affected.";
 const NOT_THE_EMULATOR: &str = "Stop is not available for this launch: EmuWiz cannot confirm that the program it started is RetroArch itself, so stopping it might not close the game or let it save. Close RetroArch from its own window. EmuWiz will keep watching this launch.";
-const STILL_CLOSING: &str =
-    "Close RetroArch yourself if it stays open. EmuWiz will not force it to quit or ask again.";
+const STILL_CLOSING: &str = "If its window has stopped responding, RetroArch may be stuck closing: it can stall for good after a save state it could not write. EmuWiz will not force it to close by itself.";
+const FORCE_WARNING: &str = "Forcing RetroArch to close ends it at once. It will not write the in-game save on the way out, so progress since the game last saved may be lost. Only the RetroArch that EmuWiz started is affected.";
+const FORCED_STILL_RUNNING: &str = "RetroArch has not closed even after being forced. EmuWiz will not send anything else; close it from your system's task manager.";
+pub(super) const FORCED_EXIT: &str = "RetroArch was forced to close because it did not finish closing. It did not write the in-game save on the way out, so progress since the game last saved may be lost.";
 
 #[derive(Default)]
 pub(super) struct StopControl {
     confirmed: bool,
     outcome: Option<GracefulStopOutcome>,
+    /// The separately confirmed second request, offered only while the
+    /// first has been sent and RetroArch is still running (issue #528).
+    confirmed_force: bool,
+    forced: Option<GracefulStopOutcome>,
     /// The launch's settled target, so it is not asked every frame. Core
     /// asks again at the moment of the request.
     target: Option<OwnedExecutable>,
@@ -30,6 +36,27 @@ pub(super) struct StopControl {
 impl StopControl {
     pub(super) fn outcome(&self) -> Option<GracefulStopOutcome> {
         self.outcome
+    }
+
+    /// Whether the player's confirmed second request reached RetroArch.
+    pub(super) fn forced(&self) -> bool {
+        matches!(
+            self.forced,
+            Some(
+                GracefulStopOutcome::StillRunning { .. } | GracefulStopOutcome::ExitedAfterRequest
+            )
+        )
+    }
+
+    fn force(&mut self, process: &mut LaunchedRetroArchProcess) {
+        if !self.confirmed_force
+            || self.forced.is_some()
+            || !matches!(self.outcome, Some(GracefulStopOutcome::StillRunning { .. }))
+        {
+            return;
+        }
+        self.confirmed_force = false;
+        self.forced = Some(process.request_second_stop(Duration::ZERO));
     }
 
     fn request(&mut self, process: &mut LaunchedRetroArchProcess) {
@@ -67,10 +94,37 @@ impl StopControl {
                     self.request(process);
                 }
             }
-            Some(GracefulStopOutcome::StillRunning { .. }) => {
-                ui.label("Stopping RetroArch: it has not closed yet.");
-                ui.small(STILL_CLOSING);
-            }
+            Some(GracefulStopOutcome::StillRunning { .. }) => match self.forced {
+                None => {
+                    ui.label("Stopping RetroArch: it has not closed yet.");
+                    ui.small(STILL_CLOSING);
+                    ui.small(FORCE_WARNING);
+                    ui.checkbox(
+                        &mut self.confirmed_force,
+                        "I understand: force RetroArch to close without writing the in-game save",
+                    );
+                    if ui
+                        .add_enabled(
+                            self.confirmed_force,
+                            egui::Button::new("Force RetroArch to close"),
+                        )
+                        .clicked()
+                    {
+                        self.force(process);
+                    }
+                }
+                Some(GracefulStopOutcome::StillRunning { .. }) => {
+                    ui.label("Forcing RetroArch to close: it has not closed yet.");
+                    ui.small(FORCED_STILL_RUNNING);
+                }
+                Some(GracefulStopOutcome::AlreadyExited | GracefulStopOutcome::ExitedAfterRequest) => {
+                    ui.label("RetroArch has closed; waiting for its final exit report.");
+                }
+                Some(GracefulStopOutcome::Refused(reason)) => {
+                    ui.label("Forcing RetroArch to close did not reach it. EmuWiz will keep watching this launch.");
+                    ui.small(format!("Refused: {reason:?}"));
+                }
+            },
             Some(GracefulStopOutcome::AlreadyExited | GracefulStopOutcome::ExitedAfterRequest) => {
                 ui.label("RetroArch has closed; waiting for its final exit report.");
             }
@@ -122,7 +176,9 @@ impl RetroArchLaunchState {
             }
             _ => return,
         };
-        if let Some((summary, _)) = requested_exit(stop.outcome(), success) {
+        if stop.forced() {
+            ui.small(format!("{}: {FORCED_EXIT}", game_name(process)));
+        } else if let Some((summary, _)) = requested_exit(stop.outcome(), success) {
             ui.small(format!("{}: {summary}", game_name(process)));
         }
     }
@@ -166,6 +222,20 @@ impl RetroArchLaunchState {
         stop.confirmed = true;
         stop.request(process);
         stop.outcome()
+    }
+
+    /// Confirms and sends the second request for the tracked launch.
+    pub(crate) fn force_stop_for_test(&mut self) -> Option<GracefulStopOutcome> {
+        let (process, stop) = match self.tracked.as_mut()? {
+            (_, RetroArchLaunchStage::Running { process, stop }) => (process, stop),
+            (_, RetroArchLaunchStage::RunningCheats { session, stop }) => {
+                (session.process_mut()?, stop)
+            }
+            _ => return None,
+        };
+        stop.confirmed_force = true;
+        stop.force(process);
+        stop.forced
     }
 }
 
